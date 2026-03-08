@@ -931,4 +931,96 @@ impl Neo4jClient {
 
         Ok((total_sessions, total_entities, total_relations))
     }
+
+    // ========================================================================
+    // Graph visualization — Chat layer
+    // ========================================================================
+
+    /// Get chat sessions with DISCUSSED relations for the graph visualization.
+    /// Only returns sessions that have at least 1 DISCUSSED relation.
+    /// Ordered by most recent, limited to `limit` sessions.
+    /// For each session, returns top 10 discussed entities by mention_count.
+    pub async fn get_chat_graph_data(
+        &self,
+        project_id: Uuid,
+        limit: usize,
+    ) -> Result<(Vec<ChatGraphSession>, Vec<ChatGraphDiscussed>)> {
+        let pid = project_id.to_string();
+        let lim = limit as i64;
+
+        // Query 1: Sessions that have DISCUSSED relations, scoped by project
+        let sessions_query = query(
+            "MATCH (proj:Project {id: $pid})-[:HAS_CHAT_SESSION]->(cs:ChatSession)-[d:DISCUSSED]->()
+             WITH cs, count(d) AS disc_count
+             WHERE disc_count > 0
+             RETURN cs.id AS id,
+                    cs.title AS title,
+                    cs.model AS model,
+                    cs.message_count AS message_count,
+                    cs.total_cost_usd AS total_cost_usd,
+                    toString(cs.created_at) AS created_at
+             ORDER BY cs.updated_at DESC
+             LIMIT $lim",
+        )
+        .param("pid", pid.clone())
+        .param("lim", lim);
+
+        let mut result = self.graph.execute(sessions_query).await?;
+        let mut sessions = Vec::new();
+        let mut session_ids = Vec::new();
+        while let Some(row) = result.next().await? {
+            let id: String = row.get("id")?;
+            session_ids.push(id.clone());
+            sessions.push(ChatGraphSession {
+                id,
+                title: row
+                    .get::<String>("title")
+                    .unwrap_or_else(|_| "Untitled".to_string()),
+                model: row.get::<Option<String>>("model").ok().flatten(),
+                message_count: row.get::<i64>("message_count").unwrap_or(0),
+                total_cost_usd: row.get::<f64>("total_cost_usd").unwrap_or(0.0),
+                created_at: row.get::<String>("created_at").unwrap_or_default(),
+            });
+        }
+
+        if sessions.is_empty() {
+            return Ok((sessions, vec![]));
+        }
+
+        // Query 2: DISCUSSED edges for those sessions, top 10 per session by mention_count
+        let discussed_query = query(
+            "MATCH (cs:ChatSession)-[d:DISCUSSED]->(target)
+             WHERE cs.id IN $session_ids
+             WITH cs, d, target,
+                  labels(target) AS target_labels
+             ORDER BY d.mention_count DESC
+             WITH cs,
+                  collect({
+                    entity_type: target_labels[0],
+                    entity_id: COALESCE(target.path, target.name, target.id),
+                    mention_count: d.mention_count
+                  })[..10] AS top_discussed
+             UNWIND top_discussed AS disc
+             RETURN cs.id AS session_id,
+                    disc.entity_type AS entity_type,
+                    disc.entity_id AS entity_id,
+                    disc.mention_count AS mention_count",
+        )
+        .param("session_ids", session_ids);
+
+        let mut result = self.graph.execute(discussed_query).await?;
+        let mut discussed = Vec::new();
+        while let Some(row) = result.next().await? {
+            discussed.push(ChatGraphDiscussed {
+                session_id: row.get("session_id")?,
+                entity_type: row
+                    .get::<String>("entity_type")
+                    .unwrap_or_else(|_| "File".to_string()),
+                entity_id: row.get::<String>("entity_id").unwrap_or_default(),
+                mention_count: row.get::<i64>("mention_count").unwrap_or(1),
+            });
+        }
+
+        Ok((sessions, discussed))
+    }
 }

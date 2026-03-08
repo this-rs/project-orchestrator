@@ -837,4 +837,166 @@ impl Neo4jClient {
 
         Ok((plans, total as usize))
     }
+
+    // ========================================================================
+    // Graph visualization — PM layer
+    // ========================================================================
+
+    /// Get all PM entities and edges for the graph visualization layer.
+    /// Uses efficient bulk Cypher queries scoped by project_id.
+    pub async fn get_pm_graph_data(
+        &self,
+        project_id: Uuid,
+        limit: usize,
+    ) -> Result<(Vec<PmGraphNode>, Vec<PmGraphEdge>)> {
+        let pid = project_id.to_string();
+        let lim = limit as i64;
+
+        // ── Query 1: All PM nodes via UNION ──
+        let nodes_query = query(
+            "MATCH (proj:Project {id: $pid})-[:HAS_PLAN]->(p:Plan)
+             RETURN p.id AS id, 'plan' AS type, p.title AS label,
+                    p.status AS status, p.priority AS priority,
+                    null AS target_date, null AS version, null AS description
+             ORDER BY p.priority DESC
+             LIMIT $lim
+
+             UNION ALL
+
+             MATCH (proj:Project {id: $pid})-[:HAS_PLAN]->(pl:Plan)-[:HAS_TASK]->(t:Task)
+             RETURN t.id AS id, 'task' AS type, t.title AS label,
+                    t.status AS status, t.priority AS priority,
+                    null AS target_date, null AS version, null AS description
+             LIMIT $lim
+
+             UNION ALL
+
+             MATCH (proj:Project {id: $pid})-[:HAS_PLAN]->(:Plan)-[:HAS_TASK]->(t:Task)-[:HAS_STEP]->(s:Step)
+             RETURN s.id AS id, 'step' AS type, s.description AS label,
+                    s.status AS status, null AS priority,
+                    null AS target_date, null AS version, null AS description
+             LIMIT $lim
+
+             UNION ALL
+
+             MATCH (proj:Project {id: $pid})-[:HAS_MILESTONE]->(m:Milestone)
+             RETURN m.id AS id, 'milestone' AS type, m.title AS label,
+                    m.status AS status, null AS priority,
+                    m.target_date AS target_date, null AS version, m.description AS description
+             LIMIT $lim
+
+             UNION ALL
+
+             MATCH (proj:Project {id: $pid})-[:HAS_RELEASE]->(r:Release)
+             RETURN r.id AS id, 'release' AS type, r.title AS label,
+                    r.status AS status, null AS priority,
+                    r.target_date AS target_date, r.version AS version, null AS description
+             LIMIT $lim
+
+             UNION ALL
+
+             MATCH (proj:Project {id: $pid})-[:HAS_PLAN]->(pl:Plan)<-[:LINKED_TO_PLAN]-(c:Commit)
+             RETURN c.sha AS id, 'commit' AS type,
+                    COALESCE(substring(c.message, 0, 60), c.sha) AS label,
+                    null AS status, null AS priority,
+                    c.timestamp AS target_date, null AS version, null AS description
+             LIMIT $lim
+
+             UNION ALL
+
+             MATCH (proj:Project {id: $pid})-[:HAS_PLAN]->(:Plan)-[:HAS_TASK]->(t:Task)<-[:LINKED_TO_TASK]-(c:Commit)
+             RETURN c.sha AS id, 'commit' AS type,
+                    COALESCE(substring(c.message, 0, 60), c.sha) AS label,
+                    null AS status, null AS priority,
+                    c.timestamp AS target_date, null AS version, null AS description
+             LIMIT $lim",
+        )
+        .param("pid", pid.clone())
+        .param("lim", lim);
+
+        let mut result = self.graph.execute(nodes_query).await?;
+        let mut nodes = Vec::new();
+        while let Some(row) = result.next().await? {
+            let id: String = row.get("id")?;
+            let node_type: String = row.get("type")?;
+            let label: String = row.get::<String>("label").unwrap_or_default();
+            let status: Option<String> = row.get::<Option<String>>("status").ok().flatten();
+            let priority: Option<i64> = row.get::<Option<i64>>("priority").ok().flatten();
+            let target_date: Option<String> =
+                row.get::<Option<String>>("target_date").ok().flatten();
+            let version: Option<String> = row.get::<Option<String>>("version").ok().flatten();
+
+            nodes.push(PmGraphNode {
+                id,
+                node_type,
+                label: if label.chars().count() > 80 {
+                    let truncated: String = label.chars().take(79).collect();
+                    format!("{truncated}…")
+                } else {
+                    label
+                },
+                attributes: serde_json::json!({
+                    "status": status,
+                    "priority": priority,
+                    "target_date": target_date,
+                    "version": version,
+                }),
+            });
+        }
+
+        // ── Query 2: All PM edges via UNION ──
+        let edges_query = query(
+            "MATCH (proj:Project {id: $pid})-[:HAS_PLAN]->(pl:Plan)-[:HAS_TASK]->(t:Task)
+             RETURN pl.id AS source, t.id AS target, 'HAS_TASK' AS rel_type
+
+             UNION ALL
+
+             MATCH (proj:Project {id: $pid})-[:HAS_PLAN]->(:Plan)-[:HAS_TASK]->(t:Task)-[:HAS_STEP]->(s:Step)
+             RETURN t.id AS source, s.id AS target, 'HAS_STEP' AS rel_type
+
+             UNION ALL
+
+             MATCH (proj:Project {id: $pid})-[:HAS_PLAN]->(:Plan)-[:HAS_TASK]->(t1:Task)-[:DEPENDS_ON]->(t2:Task)
+             RETURN t1.id AS source, t2.id AS target, 'DEPENDS_ON' AS rel_type
+
+             UNION ALL
+
+             MATCH (proj:Project {id: $pid})-[:HAS_PLAN]->(pl:Plan)-[:TARGETS_MILESTONE]->(m:Milestone)
+             RETURN pl.id AS source, m.id AS target, 'TARGETS_MILESTONE' AS rel_type
+
+             UNION ALL
+
+             MATCH (proj:Project {id: $pid})-[:HAS_PLAN]->(pl:Plan)<-[:LINKED_TO_PLAN]-(c:Commit)
+             RETURN c.sha AS source, pl.id AS target, 'LINKED_TO_PLAN' AS rel_type
+
+             UNION ALL
+
+             MATCH (proj:Project {id: $pid})-[:HAS_PLAN]->(:Plan)-[:HAS_TASK]->(t:Task)<-[:LINKED_TO_TASK]-(c:Commit)
+             RETURN c.sha AS source, t.id AS target, 'LINKED_TO_TASK' AS rel_type
+
+             UNION ALL
+
+             MATCH (proj:Project {id: $pid})-[:HAS_PLAN]->(pl:Plan)<-[:LINKED_TO_PLAN]-(c:Commit)-[r:TOUCHES]->(f:File)
+             RETURN c.sha AS source, f.path AS target, 'TOUCHES' AS rel_type
+
+             UNION ALL
+
+             MATCH (proj:Project {id: $pid})-[:HAS_PLAN]->(:Plan)-[:HAS_TASK]->(t:Task)<-[:LINKED_TO_TASK]-(c:Commit)-[r:TOUCHES]->(f:File)
+             RETURN c.sha AS source, f.path AS target, 'TOUCHES' AS rel_type",
+        )
+        .param("pid", pid);
+
+        let mut result = self.graph.execute(edges_query).await?;
+        let mut edges = Vec::new();
+        while let Some(row) = result.next().await? {
+            edges.push(PmGraphEdge {
+                source: row.get("source")?,
+                target: row.get("target")?,
+                rel_type: row.get("rel_type")?,
+                attributes: None,
+            });
+        }
+
+        Ok((nodes, edges))
+    }
 }

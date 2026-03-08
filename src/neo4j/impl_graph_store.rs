@@ -2040,6 +2040,26 @@ impl GraphStore for Neo4jClient {
     }
 
     // ========================================================================
+    // Graph visualization queries (PM + Chat layers)
+    // ========================================================================
+
+    async fn get_pm_graph_data(
+        &self,
+        project_id: Uuid,
+        limit: usize,
+    ) -> anyhow::Result<(Vec<PmGraphNode>, Vec<PmGraphEdge>)> {
+        self.get_pm_graph_data(project_id, limit).await
+    }
+
+    async fn get_chat_graph_data(
+        &self,
+        project_id: Uuid,
+        limit: usize,
+    ) -> anyhow::Result<(Vec<ChatGraphSession>, Vec<ChatGraphDiscussed>)> {
+        self.get_chat_graph_data(project_id, limit).await
+    }
+
+    // ========================================================================
     // User / Auth operations
     // ========================================================================
 
