@@ -1861,7 +1861,10 @@ impl Neo4jClient {
         if let Ok(mut rows) = self.graph.execute(rel_types_q).await {
             while let Some(row) = rows.next().await? {
                 let rel_type: String = row.get("rel_type").unwrap_or_default();
-                relationship_type_counts.push(RelTypeCount { rel_type, count: -1 });
+                relationship_type_counts.push(RelTypeCount {
+                    rel_type,
+                    count: -1,
+                });
             }
         }
 

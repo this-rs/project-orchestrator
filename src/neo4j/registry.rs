@@ -16,8 +16,8 @@ impl super::client::Neo4jClient {
             .context("Failed to serialize SkillPackage")?;
         let trust_components_json = serde_json::to_string(&published.trust_components)
             .context("Failed to serialize trust components")?;
-        let tags_json = serde_json::to_string(&published.tags)
-            .context("Failed to serialize tags")?;
+        let tags_json =
+            serde_json::to_string(&published.tags).context("Failed to serialize tags")?;
 
         let query = query(
             "MERGE (ps:PublishedSkill {id: $id})
@@ -200,22 +200,24 @@ fn parse_published_skill_node(node: &Node) -> Result<PublishedSkill> {
     let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
 
     let package_json: String = node.get("package_json")?;
-    let package: crate::skills::package::SkillPackage = serde_json::from_str(&package_json)
-        .context("Failed to deserialize package_json")?;
+    let package: crate::skills::package::SkillPackage =
+        serde_json::from_str(&package_json).context("Failed to deserialize package_json")?;
 
     let trust_score: f64 = node.get("trust_score").unwrap_or(0.0);
 
     let trust_components_json: String = node
         .get("trust_components_json")
         .unwrap_or_else(|_| "{}".to_string());
-    let trust_components: crate::skills::trust::TrustComponents =
-        serde_json::from_str(&trust_components_json).unwrap_or(crate::skills::trust::TrustComponents {
-            energy: 0.0,
-            cohesion: 0.0,
-            activation: 0.0,
-            success_rate: 0.0,
-            source_projects: 0.0,
-        });
+    let trust_components: crate::skills::trust::TrustComponents = serde_json::from_str(
+        &trust_components_json,
+    )
+    .unwrap_or(crate::skills::trust::TrustComponents {
+        energy: 0.0,
+        cohesion: 0.0,
+        activation: 0.0,
+        success_rate: 0.0,
+        source_projects: 0.0,
+    });
 
     let trust_level_str: String = node
         .get("trust_level")
@@ -231,7 +233,9 @@ fn parse_published_skill_node(node: &Node) -> Result<PublishedSkill> {
     let source_project_id = Uuid::parse_str(&source_project_id_str)?;
 
     let source_project_name: String = node.get("source_project_name").unwrap_or_default();
-    let published_by: String = node.get("published_by").unwrap_or_else(|_| "unknown".to_string());
+    let published_by: String = node
+        .get("published_by")
+        .unwrap_or_else(|_| "unknown".to_string());
 
     let published_at_str: String = node
         .get("published_at")

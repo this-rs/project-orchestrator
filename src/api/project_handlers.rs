@@ -1457,9 +1457,7 @@ pub async fn get_embeddings_projection(
         .iter()
         .any(|coords| coords.iter().any(|c| !c.is_finite()))
     {
-        tracing::warn!(
-            "UMAP produced NaN/Inf coordinates, falling back to circular layout"
-        );
+        tracing::warn!("UMAP produced NaN/Inf coordinates, falling back to circular layout");
         circular_fallback(embedding_points.len(), proj_dims)
     } else {
         projected

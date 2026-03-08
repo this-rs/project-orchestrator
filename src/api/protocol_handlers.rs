@@ -275,8 +275,13 @@ pub async fn route_protocols(
             })
             .unwrap_or_else(|| "execution".to_string());
 
-        let mut ctx =
-            ContextVector::from_plan_context(&plan_status_str, task_count, dependency_count, affected_files_count, completion_pct);
+        let mut ctx = ContextVector::from_plan_context(
+            &plan_status_str,
+            task_count,
+            dependency_count,
+            affected_files_count,
+            completion_pct,
+        );
 
         // Allow explicit overrides
         if let Some(phase) = &query.phase {
@@ -1427,9 +1432,7 @@ pub async fn simulate_activation(
         .get_protocol(body.protocol_id)
         .await
         .map_err(AppError::Internal)?
-        .ok_or_else(|| {
-            AppError::NotFound(format!("Protocol {} not found", body.protocol_id))
-        })?;
+        .ok_or_else(|| AppError::NotFound(format!("Protocol {} not found", body.protocol_id)))?;
 
     // Build context
     let context = if let Some(ctx) = body.context {
@@ -1480,10 +1483,7 @@ pub async fn simulate_activation(
         ContextVector::default()
     };
 
-    let relevance = proto
-        .relevance_vector
-        .clone()
-        .unwrap_or_default();
+    let relevance = proto.relevance_vector.clone().unwrap_or_default();
     let weights = DimensionWeights::default();
 
     let affinity = compute_affinity(&context, &relevance, &weights);

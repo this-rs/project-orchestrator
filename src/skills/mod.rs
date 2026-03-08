@@ -37,9 +37,9 @@ pub mod models;
 pub mod naming;
 pub mod package;
 pub mod project_resolver;
+pub mod registry;
 pub mod templates;
 pub mod triggers;
-pub mod registry;
 pub mod trust;
 pub mod validation;
 

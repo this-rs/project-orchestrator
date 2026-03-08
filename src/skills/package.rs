@@ -56,7 +56,6 @@ pub struct SkillPackage {
     pub decisions: Vec<PortableDecision>,
 
     // --- v2 fields (all optional for backward compatibility with v1) ---
-
     /// Protocols linked to this skill (FSM definitions).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub protocols: Vec<PortableProtocol>,
@@ -431,10 +430,7 @@ pub fn validate_package(package: &SkillPackage) -> Result<(), Vec<PackageValidat
             if !state_names.contains(trans.to_state.as_str()) {
                 errors.push(PackageValidationError {
                     field: format!("protocols[{}].transitions[{}].to_state", i, j),
-                    message: format!(
-                        "Transition references unknown state '{}'.",
-                        trans.to_state
-                    ),
+                    message: format!("Transition references unknown state '{}'.", trans.to_state),
                 });
             }
         }
@@ -722,9 +718,7 @@ mod tests {
             }],
         }];
         let errors = validate_package(&package).unwrap_err();
-        assert!(errors
-            .iter()
-            .any(|e| e.message.contains("NONEXISTENT")));
+        assert!(errors.iter().any(|e| e.message.contains("NONEXISTENT")));
     }
 
     #[test]
@@ -777,7 +771,11 @@ mod tests {
         assert_eq!(deserialized.protocols[0].states.len(), 2);
         assert_eq!(deserialized.protocols[0].transitions.len(), 1);
         assert_eq!(
-            deserialized.execution_history.as_ref().unwrap().activation_count,
+            deserialized
+                .execution_history
+                .as_ref()
+                .unwrap()
+                .activation_count,
             10
         );
     }

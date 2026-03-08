@@ -2083,7 +2083,9 @@ pub async fn persist_health_report(
     );
 
     // 3. Search for previous health-check note to compute delta
-    use crate::notes::models::{CreateNoteRequest, LinkNoteRequest, NoteType, NoteImportance, EntityType, NoteFilters};
+    use crate::notes::models::{
+        CreateNoteRequest, EntityType, LinkNoteRequest, NoteFilters, NoteImportance, NoteType,
+    };
     let filters = NoteFilters {
         tags: Some(vec!["health-check".to_string()]),
         ..Default::default()
@@ -2122,7 +2124,11 @@ pub async fn persist_health_report(
         content,
         importance: Some(NoteImportance::Medium),
         scope: None,
-        tags: Some(vec!["health-check".to_string(), "auto-generated".to_string(), today.clone()]),
+        tags: Some(vec![
+            "health-check".to_string(),
+            "auto-generated".to_string(),
+            today.clone(),
+        ]),
         anchors: None,
         assertion_rule: None,
     };

@@ -210,7 +210,10 @@ pub async fn search_remote_registry(
     offset: usize,
 ) -> anyhow::Result<(Vec<PublishedSkillSummary>, usize)> {
     let base = remote_url.trim_end_matches('/');
-    let mut url = format!("{}/api/registry/search?limit={}&offset={}", base, limit, offset);
+    let mut url = format!(
+        "{}/api/registry/search?limit={}&offset={}",
+        base, limit, offset
+    );
 
     if let Some(q) = query {
         url.push_str(&format!("&query={}", urlencoding::encode(q)));
@@ -470,10 +473,7 @@ mod tests {
 
     #[test]
     fn test_merge_empty_remote() {
-        let local = vec![
-            make_summary("A", 0.8, false),
-            make_summary("B", 0.6, false),
-        ];
+        let local = vec![make_summary("A", 0.8, false), make_summary("B", 0.6, false)];
         let remote = vec![];
 
         let merged = merge_search_results(local, remote);

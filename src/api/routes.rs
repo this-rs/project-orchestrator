@@ -1014,10 +1014,7 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/admin/bootstrap-knowledge-fabric",
             post(handlers::bootstrap_knowledge_fabric),
         )
-        .route(
-            "/api/admin/audit-gaps",
-            post(handlers::audit_gaps),
-        )
+        .route("/api/admin/audit-gaps", post(handlers::audit_gaps))
         .route(
             "/api/admin/persist-health-report",
             post(handlers::persist_health_report),

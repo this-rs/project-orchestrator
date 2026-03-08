@@ -205,7 +205,11 @@ mod tests {
         let skill = make_skill(0.9, 0.85, 100, 0.9);
         let trust = compute_trust_score(&skill, None);
 
-        assert!(trust.score > 0.7, "Expected high trust, got {}", trust.score);
+        assert!(
+            trust.score > 0.7,
+            "Expected high trust, got {}",
+            trust.score
+        );
         assert_eq!(trust.level, TrustLevel::High);
     }
 
@@ -231,8 +235,16 @@ mod tests {
 
         // energy=0, cohesion=0.75, activation=5/25≈0.2, success=0.8, source=5/8≈0.625
         // score = 0*0.2 + 0.75*0.2 + 0.2*0.2 + 0.8*0.3 + 0.625*0.1 ≈ 0 + 0.15 + 0.04 + 0.24 + 0.0625 ≈ 0.4925
-        assert!(trust.score >= 0.3, "Expected at least low, got {}", trust.score);
-        assert!(trust.score < 0.8, "Should not be high trust, got {}", trust.score);
+        assert!(
+            trust.score >= 0.3,
+            "Expected at least low, got {}",
+            trust.score
+        );
+        assert!(
+            trust.score < 0.8,
+            "Should not be high trust, got {}",
+            trust.score
+        );
     }
 
     #[test]
@@ -247,7 +259,11 @@ mod tests {
         let trust = compute_trust_score(&skill, Some(&history));
 
         // Should be high: all signals strong
-        assert!(trust.score >= 0.8, "Expected high trust, got {}", trust.score);
+        assert!(
+            trust.score >= 0.8,
+            "Expected high trust, got {}",
+            trust.score
+        );
         assert_eq!(trust.level, TrustLevel::High);
 
         // Verify execution_history overrides hit_rate
@@ -325,6 +341,10 @@ mod tests {
 
         let diff = trust_high.score - trust_low.score;
         // Difference should be approximately 0.8 * 0.3 = 0.24
-        assert!(diff > 0.2, "Success rate should have strong impact, diff={}", diff);
+        assert!(
+            diff > 0.2,
+            "Success rate should have strong impact, diff={}",
+            diff
+        );
     }
 }

@@ -146,15 +146,16 @@ pub async fn export_skill(
             })
             .collect();
 
-        let relevance_vector = proto.relevance_vector.as_ref().map(|rv| {
-            PortableRelevanceVector {
+        let relevance_vector = proto
+            .relevance_vector
+            .as_ref()
+            .map(|rv| PortableRelevanceVector {
                 phase: rv.phase,
                 structure: rv.structure,
                 domain: rv.domain,
                 resource: rv.resource,
                 lifecycle: rv.lifecycle,
-            }
-        });
+            });
 
         portable_protocols.push(PortableProtocol {
             name: proto.name.clone(),
@@ -412,8 +413,7 @@ mod tests {
 
     #[test]
     fn test_sanitize_paths_multiple_occurrences() {
-        let content =
-            "Compare /tmp/proj/a.rs and /tmp/proj/b.rs";
+        let content = "Compare /tmp/proj/a.rs and /tmp/proj/b.rs";
         let result = sanitize_paths(content, Some("/tmp/proj"));
         assert_eq!(result, "Compare a.rs and b.rs");
     }

@@ -90,17 +90,16 @@ pub async fn publish_skill(
     };
 
     // Export the skill as a package
-    let package =
-        crate::skills::export_skill(body.skill_id, neo4j, Some(project_name.clone()))
-            .await
-            .map_err(|e| {
-                let msg = e.to_string();
-                if msg.contains("not found") {
-                    AppError::NotFound(msg)
-                } else {
-                    AppError::Internal(e)
-                }
-            })?;
+    let package = crate::skills::export_skill(body.skill_id, neo4j, Some(project_name.clone()))
+        .await
+        .map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("not found") {
+                AppError::NotFound(msg)
+            } else {
+                AppError::Internal(e)
+            }
+        })?;
 
     // Build the published skill with trust score
     let published = build_published_skill(&skill, package, project_name, None);
@@ -167,8 +166,10 @@ pub async fn search_registry(
         .await
         {
             Ok((remote_summaries, remote_total)) => {
-                let merged =
-                    crate::skills::registry::merge_search_results(local_summaries, remote_summaries);
+                let merged = crate::skills::registry::merge_search_results(
+                    local_summaries,
+                    remote_summaries,
+                );
                 let combined_total = local_total + remote_total;
                 // Re-paginate the merged results (take `limit` items)
                 let page: Vec<PublishedSkillSummary> = merged.into_iter().take(limit).collect();
@@ -261,23 +262,18 @@ pub async fn import_from_registry(
     };
 
     // Import the package into the target project
-    let result = crate::skills::import_skill(
-        &published.package,
-        body.project_id,
-        neo4j,
-        strategy,
-    )
-    .await
-    .map_err(|e| {
-        let msg = e.to_string();
-        if msg.contains("already exists") {
-            AppError::Conflict(msg)
-        } else if msg.contains("validation failed") {
-            AppError::BadRequest(msg)
-        } else {
-            AppError::Internal(e)
-        }
-    })?;
+    let result = crate::skills::import_skill(&published.package, body.project_id, neo4j, strategy)
+        .await
+        .map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("already exists") {
+                AppError::Conflict(msg)
+            } else if msg.contains("validation failed") {
+                AppError::BadRequest(msg)
+            } else {
+                AppError::Internal(e)
+            }
+        })?;
 
     // Increment import count
     let _ = neo4j.increment_published_skill_imports(id).await;

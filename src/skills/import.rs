@@ -19,7 +19,9 @@ use uuid::Uuid;
 
 use crate::neo4j::traits::GraphStore;
 use crate::notes::models::{Note, NoteImportance, NoteScope, NoteStatus, NoteType};
-use crate::protocol::models::{Protocol, ProtocolCategory, ProtocolState, ProtocolTransition, StateType};
+use crate::protocol::models::{
+    Protocol, ProtocolCategory, ProtocolState, ProtocolTransition, StateType,
+};
 use crate::protocol::routing::RelevanceVector;
 use crate::skills::models::{SkillNode, SkillStatus};
 use crate::skills::package::{validate_package, PortableDecision, SkillPackage};
@@ -214,13 +216,7 @@ pub async fn import_skill(
 
     // 7. Import protocols (v2 only — skipped for v1 packages)
     let protocols_imported = if !package.protocols.is_empty() {
-        import_protocols(
-            &package.protocols,
-            target_project_id,
-            skill_id,
-            graph_store,
-        )
-        .await?
+        import_protocols(&package.protocols, target_project_id, skill_id, graph_store).await?
     } else {
         0
     };
@@ -492,8 +488,9 @@ async fn import_protocols(
         let mut terminal_state_ids: Vec<Uuid> = Vec::new();
 
         for portable_state in &portable.states {
-            let state_type = StateType::from_str(&portable_state.state_type)
-                .map_err(|e| anyhow::anyhow!("Invalid state type '{}': {}", portable_state.state_type, e))?;
+            let state_type = StateType::from_str(&portable_state.state_type).map_err(|e| {
+                anyhow::anyhow!("Invalid state type '{}': {}", portable_state.state_type, e)
+            })?;
 
             let state = ProtocolState {
                 id: Uuid::new_v4(),
@@ -521,24 +518,27 @@ async fn import_protocols(
 
         // 2. Determine entry_state — use first state as fallback if no Start type found
         let entry_state = entry_state_id.unwrap_or_else(|| {
-            portable.states.first()
+            portable
+                .states
+                .first()
                 .and_then(|s| name_to_id.get(&s.name).copied())
                 .unwrap_or_else(Uuid::new_v4)
         });
 
         // 3. Parse category and relevance vector
-        let category = ProtocolCategory::from_str(&portable.category)
-            .unwrap_or(ProtocolCategory::Business);
+        let category =
+            ProtocolCategory::from_str(&portable.category).unwrap_or(ProtocolCategory::Business);
 
-        let relevance_vector = portable.relevance_vector.as_ref().map(|rv| {
-            RelevanceVector {
+        let relevance_vector = portable
+            .relevance_vector
+            .as_ref()
+            .map(|rv| RelevanceVector {
                 phase: rv.phase,
                 structure: rv.structure,
                 domain: rv.domain,
                 resource: rv.resource,
                 lifecycle: rv.lifecycle,
-            }
-        });
+            });
 
         // 4. Create the Protocol node
         let now = Utc::now();
@@ -939,8 +939,8 @@ mod tests {
     /// Create a v2 test package with protocols for round-trip tests.
     fn make_v2_test_package() -> SkillPackage {
         use crate::skills::package::{
-            PortableProtocol, PortableRelevanceVector, PortableState, PortableTransition,
-            ExecutionHistory, SourceMetadata,
+            ExecutionHistory, PortableProtocol, PortableRelevanceVector, PortableState,
+            PortableTransition, SourceMetadata,
         };
 
         let mut pkg = make_test_package();
@@ -1024,14 +1024,20 @@ mod tests {
         assert_eq!(result.decisions_imported, 1);
 
         // Verify protocol exists in the store
-        let (protocols, count) = store.list_protocols(project_id, None, 100, 0).await.unwrap();
+        let (protocols, count) = store
+            .list_protocols(project_id, None, 100, 0)
+            .await
+            .unwrap();
         assert_eq!(count, 1);
         let proto = &protocols[0];
         assert_eq!(proto.name, "code-review");
         assert_eq!(proto.description, "Automated code review workflow");
         assert_eq!(proto.project_id, project_id);
         assert_eq!(proto.skill_id, Some(result.skill_id));
-        assert_eq!(proto.protocol_category, crate::protocol::ProtocolCategory::Business);
+        assert_eq!(
+            proto.protocol_category,
+            crate::protocol::ProtocolCategory::Business
+        );
 
         // Verify relevance vector
         let rv = proto.relevance_vector.as_ref().unwrap();
@@ -1041,12 +1047,18 @@ mod tests {
         // Verify states
         let states = store.get_protocol_states(proto.id).await.unwrap();
         assert_eq!(states.len(), 3);
-        let start_states: Vec<_> = states.iter().filter(|s| s.state_type == StateType::Start).collect();
+        let start_states: Vec<_> = states
+            .iter()
+            .filter(|s| s.state_type == StateType::Start)
+            .collect();
         assert_eq!(start_states.len(), 1);
         assert_eq!(start_states[0].name, "init");
         assert_eq!(start_states[0].action, Some("load_context".to_string()));
 
-        let terminal_states: Vec<_> = states.iter().filter(|s| s.state_type == StateType::Terminal).collect();
+        let terminal_states: Vec<_> = states
+            .iter()
+            .filter(|s| s.state_type == StateType::Terminal)
+            .collect();
         assert_eq!(terminal_states.len(), 1);
         assert_eq!(terminal_states[0].name, "done");
 
@@ -1079,15 +1091,18 @@ mod tests {
         assert_eq!(result.protocols_imported, 0);
 
         // No protocols should exist
-        let (protocols, count) = store.list_protocols(project_id, None, 100, 0).await.unwrap();
+        let (protocols, count) = store
+            .list_protocols(project_id, None, 100, 0)
+            .await
+            .unwrap();
         assert_eq!(count, 0);
         assert!(protocols.is_empty());
     }
 
     #[tokio::test]
     async fn test_import_v2_roundtrip_export_import() {
-        use crate::skills::export::export_skill;
         use crate::neo4j::models::ProjectNode;
+        use crate::skills::export::export_skill;
 
         let store = MockGraphStore::new();
         let source_project_id = Uuid::new_v4();
@@ -1156,7 +1171,10 @@ mod tests {
         };
         let note_id = note.id;
         store.create_note(&note).await.unwrap();
-        store.add_skill_member(skill_id, "note", note_id).await.unwrap();
+        store
+            .add_skill_member(skill_id, "note", note_id)
+            .await
+            .unwrap();
 
         // Create a protocol linked to the skill
         let start_state_id = Uuid::new_v4();
@@ -1194,9 +1212,8 @@ mod tests {
         store.upsert_protocol_state(&s1).await.unwrap();
         store.upsert_protocol_state(&s2).await.unwrap();
 
-        let t = crate::protocol::ProtocolTransition::new(
-            proto_id, start_state_id, end_state_id, "go",
-        );
+        let t =
+            crate::protocol::ProtocolTransition::new(proto_id, start_state_id, end_state_id, "go");
         store.upsert_protocol_transition(&t).await.unwrap();
 
         // Export
@@ -1233,7 +1250,10 @@ mod tests {
         assert_ne!(result.skill_id, skill_id); // fresh UUID
 
         // Verify imported protocol
-        let (imported_protos, _) = store.list_protocols(target_project_id, None, 100, 0).await.unwrap();
+        let (imported_protos, _) = store
+            .list_protocols(target_project_id, None, 100, 0)
+            .await
+            .unwrap();
         assert_eq!(imported_protos.len(), 1);
         let imported_proto = &imported_protos[0];
         assert_eq!(imported_proto.name, "test-proto");
@@ -1250,13 +1270,24 @@ mod tests {
         assert!(state_names.contains(&"finish".to_string()));
 
         // Verify imported transitions
-        let imported_transitions = store.get_protocol_transitions(imported_proto.id).await.unwrap();
+        let imported_transitions = store
+            .get_protocol_transitions(imported_proto.id)
+            .await
+            .unwrap();
         assert_eq!(imported_transitions.len(), 1);
         assert_eq!(imported_transitions[0].trigger, "go");
 
         // Verify transition UUIDs match imported state UUIDs (not source ones)
-        let begin_id = imported_states.iter().find(|s| s.name == "begin").unwrap().id;
-        let finish_id = imported_states.iter().find(|s| s.name == "finish").unwrap().id;
+        let begin_id = imported_states
+            .iter()
+            .find(|s| s.name == "begin")
+            .unwrap()
+            .id;
+        let finish_id = imported_states
+            .iter()
+            .find(|s| s.name == "finish")
+            .unwrap()
+            .id;
         assert_eq!(imported_transitions[0].from_state, begin_id);
         assert_eq!(imported_transitions[0].to_state, finish_id);
     }
@@ -1317,7 +1348,10 @@ mod tests {
 
         assert_eq!(result.protocols_imported, 2);
 
-        let (protos, count) = store.list_protocols(project_id, None, 100, 0).await.unwrap();
+        let (protos, count) = store
+            .list_protocols(project_id, None, 100, 0)
+            .await
+            .unwrap();
         assert_eq!(count, 2);
 
         let names: Vec<_> = protos.iter().map(|p| p.name.clone()).collect();
@@ -1326,6 +1360,9 @@ mod tests {
 
         // Verify system category was parsed correctly
         let system_proto = protos.iter().find(|p| p.name == "proto-b").unwrap();
-        assert_eq!(system_proto.protocol_category, crate::protocol::ProtocolCategory::System);
+        assert_eq!(
+            system_proto.protocol_category,
+            crate::protocol::ProtocolCategory::System
+        );
     }
 }

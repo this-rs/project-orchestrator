@@ -347,7 +347,8 @@ fn build_explanation(sorted_dims: &[DimensionScore], total_score: f64) -> String
         .take(2)
         .filter(|d| d.contribution > 0.1)
         .map(|d| {
-            let similarity_pct = ((1.0 - (d.context_value - d.relevance_value).abs()) * 100.0) as i32;
+            let similarity_pct =
+                ((1.0 - (d.context_value - d.relevance_value).abs()) * 100.0) as i32;
             format!("{} match ({}%)", d.name, similarity_pct)
         })
         .collect();
@@ -409,10 +410,7 @@ pub fn rank_protocols(
     let mut results: Vec<RouteResult> = protocols
         .iter()
         .map(|proto| {
-            let relevance = proto
-                .relevance_vector
-                .clone()
-                .unwrap_or_default();
+            let relevance = proto.relevance_vector.clone().unwrap_or_default();
             let affinity = compute_affinity(context, &relevance, weights);
             RouteResult {
                 protocol_id: proto.id,
@@ -466,7 +464,10 @@ mod tests {
         };
         let weights = DimensionWeights::default();
         let score = compute_affinity(&ctx, &rel, &weights);
-        assert!((score.score - 1.0).abs() < 0.001, "Perfect match should be 1.0");
+        assert!(
+            (score.score - 1.0).abs() < 0.001,
+            "Perfect match should be 1.0"
+        );
         assert_eq!(score.dimensions.len(), 5);
     }
 
@@ -488,7 +489,11 @@ mod tests {
         };
         let weights = DimensionWeights::default();
         let score = compute_affinity(&ctx, &rel, &weights);
-        assert!(score.score < 0.01, "Worst match should be ~0.0, got {}", score.score);
+        assert!(
+            score.score < 0.01,
+            "Worst match should be ~0.0, got {}",
+            score.score
+        );
     }
 
     #[test]
@@ -517,7 +522,10 @@ mod tests {
     fn test_from_plan_context() {
         let ctx = ContextVector::from_plan_context("execution", 12, 8, 25, 0.3);
         assert!((ctx.phase - 0.5).abs() < 0.001);
-        assert!(ctx.structure > 0.5, "12 tasks with 8 deps should be complex");
+        assert!(
+            ctx.structure > 0.5,
+            "12 tasks with 8 deps should be complex"
+        );
         assert!((ctx.lifecycle - 0.3).abs() < 0.001);
     }
 
@@ -525,11 +533,17 @@ mod tests {
     fn test_structure_computation() {
         // Minimal project
         let simple = ContextVector::compute_structure(1, 0, 2);
-        assert!(simple < 0.3, "Simple project should have low structure score");
+        assert!(
+            simple < 0.3,
+            "Simple project should have low structure score"
+        );
 
         // Complex project
         let complex = ContextVector::compute_structure(20, 15, 40);
-        assert!(complex > 0.7, "Complex project should have high structure score");
+        assert!(
+            complex > 0.7,
+            "Complex project should have high structure score"
+        );
     }
 
     #[test]
@@ -577,7 +591,10 @@ mod tests {
         };
         let weights = DimensionWeights::default();
         let score = compute_affinity(&ctx, &rel, &weights);
-        assert!(score.explanation.contains("Activated"), "High score should say Activated");
+        assert!(
+            score.explanation.contains("Activated"),
+            "High score should say Activated"
+        );
     }
 
     #[test]
@@ -585,7 +602,10 @@ mod tests {
         let w = DimensionWeights::default();
         let normalized = w.normalized();
         let sum: f64 = normalized.iter().sum();
-        assert!((sum - 1.0).abs() < 0.001, "Normalized weights should sum to 1.0");
+        assert!(
+            (sum - 1.0).abs() < 0.001,
+            "Normalized weights should sum to 1.0"
+        );
     }
 
     #[test]
@@ -607,7 +627,10 @@ mod tests {
         };
         let weights = DimensionWeights::default();
         let score = compute_affinity(&ctx, &rel, &weights);
-        assert!(score.score >= 0.0 && score.score <= 1.0, "Score must be in [0, 1]");
+        assert!(
+            score.score >= 0.0 && score.score <= 1.0,
+            "Score must be in [0, 1]"
+        );
     }
 
     #[test]
@@ -630,7 +653,11 @@ mod tests {
         let score = compute_affinity(&ctx, &rel, &weights);
 
         // Structure dimension should have lower contribution (distance = 0.5)
-        let structure_dim = score.dimensions.iter().find(|d| d.name == "structure").unwrap();
+        let structure_dim = score
+            .dimensions
+            .iter()
+            .find(|d| d.name == "structure")
+            .unwrap();
         let phase_dim = score.dimensions.iter().find(|d| d.name == "phase").unwrap();
 
         assert!(
@@ -685,7 +712,11 @@ mod tests {
         let proto_c = Protocol::new(project_id, "Generic", uuid::Uuid::new_v4());
 
         let weights = DimensionWeights::default();
-        let response = rank_protocols(&ctx, &[proto_b.clone(), proto_c.clone(), proto_a.clone()], &weights);
+        let response = rank_protocols(
+            &ctx,
+            &[proto_b.clone(), proto_c.clone(), proto_a.clone()],
+            &weights,
+        );
 
         assert_eq!(response.total_evaluated, 3);
         assert_eq!(response.results.len(), 3);
