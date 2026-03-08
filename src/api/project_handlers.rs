@@ -604,6 +604,54 @@ pub async fn get_project_graph(
         }
     }
 
+    // ---- Feature Graphs (overlay in code layer — groups of code entities) ----
+    // Parallel detail fetches to avoid sequential N+1.
+    if requested_layers.contains(&"code".to_string()) {
+        let feature_graphs = neo4j
+            .list_feature_graphs(Some(project.id))
+            .await
+            .unwrap_or_default();
+
+        // Fire all get_feature_graph_detail calls concurrently
+        let detail_futures: Vec<_> = feature_graphs
+            .iter()
+            .map(|fg| neo4j.get_feature_graph_detail(fg.id))
+            .collect();
+        let details = futures::future::join_all(detail_futures).await;
+
+        for (fg, detail_res) in feature_graphs.iter().zip(details) {
+            all_nodes.push(GraphNode {
+                id: fg.id.to_string(),
+                node_type: "feature_graph".to_string(),
+                label: fg.name.clone(),
+                layer: "code".to_string(),
+                attributes: Some(serde_json::json!({
+                    "description": fg.description,
+                    "entity_count": fg.entity_count,
+                    "entry_function": fg.entry_function,
+                })),
+            });
+            node_ids.insert(fg.id.to_string());
+
+            // INCLUDES_ENTITY edges (feature_graph → code entity)
+            if let Ok(Some(detail)) = detail_res {
+                for entity in &detail.entities {
+                    if node_ids.contains(&entity.entity_id) {
+                        all_edges.push(GraphEdge {
+                            source: fg.id.to_string(),
+                            target: entity.entity_id.clone(),
+                            edge_type: "INCLUDES_ENTITY".to_string(),
+                            layer: "code".to_string(),
+                            attributes: Some(serde_json::json!({
+                                "role": entity.role,
+                            })),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
     // ---- Fabric Layer (CO_CHANGED edges between files) ----
     if requested_layers.contains(&"fabric".to_string()) {
         let co_changes = neo4j
@@ -1402,6 +1450,19 @@ pub async fn get_embeddings_projection(
                 circular_fallback(embedding_points.len(), 2)
             }
         }
+    };
+
+    // 4b. Validate UMAP output — NaN/Inf coordinates crash serde_json serialization (500)
+    let projected = if projected
+        .iter()
+        .any(|coords| coords.iter().any(|c| !c.is_finite()))
+    {
+        tracing::warn!(
+            "UMAP produced NaN/Inf coordinates, falling back to circular layout"
+        );
+        circular_fallback(embedding_points.len(), proj_dims)
+    } else {
+        projected
     };
 
     // 5. Build projection points

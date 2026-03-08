@@ -983,9 +983,22 @@ impl Neo4jClient {
         let mut points = Vec::new();
 
         while let Some(row) = result.next().await? {
-            let id_str: String = row.get("id")?;
+            let id_str: String = match row.get("id") {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
             let id = Uuid::parse_str(&id_str).unwrap_or_default();
-            let embedding_f64: Vec<f64> = row.get("embedding")?;
+            // Skip notes with corrupt/unparseable embeddings instead of crashing the whole endpoint
+            let embedding_f64: Vec<f64> = match row.get("embedding") {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(
+                        note_id = %id_str,
+                        "Skipping note with unparseable embedding: {}", e
+                    );
+                    continue;
+                }
+            };
             let embedding: Vec<f32> = embedding_f64.iter().map(|&x| x as f32).collect();
             let note_type: String = row
                 .get("note_type")

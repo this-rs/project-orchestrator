@@ -19,6 +19,8 @@ use uuid::Uuid;
 
 use crate::neo4j::traits::GraphStore;
 use crate::notes::models::{Note, NoteImportance, NoteScope, NoteStatus, NoteType};
+use crate::protocol::models::{Protocol, ProtocolCategory, ProtocolState, ProtocolTransition, StateType};
+use crate::protocol::routing::RelevanceVector;
 use crate::skills::models::{SkillNode, SkillStatus};
 use crate::skills::package::{validate_package, PortableDecision, SkillPackage};
 
@@ -103,6 +105,8 @@ pub struct ImportResult {
     pub decisions_imported: usize,
     /// Number of synapses created between imported notes.
     pub synapses_created: usize,
+    /// Number of protocols recreated (v2 only).
+    pub protocols_imported: usize,
     /// Conflict information (if any name collision was detected).
     pub conflict: Option<ImportConflict>,
     /// Whether this was a merge into an existing skill.
@@ -208,7 +212,20 @@ pub async fn import_skill(
     // 6. Create initial synapses between all co-member notes
     let synapses_created = create_import_synapses(graph_store, &created_note_ids).await?;
 
-    // 7. Update skill counts
+    // 7. Import protocols (v2 only — skipped for v1 packages)
+    let protocols_imported = if !package.protocols.is_empty() {
+        import_protocols(
+            &package.protocols,
+            target_project_id,
+            skill_id,
+            graph_store,
+        )
+        .await?
+    } else {
+        0
+    };
+
+    // 8. Update skill counts
     let notes_created = package.notes.len();
     if !was_merged {
         // For newly created skills, update the counts
@@ -229,6 +246,7 @@ pub async fn import_skill(
         notes_created,
         decisions_imported,
         synapses_created,
+        protocols_imported,
         conflict,
         was_merged,
         source_project: package.metadata.source_project.clone(),
@@ -307,6 +325,9 @@ async fn handle_conflict(
                 skill: portable_skill.clone(),
                 notes: vec![],
                 decisions: vec![],
+                protocols: vec![],
+                execution_history: None,
+                source: None,
             };
             let skill = create_imported_skill(&package_stub, target_project_id);
             let skill_id = skill.id;
@@ -444,6 +465,136 @@ fn decision_to_note(
     })
 }
 
+/// Import protocols from a v2 package into the target project.
+///
+/// For each `PortableProtocol`:
+/// 1. Create `ProtocolState` nodes with fresh UUIDs (name-based lookup for transitions)
+/// 2. Identify entry_state (Start type) and terminal_states (Terminal type)
+/// 3. Create the `Protocol` node linked to the project and skill
+/// 4. Create `ProtocolTransition` nodes, resolving state names to UUIDs
+///
+/// Returns the number of protocols successfully imported.
+async fn import_protocols(
+    portable_protocols: &[crate::skills::package::PortableProtocol],
+    target_project_id: Uuid,
+    skill_id: Uuid,
+    graph_store: &dyn GraphStore,
+) -> Result<usize> {
+    let mut count = 0;
+
+    for portable in portable_protocols {
+        let protocol_id = Uuid::new_v4();
+
+        // 1. Create states with fresh UUIDs, build name → UUID map
+        let mut name_to_id: std::collections::HashMap<String, Uuid> =
+            std::collections::HashMap::new();
+        let mut entry_state_id: Option<Uuid> = None;
+        let mut terminal_state_ids: Vec<Uuid> = Vec::new();
+
+        for portable_state in &portable.states {
+            let state_type = StateType::from_str(&portable_state.state_type)
+                .map_err(|e| anyhow::anyhow!("Invalid state type '{}': {}", portable_state.state_type, e))?;
+
+            let state = ProtocolState {
+                id: Uuid::new_v4(),
+                protocol_id,
+                name: portable_state.name.clone(),
+                description: portable_state.description.clone(),
+                action: portable_state.action.clone(),
+                state_type,
+            };
+
+            if state_type == StateType::Start {
+                entry_state_id = Some(state.id);
+            }
+            if state_type == StateType::Terminal {
+                terminal_state_ids.push(state.id);
+            }
+
+            name_to_id.insert(state.name.clone(), state.id);
+
+            graph_store
+                .upsert_protocol_state(&state)
+                .await
+                .context("Failed to create imported protocol state")?;
+        }
+
+        // 2. Determine entry_state — use first state as fallback if no Start type found
+        let entry_state = entry_state_id.unwrap_or_else(|| {
+            portable.states.first()
+                .and_then(|s| name_to_id.get(&s.name).copied())
+                .unwrap_or_else(Uuid::new_v4)
+        });
+
+        // 3. Parse category and relevance vector
+        let category = ProtocolCategory::from_str(&portable.category)
+            .unwrap_or(ProtocolCategory::Business);
+
+        let relevance_vector = portable.relevance_vector.as_ref().map(|rv| {
+            RelevanceVector {
+                phase: rv.phase,
+                structure: rv.structure,
+                domain: rv.domain,
+                resource: rv.resource,
+                lifecycle: rv.lifecycle,
+            }
+        });
+
+        // 4. Create the Protocol node
+        let now = Utc::now();
+        let protocol = Protocol {
+            id: protocol_id,
+            name: portable.name.clone(),
+            description: portable.description.clone(),
+            project_id: target_project_id,
+            skill_id: Some(skill_id),
+            entry_state,
+            terminal_states: terminal_state_ids,
+            protocol_category: category,
+            trigger_mode: crate::protocol::models::TriggerMode::Manual,
+            trigger_config: None,
+            relevance_vector,
+            last_triggered_at: None,
+            created_at: now,
+            updated_at: now,
+        };
+
+        graph_store
+            .upsert_protocol(&protocol)
+            .await
+            .context("Failed to create imported protocol")?;
+
+        // 5. Create transitions, resolving state names to UUIDs
+        for portable_transition in &portable.transitions {
+            let from_id = name_to_id.get(&portable_transition.from_state);
+            let to_id = name_to_id.get(&portable_transition.to_state);
+
+            if let (Some(&from), Some(&to)) = (from_id, to_id) {
+                let transition = ProtocolTransition {
+                    id: Uuid::new_v4(),
+                    protocol_id,
+                    from_state: from,
+                    to_state: to,
+                    trigger: portable_transition.trigger.clone(),
+                    guard: portable_transition.guard.clone(),
+                };
+
+                graph_store
+                    .upsert_protocol_transition(&transition)
+                    .await
+                    .context("Failed to create imported protocol transition")?;
+            }
+            // Skip transitions with unresolvable state names (defensive — should not
+            // happen if the package was validated, but we don't want to abort the whole
+            // import for a single bad transition)
+        }
+
+        count += 1;
+    }
+
+    Ok(count)
+}
+
 /// Create bidirectional synapses between all pairs of imported notes.
 ///
 /// For N notes, creates N×(N-1)/2 pairs with weight `IMPORT_SYNAPSE_WEIGHT`.
@@ -528,6 +679,9 @@ mod tests {
                 alternatives: vec!["Neo4j 4.x".to_string()],
                 chosen_option: Some("neo4j-rust-driver 0.8".to_string()),
             }],
+            protocols: vec![],
+            execution_history: None,
+            source: None,
         }
     }
 
@@ -778,5 +932,400 @@ mod tests {
         let n = 5;
         let expected_pairs = n * (n - 1) / 2;
         assert_eq!(expected_pairs, 10);
+    }
+
+    // ── v2 protocol import tests ──────────────────────────────────────
+
+    /// Create a v2 test package with protocols for round-trip tests.
+    fn make_v2_test_package() -> SkillPackage {
+        use crate::skills::package::{
+            PortableProtocol, PortableRelevanceVector, PortableState, PortableTransition,
+            ExecutionHistory, SourceMetadata,
+        };
+
+        let mut pkg = make_test_package();
+
+        pkg.protocols = vec![PortableProtocol {
+            name: "code-review".to_string(),
+            description: "Automated code review workflow".to_string(),
+            category: "business".to_string(),
+            relevance_vector: Some(PortableRelevanceVector {
+                phase: 0.7,
+                structure: 0.5,
+                domain: 0.3,
+                resource: 0.6,
+                lifecycle: 0.8,
+            }),
+            states: vec![
+                PortableState {
+                    name: "init".to_string(),
+                    description: "Gather context".to_string(),
+                    action: Some("load_context".to_string()),
+                    state_type: "start".to_string(),
+                },
+                PortableState {
+                    name: "review".to_string(),
+                    description: "Perform review".to_string(),
+                    action: None,
+                    state_type: "intermediate".to_string(),
+                },
+                PortableState {
+                    name: "done".to_string(),
+                    description: "Review complete".to_string(),
+                    action: None,
+                    state_type: "terminal".to_string(),
+                },
+            ],
+            transitions: vec![
+                PortableTransition {
+                    from_state: "init".to_string(),
+                    to_state: "review".to_string(),
+                    trigger: "context_loaded".to_string(),
+                    guard: None,
+                },
+                PortableTransition {
+                    from_state: "review".to_string(),
+                    to_state: "done".to_string(),
+                    trigger: "review_complete".to_string(),
+                    guard: Some("no_critical_issues".to_string()),
+                },
+            ],
+        }];
+
+        pkg.execution_history = Some(ExecutionHistory {
+            activation_count: 15,
+            success_rate: 0.87,
+            avg_score: 0.92,
+            source_projects_count: 3,
+        });
+
+        pkg.source = Some(SourceMetadata {
+            project_name: "upstream-project".to_string(),
+            git_remote: Some("git@github.com:org/upstream.git".to_string()),
+            instance_id: Some("inst-001".to_string()),
+        });
+
+        pkg
+    }
+
+    #[tokio::test]
+    async fn test_import_v2_with_protocols() {
+        let store = MockGraphStore::new();
+        let project_id = Uuid::new_v4();
+
+        let package = make_v2_test_package();
+        let result = import_skill(&package, project_id, &store, ConflictStrategy::Skip)
+            .await
+            .unwrap();
+
+        // Verify protocol was imported
+        assert_eq!(result.protocols_imported, 1);
+        assert_eq!(result.notes_created, 2);
+        assert_eq!(result.decisions_imported, 1);
+
+        // Verify protocol exists in the store
+        let (protocols, count) = store.list_protocols(project_id, None, 100, 0).await.unwrap();
+        assert_eq!(count, 1);
+        let proto = &protocols[0];
+        assert_eq!(proto.name, "code-review");
+        assert_eq!(proto.description, "Automated code review workflow");
+        assert_eq!(proto.project_id, project_id);
+        assert_eq!(proto.skill_id, Some(result.skill_id));
+        assert_eq!(proto.protocol_category, crate::protocol::ProtocolCategory::Business);
+
+        // Verify relevance vector
+        let rv = proto.relevance_vector.as_ref().unwrap();
+        assert!((rv.phase - 0.7).abs() < f64::EPSILON);
+        assert!((rv.lifecycle - 0.8).abs() < f64::EPSILON);
+
+        // Verify states
+        let states = store.get_protocol_states(proto.id).await.unwrap();
+        assert_eq!(states.len(), 3);
+        let start_states: Vec<_> = states.iter().filter(|s| s.state_type == StateType::Start).collect();
+        assert_eq!(start_states.len(), 1);
+        assert_eq!(start_states[0].name, "init");
+        assert_eq!(start_states[0].action, Some("load_context".to_string()));
+
+        let terminal_states: Vec<_> = states.iter().filter(|s| s.state_type == StateType::Terminal).collect();
+        assert_eq!(terminal_states.len(), 1);
+        assert_eq!(terminal_states[0].name, "done");
+
+        // Verify entry_state points to the start state
+        assert_eq!(proto.entry_state, start_states[0].id);
+        assert_eq!(proto.terminal_states, vec![terminal_states[0].id]);
+
+        // Verify transitions
+        let transitions = store.get_protocol_transitions(proto.id).await.unwrap();
+        assert_eq!(transitions.len(), 2);
+
+        // Find the guarded transition
+        let guarded: Vec<_> = transitions.iter().filter(|t| t.guard.is_some()).collect();
+        assert_eq!(guarded.len(), 1);
+        assert_eq!(guarded[0].trigger, "review_complete");
+        assert_eq!(guarded[0].guard, Some("no_critical_issues".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_import_v1_package_zero_protocols() {
+        let store = MockGraphStore::new();
+        let project_id = Uuid::new_v4();
+
+        // v1 package has no protocols field
+        let package = make_test_package(); // no protocols
+        let result = import_skill(&package, project_id, &store, ConflictStrategy::Skip)
+            .await
+            .unwrap();
+
+        assert_eq!(result.protocols_imported, 0);
+
+        // No protocols should exist
+        let (protocols, count) = store.list_protocols(project_id, None, 100, 0).await.unwrap();
+        assert_eq!(count, 0);
+        assert!(protocols.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_import_v2_roundtrip_export_import() {
+        use crate::skills::export::export_skill;
+        use crate::neo4j::models::ProjectNode;
+
+        let store = MockGraphStore::new();
+        let source_project_id = Uuid::new_v4();
+        let target_project_id = Uuid::new_v4();
+
+        // Create source project in the store
+        let source_project = ProjectNode {
+            id: source_project_id,
+            name: "Source Project".to_string(),
+            slug: "source-project".to_string(),
+            root_path: "/tmp/source-project".to_string(),
+            description: None,
+            created_at: Utc::now(),
+            last_synced: None,
+            analytics_computed_at: None,
+            last_co_change_computed_at: None,
+        };
+        store.create_project(&source_project).await.unwrap();
+
+        // Create target project
+        let target_project = ProjectNode {
+            id: target_project_id,
+            name: "Target Project".to_string(),
+            slug: "target-project".to_string(),
+            root_path: "/tmp/target-project".to_string(),
+            description: None,
+            created_at: Utc::now(),
+            last_synced: None,
+            analytics_computed_at: None,
+            last_co_change_computed_at: None,
+        };
+        store.create_project(&target_project).await.unwrap();
+
+        // Create a skill with a protocol in the source project
+        let mut skill = SkillNode::new(source_project_id, "Round Trip Skill");
+        skill.description = "Test round-trip".to_string();
+        skill.tags = vec!["test".to_string()];
+        skill.activation_count = 5;
+        skill.cohesion = 0.9;
+        let skill_id = skill.id;
+        store.create_skill(&skill).await.unwrap();
+
+        // Add a note as skill member (required: package must have ≥1 note)
+        let note = Note {
+            id: Uuid::new_v4(),
+            project_id: Some(source_project_id),
+            note_type: NoteType::Guideline,
+            status: NoteStatus::Active,
+            importance: NoteImportance::High,
+            scope: NoteScope::Project,
+            content: "Use UNWIND for batch ops in /tmp/source-project/src/db.rs".to_string(),
+            tags: vec!["neo4j".to_string()],
+            anchors: vec![],
+            created_at: Utc::now(),
+            created_by: "test".to_string(),
+            last_confirmed_at: None,
+            last_confirmed_by: None,
+            staleness_score: 0.0,
+            energy: 0.8,
+            last_activated: None,
+            supersedes: None,
+            superseded_by: None,
+            changes: vec![],
+            assertion_rule: None,
+            last_assertion_result: None,
+        };
+        let note_id = note.id;
+        store.create_note(&note).await.unwrap();
+        store.add_skill_member(skill_id, "note", note_id).await.unwrap();
+
+        // Create a protocol linked to the skill
+        let start_state_id = Uuid::new_v4();
+        let end_state_id = Uuid::new_v4();
+
+        let proto = crate::protocol::Protocol::new_full(
+            source_project_id,
+            "test-proto",
+            "A test protocol",
+            start_state_id,
+            vec![end_state_id],
+            crate::protocol::ProtocolCategory::Business,
+        );
+        let proto_id = proto.id;
+        let mut proto = proto;
+        proto.skill_id = Some(skill_id);
+        store.upsert_protocol(&proto).await.unwrap();
+
+        let s1 = crate::protocol::ProtocolState {
+            id: start_state_id,
+            protocol_id: proto_id,
+            name: "begin".to_string(),
+            description: "Start state".to_string(),
+            action: Some("do_something".to_string()),
+            state_type: StateType::Start,
+        };
+        let s2 = crate::protocol::ProtocolState {
+            id: end_state_id,
+            protocol_id: proto_id,
+            name: "finish".to_string(),
+            description: "End state".to_string(),
+            action: None,
+            state_type: StateType::Terminal,
+        };
+        store.upsert_protocol_state(&s1).await.unwrap();
+        store.upsert_protocol_state(&s2).await.unwrap();
+
+        let t = crate::protocol::ProtocolTransition::new(
+            proto_id, start_state_id, end_state_id, "go",
+        );
+        store.upsert_protocol_transition(&t).await.unwrap();
+
+        // Export
+        let package = export_skill(skill_id, &store, Some("source-project".to_string()))
+            .await
+            .unwrap();
+
+        // Verify exported note has sanitized paths (absolute → relative)
+        assert_eq!(package.notes.len(), 1);
+        assert_eq!(
+            package.notes[0].content,
+            "Use UNWIND for batch ops in src/db.rs"
+        );
+        // Original absolute path should be gone
+        assert!(!package.notes[0].content.contains("/tmp/source-project"));
+
+        // Verify exported package has protocols
+        assert_eq!(package.protocols.len(), 1);
+        assert_eq!(package.protocols[0].name, "test-proto");
+        assert_eq!(package.protocols[0].states.len(), 2);
+        assert_eq!(package.protocols[0].transitions.len(), 1);
+
+        // Verify transitions use names not UUIDs
+        assert_eq!(package.protocols[0].transitions[0].from_state, "begin");
+        assert_eq!(package.protocols[0].transitions[0].to_state, "finish");
+        assert_eq!(package.protocols[0].transitions[0].trigger, "go");
+
+        // Import into a different project
+        let result = import_skill(&package, target_project_id, &store, ConflictStrategy::Skip)
+            .await
+            .unwrap();
+
+        assert_eq!(result.protocols_imported, 1);
+        assert_ne!(result.skill_id, skill_id); // fresh UUID
+
+        // Verify imported protocol
+        let (imported_protos, _) = store.list_protocols(target_project_id, None, 100, 0).await.unwrap();
+        assert_eq!(imported_protos.len(), 1);
+        let imported_proto = &imported_protos[0];
+        assert_eq!(imported_proto.name, "test-proto");
+        assert_eq!(imported_proto.skill_id, Some(result.skill_id));
+        assert_ne!(imported_proto.id, proto_id); // fresh UUID
+
+        // Verify imported states
+        let imported_states = store.get_protocol_states(imported_proto.id).await.unwrap();
+        assert_eq!(imported_states.len(), 2);
+
+        // Verify state names preserved
+        let state_names: Vec<_> = imported_states.iter().map(|s| s.name.clone()).collect();
+        assert!(state_names.contains(&"begin".to_string()));
+        assert!(state_names.contains(&"finish".to_string()));
+
+        // Verify imported transitions
+        let imported_transitions = store.get_protocol_transitions(imported_proto.id).await.unwrap();
+        assert_eq!(imported_transitions.len(), 1);
+        assert_eq!(imported_transitions[0].trigger, "go");
+
+        // Verify transition UUIDs match imported state UUIDs (not source ones)
+        let begin_id = imported_states.iter().find(|s| s.name == "begin").unwrap().id;
+        let finish_id = imported_states.iter().find(|s| s.name == "finish").unwrap().id;
+        assert_eq!(imported_transitions[0].from_state, begin_id);
+        assert_eq!(imported_transitions[0].to_state, finish_id);
+    }
+
+    #[tokio::test]
+    async fn test_import_v2_multiple_protocols() {
+        use crate::skills::package::{PortableProtocol, PortableState, PortableTransition};
+
+        let store = MockGraphStore::new();
+        let project_id = Uuid::new_v4();
+
+        let mut package = make_test_package();
+        package.protocols = vec![
+            PortableProtocol {
+                name: "proto-a".to_string(),
+                description: "First protocol".to_string(),
+                category: "business".to_string(),
+                relevance_vector: None,
+                states: vec![
+                    PortableState {
+                        name: "start".to_string(),
+                        description: String::new(),
+                        action: None,
+                        state_type: "start".to_string(),
+                    },
+                    PortableState {
+                        name: "end".to_string(),
+                        description: String::new(),
+                        action: None,
+                        state_type: "terminal".to_string(),
+                    },
+                ],
+                transitions: vec![PortableTransition {
+                    from_state: "start".to_string(),
+                    to_state: "end".to_string(),
+                    trigger: "done".to_string(),
+                    guard: None,
+                }],
+            },
+            PortableProtocol {
+                name: "proto-b".to_string(),
+                description: "Second protocol".to_string(),
+                category: "system".to_string(),
+                relevance_vector: None,
+                states: vec![PortableState {
+                    name: "only".to_string(),
+                    description: String::new(),
+                    action: None,
+                    state_type: "start".to_string(),
+                }],
+                transitions: vec![],
+            },
+        ];
+
+        let result = import_skill(&package, project_id, &store, ConflictStrategy::Skip)
+            .await
+            .unwrap();
+
+        assert_eq!(result.protocols_imported, 2);
+
+        let (protos, count) = store.list_protocols(project_id, None, 100, 0).await.unwrap();
+        assert_eq!(count, 2);
+
+        let names: Vec<_> = protos.iter().map(|p| p.name.clone()).collect();
+        assert!(names.contains(&"proto-a".to_string()));
+        assert!(names.contains(&"proto-b".to_string()));
+
+        // Verify system category was parsed correctly
+        let system_proto = protos.iter().find(|p| p.name == "proto-b").unwrap();
+        assert_eq!(system_proto.protocol_category, crate::protocol::ProtocolCategory::System);
     }
 }

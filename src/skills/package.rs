@@ -23,10 +23,15 @@ use crate::skills::models::{SkillTrigger, TriggerType};
 use crate::skills::{REGEX_DFA_SIZE_LIMIT, REGEX_SIZE_LIMIT};
 
 /// Current schema version for the SkillPackage format.
-pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+/// v1: notes + decisions
+/// v2: + protocols + execution_history + source metadata
+pub const CURRENT_SCHEMA_VERSION: u32 = 2;
 
 /// Format identifier for SkillPackage files.
-pub const FORMAT_ID: &str = "po-skill/v1";
+pub const FORMAT_ID: &str = "po-skill/v2";
+
+/// Minimum supported schema version for backward compatibility.
+pub const MIN_SUPPORTED_SCHEMA_VERSION: u32 = 1;
 
 // ============================================================================
 // SkillPackage — top-level portable format
@@ -49,6 +54,18 @@ pub struct SkillPackage {
     pub notes: Vec<PortableNote>,
     /// Member decisions (architectural choices).
     pub decisions: Vec<PortableDecision>,
+
+    // --- v2 fields (all optional for backward compatibility with v1) ---
+
+    /// Protocols linked to this skill (FSM definitions).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub protocols: Vec<PortableProtocol>,
+    /// Execution history aggregated from protocol runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_history: Option<ExecutionHistory>,
+    /// Source metadata for provenance tracking.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<SourceMetadata>,
 }
 
 // ============================================================================
@@ -157,6 +174,117 @@ pub struct PortableDecision {
 }
 
 // ============================================================================
+// v2 — Portable Protocol (FSM definition)
+// ============================================================================
+
+/// A portable protocol definition (states + transitions), stripped of internal IDs.
+///
+/// States and transitions reference each other by name (not UUID) to ensure
+/// portability. On import, fresh UUIDs are generated and name-based references
+/// are resolved to the new IDs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PortableProtocol {
+    /// Protocol name (e.g., "wave-execution").
+    pub name: String,
+    /// Description of the protocol's purpose.
+    #[serde(default)]
+    pub description: String,
+    /// Classification: "system" or "business".
+    #[serde(default = "default_protocol_category")]
+    pub category: String,
+    /// Multi-dimensional relevance vector for context-aware routing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relevance_vector: Option<PortableRelevanceVector>,
+    /// States in this protocol.
+    pub states: Vec<PortableState>,
+    /// Transitions between states (referencing states by name).
+    pub transitions: Vec<PortableTransition>,
+}
+
+fn default_protocol_category() -> String {
+    "business".to_string()
+}
+
+/// A portable FSM state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PortableState {
+    /// Human-readable name (used as key for transition references).
+    pub name: String,
+    /// Description of this state's purpose.
+    #[serde(default)]
+    pub description: String,
+    /// Optional action description (what should happen in this state).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+    /// Role: "start", "intermediate", or "terminal".
+    #[serde(default = "default_state_type")]
+    pub state_type: String,
+}
+
+fn default_state_type() -> String {
+    "intermediate".to_string()
+}
+
+/// A portable FSM transition (references states by name, not UUID).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PortableTransition {
+    /// Source state name.
+    pub from_state: String,
+    /// Target state name.
+    pub to_state: String,
+    /// Trigger event name.
+    pub trigger: String,
+    /// Optional guard condition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guard: Option<String>,
+}
+
+/// Portable relevance vector (5 dimensions, 0.0–1.0).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PortableRelevanceVector {
+    pub phase: f64,
+    pub structure: f64,
+    pub domain: f64,
+    pub resource: f64,
+    pub lifecycle: f64,
+}
+
+// ============================================================================
+// v2 — Execution History
+// ============================================================================
+
+/// Aggregated execution history from protocol runs at time of export.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutionHistory {
+    /// Total number of activations.
+    pub activation_count: i64,
+    /// Success rate (0.0–1.0). Computed as completed_runs / total_runs.
+    pub success_rate: f64,
+    /// Average relevance score across activations.
+    pub avg_score: f64,
+    /// Number of distinct projects that used this skill.
+    #[serde(default)]
+    pub source_projects_count: usize,
+}
+
+// ============================================================================
+// v2 — Source Metadata
+// ============================================================================
+
+/// Provenance information about where this package was exported from.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SourceMetadata {
+    /// Source project name.
+    pub project_name: String,
+    /// Git remote URL (for project identity).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_remote: Option<String>,
+    /// PO instance identifier (for federation routing).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<String>,
+}
+
+// ============================================================================
 // Validation
 // ============================================================================
 
@@ -188,13 +316,15 @@ impl std::fmt::Display for PackageValidationError {
 pub fn validate_package(package: &SkillPackage) -> Result<(), Vec<PackageValidationError>> {
     let mut errors = Vec::new();
 
-    // Schema version
-    if package.schema_version != CURRENT_SCHEMA_VERSION {
+    // Schema version (accept v1 and v2)
+    if package.schema_version < MIN_SUPPORTED_SCHEMA_VERSION
+        || package.schema_version > CURRENT_SCHEMA_VERSION
+    {
         errors.push(PackageValidationError {
             field: "schema_version".to_string(),
             message: format!(
-                "Unsupported schema version {}. Expected {}.",
-                package.schema_version, CURRENT_SCHEMA_VERSION
+                "Unsupported schema version {}. Supported: {}-{}.",
+                package.schema_version, MIN_SUPPORTED_SCHEMA_VERSION, CURRENT_SCHEMA_VERSION
             ),
         });
     }
@@ -262,6 +392,51 @@ pub fn validate_package(package: &SkillPackage) -> Result<(), Vec<PackageValidat
                 field: format!("notes[{}].content", i),
                 message: "Note content cannot be empty.".to_string(),
             });
+        }
+    }
+
+    // Validate v2 protocols (if present)
+    for (i, proto) in package.protocols.iter().enumerate() {
+        if proto.name.trim().is_empty() {
+            errors.push(PackageValidationError {
+                field: format!("protocols[{}].name", i),
+                message: "Protocol name cannot be empty.".to_string(),
+            });
+        }
+        // Must have at least one start state
+        let start_count = proto
+            .states
+            .iter()
+            .filter(|s| s.state_type == "start")
+            .count();
+        if start_count == 0 && !proto.states.is_empty() {
+            errors.push(PackageValidationError {
+                field: format!("protocols[{}].states", i),
+                message: "Protocol must have at least one 'start' state.".to_string(),
+            });
+        }
+        // Validate transitions reference existing state names
+        let state_names: std::collections::HashSet<&str> =
+            proto.states.iter().map(|s| s.name.as_str()).collect();
+        for (j, trans) in proto.transitions.iter().enumerate() {
+            if !state_names.contains(trans.from_state.as_str()) {
+                errors.push(PackageValidationError {
+                    field: format!("protocols[{}].transitions[{}].from_state", i, j),
+                    message: format!(
+                        "Transition references unknown state '{}'.",
+                        trans.from_state
+                    ),
+                });
+            }
+            if !state_names.contains(trans.to_state.as_str()) {
+                errors.push(PackageValidationError {
+                    field: format!("protocols[{}].transitions[{}].to_state", i, j),
+                    message: format!(
+                        "Transition references unknown state '{}'.",
+                        trans.to_state
+                    ),
+                });
+            }
         }
     }
 
@@ -355,7 +530,17 @@ mod tests {
                 alternatives: vec!["Neo4j 4.x".to_string(), "Custom driver".to_string()],
                 chosen_option: Some("neo4j-rust-driver 0.8".to_string()),
             }],
+            protocols: vec![],
+            execution_history: None,
+            source: None,
         }
+    }
+
+    /// Create a valid v1 package (backward compatibility test)
+    fn make_v1_package() -> SkillPackage {
+        let mut pkg = make_valid_package();
+        pkg.schema_version = 1;
+        pkg
     }
 
     #[test]
@@ -443,6 +628,196 @@ mod tests {
     fn test_semantic_trigger_always_valid() {
         let mut package = make_valid_package();
         package.skill.trigger_patterns = vec![SkillTrigger::semantic("[0.1, 0.2, 0.3]", 0.7)];
+        assert!(validate_package(&package).is_ok());
+    }
+
+    #[test]
+    fn test_v1_package_validates() {
+        let package = make_v1_package();
+        assert!(validate_package(&package).is_ok());
+    }
+
+    #[test]
+    fn test_v2_with_protocols_validates() {
+        let mut package = make_valid_package();
+        package.protocols = vec![PortableProtocol {
+            name: "test-protocol".to_string(),
+            description: "A test protocol".to_string(),
+            category: "business".to_string(),
+            relevance_vector: Some(PortableRelevanceVector {
+                phase: 0.5,
+                structure: 0.8,
+                domain: 0.5,
+                resource: 0.7,
+                lifecycle: 0.3,
+            }),
+            states: vec![
+                PortableState {
+                    name: "START".to_string(),
+                    description: "Entry".to_string(),
+                    action: None,
+                    state_type: "start".to_string(),
+                },
+                PortableState {
+                    name: "WORK".to_string(),
+                    description: "Do work".to_string(),
+                    action: Some("execute_task".to_string()),
+                    state_type: "intermediate".to_string(),
+                },
+                PortableState {
+                    name: "DONE".to_string(),
+                    description: "Complete".to_string(),
+                    action: None,
+                    state_type: "terminal".to_string(),
+                },
+            ],
+            transitions: vec![
+                PortableTransition {
+                    from_state: "START".to_string(),
+                    to_state: "WORK".to_string(),
+                    trigger: "begin".to_string(),
+                    guard: None,
+                },
+                PortableTransition {
+                    from_state: "WORK".to_string(),
+                    to_state: "DONE".to_string(),
+                    trigger: "complete".to_string(),
+                    guard: Some("all_steps_done".to_string()),
+                },
+            ],
+        }];
+        package.execution_history = Some(ExecutionHistory {
+            activation_count: 42,
+            success_rate: 0.85,
+            avg_score: 0.72,
+            source_projects_count: 3,
+        });
+        package.source = Some(SourceMetadata {
+            project_name: "test-project".to_string(),
+            git_remote: Some("git@github.com:org/repo.git".to_string()),
+            instance_id: None,
+        });
+        assert!(validate_package(&package).is_ok());
+    }
+
+    #[test]
+    fn test_v2_protocol_bad_transition_ref() {
+        let mut package = make_valid_package();
+        package.protocols = vec![PortableProtocol {
+            name: "bad-proto".to_string(),
+            description: String::new(),
+            category: "business".to_string(),
+            relevance_vector: None,
+            states: vec![PortableState {
+                name: "START".to_string(),
+                description: String::new(),
+                action: None,
+                state_type: "start".to_string(),
+            }],
+            transitions: vec![PortableTransition {
+                from_state: "START".to_string(),
+                to_state: "NONEXISTENT".to_string(),
+                trigger: "go".to_string(),
+                guard: None,
+            }],
+        }];
+        let errors = validate_package(&package).unwrap_err();
+        assert!(errors
+            .iter()
+            .any(|e| e.message.contains("NONEXISTENT")));
+    }
+
+    #[test]
+    fn test_v2_serde_roundtrip() {
+        let mut package = make_valid_package();
+        package.protocols = vec![PortableProtocol {
+            name: "roundtrip-proto".to_string(),
+            description: "Test".to_string(),
+            category: "system".to_string(),
+            relevance_vector: Some(PortableRelevanceVector {
+                phase: 0.1,
+                structure: 0.2,
+                domain: 0.3,
+                resource: 0.4,
+                lifecycle: 0.5,
+            }),
+            states: vec![
+                PortableState {
+                    name: "S".to_string(),
+                    description: String::new(),
+                    action: None,
+                    state_type: "start".to_string(),
+                },
+                PortableState {
+                    name: "E".to_string(),
+                    description: String::new(),
+                    action: None,
+                    state_type: "terminal".to_string(),
+                },
+            ],
+            transitions: vec![PortableTransition {
+                from_state: "S".to_string(),
+                to_state: "E".to_string(),
+                trigger: "done".to_string(),
+                guard: None,
+            }],
+        }];
+        package.execution_history = Some(ExecutionHistory {
+            activation_count: 10,
+            success_rate: 0.9,
+            avg_score: 0.8,
+            source_projects_count: 2,
+        });
+
+        let json = serde_json::to_string_pretty(&package).unwrap();
+        let deserialized: SkillPackage = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.protocols.len(), 1);
+        assert_eq!(deserialized.protocols[0].name, "roundtrip-proto");
+        assert_eq!(deserialized.protocols[0].states.len(), 2);
+        assert_eq!(deserialized.protocols[0].transitions.len(), 1);
+        assert_eq!(
+            deserialized.execution_history.as_ref().unwrap().activation_count,
+            10
+        );
+    }
+
+    #[test]
+    fn test_v1_json_deserializes_to_v2_struct() {
+        // Simulate a v1 JSON (no protocols/execution_history/source fields)
+        let v1_json = serde_json::json!({
+            "schema_version": 1,
+            "metadata": {
+                "format": "po-skill/v1",
+                "exported_at": "2026-01-01T00:00:00Z",
+                "stats": {
+                    "note_count": 1,
+                    "decision_count": 0,
+                    "trigger_count": 1,
+                    "activation_count": 5
+                }
+            },
+            "skill": {
+                "name": "V1 Skill",
+                "description": "Legacy",
+                "trigger_patterns": [{"pattern_type": "regex", "pattern_value": "test", "confidence_threshold": 0.7}],
+                "tags": ["v1"],
+                "cohesion": 0.5
+            },
+            "notes": [{
+                "note_type": "guideline",
+                "importance": "medium",
+                "content": "V1 note",
+                "tags": []
+            }],
+            "decisions": []
+        });
+
+        let package: SkillPackage = serde_json::from_value(v1_json).unwrap();
+        assert_eq!(package.schema_version, 1);
+        assert!(package.protocols.is_empty());
+        assert!(package.execution_history.is_none());
+        assert!(package.source.is_none());
         assert!(validate_package(&package).is_ok());
     }
 }

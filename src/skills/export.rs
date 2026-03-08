@@ -9,9 +9,11 @@ use chrono::Utc;
 use uuid::Uuid;
 
 use crate::neo4j::traits::GraphStore;
+use crate::protocol::models::RunStatus;
 use crate::skills::package::{
-    PackageMetadata, PackageStats, PortableDecision, PortableNote, PortableSkill, SkillPackage,
-    CURRENT_SCHEMA_VERSION, FORMAT_ID,
+    ExecutionHistory, PackageMetadata, PackageStats, PortableDecision, PortableNote,
+    PortableProtocol, PortableRelevanceVector, PortableSkill, PortableState, PortableTransition,
+    SkillPackage, SourceMetadata, CURRENT_SCHEMA_VERSION, FORMAT_ID,
 };
 
 /// Export a skill and its members as a portable package.
@@ -42,13 +44,21 @@ pub async fn export_skill(
         .await
         .context("Failed to load skill members")?;
 
+    // 2b. Load project root_path for path sanitization
+    let project_root = graph_store
+        .get_project(skill.project_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|p| p.root_path);
+
     // 3. Convert to portable format
     let portable_notes: Vec<PortableNote> = notes
         .into_iter()
         .map(|n| PortableNote {
             note_type: n.note_type.to_string(),
             importance: n.importance.to_string(),
-            content: n.content,
+            content: sanitize_paths(&n.content, project_root.as_deref()),
             tags: n.tags,
         })
         .collect();
@@ -56,10 +66,17 @@ pub async fn export_skill(
     let portable_decisions: Vec<PortableDecision> = decisions
         .into_iter()
         .map(|d| PortableDecision {
-            description: d.description,
-            rationale: d.rationale,
-            alternatives: d.alternatives,
-            chosen_option: d.chosen_option,
+            description: sanitize_paths(&d.description, project_root.as_deref()),
+            rationale: sanitize_paths(&d.rationale, project_root.as_deref()),
+            alternatives: d
+                .alternatives
+                .iter()
+                .map(|a| sanitize_paths(a, project_root.as_deref()))
+                .collect(),
+            chosen_option: d
+                .chosen_option
+                .as_deref()
+                .map(|o| sanitize_paths(o, project_root.as_deref())),
         })
         .collect();
 
@@ -73,6 +90,122 @@ pub async fn export_skill(
     };
 
     // 4. Assemble package
+    // v2 — Load protocols linked to this skill
+    let mut portable_protocols = Vec::new();
+    let mut total_runs: usize = 0;
+    let mut completed_runs: usize = 0;
+    let _total_score: f64 = 0.0;
+
+    // Find protocols linked to this skill via skill_id
+    let project_id = skill.project_id;
+    let (all_protocols, _) = graph_store
+        .list_protocols(project_id, None, 100, 0)
+        .await
+        .unwrap_or_default();
+
+    for proto in &all_protocols {
+        if proto.skill_id != Some(skill_id) {
+            continue;
+        }
+
+        // Load states and transitions
+        let states = graph_store
+            .get_protocol_states(proto.id)
+            .await
+            .unwrap_or_default();
+        let transitions = graph_store
+            .get_protocol_transitions(proto.id)
+            .await
+            .unwrap_or_default();
+
+        // Build name lookup for transitions (UUID → name)
+        let state_name_map: std::collections::HashMap<Uuid, String> =
+            states.iter().map(|s| (s.id, s.name.clone())).collect();
+
+        let portable_states: Vec<PortableState> = states
+            .iter()
+            .map(|s| PortableState {
+                name: s.name.clone(),
+                description: s.description.clone(),
+                action: s.action.clone(),
+                state_type: format!("{}", s.state_type).to_lowercase(),
+            })
+            .collect();
+
+        let portable_transitions: Vec<PortableTransition> = transitions
+            .iter()
+            .filter_map(|t| {
+                let from_name = state_name_map.get(&t.from_state)?.clone();
+                let to_name = state_name_map.get(&t.to_state)?.clone();
+                Some(PortableTransition {
+                    from_state: from_name,
+                    to_state: to_name,
+                    trigger: t.trigger.clone(),
+                    guard: t.guard.clone(),
+                })
+            })
+            .collect();
+
+        let relevance_vector = proto.relevance_vector.as_ref().map(|rv| {
+            PortableRelevanceVector {
+                phase: rv.phase,
+                structure: rv.structure,
+                domain: rv.domain,
+                resource: rv.resource,
+                lifecycle: rv.lifecycle,
+            }
+        });
+
+        portable_protocols.push(PortableProtocol {
+            name: proto.name.clone(),
+            description: proto.description.clone(),
+            category: format!("{}", proto.protocol_category).to_lowercase(),
+            relevance_vector,
+            states: portable_states,
+            transitions: portable_transitions,
+        });
+
+        // Aggregate execution history from runs
+        let (runs, run_total) = graph_store
+            .list_protocol_runs(proto.id, None, 1000, 0)
+            .await
+            .unwrap_or_default();
+        total_runs += run_total;
+        for run in &runs {
+            if run.status == RunStatus::Completed {
+                completed_runs += 1;
+            }
+        }
+    }
+
+    let execution_history = if total_runs > 0 || skill.activation_count > 0 {
+        let success_rate = if total_runs > 0 {
+            completed_runs as f64 / total_runs as f64
+        } else {
+            0.0
+        };
+        // Use hit_rate as avg_score proxy
+        let avg_score = if skill.hit_rate > 0.0 {
+            skill.hit_rate
+        } else {
+            success_rate
+        };
+        Some(ExecutionHistory {
+            activation_count: skill.activation_count,
+            success_rate,
+            avg_score,
+            source_projects_count: 1, // current project is 1
+        })
+    } else {
+        None
+    };
+
+    let source = source_project_name.clone().map(|name| SourceMetadata {
+        project_name: name,
+        git_remote: None,
+        instance_id: None,
+    });
+
     let package = SkillPackage {
         schema_version: CURRENT_SCHEMA_VERSION,
         metadata: PackageMetadata {
@@ -89,9 +222,46 @@ pub async fn export_skill(
         skill: portable_skill,
         notes: portable_notes,
         decisions: portable_decisions,
+        protocols: portable_protocols,
+        execution_history,
+        source,
     };
 
     Ok(package)
+}
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+/// Replace absolute project paths with relative paths in text content.
+///
+/// If `project_root` is provided, replaces occurrences of the root path
+/// (with or without trailing slash) with an empty string, making paths
+/// relative. This ensures packages are portable across machines.
+///
+/// Examples:
+/// - `/Users/john/myproject/src/main.rs` → `src/main.rs`
+/// - `file at /Users/john/myproject/lib/foo.rs` → `file at lib/foo.rs`
+fn sanitize_paths(content: &str, project_root: Option<&str>) -> String {
+    let Some(root) = project_root else {
+        return content.to_string();
+    };
+
+    if root.is_empty() {
+        return content.to_string();
+    }
+
+    // Normalize: ensure root ends with /
+    let root_with_slash = if root.ends_with('/') {
+        root.to_string()
+    } else {
+        format!("{}/", root)
+    };
+
+    // Replace root_with_slash first (more specific), then bare root
+    let result = content.replace(&root_with_slash, "");
+    result.replace(root, "")
 }
 
 // ============================================================================
@@ -222,5 +392,50 @@ mod tests {
             "Package JSON too large: {} bytes",
             json.len()
         );
+    }
+
+    // ── sanitize_paths tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_sanitize_paths_replaces_absolute() {
+        let content = "See file /Users/john/project/src/main.rs for details";
+        let result = sanitize_paths(content, Some("/Users/john/project"));
+        assert_eq!(result, "See file src/main.rs for details");
+    }
+
+    #[test]
+    fn test_sanitize_paths_root_with_trailing_slash() {
+        let content = "Check /home/ci/app/lib/foo.rs";
+        let result = sanitize_paths(content, Some("/home/ci/app/"));
+        assert_eq!(result, "Check lib/foo.rs");
+    }
+
+    #[test]
+    fn test_sanitize_paths_multiple_occurrences() {
+        let content =
+            "Compare /tmp/proj/a.rs and /tmp/proj/b.rs";
+        let result = sanitize_paths(content, Some("/tmp/proj"));
+        assert_eq!(result, "Compare a.rs and b.rs");
+    }
+
+    #[test]
+    fn test_sanitize_paths_no_root() {
+        let content = "Path /absolute/stays.rs intact";
+        let result = sanitize_paths(content, None);
+        assert_eq!(result, content);
+    }
+
+    #[test]
+    fn test_sanitize_paths_empty_root() {
+        let content = "No change /foo/bar.rs";
+        let result = sanitize_paths(content, Some(""));
+        assert_eq!(result, content);
+    }
+
+    #[test]
+    fn test_sanitize_paths_no_match() {
+        let content = "Path /other/project/src/lib.rs";
+        let result = sanitize_paths(content, Some("/my/project"));
+        assert_eq!(result, content);
     }
 }
