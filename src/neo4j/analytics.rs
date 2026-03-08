@@ -1239,6 +1239,7 @@ impl Neo4jClient {
     ///
     /// Formula: `risk = 0.3 * pagerank_norm + 0.3 * churn + 0.25 * (1 - density) + 0.15 * betweenness_norm`
     pub async fn compute_risk_scores(&self, project_id: Uuid) -> Result<Vec<FileRiskScore>> {
+        // Simplified query: return raw values, normalization happens in Rust
         let q = query(
             r#"
             MATCH (p:Project {id: $project_id})-[:CONTAINS]->(f:File)
@@ -1247,36 +1248,58 @@ impl Neo4jClient {
                  COALESCE(f.churn_score, 0.0) AS churn,
                  COALESCE(f.knowledge_density, 0.0) AS density,
                  COALESCE(f.fabric_betweenness, f.betweenness, 0.0) AS bw
-            WITH collect({
-                 path: f.path, pr: pr, churn: churn, density: density, bw: bw
-                 }) AS files,
-                 max(pr) AS max_pr, max(bw) AS max_bw
-            UNWIND files AS file
-            WITH file, max_pr, max_bw,
-                 CASE WHEN max_pr > 0 THEN file.pr / max_pr ELSE 0.0 END AS pr_norm,
-                 CASE WHEN max_bw > 0 THEN file.bw / max_bw ELSE 0.0 END AS bw_norm,
-                 file.churn AS churn,
-                 file.density AS density
-            WITH file.path AS path,
-                 pr_norm, churn, density, bw_norm,
-                 0.3 * pr_norm + 0.3 * churn + 0.25 * (1.0 - density) + 0.15 * bw_norm AS risk
-            RETURN path, risk, pr_norm AS pagerank, churn, 1.0 - density AS knowledge_gap, bw_norm AS betweenness
-            ORDER BY risk DESC
+            RETURN f.path AS path, pr, churn, density, bw
+            ORDER BY path
             "#,
         )
         .param("project_id", project_id.to_string());
 
         let rows = self.execute_with_params(q).await?;
 
-        let scores: Vec<FileRiskScore> = rows
+        // Collect raw values for percentile computation
+        struct RawFile {
+            path: String,
+            pr: f64,
+            churn: f64,
+            density: f64,
+            bw: f64,
+        }
+
+        let raw_files: Vec<RawFile> = rows
             .iter()
             .filter_map(|row| {
                 let path = row.get::<String>("path").ok()?;
-                let risk_score = row.get::<f64>("risk").unwrap_or(0.0);
-                let pagerank = row.get::<f64>("pagerank").unwrap_or(0.0);
-                let churn = row.get::<f64>("churn").unwrap_or(0.0);
-                let knowledge_gap = row.get::<f64>("knowledge_gap").unwrap_or(0.0);
-                let betweenness = row.get::<f64>("betweenness").unwrap_or(0.0);
+                Some(RawFile {
+                    path,
+                    pr: row.get::<f64>("pr").unwrap_or(0.0),
+                    churn: row.get::<f64>("churn").unwrap_or(0.0),
+                    density: row.get::<f64>("density").unwrap_or(0.0),
+                    bw: row.get::<f64>("bw").unwrap_or(0.0),
+                })
+            })
+            .collect();
+
+        if raw_files.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Apply percentiles in Rust: log for pagerank (power-law), linear for betweenness
+        let pr_vals: Vec<f64> = raw_files.iter().map(|f| f.pr).collect();
+        let bw_vals: Vec<f64> = raw_files.iter().map(|f| f.bw).collect();
+
+        let pr_pct = crate::graph::algorithms::to_log_percentiles(&pr_vals);
+        let bw_pct = crate::graph::algorithms::to_linear_percentiles(&bw_vals);
+
+        let scores: Vec<FileRiskScore> = raw_files
+            .iter()
+            .enumerate()
+            .map(|(i, f)| {
+                let pr_percentile = pr_pct[i];
+                let bw_percentile = bw_pct[i];
+                let risk_score = 0.3 * pr_percentile
+                    + 0.3 * f.churn
+                    + 0.25 * (1.0 - f.density)
+                    + 0.15 * bw_percentile;
 
                 let risk_level = if risk_score >= 0.75 {
                     "critical"
@@ -1289,19 +1312,26 @@ impl Neo4jClient {
                 }
                 .to_string();
 
-                Some(FileRiskScore {
-                    path,
+                FileRiskScore {
+                    path: f.path.clone(),
                     risk_score,
                     risk_level,
                     factors: RiskFactors {
-                        pagerank,
-                        churn,
-                        knowledge_gap,
-                        betweenness,
+                        pagerank: pr_percentile,
+                        churn: f.churn,
+                        knowledge_gap: 1.0 - f.density,
+                        betweenness: bw_percentile,
                     },
-                })
+                }
             })
             .collect();
+
+        let mut scores = scores;
+        scores.sort_by(|a, b| {
+            b.risk_score
+                .partial_cmp(&a.risk_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         Ok(scores)
     }

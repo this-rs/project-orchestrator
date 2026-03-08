@@ -25,8 +25,9 @@ use serde::Serialize;
 
 use super::models::{
     AnalysisProfile, AnalyticsConfig, CodeGraph, CodeHealthReport, CommunityInfo, ComponentInfo,
-    ComputeAllResult, ComputeMode, GrailConfig, GrailStats, GraphAnalytics, NodeMetrics,
-    RankCluster, RankConfidence, RankedList, RankedResult, StepTiming,
+    ComputeAllResult, ComputeMode, DistributionSummary, GrailConfig, GrailStats, GraphAnalytics,
+    HealthDelta, NodeMetrics, RankCluster, RankConfidence, RankedList, RankedResult, StepTiming,
+    TrendDirection,
 };
 
 // ============================================================================
@@ -53,10 +54,14 @@ pub fn pagerank(graph: &CodeGraph, config: &AnalyticsConfig) -> HashMap<String, 
     let mut scores: Vec<f64> = vec![initial; n];
     let mut new_scores: Vec<f64> = vec![0.0; n];
 
-    // Precompute out-degrees for each node
-    let out_degrees: Vec<usize> = g
+    // Precompute total outgoing weight for each node (sum of edge weights)
+    let out_weights: Vec<f64> = g
         .node_indices()
-        .map(|idx| g.neighbors_directed(idx, Direction::Outgoing).count())
+        .map(|idx| {
+            g.edges_directed(idx, Direction::Outgoing)
+                .map(|e| e.weight().weight)
+                .sum()
+        })
         .collect();
 
     for _ in 0..max_iter {
@@ -65,13 +70,13 @@ pub fn pagerank(graph: &CodeGraph, config: &AnalyticsConfig) -> HashMap<String, 
             *s = (1.0 - damping) / n as f64;
         }
 
-        // Distribute scores along edges
+        // Distribute scores along edges, weighted by edge weight
         for idx in g.node_indices() {
             let i = idx.index();
-            if out_degrees[i] > 0 {
-                let contribution = damping * scores[i] / out_degrees[i] as f64;
-                for neighbor in g.neighbors_directed(idx, Direction::Outgoing) {
-                    new_scores[neighbor.index()] += contribution;
+            if out_weights[i] > 0.0 {
+                for edge in g.edges_directed(idx, Direction::Outgoing) {
+                    let contribution = damping * scores[i] * edge.weight().weight / out_weights[i];
+                    new_scores[edge.target().index()] += contribution;
                 }
             } else {
                 // Dangling node: distribute evenly to all nodes
@@ -750,12 +755,15 @@ pub fn compute_health(
     };
     let max_coupling = clustering_vals.iter().copied().fold(0.0f64, f64::max);
 
+    let coupling_dist = DistributionSummary::from_values(&clustering_vals);
+
     CodeHealthReport {
         god_functions,
         circular_dependencies,
         orphan_files,
         avg_coupling,
         max_coupling,
+        coupling_dist,
     }
 }
 
@@ -1203,7 +1211,7 @@ pub fn structural_dna(
 ///
 /// Uses `log(rank+1) / log(N+1)` instead of `rank/N` to preserve discrimination
 /// in the tail of power-law distributions (inspired by bibliometrics research).
-fn to_log_percentiles(values: &[f64]) -> Vec<f64> {
+pub fn to_log_percentiles(values: &[f64]) -> Vec<f64> {
     if values.is_empty() {
         return Vec::new();
     }
@@ -1229,7 +1237,7 @@ fn to_log_percentiles(values: &[f64]) -> Vec<f64> {
 /// Convert raw values to linear percentiles (rank/N).
 ///
 /// Used for metrics with roughly uniform distributions (betweenness, type_count, etc.).
-fn to_linear_percentiles(values: &[f64]) -> Vec<f64> {
+pub fn to_linear_percentiles(values: &[f64]) -> Vec<f64> {
     if values.is_empty() {
         return Vec::new();
     }
@@ -1455,20 +1463,19 @@ pub fn compute_structural_fingerprint(
     let co_changer_vals: Vec<f64> = raw_metrics.iter().map(|m| m.co_changer_count).collect();
     let degree_vals: Vec<f64> = raw_metrics.iter().map(|m| m.community_role_raw).collect();
 
-    // Log-percentiles for power-law metrics
-    let imports_in_pct = to_log_percentiles(&imports_in_vals);
-    let imports_out_pct = to_log_percentiles(&imports_out_vals);
-    let calls_in_pct = to_log_percentiles(&calls_in_vals);
-    let calls_out_pct = to_log_percentiles(&calls_out_vals);
-    let pagerank_pct = to_log_percentiles(&pagerank_vals);
-    let function_count_pct = to_log_percentiles(&function_count_vals);
+    // Smart percentiles: auto-select log vs linear based on distribution shape
+    let imports_in_pct = smart_percentiles(&imports_in_vals);
+    let imports_out_pct = smart_percentiles(&imports_out_vals);
+    let calls_in_pct = smart_percentiles(&calls_in_vals);
+    let calls_out_pct = smart_percentiles(&calls_out_vals);
+    let pagerank_pct = smart_percentiles(&pagerank_vals);
+    let function_count_pct = smart_percentiles(&function_count_vals);
 
-    // Linear percentiles for more uniform metrics
-    let betweenness_pct = to_linear_percentiles(&betweenness_vals);
-    let type_count_pct = to_linear_percentiles(&type_count_vals);
-    let co_changer_pct = to_linear_percentiles(&co_changer_vals);
-    let degree_pct = to_linear_percentiles(&degree_vals);
-    let betweenness_raw_pct = to_linear_percentiles(&betweenness_vals);
+    let betweenness_pct = smart_percentiles(&betweenness_vals);
+    let type_count_pct = smart_percentiles(&type_count_vals);
+    let co_changer_pct = smart_percentiles(&co_changer_vals);
+    let degree_pct = smart_percentiles(&degree_vals);
+    let betweenness_raw_pct = smart_percentiles(&betweenness_vals);
 
     // Phase 3: Assemble fingerprint vectors
     let mut result = HashMap::with_capacity(n);
@@ -3184,8 +3191,7 @@ pub fn link_plausibility(
             }
         })
         .sum();
-    // Normalize Adamic-Adar to [0, 1] range (cap at reasonable max)
-    let adamic_adar_norm = (adamic_adar / 5.0).min(1.0);
+    // Store raw Adamic-Adar (normalization happens in suggest_missing_links batch)
 
     // --- Signal 5: Structural DNA cosine similarity ---
     let dna_similarity = dna_map
@@ -3196,11 +3202,11 @@ pub fn link_plausibility(
         })
         .unwrap_or(0.0);
 
-    // --- Weighted fusion ---
+    // --- Weighted fusion (adamic_adar stored raw, normalized later in batch) ---
     let plausibility = 0.25 * jaccard
         + 0.30 * co_change_weight
         + 0.15 * proximity
-        + 0.15 * adamic_adar_norm
+        + 0.15 * adamic_adar.min(1.0)
         + 0.15 * dna_similarity;
 
     let suggested_relation = infer_relation_type(graph, source, target);
@@ -3213,7 +3219,7 @@ pub fn link_plausibility(
             ("jaccard".to_string(), jaccard),
             ("co_change".to_string(), co_change_weight),
             ("proximity".to_string(), proximity),
-            ("adamic_adar".to_string(), adamic_adar_norm),
+            ("adamic_adar".to_string(), adamic_adar),
             ("dna_similarity".to_string(), dna_similarity),
         ],
         suggested_relation,
@@ -3243,8 +3249,67 @@ pub fn suggest_missing_links(
     let mut predictions: Vec<super::models::LinkPrediction> = candidates
         .into_iter()
         .map(|(s, t)| link_plausibility(graph, s, t, co_change_data, dna_map))
-        .filter(|p| p.plausibility >= min_plausibility)
         .collect();
+
+    // Normalize Adamic-Adar across the batch: find max and scale to [0, 1]
+    let max_adamic_adar = predictions
+        .iter()
+        .filter_map(|p| {
+            p.signals
+                .iter()
+                .find(|(name, _)| name == "adamic_adar")
+                .map(|(_, v)| *v)
+        })
+        .fold(0.0f64, f64::max);
+
+    if max_adamic_adar > 0.0 {
+        for pred in &mut predictions {
+            // Normalize the raw adamic_adar signal
+            if let Some(aa_signal) = pred
+                .signals
+                .iter_mut()
+                .find(|(name, _)| name == "adamic_adar")
+            {
+                let raw = aa_signal.1;
+                let normalized = raw / max_adamic_adar;
+                aa_signal.1 = normalized;
+
+                // Recompute plausibility with normalized adamic_adar
+                let jaccard = pred
+                    .signals
+                    .iter()
+                    .find(|(n, _)| n == "jaccard")
+                    .map(|(_, v)| *v)
+                    .unwrap_or(0.0);
+                let co_change = pred
+                    .signals
+                    .iter()
+                    .find(|(n, _)| n == "co_change")
+                    .map(|(_, v)| *v)
+                    .unwrap_or(0.0);
+                let proximity = pred
+                    .signals
+                    .iter()
+                    .find(|(n, _)| n == "proximity")
+                    .map(|(_, v)| *v)
+                    .unwrap_or(0.0);
+                let dna_sim = pred
+                    .signals
+                    .iter()
+                    .find(|(n, _)| n == "dna_similarity")
+                    .map(|(_, v)| *v)
+                    .unwrap_or(0.0);
+
+                pred.plausibility = 0.25 * jaccard
+                    + 0.30 * co_change
+                    + 0.15 * proximity
+                    + 0.15 * normalized
+                    + 0.15 * dna_sim;
+            }
+        }
+    }
+
+    predictions.retain(|p| p.plausibility >= min_plausibility);
 
     predictions.sort_by(|a, b| {
         b.plausibility
@@ -3299,6 +3364,232 @@ pub fn infer_relation_type(graph: &CodeGraph, source: NodeIndex, target: NodeInd
         (CodeNodeType::Struct, CodeNodeType::Trait)
         | (CodeNodeType::Trait, CodeNodeType::Struct) => "IMPLEMENTS_TRAIT".to_string(),
         _ => "RELATED".to_string(),
+    }
+}
+
+// ============================================================================
+// Health delta (T4)
+// ============================================================================
+
+/// Compute health metric deltas between two snapshots.
+///
+/// Compares current and previous `CodeHealthReport` and produces a `HealthDelta`
+/// for each tracked metric: coupling, god_functions, circular_deps, orphan_files.
+///
+/// - For coupling/god_functions/circular_deps: increase = Degrading
+/// - For orphan_files: decrease = Improving (fewer orphans is better)
+/// - |change_pct| < 5% = Stable
+/// - previous=0 and current>0 = Degrading; both zero = Stable
+pub fn compute_health_deltas(
+    current: &CodeHealthReport,
+    previous: &CodeHealthReport,
+) -> Vec<HealthDelta> {
+    let mut deltas = Vec::new();
+
+    // Helper: compute delta for a metric where increase = degrading
+    let mut add_delta = |metric: &str, cur: f64, prev: f64, increase_is_bad: bool| {
+        let change_pct = if prev == 0.0 {
+            if cur == 0.0 {
+                0.0
+            } else {
+                100.0 // Convention: 0 → non-zero = 100% change
+            }
+        } else {
+            (cur - prev) / prev * 100.0
+        };
+
+        let direction = if change_pct.abs() < 5.0 {
+            TrendDirection::Stable
+        } else if increase_is_bad {
+            if cur > prev {
+                TrendDirection::Degrading
+            } else {
+                TrendDirection::Improving
+            }
+        } else {
+            // decrease is bad (e.g., orphan_files going down is good)
+            if cur < prev {
+                TrendDirection::Improving
+            } else {
+                TrendDirection::Degrading
+            }
+        };
+
+        deltas.push(HealthDelta {
+            metric: metric.to_string(),
+            previous: prev,
+            current: cur,
+            change_pct,
+            direction,
+        });
+    };
+
+    // coupling: increase = degrading
+    add_delta(
+        "coupling",
+        current.avg_coupling,
+        previous.avg_coupling,
+        true,
+    );
+
+    // god_functions count: increase = degrading
+    add_delta(
+        "god_functions",
+        current.god_functions.len() as f64,
+        previous.god_functions.len() as f64,
+        true,
+    );
+
+    // circular_deps count: increase = degrading
+    add_delta(
+        "circular_deps",
+        current.circular_dependencies.len() as f64,
+        previous.circular_dependencies.len() as f64,
+        true,
+    );
+
+    // orphan_files count: increase = degrading (more orphans = worse)
+    add_delta(
+        "orphan_files",
+        current.orphan_files.len() as f64,
+        previous.orphan_files.len() as f64,
+        true,
+    );
+
+    deltas
+}
+
+// ============================================================================
+// Elbow K-means (T6)
+// ============================================================================
+
+/// Compute cluster inertia (sum of squared distances to centroids).
+///
+/// Inertia is the within-cluster sum of squared distances from each point
+/// to its assigned centroid. Lower inertia = tighter clusters.
+pub fn compute_inertia(
+    clusters: &[super::models::DnaCluster],
+    dna_map: &HashMap<String, Vec<f64>>,
+) -> f64 {
+    let mut total = 0.0;
+    for cluster in clusters {
+        for member in &cluster.members {
+            if let Some(vec) = dna_map.get(member) {
+                total += squared_euclidean(vec, &cluster.centroid);
+            }
+        }
+    }
+    total
+}
+
+/// Find optimal K using the Elbow method (max second derivative of inertia curve).
+///
+/// Tries K from 2..=max_k, computes inertia for each, and picks the K where
+/// the rate of inertia decrease drops most sharply (the "elbow").
+/// Returns at least 2 and at most min(max_k, n).
+pub fn find_optimal_k(dna_map: &HashMap<String, Vec<f64>>, max_k: usize) -> usize {
+    let n = dna_map.len();
+    if n <= 2 {
+        return n.max(1);
+    }
+
+    let upper = max_k.min(n);
+    if upper <= 2 {
+        return 2;
+    }
+
+    let mut inertias: Vec<(usize, f64)> = Vec::with_capacity(upper);
+
+    for k in 1..=upper {
+        let clusters = cluster_dna_vectors(dna_map, k);
+        if clusters.is_empty() {
+            continue;
+        }
+        let inertia = compute_inertia(&clusters, dna_map);
+        inertias.push((k, inertia));
+    }
+
+    if inertias.len() < 3 {
+        return 2;
+    }
+
+    // Find the elbow: maximum second derivative (largest drop in slope)
+    let mut best_k = 2;
+    let mut max_second_deriv = f64::NEG_INFINITY;
+
+    for i in 1..inertias.len() - 1 {
+        let d1 = inertias[i - 1].1 - inertias[i].1; // slope before
+        let d2 = inertias[i].1 - inertias[i + 1].1; // slope after
+        let second_deriv = d1 - d2;
+
+        if second_deriv > max_second_deriv {
+            max_second_deriv = second_deriv;
+            best_k = inertias[i].0;
+        }
+    }
+
+    best_k
+}
+
+/// Auto-clustering with Elbow method to find optimal K.
+///
+/// Searches K in 2..=min(10, n/2) using `find_optimal_k`, then runs
+/// K-means with the selected K. Falls back to K=2 for very small datasets.
+pub fn cluster_dna_auto(dna_map: &HashMap<String, Vec<f64>>) -> Vec<super::models::DnaCluster> {
+    if dna_map.is_empty() {
+        return vec![];
+    }
+    let n = dna_map.len();
+    if n <= 2 {
+        return cluster_dna_vectors(dna_map, n);
+    }
+
+    let max_k = (n / 2).clamp(2, 10);
+    let optimal_k = find_optimal_k(dna_map, max_k);
+    cluster_dna_vectors(dna_map, optimal_k)
+}
+
+// ============================================================================
+// Smart percentiles (T7)
+// ============================================================================
+
+/// Compute Fisher's skewness for a slice of values.
+///
+/// Returns 0.0 for empty or single-element slices, or when std_dev is zero.
+/// Positive skewness indicates a right-tailed (power-law-like) distribution.
+fn skewness(values: &[f64]) -> f64 {
+    let n = values.len();
+    if n < 3 {
+        return 0.0;
+    }
+    let mean = values.iter().sum::<f64>() / n as f64;
+    let variance = values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / n as f64;
+    let std_dev = variance.sqrt();
+    if std_dev == 0.0 {
+        return 0.0;
+    }
+    values
+        .iter()
+        .map(|v| ((v - mean) / std_dev).powi(3))
+        .sum::<f64>()
+        / n as f64
+}
+
+/// Choose log or linear percentiles based on distribution shape.
+///
+/// Uses Bulmer's criterion: skewness > 1.5 indicates a power-law-like
+/// distribution where log-percentiles preserve discrimination in the tail.
+/// Otherwise, linear percentiles are used for more uniform distributions.
+/// Falls back to linear for small datasets (< 10 values).
+pub fn smart_percentiles(values: &[f64]) -> Vec<f64> {
+    if values.len() < 10 {
+        return to_linear_percentiles(values);
+    }
+    let sk = skewness(values);
+    if sk > 1.5 {
+        to_log_percentiles(values)
+    } else {
+        to_linear_percentiles(values)
     }
 }
 
@@ -7196,6 +7487,507 @@ mod tests {
             cosine_discrimination > 0.05,
             "Cosine discrimination ({:.4}) too low for reliable twin detection",
             cosine_discrimination
+        );
+    }
+
+    // ========================================================================
+    // T1 — PageRank weighted tests
+    // ========================================================================
+
+    #[test]
+    fn test_pagerank_weighted() {
+        // A → B (weight=3.0), A → C (weight=1.0)
+        // B should get more PageRank than C because the edge to B is 3x heavier
+        let mut g = CodeGraph::new();
+        g.add_node(CodeNode {
+            id: "A".to_string(),
+            node_type: CodeNodeType::Function,
+            path: None,
+            name: "A".to_string(),
+            project_id: None,
+        });
+        g.add_node(CodeNode {
+            id: "B".to_string(),
+            node_type: CodeNodeType::Function,
+            path: None,
+            name: "B".to_string(),
+            project_id: None,
+        });
+        g.add_node(CodeNode {
+            id: "C".to_string(),
+            node_type: CodeNodeType::Function,
+            path: None,
+            name: "C".to_string(),
+            project_id: None,
+        });
+        g.add_edge(
+            "A",
+            "B",
+            CodeEdge {
+                edge_type: CodeEdgeType::Calls,
+                weight: 3.0,
+            },
+        );
+        g.add_edge(
+            "A",
+            "C",
+            CodeEdge {
+                edge_type: CodeEdgeType::Calls,
+                weight: 1.0,
+            },
+        );
+
+        let config = super::super::models::AnalyticsConfig::default();
+        let pr = pagerank(&g, &config);
+
+        let pr_b = pr.get("B").copied().unwrap_or(0.0);
+        let pr_c = pr.get("C").copied().unwrap_or(0.0);
+
+        assert!(
+            pr_b > pr_c,
+            "PageRank(B)={} should be > PageRank(C)={} because edge A→B has weight 3.0 vs 1.0",
+            pr_b,
+            pr_c
+        );
+    }
+
+    #[test]
+    fn test_pagerank_uniform_weights_unchanged() {
+        // With all weights = 1.0, weighted PageRank should produce same results as before
+        let g = make_star_graph(5);
+        let config = super::super::models::AnalyticsConfig::default();
+        let pr = pagerank(&g, &config);
+
+        // Center should have lower PR than leaves (center distributes to all leaves)
+        let center_pr = pr.get("center").copied().unwrap_or(0.0);
+        let leaf_pr = pr.get("leaf_0").copied().unwrap_or(0.0);
+
+        // In a star graph with only outgoing edges from center, leaves get more
+        assert!(center_pr > 0.0, "Center should have non-zero PageRank");
+        assert!(leaf_pr > 0.0, "Leaf should have non-zero PageRank");
+
+        // All leaves should have equal PR
+        for i in 0..5 {
+            let pr_i = pr.get(&format!("leaf_{}", i)).copied().unwrap_or(0.0);
+            assert!(
+                (pr_i - leaf_pr).abs() < 1e-10,
+                "All leaves should have equal PageRank"
+            );
+        }
+    }
+
+    // ========================================================================
+    // T3 — DistributionSummary tests
+    // ========================================================================
+
+    #[test]
+    fn test_dist_empty() {
+        let result = super::super::models::DistributionSummary::from_values(&[]);
+        assert!(result.is_none(), "Empty slice should return None");
+    }
+
+    #[test]
+    fn test_dist_single() {
+        let result = super::super::models::DistributionSummary::from_values(&[42.0]).unwrap();
+        assert_eq!(result.count, 1);
+        assert!((result.mean - 42.0).abs() < 1e-10);
+        assert!((result.median - 42.0).abs() < 1e-10);
+        assert!((result.std_dev).abs() < 1e-10);
+        assert!((result.min - 42.0).abs() < 1e-10);
+        assert!((result.max - 42.0).abs() < 1e-10);
+        assert!((result.skewness).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_dist_symmetric() {
+        // Symmetric distribution: skewness should be ~0
+        let values: Vec<f64> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0];
+        let result = super::super::models::DistributionSummary::from_values(&values).unwrap();
+
+        assert_eq!(result.count, 10);
+        assert!((result.mean - 5.5).abs() < 1e-10);
+        assert!((result.median - 5.5).abs() < 1e-10);
+        assert!(
+            result.skewness.abs() < 0.5,
+            "Uniform distribution should have near-zero skewness, got {}",
+            result.skewness
+        );
+        assert!((result.min - 1.0).abs() < 1e-10);
+        assert!((result.max - 10.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_dist_skewed() {
+        // Heavily right-skewed (power-law-like)
+        let values: Vec<f64> = vec![
+            1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 2.0, 3.0, 5.0, 10.0, 50.0, 100.0, 500.0,
+        ];
+        let result = super::super::models::DistributionSummary::from_values(&values).unwrap();
+
+        assert!(
+            result.skewness > 1.5,
+            "Power-law-like distribution should have skewness > 1.5, got {}",
+            result.skewness
+        );
+    }
+
+    #[test]
+    fn test_dist_percentile_ordering() {
+        let values: Vec<f64> = (0..100).map(|i| i as f64).collect();
+        let result = super::super::models::DistributionSummary::from_values(&values).unwrap();
+
+        assert!(result.p25 <= result.median, "p25 <= median");
+        assert!(result.median <= result.p75, "median <= p75");
+        assert!(result.p75 <= result.p90, "p75 <= p90");
+        assert!(result.p90 <= result.p95, "p90 <= p95");
+        assert!(result.min <= result.p25, "min <= p25");
+        assert!(result.p95 <= result.max, "p95 <= max");
+    }
+
+    // ========================================================================
+    // T4 — Health delta tests
+    // ========================================================================
+
+    #[test]
+    fn test_health_delta_degrading() {
+        use super::super::models::TrendDirection;
+        let previous = CodeHealthReport {
+            god_functions: vec!["a".to_string()],
+            circular_dependencies: vec![],
+            orphan_files: vec![],
+            avg_coupling: 0.3,
+            max_coupling: 0.5,
+            coupling_dist: None,
+        };
+        let current = CodeHealthReport {
+            god_functions: vec!["a".to_string(), "b".to_string(), "c".to_string()],
+            circular_dependencies: vec![vec!["x".to_string(), "y".to_string()]],
+            orphan_files: vec![],
+            avg_coupling: 0.5,
+            max_coupling: 0.7,
+            coupling_dist: None,
+        };
+
+        let deltas = compute_health_deltas(&current, &previous);
+
+        let coupling_delta = deltas.iter().find(|d| d.metric == "coupling").unwrap();
+        assert_eq!(coupling_delta.direction, TrendDirection::Degrading);
+        assert!(coupling_delta.change_pct > 5.0);
+
+        let god_delta = deltas.iter().find(|d| d.metric == "god_functions").unwrap();
+        assert_eq!(god_delta.direction, TrendDirection::Degrading);
+    }
+
+    #[test]
+    fn test_health_delta_improving() {
+        use super::super::models::TrendDirection;
+        let previous = CodeHealthReport {
+            god_functions: vec!["a".to_string(), "b".to_string(), "c".to_string()],
+            circular_dependencies: vec![vec!["x".to_string()]],
+            orphan_files: vec!["o1".to_string(), "o2".to_string()],
+            avg_coupling: 0.5,
+            max_coupling: 0.7,
+            coupling_dist: None,
+        };
+        let current = CodeHealthReport {
+            god_functions: vec!["a".to_string()],
+            circular_dependencies: vec![],
+            orphan_files: vec![],
+            avg_coupling: 0.3,
+            max_coupling: 0.5,
+            coupling_dist: None,
+        };
+
+        let deltas = compute_health_deltas(&current, &previous);
+
+        let coupling_delta = deltas.iter().find(|d| d.metric == "coupling").unwrap();
+        assert_eq!(coupling_delta.direction, TrendDirection::Improving);
+
+        let orphan_delta = deltas.iter().find(|d| d.metric == "orphan_files").unwrap();
+        assert_eq!(orphan_delta.direction, TrendDirection::Improving);
+    }
+
+    #[test]
+    fn test_health_delta_stable() {
+        use super::super::models::TrendDirection;
+        let report = CodeHealthReport {
+            god_functions: vec!["a".to_string()],
+            circular_dependencies: vec![],
+            orphan_files: vec![],
+            avg_coupling: 0.5,
+            max_coupling: 0.7,
+            coupling_dist: None,
+        };
+
+        let deltas = compute_health_deltas(&report, &report);
+
+        for delta in &deltas {
+            assert_eq!(
+                delta.direction,
+                TrendDirection::Stable,
+                "Same report should produce Stable for {}",
+                delta.metric
+            );
+        }
+    }
+
+    #[test]
+    fn test_health_delta_previous_zero() {
+        use super::super::models::TrendDirection;
+        let previous = CodeHealthReport::default();
+        let current = CodeHealthReport {
+            god_functions: vec!["a".to_string()],
+            circular_dependencies: vec![],
+            orphan_files: vec![],
+            avg_coupling: 0.1,
+            max_coupling: 0.2,
+            coupling_dist: None,
+        };
+
+        let deltas = compute_health_deltas(&current, &previous);
+
+        let god_delta = deltas.iter().find(|d| d.metric == "god_functions").unwrap();
+        assert_eq!(god_delta.direction, TrendDirection::Degrading);
+        assert_eq!(god_delta.previous, 0.0);
+        assert_eq!(god_delta.current, 1.0);
+
+        // Both zero should be stable
+        let orphan_delta = deltas.iter().find(|d| d.metric == "orphan_files").unwrap();
+        assert_eq!(orphan_delta.direction, TrendDirection::Stable);
+    }
+
+    // ========================================================================
+    // T5 — Adamic-Adar normalization tests
+    // ========================================================================
+
+    #[test]
+    fn test_adamic_adar_raw_signal() {
+        // Build a small graph: A—B, A—C, B—C (triangle), plus D—A, D—B
+        // Common neighbor of D and C through A and B
+        let mut g = CodeGraph::new();
+        for id in &["A", "B", "C", "D"] {
+            g.add_node(CodeNode {
+                id: id.to_string(),
+                node_type: CodeNodeType::File,
+                path: None,
+                name: id.to_string(),
+                project_id: None,
+            });
+        }
+        // Edges (bidirectional to make undirected-like)
+        for (s, t) in &[("A", "B"), ("A", "C"), ("B", "C"), ("D", "A"), ("D", "B")] {
+            g.add_edge(
+                s,
+                t,
+                CodeEdge {
+                    edge_type: CodeEdgeType::Imports,
+                    weight: 1.0,
+                },
+            );
+            g.add_edge(
+                t,
+                s,
+                CodeEdge {
+                    edge_type: CodeEdgeType::Imports,
+                    weight: 1.0,
+                },
+            );
+        }
+
+        let co_change: HashMap<(String, String), f64> = HashMap::new();
+        let d_idx = g.get_index("D").unwrap();
+        let c_idx = g.get_index("C").unwrap();
+
+        let prediction = link_plausibility(&g, d_idx, c_idx, &co_change, None);
+
+        // The adamic_adar signal should be raw (not divided by 5.0)
+        let aa_signal = prediction
+            .signals
+            .iter()
+            .find(|(n, _)| n == "adamic_adar")
+            .unwrap();
+
+        // D and C have common neighbors A and B, each with degree > 1
+        assert!(
+            aa_signal.1 > 0.0,
+            "Adamic-Adar should be positive for nodes with common neighbors"
+        );
+    }
+
+    // ========================================================================
+    // T6 — Elbow K-means tests
+    // ========================================================================
+
+    #[test]
+    fn test_elbow_synthetic_3_clusters() {
+        // Create 3 well-separated clusters in 2D
+        let mut dna_map: HashMap<String, Vec<f64>> = HashMap::new();
+
+        // Cluster 1: around (0, 0)
+        for i in 0..10 {
+            dna_map.insert(
+                format!("cluster1_{}", i),
+                vec![0.0 + (i as f64 * 0.01), 0.0 + (i as f64 * 0.01)],
+            );
+        }
+        // Cluster 2: around (10, 10)
+        for i in 0..10 {
+            dna_map.insert(
+                format!("cluster2_{}", i),
+                vec![10.0 + (i as f64 * 0.01), 10.0 + (i as f64 * 0.01)],
+            );
+        }
+        // Cluster 3: around (0, 10)
+        for i in 0..10 {
+            dna_map.insert(
+                format!("cluster3_{}", i),
+                vec![0.0 + (i as f64 * 0.01), 10.0 + (i as f64 * 0.01)],
+            );
+        }
+
+        let optimal_k = find_optimal_k(&dna_map, 8);
+
+        // Should find 2-4 clusters (3 ideal, but elbow heuristic may vary)
+        assert!(
+            (2..=5).contains(&optimal_k),
+            "Optimal K should be 2-5 for 3 well-separated clusters, got {}",
+            optimal_k
+        );
+    }
+
+    #[test]
+    fn test_elbow_empty() {
+        let dna_map: HashMap<String, Vec<f64>> = HashMap::new();
+        let clusters = cluster_dna_auto(&dna_map);
+        assert!(clusters.is_empty());
+    }
+
+    #[test]
+    fn test_elbow_single_point() {
+        let mut dna_map: HashMap<String, Vec<f64>> = HashMap::new();
+        dna_map.insert("only".to_string(), vec![1.0, 2.0]);
+
+        let clusters = cluster_dna_auto(&dna_map);
+        assert_eq!(clusters.len(), 1);
+        assert_eq!(clusters[0].members.len(), 1);
+    }
+
+    #[test]
+    fn test_compute_inertia_basic() {
+        let mut dna_map: HashMap<String, Vec<f64>> = HashMap::new();
+        dna_map.insert("a".to_string(), vec![0.0, 0.0]);
+        dna_map.insert("b".to_string(), vec![1.0, 0.0]);
+
+        let clusters = cluster_dna_vectors(&dna_map, 1);
+        let inertia = compute_inertia(&clusters, &dna_map);
+
+        // Centroid should be (0.5, 0.0), inertia = 0.25 + 0.25 = 0.5
+        assert!(
+            inertia > 0.0,
+            "Inertia should be positive for non-trivial cluster"
+        );
+    }
+
+    // ========================================================================
+    // T7 — Smart percentiles tests
+    // ========================================================================
+
+    #[test]
+    fn test_smart_percentiles_uniform() {
+        // Uniform distribution should use linear percentiles
+        let values: Vec<f64> = (0..20).map(|i| i as f64).collect();
+        let result = smart_percentiles(&values);
+        let linear = to_linear_percentiles(&values);
+
+        assert_eq!(
+            result, linear,
+            "Uniform distribution (skew~0) should use linear percentiles"
+        );
+    }
+
+    #[test]
+    fn test_smart_percentiles_exponential() {
+        // Exponential/power-law distribution should use log percentiles
+        let values: Vec<f64> = (0..20).map(|i| (2.0f64).powi(i)).collect();
+        let sk = skewness(&values);
+        assert!(
+            sk > 1.5,
+            "Exponential data should have skewness > 1.5, got {}",
+            sk
+        );
+
+        let result = smart_percentiles(&values);
+        let log_pct = to_log_percentiles(&values);
+
+        assert_eq!(
+            result, log_pct,
+            "Exponential distribution (high skewness) should use log percentiles"
+        );
+    }
+
+    #[test]
+    fn test_smart_percentiles_small_dataset() {
+        // Small dataset (< 10) should always use linear
+        let values = vec![1.0, 100.0, 10000.0];
+        let result = smart_percentiles(&values);
+        let linear = to_linear_percentiles(&values);
+
+        assert_eq!(
+            result, linear,
+            "Small datasets should always use linear percentiles"
+        );
+    }
+
+    // ========================================================================
+    // T2 — Risk scoring outlier resistance test
+    // ========================================================================
+
+    #[test]
+    fn test_risk_scoring_outlier_resistance() {
+        // Simulate compute_risk_scores scenario:
+        // 1 file with pagerank=0.5 (outlier) + 99 files at pagerank=0.001
+        // With min-max: all 99 files would be crushed to ~0.002 (indistinguishable)
+        // With log-percentiles: the 99 files should be well-distributed
+
+        let mut pr_values: Vec<f64> = vec![0.001; 99];
+        pr_values.push(0.5); // outlier
+
+        let mut bw_values: Vec<f64> = (0..100).map(|i| i as f64 * 0.01).collect();
+        bw_values[99] = 0.99;
+
+        let pr_pct = to_log_percentiles(&pr_values);
+        let bw_pct = to_linear_percentiles(&bw_values);
+
+        // Compute risk scores like compute_risk_scores does
+        let risks: Vec<f64> = (0..100)
+            .map(|i| {
+                let churn = 0.1; // uniform churn
+                let density = 0.5; // uniform density
+                0.3 * pr_pct[i] + 0.3 * churn + 0.25 * (1.0 - density) + 0.15 * bw_pct[i]
+            })
+            .collect();
+
+        // The outlier (index 99) should have the highest risk
+        let outlier_risk = risks[99];
+        let max_normal_risk = risks[..99]
+            .iter()
+            .copied()
+            .fold(f64::NEG_INFINITY, f64::max);
+        assert!(
+            outlier_risk > max_normal_risk,
+            "Outlier should have highest risk: {} vs {}",
+            outlier_risk,
+            max_normal_risk
+        );
+
+        // The 99 normal files should NOT all have the same risk score
+        // (they would with min-max because all pr_norm ≈ 0.002)
+        let min_normal_risk = risks[..99].iter().copied().fold(f64::INFINITY, f64::min);
+        let risk_spread = max_normal_risk - min_normal_risk;
+        assert!(
+            risk_spread > 0.01,
+            "Normal files should have discriminable risk scores (spread={}), not all crushed to same value",
+            risk_spread
         );
     }
 }
