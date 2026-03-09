@@ -339,16 +339,16 @@ pub fn resolve_legacy_alias(name: &str) -> Option<(&'static str, &'static str)> 
 fn project_tool() -> ToolDefinition {
     ToolDefinition {
         name: "project".to_string(),
-        description: "Manage projects. Actions: list, create, get, update, delete, sync, get_roadmap, list_plans, get_graph, get_intelligence_summary, get_embeddings_projection".to_string(),
+        description: "Manage projects. Actions: list, create, get, update, delete, sync, get_roadmap, list_plans, get_graph, get_intelligence_summary, get_embeddings_projection, get_scaffolding_level, set_scaffolding_override".to_string(),
         input_schema: InputSchema {
             schema_type: "object".to_string(),
             properties: Some(json!({
                 "action": {
                     "type": "string",
-                    "enum": ["list", "create", "get", "update", "delete", "sync", "get_roadmap", "list_plans", "get_graph", "get_intelligence_summary", "get_embeddings_projection"],
+                    "enum": ["list", "create", "get", "update", "delete", "sync", "get_roadmap", "list_plans", "get_graph", "get_intelligence_summary", "get_embeddings_projection", "get_scaffolding_level", "set_scaffolding_override"],
                     "description": "Operation to perform"
                 },
-                "slug": {"type": "string", "description": "Project slug (get/update/delete/sync/get_roadmap/list_plans/get_graph/get_intelligence_summary/get_embeddings_projection)"},
+                "slug": {"type": "string", "description": "Project slug (get/update/delete/sync/get_roadmap/list_plans/get_graph/get_intelligence_summary/get_embeddings_projection/get_scaffolding_level/set_scaffolding_override)"},
                 "name": {"type": "string", "description": "Project name (create/update)"},
                 "root_path": {"type": "string", "description": "Path to codebase root (create/update)"},
                 "description": {"type": "string", "description": "Project description (create/update)"},
@@ -358,7 +358,8 @@ fn project_tool() -> ToolDefinition {
                 "sort_by": {"type": "string", "description": "Sort field (list)"},
                 "sort_order": {"type": "string", "description": "asc or desc (list)"},
                 "layers": {"type": "string", "description": "Comma-separated layers: code,knowledge,fabric,neural,skills,behavioral (get_graph, default: code)"},
-                "community": {"type": "integer", "description": "Filter by community_id (get_graph)"}
+                "community": {"type": "integer", "description": "Filter by community_id (get_graph)"},
+                "level": {"type": "integer", "description": "Scaffolding level 0-4 to override, or null to clear (set_scaffolding_override)"}
             })),
             required: Some(vec!["action".to_string()]),
         },
@@ -923,13 +924,13 @@ fn analysis_profile_tool() -> ToolDefinition {
 fn admin_tool() -> ToolDefinition {
     ToolDefinition {
         name: "admin".to_string(),
-        description: "Admin operations. Actions: sync_directory, start_watch, stop_watch, watch_status, meilisearch_stats, delete_meilisearch_orphans, cleanup_cross_project_calls, cleanup_builtin_calls, migrate_calls_confidence, cleanup_sync_data, update_staleness_scores, update_energy_scores, search_neurons, reinforce_neurons, decay_synapses, backfill_synapses, reindex_decisions, backfill_decision_embeddings, backfill_touches, backfill_discussed, update_fabric_scores, bootstrap_knowledge_fabric, reinforce_isomorphic, detect_skills, detect_skill_fission, detect_skill_fusion, heal_scars, consolidate_memory, install_hooks".to_string(),
+        description: "Admin operations. Actions: sync_directory, start_watch, stop_watch, watch_status, meilisearch_stats, delete_meilisearch_orphans, cleanup_cross_project_calls, cleanup_builtin_calls, migrate_calls_confidence, cleanup_sync_data, update_staleness_scores, update_energy_scores, search_neurons, reinforce_neurons, decay_synapses, backfill_synapses, reindex_decisions, backfill_decision_embeddings, backfill_touches, backfill_discussed, update_fabric_scores, bootstrap_knowledge_fabric, reinforce_isomorphic, detect_skills, detect_skill_fission, detect_skill_fusion, heal_scars, consolidate_memory, detect_stagnation, deep_maintenance, install_hooks".to_string(),
         input_schema: InputSchema {
             schema_type: "object".to_string(),
             properties: Some(json!({
                 "action": {
                     "type": "string",
-                    "enum": ["sync_directory", "start_watch", "stop_watch", "watch_status", "meilisearch_stats", "delete_meilisearch_orphans", "cleanup_cross_project_calls", "cleanup_builtin_calls", "migrate_calls_confidence", "cleanup_sync_data", "update_staleness_scores", "update_energy_scores", "search_neurons", "reinforce_neurons", "decay_synapses", "backfill_synapses", "reindex_decisions", "backfill_decision_embeddings", "backfill_touches", "backfill_discussed", "update_fabric_scores", "bootstrap_knowledge_fabric", "reinforce_isomorphic", "detect_skills", "detect_skill_fission", "detect_skill_fusion", "maintain_skills", "auto_anchor_notes", "reconstruct_knowledge", "heal_scars", "consolidate_memory", "install_hooks"],
+                    "enum": ["sync_directory", "start_watch", "stop_watch", "watch_status", "meilisearch_stats", "delete_meilisearch_orphans", "cleanup_cross_project_calls", "cleanup_builtin_calls", "migrate_calls_confidence", "cleanup_sync_data", "update_staleness_scores", "update_energy_scores", "search_neurons", "reinforce_neurons", "decay_synapses", "backfill_synapses", "reindex_decisions", "backfill_decision_embeddings", "backfill_touches", "backfill_discussed", "update_fabric_scores", "bootstrap_knowledge_fabric", "reinforce_isomorphic", "detect_skills", "detect_skill_fission", "detect_skill_fusion", "maintain_skills", "auto_anchor_notes", "reconstruct_knowledge", "heal_scars", "consolidate_memory", "detect_stagnation", "deep_maintenance", "install_hooks"],
                     "description": "Operation to perform"
                 },
                 "path": {"type": "string", "description": "Directory path (sync_directory/start_watch)"},

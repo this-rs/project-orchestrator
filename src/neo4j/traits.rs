@@ -650,6 +650,26 @@ pub trait GraphStore: Send + Sync {
         project_id: Uuid,
     ) -> Result<crate::neo4j::models::MaintenanceSnapshot>;
 
+    /// Compute scaffolding level for adaptive task complexity (biomimicry T8).
+    async fn compute_scaffolding_level(
+        &self,
+        project_id: Uuid,
+        scaffolding_override: Option<u8>,
+    ) -> Result<crate::neo4j::models::ScaffoldingLevel>;
+
+    /// Set or clear the scaffolding level override on a project (biomimicry T8).
+    async fn set_scaffolding_override(
+        &self,
+        project_id: Uuid,
+        level: Option<u8>,
+    ) -> Result<()>;
+
+    /// Detect global stagnation across a project (biomimicry T12).
+    async fn detect_global_stagnation(
+        &self,
+        project_id: Uuid,
+    ) -> Result<crate::neo4j::models::StagnationReport>;
+
     /// Detect circular dependencies between files (import cycles).
     async fn get_circular_dependencies(&self, project_id: Uuid) -> Result<Vec<Vec<String>>>;
 

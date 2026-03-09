@@ -478,6 +478,108 @@ pub async fn run_maintenance_with_tracking(
 }
 
 // ============================================================================
+// Deep Maintenance (biomimicry T12 — Global Stagnation Response)
+// ============================================================================
+
+/// Run deep maintenance when global stagnation is detected.
+/// This is an aggressive cleanup cycle:
+/// 1. Detect stagnation (4 signals)
+/// 2. Run full maintenance with aggressive decay
+/// 3. Flag stale notes for review
+/// 4. Identify stuck tasks
+/// 5. Generate recommendations
+pub async fn deep_maintenance(
+    graph_store: &dyn GraphStore,
+    project_id: Uuid,
+    config: &SkillMaintenanceConfig,
+) -> anyhow::Result<crate::neo4j::models::DeepMaintenanceReport> {
+    info!(project_id = %project_id, "Starting deep maintenance (stagnation response)");
+
+    // 1. Detect stagnation
+    let stagnation = graph_store.detect_global_stagnation(project_id).await?;
+
+    // 2. Run full maintenance with aggressive decay (3x normal)
+    let mut aggressive_config = config.clone();
+    aggressive_config.synapse_decay_amount *= 3.0;
+    aggressive_config.synapse_prune_threshold *= 1.5;
+
+    let maintenance_json = match run_full_maintenance(graph_store, project_id, &aggressive_config)
+        .await
+    {
+        Ok(result) => serde_json::to_value(&result).ok(),
+        Err(e) => {
+            warn!(error = %e, "Full maintenance failed during deep maintenance");
+            None
+        }
+    };
+
+    // 3. Update staleness scores and flag stale notes
+    let stale_notes_flagged = match graph_store.update_staleness_scores().await {
+        Ok(n) => n,
+        Err(e) => {
+            warn!(error = %e, "Failed to update staleness scores");
+            0
+        }
+    };
+
+    // 4. Identify stuck tasks (in_progress for too long)
+    let stuck_tasks_found = count_stuck_tasks(graph_store, project_id).await;
+
+    // 5. Build recommendations
+    let mut recommendations = stagnation.recommendations.clone();
+    if stale_notes_flagged > 0 {
+        recommendations.push(format!(
+            "{} notes have high staleness — review with note(action: \"get_needing_review\").",
+            stale_notes_flagged
+        ));
+    }
+    if stuck_tasks_found > 0 {
+        recommendations.push(format!(
+            "{} tasks stuck in_progress — consider marking as blocked or failed.",
+            stuck_tasks_found
+        ));
+    }
+
+    info!(
+        project_id = %project_id,
+        is_stagnating = stagnation.is_stagnating,
+        signals = stagnation.signals_triggered,
+        stale_notes = stale_notes_flagged,
+        stuck_tasks = stuck_tasks_found,
+        "Deep maintenance complete"
+    );
+
+    Ok(crate::neo4j::models::DeepMaintenanceReport {
+        stagnation,
+        maintenance: maintenance_json,
+        stale_notes_flagged,
+        stuck_tasks_found,
+        recommendations,
+    })
+}
+
+/// Count tasks that are in_progress (considered stuck during stagnation).
+async fn count_stuck_tasks(graph_store: &dyn GraphStore, project_id: Uuid) -> usize {
+    let plans = match graph_store.list_project_plans(project_id).await {
+        Ok(plans) => plans,
+        Err(_) => return 0,
+    };
+
+    let mut stuck = 0usize;
+    for plan in &plans {
+        let tasks = match graph_store.get_plan_tasks(plan.id).await {
+            Ok(tasks) => tasks,
+            Err(_) => continue,
+        };
+        stuck += tasks
+            .iter()
+            .filter(|t| t.status == crate::neo4j::models::TaskStatus::InProgress)
+            .count();
+    }
+    stuck
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 

@@ -188,6 +188,25 @@ impl Neo4jClient {
         Ok(())
     }
 
+    /// Set or clear the scaffolding level override on a project (biomimicry T8).
+    /// Pass None to clear the override and return to auto-computed level.
+    pub async fn set_scaffolding_override(
+        &self,
+        id: Uuid,
+        level: Option<u8>,
+    ) -> Result<()> {
+        let q = if let Some(lvl) = level {
+            query("MATCH (p:Project {id: $id}) SET p.scaffolding_override = $level")
+                .param("id", id.to_string())
+                .param("level", lvl.min(4) as i64)
+        } else {
+            query("MATCH (p:Project {id: $id}) REMOVE p.scaffolding_override")
+                .param("id", id.to_string())
+        };
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
     /// Delete a project and all its data
     pub async fn delete_project(&self, id: Uuid, project_name: &str) -> Result<()> {
         // ================================================================
@@ -361,6 +380,10 @@ impl Neo4jClient {
                 .get::<String>("last_co_change_computed_at")
                 .ok()
                 .and_then(|s| s.parse().ok()),
+            scaffolding_override: node
+                .get::<i64>("scaffolding_override")
+                .ok()
+                .map(|v| v as u8),
         })
     }
 

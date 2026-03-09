@@ -151,6 +151,20 @@ pub struct ImplementationPlan {
     /// Plan ID if auto_create_plan was true
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_id: Option<String>,
+    /// Scaffolding level used for this plan (biomimicry adaptive complexity)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scaffolding: Option<ScaffoldingInfo>,
+}
+
+/// Scaffolding info embedded in the implementation plan
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScaffoldingInfo {
+    /// Scaffolding level (0-4)
+    pub level: u8,
+    /// Human-readable label
+    pub label: String,
+    /// Competence score that determined the level
+    pub competence_score: f64,
 }
 
 // ============================================================================
@@ -1503,6 +1517,7 @@ impl ImplementationPlanner {
         plan: &ImplementationPlan,
         project_id: Uuid,
         description: &str,
+        scaffolding_level: u8,
     ) -> Result<Uuid> {
         // Create the plan
         let create_req = CreatePlanRequest {
@@ -1552,9 +1567,27 @@ impl ImplementationPlanner {
 
             let task_node = self.plan_manager.add_task(plan_id, task_req).await?;
 
-            // Create steps for each modification or branch
+            // Create steps — granularity adapts to scaffolding level
             let mut step_order = 0u32;
-            if phase.parallel {
+            if scaffolding_level >= 3 && !phase.parallel && phase.modifications.len() > 1 {
+                // Expert mode (L3-L4): group all modifications in a single step
+                let files_list: Vec<&str> = phase
+                    .modifications
+                    .iter()
+                    .map(|m| m.file.rsplit('/').next().unwrap_or(&m.file))
+                    .collect();
+                let step = StepNodeModel {
+                    id: Uuid::new_v4(),
+                    order: step_order,
+                    description: format!("Modify: {}", files_list.join(", ")),
+                    status: StepStatus::Pending,
+                    verification: Some("cargo check".to_string()),
+                    created_at: chrono::Utc::now(),
+                    updated_at: None,
+                    completed_at: None,
+                };
+                self.plan_manager.add_step(task_node.id, &step).await?;
+            } else if phase.parallel {
                 for branch in &phase.branches {
                     let step = StepNodeModel {
                         id: Uuid::new_v4(),
@@ -1571,10 +1604,21 @@ impl ImplementationPlanner {
                 }
             } else {
                 for modification in &phase.modifications {
+                    // L0-L1: add per-symbol sub-steps for extra guidance
+                    let desc = if scaffolding_level <= 1 && !modification.symbols_affected.is_empty()
+                    {
+                        format!(
+                            "{} — symbols to update: {}",
+                            modification.reason,
+                            modification.symbols_affected.join(", ")
+                        )
+                    } else {
+                        modification.reason.clone()
+                    };
                     let step = StepNodeModel {
                         id: Uuid::new_v4(),
                         order: step_order,
-                        description: modification.reason.clone(),
+                        description: desc,
                         status: StepStatus::Pending,
                         verification: Some("cargo check".to_string()),
                         created_at: chrono::Utc::now(),
@@ -1599,6 +1643,24 @@ impl ImplementationPlanner {
     /// Plan an implementation based on the knowledge graph.
     /// Orchestrates: identify_zones → build_dag → topo_sort → compute_phases → collect_notes.
     pub async fn plan_implementation(&self, request: PlanRequest) -> Result<ImplementationPlan> {
+        // Step 0: Compute scaffolding level for adaptive complexity
+        let scaffolding = {
+            let project = self.neo4j.get_project(request.project_id).await?;
+            let override_level = project.as_ref().and_then(|p| p.scaffolding_override);
+            match self
+                .neo4j
+                .compute_scaffolding_level(request.project_id, override_level)
+                .await
+            {
+                Ok(sl) => Some(sl),
+                Err(e) => {
+                    tracing::warn!("Failed to compute scaffolding level: {}", e);
+                    None
+                }
+            }
+        };
+        let scaffolding_level = scaffolding.as_ref().map(|s| s.level).unwrap_or(2);
+
         // Step 1: Identify relevant zones
         let zones = self.identify_zones(&request).await?;
         if zones.is_empty() {
@@ -1609,6 +1671,7 @@ impl ImplementationPlanner {
                 notes: vec![],
                 total_risk: RiskLevel::Low,
                 plan_id: None,
+                scaffolding: None,
             });
         }
 
@@ -1650,11 +1713,33 @@ impl ImplementationPlanner {
             .values()
             .fold(RiskLevel::Low, |acc, n| acc.max(n.risk.clone()));
 
-        let summary = format!(
-            "Modifying {} files across {} phases",
-            dag.nodes.len(),
-            phases.len()
-        );
+        let summary = match scaffolding_level {
+            0 | 1 => format!(
+                "Modifying {} files across {} phases (risk: {:?}). \
+                 ⚠️ Scaffolding L{}: detailed steps included — follow each step carefully and verify before moving on.",
+                dag.nodes.len(),
+                phases.len(),
+                total_risk,
+                scaffolding_level,
+            ),
+            3 | 4 => format!(
+                "{} files, {} phases, risk {:?}",
+                dag.nodes.len(),
+                phases.len(),
+                total_risk,
+            ),
+            _ => format!(
+                "Modifying {} files across {} phases",
+                dag.nodes.len(),
+                phases.len(),
+            ),
+        };
+
+        let scaffolding_info = scaffolding.as_ref().map(|s| ScaffoldingInfo {
+            level: s.level,
+            label: s.label.clone(),
+            competence_score: s.competence_score,
+        });
 
         let mut plan = ImplementationPlan {
             summary,
@@ -1663,12 +1748,13 @@ impl ImplementationPlanner {
             notes,
             total_risk,
             plan_id: None,
+            scaffolding: scaffolding_info,
         };
 
         // Step 7: Auto-create Plan MCP if requested
         if request.auto_create_plan == Some(true) {
             match self
-                .auto_create_plan(&plan, request.project_id, &request.description)
+                .auto_create_plan(&plan, request.project_id, &request.description, scaffolding_level)
                 .await
             {
                 Ok(plan_id) => {
@@ -1749,6 +1835,7 @@ mod tests {
             }],
             total_risk: RiskLevel::Medium,
             plan_id: None,
+            scaffolding: None,
         };
         let json = serde_json::to_string(&plan).unwrap();
         let parsed: ImplementationPlan = serde_json::from_str(&json).unwrap();
@@ -1792,6 +1879,7 @@ mod tests {
             last_synced: None,
             analytics_computed_at: None,
             last_co_change_computed_at: None,
+            scaffolding_override: None,
         };
         let pid = project.id;
         graph.create_project(&project).await.unwrap();
@@ -2716,6 +2804,7 @@ mod tests {
             last_synced: None,
             analytics_computed_at: None,
             last_co_change_computed_at: None,
+            scaffolding_override: None,
         };
         let pid = project.id;
         graph.create_project(&project).await.unwrap();
@@ -3039,6 +3128,7 @@ mod tests {
             last_synced: None,
             analytics_computed_at: None,
             last_co_change_computed_at: None,
+            scaffolding_override: None,
         };
         let pid = project.id;
         graph.create_project(&project).await.unwrap();
@@ -3251,6 +3341,7 @@ mod tests {
             last_synced: None,
             analytics_computed_at: None,
             last_co_change_computed_at: None,
+            scaffolding_override: None,
         };
         let pid = project.id;
         graph.create_project(&project).await.unwrap();

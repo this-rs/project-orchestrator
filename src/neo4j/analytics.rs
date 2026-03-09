@@ -6,6 +6,17 @@ use anyhow::Result;
 use neo4rs::query;
 use uuid::Uuid;
 
+/// Map a scaffolding level (0-4) to its label and recommended steps description.
+pub fn level_info(level: u8) -> (u8, String, String) {
+    match level {
+        0 => (0, "L0 — Reflexe".to_string(), "5+ steps détaillés avec snippets".to_string()),
+        1 => (1, "L1 — Associatif".to_string(), "3-4 steps guidés".to_string()),
+        2 => (2, "L2 — Contextuel".to_string(), "3-4 steps standard".to_string()),
+        3 => (3, "L3 — Stratégique".to_string(), "2 steps, autonomie élevée".to_string()),
+        _ => (4, "L4 — Méta-cognitif".to_string(), "1 step abstrait, libre décomposition".to_string()),
+    }
+}
+
 impl Neo4jClient {
     /// Get distinct communities for a project (from graph analytics Louvain clustering).
     /// Returns communities sorted by file_count descending.
@@ -391,6 +402,240 @@ impl Neo4jClient {
             skill_count,
             note_count,
             captured_at: Utc::now().to_rfc3339(),
+        })
+    }
+
+    /// Compute the scaffolding level for adaptive task complexity (biomimicry T8).
+    /// Combines 4 signals: task_success_rate, avg_frustration, scar_density, homeostasis_pain.
+    /// Returns a ScaffoldingLevel (L0-L4) with competence score and metrics.
+    pub async fn compute_scaffolding_level(
+        &self,
+        project_id: Uuid,
+        scaffolding_override: Option<u8>,
+    ) -> Result<crate::neo4j::models::ScaffoldingLevel> {
+        // Q1: task success rate + avg frustration (last 20 tasks)
+        let q1 = query(
+            r#"
+            MATCH (p:Project {id: $pid})-[:HAS_PLAN]->(plan)-[:HAS_TASK]->(t:Task)
+            WHERE t.status IN ['completed', 'failed']
+            WITH t ORDER BY t.updated_at DESC LIMIT 20
+            WITH count(t) AS total,
+                 sum(CASE WHEN t.status = 'completed' THEN 1 ELSE 0 END) AS completed,
+                 avg(coalesce(t.frustration_score, 0.0)) AS avg_frust
+            RETURN total, completed,
+                   CASE WHEN total > 0 THEN toFloat(completed) / total ELSE 1.0 END AS success_rate,
+                   avg_frust
+            "#,
+        )
+        .param("pid", project_id.to_string());
+
+        // Q2: scar density (avg scar_intensity across project notes)
+        let q2 = query(
+            r#"
+            MATCH (p:Project {id: $pid})-[:HAS_NOTE]->(n:Note)
+            WHERE n.status = 'active'
+            RETURN avg(coalesce(n.scar_intensity, 0.0)) AS scar_density
+            "#,
+        )
+        .param("pid", project_id.to_string());
+
+        // Execute in parallel
+        let (r1, r2) = tokio::join!(
+            self.execute_with_params(q1),
+            self.execute_with_params(q2),
+        );
+
+        let (tasks_analyzed, task_success_rate, avg_frustration) = r1
+            .ok()
+            .and_then(|rows| rows.into_iter().next())
+            .map(|r| {
+                let total = r.get::<i64>("total").unwrap_or(0);
+                let rate = r.get::<f64>("success_rate").unwrap_or(1.0);
+                let frust = r.get::<f64>("avg_frust").unwrap_or(0.0);
+                (total, rate, frust)
+            })
+            .unwrap_or((0, 1.0, 0.0));
+
+        let scar_density = r2
+            .ok()
+            .and_then(|rows| rows.into_iter().next())
+            .and_then(|r| r.get::<f64>("scar_density").ok())
+            .unwrap_or(0.0);
+
+        // Q3: homeostasis pain (reuse compute_homeostasis)
+        let homeostasis_pain = self
+            .compute_homeostasis(project_id, None)
+            .await
+            .map(|h| h.pain_score)
+            .unwrap_or(0.0);
+
+        // Composite competence score (0.0 = struggling, 1.0 = expert)
+        // Weights: success_rate dominates, frustration/scars/pain are penalties
+        let competence_score = (task_success_rate * 0.5
+            + (1.0 - avg_frustration) * 0.2
+            + (1.0 - scar_density) * 0.15
+            + (1.0 - homeostasis_pain) * 0.15)
+            .clamp(0.0, 1.0);
+
+        // Map competence to level (L0-L4)
+        let (level, label, recommended_steps) = if let Some(ovr) = scaffolding_override {
+            let ovr = ovr.min(4);
+            level_info(ovr)
+        } else {
+            let auto_level = if competence_score >= 0.9 {
+                4
+            } else if competence_score >= 0.75 {
+                3
+            } else if competence_score >= 0.5 {
+                2
+            } else if competence_score >= 0.3 {
+                1
+            } else {
+                0
+            };
+            level_info(auto_level)
+        };
+
+        Ok(crate::neo4j::models::ScaffoldingLevel {
+            level,
+            label,
+            recommended_steps,
+            task_success_rate,
+            avg_frustration,
+            scar_density,
+            homeostasis_pain,
+            competence_score,
+            is_overridden: scaffolding_override.is_some(),
+            tasks_analyzed,
+        })
+    }
+
+    /// Detect global stagnation across a project (biomimicry T12).
+    /// Checks 4 signals: tasks completed in 48h, avg frustration, energy trend, commits in 48h.
+    /// If ≥3 signals triggered → stagnation detected.
+    pub async fn detect_global_stagnation(
+        &self,
+        project_id: Uuid,
+    ) -> Result<crate::neo4j::models::StagnationReport> {
+        // Q1: tasks completed in last 48h
+        let q1 = query(
+            r#"
+            MATCH (p:Project {id: $pid})-[:HAS_PLAN]->(plan)-[:HAS_TASK]->(t:Task)
+            WHERE t.status = 'completed'
+              AND t.completed_at IS NOT NULL
+              AND datetime(t.completed_at) > datetime() - duration('PT48H')
+            RETURN count(t) AS cnt
+            "#,
+        )
+        .param("pid", project_id.to_string());
+
+        // Q2: avg frustration on in-progress tasks
+        let q2 = query(
+            r#"
+            MATCH (p:Project {id: $pid})-[:HAS_PLAN]->(plan)-[:HAS_TASK]->(t:Task)
+            WHERE t.status = 'in_progress' AND t.frustration IS NOT NULL
+            RETURN avg(t.frustration) AS avg_f, count(t) AS cnt
+            "#,
+        )
+        .param("pid", project_id.to_string());
+
+        // Q3: mean note energy (current snapshot)
+        let q3 = query(
+            r#"
+            MATCH (n:Note {project_id: $pid})
+            WHERE n.status = 'active' AND n.energy IS NOT NULL
+            RETURN avg(n.energy) AS avg_energy, count(n) AS cnt
+            "#,
+        )
+        .param("pid", project_id.to_string());
+
+        // Q4: commits (TOUCHES) in last 48h
+        let q4 = query(
+            r#"
+            MATCH (c:Commit)-[:TOUCHES]->(f:File)
+            WHERE EXISTS { MATCH (p:Project {id: $pid})-[:CONTAINS]->(f) }
+              AND c.created_at IS NOT NULL
+              AND datetime(c.created_at) > datetime() - duration('PT48H')
+            RETURN count(DISTINCT c) AS cnt
+            "#,
+        )
+        .param("pid", project_id.to_string());
+
+        let (r1, r2, r3, r4) = tokio::join!(
+            self.execute_with_params(q1),
+            self.execute_with_params(q2),
+            self.execute_with_params(q3),
+            self.execute_with_params(q4),
+        );
+
+        let tasks_completed_48h = r1
+            .unwrap_or_default()
+            .first()
+            .and_then(|r| r.get::<i64>("cnt").ok())
+            .unwrap_or(0);
+
+        let avg_frustration = r2
+            .unwrap_or_default()
+            .first()
+            .and_then(|r| r.get::<f64>("avg_f").ok())
+            .unwrap_or(0.0);
+
+        let mean_energy = r3
+            .unwrap_or_default()
+            .first()
+            .and_then(|r| r.get::<f64>("avg_energy").ok())
+            .unwrap_or(1.0);
+
+        let commits_48h = r4
+            .unwrap_or_default()
+            .first()
+            .and_then(|r| r.get::<i64>("cnt").ok())
+            .unwrap_or(0);
+
+        // Energy trend: below 0.4 = declining (proxy without historical snapshots)
+        let energy_trend = mean_energy - 0.5; // negative = below midpoint
+
+        // Count triggered signals
+        let mut signals: u8 = 0;
+        let mut recommendations: Vec<String> = Vec::new();
+
+        if tasks_completed_48h == 0 {
+            signals += 1;
+            recommendations.push("No tasks completed in 48h — consider reviewing blocked tasks or splitting large tasks.".to_string());
+        }
+        if avg_frustration > 0.6 {
+            signals += 1;
+            recommendations.push(format!(
+                "High avg frustration ({:.2}) — consider abandoning stuck tasks or reassessing scope.",
+                avg_frustration
+            ));
+        }
+        if energy_trend < 0.0 {
+            signals += 1;
+            recommendations.push(format!(
+                "Note energy declining (mean: {:.2}) — run deep_maintenance to consolidate knowledge.",
+                mean_energy
+            ));
+        }
+        if commits_48h == 0 {
+            signals += 1;
+            recommendations.push("No commits in 48h — project may be abandoned or blocked.".to_string());
+        }
+
+        let is_stagnating = signals >= 3;
+
+        if is_stagnating {
+            recommendations.push("⚠️ Global stagnation detected — recommend running deep_maintenance.".to_string());
+        }
+
+        Ok(crate::neo4j::models::StagnationReport {
+            is_stagnating,
+            tasks_completed_48h,
+            avg_frustration,
+            energy_trend,
+            commits_48h,
+            signals_triggered: signals,
+            recommendations,
         })
     }
 

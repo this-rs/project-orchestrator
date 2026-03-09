@@ -246,6 +246,7 @@ pub fn test_project() -> ProjectNode {
         last_synced: None,
         analytics_computed_at: None,
         last_co_change_computed_at: None,
+            scaffolding_override: None,
     }
 }
 
@@ -261,6 +262,7 @@ pub fn test_project_named(name: &str) -> ProjectNode {
         last_synced: None,
         analytics_computed_at: None,
         last_co_change_computed_at: None,
+            scaffolding_override: None,
     }
 }
 

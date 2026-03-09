@@ -808,6 +808,30 @@ impl GraphStore for Neo4jClient {
         self.compute_maintenance_snapshot(project_id).await
     }
 
+    async fn compute_scaffolding_level(
+        &self,
+        project_id: Uuid,
+        scaffolding_override: Option<u8>,
+    ) -> anyhow::Result<crate::neo4j::models::ScaffoldingLevel> {
+        self.compute_scaffolding_level(project_id, scaffolding_override)
+            .await
+    }
+
+    async fn set_scaffolding_override(
+        &self,
+        project_id: Uuid,
+        level: Option<u8>,
+    ) -> anyhow::Result<()> {
+        self.set_scaffolding_override(project_id, level).await
+    }
+
+    async fn detect_global_stagnation(
+        &self,
+        project_id: Uuid,
+    ) -> anyhow::Result<crate::neo4j::models::StagnationReport> {
+        self.detect_global_stagnation(project_id).await
+    }
+
     async fn get_circular_dependencies(
         &self,
         project_id: Uuid,

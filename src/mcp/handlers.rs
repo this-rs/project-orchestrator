@@ -99,6 +99,8 @@ impl ToolHandler {
             ("project", "get_graph") => "get_project_graph",
             ("project", "get_intelligence_summary") => "get_intelligence_summary",
             ("project", "get_embeddings_projection") => "get_embeddings_projection",
+            ("project", "get_scaffolding_level") => "get_scaffolding_level",
+            ("project", "set_scaffolding_override") => "set_scaffolding_override",
 
             // Plan
             ("plan", "list") => "list_plans",
@@ -407,6 +409,8 @@ impl ToolHandler {
             ("admin", "consolidate_memory") => "consolidate_memory",
             ("admin", "audit_gaps") => "audit_gaps",
             ("admin", "persist_health_report") => "persist_health_report",
+            ("admin", "detect_stagnation") => "detect_stagnation",
+            ("admin", "deep_maintenance") => "deep_maintenance",
             ("admin", "install_hooks") => "install_hooks",
 
             _ => {
@@ -592,6 +596,31 @@ impl ToolHandler {
                 let slug = extract_string(args, "slug")?;
                 let result = http
                     .get(&format!("/api/projects/{}/embeddings/projection", slug))
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "get_scaffolding_level" => {
+                let slug = extract_string(args, "slug")?;
+                let result = http
+                    .get(&format!("/api/projects/{}/scaffolding", slug))
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "set_scaffolding_override" => {
+                let slug = extract_string(args, "slug")?;
+                let mut body = serde_json::Map::new();
+                if let Some(level) = args.get("level") {
+                    body.insert("level".to_string(), level.clone());
+                } else {
+                    body.insert("level".to_string(), Value::Null);
+                }
+                let result = http
+                    .put(
+                        &format!("/api/projects/{}/scaffolding", slug),
+                        &Value::Object(body),
+                    )
                     .await?;
                 Ok(Some(result))
             }
@@ -2078,6 +2107,31 @@ impl ToolHandler {
                 }
                 let result = http
                     .post("/api/admin/persist-health-report", &Value::Object(body))
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "detect_stagnation" => {
+                let pid = args
+                    .get("project_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("project_id is required"))?;
+                let result = http
+                    .get(&format!("/api/admin/detect-stagnation/{}", pid))
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "deep_maintenance" => {
+                let pid = args
+                    .get("project_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("project_id is required"))?;
+                let result = http
+                    .post(
+                        &format!("/api/admin/deep-maintenance/{}", pid),
+                        &Value::Object(serde_json::Map::new()),
+                    )
                     .await?;
                 Ok(Some(result))
             }

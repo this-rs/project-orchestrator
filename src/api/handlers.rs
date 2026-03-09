@@ -2984,6 +2984,64 @@ pub async fn skill_maintenance(
 }
 
 // ============================================================================
+// Stagnation Detection & Deep Maintenance (biomimicry T12)
+// ============================================================================
+
+/// Detect global stagnation across a project.
+pub async fn detect_stagnation(
+    State(state): State<OrchestratorState>,
+    Path(project_id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    state
+        .orchestrator
+        .neo4j()
+        .get_project(project_id)
+        .await
+        .map_err(AppError::Internal)?
+        .ok_or_else(|| AppError::NotFound(format!("Project not found: {}", project_id)))?;
+
+    let report = state
+        .orchestrator
+        .neo4j()
+        .detect_global_stagnation(project_id)
+        .await
+        .map_err(AppError::Internal)?;
+
+    Ok(Json(serde_json::to_value(&report).unwrap_or_default()))
+}
+
+/// Run deep maintenance (aggressive cleanup for stagnating projects).
+pub async fn run_deep_maintenance(
+    State(state): State<OrchestratorState>,
+    Path(project_id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    state
+        .orchestrator
+        .neo4j()
+        .get_project(project_id)
+        .await
+        .map_err(AppError::Internal)?
+        .ok_or_else(|| AppError::NotFound(format!("Project not found: {}", project_id)))?;
+
+    let config = crate::skills::maintenance::SkillMaintenanceConfig::default();
+
+    let report = crate::skills::maintenance::deep_maintenance(
+        state.orchestrator.neo4j(),
+        project_id,
+        &config,
+    )
+    .await
+    .map_err(AppError::Internal)?;
+
+    // Invalidate hook activation cache after deep maintenance
+    super::hook_handlers::skill_cache()
+        .invalidate_project(&project_id)
+        .await;
+
+    Ok(Json(serde_json::to_value(&report).unwrap_or_default()))
+}
+
+// ============================================================================
 // Releases
 // ============================================================================
 

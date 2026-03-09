@@ -240,6 +240,11 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/projects/{slug}/embeddings/projection",
             get(project_handlers::get_embeddings_projection),
         )
+        .route(
+            "/api/projects/{slug}/scaffolding",
+            get(project_handlers::get_scaffolding_level)
+                .put(project_handlers::set_scaffolding_level),
+        )
         // Releases (by project_id)
         .route(
             "/api/projects/{project_id}/releases",
@@ -1058,6 +1063,14 @@ fn protected_routes() -> Router<OrchestratorState> {
         .route(
             "/api/admin/skill-maintenance",
             post(handlers::skill_maintenance),
+        )
+        .route(
+            "/api/admin/detect-stagnation/{project_id}",
+            get(handlers::detect_stagnation),
+        )
+        .route(
+            "/api/admin/deep-maintenance/{project_id}",
+            post(handlers::run_deep_maintenance),
         )
         // NOTE: /api/admin/install-hooks removed — hooks are now managed
         // in-process via SkillActivationHook (zero config required)

@@ -25,6 +25,10 @@ pub struct ProjectNode {
     /// Used for incremental computation — only new commits since this date are processed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_co_change_computed_at: Option<DateTime<Utc>>,
+    /// Manual scaffolding level override (0-4). When set, bypasses auto-computation.
+    /// Biomimicry T8: allows forcing a specific cognitive level.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub scaffolding_override: Option<u8>,
 }
 
 // ============================================================================
@@ -1108,6 +1112,66 @@ pub struct MaintenanceReport {
     pub maintenance_level: String,
     /// Duration in milliseconds
     pub duration_ms: u64,
+}
+
+/// Scaffolding level for adaptive task complexity (biomimicry T8).
+/// Inspired by Elun's DifficultyAdjustment and 5 cognitive levels.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScaffoldingLevel {
+    /// Level 0-4 (L0=reflexe, L1=associatif, L2=contextuel, L3=stratégique, L4=méta-cognitif)
+    pub level: u8,
+    /// Human-readable label
+    pub label: String,
+    /// Recommended steps per task at this level
+    pub recommended_steps: String,
+    /// Task success rate over last N tasks (completed / (completed + failed))
+    pub task_success_rate: f64,
+    /// Average frustration score across recent tasks (0.0-1.0)
+    pub avg_frustration: f64,
+    /// Scar density: average scar_intensity across project notes
+    pub scar_density: f64,
+    /// Homeostatic pain: fraction of homeostasis ratios out of equilibrium
+    pub homeostasis_pain: f64,
+    /// Composite competence score (0.0-1.0) combining all metrics
+    pub competence_score: f64,
+    /// Whether the level was manually overridden
+    pub is_overridden: bool,
+    /// Number of tasks analyzed
+    pub tasks_analyzed: i64,
+}
+
+/// Deep maintenance report — aggressive cleanup when stagnation is detected (biomimicry T12).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeepMaintenanceReport {
+    /// Stagnation report that triggered deep maintenance
+    pub stagnation: StagnationReport,
+    /// Regular maintenance result from "full" level
+    pub maintenance: Option<serde_json::Value>,
+    /// Number of stale notes flagged for review
+    pub stale_notes_flagged: usize,
+    /// Number of stuck tasks identified (in_progress > 48h)
+    pub stuck_tasks_found: usize,
+    /// Recommendations generated
+    pub recommendations: Vec<String>,
+}
+
+/// Global stagnation report — detects when an entire project is stuck (biomimicry T12).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StagnationReport {
+    /// Whether global stagnation is detected
+    pub is_stagnating: bool,
+    /// Number of tasks completed in the last 48h
+    pub tasks_completed_48h: i64,
+    /// Average frustration across in-progress tasks (0.0-1.0)
+    pub avg_frustration: f64,
+    /// Mean note energy trend: negative = declining
+    pub energy_trend: f64,
+    /// Number of new TOUCHES commits in the last 48h
+    pub commits_48h: i64,
+    /// Number of stagnation signals triggered (0-4)
+    pub signals_triggered: u8,
+    /// Human-readable recommendations
+    pub recommendations: Vec<String>,
 }
 
 /// Coupling metrics from clustering coefficients.

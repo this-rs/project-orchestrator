@@ -2432,6 +2432,128 @@ impl GraphStore for MockGraphStore {
         })
     }
 
+    async fn compute_scaffolding_level(
+        &self,
+        _project_id: Uuid,
+        scaffolding_override: Option<u8>,
+    ) -> Result<crate::neo4j::models::ScaffoldingLevel> {
+        let level = scaffolding_override.unwrap_or(2).min(4);
+        let (_, label, recommended_steps) = crate::neo4j::analytics::level_info(level);
+        Ok(crate::neo4j::models::ScaffoldingLevel {
+            level,
+            label,
+            recommended_steps,
+            task_success_rate: 0.8,
+            avg_frustration: 0.1,
+            scar_density: 0.05,
+            homeostasis_pain: 0.1,
+            competence_score: 0.7,
+            is_overridden: scaffolding_override.is_some(),
+            tasks_analyzed: 0,
+        })
+    }
+
+    async fn set_scaffolding_override(
+        &self,
+        project_id: Uuid,
+        level: Option<u8>,
+    ) -> Result<()> {
+        let mut projects = self.projects.write().await;
+        if let Some(p) = projects.get_mut(&project_id) {
+            p.scaffolding_override = level.map(|l| l.min(4));
+        }
+        Ok(())
+    }
+
+    async fn detect_global_stagnation(
+        &self,
+        project_id: Uuid,
+    ) -> Result<crate::neo4j::models::StagnationReport> {
+        // Mock: check task statuses in this project's plans
+        let plans = self.plans.read().await;
+        let tasks = self.tasks.read().await;
+
+        let mut completed_recent = 0i64;
+        let mut total_frustration = 0.0f64;
+        let mut frustration_count = 0i64;
+
+        for (plan_id, plan) in plans.iter() {
+            if plan.project_id != Some(project_id) {
+                continue;
+            }
+            if let Some(task_list) = tasks.get(plan_id) {
+                for t in task_list {
+                    if t.status == crate::neo4j::models::TaskStatus::Completed {
+                        completed_recent += 1;
+                    }
+                    if t.status == crate::neo4j::models::TaskStatus::InProgress {
+                        if let Some(f) = t.frustration {
+                            total_frustration += f;
+                            frustration_count += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        let avg_frustration = if frustration_count > 0 {
+            total_frustration / frustration_count as f64
+        } else {
+            0.0
+        };
+
+        let notes = self.notes.read().await;
+        let note_count = notes
+            .iter()
+            .filter(|n| n.project_id == Some(project_id))
+            .count() as i64;
+        let mean_energy = if note_count > 0 {
+            notes
+                .iter()
+                .filter(|n| n.project_id == Some(project_id))
+                .map(|n| n.energy)
+                .sum::<f64>()
+                / note_count as f64
+        } else {
+            1.0
+        };
+        let energy_trend = mean_energy - 0.5;
+
+        let mut signals: u8 = 0;
+        let mut recommendations = Vec::new();
+
+        if completed_recent == 0 {
+            signals += 1;
+            recommendations.push("No tasks completed recently.".to_string());
+        }
+        if avg_frustration > 0.6 {
+            signals += 1;
+            recommendations.push(format!("High frustration: {:.2}", avg_frustration));
+        }
+        if energy_trend < 0.0 {
+            signals += 1;
+            recommendations.push("Note energy declining.".to_string());
+        }
+        // Mock: no commit tracking, assume 0
+        signals += 1;
+        recommendations.push("No commits tracked in mock.".to_string());
+
+        let is_stagnating = signals >= 3;
+        if is_stagnating {
+            recommendations.push("⚠️ Global stagnation detected.".to_string());
+        }
+
+        Ok(crate::neo4j::models::StagnationReport {
+            is_stagnating,
+            tasks_completed_48h: completed_recent,
+            avg_frustration,
+            energy_trend,
+            commits_48h: 0,
+            signals_triggered: signals,
+            recommendations,
+        })
+    }
+
     async fn get_circular_dependencies(&self, project_id: Uuid) -> Result<Vec<Vec<String>>> {
         let pf = self.project_files.read().await;
         let project_paths: Vec<String> = pf.get(&project_id).cloned().unwrap_or_default();
