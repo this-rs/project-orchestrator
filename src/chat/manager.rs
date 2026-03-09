@@ -1847,6 +1847,39 @@ impl ChatManager {
             .await
             .context("Failed to persist chat session")?;
 
+        // If this session was spawned by another, create the SPAWNED_BY relation in Neo4j
+        if let Some(ref spawned_by_json) = request.spawned_by {
+            if let Ok(spawned_by) = serde_json::from_str::<serde_json::Value>(spawned_by_json) {
+                if let Some(parent_id) = spawned_by.get("parent_session_id").and_then(|v| v.as_str()) {
+                    let spawn_type = spawned_by
+                        .get("type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("runner");
+                    let run_id = spawned_by
+                        .get("run_id")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| s.parse::<Uuid>().ok());
+                    let task_id = spawned_by
+                        .get("task_id")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| s.parse::<Uuid>().ok());
+                    if let Err(e) = self
+                        .graph
+                        .create_spawned_by_relation(
+                            &session_id.to_string(),
+                            parent_id,
+                            spawn_type,
+                            run_id,
+                            task_id,
+                        )
+                        .await
+                    {
+                        warn!("Failed to create SPAWNED_BY relation: {e}");
+                    }
+                }
+            }
+        }
+
         // Create broadcast channel early so CompactionNotifier can use the sender
         let (events_tx, _) = broadcast::channel(BROADCAST_BUFFER);
 

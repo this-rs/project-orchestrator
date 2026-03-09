@@ -410,6 +410,147 @@ impl Neo4jClient {
         Ok(sessions)
     }
 
+    // ========================================================================
+    // Discussion Graph — SPAWNED_BY relations & tree traversal
+    // ========================================================================
+
+    /// Create a SPAWNED_BY relation between two chat sessions.
+    /// `(:ChatSession {id: child})-[:SPAWNED_BY {type, run_id, task_id, created_at}]->(:ChatSession {id: parent})`
+    pub async fn create_spawned_by_relation(
+        &self,
+        child_session_id: &str,
+        parent_session_id: &str,
+        spawn_type: &str,
+        run_id: Option<Uuid>,
+        task_id: Option<Uuid>,
+    ) -> Result<()> {
+        let q = query(
+            r#"
+            MATCH (child:ChatSession {id: $child_id})
+            MATCH (parent:ChatSession {id: $parent_id})
+            CREATE (child)-[:SPAWNED_BY {
+                type: $spawn_type,
+                run_id: $run_id,
+                task_id: $task_id,
+                created_at: datetime()
+            }]->(parent)
+            "#,
+        )
+        .param("child_id", child_session_id.to_string())
+        .param("parent_id", parent_session_id.to_string())
+        .param("spawn_type", spawn_type.to_string())
+        .param("run_id", run_id.map(|u| u.to_string()).unwrap_or_default())
+        .param("task_id", task_id.map(|u| u.to_string()).unwrap_or_default());
+
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
+    /// Get the full session tree rooted at `session_id` (recursive traversal via SPAWNED_BY).
+    /// Bounded to 10 levels max for performance.
+    pub async fn get_session_tree(&self, session_id: &str) -> Result<Vec<SessionTreeNode>> {
+        let q = query(
+            r#"
+            MATCH path = (root:ChatSession {id: $id})<-[:SPAWNED_BY*0..10]-(child:ChatSession)
+            WITH child, length(path) AS depth, relationships(path) AS rels
+            RETURN child.id AS session_id,
+                   CASE WHEN size(rels) > 0 THEN startNode(rels[size(rels)-1]).id ELSE null END AS self_id,
+                   CASE WHEN size(rels) > 0 THEN endNode(rels[size(rels)-1]).id ELSE null END AS parent_session_id,
+                   CASE WHEN size(rels) > 0 THEN rels[size(rels)-1].type ELSE null END AS spawn_type,
+                   CASE WHEN size(rels) > 0 THEN rels[size(rels)-1].run_id ELSE null END AS run_id,
+                   CASE WHEN size(rels) > 0 THEN rels[size(rels)-1].task_id ELSE null END AS task_id,
+                   depth,
+                   child.created_at AS created_at
+            ORDER BY depth ASC, child.created_at ASC
+            "#,
+        )
+        .param("id", session_id.to_string());
+
+        let mut nodes = Vec::new();
+        let mut result = self.graph.execute(q).await?;
+        while let Some(row) = result.next().await? {
+            let session_id: String = row.get("session_id")?;
+            let parent_session_id: Option<String> = row.get("parent_session_id").ok().and_then(|s: String| if s.is_empty() { None } else { Some(s) });
+            let spawn_type: Option<String> = row.get("spawn_type").ok().and_then(|s: String| if s.is_empty() { None } else { Some(s) });
+            let run_id_str: Option<String> = row.get("run_id").ok().and_then(|s: String| if s.is_empty() { None } else { Some(s) });
+            let task_id_str: Option<String> = row.get("task_id").ok().and_then(|s: String| if s.is_empty() { None } else { Some(s) });
+            let depth: i64 = row.get("depth").unwrap_or(0);
+            let created_at_str: Option<String> = row.get("created_at").ok();
+
+            nodes.push(SessionTreeNode {
+                session_id,
+                parent_session_id,
+                spawn_type,
+                run_id: run_id_str.and_then(|s| s.parse().ok()),
+                task_id: task_id_str.and_then(|s| s.parse().ok()),
+                depth: depth as u32,
+                created_at: created_at_str.and_then(|s| s.parse().ok()),
+            });
+        }
+        Ok(nodes)
+    }
+
+    /// Follow SPAWNED_BY upward to find the root session (the one with no parent).
+    pub async fn get_session_root(&self, session_id: &str) -> Result<Option<String>> {
+        let q = query(
+            r#"
+            MATCH path = (s:ChatSession {id: $id})-[:SPAWNED_BY*0..10]->(root:ChatSession)
+            WHERE NOT (root)-[:SPAWNED_BY]->()
+            RETURN root.id AS root_id
+            ORDER BY length(path) DESC
+            LIMIT 1
+            "#,
+        )
+        .param("id", session_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let root_id: String = row.get("root_id")?;
+            Ok(Some(root_id))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Get all sessions for a PlanRun via SPAWNED_BY relation metadata.
+    pub async fn get_run_sessions(&self, run_id: Uuid) -> Result<Vec<SessionInfo>> {
+        let q = query(
+            r#"
+            MATCH (child:ChatSession)-[r:SPAWNED_BY]->(parent:ChatSession)
+            WHERE r.run_id = $run_id
+            RETURN child.id AS session_id,
+                   child.title AS title,
+                   child.model AS model,
+                   r.type AS spawn_type,
+                   r.task_id AS task_id,
+                   child.created_at AS created_at
+            ORDER BY child.created_at ASC
+            "#,
+        )
+        .param("run_id", run_id.to_string());
+
+        let mut sessions = Vec::new();
+        let mut result = self.graph.execute(q).await?;
+        while let Some(row) = result.next().await? {
+            let session_id: String = row.get("session_id")?;
+            let title: Option<String> = row.get("title").ok().and_then(|s: String| if s.is_empty() { None } else { Some(s) });
+            let model: String = row.get("model").unwrap_or_default();
+            let spawn_type: Option<String> = row.get("spawn_type").ok().and_then(|s: String| if s.is_empty() { None } else { Some(s) });
+            let task_id_str: Option<String> = row.get("task_id").ok().and_then(|s: String| if s.is_empty() { None } else { Some(s) });
+            let created_at_str: String = row.get("created_at").unwrap_or_default();
+
+            sessions.push(SessionInfo {
+                session_id,
+                title,
+                model,
+                spawn_type,
+                task_id: task_id_str.and_then(|s| s.parse().ok()),
+                created_at: created_at_str.parse().unwrap_or_else(|_| chrono::Utc::now()),
+            });
+        }
+        Ok(sessions)
+    }
+
     /// Parse a Neo4j Node into a ChatSessionNode
     fn parse_chat_session_node(node: &neo4rs::Node) -> Result<ChatSessionNode> {
         let cli_session_id: String = node.get("cli_session_id").unwrap_or_default();

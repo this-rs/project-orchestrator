@@ -247,6 +247,7 @@ impl Neo4jClient {
             current_wave: node.get::<i64>("current_wave").unwrap_or(0) as usize,
             current_task_id: current_task_id.and_then(|s| s.parse().ok()),
             current_task_title: None,
+            active_agents: Vec::new(),
             completed_tasks: parse_uuid_list(&completed_tasks_str),
             failed_tasks: parse_uuid_list(&failed_tasks_str),
             retry_counts: std::collections::HashMap::new(),

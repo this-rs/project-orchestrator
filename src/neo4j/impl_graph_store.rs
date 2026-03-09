@@ -2055,6 +2055,30 @@ impl GraphStore for Neo4jClient {
         self.get_session_children(parent_id).await
     }
 
+    async fn create_spawned_by_relation(
+        &self,
+        child_session_id: &str,
+        parent_session_id: &str,
+        spawn_type: &str,
+        run_id: Option<Uuid>,
+        task_id: Option<Uuid>,
+    ) -> anyhow::Result<()> {
+        self.create_spawned_by_relation(child_session_id, parent_session_id, spawn_type, run_id, task_id)
+            .await
+    }
+
+    async fn get_session_tree(&self, session_id: &str) -> anyhow::Result<Vec<SessionTreeNode>> {
+        self.get_session_tree(session_id).await
+    }
+
+    async fn get_session_root(&self, session_id: &str) -> anyhow::Result<Option<String>> {
+        self.get_session_root(session_id).await
+    }
+
+    async fn get_run_sessions(&self, run_id: Uuid) -> anyhow::Result<Vec<SessionInfo>> {
+        self.get_run_sessions(run_id).await
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn update_chat_session(
         &self,

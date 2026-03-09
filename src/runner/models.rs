@@ -331,6 +331,73 @@ pub enum TriggerSource {
 }
 
 // ============================================================================
+// ActiveAgent — tracks a currently running agent for a task
+// ============================================================================
+
+/// Represents an active agent working on a task within the runner.
+///
+/// Multiple agents can be active simultaneously when tasks run in parallel waves.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActiveAgent {
+    /// The task this agent is working on
+    pub task_id: Uuid,
+    /// Human-readable title of the task
+    pub task_title: String,
+    /// Chat session ID for this agent (set after spawning)
+    pub session_id: Option<Uuid>,
+    /// When this agent started working
+    pub started_at: DateTime<Utc>,
+    /// Accumulated cost in USD for this agent
+    pub cost_usd: f64,
+    /// Current status of the task
+    pub status: TaskRunStatus,
+}
+
+// ============================================================================
+// ActiveAgentSnapshot — serializable snapshot for status endpoints
+// ============================================================================
+
+/// A snapshot of an active agent for the status endpoint.
+///
+/// Contains derived fields (elapsed_secs) computed at snapshot time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActiveAgentSnapshot {
+    pub task_id: Uuid,
+    pub task_title: String,
+    pub session_id: Option<Uuid>,
+    pub elapsed_secs: f64,
+    pub cost_usd: f64,
+    pub status: TaskRunStatus,
+}
+
+impl ActiveAgent {
+    /// Create a new ActiveAgent for a task.
+    pub fn new(task_id: Uuid, task_title: String) -> Self {
+        Self {
+            task_id,
+            task_title,
+            session_id: None,
+            started_at: Utc::now(),
+            cost_usd: 0.0,
+            status: TaskRunStatus::Spawning,
+        }
+    }
+
+    /// Create a snapshot of this agent at the current point in time.
+    pub fn snapshot(&self) -> ActiveAgentSnapshot {
+        let elapsed_secs = (Utc::now() - self.started_at).num_milliseconds() as f64 / 1000.0;
+        ActiveAgentSnapshot {
+            task_id: self.task_id,
+            task_title: self.task_title.clone(),
+            session_id: self.session_id,
+            elapsed_secs,
+            cost_usd: self.cost_usd,
+            status: self.status,
+        }
+    }
+}
+
+// ============================================================================
 // RunSnapshot — status snapshot for the /status endpoint
 // ============================================================================
 
@@ -342,8 +409,14 @@ pub struct RunSnapshot {
     pub status: PlanRunStatus,
     pub current_wave: usize,
     pub total_waves: usize,
+    /// Deprecated: use `active_agents` instead. Kept for backward compatibility.
+    /// Returns the task_id of the first active agent (if exactly one).
     pub current_task_id: Option<Uuid>,
+    /// Deprecated: use `active_agents` instead. Kept for backward compatibility.
+    /// Returns the task_title of the first active agent (if exactly one).
     pub current_task_title: Option<String>,
+    /// All currently active agents (may be multiple in parallel waves).
+    pub active_agents: Vec<ActiveAgentSnapshot>,
     pub tasks_completed: usize,
     pub tasks_failed: usize,
     pub tasks_total: usize,

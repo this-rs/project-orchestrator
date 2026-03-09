@@ -1707,6 +1707,25 @@ pub trait GraphStore: Send + Sync {
     /// Get child sessions spawned by a parent session
     async fn get_session_children(&self, parent_id: Uuid) -> Result<Vec<ChatSessionNode>>;
 
+    /// Create a SPAWNED_BY relation between two chat sessions
+    async fn create_spawned_by_relation(
+        &self,
+        child_session_id: &str,
+        parent_session_id: &str,
+        spawn_type: &str,
+        run_id: Option<Uuid>,
+        task_id: Option<Uuid>,
+    ) -> Result<()>;
+
+    /// Get the full session tree rooted at a session (recursive SPAWNED_BY traversal, max 10 levels)
+    async fn get_session_tree(&self, session_id: &str) -> Result<Vec<SessionTreeNode>>;
+
+    /// Follow SPAWNED_BY upward to find the root session
+    async fn get_session_root(&self, session_id: &str) -> Result<Option<String>>;
+
+    /// Get all sessions for a PlanRun via SPAWNED_BY relation metadata
+    async fn get_run_sessions(&self, run_id: Uuid) -> Result<Vec<SessionInfo>>;
+
     /// Update a chat session (partial update, None fields are skipped)
     #[allow(clippy::too_many_arguments)]
     async fn update_chat_session(

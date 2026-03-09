@@ -207,6 +207,8 @@ pub fn resolve_legacy_alias(name: &str) -> Option<(&'static str, &'static str)> 
         "delete_chat_session" => Some(("chat", "delete_session")),
         "chat_send_message" => Some(("chat", "send_message")),
         "list_chat_messages" => Some(("chat", "list_messages")),
+        "get_session_tree" => Some(("chat", "get_session_tree")),
+        "get_run_sessions" => Some(("chat", "get_run_sessions")),
 
         // Feature Graph
         "create_feature_graph" => Some(("feature_graph", "create")),
@@ -758,13 +760,13 @@ fn component_tool() -> ToolDefinition {
 fn chat_tool() -> ToolDefinition {
     ToolDefinition {
         name: "chat".to_string(),
-        description: "Manage chat sessions. Actions: list_sessions, get_session, get_children, delete_session, send_message, list_messages, add_discussed, get_session_entities".to_string(),
+        description: "Manage chat sessions. Actions: list_sessions, get_session, get_children, delete_session, send_message, list_messages, add_discussed, get_session_entities, get_session_tree, get_run_sessions".to_string(),
         input_schema: InputSchema {
             schema_type: "object".to_string(),
             properties: Some(json!({
                 "action": {
                     "type": "string",
-                    "enum": ["list_sessions", "get_session", "get_children", "delete_session", "send_message", "list_messages", "add_discussed", "get_session_entities"],
+                    "enum": ["list_sessions", "get_session", "get_children", "delete_session", "send_message", "list_messages", "add_discussed", "get_session_entities", "get_session_tree", "get_run_sessions"],
                     "description": "Operation to perform"
                 },
                 "session_id": {"type": "string", "description": "Session UUID"},
@@ -776,6 +778,7 @@ fn chat_tool() -> ToolDefinition {
                 "workspace_slug": {"type": "string", "description": "Workspace slug (send_message)"},
                 "add_dirs": {"type": "array", "items": {"type": "string"}, "description": "Additional directories (send_message)"},
                 "entities": {"type": "array", "items": {"type": "object"}, "description": "Entities to mark as discussed (add_discussed): [{entity_type, entity_id}]"},
+                "run_id": {"type": "string", "description": "PlanRun UUID (get_run_sessions)"},
                 "project_id": {"type": "string", "description": "Project UUID (get_session_entities — scoping filter)"},
                 "limit": {"type": "integer", "description": "Max items"},
                 "offset": {"type": "integer", "description": "Skip items"}
@@ -1290,6 +1293,8 @@ mod tests {
             "list_chat_sessions",
             "get_chat_session",
             "get_session_children",
+            "get_session_tree",
+            "get_run_sessions",
             "delete_chat_session",
             "chat_send_message",
             "create_feature_graph",

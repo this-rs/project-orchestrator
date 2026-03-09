@@ -19,6 +19,7 @@
 pub mod enricher;
 pub mod guard;
 pub mod models;
+pub mod prompt;
 pub mod providers;
 #[allow(clippy::module_inception)]
 pub mod runner;
@@ -31,9 +32,10 @@ pub mod verifier;
 pub use enricher::{EnrichResult, TaskEnricher};
 pub use guard::{AgentGuard, ChatManagerHintSender, GuardConfig, GuardVerdict, HintSender};
 pub use models::{
-    PlanRunStatus, RunSnapshot, RunnerConfig, RunnerEvent, TaskResult, TaskRunStatus,
-    TaskStateMachine, Trigger, TriggerFiring, TriggerSource, TriggerType,
+    ActiveAgent, ActiveAgentSnapshot, PlanRunStatus, RunSnapshot, RunnerConfig, RunnerEvent,
+    TaskResult, TaskRunStatus, TaskStateMachine, Trigger, TriggerFiring, TriggerSource, TriggerType,
 };
+pub use prompt::{build_runner_constraints, RunnerPromptContext};
 pub use providers::TriggerProvider;
 pub use runner::{PlanRunner, RunStatus, RUNNER_CANCEL, RUNNER_STATE};
 pub use state::RunnerState;

@@ -280,6 +280,34 @@ pub async fn get_session_children(
     Ok(Json(items))
 }
 
+/// GET /api/chat/sessions/{id}/tree — Get the full session tree rooted at this session
+pub async fn get_session_tree(
+    State(state): State<OrchestratorState>,
+    Path(session_id): Path<Uuid>,
+) -> Result<Json<Vec<crate::neo4j::models::SessionTreeNode>>, AppError> {
+    let tree = state
+        .orchestrator
+        .neo4j()
+        .get_session_tree(&session_id.to_string())
+        .await
+        .map_err(AppError::Internal)?;
+    Ok(Json(tree))
+}
+
+/// GET /api/chat/runs/{run_id}/sessions — Get all sessions for a PlanRun
+pub async fn get_run_sessions(
+    State(state): State<OrchestratorState>,
+    Path(run_id): Path<Uuid>,
+) -> Result<Json<Vec<crate::neo4j::models::SessionInfo>>, AppError> {
+    let sessions = state
+        .orchestrator
+        .neo4j()
+        .get_run_sessions(run_id)
+        .await
+        .map_err(AppError::Internal)?;
+    Ok(Json(sessions))
+}
+
 /// DELETE /api/chat/sessions/{id} — Delete a session
 pub async fn delete_session(
     State(state): State<OrchestratorState>,

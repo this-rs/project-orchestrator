@@ -274,6 +274,8 @@ impl ToolHandler {
             ("chat", "list_messages") => "list_chat_messages",
             ("chat", "add_discussed") => "add_discussed",
             ("chat", "get_session_entities") => "get_session_entities",
+            ("chat", "get_session_tree") => "get_session_tree",
+            ("chat", "get_run_sessions") => "get_run_sessions",
 
             // Feature Graph
             ("feature_graph", "create") => "create_feature_graph",
@@ -3109,6 +3111,22 @@ impl ToolHandler {
                 let id = extract_id(args, "session_id")?;
                 let result = http
                     .get(&format!("/api/chat/sessions/{}/children", id))
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "get_session_tree" => {
+                let id = extract_id(args, "session_id")?;
+                let result = http
+                    .get(&format!("/api/chat/sessions/{}/tree", id))
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "get_run_sessions" => {
+                let run_id = extract_id(args, "run_id")?;
+                let result = http
+                    .get(&format!("/api/chat/runs/{}/sessions", run_id))
                     .await?;
                 Ok(Some(result))
             }
@@ -8249,6 +8267,8 @@ mod tests {
             ("list_messages", "list_chat_messages"),
             ("add_discussed", "add_discussed"),
             ("get_session_entities", "get_session_entities"),
+            ("get_session_tree", "get_session_tree"),
+            ("get_run_sessions", "get_run_sessions"),
         ] {
             let args = json!({"action": action});
             let (name, _) = handler.resolve_mega_tool("chat", &args).unwrap();

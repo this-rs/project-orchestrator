@@ -6304,6 +6304,41 @@ impl GraphStore for MockGraphStore {
         Ok(children)
     }
 
+    async fn create_spawned_by_relation(
+        &self,
+        _child_session_id: &str,
+        _parent_session_id: &str,
+        _spawn_type: &str,
+        _run_id: Option<Uuid>,
+        _task_id: Option<Uuid>,
+    ) -> Result<()> {
+        // Mock: no-op (relations are not tracked in mock)
+        Ok(())
+    }
+
+    async fn get_session_tree(&self, session_id: &str) -> Result<Vec<SessionTreeNode>> {
+        // Mock: return the session itself as root with depth 0
+        Ok(vec![SessionTreeNode {
+            session_id: session_id.to_string(),
+            parent_session_id: None,
+            spawn_type: None,
+            run_id: None,
+            task_id: None,
+            depth: 0,
+            created_at: Some(chrono::Utc::now()),
+        }])
+    }
+
+    async fn get_session_root(&self, session_id: &str) -> Result<Option<String>> {
+        // Mock: the session itself is the root
+        Ok(Some(session_id.to_string()))
+    }
+
+    async fn get_run_sessions(&self, _run_id: Uuid) -> Result<Vec<SessionInfo>> {
+        // Mock: return empty
+        Ok(vec![])
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn update_chat_session(
         &self,

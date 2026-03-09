@@ -101,6 +101,34 @@ pub struct ChatSessionNode {
 }
 
 // ============================================================================
+// Session Tree Node (for discussion graph traversal)
+// ============================================================================
+
+/// A node in a session tree, representing a session and its position in
+/// the SPAWNED_BY hierarchy.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionTreeNode {
+    pub session_id: String,
+    pub parent_session_id: Option<String>,
+    pub spawn_type: Option<String>,
+    pub run_id: Option<Uuid>,
+    pub task_id: Option<Uuid>,
+    pub depth: u32,
+    pub created_at: Option<DateTime<Utc>>,
+}
+
+/// Lightweight session info for run-scoped queries.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionInfo {
+    pub session_id: String,
+    pub title: Option<String>,
+    pub model: String,
+    pub spawn_type: Option<String>,
+    pub task_id: Option<Uuid>,
+    pub created_at: DateTime<Utc>,
+}
+
+// ============================================================================
 // Chat Event Record (for WebSocket replay & persistence)
 // ============================================================================
 
