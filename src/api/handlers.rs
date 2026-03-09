@@ -3726,6 +3726,10 @@ pub struct RunPlanRequest {
     pub cwd: String,
     /// Optional project slug (for scoping MCP operations)
     pub project_slug: Option<String>,
+    /// How this run was triggered (manual, chat, schedule, webhook, event).
+    /// Defaults to "manual" if not specified.
+    #[serde(default)]
+    pub triggered_by: Option<String>,
 }
 
 /// Response for a successfully started plan run.
@@ -3771,10 +3775,19 @@ pub async fn run_plan(
 
     let runner = Arc::new(runner);
 
+    // Parse trigger source from request (default: Manual)
+    let trigger_source = match req.triggered_by.as_deref() {
+        Some("chat") => crate::runner::TriggerSource::Chat { session_id: None },
+        Some("schedule") => crate::runner::TriggerSource::Schedule {
+            trigger_id: uuid::Uuid::nil(),
+        },
+        _ => crate::runner::TriggerSource::Manual,
+    };
+
     let start_result = runner
         .start(
             plan_id,
-            crate::runner::TriggerSource::Manual,
+            trigger_source,
             req.cwd,
             req.project_slug,
         )

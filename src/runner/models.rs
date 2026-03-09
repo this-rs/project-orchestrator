@@ -231,6 +231,9 @@ pub enum RunnerEvent {
         plan_title: String,
         total_tasks: usize,
         total_waves: usize,
+        /// Prediction based on historical runs (None if first run)
+        #[serde(skip_serializing_if = "Option::is_none")]
+        prediction: Option<crate::runner::vector::RunPrediction>,
     },
     /// A new wave of tasks has started
     WaveStarted {
@@ -513,6 +516,7 @@ mod tests {
             plan_title: "Test Plan".into(),
             total_tasks: 5,
             total_waves: 3,
+            prediction: None,
         };
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains("\"event\":\"plan_started\""));

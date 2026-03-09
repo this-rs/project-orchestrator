@@ -11,6 +11,7 @@ use crate::neo4j::traits::GraphStore;
 use crate::orchestrator::context::ContextBuilder;
 use crate::runner::guard::{AgentGuard, ChatManagerHintSender, GuardConfig, GuardVerdict};
 use crate::runner::models::{PlanRunStatus, RunnerConfig, RunnerEvent, TaskResult, TriggerSource};
+use crate::runner::vector::VectorCollector;
 use crate::runner::enricher::TaskEnricher;
 use crate::runner::state::RunnerState;
 use crate::runner::verifier::{TaskVerifier, VerifyResult};
@@ -36,6 +37,11 @@ pub static RUNNER_STATE: LazyLock<Arc<RwLock<Option<RunnerState>>>> =
 /// Checked between each task in the execution loop.
 pub static RUNNER_CANCEL: LazyLock<Arc<AtomicBool>> =
     LazyLock::new(|| Arc::new(AtomicBool::new(false)));
+
+/// Vector collector — accumulates drift/knowledge metrics during execution.
+/// Reset at the start of each run, finalized at the end.
+static VECTOR_COLLECTOR: LazyLock<Arc<RwLock<VectorCollector>>> =
+    LazyLock::new(|| Arc::new(RwLock::new(VectorCollector::new())));
 
 // ============================================================================
 // Runner constraints injected into the agent prompt
@@ -79,6 +85,19 @@ pub struct StartResult {
     pub plan_id: Uuid,
     pub total_waves: usize,
     pub total_tasks: usize,
+}
+
+/// Result of execute_task — wraps TaskResult with the session_id for enricher.
+#[derive(Debug)]
+struct TaskExecutionResult {
+    pub result: TaskResult,
+    pub session_id: Option<Uuid>,
+}
+
+impl TaskExecutionResult {
+    fn session_id(&self) -> Option<Uuid> {
+        self.session_id
+    }
 }
 
 /// Snapshot of the current runner status (for the status endpoint).
@@ -234,6 +253,7 @@ impl PlanRunner {
                 plan_title: format!("[Recovery] run {}", run_id),
                 total_tasks: saved_state.total_tasks,
                 total_waves: waves_result.waves.len(),
+                prediction: None,
             });
 
             // Spawn execution in background
@@ -307,8 +327,12 @@ impl PlanRunner {
             *global = Some(state.clone());
         }
 
-        // Reset cancel flag
+        // Reset cancel flag and vector collector
         RUNNER_CANCEL.store(false, Ordering::SeqCst);
+        {
+            let mut collector = VECTOR_COLLECTOR.write().await;
+            *collector = VectorCollector::new();
+        }
 
         let result = StartResult {
             run_id,
@@ -317,13 +341,27 @@ impl PlanRunner {
             total_tasks,
         };
 
-        // 5. Emit PlanStarted event
+        // 5. Compute prediction from historical runs
+        let prediction = match self.graph.list_plan_runs(plan_id, 50).await {
+            Ok(runs) if !runs.is_empty() => {
+                let vectors: Vec<_> = runs
+                    .iter()
+                    .rev()
+                    .map(crate::runner::vector::ExecutionVector::from_runner_state)
+                    .collect();
+                Some(crate::runner::vector::predict_run(&vectors))
+            }
+            _ => None,
+        };
+
+        // Emit PlanStarted event with prediction
         self.emit_event(RunnerEvent::PlanStarted {
             run_id,
             plan_id,
             plan_title: String::new(), // Will be enriched by caller
             total_tasks,
             total_waves,
+            prediction,
         });
 
         // 6. Spawn the execution loop in background
@@ -424,6 +462,23 @@ impl PlanRunner {
             waves.len()
         );
 
+        // Resolve project_id from slug (for enricher)
+        let project_id = if let Some(ref slug) = project_slug {
+            match self.graph.get_project_by_slug(slug).await {
+                Ok(Some(project)) => Some(project.id),
+                Ok(None) => {
+                    warn!("Project slug '{}' not found, enricher will run without project_id", slug);
+                    None
+                }
+                Err(e) => {
+                    warn!("Failed to resolve project slug '{}': {}, enricher will run without project_id", slug, e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         for (wave_idx, wave) in waves.iter().enumerate() {
             let wave_number = wave_idx + 1;
 
@@ -485,7 +540,13 @@ impl PlanRunner {
                     )
                     .await;
 
-                match task_result {
+                // Extract session_id from the result (for enricher)
+                let task_session_id = task_result
+                    .as_ref()
+                    .ok()
+                    .and_then(|r| r.session_id());
+
+                match task_result.map(|r| r.result) {
                     Ok(TaskResult::Success {
                         duration_secs,
                         cost_usd,
@@ -497,6 +558,8 @@ impl PlanRunner {
                         let enricher = TaskEnricher::new(self.graph.clone());
                         let enrich_task_id = wave_task.id;
                         let enrich_plan_id = plan_id;
+                        let enrich_project_id = project_id;
+                        let enrich_session_id = task_session_id;
                         let enrich_cwd = cwd.clone();
                         let enrich_start = task_start_time;
                         tokio::spawn(async move {
@@ -504,18 +567,19 @@ impl PlanRunner {
                                 .enrich(
                                     enrich_task_id,
                                     enrich_plan_id,
-                                    None,      // project_id — TODO: resolve from slug
-                                    None,      // session_id — TODO: pass from execute_task
+                                    enrich_project_id,
+                                    enrich_session_id,
                                     enrich_start,
                                     &enrich_cwd,
                                 )
                                 .await;
                             info!(
-                                "Enricher completed for task {}: {} commits, note={}, {} affects",
+                                "Enricher completed for task {}: {} commits, note={}, {} affects, {} discussed",
                                 enrich_task_id,
                                 result.commits_linked,
                                 result.note_created,
-                                result.affects_added
+                                result.affects_added,
+                                result.discussed_added
                             );
                         });
                     }
@@ -636,7 +700,7 @@ impl PlanRunner {
         task_title: &str,
         cwd: &str,
         project_slug: Option<&str>,
-    ) -> Result<TaskResult> {
+    ) -> Result<TaskExecutionResult> {
         info!("Executing task {}: {}", task_id, task_title);
 
         // Update global state
@@ -686,6 +750,15 @@ impl PlanRunner {
 
         let session = self.chat_manager.create_session(&request).await?;
         let session_id = session.session_id.clone();
+        let session_uuid = session_id.parse::<Uuid>().ok();
+
+        // Helper to wrap TaskResult with session_id
+        let wrap = |result: TaskResult| -> TaskExecutionResult {
+            TaskExecutionResult {
+                result,
+                session_id: session_uuid,
+            }
+        };
 
         // Subscribe to events BEFORE sending message (to not miss any)
         let rx = self.chat_manager.subscribe(&session_id).await?;
@@ -741,32 +814,32 @@ impl PlanRunner {
             EventListenResult::ChannelClosed { cost_usd } => {
                 // Check if the guard timed out (it would have interrupted the session)
                 if let GuardVerdict::Timeout { elapsed_secs } = guard_verdict {
-                    return Ok(TaskResult::Timeout {
+                    return Ok(wrap(TaskResult::Timeout {
                         duration_secs: elapsed_secs,
                         cost_usd,
-                    });
+                    }));
                 }
-                return Ok(TaskResult::Failed {
+                return Ok(wrap(TaskResult::Failed {
                     reason: "Chat event channel closed unexpectedly".to_string(),
                     attempts: 0,
                     cost_usd,
-                });
+                }));
             }
             EventListenResult::Cancelled { cost_usd } => {
-                return Ok(TaskResult::Failed {
+                return Ok(wrap(TaskResult::Failed {
                     reason: "Cancelled by user".to_string(),
                     attempts: 0,
                     cost_usd,
-                });
+                }));
             }
         };
 
         // If the guard decided timeout, honor it even if we got a result
         if let GuardVerdict::Timeout { elapsed_secs } = guard_verdict {
-            return Ok(TaskResult::Timeout {
+            return Ok(wrap(TaskResult::Timeout {
                 duration_secs: elapsed_secs,
                 cost_usd,
-            });
+            }));
         }
 
         let duration_secs = start.elapsed().as_secs_f64();
@@ -777,16 +850,16 @@ impl PlanRunner {
             if let Some(ref mut s) = *global {
                 s.add_cost(cost_usd);
                 if s.is_budget_exceeded(self.config.max_cost_usd) {
-                    return Ok(TaskResult::BudgetExceeded {
+                    return Ok(wrap(TaskResult::BudgetExceeded {
                         cumulated_cost_usd: s.cost_usd,
                         limit_usd: self.config.max_cost_usd,
-                    });
+                    }));
                 }
             }
         }
 
         if is_error {
-            return Ok(TaskResult::Failed {
+            return Ok(wrap(TaskResult::Failed {
                 reason: if error_text.is_empty() {
                     format!("Agent returned error (subtype: {})", _subtype)
                 } else {
@@ -794,7 +867,7 @@ impl PlanRunner {
                 },
                 attempts: 0,
                 cost_usd,
-            });
+            }));
         }
 
         // Post-task verification (build, steps, git sanity)
@@ -806,21 +879,21 @@ impl PlanRunner {
         let verify_result = verifier.verify(task_id, cwd).await;
 
         match verify_result {
-            VerifyResult::Pass => Ok(TaskResult::Success {
+            VerifyResult::Pass => Ok(wrap(TaskResult::Success {
                 duration_secs,
                 cost_usd,
-            }),
+            })),
             VerifyResult::Fail { reasons } => {
                 let reason = format!(
                     "Post-task verification failed:\n- {}",
                     reasons.join("\n- ")
                 );
                 warn!("Task {} verification failed: {}", task_id, reason);
-                Ok(TaskResult::Failed {
+                Ok(wrap(TaskResult::Failed {
                     reason,
                     attempts: 0,
                     cost_usd,
-                })
+                }))
             }
         }
     }
@@ -851,6 +924,12 @@ impl PlanRunner {
                 // Persist to Neo4j
                 self.graph.update_plan_run(s).await?;
             }
+        }
+
+        // Record in vector collector
+        {
+            let mut collector = VECTOR_COLLECTOR.write().await;
+            collector.record_task(task_id, duration_secs, cost_usd);
         }
 
         // Emit event
@@ -1034,6 +1113,21 @@ impl PlanRunner {
         if let Some(ref mut s) = *global {
             s.finalize(status.clone());
             self.graph.update_plan_run(s).await?;
+        }
+
+        // Finalize the execution vector from the collector
+        if let Some(ref state) = *global {
+            let collector = VECTOR_COLLECTOR.read().await;
+            let vector = collector.finalize(state);
+            // Log the derived metrics
+            info!(
+                "Run {} vector: efficiency={:.2}, velocity={:.3}, stability={:.2}",
+                run_id,
+                vector.efficiency(),
+                vector.velocity(),
+                vector.stability()
+            );
+            // TODO: persist vector to PlanRun node in Neo4j when schema supports it
         }
 
         match status {

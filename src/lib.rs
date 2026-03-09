@@ -1166,6 +1166,45 @@ pub async fn start_server(mut config: Config) -> Result<()> {
         });
     }
 
+    // Boot trigger providers (Schedule + Event) for automatic plan execution
+    if chat_manager.is_some() {
+        use runner::TriggerProvider; // for setup() method
+        let graph = orchestrator.neo4j_arc();
+        let engine = Arc::new(runner::TriggerEngine::new(graph.clone()));
+
+        // Schedule provider — evaluates cron triggers every 60s
+        let schedule_provider = runner::providers::schedule::ScheduleProvider::new(
+            graph.clone(),
+            engine.clone(),
+            None, // default 60s
+        );
+        if let Err(e) = schedule_provider.setup().await {
+            tracing::warn!("ScheduleProvider setup failed (non-fatal): {}", e);
+        } else {
+            tracing::info!("ScheduleProvider started (60s tick)");
+        }
+        // Keep provider alive by leaking into a static — teardown on process exit
+        std::mem::forget(schedule_provider);
+
+        // Event provider — reacts to CrudEvents for plan chaining
+        let event_rx = event_bus.subscribe();
+        let event_provider = runner::providers::event::EventProvider::new(
+            graph.clone(),
+            engine.clone(),
+            event_rx,
+        );
+        if let Err(e) = event_provider.setup().await {
+            tracing::warn!("EventProvider setup failed (non-fatal): {}", e);
+        } else {
+            tracing::info!("EventProvider started (CrudEvent subscriber)");
+        }
+        std::mem::forget(event_provider);
+
+        // WebhookProvider — no setup needed, the POST /api/webhooks/:trigger_id
+        // endpoint handles validation and evaluation inline.
+        tracing::info!("TriggerEngine booted with 2 active providers (schedule, event)");
+    }
+
     // Create server state
     let server_state = Arc::new(ServerState {
         orchestrator,

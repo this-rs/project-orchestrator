@@ -89,6 +89,140 @@ pub struct OutcomeDim {
 }
 
 // ============================================================================
+// VectorCollector — accumulates metrics during plan execution
+// ============================================================================
+
+/// Collects execution metrics in real-time during a plan run.
+///
+/// Accumulates drift signals, knowledge capture counts, and per-task
+/// timing/cost. Call `finalize()` at the end to produce the full
+/// `ExecutionVector` with all 7 dimensions populated.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct VectorCollector {
+    // Drift counters (incremented by guard/runner)
+    pub idle_warnings: u32,
+    pub loop_warnings: u32,
+    pub compaction_count: u32,
+    pub timeout_count: u32,
+    pub budget_warnings: u32,
+    // Knowledge counters (incremented by enricher results)
+    pub notes_created: u32,
+    pub decisions_created: u32,
+    pub commits_linked: u32,
+    pub files_modified: u32,
+    pub lines_added: u32,
+    pub lines_deleted: u32,
+    // Per-task timing/cost
+    pub per_task_durations: Vec<(Uuid, f64)>,
+    pub per_task_costs: Vec<(Uuid, f64)>,
+    // Token tracking
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    // Outcome
+    pub failure_reasons: Vec<String>,
+    pub pr_url: Option<String>,
+}
+
+impl VectorCollector {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record a completed task's timing and cost.
+    pub fn record_task(&mut self, task_id: Uuid, duration_secs: f64, cost_usd: f64) {
+        self.per_task_durations.push((task_id, duration_secs));
+        self.per_task_costs.push((task_id, cost_usd));
+    }
+
+    /// Record enrichment results from the enricher.
+    pub fn record_enrichment(&mut self, commits: usize, note_created: bool, affects: usize) {
+        self.commits_linked += commits as u32;
+        if note_created {
+            self.notes_created += 1;
+        }
+        self.decisions_created += affects as u32; // affects are decision anchors
+    }
+
+    /// Record a drift event (idle, loop, etc.)
+    pub fn record_drift(&mut self, event: DriftEvent) {
+        match event {
+            DriftEvent::Idle => self.idle_warnings += 1,
+            DriftEvent::Loop => self.loop_warnings += 1,
+            DriftEvent::Compaction => self.compaction_count += 1,
+            DriftEvent::Timeout => self.timeout_count += 1,
+            DriftEvent::Budget => self.budget_warnings += 1,
+        }
+    }
+
+    /// Build the final ExecutionVector from the collected data + RunnerState.
+    pub fn finalize(&self, state: &crate::runner::RunnerState) -> ExecutionVector {
+        let duration_secs = state
+            .completed_at
+            .map(|c| (c - state.started_at).num_seconds() as f64)
+            .unwrap_or(0.0);
+
+        ExecutionVector {
+            trigger: TriggerDim {
+                source: state.triggered_by.clone(),
+                trigger_id: None,
+                payload_hash: None,
+            },
+            timing: TimingDim {
+                started_at: state.started_at,
+                completed_at: state.completed_at,
+                duration_secs,
+                per_task_durations: self.per_task_durations.clone(),
+            },
+            cost: CostDim {
+                total_cost_usd: state.cost_usd,
+                per_task_costs: self.per_task_costs.clone(),
+                input_tokens: self.input_tokens,
+                output_tokens: self.output_tokens,
+            },
+            quality: QualityDim {
+                tasks_completed: state.completed_tasks.len() as u32,
+                tasks_failed: state.failed_tasks.len() as u32,
+                tasks_retried: state.retry_counts.values().filter(|&&v| v > 0).count() as u32,
+                steps_completed: 0, // TODO: count from graph when available
+                steps_skipped: 0,
+                build_pass: state.status == PlanRunStatus::Completed,
+                tests_pass: state.status == PlanRunStatus::Completed,
+            },
+            knowledge: KnowledgeDim {
+                notes_created: self.notes_created,
+                decisions_created: self.decisions_created,
+                commits_linked: self.commits_linked,
+                files_modified: self.files_modified,
+                lines_added: self.lines_added,
+                lines_deleted: self.lines_deleted,
+            },
+            drift: DriftDim {
+                idle_warnings: self.idle_warnings,
+                loop_warnings: self.loop_warnings,
+                compaction_count: self.compaction_count,
+                timeout_count: self.timeout_count,
+                budget_warnings: self.budget_warnings,
+            },
+            outcome: OutcomeDim {
+                status: state.status.clone(),
+                failure_reasons: self.failure_reasons.clone(),
+                pr_url: self.pr_url.clone(),
+            },
+        }
+    }
+}
+
+/// Drift event types for the collector.
+#[derive(Debug, Clone)]
+pub enum DriftEvent {
+    Idle,
+    Loop,
+    Compaction,
+    Timeout,
+    Budget,
+}
+
+// ============================================================================
 // Build from RunnerState (minimal vector from persisted data)
 // ============================================================================
 
@@ -640,7 +774,7 @@ mod tests {
 
     #[test]
     fn test_predict_run_anomaly() {
-        let mut vectors = vec![
+        let vectors = vec![
             make_vector(100.0, 1.0, 5, 0, PlanRunStatus::Completed),
             make_vector(110.0, 1.1, 5, 0, PlanRunStatus::Completed),
             make_vector(105.0, 1.0, 5, 0, PlanRunStatus::Completed),

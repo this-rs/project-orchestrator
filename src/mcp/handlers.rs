@@ -796,7 +796,8 @@ impl ToolHandler {
                     .get("project_slug")
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
-                let body = json!({ "cwd": cwd, "project_slug": project_slug });
+                // MCP calls are always from chat context → TriggerSource::Chat
+                let body = json!({ "cwd": cwd, "project_slug": project_slug, "triggered_by": "chat" });
                 let result = http
                     .post(&format!("/api/plans/{}/run", plan_id), &body)
                     .await?;
