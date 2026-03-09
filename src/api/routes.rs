@@ -1262,6 +1262,10 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/chat/sessions/{id}/messages",
             get(chat_handlers::list_messages),
         )
+        .route(
+            "/api/chat/sessions/{id}/children",
+            get(chat_handlers::get_session_children),
+        )
         // DISCUSSED relations (ChatSession → Entity)
         .route(
             "/api/chat/sessions/{id}/discussed",

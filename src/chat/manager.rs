@@ -1833,6 +1833,7 @@ impl ChatManager {
             } else {
                 Some(resolved_add_dirs.clone())
             },
+            spawned_by: request.spawned_by.clone(),
         };
         self.graph
             .create_chat_session(&session_node)
@@ -4391,7 +4392,7 @@ impl ChatManager {
         // Get all sessions without title
         let sessions = self
             .graph
-            .list_chat_sessions(None, None, 200, 0)
+            .list_chat_sessions(None, None, 200, 0, true)
             .await
             .context("Failed to list sessions")?;
 
@@ -4507,7 +4508,7 @@ impl ChatManager {
         }
 
         // Resolve conversation_id → session metadata from Neo4j
-        let (all_sessions, _) = self.graph.list_chat_sessions(None, None, 200, 0).await?;
+        let (all_sessions, _) = self.graph.list_chat_sessions(None, None, 200, 0, true).await?;
         let session_lookup: StdHashMap<String, &crate::neo4j::models::ChatSessionNode> =
             all_sessions
                 .iter()
@@ -6145,13 +6146,13 @@ mod tests {
         graph.create_chat_session(&s4).await.unwrap();
 
         // All sessions
-        let (all, total) = graph.list_chat_sessions(None, None, 50, 0).await.unwrap();
+        let (all, total) = graph.list_chat_sessions(None, None, 50, 0, false).await.unwrap();
         assert_eq!(total, 4);
         assert_eq!(all.len(), 4);
 
         // Filter by project-a
         let (filtered, total) = graph
-            .list_chat_sessions(Some("project-a"), None, 50, 0)
+            .list_chat_sessions(Some("project-a"), None, 50, 0, false)
             .await
             .unwrap();
         assert_eq!(total, 2);
@@ -6159,7 +6160,7 @@ mod tests {
 
         // Pagination
         let (page, total) = graph
-            .list_chat_sessions(Some("project-a"), None, 1, 0)
+            .list_chat_sessions(Some("project-a"), None, 1, 0, false)
             .await
             .unwrap();
         assert_eq!(total, 2);
@@ -6235,6 +6236,7 @@ mod tests {
             preview: Some("Hello, can you help me with this?".into()),
             permission_mode: None,
             add_dirs: None,
+            spawned_by: None,
         };
 
         let json = serde_json::to_string(&session).unwrap();
@@ -6593,6 +6595,7 @@ mod tests {
             preview: None,
             permission_mode: None,
             add_dirs: None,
+            spawned_by: None,
         };
 
         let json = serde_json::to_string(&session).unwrap();
@@ -6623,6 +6626,7 @@ mod tests {
             preview: None,
             permission_mode: None,
             add_dirs: None,
+            spawned_by: None,
         };
 
         let json = serde_json::to_string(&session).unwrap();

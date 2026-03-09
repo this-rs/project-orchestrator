@@ -422,6 +422,7 @@ pub fn test_chat_session(project_slug: Option<&str>) -> ChatSessionNode {
         preview: None,
         permission_mode: None,
         add_dirs: None,
+        spawned_by: None,
     }
 }
 

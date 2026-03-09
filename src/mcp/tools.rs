@@ -203,6 +203,7 @@ pub fn resolve_legacy_alias(name: &str) -> Option<(&'static str, &'static str)> 
         // Chat
         "list_chat_sessions" => Some(("chat", "list_sessions")),
         "get_chat_session" => Some(("chat", "get_session")),
+        "get_session_children" => Some(("chat", "get_children")),
         "delete_chat_session" => Some(("chat", "delete_session")),
         "chat_send_message" => Some(("chat", "send_message")),
         "list_chat_messages" => Some(("chat", "list_messages")),
@@ -757,13 +758,13 @@ fn component_tool() -> ToolDefinition {
 fn chat_tool() -> ToolDefinition {
     ToolDefinition {
         name: "chat".to_string(),
-        description: "Manage chat sessions. Actions: list_sessions, get_session, delete_session, send_message, list_messages, add_discussed, get_session_entities".to_string(),
+        description: "Manage chat sessions. Actions: list_sessions, get_session, get_children, delete_session, send_message, list_messages, add_discussed, get_session_entities".to_string(),
         input_schema: InputSchema {
             schema_type: "object".to_string(),
             properties: Some(json!({
                 "action": {
                     "type": "string",
-                    "enum": ["list_sessions", "get_session", "delete_session", "send_message", "list_messages", "add_discussed", "get_session_entities"],
+                    "enum": ["list_sessions", "get_session", "get_children", "delete_session", "send_message", "list_messages", "add_discussed", "get_session_entities"],
                     "description": "Operation to perform"
                 },
                 "session_id": {"type": "string", "description": "Session UUID"},
@@ -1288,6 +1289,7 @@ mod tests {
             "list_chat_messages",
             "list_chat_sessions",
             "get_chat_session",
+            "get_session_children",
             "delete_chat_session",
             "chat_send_message",
             "create_feature_graph",

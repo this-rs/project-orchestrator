@@ -6239,6 +6239,7 @@ impl GraphStore for MockGraphStore {
         workspace_slug: Option<&str>,
         limit: usize,
         offset: usize,
+        include_detached: bool,
     ) -> Result<(Vec<ChatSessionNode>, usize)> {
         let sessions = self.chat_sessions.read().await;
         // Collect workspace project slugs for membership check
@@ -6262,6 +6263,10 @@ impl GraphStore for MockGraphStore {
         let mut filtered: Vec<_> = sessions
             .values()
             .filter(|s| {
+                // Filter out detached sessions unless explicitly requested
+                if !include_detached && s.spawned_by.is_some() {
+                    return false;
+                }
                 if let Some(slug) = project_slug {
                     s.project_slug.as_deref() == Some(slug)
                 } else if let Some(ws) = workspace_slug {
@@ -6281,6 +6286,25 @@ impl GraphStore for MockGraphStore {
         let total = filtered.len();
         let page = paginate(&filtered, limit, offset);
         Ok((page, total))
+    }
+
+    async fn get_session_children(
+        &self,
+        parent_id: Uuid,
+    ) -> Result<Vec<ChatSessionNode>> {
+        let sessions = self.chat_sessions.read().await;
+        let parent_str = parent_id.to_string();
+        let mut children: Vec<_> = sessions
+            .values()
+            .filter(|s| {
+                s.spawned_by
+                    .as_ref()
+                    .is_some_and(|sb| sb.contains(&parent_str))
+            })
+            .cloned()
+            .collect();
+        children.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        Ok(children)
     }
 
     #[allow(clippy::too_many_arguments)]

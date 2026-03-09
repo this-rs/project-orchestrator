@@ -2039,9 +2039,17 @@ impl GraphStore for Neo4jClient {
         workspace_slug: Option<&str>,
         limit: usize,
         offset: usize,
+        include_detached: bool,
     ) -> anyhow::Result<(Vec<ChatSessionNode>, usize)> {
-        self.list_chat_sessions(project_slug, workspace_slug, limit, offset)
+        self.list_chat_sessions(project_slug, workspace_slug, limit, offset, include_detached)
             .await
+    }
+
+    async fn get_session_children(
+        &self,
+        parent_id: Uuid,
+    ) -> anyhow::Result<Vec<ChatSessionNode>> {
+        self.get_session_children(parent_id).await
     }
 
     #[allow(clippy::too_many_arguments)]

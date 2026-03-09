@@ -150,6 +150,9 @@ pub struct SessionsListQuery {
     pub project_slug: Option<String>,
     #[serde(default)]
     pub workspace_slug: Option<String>,
+    /// Include detached sessions (spawned by runner/sub-agent). Defaults to false.
+    #[serde(default)]
+    pub include_detached: bool,
     #[serde(flatten)]
     pub pagination: PaginationParams,
 }
@@ -169,6 +172,7 @@ pub async fn list_sessions(
             query.workspace_slug.as_deref(),
             query.pagination.validated_limit(),
             query.pagination.offset,
+            query.include_detached,
         )
         .await
         .map_err(AppError::Internal)?;
@@ -192,6 +196,7 @@ pub async fn list_sessions(
             preview: s.preview,
             permission_mode: s.permission_mode,
             add_dirs: s.add_dirs,
+            spawned_by: s.spawned_by.and_then(|sb| serde_json::from_str(&sb).ok()),
         })
         .collect();
 
@@ -232,7 +237,45 @@ pub async fn get_session(
         preview: node.preview,
         permission_mode: node.permission_mode,
         add_dirs: node.add_dirs,
+        spawned_by: node.spawned_by.and_then(|sb| serde_json::from_str(&sb).ok()),
     }))
+}
+
+/// GET /api/chat/sessions/{id}/children — Get child sessions spawned by this session
+pub async fn get_session_children(
+    State(state): State<OrchestratorState>,
+    Path(session_id): Path<Uuid>,
+) -> Result<Json<Vec<ChatSession>>, AppError> {
+    let children = state
+        .orchestrator
+        .neo4j()
+        .get_session_children(session_id)
+        .await
+        .map_err(AppError::Internal)?;
+
+    let items: Vec<ChatSession> = children
+        .into_iter()
+        .map(|s| ChatSession {
+            id: s.id.to_string(),
+            cli_session_id: s.cli_session_id,
+            project_slug: s.project_slug,
+            workspace_slug: s.workspace_slug,
+            cwd: s.cwd,
+            title: s.title,
+            model: s.model,
+            created_at: s.created_at.to_rfc3339(),
+            updated_at: s.updated_at.to_rfc3339(),
+            message_count: s.message_count,
+            total_cost_usd: s.total_cost_usd,
+            conversation_id: s.conversation_id,
+            preview: s.preview,
+            permission_mode: s.permission_mode,
+            add_dirs: s.add_dirs,
+            spawned_by: s.spawned_by.and_then(|sb| serde_json::from_str(&sb).ok()),
+        })
+        .collect();
+
+    Ok(Json(items))
 }
 
 /// DELETE /api/chat/sessions/{id} — Delete a session

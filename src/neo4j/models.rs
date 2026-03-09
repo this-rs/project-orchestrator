@@ -93,6 +93,11 @@ pub struct ChatSessionNode {
     /// Additional directories exposed to Claude CLI (serialized as JSON array string in Neo4j)
     #[serde(default)]
     pub add_dirs: Option<Vec<String>>,
+    /// Origin of the session — JSON string stored in Neo4j.
+    /// Pattern: `{"type":"runner","run_id":"...","plan_id":"..."}` for PlanRunner sessions.
+    /// None/empty for normal user-initiated sessions.
+    #[serde(default)]
+    pub spawned_by: Option<String>,
 }
 
 // ============================================================================
@@ -1936,6 +1941,7 @@ mod tests {
             preview: None,
             permission_mode: None,
             add_dirs: Some(vec!["/dir/a".to_string(), "/dir/b".to_string()]),
+            spawned_by: None,
         };
 
         let json = serde_json::to_string(&session).unwrap();
@@ -1963,6 +1969,7 @@ mod tests {
             preview: None,
             permission_mode: None,
             add_dirs: None,
+            spawned_by: None,
         };
 
         let json = serde_json::to_string(&session).unwrap();
