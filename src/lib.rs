@@ -332,6 +332,14 @@ pub struct OidcConfig {
     /// OAuth2 scopes (default: "openid email profile")
     #[serde(default = "default_scopes")]
     pub scopes: String,
+    /// Extra query parameters appended to the authorization URL.
+    ///
+    /// Allows provider-specific params without hardcoding per provider_key.
+    /// Example: `{"access_type": "offline", "prompt": "consent"}` for Google.
+    /// Google defaults (access_type=offline, prompt=consent) are auto-injected
+    /// when provider_key is "google" unless explicitly overridden here.
+    #[serde(default)]
+    pub extra_auth_params: std::collections::HashMap<String, String>,
 }
 
 fn default_access_token_expiry() -> u64 {
@@ -382,6 +390,7 @@ impl AuthConfig {
                     redirect_uri: redirect_uri.clone(),
                     provider_name: "Google".to_string(),
                     scopes: "openid email profile".to_string(),
+                    extra_auth_params: Default::default(),
                 })
             }
             _ => None,
@@ -1196,6 +1205,27 @@ pub async fn start_server(mut config: Config) -> Result<()> {
         tracing::info!("TriggerEngine booted with 2 active providers (schedule, event)");
     }
 
+    // Pre-build OIDC client once (avoids fetching discovery document on every request)
+    let oidc_client = if let Some(ref auth_cfg) = config.auth_config {
+        match auth::oidc::OidcClient::from_auth_config(auth_cfg).await {
+            Ok(client) => {
+                tracing::info!(
+                    provider = %client.provider_name,
+                    provider_key = %client.provider_key,
+                    "OIDC client initialized at startup"
+                );
+                Some(std::sync::Arc::new(client))
+            }
+            Err(e) => {
+                // Not fatal — server can run without OIDC (password auth, Google legacy, etc.)
+                tracing::warn!("OIDC client initialization failed (auth will be unavailable): {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Create server state
     let server_state = Arc::new(ServerState {
         orchestrator,
@@ -1211,6 +1241,7 @@ pub async fn start_server(mut config: Config) -> Result<()> {
         public_url: config.public_url.clone(),
         ws_ticket_store,
         registry_remote_url: config.registry_remote_url.clone(),
+        oidc_client,
     });
 
     // Create router

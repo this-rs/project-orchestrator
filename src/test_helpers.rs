@@ -54,6 +54,7 @@ pub fn mock_app_state() -> AppState {
             embedding_api_key: None,
             embedding_dimensions: None,
             registry_remote_url: None,
+
             config_yaml_path: None,
         }),
     }
@@ -96,6 +97,7 @@ pub fn mock_app_state_with(graph: MockGraphStore, search: MockSearchStore) -> Ap
             embedding_api_key: None,
             embedding_dimensions: None,
             registry_remote_url: None,
+
             config_yaml_path: None,
         }),
     }
@@ -138,6 +140,7 @@ pub fn mock_app_state_with_graph(graph: Arc<MockGraphStore>) -> AppState {
             embedding_api_key: None,
             embedding_dimensions: None,
             registry_remote_url: None,
+
             config_yaml_path: None,
         }),
     }
@@ -185,6 +188,7 @@ pub fn mock_app_state_with_stores() -> (AppState, Arc<MockGraphStore>, Arc<MockS
             embedding_api_key: None,
             embedding_dimensions: None,
             registry_remote_url: None,
+
             config_yaml_path: None,
         }),
     };

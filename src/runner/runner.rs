@@ -48,14 +48,29 @@ static VECTOR_COLLECTOR: LazyLock<Arc<RwLock<VectorCollector>>> =
 // ============================================================================
 
 const RUNNER_CONSTRAINTS: &str = r#"
-## Runner Constraints
+## Runner Execution Mode
 
-You are an autonomous agent spawned by the PlanRunner. Follow these rules strictly:
+You are an **autonomous code execution agent** spawned by the PlanRunner.
+Your ONLY job is to **write code, test it, and commit it**. You are NOT in a conversation.
 
-1. **DO NOT** call `task(action: "update", status: ...)` or `step(action: "update", status: ...)` via MCP — the Runner manages all status transitions.
-2. Work autonomously without asking for user confirmation. Execute the task fully.
-3. Make atomic commits with conventional format: `<type>(<scope>): <short description>`.
-4. **NEVER** commit sensitive files (.env, credentials, *.key, *.pem, *.secret).
+### Behavior Rules
+1. **Execute immediately** — read the task, analyze the code, write the fix, test, commit. No discussion.
+2. **DO NOT** call `task(action: "update", status: ...)` or `step(action: "update", status: ...)` via MCP — the Runner manages all status transitions.
+3. **DO NOT** ask questions, request confirmation, or explain your reasoning at length. Just do the work.
+4. **DO NOT** use MCP project orchestrator tools for searching code — use Read, Grep, Glob directly for speed.
+5. Make atomic commits with conventional format: `<type>(<scope>): <short description>`.
+6. **NEVER** commit sensitive files (.env, credentials, *.key, *.pem, *.secret).
+7. After writing code, ALWAYS run `cargo check` (Rust) or the relevant build command to verify compilation.
+8. If tests are mentioned in steps, run them.
+9. If `cargo check` or tests fail, fix the errors and retry — do not give up.
+10. When done with ALL steps, make a final commit summarizing the work.
+
+### Execution Flow
+1. Read the affected files listed below
+2. For each step: implement → verify → move to next
+3. Run `cargo check` / `cargo test` as verification
+4. Commit with a clear message
+5. You are DONE when all steps are implemented and the code compiles
 "#;
 
 // ============================================================================
@@ -903,15 +918,24 @@ impl PlanRunner {
         }
 
         if is_error {
-            return Ok(wrap(TaskResult::Failed {
-                reason: if error_text.is_empty() {
-                    format!("Agent returned error (subtype: {})", _subtype)
-                } else {
-                    error_text
-                },
-                attempts: 0,
-                cost_usd,
-            }));
+            // error_max_turns means the agent hit the CLI turn limit — NOT a real failure.
+            // The agent likely finished its work; proceed to verification.
+            if _subtype == "error_max_turns" {
+                info!(
+                    "Task {} hit max_turns — proceeding to verification (code may be complete)",
+                    task_id
+                );
+            } else {
+                return Ok(wrap(TaskResult::Failed {
+                    reason: if error_text.is_empty() {
+                        format!("Agent returned error (subtype: {})", _subtype)
+                    } else {
+                        error_text
+                    },
+                    attempts: 0,
+                    cost_usd,
+                }));
+            }
         }
 
         // Post-task verification (build, steps, git sanity)
@@ -1491,10 +1515,12 @@ mod tests {
 
     #[test]
     fn test_runner_constraints_in_prompt() {
-        assert!(RUNNER_CONSTRAINTS.contains("## Runner Constraints"));
+        assert!(RUNNER_CONSTRAINTS.contains("## Runner Execution Mode"));
+        assert!(RUNNER_CONSTRAINTS.contains("autonomous code execution agent"));
         assert!(RUNNER_CONSTRAINTS.contains("DO NOT"));
         assert!(RUNNER_CONSTRAINTS.contains("task(action: \"update\", status"));
         assert!(RUNNER_CONSTRAINTS.contains(".env"));
+        assert!(RUNNER_CONSTRAINTS.contains("cargo check"));
     }
 
     #[test]

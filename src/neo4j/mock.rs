@@ -519,6 +519,26 @@ impl GraphStore for MockGraphStore {
         metadata: Option<serde_json::Value>,
         slug: Option<String>,
     ) -> Result<()> {
+        // Validate slug format + uniqueness if provided
+        if let Some(ref new_slug) = slug {
+            // Format validation
+            let slug_re = regex::Regex::new(r"^[a-z0-9][a-z0-9-]*[a-z0-9]$").unwrap();
+            if new_slug.len() < 2 || new_slug.len() > 64 || !slug_re.is_match(new_slug) {
+                anyhow::bail!(
+                    "Invalid slug '{}'. Slugs must match ^[a-z0-9][a-z0-9-]*[a-z0-9]$ (2-64 chars)",
+                    new_slug
+                );
+            }
+            // Uniqueness check
+            let workspaces = self.workspaces.read().await;
+            for (wid, w) in workspaces.iter() {
+                if *wid != id && w.slug == *new_slug {
+                    anyhow::bail!("Slug '{}' is already taken by another workspace", new_slug);
+                }
+            }
+            drop(workspaces);
+        }
+
         if let Some(w) = self.workspaces.write().await.get_mut(&id) {
             if let Some(n) = name {
                 w.name = n;

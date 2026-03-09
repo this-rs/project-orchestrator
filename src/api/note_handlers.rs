@@ -1302,6 +1302,7 @@ mod tests {
             public_url: None,
             ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
             registry_remote_url: None,
+            oidc_client: None,
         });
         create_router(state)
     }
