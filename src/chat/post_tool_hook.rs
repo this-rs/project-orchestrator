@@ -16,8 +16,8 @@ use crate::skills::hook_extractor::{
 };
 use crate::skills::project_resolver::resolve_project_from_context;
 use std::collections::HashMap;
-use std::sync::Mutex;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Instant;
 use tracing::debug;
 
@@ -70,13 +70,13 @@ impl PostToolUseRedirectHook {
     }
 
     /// Build a co-changer alert for a file that was just modified.
-    async fn build_edit_alert(
-        &self,
-        file_path: &str,
-        project_id: uuid::Uuid,
-    ) -> Option<String> {
+    async fn build_edit_alert(&self, file_path: &str, project_id: uuid::Uuid) -> Option<String> {
         let project_id_str = project_id.to_string();
-        let card = match self.graph_store.get_context_card(file_path, &project_id_str).await {
+        let card = match self
+            .graph_store
+            .get_context_card(file_path, &project_id_str)
+            .await
+        {
             Ok(Some(c)) => c,
             _ => return None,
         };
@@ -93,7 +93,12 @@ impl PostToolUseRedirectHook {
 
         // Co-changers alert
         if !card.cc_co_changers_top5.is_empty() {
-            let changers: Vec<&str> = card.cc_co_changers_top5.iter().take(3).map(|s| s.as_str()).collect();
+            let changers: Vec<&str> = card
+                .cc_co_changers_top5
+                .iter()
+                .take(3)
+                .map(|s| s.as_str())
+                .collect();
             alerts.push(format!(
                 "🔗 **Co-changers**: you modified `{}` — these files often change together: {}. Consider reviewing them.",
                 file_path.rsplit('/').next().unwrap_or(file_path),
@@ -104,7 +109,10 @@ impl PostToolUseRedirectHook {
         if alerts.is_empty() {
             None
         } else {
-            Some(format!("## 📝 Post-Edit Intelligence\n{}", alerts.join("\n")))
+            Some(format!(
+                "## 📝 Post-Edit Intelligence\n{}",
+                alerts.join("\n")
+            ))
         }
     }
 }
@@ -127,8 +135,7 @@ impl nexus_claude::HookCallback for PostToolUseRedirectHook {
         let throttle_key = format!(
             "{}:{}",
             post_tool.tool_name,
-            extract_file_context(&post_tool.tool_name, &post_tool.tool_input)
-                .unwrap_or_default()
+            extract_file_context(&post_tool.tool_name, &post_tool.tool_input).unwrap_or_default()
         );
         if self.is_throttled(&throttle_key) {
             return Ok(Self::passthrough());
@@ -156,15 +163,12 @@ impl nexus_claude::HookCallback for PostToolUseRedirectHook {
                 let line_count = Self::count_result_lines(result_text);
 
                 if line_count >= MIN_NOISY_LINES {
-                    if let Some(suggestion) = generate_redirect_suggestion(
-                        &post_tool.tool_name,
-                        &post_tool.tool_input,
-                    ) {
+                    if let Some(suggestion) =
+                        generate_redirect_suggestion(&post_tool.tool_name, &post_tool.tool_input)
+                    {
                         // Try to enrich with ContextCard
-                        let file_path = extract_file_context(
-                            &post_tool.tool_name,
-                            &post_tool.tool_input,
-                        );
+                        let file_path =
+                            extract_file_context(&post_tool.tool_name, &post_tool.tool_input);
                         let enriched = if let Some(ref fp) = file_path {
                             let pid = project_id.to_string();
                             match self.graph_store.get_context_card(fp, &pid).await {
@@ -276,8 +280,14 @@ mod tests {
     #[test]
     fn test_count_result_lines() {
         assert_eq!(PostToolUseRedirectHook::count_result_lines(""), 0);
-        assert_eq!(PostToolUseRedirectHook::count_result_lines("one\ntwo\nthree"), 3);
-        let many = (0..30).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
+        assert_eq!(
+            PostToolUseRedirectHook::count_result_lines("one\ntwo\nthree"),
+            3
+        );
+        let many = (0..30)
+            .map(|i| format!("line {}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
         assert_eq!(PostToolUseRedirectHook::count_result_lines(&many), 30);
     }
 }

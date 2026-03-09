@@ -10,7 +10,9 @@
 //! - Cache: 30s per file (avoids repeated Neo4j fetches)
 //! - Total stage budget: 100ms
 
-use crate::chat::enrichment::{EnrichmentConfig, EnrichmentContext, EnrichmentInput, EnrichmentStage};
+use crate::chat::enrichment::{
+    EnrichmentConfig, EnrichmentContext, EnrichmentInput, EnrichmentStage,
+};
 use crate::graph::models::ContextCard;
 use crate::neo4j::traits::GraphStore;
 use anyhow::Result;
@@ -44,7 +46,8 @@ impl FileContextStage {
     fn extract_file_paths(message: &str) -> Vec<String> {
         let mut paths = Vec::new();
         for word in message.split_whitespace() {
-            let cleaned = word.trim_matches(|c: char| c == '`' || c == '\'' || c == '"' || c == ',');
+            let cleaned =
+                word.trim_matches(|c: char| c == '`' || c == '\'' || c == '"' || c == ',');
             // Match file-like patterns (contains / and a dot extension)
             if cleaned.contains('/')
                 && cleaned.contains('.')
@@ -105,9 +108,7 @@ impl FileContextStage {
                 .cc_co_changers_top5
                 .iter()
                 .take(3)
-                .map(|s| {
-                    s.rsplit('/').next().unwrap_or(s)
-                })
+                .map(|s| s.rsplit('/').next().unwrap_or(s))
                 .collect();
             lines.push(format!("  🔗 Co-changers: {}", changers.join(", ")));
         }
@@ -177,7 +178,11 @@ impl EnrichmentStage for FileContextStage {
             }
 
             // Fetch ContextCard (single Neo4j query, pre-computed data)
-            match self.graph_store.get_context_card(path, &project_id_str).await {
+            match self
+                .graph_store
+                .get_context_card(path, &project_id_str)
+                .await
+            {
                 Ok(Some(card)) => {
                     let formatted = Self::format_card(&card);
                     self.set_cache(path.clone(), formatted.clone());

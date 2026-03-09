@@ -138,7 +138,9 @@ impl nexus_claude::HookCallback for SkillActivationHook {
         let mut combined_context = outcome.response.context.clone();
 
         // 5b. Generate redirect suggestion for Grep/Bash tools
-        if let Some(suggestion) = generate_redirect_suggestion(&pre_tool.tool_name, &pre_tool.tool_input) {
+        if let Some(suggestion) =
+            generate_redirect_suggestion(&pre_tool.tool_name, &pre_tool.tool_input)
+        {
             // Try to enrich with ContextCard (best-effort, don't block on failure)
             let file_path = crate::skills::hook_extractor::extract_file_context(
                 &pre_tool.tool_name,

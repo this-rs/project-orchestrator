@@ -656,7 +656,8 @@ fn is_symbol_like(pattern: &str) -> bool {
     let has_camel = pattern.chars().next().map_or(false, |c| c.is_uppercase())
         && pattern.chars().any(|c| c.is_lowercase());
     // snake_case: contains underscore with alphanumeric only
-    let has_snake = pattern.contains('_') && pattern.chars().all(|c| c.is_alphanumeric() || c == '_');
+    let has_snake =
+        pattern.contains('_') && pattern.chars().all(|c| c.is_alphanumeric() || c == '_');
     // Rust path: contains ::
     let has_path = pattern.contains("::");
 
@@ -720,7 +721,8 @@ pub fn enrich_redirect_with_context_card(
     }
 
     // High-risk warning based on centrality metrics
-    let risk_score = card.cc_pagerank * 0.4 + card.cc_betweenness * 0.3
+    let risk_score = card.cc_pagerank * 0.4
+        + card.cc_betweenness * 0.3
         + (card.cc_imports_in as f64 / (card.cc_imports_in as f64 + 1.0).max(1.0)) * 0.3;
     if risk_score > 0.5 {
         warnings.push(format!(
@@ -731,7 +733,12 @@ pub fn enrich_redirect_with_context_card(
 
     // Co-changers alert
     if !card.cc_co_changers_top5.is_empty() {
-        let changers: Vec<&str> = card.cc_co_changers_top5.iter().take(3).map(|s| s.as_str()).collect();
+        let changers: Vec<&str> = card
+            .cc_co_changers_top5
+            .iter()
+            .take(3)
+            .map(|s| s.as_str())
+            .collect();
         warnings.push(format!(
             "🔗 **Co-changers**: {} — these files often change together, check them too.",
             changers.join(", ")
@@ -1590,7 +1597,10 @@ mod tests {
             ..Default::default()
         };
         let enriched = enrich_redirect_with_context_card(suggestion, &card);
-        assert!(enriched.context_warnings.iter().any(|w| w.contains("Bridge")));
+        assert!(enriched
+            .context_warnings
+            .iter()
+            .any(|w| w.contains("Bridge")));
     }
 
     #[test]
@@ -1601,15 +1611,18 @@ mod tests {
             reason: "test".to_string(),
         };
         let card = crate::graph::models::ContextCard {
-            cc_co_changers_top5: vec![
-                "enrichment.rs".to_string(),
-                "hook_handlers.rs".to_string(),
-            ],
+            cc_co_changers_top5: vec!["enrichment.rs".to_string(), "hook_handlers.rs".to_string()],
             ..Default::default()
         };
         let enriched = enrich_redirect_with_context_card(suggestion, &card);
-        assert!(enriched.context_warnings.iter().any(|w| w.contains("Co-changers")));
-        assert!(enriched.context_warnings.iter().any(|w| w.contains("enrichment.rs")));
+        assert!(enriched
+            .context_warnings
+            .iter()
+            .any(|w| w.contains("Co-changers")));
+        assert!(enriched
+            .context_warnings
+            .iter()
+            .any(|w| w.contains("enrichment.rs")));
     }
 
     #[test]
@@ -1622,7 +1635,13 @@ mod tests {
         let card = crate::graph::models::ContextCard::default();
         let enriched = enrich_redirect_with_context_card(suggestion, &card);
         // Default card has 0 for all metrics → no risk or bridge warnings
-        assert!(enriched.context_warnings.iter().all(|w| !w.contains("Bridge")));
-        assert!(enriched.context_warnings.iter().all(|w| !w.contains("High-risk")));
+        assert!(enriched
+            .context_warnings
+            .iter()
+            .all(|w| !w.contains("Bridge")));
+        assert!(enriched
+            .context_warnings
+            .iter()
+            .all(|w| !w.contains("High-risk")));
     }
 }
