@@ -191,6 +191,7 @@ async fn test_workspace_project_association() {
         last_synced: None,
         analytics_computed_at: None,
         last_co_change_computed_at: None,
+        scaffolding_override: None,
     };
     state.neo4j.create_project(&project).await.unwrap();
 
@@ -427,6 +428,7 @@ async fn test_resource_project_links() {
         last_synced: None,
         analytics_computed_at: None,
         last_co_change_computed_at: None,
+        scaffolding_override: None,
     };
     state.neo4j.create_project(&api_project).await.unwrap();
 
@@ -440,6 +442,7 @@ async fn test_resource_project_links() {
         last_synced: None,
         analytics_computed_at: None,
         last_co_change_computed_at: None,
+        scaffolding_override: None,
     };
     state.neo4j.create_project(&frontend_project).await.unwrap();
 
@@ -681,6 +684,7 @@ async fn test_component_project_mapping() {
         last_synced: None,
         analytics_computed_at: None,
         last_co_change_computed_at: None,
+        scaffolding_override: None,
     };
     state.neo4j.create_project(&project).await.unwrap();
 
@@ -797,6 +801,7 @@ async fn test_workspace_milestone_task_association() {
         actual_complexity: None,
         acceptance_criteria: vec![],
         affected_files: vec![],
+        frustration_score: 0.0,
     };
     state.neo4j.create_task(plan.id, &task).await.unwrap();
 
@@ -1072,6 +1077,7 @@ async fn test_multiple_projects_in_workspace() {
             last_synced: None,
             analytics_computed_at: None,
             last_co_change_computed_at: None,
+            scaffolding_override: None,
         };
         state.neo4j.create_project(&project).await.unwrap();
         state

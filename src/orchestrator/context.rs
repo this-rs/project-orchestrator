@@ -488,6 +488,7 @@ mod tests {
             updated_at: None,
             started_at: None,
             completed_at: None,
+            frustration_score: 0.0,
         }
     }
 
@@ -519,6 +520,7 @@ mod tests {
             similar_code: vec![],
             related_decisions: vec![],
             notes: vec![],
+            frustration_signals: None,
         };
 
         // Create a mock builder (we don't actually need database for generate_prompt)
@@ -559,6 +561,7 @@ mod tests {
             similar_code: vec![],
             related_decisions: vec![],
             notes: vec![],
+            frustration_signals: None,
         };
 
         // Verify that constraint formatting works
@@ -602,6 +605,7 @@ mod tests {
             similar_code: vec![],
             related_decisions: vec![],
             notes: vec![],
+            frustration_signals: None,
         };
 
         assert_eq!(context.steps.len(), 2);
@@ -626,11 +630,13 @@ mod tests {
                 status: DecisionStatus::Accepted,
                 embedding: None,
                 embedding_model: None,
+                scar_intensity: 0.0,
             }],
             target_files: vec![],
             similar_code: vec![],
             related_decisions: vec![],
             notes: vec![],
+            frustration_signals: None,
         };
 
         assert_eq!(context.decisions.len(), 1);
@@ -656,6 +662,7 @@ mod tests {
             similar_code: vec![],
             related_decisions: vec![],
             notes: vec![],
+            frustration_signals: None,
         };
 
         assert_eq!(context.target_files.len(), 1);
@@ -678,6 +685,7 @@ mod tests {
             }],
             related_decisions: vec![],
             notes: vec![],
+            frustration_signals: None,
         };
 
         assert_eq!(context.similar_code.len(), 1);
@@ -705,6 +713,7 @@ mod tests {
                 create_test_context_note("tip", "Consider using iterators", "medium", true),
                 create_test_context_note("observation", "This pattern is common", "low", true),
             ],
+            frustration_signals: None,
         };
 
         // Verify notes are present
@@ -755,6 +764,7 @@ mod tests {
             similar_code: vec![],
             related_decisions: vec![],
             notes: vec![],
+            frustration_signals: None,
         };
 
         assert_eq!(context.target_files[0].notes.len(), 1);
@@ -810,6 +820,7 @@ mod tests {
                 "medium",
                 false,
             )],
+            frustration_signals: None,
         };
 
         let json = serde_json::to_string(&context).unwrap();

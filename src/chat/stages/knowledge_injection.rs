@@ -853,7 +853,7 @@ mod tests {
     #[test]
     fn test_render_empty() {
         let stage = make_test_stage();
-        let result = stage.render_knowledge(&[], &[]);
+        let result = stage.render_knowledge(&[], &[], &[]);
         assert!(result.is_none());
     }
 
@@ -868,7 +868,7 @@ mod tests {
             score: 0.9,
             source: "bm25_search",
         }];
-        let result = stage.render_knowledge(&notes, &[]);
+        let result = stage.render_knowledge(&notes, &[], &[]);
         assert!(result.is_some());
         let content = result.unwrap();
         assert!(content.contains("Relevant Notes"));
@@ -885,7 +885,7 @@ mod tests {
             rationale: "No EmbeddingProvider available in ChatManager".to_string(),
             score: 0.95,
         }];
-        let result = stage.render_knowledge(&[], &decisions);
+        let result = stage.render_knowledge(&[], &decisions, &[]);
         assert!(result.is_some());
         let content = result.unwrap();
         assert!(content.contains("Relevant Decisions"));
@@ -910,7 +910,7 @@ mod tests {
             rationale: "Individual timeouts per query".to_string(),
             score: 0.9,
         }];
-        let result = stage.render_knowledge(&notes, &decisions);
+        let result = stage.render_knowledge(&notes, &decisions, &[]);
         assert!(result.is_some());
         let content = result.unwrap();
         assert!(content.contains("Relevant Notes"));
@@ -940,7 +940,7 @@ mod tests {
             })
             .collect();
 
-        let result = stage.render_knowledge(&notes, &[]);
+        let result = stage.render_knowledge(&notes, &[], &[]);
         assert!(result.is_some());
         let content = result.unwrap();
         // Should be truncated — not all 20 notes rendered
@@ -1223,7 +1223,7 @@ mod tests {
         assert_eq!(deduped.len(), 2, "Should have 2 unique notes, not 3");
 
         // Render should have no duplicates
-        let content = stage.render_knowledge(&deduped, &[]).unwrap();
+        let content = stage.render_knowledge(&deduped, &[], &[]).unwrap();
         let count = content.matches("Watch out for null").count();
         assert_eq!(
             count, 1,
@@ -1293,7 +1293,7 @@ mod tests {
             })
             .collect();
 
-        let result = stage.render_knowledge(&notes, &[]);
+        let result = stage.render_knowledge(&notes, &[], &[]);
         assert!(result.is_some());
         let content = result.unwrap();
         assert!(

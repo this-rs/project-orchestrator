@@ -1006,6 +1006,8 @@ mod tests {
             changes: vec![],
             assertion_rule: None,
             last_assertion_result: None,
+            memory_horizon: crate::notes::MemoryHorizon::Operational,
+            scar_intensity: 0.0,
         }
     }
 
@@ -1239,6 +1241,7 @@ mod tests {
             last_synced: None,
             analytics_computed_at: None,
             last_co_change_computed_at: None,
+            scaffolding_override: None,
         };
         store.create_project(&project).await.unwrap();
 
@@ -1275,6 +1278,8 @@ mod tests {
             changes: vec![],
             assertion_rule: None,
             last_assertion_result: None,
+            memory_horizon: crate::notes::MemoryHorizon::Operational,
+            scar_intensity: 0.0,
         };
         store.create_note(&note).await.unwrap();
 

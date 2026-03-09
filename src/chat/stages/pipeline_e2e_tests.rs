@@ -67,6 +67,7 @@ mod tests {
             created_at: Utc::now(),
             analytics_computed_at: None,
             last_co_change_computed_at: None,
+            scaffolding_override: None,
         };
         graph.projects.write().await.insert(project_id, project);
         (project_id, slug)
@@ -117,6 +118,8 @@ mod tests {
             changes: vec![],
             assertion_rule: None,
             last_assertion_result: None,
+            memory_horizon: crate::notes::MemoryHorizon::Operational,
+            scar_intensity: 0.0,
         };
         graph.notes.write().await.insert(note_id, note);
 
@@ -217,6 +220,7 @@ mod tests {
                 updated_at: Some(Utc::now()),
                 started_at: None,
                 completed_at: None,
+                frustration_score: 0.0,
             };
             graph.tasks.write().await.insert(task_id, task);
             task_ids.push(task_id);

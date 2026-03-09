@@ -2398,6 +2398,7 @@ impl GraphStore for MockGraphStore {
             god_functions,
             orphan_files,
             coupling_metrics,
+            prediction_accuracy: None,
         })
     }
 
@@ -2434,22 +2435,98 @@ impl GraphStore for MockGraphStore {
 
     async fn compute_scaffolding_level(
         &self,
-        _project_id: Uuid,
+        project_id: Uuid,
         scaffolding_override: Option<u8>,
     ) -> Result<crate::neo4j::models::ScaffoldingLevel> {
-        let level = scaffolding_override.unwrap_or(2).min(4);
-        let (_, label, recommended_steps) = crate::neo4j::analytics::level_info(level);
+        // Compute real values from mock data
+        let plans = self.plans.read().await;
+        let tasks = self.tasks.read().await;
+        let plan_tasks_map = self.plan_tasks.read().await;
+
+        let mut completed = 0u64;
+        let mut failed = 0u64;
+        let mut total_frustration = 0.0f64;
+        let mut frust_count = 0u64;
+
+        for (plan_id, plan) in plans.iter() {
+            if plan.project_id != Some(project_id) {
+                continue;
+            }
+            if let Some(task_ids) = plan_tasks_map.get(plan_id) {
+                for tid in task_ids {
+                    if let Some(t) = tasks.get(tid) {
+                        match t.status {
+                            crate::neo4j::models::TaskStatus::Completed => completed += 1,
+                            crate::neo4j::models::TaskStatus::Failed => failed += 1,
+                            _ => {}
+                        }
+                        total_frustration += t.frustration_score;
+                        frust_count += 1;
+                    }
+                }
+            }
+        }
+
+        let tasks_analyzed = (completed + failed) as i64;
+        let task_success_rate = if tasks_analyzed > 0 {
+            completed as f64 / tasks_analyzed as f64
+        } else {
+            1.0
+        };
+        let avg_frustration = if frust_count > 0 {
+            total_frustration / frust_count as f64
+        } else {
+            0.0
+        };
+
+        // Scar density from notes
+        let notes = self.notes.read().await;
+        let project_notes: Vec<_> = notes.values()
+            .filter(|n| n.project_id == Some(project_id) && n.status == crate::notes::NoteStatus::Active)
+            .collect();
+        let scar_density = if !project_notes.is_empty() {
+            project_notes.iter().map(|n| n.scar_intensity).sum::<f64>() / project_notes.len() as f64
+        } else {
+            0.0
+        };
+
+        let homeostasis_pain = 0.0; // Simplified for mock
+
+        let competence_score = (task_success_rate * 0.5
+            + (1.0 - avg_frustration) * 0.2
+            + (1.0 - scar_density) * 0.15
+            + (1.0 - homeostasis_pain) * 0.15)
+            .clamp(0.0, 1.0);
+
+        let (level, label, recommended_steps) = if let Some(ovr) = scaffolding_override {
+            let ovr = ovr.min(4);
+            crate::neo4j::analytics::level_info(ovr)
+        } else {
+            let auto_level = if competence_score >= 0.9 {
+                4
+            } else if competence_score >= 0.75 {
+                3
+            } else if competence_score >= 0.5 {
+                2
+            } else if competence_score >= 0.3 {
+                1
+            } else {
+                0
+            };
+            crate::neo4j::analytics::level_info(auto_level)
+        };
+
         Ok(crate::neo4j::models::ScaffoldingLevel {
             level,
             label,
             recommended_steps,
-            task_success_rate: 0.8,
-            avg_frustration: 0.1,
-            scar_density: 0.05,
-            homeostasis_pain: 0.1,
-            competence_score: 0.7,
+            task_success_rate,
+            avg_frustration,
+            scar_density,
+            homeostasis_pain,
+            competence_score,
             is_overridden: scaffolding_override.is_some(),
-            tasks_analyzed: 0,
+            tasks_analyzed,
         })
     }
 
@@ -2472,6 +2549,7 @@ impl GraphStore for MockGraphStore {
         // Mock: check task statuses in this project's plans
         let plans = self.plans.read().await;
         let tasks = self.tasks.read().await;
+        let plan_tasks = self.plan_tasks.read().await;
 
         let mut completed_recent = 0i64;
         let mut total_frustration = 0.0f64;
@@ -2481,15 +2559,17 @@ impl GraphStore for MockGraphStore {
             if plan.project_id != Some(project_id) {
                 continue;
             }
-            if let Some(task_list) = tasks.get(plan_id) {
-                for t in task_list {
-                    if t.status == crate::neo4j::models::TaskStatus::Completed {
-                        completed_recent += 1;
-                    }
-                    if t.status == crate::neo4j::models::TaskStatus::InProgress {
-                        if let Some(f) = t.frustration {
-                            total_frustration += f;
-                            frustration_count += 1;
+            if let Some(task_ids) = plan_tasks.get(plan_id) {
+                for task_id in task_ids {
+                    if let Some(t) = tasks.get(task_id) {
+                        if t.status == crate::neo4j::models::TaskStatus::Completed {
+                            completed_recent += 1;
+                        }
+                        if t.status == crate::neo4j::models::TaskStatus::InProgress {
+                            if t.frustration_score > 0.0 {
+                                total_frustration += t.frustration_score;
+                                frustration_count += 1;
+                            }
                         }
                     }
                 }
@@ -2504,12 +2584,12 @@ impl GraphStore for MockGraphStore {
 
         let notes = self.notes.read().await;
         let note_count = notes
-            .iter()
+            .values()
             .filter(|n| n.project_id == Some(project_id))
             .count() as i64;
         let mean_energy = if note_count > 0 {
             notes
-                .iter()
+                .values()
                 .filter(|n| n.project_id == Some(project_id))
                 .map(|n| n.energy)
                 .sum::<f64>()
@@ -5774,22 +5854,58 @@ impl GraphStore for MockGraphStore {
 
     async fn compute_homeostasis(
         &self,
-        _project_id: Uuid,
+        project_id: Uuid,
         _custom_ranges: Option<&[(String, f64, f64)]>,
     ) -> Result<crate::neo4j::models::HomeostasisReport> {
         use crate::neo4j::models::{HomeostasisReport, HomeostasisRatio, HomeostasisSeverity};
+
+        let notes = self.notes.read().await;
+        let project_notes: Vec<_> = notes.values()
+            .filter(|n| n.project_id == Some(project_id) && n.status == crate::notes::NoteStatus::Active)
+            .collect();
+
+        let total = project_notes.len() as f64;
+        let scarred = project_notes.iter().filter(|n| n.scar_intensity > 0.0).count() as f64;
+        let scar_load = if total > 0.0 { scarred / total } else { 0.0 };
+
+        let mut ratios = vec![
+            HomeostasisRatio {
+                name: "note_density".to_string(),
+                value: total.max(1.0),
+                target_range: (0.3, 2.0),
+                distance_to_equilibrium: 0.0,
+                severity: HomeostasisSeverity::Ok,
+                recommendation: None,
+            },
+        ];
+
+        // Add scar_load ratio if there are scarred notes
+        let scar_severity = if scar_load > 0.5 {
+            HomeostasisSeverity::Critical
+        } else if scar_load > 0.2 {
+            HomeostasisSeverity::Warning
+        } else {
+            HomeostasisSeverity::Ok
+        };
+        ratios.push(HomeostasisRatio {
+            name: "scar_load".to_string(),
+            value: scar_load,
+            target_range: (0.0, 0.2),
+            distance_to_equilibrium: if scar_load > 0.2 { scar_load - 0.2 } else { 0.0 },
+            severity: scar_severity,
+            recommendation: if scar_load > 0.2 {
+                Some("High scar density — consider reviewing scarred notes".to_string())
+            } else {
+                None
+            },
+        });
+
+        let pain_score = ratios.iter().map(|r| r.distance_to_equilibrium).sum::<f64>()
+            / ratios.len() as f64;
+
         Ok(HomeostasisReport {
-            ratios: vec![
-                HomeostasisRatio {
-                    name: "note_density".to_string(),
-                    value: 1.0,
-                    target_range: (0.3, 2.0),
-                    distance_to_equilibrium: 0.0,
-                    severity: HomeostasisSeverity::Ok,
-                    recommendation: None,
-                },
-            ],
-            pain_score: 0.0,
+            ratios,
+            pain_score,
             recommendations: vec![],
         })
     }

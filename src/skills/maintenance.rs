@@ -774,4 +774,246 @@ mod tests {
         assert_eq!(deserialized.synapses_decayed, Some(10));
         assert_eq!(deserialized.warnings.len(), 1);
     }
+
+    // ========================================================================
+    // Biomimicry integration scenarios (T13)
+    // ========================================================================
+
+    use crate::neo4j::models::*;
+    use crate::neo4j::traits::GraphStore;
+    use crate::notes::{Note, NoteImportance, NoteType};
+    use crate::test_helpers::*;
+
+    /// Helper: create project + plan + tasks with given statuses
+    async fn setup_project_with_tasks(
+        store: &MockGraphStore,
+        n_completed: usize,
+        n_failed: usize,
+        n_in_progress: usize,
+    ) -> (uuid::Uuid, uuid::Uuid, Vec<uuid::Uuid>) {
+        let project = test_project();
+        let project_id = project.id;
+        store.create_project(&project).await.unwrap();
+
+        let plan = test_plan_for_project(project_id);
+        let plan_id = plan.id;
+        store.create_plan(&plan).await.unwrap();
+        store.link_plan_to_project(plan_id, project_id).await.unwrap();
+
+        let mut task_ids = Vec::new();
+        for i in 0..n_completed {
+            let mut task = test_task_titled(&format!("Completed {}", i));
+            task.status = TaskStatus::Completed;
+            task.completed_at = Some(chrono::Utc::now());
+            let tid = task.id;
+            store.create_task(plan_id, &task).await.unwrap();
+            task_ids.push(tid);
+        }
+        for i in 0..n_failed {
+            let mut task = test_task_titled(&format!("Failed {}", i));
+            task.status = TaskStatus::Failed;
+            let tid = task.id;
+            store.create_task(plan_id, &task).await.unwrap();
+            task_ids.push(tid);
+        }
+        for i in 0..n_in_progress {
+            let mut task = test_task_titled(&format!("InProgress {}", i));
+            task.status = TaskStatus::InProgress;
+            let tid = task.id;
+            store.create_task(plan_id, &task).await.unwrap();
+            task_ids.push(tid);
+        }
+        (project_id, plan_id, task_ids)
+    }
+
+    /// Scenario 1: Scar → frustration chain
+    #[tokio::test]
+    async fn test_biomimicry_s1_scar_frustration_chain() {
+        let store = MockGraphStore::new();
+        let (_project_id, _plan_id, task_ids) =
+            setup_project_with_tasks(&store, 0, 0, 2).await;
+
+        // Create notes to scar
+        let mut note1 = Note::new(Some(_project_id), NoteType::Observation, "Obs 1".into(), "test".into());
+        note1.importance = NoteImportance::Medium;
+        note1.tags = vec!["test".into()];
+        let note1_id = note1.id;
+        store.create_note(&note1).await.unwrap();
+
+        let mut note2 = Note::new(Some(_project_id), NoteType::Observation, "Obs 2".into(), "test".into());
+        note2.importance = NoteImportance::Medium;
+        note2.tags = vec!["test".into()];
+        let note2_id = note2.id;
+        store.create_note(&note2).await.unwrap();
+
+        // Apply scars
+        let scarred = store.apply_scars(&[note1_id, note2_id], 0.5).await.unwrap();
+        assert_eq!(scarred, 2);
+
+        let n1 = store.get_note(note1_id).await.unwrap().unwrap();
+        assert!((n1.scar_intensity - 0.5).abs() < 0.01, "scar_intensity should be ~0.5, got {}", n1.scar_intensity);
+
+        // Increment frustration
+        let f1 = store.increment_frustration(task_ids[0], 0.3).await.unwrap();
+        assert!((f1 - 0.3).abs() < 0.01);
+        let f2 = store.increment_frustration(task_ids[0], 0.4).await.unwrap();
+        assert!((f2 - 0.7).abs() < 0.01);
+
+        let frust = store.get_frustration(task_ids[0]).await.unwrap();
+        assert!((frust - 0.7).abs() < 0.01);
+    }
+
+    /// Scenario 2: Homeostasis scar_load
+    #[tokio::test]
+    async fn test_biomimicry_s2_homeostasis_scar_load() {
+        let store = MockGraphStore::new();
+        let (project_id, _, _) = setup_project_with_tasks(&store, 5, 0, 0).await;
+
+        let mut note_ids = Vec::new();
+        for i in 0..10 {
+            let mut note = Note::new(Some(project_id), NoteType::Observation, format!("Obs {}", i), "test".into());
+            note.importance = NoteImportance::Medium;
+            note.tags = vec!["test".into()];
+            note_ids.push(note.id);
+            store.create_note(&note).await.unwrap();
+        }
+
+        store.apply_scars(&note_ids, 0.8).await.unwrap();
+
+        let report = store.compute_homeostasis(project_id, None).await.unwrap();
+        let scar_ratio = report.ratios.iter().find(|r| r.name == "scar_load");
+        assert!(scar_ratio.is_some(), "Homeostasis should have scar_load ratio");
+        let scar = scar_ratio.unwrap();
+        assert!(scar.value > 0.0, "scar_load should be > 0, got {}", scar.value);
+    }
+
+    /// Scenario 3: Global stagnation → deep maintenance
+    #[tokio::test]
+    async fn test_biomimicry_s3_stagnation_deep_maintenance() {
+        let store = MockGraphStore::new();
+        let (project_id, _, task_ids) = setup_project_with_tasks(&store, 0, 0, 3).await;
+
+        // High frustration on all in-progress tasks
+        for &tid in &task_ids {
+            store.increment_frustration(tid, 0.8).await.unwrap();
+        }
+
+        // Low energy notes
+        for i in 0..5 {
+            let mut note = Note::new(Some(project_id), NoteType::Observation, format!("Low {}", i), "test".into());
+            note.importance = NoteImportance::Low;
+            note.tags = vec!["test".into()];
+            note.energy = 0.1;
+            store.create_note(&note).await.unwrap();
+        }
+
+        // Detect stagnation
+        let report = store.detect_global_stagnation(project_id).await.unwrap();
+        assert!(report.is_stagnating, "Should detect stagnation");
+        assert!(report.signals_triggered >= 3, "Should have >= 3 signals, got {}", report.signals_triggered);
+        assert_eq!(report.tasks_completed_48h, 0);
+        assert!(report.avg_frustration > 0.6, "Avg frustration should be > 0.6, got {}", report.avg_frustration);
+
+        // Deep maintenance
+        let config = SkillMaintenanceConfig::default();
+        let deep = deep_maintenance(&store, project_id, &config).await.unwrap();
+        assert!(deep.stagnation.is_stagnating);
+        assert!(deep.stuck_tasks_found >= 3, "Should find >= 3 stuck tasks, got {}", deep.stuck_tasks_found);
+        assert!(!deep.recommendations.is_empty());
+    }
+
+    /// Scenario 4: Consolidation + maintenance tracking pipeline
+    #[tokio::test]
+    async fn test_biomimicry_s4_consolidation_measured() {
+        let store = MockGraphStore::new();
+        let (project_id, _, _) = setup_project_with_tasks(&store, 3, 0, 0).await;
+
+        for i in 0..5 {
+            let mut note = Note::new(Some(project_id), NoteType::Observation, format!("Note {}", i), "test".into());
+            note.importance = NoteImportance::Medium;
+            note.tags = vec!["test".into()];
+            note.energy = 0.8;
+            store.create_note(&note).await.unwrap();
+        }
+
+        // Pre-snapshot
+        let before = store.compute_maintenance_snapshot(project_id).await.unwrap();
+        assert_eq!(before.note_count, 5);
+        assert!(before.mean_energy > 0.0);
+
+        // Run tracked maintenance
+        let config = SkillMaintenanceConfig::default();
+        let (result, report) = run_maintenance_with_tracking(&store, project_id, "hourly", &config).await.unwrap();
+
+        assert_eq!(result.level, "hourly");
+        assert!(report.success_rate >= 0.0 && report.success_rate <= 1.0,
+            "success_rate should be in [0, 1], got {}", report.success_rate);
+    }
+
+    /// Scenario 5: Scaffolding adapts to project health
+    #[tokio::test]
+    async fn test_biomimicry_s5_scaffolding_integrated() {
+        let store = MockGraphStore::new();
+
+        // Healthy project: 18 completed, 2 failed
+        let (project_id, _, _) = setup_project_with_tasks(&store, 18, 2, 0).await;
+
+        for i in 0..3 {
+            let mut note = Note::new(Some(project_id), NoteType::Observation, format!("Healthy {}", i), "test".into());
+            note.importance = NoteImportance::Medium;
+            note.tags = vec!["test".into()];
+            note.energy = 0.9;
+            store.create_note(&note).await.unwrap();
+        }
+
+        let level = store.compute_scaffolding_level(project_id, None).await.unwrap();
+        assert!(level.task_success_rate >= 0.8, "Success rate should be >= 0.8, got {}", level.task_success_rate);
+        assert!(level.level >= 3, "Level should be >= 3 with high success, got L{}", level.level);
+        assert!(!level.is_overridden);
+
+        // Degraded project: 2 completed, 8 failed + scars
+        let project2 = test_project_named("degraded");
+        let project2_id = project2.id;
+        store.create_project(&project2).await.unwrap();
+
+        let plan2 = test_plan_for_project(project2_id);
+        let plan2_id = plan2.id;
+        store.create_plan(&plan2).await.unwrap();
+        store.link_plan_to_project(plan2_id, project2_id).await.unwrap();
+
+        for i in 0..2 {
+            let mut t = test_task_titled(&format!("P2 OK {}", i));
+            t.status = TaskStatus::Completed;
+            t.completed_at = Some(chrono::Utc::now());
+            store.create_task(plan2_id, &t).await.unwrap();
+        }
+        for i in 0..8 {
+            let mut t = test_task_titled(&format!("P2 Fail {}", i));
+            t.status = TaskStatus::Failed;
+            store.create_task(plan2_id, &t).await.unwrap();
+        }
+
+        let mut scar_ids = Vec::new();
+        for i in 0..5 {
+            let mut note = Note::new(Some(project2_id), NoteType::Gotcha, format!("Scar {}", i), "test".into());
+            note.importance = NoteImportance::High;
+            note.tags = vec!["test".into()];
+            scar_ids.push(note.id);
+            store.create_note(&note).await.unwrap();
+        }
+        store.apply_scars(&scar_ids, 0.9).await.unwrap();
+
+        let level2 = store.compute_scaffolding_level(project2_id, None).await.unwrap();
+        assert!(level2.task_success_rate <= 0.3, "Should be <= 0.3, got {}", level2.task_success_rate);
+        assert!(level2.level <= 1, "Should be <= L1 with low success + scars, got L{}", level2.level);
+
+        // Verify levels differ
+        assert!(level.level > level2.level, "Healthy L{} > degraded L{}", level.level, level2.level);
+
+        // Test override
+        store.set_scaffolding_override(project2_id, Some(4)).await.unwrap();
+        let overridden = store.compute_scaffolding_level(project2_id, Some(4)).await.unwrap();
+        assert_eq!(overridden.level, 4, "Override should force L4");
+        assert!(overridden.is_overridden);
+    }
 }

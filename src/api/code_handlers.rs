@@ -4411,6 +4411,7 @@ mod tests {
             last_synced: None,
             analytics_computed_at: None,
             last_co_change_computed_at: None,
+            scaffolding_override: None,
         };
         app_state.neo4j.create_project(&project).await.unwrap();
         app_state
@@ -4558,6 +4559,7 @@ mod tests {
             last_synced: None,
             analytics_computed_at: None,
             last_co_change_computed_at: None,
+            scaffolding_override: None,
         };
         graph.create_project(&project).await.unwrap();
 
@@ -4740,6 +4742,7 @@ mod tests {
             last_synced: Some(chrono::Utc::now()),
             analytics_computed_at: None,
             last_co_change_computed_at: None,
+            scaffolding_override: None,
         };
         graph.create_project(&project).await.unwrap();
 
@@ -4939,6 +4942,7 @@ mod tests {
             last_synced: Some(chrono::Utc::now()),
             analytics_computed_at: None,
             last_co_change_computed_at: None,
+            scaffolding_override: None,
         };
         graph.create_project(&project).await.unwrap();
 
@@ -5078,6 +5082,7 @@ mod tests {
             last_synced: Some(chrono::Utc::now()),
             analytics_computed_at: None,
             last_co_change_computed_at: None,
+            scaffolding_override: None,
         };
         graph.create_project(&project).await.unwrap();
 

@@ -657,6 +657,7 @@ mod tests {
             actual_complexity: None,
             started_at: None,
             completed_at: None,
+            frustration_score: 0.0,
         };
         let task2 = TaskNode {
             id: task2_id,
@@ -674,6 +675,7 @@ mod tests {
             actual_complexity: None,
             started_at: None,
             completed_at: None,
+            frustration_score: 0.0,
         };
         graph.tasks.write().await.insert(task1_id, task1);
         graph.tasks.write().await.insert(task2_id, task2);
@@ -1050,6 +1052,7 @@ mod tests {
                 actual_complexity: None,
                 started_at: None,
                 completed_at: None,
+                frustration_score: 0.0,
             },
         );
         graph

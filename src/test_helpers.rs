@@ -305,6 +305,7 @@ pub fn test_task() -> TaskNode {
         updated_at: None,
         started_at: None,
         completed_at: None,
+        frustration_score: 0.0,
     }
 }
 
@@ -334,6 +335,7 @@ pub fn test_decision(description: &str, rationale: &str) -> DecisionNode {
         status: DecisionStatus::Accepted,
         embedding: None,
         embedding_model: None,
+        scar_intensity: 0.0,
     }
 }
 

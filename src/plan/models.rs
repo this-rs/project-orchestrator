@@ -825,6 +825,7 @@ mod tests {
             similar_code: vec![],
             related_decisions: vec![],
             notes: vec![],
+            frustration_signals: None,
         };
 
         let json = serde_json::to_string(&context).unwrap();
