@@ -653,7 +653,7 @@ fn is_symbol_like(pattern: &str) -> bool {
         return false;
     }
     // CamelCase: starts with uppercase, has mixed case, no spaces
-    let has_camel = pattern.chars().next().map_or(false, |c| c.is_uppercase())
+    let has_camel = pattern.chars().next().is_some_and(|c| c.is_uppercase())
         && pattern.chars().any(|c| c.is_lowercase());
     // snake_case: contains underscore with alphanumeric only
     let has_snake =
