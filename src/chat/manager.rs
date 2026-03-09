@@ -3536,6 +3536,42 @@ impl ChatManager {
         Ok(())
     }
 
+    /// Inject a hint message into the agent session WITHOUT interrupting.
+    ///
+    /// Unlike `send_message()`, this does NOT:
+    /// - Set `interrupt_flag`
+    /// - Cancel `interrupt_token`
+    /// - Send SIGINT via `stdin_tx`
+    ///
+    /// The message is queued in `pending_messages` and will be processed
+    /// after the current stream turn ends naturally (via the drain loop).
+    ///
+    /// If the session is NOT currently streaming, falls back to `send_message()`
+    /// since there's no stream to preserve.
+    ///
+    /// Used by the AgentGuard for soft reminders (idle detection, loop detection,
+    /// post-compaction context re-injection) without killing child processes
+    /// (cargo build, npm install, etc.).
+    pub async fn inject_hint(&self, session_id: &str, message: &str) -> Result<()> {
+        let sessions = self.active_sessions.read().await;
+        let session = sessions
+            .get(session_id)
+            .ok_or_else(|| anyhow!("Session {} not found or inactive", session_id))?;
+
+        if session.is_streaming.load(Ordering::SeqCst) {
+            // Queue the message WITHOUT interrupt — the drain loop will pick it up
+            // after the current stream turn ends naturally.
+            info!("Injecting hint into session {} (no interrupt)", session_id);
+            let mut queue = session.pending_messages.lock().await;
+            queue.push_back(message.to_string());
+            Ok(())
+        } else {
+            // Not streaming — just send normally (will start a new stream)
+            drop(sessions); // Release read lock before calling send_message
+            self.send_message(session_id, message).await
+        }
+    }
+
     /// Send a permission response (allow/deny) to the Claude CLI subprocess.
     ///
     /// Unlike `send_message`, this does NOT:

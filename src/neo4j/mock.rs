@@ -69,6 +69,12 @@ pub struct MockGraphStore {
     pub chat_events: RwLock<HashMap<Uuid, Vec<ChatEventRecord>>>,
     /// Per-session auto_continue flag (stored separately from ChatSessionNode)
     pub session_auto_continue: RwLock<HashMap<Uuid, bool>>,
+    /// PlanRun states (Runner)
+    pub plan_runs: RwLock<HashMap<Uuid, crate::runner::RunnerState>>,
+    /// Triggers
+    pub triggers: RwLock<HashMap<Uuid, crate::runner::Trigger>>,
+    /// Trigger firings
+    pub trigger_firings: RwLock<HashMap<Uuid, Vec<crate::runner::TriggerFiring>>>,
 
     // Relationships (adjacency lists)
     pub plan_tasks: RwLock<HashMap<Uuid, Vec<Uuid>>>,
@@ -143,6 +149,9 @@ pub struct MockGraphStore {
     // Topology rules (keyed by rule id String)
     pub topology_rules: RwLock<HashMap<String, crate::graph::models::TopologyRule>>,
 
+    /// Decision AFFECTS relations: decision_id -> Vec<AffectsRelation>
+    pub decision_affects: RwLock<HashMap<Uuid, Vec<AffectsRelation>>>,
+
     // Test flags
     /// Controls what `has_context_cards()` returns (default: false)
     pub mock_has_context_cards: std::sync::atomic::AtomicBool,
@@ -177,6 +186,9 @@ impl MockGraphStore {
             chat_sessions: RwLock::new(HashMap::new()),
             chat_events: RwLock::new(HashMap::new()),
             session_auto_continue: RwLock::new(HashMap::new()),
+            plan_runs: RwLock::new(HashMap::new()),
+            triggers: RwLock::new(HashMap::new()),
+            trigger_firings: RwLock::new(HashMap::new()),
             plan_tasks: RwLock::new(HashMap::new()),
             task_steps: RwLock::new(HashMap::new()),
             task_decisions: RwLock::new(HashMap::new()),
@@ -227,6 +239,7 @@ impl MockGraphStore {
             published_skills: RwLock::new(HashMap::new()),
             analysis_profiles: RwLock::new(HashMap::new()),
             topology_rules: RwLock::new(HashMap::new()),
+            decision_affects: RwLock::new(HashMap::new()),
             mock_has_context_cards: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -4036,11 +4049,25 @@ impl GraphStore for MockGraphStore {
 
     async fn get_decisions_for_entity(
         &self,
-        _entity_type: &str,
-        _entity_id: &str,
-        _limit: u32,
+        entity_type: &str,
+        entity_id: &str,
+        limit: u32,
     ) -> Result<Vec<DecisionNode>> {
-        // Mock: return empty — decision entity traversal requires graph
+        // For tasks, look up via task_decisions mapping
+        if entity_type.eq_ignore_ascii_case("task") {
+            if let Ok(task_id) = Uuid::parse_str(entity_id) {
+                let task_decisions = self.task_decisions.read().await;
+                let decisions = self.decisions.read().await;
+                if let Some(decision_ids) = task_decisions.get(&task_id) {
+                    let result: Vec<DecisionNode> = decision_ids
+                        .iter()
+                        .filter_map(|did| decisions.get(did).cloned())
+                        .take(limit as usize)
+                        .collect();
+                    return Ok(result);
+                }
+            }
+        }
         Ok(vec![])
     }
 
@@ -4108,25 +4135,46 @@ impl GraphStore for MockGraphStore {
 
     async fn add_decision_affects(
         &self,
-        _decision_id: Uuid,
-        _entity_type: &str,
-        _entity_id: &str,
-        _impact_description: Option<&str>,
+        decision_id: Uuid,
+        entity_type: &str,
+        entity_id: &str,
+        impact_description: Option<&str>,
     ) -> Result<()> {
+        let relation = AffectsRelation {
+            entity_type: entity_type.to_string(),
+            entity_id: entity_id.to_string(),
+            entity_name: None,
+            impact_description: impact_description.map(|s| s.to_string()),
+        };
+        self.decision_affects
+            .write()
+            .await
+            .entry(decision_id)
+            .or_default()
+            .push(relation);
         Ok(())
     }
 
     async fn remove_decision_affects(
         &self,
-        _decision_id: Uuid,
+        decision_id: Uuid,
         _entity_type: &str,
-        _entity_id: &str,
+        entity_id: &str,
     ) -> Result<()> {
+        if let Some(affects) = self.decision_affects.write().await.get_mut(&decision_id) {
+            affects.retain(|a| a.entity_id != entity_id);
+        }
         Ok(())
     }
 
-    async fn list_decision_affects(&self, _decision_id: Uuid) -> Result<Vec<AffectsRelation>> {
-        Ok(vec![])
+    async fn list_decision_affects(&self, decision_id: Uuid) -> Result<Vec<AffectsRelation>> {
+        Ok(self
+            .decision_affects
+            .read()
+            .await
+            .get(&decision_id)
+            .cloned()
+            .unwrap_or_default())
     }
 
     async fn supersede_decision(
@@ -8671,6 +8719,157 @@ impl GraphStore for MockGraphStore {
         _project_id: Uuid,
     ) -> anyhow::Result<Vec<(crate::neo4j::models::ConstraintNode, Uuid)>> {
         Ok(vec![])
+    }
+
+    // ========================================================================
+    // PlanRun operations (Runner) — in-memory mock
+    // ========================================================================
+
+    async fn create_plan_run(&self, state: &crate::runner::RunnerState) -> anyhow::Result<()> {
+        let mut runs = self.plan_runs.write().await;
+        runs.insert(state.run_id, state.clone());
+        Ok(())
+    }
+
+    async fn update_plan_run(&self, state: &crate::runner::RunnerState) -> anyhow::Result<()> {
+        let mut runs = self.plan_runs.write().await;
+        runs.insert(state.run_id, state.clone());
+        Ok(())
+    }
+
+    async fn get_plan_run(
+        &self,
+        run_id: Uuid,
+    ) -> anyhow::Result<Option<crate::runner::RunnerState>> {
+        let runs = self.plan_runs.read().await;
+        Ok(runs.get(&run_id).cloned())
+    }
+
+    async fn list_active_plan_runs(&self) -> anyhow::Result<Vec<crate::runner::RunnerState>> {
+        let runs = self.plan_runs.read().await;
+        Ok(runs
+            .values()
+            .filter(|s| s.status == crate::runner::PlanRunStatus::Running)
+            .cloned()
+            .collect())
+    }
+
+    async fn list_plan_runs(
+        &self,
+        plan_id: Uuid,
+        limit: i64,
+    ) -> anyhow::Result<Vec<crate::runner::RunnerState>> {
+        let runs = self.plan_runs.read().await;
+        let mut result: Vec<_> = runs
+            .values()
+            .filter(|s| s.plan_id == plan_id)
+            .cloned()
+            .collect();
+        result.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+        result.truncate(limit as usize);
+        Ok(result)
+    }
+
+    // ── Triggers ──────────────────────────────────────────────────────────
+
+    async fn create_trigger(
+        &self,
+        trigger: &crate::runner::Trigger,
+    ) -> anyhow::Result<crate::runner::Trigger> {
+        let mut triggers = self.triggers.write().await;
+        triggers.insert(trigger.id, trigger.clone());
+        Ok(trigger.clone())
+    }
+
+    async fn get_trigger(
+        &self,
+        trigger_id: Uuid,
+    ) -> anyhow::Result<Option<crate::runner::Trigger>> {
+        let triggers = self.triggers.read().await;
+        Ok(triggers.get(&trigger_id).cloned())
+    }
+
+    async fn list_triggers(&self, plan_id: Uuid) -> anyhow::Result<Vec<crate::runner::Trigger>> {
+        let triggers = self.triggers.read().await;
+        Ok(triggers
+            .values()
+            .filter(|t| t.plan_id == plan_id)
+            .cloned()
+            .collect())
+    }
+
+    async fn list_all_triggers(
+        &self,
+        trigger_type: Option<&str>,
+    ) -> anyhow::Result<Vec<crate::runner::Trigger>> {
+        let triggers = self.triggers.read().await;
+        Ok(triggers
+            .values()
+            .filter(|t| trigger_type.is_none_or(|tt| t.trigger_type.to_string() == tt))
+            .cloned()
+            .collect())
+    }
+
+    async fn update_trigger(
+        &self,
+        trigger_id: Uuid,
+        enabled: Option<bool>,
+        config: Option<serde_json::Value>,
+        cooldown_secs: Option<u64>,
+    ) -> anyhow::Result<Option<crate::runner::Trigger>> {
+        let mut triggers = self.triggers.write().await;
+        if let Some(t) = triggers.get_mut(&trigger_id) {
+            if let Some(e) = enabled {
+                t.enabled = e;
+            }
+            if let Some(c) = config {
+                t.config = c;
+            }
+            if let Some(cd) = cooldown_secs {
+                t.cooldown_secs = cd;
+            }
+            Ok(Some(t.clone()))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn delete_trigger(&self, trigger_id: Uuid) -> anyhow::Result<()> {
+        let mut triggers = self.triggers.write().await;
+        triggers.remove(&trigger_id);
+        let mut firings = self.trigger_firings.write().await;
+        firings.remove(&trigger_id);
+        Ok(())
+    }
+
+    async fn record_trigger_firing(
+        &self,
+        firing: &crate::runner::TriggerFiring,
+    ) -> anyhow::Result<()> {
+        let mut firings = self.trigger_firings.write().await;
+        firings
+            .entry(firing.trigger_id)
+            .or_default()
+            .push(firing.clone());
+        // Update trigger fire_count and last_fired
+        let mut triggers = self.triggers.write().await;
+        if let Some(t) = triggers.get_mut(&firing.trigger_id) {
+            t.fire_count += 1;
+            t.last_fired = Some(firing.fired_at);
+        }
+        Ok(())
+    }
+
+    async fn list_trigger_firings(
+        &self,
+        trigger_id: Uuid,
+        limit: i64,
+    ) -> anyhow::Result<Vec<crate::runner::TriggerFiring>> {
+        let firings = self.trigger_firings.read().await;
+        let mut result: Vec<_> = firings.get(&trigger_id).cloned().unwrap_or_default();
+        result.sort_by(|a, b| b.fired_at.cmp(&a.fired_at));
+        result.truncate(limit as usize);
+        Ok(result)
     }
 }
 

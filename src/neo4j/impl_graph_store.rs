@@ -2958,4 +2958,92 @@ impl GraphStore for Neo4jClient {
     ) -> anyhow::Result<Vec<(crate::neo4j::models::ConstraintNode, Uuid)>> {
         self.get_project_constraints(project_id).await
     }
+
+    // ========================================================================
+    // PlanRun operations (Runner)
+    // ========================================================================
+
+    async fn create_plan_run(&self, state: &crate::runner::RunnerState) -> anyhow::Result<()> {
+        self.create_plan_run(state).await
+    }
+
+    async fn update_plan_run(&self, state: &crate::runner::RunnerState) -> anyhow::Result<()> {
+        self.update_plan_run(state).await
+    }
+
+    async fn get_plan_run(
+        &self,
+        run_id: Uuid,
+    ) -> anyhow::Result<Option<crate::runner::RunnerState>> {
+        self.get_plan_run(run_id).await
+    }
+
+    async fn list_active_plan_runs(&self) -> anyhow::Result<Vec<crate::runner::RunnerState>> {
+        self.list_active_plan_runs_impl().await
+    }
+
+    async fn list_plan_runs(
+        &self,
+        plan_id: Uuid,
+        limit: i64,
+    ) -> anyhow::Result<Vec<crate::runner::RunnerState>> {
+        self.list_plan_runs_impl(plan_id, limit).await
+    }
+
+    // ── Triggers ──────────────────────────────────────────────────────────
+
+    async fn create_trigger(
+        &self,
+        trigger: &crate::runner::Trigger,
+    ) -> anyhow::Result<crate::runner::Trigger> {
+        self.create_trigger_impl(trigger).await
+    }
+
+    async fn get_trigger(
+        &self,
+        trigger_id: Uuid,
+    ) -> anyhow::Result<Option<crate::runner::Trigger>> {
+        self.get_trigger_impl(trigger_id).await
+    }
+
+    async fn list_triggers(&self, plan_id: Uuid) -> anyhow::Result<Vec<crate::runner::Trigger>> {
+        self.list_triggers_impl(plan_id).await
+    }
+
+    async fn list_all_triggers(
+        &self,
+        trigger_type: Option<&str>,
+    ) -> anyhow::Result<Vec<crate::runner::Trigger>> {
+        self.list_all_triggers_impl(trigger_type).await
+    }
+
+    async fn update_trigger(
+        &self,
+        trigger_id: Uuid,
+        enabled: Option<bool>,
+        config: Option<serde_json::Value>,
+        cooldown_secs: Option<u64>,
+    ) -> anyhow::Result<Option<crate::runner::Trigger>> {
+        self.update_trigger_impl(trigger_id, enabled, config, cooldown_secs)
+            .await
+    }
+
+    async fn delete_trigger(&self, trigger_id: Uuid) -> anyhow::Result<()> {
+        self.delete_trigger_impl(trigger_id).await
+    }
+
+    async fn record_trigger_firing(
+        &self,
+        firing: &crate::runner::TriggerFiring,
+    ) -> anyhow::Result<()> {
+        self.record_trigger_firing_impl(firing).await
+    }
+
+    async fn list_trigger_firings(
+        &self,
+        trigger_id: Uuid,
+        limit: i64,
+    ) -> anyhow::Result<Vec<crate::runner::TriggerFiring>> {
+        self.list_trigger_firings_impl(trigger_id, limit).await
+    }
 }

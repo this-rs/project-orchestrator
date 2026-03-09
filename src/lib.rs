@@ -25,6 +25,7 @@ pub mod plan;
 pub mod protocol;
 pub mod reasoning;
 pub mod resolver;
+pub mod runner;
 pub mod setup_claude;
 pub mod skills;
 pub mod update;
@@ -79,6 +80,9 @@ pub struct YamlConfig {
     /// Skill registry section (optional — enables cross-instance skill sharing)
     #[serde(default)]
     pub registry: RegistryYamlConfig,
+    /// Runner section (optional — configures autonomous plan execution)
+    #[serde(default)]
+    pub runner: runner::RunnerConfig,
 }
 
 /// Skill registry configuration section (optional)
@@ -1132,6 +1136,65 @@ pub async fn start_server(mut config: Config) -> Result<()> {
 
     // Spawn the protocol scheduler (hourly evaluation of scheduled protocols)
     crate::protocol::hooks::spawn_protocol_scheduler(orchestrator.neo4j_arc());
+
+    // Recover interrupted plan runner runs from previous server instance
+    if let Some(ref cm) = chat_manager {
+        let graph = orchestrator.neo4j_arc();
+        let context_builder = orchestrator.context_builder().clone();
+        let runner_config = orchestrator.runner_config();
+        let (event_tx, _) = tokio::sync::broadcast::channel(256);
+        let runner = std::sync::Arc::new(
+            runner::PlanRunner::new(cm.clone(), graph, context_builder, runner_config, event_tx)
+                .with_event_emitter(event_bus.clone() as std::sync::Arc<dyn events::EventEmitter>),
+        );
+        tokio::spawn(async move {
+            match runner.recover_interrupted_runs(".".to_string()).await {
+                Ok(0) => {} // no runs to recover, stay silent
+                Ok(count) => {
+                    tracing::info!("PlanRunner recovery: resumed {} interrupted run(s)", count);
+                }
+                Err(e) => {
+                    tracing::warn!("PlanRunner recovery failed (non-fatal): {}", e);
+                }
+            }
+        });
+    }
+
+    // Boot trigger providers (Schedule + Event) for automatic plan execution
+    if chat_manager.is_some() {
+        use runner::TriggerProvider; // for setup() method
+        let graph = orchestrator.neo4j_arc();
+        let engine = Arc::new(runner::TriggerEngine::new(graph.clone()));
+
+        // Schedule provider — evaluates cron triggers every 60s
+        let schedule_provider = runner::providers::schedule::ScheduleProvider::new(
+            graph.clone(),
+            engine.clone(),
+            None, // default 60s
+        );
+        if let Err(e) = schedule_provider.setup().await {
+            tracing::warn!("ScheduleProvider setup failed (non-fatal): {}", e);
+        } else {
+            tracing::info!("ScheduleProvider started (60s tick)");
+        }
+        // Keep provider alive by leaking into a static — teardown on process exit
+        std::mem::forget(schedule_provider);
+
+        // Event provider — reacts to CrudEvents for plan chaining
+        let event_rx = event_bus.subscribe();
+        let event_provider =
+            runner::providers::event::EventProvider::new(graph.clone(), engine.clone(), event_rx);
+        if let Err(e) = event_provider.setup().await {
+            tracing::warn!("EventProvider setup failed (non-fatal): {}", e);
+        } else {
+            tracing::info!("EventProvider started (CrudEvent subscriber)");
+        }
+        std::mem::forget(event_provider);
+
+        // WebhookProvider — no setup needed, the POST /api/webhooks/:trigger_id
+        // endpoint handles validation and evaluation inline.
+        tracing::info!("TriggerEngine booted with 2 active providers (schedule, event)");
+    }
 
     // Create server state
     let server_state = Arc::new(ServerState {

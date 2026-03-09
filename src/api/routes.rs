@@ -291,6 +291,57 @@ fn protected_routes() -> Router<OrchestratorState> {
             get(handlers::get_plan_critical_path),
         )
         .route("/api/plans/{plan_id}/waves", get(handlers::get_plan_waves))
+        // Runner
+        .route("/api/plans/{plan_id}/run", post(handlers::run_plan))
+        .route(
+            "/api/plans/{plan_id}/run/status",
+            get(handlers::get_run_status),
+        )
+        .route(
+            "/api/plans/{plan_id}/run/cancel",
+            post(handlers::cancel_run),
+        )
+        .route(
+            "/api/plans/{plan_id}/run/auto-pr",
+            post(handlers::create_auto_pr),
+        )
+        // Plan Runs
+        .route("/api/plans/{plan_id}/runs", get(handlers::list_plan_runs))
+        .route("/api/runs/{run_id}", get(handlers::get_plan_run))
+        .route(
+            "/api/plans/{plan_id}/runs/compare",
+            post(handlers::compare_plan_runs),
+        )
+        .route(
+            "/api/plans/{plan_id}/runs/predict",
+            post(handlers::predict_plan_run),
+        )
+        // Triggers
+        .route(
+            "/api/plans/{plan_id}/triggers",
+            get(handlers::list_triggers).post(handlers::create_trigger),
+        )
+        .route(
+            "/api/triggers/{trigger_id}",
+            delete(handlers::delete_trigger),
+        )
+        .route(
+            "/api/triggers/{trigger_id}/enable",
+            post(handlers::enable_trigger),
+        )
+        .route(
+            "/api/triggers/{trigger_id}/disable",
+            post(handlers::disable_trigger),
+        )
+        .route(
+            "/api/triggers/{trigger_id}/firings",
+            get(handlers::list_trigger_firings),
+        )
+        // Webhooks
+        .route(
+            "/api/webhooks/{trigger_id}",
+            post(handlers::receive_webhook),
+        )
         // Constraints
         .route(
             "/api/plans/{plan_id}/constraints",

@@ -2519,4 +2519,69 @@ pub trait GraphStore: Send + Sync {
         &self,
         project_id: Uuid,
     ) -> Result<Vec<(crate::neo4j::models::ConstraintNode, Uuid)>>;
+
+    // ========================================================================
+    // PlanRun operations (Runner execution state)
+    // ========================================================================
+
+    /// Create a new PlanRun node linked to a Plan via (:PlanRun)-[:RUNS]->(:Plan).
+    async fn create_plan_run(&self, state: &crate::runner::RunnerState) -> Result<()>;
+
+    /// Update an existing PlanRun with current execution state.
+    async fn update_plan_run(&self, state: &crate::runner::RunnerState) -> Result<()>;
+
+    /// Get a PlanRun by its run_id.
+    async fn get_plan_run(&self, run_id: Uuid) -> Result<Option<crate::runner::RunnerState>>;
+
+    /// List all PlanRuns with status=Running (for crash recovery at boot).
+    async fn list_active_plan_runs(&self) -> Result<Vec<crate::runner::RunnerState>>;
+
+    /// List all PlanRuns for a given plan, ordered by started_at desc.
+    async fn list_plan_runs(
+        &self,
+        plan_id: Uuid,
+        limit: i64,
+    ) -> Result<Vec<crate::runner::RunnerState>>;
+
+    // ── Triggers ──────────────────────────────────────────────────────────
+
+    /// Create a trigger node linked to a plan via (:Trigger)-[:TRIGGERS]->(:Plan).
+    async fn create_trigger(
+        &self,
+        trigger: &crate::runner::Trigger,
+    ) -> Result<crate::runner::Trigger>;
+
+    /// Get a trigger by its UUID.
+    async fn get_trigger(&self, trigger_id: Uuid) -> Result<Option<crate::runner::Trigger>>;
+
+    /// List all triggers for a given plan.
+    async fn list_triggers(&self, plan_id: Uuid) -> Result<Vec<crate::runner::Trigger>>;
+
+    /// Update a trigger (enabled, config, cooldown_secs).
+    async fn update_trigger(
+        &self,
+        trigger_id: Uuid,
+        enabled: Option<bool>,
+        config: Option<serde_json::Value>,
+        cooldown_secs: Option<u64>,
+    ) -> Result<Option<crate::runner::Trigger>>;
+
+    /// Delete a trigger by its UUID.
+    async fn delete_trigger(&self, trigger_id: Uuid) -> Result<()>;
+
+    /// Record a trigger firing event.
+    async fn record_trigger_firing(&self, firing: &crate::runner::TriggerFiring) -> Result<()>;
+
+    /// List all triggers across all plans, optionally filtered by type.
+    async fn list_all_triggers(
+        &self,
+        trigger_type: Option<&str>,
+    ) -> Result<Vec<crate::runner::Trigger>>;
+
+    /// List trigger firings for a given trigger, ordered by fired_at desc.
+    async fn list_trigger_firings(
+        &self,
+        trigger_id: Uuid,
+        limit: i64,
+    ) -> Result<Vec<crate::runner::TriggerFiring>>;
 }

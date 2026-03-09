@@ -114,6 +114,19 @@ impl ToolHandler {
             ("plan", "get_dependency_graph") => "get_dependency_graph",
             ("plan", "get_critical_path") => "get_critical_path",
             ("plan", "get_waves") => "get_waves",
+            ("plan", "run") => "run_plan",
+            ("plan", "run_status") => "get_run_status",
+            ("plan", "cancel_run") => "cancel_plan_run",
+            ("plan", "auto_pr") => "create_auto_pr",
+            ("plan", "add_trigger") => "add_trigger",
+            ("plan", "list_triggers") => "list_triggers",
+            ("plan", "remove_trigger") => "remove_trigger",
+            ("plan", "enable_trigger") => "enable_trigger",
+            ("plan", "disable_trigger") => "disable_trigger",
+            ("plan", "list_runs") => "list_plan_runs",
+            ("plan", "get_run") => "get_plan_run",
+            ("plan", "compare_runs") => "compare_plan_runs",
+            ("plan", "predict_run") => "predict_plan_run",
 
             // Task
             ("task", "list") => "list_tasks",
@@ -769,6 +782,128 @@ impl ToolHandler {
             "get_waves" => {
                 let plan_id = extract_id(args, "plan_id")?;
                 let result = http.get(&format!("/api/plans/{}/waves", plan_id)).await?;
+                Ok(Some(result))
+            }
+
+            "run_plan" => {
+                let plan_id = extract_id(args, "plan_id")?;
+                let cwd = args
+                    .get("cwd")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(".")
+                    .to_string();
+                let project_slug = args
+                    .get("project_slug")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                // MCP calls are always from chat context → TriggerSource::Chat
+                let body =
+                    json!({ "cwd": cwd, "project_slug": project_slug, "triggered_by": "chat" });
+                let result = http
+                    .post(&format!("/api/plans/{}/run", plan_id), &body)
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "get_run_status" => {
+                let plan_id = extract_id(args, "plan_id")?;
+                let result = http
+                    .get(&format!("/api/plans/{}/run/status", plan_id))
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "cancel_plan_run" => {
+                let plan_id = extract_id(args, "plan_id")?;
+                let result = http
+                    .post(&format!("/api/plans/{}/run/cancel", plan_id), &json!({}))
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "create_auto_pr" => {
+                let plan_id = extract_id(args, "plan_id")?;
+                let result = http
+                    .post(&format!("/api/plans/{}/run/auto-pr", plan_id), &json!({}))
+                    .await?;
+                Ok(Some(result))
+            }
+
+            // ── P2b: Triggers (5 actions) ──────────────────────────────────
+            "add_trigger" => {
+                let plan_id = extract_id(args, "plan_id")?;
+                let body = json!({
+                    "trigger_type": args.get("trigger_type").and_then(|v| v.as_str()).unwrap_or("schedule"),
+                    "config": args.get("config").cloned().unwrap_or(json!({})),
+                    "cooldown_secs": args.get("cooldown_secs").and_then(|v| v.as_u64()).unwrap_or(0)
+                });
+                let result = http
+                    .post(&format!("/api/plans/{}/triggers", plan_id), &body)
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "list_triggers" => {
+                let plan_id = extract_id(args, "plan_id")?;
+                let result = http
+                    .get(&format!("/api/plans/{}/triggers", plan_id))
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "remove_trigger" => {
+                let trigger_id = extract_id(args, "trigger_id")?;
+                let result = http
+                    .delete(&format!("/api/triggers/{}", trigger_id))
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "enable_trigger" => {
+                let trigger_id = extract_id(args, "trigger_id")?;
+                let result = http
+                    .post(&format!("/api/triggers/{}/enable", trigger_id), &json!({}))
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "disable_trigger" => {
+                let trigger_id = extract_id(args, "trigger_id")?;
+                let result = http
+                    .post(&format!("/api/triggers/{}/disable", trigger_id), &json!({}))
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "list_plan_runs" => {
+                let plan_id = extract_id(args, "plan_id")?;
+                let result = http.get(&format!("/api/plans/{}/runs", plan_id)).await?;
+                Ok(Some(result))
+            }
+
+            "get_plan_run" => {
+                let run_id = extract_id(args, "run_id")?;
+                let result = http.get(&format!("/api/runs/{}", run_id)).await?;
+                Ok(Some(result))
+            }
+
+            "compare_plan_runs" => {
+                let plan_id = extract_id(args, "plan_id")?;
+                let run_ids = args.get("run_ids").cloned().unwrap_or(json!([]));
+                let result = http
+                    .post(
+                        &format!("/api/plans/{}/runs/compare", plan_id),
+                        &json!({ "run_ids": run_ids }),
+                    )
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "predict_plan_run" => {
+                let plan_id = extract_id(args, "plan_id")?;
+                let result = http
+                    .post(&format!("/api/plans/{}/runs/predict", plan_id), &json!({}))
+                    .await?;
                 Ok(Some(result))
             }
 

@@ -3716,6 +3716,583 @@ pub async fn get_plan_waves(
 }
 
 // ============================================================================
+// Runner — Plan execution API
+// ============================================================================
+
+/// Request body for starting a plan run.
+#[derive(Deserialize)]
+pub struct RunPlanRequest {
+    /// Working directory for the runner (where to execute commands)
+    pub cwd: String,
+    /// Optional project slug (for scoping MCP operations)
+    pub project_slug: Option<String>,
+    /// How this run was triggered (manual, chat, schedule, webhook, event).
+    /// Defaults to "manual" if not specified.
+    #[serde(default)]
+    pub triggered_by: Option<String>,
+}
+
+/// Response for a successfully started plan run.
+#[derive(Serialize)]
+pub struct RunPlanResponse {
+    pub run_id: Uuid,
+    pub plan_id: Uuid,
+    pub total_waves: usize,
+    pub total_tasks: usize,
+}
+
+/// POST /api/plans/:id/run — Start executing a plan.
+///
+/// Returns 202 Accepted with the run_id. Execution happens in background.
+/// Returns 409 Conflict if the plan already has an active run.
+pub async fn run_plan(
+    State(state): State<OrchestratorState>,
+    Path(plan_id): Path<Uuid>,
+    Json(req): Json<RunPlanRequest>,
+) -> Result<(StatusCode, Json<RunPlanResponse>), AppError> {
+    let chat_manager = state
+        .chat_manager
+        .as_ref()
+        .ok_or_else(|| AppError::Internal(anyhow::anyhow!("Chat manager not initialized")))?;
+
+    let graph = state.orchestrator.neo4j_arc();
+    let context_builder = state.orchestrator.context_builder().clone();
+    let config = state.orchestrator.runner_config();
+
+    // Create a broadcast channel for RunnerEvents
+    let (event_tx, _) = tokio::sync::broadcast::channel(256);
+
+    let mut runner = crate::runner::PlanRunner::new(
+        chat_manager.clone(),
+        graph,
+        context_builder,
+        config,
+        event_tx,
+    );
+
+    // Bridge RunnerEvents to CrudEvent for WebSocket delivery
+    runner =
+        runner.with_event_emitter(state.event_bus.clone() as Arc<dyn crate::events::EventEmitter>);
+
+    let runner = Arc::new(runner);
+
+    // Parse trigger source from request (default: Manual)
+    let trigger_source = match req.triggered_by.as_deref() {
+        Some("chat") => crate::runner::TriggerSource::Chat { session_id: None },
+        Some("schedule") => crate::runner::TriggerSource::Schedule {
+            trigger_id: uuid::Uuid::nil(),
+        },
+        _ => crate::runner::TriggerSource::Manual,
+    };
+
+    let start_result = runner
+        .start(plan_id, trigger_source, req.cwd, req.project_slug)
+        .await
+        .map_err(|e| {
+            if e.to_string().contains("already has an active run") {
+                AppError::Conflict(e.to_string())
+            } else {
+                AppError::Internal(e)
+            }
+        })?;
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(RunPlanResponse {
+            run_id: start_result.run_id,
+            plan_id: start_result.plan_id,
+            total_waves: start_result.total_waves,
+            total_tasks: start_result.total_tasks,
+        }),
+    ))
+}
+
+/// GET /api/plans/:id/run/status — Get current runner status.
+pub async fn get_run_status(
+    State(_state): State<OrchestratorState>,
+    Path(_plan_id): Path<Uuid>,
+) -> Result<Json<crate::runner::RunStatus>, AppError> {
+    let status = crate::runner::PlanRunner::status().await;
+    Ok(Json(status))
+}
+
+/// POST /api/plans/:id/run/cancel — Cancel an active plan run.
+pub async fn cancel_run(
+    State(_state): State<OrchestratorState>,
+    Path(_plan_id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    // Get the current run_id to cancel
+    let status = crate::runner::PlanRunner::status().await;
+    let run_id = status
+        .run_id
+        .ok_or_else(|| AppError::NotFound("No active run".to_string()))?;
+
+    crate::runner::PlanRunner::cancel(run_id)
+        .await
+        .map_err(AppError::Internal)?;
+
+    Ok(Json(serde_json::json!({
+        "cancelled": true,
+        "run_id": run_id,
+    })))
+}
+
+/// POST /api/plans/:id/run/auto-pr — Create a PR from a completed plan.
+///
+/// Verifies the plan is completed, collects commits, generates a PR body,
+/// and creates the PR via `gh pr create`.
+pub async fn create_auto_pr(
+    State(state): State<OrchestratorState>,
+    Path(plan_id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let graph = state.orchestrator.neo4j_arc();
+
+    // 1. Verify the plan is completed
+    let plan = graph
+        .get_plan(plan_id)
+        .await
+        .map_err(AppError::Internal)?
+        .ok_or_else(|| AppError::NotFound(format!("Plan {} not found", plan_id)))?;
+
+    use crate::neo4j::models::PlanStatus;
+    if plan.status != PlanStatus::Completed {
+        return Err(AppError::BadRequest(format!(
+            "Plan is not completed (status: {:?}). Cannot create PR.",
+            plan.status
+        )));
+    }
+
+    // 2. Get tasks for the plan
+    let tasks = graph
+        .get_plan_tasks(plan_id)
+        .await
+        .map_err(AppError::Internal)?;
+
+    // 3. Get commits linked to the plan
+    let commits = graph
+        .get_plan_commits(plan_id)
+        .await
+        .map_err(AppError::Internal)?;
+
+    // 4. Generate PR body
+    let plan_title = &plan.title;
+    let mut body = format!("## {}\n\n", plan_title);
+
+    if !plan.description.is_empty() {
+        body.push_str(&format!("{}\n\n", plan.description));
+    }
+
+    body.push_str("### Tasks\n\n");
+    for task in &tasks {
+        use crate::neo4j::models::TaskStatus;
+        let status_emoji = match task.status {
+            TaskStatus::Completed => "✅",
+            TaskStatus::Failed => "❌",
+            TaskStatus::Blocked => "🚫",
+            _ => "⬜",
+        };
+        body.push_str(&format!(
+            "- {} {}\n",
+            status_emoji,
+            task.title.as_deref().unwrap_or("Untitled")
+        ));
+    }
+
+    if !commits.is_empty() {
+        body.push_str("\n### Commits\n\n");
+        for commit in &commits {
+            body.push_str(&format!(
+                "- `{}` {}\n",
+                &commit.hash[..7.min(commit.hash.len())],
+                commit.message
+            ));
+        }
+    }
+
+    body.push_str("\n---\n🤖 Generated by PlanRunner\n");
+
+    // 5. Create PR via gh CLI
+    let pr_title = format!("[PlanRunner] {}", &plan.title);
+    let output = tokio::process::Command::new("gh")
+        .args(["pr", "create", "--title", &pr_title, "--body", &body])
+        .output()
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("Failed to run gh: {}", e)))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(AppError::Internal(anyhow::anyhow!(
+            "gh pr create failed: {}",
+            stderr
+        )));
+    }
+
+    let pr_url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+    Ok(Json(serde_json::json!({
+        "pr_url": pr_url,
+        "plan_id": plan_id,
+        "title": pr_title,
+        "tasks_count": tasks.len(),
+        "commits_count": commits.len(),
+    })))
+}
+
+// ============================================================================
+// Triggers
+// ============================================================================
+
+/// POST /api/plans/:id/triggers — Create a trigger for a plan.
+pub async fn create_trigger(
+    State(state): State<OrchestratorState>,
+    Path(plan_id): Path<Uuid>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    use crate::runner::{Trigger, TriggerType};
+
+    let trigger_type_str = body
+        .get("trigger_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("schedule");
+    let trigger_type = match trigger_type_str {
+        "schedule" => TriggerType::Schedule,
+        "webhook" => TriggerType::Webhook,
+        "event" => TriggerType::Event,
+        "chat" => TriggerType::Chat,
+        other => {
+            return Err(AppError::BadRequest(format!(
+                "Invalid trigger_type: {}. Must be schedule, webhook, event, or chat.",
+                other
+            )));
+        }
+    };
+    let config = body.get("config").cloned().unwrap_or(serde_json::json!({}));
+    let cooldown_secs = body
+        .get("cooldown_secs")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+
+    let trigger = Trigger {
+        id: Uuid::new_v4(),
+        plan_id,
+        trigger_type,
+        config,
+        enabled: true,
+        cooldown_secs,
+        last_fired: None,
+        fire_count: 0,
+        created_at: chrono::Utc::now(),
+    };
+
+    let graph = state.orchestrator.neo4j_arc();
+    let created = graph
+        .create_trigger(&trigger)
+        .await
+        .map_err(AppError::Internal)?;
+
+    Ok(Json(serde_json::to_value(&created).unwrap_or_default()))
+}
+
+/// GET /api/plans/:id/triggers — List triggers for a plan.
+pub async fn list_triggers(
+    State(state): State<OrchestratorState>,
+    Path(plan_id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let graph = state.orchestrator.neo4j_arc();
+    let triggers = graph
+        .list_triggers(plan_id)
+        .await
+        .map_err(AppError::Internal)?;
+
+    Ok(Json(serde_json::to_value(&triggers).unwrap_or_default()))
+}
+
+/// DELETE /api/triggers/:id — Delete a trigger.
+pub async fn delete_trigger(
+    State(state): State<OrchestratorState>,
+    Path(trigger_id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let graph = state.orchestrator.neo4j_arc();
+    graph
+        .delete_trigger(trigger_id)
+        .await
+        .map_err(AppError::Internal)?;
+
+    Ok(Json(
+        serde_json::json!({ "deleted": true, "trigger_id": trigger_id }),
+    ))
+}
+
+/// PATCH /api/triggers/:id/enable — Enable a trigger.
+pub async fn enable_trigger(
+    State(state): State<OrchestratorState>,
+    Path(trigger_id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let graph = state.orchestrator.neo4j_arc();
+    let trigger = graph
+        .update_trigger(trigger_id, Some(true), None, None)
+        .await
+        .map_err(AppError::Internal)?
+        .ok_or_else(|| AppError::NotFound(format!("Trigger {} not found", trigger_id)))?;
+
+    Ok(Json(serde_json::to_value(&trigger).unwrap_or_default()))
+}
+
+/// PATCH /api/triggers/:id/disable — Disable a trigger.
+pub async fn disable_trigger(
+    State(state): State<OrchestratorState>,
+    Path(trigger_id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let graph = state.orchestrator.neo4j_arc();
+    let trigger = graph
+        .update_trigger(trigger_id, Some(false), None, None)
+        .await
+        .map_err(AppError::Internal)?
+        .ok_or_else(|| AppError::NotFound(format!("Trigger {} not found", trigger_id)))?;
+
+    Ok(Json(serde_json::to_value(&trigger).unwrap_or_default()))
+}
+
+/// GET /api/triggers/:id/firings — Get trigger firing history.
+pub async fn list_trigger_firings(
+    State(state): State<OrchestratorState>,
+    Path(trigger_id): Path<Uuid>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let limit = params
+        .get("limit")
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(20);
+    let graph = state.orchestrator.neo4j_arc();
+    let firings = graph
+        .list_trigger_firings(trigger_id, limit)
+        .await
+        .map_err(AppError::Internal)?;
+
+    Ok(Json(serde_json::to_value(&firings).unwrap_or_default()))
+}
+
+// ============================================================================
+// Webhooks
+// ============================================================================
+
+/// POST /api/webhooks/:trigger_id — Receive external webhook payload.
+///
+/// Validates HMAC-SHA256 signature (if configured), filters by event type
+/// and branch pattern, then evaluates the trigger.
+pub async fn receive_webhook(
+    State(state): State<OrchestratorState>,
+    Path(trigger_id): Path<Uuid>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let graph = state.orchestrator.neo4j_arc();
+
+    // 1. Load the trigger
+    let trigger = graph
+        .get_trigger(trigger_id)
+        .await
+        .map_err(AppError::Internal)?
+        .ok_or_else(|| AppError::NotFound(format!("Trigger {} not found", trigger_id)))?;
+
+    if trigger.trigger_type != crate::runner::TriggerType::Webhook {
+        return Err(AppError::BadRequest(format!(
+            "Trigger {} is not a webhook trigger (type: {:?})",
+            trigger_id, trigger.trigger_type
+        )));
+    }
+
+    // 2. Validate HMAC signature if secret is configured
+    if let Some(secret) = trigger.config.get("secret").and_then(|v| v.as_str()) {
+        let signature = headers
+            .get("x-hub-signature-256")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if !crate::runner::providers::webhook::validate_github_signature(secret, &body, signature) {
+            return Err(AppError::Unauthorized(
+                "Invalid webhook signature".to_string(),
+            ));
+        }
+    }
+
+    // 3. Parse payload
+    let payload: serde_json::Value = serde_json::from_slice(&body)
+        .map_err(|e| AppError::BadRequest(format!("Invalid JSON payload: {}", e)))?;
+
+    // 4. Filter by event type
+    if let Some(event_filter) = trigger
+        .config
+        .get("event_filter")
+        .and_then(|v| v.as_array())
+    {
+        let github_event = headers
+            .get("x-github-event")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let event_types: Vec<&str> = event_filter.iter().filter_map(|v| v.as_str()).collect();
+        if !event_types.is_empty() && !event_types.contains(&github_event) {
+            return Ok(Json(serde_json::json!({
+                "status": "filtered",
+                "reason": format!("Event '{}' not in filter {:?}", github_event, event_types)
+            })));
+        }
+    }
+
+    // 5. Filter by branch pattern
+    if let Some(branch_pattern) = trigger
+        .config
+        .get("branch_pattern")
+        .and_then(|v| v.as_str())
+    {
+        let branch = payload.get("ref").and_then(|v| v.as_str()).unwrap_or("");
+        // Extract branch name from "refs/heads/main" format
+        let branch_name = branch.strip_prefix("refs/heads/").unwrap_or(branch);
+        if let Ok(re) = regex::Regex::new(branch_pattern) {
+            if !re.is_match(branch_name) {
+                return Ok(Json(serde_json::json!({
+                    "status": "filtered",
+                    "reason": format!("Branch '{}' does not match pattern '{}'", branch_name, branch_pattern)
+                })));
+            }
+        }
+    }
+
+    // 6. Evaluate trigger
+    let engine = crate::runner::TriggerEngine::new(graph.clone());
+    match engine.evaluate_and_prepare(&trigger).await {
+        Ok(Some(source)) => {
+            engine
+                .record_fire(&trigger, None, Some(payload))
+                .await
+                .map_err(AppError::Internal)?;
+            Ok(Json(serde_json::json!({
+                "status": "fired",
+                "trigger_id": trigger_id,
+                "source": format!("{:?}", source),
+            })))
+        }
+        Ok(None) => Ok(Json(serde_json::json!({
+            "status": "skipped",
+            "reason": "Trigger guards not met (disabled, cooldown, or active run)"
+        }))),
+        Err(e) => Err(AppError::Internal(e)),
+    }
+}
+
+// ============================================================================
+// Plan Runs — List, Get, Compare, Predict
+// ============================================================================
+
+/// GET /api/plans/:plan_id/runs — List historical plan runs.
+pub async fn list_plan_runs(
+    State(state): State<OrchestratorState>,
+    Path(plan_id): Path<Uuid>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let limit = params
+        .get("limit")
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(20);
+    let graph = state.orchestrator.neo4j_arc();
+    let runs = graph
+        .list_plan_runs(plan_id, limit)
+        .await
+        .map_err(AppError::Internal)?;
+    Ok(Json(serde_json::to_value(&runs).unwrap_or_default()))
+}
+
+/// GET /api/runs/:run_id — Get a specific plan run.
+pub async fn get_plan_run(
+    State(state): State<OrchestratorState>,
+    Path(run_id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let graph = state.orchestrator.neo4j_arc();
+    let run = graph
+        .get_plan_run(run_id)
+        .await
+        .map_err(AppError::Internal)?
+        .ok_or_else(|| AppError::NotFound(format!("Run {} not found", run_id)))?;
+    Ok(Json(serde_json::to_value(&run).unwrap_or_default()))
+}
+
+/// POST /api/plans/:plan_id/runs/compare — Compare multiple plan runs.
+///
+/// Body: { "run_ids": ["uuid1", "uuid2", ...] }
+/// Returns dimension-level comparison with trend analysis.
+pub async fn compare_plan_runs(
+    State(state): State<OrchestratorState>,
+    Path(plan_id): Path<Uuid>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let run_ids: Vec<Uuid> = body
+        .get("run_ids")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| AppError::BadRequest("run_ids array required".to_string()))?
+        .iter()
+        .filter_map(|v| v.as_str().and_then(|s| s.parse().ok()))
+        .collect();
+
+    if run_ids.len() < 2 {
+        return Err(AppError::BadRequest(
+            "At least 2 run_ids required for comparison".to_string(),
+        ));
+    }
+
+    let graph = state.orchestrator.neo4j_arc();
+
+    // Load all runs and build vectors
+    let mut vectors = Vec::new();
+    for run_id in &run_ids {
+        let run = graph
+            .get_plan_run(*run_id)
+            .await
+            .map_err(AppError::Internal)?
+            .ok_or_else(|| AppError::NotFound(format!("Run {} not found", run_id)))?;
+
+        // Verify the run belongs to this plan
+        if run.plan_id != plan_id {
+            return Err(AppError::BadRequest(format!(
+                "Run {} belongs to plan {}, not {}",
+                run_id, run.plan_id, plan_id
+            )));
+        }
+
+        vectors.push(crate::runner::vector::ExecutionVector::from_runner_state(
+            &run,
+        ));
+    }
+
+    let result = crate::runner::vector::compare_vectors(&vectors);
+    Ok(Json(serde_json::to_value(&result).unwrap_or_default()))
+}
+
+/// POST /api/plans/:plan_id/runs/predict — Predict next run based on history.
+///
+/// Uses exponential weighted average on historical runs.
+pub async fn predict_plan_run(
+    State(state): State<OrchestratorState>,
+    Path(plan_id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let graph = state.orchestrator.neo4j_arc();
+
+    // Load all runs for this plan (most recent last)
+    let runs = graph
+        .list_plan_runs(plan_id, 50)
+        .await
+        .map_err(AppError::Internal)?;
+
+    // list_plan_runs returns DESC order, reverse for chronological
+    let vectors: Vec<_> = runs
+        .iter()
+        .rev()
+        .map(crate::runner::vector::ExecutionVector::from_runner_state)
+        .collect();
+
+    let prediction = crate::runner::vector::predict_run(&vectors);
+    Ok(Json(serde_json::to_value(&prediction).unwrap_or_default()))
+}
+
+// ============================================================================
 // Roadmap
 // ============================================================================
 
