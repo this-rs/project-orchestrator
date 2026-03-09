@@ -318,6 +318,8 @@ impl PlanNode {
             created_by,
             priority,
             project_id: None,
+            execution_context: None,
+            persona: None,
         }
     }
 
@@ -338,6 +340,8 @@ impl PlanNode {
             created_by,
             priority,
             project_id: Some(project_id),
+            execution_context: None,
+            persona: None,
         }
     }
 }
@@ -363,6 +367,9 @@ impl TaskNode {
             started_at: None,
             completed_at: None,
             frustration_score: 0.0,
+            execution_context: None,
+            persona: None,
+            prompt_cache: None,
         }
     }
 
@@ -394,6 +401,9 @@ impl TaskNode {
             started_at: None,
             completed_at: None,
             frustration_score: 0.0,
+            execution_context: None,
+            persona: None,
+            prompt_cache: None,
         }
     }
 
@@ -416,6 +426,8 @@ impl StepNode {
             created_at: now,
             updated_at: Some(now),
             completed_at: None,
+            execution_context: None,
+            persona: None,
         }
     }
 }

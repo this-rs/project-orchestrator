@@ -3818,6 +3818,28 @@ impl GraphStore for MockGraphStore {
         Ok(())
     }
 
+    async fn update_task_enrichment(
+        &self,
+        task_id: Uuid,
+        execution_context: Option<&str>,
+        persona: Option<&str>,
+        prompt_cache: Option<&str>,
+    ) -> Result<()> {
+        let mut tasks = self.tasks.write().await;
+        if let Some(task) = tasks.get_mut(&task_id) {
+            if let Some(ctx) = execution_context {
+                task.execution_context = Some(ctx.to_string());
+            }
+            if let Some(p) = persona {
+                task.persona = Some(p.to_string());
+            }
+            if let Some(pc) = prompt_cache {
+                task.prompt_cache = Some(pc.to_string());
+            }
+        }
+        Ok(())
+    }
+
     async fn delete_task(&self, task_id: Uuid) -> Result<()> {
         self.tasks.write().await.remove(&task_id);
         // Cascade: steps
@@ -8946,6 +8968,38 @@ impl GraphStore for MockGraphStore {
         result.sort_by(|a, b| b.fired_at.cmp(&a.fired_at));
         result.truncate(limit as usize);
         Ok(result)
+    }
+
+    // ── AgentExecution (in-memory mock) ─────────────────────────────────────
+
+    async fn create_agent_execution(
+        &self,
+        _ae: &crate::neo4j::agent_execution::AgentExecutionNode,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn update_agent_execution(
+        &self,
+        _ae: &crate::neo4j::agent_execution::AgentExecutionNode,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn get_agent_executions_for_run(
+        &self,
+        _run_id: Uuid,
+    ) -> anyhow::Result<Vec<crate::neo4j::agent_execution::AgentExecutionNode>> {
+        Ok(Vec::new())
+    }
+
+    async fn create_used_skill_relation(
+        &self,
+        _agent_execution_id: Uuid,
+        _skill_id: Uuid,
+        _result: &str,
+    ) -> anyhow::Result<()> {
+        Ok(())
     }
 }
 

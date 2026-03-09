@@ -1,13 +1,20 @@
 //! Context builder for agent tasks
+//!
+//! Provides two modes of prompt generation:
+//! - `generate_prompt()` — static markdown prompt (backward compatible)
+//! - `build_enriched_context()` — runs the EnrichmentPipeline before prompt assembly
 
+use crate::chat::enrichment::{EnrichmentInput, EnrichmentPipeline};
 use crate::meilisearch::SearchStore;
 use crate::neo4j::models::*;
 use crate::neo4j::GraphStore;
 use crate::notes::{EntityType, Note, NoteManager};
 use crate::plan::models::*;
 use crate::plan::PlanManager;
+use crate::runner::prompt::{PromptBuilder, StructuredPrompt};
 use anyhow::Result;
 use std::sync::Arc;
+use tracing::debug;
 use uuid::Uuid;
 
 /// Builder for creating rich agent context
@@ -266,6 +273,252 @@ impl ContextBuilder {
         Ok(references)
     }
 
+    /// Build enriched context by running the EnrichmentPipeline on top of the base context.
+    ///
+    /// This is the preferred entry point for runner agents: it combines
+    /// `build_context()` + EnrichmentPipeline + propagated notes into a
+    /// single [`StructuredPrompt`] via [`PromptBuilder`].
+    ///
+    /// The `project_slug` and `project_id` are used to scope enrichment stages.
+    /// `custom_sections` are appended as `PromptSection::Custom`.
+    pub async fn build_enriched_context(
+        &self,
+        task_id: Uuid,
+        plan_id: Uuid,
+        pipeline: Option<&EnrichmentPipeline>,
+        project_slug: Option<&str>,
+        project_id: Option<Uuid>,
+        custom_sections: Vec<String>,
+    ) -> Result<StructuredPrompt> {
+        // 1. Build base context (reuse existing logic)
+        let context = self.build_context(task_id, plan_id).await?;
+
+        // 2. Build a PromptBuilder from the AgentContext
+        let mut builder = self.build_prompt_builder(&context);
+
+        // 3. Run EnrichmentPipeline if provided
+        if let Some(pipeline) = pipeline {
+            let input = EnrichmentInput {
+                message: context.task.description.clone(),
+                session_id: Uuid::new_v4(), // ephemeral session for enrichment
+                project_slug: project_slug.map(|s| s.to_string()),
+                project_id,
+                cwd: None,
+            };
+
+            let enrichment_ctx = pipeline.execute(&input).await;
+
+            if enrichment_ctx.has_content() {
+                let rendered = enrichment_ctx.render();
+                builder = builder.with_enrichment(rendered);
+                debug!(
+                    task_id = %task_id,
+                    sections = enrichment_ctx.sections.len(),
+                    total_ms = enrichment_ctx.total_time_ms,
+                    "EnrichmentPipeline injected into task context"
+                );
+            }
+        }
+
+        // 4. Inject propagated notes for affected files (Step 4 — Knowledge Fabric)
+        let propagated_notes_text = self
+            .collect_propagated_notes_for_files(&context.task.affected_files)
+            .await;
+        if !propagated_notes_text.is_empty() {
+            builder = builder.with_propagated_notes(propagated_notes_text);
+        }
+
+        // 5. Add custom sections
+        for custom in custom_sections {
+            if !custom.is_empty() {
+                builder = builder.with_custom(custom);
+            }
+        }
+
+        Ok(builder.build_structured())
+    }
+
+    /// Build a [`PromptBuilder`] from an [`AgentContext`].
+    ///
+    /// Converts each part of the context into the appropriate [`PromptSection`].
+    /// The caller can add more sections before calling `.build()`.
+    pub fn build_prompt_builder(&self, context: &AgentContext) -> PromptBuilder {
+        let mut builder = PromptBuilder::new();
+
+        // Task description
+        builder = builder.with_task(format!(
+            "{}\n",
+            context.task.description
+        ));
+
+        // Constraints
+        if !context.constraints.is_empty() {
+            let mut s = String::new();
+            for constraint in &context.constraints {
+                s.push_str(&format!(
+                    "- [{:?}] {}\n",
+                    constraint.constraint_type, constraint.description
+                ));
+            }
+            builder = builder.with_constraints(s);
+        }
+
+        // Steps
+        if !context.steps.is_empty() {
+            let mut s = String::new();
+            for step in &context.steps {
+                let status = match step.status {
+                    StepStatus::Completed => "[x]",
+                    _ => "[ ]",
+                };
+                s.push_str(&format!(
+                    "{} {}. {}\n",
+                    status,
+                    step.order + 1,
+                    step.description
+                ));
+                if let Some(ref verification) = step.verification {
+                    s.push_str(&format!("   Verification: {}\n", verification));
+                }
+            }
+            builder = builder.with_steps(s);
+        }
+
+        // Knowledge Notes
+        if !context.notes.is_empty() {
+            let mut s = String::new();
+            s.push_str("The following notes contain important context, guidelines, and gotchas:\n\n");
+
+            let critical: Vec<_> = context.notes.iter().filter(|n| n.importance == "critical").collect();
+            let high: Vec<_> = context.notes.iter().filter(|n| n.importance == "high").collect();
+            let other: Vec<_> = context.notes.iter().filter(|n| n.importance != "critical" && n.importance != "high").collect();
+
+            if !critical.is_empty() {
+                s.push_str("### Critical\n");
+                for note in critical {
+                    let source = if note.propagated { format!(" (via {})", note.source_entity) } else { String::new() };
+                    s.push_str(&format!("- **[{}]{}** {}\n", note.note_type, source, note.content));
+                }
+                s.push('\n');
+            }
+            if !high.is_empty() {
+                s.push_str("### Important\n");
+                for note in high {
+                    let source = if note.propagated { format!(" (via {})", note.source_entity) } else { String::new() };
+                    s.push_str(&format!("- **[{}]{}** {}\n", note.note_type, source, note.content));
+                }
+                s.push('\n');
+            }
+            if !other.is_empty() {
+                s.push_str("### Other Notes\n");
+                for note in other {
+                    let source = if note.propagated { format!(" (via {})", note.source_entity) } else { String::new() };
+                    s.push_str(&format!("- [{}]{} {}\n", note.note_type, source, note.content));
+                }
+                s.push('\n');
+            }
+            builder = builder.with_knowledge_notes(s);
+        }
+
+        // File context
+        if !context.target_files.is_empty() {
+            let mut s = String::new();
+            for file in &context.target_files {
+                s.push_str(&format!("### {}\n", file.path));
+                s.push_str(&format!("- Language: {}\n", file.language));
+                if !file.symbols.is_empty() {
+                    s.push_str(&format!("- Symbols: {}\n", file.symbols.join(", ")));
+                }
+                if !file.dependent_files.is_empty() {
+                    s.push_str(&format!("- Impacted files: {}\n", file.dependent_files.join(", ")));
+                }
+                // File-specific notes
+                for note in &file.notes {
+                    s.push_str(&format!("- [{}] {}\n", note.note_type, note.content));
+                }
+                s.push('\n');
+            }
+            builder = builder.with_file_context(s);
+        }
+
+        builder
+    }
+
+    /// Collect propagated notes for a list of file paths.
+    ///
+    /// Returns up to 5 propagated notes of importance >= medium, formatted as markdown.
+    /// This implements Step 4 of the enrichment task (Knowledge Fabric injection).
+    async fn collect_propagated_notes_for_files(&self, file_paths: &[String]) -> String {
+        let mut all_propagated = Vec::new();
+
+        for file_path in file_paths {
+            match self
+                .note_manager
+                .get_propagated_notes(
+                    &EntityType::File,
+                    file_path,
+                    2,    // max_depth
+                    0.3,  // min_score
+                    None, // default relation types
+                    None, // no project filter
+                    false,
+                )
+                .await
+            {
+                Ok(notes) => {
+                    for note in notes {
+                        // Filter: importance >= medium (exclude low)
+                        let dominated_importance = note.note.importance.to_string();
+                        if dominated_importance == "low" {
+                            continue;
+                        }
+                        // Only include gotchas, guidelines, and patterns
+                        let note_type_str = note.note.note_type.to_string();
+                        if matches!(
+                            note_type_str.as_str(),
+                            "gotcha" | "guideline" | "pattern"
+                        ) {
+                            all_propagated.push((file_path.clone(), note));
+                        }
+                    }
+                }
+                Err(e) => {
+                    debug!(
+                        file_path = %file_path,
+                        error = %e,
+                        "Failed to get propagated notes for file"
+                    );
+                }
+            }
+        }
+
+        if all_propagated.is_empty() {
+            return String::new();
+        }
+
+        // Sort by relevance score descending, take top 5
+        all_propagated.sort_by(|a, b| {
+            b.1.relevance_score
+                .partial_cmp(&a.1.relevance_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        all_propagated.truncate(5);
+
+        let mut output = String::new();
+        output.push_str("Propagated knowledge from the Knowledge Fabric (gotchas/guidelines/patterns):\n\n");
+        for (file_path, prop_note) in &all_propagated {
+            output.push_str(&format!(
+                "- **[{}]** ({}, via `{}`, relevance {:.0}%) {}\n",
+                prop_note.note.note_type,
+                prop_note.note.importance,
+                file_path,
+                prop_note.relevance_score * 100.0,
+                prop_note.note.content,
+            ));
+        }
+        output
+    }
+
     /// Generate a prompt for an agent
     pub fn generate_prompt(&self, context: &AgentContext) -> String {
         let mut prompt = String::new();
@@ -459,6 +712,140 @@ impl ContextBuilder {
 
         prompt
     }
+
+    // ========================================================================
+    // Pre-enrichment pipeline (Steps 2 & 3 of T9)
+    // ========================================================================
+
+    /// Pre-enrich a single task: build context, profile persona, cache the prompt.
+    ///
+    /// Persists `execution_context` (serialized AgentContext summary),
+    /// `persona` (TaskProfile JSON), and `prompt_cache` (rendered prompt) on the
+    /// TaskNode in Neo4j so that `execute_task()` can skip the expensive
+    /// `build_context()` + `generate_prompt()` calls at runtime.
+    pub async fn enrich_task(
+        &self,
+        task_id: Uuid,
+        plan_id: Uuid,
+    ) -> Result<EnrichmentResult> {
+        use crate::runner::persona::profile_task;
+
+        // 1. Build full context (the expensive part we want to cache)
+        let context = self.build_context(task_id, plan_id).await?;
+
+        // 2. Profile the task (persona)
+        let steps_count = context.steps.len();
+        let profile = profile_task(&context.task, steps_count);
+        let persona_json = serde_json::to_string(&profile)?;
+
+        // 3. Collect propagated notes for affected files
+        let propagated_notes = self
+            .collect_propagated_notes_for_files(&context.task.affected_files)
+            .await;
+
+        // 4. Generate the prompt (what the agent will receive)
+        let mut prompt = self.generate_prompt(&context);
+        if !propagated_notes.is_empty() {
+            prompt.push_str("\n## Propagated Knowledge\n");
+            prompt.push_str(&propagated_notes);
+        }
+
+        // 5. Build a compact execution_context summary (not the full prompt)
+        let exec_ctx = serde_json::json!({
+            "constraints_count": context.constraints.len(),
+            "steps_count": steps_count,
+            "target_files": context.target_files.iter().map(|f| &f.path).collect::<Vec<_>>(),
+            "similar_code_count": context.similar_code.len(),
+            "related_decisions_count": context.related_decisions.len(),
+            "notes_count": context.notes.len(),
+            "propagated_notes_len": propagated_notes.len(),
+        });
+        let exec_ctx_json = serde_json::to_string(&exec_ctx)?;
+
+        // 6. Persist to Neo4j
+        self.neo4j
+            .update_task_enrichment(
+                task_id,
+                Some(&exec_ctx_json),
+                Some(&persona_json),
+                Some(&prompt),
+            )
+            .await?;
+
+        debug!(
+            task_id = %task_id,
+            persona = %profile.complexity,
+            prompt_len = prompt.len(),
+            "Task pre-enrichment completed"
+        );
+
+        Ok(EnrichmentResult {
+            task_id,
+            persona: persona_json,
+            prompt_len: prompt.len(),
+            execution_context: exec_ctx_json,
+        })
+    }
+
+    /// Pre-enrich all tasks in a plan.
+    ///
+    /// Iterates over every task in the plan, calls `enrich_task` for each,
+    /// and returns a summary of results.
+    pub async fn enrich_plan(
+        &self,
+        plan_id: Uuid,
+    ) -> Result<PlanEnrichmentResult> {
+        let tasks = self.neo4j.get_plan_tasks(plan_id).await?;
+        if tasks.is_empty() {
+            return Err(anyhow::anyhow!("Plan has no tasks or plan not found"));
+        }
+
+        let mut results = Vec::new();
+        let mut errors = Vec::new();
+
+        for task in &tasks {
+            match self.enrich_task(task.id, plan_id).await {
+                Ok(result) => results.push(result),
+                Err(e) => {
+                    tracing::warn!(
+                        task_id = %task.id,
+                        error = %e,
+                        "Failed to enrich task"
+                    );
+                    errors.push(format!("{}: {}", task.id, e));
+                }
+            }
+        }
+
+        Ok(PlanEnrichmentResult {
+            plan_id,
+            total_tasks: tasks.len(),
+            enriched: results.len(),
+            failed: errors.len(),
+            results,
+            errors,
+        })
+    }
+}
+
+/// Result of enriching a single task.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct EnrichmentResult {
+    pub task_id: Uuid,
+    pub persona: String,
+    pub prompt_len: usize,
+    pub execution_context: String,
+}
+
+/// Result of enriching all tasks in a plan.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PlanEnrichmentResult {
+    pub plan_id: Uuid,
+    pub total_tasks: usize,
+    pub enriched: usize,
+    pub failed: usize,
+    pub results: Vec<EnrichmentResult>,
+    pub errors: Vec<String>,
 }
 
 #[cfg(test)]
@@ -489,6 +876,9 @@ mod tests {
             started_at: None,
             completed_at: None,
             frustration_score: 0.0,
+            execution_context: None,
+            persona: None,
+            prompt_cache: None,
         }
     }
 

@@ -88,6 +88,8 @@ impl Neo4jClient {
                     .get::<String>("completed_at")
                     .ok()
                     .and_then(|s| s.parse().ok()),
+                execution_context: None,
+                persona: None,
             });
         }
 
@@ -216,6 +218,8 @@ impl Neo4jClient {
                     .get::<String>("completed_at")
                     .ok()
                     .and_then(|s| s.parse().ok()),
+                execution_context: None,
+                persona: None,
             }))
         } else {
             Ok(None)

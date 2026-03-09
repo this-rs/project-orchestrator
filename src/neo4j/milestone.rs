@@ -426,6 +426,8 @@ impl Neo4jClient {
                     .get::<String>("completed_at")
                     .ok()
                     .and_then(|s| s.parse().ok()),
+                execution_context: None,
+                persona: None,
             };
             steps_map.entry(task_id).or_default().push(step);
         }

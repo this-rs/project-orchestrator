@@ -310,6 +310,9 @@ pub fn test_task() -> TaskNode {
         started_at: None,
         completed_at: None,
         frustration_score: 0.0,
+        execution_context: None,
+        persona: None,
+        prompt_cache: None,
     }
 }
 

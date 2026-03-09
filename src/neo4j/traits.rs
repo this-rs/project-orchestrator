@@ -826,6 +826,15 @@ pub trait GraphStore: Send + Sync {
     /// Update a task with new values
     async fn update_task(&self, task_id: Uuid, updates: &UpdateTaskRequest) -> Result<()>;
 
+    /// Update pre-enrichment fields on a task (execution_context, persona, prompt_cache).
+    async fn update_task_enrichment(
+        &self,
+        task_id: Uuid,
+        execution_context: Option<&str>,
+        persona: Option<&str>,
+        prompt_cache: Option<&str>,
+    ) -> Result<()>;
+
     /// Delete a task and all its related data (steps, decisions)
     async fn delete_task(&self, task_id: Uuid) -> Result<()>;
 
@@ -2607,4 +2616,32 @@ pub trait GraphStore: Send + Sync {
         trigger_id: Uuid,
         limit: i64,
     ) -> Result<Vec<crate::runner::TriggerFiring>>;
+
+    // ── AgentExecution ──────────────────────────────────────────────────────
+
+    /// Create an AgentExecution node linked to a PlanRun and Task.
+    async fn create_agent_execution(
+        &self,
+        ae: &crate::neo4j::agent_execution::AgentExecutionNode,
+    ) -> Result<()>;
+
+    /// Update an existing AgentExecution with final results.
+    async fn update_agent_execution(
+        &self,
+        ae: &crate::neo4j::agent_execution::AgentExecutionNode,
+    ) -> Result<()>;
+
+    /// Get all AgentExecution nodes for a given PlanRun.
+    async fn get_agent_executions_for_run(
+        &self,
+        run_id: Uuid,
+    ) -> Result<Vec<crate::neo4j::agent_execution::AgentExecutionNode>>;
+
+    /// Create a USED_SKILL relationship from AgentExecution to Skill.
+    async fn create_used_skill_relation(
+        &self,
+        agent_execution_id: Uuid,
+        skill_id: Uuid,
+        result: &str,
+    ) -> Result<()>;
 }

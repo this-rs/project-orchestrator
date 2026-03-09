@@ -2,8 +2,222 @@
 //!
 //! Replaces the old static `RUNNER_CONSTRAINTS` const with a template-based
 //! system that injects contextual variables (branch, forbidden files, skills, etc.).
+//!
+//! Also provides [`PromptBuilder`] — a composable builder for assembling
+//! multi-section agent prompts with deterministic section ordering.
 
 use serde::{Deserialize, Serialize};
+
+// ============================================================================
+// PromptBuilder — composable prompt assembly
+// ============================================================================
+
+/// A section of a composable prompt, rendered in priority order.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", content = "content")]
+pub enum PromptSection {
+    /// Task description (highest priority — always first)
+    TaskDescription(String),
+    /// Steps to complete
+    Steps(String),
+    /// Plan constraints
+    Constraints(String),
+    /// Knowledge notes (guidelines, gotchas, patterns)
+    KnowledgeNotes(String),
+    /// Activated skill context
+    SkillContext(String),
+    /// File context (symbols, dependencies)
+    FileContext(String),
+    /// Runner execution constraints
+    RunnerConstraints(String),
+    /// Enrichment pipeline output (injected by EnrichmentPipeline)
+    Enrichment(String),
+    /// Propagated notes from Knowledge Fabric
+    PropagatedNotes(String),
+    /// Custom section (lowest priority)
+    Custom(String),
+}
+
+impl PromptSection {
+    /// Priority order for sorting (lower = rendered first).
+    fn priority(&self) -> u8 {
+        match self {
+            Self::TaskDescription(_) => 0,
+            Self::Steps(_) => 1,
+            Self::Constraints(_) => 2,
+            Self::KnowledgeNotes(_) => 3,
+            Self::PropagatedNotes(_) => 4,
+            Self::SkillContext(_) => 5,
+            Self::FileContext(_) => 6,
+            Self::Enrichment(_) => 7,
+            Self::RunnerConstraints(_) => 8,
+            Self::Custom(_) => 9,
+        }
+    }
+
+    /// Section title for markdown rendering.
+    fn title(&self) -> &str {
+        match self {
+            Self::TaskDescription(_) => "Task",
+            Self::Steps(_) => "Steps",
+            Self::Constraints(_) => "Constraints",
+            Self::KnowledgeNotes(_) => "Knowledge Notes",
+            Self::PropagatedNotes(_) => "Propagated Knowledge",
+            Self::SkillContext(_) => "Skill Context",
+            Self::FileContext(_) => "Files to Modify",
+            Self::Enrichment(_) => "Enrichment Context",
+            Self::RunnerConstraints(_) => "Runner Constraints",
+            Self::Custom(_) => "Additional Context",
+        }
+    }
+
+    /// Get the inner content string.
+    fn content(&self) -> &str {
+        match self {
+            Self::TaskDescription(s)
+            | Self::Steps(s)
+            | Self::Constraints(s)
+            | Self::KnowledgeNotes(s)
+            | Self::PropagatedNotes(s)
+            | Self::SkillContext(s)
+            | Self::FileContext(s)
+            | Self::Enrichment(s)
+            | Self::RunnerConstraints(s)
+            | Self::Custom(s) => s,
+        }
+    }
+}
+
+/// Composable prompt builder that assembles multi-section agent prompts.
+///
+/// Sections are rendered in deterministic priority order regardless of insertion order.
+/// Use method chaining for ergonomic construction:
+/// ```ignore
+/// let prompt = PromptBuilder::new()
+///     .with_task("Implement feature X")
+///     .with_steps("1. Create module\n2. Add tests")
+///     .with_constraints("- Must be async")
+///     .build();
+/// ```
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PromptBuilder {
+    sections: Vec<PromptSection>,
+}
+
+impl PromptBuilder {
+    /// Create a new empty PromptBuilder.
+    pub fn new() -> Self {
+        Self {
+            sections: Vec::new(),
+        }
+    }
+
+    /// Add an arbitrary section.
+    pub fn add_section(mut self, section: PromptSection) -> Self {
+        self.sections.push(section);
+        self
+    }
+
+    /// Add a task description section.
+    pub fn with_task(self, description: impl Into<String>) -> Self {
+        self.add_section(PromptSection::TaskDescription(description.into()))
+    }
+
+    /// Add a steps section.
+    pub fn with_steps(self, steps: impl Into<String>) -> Self {
+        self.add_section(PromptSection::Steps(steps.into()))
+    }
+
+    /// Add a constraints section.
+    pub fn with_constraints(self, constraints: impl Into<String>) -> Self {
+        self.add_section(PromptSection::Constraints(constraints.into()))
+    }
+
+    /// Add a knowledge notes section.
+    pub fn with_knowledge_notes(self, notes: impl Into<String>) -> Self {
+        self.add_section(PromptSection::KnowledgeNotes(notes.into()))
+    }
+
+    /// Add a skill context section.
+    pub fn with_skill_context(self, context: impl Into<String>) -> Self {
+        self.add_section(PromptSection::SkillContext(context.into()))
+    }
+
+    /// Add a file context section.
+    pub fn with_file_context(self, context: impl Into<String>) -> Self {
+        self.add_section(PromptSection::FileContext(context.into()))
+    }
+
+    /// Add runner constraints section.
+    pub fn with_runner_constraints(self, constraints: impl Into<String>) -> Self {
+        self.add_section(PromptSection::RunnerConstraints(constraints.into()))
+    }
+
+    /// Add enrichment pipeline output section.
+    pub fn with_enrichment(self, enrichment: impl Into<String>) -> Self {
+        self.add_section(PromptSection::Enrichment(enrichment.into()))
+    }
+
+    /// Add propagated notes section.
+    pub fn with_propagated_notes(self, notes: impl Into<String>) -> Self {
+        self.add_section(PromptSection::PropagatedNotes(notes.into()))
+    }
+
+    /// Add a custom section.
+    pub fn with_custom(self, content: impl Into<String>) -> Self {
+        self.add_section(PromptSection::Custom(content.into()))
+    }
+
+    /// Get the sections (for JSON inspection).
+    pub fn sections(&self) -> &[PromptSection] {
+        &self.sections
+    }
+
+    /// Build the final prompt string, sections sorted by priority.
+    pub fn build(mut self) -> String {
+        self.sections.sort_by_key(|s| s.priority());
+
+        let mut prompt = String::new();
+        for section in &self.sections {
+            let content = section.content();
+            if content.is_empty() {
+                continue;
+            }
+            // TaskDescription gets # heading, others get ##
+            match section {
+                PromptSection::TaskDescription(_) => {
+                    prompt.push_str(&format!("# {}\n\n{}\n\n", section.title(), content));
+                }
+                _ => {
+                    prompt.push_str(&format!("## {}\n{}\n\n", section.title(), content));
+                }
+            }
+        }
+        prompt
+    }
+
+    /// Build and return structured sections as JSON-serializable data.
+    pub fn build_structured(mut self) -> StructuredPrompt {
+        self.sections.sort_by_key(|s| s.priority());
+        let rendered = {
+            let clone = self.clone();
+            clone.build()
+        };
+        StructuredPrompt {
+            sections: self.sections,
+            rendered,
+        }
+    }
+}
+
+/// A structured prompt with both sections and rendered output.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StructuredPrompt {
+    /// Individual sections (for review/inspection)
+    pub sections: Vec<PromptSection>,
+    /// Full rendered prompt string
+    pub rendered: String,
+}
 
 /// Context used to build the dynamic runner constraints prompt.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -110,6 +324,105 @@ pub fn build_runner_constraints(ctx: &RunnerPromptContext) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ========================================================================
+    // PromptBuilder tests
+    // ========================================================================
+
+    #[test]
+    fn test_prompt_builder_empty() {
+        let prompt = PromptBuilder::new().build();
+        assert!(prompt.is_empty());
+    }
+
+    #[test]
+    fn test_prompt_builder_single_section() {
+        let prompt = PromptBuilder::new()
+            .with_task("Implement feature X")
+            .build();
+        assert!(prompt.contains("# Task"));
+        assert!(prompt.contains("Implement feature X"));
+    }
+
+    #[test]
+    fn test_prompt_builder_priority_ordering() {
+        // Add sections in reverse priority order
+        let prompt = PromptBuilder::new()
+            .with_custom("custom content")
+            .with_runner_constraints("runner rules")
+            .with_task("task description")
+            .with_steps("step 1")
+            .with_constraints("constraint A")
+            .build();
+
+        // Task should come before Steps, Steps before Constraints, etc.
+        let task_pos = prompt.find("# Task").unwrap();
+        let steps_pos = prompt.find("## Steps").unwrap();
+        let constraints_pos = prompt.find("## Constraints").unwrap();
+        let runner_pos = prompt.find("## Runner Constraints").unwrap();
+        let custom_pos = prompt.find("## Additional Context").unwrap();
+
+        assert!(task_pos < steps_pos);
+        assert!(steps_pos < constraints_pos);
+        assert!(constraints_pos < runner_pos);
+        assert!(runner_pos < custom_pos);
+    }
+
+    #[test]
+    fn test_prompt_builder_skips_empty_sections() {
+        let prompt = PromptBuilder::new()
+            .with_task("task")
+            .with_steps("")
+            .with_constraints("constraint")
+            .build();
+        assert!(prompt.contains("# Task"));
+        assert!(prompt.contains("## Constraints"));
+        assert!(!prompt.contains("## Steps"));
+    }
+
+    #[test]
+    fn test_prompt_builder_chaining() {
+        let prompt = PromptBuilder::new()
+            .with_task("task")
+            .with_knowledge_notes("- Note 1\n- Note 2")
+            .with_skill_context("Use async/await")
+            .with_file_context("src/main.rs: rust, symbols: main")
+            .with_enrichment("<enrichment>content</enrichment>")
+            .with_propagated_notes("- [gotcha] Watch out for nulls")
+            .build();
+
+        assert!(prompt.contains("# Task"));
+        assert!(prompt.contains("## Knowledge Notes"));
+        assert!(prompt.contains("## Skill Context"));
+        assert!(prompt.contains("## Files to Modify"));
+        assert!(prompt.contains("## Enrichment Context"));
+        assert!(prompt.contains("## Propagated Knowledge"));
+    }
+
+    #[test]
+    fn test_prompt_builder_structured() {
+        let structured = PromptBuilder::new()
+            .with_task("task")
+            .with_constraints("constraint")
+            .build_structured();
+
+        assert_eq!(structured.sections.len(), 2);
+        assert!(structured.rendered.contains("# Task"));
+        assert!(structured.rendered.contains("## Constraints"));
+    }
+
+    #[test]
+    fn test_prompt_section_serialization() {
+        let section = PromptSection::TaskDescription("test".to_string());
+        let json = serde_json::to_string(&section).unwrap();
+        assert!(json.contains("TaskDescription"));
+        let deserialized: PromptSection = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.content(), "test");
+    }
+
+    // ========================================================================
+    // RunnerPromptContext / build_runner_constraints tests (existing)
+    // ========================================================================
 
     #[test]
     fn test_single_agent_matches_base() {

@@ -301,6 +301,14 @@ pub enum RunnerEvent {
         cumulated_cost_usd: f64,
         limit_usd: f64,
     },
+    /// Worktree commits were recovered after a wave
+    WorktreeRecovery {
+        run_id: Uuid,
+        wave_number: usize,
+        commits_recovered: usize,
+        conflicts: usize,
+        worktrees_cleaned: usize,
+    },
 }
 
 // ============================================================================

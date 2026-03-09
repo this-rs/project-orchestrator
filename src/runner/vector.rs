@@ -60,7 +60,7 @@ pub struct QualityDim {
 }
 
 /// Knowledge captured during the run.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct KnowledgeDim {
     pub notes_created: u32,
     pub decisions_created: u32,
@@ -71,7 +71,7 @@ pub struct KnowledgeDim {
 }
 
 /// Drift/instability signals.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DriftDim {
     pub idle_warnings: u32,
     pub loop_warnings: u32,
@@ -220,6 +220,199 @@ pub enum DriftEvent {
     Compaction,
     Timeout,
     Budget,
+}
+
+// ============================================================================
+// AgentVectorCollector — per-agent metric accumulation
+// ============================================================================
+
+/// Per-agent execution vector — a subset of ExecutionVector dimensions
+/// scoped to a single agent's work on a single task.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentExecutionVector {
+    pub task_id: Uuid,
+    pub duration_secs: f64,
+    pub cost_usd: f64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub drift: DriftDim,
+    pub knowledge: KnowledgeDim,
+    pub success: bool,
+    pub persona_profile: String,
+}
+
+/// Collects execution metrics for a single agent during task execution.
+///
+/// Each spawned agent gets its own `AgentVectorCollector`. At task completion,
+/// call `finalize()` to produce an `AgentExecutionVector` that is stored
+/// on the `AgentExecution` node in Neo4j.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentVectorCollector {
+    pub task_id: Uuid,
+    pub persona_profile: String,
+    // Drift counters
+    pub idle_warnings: u32,
+    pub loop_warnings: u32,
+    pub compaction_count: u32,
+    pub timeout_count: u32,
+    pub budget_warnings: u32,
+    // Knowledge counters
+    pub notes_created: u32,
+    pub decisions_created: u32,
+    pub commits_linked: u32,
+    pub files_modified: u32,
+    pub lines_added: u32,
+    pub lines_deleted: u32,
+    // Token tracking
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+}
+
+impl AgentVectorCollector {
+    /// Create a new per-agent collector for a specific task.
+    pub fn new(task_id: Uuid, persona_profile: String) -> Self {
+        Self {
+            task_id,
+            persona_profile,
+            ..Self::default()
+        }
+    }
+
+    /// Record a drift event on this agent's collector.
+    pub fn record_drift(&mut self, event: &DriftEvent) {
+        match event {
+            DriftEvent::Idle => self.idle_warnings += 1,
+            DriftEvent::Loop => self.loop_warnings += 1,
+            DriftEvent::Compaction => self.compaction_count += 1,
+            DriftEvent::Timeout => self.timeout_count += 1,
+            DriftEvent::Budget => self.budget_warnings += 1,
+        }
+    }
+
+    /// Record enrichment results from the enricher.
+    pub fn record_enrichment(&mut self, commits: usize, note_created: bool, affects: usize) {
+        self.commits_linked += commits as u32;
+        if note_created {
+            self.notes_created += 1;
+        }
+        self.decisions_created += affects as u32;
+    }
+
+    /// Finalize this agent's metrics into an `AgentExecutionVector`.
+    pub fn finalize(&self, duration_secs: f64, cost_usd: f64, success: bool) -> AgentExecutionVector {
+        AgentExecutionVector {
+            task_id: self.task_id,
+            duration_secs,
+            cost_usd,
+            input_tokens: self.input_tokens,
+            output_tokens: self.output_tokens,
+            drift: DriftDim {
+                idle_warnings: self.idle_warnings,
+                loop_warnings: self.loop_warnings,
+                compaction_count: self.compaction_count,
+                timeout_count: self.timeout_count,
+                budget_warnings: self.budget_warnings,
+            },
+            knowledge: KnowledgeDim {
+                notes_created: self.notes_created,
+                decisions_created: self.decisions_created,
+                commits_linked: self.commits_linked,
+                files_modified: self.files_modified,
+                lines_added: self.lines_added,
+                lines_deleted: self.lines_deleted,
+            },
+            success,
+            persona_profile: self.persona_profile.clone(),
+        }
+    }
+
+    /// Merge this agent's metrics into the global VectorCollector.
+    pub fn merge_into(&self, global: &mut VectorCollector) {
+        global.idle_warnings += self.idle_warnings;
+        global.loop_warnings += self.loop_warnings;
+        global.compaction_count += self.compaction_count;
+        global.timeout_count += self.timeout_count;
+        global.budget_warnings += self.budget_warnings;
+        global.notes_created += self.notes_created;
+        global.decisions_created += self.decisions_created;
+        global.commits_linked += self.commits_linked;
+        global.files_modified += self.files_modified;
+        global.lines_added += self.lines_added;
+        global.lines_deleted += self.lines_deleted;
+        global.input_tokens += self.input_tokens;
+        global.output_tokens += self.output_tokens;
+    }
+}
+
+// ============================================================================
+// Per-agent prediction helpers
+// ============================================================================
+
+/// Predict a future run using per-agent historical data for finer-grained estimates.
+///
+/// When per-agent vectors are available, this produces per-task duration/cost
+/// estimates that are more accurate than the run-level weighted average.
+/// Falls back to `predict_run` when no per-agent data is available.
+pub fn predict_run_per_agent(
+    run_vectors: &[ExecutionVector],
+    agent_vectors: &[Vec<AgentExecutionVector>],
+) -> RunPrediction {
+    // If no agent-level data, fall back to run-level prediction
+    if agent_vectors.is_empty() || agent_vectors.iter().all(|v| v.is_empty()) {
+        return predict_run(run_vectors);
+    }
+
+    // Collect per-task historical data across runs
+    let mut task_durations: std::collections::HashMap<Uuid, Vec<f64>> =
+        std::collections::HashMap::new();
+    let mut task_costs: std::collections::HashMap<Uuid, Vec<f64>> =
+        std::collections::HashMap::new();
+
+    for run_agents in agent_vectors {
+        for av in run_agents {
+            task_durations
+                .entry(av.task_id)
+                .or_default()
+                .push(av.duration_secs);
+            task_costs
+                .entry(av.task_id)
+                .or_default()
+                .push(av.cost_usd);
+        }
+    }
+
+    // Weighted average per task (exponential decay)
+    let decay = 0.7_f64;
+    let mut total_est_duration = 0.0_f64;
+    let mut total_est_cost = 0.0_f64;
+
+    for durations in task_durations.values() {
+        let n = durations.len();
+        let weights: Vec<f64> = (0..n).map(|i| decay.powi((n - 1 - i) as i32)).collect();
+        let weight_sum: f64 = weights.iter().sum();
+        let est: f64 = durations.iter().zip(&weights).map(|(v, w)| v * w).sum::<f64>() / weight_sum;
+        total_est_duration += est;
+    }
+
+    for costs in task_costs.values() {
+        let n = costs.len();
+        let weights: Vec<f64> = (0..n).map(|i| decay.powi((n - 1 - i) as i32)).collect();
+        let weight_sum: f64 = weights.iter().sum();
+        let est: f64 = costs.iter().zip(&weights).map(|(v, w)| v * w).sum::<f64>() / weight_sum;
+        total_est_cost += est;
+    }
+
+    // Success probability and confidence from run-level data
+    let base = predict_run(run_vectors);
+
+    RunPrediction {
+        estimated_duration_secs: total_est_duration,
+        estimated_cost_usd: total_est_cost,
+        success_probability: base.success_probability,
+        confidence: base.confidence,
+        anomalies: base.anomalies,
+        suggestions: base.suggestions,
+    }
 }
 
 // ============================================================================
@@ -781,5 +974,180 @@ mod tests {
             .anomalies
             .iter()
             .any(|a| a.dimension == "duration" || a.dimension == "cost"));
+    }
+
+    // ========================================================================
+    // Per-agent VectorCollector tests
+    // ========================================================================
+
+    #[test]
+    fn test_agent_vector_collector_new() {
+        let task_id = Uuid::new_v4();
+        let collector = AgentVectorCollector::new(task_id, "complex".to_string());
+        assert_eq!(collector.task_id, task_id);
+        assert_eq!(collector.persona_profile, "complex");
+        assert_eq!(collector.idle_warnings, 0);
+        assert_eq!(collector.input_tokens, 0);
+    }
+
+    #[test]
+    fn test_agent_vector_collector_drift() {
+        let mut collector = AgentVectorCollector::new(Uuid::new_v4(), "simple".to_string());
+        collector.record_drift(&DriftEvent::Idle);
+        collector.record_drift(&DriftEvent::Idle);
+        collector.record_drift(&DriftEvent::Loop);
+        assert_eq!(collector.idle_warnings, 2);
+        assert_eq!(collector.loop_warnings, 1);
+    }
+
+    #[test]
+    fn test_agent_vector_collector_enrichment() {
+        let mut collector = AgentVectorCollector::new(Uuid::new_v4(), "simple".to_string());
+        collector.record_enrichment(3, true, 2);
+        assert_eq!(collector.commits_linked, 3);
+        assert_eq!(collector.notes_created, 1);
+        assert_eq!(collector.decisions_created, 2);
+    }
+
+    #[test]
+    fn test_agent_vector_collector_finalize() {
+        let mut collector = AgentVectorCollector::new(Uuid::new_v4(), "complex".to_string());
+        collector.record_drift(&DriftEvent::Idle);
+        collector.notes_created = 2;
+        collector.input_tokens = 1000;
+        collector.output_tokens = 500;
+
+        let vector = collector.finalize(120.0, 0.5, true);
+        assert_eq!(vector.duration_secs, 120.0);
+        assert_eq!(vector.cost_usd, 0.5);
+        assert!(vector.success);
+        assert_eq!(vector.drift.idle_warnings, 1);
+        assert_eq!(vector.knowledge.notes_created, 2);
+        assert_eq!(vector.input_tokens, 1000);
+        assert_eq!(vector.persona_profile, "complex");
+    }
+
+    #[test]
+    fn test_agent_vector_collector_merge_into_global() {
+        let mut agent = AgentVectorCollector::new(Uuid::new_v4(), "simple".to_string());
+        agent.idle_warnings = 2;
+        agent.notes_created = 1;
+        agent.input_tokens = 500;
+        agent.output_tokens = 200;
+        agent.commits_linked = 3;
+
+        let mut global = VectorCollector::new();
+        global.idle_warnings = 1;
+        global.input_tokens = 100;
+
+        agent.merge_into(&mut global);
+
+        assert_eq!(global.idle_warnings, 3); // 1 + 2
+        assert_eq!(global.notes_created, 1);
+        assert_eq!(global.input_tokens, 600); // 100 + 500
+        assert_eq!(global.output_tokens, 200);
+        assert_eq!(global.commits_linked, 3);
+    }
+
+    #[test]
+    fn test_predict_run_per_agent_fallback() {
+        // When no agent-level data, should fall back to run-level prediction
+        let vectors = vec![
+            make_vector(600.0, 2.0, 5, 0, PlanRunStatus::Completed),
+            make_vector(500.0, 1.8, 5, 0, PlanRunStatus::Completed),
+        ];
+        let pred = predict_run_per_agent(&vectors, &[]);
+        assert!(pred.estimated_duration_secs > 0.0);
+        assert_eq!(pred.success_probability, 1.0);
+    }
+
+    #[test]
+    fn test_predict_run_per_agent_with_data() {
+        let vectors = vec![
+            make_vector(600.0, 2.0, 5, 0, PlanRunStatus::Completed),
+            make_vector(500.0, 1.5, 5, 0, PlanRunStatus::Completed),
+        ];
+
+        let task1 = Uuid::new_v4();
+        let task2 = Uuid::new_v4();
+
+        let agent_vectors = vec![
+            vec![
+                AgentExecutionVector {
+                    task_id: task1,
+                    duration_secs: 300.0,
+                    cost_usd: 1.0,
+                    input_tokens: 500,
+                    output_tokens: 200,
+                    drift: DriftDim::default(),
+                    knowledge: KnowledgeDim::default(),
+                    success: true,
+                    persona_profile: "simple".to_string(),
+                },
+                AgentExecutionVector {
+                    task_id: task2,
+                    duration_secs: 300.0,
+                    cost_usd: 1.0,
+                    input_tokens: 500,
+                    output_tokens: 200,
+                    drift: DriftDim::default(),
+                    knowledge: KnowledgeDim::default(),
+                    success: true,
+                    persona_profile: "complex".to_string(),
+                },
+            ],
+            vec![
+                AgentExecutionVector {
+                    task_id: task1,
+                    duration_secs: 250.0,
+                    cost_usd: 0.8,
+                    input_tokens: 400,
+                    output_tokens: 150,
+                    drift: DriftDim::default(),
+                    knowledge: KnowledgeDim::default(),
+                    success: true,
+                    persona_profile: "simple".to_string(),
+                },
+                AgentExecutionVector {
+                    task_id: task2,
+                    duration_secs: 250.0,
+                    cost_usd: 0.7,
+                    input_tokens: 400,
+                    output_tokens: 150,
+                    drift: DriftDim::default(),
+                    knowledge: KnowledgeDim::default(),
+                    success: true,
+                    persona_profile: "complex".to_string(),
+                },
+            ],
+        ];
+
+        let pred = predict_run_per_agent(&vectors, &agent_vectors);
+        // Per-agent estimates should be more specific
+        assert!(pred.estimated_duration_secs > 0.0);
+        assert!(pred.estimated_cost_usd > 0.0);
+        // Should be biased toward recent values (task1: 250, task2: 250)
+        assert!(pred.estimated_duration_secs < 600.0);
+        assert_eq!(pred.success_probability, 1.0);
+    }
+
+    #[test]
+    fn test_agent_execution_vector_serialization() {
+        let av = AgentExecutionVector {
+            task_id: Uuid::nil(),
+            duration_secs: 120.0,
+            cost_usd: 0.5,
+            input_tokens: 1000,
+            output_tokens: 500,
+            drift: DriftDim::default(),
+            knowledge: KnowledgeDim::default(),
+            success: true,
+            persona_profile: "simple".to_string(),
+        };
+        let json = serde_json::to_string(&av).unwrap();
+        let deserialized: AgentExecutionVector = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.task_id, Uuid::nil());
+        assert_eq!(deserialized.duration_secs, 120.0);
+        assert!(deserialized.success);
     }
 }

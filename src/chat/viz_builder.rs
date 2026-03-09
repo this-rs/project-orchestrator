@@ -635,6 +635,8 @@ mod tests {
             created_at: chrono::Utc::now(),
             created_by: "test".to_string(),
             project_id: Some(project_id),
+            execution_context: None,
+            persona: None,
         };
         graph.plans.write().await.insert(plan_id, plan);
 
@@ -658,6 +660,9 @@ mod tests {
             started_at: None,
             completed_at: None,
             frustration_score: 0.0,
+            execution_context: None,
+            persona: None,
+            prompt_cache: None,
         };
         let task2 = TaskNode {
             id: task2_id,
@@ -676,6 +681,9 @@ mod tests {
             started_at: None,
             completed_at: None,
             frustration_score: 0.0,
+            execution_context: None,
+            persona: None,
+            prompt_cache: None,
         };
         graph.tasks.write().await.insert(task1_id, task1);
         graph.tasks.write().await.insert(task2_id, task2);
@@ -840,6 +848,8 @@ mod tests {
             created_at: chrono::Utc::now(),
             created_by: "test".to_string(),
             project_id: None,
+            execution_context: None,
+            persona: None,
         };
         graph.plans.write().await.insert(plan_id, plan);
         graph.plan_tasks.write().await.insert(plan_id, vec![]);
@@ -1030,6 +1040,8 @@ mod tests {
             created_at: chrono::Utc::now(),
             created_by: "test".to_string(),
             project_id: None,
+            execution_context: None,
+            persona: None,
         };
         graph.plans.write().await.insert(plan_id, plan);
 
@@ -1053,6 +1065,9 @@ mod tests {
                 started_at: None,
                 completed_at: None,
                 frustration_score: 0.0,
+                execution_context: None,
+                persona: None,
+                prompt_cache: None,
             },
         );
         graph

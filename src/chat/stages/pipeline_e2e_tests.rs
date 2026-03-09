@@ -188,6 +188,8 @@ mod tests {
             created_at: Utc::now(),
             created_by: "test".to_string(),
             project_id: Some(project_id),
+            execution_context: None,
+            persona: None,
         };
         graph.plans.write().await.insert(plan_id, plan);
 
@@ -221,6 +223,9 @@ mod tests {
                 started_at: None,
                 completed_at: None,
                 frustration_score: 0.0,
+                execution_context: None,
+                persona: None,
+                prompt_cache: None,
             };
             graph.tasks.write().await.insert(task_id, task);
             task_ids.push(task_id);

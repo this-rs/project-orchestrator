@@ -1585,6 +1585,8 @@ impl ImplementationPlanner {
                     created_at: chrono::Utc::now(),
                     updated_at: None,
                     completed_at: None,
+                    execution_context: None,
+                    persona: None,
                 };
                 self.plan_manager.add_step(task_node.id, &step).await?;
             } else if phase.parallel {
@@ -1598,6 +1600,8 @@ impl ImplementationPlanner {
                         created_at: chrono::Utc::now(),
                         updated_at: None,
                         completed_at: None,
+                        execution_context: None,
+                        persona: None,
                     };
                     self.plan_manager.add_step(task_node.id, &step).await?;
                     step_order += 1;
@@ -1624,6 +1628,8 @@ impl ImplementationPlanner {
                         created_at: chrono::Utc::now(),
                         updated_at: None,
                         completed_at: None,
+                        execution_context: None,
+                        persona: None,
                     };
                     self.plan_manager.add_step(task_node.id, &step).await?;
                     step_order += 1;

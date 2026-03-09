@@ -1,5 +1,6 @@
 //! Neo4j client and models for the knowledge graph
 
+pub(crate) mod agent_execution;
 mod analytics;
 pub(crate) mod batch;
 mod chat;
@@ -29,6 +30,7 @@ mod trigger;
 mod user;
 mod workspace;
 
+pub use agent_execution::{AgentExecutionNode, AgentExecutionStatus};
 pub use client::Neo4jClient;
 pub use models::*;
 pub use traits::GraphStore;

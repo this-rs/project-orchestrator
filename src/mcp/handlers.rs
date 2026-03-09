@@ -127,6 +127,8 @@ impl ToolHandler {
             ("plan", "get_run") => "get_plan_run",
             ("plan", "compare_runs") => "compare_plan_runs",
             ("plan", "predict_run") => "predict_plan_run",
+            ("plan", "enrich") => "enrich_plan",
+            ("plan", "delegate_task") => "delegate_task",
 
             // Task
             ("task", "list") => "list_tasks",
@@ -141,6 +143,8 @@ impl ToolHandler {
             ("task", "get_blocked_by") => "get_tasks_blocked_by",
             ("task", "get_context") => "get_task_context",
             ("task", "get_prompt") => "get_task_prompt",
+            ("task", "build_prompt") => "build_task_prompt",
+            ("task", "enrich") => "enrich_task",
 
             // Step
             ("step", "list") => "list_steps",
@@ -1149,6 +1153,50 @@ impl ToolHandler {
                 let task_id = extract_id(args, "task_id")?;
                 let result = http
                     .get(&format!("/api/plans/{}/tasks/{}/prompt", plan_id, task_id))
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "build_task_prompt" => {
+                let plan_id = extract_id(args, "plan_id")?;
+                let task_id = extract_id(args, "task_id")?;
+                let result = http
+                    .post(
+                        &format!("/api/plans/{}/tasks/{}/build_prompt", plan_id, task_id),
+                        args,
+                    )
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "enrich_plan" => {
+                let plan_id = extract_id(args, "plan_id")?;
+                let result = http
+                    .post(&format!("/api/plans/{}/enrich", plan_id), args)
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "delegate_task" => {
+                let plan_id = extract_id(args, "plan_id")?;
+                let task_id = extract_id(args, "task_id")?;
+                let result = http
+                    .post(
+                        &format!("/api/plans/{}/tasks/{}/delegate", plan_id, task_id),
+                        args,
+                    )
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "enrich_task" => {
+                let plan_id = extract_id(args, "plan_id")?;
+                let task_id = extract_id(args, "task_id")?;
+                let result = http
+                    .post(
+                        &format!("/api/plans/{}/tasks/{}/enrich", plan_id, task_id),
+                        args,
+                    )
                     .await?;
                 Ok(Some(result))
             }
@@ -4446,6 +4494,7 @@ mod tests {
             ("get_critical_path", "get_critical_path"),
             ("get_waves", "get_waves"),
             ("delete", "delete_plan"),
+            ("delegate_task", "delegate_task"),
         ] {
             let args = json!({"action": action});
             let (name, _) = handler.resolve_mega_tool("plan", &args).unwrap();

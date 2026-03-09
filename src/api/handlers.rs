@@ -652,6 +652,352 @@ pub async fn get_task_prompt(
     Ok(Json(PromptResponse { prompt }))
 }
 
+/// Request body for build_prompt
+#[derive(Debug, Deserialize)]
+pub struct BuildPromptRequest {
+    /// Optional custom sections to append
+    #[serde(default)]
+    pub custom_sections: Vec<String>,
+}
+
+/// Build an enriched prompt for a task via PromptBuilder + EnrichmentPipeline.
+///
+/// Returns a structured prompt with individual sections (for review) and
+/// the fully rendered prompt string.
+pub async fn build_task_prompt(
+    State(state): State<OrchestratorState>,
+    Path((plan_id, task_id)): Path<(Uuid, Uuid)>,
+    Json(req): Json<BuildPromptRequest>,
+) -> Result<Json<crate::runner::prompt::StructuredPrompt>, AppError> {
+    let structured = state
+        .orchestrator
+        .context_builder()
+        .build_enriched_context(
+            task_id,
+            plan_id,
+            None, // no pipeline in HTTP context (stages require DI)
+            None, // project_slug
+            None, // project_id
+            req.custom_sections,
+        )
+        .await?;
+    Ok(Json(structured))
+}
+
+// ============================================================================
+// Task Delegation — sub-agent orchestration from the conversational agent
+// ============================================================================
+
+/// Request body for delegate_task.
+///
+/// ## Delegation workflow
+///
+/// The conversational agent orchestrates sub-agents via this endpoint:
+///
+/// 1. `skill(activate)` — activate relevant skills for the task's domain
+/// 2. `note(get_propagated)` — retrieve propagated knowledge notes
+/// 3. `code(analyze_impact)` — analyze affected files for context
+/// 4. Compose a custom prompt with `custom_sections`
+/// 5. `plan(delegate_task)` — spawn a sub-agent with the enriched prompt
+///
+/// The sub-agent runs asynchronously. Track progress via `chat(get_session_tree)`.
+/// Results (tools_used, files_modified, commits) are available on the AgentExecution
+/// node once the agent completes.
+#[derive(Debug, Deserialize)]
+pub struct DelegateTaskRequest {
+    /// Working directory for the spawned agent
+    pub cwd: String,
+    /// Optional project slug (scopes MCP operations)
+    #[serde(default)]
+    pub project_slug: Option<String>,
+    /// Optional custom prompt sections to append
+    #[serde(default)]
+    pub custom_sections: Vec<String>,
+    /// Parent session ID — if set, creates a SPAWNED_BY relation in Neo4j
+    /// so the delegation is visible in the session tree.
+    #[serde(default)]
+    pub parent_session_id: Option<String>,
+}
+
+/// Response for a successfully delegated task.
+#[derive(Debug, Serialize)]
+pub struct DelegateTaskResponse {
+    /// Session ID of the spawned sub-agent
+    pub session_id: String,
+    /// Task ID that was delegated
+    pub task_id: Uuid,
+    /// Plan ID the task belongs to
+    pub plan_id: Uuid,
+    /// First 200 characters of the prompt (for preview/debugging)
+    pub prompt_preview: String,
+}
+
+/// POST /api/plans/:plan_id/tasks/:task_id/delegate — Delegate a task to a sub-agent.
+///
+/// Builds an enriched prompt via `ContextBuilder.build_enriched_context()` with
+/// optional custom sections, spawns a Claude Code agent via `ChatManager`, and
+/// creates a SPAWNED_BY relation if `parent_session_id` is provided.
+///
+/// Returns 202 Accepted with the session_id. The agent executes asynchronously.
+/// Track progress via `chat(get_session_tree)` or `chat(get_children)`.
+/// Retrieve results from the AgentExecution node after completion.
+pub async fn delegate_task(
+    State(state): State<OrchestratorState>,
+    Path((plan_id, task_id)): Path<(Uuid, Uuid)>,
+    Json(req): Json<DelegateTaskRequest>,
+) -> Result<(StatusCode, Json<DelegateTaskResponse>), AppError> {
+    let chat_manager = state
+        .chat_manager
+        .as_ref()
+        .ok_or_else(|| AppError::Internal(anyhow::anyhow!("Chat manager not initialized")))?;
+
+    // Validate that the task exists
+    let graph = state.orchestrator.neo4j_arc();
+    let task_node = graph
+        .get_task(task_id)
+        .await
+        .map_err(AppError::Internal)?
+        .ok_or_else(|| AppError::NotFound(format!("Task {} not found", task_id)))?;
+
+    let task_title = task_node
+        .title
+        .clone()
+        .unwrap_or_else(|| "Untitled task".to_string());
+
+    // Step 1: Build enriched prompt via ContextBuilder
+    let structured = state
+        .orchestrator
+        .context_builder()
+        .build_enriched_context(
+            task_id,
+            plan_id,
+            None, // no pipeline in HTTP context (stages require DI)
+            req.project_slug.as_deref(),
+            None, // project_id resolved from slug if needed
+            req.custom_sections,
+        )
+        .await
+        .map_err(AppError::Internal)?;
+
+    let prompt = structured.rendered.clone();
+    let prompt_preview = {
+        let end = prompt
+            .char_indices()
+            .nth(200)
+            .map(|(i, _)| i)
+            .unwrap_or(prompt.len());
+        prompt[..end].to_string()
+    };
+
+    // Step 2: Spawn sub-agent via ChatManager
+    let spawned_by_json = serde_json::json!({
+        "type": "delegation",
+        "plan_id": plan_id.to_string(),
+        "task_id": task_id.to_string(),
+        "parent_session_id": req.parent_session_id,
+    });
+
+    let chat_request = crate::chat::types::ChatRequest {
+        message: String::new(), // prompt sent via send_message
+        session_id: None,
+        cwd: req.cwd,
+        project_slug: req.project_slug,
+        model: None,
+        permission_mode: Some("bypassPermissions".to_string()),
+        add_dirs: None,
+        workspace_slug: None,
+        user_claims: None,
+        spawned_by: Some(spawned_by_json.to_string()),
+    };
+
+    let session = chat_manager
+        .create_session(&chat_request)
+        .await
+        .map_err(AppError::Internal)?;
+    let session_id = session.session_id.clone();
+
+    // Step 3: Create AgentExecution node for tracking (fire-and-forget)
+    let session_uuid = session_id.parse::<Uuid>().ok();
+    {
+        use crate::neo4j::agent_execution::{AgentExecutionNode, AgentExecutionStatus};
+        let ae = AgentExecutionNode {
+            id: Uuid::new_v4(),
+            run_id: Uuid::nil(), // no PlanRun — this is a direct delegation
+            task_id,
+            session_id: session_uuid,
+            started_at: chrono::Utc::now(),
+            completed_at: None,
+            cost_usd: 0.0,
+            duration_secs: 0.0,
+            status: AgentExecutionStatus::Running,
+            tools_used: "{}".to_string(),
+            files_modified: vec![],
+            commits: vec![],
+            persona_profile: "delegation".to_string(),
+            vector_json: None,
+        };
+        let graph_clone = graph.clone();
+        tokio::spawn(async move {
+            if let Err(e) = graph_clone.create_agent_execution(&ae).await {
+                tracing::warn!("Failed to create AgentExecution for delegation: {}", e);
+            }
+        });
+    }
+
+    // Step 4: Send the enriched prompt to the agent (async — don't block)
+    let cm = chat_manager.clone();
+    let sid = session_id.clone();
+    let task_title_clone = task_title.clone();
+
+    // Emit TaskStarted event via WebSocket for real-time tracking
+    let event_bus = state.event_bus.clone();
+    let ev_task_id = task_id;
+    let ev_plan_id = plan_id;
+    let ev_session_id = session_id.clone();
+
+    tokio::spawn(async move {
+        // Send the prompt
+        if let Err(e) = cm.send_message(&sid, &prompt).await {
+            tracing::error!(
+                session_id = %sid,
+                task_id = %ev_task_id,
+                "Failed to send delegation prompt: {}", e
+            );
+            return;
+        }
+
+        tracing::info!(
+            session_id = %ev_session_id,
+            task_id = %ev_task_id,
+            plan_id = %ev_plan_id,
+            task_title = %task_title_clone,
+            "Delegation started: sub-agent spawned with enriched prompt"
+        );
+
+        // Listen for completion and emit TaskCompleted event
+        let rx = match cm.subscribe(&sid).await {
+            Ok(rx) => rx,
+            Err(e) => {
+                tracing::warn!("Failed to subscribe to delegated session {}: {}", sid, e);
+                return;
+            }
+        };
+
+        listen_delegation_result(rx, ev_task_id, &task_title_clone, event_bus).await;
+    });
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(DelegateTaskResponse {
+            session_id,
+            task_id,
+            plan_id,
+            prompt_preview,
+        }),
+    ))
+}
+
+/// Listen for a delegated sub-agent's Result event and emit a RunnerEvent-compatible
+/// CrudEvent so the frontend is notified via WebSocket.
+async fn listen_delegation_result(
+    mut rx: tokio::sync::broadcast::Receiver<crate::chat::types::ChatEvent>,
+    task_id: Uuid,
+    task_title: &str,
+    event_bus: std::sync::Arc<crate::events::HybridEmitter>,
+) {
+    use crate::events::{CrudAction, CrudEvent, EntityType, EventEmitter};
+
+    let start = std::time::Instant::now();
+    let timeout = std::time::Duration::from_secs(3600); // 1h safety net
+
+    loop {
+        let remaining = timeout.saturating_sub(start.elapsed());
+        if remaining.is_zero() {
+            tracing::warn!(task_id = %task_id, "Delegation listener timed out after 1h");
+            break;
+        }
+
+        match tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv()).await {
+            Ok(Ok(crate::chat::types::ChatEvent::Result {
+                cost_usd,
+                is_error,
+                ..
+            })) => {
+                let duration_secs = start.elapsed().as_secs_f64();
+                let cost = cost_usd.unwrap_or(0.0);
+
+                // Emit a CrudEvent so WebSocket clients see the completion
+                let payload = serde_json::json!({
+                    "event": if is_error { "delegation_failed" } else { "delegation_completed" },
+                    "task_id": task_id,
+                    "task_title": task_title,
+                    "cost_usd": cost,
+                    "duration_secs": duration_secs,
+                    "is_error": is_error,
+                });
+
+                event_bus.emit(CrudEvent {
+                    entity_type: EntityType::Task,
+                    action: CrudAction::Updated,
+                    entity_id: task_id.to_string(),
+                    related: None,
+                    payload,
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                    project_id: None,
+                });
+
+                tracing::info!(
+                    task_id = %task_id,
+                    cost_usd = cost,
+                    duration_secs = duration_secs,
+                    is_error = is_error,
+                    "Delegation completed"
+                );
+                break;
+            }
+            Ok(Ok(_)) => {
+                // Other event types — keep listening
+            }
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(n))) => {
+                tracing::warn!("Delegation listener lagged by {} events", n);
+            }
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+                tracing::warn!(task_id = %task_id, "Delegation channel closed");
+                break;
+            }
+            Err(_) => {
+                // 10s poll timeout — loop again
+            }
+        }
+    }
+}
+
+/// Enrich all tasks in a plan (pre-build context, profile persona, cache prompts).
+pub async fn enrich_plan(
+    State(state): State<OrchestratorState>,
+    Path(plan_id): Path<Uuid>,
+) -> Result<Json<crate::orchestrator::context::PlanEnrichmentResult>, AppError> {
+    let result = state
+        .orchestrator
+        .context_builder()
+        .enrich_plan(plan_id)
+        .await?;
+    Ok(Json(result))
+}
+
+/// Enrich a single task (pre-build context, profile persona, cache prompt).
+pub async fn enrich_task(
+    State(state): State<OrchestratorState>,
+    Path((plan_id, task_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<crate::orchestrator::context::EnrichmentResult>, AppError> {
+    let result = state
+        .orchestrator
+        .context_builder()
+        .enrich_task(task_id, plan_id)
+        .await?;
+    Ok(Json(result))
+}
+
 // ============================================================================
 // Decisions
 // ============================================================================

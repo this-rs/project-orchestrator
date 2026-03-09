@@ -120,6 +120,9 @@ impl Neo4jClient {
                 .ok()
                 .and_then(|s| s.parse().ok()),
             frustration_score: node.get::<f64>("frustration_score").unwrap_or(0.0),
+            execution_context: node.get::<String>("execution_context").ok().filter(|s| !s.is_empty()),
+            persona: node.get::<String>("persona").ok().filter(|s| !s.is_empty()),
+            prompt_cache: node.get::<String>("prompt_cache").ok().filter(|s| !s.is_empty()),
         })
     }
 
@@ -151,6 +154,8 @@ impl Neo4jClient {
                 .get::<String>("completed_at")
                 .ok()
                 .and_then(|s| s.parse().ok()),
+            execution_context: node.get::<String>("execution_context").ok().filter(|s| !s.is_empty()),
+            persona: node.get::<String>("persona").ok().filter(|s| !s.is_empty()),
         })
     }
 
@@ -558,6 +563,55 @@ impl Neo4jClient {
         }
         if let Some(ref assigned) = updates.assigned_to {
             q = q.param("assigned_to", assigned.clone());
+        }
+
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
+    /// Update pre-enrichment fields on a task (execution_context, persona, prompt_cache).
+    ///
+    /// Used by the pre-enrichment pipeline to cache context and prompt data
+    /// so the runner can skip the expensive ContextBuilder calls.
+    pub async fn update_task_enrichment(
+        &self,
+        task_id: Uuid,
+        execution_context: Option<&str>,
+        persona: Option<&str>,
+        prompt_cache: Option<&str>,
+    ) -> Result<()> {
+        let mut set_clauses = Vec::new();
+
+        if execution_context.is_some() {
+            set_clauses.push("t.execution_context = $execution_context");
+        }
+        if persona.is_some() {
+            set_clauses.push("t.persona = $persona");
+        }
+        if prompt_cache.is_some() {
+            set_clauses.push("t.prompt_cache = $prompt_cache");
+        }
+
+        if set_clauses.is_empty() {
+            return Ok(());
+        }
+
+        set_clauses.push("t.updated_at = datetime($updated_at)");
+
+        let cypher = format!("MATCH (t:Task {{id: $id}}) SET {}", set_clauses.join(", "));
+
+        let mut q = query(&cypher)
+            .param("id", task_id.to_string())
+            .param("updated_at", chrono::Utc::now().to_rfc3339());
+
+        if let Some(ctx) = execution_context {
+            q = q.param("execution_context", ctx.to_string());
+        }
+        if let Some(p) = persona {
+            q = q.param("persona", p.to_string());
+        }
+        if let Some(pc) = prompt_cache {
+            q = q.param("prompt_cache", pc.to_string());
         }
 
         self.graph.run(q).await?;

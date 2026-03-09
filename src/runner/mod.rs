@@ -17,8 +17,10 @@
 //! ```
 
 pub mod enricher;
+pub mod git;
 pub mod guard;
 pub mod models;
+pub mod persona;
 pub mod prompt;
 pub mod providers;
 #[allow(clippy::module_inception)]
@@ -35,10 +37,20 @@ pub use models::{
     ActiveAgent, ActiveAgentSnapshot, PlanRunStatus, RunSnapshot, RunnerConfig, RunnerEvent,
     TaskResult, TaskRunStatus, TaskStateMachine, Trigger, TriggerFiring, TriggerSource, TriggerType,
 };
-pub use prompt::{build_runner_constraints, RunnerPromptContext};
+pub use prompt::{
+    build_runner_constraints, PromptBuilder, PromptSection, RunnerPromptContext, StructuredPrompt,
+};
 pub use providers::TriggerProvider;
 pub use runner::{PlanRunner, RunStatus, RUNNER_CANCEL, RUNNER_STATE};
 pub use state::RunnerState;
 pub use trigger::TriggerEngine;
-pub use vector::{compare_vectors, predict_run, ComparisonResult, ExecutionVector, RunPrediction};
+pub use vector::{
+    compare_vectors, predict_run, predict_run_per_agent, AgentExecutionVector,
+    AgentVectorCollector, ComparisonResult, ExecutionVector, RunPrediction,
+};
+pub use git::{WorktreeCollector, WorktreeInfo, WorktreeResolution};
+pub use persona::{
+    activate_skills_for_task, complexity_directive, profile_task, record_skill_feedback,
+    Complexity, SkillActivationResult, TaskProfile,
+};
 pub use verifier::{TaskVerifier, VerifyResult};
