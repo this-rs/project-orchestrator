@@ -1571,6 +1571,11 @@ pub trait GraphStore: Send + Sync {
     /// Returns true if the node was found and healed.
     async fn heal_scars(&self, node_id: Uuid) -> Result<bool>;
 
+    /// Consolidate memory: evaluate all non-consolidated notes for promotion,
+    /// and archive stale ephemeral notes (>48h without reactivation).
+    /// Returns (promoted_count, archived_count).
+    async fn consolidate_memory(&self) -> Result<(usize, usize)>;
+
     /// Initialize energy for all notes that don't have it set.
     /// Sets energy = 1.0 and last_activated = coalesce(last_confirmed_at, created_at).
     /// Idempotent. Returns the number of notes initialized.

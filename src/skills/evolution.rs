@@ -18,7 +18,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::neo4j::traits::GraphStore;
-use crate::notes::{Note, NoteImportance, NoteScope, NoteStatus, NoteType};
+use crate::notes::{MemoryHorizon, Note, NoteImportance, NoteScope, NoteStatus, NoteType};
 use crate::skills::detection::{jaccard_similarity, SkillCandidate};
 use crate::skills::models::SkillNode;
 
@@ -291,6 +291,7 @@ async fn trace_evolution_note(graph_store: &dyn GraphStore, project_id: Uuid, co
         energy: 0.5, // Moderate initial energy — not critical knowledge
         last_activated: Some(Utc::now()),
         scar_intensity: 0.0,
+        memory_horizon: MemoryHorizon::Ephemeral, // Auto-generated trace notes are ephemeral
         supersedes: None,
         superseded_by: None,
         changes: vec![],

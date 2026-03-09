@@ -1223,6 +1223,28 @@ pub async fn heal_scars(
     })))
 }
 
+/// POST /api/notes/consolidate-memory — Batch memory consolidation
+///
+/// Biomimicry: Elun SleepSystem consolidation. Evaluates all non-consolidated
+/// active notes for promotion (Ephemeral→Operational→Consolidated) and archives
+/// stale ephemeral notes (>48h without reactivation).
+pub async fn consolidate_memory(
+    State(state): State<OrchestratorState>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let (promoted, archived) = state
+        .orchestrator
+        .neo4j()
+        .consolidate_memory()
+        .await
+        .map_err(AppError::Internal)?;
+
+    Ok(Json(serde_json::json!({
+        "promoted": promoted,
+        "archived": archived,
+        "total_processed": promoted + archived,
+    })))
+}
+
 // ============================================================================
 // Tests
 // ============================================================================

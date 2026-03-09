@@ -120,6 +120,54 @@ pub enum NoteImportance {
     Critical,
 }
 
+// ============================================================================
+// Memory Horizon (biomimicry: Elun SleepSystem consolidation)
+// ============================================================================
+
+/// Memory horizon for multi-scale note lifecycle.
+///
+/// Inspired by Elun's `SleepSystem` — consolidation via experience replay.
+/// Notes are born with a horizon that determines their lifecycle:
+/// - Ephemeral: short-lived, auto-archived after 48h without reactivation
+/// - Operational: working knowledge, promoted on activation
+/// - Consolidated: permanent knowledge, core of the knowledge base
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryHorizon {
+    /// Short-lived notes (no project, ad-hoc observations).
+    /// Auto-archived after 48h without reactivation.
+    Ephemeral,
+    /// Working knowledge (project-scoped, active during task execution).
+    /// Promoted to Consolidated on high activation or manual confirmation.
+    #[default]
+    Operational,
+    /// Permanent knowledge (guidelines, patterns, critical gotchas).
+    /// Core of the knowledge base, never auto-archived.
+    Consolidated,
+}
+
+impl std::fmt::Display for MemoryHorizon {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ephemeral => write!(f, "ephemeral"),
+            Self::Operational => write!(f, "operational"),
+            Self::Consolidated => write!(f, "consolidated"),
+        }
+    }
+}
+
+impl std::str::FromStr for MemoryHorizon {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "ephemeral" => Ok(Self::Ephemeral),
+            "operational" => Ok(Self::Operational),
+            "consolidated" => Ok(Self::Consolidated),
+            _ => Err(anyhow::anyhow!("Invalid memory horizon: {}", s)),
+        }
+    }
+}
+
 impl NoteImportance {
     /// Get the numeric weight for scoring (0.0 - 1.0)
     pub fn weight(&self) -> f64 {
@@ -388,6 +436,8 @@ pub enum ChangeType {
     AnchorRemoved,
     /// Note was superseded by another
     Superseded,
+    /// Note memory horizon was promoted (Ephemeral → Operational → Consolidated)
+    Promoted,
 }
 
 /// A change in the note's history
@@ -575,6 +625,12 @@ pub struct Note {
     #[serde(default)]
     pub scar_intensity: f64,
 
+    // Memory Horizon (biomimicry: Elun SleepSystem)
+    /// Multi-scale memory horizon controlling note lifecycle.
+    /// Ephemeral → Operational → Consolidated (promotion via activation).
+    #[serde(default)]
+    pub memory_horizon: MemoryHorizon,
+
     // Succession
     /// ID of the note this one supersedes (if any)
     pub supersedes: Option<Uuid>,
@@ -620,6 +676,11 @@ impl Note {
             energy: 1.0,
             last_activated: Some(now),
             scar_intensity: 0.0,
+            memory_horizon: if project_id.is_some() {
+                MemoryHorizon::Operational
+            } else {
+                MemoryHorizon::Ephemeral
+            },
             supersedes: None,
             superseded_by: None,
             changes: vec![NoteChange::new(ChangeType::Created, created_by)],
@@ -639,6 +700,14 @@ impl Note {
         created_by: String,
     ) -> Self {
         let now = Utc::now();
+        // Critical notes are immediately consolidated
+        let memory_horizon = if importance == NoteImportance::Critical {
+            MemoryHorizon::Consolidated
+        } else if project_id.is_some() {
+            MemoryHorizon::Operational
+        } else {
+            MemoryHorizon::Ephemeral
+        };
         Self {
             id: Uuid::new_v4(),
             project_id,
@@ -657,6 +726,7 @@ impl Note {
             energy: 1.0,
             last_activated: Some(now),
             scar_intensity: 0.0,
+            memory_horizon,
             supersedes: None,
             superseded_by: None,
             changes: vec![NoteChange::new(ChangeType::Created, created_by)],

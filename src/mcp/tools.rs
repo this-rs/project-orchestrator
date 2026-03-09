@@ -322,6 +322,7 @@ pub fn resolve_legacy_alias(name: &str) -> Option<(&'static str, &'static str)> 
         "detect_skills" => Some(("admin", "detect_skills")),
         "maintain_skills" => Some(("admin", "maintain_skills")),
         "heal_scars" => Some(("admin", "heal_scars")),
+        "consolidate_memory" => Some(("admin", "consolidate_memory")),
 
         _ => None,
     }
@@ -916,13 +917,13 @@ fn analysis_profile_tool() -> ToolDefinition {
 fn admin_tool() -> ToolDefinition {
     ToolDefinition {
         name: "admin".to_string(),
-        description: "Admin operations. Actions: sync_directory, start_watch, stop_watch, watch_status, meilisearch_stats, delete_meilisearch_orphans, cleanup_cross_project_calls, cleanup_builtin_calls, migrate_calls_confidence, cleanup_sync_data, update_staleness_scores, update_energy_scores, search_neurons, reinforce_neurons, decay_synapses, backfill_synapses, reindex_decisions, backfill_decision_embeddings, backfill_touches, backfill_discussed, update_fabric_scores, bootstrap_knowledge_fabric, reinforce_isomorphic, detect_skills, heal_scars, install_hooks".to_string(),
+        description: "Admin operations. Actions: sync_directory, start_watch, stop_watch, watch_status, meilisearch_stats, delete_meilisearch_orphans, cleanup_cross_project_calls, cleanup_builtin_calls, migrate_calls_confidence, cleanup_sync_data, update_staleness_scores, update_energy_scores, search_neurons, reinforce_neurons, decay_synapses, backfill_synapses, reindex_decisions, backfill_decision_embeddings, backfill_touches, backfill_discussed, update_fabric_scores, bootstrap_knowledge_fabric, reinforce_isomorphic, detect_skills, heal_scars, consolidate_memory, install_hooks".to_string(),
         input_schema: InputSchema {
             schema_type: "object".to_string(),
             properties: Some(json!({
                 "action": {
                     "type": "string",
-                    "enum": ["sync_directory", "start_watch", "stop_watch", "watch_status", "meilisearch_stats", "delete_meilisearch_orphans", "cleanup_cross_project_calls", "cleanup_builtin_calls", "migrate_calls_confidence", "cleanup_sync_data", "update_staleness_scores", "update_energy_scores", "search_neurons", "reinforce_neurons", "decay_synapses", "backfill_synapses", "reindex_decisions", "backfill_decision_embeddings", "backfill_touches", "backfill_discussed", "update_fabric_scores", "bootstrap_knowledge_fabric", "reinforce_isomorphic", "detect_skills", "maintain_skills", "auto_anchor_notes", "reconstruct_knowledge", "heal_scars", "install_hooks"],
+                    "enum": ["sync_directory", "start_watch", "stop_watch", "watch_status", "meilisearch_stats", "delete_meilisearch_orphans", "cleanup_cross_project_calls", "cleanup_builtin_calls", "migrate_calls_confidence", "cleanup_sync_data", "update_staleness_scores", "update_energy_scores", "search_neurons", "reinforce_neurons", "decay_synapses", "backfill_synapses", "reindex_decisions", "backfill_decision_embeddings", "backfill_touches", "backfill_discussed", "update_fabric_scores", "bootstrap_knowledge_fabric", "reinforce_isomorphic", "detect_skills", "maintain_skills", "auto_anchor_notes", "reconstruct_knowledge", "heal_scars", "consolidate_memory", "install_hooks"],
                     "description": "Operation to perform"
                 },
                 "path": {"type": "string", "description": "Directory path (sync_directory/start_watch)"},

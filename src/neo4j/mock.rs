@@ -5566,6 +5566,45 @@ impl GraphStore for MockGraphStore {
         }
     }
 
+    async fn consolidate_memory(&self) -> Result<(usize, usize)> {
+        use crate::notes::lifecycle::NoteLifecycleManager;
+        let lifecycle = NoteLifecycleManager::new();
+        let now = chrono::Utc::now();
+        let mut notes = self.notes.write().await;
+        let mut promoted = 0usize;
+        let mut archived = 0usize;
+
+        let ids: Vec<Uuid> = notes
+            .values()
+            .filter(|n| {
+                n.status == crate::notes::NoteStatus::Active
+                    && n.memory_horizon != crate::notes::MemoryHorizon::Consolidated
+            })
+            .map(|n| n.id)
+            .collect();
+
+        for id in ids {
+            if let Some(note) = notes.get(&id).cloned() {
+                if lifecycle.should_archive_ephemeral(&note, now) {
+                    if let Some(n) = notes.get_mut(&id) {
+                        n.status = crate::notes::NoteStatus::Archived;
+                        archived += 1;
+                    }
+                    continue;
+                }
+                let promo = lifecycle.evaluate_promotion(&note, 0);
+                if let Some(new_horizon) = promo.new_horizon {
+                    if let Some(n) = notes.get_mut(&id) {
+                        n.memory_horizon = new_horizon;
+                        promoted += 1;
+                    }
+                }
+            }
+        }
+
+        Ok((promoted, archived))
+    }
+
     async fn init_note_energy(&self) -> Result<usize> {
         let mut notes = self.notes.write().await;
         let mut count = 0;

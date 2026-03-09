@@ -3,8 +3,8 @@
 use super::client::Neo4jClient;
 use super::models::DecisionNode;
 use crate::notes::{
-    EntityType, Note, NoteAnchor, NoteChange, NoteFilters, NoteImportance, NoteScope, NoteStatus,
-    NoteType, PropagatedNote,
+    EntityType, MemoryHorizon, Note, NoteAnchor, NoteChange, NoteFilters, NoteImportance,
+    NoteScope, NoteStatus, NoteType, PropagatedNote,
 };
 use anyhow::{Context, Result};
 use neo4rs::query;
@@ -38,7 +38,8 @@ impl Neo4jClient {
                 last_activated: datetime($last_activated),
                 changes_json: $changes_json,
                 assertion_rule_json: $assertion_rule_json,
-                scar_intensity: $scar_intensity
+                scar_intensity: $scar_intensity,
+                memory_horizon: $memory_horizon
             })
             "#,
         )
@@ -80,7 +81,8 @@ impl Neo4jClient {
                 .map(|r| serde_json::to_string(r).unwrap_or_default())
                 .unwrap_or_default(),
         )
-        .param("scar_intensity", note.scar_intensity);
+        .param("scar_intensity", note.scar_intensity)
+        .param("memory_horizon", note.memory_horizon.to_string());
 
         self.graph.run(q).await?;
 
@@ -2059,6 +2061,99 @@ impl Neo4jClient {
         Ok(decision_healed)
     }
 
+    /// Consolidate memory: promote eligible notes and archive stale ephemeral ones.
+    /// Returns (promoted_count, archived_count).
+    pub async fn consolidate_memory(&self) -> Result<(usize, usize)> {
+        use crate::notes::lifecycle::NoteLifecycleManager;
+
+        let lifecycle = NoteLifecycleManager::new();
+        let now = chrono::Utc::now();
+
+        // 1. Fetch all non-consolidated, active notes
+        let q = query(
+            r#"
+            MATCH (n:Note)
+            WHERE n.status = 'active'
+              AND (n.memory_horizon IS NULL OR n.memory_horizon <> 'consolidated')
+            OPTIONAL MATCH (n)-[s:SYNAPSE]-()
+            RETURN n, count(s) AS activation_count
+            ORDER BY n.energy DESC
+            LIMIT 500
+            "#,
+        );
+
+        let mut result = self.graph.execute(q).await?;
+        let mut promoted = 0usize;
+        let mut archived = 0usize;
+
+        while let Some(row) = result.next().await? {
+            let node = row.get::<neo4rs::Node>("n")?;
+            let note = self.node_to_note(&node)?;
+            let activation_count = row.get::<i64>("activation_count").unwrap_or(0) as u64;
+
+            // Check archival for ephemeral
+            if lifecycle.should_archive_ephemeral(&note, now) {
+                let archive_q = query(
+                    r#"
+                    MATCH (n:Note {id: $id})
+                    SET n.status = 'archived',
+                        n.changes_json = $changes_json
+                    "#,
+                )
+                .param("id", note.id.to_string())
+                .param(
+                    "changes_json",
+                    serde_json::to_string(&{
+                        let mut changes = note.changes.clone();
+                        changes.push(NoteChange::with_details(
+                            crate::notes::ChangeType::StatusChanged,
+                            "consolidate_memory".to_string(),
+                            serde_json::json!({"reason": "ephemeral_expired", "idle_hours": 48}),
+                        ));
+                        changes
+                    })?,
+                );
+                self.graph.run(archive_q).await?;
+                archived += 1;
+                continue;
+            }
+
+            // Evaluate promotion
+            let promo = lifecycle.evaluate_promotion(&note, activation_count);
+            if let Some(new_horizon) = promo.new_horizon {
+                let promote_q = query(
+                    r#"
+                    MATCH (n:Note {id: $id})
+                    SET n.memory_horizon = $new_horizon,
+                        n.changes_json = $changes_json
+                    "#,
+                )
+                .param("id", note.id.to_string())
+                .param("new_horizon", new_horizon.to_string())
+                .param(
+                    "changes_json",
+                    serde_json::to_string(&{
+                        let mut changes = note.changes.clone();
+                        changes.push(NoteChange::with_details(
+                            crate::notes::ChangeType::Promoted,
+                            "consolidate_memory".to_string(),
+                            serde_json::json!({
+                                "from": promo.current_horizon.to_string(),
+                                "to": new_horizon.to_string(),
+                                "reason": promo.reason
+                            }),
+                        ));
+                        changes
+                    })?,
+                );
+                self.graph.run(promote_q).await?;
+                promoted += 1;
+            }
+        }
+
+        Ok((promoted, archived))
+    }
+
     /// Initialize energy for notes that don't have it yet.
     pub async fn init_note_energy(&self) -> Result<usize> {
         let q = query(
@@ -2219,6 +2314,11 @@ impl Neo4jClient {
             staleness_score: node.get("staleness_score").unwrap_or(0.0),
             energy: node.get("energy").unwrap_or(1.0),
             scar_intensity: node.get("scar_intensity").unwrap_or(0.0),
+            memory_horizon: node
+                .get::<String>("memory_horizon")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(MemoryHorizon::Consolidated), // Existing notes default to consolidated
             last_activated: node
                 .get::<String>("last_activated")
                 .ok()

@@ -397,6 +397,7 @@ impl ToolHandler {
             ("admin", "auto_anchor_notes") => "auto_anchor_notes",
             ("admin", "reconstruct_knowledge") => "reconstruct_knowledge",
             ("admin", "heal_scars") => "heal_scars",
+            ("admin", "consolidate_memory") => "consolidate_memory",
             ("admin", "audit_gaps") => "audit_gaps",
             ("admin", "persist_health_report") => "persist_health_report",
             ("admin", "install_hooks") => "install_hooks",
@@ -2124,6 +2125,13 @@ impl ToolHandler {
                 let body = json!({"node_id": node_id});
                 let result = http
                     .post("/api/notes/neurons/heal-scars", &body)
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "consolidate_memory" => {
+                let result = http
+                    .post("/api/notes/consolidate-memory", &json!({}))
                     .await?;
                 Ok(Some(result))
             }

@@ -8,6 +8,7 @@ use super::models::*;
 use crate::neo4j::models::FunctionNode;
 use crate::parser::ParsedFile;
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 // Re-export types needed for assertion verification
@@ -705,6 +706,118 @@ impl NoteLifecycleManager {
             .filter(|n| n.note_type == NoteType::Assertion)
             .map(|note| self.verify_assertion(note, file_info))
             .collect()
+    }
+}
+
+// ============================================================================
+// Memory Consolidation (biomimicry: Elun SleepSystem)
+// ============================================================================
+
+/// Result of evaluating a note for memory horizon promotion.
+#[derive(Debug, Clone)]
+pub struct PromotionResult {
+    pub note_id: Uuid,
+    pub current_horizon: MemoryHorizon,
+    pub new_horizon: Option<MemoryHorizon>,
+    pub reason: String,
+}
+
+/// Result of a batch consolidation run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConsolidationReport {
+    /// Notes promoted from Ephemeral to Operational
+    pub ephemeral_promoted: usize,
+    /// Notes promoted from Operational to Consolidated
+    pub operational_promoted: usize,
+    /// Ephemeral notes archived (>48h without reactivation)
+    pub ephemeral_archived: usize,
+    /// Total notes evaluated
+    pub total_evaluated: usize,
+}
+
+impl NoteLifecycleManager {
+    /// Evaluate whether a note should be promoted to a higher memory horizon.
+    ///
+    /// Promotion rules (inspired by Elun SleepSystem consolidation):
+    /// - Ephemeral → Operational: activations ≥ 3, OR linked to a task, OR energy ≥ 0.5
+    /// - Operational → Consolidated: activations ≥ 10, OR energy ≥ 0.8, OR manually confirmed ≥ 2 times, OR importance = Critical
+    /// - Consolidated: no further promotion
+    pub fn evaluate_promotion(&self, note: &Note, activation_count: u64) -> PromotionResult {
+        let note_id = note.id;
+        let current = note.memory_horizon.clone();
+
+        match &note.memory_horizon {
+            MemoryHorizon::Ephemeral => {
+                if activation_count >= 3 || note.energy >= 0.5 {
+                    PromotionResult {
+                        note_id,
+                        current_horizon: current,
+                        new_horizon: Some(MemoryHorizon::Operational),
+                        reason: format!(
+                            "Ephemeral→Operational: activations={}, energy={:.2}",
+                            activation_count, note.energy
+                        ),
+                    }
+                } else {
+                    PromotionResult {
+                        note_id,
+                        current_horizon: current,
+                        new_horizon: None,
+                        reason: "Below promotion threshold".to_string(),
+                    }
+                }
+            }
+            MemoryHorizon::Operational => {
+                let confirm_count = note
+                    .changes
+                    .iter()
+                    .filter(|c| matches!(c.change_type, ChangeType::Confirmed))
+                    .count();
+
+                if activation_count >= 10
+                    || note.energy >= 0.8
+                    || confirm_count >= 2
+                    || note.importance == NoteImportance::Critical
+                {
+                    PromotionResult {
+                        note_id,
+                        current_horizon: current,
+                        new_horizon: Some(MemoryHorizon::Consolidated),
+                        reason: format!(
+                            "Operational→Consolidated: activations={}, energy={:.2}, confirms={}, critical={}",
+                            activation_count, note.energy, confirm_count,
+                            note.importance == NoteImportance::Critical
+                        ),
+                    }
+                } else {
+                    PromotionResult {
+                        note_id,
+                        current_horizon: current,
+                        new_horizon: None,
+                        reason: "Below consolidation threshold".to_string(),
+                    }
+                }
+            }
+            MemoryHorizon::Consolidated => PromotionResult {
+                note_id,
+                current_horizon: current,
+                new_horizon: None,
+                reason: "Already consolidated".to_string(),
+            },
+        }
+    }
+
+    /// Check if an ephemeral note should be archived (>48h without reactivation).
+    pub fn should_archive_ephemeral(&self, note: &Note, now: DateTime<Utc>) -> bool {
+        if note.memory_horizon != MemoryHorizon::Ephemeral {
+            return false;
+        }
+        if note.status != NoteStatus::Active {
+            return false;
+        }
+        let last_active = note.last_activated.unwrap_or(note.created_at);
+        let hours_idle = now.signed_duration_since(last_active).num_hours();
+        hours_idle >= 48
     }
 }
 

@@ -1899,6 +1899,10 @@ impl GraphStore for Neo4jClient {
         self.heal_scars(node_id).await
     }
 
+    async fn consolidate_memory(&self) -> anyhow::Result<(usize, usize)> {
+        self.consolidate_memory().await
+    }
+
     async fn init_note_energy(&self) -> anyhow::Result<usize> {
         self.init_note_energy().await
     }

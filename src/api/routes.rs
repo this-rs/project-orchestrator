@@ -727,6 +727,10 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/notes/neurons/heal-scars",
             post(note_handlers::heal_scars),
         )
+        .route(
+            "/api/notes/consolidate-memory",
+            post(note_handlers::consolidate_memory),
+        )
         // Notes needing review
         .route(
             "/api/notes/needs-review",
