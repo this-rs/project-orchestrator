@@ -566,6 +566,13 @@ pub async fn detect_path() -> Json<serde_json::Value> {
 // CLI version management (check + install/upgrade)
 // ============================================================================
 
+/// GET /api/chat/cli/auth-status — Check the Claude CLI authentication status.
+///
+/// Returns whether the user is logged in, the auth method, and email.
+pub async fn get_cli_auth_status() -> Json<crate::chat::cli_auth::CliAuthStatus> {
+    Json(crate::chat::cli_auth::check_cli_auth_status().await)
+}
+
 /// GET /api/chat/cli/status — Check installed CLI version and update availability.
 ///
 /// Returns the full CLI version status including installed version, latest
