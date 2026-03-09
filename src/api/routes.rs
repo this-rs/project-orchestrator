@@ -240,6 +240,11 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/projects/{slug}/embeddings/projection",
             get(project_handlers::get_embeddings_projection),
         )
+        .route(
+            "/api/projects/{slug}/scaffolding",
+            get(project_handlers::get_scaffolding_level)
+                .put(project_handlers::set_scaffolding_level),
+        )
         // Releases (by project_id)
         .route(
             "/api/projects/{project_id}/releases",
@@ -560,6 +565,11 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/code/risk-assessment",
             get(code_handlers::get_risk_assessment),
         )
+        .route("/api/code/homeostasis", get(code_handlers::get_homeostasis))
+        .route(
+            "/api/code/structural-drift",
+            get(code_handlers::get_structural_drift),
+        )
         // ================================================================
         // Heritage Navigation
         // ================================================================
@@ -723,6 +733,14 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/notes/neurons/decay",
             post(note_handlers::decay_synapses),
         )
+        .route(
+            "/api/notes/neurons/heal-scars",
+            post(note_handlers::heal_scars),
+        )
+        .route(
+            "/api/notes/consolidate-memory",
+            post(note_handlers::consolidate_memory),
+        )
         // Notes needing review
         .route(
             "/api/notes/needs-review",
@@ -833,6 +851,11 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/skills/{skill_id}/health",
             get(skill_handlers::get_skill_health),
         )
+        .route(
+            "/api/skills/{skill_id}/split",
+            post(skill_handlers::split_skill),
+        )
+        .route("/api/skills/merge", post(skill_handlers::merge_skills))
         // ================================================================
         // Skill Registry (Pattern Federation)
         // ================================================================
@@ -1025,6 +1048,14 @@ fn protected_routes() -> Router<OrchestratorState> {
         )
         .route("/api/admin/detect-skills", post(handlers::detect_skills))
         .route(
+            "/api/admin/detect-skill-fission",
+            post(handlers::detect_skill_fission),
+        )
+        .route(
+            "/api/admin/detect-skill-fusion",
+            post(handlers::detect_skill_fusion),
+        )
+        .route(
             "/api/admin/auto-anchor-notes",
             post(handlers::auto_anchor_notes),
         )
@@ -1035,6 +1066,14 @@ fn protected_routes() -> Router<OrchestratorState> {
         .route(
             "/api/admin/skill-maintenance",
             post(handlers::skill_maintenance),
+        )
+        .route(
+            "/api/admin/detect-stagnation/{project_id}",
+            get(handlers::detect_stagnation),
+        )
+        .route(
+            "/api/admin/deep-maintenance/{project_id}",
+            post(handlers::run_deep_maintenance),
         )
         // NOTE: /api/admin/install-hooks removed — hooks are now managed
         // in-process via SkillActivationHook (zero config required)
@@ -1138,6 +1177,10 @@ fn protected_routes() -> Router<OrchestratorState> {
         .route(
             "/api/workspaces/{slug}/topology",
             get(workspace_handlers::get_workspace_topology),
+        )
+        .route(
+            "/api/workspaces/{slug}/coupling-matrix",
+            get(workspace_handlers::get_coupling_matrix),
         )
         // Workspace Intelligence (aggregated graph + summary)
         .route(

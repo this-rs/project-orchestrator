@@ -575,6 +575,15 @@ impl GraphStore for MockGraphStore {
         Ok(None)
     }
 
+    async fn compute_coupling_matrix(&self, workspace_id: Uuid) -> Result<CouplingMatrix> {
+        let projects = self.list_workspace_projects(workspace_id).await?;
+        Ok(CouplingMatrix {
+            workspace_id,
+            entries: Vec::new(),
+            project_count: projects.len(),
+        })
+    }
+
     // ========================================================================
     // Workspace Milestone operations
     // ========================================================================
@@ -2386,6 +2395,253 @@ impl GraphStore for MockGraphStore {
             god_functions,
             orphan_files,
             coupling_metrics,
+            prediction_accuracy: None,
+        })
+    }
+
+    async fn compute_maintenance_snapshot(
+        &self,
+        _project_id: Uuid,
+    ) -> Result<crate::neo4j::models::MaintenanceSnapshot> {
+        use chrono::Utc;
+        let notes = self.notes.read().await;
+        let active_notes = notes
+            .values()
+            .filter(|n| n.status == crate::notes::NoteStatus::Active)
+            .count();
+        let mean_energy = if active_notes > 0 {
+            notes
+                .values()
+                .filter(|n| n.status == crate::notes::NoteStatus::Active)
+                .map(|n| n.energy)
+                .sum::<f64>()
+                / active_notes as f64
+        } else {
+            0.5
+        };
+        let skills = self.skills.read().await;
+        let skill_count = skills
+            .values()
+            .filter(|s| {
+                matches!(
+                    s.status,
+                    crate::skills::models::SkillStatus::Active
+                        | crate::skills::models::SkillStatus::Emerging
+                )
+            })
+            .count();
+        let synapses = self.note_synapses.read().await;
+        let active_synapses: usize = synapses
+            .values()
+            .map(|v| v.iter().filter(|(_, w)| *w > 0.0).count())
+            .sum();
+        Ok(crate::neo4j::models::MaintenanceSnapshot {
+            health_score: 0.8,
+            active_synapses: active_synapses as i64,
+            mean_energy,
+            skill_count: skill_count as i64,
+            note_count: active_notes as i64,
+            captured_at: Utc::now().to_rfc3339(),
+        })
+    }
+
+    async fn compute_scaffolding_level(
+        &self,
+        project_id: Uuid,
+        scaffolding_override: Option<u8>,
+    ) -> Result<crate::neo4j::models::ScaffoldingLevel> {
+        // Compute real values from mock data
+        let plans = self.plans.read().await;
+        let tasks = self.tasks.read().await;
+        let plan_tasks_map = self.plan_tasks.read().await;
+
+        let mut completed = 0u64;
+        let mut failed = 0u64;
+        let mut total_frustration = 0.0f64;
+        let mut frust_count = 0u64;
+
+        for (plan_id, plan) in plans.iter() {
+            if plan.project_id != Some(project_id) {
+                continue;
+            }
+            if let Some(task_ids) = plan_tasks_map.get(plan_id) {
+                for tid in task_ids {
+                    if let Some(t) = tasks.get(tid) {
+                        match t.status {
+                            crate::neo4j::models::TaskStatus::Completed => completed += 1,
+                            crate::neo4j::models::TaskStatus::Failed => failed += 1,
+                            _ => {}
+                        }
+                        total_frustration += t.frustration_score;
+                        frust_count += 1;
+                    }
+                }
+            }
+        }
+
+        let tasks_analyzed = (completed + failed) as i64;
+        let task_success_rate = if tasks_analyzed > 0 {
+            completed as f64 / tasks_analyzed as f64
+        } else {
+            1.0
+        };
+        let avg_frustration = if frust_count > 0 {
+            total_frustration / frust_count as f64
+        } else {
+            0.0
+        };
+
+        // Scar density from notes
+        let notes = self.notes.read().await;
+        let project_notes: Vec<_> = notes
+            .values()
+            .filter(|n| {
+                n.project_id == Some(project_id) && n.status == crate::notes::NoteStatus::Active
+            })
+            .collect();
+        let scar_density = if !project_notes.is_empty() {
+            project_notes.iter().map(|n| n.scar_intensity).sum::<f64>() / project_notes.len() as f64
+        } else {
+            0.0
+        };
+
+        let homeostasis_pain = 0.0; // Simplified for mock
+
+        let competence_score = (task_success_rate * 0.5
+            + (1.0 - avg_frustration) * 0.2
+            + (1.0 - scar_density) * 0.15
+            + (1.0 - homeostasis_pain) * 0.15)
+            .clamp(0.0, 1.0);
+
+        let (level, label, recommended_steps) = if let Some(ovr) = scaffolding_override {
+            let ovr = ovr.min(4);
+            crate::neo4j::analytics::level_info(ovr)
+        } else {
+            let auto_level = if competence_score >= 0.9 {
+                4
+            } else if competence_score >= 0.75 {
+                3
+            } else if competence_score >= 0.5 {
+                2
+            } else if competence_score >= 0.3 {
+                1
+            } else {
+                0
+            };
+            crate::neo4j::analytics::level_info(auto_level)
+        };
+
+        Ok(crate::neo4j::models::ScaffoldingLevel {
+            level,
+            label,
+            recommended_steps,
+            task_success_rate,
+            avg_frustration,
+            scar_density,
+            homeostasis_pain,
+            competence_score,
+            is_overridden: scaffolding_override.is_some(),
+            tasks_analyzed,
+        })
+    }
+
+    async fn set_scaffolding_override(&self, project_id: Uuid, level: Option<u8>) -> Result<()> {
+        let mut projects = self.projects.write().await;
+        if let Some(p) = projects.get_mut(&project_id) {
+            p.scaffolding_override = level.map(|l| l.min(4));
+        }
+        Ok(())
+    }
+
+    async fn detect_global_stagnation(
+        &self,
+        project_id: Uuid,
+    ) -> Result<crate::neo4j::models::StagnationReport> {
+        // Mock: check task statuses in this project's plans
+        let plans = self.plans.read().await;
+        let tasks = self.tasks.read().await;
+        let plan_tasks = self.plan_tasks.read().await;
+
+        let mut completed_recent = 0i64;
+        let mut total_frustration = 0.0f64;
+        let mut frustration_count = 0i64;
+
+        for (plan_id, plan) in plans.iter() {
+            if plan.project_id != Some(project_id) {
+                continue;
+            }
+            if let Some(task_ids) = plan_tasks.get(plan_id) {
+                for task_id in task_ids {
+                    if let Some(t) = tasks.get(task_id) {
+                        if t.status == crate::neo4j::models::TaskStatus::Completed {
+                            completed_recent += 1;
+                        }
+                        if t.status == crate::neo4j::models::TaskStatus::InProgress
+                            && t.frustration_score > 0.0
+                        {
+                            total_frustration += t.frustration_score;
+                            frustration_count += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        let avg_frustration = if frustration_count > 0 {
+            total_frustration / frustration_count as f64
+        } else {
+            0.0
+        };
+
+        let notes = self.notes.read().await;
+        let note_count = notes
+            .values()
+            .filter(|n| n.project_id == Some(project_id))
+            .count() as i64;
+        let mean_energy = if note_count > 0 {
+            notes
+                .values()
+                .filter(|n| n.project_id == Some(project_id))
+                .map(|n| n.energy)
+                .sum::<f64>()
+                / note_count as f64
+        } else {
+            1.0
+        };
+        let energy_trend = mean_energy - 0.5;
+
+        let mut signals: u8 = 0;
+        let mut recommendations = Vec::new();
+
+        if completed_recent == 0 {
+            signals += 1;
+            recommendations.push("No tasks completed recently.".to_string());
+        }
+        if avg_frustration > 0.6 {
+            signals += 1;
+            recommendations.push(format!("High frustration: {:.2}", avg_frustration));
+        }
+        if energy_trend < 0.0 {
+            signals += 1;
+            recommendations.push("Note energy declining.".to_string());
+        }
+        // Mock: no commit tracking, assume 0
+        signals += 1;
+        recommendations.push("No commits tracked in mock.".to_string());
+
+        let is_stagnating = signals >= 3;
+        if is_stagnating {
+            recommendations.push("⚠️ Global stagnation detected.".to_string());
+        }
+
+        Ok(crate::neo4j::models::StagnationReport {
+            is_stagnating,
+            tasks_completed_48h: completed_recent,
+            avg_frustration,
+            energy_trend,
+            commits_48h: 0,
+            signals_triggered: signals,
+            recommendations,
         })
     }
 
@@ -5035,6 +5291,8 @@ impl GraphStore for MockGraphStore {
         _max_depth: u32,
         _min_score: f64,
         _relation_types: Option<&[String]>,
+        _source_project_id: Option<Uuid>,
+        _force_cross_project: bool,
     ) -> Result<Vec<PropagatedNote>> {
         // Simplified: propagation requires graph traversal; return empty
         Ok(vec![])
@@ -5053,15 +5311,19 @@ impl GraphStore for MockGraphStore {
                 .await?;
             Ok(ws_notes
                 .into_iter()
-                .map(|n| PropagatedNote {
-                    relevance_score: propagation_factor,
-                    source_entity: format!("workspace:{}", workspace.slug),
-                    propagation_path: vec![format!("workspace:{}", workspace.slug)],
-                    distance: 1,
-                    note: n,
-                    path_pagerank: None,
-                    relation_path: vec![crate::notes::RelationHop::structural("BELONGS_TO")],
-                    path_rel_weight: Some(1.0),
+                .map(|n| {
+                    let scar = n.scar_intensity;
+                    PropagatedNote {
+                        relevance_score: propagation_factor,
+                        source_entity: format!("workspace:{}", workspace.slug),
+                        propagation_path: vec![format!("workspace:{}", workspace.slug)],
+                        distance: 1,
+                        note: n,
+                        path_pagerank: None,
+                        relation_path: vec![crate::notes::RelationHop::structural("BELONGS_TO")],
+                        path_rel_weight: Some(1.0),
+                        scar_intensity: scar,
+                    }
                 })
                 .collect())
         } else {
@@ -5524,7 +5786,208 @@ impl GraphStore for MockGraphStore {
             pruned += before - neighbors.len();
         }
 
+        // Drop synapses lock before acquiring notes lock to avoid deadlock
+        drop(synapses);
+
+        // Decay knowledge scars (20x slower than synapse decay)
+        let scar_decay_rate = decay_amount * 0.05;
+        if scar_decay_rate > 0.0 {
+            let mut notes = self.notes.write().await;
+            for note in notes.values_mut() {
+                if note.scar_intensity > 0.0 {
+                    note.scar_intensity -= scar_decay_rate;
+                    if note.scar_intensity < 0.001 {
+                        note.scar_intensity = 0.0;
+                    }
+                }
+            }
+        }
+
         Ok((decayed, pruned))
+    }
+
+    async fn apply_scars(&self, node_ids: &[Uuid], increment: f64) -> Result<usize> {
+        let mut notes = self.notes.write().await;
+        let mut count = 0;
+        for id in node_ids {
+            if let Some(note) = notes.get_mut(id) {
+                note.scar_intensity = (note.scar_intensity + increment).min(1.0);
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    async fn heal_scars(&self, node_id: Uuid) -> Result<bool> {
+        let mut notes = self.notes.write().await;
+        if let Some(note) = notes.get_mut(&node_id) {
+            note.scar_intensity = 0.0;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    async fn consolidate_memory(&self) -> Result<(usize, usize)> {
+        use crate::notes::lifecycle::NoteLifecycleManager;
+        let lifecycle = NoteLifecycleManager::new();
+        let now = chrono::Utc::now();
+        let mut notes = self.notes.write().await;
+        let mut promoted = 0usize;
+        let mut archived = 0usize;
+
+        let ids: Vec<Uuid> = notes
+            .values()
+            .filter(|n| {
+                n.status == crate::notes::NoteStatus::Active
+                    && n.memory_horizon != crate::notes::MemoryHorizon::Consolidated
+            })
+            .map(|n| n.id)
+            .collect();
+
+        for id in ids {
+            if let Some(note) = notes.get(&id).cloned() {
+                if lifecycle.should_archive_ephemeral(&note, now) {
+                    if let Some(n) = notes.get_mut(&id) {
+                        n.status = crate::notes::NoteStatus::Archived;
+                        archived += 1;
+                    }
+                    continue;
+                }
+                let promo = lifecycle.evaluate_promotion(&note, 0);
+                if let Some(new_horizon) = promo.new_horizon {
+                    if let Some(n) = notes.get_mut(&id) {
+                        n.memory_horizon = new_horizon;
+                        promoted += 1;
+                    }
+                }
+            }
+        }
+
+        Ok((promoted, archived))
+    }
+
+    async fn compute_homeostasis(
+        &self,
+        project_id: Uuid,
+        _custom_ranges: Option<&[(String, f64, f64)]>,
+    ) -> Result<crate::neo4j::models::HomeostasisReport> {
+        use crate::neo4j::models::{HomeostasisRatio, HomeostasisReport, HomeostasisSeverity};
+
+        let notes = self.notes.read().await;
+        let project_notes: Vec<_> = notes
+            .values()
+            .filter(|n| {
+                n.project_id == Some(project_id) && n.status == crate::notes::NoteStatus::Active
+            })
+            .collect();
+
+        let total = project_notes.len() as f64;
+        let scarred = project_notes
+            .iter()
+            .filter(|n| n.scar_intensity > 0.0)
+            .count() as f64;
+        let scar_load = if total > 0.0 { scarred / total } else { 0.0 };
+
+        let mut ratios = vec![HomeostasisRatio {
+            name: "note_density".to_string(),
+            value: total.max(1.0),
+            target_range: (0.3, 2.0),
+            distance_to_equilibrium: 0.0,
+            severity: HomeostasisSeverity::Ok,
+            recommendation: None,
+        }];
+
+        // Add scar_load ratio if there are scarred notes
+        let scar_severity = if scar_load > 0.5 {
+            HomeostasisSeverity::Critical
+        } else if scar_load > 0.2 {
+            HomeostasisSeverity::Warning
+        } else {
+            HomeostasisSeverity::Ok
+        };
+        ratios.push(HomeostasisRatio {
+            name: "scar_load".to_string(),
+            value: scar_load,
+            target_range: (0.0, 0.2),
+            distance_to_equilibrium: if scar_load > 0.2 {
+                scar_load - 0.2
+            } else {
+                0.0
+            },
+            severity: scar_severity,
+            recommendation: if scar_load > 0.2 {
+                Some("High scar density — consider reviewing scarred notes".to_string())
+            } else {
+                None
+            },
+        });
+
+        let pain_score = ratios
+            .iter()
+            .map(|r| r.distance_to_equilibrium)
+            .sum::<f64>()
+            / ratios.len() as f64;
+
+        Ok(HomeostasisReport {
+            ratios,
+            pain_score,
+            recommendations: vec![],
+        })
+    }
+
+    async fn compute_structural_drift(
+        &self,
+        _project_id: Uuid,
+        _warning_threshold: Option<f64>,
+        _critical_threshold: Option<f64>,
+    ) -> Result<crate::neo4j::models::StructuralDriftReport> {
+        Ok(crate::neo4j::models::StructuralDriftReport {
+            drifting_files: vec![],
+            centroids: vec![],
+            mean_drift: 0.0,
+            warning_count: 0,
+            critical_count: 0,
+        })
+    }
+
+    async fn increment_frustration(&self, task_id: Uuid, delta: f64) -> Result<f64> {
+        let mut tasks = self.tasks.write().await;
+        if let Some(task) = tasks.get_mut(&task_id) {
+            task.frustration_score = (task.frustration_score + delta).min(1.0);
+            Ok(task.frustration_score)
+        } else {
+            anyhow::bail!("Task not found: {}", task_id)
+        }
+    }
+
+    async fn decrement_frustration(&self, task_id: Uuid, delta: f64) -> Result<f64> {
+        let mut tasks = self.tasks.write().await;
+        if let Some(task) = tasks.get_mut(&task_id) {
+            task.frustration_score = (task.frustration_score - delta).max(0.0);
+            Ok(task.frustration_score)
+        } else {
+            anyhow::bail!("Task not found: {}", task_id)
+        }
+    }
+
+    async fn get_frustration(&self, task_id: Uuid) -> Result<f64> {
+        let tasks = self.tasks.read().await;
+        if let Some(task) = tasks.get(&task_id) {
+            Ok(task.frustration_score)
+        } else {
+            anyhow::bail!("Task not found: {}", task_id)
+        }
+    }
+
+    async fn get_step_parent_task_id(&self, step_id: Uuid) -> Result<Option<Uuid>> {
+        let task_steps = self.task_steps.read().await;
+        for (task_id, step_ids) in task_steps.iter() {
+            if step_ids.contains(&step_id) {
+                return Ok(Some(*task_id));
+            }
+        }
+        Ok(None)
     }
 
     async fn init_note_energy(&self) -> Result<usize> {
@@ -5912,6 +6375,15 @@ impl GraphStore for MockGraphStore {
         _session_id: Uuid,
         _project_id: Option<Uuid>,
     ) -> Result<Vec<DiscussedEntity>> {
+        Ok(Vec::new())
+    }
+
+    async fn get_discussed_co_changers(
+        &self,
+        _project_id: Uuid,
+        _max_sessions: i64,
+        _max_results: i64,
+    ) -> Result<Vec<CoChanger>> {
         Ok(Vec::new())
     }
 

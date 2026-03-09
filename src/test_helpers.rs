@@ -246,6 +246,7 @@ pub fn test_project() -> ProjectNode {
         last_synced: None,
         analytics_computed_at: None,
         last_co_change_computed_at: None,
+        scaffolding_override: None,
     }
 }
 
@@ -261,6 +262,7 @@ pub fn test_project_named(name: &str) -> ProjectNode {
         last_synced: None,
         analytics_computed_at: None,
         last_co_change_computed_at: None,
+        scaffolding_override: None,
     }
 }
 
@@ -303,6 +305,7 @@ pub fn test_task() -> TaskNode {
         updated_at: None,
         started_at: None,
         completed_at: None,
+        frustration_score: 0.0,
     }
 }
 
@@ -332,6 +335,7 @@ pub fn test_decision(description: &str, rationale: &str) -> DecisionNode {
         status: DecisionStatus::Accepted,
         embedding: None,
         embedding_model: None,
+        scar_intensity: 0.0,
     }
 }
 

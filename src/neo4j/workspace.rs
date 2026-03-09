@@ -1511,4 +1511,193 @@ impl Neo4jClient {
             tags,
         })
     }
+
+    // ========================================================================
+    // P2P Coupling Matrix (Biomimicry — inter-project influence field)
+    // ========================================================================
+
+    /// Compute the coupling matrix for all projects in a workspace.
+    ///
+    /// For each pair of projects, computes 4 coupling signals:
+    /// 1. Structural twins: files with similar fingerprints across projects
+    /// 2. Imported skills: skills imported from one project to the other
+    /// 3. Shared notes: notes linked to entities in both projects
+    /// 4. Tag overlap: Jaccard similarity of note tags between projects
+    ///
+    /// Combined into `coupling_strength ∈ [0, 1]` via weighted average.
+    pub async fn compute_coupling_matrix(&self, workspace_id: Uuid) -> Result<CouplingMatrix> {
+        // Weights for each signal (sum = 1.0)
+        const W_TWINS: f64 = 0.35;
+        const W_SKILLS: f64 = 0.25;
+        const W_NOTES: f64 = 0.20;
+        const W_TAGS: f64 = 0.20;
+
+        // Max values for normalization (saturate at these caps)
+        const MAX_TWINS: f64 = 20.0;
+        const MAX_SKILLS: f64 = 10.0;
+        const MAX_NOTES: f64 = 50.0;
+
+        let projects = self.list_workspace_projects(workspace_id).await?;
+        let project_count = projects.len();
+
+        if project_count < 2 {
+            return Ok(CouplingMatrix {
+                workspace_id,
+                entries: Vec::new(),
+                project_count,
+            });
+        }
+
+        let mut entries = Vec::new();
+
+        for i in 0..projects.len() {
+            for j in (i + 1)..projects.len() {
+                let pa = &projects[i];
+                let pb = &projects[j];
+
+                // Signal 1: Structural twins (files with similar fingerprints)
+                let twins_count = {
+                    let q = query(
+                        r#"
+                        MATCH (pa:Project {id: $pa_id})-[:CONTAINS]->(fa:File)
+                        WHERE fa.structural_fingerprint IS NOT NULL
+                        WITH fa, fa.structural_fingerprint AS fp_a
+                        MATCH (pb:Project {id: $pb_id})-[:CONTAINS]->(fb:File)
+                        WHERE fb.structural_fingerprint IS NOT NULL
+                        WITH fa, fb, fp_a, fb.structural_fingerprint AS fp_b
+                        WHERE fa.wl_hash IS NOT NULL AND fb.wl_hash IS NOT NULL AND fa.wl_hash = fb.wl_hash
+                        RETURN count(*) AS twin_count
+                        "#,
+                    )
+                    .param("pa_id", pa.id.to_string())
+                    .param("pb_id", pb.id.to_string());
+                    let mut result = self.graph.execute(q).await?;
+                    if let Some(row) = result.next().await? {
+                        row.get::<i64>("twin_count").unwrap_or(0) as usize
+                    } else {
+                        0
+                    }
+                };
+
+                // Signal 2: Imported skills (skills with source from the other project)
+                let imported_skills = {
+                    let q = query(
+                        r#"
+                        MATCH (sa:Skill {project_id: $pa_id})
+                        WHERE sa.imported_from_project = $pb_id
+                        WITH count(sa) AS a_from_b
+                        OPTIONAL MATCH (sb:Skill {project_id: $pb_id})
+                        WHERE sb.imported_from_project = $pa_id
+                        RETURN a_from_b + count(sb) AS total_imports
+                        "#,
+                    )
+                    .param("pa_id", pa.id.to_string())
+                    .param("pb_id", pb.id.to_string());
+                    let mut result = self.graph.execute(q).await?;
+                    if let Some(row) = result.next().await? {
+                        row.get::<i64>("total_imports").unwrap_or(0) as usize
+                    } else {
+                        0
+                    }
+                };
+
+                // Signal 3: Shared notes (notes linked to entities in both projects)
+                let shared_notes = {
+                    let q = query(
+                        r#"
+                        MATCH (n:Note)-[:LINKED_TO]->(ea)
+                        WHERE (ea:File OR ea:Function OR ea:Struct)
+                        AND EXISTS { MATCH (pa:Project {id: $pa_id})-[:CONTAINS*1..2]->(ea) }
+                        WITH collect(DISTINCT n.id) AS notes_a
+                        MATCH (n2:Note)-[:LINKED_TO]->(eb)
+                        WHERE (eb:File OR eb:Function OR eb:Struct)
+                        AND EXISTS { MATCH (pb:Project {id: $pb_id})-[:CONTAINS*1..2]->(eb) }
+                        WITH notes_a, collect(DISTINCT n2.id) AS notes_b
+                        RETURN size([x IN notes_a WHERE x IN notes_b]) AS shared_count
+                        "#,
+                    )
+                    .param("pa_id", pa.id.to_string())
+                    .param("pb_id", pb.id.to_string());
+                    let mut result = self.graph.execute(q).await?;
+                    if let Some(row) = result.next().await? {
+                        row.get::<i64>("shared_count").unwrap_or(0) as usize
+                    } else {
+                        0
+                    }
+                };
+
+                // Signal 4: Tag overlap (Jaccard of note tags)
+                let tag_overlap = {
+                    let q = query(
+                        r#"
+                        MATCH (na:Note {project_id: $pa_id})
+                        WHERE na.status = 'active'
+                        UNWIND na.tags AS tag_a
+                        WITH collect(DISTINCT tag_a) AS tags_a
+                        MATCH (nb:Note {project_id: $pb_id})
+                        WHERE nb.status = 'active'
+                        UNWIND nb.tags AS tag_b
+                        WITH tags_a, collect(DISTINCT tag_b) AS tags_b
+                        RETURN
+                            size([t IN tags_a WHERE t IN tags_b]) AS intersection_size,
+                            size(tags_a) + size(tags_b) - size([t IN tags_a WHERE t IN tags_b]) AS union_size
+                        "#,
+                    )
+                    .param("pa_id", pa.id.to_string())
+                    .param("pb_id", pb.id.to_string());
+                    let mut result = self.graph.execute(q).await?;
+                    if let Some(row) = result.next().await? {
+                        let inter = row.get::<i64>("intersection_size").unwrap_or(0) as f64;
+                        let union_sz = row.get::<i64>("union_size").unwrap_or(0) as f64;
+                        if union_sz > 0.0 {
+                            inter / union_sz
+                        } else {
+                            0.0
+                        }
+                    } else {
+                        0.0
+                    }
+                };
+
+                // Normalize and combine
+                let norm_twins = (twins_count as f64 / MAX_TWINS).min(1.0);
+                let norm_skills = (imported_skills as f64 / MAX_SKILLS).min(1.0);
+                let norm_notes = (shared_notes as f64 / MAX_NOTES).min(1.0);
+                // tag_overlap is already in [0, 1]
+
+                let coupling_strength = (W_TWINS * norm_twins
+                    + W_SKILLS * norm_skills
+                    + W_NOTES * norm_notes
+                    + W_TAGS * tag_overlap)
+                    .clamp(0.0, 1.0);
+
+                entries.push(ProjectCoupling {
+                    project_a_id: pa.id,
+                    project_a_name: pa.name.clone(),
+                    project_b_id: pb.id,
+                    project_b_name: pb.name.clone(),
+                    coupling_strength,
+                    signals: CouplingSignals {
+                        structural_twins: twins_count,
+                        imported_skills,
+                        shared_notes,
+                        tag_overlap,
+                    },
+                });
+            }
+        }
+
+        // Sort by coupling strength descending
+        entries.sort_by(|a, b| {
+            b.coupling_strength
+                .partial_cmp(&a.coupling_strength)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        Ok(CouplingMatrix {
+            workspace_id,
+            entries,
+            project_count,
+        })
+    }
 }

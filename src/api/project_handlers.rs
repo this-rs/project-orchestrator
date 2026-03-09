@@ -149,6 +149,7 @@ pub async fn create_project(
         last_synced: None,
         analytics_computed_at: None,
         last_co_change_computed_at: None,
+        scaffolding_override: None,
     };
 
     state.orchestrator.create_project(&project).await?;
@@ -1522,4 +1523,68 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), AxumStatus::NOT_FOUND);
     }
+}
+
+// ============================================================================
+// Scaffolding Level (biomimicry T8)
+// ============================================================================
+
+/// GET /api/projects/:slug/scaffolding — Get scaffolding level for adaptive task complexity
+pub async fn get_scaffolding_level(
+    State(state): State<OrchestratorState>,
+    Path(slug): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let neo4j = state.orchestrator.neo4j();
+    let project = neo4j
+        .get_project_by_slug(&slug)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("Project not found: {}", slug)))?;
+
+    let level = neo4j
+        .compute_scaffolding_level(project.id, project.scaffolding_override)
+        .await
+        .map_err(AppError::Internal)?;
+
+    Ok(Json(serde_json::json!(level)))
+}
+
+/// Request to set scaffolding override
+#[derive(serde::Deserialize)]
+pub struct SetScaffoldingRequest {
+    /// Level 0-4, or null to clear override
+    pub level: Option<u8>,
+}
+
+/// PUT /api/projects/:slug/scaffolding — Set or clear scaffolding override
+pub async fn set_scaffolding_level(
+    State(state): State<OrchestratorState>,
+    Path(slug): Path<String>,
+    Json(body): Json<SetScaffoldingRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let neo4j = state.orchestrator.neo4j();
+    let project = neo4j
+        .get_project_by_slug(&slug)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("Project not found: {}", slug)))?;
+
+    if let Some(lvl) = body.level {
+        if lvl > 4 {
+            return Err(AppError::BadRequest(
+                "Scaffolding level must be 0-4".to_string(),
+            ));
+        }
+    }
+
+    neo4j
+        .set_scaffolding_override(project.id, body.level)
+        .await
+        .map_err(AppError::Internal)?;
+
+    // Return the new computed level
+    let level = neo4j
+        .compute_scaffolding_level(project.id, body.level)
+        .await
+        .map_err(AppError::Internal)?;
+
+    Ok(Json(serde_json::json!(level)))
 }

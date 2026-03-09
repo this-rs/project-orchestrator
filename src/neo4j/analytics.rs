@@ -6,6 +6,37 @@ use anyhow::Result;
 use neo4rs::query;
 use uuid::Uuid;
 
+/// Map a scaffolding level (0-4) to its label and recommended steps description.
+pub fn level_info(level: u8) -> (u8, String, String) {
+    match level {
+        0 => (
+            0,
+            "L0 — Reflexe".to_string(),
+            "5+ steps détaillés avec snippets".to_string(),
+        ),
+        1 => (
+            1,
+            "L1 — Associatif".to_string(),
+            "3-4 steps guidés".to_string(),
+        ),
+        2 => (
+            2,
+            "L2 — Contextuel".to_string(),
+            "3-4 steps standard".to_string(),
+        ),
+        3 => (
+            3,
+            "L3 — Stratégique".to_string(),
+            "2 steps, autonomie élevée".to_string(),
+        ),
+        _ => (
+            4,
+            "L4 — Méta-cognitif".to_string(),
+            "1 step abstrait, libre décomposition".to_string(),
+        ),
+    }
+}
+
 impl Neo4jClient {
     /// Get distinct communities for a project (from graph analytics Louvain clustering).
     /// Returns communities sorted by file_count descending.
@@ -204,10 +235,424 @@ impl Neo4jClient {
             })
         });
 
+        // WorldModel prediction accuracy (biomimicry T7)
+        let prediction_accuracy = self.compute_prediction_accuracy(project_id, 10).await.ok();
+
         Ok(CodeHealthReport {
             god_functions,
             orphan_files,
             coupling_metrics,
+            prediction_accuracy,
+        })
+    }
+
+    /// WorldModel prediction accuracy (biomimicry T7):
+    /// For each of the last N sessions, compute what files the agent discussed,
+    /// then check if those files were predictable from the CO_CHANGED graph
+    /// of files discussed in the *previous* session.
+    pub async fn compute_prediction_accuracy(
+        &self,
+        project_id: Uuid,
+        max_sessions: i64,
+    ) -> Result<crate::neo4j::models::PredictionAccuracy> {
+        let q = query(
+            r#"
+            MATCH (p:Project {id: $pid})-[:HAS_CHAT_SESSION]->(s:ChatSession)
+            WITH s ORDER BY s.created_at DESC LIMIT $max_sessions
+            WITH collect(s) AS sessions
+            UNWIND range(0, size(sessions) - 2) AS i
+            WITH sessions[i] AS current_session, sessions[i+1] AS prev_session
+            MATCH (prev_session)-[:DISCUSSED]->(prev_file:File)
+            WITH current_session, collect(DISTINCT prev_file.path) AS prev_files, prev_session
+            OPTIONAL MATCH (pf:File)-[:CO_CHANGED]->(predicted:File)
+            WHERE pf.path IN prev_files AND predicted.path <> pf.path
+            WITH current_session, collect(DISTINCT predicted.path) AS predicted_paths
+            MATCH (current_session)-[:DISCUSSED]->(actual_file:File)
+            WITH current_session, predicted_paths, collect(DISTINCT actual_file.path) AS actual_paths
+            WITH current_session,
+                 size(actual_paths) AS total_accessed,
+                 size([f IN actual_paths WHERE f IN predicted_paths]) AS hits
+            RETURN sum(hits) AS total_hits,
+                   sum(total_accessed) AS total_accessed,
+                   count(current_session) AS sessions_analyzed
+            "#,
+        )
+        .param("pid", project_id.to_string())
+        .param("max_sessions", max_sessions);
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let hits = row.get::<i64>("total_hits").unwrap_or(0);
+            let total = row.get::<i64>("total_accessed").unwrap_or(0);
+            let sessions = row.get::<i64>("sessions_analyzed").unwrap_or(0);
+            let accuracy = if total > 0 {
+                hits as f64 / total as f64
+            } else {
+                0.0
+            };
+            Ok(crate::neo4j::models::PredictionAccuracy {
+                hits,
+                total,
+                accuracy,
+                sessions_analyzed: sessions,
+            })
+        } else {
+            Ok(crate::neo4j::models::PredictionAccuracy {
+                hits: 0,
+                total: 0,
+                accuracy: 0.0,
+                sessions_analyzed: 0,
+            })
+        }
+    }
+
+    /// Capture a lightweight maintenance snapshot (biomimicry T11).
+    /// 5 queries: health_score proxy, active_synapses, mean_energy, skill_count, note_count.
+    pub async fn compute_maintenance_snapshot(
+        &self,
+        project_id: Uuid,
+    ) -> Result<crate::neo4j::models::MaintenanceSnapshot> {
+        use chrono::Utc;
+
+        // Q1: health_score proxy — count god functions + orphan files (lower = healthier)
+        let q1 = query(
+            r#"
+            MATCH (p:Project {id: $pid})-[:CONTAINS]->(f:File)-[:DEFINES]->(fn:Function)
+            WHERE fn.line_count > 100
+            WITH count(fn) AS god_fns
+            OPTIONAL MATCH (p2:Project {id: $pid})-[:CONTAINS]->(orphan:File)
+            WHERE NOT EXISTS { (orphan)-[:IMPORTS]->() }
+              AND NOT EXISTS { ()-[:IMPORTS]->(orphan) }
+            WITH god_fns, count(orphan) AS orphans
+            RETURN god_fns, orphans,
+                   CASE WHEN god_fns + orphans = 0 THEN 1.0
+                        ELSE 1.0 / (1.0 + god_fns * 0.1 + orphans * 0.05)
+                   END AS health_score
+            "#,
+        )
+        .param("pid", project_id.to_string());
+
+        // Q2: active synapses count
+        let q2 = query(
+            r#"
+            MATCH (p:Project {id: $pid})
+            OPTIONAL MATCH (p)-[:HAS_NOTE]->(n1:Note)-[s:SYNAPSE]->(n2:Note)
+            WHERE s.strength > 0
+            RETURN count(s) AS active_synapses
+            "#,
+        )
+        .param("pid", project_id.to_string());
+
+        // Q3: mean energy across notes
+        let q3 = query(
+            r#"
+            MATCH (p:Project {id: $pid})-[:HAS_NOTE]->(n:Note)
+            WHERE n.status = 'active'
+            RETURN avg(coalesce(n.energy, 0.5)) AS mean_energy
+            "#,
+        )
+        .param("pid", project_id.to_string());
+
+        // Q4: active skill count
+        let q4 = query(
+            r#"
+            MATCH (p:Project {id: $pid})-[:HAS_SKILL]->(s:Skill)
+            WHERE s.status IN ['active', 'emerging']
+            RETURN count(s) AS skill_count
+            "#,
+        )
+        .param("pid", project_id.to_string());
+
+        // Q5: active note count
+        let q5 = query(
+            r#"
+            MATCH (p:Project {id: $pid})-[:HAS_NOTE]->(n:Note)
+            WHERE n.status = 'active'
+            RETURN count(n) AS note_count
+            "#,
+        )
+        .param("pid", project_id.to_string());
+
+        // Execute all 5 in parallel
+        let (r1, r2, r3, r4, r5) = tokio::join!(
+            self.execute_with_params(q1),
+            self.execute_with_params(q2),
+            self.execute_with_params(q3),
+            self.execute_with_params(q4),
+            self.execute_with_params(q5),
+        );
+
+        let health_score = r1
+            .ok()
+            .and_then(|rows| rows.into_iter().next())
+            .and_then(|r| r.get::<f64>("health_score").ok())
+            .unwrap_or(0.5);
+
+        let active_synapses = r2
+            .ok()
+            .and_then(|rows| rows.into_iter().next())
+            .and_then(|r| r.get::<i64>("active_synapses").ok())
+            .unwrap_or(0);
+
+        let mean_energy = r3
+            .ok()
+            .and_then(|rows| rows.into_iter().next())
+            .and_then(|r| r.get::<f64>("mean_energy").ok())
+            .unwrap_or(0.5);
+
+        let skill_count = r4
+            .ok()
+            .and_then(|rows| rows.into_iter().next())
+            .and_then(|r| r.get::<i64>("skill_count").ok())
+            .unwrap_or(0);
+
+        let note_count = r5
+            .ok()
+            .and_then(|rows| rows.into_iter().next())
+            .and_then(|r| r.get::<i64>("note_count").ok())
+            .unwrap_or(0);
+
+        Ok(crate::neo4j::models::MaintenanceSnapshot {
+            health_score,
+            active_synapses,
+            mean_energy,
+            skill_count,
+            note_count,
+            captured_at: Utc::now().to_rfc3339(),
+        })
+    }
+
+    /// Compute the scaffolding level for adaptive task complexity (biomimicry T8).
+    /// Combines 4 signals: task_success_rate, avg_frustration, scar_density, homeostasis_pain.
+    /// Returns a ScaffoldingLevel (L0-L4) with competence score and metrics.
+    pub async fn compute_scaffolding_level(
+        &self,
+        project_id: Uuid,
+        scaffolding_override: Option<u8>,
+    ) -> Result<crate::neo4j::models::ScaffoldingLevel> {
+        // Q1: task success rate + avg frustration (last 20 tasks)
+        let q1 = query(
+            r#"
+            MATCH (p:Project {id: $pid})-[:HAS_PLAN]->(plan)-[:HAS_TASK]->(t:Task)
+            WHERE t.status IN ['completed', 'failed']
+            WITH t ORDER BY t.updated_at DESC LIMIT 20
+            WITH count(t) AS total,
+                 sum(CASE WHEN t.status = 'completed' THEN 1 ELSE 0 END) AS completed,
+                 avg(coalesce(t.frustration_score, 0.0)) AS avg_frust
+            RETURN total, completed,
+                   CASE WHEN total > 0 THEN toFloat(completed) / total ELSE 1.0 END AS success_rate,
+                   avg_frust
+            "#,
+        )
+        .param("pid", project_id.to_string());
+
+        // Q2: scar density (avg scar_intensity across project notes)
+        let q2 = query(
+            r#"
+            MATCH (p:Project {id: $pid})-[:HAS_NOTE]->(n:Note)
+            WHERE n.status = 'active'
+            RETURN avg(coalesce(n.scar_intensity, 0.0)) AS scar_density
+            "#,
+        )
+        .param("pid", project_id.to_string());
+
+        // Execute in parallel
+        let (r1, r2) = tokio::join!(self.execute_with_params(q1), self.execute_with_params(q2),);
+
+        let (tasks_analyzed, task_success_rate, avg_frustration) = r1
+            .ok()
+            .and_then(|rows| rows.into_iter().next())
+            .map(|r| {
+                let total = r.get::<i64>("total").unwrap_or(0);
+                let rate = r.get::<f64>("success_rate").unwrap_or(1.0);
+                let frust = r.get::<f64>("avg_frust").unwrap_or(0.0);
+                (total, rate, frust)
+            })
+            .unwrap_or((0, 1.0, 0.0));
+
+        let scar_density = r2
+            .ok()
+            .and_then(|rows| rows.into_iter().next())
+            .and_then(|r| r.get::<f64>("scar_density").ok())
+            .unwrap_or(0.0);
+
+        // Q3: homeostasis pain (reuse compute_homeostasis)
+        let homeostasis_pain = self
+            .compute_homeostasis(project_id, None)
+            .await
+            .map(|h| h.pain_score)
+            .unwrap_or(0.0);
+
+        // Composite competence score (0.0 = struggling, 1.0 = expert)
+        // Weights: success_rate dominates, frustration/scars/pain are penalties
+        let competence_score = (task_success_rate * 0.5
+            + (1.0 - avg_frustration) * 0.2
+            + (1.0 - scar_density) * 0.15
+            + (1.0 - homeostasis_pain) * 0.15)
+            .clamp(0.0, 1.0);
+
+        // Map competence to level (L0-L4)
+        let (level, label, recommended_steps) = if let Some(ovr) = scaffolding_override {
+            let ovr = ovr.min(4);
+            level_info(ovr)
+        } else {
+            let auto_level = if competence_score >= 0.9 {
+                4
+            } else if competence_score >= 0.75 {
+                3
+            } else if competence_score >= 0.5 {
+                2
+            } else if competence_score >= 0.3 {
+                1
+            } else {
+                0
+            };
+            level_info(auto_level)
+        };
+
+        Ok(crate::neo4j::models::ScaffoldingLevel {
+            level,
+            label,
+            recommended_steps,
+            task_success_rate,
+            avg_frustration,
+            scar_density,
+            homeostasis_pain,
+            competence_score,
+            is_overridden: scaffolding_override.is_some(),
+            tasks_analyzed,
+        })
+    }
+
+    /// Detect global stagnation across a project (biomimicry T12).
+    /// Checks 4 signals: tasks completed in 48h, avg frustration, energy trend, commits in 48h.
+    /// If ≥3 signals triggered → stagnation detected.
+    pub async fn detect_global_stagnation(
+        &self,
+        project_id: Uuid,
+    ) -> Result<crate::neo4j::models::StagnationReport> {
+        // Q1: tasks completed in last 48h
+        let q1 = query(
+            r#"
+            MATCH (p:Project {id: $pid})-[:HAS_PLAN]->(plan)-[:HAS_TASK]->(t:Task)
+            WHERE t.status = 'completed'
+              AND t.completed_at IS NOT NULL
+              AND datetime(t.completed_at) > datetime() - duration('PT48H')
+            RETURN count(t) AS cnt
+            "#,
+        )
+        .param("pid", project_id.to_string());
+
+        // Q2: avg frustration on in-progress tasks
+        let q2 = query(
+            r#"
+            MATCH (p:Project {id: $pid})-[:HAS_PLAN]->(plan)-[:HAS_TASK]->(t:Task)
+            WHERE t.status = 'in_progress' AND t.frustration IS NOT NULL
+            RETURN avg(t.frustration) AS avg_f, count(t) AS cnt
+            "#,
+        )
+        .param("pid", project_id.to_string());
+
+        // Q3: mean note energy (current snapshot)
+        let q3 = query(
+            r#"
+            MATCH (n:Note {project_id: $pid})
+            WHERE n.status = 'active' AND n.energy IS NOT NULL
+            RETURN avg(n.energy) AS avg_energy, count(n) AS cnt
+            "#,
+        )
+        .param("pid", project_id.to_string());
+
+        // Q4: commits (TOUCHES) in last 48h
+        let q4 = query(
+            r#"
+            MATCH (c:Commit)-[:TOUCHES]->(f:File)
+            WHERE EXISTS { MATCH (p:Project {id: $pid})-[:CONTAINS]->(f) }
+              AND c.created_at IS NOT NULL
+              AND datetime(c.created_at) > datetime() - duration('PT48H')
+            RETURN count(DISTINCT c) AS cnt
+            "#,
+        )
+        .param("pid", project_id.to_string());
+
+        let (r1, r2, r3, r4) = tokio::join!(
+            self.execute_with_params(q1),
+            self.execute_with_params(q2),
+            self.execute_with_params(q3),
+            self.execute_with_params(q4),
+        );
+
+        let tasks_completed_48h = r1
+            .unwrap_or_default()
+            .first()
+            .and_then(|r| r.get::<i64>("cnt").ok())
+            .unwrap_or(0);
+
+        let avg_frustration = r2
+            .unwrap_or_default()
+            .first()
+            .and_then(|r| r.get::<f64>("avg_f").ok())
+            .unwrap_or(0.0);
+
+        let mean_energy = r3
+            .unwrap_or_default()
+            .first()
+            .and_then(|r| r.get::<f64>("avg_energy").ok())
+            .unwrap_or(1.0);
+
+        let commits_48h = r4
+            .unwrap_or_default()
+            .first()
+            .and_then(|r| r.get::<i64>("cnt").ok())
+            .unwrap_or(0);
+
+        // Energy trend: below 0.4 = declining (proxy without historical snapshots)
+        let energy_trend = mean_energy - 0.5; // negative = below midpoint
+
+        // Count triggered signals
+        let mut signals: u8 = 0;
+        let mut recommendations: Vec<String> = Vec::new();
+
+        if tasks_completed_48h == 0 {
+            signals += 1;
+            recommendations.push("No tasks completed in 48h — consider reviewing blocked tasks or splitting large tasks.".to_string());
+        }
+        if avg_frustration > 0.6 {
+            signals += 1;
+            recommendations.push(format!(
+                "High avg frustration ({:.2}) — consider abandoning stuck tasks or reassessing scope.",
+                avg_frustration
+            ));
+        }
+        if energy_trend < 0.0 {
+            signals += 1;
+            recommendations.push(format!(
+                "Note energy declining (mean: {:.2}) — run deep_maintenance to consolidate knowledge.",
+                mean_energy
+            ));
+        }
+        if commits_48h == 0 {
+            signals += 1;
+            recommendations
+                .push("No commits in 48h — project may be abandoned or blocked.".to_string());
+        }
+
+        let is_stagnating = signals >= 3;
+
+        if is_stagnating {
+            recommendations.push(
+                "⚠️ Global stagnation detected — recommend running deep_maintenance.".to_string(),
+            );
+        }
+
+        Ok(crate::neo4j::models::StagnationReport {
+            is_stagnating,
+            tasks_completed_48h,
+            avg_frustration,
+            energy_trend,
+            commits_48h,
+            signals_triggered: signals,
+            recommendations,
         })
     }
 
@@ -1808,7 +2253,7 @@ impl Neo4jClient {
         // 1. Notes without any LINKED_TO relations
         let orphan_notes_q = query(
             r#"
-            MATCH (n:KnowledgeNote {project_id: $pid})
+            MATCH (n:Note {project_id: $pid})
             WHERE NOT (n)-[:LINKED_TO]->()
             RETURN n.id AS id, left(n.content, 80) AS preview
             LIMIT 100
@@ -1919,4 +2364,454 @@ impl Neo4jClient {
             relationship_type_counts,
         })
     }
+
+    // ========================================================================
+    // Homeostasis — Bio-inspired auto-regulation metrics
+    // ========================================================================
+
+    /// Compute homeostasis report for a project's knowledge graph.
+    /// Returns 5 ratios measuring the "health equilibrium" of the graph,
+    /// inspired by biological homeostasis (Elun's homeostasis.rs).
+    ///
+    /// Default target ranges can be overridden via `custom_ranges`.
+    pub async fn compute_homeostasis(
+        &self,
+        project_id: Uuid,
+        custom_ranges: Option<&[(String, f64, f64)]>,
+    ) -> Result<HomeostasisReport> {
+        let pid = project_id.to_string();
+
+        // Single Cypher query to collect all 5 ratios in one round-trip
+        let q = query(
+            r#"
+            // 1. Note density: notes / files
+            OPTIONAL MATCH (p:Project {id: $pid})-[:CONTAINS]->(f:File)
+            WITH count(DISTINCT f) AS file_count
+            OPTIONAL MATCH (n:Note {project_id: $pid})
+            WHERE n.status = 'active'
+            WITH file_count, count(DISTINCT n) AS note_count
+
+            // 2. Decision coverage: decisions with AFFECTS / total files modified
+            // Decisions don't have project_id — traverse Task→Plan→Project chain
+            OPTIONAL MATCH (p2:Project {id: $pid})-[:HAS_PLAN]->(:Plan)-[:HAS_TASK]->(:Task)-[:INFORMED_BY]->(d:Decision)-[:AFFECTS]->(target)
+            WITH file_count, note_count,
+                 count(DISTINCT target) AS files_with_decisions
+            OPTIONAL MATCH (p3:Project {id: $pid})-[:HAS_PLAN]->(:Plan)-[:HAS_TASK]->(:Task)-[:INFORMED_BY]->(d2:Decision)
+            WITH file_count, note_count, files_with_decisions,
+                 count(DISTINCT d2) AS total_decisions
+
+            // 3. Synapse health: active synapses / active notes
+            OPTIONAL MATCH (n1:Note {project_id: $pid})-[syn:SYNAPSE]->(n2:Note)
+            WHERE syn.weight > 0.1
+            WITH file_count, note_count, files_with_decisions, total_decisions,
+                 count(syn) AS active_synapses
+
+            // 4. Hotspot coverage: hotspots with notes / total hotspots
+            OPTIONAL MATCH (p:Project {id: $pid})-[:CONTAINS]->(hf:File)
+            WHERE hf.churn_score IS NOT NULL AND hf.churn_score > 0.5
+            WITH file_count, note_count, files_with_decisions, total_decisions,
+                 active_synapses, count(DISTINCT hf) AS hotspot_count
+            OPTIONAL MATCH (p:Project {id: $pid})-[:CONTAINS]->(hf2:File)
+            WHERE hf2.churn_score IS NOT NULL AND hf2.churn_score > 0.5
+            AND EXISTS { MATCH (n:Note)-[:LINKED_TO]->(hf2) WHERE n.status = 'active' }
+            WITH file_count, note_count, files_with_decisions, total_decisions,
+                 active_synapses, hotspot_count, count(DISTINCT hf2) AS covered_hotspots
+
+            // 5. Scar load: scarred nodes / total notes+decisions
+            OPTIONAL MATCH (sn:Note {project_id: $pid})
+            WHERE sn.scar_intensity IS NOT NULL AND sn.scar_intensity > 0.0
+            WITH file_count, note_count, files_with_decisions, total_decisions,
+                 active_synapses, hotspot_count, covered_hotspots,
+                 count(sn) AS scarred_notes
+            OPTIONAL MATCH (p5:Project {id: $pid})-[:HAS_PLAN]->(:Plan)-[:HAS_TASK]->(:Task)-[:INFORMED_BY]->(sd:Decision)
+            WHERE sd.scar_intensity IS NOT NULL AND sd.scar_intensity > 0.0
+            WITH file_count, note_count, files_with_decisions, total_decisions,
+                 active_synapses, hotspot_count, covered_hotspots,
+                 scarred_notes, count(sd) AS scarred_decisions
+            WITH file_count, note_count, files_with_decisions, total_decisions,
+                 active_synapses, hotspot_count, covered_hotspots,
+                 scarred_notes + scarred_decisions AS scarred_total
+
+            RETURN file_count, note_count, files_with_decisions, total_decisions,
+                   active_synapses, hotspot_count, covered_hotspots, scarred_total
+            "#,
+        )
+        .param("pid", pid);
+
+        let mut rows = self.graph.execute(q).await?;
+        let row = rows
+            .next()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("No homeostasis data returned"))?;
+
+        let file_count: i64 = row.get("file_count").unwrap_or(0);
+        let note_count: i64 = row.get("note_count").unwrap_or(0);
+        let files_with_decisions: i64 = row.get("files_with_decisions").unwrap_or(0);
+        let total_decisions: i64 = row.get("total_decisions").unwrap_or(0);
+        let active_synapses: i64 = row.get("active_synapses").unwrap_or(0);
+        let hotspot_count: i64 = row.get("hotspot_count").unwrap_or(0);
+        let covered_hotspots: i64 = row.get("covered_hotspots").unwrap_or(0);
+        let scarred_total: i64 = row.get("scarred_total").unwrap_or(0);
+
+        // Default target ranges (overridable via analysis_profile)
+        let default_ranges: Vec<(&str, f64, f64)> = vec![
+            ("note_density", 0.3, 2.0),      // 0.3-2.0 notes per file
+            ("decision_coverage", 0.1, 0.8), // 10-80% of files have decisions
+            ("synapse_health", 0.2, 3.0),    // 0.2-3.0 synapses per note
+            ("churn_balance", 0.3, 1.0),     // 30-100% hotspots covered
+            ("scar_load", 0.0, 0.15),        // 0-15% scarred nodes
+        ];
+
+        let get_range = |name: &str, default_min: f64, default_max: f64| -> (f64, f64) {
+            if let Some(ranges) = custom_ranges {
+                for (n, min, max) in ranges {
+                    if n == name {
+                        return (*min, *max);
+                    }
+                }
+            }
+            (default_min, default_max)
+        };
+
+        let mut ratios = Vec::new();
+        let mut total_pain = 0.0;
+
+        // 1. Note density
+        let note_density = if file_count > 0 {
+            note_count as f64 / file_count as f64
+        } else {
+            0.0
+        };
+        let (min, max) = get_range("note_density", default_ranges[0].1, default_ranges[0].2);
+        ratios.push(Self::make_ratio("note_density", note_density, min, max));
+
+        // 2. Decision coverage
+        let decision_cov = if file_count > 0 {
+            files_with_decisions as f64 / file_count as f64
+        } else {
+            0.0
+        };
+        let (min, max) = get_range(
+            "decision_coverage",
+            default_ranges[1].1,
+            default_ranges[1].2,
+        );
+        ratios.push(Self::make_ratio(
+            "decision_coverage",
+            decision_cov,
+            min,
+            max,
+        ));
+
+        // 3. Synapse health
+        let synapse_ratio = if note_count > 0 {
+            active_synapses as f64 / note_count as f64
+        } else {
+            0.0
+        };
+        let (min, max) = get_range("synapse_health", default_ranges[2].1, default_ranges[2].2);
+        ratios.push(Self::make_ratio("synapse_health", synapse_ratio, min, max));
+
+        // 4. Churn balance
+        let churn_bal = if hotspot_count > 0 {
+            covered_hotspots as f64 / hotspot_count as f64
+        } else {
+            1.0 // no hotspots = perfectly balanced
+        };
+        let (min, max) = get_range("churn_balance", default_ranges[3].1, default_ranges[3].2);
+        ratios.push(Self::make_ratio("churn_balance", churn_bal, min, max));
+
+        // 5. Scar load
+        let total_nodes = (note_count + total_decisions).max(1) as f64;
+        let scar_ratio = scarred_total as f64 / total_nodes;
+        let (min, max) = get_range("scar_load", default_ranges[4].1, default_ranges[4].2);
+        ratios.push(Self::make_ratio("scar_load", scar_ratio, min, max));
+
+        // Aggregate pain score (mean of normalized distances, clamped to [0, 1])
+        for r in &ratios {
+            total_pain += r.distance_to_equilibrium;
+        }
+        let pain_score = (total_pain / ratios.len() as f64).clamp(0.0, 1.0);
+
+        // Generate overall recommendations
+        let mut recommendations = Vec::new();
+        for r in &ratios {
+            if let Some(ref rec) = r.recommendation {
+                recommendations.push(rec.clone());
+            }
+        }
+
+        Ok(HomeostasisReport {
+            ratios,
+            pain_score,
+            recommendations,
+        })
+    }
+
+    /// Helper: build a HomeostasisRatio with distance and severity computation.
+    fn make_ratio(name: &str, value: f64, min: f64, max: f64) -> HomeostasisRatio {
+        let distance = if value < min {
+            (min - value) / min.max(0.01)
+        } else if value > max {
+            (value - max) / max.max(0.01)
+        } else {
+            0.0
+        };
+        let distance = distance.clamp(0.0, 2.0); // cap at 2.0
+
+        let severity = if distance == 0.0 {
+            HomeostasisSeverity::Ok
+        } else if distance < 0.5 {
+            HomeostasisSeverity::Warning
+        } else {
+            HomeostasisSeverity::Critical
+        };
+
+        let recommendation = match (name, &severity) {
+            (_, HomeostasisSeverity::Ok) => None,
+            ("note_density", _) if value < min => {
+                Some(format!("Knowledge gap: only {:.2} notes/file (target ≥ {:.1}). Add notes to under-documented files.", value, min))
+            }
+            ("note_density", _) => {
+                Some(format!("Over-documentation: {:.2} notes/file (target ≤ {:.1}). Consider consolidating redundant notes.", value, max))
+            }
+            ("decision_coverage", _) if value < min => {
+                Some(format!("Low decision coverage: {:.0}% of files have architectural decisions (target ≥ {:.0}%). Add AFFECTS links to decisions.", value * 100.0, min * 100.0))
+            }
+            ("decision_coverage", _) => {
+                Some(format!("High decision coverage: {:.0}% (target ≤ {:.0}%). Some decisions may be too granular.", value * 100.0, max * 100.0))
+            }
+            ("synapse_health", _) if value < min => {
+                Some(format!("Weak neural network: {:.2} synapses/note (target ≥ {:.1}). Run reinforce_neurons on related notes.", value, min))
+            }
+            ("synapse_health", _) => {
+                Some(format!("Dense neural network: {:.2} synapses/note (target ≤ {:.1}). Run decay_synapses to prune weak links.", value, max))
+            }
+            ("churn_balance", _) if value < min => {
+                Some(format!("Hotspot blind spots: only {:.0}% of frequently-changed files have notes (target ≥ {:.0}%). Prioritize documenting hotspots.", value * 100.0, min * 100.0))
+            }
+            ("churn_balance", _) => None, // can't have too much coverage
+            ("scar_load", _) => {
+                Some(format!("High scar load: {:.1}% of nodes are scarred (target ≤ {:.0}%). Run heal_scars on resolved issues.", value * 100.0, max * 100.0))
+            }
+            _ => None,
+        };
+
+        HomeostasisRatio {
+            name: name.to_string(),
+            value,
+            target_range: (min, max),
+            distance_to_equilibrium: distance,
+            severity,
+            recommendation,
+        }
+    }
+
+    // ========================================================================
+    // Identity Manifold — Community centroids & structural drift
+    // ========================================================================
+
+    /// Compute structural drift for all files in a project.
+    ///
+    /// 1. Fetches all files with fingerprint + community_id from Neo4j (single query)
+    /// 2. Groups by community, computes centroid (mean fingerprint) per community
+    /// 3. Computes euclidean distance from each file to its community centroid
+    /// 4. Returns files sorted by drift (descending) with severity classification
+    ///
+    /// Thresholds (configurable via `warning_threshold` and `critical_threshold`):
+    /// - ok: distance < warning_threshold
+    /// - warning: warning_threshold ≤ distance < critical_threshold
+    /// - critical: distance ≥ critical_threshold
+    pub async fn compute_structural_drift(
+        &self,
+        project_id: Uuid,
+        warning_threshold: Option<f64>,
+        critical_threshold: Option<f64>,
+    ) -> Result<crate::neo4j::models::StructuralDriftReport> {
+        use crate::neo4j::models::{
+            CommunityIdentity, HomeostasisSeverity, StructuralDrift, StructuralDriftReport,
+        };
+
+        let warn_thresh = warning_threshold.unwrap_or(1.5);
+        let crit_thresh = critical_threshold.unwrap_or(3.0);
+
+        // Single query: get all files with fingerprint + community data
+        let q = query(
+            r#"
+            MATCH (p:Project {id: $project_id})-[:CONTAINS]->(f:File)
+            WHERE f.structural_fingerprint IS NOT NULL
+              AND f.community_id IS NOT NULL
+            RETURN f.path AS path,
+                   f.structural_fingerprint AS fingerprint,
+                   f.community_id AS community_id,
+                   COALESCE(f.community_label, 'Community ' + toString(f.community_id)) AS community_label
+            "#,
+        )
+        .param("project_id", project_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+
+        // Collect all files
+        struct FileEntry {
+            path: String,
+            fingerprint: Vec<f64>,
+            community_id: i64,
+            community_label: String,
+        }
+
+        let mut files: Vec<FileEntry> = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            if let (Ok(path), Ok(fp), Ok(cid)) = (
+                row.get::<String>("path"),
+                row.get::<Vec<f64>>("fingerprint"),
+                row.get::<i64>("community_id"),
+            ) {
+                let label = row
+                    .get::<String>("community_label")
+                    .unwrap_or_else(|_| format!("Community {}", cid));
+                files.push(FileEntry {
+                    path,
+                    fingerprint: fp,
+                    community_id: cid,
+                    community_label: label,
+                });
+            }
+        }
+
+        if files.is_empty() {
+            return Ok(StructuralDriftReport {
+                drifting_files: vec![],
+                centroids: vec![],
+                mean_drift: 0.0,
+                warning_count: 0,
+                critical_count: 0,
+            });
+        }
+
+        // Group by community and compute centroids
+        let mut community_files: std::collections::HashMap<i64, Vec<&FileEntry>> =
+            std::collections::HashMap::new();
+        for file in &files {
+            community_files
+                .entry(file.community_id)
+                .or_default()
+                .push(file);
+        }
+
+        let now = chrono::Utc::now();
+        let mut centroids: Vec<CommunityIdentity> = Vec::new();
+        let mut centroid_map: std::collections::HashMap<i64, Vec<f64>> =
+            std::collections::HashMap::new();
+
+        for (cid, members) in &community_files {
+            let n = members.len();
+            if n == 0 {
+                continue;
+            }
+
+            // Determine dimensionality from first member
+            let dims = members[0].fingerprint.len();
+            let mut centroid = vec![0.0f64; dims];
+
+            for m in members {
+                for (i, &v) in m.fingerprint.iter().enumerate() {
+                    if i < dims {
+                        centroid[i] += v;
+                    }
+                }
+            }
+            for v in centroid.iter_mut() {
+                *v /= n as f64;
+            }
+
+            centroids.push(CommunityIdentity {
+                community_id: *cid,
+                community_label: members[0].community_label.clone(),
+                centroid: centroid.clone(),
+                member_count: n,
+                last_computed: now,
+            });
+            centroid_map.insert(*cid, centroid);
+        }
+
+        // Compute drift for each file
+        let mut drifting_files: Vec<StructuralDrift> = Vec::new();
+        let mut total_drift = 0.0;
+
+        for file in &files {
+            if let Some(centroid) = centroid_map.get(&file.community_id) {
+                let distance = euclidean_distance(&file.fingerprint, centroid);
+                let severity = if distance >= crit_thresh {
+                    HomeostasisSeverity::Critical
+                } else if distance >= warn_thresh {
+                    HomeostasisSeverity::Warning
+                } else {
+                    HomeostasisSeverity::Ok
+                };
+
+                let suggestion = match severity {
+                    HomeostasisSeverity::Critical => Some(format!(
+                        "File has drifted significantly from Community {} identity (distance: {:.2}). Consider migrating to a structurally closer community.",
+                        file.community_id, distance
+                    )),
+                    HomeostasisSeverity::Warning => Some(format!(
+                        "Moderate structural drift from Community {} (distance: {:.2}). Monitor for further divergence.",
+                        file.community_id, distance
+                    )),
+                    HomeostasisSeverity::Ok => None,
+                };
+
+                total_drift += distance;
+
+                drifting_files.push(StructuralDrift {
+                    file_path: file.path.clone(),
+                    community_id: file.community_id,
+                    community_label: file.community_label.clone(),
+                    drift_distance: distance,
+                    severity,
+                    suggestion,
+                });
+            }
+        }
+
+        // Sort by drift descending
+        drifting_files.sort_by(|a, b| {
+            b.drift_distance
+                .partial_cmp(&a.drift_distance)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        let mean_drift = if files.is_empty() {
+            0.0
+        } else {
+            total_drift / files.len() as f64
+        };
+
+        let warning_count = drifting_files
+            .iter()
+            .filter(|f| matches!(f.severity, HomeostasisSeverity::Warning))
+            .count();
+        let critical_count = drifting_files
+            .iter()
+            .filter(|f| matches!(f.severity, HomeostasisSeverity::Critical))
+            .count();
+
+        Ok(StructuralDriftReport {
+            drifting_files,
+            centroids,
+            mean_drift,
+            warning_count,
+            critical_count,
+        })
+    }
+}
+
+/// Euclidean distance between two vectors.
+fn euclidean_distance(a: &[f64], b: &[f64]) -> f64 {
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| (x - y) * (x - y))
+        .sum::<f64>()
+        .sqrt()
 }

@@ -106,6 +106,12 @@ pub trait GraphStore: Send + Sync {
     /// Get the workspace a project belongs to
     async fn get_project_workspace(&self, project_id: Uuid) -> Result<Option<WorkspaceNode>>;
 
+    /// Compute the P2P coupling matrix for all projects in a workspace.
+    async fn compute_coupling_matrix(
+        &self,
+        workspace_id: Uuid,
+    ) -> Result<crate::neo4j::models::CouplingMatrix>;
+
     // ========================================================================
     // Workspace Milestone operations
     // ========================================================================
@@ -637,6 +643,28 @@ pub trait GraphStore: Send + Sync {
         project_id: Uuid,
         god_function_threshold: usize,
     ) -> Result<crate::neo4j::models::CodeHealthReport>;
+
+    /// Capture a lightweight maintenance snapshot (biomimicry T11).
+    async fn compute_maintenance_snapshot(
+        &self,
+        project_id: Uuid,
+    ) -> Result<crate::neo4j::models::MaintenanceSnapshot>;
+
+    /// Compute scaffolding level for adaptive task complexity (biomimicry T8).
+    async fn compute_scaffolding_level(
+        &self,
+        project_id: Uuid,
+        scaffolding_override: Option<u8>,
+    ) -> Result<crate::neo4j::models::ScaffoldingLevel>;
+
+    /// Set or clear the scaffolding level override on a project (biomimicry T8).
+    async fn set_scaffolding_override(&self, project_id: Uuid, level: Option<u8>) -> Result<()>;
+
+    /// Detect global stagnation across a project (biomimicry T12).
+    async fn detect_global_stagnation(
+        &self,
+        project_id: Uuid,
+    ) -> Result<crate::neo4j::models::StagnationReport>;
 
     /// Detect circular dependencies between files (import cycles).
     async fn get_circular_dependencies(&self, project_id: Uuid) -> Result<Vec<Vec<String>>>;
@@ -1339,6 +1367,7 @@ pub trait GraphStore: Send + Sync {
     /// - `None` → default (CONTAINS|IMPORTS|CALLS) — backward compatible
     /// - `Some(&["CO_CHANGED", "IMPLEMENTS_TRAIT", ...])` → custom traversal
     /// Only whitelisted relation types are accepted (see `ALLOWED_PROPAGATION_RELATIONS`).
+    #[allow(clippy::too_many_arguments)]
     async fn get_propagated_notes(
         &self,
         entity_type: &EntityType,
@@ -1346,6 +1375,8 @@ pub trait GraphStore: Send + Sync {
         max_depth: u32,
         min_score: f64,
         relation_types: Option<&[String]>,
+        source_project_id: Option<Uuid>,
+        force_cross_project: bool,
     ) -> Result<Vec<PropagatedNote>>;
 
     /// Get workspace-level notes for a project (propagated from parent workspace)
@@ -1561,6 +1592,59 @@ pub trait GraphStore: Send + Sync {
         prune_threshold: f64,
     ) -> Result<(usize, usize)>;
 
+    /// Apply knowledge scars to notes/decisions after failed reasoning feedback.
+    /// Biomimicry: Elun HypersphereIdentity.Scar — penalizes nodes in search scoring.
+    /// `increment` is added to existing scar_intensity, capped at 1.0.
+    /// Returns the number of nodes scarred.
+    async fn apply_scars(&self, node_ids: &[Uuid], increment: f64) -> Result<usize>;
+
+    /// Reset scar_intensity to 0.0 for a given note or decision node.
+    /// Returns true if the node was found and healed.
+    async fn heal_scars(&self, node_id: Uuid) -> Result<bool>;
+
+    /// Consolidate memory: evaluate all non-consolidated notes for promotion,
+    /// and archive stale ephemeral notes (>48h without reactivation).
+    /// Returns (promoted_count, archived_count).
+    async fn consolidate_memory(&self) -> Result<(usize, usize)>;
+
+    /// Compute homeostasis report: 5 ratios measuring knowledge graph equilibrium.
+    async fn compute_homeostasis(
+        &self,
+        project_id: Uuid,
+        custom_ranges: Option<&[(String, f64, f64)]>,
+    ) -> Result<crate::neo4j::models::HomeostasisReport>;
+
+    // ========================================================================
+    // Identity Manifold — Structural drift (Biomimicry)
+    // ========================================================================
+
+    /// Compute structural drift report for all files in a project.
+    /// Returns community centroids and per-file drift distances.
+    async fn compute_structural_drift(
+        &self,
+        project_id: Uuid,
+        warning_threshold: Option<f64>,
+        critical_threshold: Option<f64>,
+    ) -> Result<crate::neo4j::models::StructuralDriftReport>;
+
+    // ========================================================================
+    // Frustration-Catharsis (Biomimicry)
+    // ========================================================================
+
+    /// Increment a task's frustration_score by delta (clamped to [0, 1]).
+    /// Returns the new frustration_score.
+    async fn increment_frustration(&self, task_id: Uuid, delta: f64) -> Result<f64>;
+
+    /// Decrement a task's frustration_score by delta (clamped to [0, 1]).
+    /// Returns the new frustration_score.
+    async fn decrement_frustration(&self, task_id: Uuid, delta: f64) -> Result<f64>;
+
+    /// Get the frustration_score for a task.
+    async fn get_frustration(&self, task_id: Uuid) -> Result<f64>;
+
+    /// Get the parent task ID for a step (via HAS_STEP relationship).
+    async fn get_step_parent_task_id(&self, step_id: Uuid) -> Result<Option<Uuid>>;
+
     /// Initialize energy for all notes that don't have it set.
     /// Sets energy = 1.0 and last_activated = coalesce(last_confirmed_at, created_at).
     /// Idempotent. Returns the number of notes initialized.
@@ -1695,6 +1779,15 @@ pub trait GraphStore: Send + Sync {
         session_id: Uuid,
         project_id: Option<Uuid>,
     ) -> Result<Vec<DiscussedEntity>>;
+
+    /// WorldModel predictive context (biomimicry T7):
+    /// Get co-changers of files discussed in the last N sessions.
+    async fn get_discussed_co_changers(
+        &self,
+        project_id: Uuid,
+        max_sessions: i64,
+        max_results: i64,
+    ) -> Result<Vec<CoChanger>>;
 
     /// Backfill DISCUSSED relations on all existing sessions.
     /// Returns `(sessions_processed, entities_found, relations_created)`.

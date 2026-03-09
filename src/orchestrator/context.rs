@@ -90,6 +90,41 @@ impl ContextBuilder {
         });
         all_notes.dedup_by_key(|n| n.id);
 
+        // Biomimicry: Frustration-Catharsis — inject signals when frustration is elevated
+        let frustration_signals =
+            FrustrationSignals::from_score(task_details.task.frustration_score);
+
+        // When frustrated, widen the search for additional context (thermal noise injection)
+        if let Some(ref signals) = frustration_signals {
+            if signals.widen_search {
+                // Fetch broader semantic notes to increase search radius
+                let extra_notes = self
+                    .get_notes_for_entity(&EntityType::Plan, &plan_id.to_string())
+                    .await
+                    .unwrap_or_default();
+                for note in extra_notes {
+                    if !all_notes.iter().any(|n| n.id == note.id) {
+                        all_notes.push(note);
+                    }
+                }
+
+                if signals.level == FrustrationLevel::Critical {
+                    tracing::warn!(
+                        task_id = %task_id,
+                        frustration_score = task_details.task.frustration_score,
+                        "🔴 CATHARSIS THRESHOLD REACHED: task frustration ≥ 0.9 — agent should consider deep reasoning or task re-evaluation"
+                    );
+                } else {
+                    tracing::info!(
+                        task_id = %task_id,
+                        frustration_score = task_details.task.frustration_score,
+                        level = ?signals.level,
+                        "Frustration-Catharsis: widened knowledge search for frustrated task"
+                    );
+                }
+            }
+        }
+
         Ok(AgentContext {
             task: task_details.task,
             steps: task_details.steps,
@@ -99,6 +134,7 @@ impl ContextBuilder {
             similar_code,
             related_decisions,
             notes: all_notes,
+            frustration_signals,
         })
     }
 
@@ -452,6 +488,7 @@ mod tests {
             updated_at: None,
             started_at: None,
             completed_at: None,
+            frustration_score: 0.0,
         }
     }
 
@@ -483,6 +520,7 @@ mod tests {
             similar_code: vec![],
             related_decisions: vec![],
             notes: vec![],
+            frustration_signals: None,
         };
 
         // Create a mock builder (we don't actually need database for generate_prompt)
@@ -523,6 +561,7 @@ mod tests {
             similar_code: vec![],
             related_decisions: vec![],
             notes: vec![],
+            frustration_signals: None,
         };
 
         // Verify that constraint formatting works
@@ -566,6 +605,7 @@ mod tests {
             similar_code: vec![],
             related_decisions: vec![],
             notes: vec![],
+            frustration_signals: None,
         };
 
         assert_eq!(context.steps.len(), 2);
@@ -590,11 +630,13 @@ mod tests {
                 status: DecisionStatus::Accepted,
                 embedding: None,
                 embedding_model: None,
+                scar_intensity: 0.0,
             }],
             target_files: vec![],
             similar_code: vec![],
             related_decisions: vec![],
             notes: vec![],
+            frustration_signals: None,
         };
 
         assert_eq!(context.decisions.len(), 1);
@@ -620,6 +662,7 @@ mod tests {
             similar_code: vec![],
             related_decisions: vec![],
             notes: vec![],
+            frustration_signals: None,
         };
 
         assert_eq!(context.target_files.len(), 1);
@@ -642,6 +685,7 @@ mod tests {
             }],
             related_decisions: vec![],
             notes: vec![],
+            frustration_signals: None,
         };
 
         assert_eq!(context.similar_code.len(), 1);
@@ -669,6 +713,7 @@ mod tests {
                 create_test_context_note("tip", "Consider using iterators", "medium", true),
                 create_test_context_note("observation", "This pattern is common", "low", true),
             ],
+            frustration_signals: None,
         };
 
         // Verify notes are present
@@ -719,6 +764,7 @@ mod tests {
             similar_code: vec![],
             related_decisions: vec![],
             notes: vec![],
+            frustration_signals: None,
         };
 
         assert_eq!(context.target_files[0].notes.len(), 1);
@@ -774,6 +820,7 @@ mod tests {
                 "medium",
                 false,
             )],
+            frustration_signals: None,
         };
 
         let json = serde_json::to_string(&context).unwrap();

@@ -1477,6 +1477,42 @@ pub async fn get_workspace_topology(
 }
 
 // ============================================================================
+// P2P Coupling Matrix (Biomimicry — inter-project influence field)
+// ============================================================================
+
+/// GET /api/workspaces/{slug}/coupling-matrix
+///
+/// Compute the coupling matrix between all projects in the workspace.
+/// Returns NxN pairwise coupling entries with breakdown by signal.
+pub async fn get_coupling_matrix(
+    State(state): State<OrchestratorState>,
+    Path(slug): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let workspace = state
+        .orchestrator
+        .neo4j()
+        .get_workspace_by_slug(&slug)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("Workspace '{}' not found", slug)))?;
+
+    let start = std::time::Instant::now();
+    let matrix = state
+        .orchestrator
+        .neo4j()
+        .compute_coupling_matrix(workspace.id)
+        .await
+        .map_err(AppError::Internal)?;
+    let elapsed_ms = start.elapsed().as_millis() as u64;
+
+    Ok(Json(serde_json::json!({
+        "workspace_id": matrix.workspace_id,
+        "project_count": matrix.project_count,
+        "entries": matrix.entries,
+        "elapsed_ms": elapsed_ms,
+    })))
+}
+
+// ============================================================================
 // Workspace Intelligence — Graph & Summary (aggregated across all projects)
 // ============================================================================
 

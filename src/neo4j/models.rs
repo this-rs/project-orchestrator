@@ -25,6 +25,10 @@ pub struct ProjectNode {
     /// Used for incremental computation — only new commits since this date are processed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_co_change_computed_at: Option<DateTime<Utc>>,
+    /// Manual scaffolding level override (0-4). When set, bypasses auto-computation.
+    /// Biomimicry T8: allows forcing a specific cognitive level.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub scaffolding_override: Option<u8>,
 }
 
 // ============================================================================
@@ -368,6 +372,10 @@ pub struct TaskNode {
     pub updated_at: Option<DateTime<Utc>>,
     pub started_at: Option<DateTime<Utc>>,
     pub completed_at: Option<DateTime<Utc>>,
+    /// Frustration score (0.0-1.0) — bio-inspired adaptive stress signal.
+    /// Accumulates on blocked/failure events, decays on step completion.
+    #[serde(default)]
+    pub frustration_score: f64,
 }
 
 /// Status of a task
@@ -477,6 +485,10 @@ pub struct DecisionNode {
     /// Name of the embedding model used (for traceability on re-embed).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub embedding_model: Option<String>,
+    /// Scar intensity from negative reasoning feedback (0.0 = no scar, 1.0 = max).
+    /// Biomimicry: Elun HypersphereIdentity.Scar — penalizes decisions in search scoring.
+    #[serde(default)]
+    pub scar_intensity: f64,
 }
 
 fn default_decision_status() -> DecisionStatus {
@@ -1048,6 +1060,118 @@ pub struct CodeHealthReport {
     pub god_functions: Vec<GodFunction>,
     pub orphan_files: Vec<String>,
     pub coupling_metrics: Option<CouplingMetrics>,
+    /// WorldModel prediction accuracy (biomimicry T7)
+    pub prediction_accuracy: Option<PredictionAccuracy>,
+}
+
+/// WorldModel prediction accuracy metrics (biomimicry T7).
+/// Measures how well CO_CHANGED/DISCUSSED patterns predict file access.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PredictionAccuracy {
+    /// Number of correctly predicted file accesses
+    pub hits: i64,
+    /// Total file accesses measured
+    pub total: i64,
+    /// Hit rate (hits / total), or 0.0 if total == 0
+    pub accuracy: f64,
+    /// Number of sessions analyzed
+    pub sessions_analyzed: i64,
+}
+
+/// Snapshot of key health metrics before/after a maintenance cycle (biomimicry T11).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MaintenanceSnapshot {
+    /// Composite health score (god_functions penalty + orphan penalty + coupling bonus)
+    pub health_score: f64,
+    /// Number of synapses with strength > 0
+    pub active_synapses: i64,
+    /// Average energy across all notes
+    pub mean_energy: f64,
+    /// Total number of active skills
+    pub skill_count: i64,
+    /// Total number of active notes
+    pub note_count: i64,
+    /// Timestamp of the snapshot
+    pub captured_at: String,
+}
+
+/// Report comparing pre/post maintenance snapshots (biomimicry T11).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MaintenanceReport {
+    pub before: MaintenanceSnapshot,
+    pub after: MaintenanceSnapshot,
+    /// Delta for each metric (after - before)
+    pub delta_health_score: f64,
+    pub delta_active_synapses: i64,
+    pub delta_mean_energy: f64,
+    pub delta_skill_count: i64,
+    pub delta_note_count: i64,
+    /// Success rate: fraction of metrics that improved or stayed stable
+    pub success_rate: f64,
+    /// Maintenance level that was run
+    pub maintenance_level: String,
+    /// Duration in milliseconds
+    pub duration_ms: u64,
+}
+
+/// Scaffolding level for adaptive task complexity (biomimicry T8).
+/// Inspired by Elun's DifficultyAdjustment and 5 cognitive levels.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScaffoldingLevel {
+    /// Level 0-4 (L0=reflexe, L1=associatif, L2=contextuel, L3=stratégique, L4=méta-cognitif)
+    pub level: u8,
+    /// Human-readable label
+    pub label: String,
+    /// Recommended steps per task at this level
+    pub recommended_steps: String,
+    /// Task success rate over last N tasks (completed / (completed + failed))
+    pub task_success_rate: f64,
+    /// Average frustration score across recent tasks (0.0-1.0)
+    pub avg_frustration: f64,
+    /// Scar density: average scar_intensity across project notes
+    pub scar_density: f64,
+    /// Homeostatic pain: fraction of homeostasis ratios out of equilibrium
+    pub homeostasis_pain: f64,
+    /// Composite competence score (0.0-1.0) combining all metrics
+    pub competence_score: f64,
+    /// Whether the level was manually overridden
+    pub is_overridden: bool,
+    /// Number of tasks analyzed
+    pub tasks_analyzed: i64,
+}
+
+/// Deep maintenance report — aggressive cleanup when stagnation is detected (biomimicry T12).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeepMaintenanceReport {
+    /// Stagnation report that triggered deep maintenance
+    pub stagnation: StagnationReport,
+    /// Regular maintenance result from "full" level
+    pub maintenance: Option<serde_json::Value>,
+    /// Number of stale notes flagged for review
+    pub stale_notes_flagged: usize,
+    /// Number of stuck tasks identified (in_progress > 48h)
+    pub stuck_tasks_found: usize,
+    /// Recommendations generated
+    pub recommendations: Vec<String>,
+}
+
+/// Global stagnation report — detects when an entire project is stuck (biomimicry T12).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StagnationReport {
+    /// Whether global stagnation is detected
+    pub is_stagnating: bool,
+    /// Number of tasks completed in the last 48h
+    pub tasks_completed_48h: i64,
+    /// Average frustration across in-progress tasks (0.0-1.0)
+    pub avg_frustration: f64,
+    /// Mean note energy trend: negative = declining
+    pub energy_trend: f64,
+    /// Number of new TOUCHES commits in the last 48h
+    pub commits_48h: i64,
+    /// Number of stagnation signals triggered (0-4)
+    pub signals_triggered: u8,
+    /// Human-readable recommendations
+    pub recommendations: Vec<String>,
 }
 
 /// Coupling metrics from clustering coefficients.
@@ -1080,6 +1204,144 @@ pub struct AuditGapsReport {
 pub struct RelTypeCount {
     pub rel_type: String,
     pub count: i64,
+}
+
+// ============================================================================
+// Homeostasis Report (biomimicry — auto-regulation)
+// ============================================================================
+
+/// Severity level for a homeostatic ratio out of equilibrium.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HomeostasisSeverity {
+    Ok,
+    Warning,
+    Critical,
+}
+
+/// A single homeostatic ratio with its equilibrium zone.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HomeostasisRatio {
+    /// Human-readable name of the ratio
+    pub name: String,
+    /// Current measured value
+    pub value: f64,
+    /// Target equilibrium range [min, max]
+    pub target_range: (f64, f64),
+    /// Absolute distance to nearest edge of the target range (0 = in zone)
+    pub distance_to_equilibrium: f64,
+    /// Severity based on distance
+    pub severity: HomeostasisSeverity,
+    /// Textual recommendation if out of zone
+    pub recommendation: Option<String>,
+}
+
+/// Full homeostasis report for a project's knowledge graph.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HomeostasisReport {
+    /// Individual ratios
+    pub ratios: Vec<HomeostasisRatio>,
+    /// Aggregated pain score (0.0 = perfect equilibrium, 1.0 = max pain)
+    pub pain_score: f64,
+    /// Overall recommendations
+    pub recommendations: Vec<String>,
+}
+
+// ============================================================================
+// Identity Manifold — Community structural identity & drift detection
+// ============================================================================
+
+/// Structural identity of a Louvain community (centroid of member fingerprints).
+/// Biomimicry: maps to Elun's HypersphereIdentity.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommunityIdentity {
+    /// Louvain community identifier
+    pub community_id: i64,
+    /// Community label (human-readable)
+    pub community_label: String,
+    /// Centroid: mean of all member fingerprints (17-dims)
+    pub centroid: Vec<f64>,
+    /// Number of files in this community with fingerprints
+    pub member_count: usize,
+    /// Timestamp of last computation
+    pub last_computed: chrono::DateTime<chrono::Utc>,
+}
+
+/// A file that has drifted from its community's structural identity.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StructuralDrift {
+    /// File path
+    pub file_path: String,
+    /// Community this file belongs to
+    pub community_id: i64,
+    /// Community label
+    pub community_label: String,
+    /// Euclidean distance from file fingerprint to community centroid
+    pub drift_distance: f64,
+    /// Severity based on threshold (ok, warning, critical)
+    pub severity: HomeostasisSeverity,
+    /// Suggestion if drift is critical (e.g., migrate to closer community)
+    pub suggestion: Option<String>,
+}
+
+/// Report of structural drift across all communities.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StructuralDriftReport {
+    /// Files sorted by drift distance (descending)
+    pub drifting_files: Vec<StructuralDrift>,
+    /// Community centroids computed
+    pub centroids: Vec<CommunityIdentity>,
+    /// Mean drift across all files
+    pub mean_drift: f64,
+    /// Number of files above warning threshold
+    pub warning_count: usize,
+    /// Number of files above critical threshold
+    pub critical_count: usize,
+}
+
+// ============================================================================
+// P2P Coupling (Biomimicry — inter-project influence field)
+// ============================================================================
+
+/// Coupling breakdown between two projects — 4 signals.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CouplingSignals {
+    /// Number of structural twins (files with similar fingerprints) across the two projects.
+    pub structural_twins: usize,
+    /// Number of skills imported from one project to the other.
+    pub imported_skills: usize,
+    /// Number of notes shared/propagated between projects.
+    pub shared_notes: usize,
+    /// Jaccard overlap of note tags between the two projects.
+    pub tag_overlap: f64,
+}
+
+/// Coupling entry between two projects.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectCoupling {
+    /// First project ID.
+    pub project_a_id: Uuid,
+    /// First project name.
+    pub project_a_name: String,
+    /// Second project ID.
+    pub project_b_id: Uuid,
+    /// Second project name.
+    pub project_b_name: String,
+    /// Combined coupling strength ∈ [0, 1].
+    pub coupling_strength: f64,
+    /// Breakdown by signal.
+    pub signals: CouplingSignals,
+}
+
+/// Full coupling matrix for a workspace.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CouplingMatrix {
+    /// Workspace ID.
+    pub workspace_id: Uuid,
+    /// All pairwise coupling entries.
+    pub entries: Vec<ProjectCoupling>,
+    /// Number of projects in the workspace.
+    pub project_count: usize,
 }
 
 /// GDS metrics for a single node (file or function).

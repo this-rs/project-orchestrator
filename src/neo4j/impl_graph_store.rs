@@ -125,6 +125,13 @@ impl GraphStore for Neo4jClient {
         self.get_project_workspace(project_id).await
     }
 
+    async fn compute_coupling_matrix(
+        &self,
+        workspace_id: Uuid,
+    ) -> anyhow::Result<crate::neo4j::models::CouplingMatrix> {
+        self.compute_coupling_matrix(workspace_id).await
+    }
+
     // ========================================================================
     // Workspace Milestone operations
     // ========================================================================
@@ -792,6 +799,37 @@ impl GraphStore for Neo4jClient {
     ) -> anyhow::Result<crate::neo4j::models::CodeHealthReport> {
         self.get_code_health_report(project_id, god_function_threshold)
             .await
+    }
+
+    async fn compute_maintenance_snapshot(
+        &self,
+        project_id: Uuid,
+    ) -> anyhow::Result<crate::neo4j::models::MaintenanceSnapshot> {
+        self.compute_maintenance_snapshot(project_id).await
+    }
+
+    async fn compute_scaffolding_level(
+        &self,
+        project_id: Uuid,
+        scaffolding_override: Option<u8>,
+    ) -> anyhow::Result<crate::neo4j::models::ScaffoldingLevel> {
+        self.compute_scaffolding_level(project_id, scaffolding_override)
+            .await
+    }
+
+    async fn set_scaffolding_override(
+        &self,
+        project_id: Uuid,
+        level: Option<u8>,
+    ) -> anyhow::Result<()> {
+        self.set_scaffolding_override(project_id, level).await
+    }
+
+    async fn detect_global_stagnation(
+        &self,
+        project_id: Uuid,
+    ) -> anyhow::Result<crate::neo4j::models::StagnationReport> {
+        self.detect_global_stagnation(project_id).await
     }
 
     async fn get_circular_dependencies(
@@ -1708,9 +1746,19 @@ impl GraphStore for Neo4jClient {
         max_depth: u32,
         min_score: f64,
         relation_types: Option<&[String]>,
+        source_project_id: Option<Uuid>,
+        force_cross_project: bool,
     ) -> anyhow::Result<Vec<PropagatedNote>> {
-        self.get_propagated_notes(entity_type, entity_id, max_depth, min_score, relation_types)
-            .await
+        self.get_propagated_notes(
+            entity_type,
+            entity_id,
+            max_depth,
+            min_score,
+            relation_types,
+            source_project_id,
+            force_cross_project,
+        )
+        .await
     }
 
     async fn get_workspace_notes_for_project(
@@ -1891,6 +1939,52 @@ impl GraphStore for Neo4jClient {
         self.decay_synapses(decay_amount, prune_threshold).await
     }
 
+    async fn apply_scars(&self, node_ids: &[Uuid], increment: f64) -> anyhow::Result<usize> {
+        self.apply_scars(node_ids, increment).await
+    }
+
+    async fn heal_scars(&self, node_id: Uuid) -> anyhow::Result<bool> {
+        self.heal_scars(node_id).await
+    }
+
+    async fn consolidate_memory(&self) -> anyhow::Result<(usize, usize)> {
+        self.consolidate_memory().await
+    }
+
+    async fn compute_homeostasis(
+        &self,
+        project_id: Uuid,
+        custom_ranges: Option<&[(String, f64, f64)]>,
+    ) -> anyhow::Result<crate::neo4j::models::HomeostasisReport> {
+        self.compute_homeostasis(project_id, custom_ranges).await
+    }
+
+    async fn compute_structural_drift(
+        &self,
+        project_id: Uuid,
+        warning_threshold: Option<f64>,
+        critical_threshold: Option<f64>,
+    ) -> anyhow::Result<crate::neo4j::models::StructuralDriftReport> {
+        self.compute_structural_drift(project_id, warning_threshold, critical_threshold)
+            .await
+    }
+
+    async fn increment_frustration(&self, task_id: Uuid, delta: f64) -> anyhow::Result<f64> {
+        self.increment_frustration(task_id, delta).await
+    }
+
+    async fn decrement_frustration(&self, task_id: Uuid, delta: f64) -> anyhow::Result<f64> {
+        self.decrement_frustration(task_id, delta).await
+    }
+
+    async fn get_frustration(&self, task_id: Uuid) -> anyhow::Result<f64> {
+        self.get_frustration(task_id).await
+    }
+
+    async fn get_step_parent_task_id(&self, step_id: Uuid) -> anyhow::Result<Option<Uuid>> {
+        self.get_step_parent_task_id(step_id).await
+    }
+
     async fn init_note_energy(&self) -> anyhow::Result<usize> {
         self.init_note_energy().await
     }
@@ -2056,6 +2150,16 @@ impl GraphStore for Neo4jClient {
         project_id: Option<Uuid>,
     ) -> anyhow::Result<Vec<DiscussedEntity>> {
         self.get_session_entities(session_id, project_id).await
+    }
+
+    async fn get_discussed_co_changers(
+        &self,
+        project_id: Uuid,
+        max_sessions: i64,
+        max_results: i64,
+    ) -> anyhow::Result<Vec<CoChanger>> {
+        self.get_discussed_co_changers(project_id, max_sessions, max_results)
+            .await
     }
 
     async fn backfill_discussed(&self) -> anyhow::Result<(usize, usize, usize)> {

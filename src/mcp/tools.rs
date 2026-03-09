@@ -244,6 +244,8 @@ pub fn resolve_legacy_alias(name: &str) -> Option<(&'static str, &'static str)> 
         "get_hotspots" => Some(("code", "get_hotspots")),
         "get_knowledge_gaps" => Some(("code", "get_knowledge_gaps")),
         "get_risk_assessment" => Some(("code", "get_risk_assessment")),
+        "get_homeostasis" => Some(("code", "get_homeostasis")),
+        "get_structural_drift" => Some(("code", "get_structural_drift")),
         "get_structural_profile" => Some(("code", "get_structural_profile")),
         "find_structural_twins" => Some(("code", "find_structural_twins")),
         "cluster_dna" => Some(("code", "cluster_dna")),
@@ -320,7 +322,11 @@ pub fn resolve_legacy_alias(name: &str) -> Option<(&'static str, &'static str)> 
         "reindex_decisions" => Some(("admin", "reindex_decisions")),
         "backfill_decision_embeddings" => Some(("admin", "backfill_decision_embeddings")),
         "detect_skills" => Some(("admin", "detect_skills")),
+        "detect_skill_fission" => Some(("admin", "detect_skill_fission")),
+        "detect_skill_fusion" => Some(("admin", "detect_skill_fusion")),
         "maintain_skills" => Some(("admin", "maintain_skills")),
+        "heal_scars" => Some(("admin", "heal_scars")),
+        "consolidate_memory" => Some(("admin", "consolidate_memory")),
 
         _ => None,
     }
@@ -333,16 +339,16 @@ pub fn resolve_legacy_alias(name: &str) -> Option<(&'static str, &'static str)> 
 fn project_tool() -> ToolDefinition {
     ToolDefinition {
         name: "project".to_string(),
-        description: "Manage projects. Actions: list, create, get, update, delete, sync, get_roadmap, list_plans, get_graph, get_intelligence_summary, get_embeddings_projection".to_string(),
+        description: "Manage projects. Actions: list, create, get, update, delete, sync, get_roadmap, list_plans, get_graph, get_intelligence_summary, get_embeddings_projection, get_scaffolding_level, set_scaffolding_override".to_string(),
         input_schema: InputSchema {
             schema_type: "object".to_string(),
             properties: Some(json!({
                 "action": {
                     "type": "string",
-                    "enum": ["list", "create", "get", "update", "delete", "sync", "get_roadmap", "list_plans", "get_graph", "get_intelligence_summary", "get_embeddings_projection"],
+                    "enum": ["list", "create", "get", "update", "delete", "sync", "get_roadmap", "list_plans", "get_graph", "get_intelligence_summary", "get_embeddings_projection", "get_scaffolding_level", "set_scaffolding_override"],
                     "description": "Operation to perform"
                 },
-                "slug": {"type": "string", "description": "Project slug (get/update/delete/sync/get_roadmap/list_plans/get_graph/get_intelligence_summary/get_embeddings_projection)"},
+                "slug": {"type": "string", "description": "Project slug (get/update/delete/sync/get_roadmap/list_plans/get_graph/get_intelligence_summary/get_embeddings_projection/get_scaffolding_level/set_scaffolding_override)"},
                 "name": {"type": "string", "description": "Project name (create/update)"},
                 "root_path": {"type": "string", "description": "Path to codebase root (create/update)"},
                 "description": {"type": "string", "description": "Project description (create/update)"},
@@ -352,7 +358,8 @@ fn project_tool() -> ToolDefinition {
                 "sort_by": {"type": "string", "description": "Sort field (list)"},
                 "sort_order": {"type": "string", "description": "asc or desc (list)"},
                 "layers": {"type": "string", "description": "Comma-separated layers: code,knowledge,fabric,neural,skills,behavioral (get_graph, default: code)"},
-                "community": {"type": "integer", "description": "Filter by community_id (get_graph)"}
+                "community": {"type": "integer", "description": "Filter by community_id (get_graph)"},
+                "level": {"type": "integer", "description": "Scaffolding level 0-4 to override, or null to clear (set_scaffolding_override)"}
             })),
             required: Some(vec!["action".to_string()]),
         },
@@ -475,7 +482,8 @@ fn decision_tool() -> ToolDefinition {
                 "impact_description": {"type": "string", "description": "Description of how the decision impacts the entity (add_affects)"},
                 "superseded_by_id": {"type": "string", "description": "Decision UUID being superseded (supersede)"},
                 "from": {"type": "string", "description": "Start date ISO filter (get_timeline)"},
-                "to": {"type": "string", "description": "End date ISO filter (get_timeline)"}
+                "to": {"type": "string", "description": "End date ISO filter (get_timeline)"},
+                "temperature": {"type": "number", "description": "Thermal noise 0.0-1.0 for stochastic exploration (search_semantic, default 0 = deterministic)"}
             })),
             required: Some(vec!["action".to_string()]),
         },
@@ -613,8 +621,11 @@ fn note_tool() -> ToolDefinition {
                 "entity_id": {"type": "string", "description": "Entity identifier (link_to_entity/unlink_from_entity/get_context/get_entity)"},
                 "slug": {"type": "string", "description": "Project slug (list_project/get_propagated)"},
                 "file_path": {"type": "string", "description": "File path (get_propagated)"},
+                "source_project_id": {"type": "string", "description": "Source project UUID for cross-project coupling weighting (get_propagated)"},
+                "force_cross_project": {"type": "boolean", "description": "Force cross-project propagation even when coupling < 0.2 (get_propagated, default false)"},
                 "limit": {"type": "integer", "description": "Max items"},
-                "offset": {"type": "integer", "description": "Skip items"}
+                "offset": {"type": "integer", "description": "Skip items"},
+                "temperature": {"type": "number", "description": "Thermal noise 0.0-1.0 for stochastic exploration (search_semantic, default 0 = deterministic)"}
             })),
             required: Some(vec!["action".to_string()]),
         },
@@ -624,7 +635,7 @@ fn note_tool() -> ToolDefinition {
 fn workspace_tool() -> ToolDefinition {
     ToolDefinition {
         name: "workspace".to_string(),
-        description: "Manage workspaces. Actions: list, create, get, update, delete, get_overview, list_projects, add_project, remove_project, get_topology".to_string(),
+        description: "Manage workspaces. Actions: list, create, get, update, delete, get_overview, list_projects, add_project, remove_project, get_topology, get_coupling_matrix".to_string(),
         input_schema: InputSchema {
             schema_type: "object".to_string(),
             properties: Some(json!({
@@ -800,13 +811,13 @@ fn feature_graph_tool() -> ToolDefinition {
 fn code_tool() -> ToolDefinition {
     ToolDefinition {
         name: "code".to_string(),
-        description: "Explore and analyze code. Actions: search, search_project, search_workspace, get_file_symbols, find_references, get_file_dependencies, get_call_graph, analyze_impact, get_architecture, find_similar, find_trait_implementations, find_type_traits, get_impl_blocks, get_communities, get_health, get_node_importance, plan_implementation, get_co_change_graph, get_file_co_changers, detect_processes, get_class_hierarchy, find_subclasses, find_interface_implementors, list_processes, get_process, get_entry_points, enrich_communities, get_hotspots, get_knowledge_gaps, get_risk_assessment, get_structural_profile, find_structural_twins, cluster_dna, find_cross_project_twins, predict_missing_links, check_link_plausibility, stress_test_node, stress_test_edge, stress_test_cascade, find_bridges, get_context_card, refresh_context_cards, get_fingerprint, find_isomorphic, suggest_structural_templates, get_bridge, check_topology, list_topology_rules, create_topology_rule, delete_topology_rule, check_file_topology".to_string(),
+        description: "Explore and analyze code. Actions: search, search_project, search_workspace, get_file_symbols, find_references, get_file_dependencies, get_call_graph, analyze_impact, get_architecture, find_similar, find_trait_implementations, find_type_traits, get_impl_blocks, get_communities, get_health, get_node_importance, plan_implementation, get_co_change_graph, get_file_co_changers, detect_processes, get_class_hierarchy, find_subclasses, find_interface_implementors, list_processes, get_process, get_entry_points, enrich_communities, get_hotspots, get_knowledge_gaps, get_risk_assessment, get_homeostasis, get_structural_drift, get_structural_profile, find_structural_twins, cluster_dna, find_cross_project_twins, predict_missing_links, check_link_plausibility, stress_test_node, stress_test_edge, stress_test_cascade, find_bridges, get_context_card, refresh_context_cards, get_fingerprint, find_isomorphic, suggest_structural_templates, get_bridge, check_topology, list_topology_rules, create_topology_rule, delete_topology_rule, check_file_topology".to_string(),
         input_schema: InputSchema {
             schema_type: "object".to_string(),
             properties: Some(json!({
                 "action": {
                     "type": "string",
-                    "enum": ["search", "search_project", "search_workspace", "get_file_symbols", "find_references", "get_file_dependencies", "get_call_graph", "analyze_impact", "get_architecture", "find_similar", "find_trait_implementations", "find_type_traits", "get_impl_blocks", "get_communities", "get_health", "get_node_importance", "plan_implementation", "get_co_change_graph", "get_file_co_changers", "detect_processes", "get_class_hierarchy", "find_subclasses", "find_interface_implementors", "list_processes", "get_process", "get_entry_points", "enrich_communities", "get_hotspots", "get_knowledge_gaps", "get_risk_assessment", "get_structural_profile", "find_structural_twins", "cluster_dna", "find_cross_project_twins", "predict_missing_links", "check_link_plausibility", "stress_test_node", "stress_test_edge", "stress_test_cascade", "find_bridges", "get_context_card", "refresh_context_cards", "get_fingerprint", "find_isomorphic", "suggest_structural_templates", "get_bridge", "check_topology", "list_topology_rules", "create_topology_rule", "delete_topology_rule", "check_file_topology"],
+                    "enum": ["search", "search_project", "search_workspace", "get_file_symbols", "find_references", "get_file_dependencies", "get_call_graph", "analyze_impact", "get_architecture", "find_similar", "find_trait_implementations", "find_type_traits", "get_impl_blocks", "get_communities", "get_health", "get_node_importance", "plan_implementation", "get_co_change_graph", "get_file_co_changers", "detect_processes", "get_class_hierarchy", "find_subclasses", "find_interface_implementors", "list_processes", "get_process", "get_entry_points", "enrich_communities", "get_hotspots", "get_knowledge_gaps", "get_risk_assessment", "get_homeostasis", "get_structural_profile", "find_structural_twins", "cluster_dna", "find_cross_project_twins", "predict_missing_links", "check_link_plausibility", "stress_test_node", "stress_test_edge", "stress_test_cascade", "find_bridges", "get_context_card", "refresh_context_cards", "get_fingerprint", "find_isomorphic", "suggest_structural_templates", "get_bridge", "check_topology", "list_topology_rules", "create_topology_rule", "delete_topology_rule", "check_file_topology"],
                     "description": "Operation to perform"
                 },
                 "query": {"type": "string", "description": "Search query (search/search_project/search_workspace)"},
@@ -913,13 +924,13 @@ fn analysis_profile_tool() -> ToolDefinition {
 fn admin_tool() -> ToolDefinition {
     ToolDefinition {
         name: "admin".to_string(),
-        description: "Admin operations. Actions: sync_directory, start_watch, stop_watch, watch_status, meilisearch_stats, delete_meilisearch_orphans, cleanup_cross_project_calls, cleanup_builtin_calls, migrate_calls_confidence, cleanup_sync_data, update_staleness_scores, update_energy_scores, search_neurons, reinforce_neurons, decay_synapses, backfill_synapses, reindex_decisions, backfill_decision_embeddings, backfill_touches, backfill_discussed, update_fabric_scores, bootstrap_knowledge_fabric, reinforce_isomorphic, detect_skills, install_hooks".to_string(),
+        description: "Admin operations. Actions: sync_directory, start_watch, stop_watch, watch_status, meilisearch_stats, delete_meilisearch_orphans, cleanup_cross_project_calls, cleanup_builtin_calls, migrate_calls_confidence, cleanup_sync_data, update_staleness_scores, update_energy_scores, search_neurons, reinforce_neurons, decay_synapses, backfill_synapses, reindex_decisions, backfill_decision_embeddings, backfill_touches, backfill_discussed, update_fabric_scores, bootstrap_knowledge_fabric, reinforce_isomorphic, detect_skills, detect_skill_fission, detect_skill_fusion, heal_scars, consolidate_memory, detect_stagnation, deep_maintenance, install_hooks".to_string(),
         input_schema: InputSchema {
             schema_type: "object".to_string(),
             properties: Some(json!({
                 "action": {
                     "type": "string",
-                    "enum": ["sync_directory", "start_watch", "stop_watch", "watch_status", "meilisearch_stats", "delete_meilisearch_orphans", "cleanup_cross_project_calls", "cleanup_builtin_calls", "migrate_calls_confidence", "cleanup_sync_data", "update_staleness_scores", "update_energy_scores", "search_neurons", "reinforce_neurons", "decay_synapses", "backfill_synapses", "reindex_decisions", "backfill_decision_embeddings", "backfill_touches", "backfill_discussed", "update_fabric_scores", "bootstrap_knowledge_fabric", "reinforce_isomorphic", "detect_skills", "maintain_skills", "auto_anchor_notes", "reconstruct_knowledge", "install_hooks"],
+                    "enum": ["sync_directory", "start_watch", "stop_watch", "watch_status", "meilisearch_stats", "delete_meilisearch_orphans", "cleanup_cross_project_calls", "cleanup_builtin_calls", "migrate_calls_confidence", "cleanup_sync_data", "update_staleness_scores", "update_energy_scores", "search_neurons", "reinforce_neurons", "decay_synapses", "backfill_synapses", "reindex_decisions", "backfill_decision_embeddings", "backfill_touches", "backfill_discussed", "update_fabric_scores", "bootstrap_knowledge_fabric", "reinforce_isomorphic", "detect_skills", "detect_skill_fission", "detect_skill_fusion", "maintain_skills", "auto_anchor_notes", "reconstruct_knowledge", "heal_scars", "consolidate_memory", "detect_stagnation", "deep_maintenance", "install_hooks"],
                     "description": "Operation to perform"
                 },
                 "path": {"type": "string", "description": "Directory path (sync_directory/start_watch)"},
@@ -935,7 +946,8 @@ fn admin_tool() -> ToolDefinition {
                 "prune_threshold": {"type": "number", "description": "Prune synapses below this weight (decay_synapses, default 0.1)"},
                 "limit": {"type": "integer", "description": "Max items (search_neurons)"},
                 "level": {"type": "string", "enum": ["hourly", "daily", "weekly", "full"], "description": "Maintenance level (maintain_skills, default: daily)"},
-                "force": {"type": "boolean", "description": "Force re-detection from scratch, deleting all existing skills first (detect_skills, default: false)"}
+                "force": {"type": "boolean", "description": "Force re-detection from scratch, deleting all existing skills first (detect_skills, default: false)"},
+                "node_id": {"type": "string", "description": "Note or Decision UUID (heal_scars)"}
             })),
             required: Some(vec!["action".to_string()]),
         },
@@ -945,13 +957,13 @@ fn admin_tool() -> ToolDefinition {
 fn skill_tool() -> ToolDefinition {
     ToolDefinition {
         name: "skill".to_string(),
-        description: "Manage neural skills (emergent knowledge clusters). Actions: list, create, get, update, delete, get_members, add_member, remove_member, activate, export, import, get_health".to_string(),
+        description: "Manage neural skills (emergent knowledge clusters). Actions: list, create, get, update, delete, get_members, add_member, remove_member, activate, export, import, get_health, split, merge".to_string(),
         input_schema: InputSchema {
             schema_type: "object".to_string(),
             properties: Some(json!({
                 "action": {
                     "type": "string",
-                    "enum": ["list", "create", "get", "update", "delete", "get_members", "add_member", "remove_member", "activate", "export", "import", "get_health"],
+                    "enum": ["list", "create", "get", "update", "delete", "get_members", "add_member", "remove_member", "activate", "export", "import", "get_health", "split", "merge"],
                     "description": "Operation to perform"
                 },
                 "skill_id": {"type": "string", "description": "Skill UUID (get/update/delete/get_members/add_member/remove_member/activate/export)"},
@@ -1291,6 +1303,8 @@ mod tests {
             "get_hotspots",
             "get_knowledge_gaps",
             "get_risk_assessment",
+            "get_homeostasis",
+            "get_structural_drift",
             "get_structural_profile",
             "find_structural_twins",
             "cluster_dna",

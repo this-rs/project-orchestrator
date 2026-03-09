@@ -242,6 +242,7 @@ impl ChatManager {
             pipeline.add_stage(Box::new(super::stages::SkillActivationStage::new(
                 graph.clone(),
             )));
+            pipeline.add_stage(Box::new(super::stages::BiomimicryStage::new(graph.clone())));
             pipeline.add_stage(Box::new(super::stages::KnowledgeInjectionStage::new(
                 graph.clone(),
                 search.clone(),
@@ -305,6 +306,7 @@ impl ChatManager {
             pipeline.add_stage(Box::new(super::stages::SkillActivationStage::new(
                 graph.clone(),
             )));
+            pipeline.add_stage(Box::new(super::stages::BiomimicryStage::new(graph.clone())));
             pipeline.add_stage(Box::new(super::stages::KnowledgeInjectionStage::new(
                 graph.clone(),
                 search.clone(),

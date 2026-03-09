@@ -3,6 +3,7 @@
 use super::handlers::{AppError, OrchestratorState};
 use super::{PaginatedResponse, PaginationParams, SearchFilter};
 use crate::events::graph::GraphEvent;
+use crate::graph::algorithms::add_thermal_noise;
 use crate::notes::{
     BackfillProgress, CreateAnchorRequest, CreateNoteRequest, EntityType, LinkNoteRequest, Note,
     NoteContextResponse, NoteFilters, NoteImportance, NoteScope, NoteSearchHit, NoteStatus,
@@ -100,6 +101,11 @@ pub struct ContextNotesQuery {
     /// E.g. "CONTAINS,IMPORTS,CALLS,CO_CHANGED,IMPLEMENTS_TRAIT"
     /// If absent, defaults to CONTAINS|IMPORTS|CALLS (backward compatible).
     pub relation_types: Option<String>,
+    /// Source project UUID for cross-project coupling weighting.
+    /// When set, notes from other projects are weighted by P2P coupling strength.
+    pub source_project_id: Option<Uuid>,
+    /// Force cross-project propagation even when coupling < 0.2
+    pub force_cross_project: Option<bool>,
 }
 
 // ============================================================================
@@ -486,6 +492,8 @@ pub async fn get_propagated_notes(
             query.max_depth.unwrap_or(3),
             query.min_score.unwrap_or(0.1),
             relation_types.as_deref(),
+            query.source_project_id,
+            query.force_cross_project.unwrap_or(false),
         )
         .await?;
 
@@ -1009,6 +1017,10 @@ pub struct SemanticSearchQuery {
     /// Minimum cosine similarity threshold (0.0 - 1.0).
     /// Results below this score are filtered out. Default: none (return all top-K).
     pub min_similarity: Option<f64>,
+    /// Thermal noise temperature (0.0 - 1.0) for stochastic exploration.
+    /// Inspired by Langevin dynamics: adds T × N(0, σ) Gaussian noise to scores.
+    /// 0.0 = deterministic (default), 1.0 = maximum exploration.
+    pub temperature: Option<f64>,
 }
 
 /// GET /api/notes/search-semantic — Vector-based semantic search
@@ -1029,7 +1041,7 @@ pub async fn search_notes_semantic(
         None
     };
 
-    let hits = state
+    let mut hits = state
         .orchestrator
         .note_manager()
         .semantic_search_notes(
@@ -1041,6 +1053,27 @@ pub async fn search_notes_semantic(
         )
         .await
         .map_err(AppError::Internal)?;
+
+    // Apply Langevin thermal noise for stochastic exploration
+    if let Some(temperature) = query.temperature {
+        if temperature > 0.0 {
+            let mut scored: Vec<(NoteSearchHit, f64)> = hits
+                .into_iter()
+                .map(|h| {
+                    let s = h.score;
+                    (h, s)
+                })
+                .collect();
+            add_thermal_noise(&mut scored, temperature);
+            hits = scored
+                .into_iter()
+                .map(|(mut h, s)| {
+                    h.score = s;
+                    h
+                })
+                .collect();
+        }
+    }
 
     Ok(Json(serde_json::to_value(hits).unwrap_or_default()))
 }
@@ -1177,6 +1210,56 @@ pub async fn decay_synapses(
         "synapses_pruned": pruned,
         "decay_amount": decay_amount,
         "prune_threshold": prune_threshold,
+    })))
+}
+
+/// Request body for `POST /api/notes/neurons/heal-scars`.
+#[derive(Debug, Deserialize)]
+pub struct HealScarsBody {
+    /// The UUID of the note or decision to heal.
+    pub node_id: Uuid,
+}
+
+/// POST /api/notes/neurons/heal-scars — Reset scar_intensity to 0.0
+///
+/// Biomimicry: manual scar removal for notes/decisions that were incorrectly
+/// penalized by negative reasoning feedback.
+pub async fn heal_scars(
+    State(state): State<OrchestratorState>,
+    Json(body): Json<HealScarsBody>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let healed = state
+        .orchestrator
+        .neo4j()
+        .heal_scars(body.node_id)
+        .await
+        .map_err(AppError::Internal)?;
+
+    Ok(Json(serde_json::json!({
+        "healed": healed,
+        "node_id": body.node_id.to_string(),
+    })))
+}
+
+/// POST /api/notes/consolidate-memory — Batch memory consolidation
+///
+/// Biomimicry: Elun SleepSystem consolidation. Evaluates all non-consolidated
+/// active notes for promotion (Ephemeral→Operational→Consolidated) and archives
+/// stale ephemeral notes (>48h without reactivation).
+pub async fn consolidate_memory(
+    State(state): State<OrchestratorState>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let (promoted, archived) = state
+        .orchestrator
+        .neo4j()
+        .consolidate_memory()
+        .await
+        .map_err(AppError::Internal)?;
+
+    Ok(Json(serde_json::json!({
+        "promoted": promoted,
+        "archived": archived,
+        "total_processed": promoted + archived,
     })))
 }
 

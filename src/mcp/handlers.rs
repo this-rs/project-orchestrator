@@ -99,6 +99,8 @@ impl ToolHandler {
             ("project", "get_graph") => "get_project_graph",
             ("project", "get_intelligence_summary") => "get_intelligence_summary",
             ("project", "get_embeddings_projection") => "get_embeddings_projection",
+            ("project", "get_scaffolding_level") => "get_scaffolding_level",
+            ("project", "set_scaffolding_override") => "set_scaffolding_override",
 
             // Plan
             ("plan", "list") => "list_plans",
@@ -218,6 +220,7 @@ impl ToolHandler {
             ("workspace", "add_project") => "add_project_to_workspace",
             ("workspace", "remove_project") => "remove_project_from_workspace",
             ("workspace", "get_topology") => "get_workspace_topology",
+            ("workspace", "get_coupling_matrix") => "get_coupling_matrix",
 
             // Workspace Milestone
             ("workspace_milestone", "list_all") => "list_all_workspace_milestones",
@@ -297,6 +300,8 @@ impl ToolHandler {
             ("code", "get_hotspots") => "get_hotspots",
             ("code", "get_knowledge_gaps") => "get_knowledge_gaps",
             ("code", "get_risk_assessment") => "get_risk_assessment",
+            ("code", "get_homeostasis") => "get_homeostasis",
+            ("code", "get_structural_drift") => "get_structural_drift",
             ("code", "get_bridge") => "get_bridge",
             ("code", "check_topology") => "check_topology",
             ("code", "create_topology_rule") => "create_topology_rule",
@@ -332,6 +337,8 @@ impl ToolHandler {
             ("skill", "export") => "export_skill",
             ("skill", "import") => "import_skill",
             ("skill", "get_health") => "get_skill_health",
+            ("skill", "split") => "split_skill",
+            ("skill", "merge") => "merge_skills",
 
             // Protocol (Pattern Federation)
             ("protocol", "list") => "list_protocols",
@@ -393,11 +400,17 @@ impl ToolHandler {
             ("admin", "bootstrap_knowledge_fabric") => "bootstrap_knowledge_fabric",
             ("admin", "reinforce_isomorphic") => "reinforce_isomorphic",
             ("admin", "detect_skills") => "detect_skills",
+            ("admin", "detect_skill_fission") => "detect_skill_fission",
+            ("admin", "detect_skill_fusion") => "detect_skill_fusion",
             ("admin", "maintain_skills") => "maintain_skills",
             ("admin", "auto_anchor_notes") => "auto_anchor_notes",
             ("admin", "reconstruct_knowledge") => "reconstruct_knowledge",
+            ("admin", "heal_scars") => "heal_scars",
+            ("admin", "consolidate_memory") => "consolidate_memory",
             ("admin", "audit_gaps") => "audit_gaps",
             ("admin", "persist_health_report") => "persist_health_report",
+            ("admin", "detect_stagnation") => "detect_stagnation",
+            ("admin", "deep_maintenance") => "deep_maintenance",
             ("admin", "install_hooks") => "install_hooks",
 
             _ => {
@@ -583,6 +596,31 @@ impl ToolHandler {
                 let slug = extract_string(args, "slug")?;
                 let result = http
                     .get(&format!("/api/projects/{}/embeddings/projection", slug))
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "get_scaffolding_level" => {
+                let slug = extract_string(args, "slug")?;
+                let result = http
+                    .get(&format!("/api/projects/{}/scaffolding", slug))
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "set_scaffolding_override" => {
+                let slug = extract_string(args, "slug")?;
+                let mut body = serde_json::Map::new();
+                if let Some(level) = args.get("level") {
+                    body.insert("level".to_string(), level.clone());
+                } else {
+                    body.insert("level".to_string(), Value::Null);
+                }
+                let result = http
+                    .put(
+                        &format!("/api/projects/{}/scaffolding", slug),
+                        &Value::Object(body),
+                    )
                     .await?;
                 Ok(Some(result))
             }
@@ -1114,6 +1152,9 @@ impl ToolHandler {
                 }
                 if let Some(pid) = args.get("project_id").and_then(|v| v.as_str()) {
                     query.push(("project_id".to_string(), pid.to_string()));
+                }
+                if let Some(t) = args.get("temperature").and_then(|v| v.as_f64()) {
+                    query.push(("temperature".to_string(), t.to_string()));
                 }
                 let result = http
                     .get_with_query("/api/decisions/search-semantic", &query)
@@ -1708,6 +1749,9 @@ impl ToolHandler {
                 if let Some(v) = args.get("limit").and_then(|v| v.as_i64()) {
                     query.push(("limit".to_string(), v.to_string()));
                 }
+                if let Some(t) = args.get("temperature").and_then(|v| v.as_f64()) {
+                    query.push(("temperature".to_string(), t.to_string()));
+                }
                 let result = http
                     .get_with_query("/api/notes/search-semantic", &query)
                     .await?;
@@ -1844,6 +1888,13 @@ impl ToolHandler {
                 // Forward relation_types as comma-separated string
                 if let Some(v) = args.get("relation_types").and_then(|v| v.as_str()) {
                     query.push(("relation_types".to_string(), v.to_string()));
+                }
+                // P2P coupling: cross-project weighting params
+                if let Some(v) = args.get("source_project_id").and_then(|v| v.as_str()) {
+                    query.push(("source_project_id".to_string(), v.to_string()));
+                }
+                if let Some(v) = args.get("force_cross_project").and_then(|v| v.as_bool()) {
+                    query.push(("force_cross_project".to_string(), v.to_string()));
                 }
                 let result = http.get_with_query("/api/notes/propagated", &query).await?;
                 Ok(Some(result))
@@ -2060,6 +2111,31 @@ impl ToolHandler {
                 Ok(Some(result))
             }
 
+            "detect_stagnation" => {
+                let pid = args
+                    .get("project_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("project_id is required"))?;
+                let result = http
+                    .get(&format!("/api/admin/detect-stagnation/{}", pid))
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "deep_maintenance" => {
+                let pid = args
+                    .get("project_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("project_id is required"))?;
+                let result = http
+                    .post(
+                        &format!("/api/admin/deep-maintenance/{}", pid),
+                        &Value::Object(serde_json::Map::new()),
+                    )
+                    .await?;
+                Ok(Some(result))
+            }
+
             "detect_skills" => {
                 let mut body = serde_json::Map::new();
                 if let Some(pid) = args.get("project_id").and_then(|v| v.as_str()) {
@@ -2070,6 +2146,28 @@ impl ToolHandler {
                 }
                 let result = http
                     .post("/api/admin/detect-skills", &Value::Object(body))
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "detect_skill_fission" => {
+                let mut body = serde_json::Map::new();
+                if let Some(pid) = args.get("project_id").and_then(|v| v.as_str()) {
+                    body.insert("project_id".to_string(), Value::String(pid.to_string()));
+                }
+                let result = http
+                    .post("/api/admin/detect-skill-fission", &Value::Object(body))
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "detect_skill_fusion" => {
+                let mut body = serde_json::Map::new();
+                if let Some(pid) = args.get("project_id").and_then(|v| v.as_str()) {
+                    body.insert("project_id".to_string(), Value::String(pid.to_string()));
+                }
+                let result = http
+                    .post("/api/admin/detect-skill-fusion", &Value::Object(body))
                     .await?;
                 Ok(Some(result))
             }
@@ -2108,6 +2206,20 @@ impl ToolHandler {
                 }
                 let result = http
                     .post("/api/admin/reconstruct-knowledge", &Value::Object(body))
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "heal_scars" => {
+                let node_id = extract_string(args, "node_id")?;
+                let body = json!({"node_id": node_id});
+                let result = http.post("/api/notes/neurons/heal-scars", &body).await?;
+                Ok(Some(result))
+            }
+
+            "consolidate_memory" => {
+                let result = http
+                    .post("/api/notes/consolidate-memory", &json!({}))
                     .await?;
                 Ok(Some(result))
             }
@@ -2238,6 +2350,14 @@ impl ToolHandler {
                 let slug = extract_string(args, "slug")?;
                 let result = http
                     .get(&format!("/api/workspaces/{}/topology", slug))
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "get_coupling_matrix" => {
+                let slug = extract_string(args, "slug")?;
+                let result = http
+                    .get(&format!("/api/workspaces/{}/coupling-matrix", slug))
                     .await?;
                 Ok(Some(result))
             }
@@ -3191,6 +3311,28 @@ impl ToolHandler {
                 Ok(Some(result))
             }
 
+            "get_homeostasis" => {
+                let project_slug = extract_string(args, "project_slug")?;
+                let query = vec![("project_slug".to_string(), project_slug)];
+                let result = http.get_with_query("/api/code/homeostasis", &query).await?;
+                Ok(Some(result))
+            }
+
+            "get_structural_drift" => {
+                let project_slug = extract_string(args, "project_slug")?;
+                let mut query = vec![("project_slug".to_string(), project_slug)];
+                if let Some(v) = args.get("warning_threshold").and_then(|v| v.as_f64()) {
+                    query.push(("warning_threshold".to_string(), v.to_string()));
+                }
+                if let Some(v) = args.get("critical_threshold").and_then(|v| v.as_f64()) {
+                    query.push(("critical_threshold".to_string(), v.to_string()));
+                }
+                let result = http
+                    .get_with_query("/api/code/structural-drift", &query)
+                    .await?;
+                Ok(Some(result))
+            }
+
             "get_bridge" => {
                 let source = extract_string(args, "source")?;
                 let target = extract_string(args, "target")?;
@@ -3680,6 +3822,26 @@ impl ToolHandler {
                 let result = http
                     .get(&format!("/api/skills/{}/health", skill_id))
                     .await?;
+                Ok(Some(result))
+            }
+
+            "split_skill" => {
+                let skill_id = extract_id(args, "skill_id")?;
+                let mut body = serde_json::Map::new();
+                if let Some(sub) = args.get("sub_clusters") {
+                    body.insert("sub_clusters".to_string(), sub.clone());
+                }
+                let result = http
+                    .post(
+                        &format!("/api/skills/{}/split", skill_id),
+                        &Value::Object(body),
+                    )
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "merge_skills" => {
+                let result = http.post("/api/skills/merge", args).await?;
                 Ok(Some(result))
             }
 

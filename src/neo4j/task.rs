@@ -28,6 +28,7 @@ impl Neo4jClient {
                 acceptance_criteria: $acceptance_criteria,
                 affected_files: $affected_files,
                 estimated_complexity: $estimated_complexity,
+                frustration_score: 0.0,
                 created_at: datetime($created_at),
                 updated_at: datetime($updated_at)
             })
@@ -118,6 +119,7 @@ impl Neo4jClient {
                 .get::<String>("completed_at")
                 .ok()
                 .and_then(|s| s.parse().ok()),
+            frustration_score: node.get::<f64>("frustration_score").unwrap_or(0.0),
         })
     }
 
@@ -292,6 +294,17 @@ impl Neo4jClient {
                 MATCH (t:Task {id: $id})
                 SET t.status = $status,
                     t.completed_at = datetime($now),
+                    t.updated_at = datetime($now)
+                "#,
+            ),
+            TaskStatus::Blocked => query(
+                r#"
+                MATCH (t:Task {id: $id})
+                SET t.status = $status,
+                    t.frustration_score = CASE
+                        WHEN coalesce(t.frustration_score, 0.0) + 0.2 > 1.0 THEN 1.0
+                        ELSE coalesce(t.frustration_score, 0.0) + 0.2
+                    END,
                     t.updated_at = datetime($now)
                 "#,
             ),
@@ -730,5 +743,94 @@ impl Neo4jClient {
         }
 
         Ok((tasks, total as usize))
+    }
+
+    // ========================================================================
+    // Frustration — Bio-inspired adaptive stress signal
+    // ========================================================================
+
+    /// Increment frustration score for a task by a given delta (clamped to [0, 1]).
+    pub async fn increment_frustration(&self, task_id: Uuid, delta: f64) -> Result<f64> {
+        let q = query(
+            r#"
+            MATCH (t:Task {id: $id})
+            SET t.frustration_score = CASE
+                WHEN coalesce(t.frustration_score, 0.0) + $delta > 1.0 THEN 1.0
+                ELSE coalesce(t.frustration_score, 0.0) + $delta
+            END
+            RETURN t.frustration_score AS score
+            "#,
+        )
+        .param("id", task_id.to_string())
+        .param("delta", delta);
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            Ok(row.get::<f64>("score").unwrap_or(0.0))
+        } else {
+            Ok(0.0)
+        }
+    }
+
+    /// Decrement frustration score for a task (clamped to 0.0 minimum).
+    pub async fn decrement_frustration(&self, task_id: Uuid, delta: f64) -> Result<f64> {
+        let q = query(
+            r#"
+            MATCH (t:Task {id: $id})
+            SET t.frustration_score = CASE
+                WHEN coalesce(t.frustration_score, 0.0) - $delta < 0.0 THEN 0.0
+                ELSE coalesce(t.frustration_score, 0.0) - $delta
+            END
+            RETURN t.frustration_score AS score
+            "#,
+        )
+        .param("id", task_id.to_string())
+        .param("delta", delta);
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            Ok(row.get::<f64>("score").unwrap_or(0.0))
+        } else {
+            Ok(0.0)
+        }
+    }
+
+    /// Get current frustration score for a task.
+    pub async fn get_frustration(&self, task_id: Uuid) -> Result<f64> {
+        let q = query(
+            r#"
+            MATCH (t:Task {id: $id})
+            RETURN coalesce(t.frustration_score, 0.0) AS score
+            "#,
+        )
+        .param("id", task_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            Ok(row.get::<f64>("score").unwrap_or(0.0))
+        } else {
+            Ok(0.0)
+        }
+    }
+
+    /// Get the parent task ID for a step (via HAS_STEP relationship).
+    /// Returns None if the step is not found or has no parent task.
+    pub async fn get_step_parent_task_id(&self, step_id: Uuid) -> Result<Option<Uuid>> {
+        let q = query(
+            r#"
+            MATCH (t:Task)-[:HAS_STEP]->(s:Step {id: $step_id})
+            RETURN t.id AS task_id
+            LIMIT 1
+            "#,
+        )
+        .param("step_id", step_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let task_id_str: String = row.get("task_id").unwrap_or_default();
+            Ok(Uuid::parse_str(&task_id_str).ok())
+        } else {
+            Ok(None)
+        }
     }
 }

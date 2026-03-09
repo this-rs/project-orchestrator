@@ -808,6 +808,48 @@ impl Neo4jClient {
         Ok(entities)
     }
 
+    /// WorldModel predictive context (biomimicry T7):
+    /// Get co-changers of files discussed in the last N sessions for a project.
+    /// Returns predicted files the agent may need, based on recent discussion patterns.
+    pub async fn get_discussed_co_changers(
+        &self,
+        project_id: Uuid,
+        max_sessions: i64,
+        max_results: i64,
+    ) -> Result<Vec<super::models::CoChanger>> {
+        let q = query(
+            r#"
+            MATCH (p:Project {id: $project_id})-[:HAS_CHAT_SESSION]->(s:ChatSession)
+            WITH s ORDER BY s.created_at DESC LIMIT $max_sessions
+            MATCH (s)-[:DISCUSSED]->(f:File)
+            WITH DISTINCT f
+            MATCH (f)-[cc:CO_CHANGED]->(f2:File)
+            WHERE cc.count >= 2
+            AND NOT f2 = f
+            WITH f2.path AS path, max(cc.count) AS count, max(toString(cc.last_at)) AS last_at
+            ORDER BY count DESC
+            LIMIT $max_results
+            RETURN path, count, last_at
+            "#,
+        )
+        .param("project_id", project_id.to_string())
+        .param("max_sessions", max_sessions)
+        .param("max_results", max_results);
+
+        let mut result = self.graph.execute(q).await?;
+        let mut changers = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            changers.push(super::models::CoChanger {
+                path: row.get("path")?,
+                count: row.get("count")?,
+                last_at: row.get::<String>("last_at").ok(),
+            });
+        }
+
+        Ok(changers)
+    }
+
     /// Backfill DISCUSSED relations on all existing chat sessions.
     ///
     /// Iterates all sessions in batches, extracts entities from user_message events

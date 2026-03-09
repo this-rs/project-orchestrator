@@ -3594,6 +3594,54 @@ pub fn smart_percentiles(values: &[f64]) -> Vec<f64> {
 }
 
 // ============================================================================
+// Thermal noise (biomimicry: Elun Langevin dynamics)
+// ============================================================================
+
+/// Add thermal noise to ranked search results for stochastic exploration.
+///
+/// Biomimicry: Elun's `step_langevin` adds `√(2kT·dt)·ξ` to particle positions.
+/// Here we add `T × N(0, σ)` to each score, where σ is the standard deviation
+/// of the input scores.
+///
+/// - `temperature = 0.0` → no noise (deterministic ranking, default behavior)
+/// - `temperature = 0.5` → moderate exploration (some re-ordering)
+/// - `temperature = 1.0` → maximum exploration (near-random among candidates)
+///
+/// The scores vector is modified in-place and re-sorted descending.
+/// Generic over any item type T paired with a score.
+pub fn add_thermal_noise<T>(scores: &mut [(T, f64)], temperature: f64) {
+    if temperature <= 0.0 || scores.len() < 2 {
+        return;
+    }
+
+    let temperature = temperature.clamp(0.0, 1.0);
+
+    // Compute σ (standard deviation of scores)
+    let n = scores.len() as f64;
+    let mean = scores.iter().map(|(_, s)| *s).sum::<f64>() / n;
+    let variance = scores.iter().map(|(_, s)| (*s - mean).powi(2)).sum::<f64>() / n;
+    let sigma = variance.sqrt();
+
+    if sigma < 1e-10 {
+        // All scores are identical — noise would be meaningless
+        return;
+    }
+
+    // Add Gaussian noise scaled by temperature and σ
+    // Using Box-Muller transform to avoid rand_distr dependency
+    for (_, score) in scores.iter_mut() {
+        // Box-Muller: two uniform [0,1) → one standard normal
+        let u1: f64 = rand::random();
+        let u2: f64 = rand::random();
+        let noise = (-2.0 * u1.max(1e-300).ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
+        *score += temperature * sigma * noise;
+    }
+
+    // Re-sort descending by noisy score
+    scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 

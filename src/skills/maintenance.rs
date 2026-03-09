@@ -316,6 +316,272 @@ pub async fn run_full_maintenance(
 }
 
 // ============================================================================
+// Tracked Maintenance (biomimicry T11 — Sleep Success Tracking)
+// ============================================================================
+
+/// Retrieve the success_rate from the last maintenance report stored as a Note.
+/// Returns None if no previous report exists.
+async fn get_last_maintenance_success_rate(
+    graph_store: &dyn GraphStore,
+    project_id: Uuid,
+) -> Option<f64> {
+    use crate::notes::models::NoteFilters;
+    // Find the most recent maintenance-report note by tag
+    let filters = NoteFilters {
+        tags: Some(vec!["maintenance-report".to_string()]),
+        limit: Some(1),
+        sort_by: Some("created_at".to_string()),
+        sort_order: Some("desc".to_string()),
+        ..Default::default()
+    };
+    let (notes, _) = graph_store
+        .list_notes(Some(project_id), None, &filters)
+        .await
+        .ok()?;
+    let note = notes.first()?;
+    // Parse success_rate from the note content (stored as JSON)
+    let parsed: serde_json::Value = serde_json::from_str(&note.content).ok()?;
+    parsed.get("success_rate")?.as_f64()
+}
+
+/// Store a maintenance report as a Note for future adaptive reference.
+async fn store_maintenance_report(
+    graph_store: &dyn GraphStore,
+    project_id: Uuid,
+    report: &crate::neo4j::models::MaintenanceReport,
+) {
+    let content = match serde_json::to_string_pretty(report) {
+        Ok(json) => json,
+        Err(e) => {
+            warn!(error = %e, "Failed to serialize maintenance report");
+            return;
+        }
+    };
+
+    let mut note = crate::notes::Note::new(
+        Some(project_id),
+        crate::notes::NoteType::Observation,
+        content,
+        "maintenance-tracker".to_string(),
+    );
+    note.importance = crate::notes::NoteImportance::Medium;
+    note.tags = vec![
+        "maintenance-report".to_string(),
+        "auto-generated".to_string(),
+        format!("level:{}", report.maintenance_level),
+    ];
+    if let Err(e) = graph_store.create_note(&note).await {
+        warn!(error = %e, "Failed to store maintenance report as note");
+    }
+}
+
+/// Run maintenance with pre/post snapshot tracking and delta computation.
+///
+/// 1. Capture a pre-maintenance snapshot
+/// 2. Run the requested maintenance level
+/// 3. Capture a post-maintenance snapshot
+/// 4. Compute deltas and success_rate (fraction of metrics that improved or stayed stable)
+/// 5. Return both the MaintenanceResult and the MaintenanceReport
+pub async fn run_maintenance_with_tracking(
+    graph_store: &dyn GraphStore,
+    project_id: Uuid,
+    level: &str,
+    config: &SkillMaintenanceConfig,
+) -> anyhow::Result<(MaintenanceResult, crate::neo4j::models::MaintenanceReport)> {
+    use std::time::Instant;
+
+    let start = Instant::now();
+
+    // 0. Adaptive decay: check last maintenance report success_rate
+    //    If previous success_rate < 0.5, halve the decay amount to be gentler
+    let mut adapted_config = config.clone();
+    let last_success_rate = get_last_maintenance_success_rate(graph_store, project_id).await;
+    if let Some(rate) = last_success_rate {
+        if rate < 0.5 {
+            adapted_config.synapse_decay_amount *= 0.5;
+            info!(
+                project_id = %project_id,
+                previous_success_rate = format!("{:.0}%", rate * 100.0),
+                new_decay = adapted_config.synapse_decay_amount,
+                "Adaptive decay: reducing synapse_decay_amount due to low previous success_rate"
+            );
+        }
+    }
+    let config = &adapted_config;
+
+    // 1. Pre-snapshot
+    let before = graph_store.compute_maintenance_snapshot(project_id).await?;
+
+    // 2. Run maintenance
+    let result = match level {
+        "hourly" => run_hourly_maintenance(graph_store, project_id, config).await?,
+        "daily" => run_daily_maintenance(graph_store, project_id, config).await?,
+        "weekly" => run_weekly_maintenance(graph_store, project_id, config).await?,
+        "full" => run_full_maintenance(graph_store, project_id, config).await?,
+        _ => {
+            warn!(
+                level = level,
+                "Unknown maintenance level, defaulting to daily"
+            );
+            run_daily_maintenance(graph_store, project_id, config).await?
+        }
+    };
+
+    // 3. Post-snapshot
+    let after = graph_store.compute_maintenance_snapshot(project_id).await?;
+
+    let duration_ms = start.elapsed().as_millis() as u64;
+
+    // 4. Compute deltas
+    let delta_health_score = after.health_score - before.health_score;
+    let delta_active_synapses = after.active_synapses - before.active_synapses;
+    let delta_mean_energy = after.mean_energy - before.mean_energy;
+    let delta_skill_count = after.skill_count - before.skill_count;
+    let delta_note_count = after.note_count - before.note_count;
+
+    // 5. Success rate: fraction of metrics that improved or stayed stable (>= 0)
+    let metrics = [
+        delta_health_score >= 0.0,
+        delta_active_synapses >= 0,
+        delta_mean_energy >= -0.01, // small tolerance for energy decay (expected)
+        delta_skill_count >= 0,
+        delta_note_count >= 0,
+    ];
+    let stable_or_improved = metrics.iter().filter(|&&b| b).count();
+    let success_rate = stable_or_improved as f64 / metrics.len() as f64;
+
+    let report = crate::neo4j::models::MaintenanceReport {
+        before,
+        after,
+        delta_health_score,
+        delta_active_synapses,
+        delta_mean_energy,
+        delta_skill_count,
+        delta_note_count,
+        success_rate,
+        maintenance_level: level.to_string(),
+        duration_ms,
+    };
+
+    info!(
+        project_id = %project_id,
+        level = level,
+        success_rate = format!("{:.0}%", success_rate * 100.0),
+        duration_ms = duration_ms,
+        delta_health = format!("{:+.3}", delta_health_score),
+        delta_synapses = delta_active_synapses,
+        delta_energy = format!("{:+.3}", delta_mean_energy),
+        "Tracked maintenance complete"
+    );
+
+    // 6. Store report as Note for future adaptive reference
+    store_maintenance_report(graph_store, project_id, &report).await;
+
+    Ok((result, report))
+}
+
+// ============================================================================
+// Deep Maintenance (biomimicry T12 — Global Stagnation Response)
+// ============================================================================
+
+/// Run deep maintenance when global stagnation is detected.
+/// This is an aggressive cleanup cycle:
+/// 1. Detect stagnation (4 signals)
+/// 2. Run full maintenance with aggressive decay
+/// 3. Flag stale notes for review
+/// 4. Identify stuck tasks
+/// 5. Generate recommendations
+pub async fn deep_maintenance(
+    graph_store: &dyn GraphStore,
+    project_id: Uuid,
+    config: &SkillMaintenanceConfig,
+) -> anyhow::Result<crate::neo4j::models::DeepMaintenanceReport> {
+    info!(project_id = %project_id, "Starting deep maintenance (stagnation response)");
+
+    // 1. Detect stagnation
+    let stagnation = graph_store.detect_global_stagnation(project_id).await?;
+
+    // 2. Run full maintenance with aggressive decay (3x normal)
+    let mut aggressive_config = config.clone();
+    aggressive_config.synapse_decay_amount *= 3.0;
+    aggressive_config.synapse_prune_threshold *= 1.5;
+
+    let maintenance_json =
+        match run_full_maintenance(graph_store, project_id, &aggressive_config).await {
+            Ok(result) => serde_json::to_value(&result).ok(),
+            Err(e) => {
+                warn!(error = %e, "Full maintenance failed during deep maintenance");
+                None
+            }
+        };
+
+    // 3. Update staleness scores and flag stale notes
+    let stale_notes_flagged = match graph_store.update_staleness_scores().await {
+        Ok(n) => n,
+        Err(e) => {
+            warn!(error = %e, "Failed to update staleness scores");
+            0
+        }
+    };
+
+    // 4. Identify stuck tasks (in_progress for too long)
+    let stuck_tasks_found = count_stuck_tasks(graph_store, project_id).await;
+
+    // 5. Build recommendations
+    let mut recommendations = stagnation.recommendations.clone();
+    if stale_notes_flagged > 0 {
+        recommendations.push(format!(
+            "{} notes have high staleness — review with note(action: \"get_needing_review\").",
+            stale_notes_flagged
+        ));
+    }
+    if stuck_tasks_found > 0 {
+        recommendations.push(format!(
+            "{} tasks stuck in_progress — consider marking as blocked or failed.",
+            stuck_tasks_found
+        ));
+    }
+
+    info!(
+        project_id = %project_id,
+        is_stagnating = stagnation.is_stagnating,
+        signals = stagnation.signals_triggered,
+        stale_notes = stale_notes_flagged,
+        stuck_tasks = stuck_tasks_found,
+        "Deep maintenance complete"
+    );
+
+    Ok(crate::neo4j::models::DeepMaintenanceReport {
+        stagnation,
+        maintenance: maintenance_json,
+        stale_notes_flagged,
+        stuck_tasks_found,
+        recommendations,
+    })
+}
+
+/// Count tasks that are in_progress (considered stuck during stagnation).
+async fn count_stuck_tasks(graph_store: &dyn GraphStore, project_id: Uuid) -> usize {
+    let plans = match graph_store.list_project_plans(project_id).await {
+        Ok(plans) => plans,
+        Err(_) => return 0,
+    };
+
+    let mut stuck = 0usize;
+    for plan in &plans {
+        let tasks = match graph_store.get_plan_tasks(plan.id).await {
+            Ok(tasks) => tasks,
+            Err(_) => continue,
+        };
+        stuck += tasks
+            .iter()
+            .filter(|t| t.status == crate::neo4j::models::TaskStatus::InProgress)
+            .count();
+    }
+    stuck
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -509,5 +775,351 @@ mod tests {
         assert_eq!(deserialized.level, "daily");
         assert_eq!(deserialized.synapses_decayed, Some(10));
         assert_eq!(deserialized.warnings.len(), 1);
+    }
+
+    // ========================================================================
+    // Biomimicry integration scenarios (T13)
+    // ========================================================================
+
+    use crate::neo4j::models::*;
+    use crate::neo4j::traits::GraphStore;
+    use crate::notes::{Note, NoteImportance, NoteType};
+    use crate::test_helpers::*;
+
+    /// Helper: create project + plan + tasks with given statuses
+    async fn setup_project_with_tasks(
+        store: &MockGraphStore,
+        n_completed: usize,
+        n_failed: usize,
+        n_in_progress: usize,
+    ) -> (uuid::Uuid, uuid::Uuid, Vec<uuid::Uuid>) {
+        let project = test_project();
+        let project_id = project.id;
+        store.create_project(&project).await.unwrap();
+
+        let plan = test_plan_for_project(project_id);
+        let plan_id = plan.id;
+        store.create_plan(&plan).await.unwrap();
+        store
+            .link_plan_to_project(plan_id, project_id)
+            .await
+            .unwrap();
+
+        let mut task_ids = Vec::new();
+        for i in 0..n_completed {
+            let mut task = test_task_titled(&format!("Completed {}", i));
+            task.status = TaskStatus::Completed;
+            task.completed_at = Some(chrono::Utc::now());
+            let tid = task.id;
+            store.create_task(plan_id, &task).await.unwrap();
+            task_ids.push(tid);
+        }
+        for i in 0..n_failed {
+            let mut task = test_task_titled(&format!("Failed {}", i));
+            task.status = TaskStatus::Failed;
+            let tid = task.id;
+            store.create_task(plan_id, &task).await.unwrap();
+            task_ids.push(tid);
+        }
+        for i in 0..n_in_progress {
+            let mut task = test_task_titled(&format!("InProgress {}", i));
+            task.status = TaskStatus::InProgress;
+            let tid = task.id;
+            store.create_task(plan_id, &task).await.unwrap();
+            task_ids.push(tid);
+        }
+        (project_id, plan_id, task_ids)
+    }
+
+    /// Scenario 1: Scar → frustration chain
+    #[tokio::test]
+    async fn test_biomimicry_s1_scar_frustration_chain() {
+        let store = MockGraphStore::new();
+        let (_project_id, _plan_id, task_ids) = setup_project_with_tasks(&store, 0, 0, 2).await;
+
+        // Create notes to scar
+        let mut note1 = Note::new(
+            Some(_project_id),
+            NoteType::Observation,
+            "Obs 1".into(),
+            "test".into(),
+        );
+        note1.importance = NoteImportance::Medium;
+        note1.tags = vec!["test".into()];
+        let note1_id = note1.id;
+        store.create_note(&note1).await.unwrap();
+
+        let mut note2 = Note::new(
+            Some(_project_id),
+            NoteType::Observation,
+            "Obs 2".into(),
+            "test".into(),
+        );
+        note2.importance = NoteImportance::Medium;
+        note2.tags = vec!["test".into()];
+        let note2_id = note2.id;
+        store.create_note(&note2).await.unwrap();
+
+        // Apply scars
+        let scarred = store.apply_scars(&[note1_id, note2_id], 0.5).await.unwrap();
+        assert_eq!(scarred, 2);
+
+        let n1 = store.get_note(note1_id).await.unwrap().unwrap();
+        assert!(
+            (n1.scar_intensity - 0.5).abs() < 0.01,
+            "scar_intensity should be ~0.5, got {}",
+            n1.scar_intensity
+        );
+
+        // Increment frustration
+        let f1 = store.increment_frustration(task_ids[0], 0.3).await.unwrap();
+        assert!((f1 - 0.3).abs() < 0.01);
+        let f2 = store.increment_frustration(task_ids[0], 0.4).await.unwrap();
+        assert!((f2 - 0.7).abs() < 0.01);
+
+        let frust = store.get_frustration(task_ids[0]).await.unwrap();
+        assert!((frust - 0.7).abs() < 0.01);
+    }
+
+    /// Scenario 2: Homeostasis scar_load
+    #[tokio::test]
+    async fn test_biomimicry_s2_homeostasis_scar_load() {
+        let store = MockGraphStore::new();
+        let (project_id, _, _) = setup_project_with_tasks(&store, 5, 0, 0).await;
+
+        let mut note_ids = Vec::new();
+        for i in 0..10 {
+            let mut note = Note::new(
+                Some(project_id),
+                NoteType::Observation,
+                format!("Obs {}", i),
+                "test".into(),
+            );
+            note.importance = NoteImportance::Medium;
+            note.tags = vec!["test".into()];
+            note_ids.push(note.id);
+            store.create_note(&note).await.unwrap();
+        }
+
+        store.apply_scars(&note_ids, 0.8).await.unwrap();
+
+        let report = store.compute_homeostasis(project_id, None).await.unwrap();
+        let scar_ratio = report.ratios.iter().find(|r| r.name == "scar_load");
+        assert!(
+            scar_ratio.is_some(),
+            "Homeostasis should have scar_load ratio"
+        );
+        let scar = scar_ratio.unwrap();
+        assert!(
+            scar.value > 0.0,
+            "scar_load should be > 0, got {}",
+            scar.value
+        );
+    }
+
+    /// Scenario 3: Global stagnation → deep maintenance
+    #[tokio::test]
+    async fn test_biomimicry_s3_stagnation_deep_maintenance() {
+        let store = MockGraphStore::new();
+        let (project_id, _, task_ids) = setup_project_with_tasks(&store, 0, 0, 3).await;
+
+        // High frustration on all in-progress tasks
+        for &tid in &task_ids {
+            store.increment_frustration(tid, 0.8).await.unwrap();
+        }
+
+        // Low energy notes
+        for i in 0..5 {
+            let mut note = Note::new(
+                Some(project_id),
+                NoteType::Observation,
+                format!("Low {}", i),
+                "test".into(),
+            );
+            note.importance = NoteImportance::Low;
+            note.tags = vec!["test".into()];
+            note.energy = 0.1;
+            store.create_note(&note).await.unwrap();
+        }
+
+        // Detect stagnation
+        let report = store.detect_global_stagnation(project_id).await.unwrap();
+        assert!(report.is_stagnating, "Should detect stagnation");
+        assert!(
+            report.signals_triggered >= 3,
+            "Should have >= 3 signals, got {}",
+            report.signals_triggered
+        );
+        assert_eq!(report.tasks_completed_48h, 0);
+        assert!(
+            report.avg_frustration > 0.6,
+            "Avg frustration should be > 0.6, got {}",
+            report.avg_frustration
+        );
+
+        // Deep maintenance
+        let config = SkillMaintenanceConfig::default();
+        let deep = deep_maintenance(&store, project_id, &config).await.unwrap();
+        assert!(deep.stagnation.is_stagnating);
+        assert!(
+            deep.stuck_tasks_found >= 3,
+            "Should find >= 3 stuck tasks, got {}",
+            deep.stuck_tasks_found
+        );
+        assert!(!deep.recommendations.is_empty());
+    }
+
+    /// Scenario 4: Consolidation + maintenance tracking pipeline
+    #[tokio::test]
+    async fn test_biomimicry_s4_consolidation_measured() {
+        let store = MockGraphStore::new();
+        let (project_id, _, _) = setup_project_with_tasks(&store, 3, 0, 0).await;
+
+        for i in 0..5 {
+            let mut note = Note::new(
+                Some(project_id),
+                NoteType::Observation,
+                format!("Note {}", i),
+                "test".into(),
+            );
+            note.importance = NoteImportance::Medium;
+            note.tags = vec!["test".into()];
+            note.energy = 0.8;
+            store.create_note(&note).await.unwrap();
+        }
+
+        // Pre-snapshot
+        let before = store
+            .compute_maintenance_snapshot(project_id)
+            .await
+            .unwrap();
+        assert_eq!(before.note_count, 5);
+        assert!(before.mean_energy > 0.0);
+
+        // Run tracked maintenance
+        let config = SkillMaintenanceConfig::default();
+        let (result, report) = run_maintenance_with_tracking(&store, project_id, "hourly", &config)
+            .await
+            .unwrap();
+
+        assert_eq!(result.level, "hourly");
+        assert!(
+            report.success_rate >= 0.0 && report.success_rate <= 1.0,
+            "success_rate should be in [0, 1], got {}",
+            report.success_rate
+        );
+    }
+
+    /// Scenario 5: Scaffolding adapts to project health
+    #[tokio::test]
+    async fn test_biomimicry_s5_scaffolding_integrated() {
+        let store = MockGraphStore::new();
+
+        // Healthy project: 18 completed, 2 failed
+        let (project_id, _, _) = setup_project_with_tasks(&store, 18, 2, 0).await;
+
+        for i in 0..3 {
+            let mut note = Note::new(
+                Some(project_id),
+                NoteType::Observation,
+                format!("Healthy {}", i),
+                "test".into(),
+            );
+            note.importance = NoteImportance::Medium;
+            note.tags = vec!["test".into()];
+            note.energy = 0.9;
+            store.create_note(&note).await.unwrap();
+        }
+
+        let level = store
+            .compute_scaffolding_level(project_id, None)
+            .await
+            .unwrap();
+        assert!(
+            level.task_success_rate >= 0.8,
+            "Success rate should be >= 0.8, got {}",
+            level.task_success_rate
+        );
+        assert!(
+            level.level >= 3,
+            "Level should be >= 3 with high success, got L{}",
+            level.level
+        );
+        assert!(!level.is_overridden);
+
+        // Degraded project: 2 completed, 8 failed + scars
+        let project2 = test_project_named("degraded");
+        let project2_id = project2.id;
+        store.create_project(&project2).await.unwrap();
+
+        let plan2 = test_plan_for_project(project2_id);
+        let plan2_id = plan2.id;
+        store.create_plan(&plan2).await.unwrap();
+        store
+            .link_plan_to_project(plan2_id, project2_id)
+            .await
+            .unwrap();
+
+        for i in 0..2 {
+            let mut t = test_task_titled(&format!("P2 OK {}", i));
+            t.status = TaskStatus::Completed;
+            t.completed_at = Some(chrono::Utc::now());
+            store.create_task(plan2_id, &t).await.unwrap();
+        }
+        for i in 0..8 {
+            let mut t = test_task_titled(&format!("P2 Fail {}", i));
+            t.status = TaskStatus::Failed;
+            store.create_task(plan2_id, &t).await.unwrap();
+        }
+
+        let mut scar_ids = Vec::new();
+        for i in 0..5 {
+            let mut note = Note::new(
+                Some(project2_id),
+                NoteType::Gotcha,
+                format!("Scar {}", i),
+                "test".into(),
+            );
+            note.importance = NoteImportance::High;
+            note.tags = vec!["test".into()];
+            scar_ids.push(note.id);
+            store.create_note(&note).await.unwrap();
+        }
+        store.apply_scars(&scar_ids, 0.9).await.unwrap();
+
+        let level2 = store
+            .compute_scaffolding_level(project2_id, None)
+            .await
+            .unwrap();
+        assert!(
+            level2.task_success_rate <= 0.3,
+            "Should be <= 0.3, got {}",
+            level2.task_success_rate
+        );
+        assert!(
+            level2.level <= 1,
+            "Should be <= L1 with low success + scars, got L{}",
+            level2.level
+        );
+
+        // Verify levels differ
+        assert!(
+            level.level > level2.level,
+            "Healthy L{} > degraded L{}",
+            level.level,
+            level2.level
+        );
+
+        // Test override
+        store
+            .set_scaffolding_override(project2_id, Some(4))
+            .await
+            .unwrap();
+        let overridden = store
+            .compute_scaffolding_level(project2_id, Some(4))
+            .await
+            .unwrap();
+        assert_eq!(overridden.level, 4, "Override should force L4");
+        assert!(overridden.is_overridden);
     }
 }

@@ -18,7 +18,7 @@ use std::str::FromStr;
 use uuid::Uuid;
 
 use crate::neo4j::traits::GraphStore;
-use crate::notes::models::{Note, NoteImportance, NoteScope, NoteStatus, NoteType};
+use crate::notes::models::{MemoryHorizon, Note, NoteImportance, NoteScope, NoteStatus, NoteType};
 use crate::protocol::models::{
     Protocol, ProtocolCategory, ProtocolState, ProtocolTransition, StateType,
 };
@@ -399,6 +399,8 @@ fn portable_note_to_note(
         staleness_score: 0.0,
         energy: IMPORT_NOTE_ENERGY,
         last_activated: Some(now),
+        scar_intensity: 0.0,
+        memory_horizon: MemoryHorizon::Operational, // Imported notes are operational
         supersedes: None,
         superseded_by: None,
         changes: vec![],
@@ -453,6 +455,8 @@ fn decision_to_note(
         staleness_score: 0.0,
         energy: IMPORT_NOTE_ENERGY,
         last_activated: Some(now),
+        scar_intensity: 0.0,
+        memory_horizon: MemoryHorizon::Operational, // Imported decisions are operational
         supersedes: None,
         superseded_by: None,
         changes: vec![],
@@ -1119,6 +1123,7 @@ mod tests {
             last_synced: None,
             analytics_computed_at: None,
             last_co_change_computed_at: None,
+            scaffolding_override: None,
         };
         store.create_project(&source_project).await.unwrap();
 
@@ -1133,6 +1138,7 @@ mod tests {
             last_synced: None,
             analytics_computed_at: None,
             last_co_change_computed_at: None,
+            scaffolding_override: None,
         };
         store.create_project(&target_project).await.unwrap();
 
@@ -1168,6 +1174,8 @@ mod tests {
             changes: vec![],
             assertion_rule: None,
             last_assertion_result: None,
+            memory_horizon: MemoryHorizon::Operational,
+            scar_intensity: 0.0,
         };
         let note_id = note.id;
         store.create_note(&note).await.unwrap();

@@ -819,15 +819,27 @@ impl NoteManager {
             )
             .await?;
 
-        // Convert to NoteSearchHit
-        Ok(results
+        // Convert to NoteSearchHit with scar penalty applied.
+        // Notes with high scar_intensity (past invalidations) get de-prioritized.
+        // Max penalty = 50% score reduction at scar_intensity=1.0.
+        let mut hits: Vec<NoteSearchHit> = results
             .into_iter()
-            .map(|(note, score)| NoteSearchHit {
-                note,
-                score,
-                highlights: None,
+            .map(|(note, score)| {
+                let scar_penalty = 1.0 - note.scar_intensity.clamp(0.0, 1.0) * 0.5;
+                NoteSearchHit {
+                    score: score * scar_penalty,
+                    note,
+                    highlights: None,
+                }
             })
-            .collect())
+            .collect();
+        // Re-sort by penalized score (descending)
+        hits.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        Ok(hits)
     }
 
     // ========================================================================
@@ -863,6 +875,7 @@ impl NoteManager {
     ///
     /// `relation_types` controls which graph relations to traverse.
     /// `None` → default (CONTAINS|IMPORTS|CALLS).
+    #[allow(clippy::too_many_arguments)]
     pub async fn get_propagated_notes(
         &self,
         entity_type: &EntityType,
@@ -870,9 +883,19 @@ impl NoteManager {
         max_depth: u32,
         min_score: f64,
         relation_types: Option<&[String]>,
+        source_project_id: Option<Uuid>,
+        force_cross_project: bool,
     ) -> Result<Vec<PropagatedNote>> {
         self.neo4j
-            .get_propagated_notes(entity_type, entity_id, max_depth, min_score, relation_types)
+            .get_propagated_notes(
+                entity_type,
+                entity_id,
+                max_depth,
+                min_score,
+                relation_types,
+                source_project_id,
+                force_cross_project,
+            )
             .await
     }
 
@@ -893,7 +916,15 @@ impl NoteManager {
         // Get propagated notes from graph traversal (default relations)
         let mut propagated_notes = self
             .neo4j
-            .get_propagated_notes(entity_type, entity_id, max_depth, min_score, None)
+            .get_propagated_notes(
+                entity_type,
+                entity_id,
+                max_depth,
+                min_score,
+                None,
+                None,
+                false,
+            )
             .await?;
 
         // If entity is a Project, also get workspace-level notes
@@ -1014,6 +1045,8 @@ impl NoteManager {
                 capped_depth,
                 min_score,
                 relation_types,
+                None,
+                false,
             )
             .await?;
 

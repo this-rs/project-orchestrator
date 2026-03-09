@@ -6,6 +6,7 @@ use crate::api::{
 };
 use crate::chat::ChatManager;
 use crate::events::{EventEmitter, HybridEmitter, NatsEmitter};
+use crate::graph::algorithms::add_thermal_noise;
 use crate::neo4j::models::{
     AffectsRelation, CommitNode, ConstraintNode, DecisionNode, DecisionStatus,
     DecisionTimelineEntry, MilestoneNode, MilestoneStatus, PlanNode, PlanStatus, ReleaseNode,
@@ -783,13 +784,16 @@ pub struct SearchDecisionsSemanticQuery {
     pub query: String,
     pub limit: Option<usize>,
     pub project_id: Option<String>,
+    /// Thermal noise temperature (0.0 - 1.0) for stochastic exploration.
+    /// Inspired by Langevin dynamics: adds T × N(0, σ) Gaussian noise to scores.
+    pub temperature: Option<f64>,
 }
 
 pub async fn search_decisions_semantic(
     State(state): State<OrchestratorState>,
     axum::extract::Query(params): axum::extract::Query<SearchDecisionsSemanticQuery>,
 ) -> Result<Json<Vec<DecisionSearchHit>>, AppError> {
-    let results = state
+    let mut results = state
         .orchestrator
         .plan_manager()
         .search_decisions_semantic(
@@ -798,6 +802,28 @@ pub async fn search_decisions_semantic(
             params.project_id.as_deref(),
         )
         .await?;
+
+    // Apply Langevin thermal noise for stochastic exploration
+    if let Some(temperature) = params.temperature {
+        if temperature > 0.0 {
+            let mut scored: Vec<(DecisionSearchHit, f64)> = results
+                .into_iter()
+                .map(|h| {
+                    let s = h.score;
+                    (h, s)
+                })
+                .collect();
+            add_thermal_noise(&mut scored, temperature);
+            results = scored
+                .into_iter()
+                .map(|(mut h, s)| {
+                    h.score = s;
+                    h
+                })
+                .collect();
+        }
+    }
+
     Ok(Json(results))
 }
 
@@ -1285,8 +1311,25 @@ pub async fn update_step(
         state
             .orchestrator
             .plan_manager()
-            .update_step_status(step_id, status)
+            .update_step_status(step_id, status.clone())
             .await?;
+
+        // Biomimicry: Frustration decay — completing a step reduces frustration on parent task
+        if status == crate::neo4j::models::StepStatus::Completed {
+            // Find parent task and decrement frustration by 0.1
+            if let Ok(Some(task_id)) = state
+                .orchestrator
+                .neo4j()
+                .get_step_parent_task_id(step_id)
+                .await
+            {
+                let _ = state
+                    .orchestrator
+                    .neo4j()
+                    .decrement_frustration(task_id, 0.1)
+                    .await;
+            }
+        }
     }
     if req.description.is_some() || req.verification.is_some() {
         state
@@ -2657,6 +2700,80 @@ pub async fn detect_skills(
 }
 
 // ============================================================================
+// Skill Fission / Fusion Detection (read-only inspection)
+// ============================================================================
+
+/// POST /api/admin/detect-skill-fission
+///
+/// Detect skills that are candidates for splitting (fission).
+/// Read-only — does not modify the graph.
+pub async fn detect_skill_fission(
+    State(state): State<OrchestratorState>,
+    Json(body): Json<FabricProjectRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let project_id = body.project_id;
+
+    state
+        .orchestrator
+        .neo4j()
+        .get_project(project_id)
+        .await
+        .map_err(AppError::Internal)?
+        .ok_or_else(|| AppError::NotFound(format!("Project not found: {}", project_id)))?;
+
+    let start = std::time::Instant::now();
+    let candidates = crate::skills::evolution::detect_skill_fission(
+        state.orchestrator.neo4j(),
+        project_id,
+        0.5, // overlap threshold for sub-cluster matching
+    )
+    .await
+    .map_err(AppError::Internal)?;
+    let elapsed_ms = start.elapsed().as_millis() as u64;
+
+    Ok(Json(serde_json::json!({
+        "candidates": candidates,
+        "count": candidates.len(),
+        "elapsed_ms": elapsed_ms,
+    })))
+}
+
+/// POST /api/admin/detect-skill-fusion
+///
+/// Detect pairs of skills that are candidates for merging (fusion).
+/// Read-only — does not modify the graph.
+pub async fn detect_skill_fusion(
+    State(state): State<OrchestratorState>,
+    Json(body): Json<FabricProjectRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let project_id = body.project_id;
+
+    state
+        .orchestrator
+        .neo4j()
+        .get_project(project_id)
+        .await
+        .map_err(AppError::Internal)?
+        .ok_or_else(|| AppError::NotFound(format!("Project not found: {}", project_id)))?;
+
+    let start = std::time::Instant::now();
+    let candidates = crate::skills::evolution::detect_skill_fusion(
+        state.orchestrator.neo4j(),
+        project_id,
+        0.5, // overlap threshold for fusion detection
+    )
+    .await
+    .map_err(AppError::Internal)?;
+    let elapsed_ms = start.elapsed().as_millis() as u64;
+
+    Ok(Json(serde_json::json!({
+        "candidates": candidates,
+        "count": candidates.len(),
+        "elapsed_ms": elapsed_ms,
+    })))
+}
+
+// ============================================================================
 // Auto-anchor Notes
 // ============================================================================
 
@@ -2831,52 +2948,24 @@ pub async fn skill_maintenance(
         .map_err(AppError::Internal)?
         .ok_or_else(|| AppError::NotFound(format!("Project not found: {}", project_id)))?;
 
-    let config = crate::skills::maintenance::SkillMaintenanceConfig::default();
-    let start = std::time::Instant::now();
-
-    let result = match body.level.as_str() {
-        "hourly" => {
-            crate::skills::maintenance::run_hourly_maintenance(
-                state.orchestrator.neo4j(),
-                project_id,
-                &config,
-            )
-            .await
-        }
-        "daily" => {
-            crate::skills::maintenance::run_daily_maintenance(
-                state.orchestrator.neo4j(),
-                project_id,
-                &config,
-            )
-            .await
-        }
-        "weekly" => {
-            crate::skills::maintenance::run_weekly_maintenance(
-                state.orchestrator.neo4j(),
-                project_id,
-                &config,
-            )
-            .await
-        }
-        "full" => {
-            crate::skills::maintenance::run_full_maintenance(
-                state.orchestrator.neo4j(),
-                project_id,
-                &config,
-            )
-            .await
-        }
-        _ => {
-            return Err(AppError::BadRequest(format!(
-                "Invalid maintenance level: '{}'. Expected: hourly, daily, weekly, full",
-                body.level
-            )));
-        }
+    let level = body.level.as_str();
+    if !matches!(level, "hourly" | "daily" | "weekly" | "full") {
+        return Err(AppError::BadRequest(format!(
+            "Invalid maintenance level: '{}'. Expected: hourly, daily, weekly, full",
+            level
+        )));
     }
-    .map_err(AppError::Internal)?;
 
-    let elapsed_ms = start.elapsed().as_millis() as u64;
+    let config = crate::skills::maintenance::SkillMaintenanceConfig::default();
+
+    let (result, report) = crate::skills::maintenance::run_maintenance_with_tracking(
+        state.orchestrator.neo4j(),
+        project_id,
+        level,
+        &config,
+    )
+    .await
+    .map_err(AppError::Internal)?;
 
     // Invalidate hook activation cache after maintenance
     super::hook_handlers::skill_cache()
@@ -2891,8 +2980,76 @@ pub async fn skill_maintenance(
         "evolution": result.evolution,
         "skills_detected": result.skills_detected,
         "warnings": result.warnings,
-        "elapsed_ms": elapsed_ms,
+        "elapsed_ms": report.duration_ms,
+        "tracking": {
+            "before": report.before,
+            "after": report.after,
+            "delta_health_score": report.delta_health_score,
+            "delta_active_synapses": report.delta_active_synapses,
+            "delta_mean_energy": report.delta_mean_energy,
+            "delta_skill_count": report.delta_skill_count,
+            "delta_note_count": report.delta_note_count,
+            "success_rate": report.success_rate,
+        },
     })))
+}
+
+// ============================================================================
+// Stagnation Detection & Deep Maintenance (biomimicry T12)
+// ============================================================================
+
+/// Detect global stagnation across a project.
+pub async fn detect_stagnation(
+    State(state): State<OrchestratorState>,
+    Path(project_id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    state
+        .orchestrator
+        .neo4j()
+        .get_project(project_id)
+        .await
+        .map_err(AppError::Internal)?
+        .ok_or_else(|| AppError::NotFound(format!("Project not found: {}", project_id)))?;
+
+    let report = state
+        .orchestrator
+        .neo4j()
+        .detect_global_stagnation(project_id)
+        .await
+        .map_err(AppError::Internal)?;
+
+    Ok(Json(serde_json::to_value(&report).unwrap_or_default()))
+}
+
+/// Run deep maintenance (aggressive cleanup for stagnating projects).
+pub async fn run_deep_maintenance(
+    State(state): State<OrchestratorState>,
+    Path(project_id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    state
+        .orchestrator
+        .neo4j()
+        .get_project(project_id)
+        .await
+        .map_err(AppError::Internal)?
+        .ok_or_else(|| AppError::NotFound(format!("Project not found: {}", project_id)))?;
+
+    let config = crate::skills::maintenance::SkillMaintenanceConfig::default();
+
+    let report = crate::skills::maintenance::deep_maintenance(
+        state.orchestrator.neo4j(),
+        project_id,
+        &config,
+    )
+    .await
+    .map_err(AppError::Internal)?;
+
+    // Invalidate hook activation cache after deep maintenance
+    super::hook_handlers::skill_cache()
+        .invalidate_project(&project_id)
+        .await;
+
+    Ok(Json(serde_json::to_value(&report).unwrap_or_default()))
 }
 
 // ============================================================================

@@ -3,8 +3,8 @@
 use super::client::Neo4jClient;
 use super::models::DecisionNode;
 use crate::notes::{
-    EntityType, Note, NoteAnchor, NoteChange, NoteFilters, NoteImportance, NoteScope, NoteStatus,
-    NoteType, PropagatedNote,
+    EntityType, MemoryHorizon, Note, NoteAnchor, NoteChange, NoteFilters, NoteImportance,
+    NoteScope, NoteStatus, NoteType, PropagatedNote,
 };
 use anyhow::{Context, Result};
 use neo4rs::query;
@@ -37,7 +37,9 @@ impl Neo4jClient {
                 energy: $energy,
                 last_activated: datetime($last_activated),
                 changes_json: $changes_json,
-                assertion_rule_json: $assertion_rule_json
+                assertion_rule_json: $assertion_rule_json,
+                scar_intensity: $scar_intensity,
+                memory_horizon: $memory_horizon
             })
             "#,
         )
@@ -78,7 +80,9 @@ impl Neo4jClient {
                 .as_ref()
                 .map(|r| serde_json::to_string(r).unwrap_or_default())
                 .unwrap_or_default(),
-        );
+        )
+        .param("scar_intensity", note.scar_intensity)
+        .param("memory_horizon", note.memory_horizon.to_string());
 
         self.graph.run(q).await?;
 
@@ -653,6 +657,127 @@ impl Neo4jClient {
         Ok(notes)
     }
 
+    /// Compute pairwise coupling strength between two projects.
+    /// Returns a value in [0.0, 1.0] based on 4 signals:
+    /// structural twins, imported skills, shared notes, tag overlap.
+    /// Used to weight cross-project note propagation (biomimicry P2P coupling).
+    async fn get_pairwise_coupling(&self, project_a_id: Uuid, project_b_id: Uuid) -> Result<f64> {
+        if project_a_id == project_b_id {
+            return Ok(1.0);
+        }
+
+        const W_TWINS: f64 = 0.35;
+        const W_SKILLS: f64 = 0.25;
+        const W_NOTES: f64 = 0.20;
+        const W_TAGS: f64 = 0.20;
+        const MAX_TWINS: f64 = 20.0;
+        const MAX_SKILLS: f64 = 10.0;
+        const MAX_NOTES: f64 = 50.0;
+
+        let a = project_a_id.to_string();
+        let b = project_b_id.to_string();
+
+        // Signal 1: Structural twins (files with same WL hash)
+        let twins_q = query(
+            r#"
+            MATCH (pa:Project {id: $a})-[:CONTAINS]->(fa:File)
+            MATCH (pb:Project {id: $b})-[:CONTAINS]->(fb:File)
+            WHERE fa.wl_hash IS NOT NULL AND fa.wl_hash = fb.wl_hash
+            RETURN count(DISTINCT fa) AS cnt
+            "#,
+        )
+        .param("a", a.clone())
+        .param("b", b.clone());
+
+        let twins: f64 = match self.graph.execute(twins_q).await {
+            Ok(mut r) => match r.next().await {
+                Ok(Some(row)) => {
+                    (row.get::<i64>("cnt").unwrap_or(0) as f64).min(MAX_TWINS) / MAX_TWINS
+                }
+                _ => 0.0,
+            },
+            _ => 0.0,
+        };
+
+        // Signal 2: Imported skills (skills exported from one, imported in the other)
+        let skills_q = query(
+            r#"
+            MATCH (sa:Skill {project_id: $a})-[:IMPORTED_FROM]->(sb:Skill {project_id: $b})
+            RETURN count(sa) AS cnt
+            UNION ALL
+            MATCH (sb2:Skill {project_id: $b})-[:IMPORTED_FROM]->(sa2:Skill {project_id: $a})
+            RETURN count(sb2) AS cnt
+            "#,
+        )
+        .param("a", a.clone())
+        .param("b", b.clone());
+
+        let skills: f64 = match self.graph.execute(skills_q).await {
+            Ok(mut r) => {
+                let mut total = 0i64;
+                while let Ok(Some(row)) = r.next().await {
+                    total += row.get::<i64>("cnt").unwrap_or(0);
+                }
+                (total as f64).min(MAX_SKILLS) / MAX_SKILLS
+            }
+            _ => 0.0,
+        };
+
+        // Signal 3: Shared notes (notes linked to entities in both projects)
+        let notes_q = query(
+            r#"
+            MATCH (n:Note)-[:LINKED_TO]->(ea)<-[:CONTAINS]-(pa:Project {id: $a})
+            MATCH (n)-[:LINKED_TO]->(eb)<-[:CONTAINS]-(pb:Project {id: $b})
+            RETURN count(DISTINCT n) AS cnt
+            "#,
+        )
+        .param("a", a.clone())
+        .param("b", b.clone());
+
+        let shared_notes: f64 = match self.graph.execute(notes_q).await {
+            Ok(mut r) => match r.next().await {
+                Ok(Some(row)) => {
+                    (row.get::<i64>("cnt").unwrap_or(0) as f64).min(MAX_NOTES) / MAX_NOTES
+                }
+                _ => 0.0,
+            },
+            _ => 0.0,
+        };
+
+        // Signal 4: Tag overlap (Jaccard similarity of note tags)
+        let tags_q = query(
+            r#"
+            MATCH (na:Note {project_id: $a}) WHERE na.tags IS NOT NULL
+            WITH collect(na.tags) AS a_tags_raw
+            WITH reduce(s = [], t IN a_tags_raw | s + t) AS a_tags_flat
+            WITH apoc.coll.toSet(a_tags_flat) AS a_tags
+            MATCH (nb:Note {project_id: $b}) WHERE nb.tags IS NOT NULL
+            WITH a_tags, collect(nb.tags) AS b_tags_raw
+            WITH a_tags, reduce(s = [], t IN b_tags_raw | s + t) AS b_tags_flat
+            WITH a_tags, apoc.coll.toSet(b_tags_flat) AS b_tags
+            WITH a_tags, b_tags,
+                 [t IN a_tags WHERE t IN b_tags] AS intersection
+            RETURN CASE WHEN size(a_tags) + size(b_tags) - size(intersection) = 0 THEN 0.0
+                        ELSE toFloat(size(intersection)) / (size(a_tags) + size(b_tags) - size(intersection))
+                   END AS jaccard
+            "#,
+        )
+        .param("a", a)
+        .param("b", b);
+
+        let tag_overlap: f64 = match self.graph.execute(tags_q).await {
+            Ok(mut r) => match r.next().await {
+                Ok(Some(row)) => row.get::<f64>("jaccard").unwrap_or(0.0),
+                _ => 0.0,
+            },
+            _ => 0.0,
+        };
+
+        let coupling =
+            W_TWINS * twins + W_SKILLS * skills + W_NOTES * shared_notes + W_TAGS * tag_overlap;
+        Ok(coupling)
+    }
+
     /// Get propagated notes for an entity (traversing the graph)
     /// Whitelist of relation types allowed in propagation traversal.
     /// Prevents Cypher injection via user-supplied relation_types parameter.
@@ -674,6 +799,7 @@ impl Neo4jClient {
     const DEFAULT_PROPAGATION_RELATIONS: &'static [&'static str] =
         &["CONTAINS", "IMPORTS", "CALLS"];
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn get_propagated_notes(
         &self,
         entity_type: &EntityType,
@@ -681,6 +807,8 @@ impl Neo4jClient {
         max_depth: u32,
         min_score: f64,
         relation_types: Option<&[String]>,
+        source_project_id: Option<Uuid>,
+        force_cross_project: bool,
     ) -> Result<Vec<PropagatedNote>> {
         let node_label = match entity_type {
             EntityType::Project => "Project",
@@ -737,13 +865,16 @@ impl Neo4jClient {
 
         // Query for notes propagated through the graph.
         //
-        // Scoring formula integrates 4 factors:
+        // Scoring formula integrates 5 factors:
         //   1. Distance decay: 1/(distance+1)
         //   2. Importance weight: critical=1.0, high=0.8, medium=0.5, low=0.3
         //   3. PageRank hub boost: (1 + avg_path_pagerank * 5)
         //   4. Relation type weight: product of per-relation weights along the path
         //      For SYNAPSE relations, uses the dynamic r.weight (Hebbian strength)
         //      instead of a static value.
+        //   5. Scar penalty: (1 - scar_intensity * 0.5)
+        //      Notes with high scar_intensity (from past invalidations) are de-prioritized.
+        //      Max penalty = 50% score reduction at scar_intensity=1.0.
         //
         // Relation weights (defined in Cypher CASE):
         //   CONTAINS=1.0, IMPORTS=1.0, CALLS=0.9, IMPLEMENTS_TRAIT=0.85,
@@ -787,7 +918,8 @@ impl Neo4jClient {
                           END)
                  END AS path_rel_weight
             WITH n, source, distance, path_names, rel_types, avg_path_pagerank, path_rel_weight, hop_weights,
-                 (1.0 / (distance + 1)) * importance_weight * (1.0 + avg_path_pagerank * 5.0) * path_rel_weight AS score
+                 (1.0 / (distance + 1)) * importance_weight * (1.0 + avg_path_pagerank * 5.0) * path_rel_weight
+                 * (1.0 - COALESCE(n.scar_intensity, 0.0) * 0.5) AS score
             WHERE score >= $min_score
             RETURN DISTINCT n, score, coalesce(source.name, source.path, source.id) AS source_entity,
                    path_names, distance, avg_path_pagerank,
@@ -839,6 +971,7 @@ impl Neo4jClient {
                 })
                 .collect();
 
+            let scar_intensity = note.scar_intensity;
             propagated_notes.push(PropagatedNote {
                 note,
                 relevance_score: score,
@@ -848,7 +981,68 @@ impl Neo4jClient {
                 path_pagerank: avg_path_pagerank,
                 relation_path,
                 path_rel_weight,
+                scar_intensity,
             });
+        }
+
+        // Cross-project coupling weighting (biomimicry P2P coupling)
+        // If source_project_id is set, weight notes from other projects by coupling_strength.
+        // Projects with coupling < 0.2 are suppressed unless force_cross_project is true.
+        if let Some(src_pid) = source_project_id {
+            let mut coupling_cache: std::collections::HashMap<Uuid, f64> =
+                std::collections::HashMap::new();
+            let mut filtered_notes = Vec::with_capacity(propagated_notes.len());
+
+            for mut pn in propagated_notes {
+                let note_pid = pn.note.project_id;
+                match note_pid {
+                    Some(pid) if pid != src_pid => {
+                        // Cross-project note — look up coupling (cached per foreign project)
+                        let coupling = match coupling_cache.get(&pid) {
+                            Some(&c) => c,
+                            None => {
+                                let c = self
+                                    .get_pairwise_coupling(src_pid, pid)
+                                    .await
+                                    .unwrap_or(0.0);
+                                coupling_cache.insert(pid, c);
+                                c
+                            }
+                        };
+
+                        if coupling < 0.2 && !force_cross_project {
+                            // Suppress low-coupling cross-project propagation
+                            tracing::debug!(
+                                note_id = %pn.note.id,
+                                source_project = %src_pid,
+                                note_project = %pid,
+                                coupling,
+                                "Suppressed cross-project note propagation (coupling < 0.2)"
+                            );
+                            continue;
+                        }
+
+                        // Weight the score by coupling strength
+                        pn.relevance_score *= coupling;
+                        if pn.relevance_score >= min_score {
+                            filtered_notes.push(pn);
+                        }
+                    }
+                    _ => {
+                        // Same project or global note — keep as-is
+                        filtered_notes.push(pn);
+                    }
+                }
+            }
+
+            // Re-sort after weighting
+            filtered_notes.sort_by(|a, b| {
+                b.relevance_score
+                    .partial_cmp(&a.relevance_score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+
+            return Ok(filtered_notes);
         }
 
         Ok(propagated_notes)
@@ -880,6 +1074,7 @@ impl Neo4jClient {
             let workspace_name: String = row.get("workspace_name").unwrap_or_default();
             let note = self.node_to_note(&node)?;
 
+            let scar_intensity = note.scar_intensity;
             workspace_notes.push(PropagatedNote {
                 note,
                 relevance_score: propagation_factor,
@@ -889,6 +1084,7 @@ impl Neo4jClient {
                 path_pagerank: None,
                 relation_path: vec![crate::notes::RelationHop::structural("BELONGS_TO")],
                 path_rel_weight: Some(1.0),
+                scar_intensity,
             });
         }
 
@@ -1282,7 +1478,10 @@ impl Neo4jClient {
             }
 
             let note = self.node_to_note(&node)?;
-            notes.push((note, score));
+            // Knowledge Scars: penalize scarred notes in search results
+            // Biomimicry: Elun HypersphereIdentity.Scar — scarred knowledge is less trusted
+            let adjusted_score = score * (1.0 - note.scar_intensity * 0.7);
+            notes.push((note, adjusted_score));
         }
 
         Ok(notes)
@@ -1915,7 +2114,240 @@ impl Neo4jClient {
             self.graph.run(delete_q).await?;
         }
 
+        // Step 3: Decay knowledge scars (20x slower than synapse decay)
+        // Biomimicry: Elun Scar — scars heal very slowly, allowing the system to remember failures
+        let scar_decay_rate = decay_amount * 0.05; // 1/20th of synapse decay
+        if scar_decay_rate > 0.0 {
+            let scar_decay_q = query(
+                r#"
+                MATCH (n)
+                WHERE n.scar_intensity IS NOT NULL AND n.scar_intensity > 0
+                AND (n:Note OR n:Decision)
+                SET n.scar_intensity = CASE
+                    WHEN n.scar_intensity - $scar_decay < 0.001 THEN 0.0
+                    ELSE n.scar_intensity - $scar_decay
+                END
+                RETURN count(n) AS healed
+                "#,
+            )
+            .param("scar_decay", scar_decay_rate);
+            if let Ok(mut result) = self.graph.execute(scar_decay_q).await {
+                if let Ok(Some(row)) = result.next().await {
+                    let healed: i64 = row.get("healed").unwrap_or(0);
+                    if healed > 0 {
+                        tracing::debug!(
+                            "Decayed scars on {} nodes (rate: {:.4})",
+                            healed,
+                            scar_decay_rate
+                        );
+                    }
+                }
+            }
+        }
+
         Ok((decayed, pruned))
+    }
+
+    /// Apply scars to nodes traversed during a failed reasoning path.
+    ///
+    /// Biomimicry: Elun HypersphereIdentity.Scar — nodes that led to failure
+    /// receive a scar that penalizes their score in future searches.
+    /// Scar increment is +0.2 per failure, capped at 1.0.
+    ///
+    /// Works on both Note and Decision nodes.
+    pub async fn apply_scars(&self, node_ids: &[Uuid], increment: f64) -> Result<usize> {
+        if node_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let ids: Vec<String> = node_ids.iter().map(|id| id.to_string()).collect();
+
+        // Apply scars on Note nodes
+        let note_q = query(
+            r#"
+            UNWIND $ids AS nid
+            MATCH (n:Note {id: nid})
+            SET n.scar_intensity = CASE
+                WHEN coalesce(n.scar_intensity, 0.0) + $increment > 1.0 THEN 1.0
+                ELSE coalesce(n.scar_intensity, 0.0) + $increment
+            END
+            RETURN count(n) AS scarred
+            "#,
+        )
+        .param("ids", ids.clone())
+        .param("increment", increment);
+
+        let mut result = self.graph.execute(note_q).await?;
+        let note_scarred = if let Some(row) = result.next().await? {
+            row.get::<i64>("scarred").unwrap_or(0) as usize
+        } else {
+            0
+        };
+
+        // Apply scars on Decision nodes
+        let decision_q = query(
+            r#"
+            UNWIND $ids AS nid
+            MATCH (d:Decision {id: nid})
+            SET d.scar_intensity = CASE
+                WHEN coalesce(d.scar_intensity, 0.0) + $increment > 1.0 THEN 1.0
+                ELSE coalesce(d.scar_intensity, 0.0) + $increment
+            END
+            RETURN count(d) AS scarred
+            "#,
+        )
+        .param("ids", ids)
+        .param("increment", increment);
+
+        let mut result = self.graph.execute(decision_q).await?;
+        let decision_scarred = if let Some(row) = result.next().await? {
+            row.get::<i64>("scarred").unwrap_or(0) as usize
+        } else {
+            0
+        };
+
+        Ok(note_scarred + decision_scarred)
+    }
+
+    /// Heal (reset) scars on a specific node.
+    ///
+    /// Sets scar_intensity back to 0.0 for the given note or decision.
+    /// Used for manual scar removal via `admin(action: "heal_scars")`.
+    pub async fn heal_scars(&self, node_id: Uuid) -> Result<bool> {
+        let id_str = node_id.to_string();
+
+        // Try Note first
+        let note_q = query(
+            r#"
+            MATCH (n:Note {id: $id})
+            SET n.scar_intensity = 0.0
+            RETURN count(n) AS healed
+            "#,
+        )
+        .param("id", id_str.clone());
+
+        let mut result = self.graph.execute(note_q).await?;
+        let note_healed = if let Some(row) = result.next().await? {
+            row.get::<i64>("healed").unwrap_or(0) > 0
+        } else {
+            false
+        };
+
+        if note_healed {
+            return Ok(true);
+        }
+
+        // Try Decision
+        let decision_q = query(
+            r#"
+            MATCH (d:Decision {id: $id})
+            SET d.scar_intensity = 0.0
+            RETURN count(d) AS healed
+            "#,
+        )
+        .param("id", id_str);
+
+        let mut result = self.graph.execute(decision_q).await?;
+        let decision_healed = if let Some(row) = result.next().await? {
+            row.get::<i64>("healed").unwrap_or(0) > 0
+        } else {
+            false
+        };
+
+        Ok(decision_healed)
+    }
+
+    /// Consolidate memory: promote eligible notes and archive stale ephemeral ones.
+    /// Returns (promoted_count, archived_count).
+    pub async fn consolidate_memory(&self) -> Result<(usize, usize)> {
+        use crate::notes::lifecycle::NoteLifecycleManager;
+
+        let lifecycle = NoteLifecycleManager::new();
+        let now = chrono::Utc::now();
+
+        // 1. Fetch all non-consolidated, active notes
+        let q = query(
+            r#"
+            MATCH (n:Note)
+            WHERE n.status = 'active'
+              AND (n.memory_horizon IS NULL OR n.memory_horizon <> 'consolidated')
+            OPTIONAL MATCH (n)-[s:SYNAPSE]-()
+            RETURN n, count(s) AS activation_count
+            ORDER BY n.energy DESC
+            LIMIT 500
+            "#,
+        );
+
+        let mut result = self.graph.execute(q).await?;
+        let mut promoted = 0usize;
+        let mut archived = 0usize;
+
+        while let Some(row) = result.next().await? {
+            let node = row.get::<neo4rs::Node>("n")?;
+            let note = self.node_to_note(&node)?;
+            let activation_count = row.get::<i64>("activation_count").unwrap_or(0) as u64;
+
+            // Check archival for ephemeral
+            if lifecycle.should_archive_ephemeral(&note, now) {
+                let archive_q = query(
+                    r#"
+                    MATCH (n:Note {id: $id})
+                    SET n.status = 'archived',
+                        n.changes_json = $changes_json
+                    "#,
+                )
+                .param("id", note.id.to_string())
+                .param(
+                    "changes_json",
+                    serde_json::to_string(&{
+                        let mut changes = note.changes.clone();
+                        changes.push(NoteChange::with_details(
+                            crate::notes::ChangeType::StatusChanged,
+                            "consolidate_memory".to_string(),
+                            serde_json::json!({"reason": "ephemeral_expired", "idle_hours": 48}),
+                        ));
+                        changes
+                    })?,
+                );
+                self.graph.run(archive_q).await?;
+                archived += 1;
+                continue;
+            }
+
+            // Evaluate promotion
+            let promo = lifecycle.evaluate_promotion(&note, activation_count);
+            if let Some(new_horizon) = promo.new_horizon {
+                let promote_q = query(
+                    r#"
+                    MATCH (n:Note {id: $id})
+                    SET n.memory_horizon = $new_horizon,
+                        n.changes_json = $changes_json
+                    "#,
+                )
+                .param("id", note.id.to_string())
+                .param("new_horizon", new_horizon.to_string())
+                .param(
+                    "changes_json",
+                    serde_json::to_string(&{
+                        let mut changes = note.changes.clone();
+                        changes.push(NoteChange::with_details(
+                            crate::notes::ChangeType::Promoted,
+                            "consolidate_memory".to_string(),
+                            serde_json::json!({
+                                "from": promo.current_horizon.to_string(),
+                                "to": new_horizon.to_string(),
+                                "reason": promo.reason
+                            }),
+                        ));
+                        changes
+                    })?,
+                );
+                self.graph.run(promote_q).await?;
+                promoted += 1;
+            }
+        }
+
+        Ok((promoted, archived))
     }
 
     /// Initialize energy for notes that don't have it yet.
@@ -2077,6 +2509,12 @@ impl Neo4jClient {
             last_confirmed_by: node.get("last_confirmed_by").ok(),
             staleness_score: node.get("staleness_score").unwrap_or(0.0),
             energy: node.get("energy").unwrap_or(1.0),
+            scar_intensity: node.get("scar_intensity").unwrap_or(0.0),
+            memory_horizon: node
+                .get::<String>("memory_horizon")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(MemoryHorizon::Consolidated), // Existing notes default to consolidated
             last_activated: node
                 .get::<String>("last_activated")
                 .ok()

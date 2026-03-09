@@ -847,6 +847,8 @@ mod tests {
             changes: vec![],
             assertion_rule: None,
             last_assertion_result: None,
+            memory_horizon: crate::notes::MemoryHorizon::Operational,
+            scar_intensity: 0.0,
         }
     }
 

@@ -170,6 +170,90 @@ pub struct AgentContext {
     /// Contextual notes (guidelines, gotchas, patterns) for the task
     #[serde(default)]
     pub notes: Vec<ContextNote>,
+
+    /// Frustration signals — present when task frustration_score ≥ 0.3.
+    /// Biomimicry: Frustration-Catharsis feedback loop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frustration_signals: Option<FrustrationSignals>,
+}
+
+/// Frustration-Catharsis signals injected into context when a task is struggling.
+/// Biomimicry: maps to biological frustration → behavioral adaptation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FrustrationSignals {
+    /// Current frustration score (0.0 - 1.0)
+    pub score: f64,
+    /// Severity level based on score thresholds
+    pub level: FrustrationLevel,
+    /// Actionable recommendations for the agent
+    pub recommendations: Vec<String>,
+    /// Whether to widen knowledge searches (thermal noise injection)
+    pub widen_search: bool,
+    /// Suggested reasoning depth override (higher when frustrated)
+    pub suggested_reasoning_depth: Option<u8>,
+}
+
+/// Frustration severity levels
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum FrustrationLevel {
+    /// Score < 0.3 — no frustration signal
+    None,
+    /// 0.3 ≤ score < 0.6 — mild frustration, widen searches
+    Elevated,
+    /// 0.6 ≤ score < 0.9 — significant frustration, suggest alternatives
+    High,
+    /// Score ≥ 0.9 — catharsis threshold reached, escalate
+    Critical,
+}
+
+impl FrustrationSignals {
+    /// Build frustration signals from a score. Returns None if score < 0.3.
+    pub fn from_score(score: f64) -> Option<Self> {
+        if score < 0.3 {
+            return None;
+        }
+
+        let (level, recommendations, depth) = if score >= 0.9 {
+            (
+                FrustrationLevel::Critical,
+                vec![
+                    "⚠️ CATHARSIS THRESHOLD: This task has accumulated extreme frustration.".into(),
+                    "Consider: reasoning(depth: 8) for deep knowledge graph exploration.".into(),
+                    "Consider: cross-workspace search for solutions from other projects.".into(),
+                    "Consider: re-evaluating the task decomposition or acceptance criteria.".into(),
+                ],
+                Some(8u8),
+            )
+        } else if score >= 0.6 {
+            (
+                FrustrationLevel::High,
+                vec![
+                    "High frustration detected — previous approaches may be failing.".into(),
+                    "Widen search scope: use semantic search with broader queries.".into(),
+                    "Check related decisions for alternative approaches not yet tried.".into(),
+                ],
+                Some(6u8),
+            )
+        } else {
+            (
+                FrustrationLevel::Elevated,
+                vec![
+                    "Mild frustration detected — expanding knowledge search radius.".into(),
+                    "Additional context from related notes/decisions will be included.".into(),
+                ],
+                None,
+            )
+        };
+
+        Some(Self {
+            score,
+            level,
+            recommendations,
+            widen_search: true,
+            suggested_reasoning_depth: depth,
+        })
+    }
 }
 
 /// Context about a file to be modified
@@ -278,6 +362,7 @@ impl TaskNode {
             updated_at: Some(now),
             started_at: None,
             completed_at: None,
+            frustration_score: 0.0,
         }
     }
 
@@ -308,6 +393,7 @@ impl TaskNode {
             updated_at: Some(now),
             started_at: None,
             completed_at: None,
+            frustration_score: 0.0,
         }
     }
 
@@ -353,6 +439,7 @@ impl DecisionNode {
             status: DecisionStatus::Proposed,
             embedding: None,
             embedding_model: None,
+            scar_intensity: 0.0,
         }
     }
 }
@@ -738,6 +825,7 @@ mod tests {
             similar_code: vec![],
             related_decisions: vec![],
             notes: vec![],
+            frustration_signals: None,
         };
 
         let json = serde_json::to_string(&context).unwrap();

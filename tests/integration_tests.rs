@@ -380,6 +380,7 @@ async fn test_neo4j_stale_file_cleanup() {
         last_synced: None,
         analytics_computed_at: None,
         last_co_change_computed_at: None,
+        scaffolding_override: None,
     };
     state.neo4j.create_project(&project).await.unwrap();
 

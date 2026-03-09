@@ -324,6 +324,7 @@ impl PlanManager {
             status: DecisionStatus::Proposed,
             embedding: None,
             embedding_model: None,
+            scar_intensity: 0.0,
         };
 
         self.neo4j.create_decision(task_id, &decision).await?;
@@ -630,6 +631,7 @@ impl PlanManager {
                 status: DecisionStatus::Accepted,
                 embedding: None,
                 embedding_model: None,
+                scar_intensity: 0.0,
             })
             .collect();
 
@@ -661,6 +663,7 @@ impl PlanManager {
                 status: DecisionStatus::Accepted,
                 embedding: None,
                 embedding_model: None,
+                scar_intensity: 0.0,
             })
             .collect();
 

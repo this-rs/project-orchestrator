@@ -37,6 +37,7 @@ impl Neo4jClient {
             // Use get_decision_embedding() for explicit retrieval.
             embedding: None,
             embedding_model: node.get::<String>("embedding_model").ok(),
+            scar_intensity: node.get("scar_intensity").unwrap_or(0.0),
         })
     }
 
@@ -634,8 +635,8 @@ impl Neo4jClient {
         // Step 1: Get all decisions for this project
         let q = query(
             r#"
-            MATCH (p:Project {id: $pid})<-[:BELONGS_TO_PROJECT]-(plan:Plan)
-                  <-[:BELONGS_TO_PLAN]-(task:Task)-[:HAS_DECISION]->(d:Decision)
+            MATCH (p:Project {id: $pid})-[:HAS_PLAN]->(plan:Plan)
+                  -[:HAS_TASK]->(task:Task)-[:INFORMED_BY]->(d:Decision)
             RETURN d.id AS id, d.description AS description, d.rationale AS rationale,
                    d.alternatives AS alternatives, d.chosen_option AS chosen_option,
                    d.decided_by AS decided_by, d.decided_at AS decided_at,
@@ -675,6 +676,7 @@ impl Neo4jClient {
                 status,
                 embedding: None,
                 embedding_model: None,
+                scar_intensity: row.get("scar_intensity").unwrap_or(0.0),
             });
         }
 
