@@ -2041,14 +2041,17 @@ impl GraphStore for Neo4jClient {
         offset: usize,
         include_detached: bool,
     ) -> anyhow::Result<(Vec<ChatSessionNode>, usize)> {
-        self.list_chat_sessions(project_slug, workspace_slug, limit, offset, include_detached)
-            .await
+        self.list_chat_sessions(
+            project_slug,
+            workspace_slug,
+            limit,
+            offset,
+            include_detached,
+        )
+        .await
     }
 
-    async fn get_session_children(
-        &self,
-        parent_id: Uuid,
-    ) -> anyhow::Result<Vec<ChatSessionNode>> {
+    async fn get_session_children(&self, parent_id: Uuid) -> anyhow::Result<Vec<ChatSessionNode>> {
         self.get_session_children(parent_id).await
     }
 

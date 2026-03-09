@@ -102,10 +102,7 @@ impl Neo4jClient {
                         serde_json::to_string(&session.add_dirs.clone().unwrap_or_default())
                             .unwrap_or_else(|_| "[]".to_string()),
                     )
-                    .param(
-                        "spawned_by",
-                        session.spawned_by.clone().unwrap_or_default(),
-                    ),
+                    .param("spawned_by", session.spawned_by.clone().unwrap_or_default()),
             )
             .await?;
         Ok(())
@@ -392,10 +389,7 @@ impl Neo4jClient {
     }
 
     /// Get child sessions spawned by a parent session (identified by parent_id in spawned_by JSON).
-    pub async fn get_session_children(
-        &self,
-        parent_id: Uuid,
-    ) -> Result<Vec<ChatSessionNode>> {
+    pub async fn get_session_children(&self, parent_id: Uuid) -> Result<Vec<ChatSessionNode>> {
         let q = query(
             r#"
             MATCH (s:ChatSession)

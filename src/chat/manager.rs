@@ -4508,7 +4508,10 @@ impl ChatManager {
         }
 
         // Resolve conversation_id → session metadata from Neo4j
-        let (all_sessions, _) = self.graph.list_chat_sessions(None, None, 200, 0, true).await?;
+        let (all_sessions, _) = self
+            .graph
+            .list_chat_sessions(None, None, 200, 0, true)
+            .await?;
         let session_lookup: StdHashMap<String, &crate::neo4j::models::ChatSessionNode> =
             all_sessions
                 .iter()
@@ -6146,7 +6149,10 @@ mod tests {
         graph.create_chat_session(&s4).await.unwrap();
 
         // All sessions
-        let (all, total) = graph.list_chat_sessions(None, None, 50, 0, false).await.unwrap();
+        let (all, total) = graph
+            .list_chat_sessions(None, None, 50, 0, false)
+            .await
+            .unwrap();
         assert_eq!(total, 4);
         assert_eq!(all.len(), 4);
 

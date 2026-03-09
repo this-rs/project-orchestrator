@@ -237,7 +237,9 @@ pub async fn get_session(
         preview: node.preview,
         permission_mode: node.permission_mode,
         add_dirs: node.add_dirs,
-        spawned_by: node.spawned_by.and_then(|sb| serde_json::from_str(&sb).ok()),
+        spawned_by: node
+            .spawned_by
+            .and_then(|sb| serde_json::from_str(&sb).ok()),
     }))
 }
 

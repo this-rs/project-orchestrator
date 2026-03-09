@@ -805,12 +805,15 @@ impl PlanRunner {
             add_dirs: None,
             workspace_slug: None,
             user_claims: None,
-            spawned_by: Some(serde_json::json!({
-                "type": "runner",
-                "run_id": run_id.to_string(),
-                "plan_id": plan_id.to_string(),
-                "task_id": task_id.to_string(),
-            }).to_string()),
+            spawned_by: Some(
+                serde_json::json!({
+                    "type": "runner",
+                    "run_id": run_id.to_string(),
+                    "plan_id": plan_id.to_string(),
+                    "task_id": task_id.to_string(),
+                })
+                .to_string(),
+            ),
         };
 
         let session = self.chat_manager.create_session(&request).await?;

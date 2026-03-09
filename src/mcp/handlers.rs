@@ -3107,7 +3107,9 @@ impl ToolHandler {
 
             "get_session_children" => {
                 let id = extract_id(args, "session_id")?;
-                let result = http.get(&format!("/api/chat/sessions/{}/children", id)).await?;
+                let result = http
+                    .get(&format!("/api/chat/sessions/{}/children", id))
+                    .await?;
                 Ok(Some(result))
             }
 

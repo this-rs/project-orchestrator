@@ -6288,10 +6288,7 @@ impl GraphStore for MockGraphStore {
         Ok((page, total))
     }
 
-    async fn get_session_children(
-        &self,
-        parent_id: Uuid,
-    ) -> Result<Vec<ChatSessionNode>> {
+    async fn get_session_children(&self, parent_id: Uuid) -> Result<Vec<ChatSessionNode>> {
         let sessions = self.chat_sessions.read().await;
         let parent_str = parent_id.to_string();
         let mut children: Vec<_> = sessions
