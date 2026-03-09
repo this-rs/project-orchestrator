@@ -1282,6 +1282,11 @@ fn protected_routes() -> Router<OrchestratorState> {
         // CLI version management (check + install/upgrade)
         .route("/api/chat/cli/status", get(chat_handlers::get_cli_status))
         .route("/api/chat/cli/install", post(chat_handlers::install_cli))
+        // CLI auth status
+        .route(
+            "/api/chat/cli/auth-status",
+            get(chat_handlers::get_cli_auth_status),
+        )
 }
 
 // ============================================================================
