@@ -160,6 +160,110 @@ impl PlanRunner {
         }
     }
 
+    /// Recover interrupted runs from Neo4j at server boot.
+    ///
+    /// Scans for PlanRun nodes with status=running, restores global state,
+    /// re-computes waves, and resumes execution from the last incomplete task.
+    /// Already-completed tasks are skipped by `execute_plan`.
+    pub async fn recover_interrupted_runs(self: Arc<Self>, cwd: String) -> Result<usize> {
+        let active_runs = self.graph.list_active_plan_runs().await?;
+        if active_runs.is_empty() {
+            info!("No interrupted runs to recover");
+            return Ok(0);
+        }
+
+        info!(
+            "Found {} interrupted run(s) to recover",
+            active_runs.len()
+        );
+
+        let mut recovered = 0;
+        for saved_state in active_runs {
+            let run_id = saved_state.run_id;
+            let plan_id = saved_state.plan_id;
+            info!(
+                "Recovering run {} for plan {} (wave {}, {}/{} tasks done)",
+                run_id,
+                plan_id,
+                saved_state.current_wave,
+                saved_state.completed_tasks.len(),
+                saved_state.total_tasks
+            );
+
+            // Verify the plan still exists
+            let plan = self.graph.get_plan(plan_id).await?;
+            if plan.is_none() {
+                warn!(
+                    "Plan {} no longer exists, marking run {} as failed",
+                    plan_id, run_id
+                );
+                let mut failed_state = saved_state.clone();
+                failed_state.finalize(PlanRunStatus::Failed);
+                self.graph.update_plan_run(&failed_state).await?;
+                continue;
+            }
+
+            // Re-compute waves (task statuses may have changed)
+            let waves_result = match self.graph.compute_waves(plan_id).await {
+                Ok(w) => w,
+                Err(e) => {
+                    error!("Failed to compute waves for recovery: {}", e);
+                    continue;
+                }
+            };
+
+            if waves_result.waves.is_empty() {
+                info!("Plan {} has no remaining tasks, marking complete", plan_id);
+                let mut done_state = saved_state.clone();
+                done_state.finalize(PlanRunStatus::Completed);
+                self.graph.update_plan_run(&done_state).await?;
+                continue;
+            }
+
+            // Restore global state
+            {
+                let mut global = RUNNER_STATE.write().await;
+                *global = Some(saved_state.clone());
+            }
+            RUNNER_CANCEL.store(false, Ordering::SeqCst);
+
+            // Emit recovery event
+            self.emit_event(RunnerEvent::PlanStarted {
+                run_id,
+                plan_id,
+                plan_title: format!("[Recovery] run {}", run_id),
+                total_tasks: saved_state.total_tasks,
+                total_waves: waves_result.waves.len(),
+            });
+
+            // Spawn execution in background
+            let runner = self.clone();
+            let waves = waves_result.waves;
+            let cwd_clone = cwd.clone();
+            tokio::spawn(async move {
+                if let Err(e) = runner
+                    .execute_plan(run_id, plan_id, waves, cwd_clone, None)
+                    .await
+                {
+                    error!("Recovery execution failed for run {}: {}", run_id, e);
+                    runner.emit_event(RunnerEvent::RunnerError {
+                        run_id,
+                        message: format!("Recovery failed: {}", e),
+                    });
+                    let mut global = RUNNER_STATE.write().await;
+                    if let Some(ref mut s) = *global {
+                        s.finalize(PlanRunStatus::Failed);
+                        let _ = runner.graph.update_plan_run(s).await;
+                    }
+                }
+            });
+
+            recovered += 1;
+        }
+
+        Ok(recovered)
+    }
+
     /// Start executing a plan. Returns immediately with the run_id.
     ///
     /// The execution loop runs in a background tokio task.
@@ -858,6 +962,72 @@ impl PlanRunner {
         Ok(())
     }
 
+    /// Create a PR automatically via `gh pr create` after plan completion.
+    ///
+    /// Collects tasks and commits, generates a markdown body, and calls `gh`.
+    /// Returns the PR URL on success.
+    async fn create_auto_pr(&self, plan_id: Uuid) -> Result<String> {
+        // Get plan info
+        let plan = self.graph.get_plan(plan_id).await?
+            .ok_or_else(|| anyhow!("Plan {} not found for auto-PR", plan_id))?;
+
+        // Get tasks
+        let tasks = self.graph.get_plan_tasks(plan_id).await?;
+
+        // Get commits
+        let commits = self.graph.get_plan_commits(plan_id).await?;
+
+        // Build PR body
+        let mut body = format!("## {}\n\n", plan.title);
+        if !plan.description.is_empty() {
+            body.push_str(&format!("{}\n\n", plan.description));
+        }
+
+        body.push_str("### Tasks\n\n");
+        for task in &tasks {
+            use crate::neo4j::models::TaskStatus;
+            let emoji = match task.status {
+                TaskStatus::Completed => "✅",
+                TaskStatus::Failed => "❌",
+                TaskStatus::Blocked => "🚫",
+                _ => "⬜",
+            };
+            body.push_str(&format!(
+                "- {} {}\n",
+                emoji,
+                task.title.as_deref().unwrap_or("Untitled")
+            ));
+        }
+
+        if !commits.is_empty() {
+            body.push_str("\n### Commits\n\n");
+            for commit in &commits {
+                body.push_str(&format!(
+                    "- `{}` {}\n",
+                    &commit.hash[..7.min(commit.hash.len())],
+                    commit.message
+                ));
+            }
+        }
+
+        body.push_str("\n---\n🤖 Generated by PlanRunner\n");
+
+        let pr_title = format!("[PlanRunner] {}", plan.title);
+
+        let output = tokio::process::Command::new("gh")
+            .args(["pr", "create", "--title", &pr_title, "--body", &body])
+            .output()
+            .await
+            .map_err(|e| anyhow!("Failed to run gh: {}", e))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(anyhow!("gh pr create failed: {}", stderr));
+        }
+
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
     /// Finalize the run — update state, persist, emit event.
     async fn finalize_run(&self, run_id: Uuid, status: PlanRunStatus) -> Result<()> {
         let mut global = RUNNER_STATE.write().await;
@@ -880,6 +1050,23 @@ impl PlanRunner {
                         )
                     })
                     .unwrap_or((Uuid::nil(), 0.0, 0.0, 0, 0));
+
+                // Auto-PR: generate and create PR if auto_pr is enabled
+                let pr_url = if self.config.auto_pr {
+                    match self.create_auto_pr(plan_id).await {
+                        Ok(url) => {
+                            info!("Auto-PR created: {}", url);
+                            Some(url)
+                        }
+                        Err(e) => {
+                            warn!("Auto-PR failed (non-fatal): {}", e);
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+
                 self.emit_event(RunnerEvent::PlanCompleted {
                     run_id,
                     plan_id,
@@ -888,7 +1075,7 @@ impl PlanRunner {
                     total_duration_secs: total_duration,
                     tasks_completed: tc,
                     tasks_failed: tf,
-                    pr_url: None, // Auto-PR handled by T7
+                    pr_url,
                 });
                 info!("Plan run {} completed successfully", run_id);
             }

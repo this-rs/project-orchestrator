@@ -1137,6 +1137,35 @@ pub async fn start_server(mut config: Config) -> Result<()> {
     // Spawn the protocol scheduler (hourly evaluation of scheduled protocols)
     crate::protocol::hooks::spawn_protocol_scheduler(orchestrator.neo4j_arc());
 
+    // Recover interrupted plan runner runs from previous server instance
+    if let Some(ref cm) = chat_manager {
+        let graph = orchestrator.neo4j_arc();
+        let context_builder = orchestrator.context_builder().clone();
+        let runner_config = orchestrator.runner_config();
+        let (event_tx, _) = tokio::sync::broadcast::channel(256);
+        let runner = std::sync::Arc::new(
+            runner::PlanRunner::new(
+                cm.clone(),
+                graph,
+                context_builder,
+                runner_config,
+                event_tx,
+            )
+            .with_event_emitter(event_bus.clone() as std::sync::Arc<dyn events::EventEmitter>),
+        );
+        tokio::spawn(async move {
+            match runner.recover_interrupted_runs(".".to_string()).await {
+                Ok(0) => {} // no runs to recover, stay silent
+                Ok(count) => {
+                    tracing::info!("PlanRunner recovery: resumed {} interrupted run(s)", count);
+                }
+                Err(e) => {
+                    tracing::warn!("PlanRunner recovery failed (non-fatal): {}", e);
+                }
+            }
+        });
+    }
+
     // Create server state
     let server_state = Arc::new(ServerState {
         orchestrator,
