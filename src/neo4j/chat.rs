@@ -31,7 +31,8 @@ impl Neo4jClient {
                     conversation_id: $conversation_id,
                     preview: $preview,
                     permission_mode: $permission_mode,
-                    add_dirs: $add_dirs
+                    add_dirs: $add_dirs,
+                    spawned_by: $spawned_by
                 })
                 WITH s
                 OPTIONAL MATCH (p:Project {slug: $project_slug})
@@ -58,7 +59,8 @@ impl Neo4jClient {
                     conversation_id: $conversation_id,
                     preview: $preview,
                     permission_mode: $permission_mode,
-                    add_dirs: $add_dirs
+                    add_dirs: $add_dirs,
+                    spawned_by: $spawned_by
                 })
                 "#,
             )
@@ -99,7 +101,8 @@ impl Neo4jClient {
                         "add_dirs",
                         serde_json::to_string(&session.add_dirs.clone().unwrap_or_default())
                             .unwrap_or_else(|_| "[]".to_string()),
-                    ),
+                    )
+                    .param("spawned_by", session.spawned_by.clone().unwrap_or_default()),
             )
             .await?;
         Ok(())
@@ -118,71 +121,87 @@ impl Neo4jClient {
         }
     }
 
-    /// List chat sessions with optional project_slug filter
+    /// List chat sessions with optional project_slug filter.
+    /// When `include_detached` is false (default), sessions with a non-empty `spawned_by`
+    /// field are excluded (e.g. PlanRunner sub-sessions).
     pub async fn list_chat_sessions(
         &self,
         project_slug: Option<&str>,
         workspace_slug: Option<&str>,
         limit: usize,
         offset: usize,
+        include_detached: bool,
     ) -> Result<(Vec<ChatSessionNode>, usize)> {
+        // Filter clause to exclude detached (spawned) sessions unless explicitly requested
+        let detached_filter = if include_detached {
+            ""
+        } else {
+            " AND (s.spawned_by IS NULL OR s.spawned_by = '')"
+        };
+
         let (data_query, count_query) = if let Some(slug) = project_slug {
             (
-                query(
+                query(&format!(
                     r#"
-                    MATCH (s:ChatSession {project_slug: $slug})
+                    MATCH (s:ChatSession {{project_slug: $slug}})
+                    WHERE true{detached_filter}
                     RETURN s ORDER BY s.updated_at DESC
                     SKIP $offset LIMIT $limit
                     "#,
-                )
+                ))
                 .param("slug", slug.to_string())
                 .param("offset", offset as i64)
                 .param("limit", limit as i64),
-                query("MATCH (s:ChatSession {project_slug: $slug}) RETURN count(s) AS total")
+                query(&format!(
+                    "MATCH (s:ChatSession {{project_slug: $slug}}) WHERE true{detached_filter} RETURN count(s) AS total",
+                ))
                     .param("slug", slug.to_string()),
             )
         } else if let Some(ws) = workspace_slug {
             // Match sessions directly tagged with workspace_slug
             // OR sessions whose project_slug belongs to a project in this workspace
             (
-                query(
+                query(&format!(
                     r#"
-                    OPTIONAL MATCH (w:Workspace {slug: $ws})<-[:BELONGS_TO_WORKSPACE]-(proj:Project)
+                    OPTIONAL MATCH (w:Workspace {{slug: $ws}})<-[:BELONGS_TO_WORKSPACE]-(proj:Project)
                     WITH collect(proj.slug) AS ws_project_slugs
                     MATCH (s:ChatSession)
-                    WHERE s.workspace_slug = $ws
-                       OR (s.project_slug IS NOT NULL AND s.project_slug IN ws_project_slugs)
+                    WHERE (s.workspace_slug = $ws
+                       OR (s.project_slug IS NOT NULL AND s.project_slug IN ws_project_slugs)){detached_filter}
                     RETURN s ORDER BY s.updated_at DESC
                     SKIP $offset LIMIT $limit
                     "#,
-                )
+                ))
                 .param("ws", ws.to_string())
                 .param("offset", offset as i64)
                 .param("limit", limit as i64),
-                query(
+                query(&format!(
                     r#"
-                    OPTIONAL MATCH (w:Workspace {slug: $ws})<-[:BELONGS_TO_WORKSPACE]-(proj:Project)
+                    OPTIONAL MATCH (w:Workspace {{slug: $ws}})<-[:BELONGS_TO_WORKSPACE]-(proj:Project)
                     WITH collect(proj.slug) AS ws_project_slugs
                     MATCH (s:ChatSession)
-                    WHERE s.workspace_slug = $ws
-                       OR (s.project_slug IS NOT NULL AND s.project_slug IN ws_project_slugs)
+                    WHERE (s.workspace_slug = $ws
+                       OR (s.project_slug IS NOT NULL AND s.project_slug IN ws_project_slugs)){detached_filter}
                     RETURN count(s) AS total
                     "#,
-                )
+                ))
                 .param("ws", ws.to_string()),
             )
         } else {
             (
-                query(
+                query(&format!(
                     r#"
                     MATCH (s:ChatSession)
+                    WHERE true{detached_filter}
                     RETURN s ORDER BY s.updated_at DESC
                     SKIP $offset LIMIT $limit
                     "#,
-                )
+                ))
                 .param("offset", offset as i64)
                 .param("limit", limit as i64),
-                query("MATCH (s:ChatSession) RETURN count(s) AS total"),
+                query(&format!(
+                    "MATCH (s:ChatSession) WHERE true{detached_filter} RETURN count(s) AS total",
+                )),
             )
         };
 
@@ -369,6 +388,28 @@ impl Neo4jClient {
         }
     }
 
+    /// Get child sessions spawned by a parent session (identified by parent_id in spawned_by JSON).
+    pub async fn get_session_children(&self, parent_id: Uuid) -> Result<Vec<ChatSessionNode>> {
+        let q = query(
+            r#"
+            MATCH (s:ChatSession)
+            WHERE s.spawned_by IS NOT NULL
+              AND s.spawned_by <> ''
+              AND s.spawned_by CONTAINS $parent_id
+            RETURN s ORDER BY s.created_at ASC
+            "#,
+        )
+        .param("parent_id", parent_id.to_string());
+
+        let mut sessions = Vec::new();
+        let mut result = self.graph.execute(q).await?;
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("s")?;
+            sessions.push(Self::parse_chat_session_node(&node)?);
+        }
+        Ok(sessions)
+    }
+
     /// Parse a Neo4j Node into a ChatSessionNode
     fn parse_chat_session_node(node: &neo4rs::Node) -> Result<ChatSessionNode> {
         let cli_session_id: String = node.get("cli_session_id").unwrap_or_default();
@@ -379,6 +420,7 @@ impl Neo4jClient {
         let preview: String = node.get("preview").unwrap_or_default();
         let permission_mode: String = node.get("permission_mode").unwrap_or_default();
         let add_dirs_json: String = node.get("add_dirs").unwrap_or_default();
+        let spawned_by: String = node.get("spawned_by").unwrap_or_default();
 
         // Deserialize add_dirs from JSON string (backward compat: empty string → None)
         let add_dirs: Option<Vec<String>> = if add_dirs_json.is_empty() {
@@ -442,6 +484,11 @@ impl Neo4jClient {
                 Some(permission_mode)
             },
             add_dirs,
+            spawned_by: if spawned_by.is_empty() {
+                None
+            } else {
+                Some(spawned_by)
+            },
         })
     }
 

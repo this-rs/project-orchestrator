@@ -268,6 +268,7 @@ impl ToolHandler {
             // Chat
             ("chat", "list_sessions") => "list_chat_sessions",
             ("chat", "get_session") => "get_chat_session",
+            ("chat", "get_children") => "get_session_children",
             ("chat", "delete_session") => "delete_chat_session",
             ("chat", "send_message") => "chat_send_message",
             ("chat", "list_messages") => "list_chat_messages",
@@ -3089,6 +3090,11 @@ impl ToolHandler {
                 if let Some(v) = args.get("project_slug").and_then(|v| v.as_str()) {
                     query.push(("project_slug".to_string(), v.to_string()));
                 }
+                if let Some(v) = args.get("include_detached").and_then(|v| v.as_bool()) {
+                    if v {
+                        query.push(("include_detached".to_string(), "true".to_string()));
+                    }
+                }
                 if let Some(v) = args.get("limit").and_then(|v| v.as_u64()) {
                     query.push(("limit".to_string(), v.to_string()));
                 }
@@ -3096,6 +3102,14 @@ impl ToolHandler {
                     query.push(("offset".to_string(), v.to_string()));
                 }
                 let result = http.get_with_query("/api/chat/sessions", &query).await?;
+                Ok(Some(result))
+            }
+
+            "get_session_children" => {
+                let id = extract_id(args, "session_id")?;
+                let result = http
+                    .get(&format!("/api/chat/sessions/{}/children", id))
+                    .await?;
                 Ok(Some(result))
             }
 
@@ -8229,6 +8243,7 @@ mod tests {
         for (action, expected) in [
             ("list_sessions", "list_chat_sessions"),
             ("get_session", "get_chat_session"),
+            ("get_children", "get_session_children"),
             ("delete_session", "delete_chat_session"),
             ("send_message", "chat_send_message"),
             ("list_messages", "list_chat_messages"),

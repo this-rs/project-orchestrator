@@ -33,6 +33,11 @@ pub struct ChatRequest {
     /// Used to generate the MCP session token (PO_AUTH_TOKEN).
     #[serde(skip)]
     pub user_claims: Option<crate::auth::jwt::Claims>,
+    /// Origin of the session — set by PlanRunner or sub-agent spawner.
+    /// Serialized JSON string stored as-is in Neo4j.
+    /// Not deserialized from HTTP requests (internal use only).
+    #[serde(skip)]
+    pub spawned_by: Option<String>,
 }
 
 /// Events emitted by the chat system (sent via WebSocket / broadcast)
@@ -409,6 +414,9 @@ pub struct ChatSession {
     /// Additional directories exposed to Claude CLI (--add-dir)
     #[serde(default)]
     pub add_dirs: Option<Vec<String>>,
+    /// Origin of the session (runner, sub-conversation, or null for normal)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawned_by: Option<serde_json::Value>,
 }
 
 /// Response when creating a session
@@ -1142,6 +1150,7 @@ mod tests {
             preview: Some("Hello, can you help me?".into()),
             permission_mode: None,
             add_dirs: None,
+            spawned_by: None,
         };
 
         let json = serde_json::to_string(&session).unwrap();
@@ -1355,6 +1364,7 @@ mod tests {
             preview: None,
             permission_mode: None,
             add_dirs: Some(vec!["/dir/a".into(), "/dir/b".into()]),
+            spawned_by: None,
         };
 
         let json = serde_json::to_string(&session).unwrap();

@@ -1701,7 +1701,11 @@ pub trait GraphStore: Send + Sync {
         workspace_slug: Option<&str>,
         limit: usize,
         offset: usize,
+        include_detached: bool,
     ) -> Result<(Vec<ChatSessionNode>, usize)>;
+
+    /// Get child sessions spawned by a parent session
+    async fn get_session_children(&self, parent_id: Uuid) -> Result<Vec<ChatSessionNode>>;
 
     /// Update a chat session (partial update, None fields are skipped)
     #[allow(clippy::too_many_arguments)]

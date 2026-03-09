@@ -166,7 +166,7 @@ async fn load_last_session_context(
 ) -> Result<LastSessionContext> {
     // Get the most recent session for this project (limit=1, offset=0)
     let (sessions, _) = graph
-        .list_chat_sessions(Some(project_slug), None, 1, 0)
+        .list_chat_sessions(Some(project_slug), None, 1, 0, false)
         .await?;
 
     let Some(last_session) = sessions.into_iter().next() else {
