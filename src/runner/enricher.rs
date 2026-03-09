@@ -370,10 +370,11 @@ impl TaskEnricher {
 
         for decision in &decisions {
             // Check existing affects to avoid duplicates
-            let existing = match self.graph.list_decision_affects(decision.id).await {
-                Ok(a) => a,
-                Err(_) => vec![],
-            };
+            let existing: Vec<crate::neo4j::models::AffectsRelation> = self
+                .graph
+                .list_decision_affects(decision.id)
+                .await
+                .unwrap_or_default();
             let existing_ids: std::collections::HashSet<String> =
                 existing.iter().map(|a| a.entity_id.clone()).collect();
 
@@ -457,7 +458,7 @@ impl TaskEnricher {
                 let stderr = String::from_utf8_lossy(&o.stderr);
                 if stderr.contains("not a git repository")
                     || stderr.contains("dépôt git")
-                    || o.status.code().map_or(false, |c| c > 1)
+                    || o.status.code().is_some_and(|c| c > 1)
                 {
                     return Ok(vec![]);
                 }

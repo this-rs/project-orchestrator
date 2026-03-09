@@ -24,7 +24,7 @@ use tracing::info;
 ///   "branch_pattern": "main|release/.*"
 /// }
 /// ```
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct WebhookProvider;
 
 impl WebhookProvider {

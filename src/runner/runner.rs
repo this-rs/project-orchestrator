@@ -430,7 +430,7 @@ impl PlanRunner {
                 running: state.status == PlanRunStatus::Running,
                 run_id: Some(state.run_id),
                 plan_id: Some(state.plan_id),
-                status: Some(state.status.clone()),
+                status: Some(state.status),
                 current_wave: Some(state.current_wave),
                 current_task_id: state.current_task_id,
                 current_task_title: state.current_task_title.clone(),
@@ -1126,7 +1126,7 @@ impl PlanRunner {
     async fn finalize_run(&self, run_id: Uuid, status: PlanRunStatus) -> Result<()> {
         let mut global = RUNNER_STATE.write().await;
         if let Some(ref mut s) = *global {
-            s.finalize(status.clone());
+            s.finalize(status);
             self.graph.update_plan_run(s).await?;
         }
 

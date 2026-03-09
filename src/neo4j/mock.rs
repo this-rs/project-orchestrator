@@ -8805,7 +8805,7 @@ impl GraphStore for MockGraphStore {
         let triggers = self.triggers.read().await;
         Ok(triggers
             .values()
-            .filter(|t| trigger_type.map_or(true, |tt| t.trigger_type.to_string() == tt))
+            .filter(|t| trigger_type.is_none_or(|tt| t.trigger_type.to_string() == tt))
             .cloned()
             .collect())
     }

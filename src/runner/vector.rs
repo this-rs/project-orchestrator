@@ -204,7 +204,7 @@ impl VectorCollector {
                 budget_warnings: self.budget_warnings,
             },
             outcome: OutcomeDim {
-                status: state.status.clone(),
+                status: state.status,
                 failure_reasons: self.failure_reasons.clone(),
                 pr_url: self.pr_url.clone(),
             },
@@ -281,7 +281,7 @@ impl ExecutionVector {
                 budget_warnings: 0,
             },
             outcome: OutcomeDim {
-                status: state.status.clone(),
+                status: state.status,
                 failure_reasons: vec![],
                 pr_url: None,
             },

@@ -133,9 +133,7 @@ async fn handle_event(
             .and_then(|v| v.as_str())
             .unwrap_or("");
         let matches = config_event_type == event_type
-            || status_event_type
-                .as_deref()
-                .map_or(false, |s| s == config_event_type);
+            || (status_event_type.as_deref() == Some(config_event_type));
         if !matches {
             continue;
         }

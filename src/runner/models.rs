@@ -306,10 +306,11 @@ pub enum RunnerEvent {
 // ============================================================================
 
 /// How a plan run was triggered.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TriggerSource {
     /// Manually started via API or MCP
+    #[default]
     Manual,
     /// Started from a chat conversation (LLM called plan(run))
     Chat { session_id: Option<String> },
@@ -325,12 +326,6 @@ pub enum TriggerSource {
         trigger_id: Uuid,
         source_event: String,
     },
-}
-
-impl Default for TriggerSource {
-    fn default() -> Self {
-        Self::Manual
-    }
 }
 
 // ============================================================================

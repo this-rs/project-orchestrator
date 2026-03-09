@@ -113,7 +113,7 @@ fn is_sensitive_file(path: &str) -> bool {
     let filename = path.rsplit('/').next().unwrap_or(path);
 
     // Check exact filename matches
-    if SENSITIVE_PATTERNS.iter().any(|p| filename == *p) {
+    if SENSITIVE_PATTERNS.contains(&filename) {
         return true;
     }
 
@@ -290,7 +290,7 @@ impl TaskVerifier {
                 if stderr.contains("unknown revision")
                     || stderr.contains("not a git repository")
                     || stderr.contains("dépôt git") // French locale
-                    || o.status.code().map_or(false, |c| c > 1)
+                    || o.status.code().is_some_and(|c| c > 1)
                 // git exits >1 for usage errors
                 {
                     info!("No git context to diff against, skipping git sanity");

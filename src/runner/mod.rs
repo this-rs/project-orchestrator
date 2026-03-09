@@ -20,6 +20,7 @@ pub mod enricher;
 pub mod guard;
 pub mod models;
 pub mod providers;
+#[allow(clippy::module_inception)]
 pub mod runner;
 pub mod state;
 pub mod trigger;
