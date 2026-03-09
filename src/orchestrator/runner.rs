@@ -595,6 +595,13 @@ impl Orchestrator {
         self.state.neo4j.clone()
     }
 
+    /// Get the runner config.
+    ///
+    /// TODO: propagate RunnerConfig from YamlConfig to Config for YAML-based customization.
+    pub fn runner_config(&self) -> crate::runner::RunnerConfig {
+        crate::runner::RunnerConfig::default()
+    }
+
     /// Spawn analytics computation in background (non-blocking).
     ///
     /// Same as `analyze_project_safe` but runs in a `tokio::spawn` so the caller

@@ -369,16 +369,16 @@ fn project_tool() -> ToolDefinition {
 fn plan_tool() -> ToolDefinition {
     ToolDefinition {
         name: "plan".to_string(),
-        description: "Manage plans. Actions: list, create, get, update, update_status, delete, link_to_project, unlink_from_project, get_dependency_graph, get_critical_path, get_waves".to_string(),
+        description: "Manage plans. Actions: list, create, get, update, update_status, delete, link_to_project, unlink_from_project, get_dependency_graph, get_critical_path, get_waves, run, run_status, cancel_run, auto_pr".to_string(),
         input_schema: InputSchema {
             schema_type: "object".to_string(),
             properties: Some(json!({
                 "action": {
                     "type": "string",
-                    "enum": ["list", "create", "get", "update", "update_status", "delete", "link_to_project", "unlink_from_project", "get_dependency_graph", "get_critical_path", "get_waves"],
+                    "enum": ["list", "create", "get", "update", "update_status", "delete", "link_to_project", "unlink_from_project", "get_dependency_graph", "get_critical_path", "get_waves", "run", "run_status", "cancel_run", "auto_pr"],
                     "description": "Operation to perform"
                 },
-                "plan_id": {"type": "string", "description": "Plan UUID (get/update/update_status/delete/link_to_project/unlink_from_project/get_dependency_graph/get_critical_path/get_waves)"},
+                "plan_id": {"type": "string", "description": "Plan UUID (get/update/update_status/delete/link_to_project/unlink_from_project/get_dependency_graph/get_critical_path/get_waves/run/run_status/cancel_run)"},
                 "project_id": {"type": "string", "description": "Project UUID (create/link_to_project/unlink_from_project/list)"},
                 "title": {"type": "string", "description": "Plan title (create/update)"},
                 "description": {"type": "string", "description": "Plan description (create/update)"},
@@ -390,7 +390,9 @@ fn plan_tool() -> ToolDefinition {
                 "sort_by": {"type": "string", "description": "Sort field (list)"},
                 "sort_order": {"type": "string", "description": "asc or desc (list)"},
                 "priority_min": {"type": "integer", "description": "Min priority filter (list)"},
-                "priority_max": {"type": "integer", "description": "Max priority filter (list)"}
+                "priority_max": {"type": "integer", "description": "Max priority filter (list)"},
+                "cwd": {"type": "string", "description": "Working directory for the runner (run)"},
+                "project_slug": {"type": "string", "description": "Project slug for the runner (run)"}
             })),
             required: Some(vec!["action".to_string()]),
         },

@@ -291,6 +291,23 @@ fn protected_routes() -> Router<OrchestratorState> {
             get(handlers::get_plan_critical_path),
         )
         .route("/api/plans/{plan_id}/waves", get(handlers::get_plan_waves))
+        // Runner
+        .route(
+            "/api/plans/{plan_id}/run",
+            post(handlers::run_plan),
+        )
+        .route(
+            "/api/plans/{plan_id}/run/status",
+            get(handlers::get_run_status),
+        )
+        .route(
+            "/api/plans/{plan_id}/run/cancel",
+            post(handlers::cancel_run),
+        )
+        .route(
+            "/api/plans/{plan_id}/run/auto-pr",
+            post(handlers::create_auto_pr),
+        )
         // Constraints
         .route(
             "/api/plans/{plan_id}/constraints",
