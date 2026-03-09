@@ -4,7 +4,38 @@ use super::client::{pascal_to_snake_case, snake_to_pascal_case, Neo4jClient};
 use super::models::*;
 use anyhow::Result;
 use neo4rs::query;
+use regex::Regex;
+use std::sync::LazyLock;
 use uuid::Uuid;
+
+/// Regex for valid workspace slugs: lowercase alphanumeric + hyphens,
+/// must start and end with alphanumeric, min 2 chars.
+static SLUG_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[a-z0-9][a-z0-9-]*[a-z0-9]$").unwrap());
+
+/// Validate a workspace slug format.
+///
+/// Rules:
+/// - 2-64 characters
+/// - Only lowercase letters, digits, and hyphens
+/// - Must start and end with a letter or digit (no leading/trailing hyphens)
+pub fn validate_workspace_slug(slug: &str) -> Result<()> {
+    if slug.len() < 2 || slug.len() > 64 {
+        anyhow::bail!(
+            "Slug must be between 2 and 64 characters, got {}. \
+             Expected format: ^[a-z0-9][a-z0-9-]*[a-z0-9]$",
+            slug.len()
+        );
+    }
+    if !SLUG_RE.is_match(slug) {
+        anyhow::bail!(
+            "Invalid slug '{}'. Slugs must match ^[a-z0-9][a-z0-9-]*[a-z0-9]$ \
+             (lowercase alphanumeric + hyphens, no leading/trailing hyphens)",
+            slug
+        );
+    }
+    Ok(())
+}
 
 impl Neo4jClient {
     // ========================================================================
@@ -107,6 +138,30 @@ impl Neo4jClient {
         metadata: Option<serde_json::Value>,
         slug: Option<String>,
     ) -> Result<()> {
+        // Validate slug format and uniqueness if provided
+        if let Some(ref new_slug) = slug {
+            validate_workspace_slug(new_slug)?;
+
+            // Check uniqueness: no other workspace should have this slug
+            let uniqueness_q = query(
+                r#"
+                MATCH (w:Workspace {slug: $slug})
+                WHERE w.id <> $id
+                RETURN w LIMIT 1
+                "#,
+            )
+            .param("slug", new_slug.clone())
+            .param("id", id.to_string());
+
+            let mut result = self.graph.execute(uniqueness_q).await?;
+            if result.next().await?.is_some() {
+                anyhow::bail!(
+                    "CONFLICT: Slug '{}' is already taken by another workspace",
+                    new_slug
+                );
+            }
+        }
+
         let mut set_clauses = vec!["w.updated_at = datetime($now)".to_string()];
 
         if name.is_some() {
