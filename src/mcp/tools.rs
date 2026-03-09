@@ -369,13 +369,13 @@ fn project_tool() -> ToolDefinition {
 fn plan_tool() -> ToolDefinition {
     ToolDefinition {
         name: "plan".to_string(),
-        description: "Manage plans. Actions: list, create, get, update, update_status, delete, link_to_project, unlink_from_project, get_dependency_graph, get_critical_path, get_waves, run, run_status, cancel_run, auto_pr, add_trigger, list_triggers, remove_trigger, enable_trigger, disable_trigger".to_string(),
+        description: "Manage plans. Actions: list, create, get, update, update_status, delete, link_to_project, unlink_from_project, get_dependency_graph, get_critical_path, get_waves, run, run_status, cancel_run, auto_pr, add_trigger, list_triggers, remove_trigger, enable_trigger, disable_trigger, list_runs, get_run, compare_runs, predict_run".to_string(),
         input_schema: InputSchema {
             schema_type: "object".to_string(),
             properties: Some(json!({
                 "action": {
                     "type": "string",
-                    "enum": ["list", "create", "get", "update", "update_status", "delete", "link_to_project", "unlink_from_project", "get_dependency_graph", "get_critical_path", "get_waves", "run", "run_status", "cancel_run", "auto_pr", "add_trigger", "list_triggers", "remove_trigger", "enable_trigger", "disable_trigger"],
+                    "enum": ["list", "create", "get", "update", "update_status", "delete", "link_to_project", "unlink_from_project", "get_dependency_graph", "get_critical_path", "get_waves", "run", "run_status", "cancel_run", "auto_pr", "add_trigger", "list_triggers", "remove_trigger", "enable_trigger", "disable_trigger", "list_runs", "get_run", "compare_runs", "predict_run"],
                     "description": "Operation to perform"
                 },
                 "plan_id": {"type": "string", "description": "Plan UUID (get/update/update_status/delete/link_to_project/unlink_from_project/get_dependency_graph/get_critical_path/get_waves/run/run_status/cancel_run)"},
@@ -396,7 +396,9 @@ fn plan_tool() -> ToolDefinition {
                 "trigger_id": {"type": "string", "description": "Trigger UUID (remove_trigger/enable_trigger/disable_trigger)"},
                 "trigger_type": {"type": "string", "description": "Trigger type (add_trigger): schedule, webhook, event, chat"},
                 "config": {"type": "object", "description": "Trigger config JSON (add_trigger): e.g. {\"cron\": \"0 2 * * *\"} for schedule"},
-                "cooldown_secs": {"type": "integer", "description": "Cooldown between firings in seconds (add_trigger, default 0)"}
+                "cooldown_secs": {"type": "integer", "description": "Cooldown between firings in seconds (add_trigger, default 0)"},
+                "run_id": {"type": "string", "description": "Run UUID (get_run)"},
+                "run_ids": {"type": "array", "items": {"type": "string"}, "description": "Run UUIDs to compare (compare_runs)"}
             })),
             required: Some(vec!["action".to_string()]),
         },

@@ -23,6 +23,7 @@ pub mod providers;
 pub mod runner;
 pub mod state;
 pub mod trigger;
+pub mod vector;
 pub mod verifier;
 
 // Re-export key types for convenience
@@ -37,3 +38,4 @@ pub use enricher::{EnrichResult, TaskEnricher};
 pub use verifier::{TaskVerifier, VerifyResult};
 pub use providers::TriggerProvider;
 pub use trigger::TriggerEngine;
+pub use vector::{ExecutionVector, RunPrediction, ComparisonResult, compare_vectors, predict_run};

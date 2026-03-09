@@ -4170,6 +4170,117 @@ pub async fn receive_webhook(
 }
 
 // ============================================================================
+// Plan Runs — List, Get, Compare, Predict
+// ============================================================================
+
+/// GET /api/plans/:plan_id/runs — List historical plan runs.
+pub async fn list_plan_runs(
+    State(state): State<OrchestratorState>,
+    Path(plan_id): Path<Uuid>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let limit = params
+        .get("limit")
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(20);
+    let graph = state.orchestrator.neo4j_arc();
+    let runs = graph
+        .list_plan_runs(plan_id, limit)
+        .await
+        .map_err(AppError::Internal)?;
+    Ok(Json(serde_json::to_value(&runs).unwrap_or_default()))
+}
+
+/// GET /api/runs/:run_id — Get a specific plan run.
+pub async fn get_plan_run(
+    State(state): State<OrchestratorState>,
+    Path(run_id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let graph = state.orchestrator.neo4j_arc();
+    let run = graph
+        .get_plan_run(run_id)
+        .await
+        .map_err(AppError::Internal)?
+        .ok_or_else(|| AppError::NotFound(format!("Run {} not found", run_id)))?;
+    Ok(Json(serde_json::to_value(&run).unwrap_or_default()))
+}
+
+/// POST /api/plans/:plan_id/runs/compare — Compare multiple plan runs.
+///
+/// Body: { "run_ids": ["uuid1", "uuid2", ...] }
+/// Returns dimension-level comparison with trend analysis.
+pub async fn compare_plan_runs(
+    State(state): State<OrchestratorState>,
+    Path(plan_id): Path<Uuid>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let run_ids: Vec<Uuid> = body
+        .get("run_ids")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| AppError::BadRequest("run_ids array required".to_string()))?
+        .iter()
+        .filter_map(|v| v.as_str().and_then(|s| s.parse().ok()))
+        .collect();
+
+    if run_ids.len() < 2 {
+        return Err(AppError::BadRequest(
+            "At least 2 run_ids required for comparison".to_string(),
+        ));
+    }
+
+    let graph = state.orchestrator.neo4j_arc();
+
+    // Load all runs and build vectors
+    let mut vectors = Vec::new();
+    for run_id in &run_ids {
+        let run = graph
+            .get_plan_run(*run_id)
+            .await
+            .map_err(AppError::Internal)?
+            .ok_or_else(|| AppError::NotFound(format!("Run {} not found", run_id)))?;
+
+        // Verify the run belongs to this plan
+        if run.plan_id != plan_id {
+            return Err(AppError::BadRequest(format!(
+                "Run {} belongs to plan {}, not {}",
+                run_id, run.plan_id, plan_id
+            )));
+        }
+
+        vectors.push(crate::runner::vector::ExecutionVector::from_runner_state(&run));
+    }
+
+    let result = crate::runner::vector::compare_vectors(&vectors);
+    Ok(Json(serde_json::to_value(&result).unwrap_or_default()))
+}
+
+/// POST /api/plans/:plan_id/runs/predict — Predict next run based on history.
+///
+/// Uses exponential weighted average on historical runs.
+pub async fn predict_plan_run(
+    State(state): State<OrchestratorState>,
+    Path(plan_id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let graph = state.orchestrator.neo4j_arc();
+
+    // Load all runs for this plan (most recent last)
+    let runs = graph
+        .list_plan_runs(plan_id, 50)
+        .await
+        .map_err(AppError::Internal)?;
+
+    // list_plan_runs returns DESC order, reverse for chronological
+    let vectors: Vec<_> = runs
+        .iter()
+        .rev()
+        .map(crate::runner::vector::ExecutionVector::from_runner_state)
+        .collect();
+
+    let prediction = crate::runner::vector::predict_run(&vectors);
+    Ok(Json(serde_json::to_value(&prediction).unwrap_or_default()))
+}
+
+// ============================================================================
 // Roadmap
 // ============================================================================
 

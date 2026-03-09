@@ -123,6 +123,10 @@ impl ToolHandler {
             ("plan", "remove_trigger") => "remove_trigger",
             ("plan", "enable_trigger") => "enable_trigger",
             ("plan", "disable_trigger") => "disable_trigger",
+            ("plan", "list_runs") => "list_plan_runs",
+            ("plan", "get_run") => "get_plan_run",
+            ("plan", "compare_runs") => "compare_plan_runs",
+            ("plan", "predict_run") => "predict_plan_run",
 
             // Task
             ("task", "list") => "list_tasks",
@@ -865,6 +869,43 @@ impl ToolHandler {
                 let trigger_id = extract_id(args, "trigger_id")?;
                 let result = http
                     .post(&format!("/api/triggers/{}/disable", trigger_id), &json!({}))
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "list_plan_runs" => {
+                let plan_id = extract_id(args, "plan_id")?;
+                let result = http
+                    .get(&format!("/api/plans/{}/runs", plan_id))
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "get_plan_run" => {
+                let run_id = extract_id(args, "run_id")?;
+                let result = http.get(&format!("/api/runs/{}", run_id)).await?;
+                Ok(Some(result))
+            }
+
+            "compare_plan_runs" => {
+                let plan_id = extract_id(args, "plan_id")?;
+                let run_ids = args
+                    .get("run_ids")
+                    .cloned()
+                    .unwrap_or(json!([]));
+                let result = http
+                    .post(
+                        &format!("/api/plans/{}/runs/compare", plan_id),
+                        &json!({ "run_ids": run_ids }),
+                    )
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "predict_plan_run" => {
+                let plan_id = extract_id(args, "plan_id")?;
+                let result = http
+                    .post(&format!("/api/plans/{}/runs/predict", plan_id), &json!({}))
                     .await?;
                 Ok(Some(result))
             }
