@@ -598,6 +598,161 @@ fn extract_bash_file_context(tool_input: &serde_json::Value) -> Option<String> {
 }
 
 // ============================================================================
+// Redirect suggestion — MCP-first guidance
+// ============================================================================
+
+/// A suggestion to redirect from a raw tool (Grep/Bash) to an MCP code tool.
+#[derive(Debug, Clone)]
+pub struct RedirectSuggestion {
+    /// The MCP tool action to suggest (e.g., "code(action: \"find_references\")")
+    pub mcp_tool: String,
+    /// Parameters to pass
+    pub mcp_params: String,
+    /// Human-readable reason for the redirect
+    pub reason: String,
+}
+
+/// Enriched redirect suggestion with ContextCard intelligence.
+#[derive(Debug, Clone)]
+pub struct EnrichedRedirectSuggestion {
+    /// Base redirect suggestion
+    pub suggestion: RedirectSuggestion,
+    /// Additional warnings/context from the ContextCard
+    pub context_warnings: Vec<String>,
+}
+
+impl std::fmt::Display for EnrichedRedirectSuggestion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "## 🔄 MCP Redirect Suggestion\n**Instead of** this tool, use:\n`{}`\nwith params: `{}`\n**Why**: {}",
+            self.suggestion.mcp_tool, self.suggestion.mcp_params, self.suggestion.reason
+        )?;
+        for warning in &self.context_warnings {
+            write!(f, "\n{}", warning)?;
+        }
+        Ok(())
+    }
+}
+
+/// Check if a pattern looks like a code symbol (CamelCase, snake_case, or module::path).
+fn is_symbol_like(pattern: &str) -> bool {
+    if pattern.is_empty() || pattern.len() < 3 {
+        return false;
+    }
+    // Reject URLs, file paths, regex-heavy patterns, and natural language (has spaces)
+    if pattern.contains("://")
+        || pattern.starts_with('/')
+        || pattern.starts_with('.')
+        || pattern.contains('*')
+        || pattern.contains('[')
+        || pattern.contains('{')
+        || pattern.contains('|')
+        || pattern.contains(' ')
+    {
+        return false;
+    }
+    // CamelCase: starts with uppercase, has mixed case, no spaces
+    let has_camel = pattern.chars().next().map_or(false, |c| c.is_uppercase())
+        && pattern.chars().any(|c| c.is_lowercase());
+    // snake_case: contains underscore with alphanumeric only
+    let has_snake = pattern.contains('_') && pattern.chars().all(|c| c.is_alphanumeric() || c == '_');
+    // Rust path: contains ::
+    let has_path = pattern.contains("::");
+
+    has_camel || has_snake || has_path
+}
+
+/// Generate a redirect suggestion when a raw tool (Grep/Bash) is used for something
+/// that an MCP code tool can handle better.
+///
+/// Returns `None` if no redirect is applicable (e.g., the pattern is a URL or regex).
+pub fn generate_redirect_suggestion(
+    tool_name: &str,
+    tool_input: &serde_json::Value,
+) -> Option<RedirectSuggestion> {
+    let pattern = extract_pattern(tool_name, tool_input)?;
+
+    match tool_name {
+        "Grep" | "Bash" => {
+            if is_symbol_like(&pattern) {
+                Some(RedirectSuggestion {
+                    mcp_tool: "code(action: \"find_references\")".to_string(),
+                    mcp_params: format!("symbol: \"{}\"", pattern),
+                    reason: format!(
+                        "\"{}\" looks like a code symbol — find_references traverses the graph (imports, calls) and is more precise than text search",
+                        pattern
+                    ),
+                })
+            } else if !pattern.contains('/') && !pattern.contains('\\') && pattern.len() > 2 {
+                // Free-text content search → semantic search
+                Some(RedirectSuggestion {
+                    mcp_tool: "code(action: \"search_project\")".to_string(),
+                    mcp_params: format!("query: \"{}\"", pattern),
+                    reason: format!(
+                        "\"{}\" — semantic search ranks results by relevance across all project files",
+                        pattern
+                    ),
+                })
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Enrich a redirect suggestion with intelligence from a ContextCard.
+///
+/// Adds warnings about bridge files, high-risk zones, and co-changers.
+pub fn enrich_redirect_with_context_card(
+    suggestion: RedirectSuggestion,
+    card: &crate::graph::models::ContextCard,
+) -> EnrichedRedirectSuggestion {
+    let mut warnings = Vec::new();
+
+    // Bridge warning: file with high betweenness
+    if card.cc_betweenness > 0.5 {
+        warnings.push(format!(
+            "🌉 **Bridge file** (betweenness: {:.2}) — this file is a critical bottleneck between clusters. Use `code(action: \"analyze_impact\")` before modifying.",
+            card.cc_betweenness
+        ));
+    }
+
+    // High-risk warning based on centrality metrics
+    let risk_score = card.cc_pagerank * 0.4 + card.cc_betweenness * 0.3
+        + (card.cc_imports_in as f64 / (card.cc_imports_in as f64 + 1.0).max(1.0)) * 0.3;
+    if risk_score > 0.5 {
+        warnings.push(format!(
+            "⚠️ **High-risk file** (pagerank: {:.2}, betweenness: {:.2}, imports_in: {}) — changes here may cascade widely.",
+            card.cc_pagerank, card.cc_betweenness, card.cc_imports_in
+        ));
+    }
+
+    // Co-changers alert
+    if !card.cc_co_changers_top5.is_empty() {
+        let changers: Vec<&str> = card.cc_co_changers_top5.iter().take(3).map(|s| s.as_str()).collect();
+        warnings.push(format!(
+            "🔗 **Co-changers**: {} — these files often change together, check them too.",
+            changers.join(", ")
+        ));
+    }
+
+    // Community context
+    if !card.cc_community_label.is_empty() {
+        warnings.push(format!(
+            "🏛️ **Community**: \"{}\" (id: {})",
+            card.cc_community_label, card.cc_community_id
+        ));
+    }
+
+    EnrichedRedirectSuggestion {
+        suggestion,
+        context_warnings: warnings,
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -1345,5 +1500,129 @@ mod tests {
             extract_file_context("mcp__project-orchestrator__resource", &input),
             Some("/api/schema.json".to_string())
         );
+    }
+
+    // --- is_symbol_like ---
+
+    #[test]
+    fn test_is_symbol_like_camel_case() {
+        assert!(is_symbol_like("MyStruct"));
+        assert!(is_symbol_like("RunnerState"));
+        assert!(is_symbol_like("GraphStore"));
+    }
+
+    #[test]
+    fn test_is_symbol_like_snake_case() {
+        assert!(is_symbol_like("parse_uuid"));
+        assert!(is_symbol_like("get_context_card"));
+        assert!(is_symbol_like("extract_pattern"));
+    }
+
+    #[test]
+    fn test_is_symbol_like_rust_path() {
+        assert!(is_symbol_like("neo4j::client"));
+        assert!(is_symbol_like("crate::graph::models"));
+    }
+
+    #[test]
+    fn test_is_symbol_like_rejects_non_symbols() {
+        assert!(!is_symbol_like(""));
+        assert!(!is_symbol_like("ab")); // too short
+        assert!(!is_symbol_like("http://localhost"));
+        assert!(!is_symbol_like("/usr/bin/cargo"));
+        assert!(!is_symbol_like("*.rs"));
+        assert!(!is_symbol_like("[a-z]+"));
+        assert!(!is_symbol_like("foo|bar"));
+        assert!(!is_symbol_like("./relative"));
+    }
+
+    // --- generate_redirect_suggestion ---
+
+    #[test]
+    fn test_redirect_grep_symbol() {
+        let input = json!({"pattern": "RunnerState", "path": "src/"});
+        let suggestion = generate_redirect_suggestion("Grep", &input).unwrap();
+        assert!(suggestion.mcp_tool.contains("find_references"));
+        assert!(suggestion.mcp_params.contains("RunnerState"));
+    }
+
+    #[test]
+    fn test_redirect_grep_free_text() {
+        let input = json!({"pattern": "TODO fix later", "path": "src/"});
+        let suggestion = generate_redirect_suggestion("Grep", &input).unwrap();
+        assert!(suggestion.mcp_tool.contains("search_project"));
+    }
+
+    #[test]
+    fn test_redirect_grep_url_no_redirect() {
+        let input = json!({"pattern": "http://localhost:8080"});
+        let suggestion = generate_redirect_suggestion("Grep", &input);
+        assert!(suggestion.is_none());
+    }
+
+    #[test]
+    fn test_redirect_bash_rg_symbol() {
+        let input = json!({"command": "rg parse_uuid src/"});
+        let suggestion = generate_redirect_suggestion("Bash", &input).unwrap();
+        assert!(suggestion.mcp_tool.contains("find_references"));
+        assert!(suggestion.mcp_params.contains("parse_uuid"));
+    }
+
+    #[test]
+    fn test_redirect_read_no_redirect() {
+        let input = json!({"file_path": "/src/main.rs"});
+        let suggestion = generate_redirect_suggestion("Read", &input);
+        assert!(suggestion.is_none());
+    }
+
+    // --- enrich_redirect_with_context_card ---
+
+    #[test]
+    fn test_enrich_bridge_warning() {
+        let suggestion = RedirectSuggestion {
+            mcp_tool: "code(action: \"find_references\")".to_string(),
+            mcp_params: "symbol: \"MyStruct\"".to_string(),
+            reason: "test".to_string(),
+        };
+        let card = crate::graph::models::ContextCard {
+            cc_betweenness: 0.8,
+            cc_pagerank: 0.5,
+            ..Default::default()
+        };
+        let enriched = enrich_redirect_with_context_card(suggestion, &card);
+        assert!(enriched.context_warnings.iter().any(|w| w.contains("Bridge")));
+    }
+
+    #[test]
+    fn test_enrich_co_changers() {
+        let suggestion = RedirectSuggestion {
+            mcp_tool: "code(action: \"find_references\")".to_string(),
+            mcp_params: "symbol: \"X\"".to_string(),
+            reason: "test".to_string(),
+        };
+        let card = crate::graph::models::ContextCard {
+            cc_co_changers_top5: vec![
+                "enrichment.rs".to_string(),
+                "hook_handlers.rs".to_string(),
+            ],
+            ..Default::default()
+        };
+        let enriched = enrich_redirect_with_context_card(suggestion, &card);
+        assert!(enriched.context_warnings.iter().any(|w| w.contains("Co-changers")));
+        assert!(enriched.context_warnings.iter().any(|w| w.contains("enrichment.rs")));
+    }
+
+    #[test]
+    fn test_enrich_low_risk_no_warning() {
+        let suggestion = RedirectSuggestion {
+            mcp_tool: "test".to_string(),
+            mcp_params: "test".to_string(),
+            reason: "test".to_string(),
+        };
+        let card = crate::graph::models::ContextCard::default();
+        let enriched = enrich_redirect_with_context_card(suggestion, &card);
+        // Default card has 0 for all metrics → no risk or bridge warnings
+        assert!(enriched.context_warnings.iter().all(|w| !w.contains("Bridge")));
+        assert!(enriched.context_warnings.iter().all(|w| !w.contains("High-risk")));
     }
 }
