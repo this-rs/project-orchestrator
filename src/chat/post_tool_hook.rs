@@ -10,6 +10,8 @@
 //! **NEVER block tool execution.** Any error → passthrough (continue_: true).
 
 use crate::neo4j::traits::GraphStore;
+use crate::neurons::AutoReinforcementConfig;
+use crate::skills::activation::spawn_hook_reinforcement;
 use crate::skills::hook_extractor::{
     enrich_redirect_with_context_card, extract_file_context, generate_redirect_suggestion,
     EnrichedRedirectSuggestion,
@@ -109,11 +111,43 @@ impl PostToolUseRedirectHook {
         if alerts.is_empty() {
             None
         } else {
+            // Fire-and-forget: reinforce notes linked to this file (Hebbian feedback)
+            self.spawn_file_reinforcement(file_path);
+
             Some(format!(
                 "## 📝 Post-Edit Intelligence\n{}",
                 alerts.join("\n")
             ))
         }
+    }
+
+    /// Fire-and-forget Hebbian reinforcement for notes linked to a file.
+    /// Fetches note IDs then reinforces synapses between co-surfaced notes.
+    fn spawn_file_reinforcement(&self, file_path: &str) {
+        let graph = self.graph_store.clone();
+        let path = file_path.to_string();
+        tokio::spawn(async move {
+            match graph
+                .get_notes_for_entity(&crate::notes::EntityType::File, &path)
+                .await
+            {
+                Ok(notes) if notes.len() >= 2 => {
+                    let note_ids: Vec<uuid::Uuid> = notes.iter().map(|n| n.id).collect();
+                    let config = AutoReinforcementConfig::default();
+                    spawn_hook_reinforcement(graph, note_ids, config);
+                }
+                Ok(notes) if notes.len() == 1 => {
+                    // Single note: just boost energy, no synapse reinforcement needed
+                    let _ = graph
+                        .boost_energy(
+                            notes[0].id,
+                            AutoReinforcementConfig::default().hook_energy_boost,
+                        )
+                        .await;
+                }
+                _ => {} // No notes or error → skip silently
+            }
+        });
     }
 }
 
@@ -191,6 +225,11 @@ impl nexus_claude::HookCallback for PostToolUseRedirectHook {
                             "## ⚡ Post-Tool Redirect (result had {} lines)\n{}",
                             line_count, enriched
                         ));
+
+                        // Fire-and-forget: reinforce notes linked to the file being searched
+                        if let Some(ref fp) = file_path {
+                            self.spawn_file_reinforcement(fp);
+                        }
 
                         debug!(
                             tool = %post_tool.tool_name,

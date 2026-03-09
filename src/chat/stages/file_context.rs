@@ -15,6 +15,7 @@ use crate::chat::enrichment::{
 };
 use crate::graph::models::ContextCard;
 use crate::neo4j::traits::GraphStore;
+use crate::neurons::AutoReinforcementConfig;
 use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -143,6 +144,39 @@ impl FileContextStage {
         cache.retain(|_, (ts, _)| ts.elapsed().as_secs() < CACHE_TTL_SECS * 2);
         cache.insert(path, (Instant::now(), text));
     }
+
+    /// Fire-and-forget: boost energy for notes linked to a profiled file.
+    /// This closes the neural feedback loop — files that are profiled (surfaced
+    /// in context) see their notes gain energy, making them more likely to
+    /// survive synapse decay and emerge again in future sessions.
+    fn spawn_energy_boost(&self, file_path: &str) {
+        let graph = self.graph_store.clone();
+        let path = file_path.to_string();
+        let boost = AutoReinforcementConfig::default().hook_energy_boost;
+        tokio::spawn(async move {
+            match graph
+                .get_notes_for_entity(&crate::notes::EntityType::File, &path)
+                .await
+            {
+                Ok(notes) if !notes.is_empty() => {
+                    for note in &notes {
+                        let _ = graph.boost_energy(note.id, boost).await;
+                    }
+                    // If 2+ notes co-surfaced, reinforce their synapses
+                    if notes.len() >= 2 {
+                        let note_ids: Vec<uuid::Uuid> = notes.iter().map(|n| n.id).collect();
+                        let _ = graph.reinforce_synapses(&note_ids, 0.03).await;
+                    }
+                    debug!(
+                        path = %path,
+                        notes = notes.len(),
+                        "FileContextStage: energy boost for profiled file notes"
+                    );
+                }
+                _ => {} // No notes or error → skip silently
+            }
+        });
+    }
 }
 
 #[async_trait::async_trait]
@@ -187,6 +221,8 @@ impl EnrichmentStage for FileContextStage {
                     let formatted = Self::format_card(&card);
                     self.set_cache(path.clone(), formatted.clone());
                     profiles.push(formatted);
+                    // Neural feedback: boost energy for notes linked to this file
+                    self.spawn_energy_boost(path);
                 }
                 Ok(None) => {
                     debug!(path = %path, "No ContextCard found for file");
