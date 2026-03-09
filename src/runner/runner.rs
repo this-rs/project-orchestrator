@@ -16,10 +16,10 @@ use crate::runner::models::{
     ActiveAgent, ActiveAgentSnapshot, PlanRunStatus, RunnerConfig, RunnerEvent, TaskResult,
     TriggerSource,
 };
-use crate::runner::prompt::{build_runner_constraints, RunnerPromptContext};
 use crate::runner::persona::{
     activate_skills_for_task, complexity_directive, profile_task, record_skill_feedback,
 };
+use crate::runner::prompt::{build_runner_constraints, RunnerPromptContext};
 use crate::runner::state::RunnerState;
 use crate::runner::vector::VectorCollector;
 use crate::runner::verifier::{TaskVerifier, VerifyResult};
@@ -415,7 +415,10 @@ impl PlanRunner {
                                 .iter()
                                 .filter_map(|ae| {
                                     ae.vector_json.as_ref().and_then(|json| {
-                                        serde_json::from_str::<crate::runner::vector::AgentExecutionVector>(json).ok()
+                                        serde_json::from_str::<
+                                            crate::runner::vector::AgentExecutionVector,
+                                        >(json)
+                                        .ok()
                                     })
                                 })
                                 .collect();
@@ -425,7 +428,10 @@ impl PlanRunner {
                     }
                 }
 
-                Some(crate::runner::vector::predict_run_per_agent(&vectors, &agent_vectors))
+                Some(crate::runner::vector::predict_run_per_agent(
+                    &vectors,
+                    &agent_vectors,
+                ))
             }
             _ => None,
         };
@@ -601,7 +607,14 @@ impl PlanRunner {
 
             // Execute all tasks in this wave in parallel via JoinSet
             let wave_result = self
-                .execute_wave(run_id, plan_id, wave, &cwd, project_slug.as_deref(), project_id)
+                .execute_wave(
+                    run_id,
+                    plan_id,
+                    wave,
+                    &cwd,
+                    project_slug.as_deref(),
+                    project_id,
+                )
                 .await?;
 
             // If wave was aborted (budget/cancel), finalize accordingly
@@ -829,10 +842,7 @@ impl PlanRunner {
                 .map(|r| r.activated_skill_ids.clone())
                 .unwrap_or_default();
 
-            let task_agent_execution_id = task_result
-                .as_ref()
-                .ok()
-                .map(|r| r.agent_execution_id);
+            let task_agent_execution_id = task_result.as_ref().ok().map(|r| r.agent_execution_id);
 
             let task_persona = task_result
                 .as_ref()
@@ -883,7 +893,9 @@ impl PlanRunner {
                         let graph = self.graph.clone();
                         let persona = task_persona.clone();
                         tokio::spawn(async move {
-                            use crate::neo4j::agent_execution::{AgentExecutionNode, AgentExecutionStatus};
+                            use crate::neo4j::agent_execution::{
+                                AgentExecutionNode, AgentExecutionStatus,
+                            };
                             let ae = AgentExecutionNode {
                                 id: ae_id,
                                 run_id,
@@ -951,7 +963,9 @@ impl PlanRunner {
                         let graph = self.graph.clone();
                         let persona = task_persona.clone();
                         tokio::spawn(async move {
-                            use crate::neo4j::agent_execution::{AgentExecutionNode, AgentExecutionStatus};
+                            use crate::neo4j::agent_execution::{
+                                AgentExecutionNode, AgentExecutionStatus,
+                            };
                             let ae = AgentExecutionNode {
                                 id: ae_id,
                                 run_id,
@@ -1032,7 +1046,9 @@ impl PlanRunner {
                         let graph = self.graph.clone();
                         let persona = task_persona.clone();
                         tokio::spawn(async move {
-                            use crate::neo4j::agent_execution::{AgentExecutionNode, AgentExecutionStatus};
+                            use crate::neo4j::agent_execution::{
+                                AgentExecutionNode, AgentExecutionStatus,
+                            };
                             let ae = AgentExecutionNode {
                                 id: ae_id,
                                 run_id,
@@ -1184,30 +1200,32 @@ impl PlanRunner {
         let task_profile = task_node
             .as_ref()
             .map(|t| profile_task(t, steps.len()))
-            .unwrap_or_else(|| profile_task(
-                &crate::neo4j::models::TaskNode {
-                    id: task_id,
-                    title: Some(task_title.to_string()),
-                    description: String::new(),
-                    status: crate::neo4j::models::TaskStatus::InProgress,
-                    assigned_to: None,
-                    priority: None,
-                    tags: vec![],
-                    acceptance_criteria: vec![],
-                    affected_files: vec![],
-                    estimated_complexity: None,
-                    actual_complexity: None,
-                    created_at: chrono::Utc::now(),
-                    updated_at: None,
-                    started_at: None,
-                    completed_at: None,
-                    frustration_score: 0.0,
-                    execution_context: None,
-                    persona: None,
-                    prompt_cache: None,
-                },
-                0,
-            ));
+            .unwrap_or_else(|| {
+                profile_task(
+                    &crate::neo4j::models::TaskNode {
+                        id: task_id,
+                        title: Some(task_title.to_string()),
+                        description: String::new(),
+                        status: crate::neo4j::models::TaskStatus::InProgress,
+                        assigned_to: None,
+                        priority: None,
+                        tags: vec![],
+                        acceptance_criteria: vec![],
+                        affected_files: vec![],
+                        estimated_complexity: None,
+                        actual_complexity: None,
+                        created_at: chrono::Utc::now(),
+                        updated_at: None,
+                        started_at: None,
+                        completed_at: None,
+                        frustration_score: 0.0,
+                        execution_context: None,
+                        persona: None,
+                        prompt_cache: None,
+                    },
+                    0,
+                )
+            });
         info!(
             task_id = %task_id,
             complexity = %task_profile.complexity,
@@ -1228,20 +1246,21 @@ impl PlanRunner {
             None
         };
 
-        let skill_activation = if let (Some(pid), Some(ref tn)) =
-            (project_id_for_skills, &task_node)
-        {
-            activate_skills_for_task(self.graph.as_ref(), pid, tn).await
-        } else {
-            None
-        };
+        let skill_activation =
+            if let (Some(pid), Some(ref tn)) = (project_id_for_skills, &task_node) {
+                activate_skills_for_task(self.graph.as_ref(), pid, tn).await
+            } else {
+                None
+            };
 
         let activated_skill_ids = skill_activation
             .as_ref()
             .map(|sa| sa.activated_skill_ids.clone())
             .unwrap_or_default();
 
-        let skill_context = skill_activation.map(|sa| sa.context_text).filter(|s| !s.is_empty());
+        let skill_context = skill_activation
+            .map(|sa| sa.context_text)
+            .filter(|s| !s.is_empty());
 
         // Build the prompt — use prompt_cache if available (pre-enrichment), else build from scratch
         let cached_prompt = task_node.as_ref().and_then(|t| t.prompt_cache.clone());
@@ -1255,7 +1274,11 @@ impl PlanRunner {
         } else {
             let context = self.context_builder.build_context(task_id, plan_id).await?;
             let p = self.context_builder.generate_prompt(&context);
-            let af = context.target_files.iter().map(|f| f.path.clone()).collect();
+            let af = context
+                .target_files
+                .iter()
+                .map(|f| f.path.clone())
+                .collect();
             (p, af)
         };
 

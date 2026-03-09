@@ -414,10 +414,7 @@ fn protected_routes() -> Router<OrchestratorState> {
             post(handlers::delegate_task),
         )
         // Pre-enrichment pipeline
-        .route(
-            "/api/plans/{plan_id}/enrich",
-            post(handlers::enrich_plan),
-        )
+        .route("/api/plans/{plan_id}/enrich", post(handlers::enrich_plan))
         .route(
             "/api/plans/{plan_id}/tasks/{task_id}/enrich",
             post(handlers::enrich_task),

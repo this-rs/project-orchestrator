@@ -80,9 +80,7 @@ pub fn profile_task(task: &TaskNode, steps_count: usize) -> TaskProfile {
     }
 
     // Complex: multi-file with many steps or refactoring/architecture tags
-    let has_complex_tags = tags
-        .iter()
-        .any(|t| t == "refactor" || t == "architecture");
+    let has_complex_tags = tags.iter().any(|t| t == "refactor" || t == "architecture");
     let is_complex = files_count > 1 && (steps_count > 5 || has_complex_tags);
     if is_complex {
         return TaskProfile {
@@ -148,11 +146,7 @@ pub async fn activate_skills_for_task(
     task: &TaskNode,
 ) -> Option<SkillActivationResult> {
     // Build search query from task description + tags
-    let query = format!(
-        "{} {}",
-        &task.description,
-        task.tags.join(" ")
-    );
+    let query = format!("{} {}", &task.description, task.tags.join(" "));
 
     // Also build a file context from affected_files (first file if any)
     let file_context = task.affected_files.first().map(|f| f.as_str());
@@ -176,8 +170,7 @@ pub async fn activate_skills_for_task(
     let mut matches: Vec<(SkillNode, f64)> = Vec::new();
 
     for skill in matchable {
-        let confidence =
-            evaluate_skill_match(&skill, Some(&query), file_context);
+        let confidence = evaluate_skill_match(&skill, Some(&query), file_context);
         if confidence >= config.confidence_threshold {
             matches.push((skill, confidence));
         }
@@ -188,10 +181,7 @@ pub async fn activate_skills_for_task(
     }
 
     // Sort by confidence descending
-    matches.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    matches.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
     // Take top 3 skills max
     matches.truncate(3);
@@ -300,7 +290,10 @@ pub async fn record_skill_feedback(
                 }
             }
             Ok(None) => {
-                warn!("Skill {} not found for feedback (task={})", skill_id, task_id);
+                warn!(
+                    "Skill {} not found for feedback (task={})",
+                    skill_id, task_id
+                );
             }
             Err(e) => {
                 warn!(
@@ -359,10 +352,7 @@ mod tests {
 
     #[test]
     fn test_profile_complex_task_by_steps_and_files() {
-        let task = make_task(
-            vec!["backend"],
-            vec!["src/a.rs", "src/b.rs", "src/c.rs"],
-        );
+        let task = make_task(vec!["backend"], vec!["src/a.rs", "src/b.rs", "src/c.rs"]);
         let profile = profile_task(&task, 6);
 
         assert_eq!(profile.complexity, Complexity::Complex);

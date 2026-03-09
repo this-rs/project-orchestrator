@@ -151,14 +151,22 @@ impl RunnerState {
 
     /// Update the status of an active agent.
     pub fn update_agent_status(&mut self, task_id: &Uuid, status: TaskRunStatus) {
-        if let Some(agent) = self.active_agents.iter_mut().find(|a| &a.task_id == task_id) {
+        if let Some(agent) = self
+            .active_agents
+            .iter_mut()
+            .find(|a| &a.task_id == task_id)
+        {
             agent.status = status;
         }
     }
 
     /// Add cost to an active agent.
     pub fn add_agent_cost(&mut self, task_id: &Uuid, cost: f64) {
-        if let Some(agent) = self.active_agents.iter_mut().find(|a| &a.task_id == task_id) {
+        if let Some(agent) = self
+            .active_agents
+            .iter_mut()
+            .find(|a| &a.task_id == task_id)
+        {
             agent.cost_usd += cost;
         }
     }
@@ -320,10 +328,16 @@ mod tests {
         let task_id = Uuid::new_v4();
 
         state.add_agent(ActiveAgent::new(task_id, "Task".into()));
-        assert_eq!(state.get_agent(&task_id).unwrap().status, TaskRunStatus::Spawning);
+        assert_eq!(
+            state.get_agent(&task_id).unwrap().status,
+            TaskRunStatus::Spawning
+        );
 
         state.update_agent_status(&task_id, TaskRunStatus::Running);
-        assert_eq!(state.get_agent(&task_id).unwrap().status, TaskRunStatus::Running);
+        assert_eq!(
+            state.get_agent(&task_id).unwrap().status,
+            TaskRunStatus::Running
+        );
     }
 
     #[test]

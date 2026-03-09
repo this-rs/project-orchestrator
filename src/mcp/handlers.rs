@@ -3165,9 +3165,7 @@ impl ToolHandler {
 
             "get_session_tree" => {
                 let id = extract_id(args, "session_id")?;
-                let result = http
-                    .get(&format!("/api/chat/sessions/{}/tree", id))
-                    .await?;
+                let result = http.get(&format!("/api/chat/sessions/{}/tree", id)).await?;
                 Ok(Some(result))
             }
 

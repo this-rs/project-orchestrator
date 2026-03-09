@@ -1056,7 +1056,8 @@ impl GraphStore for Neo4jClient {
         persona: Option<&str>,
         prompt_cache: Option<&str>,
     ) -> anyhow::Result<()> {
-        self.update_task_enrichment(task_id, execution_context, persona, prompt_cache).await
+        self.update_task_enrichment(task_id, execution_context, persona, prompt_cache)
+            .await
     }
 
     async fn delete_task(&self, task_id: Uuid) -> anyhow::Result<()> {
@@ -2073,8 +2074,14 @@ impl GraphStore for Neo4jClient {
         run_id: Option<Uuid>,
         task_id: Option<Uuid>,
     ) -> anyhow::Result<()> {
-        self.create_spawned_by_relation(child_session_id, parent_session_id, spawn_type, run_id, task_id)
-            .await
+        self.create_spawned_by_relation(
+            child_session_id,
+            parent_session_id,
+            spawn_type,
+            run_id,
+            task_id,
+        )
+        .await
     }
 
     async fn get_session_tree(&self, session_id: &str) -> anyhow::Result<Vec<SessionTreeNode>> {

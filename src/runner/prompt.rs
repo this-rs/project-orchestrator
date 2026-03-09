@@ -305,9 +305,7 @@ pub fn build_runner_constraints(ctx: &RunnerPromptContext) -> String {
 
     // High frustration warning
     if ctx.frustration_level > 0.7 {
-        out.push_str(
-            "\n⚠️ Frustration élevée — utilise le deep reasoning avant d'agir.\n",
-        );
+        out.push_str("\n⚠️ Frustration élevée — utilise le deep reasoning avant d'agir.\n");
     }
 
     // Parallel agent awareness

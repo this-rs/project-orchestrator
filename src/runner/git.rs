@@ -310,10 +310,7 @@ impl WorktreeCollector {
             return Ok(resolution);
         }
 
-        info!(
-            "Found {} agent worktrees to resolve",
-            agent_worktrees.len()
-        );
+        info!("Found {} agent worktrees to resolve", agent_worktrees.len());
 
         // Stash uncommitted changes to avoid conflicts
         let was_stashed = stash_if_needed(cwd).await.unwrap_or(false);
@@ -323,10 +320,7 @@ impl WorktreeCollector {
             let branch_name = match &wt.branch {
                 Some(b) => b.clone(),
                 None => {
-                    debug!(
-                        "Skipping detached worktree at {}",
-                        wt.path.display()
-                    );
+                    debug!("Skipping detached worktree at {}", wt.path.display());
                     resolution.details.push(WorktreeResult {
                         worktree: wt.clone(),
                         merge: MergeResult::default(),
@@ -423,11 +417,7 @@ impl WorktreeCollector {
 
         let agent_worktrees: Vec<&WorktreeInfo> = worktrees
             .iter()
-            .filter(|wt| {
-                wt.path
-                    .to_string_lossy()
-                    .contains(".claude/worktrees/")
-            })
+            .filter(|wt| wt.path.to_string_lossy().contains(".claude/worktrees/"))
             .collect();
 
         if agent_worktrees.is_empty() {
@@ -670,10 +660,7 @@ detached
             .path
             .to_string_lossy()
             .contains(".claude/worktrees/agent-"));
-        assert_eq!(
-            worktrees[1].branch.as_deref(),
-            Some("agent-abc123-branch")
-        );
+        assert_eq!(worktrees[1].branch.as_deref(), Some("agent-abc123-branch"));
         assert_eq!(worktrees[1].head_sha, "bbb222");
         assert!(!worktrees[1].is_detached);
 

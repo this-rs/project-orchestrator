@@ -299,7 +299,12 @@ impl AgentVectorCollector {
     }
 
     /// Finalize this agent's metrics into an `AgentExecutionVector`.
-    pub fn finalize(&self, duration_secs: f64, cost_usd: f64, success: bool) -> AgentExecutionVector {
+    pub fn finalize(
+        &self,
+        duration_secs: f64,
+        cost_usd: f64,
+        success: bool,
+    ) -> AgentExecutionVector {
         AgentExecutionVector {
             task_id: self.task_id,
             duration_secs,
@@ -374,10 +379,7 @@ pub fn predict_run_per_agent(
                 .entry(av.task_id)
                 .or_default()
                 .push(av.duration_secs);
-            task_costs
-                .entry(av.task_id)
-                .or_default()
-                .push(av.cost_usd);
+            task_costs.entry(av.task_id).or_default().push(av.cost_usd);
         }
     }
 
@@ -390,7 +392,12 @@ pub fn predict_run_per_agent(
         let n = durations.len();
         let weights: Vec<f64> = (0..n).map(|i| decay.powi((n - 1 - i) as i32)).collect();
         let weight_sum: f64 = weights.iter().sum();
-        let est: f64 = durations.iter().zip(&weights).map(|(v, w)| v * w).sum::<f64>() / weight_sum;
+        let est: f64 = durations
+            .iter()
+            .zip(&weights)
+            .map(|(v, w)| v * w)
+            .sum::<f64>()
+            / weight_sum;
         total_est_duration += est;
     }
 

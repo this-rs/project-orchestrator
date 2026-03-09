@@ -440,7 +440,10 @@ impl Neo4jClient {
         .param("parent_id", parent_session_id.to_string())
         .param("spawn_type", spawn_type.to_string())
         .param("run_id", run_id.map(|u| u.to_string()).unwrap_or_default())
-        .param("task_id", task_id.map(|u| u.to_string()).unwrap_or_default());
+        .param(
+            "task_id",
+            task_id.map(|u| u.to_string()).unwrap_or_default(),
+        );
 
         self.graph.run(q).await?;
         Ok(())
@@ -470,10 +473,22 @@ impl Neo4jClient {
         let mut result = self.graph.execute(q).await?;
         while let Some(row) = result.next().await? {
             let session_id: String = row.get("session_id")?;
-            let parent_session_id: Option<String> = row.get("parent_session_id").ok().and_then(|s: String| if s.is_empty() { None } else { Some(s) });
-            let spawn_type: Option<String> = row.get("spawn_type").ok().and_then(|s: String| if s.is_empty() { None } else { Some(s) });
-            let run_id_str: Option<String> = row.get("run_id").ok().and_then(|s: String| if s.is_empty() { None } else { Some(s) });
-            let task_id_str: Option<String> = row.get("task_id").ok().and_then(|s: String| if s.is_empty() { None } else { Some(s) });
+            let parent_session_id: Option<String> = row
+                .get("parent_session_id")
+                .ok()
+                .and_then(|s: String| if s.is_empty() { None } else { Some(s) });
+            let spawn_type: Option<String> =
+                row.get("spawn_type")
+                    .ok()
+                    .and_then(|s: String| if s.is_empty() { None } else { Some(s) });
+            let run_id_str: Option<String> =
+                row.get("run_id")
+                    .ok()
+                    .and_then(|s: String| if s.is_empty() { None } else { Some(s) });
+            let task_id_str: Option<String> =
+                row.get("task_id")
+                    .ok()
+                    .and_then(|s: String| if s.is_empty() { None } else { Some(s) });
             let depth: i64 = row.get("depth").unwrap_or(0);
             let created_at_str: Option<String> = row.get("created_at").ok();
 
@@ -533,10 +548,19 @@ impl Neo4jClient {
         let mut result = self.graph.execute(q).await?;
         while let Some(row) = result.next().await? {
             let session_id: String = row.get("session_id")?;
-            let title: Option<String> = row.get("title").ok().and_then(|s: String| if s.is_empty() { None } else { Some(s) });
+            let title: Option<String> =
+                row.get("title")
+                    .ok()
+                    .and_then(|s: String| if s.is_empty() { None } else { Some(s) });
             let model: String = row.get("model").unwrap_or_default();
-            let spawn_type: Option<String> = row.get("spawn_type").ok().and_then(|s: String| if s.is_empty() { None } else { Some(s) });
-            let task_id_str: Option<String> = row.get("task_id").ok().and_then(|s: String| if s.is_empty() { None } else { Some(s) });
+            let spawn_type: Option<String> =
+                row.get("spawn_type")
+                    .ok()
+                    .and_then(|s: String| if s.is_empty() { None } else { Some(s) });
+            let task_id_str: Option<String> =
+                row.get("task_id")
+                    .ok()
+                    .and_then(|s: String| if s.is_empty() { None } else { Some(s) });
             let created_at_str: String = row.get("created_at").unwrap_or_default();
 
             sessions.push(SessionInfo {
@@ -545,7 +569,9 @@ impl Neo4jClient {
                 model,
                 spawn_type,
                 task_id: task_id_str.and_then(|s| s.parse().ok()),
-                created_at: created_at_str.parse().unwrap_or_else(|_| chrono::Utc::now()),
+                created_at: created_at_str
+                    .parse()
+                    .unwrap_or_else(|_| chrono::Utc::now()),
             });
         }
         Ok(sessions)

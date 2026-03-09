@@ -32,10 +32,16 @@ pub mod verifier;
 
 // Re-export key types for convenience
 pub use enricher::{EnrichResult, TaskEnricher};
+pub use git::{WorktreeCollector, WorktreeInfo, WorktreeResolution};
 pub use guard::{AgentGuard, ChatManagerHintSender, GuardConfig, GuardVerdict, HintSender};
 pub use models::{
     ActiveAgent, ActiveAgentSnapshot, PlanRunStatus, RunSnapshot, RunnerConfig, RunnerEvent,
-    TaskResult, TaskRunStatus, TaskStateMachine, Trigger, TriggerFiring, TriggerSource, TriggerType,
+    TaskResult, TaskRunStatus, TaskStateMachine, Trigger, TriggerFiring, TriggerSource,
+    TriggerType,
+};
+pub use persona::{
+    activate_skills_for_task, complexity_directive, profile_task, record_skill_feedback,
+    Complexity, SkillActivationResult, TaskProfile,
 };
 pub use prompt::{
     build_runner_constraints, PromptBuilder, PromptSection, RunnerPromptContext, StructuredPrompt,
@@ -47,10 +53,5 @@ pub use trigger::TriggerEngine;
 pub use vector::{
     compare_vectors, predict_run, predict_run_per_agent, AgentExecutionVector,
     AgentVectorCollector, ComparisonResult, ExecutionVector, RunPrediction,
-};
-pub use git::{WorktreeCollector, WorktreeInfo, WorktreeResolution};
-pub use persona::{
-    activate_skills_for_task, complexity_directive, profile_task, record_skill_feedback,
-    Complexity, SkillActivationResult, TaskProfile,
 };
 pub use verifier::{TaskVerifier, VerifyResult};

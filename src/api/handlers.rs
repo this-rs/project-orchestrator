@@ -919,9 +919,7 @@ async fn listen_delegation_result(
 
         match tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv()).await {
             Ok(Ok(crate::chat::types::ChatEvent::Result {
-                cost_usd,
-                is_error,
-                ..
+                cost_usd, is_error, ..
             })) => {
                 let duration_secs = start.elapsed().as_secs_f64();
                 let cost = cost_usd.unwrap_or(0.0);

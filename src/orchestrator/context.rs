@@ -346,10 +346,7 @@ impl ContextBuilder {
         let mut builder = PromptBuilder::new();
 
         // Task description
-        builder = builder.with_task(format!(
-            "{}\n",
-            context.task.description
-        ));
+        builder = builder.with_task(format!("{}\n", context.task.description));
 
         // Constraints
         if !context.constraints.is_empty() {
@@ -387,33 +384,68 @@ impl ContextBuilder {
         // Knowledge Notes
         if !context.notes.is_empty() {
             let mut s = String::new();
-            s.push_str("The following notes contain important context, guidelines, and gotchas:\n\n");
+            s.push_str(
+                "The following notes contain important context, guidelines, and gotchas:\n\n",
+            );
 
-            let critical: Vec<_> = context.notes.iter().filter(|n| n.importance == "critical").collect();
-            let high: Vec<_> = context.notes.iter().filter(|n| n.importance == "high").collect();
-            let other: Vec<_> = context.notes.iter().filter(|n| n.importance != "critical" && n.importance != "high").collect();
+            let critical: Vec<_> = context
+                .notes
+                .iter()
+                .filter(|n| n.importance == "critical")
+                .collect();
+            let high: Vec<_> = context
+                .notes
+                .iter()
+                .filter(|n| n.importance == "high")
+                .collect();
+            let other: Vec<_> = context
+                .notes
+                .iter()
+                .filter(|n| n.importance != "critical" && n.importance != "high")
+                .collect();
 
             if !critical.is_empty() {
                 s.push_str("### Critical\n");
                 for note in critical {
-                    let source = if note.propagated { format!(" (via {})", note.source_entity) } else { String::new() };
-                    s.push_str(&format!("- **[{}]{}** {}\n", note.note_type, source, note.content));
+                    let source = if note.propagated {
+                        format!(" (via {})", note.source_entity)
+                    } else {
+                        String::new()
+                    };
+                    s.push_str(&format!(
+                        "- **[{}]{}** {}\n",
+                        note.note_type, source, note.content
+                    ));
                 }
                 s.push('\n');
             }
             if !high.is_empty() {
                 s.push_str("### Important\n");
                 for note in high {
-                    let source = if note.propagated { format!(" (via {})", note.source_entity) } else { String::new() };
-                    s.push_str(&format!("- **[{}]{}** {}\n", note.note_type, source, note.content));
+                    let source = if note.propagated {
+                        format!(" (via {})", note.source_entity)
+                    } else {
+                        String::new()
+                    };
+                    s.push_str(&format!(
+                        "- **[{}]{}** {}\n",
+                        note.note_type, source, note.content
+                    ));
                 }
                 s.push('\n');
             }
             if !other.is_empty() {
                 s.push_str("### Other Notes\n");
                 for note in other {
-                    let source = if note.propagated { format!(" (via {})", note.source_entity) } else { String::new() };
-                    s.push_str(&format!("- [{}]{} {}\n", note.note_type, source, note.content));
+                    let source = if note.propagated {
+                        format!(" (via {})", note.source_entity)
+                    } else {
+                        String::new()
+                    };
+                    s.push_str(&format!(
+                        "- [{}]{} {}\n",
+                        note.note_type, source, note.content
+                    ));
                 }
                 s.push('\n');
             }
@@ -430,7 +462,10 @@ impl ContextBuilder {
                     s.push_str(&format!("- Symbols: {}\n", file.symbols.join(", ")));
                 }
                 if !file.dependent_files.is_empty() {
-                    s.push_str(&format!("- Impacted files: {}\n", file.dependent_files.join(", ")));
+                    s.push_str(&format!(
+                        "- Impacted files: {}\n",
+                        file.dependent_files.join(", ")
+                    ));
                 }
                 // File-specific notes
                 for note in &file.notes {
@@ -474,10 +509,7 @@ impl ContextBuilder {
                         }
                         // Only include gotchas, guidelines, and patterns
                         let note_type_str = note.note.note_type.to_string();
-                        if matches!(
-                            note_type_str.as_str(),
-                            "gotcha" | "guideline" | "pattern"
-                        ) {
+                        if matches!(note_type_str.as_str(), "gotcha" | "guideline" | "pattern") {
                             all_propagated.push((file_path.clone(), note));
                         }
                     }
@@ -505,7 +537,9 @@ impl ContextBuilder {
         all_propagated.truncate(5);
 
         let mut output = String::new();
-        output.push_str("Propagated knowledge from the Knowledge Fabric (gotchas/guidelines/patterns):\n\n");
+        output.push_str(
+            "Propagated knowledge from the Knowledge Fabric (gotchas/guidelines/patterns):\n\n",
+        );
         for (file_path, prop_note) in &all_propagated {
             output.push_str(&format!(
                 "- **[{}]** ({}, via `{}`, relevance {:.0}%) {}\n",
@@ -723,11 +757,7 @@ impl ContextBuilder {
     /// `persona` (TaskProfile JSON), and `prompt_cache` (rendered prompt) on the
     /// TaskNode in Neo4j so that `execute_task()` can skip the expensive
     /// `build_context()` + `generate_prompt()` calls at runtime.
-    pub async fn enrich_task(
-        &self,
-        task_id: Uuid,
-        plan_id: Uuid,
-    ) -> Result<EnrichmentResult> {
+    pub async fn enrich_task(&self, task_id: Uuid, plan_id: Uuid) -> Result<EnrichmentResult> {
         use crate::runner::persona::profile_task;
 
         // 1. Build full context (the expensive part we want to cache)
@@ -791,10 +821,7 @@ impl ContextBuilder {
     ///
     /// Iterates over every task in the plan, calls `enrich_task` for each,
     /// and returns a summary of results.
-    pub async fn enrich_plan(
-        &self,
-        plan_id: Uuid,
-    ) -> Result<PlanEnrichmentResult> {
+    pub async fn enrich_plan(&self, plan_id: Uuid) -> Result<PlanEnrichmentResult> {
         let tasks = self.neo4j.get_plan_tasks(plan_id).await?;
         if tasks.is_empty() {
             return Err(anyhow::anyhow!("Plan has no tasks or plan not found"));

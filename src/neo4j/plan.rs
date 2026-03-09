@@ -161,7 +161,10 @@ impl Neo4jClient {
                     s.parse().ok()
                 }
             }),
-            execution_context: node.get::<String>("execution_context").ok().filter(|s| !s.is_empty()),
+            execution_context: node
+                .get::<String>("execution_context")
+                .ok()
+                .filter(|s| !s.is_empty()),
             persona: node.get::<String>("persona").ok().filter(|s| !s.is_empty()),
         })
     }

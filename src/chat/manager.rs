@@ -1850,7 +1850,9 @@ impl ChatManager {
         // If this session was spawned by another, create the SPAWNED_BY relation in Neo4j
         if let Some(ref spawned_by_json) = request.spawned_by {
             if let Ok(spawned_by) = serde_json::from_str::<serde_json::Value>(spawned_by_json) {
-                if let Some(parent_id) = spawned_by.get("parent_session_id").and_then(|v| v.as_str()) {
+                if let Some(parent_id) =
+                    spawned_by.get("parent_session_id").and_then(|v| v.as_str())
+                {
                     let spawn_type = spawned_by
                         .get("type")
                         .and_then(|v| v.as_str())
