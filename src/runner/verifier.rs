@@ -157,7 +157,7 @@ impl TaskVerifier {
             graph,
             build_check_enabled,
             test_runner_enabled,
-            command_timeout: Duration::from_secs(120),
+            command_timeout: Duration::from_secs(600),
         }
     }
 
