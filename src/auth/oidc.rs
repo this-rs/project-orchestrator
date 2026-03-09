@@ -100,6 +100,9 @@ struct TokenResponse {
 
 /// Generic OIDC client for authorization code flow.
 pub struct OidcClient {
+    /// Stable identifier for the provider (e.g. "google", "cognito", "okta").
+    /// Used for provider-specific logic instead of fragile URL matching.
+    pub provider_key: String,
     pub provider_name: String,
     auth_endpoint: String,
     token_endpoint: String,
@@ -108,10 +111,46 @@ pub struct OidcClient {
     client_secret: String,
     redirect_uri: String,
     scopes: String,
+    /// Extra query parameters appended to the authorization URL.
+    /// Allows provider-specific params (e.g. `access_type=offline` for Google)
+    /// without hardcoding per provider_key.
+    extra_auth_params: Vec<(String, String)>,
     http_client: reqwest::Client,
 }
 
 impl OidcClient {
+    /// Derive `provider_key` from OidcConfig: use explicit key, or slugify provider_name.
+    fn derive_provider_key(config: &OidcConfig) -> String {
+        config
+            .provider_key
+            .clone()
+            .unwrap_or_else(|| slugify_provider(&config.provider_name))
+    }
+
+    /// Build the extra auth params: merge config's explicit map with Google defaults
+    /// when the provider_key is "google" and the config doesn't override them.
+    fn build_extra_auth_params(
+        provider_key: &str,
+        config_params: &std::collections::HashMap<String, String>,
+    ) -> Vec<(String, String)> {
+        let mut params: Vec<(String, String)> = config_params
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+
+        // Google-specific defaults — only applied if not overridden in config
+        if provider_key == "google" {
+            if !config_params.contains_key("access_type") {
+                params.push(("access_type".to_string(), "offline".to_string()));
+            }
+            if !config_params.contains_key("prompt") {
+                params.push(("prompt".to_string(), "consent".to_string()));
+            }
+        }
+
+        params
+    }
+
     /// Create from an explicit `OidcConfig`.
     ///
     /// Uses auth_endpoint/token_endpoint from config (must be present).
@@ -122,8 +161,12 @@ impl OidcClient {
         let token_endpoint = config.token_endpoint.clone().ok_or_else(|| {
             anyhow::anyhow!("OIDC token_endpoint is required when discovery_url is not set")
         })?;
+        let provider_key = Self::derive_provider_key(config);
+        let extra_auth_params =
+            Self::build_extra_auth_params(&provider_key, &config.extra_auth_params);
 
         Ok(Self {
+            provider_key,
             provider_name: config.provider_name.clone(),
             auth_endpoint,
             token_endpoint,
@@ -132,6 +175,7 @@ impl OidcClient {
             client_secret: config.client_secret.clone(),
             redirect_uri: config.redirect_uri.clone(),
             scopes: config.scopes.clone(),
+            extra_auth_params,
             http_client: reqwest::Client::new(),
         })
     }
@@ -337,18 +381,36 @@ impl OidcClient {
         }
 
         // Parse into tolerant RawOidcUserInfo first, then normalize.
-        // Log the raw body on parse failure to aid debugging provider differences.
+        // On parse failure, log safe metadata only (no PII in error messages).
+        let content_type = userinfo_response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("unknown")
+            .to_string();
+
         let body = userinfo_response
             .text()
             .await
             .context("Failed to read OIDC userinfo response body")?;
 
-        let raw: RawOidcUserInfo = serde_json::from_str(&body).with_context(|| {
-            format!(
-                "Failed to parse OIDC userinfo response (provider: {}). Raw body: {}",
-                self.provider_name, body
-            )
-        })?;
+        let raw: RawOidcUserInfo = match serde_json::from_str(&body) {
+            Ok(info) => info,
+            Err(e) => {
+                // Full body at DEBUG level only (never in prod logs)
+                tracing::debug!(
+                    provider = %self.provider_name,
+                    body_len = body.len(),
+                    content_type = %content_type,
+                    "OIDC userinfo raw body for debugging: {}",
+                    body
+                );
+                bail!(
+                    "Failed to parse OIDC userinfo response (provider: {}, body_len: {}, content_type: {}): {}",
+                    self.provider_name, body.len(), content_type, e
+                );
+            }
+        };
 
         raw.normalize()
     }
@@ -603,6 +665,66 @@ mod tests {
         assert!(url.contains("response_type=code"));
         assert!(url.contains("client_id=cognito-id"));
         assert!(url.contains("scope=openid"));
+    }
+
+    #[test]
+    fn test_oidc_userinfo_parse_error_no_pii_leak() {
+        // Simulate a body that contains PII but is not valid RawOidcUserInfo
+        // (e.g., missing required "sub" field)
+        let pii_body = r#"{
+            "email": "secret-user@company.com",
+            "name": "John Secret",
+            "picture": "https://example.com/secret-photo.jpg"
+        }"#;
+
+        let result: Result<RawOidcUserInfo, _> = serde_json::from_str(pii_body);
+        assert!(result.is_err(), "Should fail without 'sub' claim");
+
+        // Build the error message the same way exchange_code_with_redirect does
+        let err = result.unwrap_err();
+        let error_message = format!(
+            "Failed to parse OIDC userinfo response (provider: {}, body_len: {}, content_type: {}): {}",
+            "TestProvider", pii_body.len(), "application/json", err
+        );
+
+        // Verify no PII leaks in the error message
+        assert!(
+            !error_message.contains("secret-user@company.com"),
+            "Error message must not contain email PII"
+        );
+        assert!(
+            !error_message.contains("John Secret"),
+            "Error message must not contain name PII"
+        );
+        assert!(
+            !error_message.contains("secret-photo"),
+            "Error message must not contain picture URL PII"
+        );
+        // Verify safe metadata IS present
+        assert!(error_message.contains("TestProvider"));
+        assert!(error_message.contains("body_len:"));
+        assert!(error_message.contains("content_type:"));
+    }
+
+    #[test]
+    fn test_oidc_userinfo_parse_error_invalid_json_no_pii_leak() {
+        // Non-JSON body (e.g., HTML error page) — should not leak content either
+        let html_body = "<html><body>Error: user secret-user@evil.com not found</body></html>";
+
+        let result: Result<RawOidcUserInfo, _> = serde_json::from_str(html_body);
+        assert!(result.is_err());
+
+        let err = result.unwrap_err();
+        let error_message = format!(
+            "Failed to parse OIDC userinfo response (provider: {}, body_len: {}, content_type: {}): {}",
+            "TestProvider", html_body.len(), "text/html", err
+        );
+
+        // The serde error itself should not contain the full body
+        assert!(
+            !error_message.contains("secret-user@evil.com"),
+            "Error message must not contain email from HTML body"
+        );
     }
 
     #[test]

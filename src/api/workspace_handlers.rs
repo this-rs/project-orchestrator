@@ -7,10 +7,44 @@ use axum::{
     http::StatusCode,
     Json,
 };
+use once_cell::sync::Lazy;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::handlers::{AppError, OrchestratorState};
+
+// ============================================================================
+// Slug validation
+// ============================================================================
+
+/// Regex for valid workspace slugs: lowercase alphanumeric + hyphens,
+/// must start and end with alphanumeric, min 2 chars, max 64 chars.
+static SLUG_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"^[a-z0-9][a-z0-9-]*[a-z0-9]$").unwrap());
+
+/// Validate a workspace slug format.
+///
+/// Rules:
+/// - 2-64 characters
+/// - Only lowercase letters, digits, and hyphens
+/// - Must start and end with a letter or digit (no leading/trailing hyphens)
+pub fn validate_slug(slug: &str) -> Result<(), AppError> {
+    if slug.len() < 2 || slug.len() > 64 {
+        return Err(AppError::BadRequest(format!(
+            "Slug must be between 2 and 64 characters, got {}. \
+             Expected format: ^[a-z0-9][a-z0-9-]*[a-z0-9]$",
+            slug.len()
+        )));
+    }
+    if !SLUG_RE.is_match(slug) {
+        return Err(AppError::BadRequest(format!(
+            "Invalid slug '{}'. Slugs must match ^[a-z0-9][a-z0-9-]*[a-z0-9]$ \
+             (lowercase alphanumeric + hyphens, no leading/trailing hyphens)",
+            slug
+        )));
+    }
+    Ok(())
+}
 
 // ============================================================================
 // Request/Response types - Workspace
@@ -408,6 +442,26 @@ pub async fn update_workspace(
         .get_workspace_by_slug(&slug)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Workspace '{}' not found", slug)))?;
+
+    // Validate and check uniqueness if slug is being updated
+    if let Some(ref new_slug) = req.slug {
+        validate_slug(new_slug)?;
+
+        // Check uniqueness: another workspace must not already use this slug
+        if let Some(existing) = state
+            .orchestrator
+            .neo4j()
+            .get_workspace_by_slug(new_slug)
+            .await?
+        {
+            if existing.id != workspace.id {
+                return Err(AppError::Conflict(format!(
+                    "Slug '{}' is already taken by another workspace",
+                    new_slug
+                )));
+            }
+        }
+    }
 
     state
         .orchestrator
