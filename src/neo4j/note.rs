@@ -799,6 +799,7 @@ impl Neo4jClient {
     const DEFAULT_PROPAGATION_RELATIONS: &'static [&'static str] =
         &["CONTAINS", "IMPORTS", "CALLS"];
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn get_propagated_notes(
         &self,
         entity_type: &EntityType,

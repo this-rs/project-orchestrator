@@ -3609,7 +3609,7 @@ pub fn smart_percentiles(values: &[f64]) -> Vec<f64> {
 ///
 /// The scores vector is modified in-place and re-sorted descending.
 /// Generic over any item type T paired with a score.
-pub fn add_thermal_noise<T>(scores: &mut Vec<(T, f64)>, temperature: f64) {
+pub fn add_thermal_noise<T>(scores: &mut [(T, f64)], temperature: f64) {
     if temperature <= 0.0 || scores.len() < 2 {
         return;
     }

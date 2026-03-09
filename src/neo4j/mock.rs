@@ -2576,11 +2576,11 @@ impl GraphStore for MockGraphStore {
                         if t.status == crate::neo4j::models::TaskStatus::Completed {
                             completed_recent += 1;
                         }
-                        if t.status == crate::neo4j::models::TaskStatus::InProgress {
-                            if t.frustration_score > 0.0 {
-                                total_frustration += t.frustration_score;
-                                frustration_count += 1;
-                            }
+                        if t.status == crate::neo4j::models::TaskStatus::InProgress
+                            && t.frustration_score > 0.0
+                        {
+                            total_frustration += t.frustration_score;
+                            frustration_count += 1;
                         }
                     }
                 }

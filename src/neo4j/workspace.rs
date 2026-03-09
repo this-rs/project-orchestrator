@@ -1526,8 +1526,6 @@ impl Neo4jClient {
     ///
     /// Combined into `coupling_strength ∈ [0, 1]` via weighted average.
     pub async fn compute_coupling_matrix(&self, workspace_id: Uuid) -> Result<CouplingMatrix> {
-        use std::collections::HashSet;
-
         // Weights for each signal (sum = 1.0)
         const W_TWINS: f64 = 0.35;
         const W_SKILLS: f64 = 0.25;

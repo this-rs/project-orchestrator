@@ -863,6 +863,7 @@ impl NoteManager {
     ///
     /// `relation_types` controls which graph relations to traverse.
     /// `None` → default (CONTAINS|IMPORTS|CALLS).
+    #[allow(clippy::too_many_arguments)]
     pub async fn get_propagated_notes(
         &self,
         entity_type: &EntityType,

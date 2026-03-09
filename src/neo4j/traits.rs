@@ -1367,6 +1367,7 @@ pub trait GraphStore: Send + Sync {
     /// - `None` → default (CONTAINS|IMPORTS|CALLS) — backward compatible
     /// - `Some(&["CO_CHANGED", "IMPLEMENTS_TRAIT", ...])` → custom traversal
     /// Only whitelisted relation types are accepted (see `ALLOWED_PROPAGATION_RELATIONS`).
+    #[allow(clippy::too_many_arguments)]
     async fn get_propagated_notes(
         &self,
         entity_type: &EntityType,
