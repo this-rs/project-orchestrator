@@ -322,6 +322,8 @@ pub fn resolve_legacy_alias(name: &str) -> Option<(&'static str, &'static str)> 
         "reindex_decisions" => Some(("admin", "reindex_decisions")),
         "backfill_decision_embeddings" => Some(("admin", "backfill_decision_embeddings")),
         "detect_skills" => Some(("admin", "detect_skills")),
+        "detect_skill_fission" => Some(("admin", "detect_skill_fission")),
+        "detect_skill_fusion" => Some(("admin", "detect_skill_fusion")),
         "maintain_skills" => Some(("admin", "maintain_skills")),
         "heal_scars" => Some(("admin", "heal_scars")),
         "consolidate_memory" => Some(("admin", "consolidate_memory")),
@@ -919,13 +921,13 @@ fn analysis_profile_tool() -> ToolDefinition {
 fn admin_tool() -> ToolDefinition {
     ToolDefinition {
         name: "admin".to_string(),
-        description: "Admin operations. Actions: sync_directory, start_watch, stop_watch, watch_status, meilisearch_stats, delete_meilisearch_orphans, cleanup_cross_project_calls, cleanup_builtin_calls, migrate_calls_confidence, cleanup_sync_data, update_staleness_scores, update_energy_scores, search_neurons, reinforce_neurons, decay_synapses, backfill_synapses, reindex_decisions, backfill_decision_embeddings, backfill_touches, backfill_discussed, update_fabric_scores, bootstrap_knowledge_fabric, reinforce_isomorphic, detect_skills, heal_scars, consolidate_memory, install_hooks".to_string(),
+        description: "Admin operations. Actions: sync_directory, start_watch, stop_watch, watch_status, meilisearch_stats, delete_meilisearch_orphans, cleanup_cross_project_calls, cleanup_builtin_calls, migrate_calls_confidence, cleanup_sync_data, update_staleness_scores, update_energy_scores, search_neurons, reinforce_neurons, decay_synapses, backfill_synapses, reindex_decisions, backfill_decision_embeddings, backfill_touches, backfill_discussed, update_fabric_scores, bootstrap_knowledge_fabric, reinforce_isomorphic, detect_skills, detect_skill_fission, detect_skill_fusion, heal_scars, consolidate_memory, install_hooks".to_string(),
         input_schema: InputSchema {
             schema_type: "object".to_string(),
             properties: Some(json!({
                 "action": {
                     "type": "string",
-                    "enum": ["sync_directory", "start_watch", "stop_watch", "watch_status", "meilisearch_stats", "delete_meilisearch_orphans", "cleanup_cross_project_calls", "cleanup_builtin_calls", "migrate_calls_confidence", "cleanup_sync_data", "update_staleness_scores", "update_energy_scores", "search_neurons", "reinforce_neurons", "decay_synapses", "backfill_synapses", "reindex_decisions", "backfill_decision_embeddings", "backfill_touches", "backfill_discussed", "update_fabric_scores", "bootstrap_knowledge_fabric", "reinforce_isomorphic", "detect_skills", "maintain_skills", "auto_anchor_notes", "reconstruct_knowledge", "heal_scars", "consolidate_memory", "install_hooks"],
+                    "enum": ["sync_directory", "start_watch", "stop_watch", "watch_status", "meilisearch_stats", "delete_meilisearch_orphans", "cleanup_cross_project_calls", "cleanup_builtin_calls", "migrate_calls_confidence", "cleanup_sync_data", "update_staleness_scores", "update_energy_scores", "search_neurons", "reinforce_neurons", "decay_synapses", "backfill_synapses", "reindex_decisions", "backfill_decision_embeddings", "backfill_touches", "backfill_discussed", "update_fabric_scores", "bootstrap_knowledge_fabric", "reinforce_isomorphic", "detect_skills", "detect_skill_fission", "detect_skill_fusion", "maintain_skills", "auto_anchor_notes", "reconstruct_knowledge", "heal_scars", "consolidate_memory", "install_hooks"],
                     "description": "Operation to perform"
                 },
                 "path": {"type": "string", "description": "Directory path (sync_directory/start_watch)"},
@@ -952,13 +954,13 @@ fn admin_tool() -> ToolDefinition {
 fn skill_tool() -> ToolDefinition {
     ToolDefinition {
         name: "skill".to_string(),
-        description: "Manage neural skills (emergent knowledge clusters). Actions: list, create, get, update, delete, get_members, add_member, remove_member, activate, export, import, get_health".to_string(),
+        description: "Manage neural skills (emergent knowledge clusters). Actions: list, create, get, update, delete, get_members, add_member, remove_member, activate, export, import, get_health, split, merge".to_string(),
         input_schema: InputSchema {
             schema_type: "object".to_string(),
             properties: Some(json!({
                 "action": {
                     "type": "string",
-                    "enum": ["list", "create", "get", "update", "delete", "get_members", "add_member", "remove_member", "activate", "export", "import", "get_health"],
+                    "enum": ["list", "create", "get", "update", "delete", "get_members", "add_member", "remove_member", "activate", "export", "import", "get_health", "split", "merge"],
                     "description": "Operation to perform"
                 },
                 "skill_id": {"type": "string", "description": "Skill UUID (get/update/delete/get_members/add_member/remove_member/activate/export)"},

@@ -2689,6 +2689,80 @@ pub async fn detect_skills(
 }
 
 // ============================================================================
+// Skill Fission / Fusion Detection (read-only inspection)
+// ============================================================================
+
+/// POST /api/admin/detect-skill-fission
+///
+/// Detect skills that are candidates for splitting (fission).
+/// Read-only — does not modify the graph.
+pub async fn detect_skill_fission(
+    State(state): State<OrchestratorState>,
+    Json(body): Json<FabricProjectRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let project_id = body.project_id;
+
+    state
+        .orchestrator
+        .neo4j()
+        .get_project(project_id)
+        .await
+        .map_err(AppError::Internal)?
+        .ok_or_else(|| AppError::NotFound(format!("Project not found: {}", project_id)))?;
+
+    let start = std::time::Instant::now();
+    let candidates = crate::skills::evolution::detect_skill_fission(
+        state.orchestrator.neo4j(),
+        project_id,
+        0.5, // overlap threshold for sub-cluster matching
+    )
+    .await
+    .map_err(AppError::Internal)?;
+    let elapsed_ms = start.elapsed().as_millis() as u64;
+
+    Ok(Json(serde_json::json!({
+        "candidates": candidates,
+        "count": candidates.len(),
+        "elapsed_ms": elapsed_ms,
+    })))
+}
+
+/// POST /api/admin/detect-skill-fusion
+///
+/// Detect pairs of skills that are candidates for merging (fusion).
+/// Read-only — does not modify the graph.
+pub async fn detect_skill_fusion(
+    State(state): State<OrchestratorState>,
+    Json(body): Json<FabricProjectRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let project_id = body.project_id;
+
+    state
+        .orchestrator
+        .neo4j()
+        .get_project(project_id)
+        .await
+        .map_err(AppError::Internal)?
+        .ok_or_else(|| AppError::NotFound(format!("Project not found: {}", project_id)))?;
+
+    let start = std::time::Instant::now();
+    let candidates = crate::skills::evolution::detect_skill_fusion(
+        state.orchestrator.neo4j(),
+        project_id,
+        0.5, // overlap threshold for fusion detection
+    )
+    .await
+    .map_err(AppError::Internal)?;
+    let elapsed_ms = start.elapsed().as_millis() as u64;
+
+    Ok(Json(serde_json::json!({
+        "candidates": candidates,
+        "count": candidates.len(),
+        "elapsed_ms": elapsed_ms,
+    })))
+}
+
+// ============================================================================
 // Auto-anchor Notes
 // ============================================================================
 

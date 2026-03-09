@@ -674,6 +674,251 @@ pub async fn get_skill_health(
 }
 
 // ============================================================================
+// Skill Split & Merge (Biomimicry — Evolution Guards)
+// ============================================================================
+
+/// Request body for POST /api/skills/:id/split
+#[derive(Debug, Deserialize)]
+pub struct SplitSkillRequest {
+    /// Optional: specific sub-cluster note IDs for each new skill.
+    /// If omitted, re-runs detection to find sub-clusters automatically.
+    pub sub_clusters: Option<Vec<Vec<String>>>,
+}
+
+/// Request body for POST /api/skills/merge
+#[derive(Debug, Deserialize)]
+pub struct MergeSkillsRequest {
+    /// The skill IDs to merge together (minimum 2).
+    pub skill_ids: Vec<Uuid>,
+}
+
+/// POST /api/skills/:id/split
+///
+/// Split a skill into multiple sub-skills based on cluster detection
+/// or explicitly provided sub-cluster note IDs.
+/// Archives the original skill and creates N new skills.
+pub async fn split_skill(
+    State(state): State<OrchestratorState>,
+    Path(skill_id): Path<Uuid>,
+    Json(body): Json<SplitSkillRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    use crate::skills::evolution::{
+        execute_evolution, SkillEvolution, MIN_MEMBERS_FOR_SPLIT,
+    };
+
+    let graph = state.orchestrator.neo4j();
+
+    // Verify skill exists and is not archived
+    let skill = graph
+        .get_skill(skill_id)
+        .await
+        .map_err(AppError::Internal)?
+        .ok_or_else(|| AppError::NotFound(format!("Skill {} not found", skill_id)))?;
+
+    if skill.status == SkillStatus::Archived {
+        return Err(AppError::BadRequest("Cannot split an archived skill".into()));
+    }
+
+    // Get current members
+    let (member_notes, _) = graph
+        .get_skill_members(skill_id)
+        .await
+        .map_err(AppError::Internal)?;
+    let member_ids: Vec<String> = member_notes.iter().map(|n| n.id.to_string()).collect();
+
+    // Guardrail check
+    if member_ids.len() < MIN_MEMBERS_FOR_SPLIT {
+        return Err(AppError::BadRequest(format!(
+            "Skill has {} members, minimum {} required for split",
+            member_ids.len(),
+            MIN_MEMBERS_FOR_SPLIT
+        )));
+    }
+
+    // Build candidates from explicit sub-clusters or auto-detect
+    let candidates: Vec<crate::skills::detection::SkillCandidate> = if let Some(sub_clusters) = body.sub_clusters {
+        if sub_clusters.len() < 2 {
+            return Err(AppError::BadRequest("Need at least 2 sub-clusters for split".into()));
+        }
+        sub_clusters
+            .into_iter()
+            .enumerate()
+            .map(|(i, notes)| crate::skills::detection::SkillCandidate {
+                community_id: i as u32,
+                size: notes.len(),
+                cohesion: 0.5, // default for manual splits
+                member_note_ids: notes,
+                label: format!("{}-part{}", skill.name, i + 1),
+            })
+            .collect()
+    } else {
+        // Auto-detect sub-clusters via SYNAPSE graph
+        let config = crate::skills::detection::SkillDetectionConfig::default();
+        let edges = graph
+            .get_synapse_graph(skill.project_id, config.min_synapse_weight)
+            .await
+            .map_err(AppError::Internal)?;
+        let detection = crate::skills::detection::detect_skill_candidates(
+            &edges,
+            &skill.project_id.to_string(),
+            &config,
+        );
+        // Find candidates overlapping with this skill
+        let overlap_threshold = 0.3; // lower threshold for sub-cluster detection
+        let matching: Vec<_> = detection
+            .candidates
+            .into_iter()
+            .filter(|c| {
+                let jaccard = crate::skills::detection::jaccard_similarity(
+                    &c.member_note_ids,
+                    &member_ids,
+                );
+                jaccard >= overlap_threshold
+            })
+            .collect();
+
+        if matching.len() < 2 {
+            return Err(AppError::BadRequest(
+                "No sub-clusters detected for this skill. Provide explicit sub_clusters or wait for cluster divergence.".into()
+            ));
+        }
+        matching
+    };
+
+    // Build evolution action and execute
+    let evolution = vec![SkillEvolution::Split {
+        skill_id,
+        candidates: candidates.clone(),
+    }];
+
+    // Build notes_map for execution
+    let mut notes_map = std::collections::HashMap::new();
+    for note in &member_notes {
+        notes_map.insert(note.id.to_string(), note.clone());
+    }
+
+    let result = execute_evolution(graph, &evolution, &notes_map, skill.project_id)
+        .await
+        .map_err(AppError::Internal)?;
+
+    // Invalidate hook cache
+    skill_cache()
+        .invalidate_project(&skill.project_id)
+        .await;
+
+    let new_ids: Vec<Uuid> = result
+        .split
+        .iter()
+        .flat_map(|e| e.new_skill_ids.clone())
+        .collect();
+
+    Ok(Json(serde_json::json!({
+        "original_skill_id": skill_id,
+        "archived": true,
+        "new_skill_ids": new_ids,
+        "sub_cluster_count": candidates.len(),
+    })))
+}
+
+/// POST /api/skills/merge
+///
+/// Merge multiple skills into one. The skill with the highest energy
+/// survives; others are archived and their members transferred.
+pub async fn merge_skills(
+    State(state): State<OrchestratorState>,
+    Json(body): Json<MergeSkillsRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    use crate::skills::evolution::{
+        execute_evolution, SkillEvolution, MAX_MEMBERS_AFTER_MERGE,
+    };
+
+    if body.skill_ids.len() < 2 {
+        return Err(AppError::BadRequest("Need at least 2 skill IDs to merge".into()));
+    }
+
+    let graph = state.orchestrator.neo4j();
+
+    // Verify all skills exist and are not archived
+    let mut project_id: Option<Uuid> = None;
+    let mut total_members = 0usize;
+    let mut all_member_ids: Vec<String> = Vec::new();
+
+    for &sid in &body.skill_ids {
+        let skill = graph
+            .get_skill(sid)
+            .await
+            .map_err(AppError::Internal)?
+            .ok_or_else(|| AppError::NotFound(format!("Skill {} not found", sid)))?;
+
+        if skill.status == SkillStatus::Archived {
+            return Err(AppError::BadRequest(format!("Skill {} is archived", sid)));
+        }
+
+        // Ensure all skills belong to the same project
+        match project_id {
+            None => project_id = Some(skill.project_id),
+            Some(pid) if pid != skill.project_id => {
+                return Err(AppError::BadRequest(
+                    "Cannot merge skills from different projects".into(),
+                ));
+            }
+            _ => {}
+        }
+
+        let (notes, _) = graph
+            .get_skill_members(sid)
+            .await
+            .map_err(AppError::Internal)?;
+        total_members += notes.len();
+        all_member_ids.extend(notes.iter().map(|n| n.id.to_string()));
+    }
+
+    let project_id = project_id.unwrap();
+
+    // Guardrail check
+    if total_members > MAX_MEMBERS_AFTER_MERGE {
+        return Err(AppError::BadRequest(format!(
+            "Combined {} members exceeds maximum {} for merge",
+            total_members, MAX_MEMBERS_AFTER_MERGE
+        )));
+    }
+
+    // Build a synthetic candidate representing the merged skill
+    let candidate = crate::skills::detection::SkillCandidate {
+        community_id: 0,
+        size: all_member_ids.len(),
+        cohesion: 0.5,
+        member_note_ids: all_member_ids,
+        label: "merged".to_string(),
+    };
+
+    let evolution = vec![SkillEvolution::Merge {
+        skill_ids: body.skill_ids.clone(),
+        candidate,
+    }];
+
+    let notes_map = std::collections::HashMap::new();
+
+    let result = execute_evolution(graph, &evolution, &notes_map, project_id)
+        .await
+        .map_err(AppError::Internal)?;
+
+    // Invalidate hook cache
+    skill_cache()
+        .invalidate_project(&project_id)
+        .await;
+
+    let survivor_id = result.merged.first().map(|e| e.survivor_id);
+    let absorbed_ids: Vec<Uuid> = result.merged.iter().map(|e| e.absorbed_id).collect();
+
+    Ok(Json(serde_json::json!({
+        "survivor_id": survivor_id,
+        "absorbed_ids": absorbed_ids,
+        "total_merged": result.merged.len(),
+    })))
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 

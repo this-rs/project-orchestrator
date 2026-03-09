@@ -109,10 +109,28 @@ pub enum SkillEvolution {
     Orphan { skill_id: Uuid },
 }
 
+// ── Guardrails (Biomimicry — Skill Evolution Guards) ──
+/// Minimum members for a skill to be eligible for split.
+/// Below this threshold, the skill is too small to meaningfully subdivide.
+pub const MIN_MEMBERS_FOR_SPLIT: usize = 4;
+
+/// Maximum combined members after a merge.
+/// Above this threshold, the merged skill would be too large and lose cohesion.
+pub const MAX_MEMBERS_AFTER_MERGE: usize = 20;
+
+/// Minimum cohesion for a skill to remain active.
+/// Below this threshold, the skill is considered an orphan and auto-archived.
+pub const MIN_COHESION_THRESHOLD: f64 = 0.15;
+
 /// Analyze how skills should evolve given new cluster detection results.
 ///
 /// Compares existing skill membership with newly detected clusters using
 /// Jaccard similarity. Returns a list of evolution actions to take.
+///
+/// Guardrails:
+/// - Split is skipped for skills with fewer than [`MIN_MEMBERS_FOR_SPLIT`] members
+/// - Merge is skipped if the combined member count exceeds [`MAX_MEMBERS_AFTER_MERGE`]
+/// - Stable skills with cohesion below [`MIN_COHESION_THRESHOLD`] are demoted to Orphan
 ///
 /// # Arguments
 /// * `existing_skills` - Current skills with their member note IDs
@@ -204,6 +222,21 @@ pub fn analyze_evolution(
                 .map(|(sid, _)| *sid)
                 .collect();
             if skill_ids.len() >= 2 {
+                // Guardrail: skip merge if combined member count would exceed max
+                let total_members: usize = skill_ids
+                    .iter()
+                    .filter_map(|sid| existing_skills.iter().find(|(id, _)| id == sid))
+                    .map(|(_, members)| members.len())
+                    .sum();
+                if total_members > MAX_MEMBERS_AFTER_MERGE {
+                    debug!(
+                        total_members,
+                        max = MAX_MEMBERS_AFTER_MERGE,
+                        "Skipping merge: combined members would exceed max"
+                    );
+                    continue;
+                }
+
                 for sid in &skill_ids {
                     assigned_skills.insert(*sid);
                 }
@@ -217,8 +250,18 @@ pub fn analyze_evolution(
     }
 
     // Pass 3: Find splits (one skill matched by multiple candidates)
-    for (skill_id, _) in existing_skills {
+    for (skill_id, members) in existing_skills {
         if assigned_skills.contains(skill_id) {
+            continue;
+        }
+        // Guardrail: skip split if skill has too few members to meaningfully subdivide
+        if members.len() < MIN_MEMBERS_FOR_SPLIT {
+            debug!(
+                skill_id = %skill_id,
+                members = members.len(),
+                min = MIN_MEMBERS_FOR_SPLIT,
+                "Skipping split: skill has too few members"
+            );
             continue;
         }
         let matching_candidates: Vec<usize> = candidate_best_matches
@@ -246,6 +289,35 @@ pub fn analyze_evolution(
         }
     }
 
+    // Pass 3b: Demote low-cohesion stable skills to Orphan (auto-archive)
+    let mut demoted_skills: HashSet<Uuid> = HashSet::new();
+    evolutions.retain(|ev| {
+        if let SkillEvolution::Stable {
+            skill_id,
+            candidate,
+            ..
+        } = ev
+        {
+            if candidate.cohesion < MIN_COHESION_THRESHOLD {
+                debug!(
+                    skill_id = %skill_id,
+                    cohesion = candidate.cohesion,
+                    threshold = MIN_COHESION_THRESHOLD,
+                    "Demoting low-cohesion skill to Orphan"
+                );
+                demoted_skills.insert(*skill_id);
+                return false; // remove from evolutions, will be re-added as Orphan
+            }
+        }
+        true
+    });
+    for skill_id in &demoted_skills {
+        assigned_skills.remove(skill_id);
+        evolutions.push(SkillEvolution::Orphan {
+            skill_id: *skill_id,
+        });
+    }
+
     // Pass 4: Remaining unmatched candidates → New skills
     for (cand_idx, _) in new_candidates.iter().enumerate() {
         if !assigned_candidates.contains(&cand_idx) {
@@ -265,6 +337,204 @@ pub fn analyze_evolution(
     }
 
     evolutions
+}
+
+// ============================================================================
+// Standalone Detection — Fission & Fusion (read-only inspection)
+// ============================================================================
+
+/// A candidate for skill fission (split).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FissionCandidate {
+    /// The skill that could be split.
+    pub skill_id: Uuid,
+    /// The skill name.
+    pub skill_name: String,
+    /// Current member count.
+    pub member_count: usize,
+    /// Current cohesion score.
+    pub cohesion: f64,
+    /// Number of sub-clusters detected.
+    pub sub_cluster_count: usize,
+    /// Sub-cluster sizes.
+    pub sub_cluster_sizes: Vec<usize>,
+    /// Whether the guardrail would block this split.
+    pub blocked_by_guardrail: bool,
+    /// Reason for guardrail block, if any.
+    pub guardrail_reason: Option<String>,
+}
+
+/// A candidate for skill fusion (merge).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FusionCandidate {
+    /// The skills that could be merged.
+    pub skill_ids: Vec<Uuid>,
+    /// The skill names.
+    pub skill_names: Vec<String>,
+    /// Jaccard overlap between the skills.
+    pub overlap: f64,
+    /// Combined member count after merge.
+    pub combined_member_count: usize,
+    /// Whether the guardrail would block this merge.
+    pub blocked_by_guardrail: bool,
+    /// Reason for guardrail block, if any.
+    pub guardrail_reason: Option<String>,
+}
+
+/// Detect skills that are candidates for fission (splitting).
+///
+/// Re-runs Louvain cluster detection on the SYNAPSE graph (read-only),
+/// then checks if any existing skill maps to multiple new clusters.
+/// Returns candidates without modifying the graph.
+pub async fn detect_skill_fission(
+    graph_store: &dyn GraphStore,
+    project_id: Uuid,
+    overlap_threshold: f64,
+) -> anyhow::Result<Vec<FissionCandidate>> {
+    let config = crate::skills::detection::SkillDetectionConfig::default();
+
+    // Step 1: Get current SYNAPSE edges and run Louvain (read-only)
+    let edges = graph_store
+        .get_synapse_graph(project_id, config.min_synapse_weight)
+        .await?;
+    let detection = crate::skills::detection::detect_skill_candidates(
+        &edges,
+        &project_id.to_string(),
+        &config,
+    );
+
+    if detection.status == crate::skills::detection::ClusterDetectionStatus::InsufficientData {
+        return Ok(Vec::new());
+    }
+
+    // Step 2: Get existing skills with their members
+    let existing_skills = graph_store.get_skills_for_project(project_id).await?;
+    let mut candidates = Vec::new();
+
+    for skill in &existing_skills {
+        if skill.status == crate::skills::SkillStatus::Archived {
+            continue;
+        }
+
+        let (member_notes, _) = graph_store.get_skill_members(skill.id).await?;
+        let member_ids: Vec<String> = member_notes.iter().map(|n| n.id.to_string()).collect();
+
+        if member_ids.len() < 2 {
+            continue;
+        }
+
+        // Find new clusters that overlap with this skill
+        let matching: Vec<&SkillCandidate> = detection
+            .candidates
+            .iter()
+            .filter(|c| {
+                let jaccard = jaccard_similarity(&c.member_note_ids, &member_ids);
+                jaccard >= overlap_threshold
+            })
+            .collect();
+
+        if matching.len() >= 2 {
+            let sub_cluster_sizes: Vec<usize> = matching.iter().map(|c| c.size).collect();
+            let blocked = member_ids.len() < MIN_MEMBERS_FOR_SPLIT;
+            candidates.push(FissionCandidate {
+                skill_id: skill.id,
+                skill_name: skill.name.clone(),
+                member_count: member_ids.len(),
+                cohesion: skill.cohesion,
+                sub_cluster_count: matching.len(),
+                sub_cluster_sizes,
+                blocked_by_guardrail: blocked,
+                guardrail_reason: if blocked {
+                    Some(format!(
+                        "Skill has {} members, minimum {} required for split",
+                        member_ids.len(),
+                        MIN_MEMBERS_FOR_SPLIT
+                    ))
+                } else {
+                    None
+                },
+            });
+        }
+    }
+
+    Ok(candidates)
+}
+
+/// Detect pairs of skills that are candidates for fusion (merging).
+///
+/// Compares all active skills pairwise by Jaccard similarity of their members.
+/// Returns candidates without modifying the graph.
+pub async fn detect_skill_fusion(
+    graph_store: &dyn GraphStore,
+    project_id: Uuid,
+    overlap_threshold: f64,
+) -> anyhow::Result<Vec<FusionCandidate>> {
+    let existing_skills = graph_store.get_skills_for_project(project_id).await?;
+    let mut candidates = Vec::new();
+
+    // Collect active skills with their members
+    let mut active_skills: Vec<(Uuid, String, Vec<String>)> = Vec::new();
+    for skill in &existing_skills {
+        if skill.status == crate::skills::SkillStatus::Archived {
+            continue;
+        }
+        let (member_notes, _) = graph_store.get_skill_members(skill.id).await?;
+        let member_ids: Vec<String> = member_notes.iter().map(|n| n.id.to_string()).collect();
+        active_skills.push((skill.id, skill.name.clone(), member_ids));
+    }
+
+    // Pairwise comparison
+    let mut seen_pairs: HashSet<(Uuid, Uuid)> = HashSet::new();
+    for i in 0..active_skills.len() {
+        for j in (i + 1)..active_skills.len() {
+            let (id_a, name_a, members_a) = &active_skills[i];
+            let (id_b, name_b, members_b) = &active_skills[j];
+
+            let pair_key = if id_a < id_b {
+                (*id_a, *id_b)
+            } else {
+                (*id_b, *id_a)
+            };
+            if seen_pairs.contains(&pair_key) {
+                continue;
+            }
+            seen_pairs.insert(pair_key);
+
+            let overlap = jaccard_similarity(members_a, members_b);
+            if overlap >= overlap_threshold {
+                let combined = {
+                    let mut all: HashSet<&str> = members_a.iter().map(|s| s.as_str()).collect();
+                    all.extend(members_b.iter().map(|s| s.as_str()));
+                    all.len()
+                };
+                let blocked = combined > MAX_MEMBERS_AFTER_MERGE;
+                candidates.push(FusionCandidate {
+                    skill_ids: vec![*id_a, *id_b],
+                    skill_names: vec![name_a.clone(), name_b.clone()],
+                    overlap,
+                    combined_member_count: combined,
+                    blocked_by_guardrail: blocked,
+                    guardrail_reason: if blocked {
+                        Some(format!(
+                            "Combined {} members exceeds maximum {}",
+                            combined, MAX_MEMBERS_AFTER_MERGE
+                        ))
+                    } else {
+                        None
+                    },
+                });
+            }
+        }
+    }
+
+    // Sort by overlap descending
+    candidates.sort_by(|a, b| {
+        b.overlap
+            .partial_cmp(&a.overlap)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    Ok(candidates)
 }
 
 // ============================================================================
@@ -827,6 +1097,76 @@ mod tests {
             .filter(|e| matches!(e, SkillEvolution::Stable { .. }))
             .count();
         assert_eq!(stable_count, 2, "Expected 2 stable evolutions");
+    }
+
+    // ================================================================
+    // Guardrail tests (Biomimicry — Skill Evolution Guards)
+    // ================================================================
+
+    #[test]
+    fn test_guardrail_skip_split_too_few_members() {
+        let skill_id = Uuid::new_v4();
+        // Skill with only 3 members (< MIN_MEMBERS_FOR_SPLIT = 4)
+        let existing = vec![(skill_id, vec!["a".into(), "b".into(), "c".into()])];
+        // Two candidates that both overlap with the skill
+        let candidates = vec![
+            make_candidate(0, vec!["a", "b"]),
+            make_candidate(1, vec!["b", "c"]),
+        ];
+
+        let evolutions = analyze_evolution(&existing, &candidates, 0.5);
+        // Should NOT produce a Split — skill is too small
+        let split_count = evolutions
+            .iter()
+            .filter(|e| matches!(e, SkillEvolution::Split { .. }))
+            .count();
+        assert_eq!(split_count, 0, "Should not split skill with < 4 members");
+    }
+
+    #[test]
+    fn test_guardrail_skip_merge_too_many_members() {
+        // Create skills whose combined membership exceeds MAX_MEMBERS_AFTER_MERGE (20)
+        let skill_a = Uuid::new_v4();
+        let skill_b = Uuid::new_v4();
+        let members_a: Vec<String> = (0..12).map(|i| format!("a{}", i)).collect();
+        let members_b: Vec<String> = (0..12).map(|i| format!("b{}", i)).collect();
+        let existing = vec![
+            (skill_a, members_a.clone()),
+            (skill_b, members_b.clone()),
+        ];
+        // Single candidate overlapping heavily with both
+        let mut all_members: Vec<&str> = members_a.iter().map(|s| s.as_str()).collect();
+        all_members.extend(members_b.iter().map(|s| s.as_str()));
+        let candidates = vec![make_candidate(0, all_members)];
+
+        let evolutions = analyze_evolution(&existing, &candidates, 0.5);
+        // Should NOT produce a Merge — combined 24 > 20
+        let merge_count = evolutions
+            .iter()
+            .filter(|e| matches!(e, SkillEvolution::Merge { .. }))
+            .count();
+        assert_eq!(merge_count, 0, "Should not merge when combined members > 20");
+    }
+
+    #[test]
+    fn test_guardrail_low_cohesion_demoted_to_orphan() {
+        let skill_id = Uuid::new_v4();
+        let existing = vec![(skill_id, vec!["a".into(), "b".into(), "c".into()])];
+        // Candidate matches but has very low cohesion
+        let mut candidate = make_candidate(0, vec!["a", "b", "c"]);
+        candidate.cohesion = 0.1; // < MIN_COHESION_THRESHOLD (0.15)
+        let candidates = vec![candidate];
+
+        let evolutions = analyze_evolution(&existing, &candidates, 0.7);
+        // Should produce Orphan, NOT Stable
+        let has_orphan = evolutions
+            .iter()
+            .any(|e| matches!(e, SkillEvolution::Orphan { skill_id: sid } if *sid == skill_id));
+        assert!(has_orphan, "Low-cohesion skill should be demoted to Orphan");
+        let has_stable = evolutions
+            .iter()
+            .any(|e| matches!(e, SkillEvolution::Stable { .. }));
+        assert!(!has_stable, "Low-cohesion skill should NOT remain Stable");
     }
 
     #[test]

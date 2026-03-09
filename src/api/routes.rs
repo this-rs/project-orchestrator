@@ -849,6 +849,11 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/skills/{skill_id}/health",
             get(skill_handlers::get_skill_health),
         )
+        .route(
+            "/api/skills/{skill_id}/split",
+            post(skill_handlers::split_skill),
+        )
+        .route("/api/skills/merge", post(skill_handlers::merge_skills))
         // ================================================================
         // Skill Registry (Pattern Federation)
         // ================================================================
@@ -1040,6 +1045,8 @@ fn protected_routes() -> Router<OrchestratorState> {
             post(handlers::reinforce_isomorphic_synapses),
         )
         .route("/api/admin/detect-skills", post(handlers::detect_skills))
+        .route("/api/admin/detect-skill-fission", post(handlers::detect_skill_fission))
+        .route("/api/admin/detect-skill-fusion", post(handlers::detect_skill_fusion))
         .route(
             "/api/admin/auto-anchor-notes",
             post(handlers::auto_anchor_notes),

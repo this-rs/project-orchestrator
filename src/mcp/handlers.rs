@@ -334,6 +334,8 @@ impl ToolHandler {
             ("skill", "export") => "export_skill",
             ("skill", "import") => "import_skill",
             ("skill", "get_health") => "get_skill_health",
+            ("skill", "split") => "split_skill",
+            ("skill", "merge") => "merge_skills",
 
             // Protocol (Pattern Federation)
             ("protocol", "list") => "list_protocols",
@@ -395,6 +397,8 @@ impl ToolHandler {
             ("admin", "bootstrap_knowledge_fabric") => "bootstrap_knowledge_fabric",
             ("admin", "reinforce_isomorphic") => "reinforce_isomorphic",
             ("admin", "detect_skills") => "detect_skills",
+            ("admin", "detect_skill_fission") => "detect_skill_fission",
+            ("admin", "detect_skill_fusion") => "detect_skill_fusion",
             ("admin", "maintain_skills") => "maintain_skills",
             ("admin", "auto_anchor_notes") => "auto_anchor_notes",
             ("admin", "reconstruct_knowledge") => "reconstruct_knowledge",
@@ -2084,6 +2088,28 @@ impl ToolHandler {
                 Ok(Some(result))
             }
 
+            "detect_skill_fission" => {
+                let mut body = serde_json::Map::new();
+                if let Some(pid) = args.get("project_id").and_then(|v| v.as_str()) {
+                    body.insert("project_id".to_string(), Value::String(pid.to_string()));
+                }
+                let result = http
+                    .post("/api/admin/detect-skill-fission", &Value::Object(body))
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "detect_skill_fusion" => {
+                let mut body = serde_json::Map::new();
+                if let Some(pid) = args.get("project_id").and_then(|v| v.as_str()) {
+                    body.insert("project_id".to_string(), Value::String(pid.to_string()));
+                }
+                let result = http
+                    .post("/api/admin/detect-skill-fusion", &Value::Object(body))
+                    .await?;
+                Ok(Some(result))
+            }
+
             "maintain_skills" => {
                 let mut body = serde_json::Map::new();
                 body.insert(
@@ -3730,6 +3756,26 @@ impl ToolHandler {
                 let result = http
                     .get(&format!("/api/skills/{}/health", skill_id))
                     .await?;
+                Ok(Some(result))
+            }
+
+            "split_skill" => {
+                let skill_id = extract_id(args, "skill_id")?;
+                let mut body = serde_json::Map::new();
+                if let Some(sub) = args.get("sub_clusters") {
+                    body.insert("sub_clusters".to_string(), sub.clone());
+                }
+                let result = http
+                    .post(
+                        &format!("/api/skills/{}/split", skill_id),
+                        &Value::Object(body),
+                    )
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "merge_skills" => {
+                let result = http.post("/api/skills/merge", args).await?;
                 Ok(Some(result))
             }
 
