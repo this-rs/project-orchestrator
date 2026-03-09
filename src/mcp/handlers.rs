@@ -1116,6 +1116,9 @@ impl ToolHandler {
                 if let Some(pid) = args.get("project_id").and_then(|v| v.as_str()) {
                     query.push(("project_id".to_string(), pid.to_string()));
                 }
+                if let Some(t) = args.get("temperature").and_then(|v| v.as_f64()) {
+                    query.push(("temperature".to_string(), t.to_string()));
+                }
                 let result = http
                     .get_with_query("/api/decisions/search-semantic", &query)
                     .await?;
@@ -1708,6 +1711,9 @@ impl ToolHandler {
                 }
                 if let Some(v) = args.get("limit").and_then(|v| v.as_i64()) {
                     query.push(("limit".to_string(), v.to_string()));
+                }
+                if let Some(t) = args.get("temperature").and_then(|v| v.as_f64()) {
+                    query.push(("temperature".to_string(), t.to_string()));
                 }
                 let result = http
                     .get_with_query("/api/notes/search-semantic", &query)

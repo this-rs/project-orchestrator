@@ -476,7 +476,8 @@ fn decision_tool() -> ToolDefinition {
                 "impact_description": {"type": "string", "description": "Description of how the decision impacts the entity (add_affects)"},
                 "superseded_by_id": {"type": "string", "description": "Decision UUID being superseded (supersede)"},
                 "from": {"type": "string", "description": "Start date ISO filter (get_timeline)"},
-                "to": {"type": "string", "description": "End date ISO filter (get_timeline)"}
+                "to": {"type": "string", "description": "End date ISO filter (get_timeline)"},
+                "temperature": {"type": "number", "description": "Thermal noise 0.0-1.0 for stochastic exploration (search_semantic, default 0 = deterministic)"}
             })),
             required: Some(vec!["action".to_string()]),
         },
@@ -615,7 +616,8 @@ fn note_tool() -> ToolDefinition {
                 "slug": {"type": "string", "description": "Project slug (list_project/get_propagated)"},
                 "file_path": {"type": "string", "description": "File path (get_propagated)"},
                 "limit": {"type": "integer", "description": "Max items"},
-                "offset": {"type": "integer", "description": "Skip items"}
+                "offset": {"type": "integer", "description": "Skip items"},
+                "temperature": {"type": "number", "description": "Thermal noise 0.0-1.0 for stochastic exploration (search_semantic, default 0 = deterministic)"}
             })),
             required: Some(vec!["action".to_string()]),
         },

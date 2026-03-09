@@ -3,6 +3,7 @@
 use super::handlers::{AppError, OrchestratorState};
 use super::{PaginatedResponse, PaginationParams, SearchFilter};
 use crate::events::graph::GraphEvent;
+use crate::graph::algorithms::add_thermal_noise;
 use crate::notes::{
     BackfillProgress, CreateAnchorRequest, CreateNoteRequest, EntityType, LinkNoteRequest, Note,
     NoteContextResponse, NoteFilters, NoteImportance, NoteScope, NoteSearchHit, NoteStatus,
@@ -1009,6 +1010,10 @@ pub struct SemanticSearchQuery {
     /// Minimum cosine similarity threshold (0.0 - 1.0).
     /// Results below this score are filtered out. Default: none (return all top-K).
     pub min_similarity: Option<f64>,
+    /// Thermal noise temperature (0.0 - 1.0) for stochastic exploration.
+    /// Inspired by Langevin dynamics: adds T × N(0, σ) Gaussian noise to scores.
+    /// 0.0 = deterministic (default), 1.0 = maximum exploration.
+    pub temperature: Option<f64>,
 }
 
 /// GET /api/notes/search-semantic — Vector-based semantic search
@@ -1029,7 +1034,7 @@ pub async fn search_notes_semantic(
         None
     };
 
-    let hits = state
+    let mut hits = state
         .orchestrator
         .note_manager()
         .semantic_search_notes(
@@ -1041,6 +1046,16 @@ pub async fn search_notes_semantic(
         )
         .await
         .map_err(AppError::Internal)?;
+
+    // Apply Langevin thermal noise for stochastic exploration
+    if let Some(temperature) = query.temperature {
+        if temperature > 0.0 {
+            let mut scored: Vec<(NoteSearchHit, f64)> =
+                hits.into_iter().map(|h| { let s = h.score; (h, s) }).collect();
+            add_thermal_noise(&mut scored, temperature);
+            hits = scored.into_iter().map(|(mut h, s)| { h.score = s; h }).collect();
+        }
+    }
 
     Ok(Json(serde_json::to_value(hits).unwrap_or_default()))
 }

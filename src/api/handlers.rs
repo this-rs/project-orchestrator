@@ -6,6 +6,7 @@ use crate::api::{
 };
 use crate::chat::ChatManager;
 use crate::events::{EventEmitter, HybridEmitter, NatsEmitter};
+use crate::graph::algorithms::add_thermal_noise;
 use crate::neo4j::models::{
     AffectsRelation, CommitNode, ConstraintNode, DecisionNode, DecisionStatus,
     DecisionTimelineEntry, MilestoneNode, MilestoneStatus, PlanNode, PlanStatus, ReleaseNode,
@@ -783,13 +784,16 @@ pub struct SearchDecisionsSemanticQuery {
     pub query: String,
     pub limit: Option<usize>,
     pub project_id: Option<String>,
+    /// Thermal noise temperature (0.0 - 1.0) for stochastic exploration.
+    /// Inspired by Langevin dynamics: adds T × N(0, σ) Gaussian noise to scores.
+    pub temperature: Option<f64>,
 }
 
 pub async fn search_decisions_semantic(
     State(state): State<OrchestratorState>,
     axum::extract::Query(params): axum::extract::Query<SearchDecisionsSemanticQuery>,
 ) -> Result<Json<Vec<DecisionSearchHit>>, AppError> {
-    let results = state
+    let mut results = state
         .orchestrator
         .plan_manager()
         .search_decisions_semantic(
@@ -798,6 +802,17 @@ pub async fn search_decisions_semantic(
             params.project_id.as_deref(),
         )
         .await?;
+
+    // Apply Langevin thermal noise for stochastic exploration
+    if let Some(temperature) = params.temperature {
+        if temperature > 0.0 {
+            let mut scored: Vec<(DecisionSearchHit, f64)> =
+                results.into_iter().map(|h| { let s = h.score; (h, s) }).collect();
+            add_thermal_noise(&mut scored, temperature);
+            results = scored.into_iter().map(|(mut h, s)| { h.score = s; h }).collect();
+        }
+    }
+
     Ok(Json(results))
 }
 
