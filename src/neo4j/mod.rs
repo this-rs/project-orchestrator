@@ -14,6 +14,7 @@ mod milestone;
 pub mod models;
 mod note;
 pub mod plan;
+mod plan_run;
 mod profile;
 mod project;
 mod protocol;

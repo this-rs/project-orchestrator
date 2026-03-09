@@ -2958,4 +2958,35 @@ impl GraphStore for Neo4jClient {
     ) -> anyhow::Result<Vec<(crate::neo4j::models::ConstraintNode, Uuid)>> {
         self.get_project_constraints(project_id).await
     }
+
+    // ========================================================================
+    // PlanRun operations (Runner)
+    // ========================================================================
+
+    async fn create_plan_run(&self, state: &crate::runner::RunnerState) -> anyhow::Result<()> {
+        self.create_plan_run(state).await
+    }
+
+    async fn update_plan_run(&self, state: &crate::runner::RunnerState) -> anyhow::Result<()> {
+        self.update_plan_run(state).await
+    }
+
+    async fn get_plan_run(
+        &self,
+        run_id: Uuid,
+    ) -> anyhow::Result<Option<crate::runner::RunnerState>> {
+        self.get_plan_run(run_id).await
+    }
+
+    async fn list_active_plan_runs(&self) -> anyhow::Result<Vec<crate::runner::RunnerState>> {
+        self.list_active_plan_runs_impl().await
+    }
+
+    async fn list_plan_runs(
+        &self,
+        plan_id: Uuid,
+        limit: i64,
+    ) -> anyhow::Result<Vec<crate::runner::RunnerState>> {
+        self.list_plan_runs_impl(plan_id, limit).await
+    }
 }

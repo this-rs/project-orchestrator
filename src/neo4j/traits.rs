@@ -2519,4 +2519,30 @@ pub trait GraphStore: Send + Sync {
         &self,
         project_id: Uuid,
     ) -> Result<Vec<(crate::neo4j::models::ConstraintNode, Uuid)>>;
+
+    // ========================================================================
+    // PlanRun operations (Runner execution state)
+    // ========================================================================
+
+    /// Create a new PlanRun node linked to a Plan via (:PlanRun)-[:RUNS]->(:Plan).
+    async fn create_plan_run(&self, state: &crate::runner::RunnerState) -> Result<()>;
+
+    /// Update an existing PlanRun with current execution state.
+    async fn update_plan_run(&self, state: &crate::runner::RunnerState) -> Result<()>;
+
+    /// Get a PlanRun by its run_id.
+    async fn get_plan_run(
+        &self,
+        run_id: Uuid,
+    ) -> Result<Option<crate::runner::RunnerState>>;
+
+    /// List all PlanRuns with status=Running (for crash recovery at boot).
+    async fn list_active_plan_runs(&self) -> Result<Vec<crate::runner::RunnerState>>;
+
+    /// List all PlanRuns for a given plan, ordered by started_at desc.
+    async fn list_plan_runs(
+        &self,
+        plan_id: Uuid,
+        limit: i64,
+    ) -> Result<Vec<crate::runner::RunnerState>>;
 }

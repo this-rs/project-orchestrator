@@ -25,6 +25,7 @@ pub mod plan;
 pub mod protocol;
 pub mod reasoning;
 pub mod resolver;
+pub mod runner;
 pub mod setup_claude;
 pub mod skills;
 pub mod update;
@@ -79,6 +80,9 @@ pub struct YamlConfig {
     /// Skill registry section (optional — enables cross-instance skill sharing)
     #[serde(default)]
     pub registry: RegistryYamlConfig,
+    /// Runner section (optional — configures autonomous plan execution)
+    #[serde(default)]
+    pub runner: runner::RunnerConfig,
 }
 
 /// Skill registry configuration section (optional)

@@ -69,6 +69,8 @@ pub struct MockGraphStore {
     pub chat_events: RwLock<HashMap<Uuid, Vec<ChatEventRecord>>>,
     /// Per-session auto_continue flag (stored separately from ChatSessionNode)
     pub session_auto_continue: RwLock<HashMap<Uuid, bool>>,
+    /// PlanRun states (Runner)
+    pub plan_runs: RwLock<HashMap<Uuid, crate::runner::RunnerState>>,
 
     // Relationships (adjacency lists)
     pub plan_tasks: RwLock<HashMap<Uuid, Vec<Uuid>>>,
@@ -177,6 +179,7 @@ impl MockGraphStore {
             chat_sessions: RwLock::new(HashMap::new()),
             chat_events: RwLock::new(HashMap::new()),
             session_auto_continue: RwLock::new(HashMap::new()),
+            plan_runs: RwLock::new(HashMap::new()),
             plan_tasks: RwLock::new(HashMap::new()),
             task_steps: RwLock::new(HashMap::new()),
             task_decisions: RwLock::new(HashMap::new()),
@@ -8671,6 +8674,55 @@ impl GraphStore for MockGraphStore {
         _project_id: Uuid,
     ) -> anyhow::Result<Vec<(crate::neo4j::models::ConstraintNode, Uuid)>> {
         Ok(vec![])
+    }
+
+    // ========================================================================
+    // PlanRun operations (Runner) — in-memory mock
+    // ========================================================================
+
+    async fn create_plan_run(&self, state: &crate::runner::RunnerState) -> anyhow::Result<()> {
+        let mut runs = self.plan_runs.write().await;
+        runs.insert(state.run_id, state.clone());
+        Ok(())
+    }
+
+    async fn update_plan_run(&self, state: &crate::runner::RunnerState) -> anyhow::Result<()> {
+        let mut runs = self.plan_runs.write().await;
+        runs.insert(state.run_id, state.clone());
+        Ok(())
+    }
+
+    async fn get_plan_run(
+        &self,
+        run_id: Uuid,
+    ) -> anyhow::Result<Option<crate::runner::RunnerState>> {
+        let runs = self.plan_runs.read().await;
+        Ok(runs.get(&run_id).cloned())
+    }
+
+    async fn list_active_plan_runs(&self) -> anyhow::Result<Vec<crate::runner::RunnerState>> {
+        let runs = self.plan_runs.read().await;
+        Ok(runs
+            .values()
+            .filter(|s| s.status == crate::runner::PlanRunStatus::Running)
+            .cloned()
+            .collect())
+    }
+
+    async fn list_plan_runs(
+        &self,
+        plan_id: Uuid,
+        limit: i64,
+    ) -> anyhow::Result<Vec<crate::runner::RunnerState>> {
+        let runs = self.plan_runs.read().await;
+        let mut result: Vec<_> = runs
+            .values()
+            .filter(|s| s.plan_id == plan_id)
+            .cloned()
+            .collect();
+        result.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+        result.truncate(limit as usize);
+        Ok(result)
     }
 }
 
