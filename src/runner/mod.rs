@@ -15,6 +15,7 @@
 //! ```
 
 pub mod models;
+pub mod runner;
 pub mod state;
 
 // Re-export key types for convenience
@@ -22,4 +23,5 @@ pub use models::{
     PlanRunStatus, RunSnapshot, RunnerConfig, RunnerEvent, TaskResult, TaskRunStatus,
     TaskStateMachine, TriggerSource,
 };
+pub use runner::{PlanRunner, RunStatus, RUNNER_CANCEL, RUNNER_STATE};
 pub use state::RunnerState;

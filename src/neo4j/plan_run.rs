@@ -19,25 +19,28 @@ impl Neo4jClient {
             CREATE (r:PlanRun {
                 run_id: $run_id,
                 plan_id: $plan_id,
+                total_tasks: $total_tasks,
                 current_wave: $current_wave,
                 git_branch: $git_branch,
                 started_at: datetime($started_at),
                 status: $status,
-                cumulated_cost_usd: $cumulated_cost_usd,
+                cost_usd: $cost_usd,
                 triggered_by: $triggered_by,
                 completed_tasks: $completed_tasks,
-                failed_tasks: $failed_tasks
+                failed_tasks: $failed_tasks,
+                state_json: $state_json
             })
             CREATE (r)-[:RUNS]->(p)
             "#,
         )
         .param("run_id", state.run_id.to_string())
         .param("plan_id", state.plan_id.to_string())
+        .param("total_tasks", state.total_tasks as i64)
         .param("current_wave", state.current_wave as i64)
         .param("git_branch", state.git_branch.clone())
         .param("started_at", state.started_at.to_rfc3339())
         .param("status", state.status.to_string())
-        .param("cumulated_cost_usd", state.cumulated_cost_usd)
+        .param("cost_usd", state.cost_usd)
         .param(
             "triggered_by",
             serde_json::to_string(&state.triggered_by).unwrap_or_default(),
@@ -59,6 +62,10 @@ impl Neo4jClient {
                 .map(|u| u.to_string())
                 .collect::<Vec<_>>()
                 .join(","),
+        )
+        .param(
+            "state_json",
+            serde_json::to_string(state).unwrap_or_default(),
         );
 
         self.graph.run(q).await?;
@@ -66,15 +73,18 @@ impl Neo4jClient {
     }
 
     /// Update an existing PlanRun with current execution state.
+    /// Uses state_json for full fidelity (retry_counts, current_task_title, etc.).
     pub async fn update_plan_run(&self, state: &RunnerState) -> Result<()> {
         let mut cypher = String::from(
             r#"
             MATCH (r:PlanRun {run_id: $run_id})
             SET r.current_wave = $current_wave,
                 r.status = $status,
-                r.cumulated_cost_usd = $cumulated_cost_usd,
+                r.cost_usd = $cost_usd,
+                r.total_tasks = $total_tasks,
                 r.completed_tasks = $completed_tasks,
-                r.failed_tasks = $failed_tasks
+                r.failed_tasks = $failed_tasks,
+                r.state_json = $state_json
             "#,
         );
 
@@ -98,7 +108,8 @@ impl Neo4jClient {
             .param("run_id", state.run_id.to_string())
             .param("current_wave", state.current_wave as i64)
             .param("status", state.status.to_string())
-            .param("cumulated_cost_usd", state.cumulated_cost_usd)
+            .param("cost_usd", state.cost_usd)
+            .param("total_tasks", state.total_tasks as i64)
             .param(
                 "completed_tasks",
                 state
@@ -116,6 +127,10 @@ impl Neo4jClient {
                     .map(|u| u.to_string())
                     .collect::<Vec<_>>()
                     .join(","),
+            )
+            .param(
+                "state_json",
+                serde_json::to_string(state).unwrap_or_default(),
             );
 
         self.graph.run(q).await?;
@@ -187,7 +202,20 @@ impl Neo4jClient {
     }
 
     /// Convert a Neo4j node to RunnerState.
+    ///
+    /// Prefers `state_json` (full fidelity) but falls back to individual fields
+    /// for backward compatibility.
     fn node_to_plan_run(&self, node: &neo4rs::Node) -> Result<RunnerState> {
+        // Try state_json first (has all fields including retry_counts, current_task_title)
+        if let Ok(json_str) = node.get::<String>("state_json") {
+            if !json_str.is_empty() {
+                if let Ok(state) = serde_json::from_str::<RunnerState>(&json_str) {
+                    return Ok(state);
+                }
+            }
+        }
+
+        // Fallback: reconstruct from individual fields
         let run_id: String = node.get("run_id")?;
         let plan_id: String = node.get("plan_id")?;
         let status: String = node.get("status")?;
@@ -223,15 +251,18 @@ impl Neo4jClient {
         Ok(RunnerState {
             run_id: run_id.parse()?,
             plan_id: plan_id.parse()?,
+            total_tasks: node.get::<i64>("total_tasks").unwrap_or(0) as usize,
             current_wave: node.get::<i64>("current_wave").unwrap_or(0) as usize,
             current_task_id: current_task_id.and_then(|s| s.parse().ok()),
+            current_task_title: None,
             completed_tasks: parse_uuid_list(&completed_tasks_str),
             failed_tasks: parse_uuid_list(&failed_tasks_str),
+            retry_counts: std::collections::HashMap::new(),
             git_branch: node.get("git_branch").unwrap_or_default(),
             started_at: started_at.parse()?,
             completed_at: completed_at.and_then(|s| s.parse().ok()),
             status: plan_run_status,
-            cumulated_cost_usd: node.get("cumulated_cost_usd").unwrap_or(0.0),
+            cost_usd: node.get("cost_usd").unwrap_or(0.0),
             triggered_by: serde_json::from_str(&triggered_by)
                 .unwrap_or(TriggerSource::Manual),
             project_id: node
