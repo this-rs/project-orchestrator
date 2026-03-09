@@ -839,6 +839,11 @@ pub struct PropagatedNote {
     /// Higher = stronger structural connection.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path_rel_weight: Option<f64>,
+    /// Scar intensity of the note (0.0 = no scar, 1.0 = heavily scarred).
+    /// Notes with high scar_intensity have been invalidated or superseded in the past.
+    /// The propagation score is penalized by (1 - scar_intensity * 0.5).
+    #[serde(default)]
+    pub scar_intensity: f64,
 }
 
 // ============================================================================
@@ -1302,6 +1307,7 @@ mod tests {
                 RelationHop::structural("CALLS"),
             ],
             path_rel_weight: Some(0.9),
+            scar_intensity: 0.0,
         };
         assert_eq!(pn.path_pagerank, Some(0.15));
         assert!(pn.relevance_score > 0.4);

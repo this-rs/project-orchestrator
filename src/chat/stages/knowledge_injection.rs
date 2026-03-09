@@ -76,6 +76,60 @@ impl Default for KnowledgeInjectionConfig {
     }
 }
 
+/// Returns scaffolding-adjusted config overrides based on the project's competence level.
+///
+/// - L0 (Struggling): maximum injection — the system provides all available context
+/// - L1 (Growing): generous injection
+/// - L2 (Competent): default injection (unchanged)
+/// - L3 (Proficient): reduced injection — the project has good knowledge density
+/// - L4 (Expert): minimal injection — trust the existing knowledge graph
+pub fn scaffolding_config(level: u8) -> KnowledgeInjectionConfig {
+    match level {
+        0 => KnowledgeInjectionConfig {
+            max_notes: 8,
+            max_decisions: 5,
+            max_propagated_per_file: 5,
+            max_propagated_files: 3,
+            max_entity_notes: 5,
+            max_entity_queries: 5,
+            query_timeout_ms: 300,
+            max_content_chars: 5000,
+        },
+        1 => KnowledgeInjectionConfig {
+            max_notes: 6,
+            max_decisions: 4,
+            max_propagated_per_file: 4,
+            max_propagated_files: 3,
+            max_entity_notes: 4,
+            max_entity_queries: 4,
+            query_timeout_ms: 250,
+            max_content_chars: 4000,
+        },
+        2 => KnowledgeInjectionConfig::default(), // L2 = default behavior
+        3 => KnowledgeInjectionConfig {
+            max_notes: 3,
+            max_decisions: 2,
+            max_propagated_per_file: 2,
+            max_propagated_files: 1,
+            max_entity_notes: 2,
+            max_entity_queries: 2,
+            query_timeout_ms: 150,
+            max_content_chars: 2000,
+        },
+        _ => KnowledgeInjectionConfig {
+            // L4+ = minimal
+            max_notes: 2,
+            max_decisions: 1,
+            max_propagated_per_file: 1,
+            max_propagated_files: 1,
+            max_entity_notes: 1,
+            max_entity_queries: 1,
+            query_timeout_ms: 100,
+            max_content_chars: 1500,
+        },
+    }
+}
+
 // ============================================================================
 // Deduplicated result types
 // ============================================================================
@@ -196,21 +250,23 @@ impl KnowledgeInjectionStage {
     /// Run all knowledge queries in parallel with individual timeouts.
     ///
     /// Returns deduplicated notes and decisions, sorted by relevance.
-    async fn query_knowledge(
+    /// Accepts an explicit config to support scaffolding-adjusted parameters.
+    async fn query_knowledge_with_config(
         &self,
         message: &str,
         project_slug: Option<&str>,
         _project_id: Option<Uuid>,
         entities: &[ExtractedEntity],
         referenced_uuids: &[Uuid],
+        config: &KnowledgeInjectionConfig,
     ) -> (Vec<ScoredNote>, Vec<ScoredDecision>, Vec<PredictedFile>) {
-        let query_timeout = Duration::from_millis(self.config.query_timeout_ms);
+        let query_timeout = Duration::from_millis(config.query_timeout_ms);
 
         // ── Query 1: BM25 notes search ──────────────────────────────────
         let search_clone = self.search.clone();
         let msg1 = message.to_string();
         let slug1 = project_slug.map(|s| s.to_string());
-        let max_notes = self.config.max_notes;
+        let max_notes = config.max_notes;
 
         let notes_future = async move {
             let result = search_clone
@@ -230,7 +286,7 @@ impl KnowledgeInjectionStage {
         let search_clone2 = self.search.clone();
         let msg2 = message.to_string();
         let slug2 = project_slug.map(|s| s.to_string());
-        let max_decisions = self.config.max_decisions;
+        let max_decisions = config.max_decisions;
 
         let decisions_future = async move {
             let result = search_clone2
@@ -244,17 +300,17 @@ impl KnowledgeInjectionStage {
         let file_entities: Vec<String> = entities
             .iter()
             .filter(|e| e.entity_type == ChatEntityType::File)
-            .take(self.config.max_propagated_files)
+            .take(config.max_propagated_files)
             .map(|e| e.identifier.clone())
             .collect();
         let symbol_entities: Vec<(ChatEntityType, String)> = entities
             .iter()
             .filter(|e| e.entity_type != ChatEntityType::File)
-            .take(self.config.max_entity_queries)
+            .take(config.max_entity_queries)
             .map(|e| (e.entity_type.clone(), e.identifier.clone()))
             .collect();
-        let max_entity_notes = self.config.max_entity_notes;
-        let max_propagated_per_file = self.config.max_propagated_per_file;
+        let max_entity_notes = config.max_entity_notes;
+        let max_propagated_per_file = config.max_propagated_per_file;
 
         let entity_notes_future = async move {
             let mut notes = Vec::new();
@@ -635,6 +691,7 @@ impl KnowledgeInjectionStage {
         notes: &[ScoredNote],
         decisions: &[ScoredDecision],
         predictions: &[PredictedFile],
+        max_content_chars: usize,
     ) -> Option<String> {
         if notes.is_empty() && decisions.is_empty() && predictions.is_empty() {
             return None;
@@ -653,7 +710,7 @@ impl KnowledgeInjectionStage {
                     note.importance.to_lowercase(),
                     truncate_content(&note.content, 300),
                 );
-                if chars_used + entry.len() > self.config.max_content_chars {
+                if chars_used + entry.len() > max_content_chars {
                     break;
                 }
                 content.push_str(&entry);
@@ -663,7 +720,7 @@ impl KnowledgeInjectionStage {
         }
 
         // Render decisions
-        if !decisions.is_empty() && chars_used < self.config.max_content_chars {
+        if !decisions.is_empty() && chars_used < max_content_chars {
             content.push_str("### Relevant Decisions\n");
             for decision in decisions {
                 let entry = format!(
@@ -671,7 +728,7 @@ impl KnowledgeInjectionStage {
                     truncate_content(&decision.description, 200),
                     truncate_content(&decision.rationale, 200),
                 );
-                if chars_used + entry.len() > self.config.max_content_chars {
+                if chars_used + entry.len() > max_content_chars {
                     break;
                 }
                 content.push_str(&entry);
@@ -680,7 +737,7 @@ impl KnowledgeInjectionStage {
         }
 
         // Render predicted context (WorldModel biomimicry T7)
-        if !predictions.is_empty() && chars_used < self.config.max_content_chars {
+        if !predictions.is_empty() && chars_used < max_content_chars {
             content.push_str("\n### Predicted Context (WorldModel)\n");
             content.push_str("_Files you may also need (based on co-change patterns):_\n");
             for pred in predictions.iter().take(5) {
@@ -688,7 +745,7 @@ impl KnowledgeInjectionStage {
                     "- `{}` (score: {:.2}, source: {})\n",
                     pred.path, pred.score, pred.source
                 );
-                if chars_used + entry.len() > self.config.max_content_chars {
+                if chars_used + entry.len() > max_content_chars {
                     break;
                 }
                 content.push_str(&entry);
@@ -740,6 +797,61 @@ impl EnrichmentStage for KnowledgeInjectionStage {
             self.resolve_project_id(&project_slug).await
         };
 
+        // ── Scaffolding-adaptive config ──────────────────────────────────
+        // Compute the project's scaffolding level (with 100ms timeout + fallback).
+        // This modulates how much knowledge we inject: L0 = maximum, L4 = minimal.
+        let scaffolding_enabled = std::env::var("ENRICHMENT_SCAFFOLDING")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false);
+
+        let effective_config = if scaffolding_enabled {
+            if let Some(pid) = project_id {
+                let graph_clone = self.graph.clone();
+                let scaffolding_override = None; // Use auto-computed level
+                match timeout(
+                    Duration::from_millis(100),
+                    graph_clone.compute_scaffolding_level(pid, scaffolding_override),
+                )
+                .await
+                {
+                    Ok(Ok(level)) => {
+                        let config = scaffolding_config(level.level);
+                        debug!(
+                            "[knowledge_injection] Scaffolding L{} ({}): max_notes={}, max_content={}",
+                            level.level, level.label, config.max_notes, config.max_content_chars
+                        );
+                        ctx.add_section(
+                            "Scaffolding Level",
+                            format!(
+                                "L{} ({}) — competence: {:.0}%, pain: {:.0}%",
+                                level.level,
+                                level.label,
+                                level.competence_score * 100.0,
+                                level.homeostasis_pain * 100.0
+                            ),
+                            self.name(),
+                        );
+                        config
+                    }
+                    Ok(Err(e)) => {
+                        warn!(
+                            "[knowledge_injection] Scaffolding computation failed: {}",
+                            e
+                        );
+                        self.config.clone()
+                    }
+                    Err(_) => {
+                        warn!("[knowledge_injection] Scaffolding computation timed out (100ms)");
+                        self.config.clone()
+                    }
+                }
+            } else {
+                self.config.clone()
+            }
+        } else {
+            self.config.clone()
+        };
+
         // Extract entities from the message
         let entities = entity_extractor::extract_entities(&input.message);
         let referenced_uuids = Self::extract_uuids(&input.message);
@@ -750,14 +862,15 @@ impl EnrichmentStage for KnowledgeInjectionStage {
             referenced_uuids.len()
         );
 
-        // Run all knowledge queries in parallel
+        // Run all knowledge queries in parallel (using scaffolding-adjusted config)
         let (notes, decisions, predictions) = self
-            .query_knowledge(
+            .query_knowledge_with_config(
                 &input.message,
                 Some(&project_slug),
                 project_id,
                 &entities,
                 &referenced_uuids,
+                &effective_config,
             )
             .await;
 
@@ -769,7 +882,12 @@ impl EnrichmentStage for KnowledgeInjectionStage {
         );
 
         // Render and inject into context
-        if let Some(content) = self.render_knowledge(&notes, &decisions, &predictions) {
+        if let Some(content) = self.render_knowledge(
+            &notes,
+            &decisions,
+            &predictions,
+            effective_config.max_content_chars,
+        ) {
             ctx.add_section("Relevant Knowledge", content, self.name());
         }
 
@@ -853,7 +971,7 @@ mod tests {
     #[test]
     fn test_render_empty() {
         let stage = make_test_stage();
-        let result = stage.render_knowledge(&[], &[], &[]);
+        let result = stage.render_knowledge(&[], &[], &[], 3000);
         assert!(result.is_none());
     }
 
@@ -868,7 +986,7 @@ mod tests {
             score: 0.9,
             source: "bm25_search",
         }];
-        let result = stage.render_knowledge(&notes, &[], &[]);
+        let result = stage.render_knowledge(&notes, &[], &[], 3000);
         assert!(result.is_some());
         let content = result.unwrap();
         assert!(content.contains("Relevant Notes"));
@@ -885,7 +1003,7 @@ mod tests {
             rationale: "No EmbeddingProvider available in ChatManager".to_string(),
             score: 0.95,
         }];
-        let result = stage.render_knowledge(&[], &decisions, &[]);
+        let result = stage.render_knowledge(&[], &decisions, &[], 3000);
         assert!(result.is_some());
         let content = result.unwrap();
         assert!(content.contains("Relevant Decisions"));
@@ -910,7 +1028,7 @@ mod tests {
             rationale: "Individual timeouts per query".to_string(),
             score: 0.9,
         }];
-        let result = stage.render_knowledge(&notes, &decisions, &[]);
+        let result = stage.render_knowledge(&notes, &decisions, &[], 3000);
         assert!(result.is_some());
         let content = result.unwrap();
         assert!(content.contains("Relevant Notes"));
@@ -940,7 +1058,7 @@ mod tests {
             })
             .collect();
 
-        let result = stage.render_knowledge(&notes, &[], &[]);
+        let result = stage.render_knowledge(&notes, &[], &[], 100);
         assert!(result.is_some());
         let content = result.unwrap();
         // Should be truncated — not all 20 notes rendered
@@ -1223,7 +1341,7 @@ mod tests {
         assert_eq!(deduped.len(), 2, "Should have 2 unique notes, not 3");
 
         // Render should have no duplicates
-        let content = stage.render_knowledge(&deduped, &[], &[]).unwrap();
+        let content = stage.render_knowledge(&deduped, &[], &[], 3000).unwrap();
         let count = content.matches("Watch out for null").count();
         assert_eq!(
             count, 1,
@@ -1293,7 +1411,7 @@ mod tests {
             })
             .collect();
 
-        let result = stage.render_knowledge(&notes, &[], &[]);
+        let result = stage.render_knowledge(&notes, &[], &[], 3000);
         assert!(result.is_some());
         let content = result.unwrap();
         assert!(
@@ -1320,6 +1438,59 @@ mod tests {
             graph,
             search,
             config,
+        }
+    }
+
+    // ── scaffolding_config tests ──────────────────────────────────────
+
+    #[test]
+    fn test_scaffolding_config_l0_generous() {
+        let config = scaffolding_config(0);
+        assert_eq!(config.max_notes, 8);
+        assert_eq!(config.max_decisions, 5);
+        assert_eq!(config.max_content_chars, 5000);
+        assert_eq!(config.max_propagated_per_file, 5);
+    }
+
+    #[test]
+    fn test_scaffolding_config_l2_default() {
+        let config = scaffolding_config(2);
+        let default = KnowledgeInjectionConfig::default();
+        assert_eq!(config.max_notes, default.max_notes);
+        assert_eq!(config.max_decisions, default.max_decisions);
+        assert_eq!(config.max_content_chars, default.max_content_chars);
+    }
+
+    #[test]
+    fn test_scaffolding_config_l4_minimal() {
+        let config = scaffolding_config(4);
+        assert_eq!(config.max_notes, 2);
+        assert_eq!(config.max_decisions, 1);
+        assert_eq!(config.max_content_chars, 1500);
+        assert_eq!(config.max_propagated_per_file, 1);
+    }
+
+    #[test]
+    fn test_scaffolding_config_progression() {
+        // L0 > L1 > L2 > L3 > L4 in terms of max_notes
+        let configs: Vec<_> = (0..=4).map(scaffolding_config).collect();
+        for i in 0..4 {
+            assert!(
+                configs[i].max_notes >= configs[i + 1].max_notes,
+                "L{} max_notes ({}) should be >= L{} max_notes ({})",
+                i,
+                configs[i].max_notes,
+                i + 1,
+                configs[i + 1].max_notes,
+            );
+            assert!(
+                configs[i].max_content_chars >= configs[i + 1].max_content_chars,
+                "L{} max_content_chars ({}) should be >= L{} max_content_chars ({})",
+                i,
+                configs[i].max_content_chars,
+                i + 1,
+                configs[i + 1].max_content_chars,
+            );
         }
     }
 }

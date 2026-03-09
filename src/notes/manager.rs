@@ -819,15 +819,27 @@ impl NoteManager {
             )
             .await?;
 
-        // Convert to NoteSearchHit
-        Ok(results
+        // Convert to NoteSearchHit with scar penalty applied.
+        // Notes with high scar_intensity (past invalidations) get de-prioritized.
+        // Max penalty = 50% score reduction at scar_intensity=1.0.
+        let mut hits: Vec<NoteSearchHit> = results
             .into_iter()
-            .map(|(note, score)| NoteSearchHit {
-                note,
-                score,
-                highlights: None,
+            .map(|(note, score)| {
+                let scar_penalty = 1.0 - note.scar_intensity.clamp(0.0, 1.0) * 0.5;
+                NoteSearchHit {
+                    score: score * scar_penalty,
+                    note,
+                    highlights: None,
+                }
             })
-            .collect())
+            .collect();
+        // Re-sort by penalized score (descending)
+        hits.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        Ok(hits)
     }
 
     // ========================================================================

@@ -865,13 +865,16 @@ impl Neo4jClient {
 
         // Query for notes propagated through the graph.
         //
-        // Scoring formula integrates 4 factors:
+        // Scoring formula integrates 5 factors:
         //   1. Distance decay: 1/(distance+1)
         //   2. Importance weight: critical=1.0, high=0.8, medium=0.5, low=0.3
         //   3. PageRank hub boost: (1 + avg_path_pagerank * 5)
         //   4. Relation type weight: product of per-relation weights along the path
         //      For SYNAPSE relations, uses the dynamic r.weight (Hebbian strength)
         //      instead of a static value.
+        //   5. Scar penalty: (1 - scar_intensity * 0.5)
+        //      Notes with high scar_intensity (from past invalidations) are de-prioritized.
+        //      Max penalty = 50% score reduction at scar_intensity=1.0.
         //
         // Relation weights (defined in Cypher CASE):
         //   CONTAINS=1.0, IMPORTS=1.0, CALLS=0.9, IMPLEMENTS_TRAIT=0.85,
@@ -915,7 +918,8 @@ impl Neo4jClient {
                           END)
                  END AS path_rel_weight
             WITH n, source, distance, path_names, rel_types, avg_path_pagerank, path_rel_weight, hop_weights,
-                 (1.0 / (distance + 1)) * importance_weight * (1.0 + avg_path_pagerank * 5.0) * path_rel_weight AS score
+                 (1.0 / (distance + 1)) * importance_weight * (1.0 + avg_path_pagerank * 5.0) * path_rel_weight
+                 * (1.0 - COALESCE(n.scar_intensity, 0.0) * 0.5) AS score
             WHERE score >= $min_score
             RETURN DISTINCT n, score, coalesce(source.name, source.path, source.id) AS source_entity,
                    path_names, distance, avg_path_pagerank,
@@ -967,6 +971,7 @@ impl Neo4jClient {
                 })
                 .collect();
 
+            let scar_intensity = note.scar_intensity;
             propagated_notes.push(PropagatedNote {
                 note,
                 relevance_score: score,
@@ -976,6 +981,7 @@ impl Neo4jClient {
                 path_pagerank: avg_path_pagerank,
                 relation_path,
                 path_rel_weight,
+                scar_intensity,
             });
         }
 
@@ -1068,6 +1074,7 @@ impl Neo4jClient {
             let workspace_name: String = row.get("workspace_name").unwrap_or_default();
             let note = self.node_to_note(&node)?;
 
+            let scar_intensity = note.scar_intensity;
             workspace_notes.push(PropagatedNote {
                 note,
                 relevance_score: propagation_factor,
@@ -1077,6 +1084,7 @@ impl Neo4jClient {
                 path_pagerank: None,
                 relation_path: vec![crate::notes::RelationHop::structural("BELONGS_TO")],
                 path_rel_weight: Some(1.0),
+                scar_intensity,
             });
         }
 

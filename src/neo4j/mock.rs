@@ -5311,15 +5311,19 @@ impl GraphStore for MockGraphStore {
                 .await?;
             Ok(ws_notes
                 .into_iter()
-                .map(|n| PropagatedNote {
-                    relevance_score: propagation_factor,
-                    source_entity: format!("workspace:{}", workspace.slug),
-                    propagation_path: vec![format!("workspace:{}", workspace.slug)],
-                    distance: 1,
-                    note: n,
-                    path_pagerank: None,
-                    relation_path: vec![crate::notes::RelationHop::structural("BELONGS_TO")],
-                    path_rel_weight: Some(1.0),
+                .map(|n| {
+                    let scar = n.scar_intensity;
+                    PropagatedNote {
+                        relevance_score: propagation_factor,
+                        source_entity: format!("workspace:{}", workspace.slug),
+                        propagation_path: vec![format!("workspace:{}", workspace.slug)],
+                        distance: 1,
+                        note: n,
+                        path_pagerank: None,
+                        relation_path: vec![crate::notes::RelationHop::structural("BELONGS_TO")],
+                        path_rel_weight: Some(1.0),
+                        scar_intensity: scar,
+                    }
                 })
                 .collect())
         } else {

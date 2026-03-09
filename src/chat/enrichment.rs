@@ -35,6 +35,9 @@ pub struct EnrichmentConfig {
     pub knowledge_injection: bool,
     /// Enable the status injection stage (tasks, plans in progress).
     pub status_injection: bool,
+    /// Enable the biomimicry stage (stagnation detection, homeostasis check).
+    #[serde(default)]
+    pub biomimicry: bool,
     /// Enable the reasoning tree injection stage.
     pub reasoning_tree: bool,
     /// Enable debug mode (logs timing and content of each stage).
@@ -49,6 +52,7 @@ impl Default for EnrichmentConfig {
             skill_activation: true,
             knowledge_injection: true,
             status_injection: true,
+            biomimicry: false, // Disabled by default — opt-in via ENRICHMENT_BIOMIMICRY=true
             reasoning_tree: true,
             debug: false,
             max_pipeline_ms: 500,
@@ -77,6 +81,9 @@ impl EnrichmentConfig {
             status_injection: std::env::var("ENRICHMENT_STATUS_INJECTION")
                 .map(|v| v != "false" && v != "0")
                 .unwrap_or(true),
+            biomimicry: std::env::var("ENRICHMENT_BIOMIMICRY")
+                .map(|v| v == "true" || v == "1")
+                .unwrap_or(false),
             reasoning_tree: std::env::var("ENRICHMENT_REASONING_TREE")
                 .map(|v| v != "false" && v != "0")
                 .unwrap_or(true),
@@ -661,6 +668,7 @@ mod tests {
             skill_activation: false,
             knowledge_injection: true,
             status_injection: false,
+            biomimicry: false,
             reasoning_tree: true,
             debug: true,
             max_pipeline_ms: 1000,
