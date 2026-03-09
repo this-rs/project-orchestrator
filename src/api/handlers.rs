@@ -56,6 +56,9 @@ pub struct ServerState {
     /// Remote skill registry URL (optional — enables cross-instance skill search).
     /// When set, registry search merges local + remote results.
     pub registry_remote_url: Option<String>,
+    /// Pre-built OIDC client — constructed once at server startup.
+    /// None when OIDC is not configured (legacy Google-only or no auth).
+    pub oidc_client: Option<Arc<crate::auth::oidc::OidcClient>>,
 }
 
 /// Shared orchestrator state
@@ -4685,6 +4688,7 @@ mod tests {
             public_url: None,
             ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
             registry_remote_url: None,
+            oidc_client: None,
         });
         (create_router(state), milestone.id, task1.id, task2.id)
     }
@@ -4889,6 +4893,7 @@ mod tests {
             public_url: public_url.map(|s| s.to_string()),
             ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
             registry_remote_url: None,
+            oidc_client: None,
         }
     }
 
@@ -5040,6 +5045,7 @@ mod tests {
             public_url: None,
             ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
             registry_remote_url: None,
+            oidc_client: None,
         });
         create_router(state)
     }

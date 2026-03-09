@@ -16,6 +16,18 @@ const GOOGLE_AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const GOOGLE_USERINFO_URL: &str = "https://www.googleapis.com/oauth2/v3/userinfo";
 
+/// Slugify a provider name into a stable key (e.g. "Google" → "google", "My Okta" → "my-okta").
+fn slugify_provider(name: &str) -> String {
+    name.to_lowercase()
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '-' })
+        .collect::<String>()
+        .split('-')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
 /// Raw OIDC userinfo response — tolerant of provider-specific claim differences.
 ///
 /// Different providers return different claim names:
@@ -100,6 +112,9 @@ struct TokenResponse {
 
 /// Generic OIDC client for authorization code flow.
 pub struct OidcClient {
+    /// Stable identifier for the provider (e.g. "google", "cognito", "okta").
+    /// Used for provider-specific logic instead of fragile URL matching.
+    pub provider_key: String,
     pub provider_name: String,
     auth_endpoint: String,
     token_endpoint: String,
@@ -108,10 +123,46 @@ pub struct OidcClient {
     client_secret: String,
     redirect_uri: String,
     scopes: String,
+    /// Extra query parameters appended to the authorization URL.
+    /// Allows provider-specific params (e.g. `access_type=offline` for Google)
+    /// without hardcoding per provider_key.
+    extra_auth_params: Vec<(String, String)>,
     http_client: reqwest::Client,
 }
 
 impl OidcClient {
+    /// Derive `provider_key` from OidcConfig: use explicit key, or slugify provider_name.
+    fn derive_provider_key(config: &OidcConfig) -> String {
+        config
+            .provider_key
+            .clone()
+            .unwrap_or_else(|| slugify_provider(&config.provider_name))
+    }
+
+    /// Build the extra auth params: merge config's explicit map with Google defaults
+    /// when the provider_key is "google" and the config doesn't override them.
+    fn build_extra_auth_params(
+        provider_key: &str,
+        config_params: &std::collections::HashMap<String, String>,
+    ) -> Vec<(String, String)> {
+        let mut params: Vec<(String, String)> = config_params
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+
+        // Google-specific defaults — only applied if not overridden in config
+        if provider_key == "google" {
+            if !config_params.contains_key("access_type") {
+                params.push(("access_type".to_string(), "offline".to_string()));
+            }
+            if !config_params.contains_key("prompt") {
+                params.push(("prompt".to_string(), "consent".to_string()));
+            }
+        }
+
+        params
+    }
+
     /// Create from an explicit `OidcConfig`.
     ///
     /// Uses auth_endpoint/token_endpoint from config (must be present).
@@ -122,8 +173,12 @@ impl OidcClient {
         let token_endpoint = config.token_endpoint.clone().ok_or_else(|| {
             anyhow::anyhow!("OIDC token_endpoint is required when discovery_url is not set")
         })?;
+        let provider_key = Self::derive_provider_key(config);
+        let extra_auth_params =
+            Self::build_extra_auth_params(&provider_key, &config.extra_auth_params);
 
         Ok(Self {
+            provider_key,
             provider_name: config.provider_name.clone(),
             auth_endpoint,
             token_endpoint,
@@ -132,6 +187,7 @@ impl OidcClient {
             client_secret: config.client_secret.clone(),
             redirect_uri: config.redirect_uri.clone(),
             scopes: config.scopes.clone(),
+            extra_auth_params,
             http_client: reqwest::Client::new(),
         })
     }
@@ -153,7 +209,12 @@ impl OidcClient {
             .await
             .context("Failed to parse OIDC discovery document")?;
 
+        let provider_key = Self::derive_provider_key(config);
+        let extra_auth_params =
+            Self::build_extra_auth_params(&provider_key, &config.extra_auth_params);
+
         Ok(Self {
+            provider_key,
             provider_name: config.provider_name.clone(),
             auth_endpoint: doc.authorization_endpoint,
             token_endpoint: doc.token_endpoint,
@@ -164,6 +225,7 @@ impl OidcClient {
             client_secret: config.client_secret.clone(),
             redirect_uri: config.redirect_uri.clone(),
             scopes: config.scopes.clone(),
+            extra_auth_params,
             http_client: client,
         })
     }
@@ -187,6 +249,7 @@ impl OidcClient {
             .ok_or_else(|| anyhow::anyhow!("google_redirect_uri is required"))?;
 
         Ok(Self {
+            provider_key: "google".to_string(),
             provider_name: "Google".to_string(),
             auth_endpoint: GOOGLE_AUTH_URL.to_string(),
             token_endpoint: GOOGLE_TOKEN_URL.to_string(),
@@ -195,6 +258,10 @@ impl OidcClient {
             client_secret: client_secret.clone(),
             redirect_uri: redirect_uri.clone(),
             scopes: "openid email profile".to_string(),
+            extra_auth_params: vec![
+                ("access_type".to_string(), "offline".to_string()),
+                ("prompt".to_string(), "consent".to_string()),
+            ],
             http_client: reqwest::Client::new(),
         })
     }
@@ -243,6 +310,7 @@ impl OidcClient {
     /// Generate the OIDC authorization URL with a custom redirect_uri.
     ///
     /// Used for dynamic origin-based redirect URIs (e.g. desktop vs web access).
+    /// Extra auth params (provider-specific or from config) are appended automatically.
     pub fn auth_url_with_redirect(&self, redirect_uri: &str) -> String {
         let mut url = format!(
             "{}?client_id={}&redirect_uri={}&response_type=code&scope={}",
@@ -252,18 +320,22 @@ impl OidcClient {
             urlencoding::encode(&self.scopes),
         );
 
-        // Google-specific parameters — other providers (Cognito, Okta, etc.) don't
-        // support `access_type` and may reject or ignore it.
-        if self.is_google_provider() {
-            url.push_str("&access_type=offline&prompt=consent");
+        // Append extra auth params (e.g. access_type=offline for Google)
+        for (key, value) in &self.extra_auth_params {
+            url.push_str(&format!(
+                "&{}={}",
+                urlencoding::encode(key),
+                urlencoding::encode(value)
+            ));
         }
 
         url
     }
 
     /// Returns true if this client is configured for Google (legacy or explicit).
+    #[cfg(test)]
     fn is_google_provider(&self) -> bool {
-        self.auth_endpoint.contains("accounts.google.com")
+        self.provider_key == "google"
     }
 
     /// Exchange an authorization code for user information using the configured redirect_uri.
@@ -337,18 +409,36 @@ impl OidcClient {
         }
 
         // Parse into tolerant RawOidcUserInfo first, then normalize.
-        // Log the raw body on parse failure to aid debugging provider differences.
+        // On parse failure, log safe metadata only (no PII in error messages).
+        let content_type = userinfo_response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("unknown")
+            .to_string();
+
         let body = userinfo_response
             .text()
             .await
             .context("Failed to read OIDC userinfo response body")?;
 
-        let raw: RawOidcUserInfo = serde_json::from_str(&body).with_context(|| {
-            format!(
-                "Failed to parse OIDC userinfo response (provider: {}). Raw body: {}",
-                self.provider_name, body
-            )
-        })?;
+        let raw: RawOidcUserInfo = match serde_json::from_str(&body) {
+            Ok(info) => info,
+            Err(e) => {
+                // Full body at DEBUG level only (never in prod logs)
+                tracing::debug!(
+                    provider = %self.provider_name,
+                    body_len = body.len(),
+                    content_type = %content_type,
+                    "OIDC userinfo raw body for debugging: {}",
+                    body
+                );
+                bail!(
+                    "Failed to parse OIDC userinfo response (provider: {}, body_len: {}, content_type: {}): {}",
+                    self.provider_name, body.len(), content_type, e
+                );
+            }
+        };
 
         raw.normalize()
     }
@@ -364,10 +454,20 @@ mod tests {
     use crate::test_helpers::test_auth_config;
 
     #[test]
+    fn test_slugify_provider() {
+        assert_eq!(slugify_provider("Google"), "google");
+        assert_eq!(slugify_provider("My Okta"), "my-okta");
+        assert_eq!(slugify_provider("AWS Cognito"), "aws-cognito");
+        assert_eq!(slugify_provider("  spaces  "), "spaces");
+        assert_eq!(slugify_provider("Auth0"), "auth0");
+    }
+
+    #[test]
     fn test_oidc_from_legacy_google() {
         let config = test_auth_config();
         let client = OidcClient::from_legacy_google(&config).unwrap();
 
+        assert_eq!(client.provider_key, "google");
         assert_eq!(client.provider_name, "Google");
         assert_eq!(client.auth_endpoint, GOOGLE_AUTH_URL);
         assert_eq!(client.token_endpoint, GOOGLE_TOKEN_URL);
@@ -403,21 +503,27 @@ mod tests {
             userinfo_endpoint: Some("https://okta.example.com/userinfo".to_string()),
             scopes: "openid email profile".to_string(),
             discovery_url: None,
+            extra_auth_params: Default::default(),
         };
 
         let client = OidcClient::from_config(&config).unwrap();
+        assert_eq!(client.provider_key, "okta");
         assert_eq!(client.provider_name, "Okta");
         assert_eq!(client.auth_endpoint, "https://okta.example.com/authorize");
 
         let url = client.auth_url();
         assert!(url.starts_with("https://okta.example.com/authorize"));
         assert!(url.contains("client_id=okta-id"));
+        // Non-Google provider should NOT have access_type or prompt
+        assert!(!url.contains("access_type=offline"));
+        assert!(!url.contains("prompt=consent"));
     }
 
     #[test]
     fn test_oidc_from_auth_config_sync_legacy() {
         let config = test_auth_config();
         let client = OidcClient::from_auth_config_sync(&config).unwrap();
+        assert_eq!(client.provider_key, "google");
         assert_eq!(client.provider_name, "Google");
     }
 
@@ -444,6 +550,7 @@ mod tests {
                 userinfo_endpoint: None,
                 scopes: "openid email profile".to_string(),
                 discovery_url: None,
+                extra_auth_params: Default::default(),
             }),
             google_client_id: None,
             google_client_secret: None,
@@ -451,6 +558,7 @@ mod tests {
         };
 
         let client = OidcClient::from_auth_config_sync(&config).unwrap();
+        assert_eq!(client.provider_key, "microsoft");
         assert_eq!(client.provider_name, "Microsoft");
         assert!(client.auth_url().contains("login.microsoftonline.com"));
     }
@@ -569,7 +677,7 @@ mod tests {
     #[test]
     fn test_oidc_auth_url_non_google_omits_google_params() {
         let config = OidcConfig {
-            provider_key: Some("custom".to_string()),
+            provider_key: Some("cognito".to_string()),
             provider_name: "Cognito".to_string(),
             client_id: "cognito-id".to_string(),
             client_secret: "cognito-secret".to_string(),
@@ -585,6 +693,7 @@ mod tests {
             ),
             scopes: "openid email profile".to_string(),
             discovery_url: None,
+            extra_auth_params: Default::default(),
         };
 
         let client = OidcClient::from_config(&config).unwrap();
@@ -603,6 +712,180 @@ mod tests {
         assert!(url.contains("response_type=code"));
         assert!(url.contains("client_id=cognito-id"));
         assert!(url.contains("scope=openid"));
+    }
+
+    #[test]
+    fn test_oidc_provider_key_from_explicit_config_google() {
+        // When provider_key is explicitly "google" in OidcConfig,
+        // Google-specific params should be auto-injected
+        let config = OidcConfig {
+            provider_key: Some("google".to_string()),
+            provider_name: "Google (custom proxy)".to_string(),
+            client_id: "proxy-id".to_string(),
+            client_secret: "proxy-secret".to_string(),
+            redirect_uri: "http://localhost/callback".to_string(),
+            auth_endpoint: Some("https://auth-proxy.internal/google/authorize".to_string()),
+            token_endpoint: Some("https://auth-proxy.internal/google/token".to_string()),
+            userinfo_endpoint: Some("https://auth-proxy.internal/google/userinfo".to_string()),
+            scopes: "openid email profile".to_string(),
+            discovery_url: None,
+            extra_auth_params: Default::default(),
+        };
+
+        let client = OidcClient::from_config(&config).unwrap();
+        assert_eq!(client.provider_key, "google");
+        assert!(client.is_google_provider());
+
+        let url = client.auth_url();
+        // Even though the URL is a proxy, provider_key="google" triggers Google params
+        assert!(url.contains("access_type=offline"));
+        assert!(url.contains("prompt=consent"));
+    }
+
+    #[test]
+    fn test_oidc_provider_key_fallback_slugify() {
+        // When provider_key is None, it should be derived from provider_name
+        let config = OidcConfig {
+            provider_key: None,
+            provider_name: "Google".to_string(),
+            client_id: "id".to_string(),
+            client_secret: "secret".to_string(),
+            redirect_uri: "http://localhost/callback".to_string(),
+            auth_endpoint: Some("https://custom-google.example.com/auth".to_string()),
+            token_endpoint: Some("https://custom-google.example.com/token".to_string()),
+            userinfo_endpoint: None,
+            scopes: "openid email profile".to_string(),
+            discovery_url: None,
+            extra_auth_params: Default::default(),
+        };
+
+        let client = OidcClient::from_config(&config).unwrap();
+        // Slugified "Google" → "google"
+        assert_eq!(client.provider_key, "google");
+        assert!(client.is_google_provider());
+    }
+
+    #[test]
+    fn test_oidc_extra_auth_params_from_config() {
+        // Custom extra_auth_params should be appended to the URL
+        let mut params = std::collections::HashMap::new();
+        params.insert("hd".to_string(), "example.com".to_string());
+        params.insert("login_hint".to_string(), "user@example.com".to_string());
+
+        let config = OidcConfig {
+            provider_key: Some("google".to_string()),
+            provider_name: "Google".to_string(),
+            client_id: "id".to_string(),
+            client_secret: "secret".to_string(),
+            redirect_uri: "http://localhost/callback".to_string(),
+            auth_endpoint: Some(GOOGLE_AUTH_URL.to_string()),
+            token_endpoint: Some(GOOGLE_TOKEN_URL.to_string()),
+            userinfo_endpoint: None,
+            scopes: "openid email profile".to_string(),
+            discovery_url: None,
+            extra_auth_params: params,
+        };
+
+        let client = OidcClient::from_config(&config).unwrap();
+        let url = client.auth_url();
+
+        // Custom params present
+        assert!(url.contains("hd=example.com"));
+        assert!(url.contains("login_hint=user%40example.com"));
+        // Google defaults also present (not overridden)
+        assert!(url.contains("access_type=offline"));
+        assert!(url.contains("prompt=consent"));
+    }
+
+    #[test]
+    fn test_oidc_extra_auth_params_override_google_defaults() {
+        // User can override Google defaults via extra_auth_params
+        let mut params = std::collections::HashMap::new();
+        params.insert("prompt".to_string(), "select_account".to_string());
+
+        let config = OidcConfig {
+            provider_key: Some("google".to_string()),
+            provider_name: "Google".to_string(),
+            client_id: "id".to_string(),
+            client_secret: "secret".to_string(),
+            redirect_uri: "http://localhost/callback".to_string(),
+            auth_endpoint: Some(GOOGLE_AUTH_URL.to_string()),
+            token_endpoint: Some(GOOGLE_TOKEN_URL.to_string()),
+            userinfo_endpoint: None,
+            scopes: "openid email profile".to_string(),
+            discovery_url: None,
+            extra_auth_params: params,
+        };
+
+        let client = OidcClient::from_config(&config).unwrap();
+        let url = client.auth_url();
+
+        // Custom override should be used
+        assert!(url.contains("prompt=select_account"));
+        // access_type still gets the Google default (not overridden)
+        assert!(url.contains("access_type=offline"));
+        // "prompt=consent" should NOT be present (overridden)
+        assert!(!url.contains("prompt=consent"));
+    }
+
+    #[test]
+    fn test_oidc_userinfo_parse_error_no_pii_leak() {
+        // Simulate a body that contains PII but is not valid RawOidcUserInfo
+        // (e.g., missing required "sub" field)
+        let pii_body = r#"{
+            "email": "secret-user@company.com",
+            "name": "John Secret",
+            "picture": "https://example.com/secret-photo.jpg"
+        }"#;
+
+        let result: Result<RawOidcUserInfo, _> = serde_json::from_str(pii_body);
+        assert!(result.is_err(), "Should fail without 'sub' claim");
+
+        // Build the error message the same way exchange_code_with_redirect does
+        let err = result.unwrap_err();
+        let error_message = format!(
+            "Failed to parse OIDC userinfo response (provider: {}, body_len: {}, content_type: {}): {}",
+            "TestProvider", pii_body.len(), "application/json", err
+        );
+
+        // Verify no PII leaks in the error message
+        assert!(
+            !error_message.contains("secret-user@company.com"),
+            "Error message must not contain email PII"
+        );
+        assert!(
+            !error_message.contains("John Secret"),
+            "Error message must not contain name PII"
+        );
+        assert!(
+            !error_message.contains("secret-photo"),
+            "Error message must not contain picture URL PII"
+        );
+        // Verify safe metadata IS present
+        assert!(error_message.contains("TestProvider"));
+        assert!(error_message.contains("body_len:"));
+        assert!(error_message.contains("content_type:"));
+    }
+
+    #[test]
+    fn test_oidc_userinfo_parse_error_invalid_json_no_pii_leak() {
+        // Non-JSON body (e.g., HTML error page) — should not leak content either
+        let html_body = "<html><body>Error: user secret-user@evil.com not found</body></html>";
+
+        let result: Result<RawOidcUserInfo, _> = serde_json::from_str(html_body);
+        assert!(result.is_err());
+
+        let err = result.unwrap_err();
+        let error_message = format!(
+            "Failed to parse OIDC userinfo response (provider: {}, body_len: {}, content_type: {}): {}",
+            "TestProvider", html_body.len(), "text/html", err
+        );
+
+        // The serde error itself should not contain the full body
+        assert!(
+            !error_message.contains("secret-user@evil.com"),
+            "Error message must not contain email from HTML body"
+        );
     }
 
     #[test]

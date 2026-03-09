@@ -12,7 +12,6 @@ use crate::api::handlers::{AppError, OrchestratorState};
 use crate::auth::extractor::AuthUser;
 use crate::auth::google::GoogleOAuthClient;
 use crate::auth::jwt::encode_jwt;
-use crate::auth::oidc::OidcClient;
 use crate::auth::refresh;
 use crate::neo4j::models::UserNode;
 use crate::AuthConfig;
@@ -543,20 +542,10 @@ pub async fn oidc_login(
     State(state): State<OrchestratorState>,
     AxumQuery(query): AxumQuery<OAuthLoginQuery>,
 ) -> Result<Json<AuthUrlResponse>, AppError> {
-    let auth_config = state
-        .auth_config
+    let client = state
+        .oidc_client
         .as_ref()
-        .ok_or_else(|| AppError::Forbidden("Authentication not configured".to_string()))?;
-
-    if !auth_config.has_oidc() {
-        return Err(AppError::Forbidden(
-            "OIDC authentication is not configured".to_string(),
-        ));
-    }
-
-    let client = OidcClient::from_auth_config(auth_config)
-        .await
-        .map_err(AppError::Internal)?;
+        .ok_or_else(|| AppError::Forbidden("OIDC authentication is not configured".to_string()))?;
 
     let auth_url = match state.validate_origin(query.origin.as_deref())? {
         Some(origin) => {
@@ -583,16 +572,11 @@ pub async fn oidc_callback(
         .as_ref()
         .ok_or_else(|| AppError::Forbidden("Authentication not configured".to_string()))?;
 
-    if !auth_config.has_oidc() {
-        return Err(AppError::Forbidden(
-            "OIDC authentication is not configured".to_string(),
-        ));
-    }
-
-    // 1. Build OIDC client and exchange code (redirect_uri must match the one used in auth URL)
-    let client = OidcClient::from_auth_config(auth_config)
-        .await
-        .map_err(AppError::Internal)?;
+    // 1. Get pre-built OIDC client from state (redirect_uri must match the one used in auth URL)
+    let client = state
+        .oidc_client
+        .as_ref()
+        .ok_or_else(|| AppError::Forbidden("OIDC authentication is not configured".to_string()))?;
 
     let oidc_user = match state.validate_origin(req.origin.as_deref())? {
         Some(origin) => {
@@ -1027,6 +1011,7 @@ mod tests {
             public_url: None,
             ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
             registry_remote_url: None,
+            oidc_client: None,
         })
     }
 
@@ -2017,6 +2002,7 @@ mod tests {
                 userinfo_endpoint: Some("https://okta.example.com/userinfo".to_string()),
                 scopes: "openid email profile".to_string(),
                 discovery_url: None,
+                extra_auth_params: Default::default(),
             }),
             google_client_id: None,
             google_client_secret: None,

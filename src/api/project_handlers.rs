@@ -836,6 +836,7 @@ mod tests {
             public_url: None,
             ws_ticket_store: std::sync::Arc::new(crate::api::ws_auth::WsTicketStore::new()),
             registry_remote_url: None,
+            oidc_client: None,
         })
     }
 
@@ -928,6 +929,7 @@ mod tests {
             public_url: None,
             ws_ticket_store: std::sync::Arc::new(crate::api::ws_auth::WsTicketStore::new()),
             registry_remote_url: None,
+            oidc_client: None,
         });
         let app = create_router(state);
 
@@ -989,6 +991,7 @@ mod tests {
             public_url: None,
             ws_ticket_store: std::sync::Arc::new(crate::api::ws_auth::WsTicketStore::new()),
             registry_remote_url: None,
+            oidc_client: None,
         });
         let app = create_router(state);
 
@@ -1152,6 +1155,7 @@ mod tests {
             public_url: None,
             ws_ticket_store: std::sync::Arc::new(crate::api::ws_auth::WsTicketStore::new()),
             registry_remote_url: None,
+            oidc_client: None,
         })
     }
 

@@ -7,10 +7,45 @@ use axum::{
     http::StatusCode,
     Json,
 };
+use regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::sync::LazyLock;
 use uuid::Uuid;
 
 use super::handlers::{AppError, OrchestratorState};
+
+// ============================================================================
+// Slug validation
+// ============================================================================
+
+/// Regex for valid workspace slugs: lowercase alphanumeric + hyphens,
+/// must start and end with alphanumeric, min 2 chars, max 64 chars.
+static SLUG_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[a-z0-9][a-z0-9-]*[a-z0-9]$").unwrap());
+
+/// Validate a workspace slug format.
+///
+/// Rules:
+/// - 2-64 characters
+/// - Only lowercase letters, digits, and hyphens
+/// - Must start and end with a letter or digit (no leading/trailing hyphens)
+pub fn validate_slug(slug: &str) -> Result<(), AppError> {
+    if slug.len() < 2 || slug.len() > 64 {
+        return Err(AppError::BadRequest(format!(
+            "Slug must be between 2 and 64 characters, got {}. \
+             Expected format: ^[a-z0-9][a-z0-9-]*[a-z0-9]$",
+            slug.len()
+        )));
+    }
+    if !SLUG_RE.is_match(slug) {
+        return Err(AppError::BadRequest(format!(
+            "Invalid slug '{}'. Slugs must match ^[a-z0-9][a-z0-9-]*[a-z0-9]$ \
+             (lowercase alphanumeric + hyphens, no leading/trailing hyphens)",
+            slug
+        )));
+    }
+    Ok(())
+}
 
 // ============================================================================
 // Request/Response types - Workspace
@@ -363,6 +398,23 @@ pub async fn create_workspace(
             .collect()
     });
 
+    // Validate slug format (whether explicit or auto-generated)
+    validate_slug(&slug)?;
+
+    // Check uniqueness
+    if state
+        .orchestrator
+        .neo4j()
+        .get_workspace_by_slug(&slug)
+        .await?
+        .is_some()
+    {
+        return Err(AppError::Conflict(format!(
+            "Slug '{}' is already taken by another workspace",
+            slug
+        )));
+    }
+
     let workspace = WorkspaceNode {
         id: Uuid::new_v4(),
         name: req.name,
@@ -408,6 +460,26 @@ pub async fn update_workspace(
         .get_workspace_by_slug(&slug)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Workspace '{}' not found", slug)))?;
+
+    // Validate and check uniqueness if slug is being updated
+    if let Some(ref new_slug) = req.slug {
+        validate_slug(new_slug)?;
+
+        // Check uniqueness: another workspace must not already use this slug
+        if let Some(existing) = state
+            .orchestrator
+            .neo4j()
+            .get_workspace_by_slug(new_slug)
+            .await?
+        {
+            if existing.id != workspace.id {
+                return Err(AppError::Conflict(format!(
+                    "Slug '{}' is already taken by another workspace",
+                    new_slug
+                )));
+            }
+        }
+    }
 
     state
         .orchestrator
@@ -1924,6 +1996,7 @@ mod tests {
             public_url: None,
             ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
             registry_remote_url: None,
+            oidc_client: None,
         });
         create_router(state)
     }
@@ -1999,6 +2072,7 @@ mod tests {
             public_url: None,
             ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
             registry_remote_url: None,
+            oidc_client: None,
         });
         (create_router(state), milestone_id, task1.id, task2.id)
     }
@@ -2386,6 +2460,7 @@ mod tests {
             public_url: None,
             ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
             registry_remote_url: None,
+            oidc_client: None,
         });
         let app = create_router(state);
 
@@ -2434,6 +2509,7 @@ mod tests {
             public_url: None,
             ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
             registry_remote_url: None,
+            oidc_client: None,
         });
         let app = create_router(state);
 
@@ -2470,6 +2546,7 @@ mod tests {
             public_url: None,
             ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
             registry_remote_url: None,
+            oidc_client: None,
         });
         let app = create_router(state);
 
@@ -2506,6 +2583,7 @@ mod tests {
             public_url: None,
             ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
             registry_remote_url: None,
+            oidc_client: None,
         });
         let app = create_router(state);
 
@@ -2544,6 +2622,7 @@ mod tests {
             public_url: None,
             ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
             registry_remote_url: None,
+            oidc_client: None,
         });
         let app = create_router(state);
 
@@ -2582,6 +2661,7 @@ mod tests {
             public_url: None,
             ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
             registry_remote_url: None,
+            oidc_client: None,
         });
         let app = create_router(state);
 
@@ -2618,6 +2698,7 @@ mod tests {
             public_url: None,
             ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
             registry_remote_url: None,
+            oidc_client: None,
         });
         let app = create_router(state);
 
@@ -2628,5 +2709,309 @@ mod tests {
         assert_eq!(resp.status(), HttpStatus::OK);
         let json = body_json(resp).await;
         assert_eq!(json["total"], 0);
+    }
+
+    // ========================================================================
+    // Slug validation tests
+    // ========================================================================
+
+    #[test]
+    fn test_validate_slug_valid() {
+        // Basic valid slugs
+        assert!(validate_slug("my-workspace").is_ok());
+        assert!(validate_slug("ab").is_ok());
+        assert!(validate_slug("a1").is_ok());
+        assert!(validate_slug("test-workspace-123").is_ok());
+        assert!(validate_slug("my-long-workspace-name-with-many-parts").is_ok());
+        assert!(validate_slug("a0").is_ok());
+        assert!(validate_slug("00").is_ok());
+    }
+
+    #[test]
+    fn test_validate_slug_invalid_format() {
+        // Too short
+        assert!(validate_slug("a").is_err());
+        assert!(validate_slug("").is_err());
+
+        // Leading/trailing hyphens
+        assert!(validate_slug("-bad").is_err());
+        assert!(validate_slug("bad-").is_err());
+        assert!(validate_slug("-bad-").is_err());
+
+        // Uppercase
+        assert!(validate_slug("My-Workspace").is_err());
+        assert!(validate_slug("UPPER").is_err());
+
+        // Spaces and special characters
+        assert!(validate_slug("my workspace").is_err());
+        assert!(validate_slug("my_workspace").is_err());
+        assert!(validate_slug("my.workspace").is_err());
+        assert!(validate_slug("my@workspace").is_err());
+        assert!(validate_slug("my/workspace").is_err());
+
+        // Too long (65 chars)
+        let long_slug = format!("a{}", "b".repeat(64));
+        assert!(validate_slug(&long_slug).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_workspace_slug_update_valid() {
+        let app_state = mock_app_state();
+        let ws = test_workspace(); // slug = "test-workspace"
+        app_state.neo4j.create_workspace(&ws).await.unwrap();
+
+        let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
+        let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
+            orchestrator.clone(),
+        )));
+        let state = Arc::new(ServerState {
+            orchestrator,
+            watcher,
+            chat_manager: None,
+            event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(
+                crate::events::EventBus::default(),
+            ))),
+            nats_emitter: None,
+            auth_config: Some(crate::test_helpers::test_auth_config()),
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+            setup_completed: true,
+            server_port: 6600,
+            public_url: None,
+            ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
+            registry_remote_url: None,
+            oidc_client: None,
+        });
+        let app = create_router(state);
+
+        // Update with a valid new slug
+        let req = Request::builder()
+            .method("PATCH")
+            .uri("/api/workspaces/test-workspace")
+            .header("content-type", "application/json")
+            .header("authorization", test_bearer_token())
+            .body(Body::from(r#"{"slug": "new-slug"}"#))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["slug"], "new-slug");
+    }
+
+    #[tokio::test]
+    async fn test_workspace_slug_update_invalid_format_400() {
+        let app_state = mock_app_state();
+        let ws = test_workspace();
+        app_state.neo4j.create_workspace(&ws).await.unwrap();
+
+        let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
+        let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
+            orchestrator.clone(),
+        )));
+        let state = Arc::new(ServerState {
+            orchestrator,
+            watcher,
+            chat_manager: None,
+            event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(
+                crate::events::EventBus::default(),
+            ))),
+            nats_emitter: None,
+            auth_config: Some(crate::test_helpers::test_auth_config()),
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+            setup_completed: true,
+            server_port: 6600,
+            public_url: None,
+            ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
+            registry_remote_url: None,
+            oidc_client: None,
+        });
+        let app = create_router(state);
+
+        // Try invalid slug (uppercase + spaces)
+        let req = Request::builder()
+            .method("PATCH")
+            .uri("/api/workspaces/test-workspace")
+            .header("content-type", "application/json")
+            .header("authorization", test_bearer_token())
+            .body(Body::from(r#"{"slug": "My Workspace!"}"#))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), HttpStatus::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_workspace_slug_update_too_short_400() {
+        let app_state = mock_app_state();
+        let ws = test_workspace();
+        app_state.neo4j.create_workspace(&ws).await.unwrap();
+
+        let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
+        let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
+            orchestrator.clone(),
+        )));
+        let state = Arc::new(ServerState {
+            orchestrator,
+            watcher,
+            chat_manager: None,
+            event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(
+                crate::events::EventBus::default(),
+            ))),
+            nats_emitter: None,
+            auth_config: Some(crate::test_helpers::test_auth_config()),
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+            setup_completed: true,
+            server_port: 6600,
+            public_url: None,
+            ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
+            registry_remote_url: None,
+            oidc_client: None,
+        });
+        let app = create_router(state);
+
+        // Try single-char slug
+        let req = Request::builder()
+            .method("PATCH")
+            .uri("/api/workspaces/test-workspace")
+            .header("content-type", "application/json")
+            .header("authorization", test_bearer_token())
+            .body(Body::from(r#"{"slug": "a"}"#))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), HttpStatus::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_workspace_slug_update_leading_hyphen_400() {
+        let app_state = mock_app_state();
+        let ws = test_workspace();
+        app_state.neo4j.create_workspace(&ws).await.unwrap();
+
+        let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
+        let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
+            orchestrator.clone(),
+        )));
+        let state = Arc::new(ServerState {
+            orchestrator,
+            watcher,
+            chat_manager: None,
+            event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(
+                crate::events::EventBus::default(),
+            ))),
+            nats_emitter: None,
+            auth_config: Some(crate::test_helpers::test_auth_config()),
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+            setup_completed: true,
+            server_port: 6600,
+            public_url: None,
+            ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
+            registry_remote_url: None,
+            oidc_client: None,
+        });
+        let app = create_router(state);
+
+        let req = Request::builder()
+            .method("PATCH")
+            .uri("/api/workspaces/test-workspace")
+            .header("content-type", "application/json")
+            .header("authorization", test_bearer_token())
+            .body(Body::from(r#"{"slug": "-bad"}"#))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), HttpStatus::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_workspace_slug_duplicate_409() {
+        let app_state = mock_app_state();
+
+        // Create two workspaces
+        let ws1 = test_workspace(); // slug = "test-workspace"
+        app_state.neo4j.create_workspace(&ws1).await.unwrap();
+
+        let mut ws2 = test_workspace();
+        ws2.id = Uuid::new_v4();
+        ws2.slug = "other-workspace".to_string();
+        ws2.name = "Other Workspace".to_string();
+        app_state.neo4j.create_workspace(&ws2).await.unwrap();
+
+        let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
+        let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
+            orchestrator.clone(),
+        )));
+        let state = Arc::new(ServerState {
+            orchestrator,
+            watcher,
+            chat_manager: None,
+            event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(
+                crate::events::EventBus::default(),
+            ))),
+            nats_emitter: None,
+            auth_config: Some(crate::test_helpers::test_auth_config()),
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+            setup_completed: true,
+            server_port: 6600,
+            public_url: None,
+            ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
+            registry_remote_url: None,
+            oidc_client: None,
+        });
+        let app = create_router(state);
+
+        // Try to rename ws2's slug to ws1's slug → 409
+        let req = Request::builder()
+            .method("PATCH")
+            .uri("/api/workspaces/other-workspace")
+            .header("content-type", "application/json")
+            .header("authorization", test_bearer_token())
+            .body(Body::from(r#"{"slug": "test-workspace"}"#))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), HttpStatus::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn test_workspace_slug_update_same_slug_ok() {
+        let app_state = mock_app_state();
+        let ws = test_workspace();
+        app_state.neo4j.create_workspace(&ws).await.unwrap();
+
+        let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
+        let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
+            orchestrator.clone(),
+        )));
+        let state = Arc::new(ServerState {
+            orchestrator,
+            watcher,
+            chat_manager: None,
+            event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(
+                crate::events::EventBus::default(),
+            ))),
+            nats_emitter: None,
+            auth_config: Some(crate::test_helpers::test_auth_config()),
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+            setup_completed: true,
+            server_port: 6600,
+            public_url: None,
+            ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
+            registry_remote_url: None,
+            oidc_client: None,
+        });
+        let app = create_router(state);
+
+        // Update with the same slug should succeed (not a conflict with itself)
+        let req = Request::builder()
+            .method("PATCH")
+            .uri("/api/workspaces/test-workspace")
+            .header("content-type", "application/json")
+            .header("authorization", test_bearer_token())
+            .body(Body::from(r#"{"slug": "test-workspace"}"#))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
     }
 }
