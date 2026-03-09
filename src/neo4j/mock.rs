@@ -6348,6 +6348,10 @@ impl GraphStore for MockGraphStore {
             task_id: None,
             depth: 0,
             created_at: Some(chrono::Utc::now()),
+            title: Some("Mock session".to_string()),
+            model: Some("claude-opus-4-6".to_string()),
+            total_cost_usd: Some(0.0),
+            is_streaming: false,
         }])
     }
 

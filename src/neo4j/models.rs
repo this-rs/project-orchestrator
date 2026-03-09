@@ -115,6 +115,18 @@ pub struct SessionTreeNode {
     pub task_id: Option<Uuid>,
     pub depth: u32,
     pub created_at: Option<DateTime<Utc>>,
+    /// Session title (auto-generated or user-provided)
+    #[serde(default)]
+    pub title: Option<String>,
+    /// Model used for this session
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Total cost in USD accumulated by this session
+    #[serde(default)]
+    pub total_cost_usd: Option<f64>,
+    /// Whether the session is currently streaming (runtime state, defaults to false)
+    #[serde(default)]
+    pub is_streaming: bool,
 }
 
 /// Lightweight session info for run-scoped queries.

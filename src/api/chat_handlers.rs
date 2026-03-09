@@ -308,6 +308,20 @@ pub async fn get_run_sessions(
     Ok(Json(sessions))
 }
 
+/// GET /api/runs/{run_id}/agent-executions — Get all AgentExecution nodes for a PlanRun
+pub async fn get_run_agent_executions(
+    State(state): State<OrchestratorState>,
+    Path(run_id): Path<Uuid>,
+) -> Result<Json<Vec<crate::neo4j::agent_execution::AgentExecutionNode>>, AppError> {
+    let executions = state
+        .orchestrator
+        .neo4j()
+        .get_agent_executions_for_run(run_id)
+        .await
+        .map_err(AppError::Internal)?;
+    Ok(Json(executions))
+}
+
 /// DELETE /api/chat/sessions/{id} — Delete a session
 pub async fn delete_session(
     State(state): State<OrchestratorState>,
@@ -1420,5 +1434,118 @@ mod tests {
         assert_eq!(allowed.len(), 1);
         assert_eq!(allowed[0], "mcp__project-orchestrator__*");
         assert_eq!(json["disallowed_tools"].as_array().unwrap().len(), 0);
+    }
+
+    // ====================================================================
+    // GET /api/runs/{run_id}/agent-executions — list agent executions
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_get_run_agent_executions_empty() {
+        let app = test_app().await;
+        let fake_run_id = Uuid::new_v4();
+
+        let resp = app
+            .oneshot(auth_get(&format!(
+                "/api/runs/{}/agent-executions",
+                fake_run_id
+            )))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json.as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_run_agent_executions_invalid_uuid() {
+        let app = test_app().await;
+
+        let resp = app
+            .oneshot(auth_get("/api/runs/not-a-uuid/agent-executions"))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // ====================================================================
+    // GET /api/chat/sessions/{id}/tree — enriched tree node
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_get_session_tree_includes_enriched_fields() {
+        let session = test_chat_session(Some("my-proj"));
+        let session_id = session.id;
+        let app = test_app_with_sessions(&[session]).await;
+
+        let resp = app
+            .oneshot(auth_get(&format!(
+                "/api/chat/sessions/{}/tree",
+                session_id
+            )))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let nodes = json.as_array().unwrap();
+        assert!(!nodes.is_empty());
+        let root = &nodes[0];
+        // Enriched fields should be present
+        assert!(root.get("title").is_some());
+        assert!(root.get("model").is_some());
+        assert!(root.get("total_cost_usd").is_some());
+        assert_eq!(root["is_streaming"], false);
+    }
+
+    // ====================================================================
+    // SessionTreeNode deserialization
+    // ====================================================================
+
+    #[test]
+    fn test_session_tree_node_deserialization_full() {
+        let json = r#"{
+            "session_id": "abc-123",
+            "parent_session_id": "parent-456",
+            "spawn_type": "delegate",
+            "run_id": null,
+            "task_id": null,
+            "depth": 1,
+            "created_at": "2025-01-01T00:00:00Z",
+            "title": "My session",
+            "model": "claude-opus-4-6",
+            "total_cost_usd": 0.42,
+            "is_streaming": true
+        }"#;
+        let node: crate::neo4j::models::SessionTreeNode = serde_json::from_str(json).unwrap();
+        assert_eq!(node.session_id, "abc-123");
+        assert_eq!(node.parent_session_id.as_deref(), Some("parent-456"));
+        assert_eq!(node.title.as_deref(), Some("My session"));
+        assert_eq!(node.model.as_deref(), Some("claude-opus-4-6"));
+        assert_eq!(node.total_cost_usd, Some(0.42));
+        assert!(node.is_streaming);
+        assert_eq!(node.depth, 1);
+    }
+
+    #[test]
+    fn test_session_tree_node_deserialization_defaults() {
+        let json = r#"{
+            "session_id": "abc-123",
+            "depth": 0
+        }"#;
+        let node: crate::neo4j::models::SessionTreeNode = serde_json::from_str(json).unwrap();
+        assert_eq!(node.session_id, "abc-123");
+        assert!(node.title.is_none());
+        assert!(node.model.is_none());
+        assert!(node.total_cost_usd.is_none());
+        assert!(!node.is_streaming);
     }
 }

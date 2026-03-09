@@ -463,7 +463,10 @@ impl Neo4jClient {
                    CASE WHEN size(rels) > 0 THEN rels[size(rels)-1].run_id ELSE null END AS run_id,
                    CASE WHEN size(rels) > 0 THEN rels[size(rels)-1].task_id ELSE null END AS task_id,
                    depth,
-                   child.created_at AS created_at
+                   child.created_at AS created_at,
+                   child.title AS title,
+                   child.model AS model,
+                   child.total_cost_usd AS total_cost_usd
             ORDER BY depth ASC, child.created_at ASC
             "#,
         )
@@ -491,6 +494,15 @@ impl Neo4jClient {
                     .and_then(|s: String| if s.is_empty() { None } else { Some(s) });
             let depth: i64 = row.get("depth").unwrap_or(0);
             let created_at_str: Option<String> = row.get("created_at").ok();
+            let title: Option<String> = row
+                .get("title")
+                .ok()
+                .and_then(|s: String| if s.is_empty() { None } else { Some(s) });
+            let model: Option<String> = row
+                .get("model")
+                .ok()
+                .and_then(|s: String| if s.is_empty() { None } else { Some(s) });
+            let total_cost_usd: Option<f64> = row.get("total_cost_usd").ok();
 
             nodes.push(SessionTreeNode {
                 session_id,
@@ -500,6 +512,10 @@ impl Neo4jClient {
                 task_id: task_id_str.and_then(|s| s.parse().ok()),
                 depth: depth as u32,
                 created_at: created_at_str.and_then(|s| s.parse().ok()),
+                title,
+                model,
+                total_cost_usd,
+                is_streaming: false,
             });
         }
         Ok(nodes)
