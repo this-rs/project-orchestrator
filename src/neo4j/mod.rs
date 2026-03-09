@@ -16,6 +16,7 @@ mod note;
 pub mod plan;
 mod plan_run;
 mod profile;
+mod trigger;
 mod project;
 mod protocol;
 mod registry;

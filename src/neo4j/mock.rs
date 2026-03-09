@@ -71,6 +71,10 @@ pub struct MockGraphStore {
     pub session_auto_continue: RwLock<HashMap<Uuid, bool>>,
     /// PlanRun states (Runner)
     pub plan_runs: RwLock<HashMap<Uuid, crate::runner::RunnerState>>,
+    /// Triggers
+    pub triggers: RwLock<HashMap<Uuid, crate::runner::Trigger>>,
+    /// Trigger firings
+    pub trigger_firings: RwLock<HashMap<Uuid, Vec<crate::runner::TriggerFiring>>>,
 
     // Relationships (adjacency lists)
     pub plan_tasks: RwLock<HashMap<Uuid, Vec<Uuid>>>,
@@ -183,6 +187,8 @@ impl MockGraphStore {
             chat_events: RwLock::new(HashMap::new()),
             session_auto_continue: RwLock::new(HashMap::new()),
             plan_runs: RwLock::new(HashMap::new()),
+            triggers: RwLock::new(HashMap::new()),
+            trigger_firings: RwLock::new(HashMap::new()),
             plan_tasks: RwLock::new(HashMap::new()),
             task_steps: RwLock::new(HashMap::new()),
             task_decisions: RwLock::new(HashMap::new()),
@@ -8760,6 +8766,74 @@ impl GraphStore for MockGraphStore {
             .cloned()
             .collect();
         result.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+        result.truncate(limit as usize);
+        Ok(result)
+    }
+
+    // ── Triggers ──────────────────────────────────────────────────────────
+
+    async fn create_trigger(&self, trigger: &crate::runner::Trigger) -> anyhow::Result<crate::runner::Trigger> {
+        let mut triggers = self.triggers.write().await;
+        triggers.insert(trigger.id, trigger.clone());
+        Ok(trigger.clone())
+    }
+
+    async fn get_trigger(&self, trigger_id: Uuid) -> anyhow::Result<Option<crate::runner::Trigger>> {
+        let triggers = self.triggers.read().await;
+        Ok(triggers.get(&trigger_id).cloned())
+    }
+
+    async fn list_triggers(&self, plan_id: Uuid) -> anyhow::Result<Vec<crate::runner::Trigger>> {
+        let triggers = self.triggers.read().await;
+        Ok(triggers.values().filter(|t| t.plan_id == plan_id).cloned().collect())
+    }
+
+    async fn update_trigger(
+        &self,
+        trigger_id: Uuid,
+        enabled: Option<bool>,
+        config: Option<serde_json::Value>,
+        cooldown_secs: Option<u64>,
+    ) -> anyhow::Result<Option<crate::runner::Trigger>> {
+        let mut triggers = self.triggers.write().await;
+        if let Some(t) = triggers.get_mut(&trigger_id) {
+            if let Some(e) = enabled { t.enabled = e; }
+            if let Some(c) = config { t.config = c; }
+            if let Some(cd) = cooldown_secs { t.cooldown_secs = cd; }
+            Ok(Some(t.clone()))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn delete_trigger(&self, trigger_id: Uuid) -> anyhow::Result<()> {
+        let mut triggers = self.triggers.write().await;
+        triggers.remove(&trigger_id);
+        let mut firings = self.trigger_firings.write().await;
+        firings.remove(&trigger_id);
+        Ok(())
+    }
+
+    async fn record_trigger_firing(&self, firing: &crate::runner::TriggerFiring) -> anyhow::Result<()> {
+        let mut firings = self.trigger_firings.write().await;
+        firings.entry(firing.trigger_id).or_default().push(firing.clone());
+        // Update trigger fire_count and last_fired
+        let mut triggers = self.triggers.write().await;
+        if let Some(t) = triggers.get_mut(&firing.trigger_id) {
+            t.fire_count += 1;
+            t.last_fired = Some(firing.fired_at);
+        }
+        Ok(())
+    }
+
+    async fn list_trigger_firings(
+        &self,
+        trigger_id: Uuid,
+        limit: i64,
+    ) -> anyhow::Result<Vec<crate::runner::TriggerFiring>> {
+        let firings = self.trigger_firings.read().await;
+        let mut result: Vec<_> = firings.get(&trigger_id).cloned().unwrap_or_default();
+        result.sort_by(|a, b| b.fired_at.cmp(&a.fired_at));
         result.truncate(limit as usize);
         Ok(result)
     }

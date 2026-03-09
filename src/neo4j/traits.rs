@@ -2542,4 +2542,37 @@ pub trait GraphStore: Send + Sync {
         plan_id: Uuid,
         limit: i64,
     ) -> Result<Vec<crate::runner::RunnerState>>;
+
+    // ── Triggers ──────────────────────────────────────────────────────────
+
+    /// Create a trigger node linked to a plan via (:Trigger)-[:TRIGGERS]->(:Plan).
+    async fn create_trigger(&self, trigger: &crate::runner::Trigger) -> Result<crate::runner::Trigger>;
+
+    /// Get a trigger by its UUID.
+    async fn get_trigger(&self, trigger_id: Uuid) -> Result<Option<crate::runner::Trigger>>;
+
+    /// List all triggers for a given plan.
+    async fn list_triggers(&self, plan_id: Uuid) -> Result<Vec<crate::runner::Trigger>>;
+
+    /// Update a trigger (enabled, config, cooldown_secs).
+    async fn update_trigger(
+        &self,
+        trigger_id: Uuid,
+        enabled: Option<bool>,
+        config: Option<serde_json::Value>,
+        cooldown_secs: Option<u64>,
+    ) -> Result<Option<crate::runner::Trigger>>;
+
+    /// Delete a trigger by its UUID.
+    async fn delete_trigger(&self, trigger_id: Uuid) -> Result<()>;
+
+    /// Record a trigger firing event.
+    async fn record_trigger_firing(&self, firing: &crate::runner::TriggerFiring) -> Result<()>;
+
+    /// List trigger firings for a given trigger, ordered by fired_at desc.
+    async fn list_trigger_firings(
+        &self,
+        trigger_id: Uuid,
+        limit: i64,
+    ) -> Result<Vec<crate::runner::TriggerFiring>>;
 }

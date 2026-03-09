@@ -354,6 +354,67 @@ pub struct RunSnapshot {
 }
 
 // ============================================================================
+// Trigger — automatic plan execution triggers
+// ============================================================================
+
+/// Type of trigger that can start a plan run.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TriggerType {
+    /// Cron-based schedule (e.g., "0 2 * * *")
+    Schedule,
+    /// External webhook (e.g., GitHub push)
+    Webhook,
+    /// Internal event (e.g., another plan completed)
+    Event,
+    /// Chat intent (LLM calls plan(run))
+    Chat,
+}
+
+impl fmt::Display for TriggerType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Schedule => write!(f, "schedule"),
+            Self::Webhook => write!(f, "webhook"),
+            Self::Event => write!(f, "event"),
+            Self::Chat => write!(f, "chat"),
+        }
+    }
+}
+
+/// A trigger node persisted in Neo4j, linked to a Plan via (:Trigger)-[:TRIGGERS]->(:Plan).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Trigger {
+    pub id: Uuid,
+    pub plan_id: Uuid,
+    pub trigger_type: TriggerType,
+    /// Type-specific configuration (cron expression, webhook secret, event filter, etc.)
+    pub config: serde_json::Value,
+    /// Whether this trigger is active.
+    pub enabled: bool,
+    /// Minimum seconds between firings (0 = no cooldown).
+    pub cooldown_secs: u64,
+    /// Last time this trigger fired.
+    pub last_fired: Option<DateTime<Utc>>,
+    /// Total number of times this trigger has fired.
+    pub fire_count: u64,
+    pub created_at: DateTime<Utc>,
+}
+
+/// A firing record — one entry per trigger activation.
+/// Persisted as (:TriggerFiring)-[:FIRED_BY]->(:Trigger).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TriggerFiring {
+    pub id: Uuid,
+    pub trigger_id: Uuid,
+    /// The PlanRun that was created by this firing.
+    pub plan_run_id: Option<Uuid>,
+    pub fired_at: DateTime<Utc>,
+    /// Optional payload from the trigger source (webhook body, event data, etc.)
+    pub source_payload: Option<serde_json::Value>,
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 

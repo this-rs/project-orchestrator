@@ -308,6 +308,27 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/plans/{plan_id}/run/auto-pr",
             post(handlers::create_auto_pr),
         )
+        // Triggers
+        .route(
+            "/api/plans/{plan_id}/triggers",
+            get(handlers::list_triggers).post(handlers::create_trigger),
+        )
+        .route(
+            "/api/triggers/{trigger_id}",
+            delete(handlers::delete_trigger),
+        )
+        .route(
+            "/api/triggers/{trigger_id}/enable",
+            post(handlers::enable_trigger),
+        )
+        .route(
+            "/api/triggers/{trigger_id}/disable",
+            post(handlers::disable_trigger),
+        )
+        .route(
+            "/api/triggers/{trigger_id}/firings",
+            get(handlers::list_trigger_firings),
+        )
         // Constraints
         .route(
             "/api/plans/{plan_id}/constraints",

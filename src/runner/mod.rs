@@ -19,13 +19,14 @@ pub mod guard;
 pub mod models;
 pub mod runner;
 pub mod state;
+pub mod trigger;
 pub mod verifier;
 
 // Re-export key types for convenience
 pub use guard::{AgentGuard, ChatManagerHintSender, GuardConfig, GuardVerdict, HintSender};
 pub use models::{
     PlanRunStatus, RunSnapshot, RunnerConfig, RunnerEvent, TaskResult, TaskRunStatus,
-    TaskStateMachine, TriggerSource,
+    TaskStateMachine, Trigger, TriggerFiring, TriggerSource, TriggerType,
 };
 pub use runner::{PlanRunner, RunStatus, RUNNER_CANCEL, RUNNER_STATE};
 pub use state::RunnerState;

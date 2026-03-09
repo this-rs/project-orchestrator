@@ -118,6 +118,11 @@ impl ToolHandler {
             ("plan", "run_status") => "get_run_status",
             ("plan", "cancel_run") => "cancel_plan_run",
             ("plan", "auto_pr") => "create_auto_pr",
+            ("plan", "add_trigger") => "add_trigger",
+            ("plan", "list_triggers") => "list_triggers",
+            ("plan", "remove_trigger") => "remove_trigger",
+            ("plan", "enable_trigger") => "enable_trigger",
+            ("plan", "disable_trigger") => "disable_trigger",
 
             // Task
             ("task", "list") => "list_tasks",
@@ -814,6 +819,52 @@ impl ToolHandler {
                 let plan_id = extract_id(args, "plan_id")?;
                 let result = http
                     .post(&format!("/api/plans/{}/run/auto-pr", plan_id), &json!({}))
+                    .await?;
+                Ok(Some(result))
+            }
+
+            // ── P2b: Triggers (5 actions) ──────────────────────────────────
+            "add_trigger" => {
+                let plan_id = extract_id(args, "plan_id")?;
+                let body = json!({
+                    "trigger_type": args.get("trigger_type").and_then(|v| v.as_str()).unwrap_or("schedule"),
+                    "config": args.get("config").cloned().unwrap_or(json!({})),
+                    "cooldown_secs": args.get("cooldown_secs").and_then(|v| v.as_u64()).unwrap_or(0)
+                });
+                let result = http
+                    .post(&format!("/api/plans/{}/triggers", plan_id), &body)
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "list_triggers" => {
+                let plan_id = extract_id(args, "plan_id")?;
+                let result = http
+                    .get(&format!("/api/plans/{}/triggers", plan_id))
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "remove_trigger" => {
+                let trigger_id = extract_id(args, "trigger_id")?;
+                let result = http
+                    .delete(&format!("/api/triggers/{}", trigger_id))
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "enable_trigger" => {
+                let trigger_id = extract_id(args, "trigger_id")?;
+                let result = http
+                    .post(&format!("/api/triggers/{}/enable", trigger_id), &json!({}))
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "disable_trigger" => {
+                let trigger_id = extract_id(args, "trigger_id")?;
+                let result = http
+                    .post(&format!("/api/triggers/{}/disable", trigger_id), &json!({}))
                     .await?;
                 Ok(Some(result))
             }

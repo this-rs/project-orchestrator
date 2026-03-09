@@ -3930,6 +3930,141 @@ pub async fn create_auto_pr(
 }
 
 // ============================================================================
+// Triggers
+// ============================================================================
+
+/// POST /api/plans/:id/triggers — Create a trigger for a plan.
+pub async fn create_trigger(
+    State(state): State<OrchestratorState>,
+    Path(plan_id): Path<Uuid>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    use crate::runner::{Trigger, TriggerType};
+
+    let trigger_type_str = body
+        .get("trigger_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("schedule");
+    let trigger_type = match trigger_type_str {
+        "schedule" => TriggerType::Schedule,
+        "webhook" => TriggerType::Webhook,
+        "event" => TriggerType::Event,
+        "chat" => TriggerType::Chat,
+        other => {
+            return Err(AppError::BadRequest(format!(
+                "Invalid trigger_type: {}. Must be schedule, webhook, event, or chat.",
+                other
+            )));
+        }
+    };
+    let config = body
+        .get("config")
+        .cloned()
+        .unwrap_or(serde_json::json!({}));
+    let cooldown_secs = body
+        .get("cooldown_secs")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+
+    let trigger = Trigger {
+        id: Uuid::new_v4(),
+        plan_id,
+        trigger_type,
+        config,
+        enabled: true,
+        cooldown_secs,
+        last_fired: None,
+        fire_count: 0,
+        created_at: chrono::Utc::now(),
+    };
+
+    let graph = state.orchestrator.neo4j_arc();
+    let created = graph
+        .create_trigger(&trigger)
+        .await
+        .map_err(AppError::Internal)?;
+
+    Ok(Json(serde_json::to_value(&created).unwrap_or_default()))
+}
+
+/// GET /api/plans/:id/triggers — List triggers for a plan.
+pub async fn list_triggers(
+    State(state): State<OrchestratorState>,
+    Path(plan_id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let graph = state.orchestrator.neo4j_arc();
+    let triggers = graph
+        .list_triggers(plan_id)
+        .await
+        .map_err(AppError::Internal)?;
+
+    Ok(Json(serde_json::to_value(&triggers).unwrap_or_default()))
+}
+
+/// DELETE /api/triggers/:id — Delete a trigger.
+pub async fn delete_trigger(
+    State(state): State<OrchestratorState>,
+    Path(trigger_id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let graph = state.orchestrator.neo4j_arc();
+    graph
+        .delete_trigger(trigger_id)
+        .await
+        .map_err(AppError::Internal)?;
+
+    Ok(Json(serde_json::json!({ "deleted": true, "trigger_id": trigger_id })))
+}
+
+/// PATCH /api/triggers/:id/enable — Enable a trigger.
+pub async fn enable_trigger(
+    State(state): State<OrchestratorState>,
+    Path(trigger_id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let graph = state.orchestrator.neo4j_arc();
+    let trigger = graph
+        .update_trigger(trigger_id, Some(true), None, None)
+        .await
+        .map_err(AppError::Internal)?
+        .ok_or_else(|| AppError::NotFound(format!("Trigger {} not found", trigger_id)))?;
+
+    Ok(Json(serde_json::to_value(&trigger).unwrap_or_default()))
+}
+
+/// PATCH /api/triggers/:id/disable — Disable a trigger.
+pub async fn disable_trigger(
+    State(state): State<OrchestratorState>,
+    Path(trigger_id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let graph = state.orchestrator.neo4j_arc();
+    let trigger = graph
+        .update_trigger(trigger_id, Some(false), None, None)
+        .await
+        .map_err(AppError::Internal)?
+        .ok_or_else(|| AppError::NotFound(format!("Trigger {} not found", trigger_id)))?;
+
+    Ok(Json(serde_json::to_value(&trigger).unwrap_or_default()))
+}
+
+/// GET /api/triggers/:id/firings — Get trigger firing history.
+pub async fn list_trigger_firings(
+    State(state): State<OrchestratorState>,
+    Path(trigger_id): Path<Uuid>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let limit = params
+        .get("limit")
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(20);
+    let graph = state.orchestrator.neo4j_arc();
+    let firings = graph
+        .list_trigger_firings(trigger_id, limit)
+        .await
+        .map_err(AppError::Internal)?;
+
+    Ok(Json(serde_json::to_value(&firings).unwrap_or_default()))
+}
+
+// ============================================================================
 // Roadmap
 // ============================================================================
 
