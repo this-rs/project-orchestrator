@@ -5,17 +5,20 @@
 
 use crate::chat::manager::ChatManager;
 use crate::chat::types::{ChatEvent, ChatRequest};
+use crate::events::{CrudAction, CrudEvent, EntityType, EventEmitter};
 use crate::neo4j::models::TaskStatus;
 use crate::neo4j::traits::GraphStore;
 use crate::orchestrator::context::ContextBuilder;
-use crate::runner::models::{
-    PlanRunStatus, RunnerConfig, RunnerEvent, TaskResult, TriggerSource,
-};
+use crate::runner::guard::{AgentGuard, ChatManagerHintSender, GuardConfig, GuardVerdict};
+use crate::runner::models::{PlanRunStatus, RunnerConfig, RunnerEvent, TaskResult, TriggerSource};
+use crate::runner::enricher::TaskEnricher;
 use crate::runner::state::RunnerState;
+use crate::runner::verifier::{TaskVerifier, VerifyResult};
 
 use anyhow::{anyhow, Result};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
+use std::time::Duration;
 use tokio::sync::{broadcast, RwLock};
 use tracing::{error, info, warn};
 use uuid::Uuid;
@@ -63,6 +66,10 @@ pub struct PlanRunner {
     context_builder: Arc<ContextBuilder>,
     config: RunnerConfig,
     event_tx: broadcast::Sender<RunnerEvent>,
+    /// Optional event emitter to bridge RunnerEvents into the CrudEvent system
+    /// for WebSocket delivery. When set, every RunnerEvent is also emitted as a
+    /// CrudEvent with entity_type=Runner so WS clients can filter on it.
+    event_emitter: Option<Arc<dyn EventEmitter>>,
 }
 
 /// Result of starting a plan run.
@@ -106,6 +113,50 @@ impl PlanRunner {
             context_builder,
             config,
             event_tx,
+            event_emitter: None,
+        }
+    }
+
+    /// Set the event emitter for WebSocket bridging.
+    ///
+    /// When set, every RunnerEvent is also emitted as a CrudEvent with
+    /// `entity_type: Runner` so WebSocket clients can subscribe with
+    /// `?entity_types=runner`.
+    pub fn with_event_emitter(mut self, emitter: Arc<dyn EventEmitter>) -> Self {
+        self.event_emitter = Some(emitter);
+        self
+    }
+
+    /// Emit a RunnerEvent on both the broadcast channel and the CrudEvent bus.
+    fn emit_event(&self, event: RunnerEvent) {
+        // 1. Broadcast on the dedicated RunnerEvent channel
+        let _ = self.event_tx.send(event.clone());
+
+        // 2. Bridge to CrudEvent for WebSocket delivery
+        if let Some(ref emitter) = self.event_emitter {
+            let (entity_id, action) = match &event {
+                RunnerEvent::PlanStarted { run_id, .. } => (run_id.to_string(), CrudAction::Created),
+                RunnerEvent::PlanCompleted { run_id, .. } => (run_id.to_string(), CrudAction::Updated),
+                RunnerEvent::TaskStarted { run_id, .. } => (run_id.to_string(), CrudAction::Updated),
+                RunnerEvent::TaskCompleted { run_id, .. } => (run_id.to_string(), CrudAction::Updated),
+                RunnerEvent::TaskFailed { run_id, .. } => (run_id.to_string(), CrudAction::Updated),
+                RunnerEvent::TaskTimeout { run_id, .. } => (run_id.to_string(), CrudAction::Updated),
+                RunnerEvent::WaveStarted { run_id, .. } => (run_id.to_string(), CrudAction::Updated),
+                RunnerEvent::WaveCompleted { run_id, .. } => (run_id.to_string(), CrudAction::Updated),
+                RunnerEvent::BudgetExceeded { run_id, .. } => (run_id.to_string(), CrudAction::Updated),
+                RunnerEvent::RunnerError { run_id, .. } => (run_id.to_string(), CrudAction::Updated),
+            };
+
+            let payload = serde_json::to_value(&event).unwrap_or_default();
+            emitter.emit(CrudEvent {
+                entity_type: EntityType::Runner,
+                action,
+                entity_id,
+                related: None,
+                payload,
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                project_id: None,
+            });
         }
     }
 
@@ -163,7 +214,7 @@ impl PlanRunner {
         };
 
         // 5. Emit PlanStarted event
-        let _ = self.event_tx.send(RunnerEvent::PlanStarted {
+        self.emit_event(RunnerEvent::PlanStarted {
             run_id,
             plan_id,
             plan_title: String::new(), // Will be enriched by caller
@@ -180,7 +231,7 @@ impl PlanRunner {
                 .await
             {
                 error!("PlanRunner execution failed: {}", e);
-                let _ = runner.event_tx.send(RunnerEvent::RunnerError {
+                runner.emit_event(RunnerEvent::RunnerError {
                     run_id,
                     message: e.to_string(),
                 });
@@ -287,7 +338,7 @@ impl PlanRunner {
                 }
             }
 
-            let _ = self.event_tx.send(RunnerEvent::WaveStarted {
+            self.emit_event(RunnerEvent::WaveStarted {
                 run_id,
                 wave_number,
                 task_count: wave.task_count,
@@ -309,9 +360,15 @@ impl PlanRunner {
 
                 // Skip blocked tasks
                 if wave_task.status == "blocked" {
-                    warn!("Skipping blocked task {}: {}", wave_task.id, wave_task.title.as_deref().unwrap_or("untitled"));
+                    warn!(
+                        "Skipping blocked task {}: {}",
+                        wave_task.id,
+                        wave_task.title.as_deref().unwrap_or("untitled")
+                    );
                     continue;
                 }
+
+                let task_start_time = chrono::Utc::now();
 
                 let task_result = self
                     .execute_task(
@@ -325,30 +382,76 @@ impl PlanRunner {
                     .await;
 
                 match task_result {
-                    Ok(TaskResult::Success { duration_secs, cost_usd }) => {
+                    Ok(TaskResult::Success {
+                        duration_secs,
+                        cost_usd,
+                    }) => {
                         self.on_task_completed(run_id, wave_task.id, duration_secs, cost_usd)
                             .await?;
+
+                        // Fire-and-forget enrichment (commits, auto-notes, AFFECTS)
+                        let enricher = TaskEnricher::new(self.graph.clone());
+                        let enrich_task_id = wave_task.id;
+                        let enrich_plan_id = plan_id;
+                        let enrich_cwd = cwd.clone();
+                        let enrich_start = task_start_time;
+                        tokio::spawn(async move {
+                            let result = enricher
+                                .enrich(
+                                    enrich_task_id,
+                                    enrich_plan_id,
+                                    None,      // project_id — TODO: resolve from slug
+                                    None,      // session_id — TODO: pass from execute_task
+                                    enrich_start,
+                                    &enrich_cwd,
+                                )
+                                .await;
+                            info!(
+                                "Enricher completed for task {}: {} commits, note={}, {} affects",
+                                enrich_task_id,
+                                result.commits_linked,
+                                result.note_created,
+                                result.affects_added
+                            );
+                        });
                     }
-                    Ok(TaskResult::Failed { reason, attempts, cost_usd }) => {
+                    Ok(TaskResult::Failed {
+                        reason,
+                        attempts: _,
+                        cost_usd,
+                    }) => {
                         self.on_task_failed(run_id, plan_id, wave_task.id, &reason, 0.0, cost_usd)
                             .await?;
                     }
-                    Ok(TaskResult::Timeout { duration_secs, cost_usd }) => {
-                        let _ = self.event_tx.send(RunnerEvent::TaskTimeout {
+                    Ok(TaskResult::Timeout {
+                        duration_secs,
+                        cost_usd,
+                    }) => {
+                        self.emit_event(RunnerEvent::TaskTimeout {
                             run_id,
                             task_id: wave_task.id,
                             task_title: wave_task.title.clone().unwrap_or_default(),
                             duration_secs,
                         });
-                        self.on_task_failed(run_id, plan_id, wave_task.id, "Task timeout", duration_secs, cost_usd)
-                            .await?;
+                        self.on_task_failed(
+                            run_id,
+                            plan_id,
+                            wave_task.id,
+                            "Task timeout",
+                            duration_secs,
+                            cost_usd,
+                        )
+                        .await?;
                     }
-                    Ok(TaskResult::BudgetExceeded { cumulated_cost_usd, limit_usd }) => {
+                    Ok(TaskResult::BudgetExceeded {
+                        cumulated_cost_usd,
+                        limit_usd,
+                    }) => {
                         let plan_id = {
                             let global = RUNNER_STATE.read().await;
                             global.as_ref().map(|s| s.plan_id).unwrap_or(plan_id)
                         };
-                        let _ = self.event_tx.send(RunnerEvent::BudgetExceeded {
+                        self.emit_event(RunnerEvent::BudgetExceeded {
                             run_id,
                             plan_id,
                             cumulated_cost_usd,
@@ -368,8 +471,15 @@ impl PlanRunner {
                     }
                     Err(e) => {
                         error!("Task {} execution error: {}", wave_task.id, e);
-                        self.on_task_failed(run_id, plan_id, wave_task.id, &e.to_string(), 0.0, 0.0)
-                            .await?;
+                        self.on_task_failed(
+                            run_id,
+                            plan_id,
+                            wave_task.id,
+                            &e.to_string(),
+                            0.0,
+                            0.0,
+                        )
+                        .await?;
                     }
                 }
 
@@ -378,7 +488,7 @@ impl PlanRunner {
                     let global = RUNNER_STATE.read().await;
                     if let Some(ref s) = *global {
                         if s.is_budget_exceeded(self.config.max_cost_usd) {
-                            let _ = self.event_tx.send(RunnerEvent::BudgetExceeded {
+                            self.emit_event(RunnerEvent::BudgetExceeded {
                                 run_id,
                                 plan_id,
                                 cumulated_cost_usd: s.cost_usd,
@@ -395,9 +505,12 @@ impl PlanRunner {
 
             let (tc, tf) = {
                 let global = RUNNER_STATE.read().await;
-                global.as_ref().map(|s| (s.completed_tasks.len(), s.failed_tasks.len())).unwrap_or((0, 0))
+                global
+                    .as_ref()
+                    .map(|s| (s.completed_tasks.len(), s.failed_tasks.len()))
+                    .unwrap_or((0, 0))
             };
-            let _ = self.event_tx.send(RunnerEvent::WaveCompleted {
+            self.emit_event(RunnerEvent::WaveCompleted {
                 run_id,
                 wave_number,
                 tasks_completed: tc,
@@ -432,7 +545,9 @@ impl PlanRunner {
         }
 
         // Mark task as in_progress
-        self.graph.update_task_status(task_id, TaskStatus::InProgress).await?;
+        self.graph
+            .update_task_status(task_id, TaskStatus::InProgress)
+            .await?;
 
         // Get current wave number
         let wave_number = {
@@ -440,7 +555,7 @@ impl PlanRunner {
             global.as_ref().map(|s| s.current_wave).unwrap_or(0)
         };
 
-        let _ = self.event_tx.send(RunnerEvent::TaskStarted {
+        self.emit_event(RunnerEvent::TaskStarted {
             run_id,
             task_id,
             task_title: task_title.to_string(),
@@ -448,10 +563,7 @@ impl PlanRunner {
         });
 
         // Build the prompt
-        let context = self
-            .context_builder
-            .build_context(task_id, plan_id)
-            .await?;
+        let context = self.context_builder.build_context(task_id, plan_id).await?;
         let mut prompt = self.context_builder.generate_prompt(&context);
         prompt.push_str(RUNNER_CONSTRAINTS);
 
@@ -472,77 +584,85 @@ impl PlanRunner {
         let session_id = session.session_id.clone();
 
         // Subscribe to events BEFORE sending message (to not miss any)
-        let mut rx = self.chat_manager.subscribe(&session_id).await?;
+        let rx = self.chat_manager.subscribe(&session_id).await?;
+        // Clone a second receiver for the guard
+        let guard_rx = self.chat_manager.subscribe(&session_id).await?;
 
         // Send the prompt
         self.chat_manager.send_message(&session_id, &prompt).await?;
 
-        // Listen for events until Result
         let start = std::time::Instant::now();
-        let timeout = std::time::Duration::from_secs(self.config.task_timeout_secs);
-        let mut cost_usd = 0.0_f64;
-        let mut is_error = false;
-        let mut error_text = String::new();
-        let mut _subtype = String::new();
 
-        loop {
-            let remaining = timeout.saturating_sub(start.elapsed());
-            if remaining.is_zero() {
-                return Ok(TaskResult::Timeout {
-                    duration_secs: start.elapsed().as_secs_f64(),
+        // Spawn the AgentGuard in parallel
+        let guard_config = GuardConfig {
+            idle_timeout: Duration::from_secs(self.config.idle_timeout_secs),
+            task_timeout: Duration::from_secs(self.config.task_timeout_secs),
+            loop_threshold: 3,
+            ..Default::default()
+        };
+        let hint_sender = Arc::new(ChatManagerHintSender {
+            chat_manager: self.chat_manager.clone(),
+        });
+        let guard = AgentGuard::new(
+            session_id.clone(),
+            task_title.to_string(),
+            task_id,
+            guard_config,
+            guard_rx,
+            Some(hint_sender),
+        );
+
+        let guard_handle = tokio::spawn(async move { guard.monitor().await });
+
+        // Listen for events until Result — in parallel with the guard
+        let event_result = self.listen_for_result(rx, run_id).await;
+
+        // Wait for guard to finish (it should return quickly once the channel closes)
+        let guard_verdict = match guard_handle.await {
+            Ok(verdict) => verdict,
+            Err(e) => {
+                warn!("Guard task panicked: {}", e);
+                GuardVerdict::Completed
+            }
+        };
+
+        // Process the event listener result
+        let (cost_usd, is_error, error_text, _subtype, _timed_out) = match event_result {
+            EventListenResult::Completed {
+                cost_usd,
+                is_error,
+                error_text,
+                subtype,
+            } => (cost_usd, is_error, error_text, subtype, false),
+            EventListenResult::ChannelClosed { cost_usd } => {
+                // Check if the guard timed out (it would have interrupted the session)
+                if let GuardVerdict::Timeout { elapsed_secs } = guard_verdict {
+                    return Ok(TaskResult::Timeout {
+                        duration_secs: elapsed_secs,
+                        cost_usd,
+                    });
+                }
+                return Ok(TaskResult::Failed {
+                    reason: "Chat event channel closed unexpectedly".to_string(),
+                    attempts: 0,
                     cost_usd,
                 });
             }
-
-            // Check cancel flag
-            if RUNNER_CANCEL.load(Ordering::SeqCst) {
+            EventListenResult::Cancelled { cost_usd } => {
                 return Ok(TaskResult::Failed {
                     reason: "Cancelled by user".to_string(),
                     attempts: 0,
                     cost_usd,
                 });
             }
+        };
 
-            match tokio::time::timeout(remaining, rx.recv()).await {
-                Ok(Ok(event)) => match event {
-                    ChatEvent::Result {
-                        cost_usd: event_cost,
-                        subtype,
-                        is_error: err,
-                        result_text,
-                        ..
-                    } => {
-                        if let Some(c) = event_cost {
-                            cost_usd = c;
-                        }
-                        is_error = err;
-                        _subtype = subtype.clone();
-                        if let Some(ref text) = result_text {
-                            error_text = text.clone();
-                        }
-                        break;
-                    }
-                    // Accumulate cost if available from other events
-                    _ => {} // Ignore intermediate events
-                },
-                Ok(Err(broadcast::error::RecvError::Lagged(n))) => {
-                    warn!("Runner event receiver lagged by {} events", n);
-                }
-                Ok(Err(broadcast::error::RecvError::Closed)) => {
-                    return Ok(TaskResult::Failed {
-                        reason: "Chat event channel closed unexpectedly".to_string(),
-                        attempts: 0,
-                        cost_usd,
-                    });
-                }
-                Err(_) => {
-                    // Timeout
-                    return Ok(TaskResult::Timeout {
-                        duration_secs: start.elapsed().as_secs_f64(),
-                        cost_usd,
-                    });
-                }
-            }
+        // If the guard decided timeout, honor it even if we got a result
+        if let GuardVerdict::Timeout { elapsed_secs } = guard_verdict {
+            return Ok(TaskResult::Timeout {
+                duration_secs: elapsed_secs,
+                cost_usd,
+            });
         }
 
         let duration_secs = start.elapsed().as_secs_f64();
@@ -562,7 +682,7 @@ impl PlanRunner {
         }
 
         if is_error {
-            Ok(TaskResult::Failed {
+            return Ok(TaskResult::Failed {
                 reason: if error_text.is_empty() {
                     format!("Agent returned error (subtype: {})", _subtype)
                 } else {
@@ -570,12 +690,34 @@ impl PlanRunner {
                 },
                 attempts: 0,
                 cost_usd,
-            })
-        } else {
-            Ok(TaskResult::Success {
+            });
+        }
+
+        // Post-task verification (build, steps, git sanity)
+        let verifier = TaskVerifier::new(
+            self.graph.clone(),
+            self.config.build_check,
+            self.config.test_runner,
+        );
+        let verify_result = verifier.verify(task_id, cwd).await;
+
+        match verify_result {
+            VerifyResult::Pass => Ok(TaskResult::Success {
                 duration_secs,
                 cost_usd,
-            })
+            }),
+            VerifyResult::Fail { reasons } => {
+                let reason = format!(
+                    "Post-task verification failed:\n- {}",
+                    reasons.join("\n- ")
+                );
+                warn!("Task {} verification failed: {}", task_id, reason);
+                Ok(TaskResult::Failed {
+                    reason,
+                    attempts: 0,
+                    cost_usd,
+                })
+            }
         }
     }
 
@@ -591,7 +733,9 @@ impl PlanRunner {
         cost_usd: f64,
     ) -> Result<()> {
         // Update task status
-        self.graph.update_task_status(task_id, TaskStatus::Completed).await?;
+        self.graph
+            .update_task_status(task_id, TaskStatus::Completed)
+            .await?;
 
         // Update global state
         {
@@ -606,7 +750,7 @@ impl PlanRunner {
         }
 
         // Emit event
-        let _ = self.event_tx.send(RunnerEvent::TaskCompleted {
+        self.emit_event(RunnerEvent::TaskCompleted {
             run_id,
             task_id,
             task_title: String::new(), // Title already logged
@@ -625,7 +769,7 @@ impl PlanRunner {
     async fn on_task_failed(
         &self,
         run_id: Uuid,
-        plan_id: Uuid,
+        _plan_id: Uuid,
         task_id: Uuid,
         reason: &str,
         duration_secs: f64,
@@ -661,9 +805,12 @@ impl PlanRunner {
             // For now, we just mark failed — retry logic will be enhanced in T3/T4
             let retry_count = {
                 let global = RUNNER_STATE.read().await;
-                global.as_ref().and_then(|s| s.retry_counts.get(&task_id).copied()).unwrap_or(0)
+                global
+                    .as_ref()
+                    .and_then(|s| s.retry_counts.get(&task_id).copied())
+                    .unwrap_or(0)
             };
-            let _ = self.event_tx.send(RunnerEvent::TaskFailed {
+            self.emit_event(RunnerEvent::TaskFailed {
                 run_id,
                 task_id,
                 task_title: String::new(),
@@ -673,7 +820,9 @@ impl PlanRunner {
         }
 
         // Mark task as failed
-        self.graph.update_task_status(task_id, TaskStatus::Failed).await?;
+        self.graph
+            .update_task_status(task_id, TaskStatus::Failed)
+            .await?;
 
         // Update global state
         {
@@ -688,9 +837,12 @@ impl PlanRunner {
 
         let attempts = {
             let global = RUNNER_STATE.read().await;
-            global.as_ref().and_then(|s| s.retry_counts.get(&task_id).copied()).unwrap_or(0)
+            global
+                .as_ref()
+                .and_then(|s| s.retry_counts.get(&task_id).copied())
+                .unwrap_or(0)
         };
-        let _ = self.event_tx.send(RunnerEvent::TaskFailed {
+        self.emit_event(RunnerEvent::TaskFailed {
             run_id,
             task_id,
             task_title: String::new(),
@@ -718,9 +870,17 @@ impl PlanRunner {
             PlanRunStatus::Completed => {
                 let (plan_id, total_cost, total_duration, tc, tf) = global
                     .as_ref()
-                    .map(|s| (s.plan_id, s.cost_usd, s.elapsed_secs(), s.completed_tasks.len(), s.failed_tasks.len()))
+                    .map(|s| {
+                        (
+                            s.plan_id,
+                            s.cost_usd,
+                            s.elapsed_secs(),
+                            s.completed_tasks.len(),
+                            s.failed_tasks.len(),
+                        )
+                    })
                     .unwrap_or((Uuid::nil(), 0.0, 0.0, 0, 0));
-                let _ = self.event_tx.send(RunnerEvent::PlanCompleted {
+                self.emit_event(RunnerEvent::PlanCompleted {
                     run_id,
                     plan_id,
                     status: PlanRunStatus::Completed,
@@ -746,6 +906,89 @@ impl PlanRunner {
 
         Ok(())
     }
+
+    /// Listen for chat events until a Result event is received.
+    ///
+    /// Extracted from execute_task to allow the guard to run in parallel.
+    async fn listen_for_result(
+        &self,
+        mut rx: broadcast::Receiver<ChatEvent>,
+        _run_id: Uuid,
+    ) -> EventListenResult {
+        let start = std::time::Instant::now();
+        // Use a generous timeout here — the guard handles the actual task_timeout
+        // with soft hints before hard stop. This is just a safety net.
+        let safety_timeout = std::time::Duration::from_secs(self.config.task_timeout_secs + 60);
+        let mut cost_usd = 0.0_f64;
+
+        loop {
+            let remaining = safety_timeout.saturating_sub(start.elapsed());
+            if remaining.is_zero() {
+                return EventListenResult::Completed {
+                    cost_usd,
+                    is_error: true,
+                    error_text: "Safety timeout exceeded".to_string(),
+                    subtype: "timeout".to_string(),
+                };
+            }
+
+            // Check cancel flag
+            if RUNNER_CANCEL.load(Ordering::SeqCst) {
+                return EventListenResult::Cancelled { cost_usd };
+            }
+
+            match tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await {
+                Ok(Ok(event)) => {
+                    if let ChatEvent::Result {
+                        cost_usd: event_cost,
+                        subtype,
+                        is_error,
+                        result_text,
+                        ..
+                    } = event
+                    {
+                        if let Some(c) = event_cost {
+                            cost_usd = c;
+                        }
+                        return EventListenResult::Completed {
+                            cost_usd,
+                            is_error,
+                            error_text: result_text.unwrap_or_default(),
+                            subtype,
+                        };
+                    }
+                }
+                Ok(Err(broadcast::error::RecvError::Lagged(n))) => {
+                    warn!("Runner event receiver lagged by {} events", n);
+                }
+                Ok(Err(broadcast::error::RecvError::Closed)) => {
+                    return EventListenResult::ChannelClosed { cost_usd };
+                }
+                Err(_) => {
+                    // 5s poll timeout — just loop again (check cancel flag)
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// EventListenResult — internal result type for listen_for_result
+// ============================================================================
+
+/// Internal result of the event listening loop.
+enum EventListenResult {
+    /// A Result event was received from the agent.
+    Completed {
+        cost_usd: f64,
+        is_error: bool,
+        error_text: String,
+        subtype: String,
+    },
+    /// The broadcast channel was closed unexpectedly.
+    ChannelClosed { cost_usd: f64 },
+    /// The run was cancelled by the user.
+    Cancelled { cost_usd: f64 },
 }
 
 // ============================================================================
@@ -760,6 +1003,7 @@ impl Clone for PlanRunner {
             context_builder: self.context_builder.clone(),
             config: self.config.clone(),
             event_tx: self.event_tx.clone(),
+            event_emitter: self.event_emitter.clone(),
         }
     }
 }
@@ -771,20 +1015,7 @@ impl Clone for PlanRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::neo4j::mock::MockGraphStore;
     use crate::runner::models::TriggerSource;
-
-    fn make_runner_config() -> RunnerConfig {
-        RunnerConfig {
-            task_timeout_secs: 10,
-            idle_timeout_secs: 5,
-            max_retries: 1,
-            auto_pr: false,
-            build_check: false,
-            test_runner: false,
-            max_cost_usd: 1.0,
-        }
-    }
 
     #[tokio::test]
     async fn test_status_when_no_run() {

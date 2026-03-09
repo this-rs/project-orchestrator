@@ -8,20 +8,26 @@
 //! PlanRunner (this module)
 //! ├── models.rs    — RunnerConfig, TaskResult, RunnerEvent, TaskStateMachine
 //! ├── state.rs     — RunnerState persisted in Neo4j for crash recovery
-//! ├── runner.rs    — main execution loop (future)
-//! ├── guard.rs     — AgentGuard: drift detection, hint injection (future)
-//! ├── verifier.rs  — post-task verification: build, steps, git (future)
-//! └── enricher.rs  — post-task knowledge capture (future)
+//! ├── runner.rs    — main execution loop + task dispatch
+//! ├── guard.rs     — AgentGuard: drift detection, hint injection
+//! ├── verifier.rs  — post-task verification: build, steps, git
+//! └── enricher.rs  — post-task knowledge capture (V1: git-based)
 //! ```
 
+pub mod enricher;
+pub mod guard;
 pub mod models;
 pub mod runner;
 pub mod state;
+pub mod verifier;
 
 // Re-export key types for convenience
+pub use guard::{AgentGuard, ChatManagerHintSender, GuardConfig, GuardVerdict, HintSender};
 pub use models::{
     PlanRunStatus, RunSnapshot, RunnerConfig, RunnerEvent, TaskResult, TaskRunStatus,
     TaskStateMachine, TriggerSource,
 };
 pub use runner::{PlanRunner, RunStatus, RUNNER_CANCEL, RUNNER_STATE};
 pub use state::RunnerState;
+pub use enricher::{EnrichResult, TaskEnricher};
+pub use verifier::{TaskVerifier, VerifyResult};

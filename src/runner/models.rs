@@ -131,10 +131,7 @@ impl TaskStateMachine {
         if valid {
             Ok(())
         } else {
-            Err(format!(
-                "Invalid task transition: {} → {}",
-                from, to
-            ))
+            Err(format!("Invalid task transition: {} → {}", from, to))
         }
     }
 }
@@ -291,10 +288,7 @@ pub enum RunnerEvent {
         pr_url: Option<String>,
     },
     /// A runner error occurred (non-fatal)
-    RunnerError {
-        run_id: Uuid,
-        message: String,
-    },
+    RunnerError { run_id: Uuid, message: String },
     /// Budget limit exceeded — plan execution aborted
     BudgetExceeded {
         run_id: Uuid,
@@ -319,9 +313,15 @@ pub enum TriggerSource {
     /// Started by a cron schedule
     Schedule { trigger_id: Uuid },
     /// Started by an external webhook (e.g., GitHub)
-    Webhook { trigger_id: Uuid, payload_hash: Option<String> },
+    Webhook {
+        trigger_id: Uuid,
+        payload_hash: Option<String>,
+    },
     /// Started by an internal event (e.g., another plan completing)
-    Event { trigger_id: Uuid, source_event: String },
+    Event {
+        trigger_id: Uuid,
+        source_event: String,
+    },
 }
 
 impl Default for TriggerSource {

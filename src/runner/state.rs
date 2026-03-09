@@ -57,7 +57,12 @@ pub struct RunnerState {
 
 impl RunnerState {
     /// Create a new RunnerState for a fresh plan run.
-    pub fn new(run_id: Uuid, plan_id: Uuid, total_tasks: usize, triggered_by: TriggerSource) -> Self {
+    pub fn new(
+        run_id: Uuid,
+        plan_id: Uuid,
+        total_tasks: usize,
+        triggered_by: TriggerSource,
+    ) -> Self {
         Self {
             run_id,
             plan_id,

@@ -89,10 +89,7 @@ impl Neo4jClient {
         );
 
         if let Some(task_id) = state.current_task_id {
-            cypher.push_str(&format!(
-                ", r.current_task_id = '{}'",
-                task_id
-            ));
+            cypher.push_str(&format!(", r.current_task_id = '{}'", task_id));
         } else {
             cypher.push_str(", r.current_task_id = null");
         }
@@ -176,11 +173,7 @@ impl Neo4jClient {
     }
 
     /// List all PlanRuns for a given plan.
-    pub async fn list_plan_runs_impl(
-        &self,
-        plan_id: Uuid,
-        limit: i64,
-    ) -> Result<Vec<RunnerState>> {
+    pub async fn list_plan_runs_impl(&self, plan_id: Uuid, limit: i64) -> Result<Vec<RunnerState>> {
         let q = query(
             r#"
             MATCH (r:PlanRun {plan_id: $plan_id})
@@ -226,8 +219,7 @@ impl Neo4jClient {
             .get("triggered_by")
             .unwrap_or_else(|_| r#""manual""#.to_string());
 
-        let completed_tasks_str: String =
-            node.get("completed_tasks").unwrap_or_default();
+        let completed_tasks_str: String = node.get("completed_tasks").unwrap_or_default();
         let failed_tasks_str: String = node.get("failed_tasks").unwrap_or_default();
 
         let parse_uuid_list = |s: &str| -> Vec<Uuid> {
@@ -263,8 +255,7 @@ impl Neo4jClient {
             completed_at: completed_at.and_then(|s| s.parse().ok()),
             status: plan_run_status,
             cost_usd: node.get("cost_usd").unwrap_or(0.0),
-            triggered_by: serde_json::from_str(&triggered_by)
-                .unwrap_or(TriggerSource::Manual),
+            triggered_by: serde_json::from_str(&triggered_by).unwrap_or(TriggerSource::Manual),
             project_id: node
                 .get::<String>("project_id")
                 .ok()

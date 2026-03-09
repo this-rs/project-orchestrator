@@ -145,6 +145,9 @@ pub struct MockGraphStore {
     // Topology rules (keyed by rule id String)
     pub topology_rules: RwLock<HashMap<String, crate::graph::models::TopologyRule>>,
 
+    /// Decision AFFECTS relations: decision_id -> Vec<AffectsRelation>
+    pub decision_affects: RwLock<HashMap<Uuid, Vec<AffectsRelation>>>,
+
     // Test flags
     /// Controls what `has_context_cards()` returns (default: false)
     pub mock_has_context_cards: std::sync::atomic::AtomicBool,
@@ -230,6 +233,7 @@ impl MockGraphStore {
             published_skills: RwLock::new(HashMap::new()),
             analysis_profiles: RwLock::new(HashMap::new()),
             topology_rules: RwLock::new(HashMap::new()),
+            decision_affects: RwLock::new(HashMap::new()),
             mock_has_context_cards: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -4039,11 +4043,25 @@ impl GraphStore for MockGraphStore {
 
     async fn get_decisions_for_entity(
         &self,
-        _entity_type: &str,
-        _entity_id: &str,
-        _limit: u32,
+        entity_type: &str,
+        entity_id: &str,
+        limit: u32,
     ) -> Result<Vec<DecisionNode>> {
-        // Mock: return empty — decision entity traversal requires graph
+        // For tasks, look up via task_decisions mapping
+        if entity_type.eq_ignore_ascii_case("task") {
+            if let Ok(task_id) = Uuid::parse_str(entity_id) {
+                let task_decisions = self.task_decisions.read().await;
+                let decisions = self.decisions.read().await;
+                if let Some(decision_ids) = task_decisions.get(&task_id) {
+                    let result: Vec<DecisionNode> = decision_ids
+                        .iter()
+                        .filter_map(|did| decisions.get(did).cloned())
+                        .take(limit as usize)
+                        .collect();
+                    return Ok(result);
+                }
+            }
+        }
         Ok(vec![])
     }
 
@@ -4111,25 +4129,46 @@ impl GraphStore for MockGraphStore {
 
     async fn add_decision_affects(
         &self,
-        _decision_id: Uuid,
-        _entity_type: &str,
-        _entity_id: &str,
-        _impact_description: Option<&str>,
+        decision_id: Uuid,
+        entity_type: &str,
+        entity_id: &str,
+        impact_description: Option<&str>,
     ) -> Result<()> {
+        let relation = AffectsRelation {
+            entity_type: entity_type.to_string(),
+            entity_id: entity_id.to_string(),
+            entity_name: None,
+            impact_description: impact_description.map(|s| s.to_string()),
+        };
+        self.decision_affects
+            .write()
+            .await
+            .entry(decision_id)
+            .or_default()
+            .push(relation);
         Ok(())
     }
 
     async fn remove_decision_affects(
         &self,
-        _decision_id: Uuid,
+        decision_id: Uuid,
         _entity_type: &str,
-        _entity_id: &str,
+        entity_id: &str,
     ) -> Result<()> {
+        if let Some(affects) = self.decision_affects.write().await.get_mut(&decision_id) {
+            affects.retain(|a| a.entity_id != entity_id);
+        }
         Ok(())
     }
 
-    async fn list_decision_affects(&self, _decision_id: Uuid) -> Result<Vec<AffectsRelation>> {
-        Ok(vec![])
+    async fn list_decision_affects(&self, decision_id: Uuid) -> Result<Vec<AffectsRelation>> {
+        Ok(self
+            .decision_affects
+            .read()
+            .await
+            .get(&decision_id)
+            .cloned()
+            .unwrap_or_default())
     }
 
     async fn supersede_decision(
