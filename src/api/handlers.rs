@@ -3771,7 +3771,8 @@ pub async fn run_plan(
     );
 
     // Bridge RunnerEvents to CrudEvent for WebSocket delivery
-    runner = runner.with_event_emitter(state.event_bus.clone() as Arc<dyn crate::events::EventEmitter>);
+    runner =
+        runner.with_event_emitter(state.event_bus.clone() as Arc<dyn crate::events::EventEmitter>);
 
     let runner = Arc::new(runner);
 
@@ -3785,12 +3786,7 @@ pub async fn run_plan(
     };
 
     let start_result = runner
-        .start(
-            plan_id,
-            trigger_source,
-            req.cwd,
-            req.project_slug,
-        )
+        .start(plan_id, trigger_source, req.cwd, req.project_slug)
         .await
         .map_err(|e| {
             if e.to_string().contains("already has an active run") {
@@ -3970,10 +3966,7 @@ pub async fn create_trigger(
             )));
         }
     };
-    let config = body
-        .get("config")
-        .cloned()
-        .unwrap_or(serde_json::json!({}));
+    let config = body.get("config").cloned().unwrap_or(serde_json::json!({}));
     let cooldown_secs = body
         .get("cooldown_secs")
         .and_then(|v| v.as_u64())
@@ -4025,7 +4018,9 @@ pub async fn delete_trigger(
         .await
         .map_err(AppError::Internal)?;
 
-    Ok(Json(serde_json::json!({ "deleted": true, "trigger_id": trigger_id })))
+    Ok(Json(
+        serde_json::json!({ "deleted": true, "trigger_id": trigger_id }),
+    ))
 }
 
 /// PATCH /api/triggers/:id/enable — Enable a trigger.
@@ -4125,15 +4120,16 @@ pub async fn receive_webhook(
         .map_err(|e| AppError::BadRequest(format!("Invalid JSON payload: {}", e)))?;
 
     // 4. Filter by event type
-    if let Some(event_filter) = trigger.config.get("event_filter").and_then(|v| v.as_array()) {
+    if let Some(event_filter) = trigger
+        .config
+        .get("event_filter")
+        .and_then(|v| v.as_array())
+    {
         let github_event = headers
             .get("x-github-event")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
-        let event_types: Vec<&str> = event_filter
-            .iter()
-            .filter_map(|v| v.as_str())
-            .collect();
+        let event_types: Vec<&str> = event_filter.iter().filter_map(|v| v.as_str()).collect();
         if !event_types.is_empty() && !event_types.contains(&github_event) {
             return Ok(Json(serde_json::json!({
                 "status": "filtered",
@@ -4143,11 +4139,12 @@ pub async fn receive_webhook(
     }
 
     // 5. Filter by branch pattern
-    if let Some(branch_pattern) = trigger.config.get("branch_pattern").and_then(|v| v.as_str()) {
-        let branch = payload
-            .get("ref")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+    if let Some(branch_pattern) = trigger
+        .config
+        .get("branch_pattern")
+        .and_then(|v| v.as_str())
+    {
+        let branch = payload.get("ref").and_then(|v| v.as_str()).unwrap_or("");
         // Extract branch name from "refs/heads/main" format
         let branch_name = branch.strip_prefix("refs/heads/").unwrap_or(branch);
         if let Ok(re) = regex::Regex::new(branch_pattern) {
@@ -4260,7 +4257,9 @@ pub async fn compare_plan_runs(
             )));
         }
 
-        vectors.push(crate::runner::vector::ExecutionVector::from_runner_state(&run));
+        vectors.push(crate::runner::vector::ExecutionVector::from_runner_state(
+            &run,
+        ));
     }
 
     let result = crate::runner::vector::compare_vectors(&vectors);

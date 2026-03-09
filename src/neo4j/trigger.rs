@@ -82,10 +82,7 @@ impl Neo4jClient {
     }
 
     /// List all triggers, optionally filtered by type.
-    pub async fn list_all_triggers_impl(
-        &self,
-        trigger_type: Option<&str>,
-    ) -> Result<Vec<Trigger>> {
+    pub async fn list_all_triggers_impl(&self, trigger_type: Option<&str>) -> Result<Vec<Trigger>> {
         let cypher = if let Some(tt) = trigger_type {
             format!(
                 "MATCH (t:Trigger) WHERE t.trigger_type = '{}' RETURN t ORDER BY t.created_at DESC",
@@ -286,8 +283,13 @@ impl Neo4jClient {
             trigger_id: trigger_id.parse()?,
             plan_run_id: plan_run_id.and_then(|s| s.parse().ok()),
             fired_at: fired_at.parse()?,
-            source_payload: source_payload
-                .and_then(|s| if s.is_empty() { None } else { serde_json::from_str(&s).ok() }),
+            source_payload: source_payload.and_then(|s| {
+                if s.is_empty() {
+                    None
+                } else {
+                    serde_json::from_str(&s).ok()
+                }
+            }),
         })
     }
 }

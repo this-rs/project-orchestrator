@@ -1144,14 +1144,8 @@ pub async fn start_server(mut config: Config) -> Result<()> {
         let runner_config = orchestrator.runner_config();
         let (event_tx, _) = tokio::sync::broadcast::channel(256);
         let runner = std::sync::Arc::new(
-            runner::PlanRunner::new(
-                cm.clone(),
-                graph,
-                context_builder,
-                runner_config,
-                event_tx,
-            )
-            .with_event_emitter(event_bus.clone() as std::sync::Arc<dyn events::EventEmitter>),
+            runner::PlanRunner::new(cm.clone(), graph, context_builder, runner_config, event_tx)
+                .with_event_emitter(event_bus.clone() as std::sync::Arc<dyn events::EventEmitter>),
         );
         tokio::spawn(async move {
             match runner.recover_interrupted_runs(".".to_string()).await {
@@ -1188,11 +1182,8 @@ pub async fn start_server(mut config: Config) -> Result<()> {
 
         // Event provider — reacts to CrudEvents for plan chaining
         let event_rx = event_bus.subscribe();
-        let event_provider = runner::providers::event::EventProvider::new(
-            graph.clone(),
-            engine.clone(),
-            event_rx,
-        );
+        let event_provider =
+            runner::providers::event::EventProvider::new(graph.clone(), engine.clone(), event_rx);
         if let Err(e) = event_provider.setup().await {
             tracing::warn!("EventProvider setup failed (non-fatal): {}", e);
         } else {

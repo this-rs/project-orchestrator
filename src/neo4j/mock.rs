@@ -8772,20 +8772,30 @@ impl GraphStore for MockGraphStore {
 
     // ── Triggers ──────────────────────────────────────────────────────────
 
-    async fn create_trigger(&self, trigger: &crate::runner::Trigger) -> anyhow::Result<crate::runner::Trigger> {
+    async fn create_trigger(
+        &self,
+        trigger: &crate::runner::Trigger,
+    ) -> anyhow::Result<crate::runner::Trigger> {
         let mut triggers = self.triggers.write().await;
         triggers.insert(trigger.id, trigger.clone());
         Ok(trigger.clone())
     }
 
-    async fn get_trigger(&self, trigger_id: Uuid) -> anyhow::Result<Option<crate::runner::Trigger>> {
+    async fn get_trigger(
+        &self,
+        trigger_id: Uuid,
+    ) -> anyhow::Result<Option<crate::runner::Trigger>> {
         let triggers = self.triggers.read().await;
         Ok(triggers.get(&trigger_id).cloned())
     }
 
     async fn list_triggers(&self, plan_id: Uuid) -> anyhow::Result<Vec<crate::runner::Trigger>> {
         let triggers = self.triggers.read().await;
-        Ok(triggers.values().filter(|t| t.plan_id == plan_id).cloned().collect())
+        Ok(triggers
+            .values()
+            .filter(|t| t.plan_id == plan_id)
+            .cloned()
+            .collect())
     }
 
     async fn list_all_triggers(
@@ -8795,9 +8805,7 @@ impl GraphStore for MockGraphStore {
         let triggers = self.triggers.read().await;
         Ok(triggers
             .values()
-            .filter(|t| {
-                trigger_type.map_or(true, |tt| t.trigger_type.to_string() == tt)
-            })
+            .filter(|t| trigger_type.map_or(true, |tt| t.trigger_type.to_string() == tt))
             .cloned()
             .collect())
     }
@@ -8811,9 +8819,15 @@ impl GraphStore for MockGraphStore {
     ) -> anyhow::Result<Option<crate::runner::Trigger>> {
         let mut triggers = self.triggers.write().await;
         if let Some(t) = triggers.get_mut(&trigger_id) {
-            if let Some(e) = enabled { t.enabled = e; }
-            if let Some(c) = config { t.config = c; }
-            if let Some(cd) = cooldown_secs { t.cooldown_secs = cd; }
+            if let Some(e) = enabled {
+                t.enabled = e;
+            }
+            if let Some(c) = config {
+                t.config = c;
+            }
+            if let Some(cd) = cooldown_secs {
+                t.cooldown_secs = cd;
+            }
             Ok(Some(t.clone()))
         } else {
             Ok(None)
@@ -8828,9 +8842,15 @@ impl GraphStore for MockGraphStore {
         Ok(())
     }
 
-    async fn record_trigger_firing(&self, firing: &crate::runner::TriggerFiring) -> anyhow::Result<()> {
+    async fn record_trigger_firing(
+        &self,
+        firing: &crate::runner::TriggerFiring,
+    ) -> anyhow::Result<()> {
         let mut firings = self.trigger_firings.write().await;
-        firings.entry(firing.trigger_id).or_default().push(firing.clone());
+        firings
+            .entry(firing.trigger_id)
+            .or_default()
+            .push(firing.clone());
         // Update trigger fire_count and last_fired
         let mut triggers = self.triggers.write().await;
         if let Some(t) = triggers.get_mut(&firing.trigger_id) {

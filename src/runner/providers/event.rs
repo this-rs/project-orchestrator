@@ -110,11 +110,7 @@ async fn handle_event(
     event: &CrudEvent,
 ) -> Result<()> {
     // Build the event type string for matching (e.g., "plan_updated", "task_created")
-    let event_type = format!(
-        "{:?}_{:?}",
-        event.entity_type, event.action
-    )
-    .to_lowercase();
+    let event_type = format!("{:?}_{:?}", event.entity_type, event.action).to_lowercase();
 
     // Also build a status-aware event type from payload if available
     // (e.g., "plan_completed" when payload contains {"status": "completed"})
@@ -122,13 +118,7 @@ async fn handle_event(
         .payload
         .get("status")
         .and_then(|s| s.as_str())
-        .map(|status| {
-            format!(
-                "{:?}_{}",
-                event.entity_type, status
-            )
-            .to_lowercase()
-        });
+        .map(|status| format!("{:?}_{}", event.entity_type, status).to_lowercase());
 
     let entity_id = event.entity_id.clone();
 
@@ -151,8 +141,7 @@ async fn handle_event(
         }
 
         // Match config.entity_id (optional filter)
-        if let Some(config_entity_id) = trigger.config.get("entity_id").and_then(|v| v.as_str())
-        {
+        if let Some(config_entity_id) = trigger.config.get("entity_id").and_then(|v| v.as_str()) {
             if config_entity_id != entity_id {
                 debug!(
                     "EventProvider: trigger {} entity_id filter mismatch ({} != {})",

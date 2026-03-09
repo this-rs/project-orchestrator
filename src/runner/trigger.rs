@@ -110,10 +110,7 @@ impl TriggerEngine {
     /// Evaluate and fire a trigger if conditions are met.
     ///
     /// Returns the TriggerSource to pass to PlanRunner::start().
-    pub async fn evaluate_and_prepare(
-        &self,
-        trigger: &Trigger,
-    ) -> Result<Option<TriggerSource>> {
+    pub async fn evaluate_and_prepare(&self, trigger: &Trigger) -> Result<Option<TriggerSource>> {
         match self.evaluate(trigger).await? {
             EvalResult::Fire => {
                 let source = match trigger.trigger_type {
@@ -230,12 +227,8 @@ mod tests {
         let plan_id = Uuid::new_v4();
 
         // Create an active run for this plan
-        let state = crate::runner::RunnerState::new(
-            Uuid::new_v4(),
-            plan_id,
-            3,
-            TriggerSource::Manual,
-        );
+        let state =
+            crate::runner::RunnerState::new(Uuid::new_v4(), plan_id, 3, TriggerSource::Manual);
         mock.create_plan_run(&state).await.unwrap();
 
         let engine = TriggerEngine::new(mock);

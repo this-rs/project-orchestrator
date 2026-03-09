@@ -402,8 +402,8 @@ impl MetricSeries {
         let trend = if values.len() < 2 {
             Trend::Stable
         } else {
-            let first_half: f64 = values[..values.len() / 2].iter().sum::<f64>()
-                / (values.len() / 2) as f64;
+            let first_half: f64 =
+                values[..values.len() / 2].iter().sum::<f64>() / (values.len() / 2) as f64;
             let second_half: f64 = values[values.len() / 2..].iter().sum::<f64>()
                 / (values.len() - values.len() / 2) as f64;
             let delta = (second_half - first_half) / first_half.abs().max(0.001);
@@ -528,9 +528,7 @@ pub fn predict_run(vectors: &[ExecutionVector]) -> RunPrediction {
     let n = vectors.len();
 
     // Compute weights (most recent = highest weight)
-    let weights: Vec<f64> = (0..n)
-        .map(|i| decay.powi((n - 1 - i) as i32))
-        .collect();
+    let weights: Vec<f64> = (0..n).map(|i| decay.powi((n - 1 - i) as i32)).collect();
     let weight_sum: f64 = weights.iter().sum();
 
     // Weighted averages
@@ -569,8 +567,7 @@ pub fn predict_run(vectors: &[ExecutionVector]) -> RunPrediction {
         let check = |name: &str, value: f64, extractor: &dyn Fn(&ExecutionVector) -> f64| {
             let vals: Vec<f64> = vectors[..n - 1].iter().map(extractor).collect();
             let mean = vals.iter().sum::<f64>() / vals.len() as f64;
-            let variance =
-                vals.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / vals.len() as f64;
+            let variance = vals.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / vals.len() as f64;
             let std_dev = variance.sqrt();
             if std_dev > 0.0 {
                 let severity = ((value - mean) / std_dev).abs();
@@ -628,9 +625,7 @@ pub fn predict_run(vectors: &[ExecutionVector]) -> RunPrediction {
 
         let avg_drift: f64 = vectors
             .iter()
-            .map(|v| {
-                (v.drift.idle_warnings + v.drift.loop_warnings + v.drift.timeout_count) as f64
-            })
+            .map(|v| (v.drift.idle_warnings + v.drift.loop_warnings + v.drift.timeout_count) as f64)
             .sum::<f64>()
             / n as f64;
         if avg_drift > 3.0 {

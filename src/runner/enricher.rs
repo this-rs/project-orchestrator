@@ -124,9 +124,7 @@ impl TaskEnricher {
 
         // 5. Mark files as discussed in the session
         if let Some(sid) = session_id {
-            result.discussed_added = self
-                .enrich_discussed(sid, &all_modified_files)
-                .await;
+            result.discussed_added = self.enrich_discussed(sid, &all_modified_files).await;
         }
 
         info!(
@@ -184,11 +182,7 @@ impl TaskEnricher {
             }
 
             // Link to task
-            if let Err(e) = self
-                .graph
-                .link_commit_to_task(&commit.hash, task_id)
-                .await
-            {
+            if let Err(e) = self.graph.link_commit_to_task(&commit.hash, task_id).await {
                 warn!(
                     "Enricher: failed to link commit {} to task: {}",
                     commit.hash, e
@@ -196,11 +190,7 @@ impl TaskEnricher {
             }
 
             // Link to plan (all commits, not just last — they're cheap)
-            if let Err(e) = self
-                .graph
-                .link_commit_to_plan(&commit.hash, plan_id)
-                .await
-            {
+            if let Err(e) = self.graph.link_commit_to_plan(&commit.hash, plan_id).await {
                 warn!(
                     "Enricher: failed to link commit {} to plan: {}",
                     commit.hash, e
@@ -235,7 +225,9 @@ impl TaskEnricher {
         cwd: &str,
     ) -> Option<Uuid> {
         // Build note content from git info
-        let content = self.build_note_content(commits, all_modified_files, cwd).await;
+        let content = self
+            .build_note_content(commits, all_modified_files, cwd)
+            .await;
 
         let mut note = Note::new(
             project_id,
@@ -284,11 +276,18 @@ impl TaskEnricher {
         // Commit messages
         content.push_str("### Commits\n");
         for commit in commits {
-            content.push_str(&format!("- `{}` {}\n", &commit.hash[..7.min(commit.hash.len())], commit.message));
+            content.push_str(&format!(
+                "- `{}` {}\n",
+                &commit.hash[..7.min(commit.hash.len())],
+                commit.message
+            ));
         }
 
         // Modified files
-        content.push_str(&format!("\n### Files Modified ({})\n", all_modified_files.len()));
+        content.push_str(&format!(
+            "\n### Files Modified ({})\n",
+            all_modified_files.len()
+        ));
         for file in all_modified_files {
             content.push_str(&format!("- `{}`\n", file));
         }
@@ -302,11 +301,7 @@ impl TaskEnricher {
     }
 
     /// Get diff stat from git.
-    async fn get_diff_stat(
-        &self,
-        cwd: &str,
-        commits: &[GitCommitInfo],
-    ) -> Result<String> {
+    async fn get_diff_stat(&self, cwd: &str, commits: &[GitCommitInfo]) -> Result<String> {
         if commits.is_empty() {
             return Ok(String::new());
         }
@@ -346,11 +341,7 @@ impl TaskEnricher {
 
     /// For decisions created during this task, add AFFECTS relations
     /// to all files modified in the diff.
-    async fn enrich_decision_affects(
-        &self,
-        task_id: Uuid,
-        modified_files: &[String],
-    ) -> usize {
+    async fn enrich_decision_affects(&self, task_id: Uuid, modified_files: &[String]) -> usize {
         if modified_files.is_empty() {
             return 0;
         }
@@ -363,7 +354,10 @@ impl TaskEnricher {
         {
             Ok(d) => d,
             Err(e) => {
-                warn!("Enricher: failed to get decisions for task {}: {}", task_id, e);
+                warn!(
+                    "Enricher: failed to get decisions for task {}: {}",
+                    task_id, e
+                );
                 return 0;
             }
         };
@@ -414,11 +408,7 @@ impl TaskEnricher {
     // ========================================================================
 
     /// Mark all modified files as discussed in the chat session.
-    async fn enrich_discussed(
-        &self,
-        session_id: Uuid,
-        modified_files: &[String],
-    ) -> usize {
+    async fn enrich_discussed(&self, session_id: Uuid, modified_files: &[String]) -> usize {
         if modified_files.is_empty() {
             return 0;
         }
@@ -511,11 +501,7 @@ impl TaskEnricher {
     }
 
     /// Get files changed in a specific commit with additions/deletions.
-    async fn get_commit_files(
-        &self,
-        cwd: &str,
-        hash: &str,
-    ) -> Result<Vec<FileChangedInfo>> {
+    async fn get_commit_files(&self, cwd: &str, hash: &str) -> Result<Vec<FileChangedInfo>> {
         let output = tokio::process::Command::new("git")
             .args(["diff-tree", "--no-commit-id", "-r", "--numstat", hash])
             .current_dir(cwd)
@@ -584,8 +570,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_build_note_content() {
-        let graph: Arc<dyn GraphStore> =
-            Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
         let enricher = TaskEnricher::new(graph);
 
         let commits = vec![
@@ -594,26 +579,22 @@ mod tests {
                 message: "feat(runner): add enricher".to_string(),
                 author: "Test".to_string(),
                 timestamp: Utc::now(),
-                files: vec![
-                    FileChangedInfo {
-                        path: "src/runner/enricher.rs".to_string(),
-                        additions: Some(100),
-                        deletions: Some(0),
-                    },
-                ],
+                files: vec![FileChangedInfo {
+                    path: "src/runner/enricher.rs".to_string(),
+                    additions: Some(100),
+                    deletions: Some(0),
+                }],
             },
             GitCommitInfo {
                 hash: "def4567890123".to_string(),
                 message: "fix(runner): handle edge case".to_string(),
                 author: "Test".to_string(),
                 timestamp: Utc::now(),
-                files: vec![
-                    FileChangedInfo {
-                        path: "src/runner/runner.rs".to_string(),
-                        additions: Some(5),
-                        deletions: Some(2),
-                    },
-                ],
+                files: vec![FileChangedInfo {
+                    path: "src/runner/runner.rs".to_string(),
+                    additions: Some(5),
+                    deletions: Some(2),
+                }],
             },
         ];
         let modified_files = vec![
@@ -638,8 +619,7 @@ mod tests {
     async fn test_enrich_commits_creates_and_links() {
         use crate::test_helpers::{test_plan, test_task};
 
-        let graph: Arc<dyn GraphStore> =
-            Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
 
         // Setup plan + task
         let plan = test_plan();
@@ -679,8 +659,7 @@ mod tests {
     async fn test_enrich_auto_note_creates_note() {
         use crate::test_helpers::{test_plan, test_task};
 
-        let graph: Arc<dyn GraphStore> =
-            Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
 
         // Setup plan + task + project
         let plan = test_plan();
@@ -722,8 +701,7 @@ mod tests {
         use crate::neo4j::models::{DecisionNode, DecisionStatus};
         use crate::test_helpers::{test_plan, test_task};
 
-        let graph: Arc<dyn GraphStore> =
-            Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
 
         let plan = test_plan();
         let plan_id = plan.id;
@@ -767,20 +745,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_enrich_discussed_marks_files() {
-        let graph: Arc<dyn GraphStore> =
-            Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
 
         let enricher = TaskEnricher::new(graph.clone());
 
         let session_id = Uuid::new_v4();
-        let modified_files = vec![
-            "src/main.rs".to_string(),
-            "src/lib.rs".to_string(),
-        ];
+        let modified_files = vec!["src/main.rs".to_string(), "src/lib.rs".to_string()];
 
-        let count = enricher
-            .enrich_discussed(session_id, &modified_files)
-            .await;
+        let count = enricher.enrich_discussed(session_id, &modified_files).await;
         // MockGraphStore may return 0 if add_discussed isn't fully implemented,
         // but the call should not error
         assert!(count <= modified_files.len());
@@ -791,8 +763,7 @@ mod tests {
         use crate::neo4j::models::{DecisionNode, DecisionStatus};
         use crate::test_helpers::{test_plan, test_task};
 
-        let graph: Arc<dyn GraphStore> =
-            Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
 
         let plan = test_plan();
         let plan_id = plan.id;

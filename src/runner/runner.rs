@@ -9,11 +9,11 @@ use crate::events::{CrudAction, CrudEvent, EntityType, EventEmitter};
 use crate::neo4j::models::TaskStatus;
 use crate::neo4j::traits::GraphStore;
 use crate::orchestrator::context::ContextBuilder;
+use crate::runner::enricher::TaskEnricher;
 use crate::runner::guard::{AgentGuard, ChatManagerHintSender, GuardConfig, GuardVerdict};
 use crate::runner::models::{PlanRunStatus, RunnerConfig, RunnerEvent, TaskResult, TriggerSource};
-use crate::runner::vector::VectorCollector;
-use crate::runner::enricher::TaskEnricher;
 use crate::runner::state::RunnerState;
+use crate::runner::vector::VectorCollector;
 use crate::runner::verifier::{TaskVerifier, VerifyResult};
 
 use anyhow::{anyhow, Result};
@@ -154,16 +154,34 @@ impl PlanRunner {
         // 2. Bridge to CrudEvent for WebSocket delivery
         if let Some(ref emitter) = self.event_emitter {
             let (entity_id, action) = match &event {
-                RunnerEvent::PlanStarted { run_id, .. } => (run_id.to_string(), CrudAction::Created),
-                RunnerEvent::PlanCompleted { run_id, .. } => (run_id.to_string(), CrudAction::Updated),
-                RunnerEvent::TaskStarted { run_id, .. } => (run_id.to_string(), CrudAction::Updated),
-                RunnerEvent::TaskCompleted { run_id, .. } => (run_id.to_string(), CrudAction::Updated),
+                RunnerEvent::PlanStarted { run_id, .. } => {
+                    (run_id.to_string(), CrudAction::Created)
+                }
+                RunnerEvent::PlanCompleted { run_id, .. } => {
+                    (run_id.to_string(), CrudAction::Updated)
+                }
+                RunnerEvent::TaskStarted { run_id, .. } => {
+                    (run_id.to_string(), CrudAction::Updated)
+                }
+                RunnerEvent::TaskCompleted { run_id, .. } => {
+                    (run_id.to_string(), CrudAction::Updated)
+                }
                 RunnerEvent::TaskFailed { run_id, .. } => (run_id.to_string(), CrudAction::Updated),
-                RunnerEvent::TaskTimeout { run_id, .. } => (run_id.to_string(), CrudAction::Updated),
-                RunnerEvent::WaveStarted { run_id, .. } => (run_id.to_string(), CrudAction::Updated),
-                RunnerEvent::WaveCompleted { run_id, .. } => (run_id.to_string(), CrudAction::Updated),
-                RunnerEvent::BudgetExceeded { run_id, .. } => (run_id.to_string(), CrudAction::Updated),
-                RunnerEvent::RunnerError { run_id, .. } => (run_id.to_string(), CrudAction::Updated),
+                RunnerEvent::TaskTimeout { run_id, .. } => {
+                    (run_id.to_string(), CrudAction::Updated)
+                }
+                RunnerEvent::WaveStarted { run_id, .. } => {
+                    (run_id.to_string(), CrudAction::Updated)
+                }
+                RunnerEvent::WaveCompleted { run_id, .. } => {
+                    (run_id.to_string(), CrudAction::Updated)
+                }
+                RunnerEvent::BudgetExceeded { run_id, .. } => {
+                    (run_id.to_string(), CrudAction::Updated)
+                }
+                RunnerEvent::RunnerError { run_id, .. } => {
+                    (run_id.to_string(), CrudAction::Updated)
+                }
             };
 
             let payload = serde_json::to_value(&event).unwrap_or_default();
@@ -191,10 +209,7 @@ impl PlanRunner {
             return Ok(0);
         }
 
-        info!(
-            "Found {} interrupted run(s) to recover",
-            active_runs.len()
-        );
+        info!("Found {} interrupted run(s) to recover", active_runs.len());
 
         let mut recovered = 0;
         for saved_state in active_runs {
@@ -467,7 +482,10 @@ impl PlanRunner {
             match self.graph.get_project_by_slug(slug).await {
                 Ok(Some(project)) => Some(project.id),
                 Ok(None) => {
-                    warn!("Project slug '{}' not found, enricher will run without project_id", slug);
+                    warn!(
+                        "Project slug '{}' not found, enricher will run without project_id",
+                        slug
+                    );
                     None
                 }
                 Err(e) => {
@@ -541,10 +559,7 @@ impl PlanRunner {
                     .await;
 
                 // Extract session_id from the result (for enricher)
-                let task_session_id = task_result
-                    .as_ref()
-                    .ok()
-                    .and_then(|r| r.session_id());
+                let task_session_id = task_result.as_ref().ok().and_then(|r| r.session_id());
 
                 match task_result.map(|r| r.result) {
                     Ok(TaskResult::Success {
@@ -884,10 +899,7 @@ impl PlanRunner {
                 cost_usd,
             })),
             VerifyResult::Fail { reasons } => {
-                let reason = format!(
-                    "Post-task verification failed:\n- {}",
-                    reasons.join("\n- ")
-                );
+                let reason = format!("Post-task verification failed:\n- {}", reasons.join("\n- "));
                 warn!("Task {} verification failed: {}", task_id, reason);
                 Ok(wrap(TaskResult::Failed {
                     reason,
@@ -1047,7 +1059,10 @@ impl PlanRunner {
     /// Returns the PR URL on success.
     async fn create_auto_pr(&self, plan_id: Uuid) -> Result<String> {
         // Get plan info
-        let plan = self.graph.get_plan(plan_id).await?
+        let plan = self
+            .graph
+            .get_plan(plan_id)
+            .await?
             .ok_or_else(|| anyhow!("Plan {} not found for auto-PR", plan_id))?;
 
         // Get tasks

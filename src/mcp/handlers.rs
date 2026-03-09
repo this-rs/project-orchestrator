@@ -797,7 +797,8 @@ impl ToolHandler {
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
                 // MCP calls are always from chat context → TriggerSource::Chat
-                let body = json!({ "cwd": cwd, "project_slug": project_slug, "triggered_by": "chat" });
+                let body =
+                    json!({ "cwd": cwd, "project_slug": project_slug, "triggered_by": "chat" });
                 let result = http
                     .post(&format!("/api/plans/{}/run", plan_id), &body)
                     .await?;
@@ -876,9 +877,7 @@ impl ToolHandler {
 
             "list_plan_runs" => {
                 let plan_id = extract_id(args, "plan_id")?;
-                let result = http
-                    .get(&format!("/api/plans/{}/runs", plan_id))
-                    .await?;
+                let result = http.get(&format!("/api/plans/{}/runs", plan_id)).await?;
                 Ok(Some(result))
             }
 
@@ -890,10 +889,7 @@ impl ToolHandler {
 
             "compare_plan_runs" => {
                 let plan_id = extract_id(args, "plan_id")?;
-                let run_ids = args
-                    .get("run_ids")
-                    .cloned()
-                    .unwrap_or(json!([]));
+                let run_ids = args.get("run_ids").cloned().unwrap_or(json!([]));
                 let result = http
                     .post(
                         &format!("/api/plans/{}/runs/compare", plan_id),

@@ -2546,7 +2546,10 @@ pub trait GraphStore: Send + Sync {
     // ── Triggers ──────────────────────────────────────────────────────────
 
     /// Create a trigger node linked to a plan via (:Trigger)-[:TRIGGERS]->(:Plan).
-    async fn create_trigger(&self, trigger: &crate::runner::Trigger) -> Result<crate::runner::Trigger>;
+    async fn create_trigger(
+        &self,
+        trigger: &crate::runner::Trigger,
+    ) -> Result<crate::runner::Trigger>;
 
     /// Get a trigger by its UUID.
     async fn get_trigger(&self, trigger_id: Uuid) -> Result<Option<crate::runner::Trigger>>;

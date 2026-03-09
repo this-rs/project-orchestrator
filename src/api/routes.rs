@@ -292,10 +292,7 @@ fn protected_routes() -> Router<OrchestratorState> {
         )
         .route("/api/plans/{plan_id}/waves", get(handlers::get_plan_waves))
         // Runner
-        .route(
-            "/api/plans/{plan_id}/run",
-            post(handlers::run_plan),
-        )
+        .route("/api/plans/{plan_id}/run", post(handlers::run_plan))
         .route(
             "/api/plans/{plan_id}/run/status",
             get(handlers::get_run_status),
@@ -309,14 +306,8 @@ fn protected_routes() -> Router<OrchestratorState> {
             post(handlers::create_auto_pr),
         )
         // Plan Runs
-        .route(
-            "/api/plans/{plan_id}/runs",
-            get(handlers::list_plan_runs),
-        )
-        .route(
-            "/api/runs/{run_id}",
-            get(handlers::get_plan_run),
-        )
+        .route("/api/plans/{plan_id}/runs", get(handlers::list_plan_runs))
+        .route("/api/runs/{run_id}", get(handlers::get_plan_run))
         .route(
             "/api/plans/{plan_id}/runs/compare",
             post(handlers::compare_plan_runs),

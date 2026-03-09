@@ -111,7 +111,11 @@ mod tests {
     #[test]
     fn test_validate_github_signature_bad_format() {
         assert!(!validate_github_signature("secret", b"body", "md5=abc"));
-        assert!(!validate_github_signature("secret", b"body", "sha256=notahex"));
+        assert!(!validate_github_signature(
+            "secret",
+            b"body",
+            "sha256=notahex"
+        ));
     }
 
     #[tokio::test]

@@ -27,15 +27,15 @@ pub mod vector;
 pub mod verifier;
 
 // Re-export key types for convenience
+pub use enricher::{EnrichResult, TaskEnricher};
 pub use guard::{AgentGuard, ChatManagerHintSender, GuardConfig, GuardVerdict, HintSender};
 pub use models::{
     PlanRunStatus, RunSnapshot, RunnerConfig, RunnerEvent, TaskResult, TaskRunStatus,
     TaskStateMachine, Trigger, TriggerFiring, TriggerSource, TriggerType,
 };
+pub use providers::TriggerProvider;
 pub use runner::{PlanRunner, RunStatus, RUNNER_CANCEL, RUNNER_STATE};
 pub use state::RunnerState;
-pub use enricher::{EnrichResult, TaskEnricher};
-pub use verifier::{TaskVerifier, VerifyResult};
-pub use providers::TriggerProvider;
 pub use trigger::TriggerEngine;
-pub use vector::{ExecutionVector, RunPrediction, ComparisonResult, compare_vectors, predict_run};
+pub use vector::{compare_vectors, predict_run, ComparisonResult, ExecutionVector, RunPrediction};
+pub use verifier::{TaskVerifier, VerifyResult};

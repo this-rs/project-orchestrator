@@ -16,7 +16,6 @@ mod note;
 pub mod plan;
 mod plan_run;
 mod profile;
-mod trigger;
 mod project;
 mod protocol;
 mod registry;
@@ -26,6 +25,7 @@ mod step;
 mod task;
 mod topology;
 pub mod traits;
+mod trigger;
 mod user;
 mod workspace;
 

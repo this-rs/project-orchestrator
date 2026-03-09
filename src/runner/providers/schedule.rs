@@ -61,10 +61,7 @@ impl TriggerProvider for ScheduleProvider {
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(tick));
-            info!(
-                "ScheduleProvider started (tick interval: {}s)",
-                tick
-            );
+            info!("ScheduleProvider started (tick interval: {}s)", tick);
 
             loop {
                 tokio::select! {

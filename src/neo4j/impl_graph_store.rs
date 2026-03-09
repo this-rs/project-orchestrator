@@ -2992,11 +2992,17 @@ impl GraphStore for Neo4jClient {
 
     // ── Triggers ──────────────────────────────────────────────────────────
 
-    async fn create_trigger(&self, trigger: &crate::runner::Trigger) -> anyhow::Result<crate::runner::Trigger> {
+    async fn create_trigger(
+        &self,
+        trigger: &crate::runner::Trigger,
+    ) -> anyhow::Result<crate::runner::Trigger> {
         self.create_trigger_impl(trigger).await
     }
 
-    async fn get_trigger(&self, trigger_id: Uuid) -> anyhow::Result<Option<crate::runner::Trigger>> {
+    async fn get_trigger(
+        &self,
+        trigger_id: Uuid,
+    ) -> anyhow::Result<Option<crate::runner::Trigger>> {
         self.get_trigger_impl(trigger_id).await
     }
 
@@ -3018,14 +3024,18 @@ impl GraphStore for Neo4jClient {
         config: Option<serde_json::Value>,
         cooldown_secs: Option<u64>,
     ) -> anyhow::Result<Option<crate::runner::Trigger>> {
-        self.update_trigger_impl(trigger_id, enabled, config, cooldown_secs).await
+        self.update_trigger_impl(trigger_id, enabled, config, cooldown_secs)
+            .await
     }
 
     async fn delete_trigger(&self, trigger_id: Uuid) -> anyhow::Result<()> {
         self.delete_trigger_impl(trigger_id).await
     }
 
-    async fn record_trigger_firing(&self, firing: &crate::runner::TriggerFiring) -> anyhow::Result<()> {
+    async fn record_trigger_firing(
+        &self,
+        firing: &crate::runner::TriggerFiring,
+    ) -> anyhow::Result<()> {
         self.record_trigger_firing_impl(firing).await
     }
 

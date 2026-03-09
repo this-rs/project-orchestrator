@@ -118,7 +118,10 @@ fn is_sensitive_file(path: &str) -> bool {
     }
 
     // Check extension matches
-    if SENSITIVE_EXTENSIONS.iter().any(|ext| filename.ends_with(ext)) {
+    if SENSITIVE_EXTENSIONS
+        .iter()
+        .any(|ext| filename.ends_with(ext))
+    {
         return true;
     }
 
@@ -194,10 +197,7 @@ impl TaskVerifier {
             info!("Task {} passed all verifications", task_id);
             VerifyResult::Pass
         } else {
-            warn!(
-                "Task {} failed verification: {:?}",
-                task_id, reasons
-            );
+            warn!("Task {} failed verification: {:?}", task_id, reasons);
             VerifyResult::Fail { reasons }
         }
     }
@@ -222,7 +222,12 @@ impl TaskVerifier {
                 .output(),
         )
         .await
-        .map_err(|_| anyhow::anyhow!("Build command timed out after {}s", self.command_timeout.as_secs()))?
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "Build command timed out after {}s",
+                self.command_timeout.as_secs()
+            )
+        })?
         .map_err(|e| anyhow::anyhow!("Failed to run build command: {}", e))?;
 
         if output.status.success() {
@@ -236,7 +241,12 @@ impl TaskVerifier {
             } else {
                 stderr.to_string()
             };
-            Err(anyhow::anyhow!("{} {} failed:\n{}", cmd, args.join(" "), truncated))
+            Err(anyhow::anyhow!(
+                "{} {} failed:\n{}",
+                cmd,
+                args.join(" "),
+                truncated
+            ))
         }
     }
 
@@ -307,7 +317,11 @@ impl TaskVerifier {
         if !sensitive.is_empty() {
             return Err(anyhow::anyhow!(
                 "Sensitive files detected in commit: {}",
-                sensitive.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(", ")
+                sensitive
+                    .iter()
+                    .map(|f| f.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ));
         }
 
@@ -334,7 +348,10 @@ impl TaskVerifier {
             }
         }
 
-        info!("Git sanity check passed ({} files changed)", changed_files.len());
+        info!(
+            "Git sanity check passed ({} files changed)",
+            changed_files.len()
+        );
         Ok(())
     }
 
@@ -358,7 +375,12 @@ impl TaskVerifier {
                 .output(),
         )
         .await
-        .map_err(|_| anyhow::anyhow!("Test command timed out after {}s", self.command_timeout.as_secs()))?
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "Test command timed out after {}s",
+                self.command_timeout.as_secs()
+            )
+        })?
         .map_err(|e| anyhow::anyhow!("Failed to run test command: {}", e))?;
 
         if output.status.success() {
@@ -429,7 +451,10 @@ mod tests {
     #[test]
     fn test_project_language_detect_unknown() {
         let tmp = tempfile::tempdir().unwrap();
-        assert_eq!(ProjectLanguage::detect(tmp.path()), ProjectLanguage::Unknown);
+        assert_eq!(
+            ProjectLanguage::detect(tmp.path()),
+            ProjectLanguage::Unknown
+        );
     }
 
     #[test]
@@ -468,11 +493,17 @@ mod tests {
     #[test]
     fn test_extract_stat_number() {
         assert_eq!(
-            extract_stat_number(" 5 files changed, 120 insertions(+), 30 deletions(-)", "insertion"),
+            extract_stat_number(
+                " 5 files changed, 120 insertions(+), 30 deletions(-)",
+                "insertion"
+            ),
             Some(120)
         );
         assert_eq!(
-            extract_stat_number(" 5 files changed, 120 insertions(+), 30 deletions(-)", "deletion"),
+            extract_stat_number(
+                " 5 files changed, 120 insertions(+), 30 deletions(-)",
+                "deletion"
+            ),
             Some(30)
         );
         assert_eq!(extract_stat_number("no changes", "insertion"), None);
