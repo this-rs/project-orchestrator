@@ -188,10 +188,81 @@ pub async fn activate_hook(
             // Increment activation_count (fire-and-forget)
             spawn_activation_increment(state.orchestrator.neo4j_arc(), outcome.response.skill_id);
 
-            Ok((
-                StatusCode::OK,
-                Json(serde_json::to_value(&outcome.response).unwrap_or_default()),
-            ))
+            // Build enriched response with redirect suggestion + file profile
+            let mut response = serde_json::to_value(&outcome.response).unwrap_or_default();
+
+            // Generate redirect suggestion for Grep/Bash (best-effort)
+            if let Some(suggestion) = crate::skills::hook_extractor::generate_redirect_suggestion(
+                &req.tool_name,
+                &req.tool_input,
+            ) {
+                // Try to enrich with ContextCard
+                let file_path = crate::skills::hook_extractor::extract_file_context(
+                    &req.tool_name,
+                    &req.tool_input,
+                );
+                let enriched = if let Some(ref fp) = file_path {
+                    let pid = req.project_id.to_string();
+                    match state.orchestrator.neo4j().get_context_card(fp, &pid).await {
+                        Ok(Some(card)) => {
+                            crate::skills::hook_extractor::enrich_redirect_with_context_card(
+                                suggestion, &card,
+                            )
+                        }
+                        _ => crate::skills::hook_extractor::EnrichedRedirectSuggestion {
+                            suggestion,
+                            context_warnings: vec![],
+                        },
+                    }
+                } else {
+                    crate::skills::hook_extractor::EnrichedRedirectSuggestion {
+                        suggestion,
+                        context_warnings: vec![],
+                    }
+                };
+                if let Some(obj) = response.as_object_mut() {
+                    obj.insert(
+                        "redirect_suggestion".to_string(),
+                        serde_json::json!({
+                            "mcp_tool": enriched.suggestion.mcp_tool,
+                            "mcp_params": enriched.suggestion.mcp_params,
+                            "reason": enriched.suggestion.reason,
+                            "context_warnings": enriched.context_warnings,
+                        }),
+                    );
+                }
+            }
+
+            // Add file profile for file-based tools (Read/Edit/Write) — best-effort
+            if matches!(req.tool_name.as_str(), "Read" | "Edit" | "Write") {
+                if let Some(fp) = crate::skills::hook_extractor::extract_file_context(
+                    &req.tool_name,
+                    &req.tool_input,
+                ) {
+                    let pid = req.project_id.to_string();
+                    if let Ok(Some(card)) =
+                        state.orchestrator.neo4j().get_context_card(&fp, &pid).await
+                    {
+                        if let Some(obj) = response.as_object_mut() {
+                            obj.insert(
+                                "file_profile".to_string(),
+                                serde_json::json!({
+                                    "path": card.path,
+                                    "pagerank": card.cc_pagerank,
+                                    "betweenness": card.cc_betweenness,
+                                    "community_id": card.cc_community_id,
+                                    "community_label": card.cc_community_label,
+                                    "imports_in": card.cc_imports_in,
+                                    "imports_out": card.cc_imports_out,
+                                    "co_changers_top5": card.cc_co_changers_top5,
+                                }),
+                            );
+                        }
+                    }
+                }
+            }
+
+            Ok((StatusCode::OK, Json(response)))
         }
         None => Ok((StatusCode::NO_CONTENT, Json(serde_json::json!(null)))),
     }
