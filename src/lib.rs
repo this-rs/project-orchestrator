@@ -332,6 +332,14 @@ pub struct OidcConfig {
     /// OAuth2 scopes (default: "openid email profile")
     #[serde(default = "default_scopes")]
     pub scopes: String,
+    /// Extra query parameters appended to the authorization URL.
+    ///
+    /// Allows provider-specific params without hardcoding per provider_key.
+    /// Example: `{"access_type": "offline", "prompt": "consent"}` for Google.
+    /// Google defaults (access_type=offline, prompt=consent) are auto-injected
+    /// when provider_key is "google" unless explicitly overridden here.
+    #[serde(default)]
+    pub extra_auth_params: std::collections::HashMap<String, String>,
 }
 
 fn default_access_token_expiry() -> u64 {
@@ -382,6 +390,7 @@ impl AuthConfig {
                     redirect_uri: redirect_uri.clone(),
                     provider_name: "Google".to_string(),
                     scopes: "openid email profile".to_string(),
+                    extra_auth_params: Default::default(),
                 })
             }
             _ => None,

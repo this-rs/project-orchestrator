@@ -2017,6 +2017,7 @@ mod tests {
                 userinfo_endpoint: Some("https://okta.example.com/userinfo".to_string()),
                 scopes: "openid email profile".to_string(),
                 discovery_url: None,
+                extra_auth_params: Default::default(),
             }),
             google_client_id: None,
             google_client_secret: None,
