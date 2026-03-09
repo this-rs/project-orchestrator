@@ -2406,7 +2406,7 @@ impl Neo4jClient {
             WITH file_count, note_count, files_with_decisions, total_decisions,
                  active_synapses, hotspot_count, covered_hotspots,
                  count(sn) AS scarred_notes
-            OPTIONAL MATCH (sd:Decision {project_id: $pid})
+            OPTIONAL MATCH (p5:Project {id: $pid})-[:HAS_PLAN]->(:Plan)-[:HAS_TASK]->(:Task)-[:INFORMED_BY]->(sd:Decision)
             WHERE sd.scar_intensity IS NOT NULL AND sd.scar_intensity > 0.0
             WITH file_count, note_count, files_with_decisions, total_decisions,
                  active_synapses, hotspot_count, covered_hotspots,

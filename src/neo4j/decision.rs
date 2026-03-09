@@ -635,8 +635,8 @@ impl Neo4jClient {
         // Step 1: Get all decisions for this project
         let q = query(
             r#"
-            MATCH (p:Project {id: $pid})<-[:BELONGS_TO_PROJECT]-(plan:Plan)
-                  <-[:BELONGS_TO_PLAN]-(task:Task)-[:HAS_DECISION]->(d:Decision)
+            MATCH (p:Project {id: $pid})-[:HAS_PLAN]->(plan:Plan)
+                  -[:HAS_TASK]->(task:Task)-[:INFORMED_BY]->(d:Decision)
             RETURN d.id AS id, d.description AS description, d.rationale AS rationale,
                    d.alternatives AS alternatives, d.chosen_option AS chosen_option,
                    d.decided_by AS decided_by, d.decided_at AS decided_at,
