@@ -782,6 +782,8 @@ async fn test_workspace_milestone_task_association() {
         priority: 5,
         created_by: "test".to_string(),
         project_id: None,
+        execution_context: None,
+        persona: None,
     };
     state.neo4j.create_plan(&plan).await.unwrap();
 
@@ -802,6 +804,9 @@ async fn test_workspace_milestone_task_association() {
         acceptance_criteria: vec![],
         affected_files: vec![],
         frustration_score: 0.0,
+        execution_context: None,
+        persona: None,
+        prompt_cache: None,
     };
     state.neo4j.create_task(plan.id, &task).await.unwrap();
 

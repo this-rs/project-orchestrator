@@ -1004,6 +1004,8 @@ mod tests {
                     created_at: chrono::Utc::now(),
                     updated_at: None,
                     completed_at: Some(chrono::Utc::now()),
+                    execution_context: None,
+                    persona: None,
                 },
                 StepNode {
                     id: Uuid::new_v4(),
@@ -1014,6 +1016,8 @@ mod tests {
                     created_at: chrono::Utc::now(),
                     updated_at: None,
                     completed_at: None,
+                    execution_context: None,
+                    persona: None,
                 },
             ],
             constraints: vec![],

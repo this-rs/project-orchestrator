@@ -1235,7 +1235,7 @@ impl PlanRunner {
         );
 
         // --- Step 2: Activate skills ---
-        let project_id_for_skills = if let Some(ref slug) = project_slug {
+        let project_id_for_skills = if let Some(slug) = &project_slug {
             self.graph
                 .get_project_by_slug(slug)
                 .await
