@@ -10,6 +10,7 @@
 //! - A cleanup task periodically closes timed-out sessions
 
 use super::config::ChatConfig;
+use super::post_tool_hook;
 use super::skill_hook;
 use super::types::{
     classify_api_error, truncate_snippet, ChatEvent, ChatEventPage, ChatRequest,
@@ -250,6 +251,9 @@ impl ChatManager {
             pipeline.add_stage(Box::new(super::stages::StatusInjectionStage::new(
                 graph.clone(),
             )));
+            pipeline.add_stage(Box::new(super::stages::FileContextStage::new(
+                graph.clone(),
+            )));
             Arc::new(pipeline)
         };
         Self {
@@ -312,6 +316,9 @@ impl ChatManager {
                 search.clone(),
             )));
             pipeline.add_stage(Box::new(super::stages::StatusInjectionStage::new(
+                graph.clone(),
+            )));
+            pipeline.add_stage(Box::new(super::stages::FileContextStage::new(
                 graph.clone(),
             )));
             Arc::new(pipeline)
@@ -1868,6 +1875,16 @@ impl ChatManager {
                 vec![nexus_claude::HookMatcher {
                     matcher: None, // Match all tools — filtering is done inside the hook
                     hooks: vec![std::sync::Arc::new(skill_hook)],
+                }],
+            );
+
+            // PostToolUse → PostToolUseRedirectHook suggests MCP alternatives after noisy Grep
+            let post_hook = post_tool_hook::PostToolUseRedirectHook::new(self.graph.clone());
+            hooks.insert(
+                "PostToolUse".to_string(),
+                vec![nexus_claude::HookMatcher {
+                    matcher: None,
+                    hooks: vec![std::sync::Arc::new(post_hook)],
                 }],
             );
 
@@ -4027,6 +4044,16 @@ impl ChatManager {
                 vec![nexus_claude::HookMatcher {
                     matcher: None,
                     hooks: vec![std::sync::Arc::new(skill_hook)],
+                }],
+            );
+
+            // PostToolUse → PostToolUseRedirectHook suggests MCP alternatives after noisy Grep
+            let post_hook = post_tool_hook::PostToolUseRedirectHook::new(self.graph.clone());
+            hooks.insert(
+                "PostToolUse".to_string(),
+                vec![nexus_claude::HookMatcher {
+                    matcher: None,
+                    hooks: vec![std::sync::Arc::new(post_hook)],
                 }],
             );
 

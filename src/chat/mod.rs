@@ -13,6 +13,7 @@ pub mod feedback;
 pub mod manager;
 pub mod observation_detector;
 pub mod path_detect;
+pub(crate) mod post_tool_hook;
 pub mod prompt;
 pub(crate) mod skill_hook;
 pub mod stages;

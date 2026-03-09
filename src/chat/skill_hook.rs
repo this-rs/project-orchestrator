@@ -22,6 +22,9 @@ use crate::skills::activation::{
     activate_for_hook_cached, spawn_activation_increment, spawn_hook_reinforcement,
     HookActivationConfig,
 };
+use crate::skills::hook_extractor::{
+    enrich_redirect_with_context_card, generate_redirect_suggestion,
+};
 use crate::skills::project_resolver::resolve_project_from_context;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
@@ -131,7 +134,45 @@ impl nexus_claude::HookCallback for SkillActivationHook {
         // 4b. Increment activation_count (fire-and-forget)
         spawn_activation_increment(self.graph_store.clone(), outcome.response.skill_id);
 
-        // 5. Return skill context as additionalContext
+        // 5. Build combined context: skill context + redirect suggestion (if applicable)
+        let mut combined_context = outcome.response.context.clone();
+
+        // 5b. Generate redirect suggestion for Grep/Bash tools
+        if let Some(suggestion) =
+            generate_redirect_suggestion(&pre_tool.tool_name, &pre_tool.tool_input)
+        {
+            // Try to enrich with ContextCard (best-effort, don't block on failure)
+            let file_path = crate::skills::hook_extractor::extract_file_context(
+                &pre_tool.tool_name,
+                &pre_tool.tool_input,
+            );
+            let enriched = if let Some(ref fp) = file_path {
+                let project_id_str = project_id.to_string();
+                match self.graph_store.get_context_card(fp, &project_id_str).await {
+                    Ok(Some(card)) => enrich_redirect_with_context_card(suggestion, &card),
+                    _ => crate::skills::hook_extractor::EnrichedRedirectSuggestion {
+                        suggestion,
+                        context_warnings: vec![],
+                    },
+                }
+            } else {
+                crate::skills::hook_extractor::EnrichedRedirectSuggestion {
+                    suggestion,
+                    context_warnings: vec![],
+                }
+            };
+
+            // Append redirect suggestion to context (never overwrite skill context)
+            combined_context.push_str("\n\n");
+            combined_context.push_str(&enriched.to_string());
+
+            debug!(
+                tool = %pre_tool.tool_name,
+                mcp_tool = %enriched.suggestion.mcp_tool,
+                "Redirect suggestion injected"
+            );
+        }
+
         info!(
             skill_name = %outcome.response.skill_name,
             confidence = outcome.response.confidence,
@@ -147,7 +188,7 @@ impl nexus_claude::HookCallback for SkillActivationHook {
                         permission_decision: None,
                         permission_decision_reason: None,
                         updated_input: None,
-                        additional_context: Some(outcome.response.context),
+                        additional_context: Some(combined_context),
                     },
                 )),
                 ..Default::default()
