@@ -838,6 +838,7 @@ branch refs/heads/feature
     // ----------------------------------------------------------------
 
     #[tokio::test]
+    #[ignore] // Requires real git repo with branches — skipped in CI
     async fn test_list_worktrees_in_real_repo() {
         let cwd = std::env::current_dir()
             .unwrap()
@@ -853,6 +854,7 @@ branch refs/heads/feature
     }
 
     #[tokio::test]
+    #[ignore] // Requires real git repo with branches — skipped in CI
     async fn test_current_branch_in_real_repo() {
         let cwd = std::env::current_dir()
             .unwrap()
