@@ -52,7 +52,7 @@ impl Default for GuardConfig {
     fn default() -> Self {
         Self {
             idle_timeout: Duration::from_secs(180),
-            task_timeout: Duration::from_secs(900),
+            task_timeout: Duration::from_secs(10800),
             loop_threshold: 3,
             check_interval: Duration::from_secs(5),
         }
@@ -295,7 +295,7 @@ mod tests {
     fn test_guard_config_default() {
         let config = GuardConfig::default();
         assert_eq!(config.idle_timeout.as_secs(), 180);
-        assert_eq!(config.task_timeout.as_secs(), 900);
+        assert_eq!(config.task_timeout.as_secs(), 10800);
         assert_eq!(config.loop_threshold, 3);
         assert_eq!(config.check_interval.as_secs(), 5);
     }

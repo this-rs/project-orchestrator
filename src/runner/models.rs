@@ -19,7 +19,9 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RunnerConfig {
-    /// Maximum time (seconds) for a single task before timeout. Default: 900 (15 min).
+    /// Maximum time (seconds) for a single task before timeout. Default: 10800 (3h).
+    /// Tasks involve code analysis, writing, compilation, tests, and potential retries.
+    /// The guard still injects idle reminders after idle_timeout_secs, so drift is caught early.
     pub task_timeout_secs: u64,
     /// Idle timeout (seconds) — if no file edits detected, inject a reminder. Default: 180 (3 min).
     pub idle_timeout_secs: u64,
@@ -38,7 +40,7 @@ pub struct RunnerConfig {
 impl Default for RunnerConfig {
     fn default() -> Self {
         Self {
-            task_timeout_secs: 900,
+            task_timeout_secs: 10800,
             idle_timeout_secs: 180,
             max_retries: 1,
             auto_pr: false,
@@ -423,7 +425,7 @@ mod tests {
     #[test]
     fn test_runner_config_defaults() {
         let config = RunnerConfig::default();
-        assert_eq!(config.task_timeout_secs, 900);
+        assert_eq!(config.task_timeout_secs, 10800);
         assert_eq!(config.idle_timeout_secs, 180);
         assert_eq!(config.max_retries, 1);
         assert!(!config.auto_pr);

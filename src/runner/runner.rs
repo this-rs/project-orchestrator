@@ -146,6 +146,27 @@ impl PlanRunner {
         self
     }
 
+    /// Update a task's status and emit a CrudEvent so the frontend gets real-time updates.
+    async fn update_task_status_with_event(&self, task_id: Uuid, status: TaskStatus) -> Result<()> {
+        // Serialize status before move
+        let status_json = serde_json::to_value(&status).unwrap_or_default();
+        self.graph.update_task_status(task_id, status).await?;
+
+        // Emit CrudEvent for WebSocket real-time updates
+        if let Some(ref emitter) = self.event_emitter {
+            emitter.emit(CrudEvent {
+                entity_type: EntityType::Task,
+                action: CrudAction::Updated,
+                entity_id: task_id.to_string(),
+                related: None,
+                payload: serde_json::json!({ "status": status_json }),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                project_id: None,
+            });
+        }
+        Ok(())
+    }
+
     /// Emit a RunnerEvent on both the broadcast channel and the CrudEvent bus.
     fn emit_event(&self, event: RunnerEvent) {
         // 1. Broadcast on the dedicated RunnerEvent channel
@@ -497,6 +518,16 @@ impl PlanRunner {
             None
         };
 
+        // Create a dedicated git branch for this run
+        let branch_name = self.create_git_branch(plan_id, run_id, &cwd).await;
+        if let Some(ref branch) = branch_name {
+            // Store branch name in runner state
+            let mut global = RUNNER_STATE.write().await;
+            if let Some(ref mut s) = *global {
+                s.git_branch = branch.clone();
+            }
+        }
+
         for (wave_idx, wave) in waves.iter().enumerate() {
             let wave_number = wave_idx + 1;
 
@@ -646,10 +677,9 @@ impl PlanRunner {
                     }
                     Ok(TaskResult::Blocked { blocked_by }) => {
                         warn!("Task {} blocked by {:?}", wave_task.id, blocked_by);
-                        // Mark task as blocked and continue
+                        // Mark task as blocked and continue (with CrudEvent)
                         let _ = self
-                            .graph
-                            .update_task_status(wave_task.id, TaskStatus::Blocked)
+                            .update_task_status_with_event(wave_task.id, TaskStatus::Blocked)
                             .await;
                     }
                     Err(e) => {
@@ -727,9 +757,8 @@ impl PlanRunner {
             }
         }
 
-        // Mark task as in_progress
-        self.graph
-            .update_task_status(task_id, TaskStatus::InProgress)
+        // Mark task as in_progress (with CrudEvent for WebSocket)
+        self.update_task_status_with_event(task_id, TaskStatus::InProgress)
             .await?;
 
         // Get current wave number
@@ -921,9 +950,8 @@ impl PlanRunner {
         duration_secs: f64,
         cost_usd: f64,
     ) -> Result<()> {
-        // Update task status
-        self.graph
-            .update_task_status(task_id, TaskStatus::Completed)
+        // Update task status (with CrudEvent for WebSocket)
+        self.update_task_status_with_event(task_id, TaskStatus::Completed)
             .await?;
 
         // Update global state
@@ -1014,9 +1042,8 @@ impl PlanRunner {
             });
         }
 
-        // Mark task as failed
-        self.graph
-            .update_task_status(task_id, TaskStatus::Failed)
+        // Mark task as failed (with CrudEvent for WebSocket)
+        self.update_task_status_with_event(task_id, TaskStatus::Failed)
             .await?;
 
         // Update global state
@@ -1201,6 +1228,64 @@ impl PlanRunner {
         }
 
         Ok(())
+    }
+
+    /// Create a dedicated git branch for this plan run.
+    ///
+    /// Branch format: `runner/<plan-slug>-<short-run-id>`.
+    /// Falls back gracefully if git commands fail (e.g., dirty worktree).
+    async fn create_git_branch(&self, plan_id: Uuid, run_id: Uuid, cwd: &str) -> Option<String> {
+        // Get plan title for branch naming
+        let plan_title = match self.graph.get_plan(plan_id).await {
+            Ok(Some(plan)) => plan.title,
+            _ => format!("plan-{}", &plan_id.to_string()[..8]),
+        };
+
+        // Slugify: lowercase, replace non-alphanum with hyphens, trim
+        let slug: String = plan_title
+            .to_lowercase()
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect::<String>()
+            .trim_matches('-')
+            .to_string();
+
+        // Truncate slug and add short run id
+        let slug = if slug.len() > 50 { &slug[..50] } else { &slug };
+        let short_run = &run_id.to_string()[..8];
+        let branch_name = format!("runner/{}-{}", slug, short_run);
+
+        // Create and checkout the branch
+        let output = tokio::process::Command::new("git")
+            .args(["checkout", "-b", &branch_name])
+            .current_dir(cwd)
+            .output()
+            .await;
+
+        match output {
+            Ok(o) if o.status.success() => {
+                info!("Created git branch: {}", branch_name);
+                Some(branch_name)
+            }
+            Ok(o) => {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                warn!(
+                    "Failed to create git branch '{}': {}. Running on current branch.",
+                    branch_name, stderr
+                );
+                None
+            }
+            Err(e) => {
+                warn!("Git command failed: {}. Running on current branch.", e);
+                None
+            }
+        }
     }
 
     /// Listen for chat events until a Result event is received.
