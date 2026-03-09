@@ -2295,6 +2295,51 @@ pub async fn get_homeostasis(
 }
 
 // ============================================================================
+// Identity Manifold — Structural Drift
+// ============================================================================
+
+/// Query params for GET /api/code/structural-drift
+#[derive(Debug, Deserialize)]
+pub struct StructuralDriftQuery {
+    pub project_slug: String,
+    /// Warning threshold (default: 1.5)
+    pub warning_threshold: Option<f64>,
+    /// Critical threshold (default: 3.0)
+    pub critical_threshold: Option<f64>,
+}
+
+/// GET /api/code/structural-drift
+///
+/// Compute structural drift for all files in a project.
+/// Returns community centroids and per-file drift from their community identity.
+/// Biomimicry: maps to Elun's HypersphereIdentity distance_squared_f64.
+pub async fn get_structural_drift(
+    State(state): State<OrchestratorState>,
+    Query(params): Query<StructuralDriftQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let project = state
+        .orchestrator
+        .neo4j()
+        .get_project_by_slug(&params.project_slug)
+        .await?
+        .ok_or_else(|| {
+            AppError::NotFound(format!("Project '{}' not found", params.project_slug))
+        })?;
+
+    let report = state
+        .orchestrator
+        .neo4j()
+        .compute_structural_drift(
+            project.id,
+            params.warning_threshold,
+            params.critical_threshold,
+        )
+        .await?;
+
+    Ok(Json(serde_json::to_value(report).unwrap_or_default()))
+}
+
+// ============================================================================
 // Process Detection
 // ============================================================================
 

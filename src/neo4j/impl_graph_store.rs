@@ -1911,6 +1911,16 @@ impl GraphStore for Neo4jClient {
         self.compute_homeostasis(project_id, custom_ranges).await
     }
 
+    async fn compute_structural_drift(
+        &self,
+        project_id: Uuid,
+        warning_threshold: Option<f64>,
+        critical_threshold: Option<f64>,
+    ) -> anyhow::Result<crate::neo4j::models::StructuralDriftReport> {
+        self.compute_structural_drift(project_id, warning_threshold, critical_threshold)
+            .await
+    }
+
     async fn increment_frustration(&self, task_id: Uuid, delta: f64) -> anyhow::Result<f64> {
         self.increment_frustration(task_id, delta).await
     }

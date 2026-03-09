@@ -2148,4 +2148,212 @@ impl Neo4jClient {
             recommendation,
         }
     }
+
+    // ========================================================================
+    // Identity Manifold — Community centroids & structural drift
+    // ========================================================================
+
+    /// Compute structural drift for all files in a project.
+    ///
+    /// 1. Fetches all files with fingerprint + community_id from Neo4j (single query)
+    /// 2. Groups by community, computes centroid (mean fingerprint) per community
+    /// 3. Computes euclidean distance from each file to its community centroid
+    /// 4. Returns files sorted by drift (descending) with severity classification
+    ///
+    /// Thresholds (configurable via `warning_threshold` and `critical_threshold`):
+    /// - ok: distance < warning_threshold
+    /// - warning: warning_threshold ≤ distance < critical_threshold
+    /// - critical: distance ≥ critical_threshold
+    pub async fn compute_structural_drift(
+        &self,
+        project_id: Uuid,
+        warning_threshold: Option<f64>,
+        critical_threshold: Option<f64>,
+    ) -> Result<crate::neo4j::models::StructuralDriftReport> {
+        use crate::neo4j::models::{
+            CommunityIdentity, HomeostasisSeverity, StructuralDrift, StructuralDriftReport,
+        };
+
+        let warn_thresh = warning_threshold.unwrap_or(1.5);
+        let crit_thresh = critical_threshold.unwrap_or(3.0);
+
+        // Single query: get all files with fingerprint + community data
+        let q = query(
+            r#"
+            MATCH (p:Project {id: $project_id})-[:CONTAINS]->(f:File)
+            WHERE f.structural_fingerprint IS NOT NULL
+              AND f.community_id IS NOT NULL
+            RETURN f.path AS path,
+                   f.structural_fingerprint AS fingerprint,
+                   f.community_id AS community_id,
+                   COALESCE(f.community_label, 'Community ' + toString(f.community_id)) AS community_label
+            "#,
+        )
+        .param("project_id", project_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+
+        // Collect all files
+        struct FileEntry {
+            path: String,
+            fingerprint: Vec<f64>,
+            community_id: i64,
+            community_label: String,
+        }
+
+        let mut files: Vec<FileEntry> = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            if let (Ok(path), Ok(fp), Ok(cid)) = (
+                row.get::<String>("path"),
+                row.get::<Vec<f64>>("fingerprint"),
+                row.get::<i64>("community_id"),
+            ) {
+                let label = row
+                    .get::<String>("community_label")
+                    .unwrap_or_else(|_| format!("Community {}", cid));
+                files.push(FileEntry {
+                    path,
+                    fingerprint: fp,
+                    community_id: cid,
+                    community_label: label,
+                });
+            }
+        }
+
+        if files.is_empty() {
+            return Ok(StructuralDriftReport {
+                drifting_files: vec![],
+                centroids: vec![],
+                mean_drift: 0.0,
+                warning_count: 0,
+                critical_count: 0,
+            });
+        }
+
+        // Group by community and compute centroids
+        let mut community_files: std::collections::HashMap<i64, Vec<&FileEntry>> =
+            std::collections::HashMap::new();
+        for file in &files {
+            community_files
+                .entry(file.community_id)
+                .or_default()
+                .push(file);
+        }
+
+        let now = chrono::Utc::now();
+        let mut centroids: Vec<CommunityIdentity> = Vec::new();
+        let mut centroid_map: std::collections::HashMap<i64, Vec<f64>> =
+            std::collections::HashMap::new();
+
+        for (cid, members) in &community_files {
+            let n = members.len();
+            if n == 0 {
+                continue;
+            }
+
+            // Determine dimensionality from first member
+            let dims = members[0].fingerprint.len();
+            let mut centroid = vec![0.0f64; dims];
+
+            for m in members {
+                for (i, &v) in m.fingerprint.iter().enumerate() {
+                    if i < dims {
+                        centroid[i] += v;
+                    }
+                }
+            }
+            for v in centroid.iter_mut() {
+                *v /= n as f64;
+            }
+
+            centroids.push(CommunityIdentity {
+                community_id: *cid,
+                community_label: members[0].community_label.clone(),
+                centroid: centroid.clone(),
+                member_count: n,
+                last_computed: now,
+            });
+            centroid_map.insert(*cid, centroid);
+        }
+
+        // Compute drift for each file
+        let mut drifting_files: Vec<StructuralDrift> = Vec::new();
+        let mut total_drift = 0.0;
+
+        for file in &files {
+            if let Some(centroid) = centroid_map.get(&file.community_id) {
+                let distance = euclidean_distance(&file.fingerprint, centroid);
+                let severity = if distance >= crit_thresh {
+                    HomeostasisSeverity::Critical
+                } else if distance >= warn_thresh {
+                    HomeostasisSeverity::Warning
+                } else {
+                    HomeostasisSeverity::Ok
+                };
+
+                let suggestion = match severity {
+                    HomeostasisSeverity::Critical => Some(format!(
+                        "File has drifted significantly from Community {} identity (distance: {:.2}). Consider migrating to a structurally closer community.",
+                        file.community_id, distance
+                    )),
+                    HomeostasisSeverity::Warning => Some(format!(
+                        "Moderate structural drift from Community {} (distance: {:.2}). Monitor for further divergence.",
+                        file.community_id, distance
+                    )),
+                    HomeostasisSeverity::Ok => None,
+                };
+
+                total_drift += distance;
+
+                drifting_files.push(StructuralDrift {
+                    file_path: file.path.clone(),
+                    community_id: file.community_id,
+                    community_label: file.community_label.clone(),
+                    drift_distance: distance,
+                    severity,
+                    suggestion,
+                });
+            }
+        }
+
+        // Sort by drift descending
+        drifting_files.sort_by(|a, b| {
+            b.drift_distance
+                .partial_cmp(&a.drift_distance)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        let mean_drift = if files.is_empty() {
+            0.0
+        } else {
+            total_drift / files.len() as f64
+        };
+
+        let warning_count = drifting_files
+            .iter()
+            .filter(|f| matches!(f.severity, HomeostasisSeverity::Warning))
+            .count();
+        let critical_count = drifting_files
+            .iter()
+            .filter(|f| matches!(f.severity, HomeostasisSeverity::Critical))
+            .count();
+
+        Ok(StructuralDriftReport {
+            drifting_files,
+            centroids,
+            mean_drift,
+            warning_count,
+            critical_count,
+        })
+    }
+}
+
+/// Euclidean distance between two vectors.
+fn euclidean_distance(a: &[f64], b: &[f64]) -> f64 {
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| (x - y) * (x - y))
+        .sum::<f64>()
+        .sqrt()
 }

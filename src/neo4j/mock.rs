@@ -5627,6 +5627,21 @@ impl GraphStore for MockGraphStore {
         })
     }
 
+    async fn compute_structural_drift(
+        &self,
+        _project_id: Uuid,
+        _warning_threshold: Option<f64>,
+        _critical_threshold: Option<f64>,
+    ) -> Result<crate::neo4j::models::StructuralDriftReport> {
+        Ok(crate::neo4j::models::StructuralDriftReport {
+            drifting_files: vec![],
+            centroids: vec![],
+            mean_drift: 0.0,
+            warning_count: 0,
+            critical_count: 0,
+        })
+    }
+
     async fn increment_frustration(&self, task_id: Uuid, delta: f64) -> Result<f64> {
         let mut tasks = self.tasks.write().await;
         if let Some(task) = tasks.get_mut(&task_id) {

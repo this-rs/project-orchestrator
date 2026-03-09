@@ -1131,6 +1131,58 @@ pub struct HomeostasisReport {
     pub recommendations: Vec<String>,
 }
 
+// ============================================================================
+// Identity Manifold — Community structural identity & drift detection
+// ============================================================================
+
+/// Structural identity of a Louvain community (centroid of member fingerprints).
+/// Biomimicry: maps to Elun's HypersphereIdentity.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommunityIdentity {
+    /// Louvain community identifier
+    pub community_id: i64,
+    /// Community label (human-readable)
+    pub community_label: String,
+    /// Centroid: mean of all member fingerprints (17-dims)
+    pub centroid: Vec<f64>,
+    /// Number of files in this community with fingerprints
+    pub member_count: usize,
+    /// Timestamp of last computation
+    pub last_computed: chrono::DateTime<chrono::Utc>,
+}
+
+/// A file that has drifted from its community's structural identity.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StructuralDrift {
+    /// File path
+    pub file_path: String,
+    /// Community this file belongs to
+    pub community_id: i64,
+    /// Community label
+    pub community_label: String,
+    /// Euclidean distance from file fingerprint to community centroid
+    pub drift_distance: f64,
+    /// Severity based on threshold (ok, warning, critical)
+    pub severity: HomeostasisSeverity,
+    /// Suggestion if drift is critical (e.g., migrate to closer community)
+    pub suggestion: Option<String>,
+}
+
+/// Report of structural drift across all communities.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StructuralDriftReport {
+    /// Files sorted by drift distance (descending)
+    pub drifting_files: Vec<StructuralDrift>,
+    /// Community centroids computed
+    pub centroids: Vec<CommunityIdentity>,
+    /// Mean drift across all files
+    pub mean_drift: f64,
+    /// Number of files above warning threshold
+    pub warning_count: usize,
+    /// Number of files above critical threshold
+    pub critical_count: usize,
+}
+
 /// GDS metrics for a single node (file or function).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeGdsMetrics {

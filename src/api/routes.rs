@@ -564,6 +564,10 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/code/homeostasis",
             get(code_handlers::get_homeostasis),
         )
+        .route(
+            "/api/code/structural-drift",
+            get(code_handlers::get_structural_drift),
+        )
         // ================================================================
         // Heritage Navigation
         // ================================================================

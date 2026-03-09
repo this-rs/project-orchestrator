@@ -298,6 +298,7 @@ impl ToolHandler {
             ("code", "get_knowledge_gaps") => "get_knowledge_gaps",
             ("code", "get_risk_assessment") => "get_risk_assessment",
             ("code", "get_homeostasis") => "get_homeostasis",
+            ("code", "get_structural_drift") => "get_structural_drift",
             ("code", "get_bridge") => "get_bridge",
             ("code", "check_topology") => "check_topology",
             ("code", "create_topology_rule") => "create_topology_rule",
@@ -3221,6 +3222,21 @@ impl ToolHandler {
                 let query = vec![("project_slug".to_string(), project_slug)];
                 let result = http
                     .get_with_query("/api/code/homeostasis", &query)
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "get_structural_drift" => {
+                let project_slug = extract_string(args, "project_slug")?;
+                let mut query = vec![("project_slug".to_string(), project_slug)];
+                if let Some(v) = args.get("warning_threshold").and_then(|v| v.as_f64()) {
+                    query.push(("warning_threshold".to_string(), v.to_string()));
+                }
+                if let Some(v) = args.get("critical_threshold").and_then(|v| v.as_f64()) {
+                    query.push(("critical_threshold".to_string(), v.to_string()));
+                }
+                let result = http
+                    .get_with_query("/api/code/structural-drift", &query)
                     .await?;
                 Ok(Some(result))
             }

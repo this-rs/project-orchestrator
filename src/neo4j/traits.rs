@@ -1584,6 +1584,19 @@ pub trait GraphStore: Send + Sync {
     ) -> Result<crate::neo4j::models::HomeostasisReport>;
 
     // ========================================================================
+    // Identity Manifold — Structural drift (Biomimicry)
+    // ========================================================================
+
+    /// Compute structural drift report for all files in a project.
+    /// Returns community centroids and per-file drift distances.
+    async fn compute_structural_drift(
+        &self,
+        project_id: Uuid,
+        warning_threshold: Option<f64>,
+        critical_threshold: Option<f64>,
+    ) -> Result<crate::neo4j::models::StructuralDriftReport>;
+
+    // ========================================================================
     // Frustration-Catharsis (Biomimicry)
     // ========================================================================
 
