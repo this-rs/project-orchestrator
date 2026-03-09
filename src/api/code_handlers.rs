@@ -1906,6 +1906,27 @@ pub async fn get_code_health(
         Err(_) => serde_json::json!(null),
     };
 
+    // Homeostasis pain score (best-effort)
+    let homeostasis = state
+        .orchestrator
+        .neo4j()
+        .compute_homeostasis(project.id, None)
+        .await
+        .ok();
+
+    let homeostasis_json = homeostasis.as_ref().map(|h| {
+        serde_json::json!({
+            "pain_score": h.pain_score,
+            "ratios": h.ratios.iter().map(|r| serde_json::json!({
+                "name": r.name,
+                "value": r.value,
+                "severity": r.severity,
+                "distance": r.distance_to_equilibrium,
+            })).collect::<Vec<_>>(),
+            "recommendations": h.recommendations,
+        })
+    });
+
     Ok(Json(serde_json::json!({
         "god_functions": god_functions_json,
         "god_function_count": god_functions_json.len(),
@@ -1921,6 +1942,7 @@ pub async fn get_code_health(
         "neural_metrics": neural_metrics,
         "avg_impact_score": avg_impact_score,
         "topology_violations": topology_violations,
+        "homeostasis": homeostasis_json,
     })))
 }
 
@@ -2238,6 +2260,38 @@ pub async fn get_risk_assessment(
             "low_count": low,
         }
     })))
+}
+
+// ============================================================================
+// Homeostasis — Bio-inspired auto-regulation
+// ============================================================================
+
+#[derive(Deserialize)]
+pub struct HomeostasisQuery {
+    pub project_slug: String,
+}
+
+/// GET /api/code/homeostasis — Get homeostatic equilibrium report for the knowledge graph
+pub async fn get_homeostasis(
+    State(state): State<OrchestratorState>,
+    Query(params): Query<HomeostasisQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let project = state
+        .orchestrator
+        .neo4j()
+        .get_project_by_slug(&params.project_slug)
+        .await?
+        .ok_or_else(|| {
+            AppError::NotFound(format!("Project '{}' not found", params.project_slug))
+        })?;
+
+    let report = state
+        .orchestrator
+        .neo4j()
+        .compute_homeostasis(project.id, None)
+        .await?;
+
+    Ok(Json(serde_json::to_value(report).unwrap_or_default()))
 }
 
 // ============================================================================

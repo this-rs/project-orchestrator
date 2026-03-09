@@ -5605,6 +5605,28 @@ impl GraphStore for MockGraphStore {
         Ok((promoted, archived))
     }
 
+    async fn compute_homeostasis(
+        &self,
+        _project_id: Uuid,
+        _custom_ranges: Option<&[(String, f64, f64)]>,
+    ) -> Result<crate::neo4j::models::HomeostasisReport> {
+        use crate::neo4j::models::{HomeostasisReport, HomeostasisRatio, HomeostasisSeverity};
+        Ok(HomeostasisReport {
+            ratios: vec![
+                HomeostasisRatio {
+                    name: "note_density".to_string(),
+                    value: 1.0,
+                    target_range: (0.3, 2.0),
+                    distance_to_equilibrium: 0.0,
+                    severity: HomeostasisSeverity::Ok,
+                    recommendation: None,
+                },
+            ],
+            pain_score: 0.0,
+            recommendations: vec![],
+        })
+    }
+
     async fn init_note_energy(&self) -> Result<usize> {
         let mut notes = self.notes.write().await;
         let mut count = 0;

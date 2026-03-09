@@ -1903,6 +1903,14 @@ impl GraphStore for Neo4jClient {
         self.consolidate_memory().await
     }
 
+    async fn compute_homeostasis(
+        &self,
+        project_id: Uuid,
+        custom_ranges: Option<&[(String, f64, f64)]>,
+    ) -> anyhow::Result<crate::neo4j::models::HomeostasisReport> {
+        self.compute_homeostasis(project_id, custom_ranges).await
+    }
+
     async fn init_note_energy(&self) -> anyhow::Result<usize> {
         self.init_note_energy().await
     }

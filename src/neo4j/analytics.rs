@@ -1919,4 +1919,233 @@ impl Neo4jClient {
             relationship_type_counts,
         })
     }
+
+    // ========================================================================
+    // Homeostasis — Bio-inspired auto-regulation metrics
+    // ========================================================================
+
+    /// Compute homeostasis report for a project's knowledge graph.
+    /// Returns 5 ratios measuring the "health equilibrium" of the graph,
+    /// inspired by biological homeostasis (Elun's homeostasis.rs).
+    ///
+    /// Default target ranges can be overridden via `custom_ranges`.
+    pub async fn compute_homeostasis(
+        &self,
+        project_id: Uuid,
+        custom_ranges: Option<&[(String, f64, f64)]>,
+    ) -> Result<HomeostasisReport> {
+        let pid = project_id.to_string();
+
+        // Single Cypher query to collect all 5 ratios in one round-trip
+        let q = query(
+            r#"
+            // 1. Note density: notes / files
+            OPTIONAL MATCH (p:Project {id: $pid})-[:CONTAINS]->(f:File)
+            WITH count(DISTINCT f) AS file_count
+            OPTIONAL MATCH (n:KnowledgeNote {project_id: $pid})
+            WHERE n.status = 'active'
+            WITH file_count, count(DISTINCT n) AS note_count
+
+            // 2. Decision coverage: decisions with AFFECTS / total files modified
+            OPTIONAL MATCH (d:Decision {project_id: $pid})-[:AFFECTS]->(target)
+            WITH file_count, note_count,
+                 count(DISTINCT target) AS files_with_decisions
+            OPTIONAL MATCH (d2:Decision {project_id: $pid})
+            WITH file_count, note_count, files_with_decisions,
+                 count(DISTINCT d2) AS total_decisions
+
+            // 3. Synapse health: active synapses / active notes
+            OPTIONAL MATCH (n1:KnowledgeNote {project_id: $pid})-[syn:SYNAPSE]->(n2:KnowledgeNote)
+            WHERE syn.weight > 0.1
+            WITH file_count, note_count, files_with_decisions, total_decisions,
+                 count(syn) AS active_synapses
+
+            // 4. Hotspot coverage: hotspots with notes / total hotspots
+            OPTIONAL MATCH (p:Project {id: $pid})-[:CONTAINS]->(hf:File)
+            WHERE hf.churn_score IS NOT NULL AND hf.churn_score > 0.5
+            WITH file_count, note_count, files_with_decisions, total_decisions,
+                 active_synapses, count(DISTINCT hf) AS hotspot_count
+            OPTIONAL MATCH (p:Project {id: $pid})-[:CONTAINS]->(hf2:File)
+            WHERE hf2.churn_score IS NOT NULL AND hf2.churn_score > 0.5
+            AND EXISTS { MATCH (n:KnowledgeNote)-[:LINKED_TO]->(hf2) WHERE n.status = 'active' }
+            WITH file_count, note_count, files_with_decisions, total_decisions,
+                 active_synapses, hotspot_count, count(DISTINCT hf2) AS covered_hotspots
+
+            // 5. Scar load: scarred nodes / total notes+decisions
+            OPTIONAL MATCH (sn:KnowledgeNote {project_id: $pid})
+            WHERE sn.scar_intensity IS NOT NULL AND sn.scar_intensity > 0.0
+            WITH file_count, note_count, files_with_decisions, total_decisions,
+                 active_synapses, hotspot_count, covered_hotspots,
+                 count(sn) AS scarred_notes
+            OPTIONAL MATCH (sd:Decision {project_id: $pid})
+            WHERE sd.scar_intensity IS NOT NULL AND sd.scar_intensity > 0.0
+            WITH file_count, note_count, files_with_decisions, total_decisions,
+                 active_synapses, hotspot_count, covered_hotspots,
+                 scarred_notes + count(sd) AS scarred_total
+
+            RETURN file_count, note_count, files_with_decisions, total_decisions,
+                   active_synapses, hotspot_count, covered_hotspots, scarred_total
+            "#,
+        )
+        .param("pid", pid);
+
+        let mut rows = self.graph.execute(q).await?;
+        let row = rows
+            .next()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("No homeostasis data returned"))?;
+
+        let file_count: i64 = row.get("file_count").unwrap_or(0);
+        let note_count: i64 = row.get("note_count").unwrap_or(0);
+        let files_with_decisions: i64 = row.get("files_with_decisions").unwrap_or(0);
+        let total_decisions: i64 = row.get("total_decisions").unwrap_or(0);
+        let active_synapses: i64 = row.get("active_synapses").unwrap_or(0);
+        let hotspot_count: i64 = row.get("hotspot_count").unwrap_or(0);
+        let covered_hotspots: i64 = row.get("covered_hotspots").unwrap_or(0);
+        let scarred_total: i64 = row.get("scarred_total").unwrap_or(0);
+
+        // Default target ranges (overridable via analysis_profile)
+        let default_ranges: Vec<(&str, f64, f64)> = vec![
+            ("note_density", 0.3, 2.0),       // 0.3-2.0 notes per file
+            ("decision_coverage", 0.1, 0.8),   // 10-80% of files have decisions
+            ("synapse_health", 0.2, 3.0),      // 0.2-3.0 synapses per note
+            ("churn_balance", 0.3, 1.0),       // 30-100% hotspots covered
+            ("scar_load", 0.0, 0.15),          // 0-15% scarred nodes
+        ];
+
+        let get_range = |name: &str, default_min: f64, default_max: f64| -> (f64, f64) {
+            if let Some(ranges) = custom_ranges {
+                for (n, min, max) in ranges {
+                    if n == name {
+                        return (*min, *max);
+                    }
+                }
+            }
+            (default_min, default_max)
+        };
+
+        let mut ratios = Vec::new();
+        let mut total_pain = 0.0;
+
+        // 1. Note density
+        let note_density = if file_count > 0 {
+            note_count as f64 / file_count as f64
+        } else {
+            0.0
+        };
+        let (min, max) = get_range("note_density", default_ranges[0].1, default_ranges[0].2);
+        ratios.push(Self::make_ratio("note_density", note_density, min, max));
+
+        // 2. Decision coverage
+        let decision_cov = if file_count > 0 {
+            files_with_decisions as f64 / file_count as f64
+        } else {
+            0.0
+        };
+        let (min, max) = get_range("decision_coverage", default_ranges[1].1, default_ranges[1].2);
+        ratios.push(Self::make_ratio("decision_coverage", decision_cov, min, max));
+
+        // 3. Synapse health
+        let synapse_ratio = if note_count > 0 {
+            active_synapses as f64 / note_count as f64
+        } else {
+            0.0
+        };
+        let (min, max) = get_range("synapse_health", default_ranges[2].1, default_ranges[2].2);
+        ratios.push(Self::make_ratio("synapse_health", synapse_ratio, min, max));
+
+        // 4. Churn balance
+        let churn_bal = if hotspot_count > 0 {
+            covered_hotspots as f64 / hotspot_count as f64
+        } else {
+            1.0 // no hotspots = perfectly balanced
+        };
+        let (min, max) = get_range("churn_balance", default_ranges[3].1, default_ranges[3].2);
+        ratios.push(Self::make_ratio("churn_balance", churn_bal, min, max));
+
+        // 5. Scar load
+        let total_nodes = (note_count + total_decisions).max(1) as f64;
+        let scar_ratio = scarred_total as f64 / total_nodes;
+        let (min, max) = get_range("scar_load", default_ranges[4].1, default_ranges[4].2);
+        ratios.push(Self::make_ratio("scar_load", scar_ratio, min, max));
+
+        // Aggregate pain score (mean of normalized distances, clamped to [0, 1])
+        for r in &ratios {
+            total_pain += r.distance_to_equilibrium;
+        }
+        let pain_score = (total_pain / ratios.len() as f64).clamp(0.0, 1.0);
+
+        // Generate overall recommendations
+        let mut recommendations = Vec::new();
+        for r in &ratios {
+            if let Some(ref rec) = r.recommendation {
+                recommendations.push(rec.clone());
+            }
+        }
+
+        Ok(HomeostasisReport {
+            ratios,
+            pain_score,
+            recommendations,
+        })
+    }
+
+    /// Helper: build a HomeostasisRatio with distance and severity computation.
+    fn make_ratio(name: &str, value: f64, min: f64, max: f64) -> HomeostasisRatio {
+        let distance = if value < min {
+            (min - value) / min.max(0.01)
+        } else if value > max {
+            (value - max) / max.max(0.01)
+        } else {
+            0.0
+        };
+        let distance = distance.clamp(0.0, 2.0); // cap at 2.0
+
+        let severity = if distance == 0.0 {
+            HomeostasisSeverity::Ok
+        } else if distance < 0.5 {
+            HomeostasisSeverity::Warning
+        } else {
+            HomeostasisSeverity::Critical
+        };
+
+        let recommendation = match (name, &severity) {
+            (_, HomeostasisSeverity::Ok) => None,
+            ("note_density", _) if value < min => {
+                Some(format!("Knowledge gap: only {:.2} notes/file (target ≥ {:.1}). Add notes to under-documented files.", value, min))
+            }
+            ("note_density", _) => {
+                Some(format!("Over-documentation: {:.2} notes/file (target ≤ {:.1}). Consider consolidating redundant notes.", value, max))
+            }
+            ("decision_coverage", _) if value < min => {
+                Some(format!("Low decision coverage: {:.0}% of files have architectural decisions (target ≥ {:.0}%). Add AFFECTS links to decisions.", value * 100.0, min * 100.0))
+            }
+            ("decision_coverage", _) => {
+                Some(format!("High decision coverage: {:.0}% (target ≤ {:.0}%). Some decisions may be too granular.", value * 100.0, max * 100.0))
+            }
+            ("synapse_health", _) if value < min => {
+                Some(format!("Weak neural network: {:.2} synapses/note (target ≥ {:.1}). Run reinforce_neurons on related notes.", value, min))
+            }
+            ("synapse_health", _) => {
+                Some(format!("Dense neural network: {:.2} synapses/note (target ≤ {:.1}). Run decay_synapses to prune weak links.", value, max))
+            }
+            ("churn_balance", _) if value < min => {
+                Some(format!("Hotspot blind spots: only {:.0}% of frequently-changed files have notes (target ≥ {:.0}%). Prioritize documenting hotspots.", value * 100.0, min * 100.0))
+            }
+            ("churn_balance", _) => None, // can't have too much coverage
+            ("scar_load", _) => {
+                Some(format!("High scar load: {:.1}% of nodes are scarred (target ≤ {:.0}%). Run heal_scars on resolved issues.", value * 100.0, max * 100.0))
+            }
+            _ => None,
+        };
+
+        HomeostasisRatio {
+            name: name.to_string(),
+            value,
+            target_range: (min, max),
+            distance_to_equilibrium: distance,
+            severity,
+            recommendation,
+        }
+    }
 }

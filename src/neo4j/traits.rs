@@ -1576,6 +1576,13 @@ pub trait GraphStore: Send + Sync {
     /// Returns (promoted_count, archived_count).
     async fn consolidate_memory(&self) -> Result<(usize, usize)>;
 
+    /// Compute homeostasis report: 5 ratios measuring knowledge graph equilibrium.
+    async fn compute_homeostasis(
+        &self,
+        project_id: Uuid,
+        custom_ranges: Option<&[(String, f64, f64)]>,
+    ) -> Result<crate::neo4j::models::HomeostasisReport>;
+
     /// Initialize energy for all notes that don't have it set.
     /// Sets energy = 1.0 and last_activated = coalesce(last_confirmed_at, created_at).
     /// Idempotent. Returns the number of notes initialized.

@@ -560,6 +560,10 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/code/risk-assessment",
             get(code_handlers::get_risk_assessment),
         )
+        .route(
+            "/api/code/homeostasis",
+            get(code_handlers::get_homeostasis),
+        )
         // ================================================================
         // Heritage Navigation
         // ================================================================

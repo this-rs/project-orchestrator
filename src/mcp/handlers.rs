@@ -297,6 +297,7 @@ impl ToolHandler {
             ("code", "get_hotspots") => "get_hotspots",
             ("code", "get_knowledge_gaps") => "get_knowledge_gaps",
             ("code", "get_risk_assessment") => "get_risk_assessment",
+            ("code", "get_homeostasis") => "get_homeostasis",
             ("code", "get_bridge") => "get_bridge",
             ("code", "check_topology") => "check_topology",
             ("code", "create_topology_rule") => "create_topology_rule",
@@ -3211,6 +3212,15 @@ impl ToolHandler {
                 }
                 let result = http
                     .get_with_query("/api/code/risk-assessment", &query)
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "get_homeostasis" => {
+                let project_slug = extract_string(args, "project_slug")?;
+                let query = vec![("project_slug".to_string(), project_slug)];
+                let result = http
+                    .get_with_query("/api/code/homeostasis", &query)
                     .await?;
                 Ok(Some(result))
             }

@@ -1086,6 +1086,47 @@ pub struct RelTypeCount {
     pub count: i64,
 }
 
+// ============================================================================
+// Homeostasis Report (biomimicry — auto-regulation)
+// ============================================================================
+
+/// Severity level for a homeostatic ratio out of equilibrium.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HomeostasisSeverity {
+    Ok,
+    Warning,
+    Critical,
+}
+
+/// A single homeostatic ratio with its equilibrium zone.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HomeostasisRatio {
+    /// Human-readable name of the ratio
+    pub name: String,
+    /// Current measured value
+    pub value: f64,
+    /// Target equilibrium range [min, max]
+    pub target_range: (f64, f64),
+    /// Absolute distance to nearest edge of the target range (0 = in zone)
+    pub distance_to_equilibrium: f64,
+    /// Severity based on distance
+    pub severity: HomeostasisSeverity,
+    /// Textual recommendation if out of zone
+    pub recommendation: Option<String>,
+}
+
+/// Full homeostasis report for a project's knowledge graph.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HomeostasisReport {
+    /// Individual ratios
+    pub ratios: Vec<HomeostasisRatio>,
+    /// Aggregated pain score (0.0 = perfect equilibrium, 1.0 = max pain)
+    pub pain_score: f64,
+    /// Overall recommendations
+    pub recommendations: Vec<String>,
+}
+
 /// GDS metrics for a single node (file or function).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeGdsMetrics {
