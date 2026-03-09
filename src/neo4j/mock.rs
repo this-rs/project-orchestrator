@@ -8788,6 +8788,20 @@ impl GraphStore for MockGraphStore {
         Ok(triggers.values().filter(|t| t.plan_id == plan_id).cloned().collect())
     }
 
+    async fn list_all_triggers(
+        &self,
+        trigger_type: Option<&str>,
+    ) -> anyhow::Result<Vec<crate::runner::Trigger>> {
+        let triggers = self.triggers.read().await;
+        Ok(triggers
+            .values()
+            .filter(|t| {
+                trigger_type.map_or(true, |tt| t.trigger_type.to_string() == tt)
+            })
+            .cloned()
+            .collect())
+    }
+
     async fn update_trigger(
         &self,
         trigger_id: Uuid,

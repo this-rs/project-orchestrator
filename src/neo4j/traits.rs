@@ -2569,6 +2569,12 @@ pub trait GraphStore: Send + Sync {
     /// Record a trigger firing event.
     async fn record_trigger_firing(&self, firing: &crate::runner::TriggerFiring) -> Result<()>;
 
+    /// List all triggers across all plans, optionally filtered by type.
+    async fn list_all_triggers(
+        &self,
+        trigger_type: Option<&str>,
+    ) -> Result<Vec<crate::runner::Trigger>>;
+
     /// List trigger firings for a given trigger, ordered by fired_at desc.
     async fn list_trigger_firings(
         &self,

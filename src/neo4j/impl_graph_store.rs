@@ -3004,6 +3004,13 @@ impl GraphStore for Neo4jClient {
         self.list_triggers_impl(plan_id).await
     }
 
+    async fn list_all_triggers(
+        &self,
+        trigger_type: Option<&str>,
+    ) -> anyhow::Result<Vec<crate::runner::Trigger>> {
+        self.list_all_triggers_impl(trigger_type).await
+    }
+
     async fn update_trigger(
         &self,
         trigger_id: Uuid,

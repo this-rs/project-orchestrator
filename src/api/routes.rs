@@ -329,6 +329,11 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/triggers/{trigger_id}/firings",
             get(handlers::list_trigger_firings),
         )
+        // Webhooks
+        .route(
+            "/api/webhooks/{trigger_id}",
+            post(handlers::receive_webhook),
+        )
         // Constraints
         .route(
             "/api/plans/{plan_id}/constraints",

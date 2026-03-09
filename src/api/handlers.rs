@@ -4065,6 +4065,111 @@ pub async fn list_trigger_firings(
 }
 
 // ============================================================================
+// Webhooks
+// ============================================================================
+
+/// POST /api/webhooks/:trigger_id — Receive external webhook payload.
+///
+/// Validates HMAC-SHA256 signature (if configured), filters by event type
+/// and branch pattern, then evaluates the trigger.
+pub async fn receive_webhook(
+    State(state): State<OrchestratorState>,
+    Path(trigger_id): Path<Uuid>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let graph = state.orchestrator.neo4j_arc();
+
+    // 1. Load the trigger
+    let trigger = graph
+        .get_trigger(trigger_id)
+        .await
+        .map_err(AppError::Internal)?
+        .ok_or_else(|| AppError::NotFound(format!("Trigger {} not found", trigger_id)))?;
+
+    if trigger.trigger_type != crate::runner::TriggerType::Webhook {
+        return Err(AppError::BadRequest(format!(
+            "Trigger {} is not a webhook trigger (type: {:?})",
+            trigger_id, trigger.trigger_type
+        )));
+    }
+
+    // 2. Validate HMAC signature if secret is configured
+    if let Some(secret) = trigger.config.get("secret").and_then(|v| v.as_str()) {
+        let signature = headers
+            .get("x-hub-signature-256")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if !crate::runner::providers::webhook::validate_github_signature(secret, &body, signature) {
+            return Err(AppError::Unauthorized(
+                "Invalid webhook signature".to_string(),
+            ));
+        }
+    }
+
+    // 3. Parse payload
+    let payload: serde_json::Value = serde_json::from_slice(&body)
+        .map_err(|e| AppError::BadRequest(format!("Invalid JSON payload: {}", e)))?;
+
+    // 4. Filter by event type
+    if let Some(event_filter) = trigger.config.get("event_filter").and_then(|v| v.as_array()) {
+        let github_event = headers
+            .get("x-github-event")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let event_types: Vec<&str> = event_filter
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        if !event_types.is_empty() && !event_types.contains(&github_event) {
+            return Ok(Json(serde_json::json!({
+                "status": "filtered",
+                "reason": format!("Event '{}' not in filter {:?}", github_event, event_types)
+            })));
+        }
+    }
+
+    // 5. Filter by branch pattern
+    if let Some(branch_pattern) = trigger.config.get("branch_pattern").and_then(|v| v.as_str()) {
+        let branch = payload
+            .get("ref")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        // Extract branch name from "refs/heads/main" format
+        let branch_name = branch.strip_prefix("refs/heads/").unwrap_or(branch);
+        if let Ok(re) = regex::Regex::new(branch_pattern) {
+            if !re.is_match(branch_name) {
+                return Ok(Json(serde_json::json!({
+                    "status": "filtered",
+                    "reason": format!("Branch '{}' does not match pattern '{}'", branch_name, branch_pattern)
+                })));
+            }
+        }
+    }
+
+    // 6. Evaluate trigger
+    let engine = crate::runner::TriggerEngine::new(graph.clone());
+    match engine.evaluate_and_prepare(&trigger).await {
+        Ok(Some(source)) => {
+            engine
+                .record_fire(&trigger, None, Some(payload))
+                .await
+                .map_err(AppError::Internal)?;
+            Ok(Json(serde_json::json!({
+                "status": "fired",
+                "trigger_id": trigger_id,
+                "source": format!("{:?}", source),
+            })))
+        }
+        Ok(None) => Ok(Json(serde_json::json!({
+            "status": "skipped",
+            "reason": "Trigger guards not met (disabled, cooldown, or active run)"
+        }))),
+        Err(e) => Err(AppError::Internal(e)),
+    }
+}
+
+// ============================================================================
 // Roadmap
 // ============================================================================
 

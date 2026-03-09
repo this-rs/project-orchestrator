@@ -81,6 +81,30 @@ impl Neo4jClient {
         Ok(triggers)
     }
 
+    /// List all triggers, optionally filtered by type.
+    pub async fn list_all_triggers_impl(
+        &self,
+        trigger_type: Option<&str>,
+    ) -> Result<Vec<Trigger>> {
+        let cypher = if let Some(tt) = trigger_type {
+            format!(
+                "MATCH (t:Trigger) WHERE t.trigger_type = '{}' RETURN t ORDER BY t.created_at DESC",
+                tt
+            )
+        } else {
+            "MATCH (t:Trigger) RETURN t ORDER BY t.created_at DESC".to_string()
+        };
+
+        let q = query(&cypher);
+        let mut result = self.graph.execute(q).await?;
+        let mut triggers = Vec::new();
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("t")?;
+            triggers.push(self.node_to_trigger(&node)?);
+        }
+        Ok(triggers)
+    }
+
     /// Update a trigger's enabled status, config, or cooldown.
     pub async fn update_trigger_impl(
         &self,

@@ -32,6 +32,12 @@ pub struct TriggerEngine {
     graph: Arc<dyn GraphStore>,
 }
 
+impl std::fmt::Debug for TriggerEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TriggerEngine").finish()
+    }
+}
+
 impl TriggerEngine {
     pub fn new(graph: Arc<dyn GraphStore>) -> Self {
         Self { graph }

@@ -11,12 +11,15 @@
 //! ├── runner.rs    — main execution loop + task dispatch
 //! ├── guard.rs     — AgentGuard: drift detection, hint injection
 //! ├── verifier.rs  — post-task verification: build, steps, git
-//! └── enricher.rs  — post-task knowledge capture (V1: git-based)
+//! ├── enricher.rs  — post-task knowledge capture (V1: git-based)
+//! ├── trigger.rs   — TriggerEngine: evaluation + firing
+//! └── providers/   — trigger providers (schedule, webhook, event)
 //! ```
 
 pub mod enricher;
 pub mod guard;
 pub mod models;
+pub mod providers;
 pub mod runner;
 pub mod state;
 pub mod trigger;
@@ -32,3 +35,5 @@ pub use runner::{PlanRunner, RunStatus, RUNNER_CANCEL, RUNNER_STATE};
 pub use state::RunnerState;
 pub use enricher::{EnrichResult, TaskEnricher};
 pub use verifier::{TaskVerifier, VerifyResult};
+pub use providers::TriggerProvider;
+pub use trigger::TriggerEngine;
