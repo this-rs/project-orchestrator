@@ -12,7 +12,7 @@ use crate::neo4j::models::{
     DecisionTimelineEntry, MilestoneNode, MilestoneStatus, PlanNode, PlanStatus, ReleaseNode,
     ReleaseStatus, StepNode, TaskNode, TaskWithPlan,
 };
-use crate::neo4j::plan::WaveComputationResult;
+use crate::neo4j::plan::{compute_file_conflicts, WaveComputationResult};
 use crate::orchestrator::{FileWatcher, Orchestrator};
 use crate::plan::models::*;
 use crate::AuthConfig;
@@ -3976,7 +3976,18 @@ pub async fn get_tasks_blocked_by(
     Ok(Json(blocked))
 }
 
-/// Dependency graph node for visualization
+/// Step summary for dependency graph visualization
+#[derive(Serialize)]
+pub struct DependencyGraphStep {
+    pub id: String,
+    pub order: u32,
+    pub description: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verification: Option<String>,
+}
+
+/// Dependency graph node for visualization (enriched to match Wave view)
 #[derive(Serialize)]
 pub struct DependencyGraphNode {
     pub id: Uuid,
@@ -3984,6 +3995,24 @@ pub struct DependencyGraphNode {
     pub description: String,
     pub status: String,
     pub priority: Option<i32>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub affected_files: Vec<String>,
+    pub assigned_to: Option<String>,
+    #[serde(default)]
+    pub acceptance_criteria: Vec<String>,
+    /// Number of steps for this task
+    pub step_count: usize,
+    /// Number of completed steps
+    pub completed_step_count: usize,
+    /// Number of notes linked to this task
+    pub note_count: usize,
+    /// Number of decisions linked to this task
+    pub decision_count: usize,
+    /// Individual step details (ordered)
+    #[serde(default)]
+    pub steps: Vec<DependencyGraphStep>,
 }
 
 /// Dependency graph edge
@@ -3993,41 +4022,82 @@ pub struct DependencyGraphEdge {
     pub to: Uuid,
 }
 
-/// Dependency graph response
+/// Dependency graph response (enriched to match Wave view)
 #[derive(Serialize)]
 pub struct DependencyGraphResponse {
     pub nodes: Vec<DependencyGraphNode>,
     pub edges: Vec<DependencyGraphEdge>,
+    /// File conflicts between tasks (same as Wave view)
+    #[serde(default)]
+    pub conflicts: Vec<crate::neo4j::plan::FileConflict>,
 }
 
-/// Get dependency graph for a plan
+/// Get dependency graph for a plan (enriched with steps, notes, decisions counts + conflicts)
 pub async fn get_plan_dependency_graph(
     State(state): State<OrchestratorState>,
     Path(plan_id): Path<Uuid>,
 ) -> Result<Json<DependencyGraphResponse>, AppError> {
-    let (tasks, edges) = state
-        .orchestrator
-        .neo4j()
-        .get_plan_dependency_graph(plan_id)
-        .await?;
+    let neo4j = state.orchestrator.neo4j();
+    let (tasks, edges) = neo4j.get_plan_dependency_graph(plan_id).await?;
+
+    // Batch-fetch enrichment data (counts + step details) for all tasks
+    let task_ids: Vec<String> = tasks.iter().map(|t| t.id.to_string()).collect();
+    let enrichment = neo4j
+        .get_task_enrichment_data(&task_ids)
+        .await
+        .unwrap_or_default();
 
     let nodes: Vec<DependencyGraphNode> = tasks
         .into_iter()
-        .map(|t| DependencyGraphNode {
-            id: t.id,
-            title: t.title,
-            description: t.description,
-            status: format!("{:?}", t.status),
-            priority: t.priority,
+        .map(|t| {
+            let tid = t.id.to_string();
+            let data = enrichment.get(&tid).cloned().unwrap_or_default();
+            DependencyGraphNode {
+                id: t.id,
+                title: t.title,
+                description: t.description,
+                status: format!("{:?}", t.status),
+                priority: t.priority,
+                tags: t.tags,
+                affected_files: t.affected_files,
+                assigned_to: t.assigned_to,
+                acceptance_criteria: t.acceptance_criteria,
+                step_count: data.counts.step_count,
+                completed_step_count: data.counts.completed_step_count,
+                note_count: data.counts.note_count,
+                decision_count: data.counts.decision_count,
+                steps: data
+                    .steps
+                    .into_iter()
+                    .map(|s| DependencyGraphStep {
+                        id: s.id,
+                        order: s.order,
+                        description: s.description,
+                        status: s.status,
+                        verification: s.verification,
+                    })
+                    .collect(),
+            }
         })
         .collect();
+
+    // Compute file conflicts (same logic as Wave view)
+    let conflict_items: Vec<(uuid::Uuid, &[String])> = nodes
+        .iter()
+        .map(|n| (n.id, n.affected_files.as_slice()))
+        .collect();
+    let conflicts = compute_file_conflicts(&conflict_items);
 
     let edges: Vec<DependencyGraphEdge> = edges
         .into_iter()
         .map(|(from, to)| DependencyGraphEdge { from, to })
         .collect();
 
-    Ok(Json(DependencyGraphResponse { nodes, edges }))
+    Ok(Json(DependencyGraphResponse {
+        nodes,
+        edges,
+        conflicts,
+    }))
 }
 
 /// Critical path response
@@ -4750,6 +4820,15 @@ pub async fn get_project_roadmap(
             description: t.description,
             status: format!("{:?}", t.status),
             priority: t.priority,
+            tags: t.tags,
+            affected_files: t.affected_files,
+            assigned_to: t.assigned_to,
+            acceptance_criteria: t.acceptance_criteria,
+            step_count: 0,
+            completed_step_count: 0,
+            note_count: 0,
+            decision_count: 0,
+            steps: vec![],
         })
         .collect();
 
@@ -4758,7 +4837,11 @@ pub async fn get_project_roadmap(
         .map(|(from, to)| DependencyGraphEdge { from, to })
         .collect();
 
-    let dependency_graph = DependencyGraphResponse { nodes, edges };
+    let dependency_graph = DependencyGraphResponse {
+        nodes,
+        edges,
+        conflicts: vec![],
+    };
 
     Ok(Json(RoadmapResponse {
         milestones,

@@ -808,6 +808,18 @@ pub trait GraphStore: Send + Sync {
         plan_id: Uuid,
     ) -> Result<(Vec<TaskNode>, Vec<(Uuid, Uuid)>)>;
 
+    /// Batch-fetch step counts, note counts, and decision counts for a list of task IDs.
+    async fn get_task_enrichment_counts(
+        &self,
+        task_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, crate::neo4j::plan::TaskEnrichmentCounts>>;
+
+    /// Batch-fetch full enrichment data (counts + individual step details) for dependency graph.
+    async fn get_task_enrichment_data(
+        &self,
+        task_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, crate::neo4j::plan::TaskEnrichmentData>>;
+
     /// Find critical path in a plan (longest chain of dependencies)
     async fn get_plan_critical_path(&self, plan_id: Uuid) -> Result<Vec<TaskNode>>;
 

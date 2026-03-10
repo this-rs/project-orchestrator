@@ -1026,6 +1026,22 @@ impl GraphStore for Neo4jClient {
         self.get_plan_dependency_graph(plan_id).await
     }
 
+    async fn get_task_enrichment_counts(
+        &self,
+        task_ids: &[String],
+    ) -> anyhow::Result<std::collections::HashMap<String, crate::neo4j::plan::TaskEnrichmentCounts>>
+    {
+        self.get_task_enrichment_counts(task_ids).await
+    }
+
+    async fn get_task_enrichment_data(
+        &self,
+        task_ids: &[String],
+    ) -> anyhow::Result<std::collections::HashMap<String, crate::neo4j::plan::TaskEnrichmentData>>
+    {
+        self.get_task_enrichment_data(task_ids).await
+    }
+
     async fn get_plan_critical_path(&self, plan_id: Uuid) -> anyhow::Result<Vec<TaskNode>> {
         self.get_plan_critical_path(plan_id).await
     }

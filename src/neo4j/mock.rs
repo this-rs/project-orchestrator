@@ -3516,6 +3516,72 @@ impl GraphStore for MockGraphStore {
         Ok((task_list, edges))
     }
 
+    async fn get_task_enrichment_counts(
+        &self,
+        task_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, crate::neo4j::plan::TaskEnrichmentCounts>> {
+        use crate::neo4j::plan::TaskEnrichmentCounts;
+        let mut map = std::collections::HashMap::new();
+        let tasks = self.tasks.read().await;
+        let steps = self.steps.read().await;
+        for tid in task_ids {
+            if let Ok(uuid) = tid.parse::<Uuid>() {
+                if tasks.contains_key(&uuid) {
+                    let task_steps: Vec<_> =
+                        steps.values().filter(|s| s.task_id == Some(uuid)).collect();
+                    let step_count = task_steps.len();
+                    let completed_step_count = task_steps
+                        .iter()
+                        .filter(|s| format!("{:?}", s.status) == "Completed")
+                        .count();
+                    map.insert(
+                        tid.clone(),
+                        TaskEnrichmentCounts {
+                            step_count,
+                            completed_step_count,
+                            note_count: 0,
+                            decision_count: 0,
+                        },
+                    );
+                }
+            }
+        }
+        Ok(map)
+    }
+
+    async fn get_task_enrichment_data(
+        &self,
+        task_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, crate::neo4j::plan::TaskEnrichmentData>> {
+        use crate::neo4j::plan::{StepSummary, TaskEnrichmentData};
+        let counts = self.get_task_enrichment_counts(task_ids).await?;
+        let steps = self.steps.read().await;
+        let mut map = std::collections::HashMap::new();
+        for tid in task_ids {
+            if let Ok(uuid) = tid.parse::<Uuid>() {
+                let task_steps: Vec<StepSummary> = steps
+                    .values()
+                    .filter(|s| s.task_id == Some(uuid))
+                    .map(|s| StepSummary {
+                        id: s.id.to_string(),
+                        order: s.order,
+                        description: s.description.clone(),
+                        status: format!("{:?}", s.status),
+                        verification: s.verification.clone(),
+                    })
+                    .collect();
+                map.insert(
+                    tid.clone(),
+                    TaskEnrichmentData {
+                        counts: counts.get(tid).cloned().unwrap_or_default(),
+                        steps: task_steps,
+                    },
+                );
+            }
+        }
+        Ok(map)
+    }
+
     async fn get_plan_critical_path(&self, plan_id: Uuid) -> Result<Vec<TaskNode>> {
         let (tasks, edges) = self.get_plan_dependency_graph(plan_id).await?;
         if tasks.is_empty() {

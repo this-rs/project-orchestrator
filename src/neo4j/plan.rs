@@ -10,6 +10,64 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use uuid::Uuid;
 
 // ============================================================================
+// Task enrichment counts (for dependency graph view)
+// ============================================================================
+
+/// Counts of related entities for a task node (steps, notes, decisions)
+#[derive(Debug, Clone, Default)]
+pub struct TaskEnrichmentCounts {
+    pub step_count: usize,
+    pub completed_step_count: usize,
+    pub note_count: usize,
+    pub decision_count: usize,
+}
+
+/// Individual step info for dependency graph visualization
+#[derive(Debug, Clone, Serialize)]
+pub struct StepSummary {
+    pub id: String,
+    pub order: u32,
+    pub description: String,
+    pub status: String,
+    pub verification: Option<String>,
+}
+
+/// Full enrichment data for a task node (counts + step details)
+#[derive(Debug, Clone, Default)]
+pub struct TaskEnrichmentData {
+    pub counts: TaskEnrichmentCounts,
+    pub steps: Vec<StepSummary>,
+}
+
+/// Compute file conflicts from a list of (id, affected_files) pairs.
+/// Checks all pairs for shared affected_files. Used by both DAG and Wave views.
+pub fn compute_file_conflicts(items: &[(Uuid, &[String])]) -> Vec<FileConflict> {
+    let mut conflicts = Vec::new();
+    for i in 0..items.len() {
+        let files_a: HashSet<&str> = items[i].1.iter().map(|s| s.as_str()).collect();
+        if files_a.is_empty() {
+            continue;
+        }
+        for j in (i + 1)..items.len() {
+            let shared: Vec<String> = items[j]
+                .1
+                .iter()
+                .filter(|f| files_a.contains(f.as_str()))
+                .cloned()
+                .collect();
+            if !shared.is_empty() {
+                conflicts.push(FileConflict {
+                    task_a: items[i].0,
+                    task_b: items[j].0,
+                    shared_files: shared,
+                });
+            }
+        }
+    }
+    conflicts
+}
+
+// ============================================================================
 // Wave computation types
 // ============================================================================
 
@@ -504,6 +562,125 @@ impl Neo4jClient {
         }
 
         Ok(tasks)
+    }
+
+    /// Batch-fetch step counts, note counts, and decision counts for a list of task IDs.
+    /// Returns a HashMap<task_id_string, TaskEnrichmentCounts>.
+    /// Uses a single Cypher query with UNWIND for efficiency.
+    pub async fn get_task_enrichment_counts(
+        &self,
+        task_ids: &[String],
+    ) -> Result<HashMap<String, TaskEnrichmentCounts>> {
+        if task_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let q = query(
+            r#"
+            UNWIND $task_ids AS tid
+            MATCH (t:Task {id: tid})
+            OPTIONAL MATCH (t)-[:HAS_STEP]->(s:Step)
+            WITH t, tid,
+                 count(s) AS total_steps,
+                 count(CASE WHEN s.status = 'Completed' THEN 1 END) AS done_steps
+            OPTIONAL MATCH (t)-[:HAS_DECISION]->(d:Decision)
+            WITH t, tid, total_steps, done_steps, count(d) AS decision_count
+            OPTIONAL MATCH (n:Note)-[:LINKED_TO]->(t)
+            RETURN tid,
+                   total_steps,
+                   done_steps,
+                   decision_count,
+                   count(n) AS note_count
+            "#,
+        )
+        .param("task_ids", task_ids.to_vec());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut map = HashMap::new();
+
+        while let Some(row) = result.next().await? {
+            let tid: String = row.get("tid")?;
+            let step_count: i64 = row.get("total_steps").unwrap_or(0);
+            let completed_step_count: i64 = row.get("done_steps").unwrap_or(0);
+            let note_count: i64 = row.get("note_count").unwrap_or(0);
+            let decision_count: i64 = row.get("decision_count").unwrap_or(0);
+
+            map.insert(
+                tid,
+                TaskEnrichmentCounts {
+                    step_count: step_count as usize,
+                    completed_step_count: completed_step_count as usize,
+                    note_count: note_count as usize,
+                    decision_count: decision_count as usize,
+                },
+            );
+        }
+
+        Ok(map)
+    }
+
+    /// Batch-fetch full enrichment data (counts + individual step details) for dependency graph.
+    /// Uses two efficient queries: one for counts, one for step details.
+    pub async fn get_task_enrichment_data(
+        &self,
+        task_ids: &[String],
+    ) -> Result<HashMap<String, TaskEnrichmentData>> {
+        if task_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        // 1. Get counts (reuse existing logic)
+        let counts = self.get_task_enrichment_counts(task_ids).await?;
+
+        // 2. Get step details in a single batch query
+        let q = query(
+            r#"
+            UNWIND $task_ids AS tid
+            MATCH (t:Task {id: tid})-[:HAS_STEP]->(s:Step)
+            RETURN tid,
+                   s.id AS step_id,
+                   COALESCE(s.order, 0) AS step_order,
+                   s.description AS description,
+                   s.status AS status,
+                   s.verification AS verification
+            ORDER BY tid, step_order
+            "#,
+        )
+        .param("task_ids", task_ids.to_vec());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut steps_map: HashMap<String, Vec<StepSummary>> = HashMap::new();
+
+        while let Some(row) = result.next().await? {
+            let tid: String = row.get("tid")?;
+            let step_id: String = row.get("step_id").unwrap_or_default();
+            let order: i64 = row.get("step_order").unwrap_or(0);
+            let description: String = row.get("description").unwrap_or_default();
+            let status: String = row.get("status").unwrap_or_else(|_| "Pending".to_string());
+            let verification: Option<String> = row.get("verification").ok();
+
+            steps_map.entry(tid).or_default().push(StepSummary {
+                id: step_id,
+                order: order as u32,
+                description,
+                status,
+                verification,
+            });
+        }
+
+        // 3. Merge counts + steps
+        let mut data_map = HashMap::new();
+        for tid in task_ids {
+            data_map.insert(
+                tid.clone(),
+                TaskEnrichmentData {
+                    counts: counts.get(tid).cloned().unwrap_or_default(),
+                    steps: steps_map.remove(tid).unwrap_or_default(),
+                },
+            );
+        }
+
+        Ok(data_map)
     }
 
     /// Compute execution waves for a plan using topological sort (Kahn's algorithm)
