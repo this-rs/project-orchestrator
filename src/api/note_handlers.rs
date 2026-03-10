@@ -828,9 +828,7 @@ pub async fn search_neurons(
     //   phase="propagating"  (50ms later) — propagated notes + active edges
     //   phase="done"         (100ms later) — completion signal
     if let Some(pid) = project_id {
-        use crate::events::graph::{
-            ActivationResultPayload, GraphEvent, PropagatedNote,
-        };
+        use crate::events::graph::{ActivationResultPayload, GraphEvent, PropagatedNote};
 
         let direct_ids: Vec<String> = results
             .iter()
@@ -895,9 +893,10 @@ pub async fn search_neurons(
             query: query_str.clone(),
             phase: Some("direct".to_string()),
         };
-        state
-            .event_bus
-            .emit_graph(GraphEvent::activation_result(direct_payload, pid_str.clone()));
+        state.event_bus.emit_graph(GraphEvent::activation_result(
+            direct_payload,
+            pid_str.clone(),
+        ));
 
         // Phases 2 & 3 are fire-and-forget via tokio::spawn with delays
         let event_bus = state.event_bus.clone();
