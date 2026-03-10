@@ -6272,8 +6272,8 @@ mod tests {
     // ================================================================
 
     /// Build a test router with a plan containing tasks with steps and dependencies
-    async fn test_app_with_dependency_graph(
-    ) -> (axum::Router, uuid::Uuid, uuid::Uuid, uuid::Uuid) {
+    async fn test_app_with_dependency_graph() -> (axum::Router, uuid::Uuid, uuid::Uuid, uuid::Uuid)
+    {
         let app_state = mock_app_state();
 
         // Create plan
