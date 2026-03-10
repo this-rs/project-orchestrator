@@ -10,6 +10,8 @@
 
 pub mod activation;
 pub mod config;
+pub mod intent;
 
 pub use activation::{ActivatedNote, ActivationSource, SpreadingActivationEngine};
 pub use config::{AutoReinforcementConfig, SpreadingActivationConfig};
+pub use intent::{IntentDetector, QueryIntentMode};
