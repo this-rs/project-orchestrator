@@ -111,6 +111,10 @@ pub struct ActiveSession {
     /// When `true`, the backend automatically sends "Continue" after error_max_turns.
     /// Toggled via WebSocket `set_auto_continue` message.
     pub auto_continue: Arc<AtomicBool>,
+    /// RFC accumulator for detecting sustained architectural discussions.
+    /// Persists across messages in a session — when 2+ consecutive responses
+    /// contain RFC-qualifying patterns, auto-creates an RFC draft note.
+    pub rfc_accumulator: Arc<Mutex<super::observation_detector::RfcAccumulator>>,
 }
 
 /// Runtime-mutable environment config for Claude CLI subprocess.
@@ -858,6 +862,7 @@ impl ChatManager {
         let event_emitter = self.event_emitter.clone();
         let retry_config = self.config.retry.clone();
         let enrichment_pipeline = self.enrichment_pipeline.clone();
+        let search = self.search.clone();
 
         tokio::spawn(async move {
             let mut subscriber = match nats.subscribe_rpc_send(&session_id).await {
@@ -1123,6 +1128,7 @@ impl ChatManager {
                             let nats_clone = Some(nats.clone());
                             let retry_config_clone = retry_config.clone();
                             let enrichment_pipeline_clone = enrichment_pipeline.clone();
+                            let search_clone = search.clone();
 
                             tokio::spawn(async move {
                                 Self::stream_response(
@@ -1146,6 +1152,7 @@ impl ChatManager {
                                     auto_continue,
                                     retry_config_clone,
                                     enrichment_pipeline_clone,
+                                    search_clone,
                                 )
                                 .await;
                             });
@@ -2062,6 +2069,9 @@ impl ChatManager {
                         std::collections::HashMap::new(),
                     )),
                     auto_continue: auto_continue.clone(),
+                    rfc_accumulator: Arc::new(Mutex::new(
+                        super::observation_detector::RfcAccumulator::new(),
+                    )),
                 },
             );
             interrupt_flag
@@ -2169,6 +2179,7 @@ impl ChatManager {
         let nats = self.nats.clone();
         let retry_config = self.config.retry.clone();
         let enrichment_pipeline = self.enrichment_pipeline.clone();
+        let search = self.search.clone();
 
         tokio::spawn(async move {
             Self::stream_response(
@@ -2192,6 +2203,7 @@ impl ChatManager {
                 auto_continue,
                 retry_config,
                 enrichment_pipeline,
+                search,
             )
             .await;
         });
@@ -2227,6 +2239,7 @@ impl ChatManager {
         auto_continue: Arc<AtomicBool>,
         retry_config: super::config::RetryConfig,
         enrichment_pipeline: Arc<super::enrichment::EnrichmentPipeline>,
+        search: Arc<dyn crate::meilisearch::SearchStore>,
     ) {
         // Helper closure: emit a ChatEvent to local broadcast + NATS (if configured)
         let emit_chat = |event: ChatEvent,
@@ -3248,6 +3261,23 @@ impl ChatManager {
                         assistant_text.clone(),
                         super::feedback::SessionDiscussedCache::new(),
                     );
+
+                    // RFC auto-detection: feed observation to session accumulator
+                    let rfc_acc = {
+                        let sessions = active_sessions.read().await;
+                        sessions
+                            .get(&session_id)
+                            .map(|s| s.rfc_accumulator.clone())
+                    };
+                    if let Some(rfc_acc) = rfc_acc {
+                        super::feedback::spawn_rfc_processing(
+                            graph.clone(),
+                            search.clone(),
+                            project_id,
+                            assistant_text.clone(),
+                            rfc_acc,
+                        );
+                    }
                 }
 
                 // Store pending messages via ContextInjector
@@ -3345,6 +3375,7 @@ impl ChatManager {
                 auto_continue,
                 retry_config,
                 enrichment_pipeline,
+                search,
             ))
             .await;
         } else if has_pending {
@@ -3559,6 +3590,7 @@ impl ChatManager {
         let nats = self.nats.clone();
         let retry_config = self.config.retry.clone();
         let enrichment_pipeline = self.enrichment_pipeline.clone();
+        let search = self.search.clone();
 
         tokio::spawn(async move {
             Self::stream_response(
@@ -3582,6 +3614,7 @@ impl ChatManager {
                 auto_continue,
                 retry_config,
                 enrichment_pipeline,
+                search,
             )
             .await;
         });
@@ -4231,6 +4264,9 @@ impl ChatManager {
                         std::collections::HashMap::new(),
                     )),
                     auto_continue: auto_continue.clone(),
+                    rfc_accumulator: Arc::new(Mutex::new(
+                        super::observation_detector::RfcAccumulator::new(),
+                    )),
                 },
             );
             interrupt_flag
@@ -4287,6 +4323,7 @@ impl ChatManager {
         let nats = self.nats.clone();
         let retry_config = self.config.retry.clone();
         let enrichment_pipeline = self.enrichment_pipeline.clone();
+        let search = self.search.clone();
 
         tokio::spawn(async move {
             Self::stream_response(
@@ -4310,6 +4347,7 @@ impl ChatManager {
                 auto_continue,
                 retry_config,
                 enrichment_pipeline,
+                search,
             )
             .await;
         });
@@ -6761,6 +6799,9 @@ mod tests {
                 std::collections::HashMap::new(),
             )),
             auto_continue: Arc::new(AtomicBool::new(false)),
+            rfc_accumulator: Arc::new(Mutex::new(
+                crate::chat::observation_detector::RfcAccumulator::new(),
+            )),
         };
 
         Some((session, pending_messages))
@@ -7646,6 +7687,9 @@ mod tests {
                 std::collections::HashMap::new(),
             )),
             auto_continue: Arc::new(AtomicBool::new(false)),
+            rfc_accumulator: Arc::new(Mutex::new(
+                crate::chat::observation_detector::RfcAccumulator::new(),
+            )),
         };
 
         (session, handle)
