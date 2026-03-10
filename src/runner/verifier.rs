@@ -770,18 +770,17 @@ mod tests {
             .current_dir(cwd)
             .output()
             .unwrap();
-        let base_sha = String::from_utf8_lossy(&sha_output.stdout).trim().to_string();
+        let base_sha = String::from_utf8_lossy(&sha_output.stdout)
+            .trim()
+            .to_string();
 
         // Create a verifier with base_commit — NO new commits exist
         let (graph, task_id) = setup_mock_with_task().await;
         let step = make_step("Step 1", StepStatus::Completed);
         graph.create_step(task_id, &step).await.unwrap();
 
-        let verifier =
-            TaskVerifier::with_base_commit(graph, false, false, base_sha);
-        let result = verifier
-            .verify_has_commits(cwd)
-            .await;
+        let verifier = TaskVerifier::with_base_commit(graph, false, false, base_sha);
+        let result = verifier.verify_has_commits(cwd).await;
 
         // Should fail — 0 new commits
         assert!(result.is_err());
@@ -831,7 +830,9 @@ mod tests {
             .current_dir(cwd)
             .output()
             .unwrap();
-        let base_sha = String::from_utf8_lossy(&sha_output.stdout).trim().to_string();
+        let base_sha = String::from_utf8_lossy(&sha_output.stdout)
+            .trim()
+            .to_string();
 
         // Make a NEW commit after the base
         std::fs::write(cwd.join("new_file.rs"), "fn main() {}").unwrap();
@@ -847,8 +848,7 @@ mod tests {
             .unwrap();
 
         let (graph, _task_id) = setup_mock_with_task().await;
-        let verifier =
-            TaskVerifier::with_base_commit(graph, false, false, base_sha);
+        let verifier = TaskVerifier::with_base_commit(graph, false, false, base_sha);
         let result = verifier.verify_has_commits(cwd).await;
 
         // Should pass — 1 new commit

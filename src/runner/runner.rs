@@ -1528,8 +1528,7 @@ impl PlanRunner {
                 .await;
             let has_uncommitted = output
                 .map(|o| {
-                    o.status.success()
-                        && !String::from_utf8_lossy(&o.stdout).trim().is_empty()
+                    o.status.success() && !String::from_utf8_lossy(&o.stdout).trim().is_empty()
                 })
                 .unwrap_or(false);
 
