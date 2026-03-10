@@ -231,6 +231,73 @@ async def fetch_data(url: str) -> str:
 }
 
 #[test]
+fn test_parse_python_class_inheritance() {
+    let mut parser = CodeParser::new().unwrap();
+
+    let code = r#"
+class Animal:
+    """Base animal class"""
+    def speak(self) -> str:
+        pass
+
+class Dog(Animal):
+    """Single inheritance"""
+    def speak(self) -> str:
+        return "Woof"
+
+class ServiceDog(Dog, Serializable, Hashable):
+    """Multiple inheritance: first is parent, rest are mixins/interfaces"""
+    def serve(self):
+        pass
+
+class Plain:
+    """No inheritance at all"""
+    value: int = 0
+"#;
+
+    let path = Path::new("test_inheritance.py");
+    let parsed = parser.parse_file(path, code).unwrap();
+
+    assert_eq!(parsed.structs.len(), 4, "Should find 4 classes");
+
+    // Animal — no parent
+    let animal = parsed.structs.iter().find(|s| s.name == "Animal").unwrap();
+    assert!(animal.parent_class.is_none(), "Animal has no parent");
+    assert!(animal.interfaces.is_empty(), "Animal has no interfaces");
+
+    // Dog(Animal) — single inheritance
+    let dog = parsed.structs.iter().find(|s| s.name == "Dog").unwrap();
+    assert_eq!(
+        dog.parent_class.as_deref(),
+        Some("Animal"),
+        "Dog extends Animal"
+    );
+    assert!(dog.interfaces.is_empty(), "Dog has no extra interfaces");
+
+    // ServiceDog(Dog, Serializable, Hashable) — multiple inheritance
+    let service_dog = parsed
+        .structs
+        .iter()
+        .find(|s| s.name == "ServiceDog")
+        .unwrap();
+    assert_eq!(
+        service_dog.parent_class.as_deref(),
+        Some("Dog"),
+        "ServiceDog extends Dog"
+    );
+    assert_eq!(
+        service_dog.interfaces,
+        vec!["Serializable", "Hashable"],
+        "ServiceDog implements Serializable, Hashable"
+    );
+
+    // Plain — no parent
+    let plain = parsed.structs.iter().find(|s| s.name == "Plain").unwrap();
+    assert!(plain.parent_class.is_none(), "Plain has no parent");
+    assert!(plain.interfaces.is_empty(), "Plain has no interfaces");
+}
+
+#[test]
 fn test_parse_go() {
     let mut parser = CodeParser::new().unwrap();
 
