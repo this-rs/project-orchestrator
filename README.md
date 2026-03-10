@@ -347,58 +347,88 @@ protocol(action: "route", project_id: "...", plan_id: "...")
 # → code-review:    60% (phase mismatch)
 ```
 
-### Example: Assimilation Protocol
+### Example: Safe Modification Protocol
 
-A protocol for onboarding knowledge from a new codebase:
-
-```
-protocol(action: "compose", project_id: "...",
-  name: "codebase-assimilation",
-  category: "system",
-  states: [
-    { name: "sync",       state_type: "start",        description: "Parse and index source code with Tree-sitter" },
-    { name: "explore",    state_type: "intermediate",  description: "Run get_architecture, get_communities, get_health" },
-    { name: "document",   state_type: "intermediate",  description: "Create notes for patterns, gotchas, and conventions found" },
-    { name: "assess",     state_type: "intermediate",  description: "Run risk_assessment, identify hotspots and knowledge gaps" },
-    { name: "bootstrap",  state_type: "intermediate",  description: "Bootstrap Knowledge Fabric (synapses, co-change, fabric scores)" },
-    { name: "assimilated", state_type: "terminal",     description: "Codebase fully indexed and documented" }
-  ],
-  transitions: [
-    { from_state: "sync",      to_state: "explore",     trigger: "sync_complete" },
-    { from_state: "explore",   to_state: "document",    trigger: "exploration_done" },
-    { from_state: "document",  to_state: "assess",      trigger: "documentation_done" },
-    { from_state: "assess",    to_state: "bootstrap",   trigger: "assessment_done" },
-    { from_state: "bootstrap", to_state: "assimilated", trigger: "fabric_ready" }
-  ],
-  relevance_vector: { phase: 0.0, structure: 0.8, domain: 0.5, resource: 0.5, lifecycle: 0.0 }
-)
-```
-
-### Example: Best Practices Assimilation Protocol
-
-A protocol for systematically capturing and enforcing team conventions:
+A protocol that ensures every non-trivial code change goes through proper
+impact analysis, topology checks, and documentation — using the full
+knowledge fabric:
 
 ```
 protocol(action: "compose", project_id: "...",
-  name: "best-practices-assimilation",
+  name: "safe-modification",
   category: "business",
   states: [
-    { name: "collect",    state_type: "start",        description: "Gather existing conventions from code, PRs, and team input" },
-    { name: "formalize",  state_type: "intermediate",  description: "Create guideline notes with importance and tags" },
-    { name: "validate",   state_type: "intermediate",  description: "Review and confirm guidelines with stakeholders" },
-    { name: "enforce",    state_type: "intermediate",  description: "Create topology rules and constraints to enforce conventions" },
-    { name: "active",     state_type: "terminal",      description: "Best practices are live and enforced" }
+    { name: "gather-context",  state_type: "start",
+      description: "Load notes, decisions, propagated context, active RFCs" },
+    { name: "analyze-impact",  state_type: "intermediate",
+      description: "Run analyze_impact + get_file_co_changers on target files" },
+    { name: "check-topology",  state_type: "intermediate",
+      description: "Verify new imports don't violate architectural rules" },
+    { name: "check-risks",     state_type: "intermediate",
+      description: "Evaluate risk via get_node_importance — PageRank, betweenness, churn" },
+    { name: "implement",       state_type: "intermediate",
+      description: "Make changes with full awareness of impact and constraints" },
+    { name: "verify",          state_type: "intermediate",
+      description: "Run tests + re-check topology for new violations" },
+    { name: "document",        state_type: "intermediate",
+      description: "Create notes, record decisions, link AFFECTS to changed files" },
+    { name: "done",            state_type: "terminal",
+      description: "Changes are safe, tested, and documented" }
   ],
   transitions: [
-    { from_state: "collect",   to_state: "formalize", trigger: "collection_done" },
-    { from_state: "formalize", to_state: "validate",  trigger: "guidelines_written" },
-    { from_state: "validate",  to_state: "enforce",   trigger: "validated" },
-    { from_state: "validate",  to_state: "collect",   trigger: "needs_revision" },
-    { from_state: "enforce",   to_state: "active",    trigger: "rules_deployed" }
+    { from_state: "gather-context",  to_state: "analyze-impact",  trigger: "context_loaded" },
+    { from_state: "analyze-impact",  to_state: "check-topology",  trigger: "impact_assessed" },
+    { from_state: "check-topology",  to_state: "check-risks",     trigger: "topology_ok" },
+    { from_state: "check-topology",  to_state: "gather-context",  trigger: "topology_violation",
+      guard: "New imports violate architectural rules — rethink the approach" },
+    { from_state: "check-risks",     to_state: "implement",       trigger: "risks_acceptable" },
+    { from_state: "check-risks",     to_state: "gather-context",  trigger: "high_risk",
+      guard: "Critical risk score — need a different approach" },
+    { from_state: "implement",       to_state: "verify",          trigger: "changes_made" },
+    { from_state: "verify",          to_state: "document",        trigger: "verification_passed" },
+    { from_state: "verify",          to_state: "implement",       trigger: "verification_failed" },
+    { from_state: "document",        to_state: "done",            trigger: "documented" }
   ],
-  relevance_vector: { phase: 0.25, structure: 0.3, domain: 0.8, resource: 0.5, lifecycle: 0.2 }
+  relevance_vector: { phase: 0.5, structure: 0.7, domain: 0.5, resource: 0.5, lifecycle: 0.5 }
 )
 ```
+
+### Example: Knowledge Maintenance Protocol
+
+A system protocol that runs weekly to keep the knowledge fabric healthy:
+
+```
+protocol(action: "compose", project_id: "...",
+  name: "knowledge-maintenance",
+  category: "system",
+  states: [
+    { name: "audit",           state_type: "start",
+      description: "audit_gaps — find orphan notes, decisions without AFFECTS, unlinked commits" },
+    { name: "health-check",    state_type: "intermediate",
+      description: "get_health — hotspots, risks, homeostasis, neural metrics" },
+    { name: "decay-synapses",  state_type: "intermediate",
+      description: "Gentle decay (0.03) to prune dead connections — NEVER > 0.1 per pass" },
+    { name: "update-scores",   state_type: "intermediate",
+      description: "Recalculate staleness, energy, and fabric fusion scores" },
+    { name: "review-stale",    state_type: "intermediate",
+      description: "Find stale notes — confirm, invalidate, or supersede" },
+    { name: "report",          state_type: "terminal",
+      description: "persist_health_report — saves as note with delta vs. previous report" }
+  ],
+  transitions: [
+    { from_state: "audit",           to_state: "health-check",    trigger: "audit_done" },
+    { from_state: "health-check",    to_state: "decay-synapses",  trigger: "health_assessed" },
+    { from_state: "decay-synapses",  to_state: "update-scores",   trigger: "decay_applied" },
+    { from_state: "update-scores",   to_state: "review-stale",    trigger: "scores_updated" },
+    { from_state: "review-stale",    to_state: "report",          trigger: "review_done" }
+  ],
+  relevance_vector: { phase: 0.75, structure: 0.3, domain: 0.5, resource: 0.3, lifecycle: 0.8 }
+)
+```
+
+> **Full protocol guide**: See [Protocols — Building a Safe, Self-Aware Setup](docs/guides/protocols.md)
+> for detailed step-by-step instructions on what the agent should do at each state,
+> how to set up hierarchical protocols, auto-triggers, and a recommended production suite.
 
 ---
 
@@ -565,9 +595,8 @@ code(action: "get_node_importance", project_slug: "my-project",
 | [Getting Started](docs/guides/getting-started.md) | Step-by-step tutorial for new users |
 | [API Reference](docs/api/reference.md) | Complete REST API documentation |
 | [MCP Tools](docs/api/mcp-tools.md) | All 22 MCP mega-tools with examples |
-| [Protocols & FSM](docs/guides/protocols.md) | Finite state machines for repeatable workflows |
-| [RFCs](docs/guides/rfcs.md) | Architectural decision lifecycle |
-| [Knowledge Fabric](docs/guides/knowledge-fabric.md) | Advanced knowledge graph guide |
+| [Protocols & FSM](docs/guides/protocols.md) | Building a safe, self-aware setup with protocol guardrails |
+| [Knowledge Fabric](docs/guides/advanced-knowledge-fabric.md) | Bio-inspired knowledge graph: scars, homeostasis, scaffolding |
 | [Workspaces](docs/guides/workspaces.md) | Multi-project coordination |
 | [Multi-Agent Workflows](docs/guides/multi-agent-workflow.md) | Coordinating multiple agents |
 | [Authentication](docs/guides/authentication.md) | JWT + OAuth/OIDC + Password auth setup |

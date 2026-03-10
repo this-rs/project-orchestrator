@@ -428,6 +428,8 @@ You've learned the basics! Here's what to explore next:
 
 ### Advanced Features
 
+- **[Protocols & FSM](./protocols.md)** — Build a safe, self-aware setup with guardrails for every code change
+- **[Knowledge Fabric](./advanced-knowledge-fabric.md)** — Bio-inspired features: scars, homeostasis, scaffolding
 - **[Multi-Agent Workflows](./multi-agent-workflow.md)** — Coordinate multiple AI agents
 - **Milestones & Releases** — Group tasks for version planning
 - **Constraints** — Add rules that must be followed (security, style, etc.)
