@@ -267,13 +267,29 @@ class Plain:
 
     // Dog(Animal) — single inheritance
     let dog = parsed.structs.iter().find(|s| s.name == "Dog").unwrap();
-    assert_eq!(dog.parent_class.as_deref(), Some("Animal"), "Dog extends Animal");
+    assert_eq!(
+        dog.parent_class.as_deref(),
+        Some("Animal"),
+        "Dog extends Animal"
+    );
     assert!(dog.interfaces.is_empty(), "Dog has no extra interfaces");
 
     // ServiceDog(Dog, Serializable, Hashable) — multiple inheritance
-    let service_dog = parsed.structs.iter().find(|s| s.name == "ServiceDog").unwrap();
-    assert_eq!(service_dog.parent_class.as_deref(), Some("Dog"), "ServiceDog extends Dog");
-    assert_eq!(service_dog.interfaces, vec!["Serializable", "Hashable"], "ServiceDog implements Serializable, Hashable");
+    let service_dog = parsed
+        .structs
+        .iter()
+        .find(|s| s.name == "ServiceDog")
+        .unwrap();
+    assert_eq!(
+        service_dog.parent_class.as_deref(),
+        Some("Dog"),
+        "ServiceDog extends Dog"
+    );
+    assert_eq!(
+        service_dog.interfaces,
+        vec!["Serializable", "Hashable"],
+        "ServiceDog implements Serializable, Hashable"
+    );
 
     // Plain — no parent
     let plain = parsed.structs.iter().find(|s| s.name == "Plain").unwrap();
