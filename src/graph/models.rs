@@ -1200,6 +1200,135 @@ pub fn profile_architect() -> AnalysisProfile {
     }
 }
 
+/// Debug profile — emphasizes call chains, knowledge scars and gotchas for troubleshooting.
+pub fn profile_debug() -> AnalysisProfile {
+    AnalysisProfile {
+        id: "00000000-0000-0000-0000-000000000006".to_string(),
+        project_id: None,
+        name: "debug".to_string(),
+        description: Some("Optimized for debugging — call chains, gotchas and knowledge scars are prioritized".to_string()),
+        edge_weights: HashMap::from([
+            ("IMPORTS".to_string(), 0.3),
+            ("CALLS".to_string(), 0.9),
+            ("EXTENDS".to_string(), 0.3),
+            ("IMPLEMENTS".to_string(), 0.3),
+            ("CO_CHANGED".to_string(), 0.7),
+            ("TOUCHES".to_string(), 0.4),
+            ("AFFECTS".to_string(), 0.5),
+            ("SYNAPSE".to_string(), 0.8),
+        ]),
+        fusion_weights: FusionWeights {
+            structural: 0.20,
+            co_change: 0.30,
+            knowledge: 0.30,
+            pagerank: 0.10,
+            bridge: 0.10,
+        },
+        is_builtin: true,
+    }
+}
+
+/// Explore profile — emphasizes structure and hierarchy for code comprehension.
+pub fn profile_explore() -> AnalysisProfile {
+    AnalysisProfile {
+        id: "00000000-0000-0000-0000-000000000007".to_string(),
+        project_id: None,
+        name: "explore".to_string(),
+        description: Some("Optimized for code exploration — imports, inheritance and knowledge are emphasized".to_string()),
+        edge_weights: HashMap::from([
+            ("IMPORTS".to_string(), 0.8),
+            ("CALLS".to_string(), 0.4),
+            ("EXTENDS".to_string(), 0.8),
+            ("IMPLEMENTS".to_string(), 0.7),
+            ("CO_CHANGED".to_string(), 0.2),
+            ("TOUCHES".to_string(), 0.2),
+            ("AFFECTS".to_string(), 0.4),
+            ("SYNAPSE".to_string(), 0.5),
+        ]),
+        fusion_weights: FusionWeights {
+            structural: 0.40,
+            co_change: 0.10,
+            knowledge: 0.25,
+            pagerank: 0.15,
+            bridge: 0.10,
+        },
+        is_builtin: true,
+    }
+}
+
+/// Impact profile — emphasizes temporal coupling and decision effects for change analysis.
+pub fn profile_impact() -> AnalysisProfile {
+    AnalysisProfile {
+        id: "00000000-0000-0000-0000-000000000008".to_string(),
+        project_id: None,
+        name: "impact".to_string(),
+        description: Some("Optimized for impact analysis — co-change patterns and decision effects are prioritized".to_string()),
+        edge_weights: HashMap::from([
+            ("IMPORTS".to_string(), 0.5),
+            ("CALLS".to_string(), 0.4),
+            ("EXTENDS".to_string(), 0.3),
+            ("IMPLEMENTS".to_string(), 0.3),
+            ("CO_CHANGED".to_string(), 0.9),
+            ("TOUCHES".to_string(), 0.7),
+            ("AFFECTS".to_string(), 0.8),
+            ("SYNAPSE".to_string(), 0.3),
+        ]),
+        fusion_weights: FusionWeights {
+            structural: 0.20,
+            co_change: 0.35,
+            knowledge: 0.15,
+            pagerank: 0.10,
+            bridge: 0.20,
+        },
+        is_builtin: true,
+    }
+}
+
+/// Plan profile — balanced view with slight emphasis on structure for implementation planning.
+pub fn profile_plan() -> AnalysisProfile {
+    AnalysisProfile {
+        id: "00000000-0000-0000-0000-000000000009".to_string(),
+        project_id: None,
+        name: "plan".to_string(),
+        description: Some("Optimized for implementation planning — balanced view with structural emphasis".to_string()),
+        edge_weights: HashMap::from([
+            ("IMPORTS".to_string(), 0.6),
+            ("CALLS".to_string(), 0.5),
+            ("EXTENDS".to_string(), 0.5),
+            ("IMPLEMENTS".to_string(), 0.5),
+            ("CO_CHANGED".to_string(), 0.5),
+            ("TOUCHES".to_string(), 0.3),
+            ("AFFECTS".to_string(), 0.5),
+            ("SYNAPSE".to_string(), 0.4),
+        ]),
+        fusion_weights: FusionWeights {
+            structural: 0.30,
+            co_change: 0.20,
+            knowledge: 0.20,
+            pagerank: 0.15,
+            bridge: 0.15,
+        },
+        is_builtin: true,
+    }
+}
+
+/// Look up a built-in profile by name.
+/// Returns None if the name doesn't match any built-in profile.
+pub fn profile_by_name(name: &str) -> Option<AnalysisProfile> {
+    match name.to_lowercase().as_str() {
+        "default" => Some(profile_default()),
+        "refactoring" => Some(profile_refactoring()),
+        "security" => Some(profile_security()),
+        "onboarding" => Some(profile_onboarding()),
+        "architect" => Some(profile_architect()),
+        "debug" => Some(profile_debug()),
+        "explore" => Some(profile_explore()),
+        "impact" => Some(profile_impact()),
+        "plan" => Some(profile_plan()),
+        _ => None,
+    }
+}
+
 /// Returns all built-in analysis profiles.
 pub fn builtin_profiles() -> Vec<AnalysisProfile> {
     vec![
@@ -1208,6 +1337,10 @@ pub fn builtin_profiles() -> Vec<AnalysisProfile> {
         profile_security(),
         profile_onboarding(),
         profile_architect(),
+        profile_debug(),
+        profile_explore(),
+        profile_impact(),
+        profile_plan(),
     ]
 }
 
@@ -2107,7 +2240,7 @@ mod tests {
     #[test]
     fn test_builtin_profiles_count_and_names() {
         let profiles = builtin_profiles();
-        assert_eq!(profiles.len(), 5);
+        assert_eq!(profiles.len(), 9);
 
         let names: Vec<&str> = profiles.iter().map(|p| p.name.as_str()).collect();
         assert!(names.contains(&"default"));
@@ -2115,6 +2248,10 @@ mod tests {
         assert!(names.contains(&"security"));
         assert!(names.contains(&"onboarding"));
         assert!(names.contains(&"architect"));
+        assert!(names.contains(&"debug"));
+        assert!(names.contains(&"explore"));
+        assert!(names.contains(&"impact"));
+        assert!(names.contains(&"plan"));
     }
 
     #[test]
@@ -2328,5 +2465,48 @@ mod tests {
         let deserialized: TopologyCheckResult = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.rules_checked, 5);
         assert_eq!(deserialized.timing_ms, 42);
+    }
+
+    #[test]
+    fn test_all_fusion_weights_sum_to_one() {
+        for profile in builtin_profiles() {
+            let sum = profile.fusion_weights.structural
+                + profile.fusion_weights.co_change
+                + profile.fusion_weights.knowledge
+                + profile.fusion_weights.pagerank
+                + profile.fusion_weights.bridge;
+            assert!(
+                (sum - 1.0).abs() < 0.02,
+                "Profile '{}' fusion weights sum to {}, expected ~1.0",
+                profile.name, sum
+            );
+        }
+    }
+
+    #[test]
+    fn test_no_edge_weight_below_minimum() {
+        for profile in builtin_profiles() {
+            for (edge, weight) in &profile.edge_weights {
+                assert!(
+                    *weight >= 0.1,
+                    "Profile '{}' edge '{}' weight {} is below 0.1 minimum",
+                    profile.name, edge, weight
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_profile_by_name_found() {
+        assert!(profile_by_name("debug").is_some());
+        assert!(profile_by_name("explore").is_some());
+        assert!(profile_by_name("impact").is_some());
+        assert!(profile_by_name("plan").is_some());
+        assert!(profile_by_name("Debug").is_some()); // case-insensitive
+    }
+
+    #[test]
+    fn test_profile_by_name_not_found() {
+        assert!(profile_by_name("nonexistent").is_none());
     }
 }
