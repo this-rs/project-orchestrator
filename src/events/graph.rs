@@ -182,6 +182,28 @@ impl GraphEvent {
         }
     }
 
+    /// Create a full activation result event (spreading activation search completed).
+    ///
+    /// Unlike `activation()` which is for individual synapse propagation,
+    /// this sends the complete result of a spreading activation search
+    /// so that all WS-connected 3D graphs can visualize the activation overlay.
+    pub fn activation_result(
+        payload: ActivationResultPayload,
+        project_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind: "graph".into(),
+            event_type: GraphEventType::Activation,
+            layer: GraphLayer::Neural,
+            node_id: None,
+            target_id: None,
+            edge_type: None,
+            delta: serde_json::to_value(&payload).unwrap_or_default(),
+            project_id: project_id.into(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+        }
+    }
+
     /// Create a community_changed event.
     pub fn community_changed(
         community_id: impl Into<String>,
@@ -217,6 +239,41 @@ pub struct ActivationTarget {
     pub energy_received: f64,
     /// Synapse weight used for propagation
     pub synapse_weight: f64,
+}
+
+/// Full activation result payload for the `Activation` event.
+///
+/// Sent after a spreading activation search completes. Contains all the data
+/// the frontend needs to visualize the activation overlay in any 3D graph.
+///
+/// When streamed progressively, three events are emitted:
+/// - phase="direct": only `direct_ids` + their scores
+/// - phase="propagating": `propagated` notes + scores + active_edges
+/// - phase="done": empty payload, signals completion
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActivationResultPayload {
+    /// Note IDs that are direct vector search matches
+    pub direct_ids: Vec<String>,
+    /// Propagated notes with their source info
+    pub propagated: Vec<PropagatedNote>,
+    /// Map of note_id → activation score (0.0–1.0)
+    pub scores: std::collections::HashMap<String, f64>,
+    /// Active synapse edges as "source_id-target_id" pairs
+    pub active_edges: Vec<String>,
+    /// The search query that triggered the activation
+    pub query: String,
+    /// Streaming phase: "direct", "propagating", or "done"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+}
+
+/// A propagated note with its source info (for building active edges).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PropagatedNote {
+    pub id: String,
+    /// The note that propagated to this one (synapse source)
+    pub via: Option<String>,
+    pub score: f64,
 }
 
 #[cfg(test)]

@@ -823,6 +823,114 @@ pub async fn search_neurons(
         })
         .collect();
 
+    // Emit activation results on Graph WebSocket as 3 progressive phases:
+    //   phase="direct"      (immediate) — direct vector matches only
+    //   phase="propagating"  (50ms later) — propagated notes + active edges
+    //   phase="done"         (100ms later) — completion signal
+    if let Some(pid) = project_id {
+        use crate::events::graph::{
+            ActivationResultPayload, GraphEvent, PropagatedNote,
+        };
+
+        let direct_ids: Vec<String> = results
+            .iter()
+            .filter(|r| matches!(r.source, crate::neurons::ActivationSource::Direct))
+            .map(|r| r.note.id.to_string())
+            .collect();
+
+        let propagated: Vec<PropagatedNote> = results
+            .iter()
+            .filter_map(|r| {
+                if let crate::neurons::ActivationSource::Propagated { via, .. } = &r.source {
+                    Some(PropagatedNote {
+                        id: r.note.id.to_string(),
+                        via: Some(via.to_string()),
+                        score: r.activation_score,
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let mut direct_scores = std::collections::HashMap::new();
+        let mut all_scores = std::collections::HashMap::new();
+        for r in &results {
+            let id = r.note.id.to_string();
+            let score = r.activation_score;
+            all_scores.insert(id.clone(), score);
+            if matches!(r.source, crate::neurons::ActivationSource::Direct) {
+                direct_scores.insert(id, score);
+            }
+        }
+
+        // Build active edges: synapse pairs where both endpoints are activated
+        let all_ids: std::collections::HashSet<String> =
+            results.iter().map(|r| r.note.id.to_string()).collect();
+        let active_edges: Vec<String> = results
+            .iter()
+            .filter_map(|r| {
+                if let crate::neurons::ActivationSource::Propagated { via, .. } = &r.source {
+                    let via_str = via.to_string();
+                    if all_ids.contains(&via_str) {
+                        Some(format!("{}-{}", via_str, r.note.id))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let query_str = query.query.clone();
+        let pid_str = pid.to_string();
+
+        // Phase 1 (immediate): emit direct matches only
+        let direct_payload = ActivationResultPayload {
+            direct_ids: direct_ids.clone(),
+            propagated: vec![],
+            scores: direct_scores,
+            active_edges: vec![],
+            query: query_str.clone(),
+            phase: Some("direct".to_string()),
+        };
+        state
+            .event_bus
+            .emit_graph(GraphEvent::activation_result(direct_payload, pid_str.clone()));
+
+        // Phases 2 & 3 are fire-and-forget via tokio::spawn with delays
+        let event_bus = state.event_bus.clone();
+        tokio::spawn(async move {
+            // Phase 2 (50ms later): emit propagated notes + active edges
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let propagating_payload = ActivationResultPayload {
+                direct_ids: vec![],
+                propagated,
+                scores: all_scores,
+                active_edges,
+                query: query_str.clone(),
+                phase: Some("propagating".to_string()),
+            };
+            event_bus.emit_graph(GraphEvent::activation_result(
+                propagating_payload,
+                pid_str.clone(),
+            ));
+
+            // Phase 3 (100ms after start): emit done signal
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let done_payload = ActivationResultPayload {
+                direct_ids: vec![],
+                propagated: vec![],
+                scores: std::collections::HashMap::new(),
+                active_edges: vec![],
+                query: query_str,
+                phase: Some("done".to_string()),
+            };
+            event_bus.emit_graph(GraphEvent::activation_result(done_payload, pid_str));
+        });
+    }
+
     Ok(Json(serde_json::json!({
         "results": results_json,
         "metadata": {
