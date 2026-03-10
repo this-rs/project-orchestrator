@@ -628,7 +628,7 @@ fn note_tool() -> ToolDefinition {
                 },
                 "note_id": {"type": "string", "description": "Note UUID"},
                 "project_id": {"type": "string", "description": "Project UUID"},
-                "note_type": {"type": "string", "description": "Type: guideline, gotcha, pattern, context, tip, observation, assertion"},
+                "note_type": {"type": "string", "description": "Type: guideline, gotcha, pattern, context, tip, observation, assertion, rfc"},
                 "content": {"type": "string", "description": "Note content (create/update)"},
                 "importance": {"type": "string", "description": "Importance: critical, high, medium, low"},
                 "tags": {"type": "array", "items": {"type": "string"}, "description": "Tags"},

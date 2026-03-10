@@ -32,6 +32,8 @@ pub enum NoteType {
     Observation,
     /// A verifiable rule/assertion about the code
     Assertion,
+    /// A Request for Comments (RFC) — lifecycle managed by Protocol FSM
+    Rfc,
 }
 
 impl fmt::Display for NoteType {
@@ -44,6 +46,7 @@ impl fmt::Display for NoteType {
             Self::Tip => write!(f, "tip"),
             Self::Observation => write!(f, "observation"),
             Self::Assertion => write!(f, "assertion"),
+            Self::Rfc => write!(f, "rfc"),
         }
     }
 }
@@ -60,6 +63,7 @@ impl FromStr for NoteType {
             "tip" => Ok(Self::Tip),
             "observation" => Ok(Self::Observation),
             "assertion" => Ok(Self::Assertion),
+            "rfc" => Ok(Self::Rfc),
             _ => Err(format!("Unknown note type: {}", s)),
         }
     }
@@ -774,6 +778,7 @@ impl Note {
             NoteType::Guideline => 365.0, // Stable for a long time
             NoteType::Pattern => 365.0,
             NoteType::Assertion => f64::MAX, // Never stale (verified by code)
+            NoteType::Rfc => 365.0,              // Long-lived like patterns/guidelines
         }
     }
 }
@@ -1033,12 +1038,46 @@ mod tests {
             (NoteType::Tip, "tip"),
             (NoteType::Observation, "observation"),
             (NoteType::Assertion, "assertion"),
+            (NoteType::Rfc, "rfc"),
         ];
 
         for (note_type, expected) in types {
             assert_eq!(note_type.to_string(), expected);
             assert_eq!(NoteType::from_str(expected).unwrap(), note_type);
         }
+    }
+
+    #[test]
+    fn test_note_type_rfc_serde_roundtrip() {
+        let rfc = NoteType::Rfc;
+        let json = serde_json::to_string(&rfc).unwrap();
+        assert_eq!(json, "\"rfc\"");
+
+        let parsed: NoteType = serde_json::from_str("\"rfc\"").unwrap();
+        assert_eq!(parsed, NoteType::Rfc);
+
+        #[derive(Serialize, Deserialize, PartialEq, Debug)]
+        struct TypeWrapper {
+            note_type: NoteType,
+        }
+        let wrapper = TypeWrapper {
+            note_type: NoteType::Rfc,
+        };
+        let json = serde_json::to_string(&wrapper).unwrap();
+        assert!(json.contains("\"rfc\""));
+        let parsed: TypeWrapper = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, wrapper);
+    }
+
+    #[test]
+    fn test_rfc_base_decay_days() {
+        let note = Note::new(
+            None,
+            NoteType::Rfc,
+            "RFC content".to_string(),
+            "RFC test".to_string(),
+        );
+        assert_eq!(note.base_decay_days(), 365.0);
     }
 
     #[test]
