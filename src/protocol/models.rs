@@ -154,6 +154,48 @@ impl TriggerMode {
     }
 }
 
+/// Strategy for how a parent run handles child run completion in hierarchical FSMs.
+///
+/// When a protocol state has a `sub_protocol_id`, entering that state spawns
+/// a child run. This strategy determines when the parent transitions out:
+/// - **AllComplete**: Wait for ALL child runs to complete
+/// - **AnyComplete**: Transition as soon as ANY child completes
+/// - **Manual**: No auto-transition — requires explicit trigger
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum CompletionStrategy {
+    /// Parent transitions when ALL children complete
+    #[default]
+    AllComplete,
+    /// Parent transitions when ANY child completes
+    AnyComplete,
+    /// No automatic transition — requires explicit trigger
+    Manual,
+}
+
+impl fmt::Display for CompletionStrategy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AllComplete => write!(f, "all_complete"),
+            Self::AnyComplete => write!(f, "any_complete"),
+            Self::Manual => write!(f, "manual"),
+        }
+    }
+}
+
+impl FromStr for CompletionStrategy {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "all_complete" | "allcomplete" => Ok(Self::AllComplete),
+            "any_complete" | "anycomplete" => Ok(Self::AnyComplete),
+            "manual" => Ok(Self::Manual),
+            _ => Err(format!("Unknown completion strategy: {}", s)),
+        }
+    }
+}
+
 /// Configuration for automatic protocol triggers.
 ///
 /// Specifies which events and/or schedule should trigger the protocol.
@@ -303,6 +345,12 @@ pub struct ProtocolState {
     /// Role of this state in the FSM lifecycle
     #[serde(default)]
     pub state_type: StateType,
+    /// Optional sub-protocol to spawn when entering this state (hierarchical FSM)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sub_protocol_id: Option<Uuid>,
+    /// How child run completion triggers parent transition (defaults to AllComplete)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_strategy: Option<CompletionStrategy>,
 }
 
 impl ProtocolState {
@@ -315,6 +363,8 @@ impl ProtocolState {
             description: String::new(),
             action: None,
             state_type: StateType::Intermediate,
+            sub_protocol_id: None,
+            completion_strategy: None,
         }
     }
 
@@ -474,6 +524,7 @@ pub struct StateVisit {
 /// (ProtocolRun)-[:CURRENT_STATE]->(ProtocolState) — current position in FSM
 /// (ProtocolRun)-[:LINKED_TO_PLAN]->(Plan)      — optional plan context
 /// (ProtocolRun)-[:LINKED_TO_TASK]->(Task)      — optional task context
+/// (ProtocolRun)-[:CHILD_OF]->(ProtocolRun)     — hierarchical parent link
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProtocolRun {
@@ -485,6 +536,9 @@ pub struct ProtocolRun {
     pub plan_id: Option<Uuid>,
     /// Optional task context
     pub task_id: Option<Uuid>,
+    /// Parent run ID for hierarchical protocol execution (None = root run)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_run_id: Option<Uuid>,
     /// Current state in the FSM
     pub current_state: Uuid,
     /// Ordered history of visited states
@@ -502,6 +556,9 @@ pub struct ProtocolRun {
     /// How this run was triggered: "manual", "event:post_sync", "schedule:daily", etc.
     #[serde(default = "default_triggered_by")]
     pub triggered_by: String,
+    /// Nesting depth (0 = root, 1 = child of root, etc.)
+    #[serde(default)]
+    pub depth: u32,
 }
 
 fn default_triggered_by() -> String {
@@ -521,6 +578,7 @@ impl ProtocolRun {
             protocol_id,
             plan_id: None,
             task_id: None,
+            parent_run_id: None,
             current_state: entry_state_id,
             states_visited: vec![StateVisit {
                 state_id: entry_state_id,
@@ -533,6 +591,7 @@ impl ProtocolRun {
             completed_at: None,
             error: None,
             triggered_by: "manual".to_string(),
+            depth: 0,
         }
     }
 
