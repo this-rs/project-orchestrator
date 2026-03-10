@@ -32,11 +32,29 @@ pub struct StepSummary {
     pub verification: Option<String>,
 }
 
-/// Full enrichment data for a task node (counts + step details)
+/// Chat session summary linked to a task (via SPAWNED_BY{task_id})
+#[derive(Debug, Clone, Serialize)]
+pub struct TaskSessionSummary {
+    pub session_id: String,
+    pub title: Option<String>,
+    pub is_active: bool,
+    pub child_count: usize,
+}
+
+/// File discussed in chat sessions linked to a task (via DISCUSSED relation)
+#[derive(Debug, Clone, Serialize)]
+pub struct TaskDiscussedFile {
+    pub file_path: String,
+    pub mention_count: i64,
+}
+
+/// Full enrichment data for a task node (counts + step details + sessions + discussed files)
 #[derive(Debug, Clone, Default)]
 pub struct TaskEnrichmentData {
     pub counts: TaskEnrichmentCounts,
     pub steps: Vec<StepSummary>,
+    pub sessions: Vec<TaskSessionSummary>,
+    pub discussed_files: Vec<TaskDiscussedFile>,
 }
 
 /// Compute file conflicts from a list of (id, affected_files) pairs.
@@ -668,7 +686,84 @@ impl Neo4jClient {
             });
         }
 
-        // 3. Merge counts + steps
+        // 3. Get chat sessions linked to tasks via SPAWNED_BY{task_id}
+        let session_q = query(
+            r#"
+            UNWIND $task_ids AS tid
+            OPTIONAL MATCH (cs:ChatSession)-[sb:SPAWNED_BY]->(parent:ChatSession)
+            WHERE sb.task_id = tid
+            WITH tid, cs
+            WHERE cs IS NOT NULL
+            OPTIONAL MATCH (child:ChatSession)-[:SPAWNED_BY]->(cs)
+            RETURN tid,
+                   cs.id AS session_id,
+                   cs.title AS title,
+                   COALESCE(cs.is_streaming, false) AS is_active,
+                   count(child) AS child_count
+            "#,
+        )
+        .param("task_ids", task_ids.to_vec());
+
+        let mut session_result = self.graph.execute(session_q).await?;
+        let mut sessions_map: HashMap<String, Vec<TaskSessionSummary>> = HashMap::new();
+
+        while let Some(row) = session_result.next().await? {
+            let tid: String = row.get("tid")?;
+            let session_id: Option<String> = row.get("session_id").ok();
+            if let Some(sid) = session_id {
+                if !sid.is_empty() {
+                    let title: Option<String> = row.get("title").ok();
+                    let is_active: bool = row.get("is_active").unwrap_or(false);
+                    let child_count: i64 = row.get("child_count").unwrap_or(0);
+
+                    sessions_map
+                        .entry(tid)
+                        .or_default()
+                        .push(TaskSessionSummary {
+                            session_id: sid,
+                            title,
+                            is_active,
+                            child_count: child_count as usize,
+                        });
+                }
+            }
+        }
+
+        // 4. Get discussed files from sessions linked to tasks
+        let discussed_q = query(
+            r#"
+            UNWIND $task_ids AS tid
+            MATCH (cs:ChatSession)-[sb:SPAWNED_BY]->(parent:ChatSession)
+            WHERE sb.task_id = tid
+            MATCH (cs)-[d:DISCUSSED]->(f:File)
+            RETURN tid,
+                   f.path AS file_path,
+                   sum(d.mention_count) AS mention_count
+            ORDER BY tid, mention_count DESC
+            "#,
+        )
+        .param("task_ids", task_ids.to_vec());
+
+        let mut discussed_result = self.graph.execute(discussed_q).await?;
+        let mut discussed_map: HashMap<String, Vec<TaskDiscussedFile>> = HashMap::new();
+
+        while let Some(row) = discussed_result.next().await? {
+            let tid: String = row.get("tid")?;
+            let file_path: String = row.get("file_path").unwrap_or_default();
+            let mention_count: i64 = row.get("mention_count").unwrap_or(1);
+
+            if !file_path.is_empty() {
+                discussed_map
+                    .entry(tid)
+                    .or_default()
+                    .push(TaskDiscussedFile {
+                        file_path,
+                        mention_count,
+                    });
+            }
+        }
+
+        // 5. Merge counts + steps + sessions + discussed files
         let mut data_map = HashMap::new();
         for tid in task_ids {
             data_map.insert(
@@ -676,6 +771,8 @@ impl Neo4jClient {
                 TaskEnrichmentData {
                     counts: counts.get(tid).cloned().unwrap_or_default(),
                     steps: steps_map.remove(tid).unwrap_or_default(),
+                    sessions: sessions_map.remove(tid).unwrap_or_default(),
+                    discussed_files: discussed_map.remove(tid).unwrap_or_default(),
                 },
             );
         }

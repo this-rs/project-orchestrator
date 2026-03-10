@@ -3582,6 +3582,8 @@ impl GraphStore for MockGraphStore {
                     TaskEnrichmentData {
                         counts: counts.get(tid).cloned().unwrap_or_default(),
                         steps: task_steps,
+                        sessions: vec![],
+                        discussed_files: vec![],
                     },
                 );
             }

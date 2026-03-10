@@ -3987,6 +3987,31 @@ pub struct DependencyGraphStep {
     pub verification: Option<String>,
 }
 
+/// Chat session summary for dependency graph visualization
+#[derive(Serialize)]
+pub struct DependencyGraphSession {
+    pub session_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    pub is_active: bool,
+    pub child_count: usize,
+}
+
+/// Discussed file for dependency graph visualization
+#[derive(Serialize)]
+pub struct DependencyGraphDiscussedFile {
+    pub file_path: String,
+    pub mention_count: i64,
+}
+
+/// Feature graph summary for dependency graph response
+#[derive(Serialize)]
+pub struct FeatureGraphSummary {
+    pub id: String,
+    pub name: String,
+    pub entity_count: usize,
+}
+
 /// Dependency graph node for visualization (enriched to match Wave view)
 #[derive(Serialize)]
 pub struct DependencyGraphNode {
@@ -4013,6 +4038,18 @@ pub struct DependencyGraphNode {
     /// Individual step details (ordered)
     #[serde(default)]
     pub steps: Vec<DependencyGraphStep>,
+    /// Number of chat sessions linked to this task
+    #[serde(default)]
+    pub session_count: usize,
+    /// Number of currently active (streaming) sessions
+    #[serde(default)]
+    pub active_session_count: usize,
+    /// Total number of child sessions (sub-discussions)
+    #[serde(default)]
+    pub child_session_count: usize,
+    /// Files discussed in linked chat sessions
+    #[serde(default)]
+    pub discussed_files: Vec<DependencyGraphDiscussedFile>,
 }
 
 /// Dependency graph edge
@@ -4030,6 +4067,9 @@ pub struct DependencyGraphResponse {
     /// File conflicts between tasks (same as Wave view)
     #[serde(default)]
     pub conflicts: Vec<crate::neo4j::plan::FileConflict>,
+    /// Feature graphs linked to the plan's project
+    #[serde(default)]
+    pub feature_graphs: Vec<FeatureGraphSummary>,
 }
 
 /// Get dependency graph for a plan (enriched with steps, notes, decisions counts + conflicts)
@@ -4077,6 +4117,17 @@ pub async fn get_plan_dependency_graph(
                         verification: s.verification,
                     })
                     .collect(),
+                session_count: data.sessions.len(),
+                active_session_count: data.sessions.iter().filter(|s| s.is_active).count(),
+                child_session_count: data.sessions.iter().map(|s| s.child_count).sum(),
+                discussed_files: data
+                    .discussed_files
+                    .into_iter()
+                    .map(|f| DependencyGraphDiscussedFile {
+                        file_path: f.file_path,
+                        mention_count: f.mention_count,
+                    })
+                    .collect(),
             }
         })
         .collect();
@@ -4093,10 +4144,34 @@ pub async fn get_plan_dependency_graph(
         .map(|(from, to)| DependencyGraphEdge { from, to })
         .collect();
 
+    // Fetch feature graphs for the plan's project
+    let feature_graphs = if let Ok(Some(project_id)) = neo4j
+        .get_plan(plan_id)
+        .await
+        .map(|p| p.and_then(|pl| pl.project_id))
+    {
+        let fgs = neo4j
+            .list_feature_graphs(Some(project_id))
+            .await
+            .unwrap_or_default();
+        fgs.into_iter()
+            .map(|fg| {
+                FeatureGraphSummary {
+                    id: fg.id.to_string(),
+                    name: fg.name,
+                    entity_count: 0, // lightweight — don't count entities for each FG
+                }
+            })
+            .collect()
+    } else {
+        vec![]
+    };
+
     Ok(Json(DependencyGraphResponse {
         nodes,
         edges,
         conflicts,
+        feature_graphs,
     }))
 }
 
@@ -4829,6 +4904,10 @@ pub async fn get_project_roadmap(
             note_count: 0,
             decision_count: 0,
             steps: vec![],
+            session_count: 0,
+            active_session_count: 0,
+            child_session_count: 0,
+            discussed_files: vec![],
         })
         .collect();
 
@@ -4841,6 +4920,7 @@ pub async fn get_project_roadmap(
         nodes,
         edges,
         conflicts: vec![],
+        feature_graphs: vec![],
     };
 
     Ok(Json(RoadmapResponse {
