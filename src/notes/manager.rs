@@ -296,17 +296,40 @@ impl NoteManager {
     }
 
     // ========================================================================
+    // RFC Template
+    // ========================================================================
+
+    /// Default template for RFC notes with structured sections.
+    pub const RFC_TEMPLATE: &'static str = "## Problem\n\n\
+<!-- Describe the problem or opportunity this RFC addresses -->\n\n\
+## Proposed Solution\n\n\
+<!-- Describe your proposed approach -->\n\n\
+## Alternatives\n\n\
+<!-- What other approaches were considered? Why were they rejected? -->\n\n\
+## Impact\n\n\
+<!-- What files, modules, or systems are affected? What are the risks? -->\n\n\
+## Decision\n\n\
+<!-- Final decision and rationale (filled after review) -->\n";
+
+    // ========================================================================
     // CRUD Operations
     // ========================================================================
 
     /// Create a new note
     pub async fn create_note(&self, input: CreateNoteRequest, created_by: &str) -> Result<Note> {
+        // RFC auto-template: use structured template if content is empty
+        let content = if input.note_type == NoteType::Rfc && input.content.trim().is_empty() {
+            Self::RFC_TEMPLATE.to_string()
+        } else {
+            input.content
+        };
+
         let note = Note::new_full(
             input.project_id,
             input.note_type,
             input.importance.unwrap_or_default(),
             input.scope.unwrap_or(NoteScope::Project),
-            input.content,
+            content,
             input.tags.unwrap_or_default(),
             created_by.to_string(),
         );
@@ -342,6 +365,28 @@ impl NoteManager {
         // Auto-anchor to files mentioned in content (fire-and-forget)
         self.spawn_auto_anchor(&note);
 
+        // RFC auto-start: find rfc-lifecycle protocol and start a run
+        let mut note = note;
+        if note.note_type == NoteType::Rfc {
+            if let Some(project_id) = note.project_id {
+                match self.auto_start_rfc_lifecycle(&mut note, project_id).await {
+                    Ok(()) => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            note_id = %note.id,
+                            error = %e,
+                            "RFC auto-start: failed to start rfc-lifecycle run"
+                        );
+                    }
+                }
+            } else {
+                tracing::debug!(
+                    note_id = %note.id,
+                    "RFC auto-start: skipped — note has no project_id"
+                );
+            }
+        }
+
         let project_id_str = note.project_id.map(|id| id.to_string()).unwrap_or_default();
         self.emit(
             CrudEvent::new(
@@ -369,6 +414,57 @@ impl NoteManager {
         }
 
         Ok(note)
+    }
+
+    /// Auto-start an rfc-lifecycle protocol run for an RFC note.
+    ///
+    /// Looks up the `rfc-lifecycle` protocol in the note's project, starts a run,
+    /// and stores the run ID in the note's tags as `rfc-run:<uuid>`.
+    /// Non-fatal: if the protocol doesn't exist or the run can't be started,
+    /// the note is still created successfully.
+    async fn auto_start_rfc_lifecycle(&self, note: &mut Note, project_id: Uuid) -> Result<()> {
+        // Find the rfc-lifecycle protocol in this project
+        let (protocols, _) = self.neo4j.list_protocols(project_id, None, 100, 0).await?;
+        let protocol = protocols.iter().find(|p| p.name == "rfc-lifecycle");
+
+        let protocol = match protocol {
+            Some(p) => p,
+            None => {
+                tracing::debug!(
+                    project_id = %project_id,
+                    "RFC auto-start: no rfc-lifecycle protocol found in project"
+                );
+                return Ok(());
+            }
+        };
+
+        // Start the run
+        let run = crate::protocol::engine::start_run(
+            self.neo4j.as_ref(),
+            protocol.id,
+            None,
+            None,
+            Some("rfc-note-creation"),
+        )
+        .await?;
+
+        tracing::info!(
+            note_id = %note.id,
+            run_id = %run.id,
+            protocol_id = %protocol.id,
+            "RFC auto-start: started rfc-lifecycle run"
+        );
+
+        // Add rfc-run tag to the note
+        let run_tag = format!("rfc-run:{}", run.id);
+        note.tags.push(run_tag);
+
+        // Persist the updated tags
+        self.neo4j
+            .update_note(note.id, None, None, None, Some(note.tags.clone()), None)
+            .await?;
+
+        Ok(())
     }
 
     /// Get a note by ID
@@ -2854,5 +2950,170 @@ mod tests {
         mgr.link_note_to_entity(note.id, &link_req).await.unwrap();
         mgr.confirm_note(note.id, "agent-1").await.unwrap();
         mgr.delete_note(note.id).await.unwrap();
+    }
+
+    // ====================================================================
+    // RFC auto-template & auto-start
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_rfc_auto_template_empty_content() {
+        let (mgr, pid) = create_note_manager().await;
+        let req = CreateNoteRequest {
+            project_id: Some(pid),
+            note_type: NoteType::Rfc,
+            content: "".to_string(),
+            importance: Some(NoteImportance::High),
+            scope: None,
+            tags: Some(vec!["test-rfc".to_string()]),
+            anchors: None,
+            assertion_rule: None,
+        };
+
+        let note = mgr.create_note(req, "agent-1").await.unwrap();
+
+        // Content should be auto-filled with the RFC template
+        assert!(note.content.contains("## Problem"));
+        assert!(note.content.contains("## Proposed Solution"));
+        assert!(note.content.contains("## Alternatives"));
+        assert!(note.content.contains("## Impact"));
+        assert!(note.content.contains("## Decision"));
+    }
+
+    #[tokio::test]
+    async fn test_rfc_preserves_existing_content() {
+        let (mgr, pid) = create_note_manager().await;
+        let custom_content = "# My Custom RFC\n\nThis RFC is about X.".to_string();
+        let req = CreateNoteRequest {
+            project_id: Some(pid),
+            note_type: NoteType::Rfc,
+            content: custom_content.clone(),
+            importance: Some(NoteImportance::High),
+            scope: None,
+            tags: None,
+            anchors: None,
+            assertion_rule: None,
+        };
+
+        let note = mgr.create_note(req, "agent-1").await.unwrap();
+
+        // Non-empty content should be preserved as-is
+        assert_eq!(note.content, custom_content);
+    }
+
+    #[tokio::test]
+    async fn test_rfc_auto_start_lifecycle_run() {
+        let state = mock_app_state();
+        let project = test_project();
+        let project_id = project.id;
+        state.neo4j.create_project(&project).await.unwrap();
+        let mgr = NoteManager::new(state.neo4j.clone(), state.meili.clone());
+
+        // Seed an rfc-lifecycle protocol with a start state
+        let start_state_id = Uuid::new_v4();
+        let mut protocol =
+            crate::protocol::Protocol::new(project_id, "rfc-lifecycle", start_state_id);
+        let protocol_id = protocol.id;
+        protocol.terminal_states = vec![]; // no terminal states needed for this test
+        state.neo4j.upsert_protocol(&protocol).await.unwrap();
+
+        // Create the start state
+        let start_state = crate::protocol::ProtocolState::start(protocol_id, "draft");
+        // Override the state ID to match entry_state
+        let mut start_state = start_state;
+        start_state.id = start_state_id;
+        state
+            .neo4j
+            .upsert_protocol_state(&start_state)
+            .await
+            .unwrap();
+
+        // Create an RFC note — should auto-start the run
+        let req = CreateNoteRequest {
+            project_id: Some(project_id),
+            note_type: NoteType::Rfc,
+            content: "".to_string(),
+            importance: Some(NoteImportance::High),
+            scope: None,
+            tags: None,
+            anchors: None,
+            assertion_rule: None,
+        };
+
+        let note = mgr.create_note(req, "agent-1").await.unwrap();
+
+        // Verify template was applied
+        assert!(note.content.contains("## Problem"));
+
+        // Verify rfc-run tag is present
+        let rfc_run_tag = note
+            .tags
+            .iter()
+            .find(|t| t.starts_with("rfc-run:"))
+            .expect("Expected rfc-run:<uuid> tag");
+
+        // Extract run_id from tag
+        let run_id_str = rfc_run_tag.strip_prefix("rfc-run:").unwrap();
+        let run_id: Uuid = run_id_str
+            .parse()
+            .expect("rfc-run tag should contain valid UUID");
+
+        // Verify the run exists and is in running state at the draft state
+        let run = state
+            .neo4j
+            .get_protocol_run(run_id)
+            .await
+            .unwrap()
+            .expect("Protocol run should exist");
+        assert_eq!(run.protocol_id, protocol_id);
+        assert_eq!(run.status, crate::protocol::RunStatus::Running);
+        assert_eq!(run.current_state, start_state_id);
+        assert_eq!(run.triggered_by, "rfc-note-creation");
+    }
+
+    #[tokio::test]
+    async fn test_rfc_no_protocol_still_creates_note() {
+        let (mgr, pid) = create_note_manager().await;
+        // No rfc-lifecycle protocol seeded — should still create the note successfully
+
+        let req = CreateNoteRequest {
+            project_id: Some(pid),
+            note_type: NoteType::Rfc,
+            content: "".to_string(),
+            importance: Some(NoteImportance::Medium),
+            scope: None,
+            tags: None,
+            anchors: None,
+            assertion_rule: None,
+        };
+
+        let note = mgr.create_note(req, "agent-1").await.unwrap();
+
+        // Template should still be applied
+        assert!(note.content.contains("## Problem"));
+        // No rfc-run tag since no protocol exists
+        assert!(!note.tags.iter().any(|t| t.starts_with("rfc-run:")));
+    }
+
+    #[tokio::test]
+    async fn test_non_rfc_note_unaffected() {
+        let (mgr, pid) = create_note_manager().await;
+        let req = CreateNoteRequest {
+            project_id: Some(pid),
+            note_type: NoteType::Guideline,
+            content: "".to_string(),
+            importance: Some(NoteImportance::Medium),
+            scope: None,
+            tags: None,
+            anchors: None,
+            assertion_rule: None,
+        };
+
+        let note = mgr.create_note(req, "agent-1").await.unwrap();
+
+        // Non-RFC notes should NOT get the template
+        assert!(!note.content.contains("## Problem"));
+        // And no rfc-run tag
+        assert!(!note.tags.iter().any(|t| t.starts_with("rfc-run:")));
     }
 }

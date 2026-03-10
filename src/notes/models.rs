@@ -778,7 +778,7 @@ impl Note {
             NoteType::Guideline => 365.0, // Stable for a long time
             NoteType::Pattern => 365.0,
             NoteType::Assertion => f64::MAX, // Never stale (verified by code)
-            NoteType::Rfc => 365.0,              // Long-lived like patterns/guidelines
+            NoteType::Rfc => 365.0,          // Long-lived like patterns/guidelines
         }
     }
 }
