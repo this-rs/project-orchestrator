@@ -797,6 +797,7 @@ pub async fn delegate_task(
         "parent_session_id": req.parent_session_id,
     });
 
+    let chat_request_cwd = req.cwd.clone();
     let chat_request = crate::chat::types::ChatRequest {
         message: String::new(), // prompt sent via send_message
         session_id: None,
@@ -883,7 +884,9 @@ pub async fn delegate_task(
             }
         };
 
-        listen_delegation_result(rx, ev_task_id, &task_title_clone, event_bus).await;
+        let delegation_cwd = Some(chat_request_cwd.clone());
+        listen_delegation_result(rx, ev_task_id, &task_title_clone, event_bus, delegation_cwd)
+            .await;
     });
 
     Ok((
@@ -899,11 +902,13 @@ pub async fn delegate_task(
 
 /// Listen for a delegated sub-agent's Result event and emit a RunnerEvent-compatible
 /// CrudEvent so the frontend is notified via WebSocket.
+/// Also collects commits from agent worktrees after completion (prevents ghost completions).
 async fn listen_delegation_result(
     mut rx: tokio::sync::broadcast::Receiver<crate::chat::types::ChatEvent>,
     task_id: Uuid,
     task_title: &str,
     event_bus: std::sync::Arc<crate::events::HybridEmitter>,
+    cwd: Option<String>,
 ) {
     use crate::events::{CrudAction, CrudEvent, EntityType, EventEmitter};
 
@@ -951,6 +956,34 @@ async fn listen_delegation_result(
                     is_error = is_error,
                     "Delegation completed"
                 );
+
+                // Collect commits from agent worktrees (prevents ghost completions)
+                if let Some(ref cwd) = cwd {
+                    if let Ok(run_branch) = crate::runner::git::current_branch(cwd).await {
+                        if !run_branch.is_empty() {
+                            match crate::runner::git::collect_worktree_commits(cwd, &run_branch)
+                                .await
+                            {
+                                Ok(wt_result) => {
+                                    if !wt_result.recovered_commits.is_empty() {
+                                        tracing::info!(
+                                            task_id = %task_id,
+                                            commits = wt_result.recovered_commits.len(),
+                                            "Delegation: recovered commits from agent worktrees"
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        task_id = %task_id,
+                                        "Delegation worktree collection failed (non-fatal): {}", e
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+
                 break;
             }
             Ok(Ok(_)) => {

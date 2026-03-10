@@ -482,6 +482,25 @@ impl WorktreeCollector {
 // Standalone helpers (used by runner.rs directly)
 // ============================================================================
 
+/// Get the HEAD commit SHA.
+pub async fn head_sha(cwd: &str) -> Result<String> {
+    let output = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(cwd)
+        .output()
+        .await
+        .context("Failed to get HEAD SHA")?;
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "git rev-parse HEAD failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
 /// Get the current branch name.
 pub async fn current_branch(cwd: &str) -> Result<String> {
     let output = Command::new("git")
