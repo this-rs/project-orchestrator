@@ -879,8 +879,17 @@ impl NoteManager {
         workspace_slug: Option<&str>,
         limit: Option<usize>,
         min_similarity: Option<f64>,
+        profile: Option<&str>,
     ) -> Result<Vec<NoteSearchHit>> {
         let limit = limit.unwrap_or(20);
+
+        if let Some(profile_name) = profile {
+            tracing::debug!(
+                profile = profile_name,
+                query = query,
+                "semantic_search_notes: intent-adaptive profile active"
+            );
+        }
 
         // If no embedding provider, fall back to BM25 text search
         let provider = match &self.embedding_provider {
@@ -2633,7 +2642,7 @@ mod tests {
 
         // Search for error-handling related notes
         let results = mgr
-            .semantic_search_notes("how to handle errors", None, None, Some(10), None)
+            .semantic_search_notes("how to handle errors", None, None, Some(10), None, None)
             .await
             .unwrap();
 
@@ -2664,7 +2673,7 @@ mod tests {
 
         // Semantic search without provider should fall back to BM25 (no panic, no error)
         let results = mgr
-            .semantic_search_notes("test", None, None, Some(10), None)
+            .semantic_search_notes("test", None, None, Some(10), None, None)
             .await;
 
         // Should not error — falls back gracefully to Meilisearch
@@ -2680,7 +2689,7 @@ mod tests {
 
         // Search with project filter
         let results = mgr
-            .semantic_search_notes("guideline", Some(pid), None, Some(10), None)
+            .semantic_search_notes("guideline", Some(pid), None, Some(10), None, None)
             .await
             .unwrap();
 

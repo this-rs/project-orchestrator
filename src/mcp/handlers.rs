@@ -8,6 +8,54 @@ use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 
 use super::http_client::{extract_id, extract_optional_string, extract_string, McpHttpClient};
+use crate::neurons::intent::{IntentDetector, QueryIntentMode};
+use crate::graph::models::profile_by_name;
+
+/// Resolve an intent-adaptive analysis profile name from MCP params.
+///
+/// Priority: explicit `profile` > explicit `intent_mode` > auto-detect from query.
+/// Returns `None` when the query has no detectable intent (backward-compatible default).
+fn resolve_intent_profile(
+    query: &str,
+    explicit_profile: Option<&str>,
+    explicit_intent_mode: Option<&str>,
+) -> Option<String> {
+    if let Some(name) = explicit_profile {
+        // Explicit profile override — validate it exists
+        if profile_by_name(name).is_some() {
+            tracing::debug!(profile = name, source = "explicit", "intent-adaptive profile resolved");
+            return Some(name.to_string());
+        } else {
+            tracing::warn!(profile = name, "unknown profile name, falling back to auto-detection");
+        }
+    }
+
+    if let Some(mode_str) = explicit_intent_mode {
+        let mode = match mode_str {
+            "debug" => QueryIntentMode::Debug,
+            "explore" => QueryIntentMode::Explore,
+            "impact" => QueryIntentMode::Impact,
+            "plan" => QueryIntentMode::Plan,
+            _ => QueryIntentMode::Default,
+        };
+        if mode != QueryIntentMode::Default {
+            let name = mode.to_string();
+            tracing::debug!(profile = %name, source = "explicit_intent", "intent-adaptive profile resolved");
+            return Some(name);
+        }
+    }
+
+    // Auto-detect from query
+    let mode = IntentDetector::detect(query);
+    if mode == QueryIntentMode::Default {
+        tracing::debug!(source = "auto", detected = "default", "no intent detected, using default behavior");
+        None
+    } else {
+        let name = mode.to_string();
+        tracing::debug!(profile = %name, source = "auto", "intent-adaptive profile resolved");
+        Some(name)
+    }
+}
 
 /// Handles MCP tool calls by proxying to the REST API.
 pub struct ToolHandler {
@@ -1340,6 +1388,10 @@ impl ToolHandler {
 
             "search_decisions_semantic" => {
                 let query_str = extract_string(args, "query")?;
+                let explicit_profile = args.get("profile").and_then(|v| v.as_str());
+                let explicit_intent = args.get("intent_mode").and_then(|v| v.as_str());
+                let resolved_profile = resolve_intent_profile(&query_str, explicit_profile, explicit_intent);
+
                 let mut query = vec![("query".to_string(), query_str)];
                 if let Some(l) = args.get("limit").and_then(|v| v.as_u64()) {
                     query.push(("limit".to_string(), l.to_string()));
@@ -1349,6 +1401,9 @@ impl ToolHandler {
                 }
                 if let Some(t) = args.get("temperature").and_then(|v| v.as_f64()) {
                     query.push(("temperature".to_string(), t.to_string()));
+                }
+                if let Some(ref profile) = resolved_profile {
+                    query.push(("profile".to_string(), profile.clone()));
                 }
                 let result = http
                     .get_with_query("/api/decisions/search-semantic", &query)
@@ -1933,6 +1988,10 @@ impl ToolHandler {
 
             "search_notes_semantic" => {
                 let query_str = extract_string(args, "query")?;
+                let explicit_profile = args.get("profile").and_then(|v| v.as_str());
+                let explicit_intent = args.get("intent_mode").and_then(|v| v.as_str());
+                let resolved_profile = resolve_intent_profile(&query_str, explicit_profile, explicit_intent);
+
                 let mut query = vec![("query".to_string(), query_str)];
                 if let Some(v) = args.get("project_slug").and_then(|v| v.as_str()) {
                     query.push(("project_slug".to_string(), v.to_string()));
@@ -1945,6 +2004,9 @@ impl ToolHandler {
                 }
                 if let Some(t) = args.get("temperature").and_then(|v| v.as_f64()) {
                     query.push(("temperature".to_string(), t.to_string()));
+                }
+                if let Some(ref profile) = resolved_profile {
+                    query.push(("profile".to_string(), profile.clone()));
                 }
                 let result = http
                     .get_with_query("/api/notes/search-semantic", &query)

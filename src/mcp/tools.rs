@@ -501,7 +501,9 @@ fn decision_tool() -> ToolDefinition {
                 "superseded_by_id": {"type": "string", "description": "Decision UUID being superseded (supersede)"},
                 "from": {"type": "string", "description": "Start date ISO filter (get_timeline)"},
                 "to": {"type": "string", "description": "End date ISO filter (get_timeline)"},
-                "temperature": {"type": "number", "description": "Thermal noise 0.0-1.0 for stochastic exploration (search_semantic, default 0 = deterministic)"}
+                "temperature": {"type": "number", "description": "Thermal noise 0.0-1.0 for stochastic exploration (search_semantic, default 0 = deterministic)"},
+                "profile": {"type": "string", "description": "Optional profile name to override auto-detection for search_semantic (e.g., 'debug', 'explore', 'impact', 'plan', 'security', 'architect', 'onboarding', 'refactoring')"},
+                "intent_mode": {"type": "string", "description": "Optional intent mode to force for search_semantic (debug/explore/impact/plan) — auto-detected from query if not provided"}
             })),
             required: Some(vec!["action".to_string()]),
         },
@@ -644,6 +646,8 @@ fn note_tool() -> ToolDefinition {
                 "limit": {"type": "integer", "description": "Max items"},
                 "offset": {"type": "integer", "description": "Skip items"},
                 "temperature": {"type": "number", "description": "Thermal noise 0.0-1.0 for stochastic exploration (search_semantic, default 0 = deterministic)"},
+                "profile": {"type": "string", "description": "Optional profile name to override auto-detection for search_semantic (e.g., 'debug', 'explore', 'impact', 'plan', 'security', 'architect', 'onboarding', 'refactoring')"},
+                "intent_mode": {"type": "string", "description": "Optional intent mode to force for search_semantic (debug/explore/impact/plan) — auto-detected from query if not provided"},
                 "trigger": {"type": "string", "description": "Transition trigger to fire on the RFC's protocol run (advance_rfc)"}
             })),
             required: Some(vec!["action".to_string()]),

@@ -1167,6 +1167,9 @@ pub struct SearchDecisionsSemanticQuery {
     /// Thermal noise temperature (0.0 - 1.0) for stochastic exploration.
     /// Inspired by Langevin dynamics: adds T × N(0, σ) Gaussian noise to scores.
     pub temperature: Option<f64>,
+    /// Intent-adaptive analysis profile name (e.g., "debug", "explore", "impact", "plan").
+    /// When provided, weights the search results according to the profile's configuration.
+    pub profile: Option<String>,
 }
 
 pub async fn search_decisions_semantic(

@@ -1128,6 +1128,9 @@ pub struct SemanticSearchQuery {
     /// Inspired by Langevin dynamics: adds T × N(0, σ) Gaussian noise to scores.
     /// 0.0 = deterministic (default), 1.0 = maximum exploration.
     pub temperature: Option<f64>,
+    /// Intent-adaptive analysis profile name (e.g., "debug", "explore", "impact", "plan").
+    /// When provided, weights the search results according to the profile's configuration.
+    pub profile: Option<String>,
 }
 
 /// GET /api/notes/search-semantic — Vector-based semantic search
@@ -1157,6 +1160,7 @@ pub async fn search_notes_semantic(
             query.workspace_slug.as_deref(),
             query.limit,
             query.min_similarity,
+            query.profile.as_deref(),
         )
         .await
         .map_err(AppError::Internal)?;
