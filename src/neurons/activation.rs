@@ -18,6 +18,7 @@ use tracing::debug;
 use uuid::Uuid;
 
 use crate::embeddings::EmbeddingProvider;
+use crate::graph::models::AnalysisProfile;
 use crate::neo4j::GraphStore;
 use crate::notes::{Note, NoteImportance, NoteType};
 
@@ -127,6 +128,30 @@ impl SpreadingActivationEngine {
         project_id: Option<Uuid>,
         config: &SpreadingActivationConfig,
     ) -> Result<Vec<ActivatedNote>> {
+        self.activate_with_profile(query, project_id, config, None)
+            .await
+    }
+
+    /// Run spreading activation with an optional analysis profile for intent-adaptive weighting.
+    ///
+    /// When a profile is provided, Phase 2 (spreading) multiplies each synapse's
+    /// spread score by the profile's edge weight for the `SYNAPSE` relation type.
+    /// This biases results toward the intent (debug → SYNAPSE=0.8 high propagation,
+    /// impact → SYNAPSE=0.3 dampened propagation) without filtering any signal completely.
+    ///
+    /// When no profile is provided, behaves identically to `activate()`.
+    pub async fn activate_with_profile(
+        &self,
+        query: &str,
+        project_id: Option<Uuid>,
+        config: &SpreadingActivationConfig,
+        profile: Option<&AnalysisProfile>,
+    ) -> Result<Vec<ActivatedNote>> {
+        debug!(
+            "Spreading activation: profile={}",
+            profile.map(|p| p.name.as_str()).unwrap_or("none")
+        );
+
         // Phase 1: Initial activation via vector search
         let embedding = self.embedding_provider.embed_text(query).await?;
         let seed_notes = self
@@ -236,11 +261,19 @@ impl SpreadingActivationEngine {
 
                     // Calculate spread score with scar penalty (biomimicry: Elun Scar)
                     let scar_penalty = 1.0 - neighbor_note.scar_intensity * 0.7;
+
+                    // Intent-adaptive: weight by profile's SYNAPSE edge weight
+                    let profile_synapse_weight = profile
+                        .and_then(|p| p.edge_weights.get("SYNAPSE"))
+                        .copied()
+                        .unwrap_or(1.0);
+
                     let spread_score = parent_activation
                         * synapse_weight
                         * neighbor_energy
                         * config.decay_per_hop
-                        * scar_penalty;
+                        * scar_penalty
+                        * profile_synapse_weight;
 
                     // Skip if below threshold
                     if spread_score < config.min_activation {
@@ -1250,5 +1283,122 @@ mod tests {
             "Gibberish query with threshold should return few or no results, got {}",
             results.len()
         );
+    }
+
+    #[tokio::test]
+    async fn test_activate_with_profile_none_same_as_activate() {
+        // This is a compile-time check that the API works.
+        // Full integration tests require a real GraphStore + EmbeddingProvider.
+        // The key guarantee: activate(q, p, c) == activate_with_profile(q, p, c, None)
+        // which is ensured by the delegation pattern.
+        let mock = Arc::new(MockGraphStore::new());
+        let engine = SpreadingActivationEngine::new(gs(&mock), mock_embedding_provider());
+        let config = SpreadingActivationConfig::default();
+
+        let results_activate = engine
+            .activate("test query", None, &config)
+            .await
+            .unwrap();
+        let results_with_profile = engine
+            .activate_with_profile("test query", None, &config, None)
+            .await
+            .unwrap();
+
+        assert_eq!(results_activate.len(), results_with_profile.len());
+    }
+
+    #[tokio::test]
+    async fn test_activate_with_profile_dampens_spreading() {
+        use std::collections::HashMap;
+
+        let mock = Arc::new(MockGraphStore::new());
+        let store = gs(&mock);
+        let project_id = Uuid::new_v4();
+
+        let note_a = note_with_energy(
+            Uuid::new_v4(),
+            Some(project_id),
+            "profile source",
+            1.0,
+        );
+        let note_b = note_with_energy(
+            Uuid::new_v4(),
+            Some(project_id),
+            "profile neighbor",
+            1.0,
+        );
+
+        store.create_note(&note_a).await.unwrap();
+        store.create_note(&note_b).await.unwrap();
+
+        let embedding = mock_embedding_provider()
+            .embed_text("profile source")
+            .await
+            .unwrap();
+        store
+            .set_note_embedding(note_a.id, &embedding, "mock")
+            .await
+            .unwrap();
+
+        store
+            .create_synapses(note_a.id, &[(note_b.id, 0.9)])
+            .await
+            .unwrap();
+
+        let config = SpreadingActivationConfig {
+            min_activation: 0.001,
+            ..Default::default()
+        };
+
+        let engine = SpreadingActivationEngine::new(store, mock_embedding_provider());
+
+        // Without profile (SYNAPSE weight = 1.0)
+        let results_no_profile = engine
+            .activate_with_profile("profile source", Some(project_id), &config, None)
+            .await
+            .unwrap();
+
+        // With a low-SYNAPSE profile (dampened spreading)
+        let low_synapse_profile = AnalysisProfile {
+            id: Uuid::new_v4().to_string(),
+            project_id: None,
+            name: "test_low_synapse".to_string(),
+            description: None,
+            edge_weights: HashMap::from([("SYNAPSE".to_string(), 0.3)]),
+            fusion_weights: Default::default(),
+            is_builtin: false,
+        };
+        let results_low = engine
+            .activate_with_profile(
+                "profile source",
+                Some(project_id),
+                &config,
+                Some(&low_synapse_profile),
+            )
+            .await
+            .unwrap();
+
+        // Both should find the direct match (note_a)
+        assert!(results_no_profile.iter().any(|r| r.note.id == note_a.id));
+        assert!(results_low.iter().any(|r| r.note.id == note_a.id));
+
+        // If note_b appears in both, the low-profile version should have a lower score
+        let b_score_no_profile = results_no_profile
+            .iter()
+            .find(|r| r.note.id == note_b.id)
+            .map(|r| r.activation_score);
+        let b_score_low = results_low
+            .iter()
+            .find(|r| r.note.id == note_b.id)
+            .map(|r| r.activation_score);
+
+        if let (Some(score_none), Some(score_low)) = (b_score_no_profile, b_score_low) {
+            assert!(
+                score_low < score_none,
+                "Low SYNAPSE profile should dampen propagated score: {} < {}",
+                score_low,
+                score_none
+            );
+        }
     }
 }
