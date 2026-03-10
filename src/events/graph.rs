@@ -459,6 +459,106 @@ mod tests {
     }
 
     #[test]
+    fn test_graph_event_activation_result_constructor() {
+        let payload = ActivationResultPayload {
+            direct_ids: vec!["note-1".into(), "note-2".into()],
+            propagated: vec![PropagatedNote {
+                id: "note-3".into(),
+                via: Some("note-1".into()),
+                score: 0.65,
+            }],
+            scores: {
+                let mut m = std::collections::HashMap::new();
+                m.insert("note-1".to_string(), 0.9);
+                m.insert("note-2".to_string(), 0.8);
+                m.insert("note-3".to_string(), 0.65);
+                m
+            },
+            active_edges: vec!["note-1-note-3".into()],
+            query: "test query".into(),
+            phase: Some("direct".into()),
+        };
+
+        let event = GraphEvent::activation_result(payload, "proj-1");
+
+        assert_eq!(event.event_type, GraphEventType::Activation);
+        assert_eq!(event.layer, GraphLayer::Neural);
+        assert!(event.node_id.is_none());
+        assert_eq!(event.project_id, "proj-1");
+        assert_eq!(event.delta["query"], "test query");
+        assert_eq!(event.delta["phase"], "direct");
+        let direct = event.delta["direct_ids"].as_array().unwrap();
+        assert_eq!(direct.len(), 2);
+        let propagated = event.delta["propagated"].as_array().unwrap();
+        assert_eq!(propagated.len(), 1);
+        assert_eq!(propagated[0]["via"], "note-1");
+        let edges = event.delta["active_edges"].as_array().unwrap();
+        assert_eq!(edges.len(), 1);
+    }
+
+    #[test]
+    fn test_activation_result_done_phase_empty() {
+        let payload = ActivationResultPayload {
+            direct_ids: vec![],
+            propagated: vec![],
+            scores: std::collections::HashMap::new(),
+            active_edges: vec![],
+            query: "q".into(),
+            phase: Some("done".into()),
+        };
+
+        let event = GraphEvent::activation_result(payload, "proj-1");
+        assert_eq!(event.delta["phase"], "done");
+        assert!(event.delta["direct_ids"].as_array().unwrap().is_empty());
+        assert!(event.delta["propagated"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_activation_result_payload_serde_roundtrip() {
+        let payload = ActivationResultPayload {
+            direct_ids: vec!["n1".into()],
+            propagated: vec![PropagatedNote {
+                id: "n2".into(),
+                via: None,
+                score: 0.5,
+            }],
+            scores: {
+                let mut m = std::collections::HashMap::new();
+                m.insert("n1".to_string(), 0.9);
+                m
+            },
+            active_edges: vec![],
+            query: "test".into(),
+            phase: None,
+        };
+
+        let json = serde_json::to_string(&payload).unwrap();
+        let parsed: ActivationResultPayload = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed.direct_ids, vec!["n1"]);
+        assert_eq!(parsed.propagated.len(), 1);
+        assert!(parsed.propagated[0].via.is_none());
+        assert_eq!(parsed.propagated[0].score, 0.5);
+        assert!(parsed.phase.is_none());
+        // phase=None should be skipped in serialization
+        assert!(!json.contains("phase"));
+    }
+
+    #[test]
+    fn test_propagated_note_serde() {
+        let note = PropagatedNote {
+            id: "note-42".into(),
+            via: Some("note-1".into()),
+            score: 0.73,
+        };
+        let json = serde_json::to_string(&note).unwrap();
+        let parsed: PropagatedNote = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.id, "note-42");
+        assert_eq!(parsed.via.as_deref(), Some("note-1"));
+        assert!((parsed.score - 0.73).abs() < f64::EPSILON);
+    }
+
+    #[test]
     fn test_graph_event_clone_for_broadcast() {
         let event = GraphEvent::reinforcement("note-1", 0.2, "proj-1");
         let cloned = event.clone();
