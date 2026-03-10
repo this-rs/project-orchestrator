@@ -1023,6 +1023,14 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/protocols/runs/{run_id}/progress",
             post(protocol_handlers::report_progress),
         )
+        .route(
+            "/api/protocols/runs/{run_id}/children",
+            get(protocol_handlers::get_run_children),
+        )
+        .route(
+            "/api/protocols/runs/{run_id}/tree",
+            get(protocol_handlers::get_run_tree),
+        )
         // ================================================================
         // Reasoning Tree
         // ================================================================

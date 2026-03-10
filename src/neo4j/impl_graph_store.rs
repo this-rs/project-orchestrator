@@ -2978,6 +2978,24 @@ impl GraphStore for Neo4jClient {
             .await
     }
 
+    async fn list_child_runs(
+        &self,
+        parent_run_id: uuid::Uuid,
+    ) -> anyhow::Result<Vec<crate::protocol::ProtocolRun>> {
+        self.list_child_runs(parent_run_id).await
+    }
+
+    async fn count_child_runs(&self, parent_run_id: uuid::Uuid) -> anyhow::Result<usize> {
+        self.count_child_runs(parent_run_id).await
+    }
+
+    async fn get_run_tree(
+        &self,
+        root_run_id: uuid::Uuid,
+    ) -> anyhow::Result<Vec<crate::protocol::ProtocolRun>> {
+        self.get_run_tree(root_run_id).await
+    }
+
     async fn delete_protocol_run(&self, run_id: uuid::Uuid) -> anyhow::Result<bool> {
         self.delete_protocol_run(run_id).await
     }
