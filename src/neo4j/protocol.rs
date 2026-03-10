@@ -6,7 +6,7 @@
 use super::client::Neo4jClient;
 use crate::protocol::{
     Protocol, ProtocolCategory, ProtocolRun, ProtocolState, ProtocolTransition, RunStatus,
-    StateVisit,
+    RuntimeState, StateVisit,
 };
 use anyhow::{Context, Result};
 use neo4rs::query;
@@ -87,6 +87,26 @@ impl Neo4jClient {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or_default(),
+            sub_protocol_id: node
+                .get::<String>("sub_protocol_id")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .and_then(|s| s.parse().ok()),
+            completion_strategy: node
+                .get::<String>("completion_strategy")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .and_then(|s| s.parse().ok()),
+            on_failure_strategy: node
+                .get::<String>("on_failure_strategy")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .and_then(|s| s.parse().ok()),
+            generator_config: node
+                .get::<String>("generator_config_json")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .and_then(|s| serde_json::from_str(&s).ok()),
         })
     }
 
@@ -341,7 +361,11 @@ impl Neo4jClient {
                 s.name = $name,
                 s.description = $description,
                 s.action = $action,
-                s.state_type = $state_type
+                s.state_type = $state_type,
+                s.sub_protocol_id = $sub_protocol_id,
+                s.completion_strategy = $completion_strategy,
+                s.on_failure_strategy = $on_failure_strategy,
+                s.generator_config_json = $generator_config_json
             MERGE (proto)-[:HAS_STATE]->(s)
             "#,
         )
@@ -350,7 +374,36 @@ impl Neo4jClient {
         .param("name", state.name.clone())
         .param("description", state.description.clone())
         .param("action", state.action.clone().unwrap_or_default())
-        .param("state_type", state.state_type.to_string());
+        .param("state_type", state.state_type.to_string())
+        .param(
+            "sub_protocol_id",
+            state
+                .sub_protocol_id
+                .map(|u| u.to_string())
+                .unwrap_or_default(),
+        )
+        .param(
+            "completion_strategy",
+            state
+                .completion_strategy
+                .map(|c| c.to_string())
+                .unwrap_or_default(),
+        )
+        .param(
+            "on_failure_strategy",
+            state
+                .on_failure_strategy
+                .map(|s| s.to_string())
+                .unwrap_or_default(),
+        )
+        .param(
+            "generator_config_json",
+            state
+                .generator_config
+                .as_ref()
+                .map(|c| serde_json::to_string(c).unwrap_or_default())
+                .unwrap_or_default(),
+        );
 
         self.graph
             .run(q)
@@ -529,6 +582,11 @@ impl Neo4jClient {
                 .ok()
                 .filter(|s| !s.is_empty())
                 .and_then(|s| s.parse().ok()),
+            parent_run_id: node
+                .get::<String>("parent_run_id")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .and_then(|s| s.parse().ok()),
             current_state: node.get::<String>("current_state")?.parse()?,
             states_visited,
             status: node
@@ -549,6 +607,7 @@ impl Neo4jClient {
             triggered_by: node
                 .get::<String>("triggered_by")
                 .unwrap_or_else(|_| "manual".to_string()),
+            depth: node.get::<i64>("depth").unwrap_or(0) as u32,
         })
     }
 
@@ -566,21 +625,24 @@ impl Neo4jClient {
         let q = query(
             r#"
             MATCH (proto:Protocol {id: $protocol_id})
-            WHERE NOT EXISTS {
+            WHERE $is_child = true OR NOT EXISTS {
                 MATCH (existing:ProtocolRun {protocol_id: $protocol_id, status: 'running'})
+                WHERE existing.parent_run_id IS NULL OR existing.parent_run_id = ''
             }
             CREATE (r:ProtocolRun {
                 id: $id,
                 protocol_id: $protocol_id,
                 plan_id: $plan_id,
                 task_id: $task_id,
+                parent_run_id: $parent_run_id,
                 current_state: $current_state,
                 states_visited_json: $states_visited_json,
                 status: $status,
                 started_at: $started_at,
                 completed_at: $completed_at,
                 error: $error,
-                triggered_by: $triggered_by
+                triggered_by: $triggered_by,
+                depth: $depth
             })
             CREATE (r)-[:INSTANCE_OF]->(proto)
             RETURN r.id AS created_id
@@ -596,6 +658,10 @@ impl Neo4jClient {
             "task_id",
             run.task_id.map(|u| u.to_string()).unwrap_or_default(),
         )
+        .param(
+            "parent_run_id",
+            run.parent_run_id.map(|u| u.to_string()).unwrap_or_default(),
+        )
         .param("current_state", run.current_state.to_string())
         .param("states_visited_json", states_visited_json)
         .param("status", run.status.to_string())
@@ -607,7 +673,9 @@ impl Neo4jClient {
                 .unwrap_or_default(),
         )
         .param("error", run.error.clone().unwrap_or_default())
-        .param("triggered_by", run.triggered_by.clone());
+        .param("triggered_by", run.triggered_by.clone())
+        .param("depth", run.depth as i64)
+        .param("is_child", run.parent_run_id.is_some());
 
         let mut result = self
             .graph
@@ -626,6 +694,20 @@ impl Neo4jClient {
                 "Skipped: concurrent run already running for protocol {}",
                 run.protocol_id
             );
+        }
+
+        // Link to parent run if present (hierarchical)
+        if let Some(parent_id) = &run.parent_run_id {
+            let link_q = query(
+                r#"
+                MATCH (child:ProtocolRun {id: $child_id})
+                MATCH (parent:ProtocolRun {id: $parent_id})
+                MERGE (child)-[:CHILD_OF]->(parent)
+                "#,
+            )
+            .param("child_id", run.id.to_string())
+            .param("parent_id", parent_id.to_string());
+            let _ = self.graph.run(link_q).await;
         }
 
         // Link to plan if present
@@ -784,7 +866,76 @@ impl Neo4jClient {
         Ok((runs, total))
     }
 
-    /// Delete a protocol run.
+    /// List child runs for a given parent run, ordered by started_at.
+    pub async fn list_child_runs(&self, parent_run_id: Uuid) -> Result<Vec<ProtocolRun>> {
+        let q = query(
+            r#"
+            MATCH (child:ProtocolRun)-[:CHILD_OF]->(parent:ProtocolRun {id: $parent_id})
+            RETURN child
+            ORDER BY child.started_at ASC
+            "#,
+        )
+        .param("parent_id", parent_run_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut runs = Vec::new();
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("child")?;
+            runs.push(Self::node_to_protocol_run(&node)?);
+        }
+        Ok(runs)
+    }
+
+    /// Count children for a given run.
+    pub async fn count_child_runs(&self, parent_run_id: Uuid) -> Result<usize> {
+        let q = query(
+            r#"
+            MATCH (child:ProtocolRun)-[:CHILD_OF]->(parent:ProtocolRun {id: $parent_id})
+            RETURN count(child) AS cnt
+            "#,
+        )
+        .param("parent_id", parent_run_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            Ok(row.get::<i64>("cnt").unwrap_or(0) as usize)
+        } else {
+            Ok(0)
+        }
+    }
+
+    /// Get the full run tree rooted at a given run (recursive, depth limit 5).
+    ///
+    /// Returns a flat list of all runs in the tree (root + all descendants),
+    /// ordered by depth then started_at.
+    pub async fn get_run_tree(&self, root_run_id: Uuid) -> Result<Vec<ProtocolRun>> {
+        let q = query(
+            r#"
+            MATCH (root:ProtocolRun {id: $root_id})
+            OPTIONAL MATCH path = (descendant:ProtocolRun)-[:CHILD_OF*1..5]->(root)
+            WITH root, collect(DISTINCT descendant) AS descendants
+            UNWIND ([root] + descendants) AS r
+            RETURN DISTINCT r
+            ORDER BY r.depth ASC, r.started_at ASC
+            "#,
+        )
+        .param("root_id", root_run_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut runs = Vec::new();
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("r")?;
+            match Self::node_to_protocol_run(&node) {
+                Ok(run) => runs.push(run),
+                Err(e) => {
+                    warn!("Skipping corrupted ProtocolRun in tree: {}", e);
+                }
+            }
+        }
+        Ok(runs)
+    }
+
+    /// Delete a protocol run and its associated runtime states.
     pub async fn delete_protocol_run(&self, run_id: Uuid) -> Result<bool> {
         let check_q = query(
             r#"
@@ -801,6 +952,16 @@ impl Neo4jClient {
             return Ok(false);
         }
 
+        // Cascade delete runtime states first
+        let delete_rs_q = query(
+            r#"
+            MATCH (rs:RuntimeState {run_id: $run_id})
+            DETACH DELETE rs
+            "#,
+        )
+        .param("run_id", run_id.to_string());
+        let _ = self.graph.run(delete_rs_q).await;
+
         let delete_q = query(
             r#"
             MATCH (r:ProtocolRun {id: $id})
@@ -815,5 +976,130 @@ impl Neo4jClient {
             .context("Failed to delete protocol run")?;
 
         Ok(true)
+    }
+
+    // ========================================================================
+    // RuntimeState CRUD (Generator-produced dynamic states)
+    // ========================================================================
+
+    /// Convert a Neo4j node to a [`RuntimeState`].
+    pub(crate) fn node_to_runtime_state(node: &neo4rs::Node) -> Result<RuntimeState> {
+        Ok(RuntimeState {
+            id: node.get::<String>("id")?.parse()?,
+            run_id: node.get::<String>("run_id")?.parse()?,
+            generated_by: node.get::<String>("generated_by")?.parse()?,
+            name: node.get("name")?,
+            index: node.get::<i64>("index").unwrap_or(0) as u32,
+            sub_protocol_id: node
+                .get::<String>("sub_protocol_id")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .and_then(|s| s.parse().ok()),
+            action: node.get::<String>("action").ok().filter(|s| !s.is_empty()),
+            status: node
+                .get::<String>("status")
+                .unwrap_or_else(|_| "pending".to_string()),
+            next_runtime_state_id: node
+                .get::<String>("next_runtime_state_id")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .and_then(|s| s.parse().ok()),
+            linking_strategy: node
+                .get::<String>("linking_strategy")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or_default(),
+        })
+    }
+
+    /// Create a new RuntimeState node with HAS_RUNTIME_STATE and GENERATED_BY relationships.
+    pub async fn create_runtime_state(&self, state: &RuntimeState) -> Result<()> {
+        let q = query(
+            r#"
+            MATCH (r:ProtocolRun {id: $run_id})
+            MATCH (ps:ProtocolState {id: $generated_by})
+            CREATE (rs:RuntimeState {
+                id: $id,
+                run_id: $run_id,
+                generated_by: $generated_by,
+                name: $name,
+                index: $index,
+                sub_protocol_id: $sub_protocol_id,
+                action: $action,
+                status: $status,
+                next_runtime_state_id: $next_runtime_state_id,
+                linking_strategy: $linking_strategy
+            })
+            CREATE (r)-[:HAS_RUNTIME_STATE]->(rs)
+            CREATE (rs)-[:GENERATED_BY]->(ps)
+            "#,
+        )
+        .param("id", state.id.to_string())
+        .param("run_id", state.run_id.to_string())
+        .param("generated_by", state.generated_by.to_string())
+        .param("name", state.name.clone())
+        .param("index", state.index as i64)
+        .param(
+            "sub_protocol_id",
+            state
+                .sub_protocol_id
+                .map(|u| u.to_string())
+                .unwrap_or_default(),
+        )
+        .param("action", state.action.clone().unwrap_or_default())
+        .param("status", state.status.clone())
+        .param(
+            "next_runtime_state_id",
+            state
+                .next_runtime_state_id
+                .map(|u| u.to_string())
+                .unwrap_or_default(),
+        )
+        .param("linking_strategy", state.linking_strategy.to_string());
+
+        self.graph
+            .run(q)
+            .await
+            .context("Failed to create runtime state")?;
+
+        Ok(())
+    }
+
+    /// Get all RuntimeStates for a protocol run, ordered by index.
+    pub async fn get_runtime_states(&self, run_id: Uuid) -> Result<Vec<RuntimeState>> {
+        let q = query(
+            r#"
+            MATCH (rs:RuntimeState {run_id: $run_id})
+            RETURN rs
+            ORDER BY rs.index ASC
+            "#,
+        )
+        .param("run_id", run_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut states = Vec::new();
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("rs")?;
+            states.push(Self::node_to_runtime_state(&node)?);
+        }
+        Ok(states)
+    }
+
+    /// Delete all RuntimeStates for a protocol run.
+    pub async fn delete_runtime_states(&self, run_id: Uuid) -> Result<()> {
+        let q = query(
+            r#"
+            MATCH (rs:RuntimeState {run_id: $run_id})
+            DETACH DELETE rs
+            "#,
+        )
+        .param("run_id", run_id.to_string());
+
+        self.graph
+            .run(q)
+            .await
+            .context("Failed to delete runtime states")?;
+
+        Ok(())
     }
 }

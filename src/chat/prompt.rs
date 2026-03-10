@@ -81,7 +81,7 @@ Business processes: `code(action: "list_processes")`, `code(action: "get_process
 
 ### Notes (Knowledge Base)
 
-- **Types**: guideline, gotcha, pattern, context, tip, observation, assertion
+- **Types**: guideline, gotcha, pattern, context, tip, observation, assertion, rfc
 - **Importance**: critical, high, medium, low
 - **Statuses**: active, needs_review, stale, obsolete, archived
 - Attachable to: project, file, function, struct, trait, task, plan, workspace...
@@ -140,6 +140,7 @@ Before any work, load relevant knowledge:
 3. `decision(action: "search_semantic", query)` — past architectural decisions (vector search, more precise than BM25)
 4. `note(action: "get_propagated", slug, file_path)` — notes propagated via the Knowledge Fabric (IMPORTS, CO_CHANGED, AFFECTS) for relevant files
 5. `note(action: "search", query)` — complementary BM25 search when exact keyword matching is needed
+6. `note(action: "list_rfcs", project_id)` — load active RFCs to avoid conflicting with in-flight architectural proposals
 
 This prevents redoing already documented work or violating established conventions.
 
@@ -353,6 +354,88 @@ note(action: "link_to_entity", note_id, "function", "build_system_prompt")
 - `decision(action: "add", task_id, description, rationale, alternatives, chosen_option)`
 - Link decisions to impacted files: `decision(action: "add_affects", decision_id, entity_type: "File", entity_id: "src/path.rs")`
 - When a decision is superseded: `decision(action: "supersede", decision_id, new_decision_id)`
+
+### RFC Management
+
+RFCs (Requests for Comments) are notes with `note_type: "rfc"` whose lifecycle is managed by a Protocol FSM.
+
+**When to create an RFC:**
+- Architectural decisions affecting multiple components or files
+- Cross-cutting changes (new patterns, API redesigns, data model migrations)
+- Changes that need team/stakeholder review before implementation
+
+**Creating an RFC:**
+```
+note(action: "create", project_id, note_type: "rfc", content: "...", importance: "high", tags: ["rfc"])
+```
+
+**Required RFC sections** (in `content`):
+- **Problem**: What issue or need does this address?
+- **Proposed Solution**: Detailed approach with implementation outline
+- **Alternatives**: Other options considered and why they were rejected
+- **Impact**: Affected files, components, breaking changes, migration path
+
+**RFC lifecycle**: `draft` → `proposed` → `accepted` → `implemented` (or `rejected`)
+
+**RFC MCP actions:**
+- `note(action: "list_rfcs", project_id)` — list all RFCs with their current lifecycle state
+- `note(action: "get_rfc_status", note_id)` — get detailed RFC status (current state, protocol run)
+- `note(action: "advance_rfc", note_id, trigger)` — fire a lifecycle transition (e.g., trigger: "propose", "accept", "implement", "reject")
+
+**Rules:**
+- Check `list_rfcs` during warm-up — never start work that conflicts with an in-flight RFC
+- An accepted RFC should be linked to a Plan via `note(action: "link_to_entity", note_id, "plan", plan_id)`
+- When implementation is done, advance to `implemented` and link the final commit
+
+### Hierarchical Protocols
+
+Protocols support hierarchical composition — a state can delegate to a child protocol (macro-state).
+
+**Key concepts:**
+- `sub_protocol_id` on a ProtocolState: when the run enters this state, it automatically spawns a child run of the referenced protocol
+- `parent_run_id` on a ProtocolRun: links a child run back to its parent
+- The parent run pauses on the macro-state until the child completes
+
+**CompletionStrategy** (how the parent handles child completion):
+- `all_complete` (default): parent transitions only when ALL children complete
+- `any_complete`: parent transitions as soon as ANY child completes
+- `manual`: no auto-transition — requires explicit trigger on parent
+
+**OnFailureStrategy** (how the parent handles child failure):
+- `abort` (default): fail the parent run immediately
+- `skip`: fire `child_skipped` on parent to advance past the macro-state
+- `retry(N)`: re-start the child up to N times, then abort
+
+**Composing hierarchical protocols:**
+```
+// 1. Create the child protocol first:
+protocol(action: "compose", project_id, name: "code-review-sub", ...)
+
+// 2. Create the parent with a macro-state referencing the child:
+protocol(action: "compose", project_id, name: "feature-workflow",
+  states: [
+    { name: "plan", state_type: "start" },
+    { name: "implement", state_type: "intermediate", sub_protocol_id: "<child-protocol-id>" },
+    { name: "done", state_type: "terminal" }
+  ],
+  transitions: [
+    { from_state: "plan", to_state: "implement", trigger: "plan_approved" },
+    { from_state: "implement", to_state: "done", trigger: "child_completed" }
+  ]
+)
+
+// 3. Start a run — entering "implement" auto-spawns the child:
+protocol(action: "start_run", protocol_id: "<parent-id>")
+protocol(action: "transition", run_id: "<parent-run>", trigger: "plan_approved")
+// → child run created automatically, parent waits
+```
+
+**Inspecting the run hierarchy:**
+- `protocol(action: "get_run", run_id)` — returns the run with its current state, status, and visit history
+- `protocol(action: "get_run_tree", run_id)` — returns the run with its full child hierarchy (parent + all nested child runs recursively)
+- `protocol(action: "get_run_children", run_id)` — returns only the direct child runs of a given run
+
+**Use cases:** Multi-phase workflows (plan→implement→review), RFC lifecycle with embedded review protocols, wave execution with per-task sub-protocols.
 
 ### Knowledge Fabric
 
@@ -581,12 +664,12 @@ Register and link git commits. Actions: create, link_to_task, link_to_plan, get_
 | get_file_history | `file_path` (req), `limit` | Get commit history for file |
 
 ## note
-Manage knowledge notes. Actions: list, create, get, update, delete, search, search_semantic, confirm, invalidate, supersede, link_to_entity, unlink_from_entity, get_context, get_needing_review, list_project, get_propagated, get_entity, get_context_knowledge, get_propagated_knowledge
+Manage knowledge notes. Actions: list, create, get, update, delete, search, search_semantic, confirm, invalidate, supersede, link_to_entity, unlink_from_entity, get_context, get_needing_review, list_project, get_propagated, get_entity, get_context_knowledge, get_propagated_knowledge, list_rfcs, advance_rfc, get_rfc_status
 
 | Action | Key Parameters | Description |
 |--------|---------------|-------------|
 | list | `status`, `limit`, `offset` | List all notes |
-| create | `project_id`, `note_type` (req: guideline/gotcha/pattern/context/tip/observation/assertion), `content` (req), `importance`, `tags` | Create note |
+| create | `project_id`, `note_type` (req: guideline/gotcha/pattern/context/tip/observation/assertion/rfc), `content` (req), `importance`, `tags` | Create note |
 | get | `note_id` (req) | Get note by UUID |
 | update | `note_id` (req), `content`, `importance`, `tags` | Update note |
 | delete | `note_id` (req) | Delete note |
@@ -604,6 +687,9 @@ Manage knowledge notes. Actions: list, create, get, update, delete, search, sear
 | get_entity | `entity_type` (req), `entity_id` (req) | Get notes linked to entity |
 | get_context_knowledge | `entity_type` (req), `entity_id` (req) | Get contextual knowledge |
 | get_propagated_knowledge | `entity_type` (req), `entity_id` (req) | Get propagated knowledge |
+| list_rfcs | `project_id` | List all RFCs with lifecycle state |
+| advance_rfc | `note_id` (req), `trigger` (req) | Fire lifecycle transition on RFC (propose/accept/implement/reject) |
+| get_rfc_status | `note_id` (req) | Get RFC lifecycle status and protocol run details |
 
 ## workspace
 Manage workspaces. Actions: list, create, get, update, delete, get_overview, list_projects, add_project, remove_project, get_topology

@@ -617,18 +617,18 @@ fn commit_tool() -> ToolDefinition {
 fn note_tool() -> ToolDefinition {
     ToolDefinition {
         name: "note".to_string(),
-        description: "Manage knowledge notes. Actions: list, create, get, update, delete, search, search_semantic, confirm, invalidate, supersede, link_to_entity, unlink_from_entity, get_context, get_needing_review, list_project, get_propagated, get_entity, get_context_knowledge, get_propagated_knowledge".to_string(),
+        description: "Manage knowledge notes. Actions: list, create, get, update, delete, search, search_semantic, confirm, invalidate, supersede, link_to_entity, unlink_from_entity, get_context, get_needing_review, list_project, get_propagated, get_entity, get_context_knowledge, get_propagated_knowledge, list_rfcs, advance_rfc, get_rfc_status".to_string(),
         input_schema: InputSchema {
             schema_type: "object".to_string(),
             properties: Some(json!({
                 "action": {
                     "type": "string",
-                    "enum": ["list", "create", "get", "update", "delete", "search", "search_semantic", "confirm", "invalidate", "supersede", "link_to_entity", "unlink_from_entity", "get_context", "get_needing_review", "list_project", "get_propagated", "get_entity", "get_context_knowledge", "get_propagated_knowledge"],
+                    "enum": ["list", "create", "get", "update", "delete", "search", "search_semantic", "confirm", "invalidate", "supersede", "link_to_entity", "unlink_from_entity", "get_context", "get_needing_review", "list_project", "get_propagated", "get_entity", "get_context_knowledge", "get_propagated_knowledge", "list_rfcs", "advance_rfc", "get_rfc_status"],
                     "description": "Operation to perform"
                 },
                 "note_id": {"type": "string", "description": "Note UUID"},
                 "project_id": {"type": "string", "description": "Project UUID"},
-                "note_type": {"type": "string", "description": "Type: guideline, gotcha, pattern, context, tip, observation, assertion"},
+                "note_type": {"type": "string", "description": "Type: guideline, gotcha, pattern, context, tip, observation, assertion, rfc"},
                 "content": {"type": "string", "description": "Note content (create/update)"},
                 "importance": {"type": "string", "description": "Importance: critical, high, medium, low"},
                 "tags": {"type": "array", "items": {"type": "string"}, "description": "Tags"},
@@ -643,7 +643,8 @@ fn note_tool() -> ToolDefinition {
                 "force_cross_project": {"type": "boolean", "description": "Force cross-project propagation even when coupling < 0.2 (get_propagated, default false)"},
                 "limit": {"type": "integer", "description": "Max items"},
                 "offset": {"type": "integer", "description": "Skip items"},
-                "temperature": {"type": "number", "description": "Thermal noise 0.0-1.0 for stochastic exploration (search_semantic, default 0 = deterministic)"}
+                "temperature": {"type": "number", "description": "Thermal noise 0.0-1.0 for stochastic exploration (search_semantic, default 0 = deterministic)"},
+                "trigger": {"type": "string", "description": "Transition trigger to fire on the RFC's protocol run (advance_rfc)"}
             })),
             required: Some(vec!["action".to_string()]),
         },
@@ -1019,13 +1020,13 @@ fn skill_tool() -> ToolDefinition {
 fn protocol_tool() -> ToolDefinition {
     ToolDefinition {
         name: "protocol".to_string(),
-        description: "Manage protocols (Pattern Federation FSMs). Actions: list, create, get, update, delete, add_state, delete_state, list_states, add_transition, delete_transition, list_transitions, link_to_skill, start_run, get_run, list_runs, transition, cancel_run, fail_run, report_progress, delete_run, route, compose, simulate".to_string(),
+        description: "Manage protocols (Pattern Federation FSMs). Actions: list, create, get, update, delete, add_state, delete_state, list_states, add_transition, delete_transition, list_transitions, link_to_skill, start_run, get_run, list_runs, transition, cancel_run, fail_run, report_progress, delete_run, route, compose, simulate, get_run_tree, get_run_children".to_string(),
         input_schema: InputSchema {
             schema_type: "object".to_string(),
             properties: Some(json!({
                 "action": {
                     "type": "string",
-                    "enum": ["list", "create", "get", "update", "delete", "add_state", "delete_state", "list_states", "add_transition", "delete_transition", "list_transitions", "link_to_skill", "start_run", "get_run", "list_runs", "transition", "cancel_run", "fail_run", "report_progress", "delete_run", "route", "compose", "simulate"],
+                    "enum": ["list", "create", "get", "update", "delete", "add_state", "delete_state", "list_states", "add_transition", "delete_transition", "list_transitions", "link_to_skill", "start_run", "get_run", "list_runs", "transition", "cancel_run", "fail_run", "report_progress", "delete_run", "route", "compose", "simulate", "get_run_tree", "get_run_children"],
                     "description": "Operation to perform"
                 },
                 "protocol_id": {"type": "string", "description": "Protocol UUID (get/update/delete/add_state/delete_state/list_states/add_transition/delete_transition/list_transitions/link_to_skill/start_run/list_runs)"},
@@ -1051,6 +1052,7 @@ fn protocol_tool() -> ToolDefinition {
                 "elapsed_ms": {"type": "integer", "description": "Milliseconds elapsed since state entry (report_progress)"},
                 "plan_id": {"type": "string", "description": "Plan UUID (start_run — optional context)"},
                 "task_id": {"type": "string", "description": "Task UUID (start_run — optional context)"},
+                "parent_run_id": {"type": "string", "description": "Parent run UUID for hierarchical execution (start_run — creates CHILD_OF relation, depth = parent.depth + 1)"},
                 "error": {"type": "string", "description": "Error message (fail_run)"},
                 "status": {"type": "string", "description": "Status filter (list_runs): running, completed, failed, cancelled"},
                 "states": {

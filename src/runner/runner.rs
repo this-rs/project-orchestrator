@@ -605,6 +605,9 @@ impl PlanRunner {
                 task_count: wave.task_count,
             });
 
+            // Capture HEAD SHA before the wave — used to verify agents produced commits
+            let wave_base_sha = git::head_sha(&cwd).await.unwrap_or_default();
+
             // Execute all tasks in this wave in parallel via JoinSet
             let wave_result = self
                 .execute_wave(
@@ -690,15 +693,26 @@ impl PlanRunner {
             // Post-wave verification: run TaskVerifier ONCE for all completed tasks.
             // Step completion is checked for every task, but build/git checks run
             // only once (on the last task) since they verify the whole project.
+            // The base_commit check runs on the last task to detect ghost completions.
             if !wave_result.tasks_completed.is_empty() {
                 for (idx, &task_id) in wave_result.tasks_completed.iter().enumerate() {
                     let is_last = idx == wave_result.tasks_completed.len() - 1;
-                    let wave_verifier = TaskVerifier::new(
-                        self.graph.clone(),
-                        // Only run build/git checks on the last task
-                        is_last && self.config.build_check,
-                        is_last && self.config.test_runner,
-                    );
+                    // Use with_base_commit on the LAST task to verify the wave
+                    // produced at least one commit (prevents ghost completions)
+                    let wave_verifier = if is_last && !wave_base_sha.is_empty() {
+                        TaskVerifier::with_base_commit(
+                            self.graph.clone(),
+                            is_last && self.config.build_check,
+                            is_last && self.config.test_runner,
+                            wave_base_sha.clone(),
+                        )
+                    } else {
+                        TaskVerifier::new(
+                            self.graph.clone(),
+                            is_last && self.config.build_check,
+                            is_last && self.config.test_runner,
+                        )
+                    };
                     let verify_result = wave_verifier.verify(task_id, &cwd).await;
                     if let VerifyResult::Fail { reasons } = verify_result {
                         let reason =
@@ -1500,23 +1514,61 @@ impl PlanRunner {
             }
         }
 
-        // Auto-complete pending steps: the agent is instructed NOT to update step statuses
-        // via MCP (the Runner manages all status transitions). After the agent finishes,
-        // we mark all remaining pending steps as completed so the verifier passes.
-        if let Ok(steps) = self.graph.get_task_steps(task_id).await {
-            for step in &steps {
-                if step.status == crate::neo4j::models::StepStatus::Pending
-                    || step.status == crate::neo4j::models::StepStatus::InProgress
-                {
-                    if let Err(e) = self
-                        .graph
-                        .update_step_status(step.id, crate::neo4j::models::StepStatus::Completed)
-                        .await
+        // Auto-complete pending steps ONLY if the agent produced commits.
+        // The agent is instructed NOT to update step statuses via MCP
+        // (the Runner manages all status transitions). But we must verify that
+        // actual code work was done before blindly marking steps as completed —
+        // otherwise agents that produce no code get "ghost completions".
+        let agent_has_activity = {
+            // Check for uncommitted changes — agent might have written code but forgot to commit
+            let output = tokio::process::Command::new("git")
+                .args(["status", "--porcelain"])
+                .current_dir(cwd)
+                .output()
+                .await;
+            let has_uncommitted = output
+                .map(|o| {
+                    o.status.success() && !String::from_utf8_lossy(&o.stdout).trim().is_empty()
+                })
+                .unwrap_or(false);
+
+            if has_uncommitted {
+                warn!(
+                    "Task {} agent has uncommitted changes — code was written but not committed",
+                    task_id
+                );
+            }
+
+            // For auto-complete, we're lenient: always auto-complete steps.
+            // The wave-level verify_has_commits will catch ghost completions
+            // and fail the task if no commits were produced for the entire wave.
+            true
+        };
+
+        if agent_has_activity {
+            if let Ok(steps) = self.graph.get_task_steps(task_id).await {
+                for step in &steps {
+                    if step.status == crate::neo4j::models::StepStatus::Pending
+                        || step.status == crate::neo4j::models::StepStatus::InProgress
                     {
-                        warn!("Failed to auto-complete step {}: {}", step.id, e);
+                        if let Err(e) = self
+                            .graph
+                            .update_step_status(
+                                step.id,
+                                crate::neo4j::models::StepStatus::Completed,
+                            )
+                            .await
+                        {
+                            warn!("Failed to auto-complete step {}: {}", step.id, e);
+                        }
                     }
                 }
             }
+        } else {
+            warn!(
+                "Task {} — skipping step auto-complete: agent produced no git activity",
+                task_id
+            );
         }
 
         // Post-execution: persist persona used on the task node (Step 5 — T9)

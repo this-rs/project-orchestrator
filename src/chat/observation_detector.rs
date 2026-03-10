@@ -45,6 +45,8 @@ enum ObservationCategory {
     Convention,
     Gotcha,
     Pattern,
+    /// RFC proposal — architectural discussion worth formalizing
+    Rfc,
 }
 
 impl ObservationCategory {
@@ -54,6 +56,7 @@ impl ObservationCategory {
             Self::Convention => "guideline",
             Self::Gotcha => "gotcha",
             Self::Pattern => "pattern",
+            Self::Rfc => "rfc",
         }
     }
 
@@ -63,6 +66,7 @@ impl ObservationCategory {
             Self::Convention => "high",
             Self::Gotcha => "critical",
             Self::Pattern => "medium",
+            Self::Rfc => "high",
         }
     }
 
@@ -72,6 +76,7 @@ impl ObservationCategory {
             Self::Convention => 0.80,
             Self::Gotcha => 0.90,
             Self::Pattern => 0.82,
+            Self::Rfc => 0.75,
         }
     }
 }
@@ -164,6 +169,38 @@ static OBSERVATION_PATTERNS: LazyLock<Vec<PatternRule>> = LazyLock::new(|| {
             category: ObservationCategory::Pattern,
             weight: 0.95,
         },
+        // === RFC Proposals (direct — high confidence) ===
+        PatternRule {
+            regex: Regex::new(r"(?i)\bRFC\b\s*[:\-—]").unwrap(),
+            category: ObservationCategory::Rfc,
+            weight: 1.15, // 0.75 * 1.15 ≈ 0.86
+        },
+        PatternRule {
+            regex: Regex::new(r"(?i)(?:I\s+propose|we\s+should\s+consider|architecture\s+question|architectural\s+proposal)").unwrap(),
+            category: ObservationCategory::Rfc,
+            weight: 1.10, // 0.75 * 1.10 ≈ 0.83
+        },
+        PatternRule {
+            regex: Regex::new(r"(?i)(?:proposition\s+(?:architecturale|technique)|proposition\s*[:\-—])").unwrap(),
+            category: ObservationCategory::Rfc,
+            weight: 1.10,
+        },
+        // === RFC Proposals (indirect — lower confidence) ===
+        PatternRule {
+            regex: Regex::new(r"(?i)(?:on\s+devrait|il\s+faudrait|il\s+manque\s+un)").unwrap(),
+            category: ObservationCategory::Rfc,
+            weight: 1.07, // 0.75 * 1.07 ≈ 0.80 (just at threshold)
+        },
+        PatternRule {
+            regex: Regex::new(r"(?i)(?:we\s+should|we\s+need\s+to\s+(?:rethink|redesign|refactor)|how\s+would\s+you\s+structure)").unwrap(),
+            category: ObservationCategory::Rfc,
+            weight: 1.07,
+        },
+        PatternRule {
+            regex: Regex::new(r"(?i)(?:comment\s+tu\s+structurerais|il\s+faudrait\s+repenser|on\s+pourrait\s+(?:envisager|concevoir))").unwrap(),
+            category: ObservationCategory::Rfc,
+            weight: 1.07,
+        },
     ]
 });
 
@@ -251,9 +288,82 @@ fn build_suggestion(context: &str, category: ObservationCategory) -> String {
         ObservationCategory::Convention => "**Convention**: ",
         ObservationCategory::Gotcha => "**Gotcha**: ",
         ObservationCategory::Pattern => "**Pattern**: ",
+        ObservationCategory::Rfc => "**RFC Proposal**: ",
     };
 
     format!("{}{}", prefix, context)
+}
+
+// ============================================================================
+// RFC Accumulator
+// ============================================================================
+
+/// Tracks consecutive RFC-related observations to avoid creating notes
+/// from a single offhand mention. Only suggests note creation when
+/// 2+ responses in a conversation contain RFC-qualifying patterns.
+#[derive(Debug)]
+pub struct RfcAccumulator {
+    /// Number of consecutive responses with RFC observations
+    pub consecutive_count: u32,
+    /// Accumulated context from multiple responses
+    pub accumulated_context: Vec<String>,
+    /// The threshold for triggering RFC creation (default: 2)
+    pub threshold: u32,
+}
+
+impl Default for RfcAccumulator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RfcAccumulator {
+    pub fn new() -> Self {
+        Self {
+            consecutive_count: 0,
+            accumulated_context: Vec::new(),
+            threshold: 2,
+        }
+    }
+
+    /// Feed a response observation result.
+    /// Returns `Some(accumulated_content)` if the threshold is reached.
+    pub fn feed(&mut self, observation: Option<&DetectedObservation>) -> Option<String> {
+        match observation {
+            Some(obs) if obs.note_type == "rfc" => {
+                self.consecutive_count += 1;
+                self.accumulated_context.push(obs.context_excerpt.clone());
+
+                if self.consecutive_count >= self.threshold {
+                    // Build accumulated RFC content
+                    let content = self.build_rfc_content();
+                    Some(content)
+                } else {
+                    None
+                }
+            }
+            _ => {
+                // Non-RFC response breaks the streak
+                self.reset();
+                None
+            }
+        }
+    }
+
+    /// Reset the accumulator
+    pub fn reset(&mut self) {
+        self.consecutive_count = 0;
+        self.accumulated_context.clear();
+    }
+
+    /// Build RFC note content from accumulated context
+    fn build_rfc_content(&self) -> String {
+        let contexts = self.accumulated_context.join("\n\n---\n\n");
+        format!(
+            "## Problem\n\n{}\n\n## Proposed Solution\n\n_To be filled based on discussion above._\n\n## Context\n\nAuto-detected from {} consecutive architectural discussions.",
+            contexts, self.consecutive_count
+        )
+    }
 }
 
 // ============================================================================
@@ -381,6 +491,64 @@ mod tests {
         assert!(viz.data.get("note_type").is_some());
     }
 
+    // === RFC detection tests ===
+
+    #[test]
+    fn test_detect_rfc_direct_en() {
+        let text = "RFC: We need a centralized event bus for inter-service communication. Currently each service has its own ad-hoc notification mechanism which creates tight coupling.";
+        let obs = detect_observations(text);
+        assert!(obs.is_some());
+        let obs = obs.unwrap();
+        assert_eq!(obs.note_type, "rfc");
+        assert_eq!(obs.importance, "high");
+        assert!(obs.confidence >= CONFIDENCE_THRESHOLD);
+    }
+
+    #[test]
+    fn test_detect_rfc_proposal_en() {
+        let text = "I propose we restructure the protocol module to separate the engine from the hooks. This would make testing much easier and reduce coupling between components.";
+        let obs = detect_observations(text);
+        assert!(obs.is_some());
+        let obs = obs.unwrap();
+        assert_eq!(obs.note_type, "rfc");
+    }
+
+    #[test]
+    fn test_detect_rfc_direct_fr() {
+        let text = "Proposition architecturale: on devrait séparer le graph store en deux traits distincts — un pour les lectures et un pour les écritures, comme le pattern CQRS.";
+        let obs = detect_observations(text);
+        assert!(obs.is_some());
+        let obs = obs.unwrap();
+        assert_eq!(obs.note_type, "rfc");
+    }
+
+    #[test]
+    fn test_detect_rfc_indirect_fr() {
+        let text = "Il faudrait repenser la façon dont les events sont propagés. Le système actuel de broadcast est trop simple pour gérer les cas de retry et les dead letters.";
+        let obs = detect_observations(text);
+        assert!(obs.is_some());
+        let obs = obs.unwrap();
+        assert_eq!(obs.note_type, "rfc");
+    }
+
+    #[test]
+    fn test_detect_rfc_indirect_en() {
+        let text = "We should rethink how the knowledge fabric handles cross-project notes. The current approach doesn't scale well when there are more than 10 projects in a workspace.";
+        let obs = detect_observations(text);
+        assert!(obs.is_some());
+        let obs = obs.unwrap();
+        assert_eq!(obs.note_type, "rfc");
+    }
+
+    #[test]
+    fn test_no_rfc_false_positive() {
+        // Normal code discussion, not an architectural proposal
+        let text = "I've added the missing import and fixed the test. The function now returns the correct value when called with empty input.";
+        let obs = detect_observations(text);
+        // Should not detect an RFC
+        assert!(obs.is_none() || obs.unwrap().note_type != "rfc");
+    }
+
     #[test]
     fn test_max_one_observation() {
         // Text with multiple patterns — should only return the highest confidence one
@@ -395,5 +563,88 @@ mod tests {
         let text = "First sentence. The root cause was a bug. Last sentence here.";
         let context = extract_context(text, 16, 40, 300);
         assert!(context.contains("root cause"));
+    }
+
+    // === RFC Accumulator tests ===
+
+    #[test]
+    fn test_rfc_accumulator_threshold() {
+        let mut acc = RfcAccumulator::new();
+
+        let rfc_obs = DetectedObservation {
+            note_type: "rfc".to_string(),
+            confidence: 0.85,
+            trigger_pattern: "I propose".to_string(),
+            context_excerpt: "I propose we restructure the module".to_string(),
+            suggested_content: "**RFC Proposal**: I propose we restructure the module".to_string(),
+            importance: "high".to_string(),
+        };
+
+        // First RFC observation — not enough
+        assert!(acc.feed(Some(&rfc_obs)).is_none());
+        assert_eq!(acc.consecutive_count, 1);
+
+        // Second RFC observation — threshold reached
+        let result = acc.feed(Some(&rfc_obs));
+        assert!(result.is_some());
+        let content = result.unwrap();
+        assert!(content.contains("## Problem"));
+        assert!(content.contains("## Proposed Solution"));
+    }
+
+    #[test]
+    fn test_rfc_accumulator_reset_on_non_rfc() {
+        let mut acc = RfcAccumulator::new();
+
+        let rfc_obs = DetectedObservation {
+            note_type: "rfc".to_string(),
+            confidence: 0.85,
+            trigger_pattern: "we should".to_string(),
+            context_excerpt: "We should consider a new approach".to_string(),
+            suggested_content: "content".to_string(),
+            importance: "high".to_string(),
+        };
+
+        let non_rfc_obs = DetectedObservation {
+            note_type: "gotcha".to_string(),
+            confidence: 0.90,
+            trigger_pattern: "watch out".to_string(),
+            context_excerpt: "Watch out for this".to_string(),
+            suggested_content: "content".to_string(),
+            importance: "critical".to_string(),
+        };
+
+        // First RFC
+        assert!(acc.feed(Some(&rfc_obs)).is_none());
+        assert_eq!(acc.consecutive_count, 1);
+
+        // Non-RFC breaks streak
+        assert!(acc.feed(Some(&non_rfc_obs)).is_none());
+        assert_eq!(acc.consecutive_count, 0);
+
+        // RFC again — count starts from 1
+        assert!(acc.feed(Some(&rfc_obs)).is_none());
+        assert_eq!(acc.consecutive_count, 1);
+    }
+
+    #[test]
+    fn test_rfc_accumulator_none_resets() {
+        let mut acc = RfcAccumulator::new();
+
+        let rfc_obs = DetectedObservation {
+            note_type: "rfc".to_string(),
+            confidence: 0.85,
+            trigger_pattern: "RFC:".to_string(),
+            context_excerpt: "RFC: new event bus".to_string(),
+            suggested_content: "content".to_string(),
+            importance: "high".to_string(),
+        };
+
+        acc.feed(Some(&rfc_obs));
+        assert_eq!(acc.consecutive_count, 1);
+
+        // None observation (no match) resets
+        acc.feed(None);
+        assert_eq!(acc.consecutive_count, 0);
     }
 }

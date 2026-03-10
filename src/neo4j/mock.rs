@@ -139,6 +139,7 @@ pub struct MockGraphStore {
     pub protocol_states: RwLock<HashMap<Uuid, crate::protocol::ProtocolState>>,
     pub protocol_transitions: RwLock<HashMap<Uuid, crate::protocol::ProtocolTransition>>,
     pub protocol_runs: RwLock<HashMap<Uuid, crate::protocol::ProtocolRun>>,
+    pub runtime_states: RwLock<HashMap<Uuid, crate::protocol::RuntimeState>>,
 
     // Registry (published skills)
     pub published_skills: RwLock<HashMap<Uuid, crate::skills::registry::PublishedSkill>>,
@@ -236,6 +237,7 @@ impl MockGraphStore {
             protocol_states: RwLock::new(HashMap::new()),
             protocol_transitions: RwLock::new(HashMap::new()),
             protocol_runs: RwLock::new(HashMap::new()),
+            runtime_states: RwLock::new(HashMap::new()),
             published_skills: RwLock::new(HashMap::new()),
             analysis_profiles: RwLock::new(HashMap::new()),
             topology_rules: RwLock::new(HashMap::new()),
@@ -8956,14 +8958,19 @@ impl GraphStore for MockGraphStore {
         // Atomic concurrency guard: reject if a Running run already exists
         // for this protocol. Check and insert happen within the same write
         // lock, so there's no TOCTOU window.
-        let has_running = store.values().any(|r| {
-            r.protocol_id == run.protocol_id && r.status == crate::protocol::RunStatus::Running
-        });
-        if has_running {
-            anyhow::bail!(
-                "Skipped: concurrent run already running for protocol {}",
-                run.protocol_id
-            );
+        // Child runs (with parent_run_id) are exempt — the parent manages exclusion.
+        if run.parent_run_id.is_none() {
+            let has_running = store.values().any(|r| {
+                r.protocol_id == run.protocol_id
+                    && r.status == crate::protocol::RunStatus::Running
+                    && r.parent_run_id.is_none()
+            });
+            if has_running {
+                anyhow::bail!(
+                    "Skipped: concurrent run already running for protocol {}",
+                    run.protocol_id
+                );
+            }
         }
 
         store.insert(run.id, run.clone());
@@ -9008,8 +9015,111 @@ impl GraphStore for MockGraphStore {
         Ok((page, total))
     }
 
+    async fn list_child_runs(
+        &self,
+        parent_run_id: Uuid,
+    ) -> anyhow::Result<Vec<crate::protocol::ProtocolRun>> {
+        let store = self.protocol_runs.read().await;
+        let mut children: Vec<_> = store
+            .values()
+            .filter(|r| r.parent_run_id == Some(parent_run_id))
+            .cloned()
+            .collect();
+        children.sort_by(|a, b| a.started_at.cmp(&b.started_at));
+        Ok(children)
+    }
+
+    async fn count_child_runs(&self, parent_run_id: Uuid) -> anyhow::Result<usize> {
+        let store = self.protocol_runs.read().await;
+        Ok(store
+            .values()
+            .filter(|r| r.parent_run_id == Some(parent_run_id))
+            .count())
+    }
+
+    async fn get_run_tree(
+        &self,
+        root_run_id: Uuid,
+    ) -> anyhow::Result<Vec<crate::protocol::ProtocolRun>> {
+        let store = self.protocol_runs.read().await;
+
+        // Check root exists
+        let root = store.get(&root_run_id).cloned();
+        let Some(root) = root else {
+            return Ok(vec![]);
+        };
+
+        // BFS to collect all descendants (depth limit 5)
+        let mut result = vec![root];
+        let mut current_parents = vec![root_run_id];
+        for _depth in 0..5 {
+            let children: Vec<_> = store
+                .values()
+                .filter(|r| {
+                    r.parent_run_id
+                        .is_some_and(|pid| current_parents.contains(&pid))
+                })
+                .cloned()
+                .collect();
+            if children.is_empty() {
+                break;
+            }
+            current_parents = children.iter().map(|r| r.id).collect();
+            result.extend(children);
+        }
+
+        // Sort by depth then started_at
+        result.sort_by(|a, b| a.depth.cmp(&b.depth).then(a.started_at.cmp(&b.started_at)));
+        Ok(result)
+    }
+
     async fn delete_protocol_run(&self, run_id: Uuid) -> anyhow::Result<bool> {
-        Ok(self.protocol_runs.write().await.remove(&run_id).is_some())
+        let existed = self.protocol_runs.write().await.remove(&run_id).is_some();
+        if existed {
+            // Cascade delete runtime states for this run
+            self.runtime_states
+                .write()
+                .await
+                .retain(|_, rs| rs.run_id != run_id);
+        }
+        Ok(existed)
+    }
+
+    // ========================================================================
+    // RuntimeState operations (Generator-produced dynamic states)
+    // ========================================================================
+
+    async fn create_runtime_state(
+        &self,
+        state: &crate::protocol::RuntimeState,
+    ) -> anyhow::Result<()> {
+        self.runtime_states
+            .write()
+            .await
+            .insert(state.id, state.clone());
+        Ok(())
+    }
+
+    async fn get_runtime_states(
+        &self,
+        run_id: Uuid,
+    ) -> anyhow::Result<Vec<crate::protocol::RuntimeState>> {
+        let store = self.runtime_states.read().await;
+        let mut states: Vec<_> = store
+            .values()
+            .filter(|rs| rs.run_id == run_id)
+            .cloned()
+            .collect();
+        states.sort_by_key(|rs| rs.index);
+        Ok(states)
+    }
+
+    async fn delete_runtime_states(&self, run_id: Uuid) -> anyhow::Result<()> {
+        self.runtime_states
+            .write()
+            .await
+            .retain(|_, rs| rs.run_id != run_id);
+        Ok(())
     }
 
     // SI — System Inference: audit knowledge gaps

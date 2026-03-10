@@ -503,6 +503,10 @@ async fn import_protocols(
                 description: portable_state.description.clone(),
                 action: portable_state.action.clone(),
                 state_type,
+                sub_protocol_id: None,
+                completion_strategy: None,
+                on_failure_strategy: None,
+                generator_config: None,
             };
 
             if state_type == StateType::Start {
@@ -1208,6 +1212,10 @@ mod tests {
             description: "Start state".to_string(),
             action: Some("do_something".to_string()),
             state_type: StateType::Start,
+            sub_protocol_id: None,
+            completion_strategy: None,
+            on_failure_strategy: None,
+            generator_config: None,
         };
         let s2 = crate::protocol::ProtocolState {
             id: end_state_id,
@@ -1216,6 +1224,10 @@ mod tests {
             description: "End state".to_string(),
             action: None,
             state_type: StateType::Terminal,
+            sub_protocol_id: None,
+            completion_strategy: None,
+            on_failure_strategy: None,
+            generator_config: None,
         };
         store.upsert_protocol_state(&s1).await.unwrap();
         store.upsert_protocol_state(&s2).await.unwrap();

@@ -17,8 +17,11 @@ use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::chat::entity_extractor::{extract_entities, validate_entities, ValidatedEntity};
-use crate::chat::observation_detector::{detect_observations, DetectedObservation};
+use crate::chat::observation_detector::{detect_observations, DetectedObservation, RfcAccumulator};
+use crate::events::EventEmitter;
+use crate::meilisearch::SearchStore;
 use crate::neo4j::traits::GraphStore;
+use crate::notes::models::{Note, NoteImportance, NoteType};
 
 // ============================================================================
 // Types
@@ -277,6 +280,166 @@ fn resolve_entity_id(entity: &ValidatedEntity) -> String {
     }
 }
 
+// ============================================================================
+// RFC Auto-Creation (conversation intelligence)
+// ============================================================================
+
+/// Similarity threshold for RFC deduplication.
+/// If an existing RFC note scores above this, skip creation.
+const RFC_DEDUP_SIMILARITY_THRESHOLD: f64 = 0.85;
+
+/// Process an observation through the RFC accumulator.
+///
+/// When the accumulator threshold is reached (2+ consecutive RFC observations):
+/// 1. Builds RFC content from accumulated context
+/// 2. Checks for duplicate RFC notes via search (similarity > 0.85 → skip)
+/// 3. Creates the RFC note in the graph store
+///
+/// Returns `true` if a new RFC note was created.
+pub async fn process_rfc_observation(
+    observation: Option<&DetectedObservation>,
+    accumulator: &Arc<Mutex<RfcAccumulator>>,
+    graph: &Arc<dyn GraphStore>,
+    search: &Arc<dyn SearchStore>,
+    project_id: Option<Uuid>,
+    session_id: Option<Uuid>,
+    event_emitter: Option<&Arc<dyn EventEmitter>>,
+) -> bool {
+    let rfc_content = {
+        let mut acc = accumulator.lock().await;
+        acc.feed(observation)
+    };
+
+    let Some(content) = rfc_content else {
+        return false;
+    };
+
+    debug!("[feedback] RFC accumulator triggered, checking for duplicates");
+
+    // Deduplication: search existing RFC notes for similarity
+    let first_line = content.lines().nth(2).unwrap_or(&content);
+    let search_query = if first_line.len() > 100 {
+        &first_line[..100]
+    } else {
+        first_line
+    };
+
+    match search
+        .search_notes_with_scores(search_query, 3, None, Some("rfc"), None, None)
+        .await
+    {
+        Ok(hits) => {
+            if let Some(hit) = hits.first() {
+                if hit.score > RFC_DEDUP_SIMILARITY_THRESHOLD {
+                    debug!(
+                        "[feedback] RFC dedup: found similar note '{}' (score: {:.3}), skipping creation",
+                        hit.document.id, hit.score
+                    );
+                    // Reset accumulator after dedup skip to avoid re-triggering
+                    let mut acc = accumulator.lock().await;
+                    acc.reset();
+                    return false;
+                }
+            }
+        }
+        Err(e) => {
+            warn!(
+                "[feedback] RFC dedup search failed: {} — proceeding with creation",
+                e
+            );
+        }
+    }
+
+    // Create the RFC note
+    let mut note = Note::new(
+        project_id,
+        NoteType::Rfc,
+        content,
+        "system/rfc-detector".to_string(),
+    );
+    note.importance = NoteImportance::High;
+    note.tags = vec!["auto-detected".to_string(), "rfc".to_string()];
+
+    match graph.create_note(&note).await {
+        Ok(()) => {
+            debug!(
+                "[feedback] Created RFC note {} from accumulated observations",
+                note.id
+            );
+
+            // Entity linking: link RFC note to entities discussed in this session
+            if let Some(sid) = session_id {
+                match graph.get_session_entities(sid, project_id).await {
+                    Ok(entities) => {
+                        for entity in &entities {
+                            if let Ok(etype) = entity
+                                .entity_type
+                                .parse::<crate::notes::models::EntityType>()
+                            {
+                                if let Err(e) = graph
+                                    .link_note_to_entity(
+                                        note.id,
+                                        &etype,
+                                        &entity.entity_id,
+                                        None,
+                                        None,
+                                    )
+                                    .await
+                                {
+                                    debug!(
+                                        "[feedback] Failed to link RFC note to {}/{}: {}",
+                                        entity.entity_type, entity.entity_id, e
+                                    );
+                                }
+                            }
+                        }
+                        if !entities.is_empty() {
+                            debug!(
+                                "[feedback] Linked RFC note {} to {} discussed entities",
+                                note.id,
+                                entities.len()
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        debug!(
+                            "[feedback] Failed to get session entities for linking: {}",
+                            e
+                        );
+                    }
+                }
+            }
+
+            // Emit WS event: note.created
+            if let Some(emitter) = event_emitter {
+                emitter.emit_created(
+                    crate::events::EntityType::Note,
+                    &note.id.to_string(),
+                    serde_json::json!({
+                        "note_type": "rfc",
+                        "importance": "high",
+                        "source": "system/rfc-detector",
+                    }),
+                    project_id.map(|pid| pid.to_string()),
+                );
+                debug!(
+                    "[feedback] Emitted note.created WS event for RFC note {}",
+                    note.id
+                );
+            }
+
+            // Reset accumulator after successful creation
+            let mut acc = accumulator.lock().await;
+            acc.reset();
+            true
+        }
+        Err(e) => {
+            warn!("[feedback] Failed to create RFC note: {} — non-blocking", e);
+            false
+        }
+    }
+}
+
 /// Convenience function to spawn async feedback processing.
 ///
 /// Call this after each LLM response. It spawns a background task
@@ -298,6 +461,40 @@ pub fn spawn_feedback(
                 "[feedback] Async feedback completed: {} entities in {}ms",
                 count, elapsed
             );
+        }
+    });
+}
+
+/// Spawn async RFC observation processing.
+///
+/// Detects RFC-qualifying patterns in the response text, feeds them to the
+/// session's `RfcAccumulator`, and auto-creates an RFC draft note when the
+/// threshold is reached (2+ consecutive architectural discussions).
+///
+/// Includes deduplication: skips creation if a similar RFC note already exists.
+pub fn spawn_rfc_processing(
+    graph: Arc<dyn GraphStore>,
+    search: Arc<dyn SearchStore>,
+    project_id: Option<Uuid>,
+    response_text: String,
+    rfc_accumulator: Arc<Mutex<RfcAccumulator>>,
+    session_id: Option<Uuid>,
+    event_emitter: Option<Arc<dyn EventEmitter>>,
+) {
+    tokio::spawn(async move {
+        let observation = detect_response_observations(&response_text);
+        let rfc_created = process_rfc_observation(
+            observation.as_ref(),
+            &rfc_accumulator,
+            &graph,
+            &search,
+            project_id,
+            session_id,
+            event_emitter.as_ref(),
+        )
+        .await;
+        if rfc_created {
+            debug!("[feedback] RFC note auto-created from conversation intelligence");
         }
     });
 }
@@ -502,5 +699,258 @@ mod tests {
             file_path: Some("src/chat/prompt.rs".to_string()),
         };
         assert_eq!(resolve_entity_id(&entity), "build_prompt");
+    }
+
+    // ========================================================================
+    // RFC Auto-Creation Tests (T2.2)
+    // ========================================================================
+
+    /// Helper to create an RFC observation
+    fn make_rfc_observation(context: &str) -> DetectedObservation {
+        DetectedObservation {
+            note_type: "rfc".to_string(),
+            confidence: 0.85,
+            trigger_pattern: "I propose".to_string(),
+            context_excerpt: context.to_string(),
+            suggested_content: format!("**RFC Proposal**: {}", context),
+            importance: "high".to_string(),
+        }
+    }
+
+    /// Test: RFC accumulator integration — below threshold, no note created
+    #[tokio::test]
+    async fn test_rfc_processing_below_threshold() {
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let search: Arc<dyn SearchStore> =
+            Arc::new(crate::meilisearch::mock::MockSearchStore::new());
+        let accumulator = Arc::new(Mutex::new(RfcAccumulator::new()));
+
+        let obs = make_rfc_observation("I propose we restructure the module");
+        let created =
+            process_rfc_observation(Some(&obs), &accumulator, &graph, &search, None, None, None)
+                .await;
+
+        assert!(!created, "Should not create note on first observation");
+        let acc = accumulator.lock().await;
+        assert_eq!(acc.consecutive_count, 1);
+    }
+
+    /// Test: RFC accumulator integration — threshold reached, note created
+    #[tokio::test]
+    async fn test_rfc_processing_threshold_creates_note() {
+        let mock_graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let graph: Arc<dyn GraphStore> = mock_graph.clone();
+        let search: Arc<dyn SearchStore> =
+            Arc::new(crate::meilisearch::mock::MockSearchStore::new());
+        let accumulator = Arc::new(Mutex::new(RfcAccumulator::new()));
+
+        let obs1 = make_rfc_observation("I propose we restructure the module");
+        let obs2 = make_rfc_observation("We should also consider a plugin architecture");
+
+        // First observation — no creation
+        let created1 =
+            process_rfc_observation(Some(&obs1), &accumulator, &graph, &search, None, None, None)
+                .await;
+        assert!(!created1);
+
+        // Second observation — threshold reached, note should be created
+        let created2 =
+            process_rfc_observation(Some(&obs2), &accumulator, &graph, &search, None, None, None)
+                .await;
+        assert!(created2, "Should create RFC note when threshold is reached");
+
+        // Verify the note was created in the graph store
+        let notes = mock_graph.notes.read().await;
+        assert_eq!(notes.len(), 1, "Exactly one RFC note should exist");
+        let note = notes.values().next().unwrap();
+        assert_eq!(note.note_type, NoteType::Rfc);
+        assert_eq!(note.importance, NoteImportance::High);
+        assert!(note.tags.contains(&"auto-detected".to_string()));
+        assert!(note.tags.contains(&"rfc".to_string()));
+        assert!(note.content.contains("## Problem"));
+        assert!(note.content.contains("## Proposed Solution"));
+
+        // Accumulator should be reset after creation
+        let acc = accumulator.lock().await;
+        assert_eq!(acc.consecutive_count, 0);
+    }
+
+    /// Test: Non-RFC observation resets accumulator, no note created
+    #[tokio::test]
+    async fn test_rfc_processing_reset_on_non_rfc() {
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let search: Arc<dyn SearchStore> =
+            Arc::new(crate::meilisearch::mock::MockSearchStore::new());
+        let accumulator = Arc::new(Mutex::new(RfcAccumulator::new()));
+
+        let rfc_obs = make_rfc_observation("I propose we restructure the module");
+        let non_rfc_obs = DetectedObservation {
+            note_type: "gotcha".to_string(),
+            confidence: 0.90,
+            trigger_pattern: "watch out".to_string(),
+            context_excerpt: "Watch out for this trap".to_string(),
+            suggested_content: "content".to_string(),
+            importance: "critical".to_string(),
+        };
+
+        // First: RFC observation
+        process_rfc_observation(
+            Some(&rfc_obs),
+            &accumulator,
+            &graph,
+            &search,
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        // Second: non-RFC observation — resets accumulator
+        process_rfc_observation(
+            Some(&non_rfc_obs),
+            &accumulator,
+            &graph,
+            &search,
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        let acc = accumulator.lock().await;
+        assert_eq!(acc.consecutive_count, 0, "Non-RFC should reset counter");
+        drop(acc);
+
+        // Third: RFC again — starts from 1, not threshold
+        let created = process_rfc_observation(
+            Some(&rfc_obs),
+            &accumulator,
+            &graph,
+            &search,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(!created, "Should not create after reset");
+    }
+
+    /// Test: None observation resets accumulator
+    #[tokio::test]
+    async fn test_rfc_processing_none_resets() {
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let search: Arc<dyn SearchStore> =
+            Arc::new(crate::meilisearch::mock::MockSearchStore::new());
+        let accumulator = Arc::new(Mutex::new(RfcAccumulator::new()));
+
+        let rfc_obs = make_rfc_observation("I propose something");
+
+        process_rfc_observation(
+            Some(&rfc_obs),
+            &accumulator,
+            &graph,
+            &search,
+            None,
+            None,
+            None,
+        )
+        .await;
+        process_rfc_observation(None, &accumulator, &graph, &search, None, None, None).await;
+
+        let acc = accumulator.lock().await;
+        assert_eq!(acc.consecutive_count, 0);
+    }
+
+    /// Test: RFC with project_id creates note with correct project
+    #[tokio::test]
+    async fn test_rfc_processing_with_project_id() {
+        let mock_graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let graph: Arc<dyn GraphStore> = mock_graph.clone();
+        let search: Arc<dyn SearchStore> =
+            Arc::new(crate::meilisearch::mock::MockSearchStore::new());
+        let accumulator = Arc::new(Mutex::new(RfcAccumulator::new()));
+        let project_id = Uuid::new_v4();
+
+        let obs = make_rfc_observation("Architectural discussion content");
+
+        // Feed twice to reach threshold
+        process_rfc_observation(
+            Some(&obs),
+            &accumulator,
+            &graph,
+            &search,
+            Some(project_id),
+            None,
+            None,
+        )
+        .await;
+        let created = process_rfc_observation(
+            Some(&obs),
+            &accumulator,
+            &graph,
+            &search,
+            Some(project_id),
+            None,
+            None,
+        )
+        .await;
+        assert!(created);
+
+        let notes = mock_graph.notes.read().await;
+        let note = notes.values().next().unwrap();
+        assert_eq!(note.project_id, Some(project_id));
+    }
+
+    /// E2E: Full pipeline — RFC text detected, accumulated, note created
+    #[tokio::test]
+    async fn test_e2e_rfc_pipeline_full_flow() {
+        let mock_graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let graph: Arc<dyn GraphStore> = mock_graph.clone();
+        let search: Arc<dyn SearchStore> =
+            Arc::new(crate::meilisearch::mock::MockSearchStore::new());
+        let accumulator = Arc::new(Mutex::new(RfcAccumulator::new()));
+
+        // Two consecutive responses with RFC-qualifying text
+        let response1 = "I propose we restructure the protocol module to separate the engine from the hooks. This would make testing much easier.";
+        let response2 = "We should also consider a plugin architecture for the hooks. The current monolithic approach creates tight coupling between components.";
+
+        // Process first response
+        let obs1 = detect_response_observations(response1);
+        assert!(obs1.is_some(), "First response should detect RFC pattern");
+        let created1 = process_rfc_observation(
+            obs1.as_ref(),
+            &accumulator,
+            &graph,
+            &search,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(!created1, "First response should not create note yet");
+
+        // Process second response
+        let obs2 = detect_response_observations(response2);
+        assert!(obs2.is_some(), "Second response should detect RFC pattern");
+        let created2 = process_rfc_observation(
+            obs2.as_ref(),
+            &accumulator,
+            &graph,
+            &search,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(created2, "Second response should trigger note creation");
+
+        // Verify note content
+        let notes = mock_graph.notes.read().await;
+        assert_eq!(notes.len(), 1);
+        let note = notes.values().next().unwrap();
+        assert_eq!(note.note_type, NoteType::Rfc);
+        assert!(note
+            .content
+            .contains("2 consecutive architectural discussions"));
     }
 }

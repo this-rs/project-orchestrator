@@ -225,6 +225,9 @@ impl ToolHandler {
             ("note", "get_propagated_knowledge") => "get_propagated_knowledge",
             ("note", "get_context_knowledge") => "get_context_knowledge",
             ("note", "get_entity") => "get_entity_notes",
+            ("note", "list_rfcs") => "list_rfcs",
+            ("note", "advance_rfc") => "advance_rfc",
+            ("note", "get_rfc_status") => "get_rfc_status",
 
             // Workspace
             ("workspace", "list") => "list_workspaces",
@@ -387,6 +390,8 @@ impl ToolHandler {
             ("protocol", "route") => "route_protocols",
             ("protocol", "compose") => "compose_protocol",
             ("protocol", "simulate") => "simulate_protocol",
+            ("protocol", "get_run_tree") => "get_protocol_run_tree",
+            ("protocol", "get_run_children") => "get_protocol_run_children",
 
             // Reasoning Tree
             ("reasoning", "reason") => "reason",
@@ -2159,6 +2164,98 @@ impl ToolHandler {
                         .await?
                 };
                 Ok(Some(result))
+            }
+
+            // --- RFC convenience (3) ---
+            "list_rfcs" => {
+                // Proxy to list_notes with note_type=rfc
+                let mut query = vec![("note_type".to_string(), "rfc".to_string())];
+                if let Some(v) = args.get("project_id").and_then(|v| v.as_str()) {
+                    query.push(("project_id".to_string(), v.to_string()));
+                }
+                if let Some(v) = args.get("status").and_then(|v| v.as_str()) {
+                    query.push(("status".to_string(), v.to_string()));
+                }
+                if let Some(v) = args.get("limit").and_then(|v| v.as_i64()) {
+                    query.push(("limit".to_string(), v.to_string()));
+                }
+                if let Some(v) = args.get("offset").and_then(|v| v.as_i64()) {
+                    query.push(("offset".to_string(), v.to_string()));
+                }
+                let result = http.get_with_query("/api/notes", &query).await?;
+                Ok(Some(result))
+            }
+
+            "advance_rfc" => {
+                // Get note → extract rfc-run:UUID tag → fire transition
+                let note_id = extract_id(args, "note_id")?;
+                let trigger = extract_string(args, "trigger")?;
+
+                // 1. Get the note to find the run ID from tags
+                let note = http.get(&format!("/api/notes/{}", note_id)).await?;
+                let tags = note
+                    .get("tags")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                let run_id = tags
+                    .iter()
+                    .filter_map(|t| t.as_str())
+                    .find(|t| t.starts_with("rfc-run:"))
+                    .map(|t| t.trim_start_matches("rfc-run:").to_string())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Note {} has no rfc-run:UUID tag — not an RFC with a lifecycle run",
+                            note_id
+                        )
+                    })?;
+
+                // 2. Fire transition on the run
+                let body = json!({"trigger": trigger});
+                let result = http
+                    .post(&format!("/api/protocols/runs/{}/transition", run_id), &body)
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "get_rfc_status" => {
+                // Get note → extract rfc-run:UUID → get run details
+                let note_id = extract_id(args, "note_id")?;
+
+                // 1. Get the note
+                let note = http.get(&format!("/api/notes/{}", note_id)).await?;
+                let tags = note
+                    .get("tags")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                let run_id = tags
+                    .iter()
+                    .filter_map(|t| t.as_str())
+                    .find(|t| t.starts_with("rfc-run:"))
+                    .map(|t| t.trim_start_matches("rfc-run:").to_string());
+
+                if let Some(run_id) = run_id {
+                    // 2. Get the run (enriched with children_count)
+                    let run = http.get(&format!("/api/protocols/runs/{}", run_id)).await?;
+                    Ok(Some(json!({
+                        "note_id": note_id.to_string(),
+                        "note_type": note.get("note_type"),
+                        "content_preview": note.get("content").and_then(|c| c.as_str()).map(|c| {
+                            if c.len() > 200 { format!("{}...", &c[..200]) } else { c.to_string() }
+                        }),
+                        "rfc_run": run,
+                        "tags": note.get("tags"),
+                    })))
+                } else {
+                    Ok(Some(json!({
+                        "note_id": note_id.to_string(),
+                        "note_type": note.get("note_type"),
+                        "rfc_run": null,
+                        "message": "No rfc-lifecycle run associated with this note",
+                        "tags": note.get("tags"),
+                    })))
+                }
             }
 
             // --- Admin (5) ---
@@ -4273,6 +4370,9 @@ impl ToolHandler {
                 if let Some(v) = args.get("task_id") {
                     body.insert("task_id".to_string(), v.clone());
                 }
+                if let Some(v) = args.get("parent_run_id") {
+                    body.insert("parent_run_id".to_string(), v.clone());
+                }
                 let result = http
                     .post(
                         &format!("/api/protocols/{}/runs", protocol_id),
@@ -4375,6 +4475,23 @@ impl ToolHandler {
                 } else {
                     result
                 }))
+            }
+
+            // ── Protocol Hierarchy (2 tools) ────────────────────
+            "get_protocol_run_tree" => {
+                let run_id = extract_id(args, "run_id")?;
+                let result = http
+                    .get(&format!("/api/protocols/runs/{}/tree", run_id))
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "get_protocol_run_children" => {
+                let run_id = extract_id(args, "run_id")?;
+                let result = http
+                    .get(&format!("/api/protocols/runs/{}/children", run_id))
+                    .await?;
+                Ok(Some(result))
             }
 
             "route_protocols" => {

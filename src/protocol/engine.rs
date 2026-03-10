@@ -19,9 +19,16 @@
 //! 5. Only `Running` runs can accept transitions
 
 use crate::neo4j::traits::GraphStore;
-use crate::protocol::{ProtocolRun, RunStatus, TransitionResult};
+use crate::protocol::{
+    ChildCompletionInfo, CompletionStrategy, OnFailureStrategy, ProtocolRun, RunStatus, StateType,
+    TransitionResult,
+};
 use anyhow::{bail, Context, Result};
 use uuid::Uuid;
+
+/// Maximum nesting depth for hierarchical protocol runs.
+/// Prevents infinite recursion when protocols reference each other.
+const MAX_HIERARCHY_DEPTH: u32 = 5;
 
 /// Start a new protocol run.
 ///
@@ -102,20 +109,123 @@ pub async fn start_run(
     Ok(run)
 }
 
+/// Start a child run for hierarchical protocol execution.
+///
+/// Creates a `ProtocolRun` linked to a parent run via `parent_run_id`.
+/// The child run inherits the parent's `plan_id` and `task_id`.
+///
+/// # Hierarchy Safety
+/// - Depth is `parent.depth + 1`; bails if `depth >= MAX_HIERARCHY_DEPTH` (5)
+/// - Cycle detection: walks ancestors to ensure `sub_protocol_id` is not already
+///   in the ancestor chain (prevents A→B→A infinite loops)
+///
+/// # Errors
+/// - Max depth exceeded
+/// - Cycle detected in protocol hierarchy
+/// - Sub-protocol not found or has no entry state
+pub async fn start_child_run(
+    store: &dyn GraphStore,
+    parent_run: &ProtocolRun,
+    sub_protocol_id: Uuid,
+) -> Result<ProtocolRun> {
+    let child_depth = parent_run.depth + 1;
+
+    // Guard: max depth
+    if child_depth >= MAX_HIERARCHY_DEPTH {
+        bail!(
+            "Max hierarchy depth ({}) exceeded: parent run {} is at depth {}, \
+             cannot spawn child at depth {}",
+            MAX_HIERARCHY_DEPTH,
+            parent_run.id,
+            parent_run.depth,
+            child_depth,
+        );
+    }
+
+    // Guard: cycle detection — walk ancestors to check no protocol_id repeats
+    let mut ancestor_protocol_ids = vec![parent_run.protocol_id];
+    let mut current_ancestor_id = parent_run.parent_run_id;
+    while let Some(ancestor_id) = current_ancestor_id {
+        if let Some(ancestor) = store.get_protocol_run(ancestor_id).await? {
+            ancestor_protocol_ids.push(ancestor.protocol_id);
+            current_ancestor_id = ancestor.parent_run_id;
+        } else {
+            break;
+        }
+    }
+    if ancestor_protocol_ids.contains(&sub_protocol_id) {
+        bail!(
+            "Cycle detected in protocol hierarchy: sub_protocol {} is already \
+             an ancestor of run {}. Chain: {:?}",
+            sub_protocol_id,
+            parent_run.id,
+            ancestor_protocol_ids,
+        );
+    }
+
+    // Load sub-protocol and its entry state
+    let sub_protocol = store
+        .get_protocol(sub_protocol_id)
+        .await?
+        .with_context(|| format!("Sub-protocol not found: {sub_protocol_id}"))?;
+
+    let states = store.get_protocol_states(sub_protocol_id).await?;
+    let entry_state = states
+        .iter()
+        .find(|s| s.id == sub_protocol.entry_state)
+        .with_context(|| {
+            format!(
+                "Entry state {} not found in sub-protocol {}",
+                sub_protocol.entry_state, sub_protocol_id
+            )
+        })?;
+
+    // Create the child run
+    let mut child = ProtocolRun::new(sub_protocol_id, entry_state.id, &entry_state.name);
+    child.parent_run_id = Some(parent_run.id);
+    child.depth = child_depth;
+    child.plan_id = parent_run.plan_id;
+    child.task_id = parent_run.task_id;
+    child.triggered_by = format!("hierarchy:parent_{}", parent_run.id);
+
+    // Persist (no concurrency guard for child runs — parent manages exclusion)
+    store
+        .create_protocol_run(&child)
+        .await
+        .context("Failed to create child protocol run")?;
+
+    Ok(child)
+}
+
 /// Fire a transition on a running protocol.
 ///
 /// Finds a matching transition from the current state with the given trigger,
 /// advances the run to the target state, and auto-completes if the target
 /// is a terminal state.
 ///
+/// **Hierarchical FSM**: If the target state has a `sub_protocol_id`, a child
+/// run is automatically spawned. The parent stays `Running` at the macro-state
+/// until the child completes (see [`handle_child_completion`]).
+///
 /// # Returns
 /// A [`TransitionResult`] indicating success/failure and the new state.
+/// If a child run was spawned, `child_run_id` will be set.
 ///
 /// # Errors
 /// - Run not found
 /// - Run is not active (already completed/failed/cancelled)
 /// - No matching transition for the given trigger from current state
-pub async fn fire_transition(
+/// - Max hierarchy depth exceeded (if target has sub_protocol_id)
+/// - Cycle detected in protocol hierarchy
+pub fn fire_transition<'a>(
+    store: &'a dyn GraphStore,
+    run_id: Uuid,
+    trigger: &'a str,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<TransitionResult>> + Send + 'a>> {
+    Box::pin(fire_transition_inner(store, run_id, trigger))
+}
+
+async fn fire_transition_inner(
     store: &dyn GraphStore,
     run_id: Uuid,
     trigger: &str,
@@ -138,6 +248,8 @@ pub async fn fire_transition(
                 "Run is not active (status: {}). Cannot fire transition.",
                 run.status
             )),
+            child_run_id: None,
+            child_completion: None,
         });
     }
 
@@ -160,6 +272,8 @@ pub async fn fire_transition(
                     "No transition found from state {} with trigger '{trigger}'",
                     run.current_state
                 )),
+                child_run_id: None,
+                child_completion: None,
             });
         }
     };
@@ -201,6 +315,43 @@ pub async fn fire_transition(
         .await
         .context("Failed to update protocol run after transition")?;
 
+    // 9. If this run just completed and has a parent, handle child completion
+    let child_completion = if is_terminal {
+        if let Some(parent_run_id) = run.parent_run_id {
+            // Auto-transition parent if completion strategy allows
+            let _ = handle_child_completion(store, &run).await;
+            // Populate child completion info for event emission at handler layer
+            Some(ChildCompletionInfo {
+                parent_run_id,
+                child_run_id: run.id,
+                protocol_id: run.protocol_id,
+                status: run.status,
+            })
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // 10. Auto-spawn child run if target state has sub_protocol_id (hierarchical FSM)
+    let child_run_id = if !is_terminal {
+        if let Some(sub_protocol_id) = target_state.sub_protocol_id {
+            let child = start_child_run(store, &run, sub_protocol_id).await?;
+            Some(child.id)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // 11. Generator state: create RuntimeStates if target is a Generator
+    if !is_terminal && target_state.state_type == StateType::Generator {
+        // generate() is idempotent — skips if RuntimeStates already exist
+        let _ = crate::protocol::generator::generate(target_state, &run, store).await;
+    }
+
     Ok(TransitionResult {
         success: true,
         current_state: run.current_state,
@@ -208,7 +359,124 @@ pub async fn fire_transition(
         run_completed: is_terminal,
         status: run.status,
         error: None,
+        child_run_id,
+        child_completion,
     })
+}
+
+/// Handle completion of a child run — auto-transition parent if completion strategy allows.
+///
+/// Called after a run reaches a terminal state. If the run has a `parent_run_id`:
+/// 1. Load parent run and find its current macro-state
+/// 2. Check `completion_strategy` on the macro-state
+/// 3. If strategy allows (`AllComplete`: all siblings done, `AnyComplete`: immediate),
+///    fire `child_completed` trigger on parent
+/// 4. `Manual`: do nothing
+///
+/// Returns `Some(TransitionResult)` if the parent was auto-transitioned, `None` otherwise.
+pub async fn handle_child_completion(
+    store: &dyn GraphStore,
+    completed_run: &ProtocolRun,
+) -> Result<Option<TransitionResult>> {
+    // Only process if this run has a parent
+    let parent_run_id = match completed_run.parent_run_id {
+        Some(id) => id,
+        None => return Ok(None),
+    };
+
+    let parent_run = store
+        .get_protocol_run(parent_run_id)
+        .await?
+        .with_context(|| format!("Parent run not found: {parent_run_id}"))?;
+
+    if !parent_run.is_active() {
+        return Ok(None); // Parent already done
+    }
+
+    // Find the macro-state (parent's current state)
+    let states = store.get_protocol_states(parent_run.protocol_id).await?;
+    let macro_state = states.iter().find(|s| s.id == parent_run.current_state);
+
+    // Handle child failure before checking completion strategy
+    if completed_run.status == RunStatus::Failed {
+        let failure_strategy = macro_state
+            .and_then(|s| s.on_failure_strategy)
+            .unwrap_or(OnFailureStrategy::Abort);
+
+        return match failure_strategy {
+            OnFailureStrategy::Abort => {
+                let _failed_parent = fail_run(
+                    store,
+                    parent_run_id,
+                    &format!("Child run failed: {}", completed_run.id),
+                )
+                .await?;
+                Ok(None)
+            }
+            OnFailureStrategy::Skip => {
+                let result =
+                    Box::pin(fire_transition(store, parent_run_id, "child_skipped")).await?;
+                Ok(Some(result))
+            }
+            OnFailureStrategy::Retry { max } => {
+                // Count how many FAILED child runs exist for this parent
+                let siblings = store.list_child_runs(parent_run_id).await?;
+                let failed_count = siblings
+                    .iter()
+                    .filter(|r| r.status == RunStatus::Failed)
+                    .count();
+
+                if (failed_count as u8) <= max {
+                    // Retry: spawn a new child run with the same sub-protocol
+                    let parent_run_fresh = store
+                        .get_protocol_run(parent_run_id)
+                        .await?
+                        .with_context(|| {
+                            format!("Parent run not found for retry: {parent_run_id}")
+                        })?;
+                    let sub_protocol_id = completed_run.protocol_id;
+                    let _child = start_child_run(store, &parent_run_fresh, sub_protocol_id).await?;
+                    Ok(None)
+                } else {
+                    // Max retries exceeded — fall back to Abort
+                    let _failed_parent = fail_run(
+                        store,
+                        parent_run_id,
+                        &format!(
+                            "Child run failed after {} retries: {}",
+                            max, completed_run.id
+                        ),
+                    )
+                    .await?;
+                    Ok(None)
+                }
+            }
+        };
+    }
+
+    let strategy = macro_state
+        .and_then(|s| s.completion_strategy)
+        .unwrap_or(CompletionStrategy::AllComplete);
+
+    match strategy {
+        CompletionStrategy::Manual => Ok(None),
+        CompletionStrategy::AnyComplete => {
+            // Transition parent immediately
+            let result = fire_transition(store, parent_run_id, "child_completed").await?;
+            Ok(Some(result))
+        }
+        CompletionStrategy::AllComplete => {
+            // Check if ALL sibling child runs are completed
+            let siblings = store.list_child_runs(parent_run_id).await?;
+            let all_done = siblings.iter().all(|r| r.is_finished());
+            if all_done {
+                let result = fire_transition(store, parent_run_id, "child_completed").await?;
+                Ok(Some(result))
+            } else {
+                Ok(None)
+            }
+        }
+    }
 }
 
 /// Cancel an active protocol run.
@@ -242,10 +510,21 @@ pub async fn cancel_run(store: &dyn GraphStore, run_id: Uuid) -> Result<Protocol
 
 /// Fail an active protocol run with an error message.
 ///
+/// Uses `Box::pin` internally to support recursive failure propagation
+/// (child failure → parent failure via `handle_child_completion`).
+///
 /// # Errors
 /// - Run not found
 /// - Run is not active
-pub async fn fail_run(store: &dyn GraphStore, run_id: Uuid, error: &str) -> Result<ProtocolRun> {
+pub fn fail_run<'a>(
+    store: &'a dyn GraphStore,
+    run_id: Uuid,
+    error: &'a str,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ProtocolRun>> + Send + 'a>> {
+    Box::pin(fail_run_inner(store, run_id, error))
+}
+
+async fn fail_run_inner(store: &dyn GraphStore, run_id: Uuid, error: &str) -> Result<ProtocolRun> {
     let mut run = store
         .get_protocol_run(run_id)
         .await?
@@ -265,6 +544,11 @@ pub async fn fail_run(store: &dyn GraphStore, run_id: Uuid, error: &str) -> Resu
         .update_protocol_run(&run)
         .await
         .context("Failed to update protocol run after fail")?;
+
+    // If this failed run has a parent, handle child failure compensation
+    if run.parent_run_id.is_some() {
+        let _ = handle_child_completion(store, &run).await;
+    }
 
     Ok(run)
 }
@@ -635,6 +919,162 @@ mod tests {
         assert_eq!(run2.status, RunStatus::Running);
     }
 
+    // ================================================================
+    // Hierarchical FSM tests (T4.1)
+    // ================================================================
+
+    /// Helper: set up a parent protocol with a macro-state pointing to a child protocol.
+    /// Parent: Start -> Macro(sub=child_protocol) -> Done
+    /// Child: ChildStart -> ChildDone (terminal)
+    async fn setup_hierarchical(store: &MockGraphStore) -> (Uuid, Protocol, Protocol) {
+        let project_id = Uuid::new_v4();
+        let project = crate::neo4j::models::ProjectNode {
+            id: project_id,
+            name: "test-hierarchy".to_string(),
+            slug: "test-hierarchy".to_string(),
+            description: None,
+            root_path: "/tmp/test-h".to_string(),
+            created_at: chrono::Utc::now(),
+            last_synced: None,
+            analytics_computed_at: None,
+            last_co_change_computed_at: None,
+            scaffolding_override: None,
+        };
+        store.create_project(&project).await.unwrap();
+
+        // Child protocol: ChildStart -> ChildDone
+        let child_id = Uuid::new_v4();
+        let child_start = ProtocolState::start(child_id, "ChildStart");
+        let child_done = ProtocolState::terminal(child_id, "ChildDone");
+        let mut child_proto = Protocol::new_full(
+            project_id,
+            "Child Protocol",
+            "A child sub-protocol",
+            child_start.id,
+            vec![child_done.id],
+            ProtocolCategory::Business,
+        );
+        child_proto.id = child_id;
+        store.upsert_protocol(&child_proto).await.unwrap();
+        store.upsert_protocol_state(&child_start).await.unwrap();
+        store.upsert_protocol_state(&child_done).await.unwrap();
+        let ct = ProtocolTransition::new(child_id, child_start.id, child_done.id, "child_finish");
+        store.upsert_protocol_transition(&ct).await.unwrap();
+
+        // Parent protocol: Start -> Macro(sub=child) -> Done
+        let parent_id = Uuid::new_v4();
+        let p_start = ProtocolState::start(parent_id, "Start");
+        let mut p_macro = ProtocolState::new(parent_id, "Macro");
+        p_macro.sub_protocol_id = Some(child_id);
+        p_macro.completion_strategy = Some(crate::protocol::CompletionStrategy::AllComplete);
+        let p_done = ProtocolState::terminal(parent_id, "Done");
+
+        let mut parent_proto = Protocol::new_full(
+            project_id,
+            "Parent Protocol",
+            "A parent with macro-state",
+            p_start.id,
+            vec![p_done.id],
+            ProtocolCategory::Business,
+        );
+        parent_proto.id = parent_id;
+        store.upsert_protocol(&parent_proto).await.unwrap();
+        store.upsert_protocol_state(&p_start).await.unwrap();
+        store.upsert_protocol_state(&p_macro).await.unwrap();
+        store.upsert_protocol_state(&p_done).await.unwrap();
+
+        let t1 = ProtocolTransition::new(parent_id, p_start.id, p_macro.id, "enter_macro");
+        let t2 = ProtocolTransition::new(parent_id, p_macro.id, p_done.id, "child_completed");
+        store.upsert_protocol_transition(&t1).await.unwrap();
+        store.upsert_protocol_transition(&t2).await.unwrap();
+
+        (project_id, parent_proto, child_proto)
+    }
+
+    #[tokio::test]
+    async fn test_auto_spawn_child_run() {
+        let store = MockGraphStore::new();
+        let (_, parent_proto, child_proto) = setup_hierarchical(&store).await;
+
+        // Start parent run
+        let parent_run = start_run(&store, parent_proto.id, None, None, None)
+            .await
+            .unwrap();
+
+        // Transition to macro-state → should auto-spawn child run
+        let result = fire_transition(&store, parent_run.id, "enter_macro")
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert_eq!(result.current_state_name, "Macro");
+        assert!(!result.run_completed);
+
+        // Verify child_run_id is set
+        assert!(result.child_run_id.is_some());
+        let child_run_id = result.child_run_id.unwrap();
+
+        // Verify child run exists in store
+        let child_run = store.get_protocol_run(child_run_id).await.unwrap().unwrap();
+        assert_eq!(child_run.protocol_id, child_proto.id);
+        assert_eq!(child_run.parent_run_id, Some(parent_run.id));
+        assert_eq!(child_run.depth, 1);
+        assert_eq!(child_run.status, RunStatus::Running);
+        assert!(child_run.triggered_by.starts_with("hierarchy:parent_"));
+    }
+
+    #[tokio::test]
+    async fn test_no_spawn_without_sub_protocol() {
+        let store = MockGraphStore::new();
+        let (_, protocol) = setup_protocol(&store).await;
+
+        let run = start_run(&store, protocol.id, None, None, None)
+            .await
+            .unwrap();
+
+        // Transition to Processing (no sub_protocol_id) → no child spawn
+        let result = fire_transition(&store, run.id, "begin").await.unwrap();
+        assert!(result.success);
+        assert!(result.child_run_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_max_depth_rejected() {
+        let store = MockGraphStore::new();
+        let (_, parent_proto, _) = setup_hierarchical(&store).await;
+
+        // Start a root run
+        let root_run = start_run(&store, parent_proto.id, None, None, None)
+            .await
+            .unwrap();
+
+        // Simulate a deeply nested parent by creating a fake parent run at depth 4
+        let mut deep_parent = ProtocolRun::new(parent_proto.id, root_run.current_state, "Start");
+        deep_parent.depth = MAX_HIERARCHY_DEPTH - 1; // depth 4
+        deep_parent.parent_run_id = Some(root_run.id);
+
+        let result = start_child_run(&store, &deep_parent, parent_proto.id).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("Max hierarchy depth"), "Error: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_cycle_detection() {
+        let store = MockGraphStore::new();
+        let (_, parent_proto, _) = setup_hierarchical(&store).await;
+
+        // Start a run for the parent protocol
+        let parent_run = start_run(&store, parent_proto.id, None, None, None)
+            .await
+            .unwrap();
+
+        // Try to spawn a child with the SAME protocol_id as parent → cycle!
+        let result = start_child_run(&store, &parent_run, parent_proto.id).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("Cycle detected"), "Error: {err}");
+    }
+
     #[tokio::test]
     async fn test_full_lifecycle() {
         let store = MockGraphStore::new();
@@ -673,5 +1113,488 @@ mod tests {
             .map(|sv| sv.state_name.as_str())
             .collect();
         assert_eq!(names, vec!["Start", "Processing", "Done"]);
+    }
+
+    // ================================================================
+    // Child completion tests (T4.2)
+    // ================================================================
+
+    #[tokio::test]
+    async fn test_child_completion_no_parent() {
+        let store = MockGraphStore::new();
+        let (_, protocol) = setup_protocol(&store).await;
+
+        // Start and complete a root run (no parent)
+        let run = start_run(&store, protocol.id, None, None, None)
+            .await
+            .unwrap();
+        fire_transition(&store, run.id, "begin").await.unwrap();
+        fire_transition(&store, run.id, "finish").await.unwrap();
+
+        let completed = store.get_protocol_run(run.id).await.unwrap().unwrap();
+        assert_eq!(completed.status, RunStatus::Completed);
+
+        // handle_child_completion should return None for a root run
+        let result = handle_child_completion(&store, &completed).await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_child_completion_all_complete() {
+        let store = MockGraphStore::new();
+        let (project_id, parent_proto, _child_proto) = setup_hierarchical(&store).await;
+
+        // Create a second child protocol (different from the first to avoid concurrency guard)
+        let child2_id = Uuid::new_v4();
+        let c2_start = ProtocolState::start(child2_id, "C2Start");
+        let c2_done = ProtocolState::terminal(child2_id, "C2Done");
+        let mut child2_proto = Protocol::new_full(
+            project_id,
+            "Child Protocol 2",
+            "Second child sub-protocol",
+            c2_start.id,
+            vec![c2_done.id],
+            ProtocolCategory::Business,
+        );
+        child2_proto.id = child2_id;
+        store.upsert_protocol(&child2_proto).await.unwrap();
+        store.upsert_protocol_state(&c2_start).await.unwrap();
+        store.upsert_protocol_state(&c2_done).await.unwrap();
+        let c2t = ProtocolTransition::new(child2_id, c2_start.id, c2_done.id, "c2_finish");
+        store.upsert_protocol_transition(&c2t).await.unwrap();
+
+        // Start parent and transition to macro-state (spawns child 1)
+        let parent_run = start_run(&store, parent_proto.id, None, None, None)
+            .await
+            .unwrap();
+        let result = fire_transition(&store, parent_run.id, "enter_macro")
+            .await
+            .unwrap();
+        assert!(result.success);
+        let child1_id = result.child_run_id.unwrap();
+
+        // Manually spawn a second child run (different protocol) to test AllComplete
+        let parent_run_now = store
+            .get_protocol_run(parent_run.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let child2 = start_child_run(&store, &parent_run_now, child2_proto.id)
+            .await
+            .unwrap();
+
+        // Complete child 1 — fire_transition auto-calls handle_child_completion internally.
+        // Parent should NOT transition yet (child2 still running).
+        fire_transition(&store, child1_id, "child_finish")
+            .await
+            .unwrap();
+        let child1_done = store.get_protocol_run(child1_id).await.unwrap().unwrap();
+        assert_eq!(child1_done.status, RunStatus::Completed);
+
+        // Verify parent is still Running at Macro
+        let parent_check = store
+            .get_protocol_run(parent_run.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            parent_check.status,
+            RunStatus::Running,
+            "Parent should NOT transition when only 1 of 2 children is done"
+        );
+
+        // Complete child 2 — now ALL children done, fire_transition auto-transitions parent
+        fire_transition(&store, child2.id, "c2_finish")
+            .await
+            .unwrap();
+        let child2_done = store.get_protocol_run(child2.id).await.unwrap().unwrap();
+        assert_eq!(child2_done.status, RunStatus::Completed);
+
+        // Verify parent is now Completed (auto-transitioned by handle_child_completion)
+        let parent_final = store
+            .get_protocol_run(parent_run.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            parent_final.status,
+            RunStatus::Completed,
+            "Parent should auto-transition when all children are done"
+        );
+        assert_eq!(
+            parent_final.states_visited.last().unwrap().state_name,
+            "Done"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_child_completion_any_complete() {
+        let store = MockGraphStore::new();
+        let (project_id, _, child_proto) = setup_hierarchical(&store).await;
+
+        // Set up a parent protocol with AnyComplete strategy
+        let parent_id = Uuid::new_v4();
+        let p_start = ProtocolState::start(parent_id, "Start");
+        let mut p_macro = ProtocolState::new(parent_id, "Macro");
+        p_macro.sub_protocol_id = Some(child_proto.id);
+        p_macro.completion_strategy = Some(crate::protocol::CompletionStrategy::AnyComplete);
+        let p_done = ProtocolState::terminal(parent_id, "Done");
+
+        let mut parent_proto = Protocol::new_full(
+            project_id,
+            "AnyComplete Parent",
+            "Parent with AnyComplete strategy",
+            p_start.id,
+            vec![p_done.id],
+            ProtocolCategory::Business,
+        );
+        parent_proto.id = parent_id;
+        store.upsert_protocol(&parent_proto).await.unwrap();
+        store.upsert_protocol_state(&p_start).await.unwrap();
+        store.upsert_protocol_state(&p_macro).await.unwrap();
+        store.upsert_protocol_state(&p_done).await.unwrap();
+
+        let t1 = ProtocolTransition::new(parent_id, p_start.id, p_macro.id, "enter_macro");
+        let t2 = ProtocolTransition::new(parent_id, p_macro.id, p_done.id, "child_completed");
+        store.upsert_protocol_transition(&t1).await.unwrap();
+        store.upsert_protocol_transition(&t2).await.unwrap();
+
+        // Start parent and transition to macro-state (spawns child 1)
+        let parent_run = start_run(&store, parent_proto.id, None, None, None)
+            .await
+            .unwrap();
+        let result = fire_transition(&store, parent_run.id, "enter_macro")
+            .await
+            .unwrap();
+        assert!(result.success);
+        let child1_id = result.child_run_id.unwrap();
+
+        // Create a second child protocol to avoid concurrency guard
+        let child2_id = Uuid::new_v4();
+        let c2_start = ProtocolState::start(child2_id, "C2Start");
+        let c2_done = ProtocolState::terminal(child2_id, "C2Done");
+        let mut child2_proto = Protocol::new_full(
+            project_id,
+            "Child Protocol 2",
+            "Second child",
+            c2_start.id,
+            vec![c2_done.id],
+            ProtocolCategory::Business,
+        );
+        child2_proto.id = child2_id;
+        store.upsert_protocol(&child2_proto).await.unwrap();
+        store.upsert_protocol_state(&c2_start).await.unwrap();
+        store.upsert_protocol_state(&c2_done).await.unwrap();
+        let c2t = ProtocolTransition::new(child2_id, c2_start.id, c2_done.id, "c2_finish");
+        store.upsert_protocol_transition(&c2t).await.unwrap();
+
+        // Spawn a second child (different protocol)
+        let parent_run_now = store
+            .get_protocol_run(parent_run.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let _child2 = start_child_run(&store, &parent_run_now, child2_proto.id)
+            .await
+            .unwrap();
+
+        // Complete only child 1 — with AnyComplete, fire_transition auto-transitions parent
+        fire_transition(&store, child1_id, "child_finish")
+            .await
+            .unwrap();
+        let child1_done = store.get_protocol_run(child1_id).await.unwrap().unwrap();
+        assert_eq!(child1_done.status, RunStatus::Completed);
+
+        // Verify parent is now Completed (AnyComplete transitions on first child)
+        let parent_final = store
+            .get_protocol_run(parent_run.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            parent_final.status,
+            RunStatus::Completed,
+            "AnyComplete: parent should auto-transition on first child completion"
+        );
+        assert_eq!(
+            parent_final.states_visited.last().unwrap().state_name,
+            "Done"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_child_completion_manual() {
+        let store = MockGraphStore::new();
+        let (project_id, _, child_proto) = setup_hierarchical(&store).await;
+
+        // Set up a parent protocol with Manual strategy
+        let parent_id = Uuid::new_v4();
+        let p_start = ProtocolState::start(parent_id, "Start");
+        let mut p_macro = ProtocolState::new(parent_id, "Macro");
+        p_macro.sub_protocol_id = Some(child_proto.id);
+        p_macro.completion_strategy = Some(crate::protocol::CompletionStrategy::Manual);
+        let p_done = ProtocolState::terminal(parent_id, "Done");
+
+        let mut parent_proto = Protocol::new_full(
+            project_id,
+            "Manual Parent",
+            "Parent with Manual strategy",
+            p_start.id,
+            vec![p_done.id],
+            ProtocolCategory::Business,
+        );
+        parent_proto.id = parent_id;
+        store.upsert_protocol(&parent_proto).await.unwrap();
+        store.upsert_protocol_state(&p_start).await.unwrap();
+        store.upsert_protocol_state(&p_macro).await.unwrap();
+        store.upsert_protocol_state(&p_done).await.unwrap();
+
+        let t1 = ProtocolTransition::new(parent_id, p_start.id, p_macro.id, "enter_macro");
+        let t2 = ProtocolTransition::new(parent_id, p_macro.id, p_done.id, "child_completed");
+        store.upsert_protocol_transition(&t1).await.unwrap();
+        store.upsert_protocol_transition(&t2).await.unwrap();
+
+        // Start parent and transition to macro-state (spawns child)
+        let parent_run = start_run(&store, parent_proto.id, None, None, None)
+            .await
+            .unwrap();
+        let result = fire_transition(&store, parent_run.id, "enter_macro")
+            .await
+            .unwrap();
+        assert!(result.success);
+        let child_id = result.child_run_id.unwrap();
+
+        // Complete the child — fire_transition auto-calls handle_child_completion
+        fire_transition(&store, child_id, "child_finish")
+            .await
+            .unwrap();
+        let child_done = store.get_protocol_run(child_id).await.unwrap().unwrap();
+        assert_eq!(child_done.status, RunStatus::Completed);
+
+        // Manual strategy: parent should NOT auto-transition.
+        // Verify parent is still Running
+        let parent_check = store
+            .get_protocol_run(parent_run.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(parent_check.status, RunStatus::Running);
+    }
+
+    #[tokio::test]
+    async fn test_child_failure_abort() {
+        let store = MockGraphStore::new();
+        let (_, parent_proto, _child_proto) = setup_hierarchical(&store).await;
+
+        // Start parent and transition to macro-state (spawns child)
+        let parent_run = start_run(&store, parent_proto.id, None, None, None)
+            .await
+            .unwrap();
+        let result = fire_transition(&store, parent_run.id, "enter_macro")
+            .await
+            .unwrap();
+        assert!(result.success);
+        let child_run_id = result.child_run_id.unwrap();
+
+        // Fail the child run — default on_failure_strategy is Abort
+        fail_run(&store, child_run_id, "child error").await.unwrap();
+
+        // Verify parent is now Failed
+        let parent_final = store
+            .get_protocol_run(parent_run.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            parent_final.status,
+            RunStatus::Failed,
+            "Abort strategy: parent should fail when child fails"
+        );
+        assert!(parent_final
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("Child run failed"));
+    }
+
+    #[tokio::test]
+    async fn test_child_failure_skip() {
+        let store = MockGraphStore::new();
+        let (project_id, _, child_proto) = setup_hierarchical(&store).await;
+
+        // Set up a parent protocol with Skip on_failure_strategy
+        // and a "child_skipped" transition from Macro to Done
+        let parent_id = Uuid::new_v4();
+        let p_start = ProtocolState::start(parent_id, "Start");
+        let mut p_macro = ProtocolState::new(parent_id, "Macro");
+        p_macro.sub_protocol_id = Some(child_proto.id);
+        p_macro.completion_strategy = Some(crate::protocol::CompletionStrategy::AllComplete);
+        p_macro.on_failure_strategy = Some(OnFailureStrategy::Skip);
+        let p_done = ProtocolState::terminal(parent_id, "Done");
+
+        let mut parent_proto = Protocol::new_full(
+            project_id,
+            "Skip Parent",
+            "Parent with Skip failure strategy",
+            p_start.id,
+            vec![p_done.id],
+            ProtocolCategory::Business,
+        );
+        parent_proto.id = parent_id;
+        store.upsert_protocol(&parent_proto).await.unwrap();
+        store.upsert_protocol_state(&p_start).await.unwrap();
+        store.upsert_protocol_state(&p_macro).await.unwrap();
+        store.upsert_protocol_state(&p_done).await.unwrap();
+
+        let t1 = ProtocolTransition::new(parent_id, p_start.id, p_macro.id, "enter_macro");
+        let t2 = ProtocolTransition::new(parent_id, p_macro.id, p_done.id, "child_completed");
+        let t3 = ProtocolTransition::new(parent_id, p_macro.id, p_done.id, "child_skipped");
+        store.upsert_protocol_transition(&t1).await.unwrap();
+        store.upsert_protocol_transition(&t2).await.unwrap();
+        store.upsert_protocol_transition(&t3).await.unwrap();
+
+        // Start parent and transition to macro-state (spawns child)
+        let parent_run = start_run(&store, parent_proto.id, None, None, None)
+            .await
+            .unwrap();
+        let result = fire_transition(&store, parent_run.id, "enter_macro")
+            .await
+            .unwrap();
+        assert!(result.success);
+        let child_run_id = result.child_run_id.unwrap();
+
+        // Fail the child run — Skip strategy should fire "child_skipped" on parent
+        fail_run(&store, child_run_id, "child error").await.unwrap();
+
+        // Verify parent has transitioned to Done via child_skipped
+        let parent_final = store
+            .get_protocol_run(parent_run.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            parent_final.status,
+            RunStatus::Completed,
+            "Skip strategy: parent should transition to Done via child_skipped"
+        );
+        assert_eq!(
+            parent_final.states_visited.last().unwrap().state_name,
+            "Done"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_child_failure_retry() {
+        let store = MockGraphStore::new();
+        let (project_id, _, child_proto) = setup_hierarchical(&store).await;
+
+        // Set up a parent protocol with Retry{max:2} on_failure_strategy
+        let parent_id = Uuid::new_v4();
+        let p_start = ProtocolState::start(parent_id, "Start");
+        let mut p_macro = ProtocolState::new(parent_id, "Macro");
+        p_macro.sub_protocol_id = Some(child_proto.id);
+        p_macro.completion_strategy = Some(crate::protocol::CompletionStrategy::AllComplete);
+        p_macro.on_failure_strategy = Some(OnFailureStrategy::Retry { max: 2 });
+        let p_done = ProtocolState::terminal(parent_id, "Done");
+
+        let mut parent_proto = Protocol::new_full(
+            project_id,
+            "Retry Parent",
+            "Parent with Retry failure strategy",
+            p_start.id,
+            vec![p_done.id],
+            ProtocolCategory::Business,
+        );
+        parent_proto.id = parent_id;
+        store.upsert_protocol(&parent_proto).await.unwrap();
+        store.upsert_protocol_state(&p_start).await.unwrap();
+        store.upsert_protocol_state(&p_macro).await.unwrap();
+        store.upsert_protocol_state(&p_done).await.unwrap();
+
+        let t1 = ProtocolTransition::new(parent_id, p_start.id, p_macro.id, "enter_macro");
+        let t2 = ProtocolTransition::new(parent_id, p_macro.id, p_done.id, "child_completed");
+        store.upsert_protocol_transition(&t1).await.unwrap();
+        store.upsert_protocol_transition(&t2).await.unwrap();
+
+        // Start parent and transition to macro-state (spawns child 1)
+        let parent_run = start_run(&store, parent_proto.id, None, None, None)
+            .await
+            .unwrap();
+        let result = fire_transition(&store, parent_run.id, "enter_macro")
+            .await
+            .unwrap();
+        assert!(result.success);
+        let child1_id = result.child_run_id.unwrap();
+
+        // Fail child 1 — should spawn a retry (child 2)
+        fail_run(&store, child1_id, "attempt 1 failed")
+            .await
+            .unwrap();
+
+        // Parent should still be running
+        let parent_check = store
+            .get_protocol_run(parent_run.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(parent_check.status, RunStatus::Running);
+
+        // There should be a new child run (the retry)
+        let children = store.list_child_runs(parent_run.id).await.unwrap();
+        assert_eq!(
+            children.len(),
+            2,
+            "Should have 2 children after first retry"
+        );
+        let child2 = children
+            .iter()
+            .find(|r| r.status == RunStatus::Running)
+            .unwrap();
+
+        // Fail child 2 — should spawn another retry (child 3)
+        fail_run(&store, child2.id, "attempt 2 failed")
+            .await
+            .unwrap();
+
+        // Parent should still be running
+        let parent_check = store
+            .get_protocol_run(parent_run.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(parent_check.status, RunStatus::Running);
+
+        let children = store.list_child_runs(parent_run.id).await.unwrap();
+        assert_eq!(
+            children.len(),
+            3,
+            "Should have 3 children after second retry"
+        );
+        let child3 = children
+            .iter()
+            .find(|r| r.status == RunStatus::Running)
+            .unwrap();
+
+        // Fail child 3 — max retries (2) exceeded, parent should abort
+        fail_run(&store, child3.id, "attempt 3 failed")
+            .await
+            .unwrap();
+
+        // Parent should now be Failed
+        let parent_final = store
+            .get_protocol_run(parent_run.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            parent_final.status,
+            RunStatus::Failed,
+            "Retry strategy: parent should fail after max retries exceeded"
+        );
+        assert!(parent_final
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("after 2 retries"));
     }
 }

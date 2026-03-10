@@ -2978,8 +2978,48 @@ impl GraphStore for Neo4jClient {
             .await
     }
 
+    async fn list_child_runs(
+        &self,
+        parent_run_id: uuid::Uuid,
+    ) -> anyhow::Result<Vec<crate::protocol::ProtocolRun>> {
+        self.list_child_runs(parent_run_id).await
+    }
+
+    async fn count_child_runs(&self, parent_run_id: uuid::Uuid) -> anyhow::Result<usize> {
+        self.count_child_runs(parent_run_id).await
+    }
+
+    async fn get_run_tree(
+        &self,
+        root_run_id: uuid::Uuid,
+    ) -> anyhow::Result<Vec<crate::protocol::ProtocolRun>> {
+        self.get_run_tree(root_run_id).await
+    }
+
     async fn delete_protocol_run(&self, run_id: uuid::Uuid) -> anyhow::Result<bool> {
         self.delete_protocol_run(run_id).await
+    }
+
+    // ========================================================================
+    // RuntimeState operations (Generator-produced dynamic states)
+    // ========================================================================
+
+    async fn create_runtime_state(
+        &self,
+        state: &crate::protocol::RuntimeState,
+    ) -> anyhow::Result<()> {
+        self.create_runtime_state(state).await
+    }
+
+    async fn get_runtime_states(
+        &self,
+        run_id: uuid::Uuid,
+    ) -> anyhow::Result<Vec<crate::protocol::RuntimeState>> {
+        self.get_runtime_states(run_id).await
+    }
+
+    async fn delete_runtime_states(&self, run_id: uuid::Uuid) -> anyhow::Result<()> {
+        self.delete_runtime_states(run_id).await
     }
 
     // SI — System Inference: audit knowledge gaps

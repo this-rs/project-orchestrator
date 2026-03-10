@@ -43,6 +43,7 @@ pub fn generate_context_template(
     let observations = filter_sort(notes, NoteType::Observation);
     let contexts = filter_sort(notes, NoteType::Context);
     let assertions = filter_sort(notes, NoteType::Assertion);
+    let rfcs = filter_sort(notes, NoteType::Rfc);
 
     // Build sections in priority order
     if !guidelines.is_empty() {
@@ -65,6 +66,9 @@ pub fn generate_context_template(
     }
     if !observations.is_empty() {
         sections.push(format_section("## Observations", &observations));
+    }
+    if !rfcs.is_empty() {
+        sections.push(format_section("## RFCs", &rfcs));
     }
 
     // Dynamic placeholders

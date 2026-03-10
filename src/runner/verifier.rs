@@ -144,6 +144,8 @@ pub struct TaskVerifier {
     test_runner_enabled: bool,
     /// Build/test timeout
     command_timeout: Duration,
+    /// SHA of HEAD before the agent started — if set, verify that new commits exist
+    base_commit: Option<String>,
 }
 
 impl TaskVerifier {
@@ -158,6 +160,23 @@ impl TaskVerifier {
             build_check_enabled,
             test_runner_enabled,
             command_timeout: Duration::from_secs(600),
+            base_commit: None,
+        }
+    }
+
+    /// Create a TaskVerifier that checks for new commits since `base_sha`.
+    pub fn with_base_commit(
+        graph: Arc<dyn GraphStore>,
+        build_check_enabled: bool,
+        test_runner_enabled: bool,
+        base_sha: String,
+    ) -> Self {
+        Self {
+            graph,
+            build_check_enabled,
+            test_runner_enabled,
+            command_timeout: Duration::from_secs(600),
+            base_commit: Some(base_sha),
         }
     }
 
@@ -168,6 +187,11 @@ impl TaskVerifier {
     pub async fn verify(&self, task_id: Uuid, cwd: &str) -> VerifyResult {
         let mut reasons = Vec::new();
         let cwd_path = Path::new(cwd);
+
+        // 0. Verify the agent produced commits (critical — prevents ghost completions)
+        if let Err(e) = self.verify_has_commits(cwd_path).await {
+            reasons.push(format!("No code produced: {}", e));
+        }
 
         // 1. Build check
         if self.build_check_enabled {
@@ -199,6 +223,82 @@ impl TaskVerifier {
         } else {
             warn!("Task {} failed verification: {:?}", task_id, reasons);
             VerifyResult::Fail { reasons }
+        }
+    }
+
+    /// Verify the agent produced at least one new commit since the base commit.
+    ///
+    /// This prevents "ghost completions" where the agent updates MCP statuses
+    /// but produces zero code changes. If `base_commit` is None (legacy callers),
+    /// we fall back to checking for uncommitted changes (dirty worktree).
+    async fn verify_has_commits(&self, cwd: &Path) -> Result<()> {
+        if let Some(ref base_sha) = self.base_commit {
+            // Count commits since base
+            let output = tokio::process::Command::new("git")
+                .args(["rev-list", "--count", &format!("{}..HEAD", base_sha)])
+                .current_dir(cwd)
+                .output()
+                .await;
+
+            match output {
+                Ok(o) if o.status.success() => {
+                    let count_str = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                    let count: usize = count_str.parse().unwrap_or(0);
+                    if count == 0 {
+                        // Also check for uncommitted changes — agent might have written
+                        // code but forgotten to commit
+                        let has_changes = self.has_uncommitted_changes(cwd).await;
+                        if has_changes {
+                            return Err(anyhow::anyhow!(
+                                "Agent wrote code but did NOT commit (0 new commits since {}, \
+                                 but working tree has uncommitted changes). \
+                                 The agent must run `git add` + `git commit`.",
+                                &base_sha[..8]
+                            ));
+                        }
+                        return Err(anyhow::anyhow!(
+                            "Agent produced 0 new commits since {} — no code was written. \
+                             Task cannot be marked as completed without code changes.",
+                            &base_sha[..8]
+                        ));
+                    }
+                    info!(
+                        "Agent produced {} commit(s) since {}",
+                        count,
+                        &base_sha[..base_sha.len().min(8)]
+                    );
+                    Ok(())
+                }
+                Ok(o) => {
+                    let stderr = String::from_utf8_lossy(&o.stderr);
+                    warn!("git rev-list failed (non-fatal): {}", stderr);
+                    Ok(()) // Don't fail on git errors — might be a shallow clone
+                }
+                Err(e) => {
+                    warn!("Failed to run git rev-list: {}", e);
+                    Ok(())
+                }
+            }
+        } else {
+            // No base commit — skip this check (legacy verifier callers)
+            Ok(())
+        }
+    }
+
+    /// Check if the working tree has uncommitted changes.
+    async fn has_uncommitted_changes(&self, cwd: &Path) -> bool {
+        let output = tokio::process::Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(cwd)
+            .output()
+            .await;
+
+        match output {
+            Ok(o) if o.status.success() => {
+                let stdout = String::from_utf8_lossy(&o.stdout);
+                !stdout.trim().is_empty()
+            }
+            _ => false,
         }
     }
 
@@ -628,5 +728,140 @@ mod tests {
         if let VerifyResult::Fail { reasons } = result {
             assert!(reasons.iter().any(|r| r.contains("Incomplete step")));
         }
+    }
+
+    #[tokio::test]
+    async fn test_verify_has_commits_detects_ghost_completion() {
+        // Create a temp git repo with a single commit
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path();
+
+        // Init repo with one commit
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        std::fs::write(cwd.join("file.txt"), "initial").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "initial"])
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+
+        // Get the base SHA
+        let sha_output = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        let base_sha = String::from_utf8_lossy(&sha_output.stdout)
+            .trim()
+            .to_string();
+
+        // Create a verifier with base_commit — NO new commits exist
+        let (graph, task_id) = setup_mock_with_task().await;
+        let step = make_step("Step 1", StepStatus::Completed);
+        graph.create_step(task_id, &step).await.unwrap();
+
+        let verifier = TaskVerifier::with_base_commit(graph, false, false, base_sha);
+        let result = verifier.verify_has_commits(cwd).await;
+
+        // Should fail — 0 new commits
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("0 new commits"),
+            "Error should mention 0 new commits: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_verify_has_commits_passes_with_new_commit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path();
+
+        // Init repo with one commit
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        std::fs::write(cwd.join("file.txt"), "initial").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "initial"])
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+
+        let sha_output = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        let base_sha = String::from_utf8_lossy(&sha_output.stdout)
+            .trim()
+            .to_string();
+
+        // Make a NEW commit after the base
+        std::fs::write(cwd.join("new_file.rs"), "fn main() {}").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "feat: new feature"])
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+
+        let (graph, _task_id) = setup_mock_with_task().await;
+        let verifier = TaskVerifier::with_base_commit(graph, false, false, base_sha);
+        let result = verifier.verify_has_commits(cwd).await;
+
+        // Should pass — 1 new commit
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_verify_without_base_commit_skips_check() {
+        let (graph, _task_id) = setup_mock_with_task().await;
+
+        // No base_commit — should always pass (legacy behavior)
+        let verifier = TaskVerifier::new(graph, false, false);
+        let result = verifier.verify_has_commits(Path::new("/tmp")).await;
+        assert!(result.is_ok());
     }
 }
