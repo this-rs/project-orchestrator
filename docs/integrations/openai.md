@@ -6,7 +6,7 @@ Guide to integrating Project Orchestrator with OpenAI's Agents SDK.
 
 ## Overview
 
-OpenAI Agents SDK supports MCP (Model Context Protocol), allowing your agents to use Project Orchestrator's **19 mega-tools** for code intelligence, plan management, and multi-agent coordination.
+OpenAI Agents SDK supports MCP (Model Context Protocol), allowing your agents to use Project Orchestrator's **22 mega-tools** for code intelligence, plan management, and multi-agent coordination.
 
 ### What you get
 
@@ -298,7 +298,7 @@ async def run_team():
 
 ## Available Mega-Tools
 
-All 19 Project Orchestrator mega-tools are available. See [MCP Tools Reference](../api/mcp-tools.md) for the complete list.
+All 22 Project Orchestrator mega-tools are available. See [MCP Tools Reference](../api/mcp-tools.md) for the complete list.
 
 Key mega-tools for OpenAI agents:
 

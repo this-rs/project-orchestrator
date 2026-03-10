@@ -6,7 +6,7 @@ Complete guide to integrating Project Orchestrator with Claude Code (Anthropic's
 
 ## Overview
 
-The integration gives Claude Code access to **19 mega-tools** (each with multiple actions) for:
+The integration gives Claude Code access to **22 mega-tools** (each with multiple actions) for:
 
 - **Project Management** — Create, sync, and explore codebases
 - **Plan & Task Tracking** — Manage development workflows with dependencies
@@ -124,9 +124,9 @@ Claude should use the `project` tool with action `list` and return results.
 
 ---
 
-## Available Mega-Tools (19)
+## Available Mega-Tools (22)
 
-Project Orchestrator uses a **mega-tool architecture**: 19 tools, each with an `action` parameter that dispatches to specific operations. This keeps the tool count low while providing comprehensive functionality.
+Project Orchestrator uses a **mega-tool architecture**: 22 tools, each with an `action` parameter that dispatches to specific operations. This keeps the tool count low while providing comprehensive functionality.
 
 ### How it works
 
@@ -161,6 +161,9 @@ Project Orchestrator uses a **mega-tool architecture**: 19 tools, each with an `
 | `code` | 30 | Code search, impact analysis, call graphs, health metrics |
 | `admin` | 23 | Sync, watch, Knowledge Fabric, neural maintenance |
 | `skill` | 12 | Neural skills: emergent knowledge clusters |
+| `analysis_profile` | 4 | Edge/fusion weight presets for analysis |
+| `protocol` | 20 | Protocol FSM: compose, simulate, run, route |
+| `reasoning` | 2 | Reasoning trees from knowledge graph |
 
 For detailed documentation of every action and parameter, see the [MCP Tools Reference](../api/mcp-tools.md).
 

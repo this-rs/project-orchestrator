@@ -6,7 +6,7 @@ Guide to integrating Project Orchestrator with Cursor IDE.
 
 ## Overview
 
-Cursor supports MCP (Model Context Protocol) servers, giving you access to Project Orchestrator's **19 mega-tools** directly in the editor. Use Chat or Composer to:
+Cursor supports MCP (Model Context Protocol) servers, giving you access to Project Orchestrator's **22 mega-tools** directly in the editor. Use Chat or Composer to:
 
 - **Explore code** with semantic search and graph queries
 - **Manage plans and tasks** without leaving your editor
@@ -281,7 +281,7 @@ Record this decision with rationale: better error handling and readability.
 
 ## Available Mega-Tools
 
-All 19 Project Orchestrator mega-tools are available in Cursor. Most useful for editor workflows:
+All 22 Project Orchestrator mega-tools are available in Cursor. Most useful for editor workflows:
 
 | Mega-Tool | Key Actions | Cursor Use Case |
 |-----------|-------------|-----------------|

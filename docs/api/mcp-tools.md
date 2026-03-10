@@ -1,12 +1,12 @@
 # MCP Mega-Tools Reference
 
-Complete documentation for the **20 mega-tools** exposed by Project Orchestrator.
+Complete documentation for the **22 mega-tools** exposed by Project Orchestrator.
 
 ---
 
 ## How Mega-Tools Work
 
-Each mega-tool uses an **`action` parameter** to select the operation. This replaces the previous 145+ individual tools with a cleaner, consolidated interface.
+Each mega-tool uses an **`action` parameter** to select the operation. This consolidates all functionality into a clean, organized interface.
 
 **Example call:**
 ```json
@@ -45,6 +45,8 @@ Each mega-tool uses an **`action` parameter** to select the operation. This repl
 | [`admin`](#admin) | 25 | Sync, watch, Knowledge Fabric, maintenance, skills |
 | [`skill`](#skill) | 12 | Neural skills detection, activation |
 | [`analysis_profile`](#analysis_profile) | 4 | Edge/fusion weight presets for analysis |
+| [`protocol`](#protocol) | 20 | Protocol FSM: compose, simulate, run, route, transitions |
+| [`reasoning`](#reasoning) | 2 | Reasoning trees from knowledge graph |
 
 ---
 
@@ -232,7 +234,7 @@ Manage knowledge notes with semantic search and graph propagation.
 | `get_context_knowledge` | Context knowledge | `entity_type`, `entity_id` |
 | `get_propagated_knowledge` | Propagated knowledge | `entity_type`, `entity_id` |
 
-**Note Types:** `guideline`, `gotcha`, `pattern`, `context`, `tip`, `observation`, `assertion`
+**Note Types:** `guideline`, `gotcha`, `pattern`, `context`, `tip`, `observation`, `assertion`, `rfc`
 
 **Note Status:** `active`, `needs_review`, `stale`, `obsolete`, `archived`
 
@@ -505,3 +507,67 @@ Manage analysis profiles (edge/fusion weight presets for GDS analytics).
 **Edge Weights:** `{"IMPORTS": 0.7, "CALLS": 0.5, "CO_CHANGED": 0.3, ...}` — relative weight of each edge type in GDS computations.
 
 **Fusion Weights:** `{"structural": 0.3, "temporal": 0.4, "semantic": 0.3}` — how to blend structural, temporal, and semantic signals.
+
+---
+
+## protocol
+
+Manage Protocol FSMs (Pattern Federation) for repeatable workflows.
+
+### Protocol CRUD
+
+| Action | Description | Key Parameters |
+|--------|-------------|----------------|
+| `list` | List protocols for project | `project_id`, `category`, `limit`, `offset` |
+| `create` | Create protocol | `project_id`, `name`, `description`, `category` (system/business), `relevance_vector` |
+| `get` | Get protocol with states & transitions | `protocol_id` |
+| `update` | Update protocol | `protocol_id`, `name`, `description`, `relevance_vector` |
+| `delete` | Delete protocol and all states/transitions | `protocol_id` |
+
+### States & Transitions
+
+| Action | Description | Key Parameters |
+|--------|-------------|----------------|
+| `add_state` | Add state to protocol | `protocol_id`, `name`, `state_type` (start/intermediate/terminal), `description`, `action` |
+| `delete_state` | Delete a state | `protocol_id`, `state_id` |
+| `list_states` | List states | `protocol_id` |
+| `add_transition` | Add transition | `protocol_id`, `from_state`, `to_state`, `trigger`, `guard` |
+| `delete_transition` | Delete transition | `protocol_id`, `transition_id` |
+| `list_transitions` | List transitions | `protocol_id` |
+
+### Runtime
+
+| Action | Description | Key Parameters |
+|--------|-------------|----------------|
+| `start_run` | Start a protocol run | `protocol_id`, `plan_id`, `task_id` |
+| `transition` | Fire a transition on a running protocol | `run_id`, `trigger` |
+| `get_run` | Get run with current state and history | `run_id` |
+| `list_runs` | List runs for a protocol | `protocol_id`, `status` |
+| `cancel_run` | Cancel a running protocol | `run_id` |
+| `fail_run` | Mark run as failed | `run_id`, `error` |
+| `report_progress` | Report progress during long state | `run_id`, `state_name`, `sub_action`, `processed`, `total` |
+
+### Composition & Routing
+
+| Action | Description | Key Parameters |
+|--------|-------------|----------------|
+| `compose` | One-shot creation (skill + protocol + states + transitions) | `project_id`, `name`, `states`, `transitions`, `notes`, `relevance_vector` |
+| `simulate` | Dry-run activation (affinity score) | `protocol_id`, `context`, `plan_id` |
+| `route` | Rank protocols by context affinity | `project_id`, `plan_id`, `phase`, `domain` |
+
+**Protocol Categories:** `system`, `business`
+
+**State Types:** `start`, `intermediate`, `terminal`, `generator`
+
+**Run Statuses:** `running`, `completed`, `failed`, `cancelled`
+
+---
+
+## reasoning
+
+Build reasoning trees from the knowledge graph.
+
+| Action | Description | Key Parameters |
+|--------|-------------|----------------|
+| `reason` | Build a reasoning tree from a natural language query | `request`, `project_id`, `depth`, `include_actions`, `max_nodes` |
+| `reason_feedback` | Provide feedback to reinforce useful paths | `tree_id`, `followed_nodes`, `outcome` (success/partial/failure) |

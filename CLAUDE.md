@@ -9,7 +9,7 @@ For user-facing documentation, see the `docs/` folder:
 - **[Installation Guide](docs/setup/installation.md)** — Full setup instructions
 - **[Getting Started](docs/guides/getting-started.md)** — Tutorial for new users
 - **[API Reference](docs/api/reference.md)** — REST API documentation
-- **[MCP Tools](docs/api/mcp-tools.md)** — All 145 MCP tools documented
+- **[MCP Tools](docs/api/mcp-tools.md)** — All 22 MCP mega-tools documented
 - **Integration Guides:**
   - [Claude Code](docs/integrations/claude-code.md)
   - [OpenAI Agents](docs/integrations/openai.md)
@@ -28,7 +28,7 @@ For user-facing documentation, see the `docs/` folder:
 - Meilisearch for semantic search across code and decisions
 - Tree-sitter for multi-language code parsing
 - HTTP API for plans, tasks, decisions, and code exploration
-- MCP server for Claude Code integration (20 mega-tools)
+- MCP server for Claude Code integration (22 mega-tools)
 - File watcher for auto-syncing changes
 - Authentication system: Google OAuth2, generic OIDC, password login + JWT, deny-by-default middleware
 - Chat WebSocket for real-time conversational AI (migrated from SSE)
@@ -111,7 +111,7 @@ Or use command-line arguments:
 
 ### Available MCP Mega-Tools
 
-The MCP server exposes **20 mega-tools**, each with an `action` parameter to select the operation:
+The MCP server exposes **22 mega-tools**, each with an `action` parameter to select the operation:
 
 | Mega-Tool | Actions | Description |
 |-----------|---------|-------------|
@@ -135,6 +135,8 @@ The MCP server exposes **20 mega-tools**, each with an `action` parameter to sel
 | `admin` | 25 | Sync, watch, Knowledge Fabric, neural maintenance, skills |
 | `skill` | 12 | Neural skills detection, activation, export/import |
 | `analysis_profile` | 4 | Edge/fusion weight presets for analysis |
+| `protocol` | 20 | Protocol FSM: compose, simulate, run, route, transitions |
+| `reasoning` | 2 | Reasoning trees from knowledge graph |
 
 ### Debug Logging
 
@@ -169,7 +171,7 @@ docs/
 │   └── cursor.md            # Cursor IDE setup
 ├── api/
 │   ├── reference.md         # REST API documentation
-│   └── mcp-tools.md         # MCP tools reference (20 mega-tools)
+│   └── mcp-tools.md         # MCP tools reference (22 mega-tools)
 └── guides/
     ├── getting-started.md   # Tutorial for new users
     ├── multi-agent-workflow.md # Multi-agent coordination
@@ -205,7 +207,7 @@ src/
 ├── mcp/
 │   ├── mod.rs           # MCP module exports
 │   ├── protocol.rs      # JSON-RPC 2.0 types
-│   ├── tools.rs         # Mega-tool definitions (20 tools)
+│   ├── tools.rs         # Mega-tool definitions (22 tools)
 │   ├── handlers.rs      # Tool implementations
 │   └── server.rs        # MCP server (stdio)
 ├── neo4j/
@@ -361,7 +363,7 @@ See the [Knowledge Notes Guide](docs/guides/knowledge-notes.md) for detailed doc
 - `DELETE /api/notes/{id}/links/{type}/{entity}` - Unlink note from entity
 - `GET /api/projects/{id}/notes` - List notes for a project
 
-**Note Types:** `guideline`, `gotcha`, `pattern`, `context`, `tip`, `observation`, `assertion`
+**Note Types:** `guideline`, `gotcha`, `pattern`, `context`, `tip`, `observation`, `assertion`, `rfc`
 
 **Note Status:** `active`, `needs_review`, `stale`, `obsolete`, `archived`
 

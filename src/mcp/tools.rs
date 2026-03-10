@@ -1,6 +1,6 @@
 //! MCP Tool definitions — Mega-tools architecture
 //!
-//! Instead of 160 individual tools, we expose ~19 mega-tools with an `action` parameter.
+//! Instead of 160 individual tools, we expose 22 mega-tools with an `action` parameter.
 //! Each mega-tool groups all operations for a domain (e.g., project, plan, task).
 //! The `action` parameter selects the specific operation; additional parameters vary by action.
 //!
