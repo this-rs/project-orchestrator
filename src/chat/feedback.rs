@@ -311,9 +311,7 @@ pub async fn process_rfc_observation(
         return false;
     };
 
-    debug!(
-        "[feedback] RFC accumulator triggered, checking for duplicates"
-    );
+    debug!("[feedback] RFC accumulator triggered, checking for duplicates");
 
     // Deduplication: search existing RFC notes for similarity
     let first_line = content.lines().skip(2).next().unwrap_or(&content);
@@ -350,7 +348,12 @@ pub async fn process_rfc_observation(
     }
 
     // Create the RFC note
-    let mut note = Note::new(project_id, NoteType::Rfc, content, "system/rfc-detector".to_string());
+    let mut note = Note::new(
+        project_id,
+        NoteType::Rfc,
+        content,
+        "system/rfc-detector".to_string(),
+    );
     note.importance = NoteImportance::High;
     note.tags = vec!["auto-detected".to_string(), "rfc".to_string()];
 
@@ -366,10 +369,7 @@ pub async fn process_rfc_observation(
             true
         }
         Err(e) => {
-            warn!(
-                "[feedback] Failed to create RFC note: {} — non-blocking",
-                e
-            );
+            warn!("[feedback] Failed to create RFC note: {} — non-blocking", e);
             false
         }
     }
@@ -652,18 +652,13 @@ mod tests {
     #[tokio::test]
     async fn test_rfc_processing_below_threshold() {
         let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
-        let search: Arc<dyn SearchStore> = Arc::new(crate::meilisearch::mock::MockSearchStore::new());
+        let search: Arc<dyn SearchStore> =
+            Arc::new(crate::meilisearch::mock::MockSearchStore::new());
         let accumulator = Arc::new(Mutex::new(RfcAccumulator::new()));
 
         let obs = make_rfc_observation("I propose we restructure the module");
-        let created = process_rfc_observation(
-            Some(&obs),
-            &accumulator,
-            &graph,
-            &search,
-            None,
-        )
-        .await;
+        let created =
+            process_rfc_observation(Some(&obs), &accumulator, &graph, &search, None).await;
 
         assert!(!created, "Should not create note on first observation");
         let acc = accumulator.lock().await;
@@ -675,32 +670,21 @@ mod tests {
     async fn test_rfc_processing_threshold_creates_note() {
         let mock_graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
         let graph: Arc<dyn GraphStore> = mock_graph.clone();
-        let search: Arc<dyn SearchStore> = Arc::new(crate::meilisearch::mock::MockSearchStore::new());
+        let search: Arc<dyn SearchStore> =
+            Arc::new(crate::meilisearch::mock::MockSearchStore::new());
         let accumulator = Arc::new(Mutex::new(RfcAccumulator::new()));
 
         let obs1 = make_rfc_observation("I propose we restructure the module");
         let obs2 = make_rfc_observation("We should also consider a plugin architecture");
 
         // First observation — no creation
-        let created1 = process_rfc_observation(
-            Some(&obs1),
-            &accumulator,
-            &graph,
-            &search,
-            None,
-        )
-        .await;
+        let created1 =
+            process_rfc_observation(Some(&obs1), &accumulator, &graph, &search, None).await;
         assert!(!created1);
 
         // Second observation — threshold reached, note should be created
-        let created2 = process_rfc_observation(
-            Some(&obs2),
-            &accumulator,
-            &graph,
-            &search,
-            None,
-        )
-        .await;
+        let created2 =
+            process_rfc_observation(Some(&obs2), &accumulator, &graph, &search, None).await;
         assert!(created2, "Should create RFC note when threshold is reached");
 
         // Verify the note was created in the graph store
@@ -723,7 +707,8 @@ mod tests {
     #[tokio::test]
     async fn test_rfc_processing_reset_on_non_rfc() {
         let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
-        let search: Arc<dyn SearchStore> = Arc::new(crate::meilisearch::mock::MockSearchStore::new());
+        let search: Arc<dyn SearchStore> =
+            Arc::new(crate::meilisearch::mock::MockSearchStore::new());
         let accumulator = Arc::new(Mutex::new(RfcAccumulator::new()));
 
         let rfc_obs = make_rfc_observation("I propose we restructure the module");
@@ -747,7 +732,8 @@ mod tests {
         drop(acc);
 
         // Third: RFC again — starts from 1, not threshold
-        let created = process_rfc_observation(Some(&rfc_obs), &accumulator, &graph, &search, None).await;
+        let created =
+            process_rfc_observation(Some(&rfc_obs), &accumulator, &graph, &search, None).await;
         assert!(!created, "Should not create after reset");
     }
 
@@ -755,7 +741,8 @@ mod tests {
     #[tokio::test]
     async fn test_rfc_processing_none_resets() {
         let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
-        let search: Arc<dyn SearchStore> = Arc::new(crate::meilisearch::mock::MockSearchStore::new());
+        let search: Arc<dyn SearchStore> =
+            Arc::new(crate::meilisearch::mock::MockSearchStore::new());
         let accumulator = Arc::new(Mutex::new(RfcAccumulator::new()));
 
         let rfc_obs = make_rfc_observation("I propose something");
@@ -772,7 +759,8 @@ mod tests {
     async fn test_rfc_processing_with_project_id() {
         let mock_graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
         let graph: Arc<dyn GraphStore> = mock_graph.clone();
-        let search: Arc<dyn SearchStore> = Arc::new(crate::meilisearch::mock::MockSearchStore::new());
+        let search: Arc<dyn SearchStore> =
+            Arc::new(crate::meilisearch::mock::MockSearchStore::new());
         let accumulator = Arc::new(Mutex::new(RfcAccumulator::new()));
         let project_id = Uuid::new_v4();
 
@@ -780,7 +768,9 @@ mod tests {
 
         // Feed twice to reach threshold
         process_rfc_observation(Some(&obs), &accumulator, &graph, &search, Some(project_id)).await;
-        let created = process_rfc_observation(Some(&obs), &accumulator, &graph, &search, Some(project_id)).await;
+        let created =
+            process_rfc_observation(Some(&obs), &accumulator, &graph, &search, Some(project_id))
+                .await;
         assert!(created);
 
         let notes = mock_graph.notes.read().await;
@@ -793,7 +783,8 @@ mod tests {
     async fn test_e2e_rfc_pipeline_full_flow() {
         let mock_graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
         let graph: Arc<dyn GraphStore> = mock_graph.clone();
-        let search: Arc<dyn SearchStore> = Arc::new(crate::meilisearch::mock::MockSearchStore::new());
+        let search: Arc<dyn SearchStore> =
+            Arc::new(crate::meilisearch::mock::MockSearchStore::new());
         let accumulator = Arc::new(Mutex::new(RfcAccumulator::new()));
 
         // Two consecutive responses with RFC-qualifying text
@@ -803,13 +794,15 @@ mod tests {
         // Process first response
         let obs1 = detect_response_observations(response1);
         assert!(obs1.is_some(), "First response should detect RFC pattern");
-        let created1 = process_rfc_observation(obs1.as_ref(), &accumulator, &graph, &search, None).await;
+        let created1 =
+            process_rfc_observation(obs1.as_ref(), &accumulator, &graph, &search, None).await;
         assert!(!created1, "First response should not create note yet");
 
         // Process second response
         let obs2 = detect_response_observations(response2);
         assert!(obs2.is_some(), "Second response should detect RFC pattern");
-        let created2 = process_rfc_observation(obs2.as_ref(), &accumulator, &graph, &search, None).await;
+        let created2 =
+            process_rfc_observation(obs2.as_ref(), &accumulator, &graph, &search, None).await;
         assert!(created2, "Second response should trigger note creation");
 
         // Verify note content
@@ -817,6 +810,8 @@ mod tests {
         assert_eq!(notes.len(), 1);
         let note = notes.values().next().unwrap();
         assert_eq!(note.note_type, NoteType::Rfc);
-        assert!(note.content.contains("2 consecutive architectural discussions"));
+        assert!(note
+            .content
+            .contains("2 consecutive architectural discussions"));
     }
 }

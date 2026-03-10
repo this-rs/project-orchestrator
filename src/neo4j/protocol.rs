@@ -995,10 +995,7 @@ impl Neo4jClient {
                 .ok()
                 .filter(|s| !s.is_empty())
                 .and_then(|s| s.parse().ok()),
-            action: node
-                .get::<String>("action")
-                .ok()
-                .filter(|s| !s.is_empty()),
+            action: node.get::<String>("action").ok().filter(|s| !s.is_empty()),
             status: node
                 .get::<String>("status")
                 .unwrap_or_else(|_| "pending".to_string()),

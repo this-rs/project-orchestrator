@@ -20,8 +20,8 @@
 
 use crate::neo4j::traits::GraphStore;
 use crate::protocol::{
-    ChildCompletionInfo, CompletionStrategy, OnFailureStrategy, ProtocolRun, RunStatus,
-    StateType, TransitionResult,
+    ChildCompletionInfo, CompletionStrategy, OnFailureStrategy, ProtocolRun, RunStatus, StateType,
+    TransitionResult,
 };
 use anyhow::{bail, Context, Result};
 use uuid::Uuid;
@@ -435,8 +435,7 @@ pub async fn handle_child_completion(
                             format!("Parent run not found for retry: {parent_run_id}")
                         })?;
                     let sub_protocol_id = completed_run.protocol_id;
-                    let _child =
-                        start_child_run(store, &parent_run_fresh, sub_protocol_id).await?;
+                    let _child = start_child_run(store, &parent_run_fresh, sub_protocol_id).await?;
                     Ok(None)
                 } else {
                     // Max retries exceeded — fall back to Abort
@@ -525,11 +524,7 @@ pub fn fail_run<'a>(
     Box::pin(fail_run_inner(store, run_id, error))
 }
 
-async fn fail_run_inner(
-    store: &dyn GraphStore,
-    run_id: Uuid,
-    error: &str,
-) -> Result<ProtocolRun> {
+async fn fail_run_inner(store: &dyn GraphStore, run_id: Uuid, error: &str) -> Result<ProtocolRun> {
     let mut run = store
         .get_protocol_run(run_id)
         .await?
@@ -931,9 +926,7 @@ mod tests {
     /// Helper: set up a parent protocol with a macro-state pointing to a child protocol.
     /// Parent: Start -> Macro(sub=child_protocol) -> Done
     /// Child: ChildStart -> ChildDone (terminal)
-    async fn setup_hierarchical(
-        store: &MockGraphStore,
-    ) -> (Uuid, Protocol, Protocol) {
+    async fn setup_hierarchical(store: &MockGraphStore) -> (Uuid, Protocol, Protocol) {
         let project_id = Uuid::new_v4();
         let project = crate::neo4j::models::ProjectNode {
             id: project_id,
@@ -1021,11 +1014,7 @@ mod tests {
         let child_run_id = result.child_run_id.unwrap();
 
         // Verify child run exists in store
-        let child_run = store
-            .get_protocol_run(child_run_id)
-            .await
-            .unwrap()
-            .unwrap();
+        let child_run = store.get_protocol_run(child_run_id).await.unwrap().unwrap();
         assert_eq!(child_run.protocol_id, child_proto.id);
         assert_eq!(child_run.parent_run_id, Some(parent_run.id));
         assert_eq!(child_run.depth, 1);
@@ -1059,11 +1048,7 @@ mod tests {
             .unwrap();
 
         // Simulate a deeply nested parent by creating a fake parent run at depth 4
-        let mut deep_parent = ProtocolRun::new(
-            parent_proto.id,
-            root_run.current_state,
-            "Start",
-        );
+        let mut deep_parent = ProtocolRun::new(parent_proto.id, root_run.current_state, "Start");
         deep_parent.depth = MAX_HIERARCHY_DEPTH - 1; // depth 4
         deep_parent.parent_run_id = Some(root_run.id);
 
@@ -1237,11 +1222,7 @@ mod tests {
             "Parent should auto-transition when all children are done"
         );
         assert_eq!(
-            parent_final
-                .states_visited
-                .last()
-                .unwrap()
-                .state_name,
+            parent_final.states_visited.last().unwrap().state_name,
             "Done"
         );
     }
@@ -1256,8 +1237,7 @@ mod tests {
         let p_start = ProtocolState::start(parent_id, "Start");
         let mut p_macro = ProtocolState::new(parent_id, "Macro");
         p_macro.sub_protocol_id = Some(child_proto.id);
-        p_macro.completion_strategy =
-            Some(crate::protocol::CompletionStrategy::AnyComplete);
+        p_macro.completion_strategy = Some(crate::protocol::CompletionStrategy::AnyComplete);
         let p_done = ProtocolState::terminal(parent_id, "Done");
 
         let mut parent_proto = Protocol::new_full(
@@ -1337,11 +1317,7 @@ mod tests {
             "AnyComplete: parent should auto-transition on first child completion"
         );
         assert_eq!(
-            parent_final
-                .states_visited
-                .last()
-                .unwrap()
-                .state_name,
+            parent_final.states_visited.last().unwrap().state_name,
             "Done"
         );
     }
@@ -1356,8 +1332,7 @@ mod tests {
         let p_start = ProtocolState::start(parent_id, "Start");
         let mut p_macro = ProtocolState::new(parent_id, "Macro");
         p_macro.sub_protocol_id = Some(child_proto.id);
-        p_macro.completion_strategy =
-            Some(crate::protocol::CompletionStrategy::Manual);
+        p_macro.completion_strategy = Some(crate::protocol::CompletionStrategy::Manual);
         let p_done = ProtocolState::terminal(parent_id, "Done");
 
         let mut parent_proto = Protocol::new_full(
@@ -1435,7 +1410,11 @@ mod tests {
             RunStatus::Failed,
             "Abort strategy: parent should fail when child fails"
         );
-        assert!(parent_final.error.as_ref().unwrap().contains("Child run failed"));
+        assert!(parent_final
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("Child run failed"));
     }
 
     #[tokio::test]
@@ -1562,8 +1541,15 @@ mod tests {
 
         // There should be a new child run (the retry)
         let children = store.list_child_runs(parent_run.id).await.unwrap();
-        assert_eq!(children.len(), 2, "Should have 2 children after first retry");
-        let child2 = children.iter().find(|r| r.status == RunStatus::Running).unwrap();
+        assert_eq!(
+            children.len(),
+            2,
+            "Should have 2 children after first retry"
+        );
+        let child2 = children
+            .iter()
+            .find(|r| r.status == RunStatus::Running)
+            .unwrap();
 
         // Fail child 2 — should spawn another retry (child 3)
         fail_run(&store, child2.id, "attempt 2 failed")
@@ -1579,8 +1565,15 @@ mod tests {
         assert_eq!(parent_check.status, RunStatus::Running);
 
         let children = store.list_child_runs(parent_run.id).await.unwrap();
-        assert_eq!(children.len(), 3, "Should have 3 children after second retry");
-        let child3 = children.iter().find(|r| r.status == RunStatus::Running).unwrap();
+        assert_eq!(
+            children.len(),
+            3,
+            "Should have 3 children after second retry"
+        );
+        let child3 = children
+            .iter()
+            .find(|r| r.status == RunStatus::Running)
+            .unwrap();
 
         // Fail child 3 — max retries (2) exceeded, parent should abort
         fail_run(&store, child3.id, "attempt 3 failed")

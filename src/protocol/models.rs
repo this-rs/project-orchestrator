@@ -903,12 +903,7 @@ fn default_runtime_status() -> String {
 
 impl RuntimeState {
     /// Create a new pending RuntimeState.
-    pub fn new(
-        run_id: Uuid,
-        generated_by: Uuid,
-        name: impl Into<String>,
-        index: u32,
-    ) -> Self {
+    pub fn new(run_id: Uuid, generated_by: Uuid, name: impl Into<String>, index: u32) -> Self {
         Self {
             id: Uuid::new_v4(),
             run_id,
@@ -1276,8 +1271,14 @@ mod tests {
     #[test]
     fn test_state_type_generator_display_parse() {
         assert_eq!(StateType::Generator.to_string(), "generator");
-        assert_eq!(StateType::from_str("generator").unwrap(), StateType::Generator);
-        assert_eq!(StateType::from_str("Generator").unwrap(), StateType::Generator);
+        assert_eq!(
+            StateType::from_str("generator").unwrap(),
+            StateType::Generator
+        );
+        assert_eq!(
+            StateType::from_str("Generator").unwrap(),
+            StateType::Generator
+        );
     }
 
     #[test]

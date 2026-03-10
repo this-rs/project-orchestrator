@@ -70,9 +70,7 @@ pub async fn generate(
     // Create RuntimeStates
     let mut runtime_states = Vec::with_capacity(items);
     for i in 0..items {
-        let name = config
-            .state_template
-            .replace("{index}", &i.to_string());
+        let name = config.state_template.replace("{index}", &i.to_string());
         let mut rs = RuntimeState::new(run.id, state.id, name, i as u32);
         rs.sub_protocol_id = config.sub_protocol_id;
         store.create_runtime_state(&rs).await?;
@@ -264,7 +262,10 @@ mod tests {
         let bare_state = ProtocolState::new(protocol.id, "Bare");
         let result = generate(&bare_state, &run, &store).await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("no generator_config"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("no generator_config"));
     }
 
     #[tokio::test]
@@ -351,9 +352,10 @@ mod tests {
         }
 
         // 4. Fire "generated_complete" → transitions to Done (terminal)
-        let result2 = crate::protocol::engine::fire_transition(&store, run.id, "generated_complete")
-            .await
-            .unwrap();
+        let result2 =
+            crate::protocol::engine::fire_transition(&store, run.id, "generated_complete")
+                .await
+                .unwrap();
         assert!(result2.success, "Transition to Done failed");
         assert_eq!(result2.current_state_name, "Done");
         assert!(result2.run_completed);
@@ -400,6 +402,10 @@ mod tests {
 
         // Verify no duplicates
         let all = store.get_runtime_states(run.id).await.unwrap();
-        assert_eq!(all.len(), 2, "Idempotent: should still have exactly 2 RuntimeStates");
+        assert_eq!(
+            all.len(),
+            2,
+            "Idempotent: should still have exactly 2 RuntimeStates"
+        );
     }
 }

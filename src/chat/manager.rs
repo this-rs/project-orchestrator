@@ -3265,9 +3265,7 @@ impl ChatManager {
                     // RFC auto-detection: feed observation to session accumulator
                     let rfc_acc = {
                         let sessions = active_sessions.read().await;
-                        sessions
-                            .get(&session_id)
-                            .map(|s| s.rfc_accumulator.clone())
+                        sessions.get(&session_id).map(|s| s.rfc_accumulator.clone())
                     };
                     if let Some(rfc_acc) = rfc_acc {
                         super::feedback::spawn_rfc_processing(
