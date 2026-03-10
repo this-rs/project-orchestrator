@@ -9008,6 +9008,64 @@ impl GraphStore for MockGraphStore {
         Ok((page, total))
     }
 
+    async fn list_child_runs(
+        &self,
+        parent_run_id: Uuid,
+    ) -> anyhow::Result<Vec<crate::protocol::ProtocolRun>> {
+        let store = self.protocol_runs.read().await;
+        let mut children: Vec<_> = store
+            .values()
+            .filter(|r| r.parent_run_id == Some(parent_run_id))
+            .cloned()
+            .collect();
+        children.sort_by(|a, b| a.started_at.cmp(&b.started_at));
+        Ok(children)
+    }
+
+    async fn count_child_runs(&self, parent_run_id: Uuid) -> anyhow::Result<usize> {
+        let store = self.protocol_runs.read().await;
+        Ok(store
+            .values()
+            .filter(|r| r.parent_run_id == Some(parent_run_id))
+            .count())
+    }
+
+    async fn get_run_tree(
+        &self,
+        root_run_id: Uuid,
+    ) -> anyhow::Result<Vec<crate::protocol::ProtocolRun>> {
+        let store = self.protocol_runs.read().await;
+
+        // Check root exists
+        let root = store.get(&root_run_id).cloned();
+        let Some(root) = root else {
+            return Ok(vec![]);
+        };
+
+        // BFS to collect all descendants (depth limit 5)
+        let mut result = vec![root];
+        let mut current_parents = vec![root_run_id];
+        for _depth in 0..5 {
+            let children: Vec<_> = store
+                .values()
+                .filter(|r| {
+                    r.parent_run_id
+                        .is_some_and(|pid| current_parents.contains(&pid))
+                })
+                .cloned()
+                .collect();
+            if children.is_empty() {
+                break;
+            }
+            current_parents = children.iter().map(|r| r.id).collect();
+            result.extend(children);
+        }
+
+        // Sort by depth then started_at
+        result.sort_by(|a, b| a.depth.cmp(&b.depth).then(a.started_at.cmp(&b.started_at)));
+        Ok(result)
+    }
+
     async fn delete_protocol_run(&self, run_id: Uuid) -> anyhow::Result<bool> {
         Ok(self.protocol_runs.write().await.remove(&run_id).is_some())
     }

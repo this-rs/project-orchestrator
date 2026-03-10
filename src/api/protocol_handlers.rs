@@ -415,6 +415,8 @@ pub async fn create_protocol(
                 description: s.description.clone().unwrap_or_default(),
                 action: s.action.clone(),
                 state_type,
+                sub_protocol_id: None,
+                completion_strategy: None,
             };
             created_states.push(ps);
         }
@@ -668,6 +670,8 @@ pub async fn add_state(
         description: body.description.unwrap_or_default(),
         action: body.action,
         state_type,
+        sub_protocol_id: None,
+        completion_strategy: None,
     };
 
     state
@@ -958,22 +962,110 @@ pub async fn fire_transition(
     Ok(Json(result))
 }
 
-/// Get a protocol run by ID
+/// Enriched protocol run response with hierarchy metadata
+#[derive(Debug, Serialize)]
+pub struct EnrichedProtocolRun {
+    #[serde(flatten)]
+    pub run: ProtocolRun,
+    /// Number of direct child runs
+    pub children_count: usize,
+}
+
+/// Get a protocol run by ID (enriched with children_count)
 ///
 /// GET /api/protocols/runs/:run_id
 pub async fn get_run(
     State(state): State<OrchestratorState>,
     Path(run_id): Path<Uuid>,
-) -> Result<Json<ProtocolRun>, AppError> {
-    let run = state
-        .orchestrator
-        .neo4j()
+) -> Result<Json<EnrichedProtocolRun>, AppError> {
+    let neo4j = state.orchestrator.neo4j();
+    let run = neo4j
         .get_protocol_run(run_id)
         .await
         .map_err(AppError::Internal)?
         .ok_or_else(|| AppError::NotFound(format!("ProtocolRun {} not found", run_id)))?;
 
-    Ok(Json(run))
+    let children_count = neo4j
+        .count_child_runs(run_id)
+        .await
+        .map_err(AppError::Internal)?;
+
+    Ok(Json(EnrichedProtocolRun {
+        run,
+        children_count,
+    }))
+}
+
+/// Get direct children of a protocol run
+///
+/// GET /api/protocols/runs/:run_id/children
+pub async fn get_run_children(
+    State(state): State<OrchestratorState>,
+    Path(run_id): Path<Uuid>,
+) -> Result<Json<Vec<ProtocolRun>>, AppError> {
+    // Verify parent exists
+    let neo4j = state.orchestrator.neo4j();
+    neo4j
+        .get_protocol_run(run_id)
+        .await
+        .map_err(AppError::Internal)?
+        .ok_or_else(|| AppError::NotFound(format!("ProtocolRun {} not found", run_id)))?;
+
+    let children = neo4j
+        .list_child_runs(run_id)
+        .await
+        .map_err(AppError::Internal)?;
+
+    Ok(Json(children))
+}
+
+/// Recursive tree node for protocol run hierarchy
+#[derive(Debug, Serialize)]
+pub struct RunTreeNode {
+    #[serde(flatten)]
+    pub run: ProtocolRun,
+    pub children: Vec<RunTreeNode>,
+}
+
+/// Get the full run tree starting from a root run (recursive)
+///
+/// GET /api/protocols/runs/:run_id/tree
+pub async fn get_run_tree(
+    State(state): State<OrchestratorState>,
+    Path(run_id): Path<Uuid>,
+) -> Result<Json<RunTreeNode>, AppError> {
+    let neo4j = state.orchestrator.neo4j();
+    let root = neo4j
+        .get_protocol_run(run_id)
+        .await
+        .map_err(AppError::Internal)?
+        .ok_or_else(|| AppError::NotFound(format!("ProtocolRun {} not found", run_id)))?;
+
+    // Build tree recursively (max depth 10 to prevent infinite loops)
+    async fn build_tree(
+        neo4j: &dyn crate::neo4j::traits::GraphStore,
+        run: ProtocolRun,
+        depth: usize,
+    ) -> Result<RunTreeNode, AppError> {
+        if depth > 10 {
+            return Ok(RunTreeNode {
+                run,
+                children: vec![],
+            });
+        }
+        let child_runs = neo4j
+            .list_child_runs(run.id)
+            .await
+            .map_err(AppError::Internal)?;
+        let mut children = Vec::with_capacity(child_runs.len());
+        for child in child_runs {
+            children.push(Box::pin(build_tree(neo4j, child, depth + 1)).await?);
+        }
+        Ok(RunTreeNode { run, children })
+    }
+
+    let tree = build_tree(neo4j, root, 0).await?;
+    Ok(Json(tree))
 }
 
 /// List runs for a protocol
@@ -1179,6 +1271,8 @@ pub struct ComposeStateInline {
     pub description: Option<String>,
     pub state_type: Option<String>,
     pub action: Option<String>,
+    /// Optional sub-protocol to spawn when entering this state
+    pub sub_protocol_id: Option<Uuid>,
 }
 
 /// Inline transition for composition (uses state names instead of UUIDs)
@@ -1349,6 +1443,8 @@ pub async fn compose_protocol(
             description: s.description.clone().unwrap_or_default(),
             action: s.action.clone(),
             state_type,
+            sub_protocol_id: s.sub_protocol_id,
+            completion_strategy: None,
         };
         name_to_id.insert(s.name.clone(), ps.id);
         created_states.push(ps);

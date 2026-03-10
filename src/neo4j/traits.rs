@@ -2516,6 +2516,16 @@ pub trait GraphStore: Send + Sync {
         offset: usize,
     ) -> Result<(Vec<ProtocolRun>, usize)>;
 
+    /// List child runs for a given parent run.
+    async fn list_child_runs(&self, parent_run_id: Uuid) -> Result<Vec<ProtocolRun>>;
+
+    /// Count children for a given run.
+    async fn count_child_runs(&self, parent_run_id: Uuid) -> Result<usize>;
+
+    /// Get the full run tree rooted at a given run (recursive, depth limit 5).
+    /// Returns root + all descendants, ordered by depth then started_at.
+    async fn get_run_tree(&self, root_run_id: Uuid) -> Result<Vec<ProtocolRun>>;
+
     /// Delete a protocol run.
     /// Returns true if the run existed and was deleted.
     async fn delete_protocol_run(&self, run_id: Uuid) -> Result<bool>;
