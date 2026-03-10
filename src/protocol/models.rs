@@ -264,10 +264,11 @@ impl FromStr for CompletionStrategy {
 /// - **Abort**: Fail the parent run immediately (default)
 /// - **Skip**: Fire 'child_skipped' on parent to advance past the macro-state
 /// - **Retry**: Re-start the child run up to `max` times, then fall back to Abort
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum OnFailureStrategy {
     /// Fail the parent run immediately
+    #[default]
     Abort,
     /// Skip the failed child and fire 'child_skipped' on parent
     Skip,
@@ -278,11 +279,6 @@ pub enum OnFailureStrategy {
     },
 }
 
-impl Default for OnFailureStrategy {
-    fn default() -> Self {
-        Self::Abort
-    }
-}
 
 impl fmt::Display for OnFailureStrategy {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

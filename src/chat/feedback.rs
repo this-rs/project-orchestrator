@@ -314,7 +314,7 @@ pub async fn process_rfc_observation(
     debug!("[feedback] RFC accumulator triggered, checking for duplicates");
 
     // Deduplication: search existing RFC notes for similarity
-    let first_line = content.lines().skip(2).next().unwrap_or(&content);
+    let first_line = content.lines().nth(2).unwrap_or(&content);
     let search_query = if first_line.len() > 100 {
         &first_line[..100]
     } else {
