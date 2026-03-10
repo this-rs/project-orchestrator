@@ -6115,4 +6115,329 @@ mod tests {
             "e83b0663-9600-450d-9f63-234e857394df"
         );
     }
+
+    // ================================================================
+    // Dependency graph — enriched structs serialization
+    // ================================================================
+
+    #[test]
+    fn test_dependency_graph_step_serialization() {
+        let step = DependencyGraphStep {
+            id: "step-1".to_string(),
+            order: 0,
+            description: "Create endpoint".to_string(),
+            status: "Pending".to_string(),
+            verification: Some("cargo test".to_string()),
+        };
+        let json = serde_json::to_value(&step).unwrap();
+        assert_eq!(json["id"], "step-1");
+        assert_eq!(json["order"], 0);
+        assert_eq!(json["description"], "Create endpoint");
+        assert_eq!(json["status"], "Pending");
+        assert_eq!(json["verification"], "cargo test");
+    }
+
+    #[test]
+    fn test_dependency_graph_step_no_verification() {
+        let step = DependencyGraphStep {
+            id: "step-2".to_string(),
+            order: 1,
+            description: "Review code".to_string(),
+            status: "Completed".to_string(),
+            verification: None,
+        };
+        let json = serde_json::to_value(&step).unwrap();
+        assert!(json.get("verification").is_none()); // skip_serializing_if
+    }
+
+    #[test]
+    fn test_dependency_graph_session_serialization() {
+        let session = DependencyGraphSession {
+            session_id: "sess-1".to_string(),
+            title: Some("Planning session".to_string()),
+            is_active: true,
+            child_count: 3,
+        };
+        let json = serde_json::to_value(&session).unwrap();
+        assert_eq!(json["session_id"], "sess-1");
+        assert_eq!(json["title"], "Planning session");
+        assert_eq!(json["is_active"], true);
+        assert_eq!(json["child_count"], 3);
+    }
+
+    #[test]
+    fn test_dependency_graph_session_no_title() {
+        let session = DependencyGraphSession {
+            session_id: "sess-2".to_string(),
+            title: None,
+            is_active: false,
+            child_count: 0,
+        };
+        let json = serde_json::to_value(&session).unwrap();
+        assert!(json.get("title").is_none()); // skip_serializing_if
+    }
+
+    #[test]
+    fn test_dependency_graph_discussed_file_serialization() {
+        let f = DependencyGraphDiscussedFile {
+            file_path: "src/main.rs".to_string(),
+            mention_count: 5,
+        };
+        let json = serde_json::to_value(&f).unwrap();
+        assert_eq!(json["file_path"], "src/main.rs");
+        assert_eq!(json["mention_count"], 5);
+    }
+
+    #[test]
+    fn test_feature_graph_summary_serialization() {
+        let fg = FeatureGraphSummary {
+            id: "fg-1".to_string(),
+            name: "Auth flow".to_string(),
+            entity_count: 12,
+        };
+        let json = serde_json::to_value(&fg).unwrap();
+        assert_eq!(json["id"], "fg-1");
+        assert_eq!(json["name"], "Auth flow");
+        assert_eq!(json["entity_count"], 12);
+    }
+
+    #[test]
+    fn test_dependency_graph_node_enriched_serialization() {
+        let node = DependencyGraphNode {
+            id: uuid::Uuid::new_v4(),
+            title: Some("Implement API".to_string()),
+            description: "Build the REST endpoint".to_string(),
+            status: "Pending".to_string(),
+            priority: Some(80),
+            tags: vec!["api".to_string(), "backend".to_string()],
+            affected_files: vec!["src/api.rs".to_string()],
+            assigned_to: Some("agent-1".to_string()),
+            acceptance_criteria: vec!["Tests pass".to_string()],
+            step_count: 3,
+            completed_step_count: 1,
+            note_count: 2,
+            decision_count: 1,
+            steps: vec![DependencyGraphStep {
+                id: "s1".to_string(),
+                order: 0,
+                description: "Step 1".to_string(),
+                status: "Completed".to_string(),
+                verification: None,
+            }],
+            session_count: 1,
+            active_session_count: 0,
+            child_session_count: 2,
+            discussed_files: vec![DependencyGraphDiscussedFile {
+                file_path: "src/api.rs".to_string(),
+                mention_count: 3,
+            }],
+        };
+        let json = serde_json::to_value(&node).unwrap();
+        assert_eq!(json["step_count"], 3);
+        assert_eq!(json["completed_step_count"], 1);
+        assert_eq!(json["note_count"], 2);
+        assert_eq!(json["decision_count"], 1);
+        assert_eq!(json["session_count"], 1);
+        assert_eq!(json["active_session_count"], 0);
+        assert_eq!(json["child_session_count"], 2);
+        assert_eq!(json["steps"].as_array().unwrap().len(), 1);
+        assert_eq!(json["discussed_files"].as_array().unwrap().len(), 1);
+        assert_eq!(json["tags"].as_array().unwrap().len(), 2);
+        assert_eq!(json["affected_files"].as_array().unwrap().len(), 1);
+        assert_eq!(json["assigned_to"], "agent-1");
+        assert_eq!(json["acceptance_criteria"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_dependency_graph_response_serialization() {
+        let resp = DependencyGraphResponse {
+            nodes: vec![],
+            edges: vec![],
+            conflicts: vec![],
+            feature_graphs: vec![FeatureGraphSummary {
+                id: "fg-1".to_string(),
+                name: "Auth".to_string(),
+                entity_count: 0,
+            }],
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert!(json["nodes"].is_array());
+        assert!(json["edges"].is_array());
+        assert!(json["conflicts"].is_array());
+        assert_eq!(json["feature_graphs"].as_array().unwrap().len(), 1);
+    }
+
+    // ================================================================
+    // GET /api/plans/{id}/dependency-graph — enriched handler test
+    // ================================================================
+
+    /// Build a test router with a plan containing tasks with steps and dependencies
+    async fn test_app_with_dependency_graph(
+    ) -> (axum::Router, uuid::Uuid, uuid::Uuid, uuid::Uuid) {
+        let app_state = mock_app_state();
+
+        // Create plan
+        let plan = test_plan();
+        app_state.neo4j.create_plan(&plan).await.unwrap();
+
+        // Create two tasks with affected_files (for conflict detection)
+        let mut task1 = test_task_titled("Backend API");
+        task1.affected_files = vec!["src/api.rs".to_string(), "src/shared.rs".to_string()];
+        let mut task2 = test_task_titled("Frontend UI");
+        task2.affected_files = vec!["src/ui.rs".to_string(), "src/shared.rs".to_string()];
+        app_state.neo4j.create_task(plan.id, &task1).await.unwrap();
+        app_state.neo4j.create_task(plan.id, &task2).await.unwrap();
+
+        // Add dependency: task2 depends on task1
+        app_state
+            .neo4j
+            .add_task_dependency(task2.id, task1.id)
+            .await
+            .unwrap();
+
+        // Add steps to task1
+        let step1 = test_step(0, "Create endpoint");
+        let step2 = test_step(1, "Add tests");
+        app_state.neo4j.create_step(task1.id, &step1).await.unwrap();
+        app_state.neo4j.create_step(task1.id, &step2).await.unwrap();
+
+        let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
+        let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
+            orchestrator.clone(),
+        )));
+        let state = Arc::new(ServerState {
+            orchestrator,
+            watcher,
+            chat_manager: None,
+            event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(
+                crate::events::EventBus::default(),
+            ))),
+            nats_emitter: None,
+            auth_config: Some(crate::test_helpers::test_auth_config()),
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+            setup_completed: true,
+            server_port: 6600,
+            public_url: None,
+            ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
+            registry_remote_url: None,
+            oidc_client: None,
+        });
+        (create_router(state), plan.id, task1.id, task2.id)
+    }
+
+    #[tokio::test]
+    async fn test_get_dependency_graph_enriched() {
+        let (app, plan_id, task1_id, task2_id) = test_app_with_dependency_graph().await;
+        let uri = format!("/api/plans/{}/dependency-graph", plan_id);
+        let resp = app.oneshot(auth_get(&uri)).await.unwrap();
+
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // Nodes
+        let nodes = json["nodes"].as_array().unwrap();
+        assert_eq!(nodes.len(), 2);
+
+        // Find task1 node — should have enriched step data
+        let t1 = nodes
+            .iter()
+            .find(|n| n["id"].as_str().unwrap() == task1_id.to_string())
+            .unwrap();
+        assert_eq!(t1["step_count"], 2);
+        assert_eq!(t1["completed_step_count"], 0); // none completed yet
+        assert!(t1["steps"].is_array());
+        assert_eq!(t1["steps"].as_array().unwrap().len(), 2);
+
+        // Step details
+        let step_descs: Vec<&str> = t1["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|s| s["description"].as_str())
+            .collect();
+        assert!(step_descs.contains(&"Create endpoint"));
+        assert!(step_descs.contains(&"Add tests"));
+
+        // task2 has no steps
+        let t2 = nodes
+            .iter()
+            .find(|n| n["id"].as_str().unwrap() == task2_id.to_string())
+            .unwrap();
+        assert_eq!(t2["step_count"], 0);
+        assert_eq!(t2["steps"].as_array().unwrap().len(), 0);
+
+        // Enrichment fields present
+        assert!(t1["tags"].is_array());
+        assert!(t1["affected_files"].is_array());
+        assert!(t1["acceptance_criteria"].is_array());
+        assert!(t1["note_count"].is_number());
+        assert!(t1["decision_count"].is_number());
+        assert!(t1["session_count"].is_number());
+        assert!(t1["discussed_files"].is_array());
+
+        // Edges — task2 depends on task1
+        let edges = json["edges"].as_array().unwrap();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0]["from"].as_str().unwrap(), task2_id.to_string());
+        assert_eq!(edges[0]["to"].as_str().unwrap(), task1_id.to_string());
+
+        // Conflicts — src/shared.rs is in both tasks
+        let conflicts = json["conflicts"].as_array().unwrap();
+        assert!(
+            !conflicts.is_empty(),
+            "Should detect file conflict on src/shared.rs"
+        );
+
+        // Feature graphs — empty (no project linked)
+        assert!(json["feature_graphs"].is_array());
+    }
+
+    #[tokio::test]
+    async fn test_get_dependency_graph_empty_plan() {
+        let app_state = mock_app_state();
+        let plan = test_plan();
+        app_state.neo4j.create_plan(&plan).await.unwrap();
+
+        let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
+        let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
+            orchestrator.clone(),
+        )));
+        let state = Arc::new(ServerState {
+            orchestrator,
+            watcher,
+            chat_manager: None,
+            event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(
+                crate::events::EventBus::default(),
+            ))),
+            nats_emitter: None,
+            auth_config: Some(crate::test_helpers::test_auth_config()),
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+            setup_completed: true,
+            server_port: 6600,
+            public_url: None,
+            ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
+            registry_remote_url: None,
+            oidc_client: None,
+        });
+        let app = create_router(state);
+
+        let uri = format!("/api/plans/{}/dependency-graph", plan.id);
+        let resp = app.oneshot(auth_get(&uri)).await.unwrap();
+
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["nodes"].as_array().unwrap().len(), 0);
+        assert_eq!(json["edges"].as_array().unwrap().len(), 0);
+        assert_eq!(json["conflicts"].as_array().unwrap().len(), 0);
+        assert_eq!(json["feature_graphs"].as_array().unwrap().len(), 0);
+    }
 }
