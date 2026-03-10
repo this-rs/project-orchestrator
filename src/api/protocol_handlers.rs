@@ -417,6 +417,8 @@ pub async fn create_protocol(
                 state_type,
                 sub_protocol_id: None,
                 completion_strategy: None,
+                on_failure_strategy: None,
+                generator_config: None,
             };
             created_states.push(ps);
         }
@@ -672,6 +674,8 @@ pub async fn add_state(
         state_type,
         sub_protocol_id: None,
         completion_strategy: None,
+        on_failure_strategy: None,
+        generator_config: None,
     };
 
     state
@@ -957,6 +961,27 @@ pub async fn fire_transition(
             }),
             None,
         );
+
+        // Emit child_completed / child_failed event when a child run reaches terminal state
+        if let Some(ref info) = result.child_completion {
+            let event_action = if info.status == RunStatus::Failed {
+                "child_failed"
+            } else {
+                "child_completed"
+            };
+            state.event_bus.emit_updated(
+                crate::events::EntityType::ProtocolRun,
+                &info.parent_run_id.to_string(),
+                serde_json::json!({
+                    "event": event_action,
+                    "parent_run_id": info.parent_run_id,
+                    "child_run_id": info.child_run_id,
+                    "protocol_id": info.protocol_id,
+                    "child_status": info.status.to_string(),
+                }),
+                None,
+            );
+        }
     }
 
     Ok(Json(result))
@@ -1158,6 +1183,22 @@ pub async fn fail_run(
         }),
         None,
     );
+
+    // Emit child_failed event if this run has a parent
+    if let Some(parent_run_id) = run.parent_run_id {
+        state.event_bus.emit_updated(
+            crate::events::EntityType::ProtocolRun,
+            &parent_run_id.to_string(),
+            serde_json::json!({
+                "event": "child_failed",
+                "parent_run_id": parent_run_id,
+                "child_run_id": run.id,
+                "protocol_id": run.protocol_id,
+                "child_status": run.status.to_string(),
+            }),
+            None,
+        );
+    }
 
     Ok(Json(run))
 }
@@ -1445,6 +1486,8 @@ pub async fn compose_protocol(
             state_type,
             sub_protocol_id: s.sub_protocol_id,
             completion_strategy: None,
+            on_failure_strategy: None,
+            generator_config: None,
         };
         name_to_id.insert(s.name.clone(), ps.id);
         created_states.push(ps);

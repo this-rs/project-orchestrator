@@ -71,6 +71,9 @@ pub enum StateType {
     Intermediate,
     /// Final state where the protocol run ends
     Terminal,
+    /// Generator state that dynamically creates RuntimeStates
+    #[serde(rename = "generator")]
+    Generator,
 }
 
 impl fmt::Display for StateType {
@@ -79,6 +82,7 @@ impl fmt::Display for StateType {
             Self::Start => write!(f, "start"),
             Self::Intermediate => write!(f, "intermediate"),
             Self::Terminal => write!(f, "terminal"),
+            Self::Generator => write!(f, "generator"),
         }
     }
 }
@@ -91,9 +95,66 @@ impl FromStr for StateType {
             "start" => Ok(Self::Start),
             "intermediate" => Ok(Self::Intermediate),
             "terminal" => Ok(Self::Terminal),
+            "generator" => Ok(Self::Generator),
             _ => Err(format!("Unknown state type: {}", s)),
         }
     }
+}
+
+/// Strategy for linking generated RuntimeStates.
+///
+/// Determines how the dynamically generated states are connected:
+/// - **Sequential**: States are chained one after another (A→B→C)
+/// - **Parallel**: All states are independent and can run concurrently
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum LinkingStrategy {
+    /// States are chained sequentially (A→B→C)
+    #[default]
+    Sequential,
+    /// States run in parallel (no dependencies between them)
+    Parallel,
+}
+
+impl fmt::Display for LinkingStrategy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Sequential => write!(f, "sequential"),
+            Self::Parallel => write!(f, "parallel"),
+        }
+    }
+}
+
+impl FromStr for LinkingStrategy {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "sequential" => Ok(Self::Sequential),
+            "parallel" => Ok(Self::Parallel),
+            _ => Err(format!("Unknown linking strategy: {}", s)),
+        }
+    }
+}
+
+/// Configuration for a Generator state.
+///
+/// Specifies how RuntimeStates are dynamically generated when entering
+/// a Generator state. The `data_source` determines where to fetch items,
+/// `state_template` defines the name template, and `linking` controls
+/// how the generated states are connected.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GeneratorConfig {
+    /// Data source identifier (e.g., "test", "plan_tasks", "wave_items")
+    pub data_source: String,
+    /// Name template for generated states (e.g., "Task {index}")
+    pub state_template: String,
+    /// Optional sub-protocol to spawn for each generated state
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sub_protocol_id: Option<Uuid>,
+    /// How generated states are linked together
+    #[serde(default)]
+    pub linking: LinkingStrategy,
 }
 
 /// Trigger mode for automatic protocol execution.
@@ -192,6 +253,65 @@ impl FromStr for CompletionStrategy {
             "any_complete" | "anycomplete" => Ok(Self::AnyComplete),
             "manual" => Ok(Self::Manual),
             _ => Err(format!("Unknown completion strategy: {}", s)),
+        }
+    }
+}
+
+/// Strategy for handling child run failures in hierarchical FSMs.
+///
+/// When a child run fails, the parent's macro-state uses this strategy
+/// to decide what to do:
+/// - **Abort**: Fail the parent run immediately (default)
+/// - **Skip**: Fire 'child_skipped' on parent to advance past the macro-state
+/// - **Retry**: Re-start the child run up to `max` times, then fall back to Abort
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum OnFailureStrategy {
+    /// Fail the parent run immediately
+    Abort,
+    /// Skip the failed child and fire 'child_skipped' on parent
+    Skip,
+    /// Retry the child run up to `max` times, then Abort
+    Retry {
+        /// Maximum number of retry attempts
+        max: u8,
+    },
+}
+
+impl Default for OnFailureStrategy {
+    fn default() -> Self {
+        Self::Abort
+    }
+}
+
+impl fmt::Display for OnFailureStrategy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Abort => write!(f, "abort"),
+            Self::Skip => write!(f, "skip"),
+            Self::Retry { max } => write!(f, "retry({})", max),
+        }
+    }
+}
+
+impl FromStr for OnFailureStrategy {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "abort" => Ok(Self::Abort),
+            "skip" => Ok(Self::Skip),
+            s if s.starts_with("retry") => {
+                // Parse "retry(N)" or "retry:N" or just "retry" (default max=3)
+                let max = s
+                    .trim_start_matches("retry")
+                    .trim_start_matches(&['(', ':', ' '][..])
+                    .trim_end_matches(')')
+                    .parse::<u8>()
+                    .unwrap_or(3);
+                Ok(Self::Retry { max })
+            }
+            _ => Err(format!("Unknown on_failure strategy: {}", s)),
         }
     }
 }
@@ -351,6 +471,12 @@ pub struct ProtocolState {
     /// How child run completion triggers parent transition (defaults to AllComplete)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completion_strategy: Option<CompletionStrategy>,
+    /// How child run failure is handled (defaults to Abort)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_failure_strategy: Option<OnFailureStrategy>,
+    /// Configuration for Generator states (only used when state_type == Generator)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generator_config: Option<GeneratorConfig>,
 }
 
 impl ProtocolState {
@@ -365,6 +491,8 @@ impl ProtocolState {
             state_type: StateType::Intermediate,
             sub_protocol_id: None,
             completion_strategy: None,
+            on_failure_strategy: None,
+            generator_config: None,
         }
     }
 
@@ -694,6 +822,22 @@ impl ProtocolRunProgress {
     }
 }
 
+/// Info about a child run that completed during this transition.
+///
+/// Populated when a run reaches a terminal state and has a `parent_run_id`.
+/// Used by the handler layer to emit `child_completed` / `child_failed` WebSocket events.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChildCompletionInfo {
+    /// The parent run that owns this child
+    pub parent_run_id: Uuid,
+    /// The child run that just completed
+    pub child_run_id: Uuid,
+    /// The protocol being executed by the child
+    pub protocol_id: Uuid,
+    /// Terminal status of the child run
+    pub status: RunStatus,
+}
+
 /// Result of a transition attempt.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransitionResult {
@@ -709,6 +853,73 @@ pub struct TransitionResult {
     pub status: RunStatus,
     /// Error message if transition failed
     pub error: Option<String>,
+    /// ID of the child run spawned by hierarchical FSM (if target state had sub_protocol_id)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_run_id: Option<Uuid>,
+    /// Info about a child run that completed during this transition (for event emission)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_completion: Option<ChildCompletionInfo>,
+}
+
+// ============================================================================
+// RuntimeState (Generator-produced dynamic states)
+// ============================================================================
+
+/// A dynamically generated state produced by a Generator state.
+///
+/// RuntimeStates are created at runtime when a protocol run enters a Generator
+/// state. They represent individual work items derived from a data source.
+///
+/// # Neo4j Relations
+/// ```text
+/// (ProtocolRun)-[:HAS_RUNTIME_STATE]->(RuntimeState)
+/// (RuntimeState)-[:GENERATED_BY]->(ProtocolState)   — the Generator state
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeState {
+    /// Unique identifier
+    pub id: Uuid,
+    /// The protocol run this runtime state belongs to
+    pub run_id: Uuid,
+    /// The Generator ProtocolState that produced this state
+    pub generated_by: Uuid,
+    /// Human-readable name (derived from state_template)
+    pub name: String,
+    /// Position index within the generated sequence (0-based)
+    pub index: u32,
+    /// Optional sub-protocol to spawn for this runtime state
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sub_protocol_id: Option<Uuid>,
+    /// Optional action to execute
+    pub action: Option<String>,
+    /// Current status of this runtime state
+    #[serde(default = "default_runtime_status")]
+    pub status: String,
+}
+
+fn default_runtime_status() -> String {
+    "pending".to_string()
+}
+
+impl RuntimeState {
+    /// Create a new pending RuntimeState.
+    pub fn new(
+        run_id: Uuid,
+        generated_by: Uuid,
+        name: impl Into<String>,
+        index: u32,
+    ) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            run_id,
+            generated_by,
+            name: name.into(),
+            index,
+            sub_protocol_id: None,
+            action: None,
+            status: "pending".to_string(),
+        }
+    }
 }
 
 // ============================================================================
@@ -868,6 +1079,7 @@ mod tests {
             StateType::Start,
             StateType::Intermediate,
             StateType::Terminal,
+            StateType::Generator,
         ] {
             let json = serde_json::to_string(&st).unwrap();
             let deserialized: StateType = serde_json::from_str(&json).unwrap();
@@ -1057,5 +1269,137 @@ mod tests {
         assert!(req.description.is_none());
         assert!(req.skill_id.is_none());
         assert!(req.protocol_category.is_none());
+    }
+
+    // --- Generator / LinkingStrategy / RuntimeState tests ---
+
+    #[test]
+    fn test_state_type_generator_display_parse() {
+        assert_eq!(StateType::Generator.to_string(), "generator");
+        assert_eq!(StateType::from_str("generator").unwrap(), StateType::Generator);
+        assert_eq!(StateType::from_str("Generator").unwrap(), StateType::Generator);
+    }
+
+    #[test]
+    fn test_state_type_generator_serde() {
+        let json = serde_json::to_string(&StateType::Generator).unwrap();
+        assert_eq!(json, "\"generator\"");
+        let deserialized: StateType = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized, StateType::Generator);
+    }
+
+    #[test]
+    fn test_linking_strategy_default() {
+        assert_eq!(LinkingStrategy::default(), LinkingStrategy::Sequential);
+    }
+
+    #[test]
+    fn test_linking_strategy_display_parse() {
+        assert_eq!(LinkingStrategy::Sequential.to_string(), "sequential");
+        assert_eq!(LinkingStrategy::Parallel.to_string(), "parallel");
+        assert_eq!(
+            LinkingStrategy::from_str("sequential").unwrap(),
+            LinkingStrategy::Sequential
+        );
+        assert_eq!(
+            LinkingStrategy::from_str("parallel").unwrap(),
+            LinkingStrategy::Parallel
+        );
+        assert!(LinkingStrategy::from_str("invalid").is_err());
+    }
+
+    #[test]
+    fn test_linking_strategy_serde_roundtrip() {
+        for ls in [LinkingStrategy::Sequential, LinkingStrategy::Parallel] {
+            let json = serde_json::to_string(&ls).unwrap();
+            let deserialized: LinkingStrategy = serde_json::from_str(&json).unwrap();
+            assert_eq!(ls, deserialized);
+        }
+    }
+
+    #[test]
+    fn test_generator_config_serde_roundtrip() {
+        let config = GeneratorConfig {
+            data_source: "test".to_string(),
+            state_template: "Task {index}".to_string(),
+            sub_protocol_id: Some(Uuid::new_v4()),
+            linking: LinkingStrategy::Parallel,
+        };
+
+        let json = serde_json::to_string(&config).unwrap();
+        let deserialized: GeneratorConfig = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.data_source, "test");
+        assert_eq!(deserialized.state_template, "Task {index}");
+        assert_eq!(deserialized.sub_protocol_id, config.sub_protocol_id);
+        assert_eq!(deserialized.linking, LinkingStrategy::Parallel);
+    }
+
+    #[test]
+    fn test_generator_config_defaults() {
+        let json = r#"{"data_source":"test","state_template":"Item {index}"}"#;
+        let config: GeneratorConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.linking, LinkingStrategy::Sequential);
+        assert!(config.sub_protocol_id.is_none());
+    }
+
+    #[test]
+    fn test_protocol_state_generator_config() {
+        let mut state = ProtocolState::new(Uuid::new_v4(), "Generator");
+        state.state_type = StateType::Generator;
+        state.generator_config = Some(GeneratorConfig {
+            data_source: "plan_tasks".to_string(),
+            state_template: "Task {index}".to_string(),
+            sub_protocol_id: None,
+            linking: LinkingStrategy::Sequential,
+        });
+
+        let json = serde_json::to_string(&state).unwrap();
+        let deserialized: ProtocolState = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.state_type, StateType::Generator);
+        assert!(deserialized.generator_config.is_some());
+        let gc = deserialized.generator_config.unwrap();
+        assert_eq!(gc.data_source, "plan_tasks");
+    }
+
+    #[test]
+    fn test_protocol_state_without_generator_config_compat() {
+        // Existing states without generator_config should deserialize fine
+        let state = ProtocolState::start(Uuid::new_v4(), "Start");
+        let json = serde_json::to_string(&state).unwrap();
+        let deserialized: ProtocolState = serde_json::from_str(&json).unwrap();
+        assert!(deserialized.generator_config.is_none());
+    }
+
+    #[test]
+    fn test_runtime_state_new() {
+        let run_id = Uuid::new_v4();
+        let generated_by = Uuid::new_v4();
+        let rs = RuntimeState::new(run_id, generated_by, "Task 0", 0);
+
+        assert_eq!(rs.run_id, run_id);
+        assert_eq!(rs.generated_by, generated_by);
+        assert_eq!(rs.name, "Task 0");
+        assert_eq!(rs.index, 0);
+        assert_eq!(rs.status, "pending");
+        assert!(rs.sub_protocol_id.is_none());
+        assert!(rs.action.is_none());
+    }
+
+    #[test]
+    fn test_runtime_state_serde_roundtrip() {
+        let mut rs = RuntimeState::new(Uuid::new_v4(), Uuid::new_v4(), "Item 3", 3);
+        rs.action = Some("process_item".to_string());
+        rs.status = "running".to_string();
+
+        let json = serde_json::to_string(&rs).unwrap();
+        let deserialized: RuntimeState = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.id, rs.id);
+        assert_eq!(deserialized.name, "Item 3");
+        assert_eq!(deserialized.index, 3);
+        assert_eq!(deserialized.status, "running");
+        assert_eq!(deserialized.action, Some("process_item".to_string()));
     }
 }

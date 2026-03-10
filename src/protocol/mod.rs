@@ -22,6 +22,7 @@
 //! ```
 
 pub mod engine;
+pub mod generator;
 pub mod hooks;
 pub mod models;
 pub mod routing;

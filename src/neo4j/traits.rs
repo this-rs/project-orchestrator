@@ -14,7 +14,9 @@ use crate::notes::{
 };
 use crate::parser::FunctionCall;
 use crate::plan::models::{TaskDetails, UpdatePlanRequest, UpdateStepRequest, UpdateTaskRequest};
-use crate::protocol::{Protocol, ProtocolRun, ProtocolState, ProtocolTransition, RunStatus};
+use crate::protocol::{
+    Protocol, ProtocolRun, ProtocolState, ProtocolTransition, RunStatus, RuntimeState,
+};
 use crate::skills::{ActivatedSkillContext, SkillNode, SkillStatus};
 use anyhow::Result;
 use async_trait::async_trait;
@@ -2529,6 +2531,19 @@ pub trait GraphStore: Send + Sync {
     /// Delete a protocol run.
     /// Returns true if the run existed and was deleted.
     async fn delete_protocol_run(&self, run_id: Uuid) -> Result<bool>;
+
+    // ========================================================================
+    // RuntimeState operations (Generator-produced dynamic states)
+    // ========================================================================
+
+    /// Create a new RuntimeState node with HAS_RUNTIME_STATE and GENERATED_BY relationships.
+    async fn create_runtime_state(&self, state: &RuntimeState) -> Result<()>;
+
+    /// Get all RuntimeStates for a protocol run, ordered by index.
+    async fn get_runtime_states(&self, run_id: Uuid) -> Result<Vec<RuntimeState>>;
+
+    /// Delete all RuntimeStates for a protocol run.
+    async fn delete_runtime_states(&self, run_id: Uuid) -> Result<()>;
 
     // ========================================================================
     // System Inference — Audit Gaps

@@ -3000,6 +3000,28 @@ impl GraphStore for Neo4jClient {
         self.delete_protocol_run(run_id).await
     }
 
+    // ========================================================================
+    // RuntimeState operations (Generator-produced dynamic states)
+    // ========================================================================
+
+    async fn create_runtime_state(
+        &self,
+        state: &crate::protocol::RuntimeState,
+    ) -> anyhow::Result<()> {
+        self.create_runtime_state(state).await
+    }
+
+    async fn get_runtime_states(
+        &self,
+        run_id: uuid::Uuid,
+    ) -> anyhow::Result<Vec<crate::protocol::RuntimeState>> {
+        self.get_runtime_states(run_id).await
+    }
+
+    async fn delete_runtime_states(&self, run_id: uuid::Uuid) -> anyhow::Result<()> {
+        self.delete_runtime_states(run_id).await
+    }
+
     // SI — System Inference: audit knowledge gaps
     async fn audit_knowledge_gaps(
         &self,
