@@ -372,8 +372,9 @@ pub async fn process_rfc_observation(
                 match graph.get_session_entities(sid, project_id).await {
                     Ok(entities) => {
                         for entity in &entities {
-                            if let Ok(etype) =
-                                entity.entity_type.parse::<crate::notes::models::EntityType>()
+                            if let Ok(etype) = entity
+                                .entity_type
+                                .parse::<crate::notes::models::EntityType>()
                             {
                                 if let Err(e) = graph
                                     .link_note_to_entity(
@@ -421,7 +422,10 @@ pub async fn process_rfc_observation(
                     }),
                     project_id.map(|pid| pid.to_string()),
                 );
-                debug!("[feedback] Emitted note.created WS event for RFC note {}", note.id);
+                debug!(
+                    "[feedback] Emitted note.created WS event for RFC note {}",
+                    note.id
+                );
             }
 
             // Reset accumulator after successful creation
@@ -723,7 +727,8 @@ mod tests {
 
         let obs = make_rfc_observation("I propose we restructure the module");
         let created =
-            process_rfc_observation(Some(&obs), &accumulator, &graph, &search, None, None, None).await;
+            process_rfc_observation(Some(&obs), &accumulator, &graph, &search, None, None, None)
+                .await;
 
         assert!(!created, "Should not create note on first observation");
         let acc = accumulator.lock().await;
@@ -744,12 +749,14 @@ mod tests {
 
         // First observation — no creation
         let created1 =
-            process_rfc_observation(Some(&obs1), &accumulator, &graph, &search, None, None, None).await;
+            process_rfc_observation(Some(&obs1), &accumulator, &graph, &search, None, None, None)
+                .await;
         assert!(!created1);
 
         // Second observation — threshold reached, note should be created
         let created2 =
-            process_rfc_observation(Some(&obs2), &accumulator, &graph, &search, None, None, None).await;
+            process_rfc_observation(Some(&obs2), &accumulator, &graph, &search, None, None, None)
+                .await;
         assert!(created2, "Should create RFC note when threshold is reached");
 
         // Verify the note was created in the graph store
@@ -787,18 +794,44 @@ mod tests {
         };
 
         // First: RFC observation
-        process_rfc_observation(Some(&rfc_obs), &accumulator, &graph, &search, None, None, None).await;
+        process_rfc_observation(
+            Some(&rfc_obs),
+            &accumulator,
+            &graph,
+            &search,
+            None,
+            None,
+            None,
+        )
+        .await;
 
         // Second: non-RFC observation — resets accumulator
-        process_rfc_observation(Some(&non_rfc_obs), &accumulator, &graph, &search, None, None, None).await;
+        process_rfc_observation(
+            Some(&non_rfc_obs),
+            &accumulator,
+            &graph,
+            &search,
+            None,
+            None,
+            None,
+        )
+        .await;
 
         let acc = accumulator.lock().await;
         assert_eq!(acc.consecutive_count, 0, "Non-RFC should reset counter");
         drop(acc);
 
         // Third: RFC again — starts from 1, not threshold
-        let created =
-            process_rfc_observation(Some(&rfc_obs), &accumulator, &graph, &search, None, None, None).await;
+        let created = process_rfc_observation(
+            Some(&rfc_obs),
+            &accumulator,
+            &graph,
+            &search,
+            None,
+            None,
+            None,
+        )
+        .await;
         assert!(!created, "Should not create after reset");
     }
 
@@ -812,7 +845,16 @@ mod tests {
 
         let rfc_obs = make_rfc_observation("I propose something");
 
-        process_rfc_observation(Some(&rfc_obs), &accumulator, &graph, &search, None, None, None).await;
+        process_rfc_observation(
+            Some(&rfc_obs),
+            &accumulator,
+            &graph,
+            &search,
+            None,
+            None,
+            None,
+        )
+        .await;
         process_rfc_observation(None, &accumulator, &graph, &search, None, None, None).await;
 
         let acc = accumulator.lock().await;
@@ -832,10 +874,26 @@ mod tests {
         let obs = make_rfc_observation("Architectural discussion content");
 
         // Feed twice to reach threshold
-        process_rfc_observation(Some(&obs), &accumulator, &graph, &search, Some(project_id), None, None).await;
-        let created =
-            process_rfc_observation(Some(&obs), &accumulator, &graph, &search, Some(project_id), None, None)
-                .await;
+        process_rfc_observation(
+            Some(&obs),
+            &accumulator,
+            &graph,
+            &search,
+            Some(project_id),
+            None,
+            None,
+        )
+        .await;
+        let created = process_rfc_observation(
+            Some(&obs),
+            &accumulator,
+            &graph,
+            &search,
+            Some(project_id),
+            None,
+            None,
+        )
+        .await;
         assert!(created);
 
         let notes = mock_graph.notes.read().await;
@@ -859,15 +917,31 @@ mod tests {
         // Process first response
         let obs1 = detect_response_observations(response1);
         assert!(obs1.is_some(), "First response should detect RFC pattern");
-        let created1 =
-            process_rfc_observation(obs1.as_ref(), &accumulator, &graph, &search, None, None, None).await;
+        let created1 = process_rfc_observation(
+            obs1.as_ref(),
+            &accumulator,
+            &graph,
+            &search,
+            None,
+            None,
+            None,
+        )
+        .await;
         assert!(!created1, "First response should not create note yet");
 
         // Process second response
         let obs2 = detect_response_observations(response2);
         assert!(obs2.is_some(), "Second response should detect RFC pattern");
-        let created2 =
-            process_rfc_observation(obs2.as_ref(), &accumulator, &graph, &search, None, None, None).await;
+        let created2 = process_rfc_observation(
+            obs2.as_ref(),
+            &accumulator,
+            &graph,
+            &search,
+            None,
+            None,
+            None,
+        )
+        .await;
         assert!(created2, "Second response should trigger note creation");
 
         // Verify note content
