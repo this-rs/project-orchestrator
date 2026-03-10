@@ -999,6 +999,16 @@ impl Neo4jClient {
             status: node
                 .get::<String>("status")
                 .unwrap_or_else(|_| "pending".to_string()),
+            next_runtime_state_id: node
+                .get::<String>("next_runtime_state_id")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .and_then(|s| s.parse().ok()),
+            linking_strategy: node
+                .get::<String>("linking_strategy")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or_default(),
         })
     }
 
@@ -1016,7 +1026,9 @@ impl Neo4jClient {
                 index: $index,
                 sub_protocol_id: $sub_protocol_id,
                 action: $action,
-                status: $status
+                status: $status,
+                next_runtime_state_id: $next_runtime_state_id,
+                linking_strategy: $linking_strategy
             })
             CREATE (r)-[:HAS_RUNTIME_STATE]->(rs)
             CREATE (rs)-[:GENERATED_BY]->(ps)
@@ -1035,7 +1047,15 @@ impl Neo4jClient {
                 .unwrap_or_default(),
         )
         .param("action", state.action.clone().unwrap_or_default())
-        .param("status", state.status.clone());
+        .param("status", state.status.clone())
+        .param(
+            "next_runtime_state_id",
+            state
+                .next_runtime_state_id
+                .map(|u| u.to_string())
+                .unwrap_or_default(),
+        )
+        .param("linking_strategy", state.linking_strategy.to_string());
 
         self.graph
             .run(q)

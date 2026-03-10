@@ -10,7 +10,7 @@
 //!   (run_id, generator_state_id) pair, generation is skipped.
 
 use crate::neo4j::traits::GraphStore;
-use crate::protocol::{GeneratorConfig, ProtocolRun, ProtocolState, RuntimeState};
+use crate::protocol::{GeneratorConfig, LinkingStrategy, ProtocolRun, ProtocolState, RuntimeState};
 use anyhow::{bail, Result};
 
 /// Maximum number of RuntimeStates a single Generator can produce.
@@ -67,14 +67,34 @@ pub async fn generate(
         );
     }
 
-    // Create RuntimeStates
+    // Create RuntimeStates (without persisting yet — we need all IDs for linking)
     let mut runtime_states = Vec::with_capacity(items);
     for i in 0..items {
         let name = config.state_template.replace("{index}", &i.to_string());
         let mut rs = RuntimeState::new(run.id, state.id, name, i as u32);
         rs.sub_protocol_id = config.sub_protocol_id;
-        store.create_runtime_state(&rs).await?;
+        rs.linking_strategy = config.linking;
         runtime_states.push(rs);
+    }
+
+    // Apply linking strategy
+    match config.linking {
+        LinkingStrategy::Sequential => {
+            // Chain: state_0 → state_1 → state_2 → ... (last has next = None)
+            for i in 0..runtime_states.len().saturating_sub(1) {
+                let next_id = runtime_states[i + 1].id;
+                runtime_states[i].next_runtime_state_id = Some(next_id);
+            }
+        }
+        LinkingStrategy::Parallel => {
+            // All states are independent — no next_runtime_state_id linking.
+            // Fan-out from generator state to all, fan-in implicit when all complete.
+        }
+    }
+
+    // Persist all RuntimeStates
+    for rs in &runtime_states {
+        store.create_runtime_state(rs).await?;
     }
 
     Ok(runtime_states)
@@ -98,6 +118,14 @@ async fn resolve_data_source(config: &GeneratorConfig) -> Result<usize> {
             .parse()
             .map_err(|_| anyhow::anyhow!("Invalid test count: '{}'", count_str))?;
         return Ok(count);
+    }
+
+    // "plan.get_waves" and similar plan-based sources require runtime context
+    // (plan_id, store access). For now, they are not resolvable at generation time
+    // and return 0 items. The caller should use "test:N" for testing or provide
+    // a concrete plan-aware generator in the future.
+    if source.starts_with("plan.") {
+        return Ok(0);
     }
 
     // Unknown data sources return 0 items (no-op)

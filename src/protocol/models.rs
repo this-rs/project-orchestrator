@@ -890,6 +890,12 @@ pub struct RuntimeState {
     /// Current status of this runtime state
     #[serde(default = "default_runtime_status")]
     pub status: String,
+    /// Next runtime state in a sequential chain (None for last or parallel)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_runtime_state_id: Option<Uuid>,
+    /// The linking strategy used when this state was generated
+    #[serde(default)]
+    pub linking_strategy: LinkingStrategy,
 }
 
 fn default_runtime_status() -> String {
@@ -908,6 +914,8 @@ impl RuntimeState {
             sub_protocol_id: None,
             action: None,
             status: "pending".to_string(),
+            next_runtime_state_id: None,
+            linking_strategy: LinkingStrategy::default(),
         }
     }
 }

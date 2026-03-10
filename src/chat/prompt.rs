@@ -430,6 +430,11 @@ protocol(action: "transition", run_id: "<parent-run>", trigger: "plan_approved")
 // → child run created automatically, parent waits
 ```
 
+**Inspecting the run hierarchy:**
+- `protocol(action: "get_run", run_id)` — returns the run with its current state, status, and visit history
+- `protocol(action: "get_run_tree", run_id)` — returns the run with its full child hierarchy (parent + all nested child runs recursively)
+- `protocol(action: "get_run_children", run_id)` — returns only the direct child runs of a given run
+
 **Use cases:** Multi-phase workflows (plan→implement→review), RFC lifecycle with embedded review protocols, wave execution with per-task sub-protocols.
 
 ### Knowledge Fabric

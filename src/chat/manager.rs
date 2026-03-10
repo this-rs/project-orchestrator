@@ -3274,6 +3274,8 @@ impl ChatManager {
                             project_id,
                             assistant_text.clone(),
                             rfc_acc,
+                            Some(uuid),
+                            event_emitter.clone(),
                         );
                     }
                 }
