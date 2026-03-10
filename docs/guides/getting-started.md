@@ -426,6 +426,10 @@ Task 1 (completed)
 
 You've learned the basics! Here's what to explore next:
 
+### Essential Next Step
+
+- **[Foundation Kit](./foundation-kit.md)** — Seed your instance with foundational knowledge (workflow rules, safety gotchas, tool strategies). **Do this before anything else** — a blank instance doesn't know what it doesn't know.
+
 ### Advanced Features
 
 - **[Protocols & FSM](./protocols.md)** — Build a safe, self-aware setup with guardrails for every code change

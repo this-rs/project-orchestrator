@@ -593,9 +593,10 @@ code(action: "get_node_importance", project_slug: "my-project",
 |-------|-------------|
 | [Installation](docs/setup/installation.md) | Full setup instructions and configuration |
 | [Getting Started](docs/guides/getting-started.md) | Step-by-step tutorial for new users |
+| [**Foundation Kit**](docs/guides/foundation-kit.md) | **Start here after setup** — seed knowledge for a self-aware instance |
+| [Protocols & FSM](docs/guides/protocols.md) | Building a safe, self-aware setup with protocol guardrails |
 | [API Reference](docs/api/reference.md) | Complete REST API documentation |
 | [MCP Tools](docs/api/mcp-tools.md) | All 22 MCP mega-tools with examples |
-| [Protocols & FSM](docs/guides/protocols.md) | Building a safe, self-aware setup with protocol guardrails |
 | [Knowledge Fabric](docs/guides/advanced-knowledge-fabric.md) | Bio-inspired knowledge graph: scars, homeostasis, scaffolding |
 | [Workspaces](docs/guides/workspaces.md) | Multi-project coordination |
 | [Multi-Agent Workflows](docs/guides/multi-agent-workflow.md) | Coordinating multiple agents |
