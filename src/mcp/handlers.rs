@@ -8,8 +8,8 @@ use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 
 use super::http_client::{extract_id, extract_optional_string, extract_string, McpHttpClient};
-use crate::neurons::intent::{IntentDetector, QueryIntentMode};
 use crate::graph::models::profile_by_name;
+use crate::neurons::intent::{IntentDetector, QueryIntentMode};
 
 /// Resolve an intent-adaptive analysis profile name from MCP params.
 ///
@@ -23,10 +23,17 @@ fn resolve_intent_profile(
     if let Some(name) = explicit_profile {
         // Explicit profile override — validate it exists
         if profile_by_name(name).is_some() {
-            tracing::debug!(profile = name, source = "explicit", "intent-adaptive profile resolved");
+            tracing::debug!(
+                profile = name,
+                source = "explicit",
+                "intent-adaptive profile resolved"
+            );
             return Some(name.to_string());
         } else {
-            tracing::warn!(profile = name, "unknown profile name, falling back to auto-detection");
+            tracing::warn!(
+                profile = name,
+                "unknown profile name, falling back to auto-detection"
+            );
         }
     }
 
@@ -48,7 +55,11 @@ fn resolve_intent_profile(
     // Auto-detect from query
     let mode = IntentDetector::detect(query);
     if mode == QueryIntentMode::Default {
-        tracing::debug!(source = "auto", detected = "default", "no intent detected, using default behavior");
+        tracing::debug!(
+            source = "auto",
+            detected = "default",
+            "no intent detected, using default behavior"
+        );
         None
     } else {
         let name = mode.to_string();
@@ -1390,7 +1401,8 @@ impl ToolHandler {
                 let query_str = extract_string(args, "query")?;
                 let explicit_profile = args.get("profile").and_then(|v| v.as_str());
                 let explicit_intent = args.get("intent_mode").and_then(|v| v.as_str());
-                let resolved_profile = resolve_intent_profile(&query_str, explicit_profile, explicit_intent);
+                let resolved_profile =
+                    resolve_intent_profile(&query_str, explicit_profile, explicit_intent);
 
                 let mut query = vec![("query".to_string(), query_str)];
                 if let Some(l) = args.get("limit").and_then(|v| v.as_u64()) {
@@ -1990,7 +2002,8 @@ impl ToolHandler {
                 let query_str = extract_string(args, "query")?;
                 let explicit_profile = args.get("profile").and_then(|v| v.as_str());
                 let explicit_intent = args.get("intent_mode").and_then(|v| v.as_str());
-                let resolved_profile = resolve_intent_profile(&query_str, explicit_profile, explicit_intent);
+                let resolved_profile =
+                    resolve_intent_profile(&query_str, explicit_profile, explicit_intent);
 
                 let mut query = vec![("query".to_string(), query_str)];
                 if let Some(v) = args.get("project_slug").and_then(|v| v.as_str()) {

@@ -1295,10 +1295,7 @@ mod tests {
         let engine = SpreadingActivationEngine::new(gs(&mock), mock_embedding_provider());
         let config = SpreadingActivationConfig::default();
 
-        let results_activate = engine
-            .activate("test query", None, &config)
-            .await
-            .unwrap();
+        let results_activate = engine.activate("test query", None, &config).await.unwrap();
         let results_with_profile = engine
             .activate_with_profile("test query", None, &config, None)
             .await
@@ -1315,18 +1312,8 @@ mod tests {
         let store = gs(&mock);
         let project_id = Uuid::new_v4();
 
-        let note_a = note_with_energy(
-            Uuid::new_v4(),
-            Some(project_id),
-            "profile source",
-            1.0,
-        );
-        let note_b = note_with_energy(
-            Uuid::new_v4(),
-            Some(project_id),
-            "profile neighbor",
-            1.0,
-        );
+        let note_a = note_with_energy(Uuid::new_v4(), Some(project_id), "profile source", 1.0);
+        let note_b = note_with_energy(Uuid::new_v4(), Some(project_id), "profile neighbor", 1.0);
 
         store.create_note(&note_a).await.unwrap();
         store.create_note(&note_b).await.unwrap();

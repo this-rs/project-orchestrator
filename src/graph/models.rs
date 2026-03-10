@@ -1206,7 +1206,10 @@ pub fn profile_debug() -> AnalysisProfile {
         id: "00000000-0000-0000-0000-000000000006".to_string(),
         project_id: None,
         name: "debug".to_string(),
-        description: Some("Optimized for debugging — call chains, gotchas and knowledge scars are prioritized".to_string()),
+        description: Some(
+            "Optimized for debugging — call chains, gotchas and knowledge scars are prioritized"
+                .to_string(),
+        ),
         edge_weights: HashMap::from([
             ("IMPORTS".to_string(), 0.3),
             ("CALLS".to_string(), 0.9),
@@ -1234,7 +1237,10 @@ pub fn profile_explore() -> AnalysisProfile {
         id: "00000000-0000-0000-0000-000000000007".to_string(),
         project_id: None,
         name: "explore".to_string(),
-        description: Some("Optimized for code exploration — imports, inheritance and knowledge are emphasized".to_string()),
+        description: Some(
+            "Optimized for code exploration — imports, inheritance and knowledge are emphasized"
+                .to_string(),
+        ),
         edge_weights: HashMap::from([
             ("IMPORTS".to_string(), 0.8),
             ("CALLS".to_string(), 0.4),
@@ -1290,7 +1296,10 @@ pub fn profile_plan() -> AnalysisProfile {
         id: "00000000-0000-0000-0000-000000000009".to_string(),
         project_id: None,
         name: "plan".to_string(),
-        description: Some("Optimized for implementation planning — balanced view with structural emphasis".to_string()),
+        description: Some(
+            "Optimized for implementation planning — balanced view with structural emphasis"
+                .to_string(),
+        ),
         edge_weights: HashMap::from([
             ("IMPORTS".to_string(), 0.6),
             ("CALLS".to_string(), 0.5),
@@ -2478,7 +2487,8 @@ mod tests {
             assert!(
                 (sum - 1.0).abs() < 0.02,
                 "Profile '{}' fusion weights sum to {}, expected ~1.0",
-                profile.name, sum
+                profile.name,
+                sum
             );
         }
     }
@@ -2490,7 +2500,9 @@ mod tests {
                 assert!(
                     *weight >= 0.1,
                     "Profile '{}' edge '{}' weight {} is below 0.1 minimum",
-                    profile.name, edge, weight
+                    profile.name,
+                    edge,
+                    weight
                 );
             }
         }

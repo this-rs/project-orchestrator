@@ -36,18 +36,8 @@ impl std::fmt::Display for QueryIntentMode {
 }
 
 const DEBUG_KEYWORDS: &[&str] = &[
-    "pourquoi",
-    "échoue",
-    "bug",
-    "erreur",
-    "crash",
-    "plantage",
-    "why",
-    "fail",
-    "broken",
-    "error",
-    "panic",
-    "trace",
+    "pourquoi", "échoue", "bug", "erreur", "crash", "plantage", "why", "fail", "broken", "error",
+    "panic", "trace",
 ];
 
 const EXPLORE_KEYWORDS: &[&str] = &[
