@@ -7562,6 +7562,263 @@ impl GraphStore for MockGraphStore {
         Ok(sorted.into_iter().map(|(name, _)| name).collect())
     }
 
+    async fn get_feature_graph_statistics(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<FeatureGraphStatistics>> {
+        let detail = match self.get_feature_graph_detail(id).await? {
+            Some(d) => d,
+            None => return Ok(None),
+        };
+
+        let entity_count = detail.entities.len();
+        if entity_count == 0 {
+            return Ok(Some(FeatureGraphStatistics {
+                id,
+                name: detail.graph.name.clone(),
+                entity_count: 0,
+                entity_breakdown: std::collections::HashMap::new(),
+                role_breakdown: std::collections::HashMap::new(),
+                internal_edge_count: 0,
+                external_edge_count: 0,
+                cohesion: 0.0,
+                coupling: 0.0,
+                avg_importance: None,
+                entry_points: vec![],
+                exit_points: vec![],
+            }));
+        }
+
+        let mut entity_breakdown: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        let mut role_breakdown: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        let mut importance_sum = 0.0_f64;
+        let mut importance_count = 0_usize;
+
+        let entity_ids: std::collections::HashSet<String> = detail
+            .entities
+            .iter()
+            .map(|e| e.entity_id.clone())
+            .collect();
+
+        for e in &detail.entities {
+            *entity_breakdown.entry(e.entity_type.clone()).or_insert(0) += 1;
+            if let Some(role) = &e.role {
+                *role_breakdown.entry(role.clone()).or_insert(0) += 1;
+            }
+            if let Some(score) = e.importance_score {
+                importance_sum += score;
+                importance_count += 1;
+            }
+        }
+
+        let internal_edge_count = detail.relations.len();
+
+        // External edges: count call relationships going outside the graph
+        let cr = self.call_relationships.read().await;
+        let mut external_edge_count = 0_usize;
+        let mut entry_points_set: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        let mut exit_points_set: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+
+        for e in &detail.entities {
+            if e.entity_type == "function" || e.entity_type == "Function" {
+                // Outgoing calls to outside
+                if let Some(callees) = cr.get(&e.entity_id) {
+                    for callee in callees {
+                        if !entity_ids.contains(callee) {
+                            external_edge_count += 1;
+                            exit_points_set.insert(e.entity_id.clone());
+                        }
+                    }
+                }
+                // Incoming calls from outside
+                for (caller, callees) in cr.iter() {
+                    if !entity_ids.contains(caller) && callees.contains(&e.entity_id) {
+                        external_edge_count += 1;
+                        entry_points_set.insert(e.entity_id.clone());
+                    }
+                }
+            }
+        }
+        drop(cr);
+
+        let max_possible = if entity_count > 1 {
+            entity_count * (entity_count - 1) / 2
+        } else {
+            1
+        };
+        let cohesion = internal_edge_count as f64 / max_possible as f64;
+        let total_edges = internal_edge_count + external_edge_count;
+        let coupling = if total_edges > 0 {
+            external_edge_count as f64 / total_edges as f64
+        } else {
+            0.0
+        };
+
+        let avg_importance = if importance_count > 0 {
+            Some(importance_sum / importance_count as f64)
+        } else {
+            None
+        };
+
+        Ok(Some(FeatureGraphStatistics {
+            id,
+            name: detail.graph.name,
+            entity_count,
+            entity_breakdown,
+            role_breakdown,
+            internal_edge_count,
+            external_edge_count,
+            cohesion,
+            coupling,
+            avg_importance,
+            entry_points: entry_points_set.into_iter().collect(),
+            exit_points: exit_points_set.into_iter().collect(),
+        }))
+    }
+
+    async fn compare_feature_graphs(
+        &self,
+        id_a: Uuid,
+        id_b: Uuid,
+    ) -> Result<Option<FeatureGraphComparison>> {
+        let detail_a = match self.get_feature_graph_detail(id_a).await? {
+            Some(d) => d,
+            None => return Ok(None),
+        };
+        let detail_b = match self.get_feature_graph_detail(id_b).await? {
+            Some(d) => d,
+            None => return Ok(None),
+        };
+
+        let set_a: std::collections::HashSet<(String, String)> = detail_a
+            .entities
+            .iter()
+            .map(|e| (e.entity_type.clone(), e.entity_id.clone()))
+            .collect();
+        let set_b: std::collections::HashSet<(String, String)> = detail_b
+            .entities
+            .iter()
+            .map(|e| (e.entity_type.clone(), e.entity_id.clone()))
+            .collect();
+
+        let shared_keys: std::collections::HashSet<_> = set_a.intersection(&set_b).collect();
+        let union_count = set_a.union(&set_b).count();
+
+        let shared_entities: Vec<FeatureGraphEntity> = detail_a
+            .entities
+            .iter()
+            .filter(|e| shared_keys.contains(&(e.entity_type.clone(), e.entity_id.clone())))
+            .cloned()
+            .collect();
+
+        let unique_to_a: Vec<FeatureGraphEntity> = detail_a
+            .entities
+            .iter()
+            .filter(|e| !set_b.contains(&(e.entity_type.clone(), e.entity_id.clone())))
+            .cloned()
+            .collect();
+
+        let unique_to_b: Vec<FeatureGraphEntity> = detail_b
+            .entities
+            .iter()
+            .filter(|e| !set_a.contains(&(e.entity_type.clone(), e.entity_id.clone())))
+            .cloned()
+            .collect();
+
+        let similarity = if union_count > 0 {
+            shared_keys.len() as f64 / union_count as f64
+        } else {
+            0.0
+        };
+
+        Ok(Some(FeatureGraphComparison {
+            graph_a: FeatureGraphComparisonSide {
+                id: id_a,
+                name: detail_a.graph.name,
+                entity_count: detail_a.entities.len(),
+            },
+            graph_b: FeatureGraphComparisonSide {
+                id: id_b,
+                name: detail_b.graph.name,
+                entity_count: detail_b.entities.len(),
+            },
+            shared_entities,
+            unique_to_a,
+            unique_to_b,
+            similarity,
+        }))
+    }
+
+    async fn find_overlapping_feature_graphs(
+        &self,
+        id: Uuid,
+        min_overlap: f64,
+    ) -> Result<Vec<FeatureGraphOverlap>> {
+        let detail = match self.get_feature_graph_detail(id).await? {
+            Some(d) => d,
+            None => return Ok(vec![]),
+        };
+        let ref_set: std::collections::HashSet<(String, String)> = detail
+            .entities
+            .iter()
+            .map(|e| (e.entity_type.clone(), e.entity_id.clone()))
+            .collect();
+        let ref_count = ref_set.len();
+        if ref_count == 0 {
+            return Ok(vec![]);
+        }
+
+        let others = self
+            .list_feature_graphs(Some(detail.graph.project_id))
+            .await?;
+
+        let mut overlaps = Vec::new();
+        for other in others {
+            if other.id == id {
+                continue;
+            }
+            let other_detail = match self.get_feature_graph_detail(other.id).await? {
+                Some(d) => d,
+                None => continue,
+            };
+            let other_set: std::collections::HashSet<(String, String)> = other_detail
+                .entities
+                .iter()
+                .map(|e| (e.entity_type.clone(), e.entity_id.clone()))
+                .collect();
+
+            let shared: Vec<String> = ref_set
+                .intersection(&other_set)
+                .map(|(t, id)| format!("{}:{}", t, id))
+                .collect();
+            let shared_count = shared.len();
+            if shared_count == 0 {
+                continue;
+            }
+
+            let min_count = ref_count.min(other_set.len());
+            let overlap_ratio = shared_count as f64 / min_count as f64;
+
+            if overlap_ratio >= min_overlap {
+                overlaps.push(FeatureGraphOverlap {
+                    id: other.id,
+                    name: other.name,
+                    entity_count: other_set.len(),
+                    shared_count,
+                    shared_entities: shared,
+                    overlap_ratio,
+                });
+            }
+        }
+
+        overlaps.sort_by(|a, b| b.overlap_ratio.partial_cmp(&a.overlap_ratio).unwrap());
+        Ok(overlaps)
+    }
+
     async fn get_project_import_edges(
         &self,
         project_id: Uuid,
@@ -11183,6 +11440,353 @@ mod tests {
             "error should mention 'not found', got: {}",
             err_msg
         );
+    }
+
+    // ========================================================================
+    // Feature Graph — Statistics, Compare, Overlapping
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_feature_graph_statistics() {
+        let store = MockGraphStore::new();
+        let project = test_project_named("test-stats");
+        seed_project(
+            &store,
+            &project,
+            &[
+                ("src/a.rs", &["fn_a", "fn_b"]),
+                ("src/b.rs", &["fn_outside"]),
+            ],
+        )
+        .await;
+
+        // fn_a -> fn_b (will be internal), fn_a -> fn_outside (will be external)
+        store
+            .create_call_relationship("src/a.rs::fn_a", "fn_b", Some(project.id), 0.9, "scored")
+            .await
+            .unwrap();
+        store
+            .create_call_relationship(
+                "src/a.rs::fn_a",
+                "fn_outside",
+                Some(project.id),
+                0.9,
+                "scored",
+            )
+            .await
+            .unwrap();
+
+        // Create a feature graph with fn_a and fn_b only (fn_outside is external)
+        let fg = FeatureGraphNode {
+            id: Uuid::new_v4(),
+            name: "stats-test".to_string(),
+            description: None,
+            project_id: project.id,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            entity_count: None,
+            entry_function: None,
+            build_depth: None,
+            include_relations: None,
+        };
+        store.create_feature_graph(&fg).await.unwrap();
+        store
+            .add_entity_to_feature_graph(fg.id, "function", "fn_a", Some("entry_point"), None)
+            .await
+            .unwrap();
+        store
+            .add_entity_to_feature_graph(fg.id, "function", "fn_b", Some("core_logic"), None)
+            .await
+            .unwrap();
+
+        let stats = store
+            .get_feature_graph_statistics(fg.id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(stats.entity_count, 2);
+        assert_eq!(stats.entity_breakdown.get("function"), Some(&2));
+        assert_eq!(stats.role_breakdown.get("entry_point"), Some(&1));
+        assert_eq!(stats.role_breakdown.get("core_logic"), Some(&1));
+        // fn_a calls fn_outside which is not in the graph → external edge
+        assert!(stats.external_edge_count > 0);
+        assert!(stats.cohesion >= 0.0);
+        assert!(stats.coupling >= 0.0 && stats.coupling <= 1.0);
+    }
+
+    #[tokio::test]
+    async fn test_feature_graph_statistics_empty() {
+        let store = MockGraphStore::new();
+        let project = test_project_named("test-empty");
+        seed_project(&store, &project, &[]).await;
+
+        let fg = FeatureGraphNode {
+            id: Uuid::new_v4(),
+            name: "empty-graph".to_string(),
+            description: None,
+            project_id: project.id,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            entity_count: None,
+            entry_function: None,
+            build_depth: None,
+            include_relations: None,
+        };
+        store.create_feature_graph(&fg).await.unwrap();
+
+        let stats = store
+            .get_feature_graph_statistics(fg.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stats.entity_count, 0);
+        assert_eq!(stats.cohesion, 0.0);
+        assert_eq!(stats.coupling, 0.0);
+    }
+
+    #[tokio::test]
+    async fn test_feature_graph_statistics_not_found() {
+        let store = MockGraphStore::new();
+        let result = store
+            .get_feature_graph_statistics(Uuid::new_v4())
+            .await
+            .unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_compare_feature_graphs() {
+        let store = MockGraphStore::new();
+        let project = test_project_named("test-compare");
+        seed_project(
+            &store,
+            &project,
+            &[("src/a.rs", &["fn_shared", "fn_only_a", "fn_only_b"])],
+        )
+        .await;
+
+        // Graph A: fn_shared + fn_only_a
+        let fg_a = FeatureGraphNode {
+            id: Uuid::new_v4(),
+            name: "graph-a".to_string(),
+            description: None,
+            project_id: project.id,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            entity_count: None,
+            entry_function: None,
+            build_depth: None,
+            include_relations: None,
+        };
+        store.create_feature_graph(&fg_a).await.unwrap();
+        store
+            .add_entity_to_feature_graph(fg_a.id, "function", "fn_shared", None, None)
+            .await
+            .unwrap();
+        store
+            .add_entity_to_feature_graph(fg_a.id, "function", "fn_only_a", None, None)
+            .await
+            .unwrap();
+
+        // Graph B: fn_shared + fn_only_b
+        let fg_b = FeatureGraphNode {
+            id: Uuid::new_v4(),
+            name: "graph-b".to_string(),
+            description: None,
+            project_id: project.id,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            entity_count: None,
+            entry_function: None,
+            build_depth: None,
+            include_relations: None,
+        };
+        store.create_feature_graph(&fg_b).await.unwrap();
+        store
+            .add_entity_to_feature_graph(fg_b.id, "function", "fn_shared", None, None)
+            .await
+            .unwrap();
+        store
+            .add_entity_to_feature_graph(fg_b.id, "function", "fn_only_b", None, None)
+            .await
+            .unwrap();
+
+        let cmp = store
+            .compare_feature_graphs(fg_a.id, fg_b.id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(cmp.shared_entities.len(), 1);
+        assert_eq!(cmp.shared_entities[0].entity_id, "fn_shared");
+        assert_eq!(cmp.unique_to_a.len(), 1);
+        assert_eq!(cmp.unique_to_a[0].entity_id, "fn_only_a");
+        assert_eq!(cmp.unique_to_b.len(), 1);
+        assert_eq!(cmp.unique_to_b[0].entity_id, "fn_only_b");
+        // Jaccard: 1 shared / 3 union = 0.333...
+        assert!((cmp.similarity - 1.0 / 3.0).abs() < 0.01);
+    }
+
+    #[tokio::test]
+    async fn test_compare_feature_graphs_not_found() {
+        let store = MockGraphStore::new();
+        let result = store
+            .compare_feature_graphs(Uuid::new_v4(), Uuid::new_v4())
+            .await
+            .unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_find_overlapping_feature_graphs() {
+        let store = MockGraphStore::new();
+        let project = test_project_named("test-overlap");
+        seed_project(&store, &project, &[("src/a.rs", &["fn_x", "fn_y", "fn_z"])]).await;
+
+        // Reference graph: fn_x, fn_y
+        let fg_ref = FeatureGraphNode {
+            id: Uuid::new_v4(),
+            name: "ref-graph".to_string(),
+            description: None,
+            project_id: project.id,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            entity_count: None,
+            entry_function: None,
+            build_depth: None,
+            include_relations: None,
+        };
+        store.create_feature_graph(&fg_ref).await.unwrap();
+        store
+            .add_entity_to_feature_graph(fg_ref.id, "function", "fn_x", None, None)
+            .await
+            .unwrap();
+        store
+            .add_entity_to_feature_graph(fg_ref.id, "function", "fn_y", None, None)
+            .await
+            .unwrap();
+
+        // Overlapping graph: fn_x, fn_z (shares fn_x)
+        let fg_overlap = FeatureGraphNode {
+            id: Uuid::new_v4(),
+            name: "overlap-graph".to_string(),
+            description: None,
+            project_id: project.id,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            entity_count: None,
+            entry_function: None,
+            build_depth: None,
+            include_relations: None,
+        };
+        store.create_feature_graph(&fg_overlap).await.unwrap();
+        store
+            .add_entity_to_feature_graph(fg_overlap.id, "function", "fn_x", None, None)
+            .await
+            .unwrap();
+        store
+            .add_entity_to_feature_graph(fg_overlap.id, "function", "fn_z", None, None)
+            .await
+            .unwrap();
+
+        // Disjoint graph: fn_z only (no overlap with ref)
+        let fg_disjoint = FeatureGraphNode {
+            id: Uuid::new_v4(),
+            name: "disjoint-graph".to_string(),
+            description: None,
+            project_id: project.id,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            entity_count: None,
+            entry_function: None,
+            build_depth: None,
+            include_relations: None,
+        };
+        store.create_feature_graph(&fg_disjoint).await.unwrap();
+        store
+            .add_entity_to_feature_graph(fg_disjoint.id, "function", "fn_z", None, None)
+            .await
+            .unwrap();
+
+        // Find overlapping with min_overlap = 0.1 (low threshold)
+        let overlaps = store
+            .find_overlapping_feature_graphs(fg_ref.id, 0.1)
+            .await
+            .unwrap();
+
+        // Should find the overlapping graph (fn_x shared), not the disjoint one
+        assert_eq!(overlaps.len(), 1);
+        assert_eq!(overlaps[0].id, fg_overlap.id);
+        assert_eq!(overlaps[0].shared_count, 1);
+        // overlap_ratio = 1 / min(2, 2) = 0.5
+        assert!((overlaps[0].overlap_ratio - 0.5).abs() < 0.01);
+    }
+
+    #[tokio::test]
+    async fn test_find_overlapping_feature_graphs_high_threshold() {
+        let store = MockGraphStore::new();
+        let project = test_project_named("test-high-thresh");
+        seed_project(&store, &project, &[("src/a.rs", &["fn_a", "fn_b"])]).await;
+
+        let fg1 = FeatureGraphNode {
+            id: Uuid::new_v4(),
+            name: "g1".to_string(),
+            description: None,
+            project_id: project.id,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            entity_count: None,
+            entry_function: None,
+            build_depth: None,
+            include_relations: None,
+        };
+        store.create_feature_graph(&fg1).await.unwrap();
+        store
+            .add_entity_to_feature_graph(fg1.id, "function", "fn_a", None, None)
+            .await
+            .unwrap();
+        store
+            .add_entity_to_feature_graph(fg1.id, "function", "fn_b", None, None)
+            .await
+            .unwrap();
+
+        let fg2 = FeatureGraphNode {
+            id: Uuid::new_v4(),
+            name: "g2".to_string(),
+            description: None,
+            project_id: project.id,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            entity_count: None,
+            entry_function: None,
+            build_depth: None,
+            include_relations: None,
+        };
+        store.create_feature_graph(&fg2).await.unwrap();
+        store
+            .add_entity_to_feature_graph(fg2.id, "function", "fn_a", None, None)
+            .await
+            .unwrap();
+
+        // overlap_ratio = 1 shared / min(2, 1) = 1.0, so it passes 0.9
+        // Use threshold > 1.0 to guarantee filtering
+        let overlaps = store
+            .find_overlapping_feature_graphs(fg1.id, 1.1)
+            .await
+            .unwrap();
+        assert!(
+            overlaps.is_empty(),
+            "threshold > 1.0 should filter everything"
+        );
+
+        // With 0.9 threshold, the overlap (ratio=1.0) should still be found
+        let overlaps = store
+            .find_overlapping_feature_graphs(fg1.id, 0.9)
+            .await
+            .unwrap();
+        assert_eq!(overlaps.len(), 1);
+        assert!((overlaps[0].overlap_ratio - 1.0).abs() < 0.01);
     }
 
     // ========================================================================

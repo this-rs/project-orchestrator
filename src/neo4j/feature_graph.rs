@@ -1181,6 +1181,275 @@ impl Neo4jClient {
         Ok(functions)
     }
 
+    /// Compute statistics for a feature graph.
+    pub async fn get_feature_graph_statistics(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<FeatureGraphStatistics>> {
+        // 1. Get the graph + entities
+        let detail = match self.get_feature_graph_detail(id).await? {
+            Some(d) => d,
+            None => return Ok(None),
+        };
+
+        let entity_count = detail.entities.len();
+        if entity_count == 0 {
+            return Ok(Some(FeatureGraphStatistics {
+                id,
+                name: detail.graph.name.clone(),
+                entity_count: 0,
+                entity_breakdown: std::collections::HashMap::new(),
+                role_breakdown: std::collections::HashMap::new(),
+                internal_edge_count: 0,
+                external_edge_count: 0,
+                cohesion: 0.0,
+                coupling: 0.0,
+                avg_importance: None,
+                entry_points: vec![],
+                exit_points: vec![],
+            }));
+        }
+
+        // Entity & role breakdowns
+        let mut entity_breakdown: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        let mut role_breakdown: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        let mut importance_sum = 0.0_f64;
+        let mut importance_count = 0_usize;
+
+        for e in &detail.entities {
+            *entity_breakdown.entry(e.entity_type.clone()).or_insert(0) += 1;
+            if let Some(role) = &e.role {
+                *role_breakdown.entry(role.clone()).or_insert(0) += 1;
+            }
+            if let Some(score) = e.importance_score {
+                importance_sum += score;
+                importance_count += 1;
+            }
+        }
+
+        let internal_edge_count = detail.relations.len();
+
+        // 2. Count external edges: edges from/to entities in the graph to entities outside
+        let q = query(
+            "MATCH (fg:FeatureGraph {id: $id})-[:INCLUDES_ENTITY]->(a)
+             MATCH (a)-[r:CALLS|IMPORTS|EXTENDS|IMPLEMENTS|IMPLEMENTS_TRAIT|IMPLEMENTS_FOR]-(b)
+             WHERE NOT (fg)-[:INCLUDES_ENTITY]->(b)
+             RETURN labels(a)[0] AS a_type,
+                    COALESCE(a.path, a.name) AS a_id,
+                    labels(b)[0] AS b_type,
+                    COALESCE(b.path, b.name) AS b_id,
+                    type(r) AS rel_type,
+                    startNode(r) = a AS is_outgoing",
+        )
+        .param("id", id.to_string());
+
+        let mut stream = self.graph.execute(q).await?;
+        let mut external_edge_count = 0_usize;
+        let mut incoming_external: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        let mut outgoing_external: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+
+        while let Some(row) = stream.next().await? {
+            external_edge_count += 1;
+            let a_id: String = row.get("a_id").unwrap_or_default();
+            let is_outgoing: bool = row.get("is_outgoing").unwrap_or(false);
+            if is_outgoing {
+                outgoing_external.insert(a_id);
+            } else {
+                incoming_external.insert(a_id);
+            }
+        }
+
+        // Entry points: entities that have incoming external edges (called from outside)
+        let entry_points: Vec<String> = incoming_external.into_iter().collect();
+        // Exit points: entities that have outgoing external edges (call outside)
+        let exit_points: Vec<String> = outgoing_external.into_iter().collect();
+
+        // Cohesion: internal_edges / max_possible_edges
+        let max_possible = if entity_count > 1 {
+            entity_count * (entity_count - 1) / 2
+        } else {
+            1
+        };
+        let cohesion = internal_edge_count as f64 / max_possible as f64;
+
+        // Coupling: external / total
+        let total_edges = internal_edge_count + external_edge_count;
+        let coupling = if total_edges > 0 {
+            external_edge_count as f64 / total_edges as f64
+        } else {
+            0.0
+        };
+
+        let avg_importance = if importance_count > 0 {
+            Some(importance_sum / importance_count as f64)
+        } else {
+            None
+        };
+
+        Ok(Some(FeatureGraphStatistics {
+            id,
+            name: detail.graph.name,
+            entity_count,
+            entity_breakdown,
+            role_breakdown,
+            internal_edge_count,
+            external_edge_count,
+            cohesion,
+            coupling,
+            avg_importance,
+            entry_points,
+            exit_points,
+        }))
+    }
+
+    /// Compare two feature graphs.
+    pub async fn compare_feature_graphs(
+        &self,
+        id_a: Uuid,
+        id_b: Uuid,
+    ) -> Result<Option<FeatureGraphComparison>> {
+        let detail_a = match self.get_feature_graph_detail(id_a).await? {
+            Some(d) => d,
+            None => return Ok(None),
+        };
+        let detail_b = match self.get_feature_graph_detail(id_b).await? {
+            Some(d) => d,
+            None => return Ok(None),
+        };
+
+        let set_a: std::collections::HashSet<(String, String)> = detail_a
+            .entities
+            .iter()
+            .map(|e| (e.entity_type.clone(), e.entity_id.clone()))
+            .collect();
+        let set_b: std::collections::HashSet<(String, String)> = detail_b
+            .entities
+            .iter()
+            .map(|e| (e.entity_type.clone(), e.entity_id.clone()))
+            .collect();
+
+        let shared_keys: std::collections::HashSet<_> = set_a.intersection(&set_b).collect();
+        let union_count = set_a.union(&set_b).count();
+
+        let shared_entities: Vec<FeatureGraphEntity> = detail_a
+            .entities
+            .iter()
+            .filter(|e| shared_keys.contains(&(e.entity_type.clone(), e.entity_id.clone())))
+            .cloned()
+            .collect();
+
+        let unique_to_a: Vec<FeatureGraphEntity> = detail_a
+            .entities
+            .iter()
+            .filter(|e| !set_b.contains(&(e.entity_type.clone(), e.entity_id.clone())))
+            .cloned()
+            .collect();
+
+        let unique_to_b: Vec<FeatureGraphEntity> = detail_b
+            .entities
+            .iter()
+            .filter(|e| !set_a.contains(&(e.entity_type.clone(), e.entity_id.clone())))
+            .cloned()
+            .collect();
+
+        let similarity = if union_count > 0 {
+            shared_keys.len() as f64 / union_count as f64
+        } else {
+            0.0
+        };
+
+        Ok(Some(FeatureGraphComparison {
+            graph_a: FeatureGraphComparisonSide {
+                id: id_a,
+                name: detail_a.graph.name,
+                entity_count: detail_a.entities.len(),
+            },
+            graph_b: FeatureGraphComparisonSide {
+                id: id_b,
+                name: detail_b.graph.name,
+                entity_count: detail_b.entities.len(),
+            },
+            shared_entities,
+            unique_to_a,
+            unique_to_b,
+            similarity,
+        }))
+    }
+
+    /// Find feature graphs that overlap with a reference graph.
+    pub async fn find_overlapping_feature_graphs(
+        &self,
+        id: Uuid,
+        min_overlap: f64,
+    ) -> Result<Vec<FeatureGraphOverlap>> {
+        // Get reference graph
+        let detail = match self.get_feature_graph_detail(id).await? {
+            Some(d) => d,
+            None => return Ok(vec![]),
+        };
+        let ref_set: std::collections::HashSet<(String, String)> = detail
+            .entities
+            .iter()
+            .map(|e| (e.entity_type.clone(), e.entity_id.clone()))
+            .collect();
+        let ref_count = ref_set.len();
+        if ref_count == 0 {
+            return Ok(vec![]);
+        }
+
+        // Find all other feature graphs in the same project
+        let others = self
+            .list_feature_graphs(Some(detail.graph.project_id))
+            .await?;
+
+        let mut overlaps = Vec::new();
+        for other in others {
+            if other.id == id {
+                continue;
+            }
+            let other_detail = match self.get_feature_graph_detail(other.id).await? {
+                Some(d) => d,
+                None => continue,
+            };
+            let other_set: std::collections::HashSet<(String, String)> = other_detail
+                .entities
+                .iter()
+                .map(|e| (e.entity_type.clone(), e.entity_id.clone()))
+                .collect();
+
+            let shared: Vec<String> = ref_set
+                .intersection(&other_set)
+                .map(|(t, id)| format!("{}:{}", t, id))
+                .collect();
+            let shared_count = shared.len();
+
+            if shared_count == 0 {
+                continue;
+            }
+
+            let min_count = ref_count.min(other_set.len());
+            let overlap_ratio = shared_count as f64 / min_count as f64;
+
+            if overlap_ratio >= min_overlap {
+                overlaps.push(FeatureGraphOverlap {
+                    id: other.id,
+                    name: other.name,
+                    entity_count: other_set.len(),
+                    shared_count,
+                    shared_entities: shared,
+                    overlap_ratio,
+                });
+            }
+        }
+
+        overlaps.sort_by(|a, b| b.overlap_ratio.partial_cmp(&a.overlap_ratio).unwrap());
+        Ok(overlaps)
+    }
+
     fn node_to_feature_graph(&self, node: &neo4rs::Node) -> Result<FeatureGraphNode> {
         Ok(FeatureGraphNode {
             id: node.get::<String>("id")?.parse()?,

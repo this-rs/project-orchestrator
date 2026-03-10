@@ -217,6 +217,9 @@ pub fn resolve_legacy_alias(name: &str) -> Option<(&'static str, &'static str)> 
         "add_to_feature_graph" => Some(("feature_graph", "add_entity")),
         "auto_build_feature_graph" => Some(("feature_graph", "auto_build")),
         "delete_feature_graph" => Some(("feature_graph", "delete")),
+        "get_feature_graph_statistics" => Some(("feature_graph", "get_statistics")),
+        "compare_feature_graphs" => Some(("feature_graph", "compare")),
+        "find_overlapping_feature_graphs" => Some(("feature_graph", "find_overlapping")),
 
         // Code
         "search_code" => Some(("code", "search")),
@@ -796,17 +799,17 @@ fn feature_graph_tool() -> ToolDefinition {
     ToolDefinition {
         name: "feature_graph".to_string(),
         description:
-            "Manage feature graphs. Actions: create, get, list, add_entity, auto_build, delete"
+            "Manage feature graphs. Actions: create, get, list, add_entity, auto_build, delete, get_statistics, compare, find_overlapping"
                 .to_string(),
         input_schema: InputSchema {
             schema_type: "object".to_string(),
             properties: Some(json!({
                 "action": {
                     "type": "string",
-                    "enum": ["create", "get", "list", "add_entity", "auto_build", "delete"],
+                    "enum": ["create", "get", "list", "add_entity", "auto_build", "delete", "get_statistics", "compare", "find_overlapping"],
                     "description": "Operation to perform"
                 },
-                "id": {"type": "string", "description": "Feature graph UUID (get/delete)"},
+                "id": {"type": "string", "description": "Feature graph UUID (get/delete/get_statistics/find_overlapping)"},
                 "feature_graph_id": {"type": "string", "description": "Feature graph UUID (add_entity)"},
                 "project_id": {"type": "string", "description": "Project UUID (create/list/auto_build)"},
                 "name": {"type": "string", "description": "Name (create/auto_build)"},
@@ -817,7 +820,10 @@ fn feature_graph_tool() -> ToolDefinition {
                 "entry_function": {"type": "string", "description": "Entry function (auto_build)"},
                 "depth": {"type": "integer", "description": "Traversal depth (auto_build)"},
                 "include_relations": {"type": "array", "items": {"type": "string"}, "description": "Relation types to include (auto_build)"},
-                "filter_community": {"type": "boolean", "description": "Filter by community (auto_build)"}
+                "filter_community": {"type": "boolean", "description": "Filter by community (auto_build)"},
+                "id_a": {"type": "string", "description": "First feature graph UUID (compare)"},
+                "id_b": {"type": "string", "description": "Second feature graph UUID (compare)"},
+                "min_overlap": {"type": "number", "description": "Minimum overlap ratio 0-1 (find_overlapping, default 0.1)"}
             })),
             required: Some(vec!["action".to_string()]),
         },

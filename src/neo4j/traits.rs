@@ -1990,6 +1990,26 @@ pub trait GraphStore: Send + Sync {
     /// (callers + callees). Used for auto-generating feature graphs after sync.
     async fn get_top_entry_functions(&self, project_id: Uuid, limit: usize) -> Result<Vec<String>>;
 
+    /// Compute statistics for a feature graph: coupling, cohesion, complexity metrics.
+    async fn get_feature_graph_statistics(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<FeatureGraphStatistics>>;
+
+    /// Compare two feature graphs: shared entities, unique entities, similarity score.
+    async fn compare_feature_graphs(
+        &self,
+        id_a: Uuid,
+        id_b: Uuid,
+    ) -> Result<Option<FeatureGraphComparison>>;
+
+    /// Find feature graphs that overlap with a reference graph (same project).
+    async fn find_overlapping_feature_graphs(
+        &self,
+        id: Uuid,
+        min_overlap: f64,
+    ) -> Result<Vec<FeatureGraphOverlap>>;
+
     // ========================================================================
     // Bulk graph extraction (for graph analytics)
     // ========================================================================

@@ -1554,6 +1554,77 @@ pub struct FeatureGraphDetail {
     pub relations: Vec<FeatureGraphRelation>,
 }
 
+/// Statistics for a feature graph — coupling, cohesion and complexity metrics.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeatureGraphStatistics {
+    /// Feature graph UUID
+    pub id: Uuid,
+    /// Feature graph name
+    pub name: String,
+    /// Total entity count
+    pub entity_count: usize,
+    /// Breakdown by entity type: {"file": 3, "function": 12, ...}
+    pub entity_breakdown: std::collections::HashMap<String, usize>,
+    /// Breakdown by role: {"core_logic": 8, "support": 4, ...}
+    pub role_breakdown: std::collections::HashMap<String, usize>,
+    /// Number of intra-graph relations (edges between entities in the graph)
+    pub internal_edge_count: usize,
+    /// Number of external dependencies (edges going out of the graph)
+    pub external_edge_count: usize,
+    /// Cohesion score: internal_edges / (entity_count * (entity_count - 1) / 2)
+    /// Higher = more tightly coupled internally
+    pub cohesion: f64,
+    /// Coupling score: external_edges / (internal_edges + external_edges)
+    /// Lower = more self-contained
+    pub coupling: f64,
+    /// Average importance score of entities (PageRank-based, if available)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avg_importance: Option<f64>,
+    /// Number of entry points (entities with incoming edges from outside but no outgoing to outside)
+    pub entry_points: Vec<String>,
+    /// Number of exit points (entities with outgoing edges to outside but no incoming from outside)
+    pub exit_points: Vec<String>,
+}
+
+/// Result of comparing two feature graphs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeatureGraphComparison {
+    /// First feature graph
+    pub graph_a: FeatureGraphComparisonSide,
+    /// Second feature graph
+    pub graph_b: FeatureGraphComparisonSide,
+    /// Entities shared by both graphs (entity_type, entity_id)
+    pub shared_entities: Vec<FeatureGraphEntity>,
+    /// Entities only in graph A
+    pub unique_to_a: Vec<FeatureGraphEntity>,
+    /// Entities only in graph B
+    pub unique_to_b: Vec<FeatureGraphEntity>,
+    /// Jaccard similarity: |shared| / |A ∪ B|
+    pub similarity: f64,
+}
+
+/// Summary info for one side of a comparison.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeatureGraphComparisonSide {
+    pub id: Uuid,
+    pub name: String,
+    pub entity_count: usize,
+}
+
+/// A feature graph that overlaps with a reference graph.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeatureGraphOverlap {
+    pub id: Uuid,
+    pub name: String,
+    pub entity_count: usize,
+    /// Number of shared entities with the reference graph
+    pub shared_count: usize,
+    /// Shared entity identifiers (entity_type:entity_id)
+    pub shared_entities: Vec<String>,
+    /// Overlap ratio: shared_count / min(ref_count, this_count)
+    pub overlap_ratio: f64,
+}
+
 // ============================================================================
 // Relationship types
 // ============================================================================

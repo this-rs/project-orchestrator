@@ -288,6 +288,9 @@ impl ToolHandler {
             ("feature_graph", "add_entity") => "add_to_feature_graph",
             ("feature_graph", "auto_build") => "auto_build_feature_graph",
             ("feature_graph", "delete") => "delete_feature_graph",
+            ("feature_graph", "get_statistics") => "get_feature_graph_statistics",
+            ("feature_graph", "compare") => "compare_feature_graphs",
+            ("feature_graph", "find_overlapping") => "find_overlapping_feature_graphs",
 
             // Code
             ("code", "search") => "search_code",
@@ -3344,6 +3347,36 @@ impl ToolHandler {
                 }
                 let result = http
                     .post("/api/feature-graphs/auto-build", &Value::Object(body))
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "get_feature_graph_statistics" => {
+                let id = extract_id(args, "id")?;
+                let result = http
+                    .get(&format!("/api/feature-graphs/{}/statistics", id))
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "compare_feature_graphs" => {
+                let id_a = extract_id(args, "id_a")?;
+                let id_b = extract_id(args, "id_b")?;
+                let query = vec![("id_a".to_string(), id_a), ("id_b".to_string(), id_b)];
+                let result = http
+                    .get_with_query("/api/feature-graphs/compare", &query)
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "find_overlapping_feature_graphs" => {
+                let id = extract_id(args, "id")?;
+                let mut query = Vec::new();
+                if let Some(v) = args.get("min_overlap").and_then(|v| v.as_f64()) {
+                    query.push(("min_overlap".to_string(), v.to_string()));
+                }
+                let result = http
+                    .get_with_query(&format!("/api/feature-graphs/{}/overlapping", id), &query)
                     .await?;
                 Ok(Some(result))
             }
@@ -8359,6 +8392,9 @@ mod tests {
             ("add_entity", "add_to_feature_graph"),
             ("auto_build", "auto_build_feature_graph"),
             ("delete", "delete_feature_graph"),
+            ("get_statistics", "get_feature_graph_statistics"),
+            ("compare", "compare_feature_graphs"),
+            ("find_overlapping", "find_overlapping_feature_graphs"),
         ] {
             let args = json!({"action": action});
             let (name, _) = handler.resolve_mega_tool("feature_graph", &args).unwrap();

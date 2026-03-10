@@ -2402,6 +2402,29 @@ impl GraphStore for Neo4jClient {
         self.get_top_entry_functions(project_id, limit).await
     }
 
+    async fn get_feature_graph_statistics(
+        &self,
+        id: Uuid,
+    ) -> anyhow::Result<Option<FeatureGraphStatistics>> {
+        self.get_feature_graph_statistics(id).await
+    }
+
+    async fn compare_feature_graphs(
+        &self,
+        id_a: Uuid,
+        id_b: Uuid,
+    ) -> anyhow::Result<Option<FeatureGraphComparison>> {
+        self.compare_feature_graphs(id_a, id_b).await
+    }
+
+    async fn find_overlapping_feature_graphs(
+        &self,
+        id: Uuid,
+        min_overlap: f64,
+    ) -> anyhow::Result<Vec<FeatureGraphOverlap>> {
+        self.find_overlapping_feature_graphs(id, min_overlap).await
+    }
+
     async fn get_project_import_edges(
         &self,
         project_id: Uuid,

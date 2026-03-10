@@ -1716,6 +1716,80 @@ pub async fn auto_build_feature_graph(
     })))
 }
 
+/// GET /api/feature-graphs/:id/statistics
+pub async fn get_feature_graph_statistics(
+    State(state): State<OrchestratorState>,
+    Path(id): Path<uuid::Uuid>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    match state
+        .orchestrator
+        .neo4j()
+        .get_feature_graph_statistics(id)
+        .await?
+    {
+        Some(stats) => Ok(Json(
+            serde_json::to_value(&stats).map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?,
+        )),
+        None => Err(AppError::NotFound(format!(
+            "Feature graph {} not found",
+            id
+        ))),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct CompareQuery {
+    pub id_a: uuid::Uuid,
+    pub id_b: uuid::Uuid,
+}
+
+/// GET /api/feature-graphs/compare?id_a=...&id_b=...
+pub async fn compare_feature_graphs(
+    State(state): State<OrchestratorState>,
+    Query(query): Query<CompareQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    match state
+        .orchestrator
+        .neo4j()
+        .compare_feature_graphs(query.id_a, query.id_b)
+        .await?
+    {
+        Some(comparison) => Ok(Json(
+            serde_json::to_value(&comparison)
+                .map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?,
+        )),
+        None => Err(AppError::NotFound(
+            "One or both feature graphs not found".to_string(),
+        )),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct OverlappingQuery {
+    #[serde(default = "default_min_overlap")]
+    pub min_overlap: f64,
+}
+
+fn default_min_overlap() -> f64 {
+    0.1
+}
+
+/// GET /api/feature-graphs/:id/overlapping?min_overlap=0.1
+pub async fn find_overlapping_feature_graphs(
+    State(state): State<OrchestratorState>,
+    Path(id): Path<uuid::Uuid>,
+    Query(query): Query<OverlappingQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let overlaps = state
+        .orchestrator
+        .neo4j()
+        .find_overlapping_feature_graphs(id, query.min_overlap)
+        .await?;
+    Ok(Json(
+        serde_json::json!({ "overlapping": overlaps, "count": overlaps.len() }),
+    ))
+}
+
 // ============================================================================
 // Structural Analytics
 // ============================================================================

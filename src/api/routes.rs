@@ -606,6 +606,18 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/feature-graphs/{id}/entities",
             post(code_handlers::add_entity_to_feature_graph),
         )
+        .route(
+            "/api/feature-graphs/{id}/statistics",
+            get(code_handlers::get_feature_graph_statistics),
+        )
+        .route(
+            "/api/feature-graphs/{id}/overlapping",
+            get(code_handlers::find_overlapping_feature_graphs),
+        )
+        .route(
+            "/api/feature-graphs/compare",
+            get(code_handlers::compare_feature_graphs),
+        )
         // ================================================================
         // Structural Analytics
         // ================================================================
