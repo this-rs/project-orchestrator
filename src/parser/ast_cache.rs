@@ -19,7 +19,12 @@ use std::num::NonZeroUsize;
 use super::ParsedFile;
 
 /// Default maximum number of cached parse results.
-pub const DEFAULT_AST_CACHE_CAPACITY: usize = 200;
+///
+/// Set to 50_000 to cover even the largest monorepos across multiple sync
+/// cycles without eviction. Memory cost: ~600 MB at full capacity (~12 KB
+/// per ParsedFile average), but in practice usage stays well below the cap
+/// since entries are keyed by `path:content_hash` and LRU evicts stale ones.
+pub const DEFAULT_AST_CACHE_CAPACITY: usize = 50_000;
 
 /// Statistics about the AST cache.
 #[derive(Debug, Clone, Copy)]
