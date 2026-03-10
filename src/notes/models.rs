@@ -32,6 +32,8 @@ pub enum NoteType {
     Observation,
     /// A verifiable rule/assertion about the code
     Assertion,
+    /// A Request for Comments (RFC) — lifecycle managed by Protocol FSM
+    Rfc,
 }
 
 impl fmt::Display for NoteType {
@@ -44,6 +46,7 @@ impl fmt::Display for NoteType {
             Self::Tip => write!(f, "tip"),
             Self::Observation => write!(f, "observation"),
             Self::Assertion => write!(f, "assertion"),
+            Self::Rfc => write!(f, "rfc"),
         }
     }
 }
@@ -60,6 +63,7 @@ impl FromStr for NoteType {
             "tip" => Ok(Self::Tip),
             "observation" => Ok(Self::Observation),
             "assertion" => Ok(Self::Assertion),
+            "rfc" => Ok(Self::Rfc),
             _ => Err(format!("Unknown note type: {}", s)),
         }
     }
@@ -774,6 +778,7 @@ impl Note {
             NoteType::Guideline => 365.0, // Stable for a long time
             NoteType::Pattern => 365.0,
             NoteType::Assertion => f64::MAX, // Never stale (verified by code)
+            NoteType::Rfc => 365.0, // RFCs are long-lived like patterns/guidelines
         }
     }
 }

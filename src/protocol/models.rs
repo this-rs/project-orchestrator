@@ -154,6 +154,42 @@ impl TriggerMode {
     }
 }
 
+/// Strategy for how a parent run should handle child run completion.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum CompletionStrategy {
+    /// Parent transitions when ALL children complete
+    #[default]
+    AllComplete,
+    /// Parent transitions when ANY child completes
+    AnyComplete,
+    /// No automatic transition — requires explicit trigger
+    Manual,
+}
+
+impl fmt::Display for CompletionStrategy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AllComplete => write!(f, "all_complete"),
+            Self::AnyComplete => write!(f, "any_complete"),
+            Self::Manual => write!(f, "manual"),
+        }
+    }
+}
+
+impl FromStr for CompletionStrategy {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "all_complete" => Ok(Self::AllComplete),
+            "any_complete" => Ok(Self::AnyComplete),
+            "manual" => Ok(Self::Manual),
+            _ => Err(format!("Unknown completion strategy: {}", s)),
+        }
+    }
+}
+
 /// Configuration for automatic protocol triggers.
 ///
 /// Specifies which events and/or schedule should trigger the protocol.
@@ -303,6 +339,12 @@ pub struct ProtocolState {
     /// Role of this state in the FSM lifecycle
     #[serde(default)]
     pub state_type: StateType,
+    /// Optional sub-protocol to spawn when entering this state (hierarchical FSM)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sub_protocol_id: Option<Uuid>,
+    /// How child run completion triggers parent transition (defaults to AllComplete)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_strategy: Option<CompletionStrategy>,
 }
 
 impl ProtocolState {
@@ -315,6 +357,8 @@ impl ProtocolState {
             description: String::new(),
             action: None,
             state_type: StateType::Intermediate,
+            sub_protocol_id: None,
+            completion_strategy: None,
         }
     }
 

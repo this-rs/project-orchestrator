@@ -341,7 +341,9 @@ impl Neo4jClient {
                 s.name = $name,
                 s.description = $description,
                 s.action = $action,
-                s.state_type = $state_type
+                s.state_type = $state_type,
+                s.sub_protocol_id = $sub_protocol_id,
+                s.completion_strategy = $completion_strategy
             MERGE (proto)-[:HAS_STATE]->(s)
             "#,
         )
@@ -350,7 +352,21 @@ impl Neo4jClient {
         .param("name", state.name.clone())
         .param("description", state.description.clone())
         .param("action", state.action.clone().unwrap_or_default())
-        .param("state_type", state.state_type.to_string());
+        .param("state_type", state.state_type.to_string())
+        .param(
+            "sub_protocol_id",
+            state
+                .sub_protocol_id
+                .map(|u| u.to_string())
+                .unwrap_or_default(),
+        )
+        .param(
+            "completion_strategy",
+            state
+                .completion_strategy
+                .map(|c| c.to_string())
+                .unwrap_or_default(),
+        );
 
         self.graph
             .run(q)
@@ -549,6 +565,16 @@ impl Neo4jClient {
             triggered_by: node
                 .get::<String>("triggered_by")
                 .unwrap_or_else(|_| "manual".to_string()),
+            parent_run_id: node
+                .get::<String>("parent_run_id")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .and_then(|s| s.parse().ok()),
+            depth: node
+                .get::<i64>("depth")
+                .ok()
+                .map(|d| d as u32)
+                .unwrap_or(0),
         })
     }
 
@@ -580,7 +606,9 @@ impl Neo4jClient {
                 started_at: $started_at,
                 completed_at: $completed_at,
                 error: $error,
-                triggered_by: $triggered_by
+                triggered_by: $triggered_by,
+                parent_run_id: $parent_run_id,
+                depth: $depth
             })
             CREATE (r)-[:INSTANCE_OF]->(proto)
             RETURN r.id AS created_id
