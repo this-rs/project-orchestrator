@@ -279,7 +279,6 @@ pub enum OnFailureStrategy {
     },
 }
 
-
 impl fmt::Display for OnFailureStrategy {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
