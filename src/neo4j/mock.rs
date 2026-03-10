@@ -3523,16 +3523,21 @@ impl GraphStore for MockGraphStore {
         use crate::neo4j::plan::TaskEnrichmentCounts;
         let mut map = std::collections::HashMap::new();
         let tasks = self.tasks.read().await;
-        let steps = self.steps.read().await;
+        let steps_store = self.steps.read().await;
+        let task_steps_map = self.task_steps.read().await;
         for tid in task_ids {
             if let Ok(uuid) = tid.parse::<Uuid>() {
                 if tasks.contains_key(&uuid) {
-                    let task_steps: Vec<_> =
-                        steps.values().filter(|s| s.task_id == Some(uuid)).collect();
-                    let step_count = task_steps.len();
-                    let completed_step_count = task_steps
+                    let step_ids = task_steps_map.get(&uuid).cloned().unwrap_or_default();
+                    let step_count = step_ids.len();
+                    let completed_step_count = step_ids
                         .iter()
-                        .filter(|s| format!("{:?}", s.status) == "Completed")
+                        .filter(|sid| {
+                            steps_store
+                                .get(sid)
+                                .map(|s| format!("{:?}", s.status) == "Completed")
+                                .unwrap_or(false)
+                        })
                         .count();
                     map.insert(
                         tid.clone(),
@@ -3555,13 +3560,15 @@ impl GraphStore for MockGraphStore {
     ) -> Result<std::collections::HashMap<String, crate::neo4j::plan::TaskEnrichmentData>> {
         use crate::neo4j::plan::{StepSummary, TaskEnrichmentData};
         let counts = self.get_task_enrichment_counts(task_ids).await?;
-        let steps = self.steps.read().await;
+        let steps_store = self.steps.read().await;
+        let task_steps_map = self.task_steps.read().await;
         let mut map = std::collections::HashMap::new();
         for tid in task_ids {
             if let Ok(uuid) = tid.parse::<Uuid>() {
-                let task_steps: Vec<StepSummary> = steps
-                    .values()
-                    .filter(|s| s.task_id == Some(uuid))
+                let step_ids = task_steps_map.get(&uuid).cloned().unwrap_or_default();
+                let task_steps: Vec<StepSummary> = step_ids
+                    .iter()
+                    .filter_map(|sid| steps_store.get(sid))
                     .map(|s| StepSummary {
                         id: s.id.to_string(),
                         order: s.order,
