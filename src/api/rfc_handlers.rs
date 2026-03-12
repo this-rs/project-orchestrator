@@ -33,6 +33,14 @@ pub struct RfcSection {
     pub content: String,
 }
 
+/// A trigger available from the current FSM state.
+#[derive(Debug, Serialize)]
+pub struct AvailableTransition {
+    pub trigger: String,
+    pub target_state: String,
+    pub guard: Option<String>,
+}
+
 /// RFC response matching the frontend `Rfc` interface.
 #[derive(Debug, Serialize)]
 pub struct RfcResponse {
@@ -43,6 +51,9 @@ pub struct RfcResponse {
     pub sections: Vec<RfcSection>,
     pub protocol_run_id: Option<String>,
     pub current_state: Option<String>,
+    /// Available FSM transitions from the current state (populated on GET detail).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub available_transitions: Option<Vec<AvailableTransition>>,
     pub created_at: String,
     pub updated_at: Option<String>,
     pub created_by: Option<String>,
@@ -183,7 +194,8 @@ fn note_to_rfc(note: &Note) -> RfcResponse {
         importance: format!("{}", note.importance),
         sections,
         protocol_run_id: run_id,
-        current_state: None, // enriched later if needed
+        current_state: None,               // enriched later if needed
+        available_transitions: None,        // enriched later if needed
         created_at: note.created_at.to_rfc3339(),
         updated_at: None,
         created_by: Some(note.created_by.clone()),
@@ -310,6 +322,36 @@ pub async fn get_rfc(
                                 },
                             )
                             .await;
+                    }
+                }
+
+                // Load available transitions from the current state
+                if run.is_active() {
+                    if let Ok(transitions) =
+                        state.orchestrator.neo4j().get_protocol_transitions(run.protocol_id).await
+                    {
+                        let states = state
+                            .orchestrator
+                            .neo4j()
+                            .get_protocol_states(run.protocol_id)
+                            .await
+                            .unwrap_or_default();
+                        let state_name_map: std::collections::HashMap<Uuid, String> =
+                            states.iter().map(|s| (s.id, s.name.clone())).collect();
+
+                        let available: Vec<AvailableTransition> = transitions
+                            .iter()
+                            .filter(|t| t.from_state == run.current_state)
+                            .map(|t| AvailableTransition {
+                                trigger: t.trigger.clone(),
+                                target_state: state_name_map
+                                    .get(&t.to_state)
+                                    .cloned()
+                                    .unwrap_or_else(|| t.to_state.to_string()),
+                                guard: t.guard.clone(),
+                            })
+                            .collect();
+                        rfc.available_transitions = Some(available);
                     }
                 }
             }
