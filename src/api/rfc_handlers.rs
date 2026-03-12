@@ -546,34 +546,104 @@ pub async fn transition_rfc(
         return Err(AppError::NotFound(format!("RFC {} not found", rfc_id)));
     }
 
-    // 2. Extract run ID from tags
-    let run_id_str = extract_run_id(&note.tags).ok_or_else(|| {
-        AppError::BadRequest(format!(
-            "RFC {} has no rfc-run:<uuid> tag — no protocol run linked. \
-             Transition not possible without an associated protocol run.",
-            rfc_id
-        ))
-    })?;
+    // 2. Extract or auto-create protocol run
+    let run_id = if let Some(run_id_str) = extract_run_id(&note.tags) {
+        let run_id = run_id_str.parse::<Uuid>().map_err(|_| {
+            AppError::BadRequest(format!(
+                "RFC {} has invalid rfc-run tag value: {}",
+                rfc_id, run_id_str
+            ))
+        })?;
 
-    let run_id = run_id_str.parse::<Uuid>().map_err(|_| {
-        AppError::BadRequest(format!(
-            "RFC {} has invalid rfc-run tag value: {}",
-            rfc_id, run_id_str
-        ))
-    })?;
-
-    // 3. If the run is failed/cancelled, recover it to running before attempting transition.
-    //    This handles the case where a server crash left the run in a failed state
-    //    but the FSM state is still valid and the user wants to continue the lifecycle.
-    if let Ok(Some(mut run)) = state.orchestrator.neo4j().get_protocol_run(run_id).await {
-        if run.status == protocol::RunStatus::Failed || run.status == protocol::RunStatus::Cancelled
-        {
-            run.status = protocol::RunStatus::Running;
-            run.error = None;
-            run.completed_at = None;
-            let _ = state.orchestrator.neo4j().update_protocol_run(&run).await;
+        // 3a. If the run is failed/cancelled, recover it to running before attempting transition.
+        if let Ok(Some(mut run)) = state.orchestrator.neo4j().get_protocol_run(run_id).await {
+            if run.status == protocol::RunStatus::Failed
+                || run.status == protocol::RunStatus::Cancelled
+            {
+                run.status = protocol::RunStatus::Running;
+                run.error = None;
+                run.completed_at = None;
+                let _ = state.orchestrator.neo4j().update_protocol_run(&run).await;
+            }
         }
-    }
+
+        run_id
+    } else {
+        // 3b. No run linked — auto-create one on the rfc-lifecycle protocol.
+        //     Find the protocol by name in the note's project (or any project).
+        let project_id = note.project_id.ok_or_else(|| {
+            AppError::BadRequest(
+                "RFC has no project_id — cannot find rfc-lifecycle protocol".to_string(),
+            )
+        })?;
+
+        let (protocols, _) = state
+            .orchestrator
+            .neo4j()
+            .list_protocols(project_id, None, 200, 0)
+            .await
+            .map_err(AppError::Internal)?;
+
+        let lifecycle_protocol = protocols
+            .iter()
+            .find(|p| p.name == "rfc-lifecycle")
+            .ok_or_else(|| {
+                AppError::BadRequest(format!(
+                    "No 'rfc-lifecycle' protocol found in project {}. \
+                     Create one before transitioning RFCs.",
+                    project_id
+                ))
+            })?;
+
+        // Resolve the entry state
+        let states = state
+            .orchestrator
+            .neo4j()
+            .get_protocol_states(lifecycle_protocol.id)
+            .await
+            .map_err(AppError::Internal)?;
+
+        let entry_state = states
+            .iter()
+            .find(|s| s.id == lifecycle_protocol.entry_state)
+            .ok_or_else(|| {
+                AppError::Internal(anyhow::anyhow!(
+                    "Entry state not found for rfc-lifecycle protocol"
+                ))
+            })?;
+
+        // Create a dedicated run for this RFC (bypass start_run concurrency check —
+        // each RFC gets its own independent run on the shared protocol)
+        let mut run =
+            protocol::ProtocolRun::new(lifecycle_protocol.id, entry_state.id, &entry_state.name);
+        run.triggered_by = "rfc-auto-create".to_string();
+
+        state
+            .orchestrator
+            .neo4j()
+            .create_protocol_run(&run)
+            .await
+            .map_err(AppError::Internal)?;
+
+        // Link the run to the RFC via tag
+        let mut tags = note.tags.clone();
+        tags.push(format!("rfc-run:{}", run.id));
+        let _ = state
+            .orchestrator
+            .note_manager()
+            .update_note(
+                rfc_id,
+                UpdateNoteRequest {
+                    content: None,
+                    importance: None,
+                    status: None,
+                    tags: Some(tags),
+                },
+            )
+            .await;
+
+        run.id
+    };
 
     // 4. Fire transition on the protocol run
     let result =
