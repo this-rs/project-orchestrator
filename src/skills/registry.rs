@@ -365,6 +365,10 @@ mod tests {
             execution_history: None,
             source: None,
             episodes: Vec::new(),
+            distilled_episodes: Vec::new(),
+            package_trust: None,
+            privacy_report: None,
+            privacy_mode: None,
         }
     }
 

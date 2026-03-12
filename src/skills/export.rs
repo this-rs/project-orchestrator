@@ -257,6 +257,10 @@ pub async fn export_skill(
         execution_history,
         source,
         episodes: portable_episodes,
+        distilled_episodes: Vec::new(),
+        package_trust: None,
+        privacy_report: None,
+        privacy_mode: None,
     };
 
     Ok(package)

@@ -25,10 +25,10 @@ use crate::skills::{REGEX_DFA_SIZE_LIMIT, REGEX_SIZE_LIMIT};
 /// Current schema version for the SkillPackage format.
 /// v1: notes + decisions
 /// v2: + protocols + execution_history + source metadata
-pub const CURRENT_SCHEMA_VERSION: u32 = 2;
+pub const CURRENT_SCHEMA_VERSION: u32 = 3;
 
 /// Format identifier for SkillPackage files.
-pub const FORMAT_ID: &str = "po-skill/v2";
+pub const FORMAT_ID: &str = "po-skill/v3";
 
 /// Minimum supported schema version for backward compatibility.
 pub const MIN_SUPPORTED_SCHEMA_VERSION: u32 = 1;
@@ -68,6 +68,20 @@ pub struct SkillPackage {
     /// Episodic memories captured during skill usage (v3).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub episodes: Vec<crate::episodes::PortableEpisode>,
+
+    // --- v3 fields (all optional for backward compatibility with v1/v2) ---
+    /// Distilled episodes with trust proofs and anonymization metadata.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub distilled_episodes: Vec<crate::episodes::distill_models::DistillationEnvelope>,
+    /// Aggregate trust score for the package (0.0 - 1.0).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package_trust: Option<f64>,
+    /// Privacy report summarizing all anonymization applied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub privacy_report: Option<crate::episodes::distill_models::AnonymizationReport>,
+    /// Privacy mode used during distillation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub privacy_mode: Option<crate::episodes::distill_models::PrivacyMode>,
 }
 
 // ============================================================================
@@ -533,6 +547,10 @@ mod tests {
             execution_history: None,
             source: None,
             episodes: Vec::new(),
+            distilled_episodes: Vec::new(),
+            package_trust: None,
+            privacy_report: None,
+            privacy_mode: None,
         }
     }
 
@@ -821,5 +839,101 @@ mod tests {
         assert!(package.execution_history.is_none());
         assert!(package.source.is_none());
         assert!(validate_package(&package).is_ok());
+    }
+
+    #[test]
+    fn test_v2_json_deserializes_to_v3_struct() {
+        let v2_json = serde_json::json!({
+            "schema_version": 2,
+            "metadata": {
+                "format": "po-skill/v2",
+                "exported_at": "2026-02-01T00:00:00Z",
+                "stats": {
+                    "note_count": 1,
+                    "decision_count": 0,
+                    "trigger_count": 1,
+                    "activation_count": 10
+                }
+            },
+            "skill": {
+                "name": "V2 Skill",
+                "description": "V2 format",
+                "trigger_patterns": [{"pattern_type": "regex", "pattern_value": "test", "confidence_threshold": 0.7}],
+                "tags": ["v2"],
+                "cohesion": 0.6
+            },
+            "notes": [{
+                "note_type": "guideline",
+                "importance": "high",
+                "content": "V2 note content",
+                "tags": ["neo4j"]
+            }],
+            "decisions": [],
+            "protocols": [],
+            "execution_history": {
+                "activation_count": 10,
+                "success_rate": 0.9,
+                "avg_score": 0.75,
+                "source_projects_count": 2
+            },
+            "source": {
+                "project_name": "test-project",
+                "git_remote": "git@github.com:org/repo.git"
+            }
+        });
+
+        let package: SkillPackage = serde_json::from_value(v2_json).unwrap();
+        assert_eq!(package.schema_version, 2);
+        assert_eq!(package.skill.name, "V2 Skill");
+        assert!(package.distilled_episodes.is_empty());
+        assert!(package.package_trust.is_none());
+        assert!(package.privacy_report.is_none());
+        assert!(package.privacy_mode.is_none());
+        assert!(package.execution_history.is_some());
+        assert!(package.source.is_some());
+        assert!(validate_package(&package).is_ok());
+    }
+
+    #[test]
+    fn test_v3_serde_roundtrip() {
+        use crate::episodes::distill_models::*;
+        use std::collections::HashMap;
+
+        let mut package = make_valid_package();
+        package.distilled_episodes = vec![DistillationEnvelope {
+            lesson: DistilledLesson {
+                abstract_pattern: "Always index relations".to_string(),
+                domain_tags: vec!["neo4j".to_string()],
+                portability_layer: PortabilityLayer::Domain,
+                confidence: 0.85,
+            },
+            anonymized_content: "Use UNWIND for batch operations".to_string(),
+            meta: DistillationMeta {
+                pipeline_version: "1.0".to_string(),
+                sensitivity_level: SensitivityLevel::Public,
+                quality_score: 0.85,
+                content_hash: "abc123def456".to_string(),
+            },
+            trust_proof: TrustProof {
+                source_did: "did:key:z6MkTest".to_string(),
+                signature_hex: "deadbeef".to_string(),
+                trust_scores: HashMap::from([("confidence".to_string(), 0.85)]),
+            },
+            anonymization_report: None,
+        }];
+        package.package_trust = Some(0.85);
+        package.privacy_mode = Some(PrivacyMode::Standard);
+
+        let json = serde_json::to_string_pretty(&package).unwrap();
+        let restored: SkillPackage = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(restored.schema_version, CURRENT_SCHEMA_VERSION);
+        assert_eq!(restored.distilled_episodes.len(), 1);
+        assert_eq!(
+            restored.distilled_episodes[0].lesson.abstract_pattern,
+            "Always index relations"
+        );
+        assert_eq!(restored.package_trust, Some(0.85));
+        assert_eq!(restored.privacy_mode, Some(PrivacyMode::Standard));
     }
 }

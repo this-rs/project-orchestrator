@@ -353,6 +353,10 @@ async fn handle_conflict(
                 execution_history: None,
                 source: None,
                 episodes: Vec::new(),
+                distilled_episodes: Vec::new(),
+                package_trust: None,
+                privacy_report: None,
+                privacy_mode: None,
             };
             let skill = create_imported_skill(&package_stub, target_project_id);
             let skill_id = skill.id;
@@ -803,6 +807,10 @@ mod tests {
             execution_history: None,
             source: None,
             episodes: Vec::new(),
+            distilled_episodes: Vec::new(),
+            package_trust: None,
+            privacy_report: None,
+            privacy_mode: None,
         }
     }
 

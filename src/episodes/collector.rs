@@ -153,3 +153,126 @@ pub async fn list_episodes(
 
     Ok(episodes)
 }
+
+// ============================================================================
+// Distillation collection
+// ============================================================================
+
+/// A bundle of episode data ready for the distillation pipeline.
+///
+/// Collects the raw materials that `abstract_lesson()` and `anonymize()` need.
+#[derive(Debug, Clone)]
+pub struct DistillationBundle {
+    /// The source episode.
+    pub episode: Episode,
+    /// Note titles extracted from the episode's outcome.
+    pub note_titles: Vec<String>,
+    /// Tags aggregated from all notes.
+    pub tags: Vec<String>,
+    /// Concatenated note content.
+    pub content: String,
+}
+
+/// Prepare an episode for the distillation pipeline.
+///
+/// Assembles a [`DistillationBundle`] from an episode and its associated note
+/// metadata. In a full implementation this would query Neo4j for note details;
+/// here we accept pre-resolved note data to keep the function testable without
+/// a live graph.
+pub fn collect_for_distillation(
+    episode: Episode,
+    note_titles: Vec<String>,
+    note_tags: Vec<String>,
+    note_content: String,
+) -> DistillationBundle {
+    DistillationBundle {
+        episode,
+        note_titles,
+        tags: note_tags,
+        content: note_content,
+    }
+}
+
+impl DistillationBundle {
+    /// Convert into the [`EpisodeContent`] expected by `abstract_lesson()`.
+    pub fn to_episode_content(&self) -> crate::episodes::distill::EpisodeContent {
+        crate::episodes::distill::EpisodeContent {
+            note_titles: self.note_titles.clone(),
+            tags: self.tags.clone(),
+            content: self.content.clone(),
+        }
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+
+    fn sample_episode() -> Episode {
+        Episode {
+            id: Uuid::new_v4(),
+            project_id: Uuid::new_v4(),
+            stimulus: Stimulus {
+                request: "test request".to_string(),
+                trigger: StimulusTrigger::UserRequest,
+                timestamp: Utc::now(),
+                context_hash: None,
+            },
+            process: Process {
+                reasoning_tree_id: None,
+                states_visited: vec![],
+                duration_ms: None,
+            },
+            outcome: Outcome {
+                note_ids: vec![Uuid::new_v4()],
+                decision_ids: vec![],
+                commit_shas: vec![],
+                files_modified: 0,
+            },
+            validation: Validation {
+                feedback_type: FeedbackType::None,
+                score: None,
+                evidence_count: 0,
+            },
+            lesson: None,
+            collected_at: Utc::now(),
+            source_run_id: None,
+        }
+    }
+
+    #[test]
+    fn test_collect_for_distillation() {
+        let episode = sample_episode();
+        let ep_id = episode.id;
+        let bundle = collect_for_distillation(
+            episode,
+            vec!["Note A".to_string(), "Note B".to_string()],
+            vec!["rust".to_string(), "testing".to_string()],
+            "Combined note content here.".to_string(),
+        );
+        assert_eq!(bundle.episode.id, ep_id);
+        assert_eq!(bundle.note_titles.len(), 2);
+        assert_eq!(bundle.tags.len(), 2);
+        assert!(!bundle.content.is_empty());
+    }
+
+    #[test]
+    fn test_bundle_to_episode_content() {
+        let episode = sample_episode();
+        let bundle = collect_for_distillation(
+            episode,
+            vec!["Title".to_string()],
+            vec!["tag".to_string()],
+            "content".to_string(),
+        );
+        let ec = bundle.to_episode_content();
+        assert_eq!(ec.note_titles.len(), 1);
+        assert_eq!(ec.tags, vec!["tag".to_string()]);
+        assert_eq!(ec.content, "content");
+    }
+}
