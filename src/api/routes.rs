@@ -242,6 +242,14 @@ fn protected_routes() -> Router<OrchestratorState> {
             get(project_handlers::get_embeddings_projection),
         )
         .route(
+            "/api/projects/{slug}/health-dashboard",
+            get(project_handlers::get_health_dashboard),
+        )
+        .route(
+            "/api/projects/{slug}/auto-roadmap",
+            get(project_handlers::get_auto_roadmap),
+        )
+        .route(
             "/api/projects/{slug}/scaffolding",
             get(project_handlers::get_scaffolding_level)
                 .put(project_handlers::set_scaffolding_level),

@@ -68,6 +68,42 @@ fn resolve_intent_profile(
     }
 }
 
+/// Fix stringified JSON values from MCP transport.
+///
+/// Claude Code sometimes sends array/integer/boolean parameters as JSON strings
+/// (e.g. `"[\"a\"]"` instead of `["a"]`, `"100"` instead of `100`).
+/// This function detects and deserializes them back to proper JSON types.
+fn unstringify_json_values(args: &mut Value) {
+    let obj = match args.as_object_mut() {
+        Some(o) => o,
+        None => return,
+    };
+    for (_key, val) in obj.iter_mut() {
+        if let Some(s) = val.as_str().map(|s| s.to_owned()) {
+            let trimmed = s.trim();
+            if trimmed.starts_with('[') || trimmed.starts_with('{') {
+                if let Ok(parsed) = serde_json::from_str::<Value>(&s) {
+                    if parsed.is_array() || parsed.is_object() {
+                        *val = parsed;
+                        continue;
+                    }
+                }
+            }
+            if trimmed == "true" {
+                *val = Value::Bool(true);
+                continue;
+            }
+            if trimmed == "false" {
+                *val = Value::Bool(false);
+                continue;
+            }
+            if let Ok(n) = trimmed.parse::<i64>() {
+                *val = Value::Number(n.into());
+            }
+        }
+    }
+}
+
 /// Handles MCP tool calls by proxying to the REST API.
 pub struct ToolHandler {
     client: McpHttpClient,
@@ -161,6 +197,8 @@ impl ToolHandler {
             ("project", "get_embeddings_projection") => "get_embeddings_projection",
             ("project", "get_scaffolding_level") => "get_scaffolding_level",
             ("project", "set_scaffolding_override") => "set_scaffolding_override",
+            ("project", "get_health_dashboard") => "get_health_dashboard",
+            ("project", "get_auto_roadmap") => "get_auto_roadmap",
 
             // Plan
             ("plan", "list") => "list_plans",
@@ -529,7 +567,8 @@ impl ToolHandler {
         // ── Mega-tool resolution ────────────────────────────────────────
         let (resolved_name, resolved_args) = self.resolve_mega_tool(name, &args)?;
         let name = resolved_name.as_str();
-        let args = resolved_args;
+        let mut args = resolved_args;
+        unstringify_json_values(&mut args);
 
         // ── HTTP routing ────────────────────────────────────────────────
         if let Some(result) = self.try_handle_http(name, &args).await? {
@@ -682,6 +721,22 @@ impl ToolHandler {
                 let slug = extract_string(args, "slug")?;
                 let result = http
                     .get(&format!("/api/projects/{}/intelligence/summary", slug))
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "get_health_dashboard" => {
+                let slug = extract_string(args, "slug")?;
+                let result = http
+                    .get(&format!("/api/projects/{}/health-dashboard", slug))
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "get_auto_roadmap" => {
+                let slug = extract_string(args, "slug")?;
+                let result = http
+                    .get(&format!("/api/projects/{}/auto-roadmap", slug))
                     .await?;
                 Ok(Some(result))
             }
@@ -8622,5 +8677,56 @@ mod tests {
             let (name, _) = handler.resolve_mega_tool("feature_graph", &args).unwrap();
             assert_eq!(name, expected);
         }
+    }
+
+    // ========================================================================
+    // unstringify_json_values tests
+    // ========================================================================
+
+    #[test]
+    fn test_unstringify_json_values() {
+        let mut v = json!({
+            "tags": "[\"a\",\"b\"]",
+            "priority": "100",
+            "affected_files": "[\"src/main.rs\"]",
+            "title": "normal string",
+            "flag": "true"
+        });
+        unstringify_json_values(&mut v);
+        assert_eq!(v["tags"], json!(["a", "b"]));
+        assert_eq!(v["priority"], json!(100));
+        assert_eq!(v["affected_files"], json!(["src/main.rs"]));
+        assert_eq!(v["title"], "normal string"); // unchanged
+        assert_eq!(v["flag"], json!(true));
+    }
+
+    #[test]
+    fn test_unstringify_json_values_false() {
+        let mut v = json!({"active": "false"});
+        unstringify_json_values(&mut v);
+        assert_eq!(v["active"], json!(false));
+    }
+
+    #[test]
+    fn test_unstringify_json_values_object() {
+        let mut v = json!({"meta": "{\"key\":\"val\"}"});
+        unstringify_json_values(&mut v);
+        assert_eq!(v["meta"], json!({"key": "val"}));
+    }
+
+    #[test]
+    fn test_unstringify_json_values_leaves_non_json_strings() {
+        let mut v = json!({"name": "hello world", "path": "/tmp/foo"});
+        let original = v.clone();
+        unstringify_json_values(&mut v);
+        assert_eq!(v, original);
+    }
+
+    #[test]
+    fn test_unstringify_json_values_non_object() {
+        // Should not panic on non-object values
+        let mut v = json!("just a string");
+        unstringify_json_values(&mut v);
+        assert_eq!(v, json!("just a string"));
     }
 }
