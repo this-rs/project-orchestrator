@@ -194,8 +194,8 @@ fn note_to_rfc(note: &Note) -> RfcResponse {
         importance: format!("{}", note.importance),
         sections,
         protocol_run_id: run_id,
-        current_state: None,               // enriched later if needed
-        available_transitions: None,        // enriched later if needed
+        current_state: None,         // enriched later if needed
+        available_transitions: None, // enriched later if needed
         created_at: note.created_at.to_rfc3339(),
         updated_at: None,
         created_by: Some(note.created_by.clone()),
@@ -327,8 +327,11 @@ pub async fn get_rfc(
 
                 // Load available transitions from the current state
                 if run.is_active() {
-                    if let Ok(transitions) =
-                        state.orchestrator.neo4j().get_protocol_transitions(run.protocol_id).await
+                    if let Ok(transitions) = state
+                        .orchestrator
+                        .neo4j()
+                        .get_protocol_transitions(run.protocol_id)
+                        .await
                     {
                         let states = state
                             .orchestrator
