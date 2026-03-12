@@ -8,7 +8,7 @@ use anyhow::{anyhow, Result};
 use chrono::{DateTime, Duration, Utc};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use pasetors::claims::{Claims, ClaimsValidationRules};
-use pasetors::keys::{AsymmetricKeyPair, AsymmetricPublicKey, AsymmetricSecretKey};
+use pasetors::keys::{AsymmetricPublicKey, AsymmetricSecretKey};
 use pasetors::token::UntrustedToken;
 use pasetors::version4::V4;
 use pasetors::{public, Public};
@@ -143,7 +143,7 @@ pub fn verify_token(token: &str, verifying_key: &VerifyingKey) -> Result<TokenCl
 
     // Extract custom claims (everything except standard fields)
     let _standard_fields = ["iss", "sub", "iat", "exp", "nbf", "jti", "aud"];
-    let mut custom = HashMap::new();
+    let custom = HashMap::new();
 
     // Note: pasetors Claims doesn't expose iteration, so custom claims
     // are only available if we re-parse the payload

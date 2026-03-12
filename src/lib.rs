@@ -30,6 +30,7 @@ pub mod resolver;
 pub mod runner;
 pub mod setup_claude;
 pub mod skills;
+pub mod transport;
 pub mod update;
 
 #[cfg(test)]
