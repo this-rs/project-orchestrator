@@ -1142,16 +1142,23 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
     // ── Knowledge / Notes ───────────────────────────────────────────
     ToolGroup {
         name: "knowledge",
-        description: "Notes, guidelines, gotchas, patterns, Knowledge Fabric propagation",
+        description: "Notes, guidelines, gotchas, patterns, Knowledge Fabric propagation, episodic memory",
         keywords: &[
             "note", "guideline", "gotcha", "pattern", "knowledge", "connaissance",
             "tip", "observation", "assertion", "context", "contexte", "memory", "mémoire",
-            "propagation", "fabric",
+            "propagation", "fabric", "episode", "épisode", "episodic", "épisodique",
+            "artifact", "lesson", "leçon",
         ],
-        tools: &[ToolRef {
-            name: "note",
-            description: "Manage notes (list/create/get/update/delete/search/search_semantic/confirm/invalidate/supersede/link_to_entity/unlink_from_entity/get_context/get_context_knowledge/get_propagated/get_propagated_knowledge/get_entity/get_needing_review/list_project)",
-        }],
+        tools: &[
+            ToolRef {
+                name: "note",
+                description: "Manage notes (list/create/get/update/delete/search/search_semantic/confirm/invalidate/supersede/link_to_entity/unlink_from_entity/get_context/get_context_knowledge/get_propagated/get_propagated_knowledge/get_entity/get_needing_review/list_project)",
+            },
+            ToolRef {
+                name: "episode",
+                description: "Episodic memory (collect/list/anonymize/export_artifact) — collect cognitive episodes from ProtocolRuns, convert to portable format, export enriched artifacts",
+            },
+        ],
     },
     // ── Git Tracking ────────────────────────────────────────────────
     ToolGroup {
@@ -1287,7 +1294,7 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
 ];
 
 /// Total number of unique tools across all groups.
-/// Must match the MCP tools.rs count (currently 22 mega-tools).
+/// Must match the MCP tools.rs count (currently 23 mega-tools).
 pub fn tool_catalog_tool_count() -> usize {
     let mut names: Vec<&str> = TOOL_GROUPS
         .iter()
@@ -2968,11 +2975,11 @@ mod tests {
     // ================================================================
 
     #[test]
-    fn test_tool_groups_cover_all_22_mega_tools() {
+    fn test_tool_groups_cover_all_23_mega_tools() {
         let count = tool_catalog_tool_count();
         assert_eq!(
-            count, 22,
-            "TOOL_GROUPS must cover exactly 22 unique mega-tools (got {}). \
+            count, 23,
+            "TOOL_GROUPS must cover exactly 23 unique mega-tools (got {}). \
              Update the catalog when adding/removing MCP tools.",
             count
         );

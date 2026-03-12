@@ -154,7 +154,7 @@ fn default_true() -> bool {
 }
 
 /// A structural edge in the exported artifact.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArtifactEdge {
     pub source: String,
     pub target: String,
@@ -163,7 +163,7 @@ pub struct ArtifactEdge {
 }
 
 /// The enriched artifact — hybrid structure + episodes.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnrichedArtifact {
     /// Schema version.
     pub schema_version: u32,
@@ -181,7 +181,7 @@ pub struct EnrichedArtifact {
 }
 
 /// Stats about the exported artifact.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArtifactStats {
     pub edge_count: usize,
     pub episode_count: usize,

@@ -7,7 +7,9 @@
 //! Episodes are the bridge between local knowledge (notes, decisions,
 //! protocol runs) and portable knowledge (SkillPackage v3).
 
+pub mod artifact_comparison;
 pub mod collector;
+pub mod evaluation;
 pub mod models;
 
 pub use models::{
