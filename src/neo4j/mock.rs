@@ -5426,7 +5426,11 @@ impl GraphStore for MockGraphStore {
         Ok(0)
     }
 
-    async fn propagate_note_via_feature_graph(&self, _note_id: Uuid, _feature_graph_id: &str) -> Result<usize> {
+    async fn propagate_note_via_feature_graph(
+        &self,
+        _note_id: Uuid,
+        _feature_graph_id: &str,
+    ) -> Result<usize> {
         Ok(0)
     }
 
@@ -5434,7 +5438,11 @@ impl GraphStore for MockGraphStore {
         Ok(0)
     }
 
-    async fn propagate_note_via_protocol(&self, _note_id: Uuid, _protocol_id: &str) -> Result<usize> {
+    async fn propagate_note_via_protocol(
+        &self,
+        _note_id: Uuid,
+        _protocol_id: &str,
+    ) -> Result<usize> {
         Ok(0)
     }
 

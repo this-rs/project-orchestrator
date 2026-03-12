@@ -757,9 +757,18 @@ impl Neo4jClient {
     /// Called from bootstrap_knowledge_fabric as a fallback/initialization path.
     /// The primary propagation path is event-driven via link_note_to_entity hooks.
     pub async fn propagate_high_level_links(&self, project_id: Uuid) -> Result<usize> {
-        let fg = self.propagate_feature_graph_links(project_id).await.unwrap_or(0);
-        let skill = self.propagate_skill_member_links(project_id).await.unwrap_or(0);
-        let proto = self.propagate_protocol_skill_links(project_id).await.unwrap_or(0);
+        let fg = self
+            .propagate_feature_graph_links(project_id)
+            .await
+            .unwrap_or(0);
+        let skill = self
+            .propagate_skill_member_links(project_id)
+            .await
+            .unwrap_or(0);
+        let proto = self
+            .propagate_protocol_skill_links(project_id)
+            .await
+            .unwrap_or(0);
         let total = fg + skill + proto;
 
         if total > 0 {
@@ -825,11 +834,7 @@ impl Neo4jClient {
     }
 
     /// Propagate a single note linked to a Skill to files of the skill's member notes.
-    pub async fn propagate_note_via_skill(
-        &self,
-        note_id: Uuid,
-        skill_id: &str,
-    ) -> Result<usize> {
+    pub async fn propagate_note_via_skill(&self, note_id: Uuid, skill_id: &str) -> Result<usize> {
         let q = query(
             r#"
             MATCH (n:Note {id: $note_id})

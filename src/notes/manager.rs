@@ -625,7 +625,9 @@ impl NoteManager {
                 tokio::spawn(async move {
                     let result = match &entity_type {
                         EntityType::FeatureGraph => {
-                            neo4j.propagate_note_via_feature_graph(note_id, &entity_id).await
+                            neo4j
+                                .propagate_note_via_feature_graph(note_id, &entity_id)
+                                .await
                         }
                         EntityType::Skill => {
                             neo4j.propagate_note_via_skill(note_id, &entity_id).await
