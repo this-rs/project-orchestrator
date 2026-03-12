@@ -585,10 +585,12 @@ pub async fn export_skill(
     Path(skill_id): Path<Uuid>,
     Query(query): Query<ExportQuery>,
 ) -> Result<Json<crate::skills::SkillPackage>, AppError> {
+    let identity_ref = state.identity.as_deref();
     let package = crate::skills::export_skill(
         skill_id,
         state.orchestrator.neo4j(),
         query.source_project_name,
+        identity_ref,
     )
     .await
     .map_err(|e| {
@@ -1129,6 +1131,7 @@ mod tests {
             ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
             registry_remote_url: None,
             oidc_client: None,
+            identity: None,
         });
         create_router(state)
     }
@@ -1159,6 +1162,7 @@ mod tests {
             ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
             registry_remote_url: None,
             oidc_client: None,
+            identity: None,
         });
         (create_router(state), project_id)
     }
@@ -1243,6 +1247,7 @@ mod tests {
             ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
             registry_remote_url: None,
             oidc_client: None,
+            identity: None,
         });
         let app = create_router(state);
 
@@ -1295,6 +1300,7 @@ mod tests {
             ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
             registry_remote_url: None,
             oidc_client: None,
+            identity: None,
         });
         let app = create_router(state);
 
@@ -1334,6 +1340,7 @@ mod tests {
             ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
             registry_remote_url: None,
             oidc_client: None,
+            identity: None,
         });
         let app = create_router(state);
 
@@ -1376,6 +1383,7 @@ mod tests {
             ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
             registry_remote_url: None,
             oidc_client: None,
+            identity: None,
         });
         let app = create_router(state);
 
@@ -1423,6 +1431,7 @@ mod tests {
             ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
             registry_remote_url: None,
             oidc_client: None,
+            identity: None,
         });
         let app = create_router(state);
 

@@ -15,6 +15,7 @@ pub mod embeddings;
 pub mod episodes;
 pub mod events;
 pub mod graph;
+pub mod identity;
 pub mod mcp;
 pub mod meilisearch;
 pub mod neo4j;
@@ -25,10 +26,12 @@ pub mod parser;
 pub mod plan;
 pub mod protocol;
 pub mod reasoning;
+pub mod reception;
 pub mod resolver;
 pub mod runner;
 pub mod setup_claude;
 pub mod skills;
+pub mod transport;
 pub mod update;
 
 #[cfg(test)]
@@ -1243,6 +1246,20 @@ pub async fn start_server(mut config: Config) -> Result<()> {
         ws_ticket_store,
         registry_remote_url: config.registry_remote_url.clone(),
         oidc_client,
+        identity: {
+            match identity::InstanceIdentity::load_or_generate(None) {
+                Ok(id) => {
+                    tracing::info!(did = %id.did_key(), "Instance identity loaded");
+                    Some(Arc::new(id))
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to load instance identity: {e} — package signing disabled"
+                    );
+                    None
+                }
+            }
+        },
     });
 
     // Create router

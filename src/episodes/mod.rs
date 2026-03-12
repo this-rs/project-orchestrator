@@ -7,8 +7,11 @@
 //! Episodes are the bridge between local knowledge (notes, decisions,
 //! protocol runs) and portable knowledge (SkillPackage v3).
 
+pub mod anonymize;
 pub mod artifact_comparison;
 pub mod collector;
+pub mod distill;
+pub mod distill_models;
 pub mod evaluation;
 pub mod models;
 

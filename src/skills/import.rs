@@ -25,7 +25,9 @@ use crate::protocol::models::{
 };
 use crate::protocol::routing::RelevanceVector;
 use crate::skills::models::{SkillNode, SkillStatus};
-use crate::skills::package::{validate_package, PortableDecision, SkillPackage};
+use crate::skills::package::{
+    validate_package, verify_package_signature, PortableDecision, SkillPackage,
+};
 
 // ============================================================================
 // Configuration
@@ -154,6 +156,16 @@ pub async fn import_skill(
         let messages: Vec<String> = errors.iter().map(|e| e.to_string()).collect();
         anyhow::anyhow!("Package validation failed: {}", messages.join("; "))
     })?;
+
+    // 1b. Verify cryptographic signature — MANDATORY
+    // All packages must be signed. Unsigned packages are rejected.
+    verify_package_signature(package).map_err(|e| {
+        anyhow::anyhow!("Package signature verification failed — refusing import: {e}")
+    })?;
+    tracing::info!(
+        source_did = %package.signature.as_ref().unwrap().source_did,
+        "Package signature verified successfully"
+    );
 
     // 2. Check for name conflicts
     let existing_skill =
@@ -353,6 +365,11 @@ async fn handle_conflict(
                 execution_history: None,
                 source: None,
                 episodes: Vec::new(),
+                distilled_episodes: Vec::new(),
+                package_trust: None,
+                privacy_report: None,
+                privacy_mode: None,
+                signature: None,
             };
             let skill = create_imported_skill(&package_stub, target_project_id);
             let skill_id = skill.id;
@@ -752,12 +769,21 @@ async fn create_import_synapses(graph_store: &dyn GraphStore, note_ids: &[Uuid])
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::identity::InstanceIdentity;
     use crate::neo4j::mock::MockGraphStore;
     use crate::skills::models::SkillTrigger;
     use crate::skills::package::*;
 
-    /// Create a valid test package for import tests.
+    /// Create a valid, signed test package for import tests.
     fn make_test_package() -> SkillPackage {
+        let mut pkg = make_unsigned_test_package();
+        let identity = InstanceIdentity::generate();
+        sign_package(&mut pkg, &identity).unwrap();
+        pkg
+    }
+
+    /// Create a valid but unsigned test package (used as base).
+    fn make_unsigned_test_package() -> SkillPackage {
         SkillPackage {
             schema_version: CURRENT_SCHEMA_VERSION,
             metadata: PackageMetadata {
@@ -803,6 +829,11 @@ mod tests {
             execution_history: None,
             source: None,
             episodes: Vec::new(),
+            distilled_episodes: Vec::new(),
+            package_trust: None,
+            privacy_report: None,
+            privacy_mode: None,
+            signature: None,
         }
     }
 
@@ -1008,9 +1039,11 @@ mod tests {
         let store = MockGraphStore::new();
         let project_id = Uuid::new_v4();
 
-        let mut package = make_test_package();
+        let mut package = make_unsigned_test_package();
         package.decisions.clear();
         package.metadata.stats.decision_count = 0;
+        let identity = InstanceIdentity::generate();
+        sign_package(&mut package, &identity).unwrap();
 
         let result = import_skill(&package, project_id, &store, ConflictStrategy::Skip)
             .await
@@ -1064,7 +1097,7 @@ mod tests {
             PortableTransition, SourceMetadata,
         };
 
-        let mut pkg = make_test_package();
+        let mut pkg = make_unsigned_test_package();
 
         pkg.protocols = vec![PortableProtocol {
             name: "code-review".to_string(),
@@ -1125,6 +1158,10 @@ mod tests {
             git_remote: Some("git@github.com:org/upstream.git".to_string()),
             instance_id: Some("inst-001".to_string()),
         });
+
+        // Sign after all mutations
+        let identity = InstanceIdentity::generate();
+        sign_package(&mut pkg, &identity).unwrap();
 
         pkg
     }
@@ -1349,10 +1386,16 @@ mod tests {
             crate::protocol::ProtocolTransition::new(proto_id, start_state_id, end_state_id, "go");
         store.upsert_protocol_transition(&t).await.unwrap();
 
-        // Export
-        let package = export_skill(skill_id, &store, Some("source-project".to_string()))
-            .await
-            .unwrap();
+        // Export (signed)
+        let identity = InstanceIdentity::generate();
+        let package = export_skill(
+            skill_id,
+            &store,
+            Some("source-project".to_string()),
+            Some(&identity),
+        )
+        .await
+        .unwrap();
 
         // Verify exported note has sanitized paths (absolute → relative)
         assert_eq!(package.notes.len(), 1);
@@ -1432,7 +1475,7 @@ mod tests {
         let store = MockGraphStore::new();
         let project_id = Uuid::new_v4();
 
-        let mut package = make_test_package();
+        let mut package = make_unsigned_test_package();
         package.protocols = vec![
             PortableProtocol {
                 name: "proto-a".to_string(),
@@ -1474,6 +1517,8 @@ mod tests {
                 transitions: vec![],
             },
         ];
+        let identity = InstanceIdentity::generate();
+        sign_package(&mut package, &identity).unwrap();
 
         let result = import_skill(&package, project_id, &store, ConflictStrategy::Skip)
             .await

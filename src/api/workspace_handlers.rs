@@ -1997,6 +1997,7 @@ mod tests {
             ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
             registry_remote_url: None,
             oidc_client: None,
+            identity: None,
         });
         create_router(state)
     }
@@ -2073,6 +2074,7 @@ mod tests {
             ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
             registry_remote_url: None,
             oidc_client: None,
+            identity: None,
         });
         (create_router(state), milestone_id, task1.id, task2.id)
     }
@@ -2461,6 +2463,7 @@ mod tests {
             ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
             registry_remote_url: None,
             oidc_client: None,
+            identity: None,
         });
         let app = create_router(state);
 
@@ -2510,6 +2513,7 @@ mod tests {
             ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
             registry_remote_url: None,
             oidc_client: None,
+            identity: None,
         });
         let app = create_router(state);
 
@@ -2547,6 +2551,7 @@ mod tests {
             ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
             registry_remote_url: None,
             oidc_client: None,
+            identity: None,
         });
         let app = create_router(state);
 
@@ -2584,6 +2589,7 @@ mod tests {
             ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
             registry_remote_url: None,
             oidc_client: None,
+            identity: None,
         });
         let app = create_router(state);
 
@@ -2623,6 +2629,7 @@ mod tests {
             ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
             registry_remote_url: None,
             oidc_client: None,
+            identity: None,
         });
         let app = create_router(state);
 
@@ -2662,6 +2669,7 @@ mod tests {
             ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
             registry_remote_url: None,
             oidc_client: None,
+            identity: None,
         });
         let app = create_router(state);
 
@@ -2699,6 +2707,7 @@ mod tests {
             ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
             registry_remote_url: None,
             oidc_client: None,
+            identity: None,
         });
         let app = create_router(state);
 
@@ -2781,6 +2790,7 @@ mod tests {
             ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
             registry_remote_url: None,
             oidc_client: None,
+            identity: None,
         });
         let app = create_router(state);
 
@@ -2825,6 +2835,7 @@ mod tests {
             ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
             registry_remote_url: None,
             oidc_client: None,
+            identity: None,
         });
         let app = create_router(state);
 
@@ -2867,6 +2878,7 @@ mod tests {
             ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
             registry_remote_url: None,
             oidc_client: None,
+            identity: None,
         });
         let app = create_router(state);
 
@@ -2909,6 +2921,7 @@ mod tests {
             ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
             registry_remote_url: None,
             oidc_client: None,
+            identity: None,
         });
         let app = create_router(state);
 
@@ -2958,6 +2971,7 @@ mod tests {
             ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
             registry_remote_url: None,
             oidc_client: None,
+            identity: None,
         });
         let app = create_router(state);
 
@@ -3000,6 +3014,7 @@ mod tests {
             ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
             registry_remote_url: None,
             oidc_client: None,
+            identity: None,
         });
         let app = create_router(state);
 

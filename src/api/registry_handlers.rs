@@ -90,16 +90,22 @@ pub async fn publish_skill(
     };
 
     // Export the skill as a package
-    let package = crate::skills::export_skill(body.skill_id, neo4j, Some(project_name.clone()))
-        .await
-        .map_err(|e| {
-            let msg = e.to_string();
-            if msg.contains("not found") {
-                AppError::NotFound(msg)
-            } else {
-                AppError::Internal(e)
-            }
-        })?;
+    let identity_ref = state.identity.as_deref();
+    let package = crate::skills::export_skill(
+        body.skill_id,
+        neo4j,
+        Some(project_name.clone()),
+        identity_ref,
+    )
+    .await
+    .map_err(|e| {
+        let msg = e.to_string();
+        if msg.contains("not found") {
+            AppError::NotFound(msg)
+        } else {
+            AppError::Internal(e)
+        }
+    })?;
 
     // Build the published skill with trust score
     let published = build_published_skill(&skill, package, project_name, None);
