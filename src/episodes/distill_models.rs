@@ -11,10 +11,11 @@ use std::collections::HashMap;
 // ============================================================================
 
 /// Classification of content sensitivity for the privacy gate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SensitivityLevel {
     /// Safe for public export.
+    #[default]
     Public,
     /// Contains project-specific details (paths, IPs, UUIDs) — needs redaction.
     Restricted,
@@ -24,32 +25,21 @@ pub enum SensitivityLevel {
     Forbidden,
 }
 
-impl Default for SensitivityLevel {
-    fn default() -> Self {
-        Self::Public
-    }
-}
-
 // ============================================================================
 // Privacy mode
 // ============================================================================
 
 /// Controls how aggressively the anonymizer runs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PrivacyMode {
     /// Block on L2 and L3 findings.
     Strict,
     /// Redact L2, block on L3 (default behaviour).
+    #[default]
     Standard,
     /// Redact L2 and L3 (never block). USE WITH CAUTION.
     Relaxed,
-}
-
-impl Default for PrivacyMode {
-    fn default() -> Self {
-        Self::Standard
-    }
 }
 
 // ============================================================================
@@ -57,7 +47,7 @@ impl Default for PrivacyMode {
 // ============================================================================
 
 /// How portable / universal a lesson is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PortabilityLayer {
     /// Only useful within this specific project instance.
@@ -65,15 +55,10 @@ pub enum PortabilityLayer {
     /// Useful within the same project across instances.
     Project,
     /// Useful across projects in the same domain (e.g., all Rust codebases).
+    #[default]
     Domain,
     /// Universally applicable pattern.
     Universal,
-}
-
-impl Default for PortabilityLayer {
-    fn default() -> Self {
-        Self::Domain
-    }
 }
 
 // ============================================================================

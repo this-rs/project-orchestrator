@@ -115,8 +115,8 @@ pub async fn handle_sync(
             for envelope in &envelopes {
                 // Compute content hash for dedup
                 let hash = sha2_hash(&serde_json::to_vec(envelope).unwrap_or_default());
-                if !store.contains_key(&hash) {
-                    store.insert(hash, envelope.clone());
+                if let std::collections::hash_map::Entry::Vacant(e) = store.entry(hash) {
+                    e.insert(envelope.clone());
                     ingested += 1;
                 }
             }

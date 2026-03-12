@@ -52,6 +52,7 @@ pub struct HttpTransport {
     client: Client,
     registry: PeerRegistry,
     /// Subscribers keyed by topic. Each subscriber gets a sender half.
+    #[allow(clippy::type_complexity)]
     subscribers: Arc<RwLock<Vec<(String, mpsc::Sender<Message>)>>>,
     /// Flag to track shutdown state.
     shutdown: Arc<RwLock<bool>>,
@@ -129,10 +130,10 @@ impl HttpTransport {
         let topic = message_topic(&message);
         let subs = self.subscribers.read().await;
         for (sub_topic, sender) in subs.iter() {
-            if sub_topic == &topic || sub_topic == "*" {
-                if sender.try_send(message.clone()).is_err() {
-                    debug!(topic = %sub_topic, "Subscriber channel full or closed, dropping message");
-                }
+            if (sub_topic == &topic || sub_topic == "*")
+                && sender.try_send(message.clone()).is_err()
+            {
+                debug!(topic = %sub_topic, "Subscriber channel full or closed, dropping message");
             }
         }
     }

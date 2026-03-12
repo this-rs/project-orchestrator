@@ -21,7 +21,7 @@ const TRUST_WEIGHT: f64 = 0.25;
 const DEFAULT_TRUST: f64 = 0.5;
 
 /// Local context used for relevance scoring.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LocalContext {
     /// Tags representing local project domains (e.g., `["rust", "neo4j", "p2p"]`).
     pub local_tags: Vec<String>,
@@ -30,16 +30,6 @@ pub struct LocalContext {
     /// Known peer trust scores, keyed by DID.
     #[serde(default)]
     pub known_peers: HashMap<String, f64>,
-}
-
-impl Default for LocalContext {
-    fn default() -> Self {
-        Self {
-            local_tags: Vec::new(),
-            local_languages: Vec::new(),
-            known_peers: HashMap::new(),
-        }
-    }
 }
 
 /// Result of multi-dimensional relevance scoring.
