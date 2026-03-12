@@ -65,6 +65,7 @@ struct RfcContent {
 pub struct RfcListQuery {
     pub status: Option<String>,
     pub importance: Option<String>,
+    pub project_id: Option<Uuid>,
     pub limit: Option<usize>,
     pub offset: Option<usize>,
 }
@@ -113,14 +114,46 @@ fn extract_run_id(tags: &[String]) -> Option<String> {
         .map(|t| t.trim_start_matches("rfc-run:").to_string())
 }
 
+/// Try to extract a title from markdown content.
+///
+/// Looks for patterns like:
+///   - `# Title`
+///   - `## RFC — Title`
+///   - `## RFC: Title`
+///   - `## Title`
+fn extract_title_from_markdown(content: &str) -> Option<String> {
+    for line in content.lines() {
+        let trimmed = line.trim();
+        // Match lines starting with # or ##
+        if let Some(rest) = trimmed.strip_prefix("## ").or_else(|| trimmed.strip_prefix("# ")) {
+            // Strip optional "RFC —" or "RFC:" prefix
+            let title = rest
+                .strip_prefix("RFC")
+                .and_then(|s| {
+                    s.strip_prefix(" — ")
+                        .or_else(|| s.strip_prefix(" - "))
+                        .or_else(|| s.strip_prefix(": "))
+                })
+                .unwrap_or(rest)
+                .trim();
+            if !title.is_empty() {
+                return Some(title.to_string());
+            }
+        }
+    }
+    None
+}
+
 /// Convert a Note into an RfcResponse.
 fn note_to_rfc(note: &Note) -> RfcResponse {
     let (title, sections) = match serde_json::from_str::<RfcContent>(&note.content) {
         Ok(c) => (c.title, c.sections),
         Err(_) => {
-            // Fallback: treat raw content as a single section
+            // Try extracting title from markdown headers before falling back
+            let title = extract_title_from_markdown(&note.content)
+                .unwrap_or_else(|| "Untitled RFC".to_string());
             (
-                "Untitled RFC".to_string(),
+                title,
                 vec![RfcSection {
                     title: "Content".to_string(),
                     content: note.content.clone(),
@@ -215,7 +248,7 @@ pub async fn list_rfcs(
     let (notes, total) = state
         .orchestrator
         .note_manager()
-        .list_notes(None, None, &filters)
+        .list_notes(query.project_id, None, &filters)
         .await?;
 
     let items: Vec<RfcResponse> = notes.iter().map(note_to_rfc).collect();
