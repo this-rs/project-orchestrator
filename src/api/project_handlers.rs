@@ -1863,14 +1863,7 @@ pub async fn get_auto_roadmap(
     let auto_maintenance_protocol_id =
         uuid::Uuid::parse_str("efadbe82-0bba-4a76-9d15-aec57bc66ea1").unwrap();
 
-    let (
-        homeostasis_res,
-        audit_res,
-        risk_res,
-        reports_res,
-        plans_res,
-        triggers_res,
-    ) = tokio::join!(
+    let (homeostasis_res, audit_res, risk_res, reports_res, plans_res, triggers_res) = tokio::join!(
         neo4j.compute_homeostasis(pid, None),
         neo4j.audit_knowledge_gaps(pid),
         neo4j.compute_risk_scores(pid),
@@ -1957,8 +1950,8 @@ pub async fn get_auto_roadmap(
                     audit.decisions_without_affects.len()
                 ),
                 affected_files: vec![],
-                recommended_action:
-                    "Add AFFECTS relations to link decisions to impacted files".to_string(),
+                recommended_action: "Add AFFECTS relations to link decisions to impacted files"
+                    .to_string(),
                 actionability: Actionability::AgentFix,
             });
         }
@@ -2058,17 +2051,17 @@ pub async fn get_auto_roadmap(
         let mut summaries = Vec::new();
         for p in active_plans {
             // Best-effort: try to get task counts for each plan
-            let (task_count, completed_count) =
-                if let Ok(tasks) = neo4j.get_plan_tasks(p.id).await {
-                    let total = tasks.len();
-                    let completed = tasks
-                        .iter()
-                        .filter(|t| t.status == TaskStatus::Completed)
-                        .count();
-                    (total, completed)
-                } else {
-                    (0, 0)
-                };
+            let (task_count, completed_count) = if let Ok(tasks) = neo4j.get_plan_tasks(p.id).await
+            {
+                let total = tasks.len();
+                let completed = tasks
+                    .iter()
+                    .filter(|t| t.status == TaskStatus::Completed)
+                    .count();
+                (total, completed)
+            } else {
+                (0, 0)
+            };
             let progress = if task_count > 0 {
                 (completed_count as f64 / task_count as f64) * 100.0
             } else {
@@ -2121,8 +2114,7 @@ pub async fn get_auto_roadmap(
             .map(|t| {
                 // Return info about when it last fired + cooldown to estimate next run
                 if let Some(last) = &t.last_fired {
-                    let next =
-                        *last + chrono::Duration::seconds(t.cooldown_secs.max(86400) as i64);
+                    let next = *last + chrono::Duration::seconds(t.cooldown_secs.max(86400) as i64);
                     next.to_rfc3339()
                 } else {
                     "pending (never fired)".to_string()
