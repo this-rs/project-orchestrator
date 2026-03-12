@@ -10,16 +10,20 @@
 
 use super::handlers::{AppError, OrchestratorState};
 use super::PaginatedResponse;
+use crate::neo4j::GraphStore;
 use crate::notes::{
     CreateNoteRequest, Note, NoteFilters, NoteImportance, NoteType, UpdateNoteRequest,
 };
-use crate::protocol;
+use crate::protocol::{
+    self, Protocol, ProtocolCategory, ProtocolState, ProtocolTransition, StateType,
+};
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     Json,
 };
 use serde::{Deserialize, Serialize};
+use tracing::info;
 use uuid::Uuid;
 
 // ============================================================================
@@ -217,6 +221,140 @@ fn rfc_content_json(title: &str, sections: &[RfcSection]) -> String {
 fn set_status_tag(tags: &mut Vec<String>, status: &str) {
     tags.retain(|t| !t.starts_with("rfc-status:"));
     tags.push(format!("rfc-status:{}", status));
+}
+
+// ============================================================================
+// Bootstrap — auto-create rfc-lifecycle protocol if missing
+// ============================================================================
+
+/// Find the `rfc-lifecycle` protocol for a project, or auto-create it.
+///
+/// This makes the RFC system self-bootstrapping: a fresh project without any
+/// protocol will get the full 9-state FSM created on first RFC transition.
+///
+/// States: draft → proposed → under_review → accepted → planning →
+///         in_progress → implemented | rejected | superseded
+///
+/// 16 transitions covering the full lifecycle.
+async fn find_or_create_rfc_lifecycle(
+    neo4j: &dyn GraphStore,
+    project_id: Uuid,
+) -> Result<Protocol, AppError> {
+    // 1. Try to find existing protocol
+    let (protocols, _) = neo4j
+        .list_protocols(project_id, None, 200, 0)
+        .await
+        .map_err(AppError::Internal)?;
+
+    if let Some(existing) = protocols.iter().find(|p| p.name == "rfc-lifecycle") {
+        return Ok(existing.clone());
+    }
+
+    // 2. Not found — bootstrap the full protocol
+    info!(
+        "Bootstrapping rfc-lifecycle protocol for project {}",
+        project_id
+    );
+
+    // -- Create states --
+    let protocol_id = Uuid::new_v4();
+
+    let s_draft = ProtocolState {
+        state_type: StateType::Start,
+        ..ProtocolState::new(protocol_id, "draft")
+    };
+    let s_proposed = ProtocolState::new(protocol_id, "proposed");
+    let s_under_review = ProtocolState::new(protocol_id, "under_review");
+    let s_accepted = ProtocolState::new(protocol_id, "accepted");
+    let s_planning = ProtocolState::new(protocol_id, "planning");
+    let s_in_progress = ProtocolState::new(protocol_id, "in_progress");
+    let s_implemented = ProtocolState::terminal(protocol_id, "implemented");
+    let s_rejected = ProtocolState::terminal(protocol_id, "rejected");
+    let s_superseded = ProtocolState::terminal(protocol_id, "superseded");
+
+    let all_states = [
+        &s_draft,
+        &s_proposed,
+        &s_under_review,
+        &s_accepted,
+        &s_planning,
+        &s_in_progress,
+        &s_implemented,
+        &s_rejected,
+        &s_superseded,
+    ];
+
+    // -- Create protocol node --
+    let protocol = Protocol::new_full(
+        project_id,
+        "rfc-lifecycle",
+        "RFC lifecycle FSM — auto-bootstrapped. 9 states, 16 transitions.",
+        s_draft.id,
+        vec![s_implemented.id, s_rejected.id, s_superseded.id],
+        ProtocolCategory::Business,
+    );
+    // Override the id to match our pre-generated one
+    let protocol = Protocol {
+        id: protocol_id,
+        ..protocol
+    };
+
+    neo4j
+        .upsert_protocol(&protocol)
+        .await
+        .map_err(AppError::Internal)?;
+
+    // -- Persist states --
+    for s in &all_states {
+        neo4j
+            .upsert_protocol_state(s)
+            .await
+            .map_err(AppError::Internal)?;
+    }
+
+    // -- Create 16 transitions --
+    // Helper to build & persist a transition
+    let transitions_def: Vec<(Uuid, Uuid, &str)> = vec![
+        // draft →
+        (s_draft.id, s_proposed.id, "propose"),
+        (s_draft.id, s_superseded.id, "supersede"),
+        // proposed →
+        (s_proposed.id, s_under_review.id, "submit_review"),
+        (s_proposed.id, s_rejected.id, "reject"),
+        (s_proposed.id, s_superseded.id, "supersede"),
+        // under_review →
+        (s_under_review.id, s_accepted.id, "accept"),
+        (s_under_review.id, s_draft.id, "revise"),
+        (s_under_review.id, s_rejected.id, "reject"),
+        (s_under_review.id, s_superseded.id, "supersede"),
+        // accepted →
+        (s_accepted.id, s_planning.id, "start_planning"),
+        (s_accepted.id, s_superseded.id, "supersede"),
+        // planning →
+        (s_planning.id, s_in_progress.id, "start_work"),
+        (s_planning.id, s_superseded.id, "supersede"),
+        // in_progress →
+        (s_in_progress.id, s_implemented.id, "complete"),
+        (s_in_progress.id, s_planning.id, "replan"),
+        (s_in_progress.id, s_superseded.id, "supersede"),
+    ];
+
+    for (from, to, trigger) in &transitions_def {
+        let t = ProtocolTransition::new(protocol_id, *from, *to, *trigger);
+        neo4j
+            .upsert_protocol_transition(&t)
+            .await
+            .map_err(AppError::Internal)?;
+    }
+
+    info!(
+        "rfc-lifecycle protocol bootstrapped: {} with {} states, {} transitions",
+        protocol_id,
+        all_states.len(),
+        transitions_def.len()
+    );
+
+    Ok(protocol)
 }
 
 // ============================================================================
@@ -570,30 +708,15 @@ pub async fn transition_rfc(
         run_id
     } else {
         // 3b. No run linked — auto-create one on the rfc-lifecycle protocol.
-        //     Find the protocol by name in the note's project (or any project).
+        //     If the protocol doesn't exist, bootstrap it automatically.
         let project_id = note.project_id.ok_or_else(|| {
             AppError::BadRequest(
                 "RFC has no project_id — cannot find rfc-lifecycle protocol".to_string(),
             )
         })?;
 
-        let (protocols, _) = state
-            .orchestrator
-            .neo4j()
-            .list_protocols(project_id, None, 200, 0)
-            .await
-            .map_err(AppError::Internal)?;
-
-        let lifecycle_protocol = protocols
-            .iter()
-            .find(|p| p.name == "rfc-lifecycle")
-            .ok_or_else(|| {
-                AppError::BadRequest(format!(
-                    "No 'rfc-lifecycle' protocol found in project {}. \
-                     Create one before transitioning RFCs.",
-                    project_id
-                ))
-            })?;
+        let lifecycle_protocol =
+            find_or_create_rfc_lifecycle(state.orchestrator.neo4j(), project_id).await?;
 
         // Resolve the entry state
         let states = state
