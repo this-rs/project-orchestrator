@@ -1730,22 +1730,22 @@ pub async fn get_health_dashboard(
         })
     });
 
-    let auto_maintenance_status = maintenance_res.ok().and_then(|(runs, _total)| {
+    let auto_maintenance_status = maintenance_res.ok().map(|(runs, _total)| {
         let protocol_id_str = auto_maintenance_protocol_id.to_string();
         if let Some(run) = runs.into_iter().next() {
-            Some(AutoMaintenanceStatus {
+            AutoMaintenanceStatus {
                 protocol_id: protocol_id_str,
                 last_run_id: Some(run.id.to_string()),
                 last_run_status: Some(format!("{:?}", run.status)),
                 last_run_date: Some(run.started_at.to_rfc3339()),
-            })
+            }
         } else {
-            Some(AutoMaintenanceStatus {
+            AutoMaintenanceStatus {
                 protocol_id: protocol_id_str,
                 last_run_id: None,
                 last_run_status: None,
                 last_run_date: None,
-            })
+            }
         }
     });
 
