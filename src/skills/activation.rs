@@ -1573,6 +1573,15 @@ pub async fn reconstruct_knowledge_links(
             0
         });
 
+    // 5. High-level entity propagation (FeatureGraph, Skill, Protocol → Files)
+    let high_level_propagated = graph_store
+        .propagate_high_level_links(project_id)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(%project_id, error = %e, "High-level propagation failed (non-fatal)");
+            0
+        });
+
     let elapsed = start.elapsed();
 
     let report = ReconstructReport {
@@ -1580,7 +1589,7 @@ pub async fn reconstruct_knowledge_links(
         notes_linked: anchor_result.anchors_created,
         decisions_processed,
         affects_created,
-        structural_propagated,
+        structural_propagated: structural_propagated + high_level_propagated,
         semantic_linked,
         elapsed_ms: elapsed.as_millis() as u64,
     };

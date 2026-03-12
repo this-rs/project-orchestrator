@@ -617,6 +617,302 @@ impl Neo4jClient {
         Ok(total)
     }
 
+    // ================================================================
+    // High-Level Entity Propagation (FeatureGraph, Skill, Protocol)
+    // ================================================================
+
+    /// Propagate notes linked to FeatureGraphs to their member files (batch).
+    ///
+    /// For each note LINKED_TO a FeatureGraph, creates LINKED_TO relationships
+    /// to files that are members of that feature graph (via INCLUDES_ENTITY).
+    /// Scoped to a single project via BELONGS_TO.
+    pub async fn propagate_feature_graph_links(&self, project_id: Uuid) -> Result<usize> {
+        let q = query(
+            r#"
+            MATCH (fg:FeatureGraph)-[:BELONGS_TO]->(p:Project {id: $project_id})
+            MATCH (n:Note)-[existing:LINKED_TO]->(fg)
+            WHERE existing.propagated IS NULL OR existing.propagated = false
+            MATCH (fg)-[:INCLUDES_ENTITY]->(f:File)
+            WHERE NOT (n)-[:LINKED_TO]->(f)
+            MERGE (n)-[r:LINKED_TO]->(f)
+            ON CREATE SET
+                r.propagated = true,
+                r.propagation_source = 'feature_graph',
+                r.propagation_depth = 1,
+                r.last_verified = datetime()
+            RETURN count(r) AS cnt
+            "#,
+        )
+        .param("project_id", project_id.to_string());
+
+        let mut total = 0i64;
+        if let Ok(mut result) = self.graph.execute(q).await {
+            if let Ok(Some(row)) = result.next().await {
+                total = row.get::<i64>("cnt").unwrap_or(0);
+            }
+        }
+
+        if total > 0 {
+            tracing::info!(
+                %project_id,
+                propagated = total,
+                source = "feature_graph",
+                "Propagated {} knowledge links via FeatureGraph membership",
+                total
+            );
+        }
+
+        Ok(total as usize)
+    }
+
+    /// Propagate notes linked to Skills to files touched by the skill's member notes (batch).
+    ///
+    /// Path: Note -[:LINKED_TO]-> Skill <-[:MEMBER_OF]- MemberNote -[:LINKED_TO]-> File
+    /// Scoped to project via the member note's project_id.
+    pub async fn propagate_skill_member_links(&self, project_id: Uuid) -> Result<usize> {
+        let q = query(
+            r#"
+            MATCH (n:Note {project_id: $project_id})-[existing:LINKED_TO]->(s:Skill)
+            WHERE existing.propagated IS NULL OR existing.propagated = false
+            MATCH (member:Note)-[:MEMBER_OF]->(s)
+            MATCH (member)-[:LINKED_TO]->(f:File)
+            WHERE NOT (n)-[:LINKED_TO]->(f) AND n <> member
+            MERGE (n)-[r:LINKED_TO]->(f)
+            ON CREATE SET
+                r.propagated = true,
+                r.propagation_source = 'skill_member',
+                r.propagation_depth = 1,
+                r.last_verified = datetime()
+            RETURN count(r) AS cnt
+            "#,
+        )
+        .param("project_id", project_id.to_string());
+
+        let mut total = 0i64;
+        if let Ok(mut result) = self.graph.execute(q).await {
+            if let Ok(Some(row)) = result.next().await {
+                total = row.get::<i64>("cnt").unwrap_or(0);
+            }
+        }
+
+        if total > 0 {
+            tracing::info!(
+                %project_id,
+                propagated = total,
+                source = "skill_member",
+                "Propagated {} knowledge links via Skill member notes",
+                total
+            );
+        }
+
+        Ok(total as usize)
+    }
+
+    /// Propagate notes linked to Protocols to files via Protocol → Skill → MemberNotes → Files (batch).
+    ///
+    /// Path: Note -[:LINKED_TO]-> Protocol -[:BELONGS_TO_SKILL]-> Skill <-[:MEMBER_OF]- MemberNote -[:LINKED_TO]-> File
+    /// Scoped to project via the member note's project_id.
+    pub async fn propagate_protocol_skill_links(&self, project_id: Uuid) -> Result<usize> {
+        let q = query(
+            r#"
+            MATCH (n:Note {project_id: $project_id})-[existing:LINKED_TO]->(proto:Protocol)
+            WHERE existing.propagated IS NULL OR existing.propagated = false
+            MATCH (proto)-[:BELONGS_TO_SKILL]->(s:Skill)
+            MATCH (member:Note)-[:MEMBER_OF]->(s)
+            MATCH (member)-[:LINKED_TO]->(f:File)
+            WHERE NOT (n)-[:LINKED_TO]->(f) AND n <> member
+            MERGE (n)-[r:LINKED_TO]->(f)
+            ON CREATE SET
+                r.propagated = true,
+                r.propagation_source = 'protocol_skill',
+                r.propagation_depth = 1,
+                r.last_verified = datetime()
+            RETURN count(r) AS cnt
+            "#,
+        )
+        .param("project_id", project_id.to_string());
+
+        let mut total = 0i64;
+        if let Ok(mut result) = self.graph.execute(q).await {
+            if let Ok(Some(row)) = result.next().await {
+                total = row.get::<i64>("cnt").unwrap_or(0);
+            }
+        }
+
+        if total > 0 {
+            tracing::info!(
+                %project_id,
+                propagated = total,
+                source = "protocol_skill",
+                "Propagated {} knowledge links via Protocol→Skill→MemberNotes",
+                total
+            );
+        }
+
+        Ok(total as usize)
+    }
+
+    /// Propagate all high-level entity links (FeatureGraph + Skill + Protocol) for a project.
+    ///
+    /// Called from bootstrap_knowledge_fabric as a fallback/initialization path.
+    /// The primary propagation path is event-driven via link_note_to_entity hooks.
+    pub async fn propagate_high_level_links(&self, project_id: Uuid) -> Result<usize> {
+        let fg = self.propagate_feature_graph_links(project_id).await.unwrap_or(0);
+        let skill = self.propagate_skill_member_links(project_id).await.unwrap_or(0);
+        let proto = self.propagate_protocol_skill_links(project_id).await.unwrap_or(0);
+        let total = fg + skill + proto;
+
+        if total > 0 {
+            tracing::info!(
+                %project_id,
+                feature_graph = fg,
+                skill_member = skill,
+                protocol_skill = proto,
+                total = total,
+                "Propagated {} high-level knowledge links (batch)",
+                total
+            );
+        }
+
+        Ok(total)
+    }
+
+    // ================================================================
+    // Single-Note Propagation (event-driven, called from link_note_to_entity)
+    // ================================================================
+
+    /// Propagate a single note linked to a FeatureGraph to its member files.
+    pub async fn propagate_note_via_feature_graph(
+        &self,
+        note_id: Uuid,
+        feature_graph_id: &str,
+    ) -> Result<usize> {
+        let q = query(
+            r#"
+            MATCH (n:Note {id: $note_id})
+            MATCH (fg:FeatureGraph {id: $fg_id})-[:INCLUDES_ENTITY]->(f:File)
+            WHERE NOT (n)-[:LINKED_TO]->(f)
+            MERGE (n)-[r:LINKED_TO]->(f)
+            ON CREATE SET
+                r.propagated = true,
+                r.propagation_source = 'feature_graph',
+                r.propagation_depth = 1,
+                r.last_verified = datetime()
+            RETURN count(r) AS cnt
+            "#,
+        )
+        .param("note_id", note_id.to_string())
+        .param("fg_id", feature_graph_id.to_string());
+
+        let mut total = 0i64;
+        if let Ok(mut result) = self.graph.execute(q).await {
+            if let Ok(Some(row)) = result.next().await {
+                total = row.get::<i64>("cnt").unwrap_or(0);
+            }
+        }
+
+        if total > 0 {
+            tracing::info!(
+                %note_id,
+                feature_graph_id,
+                propagated = total,
+                "Event-driven: propagated note to {} files via FeatureGraph",
+                total
+            );
+        }
+
+        Ok(total as usize)
+    }
+
+    /// Propagate a single note linked to a Skill to files of the skill's member notes.
+    pub async fn propagate_note_via_skill(
+        &self,
+        note_id: Uuid,
+        skill_id: &str,
+    ) -> Result<usize> {
+        let q = query(
+            r#"
+            MATCH (n:Note {id: $note_id})
+            MATCH (member:Note)-[:MEMBER_OF]->(s:Skill {id: $skill_id})
+            MATCH (member)-[:LINKED_TO]->(f:File)
+            WHERE NOT (n)-[:LINKED_TO]->(f) AND n <> member
+            MERGE (n)-[r:LINKED_TO]->(f)
+            ON CREATE SET
+                r.propagated = true,
+                r.propagation_source = 'skill_member',
+                r.propagation_depth = 1,
+                r.last_verified = datetime()
+            RETURN count(r) AS cnt
+            "#,
+        )
+        .param("note_id", note_id.to_string())
+        .param("skill_id", skill_id.to_string());
+
+        let mut total = 0i64;
+        if let Ok(mut result) = self.graph.execute(q).await {
+            if let Ok(Some(row)) = result.next().await {
+                total = row.get::<i64>("cnt").unwrap_or(0);
+            }
+        }
+
+        if total > 0 {
+            tracing::info!(
+                %note_id,
+                skill_id,
+                propagated = total,
+                "Event-driven: propagated note to {} files via Skill members",
+                total
+            );
+        }
+
+        Ok(total as usize)
+    }
+
+    /// Propagate a single note linked to a Protocol to files via Protocol → Skill → MemberNotes.
+    pub async fn propagate_note_via_protocol(
+        &self,
+        note_id: Uuid,
+        protocol_id: &str,
+    ) -> Result<usize> {
+        let q = query(
+            r#"
+            MATCH (proto:Protocol {id: $proto_id})-[:BELONGS_TO_SKILL]->(s:Skill)
+            MATCH (member:Note)-[:MEMBER_OF]->(s)
+            MATCH (member)-[:LINKED_TO]->(f:File)
+            MATCH (n:Note {id: $note_id})
+            WHERE NOT (n)-[:LINKED_TO]->(f) AND n <> member
+            MERGE (n)-[r:LINKED_TO]->(f)
+            ON CREATE SET
+                r.propagated = true,
+                r.propagation_source = 'protocol_skill',
+                r.propagation_depth = 1,
+                r.last_verified = datetime()
+            RETURN count(r) AS cnt
+            "#,
+        )
+        .param("note_id", note_id.to_string())
+        .param("proto_id", protocol_id.to_string());
+
+        let mut total = 0i64;
+        if let Ok(mut result) = self.graph.execute(q).await {
+            if let Ok(Some(row)) = result.next().await {
+                total = row.get::<i64>("cnt").unwrap_or(0);
+            }
+        }
+
+        if total > 0 {
+            tracing::info!(
+                %note_id,
+                protocol_id,
+                propagated = total,
+                "Event-driven: propagated note to {} files via Protocol→Skill",
+                total
+            );
+        }
+
+        Ok(total as usize)
+    }
+
     /// Get all notes attached to an entity
     pub async fn get_notes_for_entity(
         &self,

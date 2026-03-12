@@ -614,6 +614,41 @@ impl NoteManager {
                 ));
             }
         }
+
+        // Event-driven propagation: when linking to high-level entities,
+        // immediately propagate the note to their member files (fire-and-forget)
+        match &entity.entity_type {
+            EntityType::FeatureGraph | EntityType::Protocol | EntityType::Skill => {
+                let neo4j = self.neo4j.clone();
+                let entity_type = entity.entity_type.clone();
+                let entity_id = entity.entity_id.clone();
+                tokio::spawn(async move {
+                    let result = match &entity_type {
+                        EntityType::FeatureGraph => {
+                            neo4j.propagate_note_via_feature_graph(note_id, &entity_id).await
+                        }
+                        EntityType::Skill => {
+                            neo4j.propagate_note_via_skill(note_id, &entity_id).await
+                        }
+                        EntityType::Protocol => {
+                            neo4j.propagate_note_via_protocol(note_id, &entity_id).await
+                        }
+                        _ => unreachable!(),
+                    };
+                    if let Err(e) = result {
+                        tracing::warn!(
+                            %note_id,
+                            entity_type = %entity_type,
+                            entity_id = %entity_id,
+                            error = %e,
+                            "Event-driven propagation failed (non-blocking)"
+                        );
+                    }
+                });
+            }
+            _ => {}
+        }
+
         Ok(())
     }
 

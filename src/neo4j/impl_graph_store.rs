@@ -1749,6 +1749,22 @@ impl GraphStore for Neo4jClient {
         self.propagate_structural_links(project_id).await
     }
 
+    async fn propagate_high_level_links(&self, project_id: Uuid) -> anyhow::Result<usize> {
+        self.propagate_high_level_links(project_id).await
+    }
+
+    async fn propagate_note_via_feature_graph(&self, note_id: Uuid, feature_graph_id: &str) -> anyhow::Result<usize> {
+        self.propagate_note_via_feature_graph(note_id, feature_graph_id).await
+    }
+
+    async fn propagate_note_via_skill(&self, note_id: Uuid, skill_id: &str) -> anyhow::Result<usize> {
+        self.propagate_note_via_skill(note_id, skill_id).await
+    }
+
+    async fn propagate_note_via_protocol(&self, note_id: Uuid, protocol_id: &str) -> anyhow::Result<usize> {
+        self.propagate_note_via_protocol(note_id, protocol_id).await
+    }
+
     async fn propagate_semantic_links(
         &self,
         project_id: Uuid,

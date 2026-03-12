@@ -1359,6 +1359,19 @@ pub trait GraphStore: Send + Sync {
     /// Returns the number of propagated links created.
     async fn propagate_structural_links(&self, project_id: Uuid) -> Result<usize>;
 
+    /// Propagate LINKED_TO via high-level entities (FeatureGraph, Skill, Protocol).
+    /// Returns the number of propagated links created.
+    async fn propagate_high_level_links(&self, project_id: Uuid) -> Result<usize>;
+
+    /// Propagate a single note linked to a FeatureGraph to its member files (event-driven).
+    async fn propagate_note_via_feature_graph(&self, note_id: Uuid, feature_graph_id: &str) -> Result<usize>;
+
+    /// Propagate a single note linked to a Skill to files of member notes (event-driven).
+    async fn propagate_note_via_skill(&self, note_id: Uuid, skill_id: &str) -> Result<usize>;
+
+    /// Propagate a single note linked to a Protocol via Skill to files (event-driven).
+    async fn propagate_note_via_protocol(&self, note_id: Uuid, protocol_id: &str) -> Result<usize>;
+
     /// Propagate LINKED_TO relationships via semantic similarity (embeddings).
     /// For each File with an embedding, queries the note HNSW index for top-K
     /// nearest notes and creates links above `min_similarity` threshold.
