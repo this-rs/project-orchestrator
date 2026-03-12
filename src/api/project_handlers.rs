@@ -1596,3 +1596,582 @@ pub async fn set_scaffolding_level(
 
     Ok(Json(serde_json::json!(level)))
 }
+
+// ============================================================================
+// Health Dashboard — Aggregated health overview
+// ============================================================================
+
+#[derive(Serialize, Deserialize)]
+pub struct HealthDashboardResponse {
+    /// Homeostasis pain score, ratios, and recommendations
+    pub homeostasis: Option<serde_json::Value>,
+    /// Audit gaps summary: total gaps, orphan notes, skills without members, etc.
+    pub audit_gaps: Option<AuditGapsSummary>,
+    /// Top 10 risk files from risk assessment
+    pub risk_top10: Option<Vec<serde_json::Value>>,
+    /// Latest note with tag "health-check"
+    pub latest_health_report: Option<HealthReportSummary>,
+    /// Last auto-maintenance protocol run
+    pub auto_maintenance_status: Option<AutoMaintenanceStatus>,
+    /// ISO 8601 timestamp when this response was generated
+    pub generated_at: String,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct AuditGapsSummary {
+    pub total_gaps: i64,
+    pub orphan_notes_count: i64,
+    pub skills_without_members_count: i64,
+    pub commits_without_touches_count: i64,
+    pub decisions_without_affects_count: i64,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct HealthReportSummary {
+    pub note_id: String,
+    pub created_at: String,
+    /// First 500 chars of the note content
+    pub content_preview: String,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct AutoMaintenanceStatus {
+    pub protocol_id: String,
+    pub last_run_id: Option<String>,
+    pub last_run_status: Option<String>,
+    pub last_run_date: Option<String>,
+}
+
+/// GET /api/projects/:slug/health-dashboard — Aggregated health dashboard
+///
+/// Returns homeostasis, audit gaps, risk top-10, latest health report, and
+/// auto-maintenance status in a single response. All sub-queries run in
+/// parallel via `tokio::join!`; individual failures degrade gracefully to None.
+pub async fn get_health_dashboard(
+    State(state): State<OrchestratorState>,
+    Path(slug): Path<String>,
+) -> Result<Json<HealthDashboardResponse>, AppError> {
+    let neo4j = state.orchestrator.neo4j();
+
+    // 1. Resolve slug -> project
+    let project = neo4j
+        .get_project_by_slug(&slug)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("Project not found: {}", slug)))?;
+
+    let pid = project.id;
+
+    // 2. Launch all queries in parallel
+    let health_note_filters = crate::notes::NoteFilters {
+        tags: Some(vec!["health-check".to_string()]),
+        limit: Some(1),
+        sort_by: Some("created_at".to_string()),
+        sort_order: Some("desc".to_string()),
+        ..Default::default()
+    };
+    let auto_maintenance_protocol_id =
+        uuid::Uuid::parse_str("efadbe82-0bba-4a76-9d15-aec57bc66ea1").unwrap();
+
+    let (homeostasis_res, audit_res, risk_res, report_res, maintenance_res) = tokio::join!(
+        // a) homeostasis
+        neo4j.compute_homeostasis(pid, None),
+        // b) audit gaps
+        neo4j.audit_knowledge_gaps(pid),
+        // c) risk assessment (top 10)
+        neo4j.compute_risk_scores(pid),
+        // d) latest health report note
+        neo4j.list_notes(Some(pid), None, &health_note_filters),
+        // e) auto-maintenance protocol runs
+        neo4j.list_protocol_runs(auto_maintenance_protocol_id, None, 1, 0),
+    );
+
+    // 3. Build response — best-effort: each failure -> None
+    let homeostasis = homeostasis_res.ok().map(|h| {
+        serde_json::json!({
+            "pain_score": h.pain_score,
+            "ratios": h.ratios.iter().map(|r| serde_json::json!({
+                "name": r.name,
+                "value": r.value,
+                "severity": r.severity,
+                "distance": r.distance_to_equilibrium,
+            })).collect::<Vec<_>>(),
+            "recommendations": h.recommendations,
+        })
+    });
+
+    let audit_gaps = audit_res.ok().map(|report| AuditGapsSummary {
+        total_gaps: report.total_gaps as i64,
+        orphan_notes_count: report.orphan_notes.len() as i64,
+        skills_without_members_count: report.skills_without_members.len() as i64,
+        commits_without_touches_count: report.commits_without_touches.len() as i64,
+        decisions_without_affects_count: report.decisions_without_affects.len() as i64,
+    });
+
+    let risk_top10 = risk_res.ok().map(|scores| {
+        scores
+            .iter()
+            .take(10)
+            .map(|s| serde_json::to_value(s).unwrap_or_default())
+            .collect()
+    });
+
+    let latest_health_report = report_res.ok().and_then(|(notes, _total)| {
+        notes.into_iter().next().map(|note| {
+            let preview = if note.content.len() > 500 {
+                format!("{}...", &note.content[..500])
+            } else {
+                note.content.clone()
+            };
+            HealthReportSummary {
+                note_id: note.id.to_string(),
+                created_at: note.created_at.to_rfc3339(),
+                content_preview: preview,
+            }
+        })
+    });
+
+    let auto_maintenance_status = maintenance_res.ok().and_then(|(runs, _total)| {
+        let protocol_id_str = auto_maintenance_protocol_id.to_string();
+        if let Some(run) = runs.into_iter().next() {
+            Some(AutoMaintenanceStatus {
+                protocol_id: protocol_id_str,
+                last_run_id: Some(run.id.to_string()),
+                last_run_status: Some(format!("{:?}", run.status)),
+                last_run_date: Some(run.started_at.to_rfc3339()),
+            })
+        } else {
+            Some(AutoMaintenanceStatus {
+                protocol_id: protocol_id_str,
+                last_run_id: None,
+                last_run_status: None,
+                last_run_date: None,
+            })
+        }
+    });
+
+    Ok(Json(HealthDashboardResponse {
+        homeostasis,
+        audit_gaps,
+        risk_top10,
+        latest_health_report,
+        auto_maintenance_status,
+        generated_at: chrono::Utc::now().to_rfc3339(),
+    }))
+}
+
+// ============================================================================
+// Auto-Roadmap — Self-generated roadmap from live graph data
+// ============================================================================
+
+/// Actionability level for a roadmap issue.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Actionability {
+    /// Can be fixed automatically by the system (e.g. backfill synapses)
+    AutoFix,
+    /// Can be fixed by an AI agent (e.g. add missing notes)
+    AgentFix,
+    /// Requires human decision or intervention
+    HumanRequired,
+}
+
+/// Severity level for a roadmap issue.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum IssueSeverity {
+    Critical = 3,
+    High = 2,
+    Medium = 1,
+    Low = 0,
+}
+
+/// A single issue identified in the codebase.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoadmapIssue {
+    pub issue_type: String,
+    pub severity: IssueSeverity,
+    pub description: String,
+    pub affected_files: Vec<String>,
+    pub recommended_action: String,
+    pub actionability: Actionability,
+}
+
+/// A remediation plan with progress.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemediationPlanSummary {
+    pub plan_id: String,
+    pub title: String,
+    pub status: String,
+    pub progress_pct: f64,
+    pub task_count: usize,
+    pub completed_count: usize,
+}
+
+/// A single health trend data point.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HealthTrendPoint {
+    pub date: String,
+    pub pain_score: Option<f64>,
+    pub total_gaps: Option<i64>,
+    pub content_preview: String,
+}
+
+/// Full auto-generated roadmap response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutoRoadmapResponse {
+    /// Issues sorted by severity (critical first)
+    pub issues: Vec<RoadmapIssue>,
+    /// Active remediation plans with progress
+    pub remediation_plans: Vec<RemediationPlanSummary>,
+    /// Last N health reports showing trend
+    pub health_trend: Vec<HealthTrendPoint>,
+    /// Next scheduled auto-maintenance run
+    pub next_scheduled_run: Option<String>,
+    /// Total issue count by severity
+    pub issue_counts: HashMap<String, usize>,
+    /// ISO 8601 timestamp
+    pub generated_at: String,
+}
+
+/// GET /api/projects/:slug/auto-roadmap — Self-generated roadmap
+///
+/// Transforms live health data into a classified list of issues with severity,
+/// actionability, and remediation plans. All sub-queries run in parallel.
+pub async fn get_auto_roadmap(
+    State(state): State<OrchestratorState>,
+    Path(slug): Path<String>,
+) -> Result<Json<AutoRoadmapResponse>, AppError> {
+    let neo4j = state.orchestrator.neo4j();
+
+    // 1. Resolve slug -> project
+    let project = neo4j
+        .get_project_by_slug(&slug)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("Project not found: {}", slug)))?;
+
+    let pid = project.id;
+
+    // 2. Parallel queries: health data + plans + historical reports
+    let health_note_filters = crate::notes::NoteFilters {
+        tags: Some(vec!["health-check".to_string()]),
+        limit: Some(5),
+        sort_by: Some("created_at".to_string()),
+        sort_order: Some("desc".to_string()),
+        ..Default::default()
+    };
+
+    let auto_maintenance_protocol_id =
+        uuid::Uuid::parse_str("efadbe82-0bba-4a76-9d15-aec57bc66ea1").unwrap();
+
+    let (
+        homeostasis_res,
+        audit_res,
+        risk_res,
+        reports_res,
+        plans_res,
+        triggers_res,
+    ) = tokio::join!(
+        neo4j.compute_homeostasis(pid, None),
+        neo4j.audit_knowledge_gaps(pid),
+        neo4j.compute_risk_scores(pid),
+        neo4j.list_notes(Some(pid), None, &health_note_filters),
+        neo4j.list_plans_for_project(pid, None, 50, 0),
+        neo4j.list_all_triggers(Some("schedule")),
+    );
+
+    let mut issues: Vec<RoadmapIssue> = Vec::new();
+
+    // 3a. Transform risk scores into issues (high-risk files)
+    if let Ok(risk_scores) = &risk_res {
+        for score in risk_scores.iter().take(20) {
+            let severity = if score.risk_score >= 0.8 {
+                IssueSeverity::Critical
+            } else if score.risk_score >= 0.6 {
+                IssueSeverity::High
+            } else if score.risk_score >= 0.4 {
+                IssueSeverity::Medium
+            } else {
+                continue; // skip low-risk files
+            };
+
+            let actionability = if score.factors.knowledge_gap >= 0.8 {
+                Actionability::AgentFix
+            } else {
+                Actionability::HumanRequired
+            };
+
+            let mut desc_parts = Vec::new();
+            if score.factors.knowledge_gap >= 0.8 {
+                desc_parts.push(format!("knowledge_gap={:.2}", score.factors.knowledge_gap));
+            }
+            if score.factors.churn >= 0.5 {
+                desc_parts.push(format!("churn={:.2}", score.factors.churn));
+            }
+            if score.factors.pagerank >= 0.01 {
+                desc_parts.push(format!("pagerank={:.3}", score.factors.pagerank));
+            }
+
+            issues.push(RoadmapIssue {
+                issue_type: "high_risk_file".to_string(),
+                severity,
+                description: format!(
+                    "High-risk file: {} (score={:.2}, {})",
+                    score.path,
+                    score.risk_score,
+                    desc_parts.join(", ")
+                ),
+                affected_files: vec![score.path.clone()],
+                recommended_action: if score.factors.knowledge_gap >= 0.8 {
+                    "Add documentation notes and architectural decisions for this file".to_string()
+                } else {
+                    "Review and consider refactoring to reduce complexity".to_string()
+                },
+                actionability,
+            });
+        }
+    }
+
+    // 3b. Transform audit gaps into issues
+    if let Ok(ref audit) = audit_res {
+        if !audit.orphan_notes.is_empty() {
+            issues.push(RoadmapIssue {
+                issue_type: "orphan_notes".to_string(),
+                severity: IssueSeverity::Low,
+                description: format!(
+                    "{} orphan notes without linked entities",
+                    audit.orphan_notes.len()
+                ),
+                affected_files: vec![],
+                recommended_action: "Link orphan notes to relevant files/functions or archive them"
+                    .to_string(),
+                actionability: Actionability::AutoFix,
+            });
+        }
+
+        if !audit.decisions_without_affects.is_empty() {
+            issues.push(RoadmapIssue {
+                issue_type: "unlinked_decisions".to_string(),
+                severity: IssueSeverity::Medium,
+                description: format!(
+                    "{} architectural decisions without AFFECTS relations",
+                    audit.decisions_without_affects.len()
+                ),
+                affected_files: vec![],
+                recommended_action:
+                    "Add AFFECTS relations to link decisions to impacted files".to_string(),
+                actionability: Actionability::AgentFix,
+            });
+        }
+
+        if !audit.skills_without_members.is_empty() {
+            issues.push(RoadmapIssue {
+                issue_type: "empty_skills".to_string(),
+                severity: IssueSeverity::Low,
+                description: format!(
+                    "{} skills without members (notes/decisions)",
+                    audit.skills_without_members.len()
+                ),
+                affected_files: vec![],
+                recommended_action: "Add members to skills or archive empty ones".to_string(),
+                actionability: Actionability::AutoFix,
+            });
+        }
+
+        if !audit.commits_without_touches.is_empty() {
+            issues.push(RoadmapIssue {
+                issue_type: "commits_without_touches".to_string(),
+                severity: IssueSeverity::Low,
+                description: format!(
+                    "{} commits without TOUCHES relations",
+                    audit.commits_without_touches.len()
+                ),
+                affected_files: vec![],
+                recommended_action: "Run backfill_touches to create missing relations".to_string(),
+                actionability: Actionability::AutoFix,
+            });
+        }
+    }
+
+    // 3c. Transform homeostasis into issues
+    if let Ok(ref homeo) = homeostasis_res {
+        if homeo.pain_score >= 0.7 {
+            issues.push(RoadmapIssue {
+                issue_type: "high_pain_score".to_string(),
+                severity: IssueSeverity::High,
+                description: format!(
+                    "Homeostasis pain score is {:.2} (threshold: 0.7). System health is degraded.",
+                    homeo.pain_score
+                ),
+                affected_files: vec![],
+                recommended_action: "Run auto-maintenance protocol to address imbalances"
+                    .to_string(),
+                actionability: Actionability::AutoFix,
+            });
+        }
+
+        for ratio in &homeo.ratios {
+            if ratio.distance_to_equilibrium >= 0.5 {
+                issues.push(RoadmapIssue {
+                    issue_type: "homeostasis_imbalance".to_string(),
+                    severity: if ratio.distance_to_equilibrium >= 0.8 {
+                        IssueSeverity::High
+                    } else {
+                        IssueSeverity::Medium
+                    },
+                    description: format!(
+                        "Homeostasis ratio '{}' is out of balance: value={:.2}, distance_to_equilibrium={:.2}",
+                        ratio.name, ratio.value, ratio.distance_to_equilibrium
+                    ),
+                    affected_files: vec![],
+                    recommended_action: format!("Address '{}' imbalance: {:?}", ratio.name, ratio.severity),
+                    actionability: Actionability::AgentFix,
+                });
+            }
+        }
+    }
+
+    // 4. Sort issues by severity (critical first)
+    issues.sort_by(|a, b| b.severity.cmp(&a.severity));
+
+    // 5. Issue counts
+    let mut issue_counts: HashMap<String, usize> = HashMap::new();
+    for issue in &issues {
+        let key = format!("{:?}", issue.severity).to_lowercase();
+        *issue_counts.entry(key).or_insert(0) += 1;
+    }
+
+    // 6. Remediation plans — active/approved plans for this project
+    let remediation_plans = if let Ok((plans, _total)) = plans_res {
+        use crate::neo4j::models::TaskStatus;
+
+        let active_plans: Vec<_> = plans
+            .iter()
+            .filter(|p| {
+                matches!(
+                    p.status,
+                    crate::neo4j::models::PlanStatus::InProgress
+                        | crate::neo4j::models::PlanStatus::Approved
+                )
+            })
+            .collect();
+
+        let mut summaries = Vec::new();
+        for p in active_plans {
+            // Best-effort: try to get task counts for each plan
+            let (task_count, completed_count) =
+                if let Ok(tasks) = neo4j.get_plan_tasks(p.id).await {
+                    let total = tasks.len();
+                    let completed = tasks
+                        .iter()
+                        .filter(|t| t.status == TaskStatus::Completed)
+                        .count();
+                    (total, completed)
+                } else {
+                    (0, 0)
+                };
+            let progress = if task_count > 0 {
+                (completed_count as f64 / task_count as f64) * 100.0
+            } else {
+                0.0
+            };
+            summaries.push(RemediationPlanSummary {
+                plan_id: p.id.to_string(),
+                title: p.title.clone(),
+                status: format!("{:?}", p.status),
+                progress_pct: progress,
+                task_count,
+                completed_count,
+            });
+        }
+        summaries
+    } else {
+        vec![]
+    };
+
+    // 7. Health trend — last 5 health reports
+    let health_trend = if let Ok((notes, _total)) = reports_res {
+        notes
+            .iter()
+            .map(|note| {
+                // Try to extract pain_score from note content (it's a persisted health report)
+                let pain_score = extract_pain_score_from_content(&note.content);
+                let total_gaps = extract_total_gaps_from_content(&note.content);
+                let preview = if note.content.len() > 200 {
+                    format!("{}...", &note.content[..200])
+                } else {
+                    note.content.clone()
+                };
+                HealthTrendPoint {
+                    date: note.created_at.to_rfc3339(),
+                    pain_score,
+                    total_gaps,
+                    content_preview: preview,
+                }
+            })
+            .collect()
+    } else {
+        vec![]
+    };
+
+    // 8. Next scheduled run — find the next schedule trigger for auto-maintenance
+    let next_scheduled_run = triggers_res.ok().and_then(|triggers| {
+        triggers
+            .iter()
+            .find(|t| t.plan_id == auto_maintenance_protocol_id && t.enabled)
+            .map(|t| {
+                // Return info about when it last fired + cooldown to estimate next run
+                if let Some(last) = &t.last_fired {
+                    let next =
+                        *last + chrono::Duration::seconds(t.cooldown_secs.max(86400) as i64);
+                    next.to_rfc3339()
+                } else {
+                    "pending (never fired)".to_string()
+                }
+            })
+    });
+
+    Ok(Json(AutoRoadmapResponse {
+        issues,
+        remediation_plans,
+        health_trend,
+        next_scheduled_run,
+        issue_counts,
+        generated_at: chrono::Utc::now().to_rfc3339(),
+    }))
+}
+
+/// Extract pain_score from a health report note content.
+fn extract_pain_score_from_content(content: &str) -> Option<f64> {
+    // Health reports contain "pain_score: 0.62" or similar
+    for line in content.lines() {
+        let lower = line.to_lowercase();
+        if lower.contains("pain_score") || lower.contains("pain score") {
+            // Try to find a float number after the key
+            for word in line.split_whitespace() {
+                let cleaned = word.trim_matches(|c: char| !c.is_ascii_digit() && c != '.');
+                if let Ok(val) = cleaned.parse::<f64>() {
+                    if (0.0..=1.0).contains(&val) {
+                        return Some(val);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Extract total_gaps from a health report note content.
+fn extract_total_gaps_from_content(content: &str) -> Option<i64> {
+    for line in content.lines() {
+        let lower = line.to_lowercase();
+        if lower.contains("total_gaps") || lower.contains("total gaps") {
+            for word in line.split_whitespace() {
+                let cleaned = word.trim_matches(|c: char| !c.is_ascii_digit());
+                if let Ok(val) = cleaned.parse::<i64>() {
+                    return Some(val);
+                }
+            }
+        }
+    }
+    None
+}
