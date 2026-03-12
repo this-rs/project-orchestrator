@@ -360,24 +360,47 @@ impl Neo4jClient {
             EntityType::Process => "Process",
         };
 
-        // Determine the match field based on entity type
-        let (match_field, match_value) = match entity_type {
-            EntityType::File => ("path", entity_id.to_string()),
-            EntityType::Commit => ("hash", entity_id.to_string()),
-            _ => ("id", entity_id.to_string()),
+        // Determine the match field based on entity type.
+        // For File entities with relative paths, use ENDS WITH matching
+        // since Neo4j stores absolute paths.
+        let (match_field, match_value, use_suffix_match) = match entity_type {
+            EntityType::File => {
+                if entity_id.starts_with('/') {
+                    ("path", entity_id.to_string(), false)
+                } else {
+                    ("path", format!("/{}", entity_id), true)
+                }
+            }
+            EntityType::Commit => ("hash", entity_id.to_string(), false),
+            _ => ("id", entity_id.to_string(), false),
         };
 
-        let cypher = format!(
-            r#"
-            MATCH (n:Note {{id: $note_id}})
-            MATCH (e:{} {{{}: $entity_id}})
-            MERGE (n)-[r:LINKED_TO]->(e)
-            SET r.signature_hash = $sig_hash,
-                r.body_hash = $body_hash,
-                r.last_verified = datetime()
-            "#,
-            node_label, match_field
-        );
+        let cypher = if use_suffix_match {
+            format!(
+                r#"
+                MATCH (n:Note {{id: $note_id}})
+                MATCH (e:{})
+                WHERE e.{} ENDS WITH $entity_id
+                MERGE (n)-[r:LINKED_TO]->(e)
+                SET r.signature_hash = $sig_hash,
+                    r.body_hash = $body_hash,
+                    r.last_verified = datetime()
+                "#,
+                node_label, match_field
+            )
+        } else {
+            format!(
+                r#"
+                MATCH (n:Note {{id: $note_id}})
+                MATCH (e:{} {{{}: $entity_id}})
+                MERGE (n)-[r:LINKED_TO]->(e)
+                SET r.signature_hash = $sig_hash,
+                    r.body_hash = $body_hash,
+                    r.last_verified = datetime()
+                "#,
+                node_label, match_field
+            )
+        };
 
         let q = query(&cypher)
             .param("note_id", note_id.to_string())
@@ -428,19 +451,36 @@ impl Neo4jClient {
             EntityType::Process => "Process",
         };
 
-        let (match_field, match_value) = match entity_type {
-            EntityType::File => ("path", entity_id.to_string()),
-            EntityType::Commit => ("hash", entity_id.to_string()),
-            _ => ("id", entity_id.to_string()),
+        let (match_field, match_value, use_suffix_match) = match entity_type {
+            EntityType::File => {
+                if entity_id.starts_with('/') {
+                    ("path", entity_id.to_string(), false)
+                } else {
+                    ("path", format!("/{}", entity_id), true)
+                }
+            }
+            EntityType::Commit => ("hash", entity_id.to_string(), false),
+            _ => ("id", entity_id.to_string(), false),
         };
 
-        let cypher = format!(
-            r#"
-            MATCH (n:Note {{id: $note_id}})-[r:LINKED_TO]->(e:{} {{{}: $entity_id}})
-            DELETE r
-            "#,
-            node_label, match_field
-        );
+        let cypher = if use_suffix_match {
+            format!(
+                r#"
+                MATCH (n:Note {{id: $note_id}})-[r:LINKED_TO]->(e:{})
+                WHERE e.{} ENDS WITH $entity_id
+                DELETE r
+                "#,
+                node_label, match_field
+            )
+        } else {
+            format!(
+                r#"
+                MATCH (n:Note {{id: $note_id}})-[r:LINKED_TO]->(e:{} {{{}: $entity_id}})
+                DELETE r
+                "#,
+                node_label, match_field
+            )
+        };
 
         let q = query(&cypher)
             .param("note_id", note_id.to_string())
@@ -956,21 +996,40 @@ impl Neo4jClient {
             EntityType::Process => "Process",
         };
 
-        let (match_field, match_value) = match entity_type {
-            EntityType::File => ("path", entity_id.to_string()),
-            EntityType::Commit => ("hash", entity_id.to_string()),
-            _ => ("id", entity_id.to_string()),
+        let (match_field, match_value, use_suffix_match) = match entity_type {
+            EntityType::File => {
+                if entity_id.starts_with('/') {
+                    ("path", entity_id.to_string(), false)
+                } else {
+                    ("path", format!("/{}", entity_id), true)
+                }
+            }
+            EntityType::Commit => ("hash", entity_id.to_string(), false),
+            _ => ("id", entity_id.to_string(), false),
         };
 
-        let cypher = format!(
-            r#"
-            MATCH (n:Note)-[:LINKED_TO]->(e:{} {{{}: $entity_id}})
-            WHERE n.status IN ['active', 'needs_review']
-            RETURN n
-            ORDER BY n.importance DESC, n.created_at DESC
-            "#,
-            node_label, match_field
-        );
+        let cypher = if use_suffix_match {
+            format!(
+                r#"
+                MATCH (n:Note)-[:LINKED_TO]->(e:{})
+                WHERE e.{} ENDS WITH $entity_id
+                  AND n.status IN ['active', 'needs_review']
+                RETURN n
+                ORDER BY n.importance DESC, n.created_at DESC
+                "#,
+                node_label, match_field
+            )
+        } else {
+            format!(
+                r#"
+                MATCH (n:Note)-[:LINKED_TO]->(e:{} {{{}: $entity_id}})
+                WHERE n.status IN ['active', 'needs_review']
+                RETURN n
+                ORDER BY n.importance DESC, n.created_at DESC
+                "#,
+                node_label, match_field
+            )
+        };
 
         let q = query(&cypher).param("entity_id", match_value);
 
@@ -1170,10 +1229,16 @@ impl Neo4jClient {
             EntityType::Process => "Process",
         };
 
-        let (match_field, match_value) = match entity_type {
-            EntityType::File => ("path", entity_id.to_string()),
-            EntityType::Commit => ("hash", entity_id.to_string()),
-            _ => ("id", entity_id.to_string()),
+        let (match_field, match_value, use_suffix_match) = match entity_type {
+            EntityType::File => {
+                if entity_id.starts_with('/') {
+                    ("path", entity_id.to_string(), false)
+                } else {
+                    ("path", format!("/{}", entity_id), true)
+                }
+            }
+            EntityType::Commit => ("hash", entity_id.to_string(), false),
+            _ => ("id", entity_id.to_string(), false),
         };
 
         // Build the relation traversal pattern from the whitelist.
@@ -1200,6 +1265,20 @@ impl Neo4jClient {
             None => Self::DEFAULT_PROPAGATION_RELATIONS.join("|"),
         };
 
+        // Build the target match clause. For relative file paths, use ENDS WITH
+        // to match against the suffix of the absolute path stored in Neo4j.
+        let target_match = if use_suffix_match {
+            format!(
+                "MATCH (target:{}) WHERE target.{} ENDS WITH $entity_id",
+                node_label, match_field
+            )
+        } else {
+            format!(
+                "MATCH (target:{} {{{}: $entity_id}})",
+                node_label, match_field
+            )
+        };
+
         // Query for notes propagated through the graph.
         //
         // Scoring formula integrates 5 factors:
@@ -1219,7 +1298,7 @@ impl Neo4jClient {
         //   CO_CHANGED=0.6, DISCUSSED=0.5, SYNAPSE=dynamic r.weight, default=0.5
         let cypher = format!(
             r#"
-            MATCH (target:{} {{{}: $entity_id}})
+            {}
             MATCH path = (n:Note)-[:LINKED_TO]->(source)-[:{}*0..{}]->(target)
             WHERE n.status = 'active'
             WITH n, source, path, length(path) - 1 AS distance,
@@ -1264,7 +1343,7 @@ impl Neo4jClient {
             ORDER BY score DESC
             LIMIT 20
             "#,
-            node_label, match_field, rel_pattern, max_depth
+            target_match, rel_pattern, max_depth
         );
 
         let q = query(&cypher)

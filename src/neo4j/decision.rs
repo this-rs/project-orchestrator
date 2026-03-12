@@ -173,16 +173,49 @@ impl Neo4jClient {
         entity_id: &str,
         limit: u32,
     ) -> Result<Vec<DecisionNode>> {
-        // Try both direct AFFECTS and indirect via task affected_files
+        // Try both direct AFFECTS and indirect via task affected_files.
+        // For File entities with relative paths, use ENDS WITH matching
+        // since Neo4j stores absolute paths.
+        let is_relative_file = entity_type == "File" && !entity_id.starts_with('/');
+        let match_field = if entity_type == "File" { "path" } else { "id" };
+
+        let (target_clause, match_value) = if is_relative_file {
+            let suffix = format!("/{}", entity_id);
+            (
+                format!(
+                    "OPTIONAL MATCH (d1:Decision)-[:AFFECTS]->(target:{})\n            WHERE target.{} ENDS WITH $entity_id",
+                    entity_type, match_field
+                ),
+                suffix,
+            )
+        } else {
+            (
+                format!(
+                    "OPTIONAL MATCH (d1:Decision)-[:AFFECTS]->(target:{} {{{}: $entity_id}})",
+                    entity_type, match_field
+                ),
+                entity_id.to_string(),
+            )
+        };
+
+        // For affected_files (Path 2), also handle relative paths:
+        // affected_files typically stores relative paths, so check both
+        // exact match and suffix match to cover all cases.
+        let affected_files_clause = if is_relative_file {
+            "WHERE $entity_id_raw IN t.affected_files\n               OR ANY(af IN t.affected_files WHERE af ENDS WITH $entity_id)"
+        } else {
+            "WHERE $entity_id IN t.affected_files"
+        };
+
         let cypher = format!(
             r#"
             // Path 1: Direct AFFECTS relation (P3 — may not exist yet)
-            OPTIONAL MATCH (d1:Decision)-[:AFFECTS]->(target:{} {{{}: $entity_id}})
+            {}
             WITH collect(DISTINCT d1) AS direct_decisions
 
             // Path 2: Indirect via Task affected_files containing entity_id
             OPTIONAL MATCH (t:Task)-[:INFORMED_BY]->(d2:Decision)
-            WHERE $entity_id IN t.affected_files
+            {}
             WITH direct_decisions, collect(DISTINCT d2) AS indirect_decisions
 
             // Merge and deduplicate
@@ -193,13 +226,17 @@ impl Neo4jClient {
             ORDER BY d.decided_at DESC
             LIMIT $limit
             "#,
-            entity_type,
-            if entity_type == "File" { "path" } else { "id" },
+            target_clause, affected_files_clause,
         );
 
-        let q = query(&cypher)
-            .param("entity_id", entity_id.to_string())
+        let mut q = query(&cypher)
+            .param("entity_id", match_value)
             .param("limit", limit as i64);
+
+        // Add raw entity_id param for affected_files matching with relative paths
+        if is_relative_file {
+            q = q.param("entity_id_raw", entity_id.to_string());
+        }
 
         let mut result = self.graph.execute(q).await?;
         let mut decisions = Vec::new();
