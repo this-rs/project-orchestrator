@@ -320,19 +320,15 @@ pub async fn update_rfc(
     // Merge content: update title/sections if provided
     let new_content = if body.title.is_some() || body.sections.is_some() {
         let existing_content = serde_json::from_str::<RfcContent>(&existing.content).ok();
-        let title = body
-            .title
-            .unwrap_or_else(|| {
-                existing_content
-                    .as_ref()
-                    .map(|c| c.title.clone())
-                    .unwrap_or_else(|| "Untitled RFC".to_string())
-            });
-        let sections = body.sections.unwrap_or_else(|| {
+        let title = body.title.unwrap_or_else(|| {
             existing_content
-                .map(|c| c.sections)
-                .unwrap_or_default()
+                .as_ref()
+                .map(|c| c.title.clone())
+                .unwrap_or_else(|| "Untitled RFC".to_string())
         });
+        let sections = body
+            .sections
+            .unwrap_or_else(|| existing_content.map(|c| c.sections).unwrap_or_default());
         Some(rfc_content_json(&title, &sections))
     } else {
         None
