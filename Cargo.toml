@@ -87,6 +87,11 @@ tokio-stream = "0.1"
 jsonwebtoken = "9"
 bcrypt = "0.16"
 
+# P2P Identity (M4)
+ed25519-dalek = { version = "2.1", features = ["serde", "rand_core"] }
+pasetors = "0.7"
+multibase = "0.9"
+
 # Self-update (archive extraction)
 flate2 = "1"
 tar = "0.4"
