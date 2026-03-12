@@ -1102,4 +1102,248 @@ impl Neo4jClient {
 
         Ok(())
     }
+
+    // ========================================================================
+    // PRODUCED_DURING — link artefacts to the run that produced them
+    // ========================================================================
+
+    /// Create a PRODUCED_DURING relationship from a Note or Decision to a ProtocolRun.
+    ///
+    /// Direction: `(artefact)-[:PRODUCED_DURING {produced_at}]->(run)`
+    /// The artefact (Note or Decision) points to the run that produced it.
+    pub async fn create_produced_during(
+        &self,
+        entity_type: &str,
+        entity_id: Uuid,
+        run_id: Uuid,
+    ) -> Result<bool> {
+        let node_label = match entity_type {
+            "note" | "Note" => "Note",
+            "decision" | "Decision" => "Decision",
+            other => anyhow::bail!("PRODUCED_DURING only supports Note and Decision, got: {other}"),
+        };
+
+        let cypher = format!(
+            r#"
+            MATCH (e:{} {{id: $entity_id}})
+            MATCH (r:ProtocolRun {{id: $run_id}})
+            MERGE (e)-[rel:PRODUCED_DURING]->(r)
+            ON CREATE SET rel.produced_at = datetime()
+            RETURN rel IS NOT NULL AS created
+            "#,
+            node_label
+        );
+
+        let q = query(&cypher)
+            .param("entity_id", entity_id.to_string())
+            .param("run_id", run_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            Ok(row.get::<bool>("created").unwrap_or(false))
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Get all artefacts (notes + decisions) produced during a protocol run.
+    ///
+    /// Returns a list of `(entity_type, entity_id, produced_at)` tuples.
+    pub async fn get_run_outcomes(
+        &self,
+        run_id: Uuid,
+    ) -> Result<Vec<ProducedArtefact>> {
+        let q = query(
+            r#"
+            MATCH (e)-[rel:PRODUCED_DURING]->(r:ProtocolRun {id: $run_id})
+            WHERE e:Note OR e:Decision
+            RETURN
+                CASE WHEN e:Note THEN 'note' ELSE 'decision' END AS entity_type,
+                e.id AS entity_id,
+                rel.produced_at AS produced_at,
+                CASE WHEN e:Note THEN coalesce(e.content, '') ELSE coalesce(e.description, '') END AS summary
+            ORDER BY rel.produced_at ASC
+            "#,
+        )
+        .param("run_id", run_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut artefacts = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            let entity_type: String = row.get("entity_type")?;
+            let entity_id: String = row.get("entity_id")?;
+            let produced_at: Option<String> = row.get::<String>("produced_at").ok();
+            let summary: String = row.get("summary").unwrap_or_default();
+
+            artefacts.push(ProducedArtefact {
+                entity_type,
+                entity_id: entity_id.parse()?,
+                produced_at: produced_at
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or_else(chrono::Utc::now),
+                summary: if summary.len() > 200 {
+                    format!("{}...", &summary[..200])
+                } else {
+                    summary
+                },
+            });
+        }
+
+        Ok(artefacts)
+    }
+
+    /// Find the most recently started active (running) protocol run for a project.
+    ///
+    /// Traverses: ProtocolRun -[:INSTANCE_OF]-> Protocol {project_id}.
+    /// Returns the run_id if found, None otherwise.
+    pub async fn find_active_run_for_project(
+        &self,
+        project_id: Uuid,
+    ) -> Result<Option<Uuid>> {
+        let q = query(
+            r#"
+            MATCH (r:ProtocolRun {status: 'running'})-[:INSTANCE_OF]->(p:Protocol {project_id: $project_id})
+            RETURN r.id AS run_id
+            ORDER BY r.started_at DESC
+            LIMIT 1
+            "#,
+        )
+        .param("project_id", project_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let run_id_str: String = row.get("run_id")?;
+            Ok(Some(run_id_str.parse()?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Get the ID of a persisted reasoning tree linked to a protocol run.
+    /// Returns the tree UUID if found, None otherwise.
+    pub async fn get_run_reasoning_tree_id(
+        &self,
+        run_id: Uuid,
+    ) -> Result<Option<Uuid>> {
+        let q = query(
+            r#"
+            MATCH (t:PersistedReasoningTree)-[:REASONING_FOR]->(r:ProtocolRun {id: $run_id})
+            RETURN t.id AS tree_id
+            ORDER BY t.persisted_at DESC
+            LIMIT 1
+            "#,
+        )
+        .param("run_id", run_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let tree_id_str: String = row.get("tree_id")?;
+            Ok(Some(tree_id_str.parse()?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// List completed protocol runs for a project (most recent first).
+    pub async fn list_completed_runs_for_project(
+        &self,
+        project_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<ProtocolRun>> {
+        let q = query(
+            r#"
+            MATCH (r:ProtocolRun {status: 'completed'})-[:INSTANCE_OF]->(p:Protocol {project_id: $project_id})
+            RETURN r
+            ORDER BY r.completed_at DESC
+            LIMIT $limit
+            "#,
+        )
+        .param("project_id", project_id.to_string())
+        .param("limit", limit as i64);
+
+        let mut result = self.graph.execute(q).await?;
+        let mut runs = Vec::new();
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("r")?;
+            if let Ok(run) = Self::node_to_protocol_run(&node) {
+                runs.push(run);
+            }
+        }
+        Ok(runs)
+    }
+
+    /// Backfill PRODUCED_DURING relations for completed runs.
+    ///
+    /// Uses a heuristic: notes/decisions created between run.started_at and
+    /// run.completed_at with the same project_id are assumed to have been
+    /// produced during that run.
+    ///
+    /// Returns the number of relations created.
+    pub async fn backfill_produced_during(&self, project_id: Uuid) -> Result<usize> {
+        let q = query(
+            r#"
+            MATCH (r:ProtocolRun {status: 'completed'})
+            MATCH (p:Protocol {id: r.protocol_id})
+            WHERE p.project_id = $project_id
+              AND r.completed_at IS NOT NULL
+
+            // Find notes created during the run window
+            OPTIONAL MATCH (n:Note)
+            WHERE n.project_id = $project_id
+              AND n.created_at >= r.started_at
+              AND n.created_at <= r.completed_at
+              AND NOT (n)-[:PRODUCED_DURING]->(r)
+            WITH r, collect(DISTINCT n) AS notes
+
+            // Find decisions created during the run window
+            OPTIONAL MATCH (d:Decision)
+            WHERE d.decided_at >= r.started_at
+              AND d.decided_at <= r.completed_at
+              AND NOT (d)-[:PRODUCED_DURING]->(r)
+
+            // Check decision is linked to a task in the same project
+            OPTIONAL MATCH (d)<-[:INFORMED_BY]-(t:Task)<-[:HAS_TASK]-(pl:Plan)-[:BELONGS_TO]->(proj:Project {id: $project_id})
+            WITH r, notes, collect(DISTINCT d) AS decisions
+
+            // Create PRODUCED_DURING for notes
+            UNWIND notes AS n
+            WITH r, decisions, n
+            WHERE n IS NOT NULL
+            MERGE (n)-[rel:PRODUCED_DURING]->(r)
+            ON CREATE SET rel.produced_at = n.created_at, rel.backfilled = true
+            WITH r, decisions, count(rel) AS note_count
+
+            // Create PRODUCED_DURING for decisions
+            UNWIND decisions AS d
+            WITH r, note_count, d
+            WHERE d IS NOT NULL
+            MERGE (d)-[rel:PRODUCED_DURING]->(r)
+            ON CREATE SET rel.produced_at = d.decided_at, rel.backfilled = true
+
+            RETURN sum(note_count) + count(rel) AS total_created
+            "#,
+        )
+        .param("project_id", project_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            Ok(row.get::<i64>("total_created").unwrap_or(0) as usize)
+        } else {
+            Ok(0)
+        }
+    }
+}
+
+/// An artefact produced during a protocol run (returned by `get_run_outcomes`).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ProducedArtefact {
+    /// "note" or "decision"
+    pub entity_type: String,
+    /// UUID of the note or decision
+    pub entity_id: Uuid,
+    /// When the artefact was produced
+    pub produced_at: chrono::DateTime<chrono::Utc>,
+    /// Content preview (first 200 chars)
+    pub summary: String,
 }

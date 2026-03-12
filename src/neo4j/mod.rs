@@ -19,6 +19,7 @@ mod plan_run;
 mod profile;
 mod project;
 mod protocol;
+pub(crate) mod reasoning;
 mod registry;
 mod release;
 mod skill;

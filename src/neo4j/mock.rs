@@ -9109,6 +9109,59 @@ impl GraphStore for MockGraphStore {
         Ok(existed)
     }
 
+    async fn create_produced_during(
+        &self,
+        _entity_type: &str,
+        _entity_id: Uuid,
+        _run_id: Uuid,
+    ) -> anyhow::Result<bool> {
+        // Mock: always succeed
+        Ok(true)
+    }
+
+    async fn get_run_outcomes(
+        &self,
+        _run_id: Uuid,
+    ) -> anyhow::Result<Vec<crate::neo4j::protocol::ProducedArtefact>> {
+        // Mock: return empty
+        Ok(Vec::new())
+    }
+
+    async fn find_active_run_for_project(
+        &self,
+        _project_id: Uuid,
+    ) -> anyhow::Result<Option<Uuid>> {
+        // Mock: no active run
+        Ok(None)
+    }
+
+    async fn persist_reasoning_tree(
+        &self,
+        tree: &crate::reasoning::ReasoningTree,
+        _linked_entity_type: Option<&str>,
+        _linked_entity_id: Option<Uuid>,
+    ) -> anyhow::Result<Uuid> {
+        // Mock: return the tree's ID
+        Ok(tree.id)
+    }
+
+    async fn get_run_reasoning_tree_id(
+        &self,
+        _run_id: Uuid,
+    ) -> anyhow::Result<Option<Uuid>> {
+        // Mock: no persisted reasoning tree
+        Ok(None)
+    }
+
+    async fn list_completed_runs_for_project(
+        &self,
+        _project_id: Uuid,
+        _limit: usize,
+    ) -> anyhow::Result<Vec<crate::protocol::models::ProtocolRun>> {
+        // Mock: no completed runs
+        Ok(Vec::new())
+    }
+
     // ========================================================================
     // RuntimeState operations (Generator-produced dynamic states)
     // ========================================================================

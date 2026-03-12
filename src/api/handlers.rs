@@ -1039,11 +1039,47 @@ pub async fn add_decision(
     Path(task_id): Path<Uuid>,
     Json(req): Json<CreateDecisionRequest>,
 ) -> Result<Json<DecisionNode>, AppError> {
+    let explicit_run_id = req.run_id;
     let decision = state
         .orchestrator
         .plan_manager()
         .add_decision(task_id, req, "agent")
         .await?;
+
+    // Resolve run_id: explicit > auto-detect from active run
+    let run_id = match explicit_run_id {
+        Some(rid) => Some(rid),
+        None => {
+            // Auto-detect: resolve project_id from task, then find active run
+            match state.orchestrator.neo4j().get_project_for_task(task_id).await {
+                Ok(Some(project)) => {
+                    state.orchestrator.neo4j()
+                        .find_active_run_for_project(project.id)
+                        .await
+                        .unwrap_or(None)
+                }
+                _ => None,
+            }
+        }
+    };
+
+    // Create PRODUCED_DURING relation if we have a run_id
+    if let Some(rid) = run_id {
+        if let Err(e) = state
+            .orchestrator
+            .neo4j()
+            .create_produced_during("Decision", decision.id, rid)
+            .await
+        {
+            tracing::warn!(
+                decision_id = %decision.id,
+                run_id = %rid,
+                error = %e,
+                "Failed to create PRODUCED_DURING relation for decision"
+            );
+        }
+    }
+
     Ok(Json(decision))
 }
 
@@ -2732,6 +2768,7 @@ pub async fn persist_health_report(
         ]),
         anchors: None,
         assertion_rule: None,
+        run_id: None,
     };
     let note = state
         .orchestrator

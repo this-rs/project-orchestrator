@@ -123,6 +123,9 @@ pub struct CreateDecisionRequest {
     pub rationale: String,
     pub alternatives: Option<Vec<String>>,
     pub chosen_option: Option<String>,
+    /// Optional protocol run ID for PRODUCED_DURING relation
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<Uuid>,
 }
 
 /// Full plan details including tasks

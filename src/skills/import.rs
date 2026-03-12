@@ -324,6 +324,7 @@ async fn handle_conflict(
                 protocols: vec![],
                 execution_history: None,
                 source: None,
+                episodes: Vec::new(),
             };
             let skill = create_imported_skill(&package_stub, target_project_id);
             let skill_id = skill.id;
@@ -690,6 +691,7 @@ mod tests {
             protocols: vec![],
             execution_history: None,
             source: None,
+            episodes: Vec::new(),
         }
     }
 

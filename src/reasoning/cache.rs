@@ -194,6 +194,62 @@ impl ReasoningTreeCache {
         id_idx.insert(tree_id, key);
     }
 
+    /// Look up a cached tree by its UUID.
+    ///
+    /// Returns `None` if not found or expired. Used by `reason_feedback`
+    /// to retrieve a tree for selective persistence before cache invalidation.
+    pub async fn get_by_id(&self, tree_id: Uuid) -> Option<ReasoningTree> {
+        let id_idx = self.id_index.read().await;
+        let key = id_idx.get(&tree_id)?.clone();
+        drop(id_idx);
+
+        let mut cache = self.inner.write().await;
+        if let Some(entry) = cache.get(&key) {
+            if entry.is_expired(self.ttl) {
+                let tid = entry.tree.id;
+                cache.pop(&key);
+                drop(cache);
+                self.id_index.write().await.remove(&tid);
+                None
+            } else {
+                Some(entry.tree.clone())
+            }
+        } else {
+            None
+        }
+    }
+
+    /// Find a recently cached tree for a given project (within `max_age`).
+    ///
+    /// Used for temporal correlation: when a note is created shortly after
+    /// a reasoning tree was built for the same project, we persist the tree.
+    /// Returns the most recently inserted matching tree, if any.
+    pub async fn get_recent_for_project(
+        &self,
+        project_id: Uuid,
+        max_age: Duration,
+    ) -> Option<ReasoningTree> {
+        let cache = self.inner.read().await;
+        let mut best: Option<(&CacheEntry, Instant)> = None;
+
+        for (_, entry) in cache.iter() {
+            if entry.tree.project_id == Some(project_id)
+                && entry.inserted_at.elapsed() <= max_age
+                && !entry.is_expired(self.ttl)
+            {
+                match &best {
+                    None => best = Some((entry, entry.inserted_at)),
+                    Some((_, prev_ts)) if entry.inserted_at > *prev_ts => {
+                        best = Some((entry, entry.inserted_at));
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        best.map(|(entry, _)| entry.tree.clone())
+    }
+
     /// Invalidate a cached tree by its UUID.
     ///
     /// Used after `reason_feedback` to ensure re-computation with updated scores.

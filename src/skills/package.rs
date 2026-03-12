@@ -65,6 +65,9 @@ pub struct SkillPackage {
     /// Source metadata for provenance tracking.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<SourceMetadata>,
+    /// Episodic memories captured during skill usage (v3).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub episodes: Vec<crate::episodes::PortableEpisode>,
 }
 
 // ============================================================================
@@ -529,6 +532,7 @@ mod tests {
             protocols: vec![],
             execution_history: None,
             source: None,
+            episodes: Vec::new(),
         }
     }
 

@@ -30,6 +30,7 @@ pub fn all_tools() -> Vec<ToolDefinition> {
         feature_graph_tool(),
         code_tool(),
         reasoning_tool(),
+        episode_tool(),
         analysis_profile_tool(),
         admin_tool(),
         skill_tool(),
@@ -889,6 +890,28 @@ fn code_tool() -> ToolDefinition {
                 "severity": {"type": "string", "description": "Rule severity (create_topology_rule): error, warning"},
                 "new_imports": {"type": "array", "items": {"type": "string"}, "description": "New import paths to check against topology rules (check_file_topology)"},
                 "limit": {"type": "integer", "description": "Max results / depth (search/get_call_graph)"}
+            })),
+            required: Some(vec!["action".to_string()]),
+        },
+    }
+}
+
+fn episode_tool() -> ToolDefinition {
+    ToolDefinition {
+        name: "episode".to_string(),
+        description:
+            "Manage episodic memory. Actions: collect, list, anonymize".to_string(),
+        input_schema: InputSchema {
+            schema_type: "object".to_string(),
+            properties: Some(json!({
+                "action": {
+                    "type": "string",
+                    "enum": ["collect", "list", "anonymize"],
+                    "description": "Operation to perform"
+                },
+                "run_id": {"type": "string", "description": "ProtocolRun UUID to collect episode from (collect/anonymize)"},
+                "project_id": {"type": "string", "description": "Project UUID (collect/list/anonymize)"},
+                "limit": {"type": "integer", "description": "Max episodes to return (list, default 20)"}
             })),
             required: Some(vec!["action".to_string()]),
         },

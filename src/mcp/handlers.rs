@@ -123,6 +123,7 @@ impl ToolHandler {
             "skill",
             "analysis_profile",
             "protocol",
+            "episode",
         ];
 
         if !mega_tools.contains(&name) {
@@ -455,6 +456,11 @@ impl ToolHandler {
             // Reasoning Tree
             ("reasoning", "reason") => "reason",
             ("reasoning", "reason_feedback") => "reason_feedback",
+
+            // Episode (Episodic Memory)
+            ("episode", "collect") => "collect_episode",
+            ("episode", "list") => "list_episodes",
+            ("episode", "anonymize") => "anonymize_episode",
 
             // Analysis Profile
             ("analysis_profile", "list") => "list_analysis_profiles",
@@ -4073,6 +4079,25 @@ impl ToolHandler {
                 let result = http
                     .post(&format!("/api/reason/{}/feedback", tree_id), &body)
                     .await?;
+                Ok(Some(result))
+            }
+
+            // ── Episodes (Episodic Memory) ──────────────────────────────
+            "collect_episode" => {
+                let result = http.post("/api/episodes/collect", args).await?;
+                Ok(Some(result))
+            }
+            "list_episodes" => {
+                let project_id = extract_id(args, "project_id")?;
+                let mut query = vec![("project_id".to_string(), project_id)];
+                if let Some(l) = args.get("limit").and_then(|v| v.as_u64()) {
+                    query.push(("limit".to_string(), l.to_string()));
+                }
+                let result = http.get_with_query("/api/episodes", &query).await?;
+                Ok(Some(result))
+            }
+            "anonymize_episode" => {
+                let result = http.post("/api/episodes/anonymize", args).await?;
                 Ok(Some(result))
             }
 

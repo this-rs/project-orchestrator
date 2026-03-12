@@ -123,6 +123,8 @@ pub struct CreateNoteBody {
     pub tags: Option<Vec<String>>,
     pub anchors: Option<Vec<CreateAnchorRequest>>,
     pub assertion_rule: Option<crate::notes::AssertionRule>,
+    /// Optional protocol run ID for PRODUCED_DURING relation
+    pub run_id: Option<Uuid>,
 }
 
 /// Request to update a note
@@ -201,8 +203,10 @@ pub async fn create_note(
     State(state): State<OrchestratorState>,
     Json(body): Json<CreateNoteBody>,
 ) -> Result<(StatusCode, Json<Note>), AppError> {
+    let explicit_run_id = body.run_id;
+    let project_id = body.project_id;
     let request = CreateNoteRequest {
-        project_id: body.project_id,
+        project_id,
         note_type: body.note_type,
         content: body.content,
         importance: body.importance,
@@ -210,6 +214,7 @@ pub async fn create_note(
         tags: body.tags,
         anchors: body.anchors,
         assertion_rule: body.assertion_rule,
+        run_id: None, // run_id is handled at the handler level, not passed down
     };
 
     let note = state
@@ -217,6 +222,76 @@ pub async fn create_note(
         .note_manager()
         .create_note(request, "api")
         .await?;
+
+    // Resolve run_id: explicit > auto-detect from active run
+    let run_id = match explicit_run_id {
+        Some(rid) => Some(rid),
+        None => {
+            // Auto-detect: find active run for the same project
+            if let Some(pid) = project_id {
+                match state.orchestrator.neo4j().find_active_run_for_project(pid).await {
+                    Ok(active_run) => active_run,
+                    Err(e) => {
+                        tracing::debug!(
+                            project_id = %pid,
+                            error = %e,
+                            "Failed to auto-detect active run for PRODUCED_DURING"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        }
+    };
+
+    // Create PRODUCED_DURING relation if we have a run_id
+    if let Some(rid) = run_id {
+        if let Err(e) = state
+            .orchestrator
+            .neo4j()
+            .create_produced_during("Note", note.id, rid)
+            .await
+        {
+            tracing::warn!(
+                note_id = %note.id,
+                run_id = %rid,
+                error = %e,
+                "Failed to create PRODUCED_DURING relation for note"
+            );
+        }
+    }
+
+    // Temporal correlation: if a ReasoningTree was recently built for this project,
+    // persist it with a REASONING_FOR → Note link (the tree "caused" this note).
+    if let Some(pid) = project_id {
+        if let Some(engine) = state.orchestrator.reasoning_engine() {
+            let max_age = std::time::Duration::from_secs(60);
+            if let Some(tree) = engine.cache().get_recent_for_project(pid, max_age).await {
+                match state
+                    .orchestrator
+                    .neo4j()
+                    .persist_reasoning_tree(&tree, Some("Note"), Some(note.id))
+                    .await
+                {
+                    Ok(persisted_id) => {
+                        tracing::info!(
+                            tree_id = %persisted_id,
+                            note_id = %note.id,
+                            "Persisted reasoning tree via temporal correlation (note created within 60s)"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            error = %e,
+                            "Failed to persist reasoning tree via temporal correlation"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     Ok((StatusCode::CREATED, Json(note)))
 }
@@ -401,6 +476,7 @@ pub async fn supersede_note(
         tags: body.tags,
         anchors: body.anchors,
         assertion_rule: body.assertion_rule,
+        run_id: None,
     };
 
     let new_note = state

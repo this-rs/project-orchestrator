@@ -522,6 +522,7 @@ mod tests {
             tags: None,
             anchors: None,
             assertion_rule: None,
+            run_id: None,
         };
 
         let result = nm.create_note(req, "test-agent").await;

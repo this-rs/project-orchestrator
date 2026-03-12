@@ -1931,6 +1931,7 @@ mod tests {
             tags: Some(vec!["test".to_string()]),
             anchors: None,
             assertion_rule: None,
+            run_id: None,
         }
     }
 
@@ -2293,6 +2294,7 @@ mod tests {
             tags: Some(vec!["global".to_string()]),
             anchors: None,
             assertion_rule: None,
+            run_id: None,
         }
     }
 
@@ -2963,6 +2965,7 @@ mod tests {
             tags: None,
             anchors: None,
             assertion_rule: None,
+            run_id: None,
         };
 
         let _note = manager.create_note(req, "agent-1").await.unwrap();
@@ -3014,6 +3017,7 @@ mod tests {
             tags: Some(vec!["test-rfc".to_string()]),
             anchors: None,
             assertion_rule: None,
+            run_id: None,
         };
 
         let note = mgr.create_note(req, "agent-1").await.unwrap();
@@ -3039,6 +3043,7 @@ mod tests {
             tags: None,
             anchors: None,
             assertion_rule: None,
+            run_id: None,
         };
 
         let note = mgr.create_note(req, "agent-1").await.unwrap();
@@ -3084,6 +3089,7 @@ mod tests {
             tags: None,
             anchors: None,
             assertion_rule: None,
+            run_id: None,
         };
 
         let note = mgr.create_note(req, "agent-1").await.unwrap();
@@ -3131,6 +3137,7 @@ mod tests {
             tags: None,
             anchors: None,
             assertion_rule: None,
+            run_id: None,
         };
 
         let note = mgr.create_note(req, "agent-1").await.unwrap();
@@ -3153,6 +3160,7 @@ mod tests {
             tags: None,
             anchors: None,
             assertion_rule: None,
+            run_id: None,
         };
 
         let note = mgr.create_note(req, "agent-1").await.unwrap();

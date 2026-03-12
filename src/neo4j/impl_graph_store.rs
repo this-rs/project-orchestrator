@@ -3029,6 +3029,56 @@ impl GraphStore for Neo4jClient {
         self.delete_protocol_run(run_id).await
     }
 
+    async fn create_produced_during(
+        &self,
+        entity_type: &str,
+        entity_id: uuid::Uuid,
+        run_id: uuid::Uuid,
+    ) -> anyhow::Result<bool> {
+        self.create_produced_during(entity_type, entity_id, run_id)
+            .await
+    }
+
+    async fn get_run_outcomes(
+        &self,
+        run_id: uuid::Uuid,
+    ) -> anyhow::Result<Vec<crate::neo4j::protocol::ProducedArtefact>> {
+        self.get_run_outcomes(run_id).await
+    }
+
+    async fn find_active_run_for_project(
+        &self,
+        project_id: uuid::Uuid,
+    ) -> anyhow::Result<Option<uuid::Uuid>> {
+        self.find_active_run_for_project(project_id).await
+    }
+
+    async fn persist_reasoning_tree(
+        &self,
+        tree: &crate::reasoning::ReasoningTree,
+        linked_entity_type: Option<&str>,
+        linked_entity_id: Option<uuid::Uuid>,
+    ) -> anyhow::Result<uuid::Uuid> {
+        self.persist_reasoning_tree(tree, linked_entity_type, linked_entity_id)
+            .await
+    }
+
+    async fn get_run_reasoning_tree_id(
+        &self,
+        run_id: uuid::Uuid,
+    ) -> anyhow::Result<Option<uuid::Uuid>> {
+        self.get_run_reasoning_tree_id(run_id).await
+    }
+
+    async fn list_completed_runs_for_project(
+        &self,
+        project_id: uuid::Uuid,
+        limit: usize,
+    ) -> anyhow::Result<Vec<crate::protocol::models::ProtocolRun>> {
+        self.list_completed_runs_for_project(project_id, limit)
+            .await
+    }
+
     // ========================================================================
     // RuntimeState operations (Generator-produced dynamic states)
     // ========================================================================

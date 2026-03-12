@@ -12,6 +12,7 @@ pub mod api;
 pub mod auth;
 pub mod chat;
 pub mod embeddings;
+pub mod episodes;
 pub mod events;
 pub mod graph;
 pub mod mcp;

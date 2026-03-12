@@ -364,6 +364,7 @@ mod tests {
             protocols: vec![],
             execution_history: None,
             source: None,
+            episodes: Vec::new(),
         }
     }
 

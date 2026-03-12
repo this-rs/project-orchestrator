@@ -201,6 +201,36 @@ pub async fn export_skill(
         None
     };
 
+    // v3 — Collect episodes from completed runs of linked protocols
+    let mut portable_episodes = Vec::new();
+    let mut seen_run_ids = std::collections::HashSet::new();
+    for proto in &all_protocols {
+        if proto.skill_id != Some(skill_id) {
+            continue;
+        }
+        let (runs, _) = graph_store
+            .list_protocol_runs(proto.id, Some(RunStatus::Completed), 50, 0)
+            .await
+            .unwrap_or_default();
+        for run in &runs {
+            if seen_run_ids.insert(run.id) {
+                match crate::episodes::collector::collect_episode(graph_store, run.id, project_id)
+                    .await
+                {
+                    Ok(Some(ep)) => portable_episodes.push(ep.to_portable()),
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::debug!(
+                            run_id = %run.id,
+                            error = %e,
+                            "Failed to collect episode for export, skipping"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     let source = source_project_name.clone().map(|name| SourceMetadata {
         project_name: name,
         git_remote: None,
@@ -226,6 +256,7 @@ pub async fn export_skill(
         protocols: portable_protocols,
         execution_history,
         source,
+        episodes: portable_episodes,
     };
 
     Ok(package)

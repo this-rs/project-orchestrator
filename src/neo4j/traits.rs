@@ -2549,6 +2549,46 @@ pub trait GraphStore: Send + Sync {
     /// Returns true if the run existed and was deleted.
     async fn delete_protocol_run(&self, run_id: Uuid) -> Result<bool>;
 
+    /// Create a PRODUCED_DURING relation between a Note/Decision and a ProtocolRun.
+    /// entity_type must be "Note" or "Decision".
+    async fn create_produced_during(
+        &self,
+        entity_type: &str,
+        entity_id: Uuid,
+        run_id: Uuid,
+    ) -> Result<bool>;
+
+    /// Get all notes and decisions produced during a protocol run.
+    async fn get_run_outcomes(
+        &self,
+        run_id: Uuid,
+    ) -> Result<Vec<crate::neo4j::protocol::ProducedArtefact>>;
+
+    /// Find the most recently started active (running) protocol run for a project.
+    async fn find_active_run_for_project(
+        &self,
+        project_id: Uuid,
+    ) -> Result<Option<Uuid>>;
+
+    /// Persist a ReasoningTree to Neo4j as a PersistedReasoningTree node.
+    /// Optionally links it to an entity via REASONING_FOR relation.
+    async fn persist_reasoning_tree(
+        &self,
+        tree: &crate::reasoning::ReasoningTree,
+        linked_entity_type: Option<&str>,
+        linked_entity_id: Option<Uuid>,
+    ) -> Result<Uuid>;
+
+    /// Get the ID of a persisted reasoning tree linked to a protocol run.
+    async fn get_run_reasoning_tree_id(&self, run_id: Uuid) -> Result<Option<Uuid>>;
+
+    /// List completed protocol runs for a project (most recent first).
+    async fn list_completed_runs_for_project(
+        &self,
+        project_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<crate::protocol::models::ProtocolRun>>;
+
     // ========================================================================
     // RuntimeState operations (Generator-produced dynamic states)
     // ========================================================================

@@ -902,6 +902,10 @@ pub struct CreateNoteRequest {
     pub anchors: Option<Vec<CreateAnchorRequest>>,
     /// Assertion rule (for assertion notes)
     pub assertion_rule: Option<AssertionRule>,
+    /// Optional protocol run ID — if provided, a PRODUCED_DURING relation
+    /// will be created automatically after note creation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<Uuid>,
 }
 
 /// Request to create an anchor

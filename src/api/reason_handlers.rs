@@ -98,6 +98,9 @@ pub struct ReasonFeedbackResponse {
     pub scars_applied: usize,
     /// Whether the cached tree was invalidated.
     pub cache_invalidated: bool,
+    /// Whether the tree was persisted to Neo4j (selective persistence on success).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub tree_persisted: bool,
 }
 
 fn is_zero_usize(v: &usize) -> bool {
@@ -275,6 +278,38 @@ pub async fn reason_feedback(
         }
     }
 
+    // Selective persistence: on success, persist the tree to Neo4j before invalidating cache
+    let mut tree_persisted = false;
+    if matches!(body.outcome, FeedbackOutcome::Success) {
+        if let Some(engine) = state.orchestrator.reasoning_engine() {
+            if let Some(tree) = engine.cache().get_by_id(tree_id).await {
+                match state
+                    .orchestrator
+                    .neo4j()
+                    .persist_reasoning_tree(&tree, None, None)
+                    .await
+                {
+                    Ok(persisted_id) => {
+                        tracing::info!(
+                            tree_id = %persisted_id,
+                            node_count = tree.node_count,
+                            confidence = ?tree.confidence,
+                            "Persisted reasoning tree on positive feedback"
+                        );
+                        tree_persisted = true;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            tree_id = %tree_id,
+                            error = %e,
+                            "Failed to persist reasoning tree on positive feedback"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     // Invalidate the cached tree so next reason call reflects updated scores
     let cache_invalidated = if let Some(engine) = state.orchestrator.reasoning_engine() {
         engine.invalidate_cache(tree_id).await
@@ -290,5 +325,6 @@ pub async fn reason_feedback(
         synapse_boost,
         scars_applied,
         cache_invalidated,
+        tree_persisted,
     }))
 }

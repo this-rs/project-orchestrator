@@ -1162,6 +1162,7 @@ mod tests {
                 rationale: "Simpler for frontend integration".to_string(),
                 alternatives: Some(vec!["gRPC".to_string(), "GraphQL".to_string()]),
                 chosen_option: Some("REST".to_string()),
+                run_id: None,
             },
             "architect",
         )
@@ -1493,6 +1494,7 @@ mod tests {
                     rationale: "Best async runtime for Rust".to_string(),
                     alternatives: Some(vec!["async-std".to_string(), "smol".to_string()]),
                     chosen_option: Some("tokio".to_string()),
+                    run_id: None,
                 },
                 "engineer",
             )
@@ -1567,6 +1569,7 @@ mod tests {
                     rationale: "Best web framework for Rust".to_string(),
                     alternatives: None,
                     chosen_option: Some("axum".to_string()),
+                    run_id: None,
                 },
                 "engineer",
             )
@@ -1725,6 +1728,7 @@ mod tests {
                 rationale: "Better scalability".to_string(),
                 alternatives: None,
                 chosen_option: None,
+                run_id: None,
             },
             "architect",
         )
@@ -1738,6 +1742,7 @@ mod tests {
                 rationale: "Strong ACID compliance".to_string(),
                 alternatives: None,
                 chosen_option: None,
+                run_id: None,
             },
             "architect",
         )
