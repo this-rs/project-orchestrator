@@ -13,6 +13,7 @@ use super::note_handlers;
 use super::profile_handlers;
 use super::project_handlers;
 use super::protocol_handlers;
+use super::rfc_handlers;
 use super::reason_handlers;
 use super::registry_handlers;
 use super::skill_handlers;
@@ -961,6 +962,23 @@ fn protected_routes() -> Router<OrchestratorState> {
         .route(
             "/api/registry/{id}/import",
             post(registry_handlers::import_from_registry),
+        )
+        // ================================================================
+        // RFCs (Notes with note_type=rfc, frontend-friendly API)
+        // ================================================================
+        .route(
+            "/api/rfcs",
+            get(rfc_handlers::list_rfcs).post(rfc_handlers::create_rfc),
+        )
+        .route(
+            "/api/rfcs/{rfc_id}",
+            get(rfc_handlers::get_rfc)
+                .patch(rfc_handlers::update_rfc)
+                .delete(rfc_handlers::delete_rfc),
+        )
+        .route(
+            "/api/rfcs/{rfc_id}/transition",
+            post(rfc_handlers::transition_rfc),
         )
         // ================================================================
         // Protocols (Pattern Federation)
