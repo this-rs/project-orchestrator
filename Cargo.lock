@@ -3327,6 +3327,7 @@ dependencies = [
  "petgraph",
  "rag-umap",
  "rand 0.10.0",
+ "rand_core 0.6.4",
  "rayon",
  "regex",
  "reqwest 0.12.28",

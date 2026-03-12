@@ -15,6 +15,7 @@ pub mod embeddings;
 pub mod episodes;
 pub mod events;
 pub mod graph;
+pub mod identity;
 pub mod mcp;
 pub mod meilisearch;
 pub mod neo4j;
