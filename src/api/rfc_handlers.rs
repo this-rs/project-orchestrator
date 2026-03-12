@@ -274,9 +274,7 @@ pub async fn list_rfcs(
     for rfc in items.iter_mut() {
         if let Some(ref run_id_str) = rfc.protocol_run_id {
             if let Ok(run_id) = run_id_str.parse::<Uuid>() {
-                if let Ok(Some(run)) =
-                    state.orchestrator.neo4j().get_protocol_run(run_id).await
-                {
+                if let Ok(Some(run)) = state.orchestrator.neo4j().get_protocol_run(run_id).await {
                     if let Some(last_visit) = run.states_visited.last() {
                         rfc.current_state = Some(last_visit.state_name.clone());
                     }
