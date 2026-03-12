@@ -286,6 +286,31 @@ pub async fn get_rfc(
                 // The last entry in states_visited has the current state name
                 if let Some(last_visit) = run.states_visited.last() {
                     rfc.current_state = Some(last_visit.state_name.clone());
+
+                    // If the rfc-status tag is missing (e.g. server crash during transition),
+                    // derive the status from the run's current state and backfill the tag.
+                    let has_status_tag = note.tags.iter().any(|t| t.starts_with("rfc-status:"));
+                    if !has_status_tag {
+                        let derived_status = map_state_to_rfc_status(&last_visit.state_name);
+                        rfc.status = derived_status.clone();
+
+                        // Best-effort: backfill the missing tag so future reads are consistent
+                        let mut tags = note.tags.clone();
+                        set_status_tag(&mut tags, &derived_status);
+                        let _ = state
+                            .orchestrator
+                            .note_manager()
+                            .update_note(
+                                rfc_id,
+                                UpdateNoteRequest {
+                                    content: None,
+                                    importance: None,
+                                    status: None,
+                                    tags: Some(tags),
+                                },
+                            )
+                            .await;
+                    }
                 }
             }
         }
@@ -477,7 +502,20 @@ pub async fn transition_rfc(
         ))
     })?;
 
-    // 3. Fire transition on the protocol run
+    // 3. If the run is failed/cancelled, recover it to running before attempting transition.
+    //    This handles the case where a server crash left the run in a failed state
+    //    but the FSM state is still valid and the user wants to continue the lifecycle.
+    if let Ok(Some(mut run)) = state.orchestrator.neo4j().get_protocol_run(run_id).await {
+        if run.status == protocol::RunStatus::Failed || run.status == protocol::RunStatus::Cancelled
+        {
+            run.status = protocol::RunStatus::Running;
+            run.error = None;
+            run.completed_at = None;
+            let _ = state.orchestrator.neo4j().update_protocol_run(&run).await;
+        }
+    }
+
+    // 4. Fire transition on the protocol run
     let result =
         protocol::engine::fire_transition(state.orchestrator.neo4j(), run_id, &body.action)
             .await
