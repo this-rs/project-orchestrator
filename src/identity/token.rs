@@ -107,7 +107,8 @@ pub fn verify_token(token: &str, verifying_key: &VerifyingKey) -> Result<TokenCl
         .map_err(|e| anyhow!("PASETO token verification failed: {e}"))?;
 
     // Parse the claims payload
-    let claims_json = verified.payload_claims()
+    let claims_json = verified
+        .payload_claims()
         .ok_or_else(|| anyhow!("PASETO token has no claims"))?;
 
     let iss = claims_json
@@ -171,10 +172,13 @@ mod tests {
         let token = create_token(&signing_key, did_key, "p2p-sync", None, None)
             .expect("should create token");
 
-        assert!(token.starts_with("v4.public."), "Token should be PASETO v4.public");
+        assert!(
+            token.starts_with("v4.public."),
+            "Token should be PASETO v4.public"
+        );
 
-        let claims = verify_token(&token, &signing_key.verifying_key())
-            .expect("should verify valid token");
+        let claims =
+            verify_token(&token, &signing_key.verifying_key()).expect("should verify valid token");
 
         assert_eq!(claims.iss, did_key);
         assert_eq!(claims.sub, "p2p-sync");
@@ -206,14 +210,8 @@ mod tests {
         custom.insert("peer_id".to_string(), serde_json::json!("alice"));
         custom.insert("sync_version".to_string(), serde_json::json!(3));
 
-        let token = create_token(
-            &signing_key,
-            "did:key:z6MkTest",
-            "sync",
-            None,
-            Some(custom),
-        )
-        .expect("should create token with custom claims");
+        let token = create_token(&signing_key, "did:key:z6MkTest", "sync", None, Some(custom))
+            .expect("should create token with custom claims");
 
         let claims = verify_token(&token, &signing_key.verifying_key()).unwrap();
         assert_eq!(claims.sub, "sync");
@@ -228,7 +226,10 @@ mod tests {
             .expect("should create token");
 
         let result = verify_token(&token, &wrong_key.verifying_key());
-        assert!(result.is_err(), "Should reject token signed with different key");
+        assert!(
+            result.is_err(),
+            "Should reject token signed with different key"
+        );
     }
 
     #[test]

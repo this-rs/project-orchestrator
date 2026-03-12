@@ -180,7 +180,10 @@ fn test_tampered_envelope_rejected() {
 
     // 3. Bob verifies -> should FAIL (content hash mismatch)
     let result = verify_envelope(&envelope);
-    assert!(result.is_err(), "Tampered envelope should fail verification");
+    assert!(
+        result.is_err(),
+        "Tampered envelope should fail verification"
+    );
     let err_msg = result.unwrap_err().to_string();
     assert!(
         err_msg.contains("Content hash mismatch"),
@@ -231,8 +234,14 @@ fn test_privacy_gate_blocks_secrets() {
         anonymized.contains("<author>"),
         "Email should be redacted to <author>"
     );
-    assert!(!anonymized.contains("/Users/alice"), "Original path should be gone");
-    assert!(!anonymized.contains("alice@example.com"), "Original email should be gone");
+    assert!(
+        !anonymized.contains("/Users/alice"),
+        "Original path should be gone"
+    );
+    assert!(
+        !anonymized.contains("alice@example.com"),
+        "Original email should be gone"
+    );
     assert!(report.redacted_count >= 2);
     assert!(report.patterns_applied.contains(&"H8-abs-path".to_string()));
     assert!(report.patterns_applied.contains(&"H10-email".to_string()));
@@ -248,7 +257,11 @@ fn test_low_relevance_rejected() {
     let alice_key = SigningKey::generate(&mut &mut rand_core_06::OsRng);
     let lesson = DistilledLesson {
         abstract_pattern: "Use resource limits in Kubernetes deployments".to_string(),
-        domain_tags: vec!["kubernetes".to_string(), "docker".to_string(), "devops".to_string()],
+        domain_tags: vec![
+            "kubernetes".to_string(),
+            "docker".to_string(),
+            "devops".to_string(),
+        ],
         portability_layer: PortabilityLayer::Domain,
         confidence: 0.9,
     };
@@ -318,7 +331,10 @@ fn test_tombstone_revocation() {
     let result = receive_envelope(&envelope, &local_context);
     assert!(result.is_ok(), "First reception should succeed");
     let result = result.unwrap();
-    assert!(result.score.accepted, "Should be accepted with matching tags");
+    assert!(
+        result.score.accepted,
+        "Should be accepted with matching tags"
+    );
 
     // 2. Create a tombstone for that content_hash
     let mut tombstones = TombstoneRegistry::new();
@@ -423,7 +439,11 @@ fn test_receive_envelope_full_pipeline() {
     let alice_key = SigningKey::generate(&mut &mut rand_core_06::OsRng);
     let lesson = DistilledLesson {
         abstract_pattern: "Use connection pooling for database access".to_string(),
-        domain_tags: vec!["rust".to_string(), "database".to_string(), "performance".to_string()],
+        domain_tags: vec![
+            "rust".to_string(),
+            "database".to_string(),
+            "performance".to_string(),
+        ],
         portability_layer: PortabilityLayer::Domain,
         confidence: 0.92,
     };

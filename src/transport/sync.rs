@@ -50,8 +50,7 @@ impl VectorClock {
     /// - `After`      — every entry in `self` ≥ `other`, and at least one is >.
     /// - `Concurrent` — neither dominates.
     pub fn compare(&self, other: &VectorClock) -> ClockOrdering {
-        let all_keys: HashSet<&String> =
-            self.clocks.keys().chain(other.clocks.keys()).collect();
+        let all_keys: HashSet<&String> = self.clocks.keys().chain(other.clocks.keys()).collect();
 
         let mut has_less = false;
         let mut has_greater = false;
@@ -110,13 +109,9 @@ pub enum SyncMessage {
         content_hashes: HashSet<String>,
     },
     /// "Please send me these" — responder asks for missing content.
-    Want {
-        content_hashes: HashSet<String>,
-    },
+    Want { content_hashes: HashSet<String> },
     /// Requested content payload (generic JSON envelopes for now).
-    Data {
-        envelopes: Vec<serde_json::Value>,
-    },
+    Data { envelopes: Vec<serde_json::Value> },
 }
 
 // ---------------------------------------------------------------------------
@@ -150,10 +145,7 @@ pub struct SyncSession {
 
 impl SyncSession {
     /// Create a session pre-loaded with local content.
-    pub fn new(
-        local_clock: VectorClock,
-        local_items: HashMap<String, serde_json::Value>,
-    ) -> Self {
+    pub fn new(local_clock: VectorClock, local_items: HashMap<String, serde_json::Value>) -> Self {
         let local_hashes: HashSet<String> = local_items.keys().cloned().collect();
         Self {
             local_clock,
@@ -370,10 +362,7 @@ mod tests {
         // B processes Have → Want (B wants hash1, which it's missing)
         let want_msg = session_b.process_have(have_msg);
         assert_eq!(session_b.state, SyncState::WaitingForData);
-        if let SyncMessage::Want {
-            ref content_hashes,
-        } = want_msg
-        {
+        if let SyncMessage::Want { ref content_hashes } = want_msg {
             assert!(content_hashes.contains("hash1"));
             assert_eq!(content_hashes.len(), 1);
         } else {
@@ -394,18 +383,16 @@ mod tests {
     #[test]
     fn sync_no_missing_items() {
         let clock = VectorClock::new();
-        let items: HashMap<String, serde_json::Value> =
-            [("h1".into(), serde_json::json!("a"))].into_iter().collect();
+        let items: HashMap<String, serde_json::Value> = [("h1".into(), serde_json::json!("a"))]
+            .into_iter()
+            .collect();
 
         let mut initiator = SyncSession::new(clock.clone(), items.clone());
         let mut responder = SyncSession::new(clock, items);
 
         let have = initiator.initiate();
         let want = responder.process_have(have);
-        if let SyncMessage::Want {
-            ref content_hashes,
-        } = want
-        {
+        if let SyncMessage::Want { ref content_hashes } = want {
             assert!(content_hashes.is_empty());
         } else {
             panic!("expected Want");

@@ -78,9 +78,7 @@ impl InstanceIdentity {
 
     /// Load identity from file, or generate a new one if not found.
     pub fn load_or_generate(path: Option<&Path>) -> Result<Self> {
-        let storage_path = path
-            .map(PathBuf::from)
-            .unwrap_or_else(default_storage_path);
+        let storage_path = path.map(PathBuf::from).unwrap_or_else(default_storage_path);
 
         if storage_path.exists() {
             Self::load_from_file(&storage_path)
@@ -97,14 +95,17 @@ impl InstanceIdentity {
         let data = fs::read_to_string(path)
             .with_context(|| format!("Failed to read identity file: {}", path.display()))?;
 
-        let stored: StoredIdentity = serde_json::from_str(&data)
-            .with_context(|| "Failed to parse identity file")?;
+        let stored: StoredIdentity =
+            serde_json::from_str(&data).with_context(|| "Failed to parse identity file")?;
 
-        let key_bytes = hex::decode(&stored.signing_key_hex)
-            .with_context(|| "Invalid hex in signing key")?;
+        let key_bytes =
+            hex::decode(&stored.signing_key_hex).with_context(|| "Invalid hex in signing key")?;
 
         if key_bytes.len() != 32 {
-            anyhow::bail!("Invalid signing key length: expected 32 bytes, got {}", key_bytes.len());
+            anyhow::bail!(
+                "Invalid signing key length: expected 32 bytes, got {}",
+                key_bytes.len()
+            );
         }
 
         let key_array: [u8; 32] = key_bytes.try_into().unwrap();

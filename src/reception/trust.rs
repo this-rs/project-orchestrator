@@ -113,7 +113,8 @@ impl TrustManager {
     pub fn compute_global_trust(&mut self, alpha: f64) {
         self.alpha = alpha.clamp(0.0, 1.0);
         for peer in self.peers.values_mut() {
-            peer.global_trust = self.alpha * peer.local_trust + (1.0 - self.alpha) * peer.network_trust;
+            peer.global_trust =
+                self.alpha * peer.local_trust + (1.0 - self.alpha) * peer.network_trust;
         }
     }
 

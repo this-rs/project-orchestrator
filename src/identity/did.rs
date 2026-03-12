@@ -63,8 +63,7 @@ pub fn from_did_key(did: &str) -> Result<VerifyingKey> {
     }
 
     let key_array: [u8; 32] = key_bytes.try_into().unwrap();
-    VerifyingKey::from_bytes(&key_array)
-        .map_err(|e| anyhow!("Invalid Ed25519 public key: {e}"))
+    VerifyingKey::from_bytes(&key_array).map_err(|e| anyhow!("Invalid Ed25519 public key: {e}"))
 }
 
 #[cfg(test)]
@@ -80,7 +79,10 @@ mod tests {
         let did = to_did_key(&verifying_key);
 
         // Must start with did:key:z6Mk (z = base58btc, 6Mk = Ed25519 multicodec)
-        assert!(did.starts_with("did:key:z"), "did:key should start with 'did:key:z'");
+        assert!(
+            did.starts_with("did:key:z"),
+            "did:key should start with 'did:key:z'"
+        );
 
         // Round-trip
         let recovered = from_did_key(&did).expect("should parse valid did:key");

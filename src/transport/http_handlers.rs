@@ -30,9 +30,7 @@ pub struct P2pState {
 }
 
 /// `GET /api/p2p/identity` — return this instance's PeerInfo for handshake.
-pub async fn get_identity(
-    State(state): State<Arc<P2pState>>,
-) -> impl IntoResponse {
+pub async fn get_identity(State(state): State<Arc<P2pState>>) -> impl IntoResponse {
     Json(IdentityResponse {
         peer_info: state.local_peer_info.clone(),
     })
@@ -87,15 +85,10 @@ pub async fn handle_sync(
             // They sent HAVE — compute what we're missing and send WANT
             let store = state.sync_store.read().await;
             let our_hashes: std::collections::HashSet<String> = store.keys().cloned().collect();
-            let missing: std::collections::HashSet<String> = their_hashes
-                .difference(&our_hashes)
-                .cloned()
-                .collect();
+            let missing: std::collections::HashSet<String> =
+                their_hashes.difference(&our_hashes).cloned().collect();
 
-            debug!(
-                missing_count = missing.len(),
-                "Responding with WANT"
-            );
+            debug!(missing_count = missing.len(), "Responding with WANT");
 
             SyncMessage::Want {
                 content_hashes: missing,
@@ -109,10 +102,7 @@ pub async fn handle_sync(
                 .filter_map(|hash| store.get(hash).cloned())
                 .collect();
 
-            debug!(
-                sending_count = envelopes.len(),
-                "Responding with DATA"
-            );
+            debug!(sending_count = envelopes.len(), "Responding with DATA");
 
             SyncMessage::Data { envelopes }
         }
@@ -187,7 +177,11 @@ pub async fn sync_with_peer(
     let our_hashes: std::collections::HashSet<String> = store.keys().cloned().collect();
 
     let have_request = SyncRequest {
-        sender_did: transport.registry().list().await.first()
+        sender_did: transport
+            .registry()
+            .list()
+            .await
+            .first()
             .map(|p| p.did_key.clone())
             .unwrap_or_default(),
         sync_message: SyncMessage::Have {
@@ -209,7 +203,9 @@ pub async fn sync_with_peer(
         return Err(anyhow::anyhow!("Sync HAVE failed: {}", resp.status()));
     }
 
-    let want_response: SyncResponse = resp.json().await
+    let want_response: SyncResponse = resp
+        .json()
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to parse WANT response: {e}"))?;
 
     let items_requested = match &want_response.sync_message {

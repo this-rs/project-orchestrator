@@ -49,14 +49,12 @@ static RE_H2_PREFIXED_TOKEN: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 /// H3: Private key blocks.
-static RE_H3_PRIVATE_KEY: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"-----BEGIN[A-Z ]*PRIVATE KEY-----").unwrap()
-});
+static RE_H3_PRIVATE_KEY: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"-----BEGIN[A-Z ]*PRIVATE KEY-----").unwrap());
 
 /// H4: Connection strings with credentials (user:pass@host).
-static RE_H4_CONN_STRING: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"[a-zA-Z][a-zA-Z0-9+.-]*://[^:]+:[^@]+@[^\s]+").unwrap()
-});
+static RE_H4_CONN_STRING: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"[a-zA-Z][a-zA-Z0-9+.-]*://[^:]+:[^@]+@[^\s]+").unwrap());
 
 /// H5: JWT tokens (three base64url segments separated by dots).
 static RE_H5_JWT: LazyLock<Regex> = LazyLock::new(|| {
@@ -64,9 +62,8 @@ static RE_H5_JWT: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 /// H6: Password hashes ($2b$, $argon2id$, etc.).
-static RE_H6_PASS_HASH: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\$(?:2[aby]\$|argon2id\$)[^\s]+").unwrap()
-});
+static RE_H6_PASS_HASH: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\$(?:2[aby]\$|argon2id\$)[^\s]+").unwrap());
 
 /// H7: .env-style secret assignments.
 static RE_H7_ENV_SECRET: LazyLock<Regex> = LazyLock::new(|| {
@@ -76,9 +73,8 @@ static RE_H7_ENV_SECRET: LazyLock<Regex> = LazyLock::new(|| {
 // --- L2-CONFIDENTIAL (H8-H13) ---
 
 /// H8: Absolute paths (/Users/xxx/ or /home/xxx/).
-static RE_H8_ABS_PATH: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"/(?:Users|home)/[A-Za-z0-9._-]+/[^\s]*").unwrap()
-});
+static RE_H8_ABS_PATH: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"/(?:Users|home)/[A-Za-z0-9._-]+/[^\s]*").unwrap());
 
 /// H9: RFC1918 private IPs.
 static RE_H9_PRIVATE_IP: LazyLock<Regex> = LazyLock::new(|| {
@@ -86,24 +82,22 @@ static RE_H9_PRIVATE_IP: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 /// H10: Email addresses.
-static RE_H10_EMAIL: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}").unwrap()
-});
+static RE_H10_EMAIL: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}").unwrap());
 
 /// H11: Corporate/internal domains.
-static RE_H11_CORP_DOMAIN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\b[a-zA-Z0-9-]+\.(?:holdings|internal|corp|local)\b").unwrap()
-});
+static RE_H11_CORP_DOMAIN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b[a-zA-Z0-9-]+\.(?:holdings|internal|corp|local)\b").unwrap());
 
 /// H12: UUIDs (8-4-4-4-12 hex).
 static RE_H12_UUID: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b").unwrap()
+    Regex::new(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b")
+        .unwrap()
 });
 
 /// H13: Git SHAs (40-character hex strings).
-static RE_H13_GIT_SHA: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\b[0-9a-fA-F]{40}\b").unwrap()
-});
+static RE_H13_GIT_SHA: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b[0-9a-fA-F]{40}\b").unwrap());
 
 // ============================================================================
 // Anonymization entry point
@@ -167,7 +161,13 @@ pub fn anonymize(content: &str) -> Result<(String, AnonymizationReport), L3Block
     // H9: Private IPs → <ip:N> (deterministic)
     if RE_H9_PRIVATE_IP.is_match(&result) {
         patterns_applied.push("H9-private-ip".to_string());
-        result = replace_deterministic(&RE_H9_PRIVATE_IP, &result, "ip", &mut ip_map, &mut redacted_count);
+        result = replace_deterministic(
+            &RE_H9_PRIVATE_IP,
+            &result,
+            "ip",
+            &mut ip_map,
+            &mut redacted_count,
+        );
     }
 
     // H10: Emails → <author>
@@ -189,13 +189,25 @@ pub fn anonymize(content: &str) -> Result<(String, AnonymizationReport), L3Block
     // H12: UUIDs → <uuid:N> (deterministic)
     if RE_H12_UUID.is_match(&result) {
         patterns_applied.push("H12-uuid".to_string());
-        result = replace_deterministic(&RE_H12_UUID, &result, "uuid", &mut uuid_map, &mut redacted_count);
+        result = replace_deterministic(
+            &RE_H12_UUID,
+            &result,
+            "uuid",
+            &mut uuid_map,
+            &mut redacted_count,
+        );
     }
 
     // H13: Git SHAs → <commit:N> (deterministic)
     if RE_H13_GIT_SHA.is_match(&result) {
         patterns_applied.push("H13-git-sha".to_string());
-        result = replace_deterministic(&RE_H13_GIT_SHA, &result, "commit", &mut sha_map, &mut redacted_count);
+        result = replace_deterministic(
+            &RE_H13_GIT_SHA,
+            &result,
+            "commit",
+            &mut sha_map,
+            &mut redacted_count,
+        );
     }
 
     let report = AnonymizationReport {
@@ -370,7 +382,9 @@ mod tests {
         assert!(result.contains("<ip:0>"));
         assert!(result.contains("<ip:1>"));
         assert!(!result.contains("192.168.1.100"));
-        assert!(report.patterns_applied.contains(&"H9-private-ip".to_string()));
+        assert!(report
+            .patterns_applied
+            .contains(&"H9-private-ip".to_string()));
     }
 
     #[test]
@@ -396,12 +410,15 @@ mod tests {
         let (result, report) = anonymize(content).unwrap();
         assert!(result.contains("<corp-domain>"));
         assert!(!result.contains("app.internal"));
-        assert!(report.patterns_applied.contains(&"H11-corp-domain".to_string()));
+        assert!(report
+            .patterns_applied
+            .contains(&"H11-corp-domain".to_string()));
     }
 
     #[test]
     fn test_h12_uuid_redacted() {
-        let content = "note 550e8400-e29b-41d4-a716-446655440000 and 6ba7b810-9dad-11d1-80b4-00c04fd430c8";
+        let content =
+            "note 550e8400-e29b-41d4-a716-446655440000 and 6ba7b810-9dad-11d1-80b4-00c04fd430c8";
         let (result, report) = anonymize(content).unwrap();
         assert!(result.contains("<uuid:0>"));
         assert!(result.contains("<uuid:1>"));
@@ -439,7 +456,8 @@ mod tests {
 
     #[test]
     fn test_multiple_l2_patterns() {
-        let content = "path /Users/dev/app with uuid 550e8400-e29b-41d4-a716-446655440000 at 192.168.1.1";
+        let content =
+            "path /Users/dev/app with uuid 550e8400-e29b-41d4-a716-446655440000 at 192.168.1.1";
         let (result, report) = anonymize(content).unwrap();
         assert!(result.contains("<PROJECT_ROOT>/"));
         assert!(result.contains("<uuid:0>"));

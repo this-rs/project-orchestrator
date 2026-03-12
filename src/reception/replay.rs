@@ -35,10 +35,7 @@ pub fn replay_lesson(envelope: &VerifiedEnvelope) -> Vec<ReplayedNote> {
 
     let content = format!(
         "[P2P Import] {}\n\nSource: {}\nPortability: {:?}\nConfidence: {:.2}",
-        lesson.abstract_pattern,
-        envelope.source_did,
-        lesson.portability_layer,
-        lesson.confidence,
+        lesson.abstract_pattern, envelope.source_did, lesson.portability_layer, lesson.confidence,
     );
 
     let note = ReplayedNote {
@@ -63,7 +60,11 @@ mod tests {
     use chrono::Utc;
     use std::collections::HashMap;
 
-    fn make_verified(pattern: &str, tags: Vec<String>, portability: PortabilityLayer) -> VerifiedEnvelope {
+    fn make_verified(
+        pattern: &str,
+        tags: Vec<String>,
+        portability: PortabilityLayer,
+    ) -> VerifiedEnvelope {
         VerifiedEnvelope {
             envelope: DistillationEnvelope {
                 lesson: DistilledLesson {
@@ -121,7 +122,9 @@ mod tests {
             PortabilityLayer::Domain,
         );
         let notes = replay_lesson(&env);
-        assert!(notes[0].content.contains("Index foreign keys in relational databases"));
+        assert!(notes[0]
+            .content
+            .contains("Index foreign keys in relational databases"));
     }
 
     #[test]

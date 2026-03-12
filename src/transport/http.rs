@@ -200,10 +200,7 @@ impl TransportLayer for HttpTransport {
         }
 
         if errors.len() == peers.len() && !peers.is_empty() {
-            return Err(anyhow!(
-                "Broadcast failed to all {} peers",
-                peers.len()
-            ));
+            return Err(anyhow!("Broadcast failed to all {} peers", peers.len()));
         }
 
         Ok(())
@@ -211,10 +208,7 @@ impl TransportLayer for HttpTransport {
 
     async fn subscribe(&self, topic: &str) -> Result<mpsc::Receiver<Message>> {
         let (tx, rx) = mpsc::channel(256);
-        self.subscribers
-            .write()
-            .await
-            .push((topic.to_string(), tx));
+        self.subscribers.write().await.push((topic.to_string(), tx));
         Ok(rx)
     }
 
@@ -281,11 +275,7 @@ mod tests {
 
     #[test]
     fn test_message_topic_mapping() {
-        let msg = Message::new(
-            MessageType::Handshake,
-            "did:key:test".to_string(),
-            vec![],
-        );
+        let msg = Message::new(MessageType::Handshake, "did:key:test".to_string(), vec![]);
         assert_eq!(message_topic(&msg), "handshake");
 
         let msg = Message::new(MessageType::Have, "did:key:test".to_string(), vec![]);
@@ -331,7 +321,11 @@ mod tests {
         let mut rx = transport.subscribe("sync").await.unwrap();
 
         // Dispatch a Have message → should match "sync" topic
-        let msg = Message::new(MessageType::Have, "did:key:alice".to_string(), b"test".to_vec());
+        let msg = Message::new(
+            MessageType::Have,
+            "did:key:alice".to_string(),
+            b"test".to_vec(),
+        );
         transport.dispatch_incoming(msg.clone()).await;
 
         let received = rx.try_recv().unwrap();
@@ -345,11 +339,7 @@ mod tests {
 
         let mut rx = transport.subscribe("*").await.unwrap();
 
-        let msg = Message::new(
-            MessageType::Tombstone,
-            "did:key:bob".to_string(),
-            vec![],
-        );
+        let msg = Message::new(MessageType::Tombstone, "did:key:bob".to_string(), vec![]);
         transport.dispatch_incoming(msg).await;
 
         let received = rx.try_recv().unwrap();

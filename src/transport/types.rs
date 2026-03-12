@@ -191,9 +191,12 @@ mod tests {
         assert!(reg.update_last_seen("did:key:alice").await);
         let updated = reg.get("did:key:alice").await.unwrap();
         // Verify last_seen was updated to a recent time (not the 2020 value).
-        assert!(updated.last_seen > DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc));
+        assert!(
+            updated.last_seen
+                > DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc)
+        );
     }
 
     #[tokio::test]

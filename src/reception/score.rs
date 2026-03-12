@@ -79,7 +79,10 @@ fn jaccard_similarity(a: &[String], b: &[String]) -> f64 {
 /// Score the relevance of a verified envelope against local context.
 ///
 /// Formula: `40% tag_overlap + 35% tech_overlap + 25% source_trust`
-pub fn score_relevance(envelope: &VerifiedEnvelope, local_context: &LocalContext) -> RelevanceScore {
+pub fn score_relevance(
+    envelope: &VerifiedEnvelope,
+    local_context: &LocalContext,
+) -> RelevanceScore {
     // Tag overlap: Jaccard similarity between envelope domain_tags and local_tags
     let tag_score = jaccard_similarity(
         &envelope.envelope.lesson.domain_tags,
@@ -173,7 +176,10 @@ mod tests {
         let score = score_relevance(&env, &ctx);
         assert_eq!(score.tag_score, 0.0);
         assert_eq!(score.tech_score, 0.0);
-        assert!((score.trust_score - 0.5).abs() < f64::EPSILON, "Unknown peer should get 0.5");
+        assert!(
+            (score.trust_score - 0.5).abs() < f64::EPSILON,
+            "Unknown peer should get 0.5"
+        );
         // total = 0.0 + 0.0 + 0.25 * 0.5 = 0.125
         assert!(score.total < DEFAULT_THRESHOLD);
         assert!(!score.accepted);
@@ -203,7 +209,10 @@ mod tests {
             known_peers: HashMap::new(),
         };
         let score = score_relevance(&env, &ctx);
-        assert!(score.tag_score > 0.99, "Case-insensitive matching should give perfect score");
+        assert!(
+            score.tag_score > 0.99,
+            "Case-insensitive matching should give perfect score"
+        );
     }
 
     #[test]

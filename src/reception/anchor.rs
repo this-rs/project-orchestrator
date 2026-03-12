@@ -60,10 +60,7 @@ pub fn anchor_notes(notes: &[ReplayedNote], local_tags: &[String]) -> AnchorResu
 
     for note in notes {
         let note_tags_lower: HashSet<String> = note.tags.iter().map(|t| t.to_lowercase()).collect();
-        let overlap: Vec<String> = note_tags_lower
-            .intersection(&local_set)
-            .cloned()
-            .collect();
+        let overlap: Vec<String> = note_tags_lower.intersection(&local_set).cloned().collect();
 
         if !overlap.is_empty() {
             anchored_count += 1;

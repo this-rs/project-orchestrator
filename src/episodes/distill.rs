@@ -52,25 +52,43 @@ pub fn abstract_lesson(episode: &EpisodeContent) -> DistilledLesson {
 fn compute_portability(content: &str, tags: &[String]) -> PortabilityLayer {
     // L1: absolute paths or UUIDs → Local
     let has_abs_path = content.contains("/Users/") || content.contains("/home/");
-    let uuid_re =
-        regex::Regex::new(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
-            .unwrap();
+    let uuid_re = regex::Regex::new(
+        r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+    )
+    .unwrap();
     if has_abs_path || uuid_re.is_match(content) {
         return PortabilityLayer::Local;
     }
 
     // Domain-specific terms (languages, frameworks, databases)
     let domain_terms = [
-        "rust", "python", "java", "typescript", "go", "neo4j", "postgres",
-        "redis", "docker", "kubernetes", "react", "vue", "angular", "graphql",
-        "grpc", "kafka", "rabbitmq", "elasticsearch", "mongodb", "sqlite",
+        "rust",
+        "python",
+        "java",
+        "typescript",
+        "go",
+        "neo4j",
+        "postgres",
+        "redis",
+        "docker",
+        "kubernetes",
+        "react",
+        "vue",
+        "angular",
+        "graphql",
+        "grpc",
+        "kafka",
+        "rabbitmq",
+        "elasticsearch",
+        "mongodb",
+        "sqlite",
     ];
     let content_lower = content.to_lowercase();
     let tags_lower: Vec<String> = tags.iter().map(|t| t.to_lowercase()).collect();
 
-    let has_domain_term = domain_terms.iter().any(|term| {
-        content_lower.contains(term) || tags_lower.iter().any(|t| t.contains(term))
-    });
+    let has_domain_term = domain_terms
+        .iter()
+        .any(|term| content_lower.contains(term) || tags_lower.iter().any(|t| t.contains(term)));
 
     if has_domain_term {
         return PortabilityLayer::Domain;
@@ -78,11 +96,14 @@ fn compute_portability(content: &str, tags: &[String]) -> PortabilityLayer {
 
     // Check for project-specific indicators (proper nouns, config references)
     let project_indicators = [
-        "config.", ".yaml", ".toml", "Cargo.", "package.json", "Makefile",
+        "config.",
+        ".yaml",
+        ".toml",
+        "Cargo.",
+        "package.json",
+        "Makefile",
     ];
-    let has_project_indicator = project_indicators
-        .iter()
-        .any(|ind| content.contains(ind));
+    let has_project_indicator = project_indicators.iter().any(|ind| content.contains(ind));
 
     if has_project_indicator {
         return PortabilityLayer::Project;
@@ -228,7 +249,11 @@ mod tests {
                 "Use UNWIND for batch operations".to_string(),
                 "Index all PRODUCED_DURING relations".to_string(),
             ],
-            tags: vec!["neo4j".to_string(), "performance".to_string(), "Rust".to_string()],
+            tags: vec![
+                "neo4j".to_string(),
+                "performance".to_string(),
+                "Rust".to_string(),
+            ],
             content: "When working with neo4j, always use UNWIND for batch inserts. \
                       This avoids N+1 query patterns and improves throughput by 10x."
                 .to_string(),
@@ -328,7 +353,10 @@ mod tests {
             content: String::new(),
         };
         let lesson = abstract_lesson(&empty);
-        assert!(lesson.confidence >= 0.1, "Confidence should never be below 0.1");
+        assert!(
+            lesson.confidence >= 0.1,
+            "Confidence should never be below 0.1"
+        );
     }
 
     // --- Pattern derivation tests ---
@@ -405,7 +433,10 @@ mod tests {
 
         let envelope = create_envelope(&identity, "redacted content", lesson, Some(report));
 
-        assert_eq!(envelope.meta.sensitivity_level, SensitivityLevel::Restricted);
+        assert_eq!(
+            envelope.meta.sensitivity_level,
+            SensitivityLevel::Restricted
+        );
         assert!(envelope.anonymization_report.is_some());
         assert_eq!(envelope.anonymization_report.unwrap().redacted_count, 3);
     }
@@ -424,11 +455,13 @@ mod tests {
 
         // Verify the signature: sign(content_hash) should be verifiable
         let sig_bytes = hex::decode(&envelope.trust_proof.signature_hex).unwrap();
-        let signature = ed25519_dalek::Signature::from_bytes(
-            sig_bytes.as_slice().try_into().unwrap(),
-        );
+        let signature =
+            ed25519_dalek::Signature::from_bytes(sig_bytes.as_slice().try_into().unwrap());
         let valid = identity.verify(envelope.meta.content_hash.as_bytes(), &signature);
-        assert!(valid, "Envelope signature should be verifiable with the identity");
+        assert!(
+            valid,
+            "Envelope signature should be verifiable with the identity"
+        );
     }
 
     #[test]

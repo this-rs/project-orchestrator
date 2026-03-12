@@ -127,7 +127,11 @@ mod tests {
     fn test_verify_valid_envelope() {
         let (envelope, _) = make_signed_envelope();
         let result = verify_envelope(&envelope);
-        assert!(result.is_ok(), "Valid envelope should verify: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Valid envelope should verify: {:?}",
+            result.err()
+        );
         let verified = result.unwrap();
         assert!(verified.source_did.starts_with("did:key:z"));
         assert!(verified.verified_at <= Utc::now());
@@ -137,11 +141,15 @@ mod tests {
     fn test_verify_tampered_content_hash() {
         let (mut envelope, _) = make_signed_envelope();
         // Tamper with content_hash — signature will fail
-        envelope.meta.content_hash = "0000000000000000000000000000000000000000000000000000000000000000".to_string();
+        envelope.meta.content_hash =
+            "0000000000000000000000000000000000000000000000000000000000000000".to_string();
         let result = verify_envelope(&envelope);
         assert!(result.is_err());
         assert!(
-            result.unwrap_err().to_string().contains("Signature verification failed"),
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Signature verification failed"),
             "Should fail signature check when hash is tampered"
         );
     }
@@ -158,7 +166,10 @@ mod tests {
         let result = verify_envelope(&envelope);
         assert!(result.is_err());
         assert!(
-            result.unwrap_err().to_string().contains("Content hash mismatch"),
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Content hash mismatch"),
             "Should fail content integrity check"
         );
     }
