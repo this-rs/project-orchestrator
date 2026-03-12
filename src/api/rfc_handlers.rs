@@ -788,9 +788,17 @@ pub async fn transition_rfc(
         ));
     }
 
-    // 4. Map the new state name to an RFC status and update the tag
+    // 4. Map the new state name to an RFC status and update the tag.
+    //    Re-read the note to get the latest tags (the auto-create path may have
+    //    added an rfc-run:<uuid> tag since we first loaded `note`).
+    let fresh_note = state
+        .orchestrator
+        .note_manager()
+        .get_note(rfc_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("RFC {} disappeared mid-transition", rfc_id)))?;
     let new_status = map_state_to_rfc_status(&result.current_state_name);
-    let mut tags = note.tags.clone();
+    let mut tags = fresh_note.tags.clone();
     set_status_tag(&mut tags, &new_status);
 
     let update_req = UpdateNoteRequest {
@@ -827,5 +835,1166 @@ fn map_state_to_rfc_status(state_name: &str) -> String {
         "rejected" | "declined" => "rejected".to_string(),
         // Fallback: use the state name as-is
         _ => lower,
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::handlers::ServerState;
+    use crate::api::routes::create_router;
+    use crate::notes::{CreateNoteRequest, NoteImportance, NoteScope, NoteType};
+    use crate::orchestrator::watcher::FileWatcher;
+    use crate::orchestrator::Orchestrator;
+    use crate::test_helpers::{mock_app_state, test_auth_config, test_bearer_token, test_project};
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode as AxumStatus},
+    };
+    use tower::ServiceExt;
+
+    // ----------------------------------------------------------------
+    // Test infrastructure
+    // ----------------------------------------------------------------
+
+    async fn mock_server_state() -> super::OrchestratorState {
+        let app_state = mock_app_state();
+        let orchestrator = std::sync::Arc::new(Orchestrator::new(app_state).await.unwrap());
+        let watcher = std::sync::Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
+            orchestrator.clone(),
+        )));
+        std::sync::Arc::new(ServerState {
+            orchestrator,
+            watcher,
+            chat_manager: None,
+            event_bus: std::sync::Arc::new(crate::events::HybridEmitter::new(std::sync::Arc::new(
+                crate::events::EventBus::default(),
+            ))),
+            nats_emitter: None,
+            auth_config: Some(test_auth_config()),
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+            setup_completed: true,
+            server_port: 6600,
+            public_url: None,
+            ws_ticket_store: std::sync::Arc::new(crate::api::ws_auth::WsTicketStore::new()),
+            registry_remote_url: None,
+            oidc_client: None,
+            identity: None,
+        })
+    }
+
+    /// Build a mock server state with a pre-seeded project and return the project ID.
+    async fn mock_server_with_project() -> (super::OrchestratorState, Uuid) {
+        let app_state = mock_app_state();
+        let project = test_project();
+        let project_id = project.id;
+        app_state.neo4j.create_project(&project).await.unwrap();
+
+        let orchestrator = std::sync::Arc::new(Orchestrator::new(app_state).await.unwrap());
+        let watcher = std::sync::Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
+            orchestrator.clone(),
+        )));
+        let state = std::sync::Arc::new(ServerState {
+            orchestrator,
+            watcher,
+            chat_manager: None,
+            event_bus: std::sync::Arc::new(crate::events::HybridEmitter::new(std::sync::Arc::new(
+                crate::events::EventBus::default(),
+            ))),
+            nats_emitter: None,
+            auth_config: Some(test_auth_config()),
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+            setup_completed: true,
+            server_port: 6600,
+            public_url: None,
+            ws_ticket_store: std::sync::Arc::new(crate::api::ws_auth::WsTicketStore::new()),
+            registry_remote_url: None,
+            oidc_client: None,
+            identity: None,
+        });
+        (state, project_id)
+    }
+
+    fn authed_get(uri: &str) -> Request<Body> {
+        Request::builder()
+            .uri(uri)
+            .header("authorization", test_bearer_token())
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    fn authed_post(uri: &str, body: serde_json::Value) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header("authorization", test_bearer_token())
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    fn authed_patch(uri: &str, body: serde_json::Value) -> Request<Body> {
+        Request::builder()
+            .method("PATCH")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header("authorization", test_bearer_token())
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    fn authed_delete(uri: &str) -> Request<Body> {
+        Request::builder()
+            .method("DELETE")
+            .uri(uri)
+            .header("authorization", test_bearer_token())
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    async fn body_json(resp: axum::http::Response<Body>) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// Create an RFC note directly in the mock store and return its ID.
+    async fn seed_rfc(state: &super::OrchestratorState, project_id: Uuid) -> Uuid {
+        let content = serde_json::json!({
+            "title": "Test RFC",
+            "sections": [
+                {"title": "Problem", "content": "Something needs fixing"},
+                {"title": "Proposed Solution", "content": "Fix it this way"}
+            ]
+        });
+        let req = CreateNoteRequest {
+            project_id: Some(project_id),
+            note_type: NoteType::Rfc,
+            content: content.to_string(),
+            importance: Some(NoteImportance::High),
+            scope: None,
+            tags: Some(vec!["rfc-status:draft".to_string()]),
+            anchors: None,
+            assertion_rule: None,
+            run_id: None,
+        };
+        let note = state
+            .orchestrator
+            .note_manager()
+            .create_note(req, "test")
+            .await
+            .unwrap();
+        note.id
+    }
+
+    // ----------------------------------------------------------------
+    // Unit tests — pure functions
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn test_extract_rfc_status_present() {
+        let tags = vec![
+            "rfc".to_string(),
+            "rfc-status:proposed".to_string(),
+            "feature".to_string(),
+        ];
+        assert_eq!(extract_rfc_status(&tags), "proposed");
+    }
+
+    #[test]
+    fn test_extract_rfc_status_missing() {
+        let tags = vec!["rfc".to_string(), "feature".to_string()];
+        assert_eq!(extract_rfc_status(&tags), "draft");
+    }
+
+    #[test]
+    fn test_extract_run_id_present() {
+        let run_id = Uuid::new_v4();
+        let tags = vec![format!("rfc-run:{}", run_id)];
+        assert_eq!(extract_run_id(&tags), Some(run_id.to_string()));
+    }
+
+    #[test]
+    fn test_extract_run_id_missing() {
+        let tags = vec!["rfc-status:draft".to_string()];
+        assert_eq!(extract_run_id(&tags), None);
+    }
+
+    #[test]
+    fn test_set_status_tag_replaces_existing() {
+        let mut tags = vec!["rfc-status:draft".to_string(), "feature".to_string()];
+        set_status_tag(&mut tags, "proposed");
+        assert!(tags.contains(&"rfc-status:proposed".to_string()));
+        assert!(!tags.contains(&"rfc-status:draft".to_string()));
+        assert!(tags.contains(&"feature".to_string()));
+    }
+
+    #[test]
+    fn test_set_status_tag_adds_if_missing() {
+        let mut tags = vec!["feature".to_string()];
+        set_status_tag(&mut tags, "draft");
+        assert_eq!(tags.len(), 2);
+        assert!(tags.contains(&"rfc-status:draft".to_string()));
+    }
+
+    #[test]
+    fn test_map_state_to_rfc_status_known_states() {
+        assert_eq!(map_state_to_rfc_status("draft"), "draft");
+        assert_eq!(map_state_to_rfc_status("proposed"), "proposed");
+        assert_eq!(map_state_to_rfc_status("in_review"), "proposed");
+        assert_eq!(map_state_to_rfc_status("review"), "proposed");
+        assert_eq!(map_state_to_rfc_status("accepted"), "accepted");
+        assert_eq!(map_state_to_rfc_status("approved"), "accepted");
+        assert_eq!(map_state_to_rfc_status("implemented"), "implemented");
+        assert_eq!(map_state_to_rfc_status("done"), "implemented");
+        assert_eq!(map_state_to_rfc_status("completed"), "implemented");
+        assert_eq!(map_state_to_rfc_status("rejected"), "rejected");
+        assert_eq!(map_state_to_rfc_status("declined"), "rejected");
+    }
+
+    #[test]
+    fn test_map_state_to_rfc_status_case_insensitive() {
+        assert_eq!(map_state_to_rfc_status("DRAFT"), "draft");
+        assert_eq!(map_state_to_rfc_status("Proposed"), "proposed");
+        assert_eq!(map_state_to_rfc_status("ACCEPTED"), "accepted");
+    }
+
+    #[test]
+    fn test_map_state_to_rfc_status_fallback() {
+        assert_eq!(map_state_to_rfc_status("under_review"), "under_review");
+        assert_eq!(map_state_to_rfc_status("planning"), "planning");
+        assert_eq!(map_state_to_rfc_status("in_progress"), "in_progress");
+        assert_eq!(map_state_to_rfc_status("superseded"), "superseded");
+    }
+
+    #[test]
+    fn test_extract_title_from_markdown_h1() {
+        assert_eq!(
+            extract_title_from_markdown("# My Title\nSome content"),
+            Some("My Title".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_title_from_markdown_h2() {
+        assert_eq!(
+            extract_title_from_markdown("## My Title\nSome content"),
+            Some("My Title".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_title_from_markdown_rfc_prefix() {
+        assert_eq!(
+            extract_title_from_markdown("## RFC — Auto Bootstrap\nContent"),
+            Some("Auto Bootstrap".to_string())
+        );
+        assert_eq!(
+            extract_title_from_markdown("## RFC: Auto Bootstrap\nContent"),
+            Some("Auto Bootstrap".to_string())
+        );
+        assert_eq!(
+            extract_title_from_markdown("## RFC - Auto Bootstrap\nContent"),
+            Some("Auto Bootstrap".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_title_from_markdown_no_heading() {
+        assert_eq!(
+            extract_title_from_markdown("Just some text\nNo heading here"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_note_to_rfc_json_content() {
+        let content = serde_json::json!({
+            "title": "My RFC",
+            "sections": [{"title": "Problem", "content": "Something broke"}]
+        });
+        let note = crate::notes::Note::new_full(
+            Some(Uuid::new_v4()),
+            NoteType::Rfc,
+            NoteImportance::High,
+            NoteScope::Project,
+            content.to_string(),
+            vec!["rfc-status:draft".to_string()],
+            "test".to_string(),
+        );
+        let rfc = note_to_rfc(&note);
+        assert_eq!(rfc.title, "My RFC");
+        assert_eq!(rfc.status, "draft");
+        assert_eq!(rfc.importance, "high");
+        assert_eq!(rfc.sections.len(), 1);
+        assert_eq!(rfc.sections[0].title, "Problem");
+    }
+
+    #[test]
+    fn test_note_to_rfc_markdown_content() {
+        let note = crate::notes::Note::new_full(
+            Some(Uuid::new_v4()),
+            NoteType::Rfc,
+            NoteImportance::Medium,
+            NoteScope::Project,
+            "## RFC — Auto Bootstrap\n\nSome content here".to_string(),
+            vec!["rfc-status:proposed".to_string()],
+            "test".to_string(),
+        );
+        let rfc = note_to_rfc(&note);
+        assert_eq!(rfc.title, "Auto Bootstrap");
+        assert_eq!(rfc.status, "proposed");
+        assert_eq!(rfc.sections.len(), 1);
+        assert_eq!(rfc.sections[0].title, "Content");
+    }
+
+    #[test]
+    fn test_note_to_rfc_plain_text_fallback() {
+        let note = crate::notes::Note::new_full(
+            Some(Uuid::new_v4()),
+            NoteType::Rfc,
+            NoteImportance::Low,
+            NoteScope::Project,
+            "Just plain text, no heading".to_string(),
+            vec!["rfc-status:draft".to_string()],
+            "test".to_string(),
+        );
+        let rfc = note_to_rfc(&note);
+        assert_eq!(rfc.title, "Untitled RFC");
+    }
+
+    #[test]
+    fn test_note_to_rfc_filters_internal_tags() {
+        let note = crate::notes::Note::new_full(
+            Some(Uuid::new_v4()),
+            NoteType::Rfc,
+            NoteImportance::Medium,
+            NoteScope::Project,
+            "{}".to_string(),
+            vec![
+                "rfc-status:draft".to_string(),
+                "rfc-run:some-uuid".to_string(),
+                "user-tag".to_string(),
+            ],
+            "test".to_string(),
+        );
+        let rfc = note_to_rfc(&note);
+        assert_eq!(rfc.tags, vec!["user-tag".to_string()]);
+    }
+
+    #[test]
+    fn test_note_to_rfc_extracts_run_id() {
+        let run_id = Uuid::new_v4();
+        let note = crate::notes::Note::new_full(
+            Some(Uuid::new_v4()),
+            NoteType::Rfc,
+            NoteImportance::Medium,
+            NoteScope::Project,
+            "{}".to_string(),
+            vec![format!("rfc-run:{}", run_id)],
+            "test".to_string(),
+        );
+        let rfc = note_to_rfc(&note);
+        assert_eq!(rfc.protocol_run_id, Some(run_id.to_string()));
+    }
+
+    #[test]
+    fn test_rfc_content_json_roundtrip() {
+        let sections = vec![
+            RfcSection {
+                title: "Problem".to_string(),
+                content: "Something".to_string(),
+            },
+            RfcSection {
+                title: "Solution".to_string(),
+                content: "Fix it".to_string(),
+            },
+        ];
+        let json = rfc_content_json("My RFC", &sections);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["title"], "My RFC");
+        assert_eq!(parsed["sections"].as_array().unwrap().len(), 2);
+    }
+
+    // ----------------------------------------------------------------
+    // Handler integration tests (axum + mock backends)
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_list_rfcs_empty() {
+        let state = mock_server_state().await;
+        let app = create_router(state);
+
+        let resp = app.oneshot(authed_get("/api/rfcs")).await.unwrap();
+        assert_eq!(resp.status(), AxumStatus::OK);
+
+        let json = body_json(resp).await;
+        assert_eq!(json["total"], 0);
+        assert_eq!(json["items"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_create_rfc() {
+        let (state, project_id) = mock_server_with_project().await;
+        let app = create_router(state);
+
+        let body = serde_json::json!({
+            "title": "New RFC",
+            "sections": [{"title": "Problem", "content": "Need improvement"}],
+            "importance": "high",
+            "project_id": project_id.to_string(),
+            "tags": ["backend"]
+        });
+
+        let resp = app.oneshot(authed_post("/api/rfcs", body)).await.unwrap();
+        assert_eq!(resp.status(), AxumStatus::CREATED);
+
+        let json = body_json(resp).await;
+        assert_eq!(json["title"], "New RFC");
+        assert_eq!(json["status"], "draft");
+        assert_eq!(json["importance"], "high");
+        assert_eq!(json["sections"].as_array().unwrap().len(), 1);
+        assert!(json["id"].as_str().is_some());
+        // Internal tags should be filtered
+        let tags = json["tags"].as_array().unwrap();
+        assert!(tags.iter().any(|t| t.as_str() == Some("backend")));
+        assert!(!tags
+            .iter()
+            .any(|t| t.as_str().unwrap().starts_with("rfc-status:")));
+    }
+
+    #[tokio::test]
+    async fn test_get_rfc() {
+        let (state, project_id) = mock_server_with_project().await;
+        let rfc_id = seed_rfc(&state, project_id).await;
+        let app = create_router(state);
+
+        let resp = app
+            .oneshot(authed_get(&format!("/api/rfcs/{}", rfc_id)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), AxumStatus::OK);
+
+        let json = body_json(resp).await;
+        assert_eq!(json["id"], rfc_id.to_string());
+        assert_eq!(json["title"], "Test RFC");
+        assert_eq!(json["status"], "draft");
+        assert_eq!(json["sections"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_get_rfc_not_found() {
+        let state = mock_server_state().await;
+        let app = create_router(state);
+        let fake_id = Uuid::new_v4();
+
+        let resp = app
+            .oneshot(authed_get(&format!("/api/rfcs/{}", fake_id)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), AxumStatus::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_update_rfc_title() {
+        let (state, project_id) = mock_server_with_project().await;
+        let rfc_id = seed_rfc(&state, project_id).await;
+        let app = create_router(state);
+
+        let body = serde_json::json!({"title": "Updated RFC Title"});
+        let resp = app
+            .oneshot(authed_patch(&format!("/api/rfcs/{}", rfc_id), body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), AxumStatus::OK);
+
+        let json = body_json(resp).await;
+        assert_eq!(json["title"], "Updated RFC Title");
+        // Sections should be preserved
+        assert_eq!(json["sections"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_update_rfc_sections() {
+        let (state, project_id) = mock_server_with_project().await;
+        let rfc_id = seed_rfc(&state, project_id).await;
+        let app = create_router(state);
+
+        let body = serde_json::json!({
+            "sections": [{"title": "New Section", "content": "New content"}]
+        });
+        let resp = app
+            .oneshot(authed_patch(&format!("/api/rfcs/{}", rfc_id), body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), AxumStatus::OK);
+
+        let json = body_json(resp).await;
+        assert_eq!(json["sections"].as_array().unwrap().len(), 1);
+        assert_eq!(json["sections"][0]["title"], "New Section");
+        // Title should be preserved
+        assert_eq!(json["title"], "Test RFC");
+    }
+
+    #[tokio::test]
+    async fn test_update_rfc_importance() {
+        let (state, project_id) = mock_server_with_project().await;
+        let rfc_id = seed_rfc(&state, project_id).await;
+        let app = create_router(state);
+
+        let body = serde_json::json!({"importance": "critical"});
+        let resp = app
+            .oneshot(authed_patch(&format!("/api/rfcs/{}", rfc_id), body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), AxumStatus::OK);
+
+        let json = body_json(resp).await;
+        assert_eq!(json["importance"], "critical");
+    }
+
+    #[tokio::test]
+    async fn test_update_rfc_not_found() {
+        let state = mock_server_state().await;
+        let app = create_router(state);
+        let fake_id = Uuid::new_v4();
+
+        let body = serde_json::json!({"title": "No such RFC"});
+        let resp = app
+            .oneshot(authed_patch(&format!("/api/rfcs/{}", fake_id), body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), AxumStatus::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_delete_rfc() {
+        let (state, project_id) = mock_server_with_project().await;
+        let rfc_id = seed_rfc(&state, project_id).await;
+        let app = create_router(state);
+
+        let resp = app
+            .oneshot(authed_delete(&format!("/api/rfcs/{}", rfc_id)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), AxumStatus::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn test_delete_rfc_not_found() {
+        let state = mock_server_state().await;
+        let app = create_router(state);
+        let fake_id = Uuid::new_v4();
+
+        let resp = app
+            .oneshot(authed_delete(&format!("/api/rfcs/{}", fake_id)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), AxumStatus::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_list_rfcs_returns_created() {
+        let (state, project_id) = mock_server_with_project().await;
+        let _rfc_id = seed_rfc(&state, project_id).await;
+        let app = create_router(state);
+
+        let resp = app.oneshot(authed_get("/api/rfcs")).await.unwrap();
+        assert_eq!(resp.status(), AxumStatus::OK);
+
+        let json = body_json(resp).await;
+        assert_eq!(json["total"], 1);
+        let items = json["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["title"], "Test RFC");
+        assert_eq!(items[0]["status"], "draft");
+    }
+
+    #[tokio::test]
+    async fn test_list_rfcs_with_status_filter() {
+        let (state, project_id) = mock_server_with_project().await;
+        // Create a draft RFC
+        let _rfc_id = seed_rfc(&state, project_id).await;
+        let app = create_router(state);
+
+        // Filter by "proposed" — should return 0
+        let resp = app
+            .oneshot(authed_get("/api/rfcs?status=proposed"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), AxumStatus::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["total"], 0);
+    }
+
+    #[tokio::test]
+    async fn test_list_rfcs_with_draft_filter() {
+        let (state, project_id) = mock_server_with_project().await;
+        let _rfc_id = seed_rfc(&state, project_id).await;
+        let app = create_router(state);
+
+        let resp = app
+            .oneshot(authed_get("/api/rfcs?status=draft"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), AxumStatus::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["total"], 1);
+    }
+
+    #[tokio::test]
+    async fn test_transition_rfc_bootstrap_and_propose() {
+        let (state, project_id) = mock_server_with_project().await;
+        let rfc_id = seed_rfc(&state, project_id).await;
+        let app = create_router(state);
+
+        // Transition: draft → proposed (triggers bootstrap of rfc-lifecycle protocol)
+        let body = serde_json::json!({"action": "propose"});
+        let resp = app
+            .oneshot(authed_post(
+                &format!("/api/rfcs/{}/transition", rfc_id),
+                body,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), AxumStatus::OK);
+
+        let json = body_json(resp).await;
+        assert_eq!(json["current_state"], "proposed");
+        assert_eq!(json["status"], "proposed");
+        // Should have a protocol run linked
+        assert!(json["protocol_run_id"].as_str().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_transition_rfc_full_lifecycle() {
+        let (state, project_id) = mock_server_with_project().await;
+        let rfc_id = seed_rfc(&state, project_id).await;
+
+        // draft → proposed
+        let app = create_router(state.clone());
+        let resp = app
+            .oneshot(authed_post(
+                &format!("/api/rfcs/{}/transition", rfc_id),
+                serde_json::json!({"action": "propose"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), AxumStatus::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["current_state"], "proposed");
+
+        // proposed → under_review
+        let app = create_router(state.clone());
+        let resp = app
+            .oneshot(authed_post(
+                &format!("/api/rfcs/{}/transition", rfc_id),
+                serde_json::json!({"action": "submit_review"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), AxumStatus::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["current_state"], "under_review");
+
+        // under_review → accepted
+        let app = create_router(state.clone());
+        let resp = app
+            .oneshot(authed_post(
+                &format!("/api/rfcs/{}/transition", rfc_id),
+                serde_json::json!({"action": "accept"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), AxumStatus::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["current_state"], "accepted");
+
+        // accepted → planning
+        let app = create_router(state.clone());
+        let resp = app
+            .oneshot(authed_post(
+                &format!("/api/rfcs/{}/transition", rfc_id),
+                serde_json::json!({"action": "start_planning"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), AxumStatus::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["current_state"], "planning");
+
+        // planning → in_progress
+        let app = create_router(state.clone());
+        let resp = app
+            .oneshot(authed_post(
+                &format!("/api/rfcs/{}/transition", rfc_id),
+                serde_json::json!({"action": "start_work"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), AxumStatus::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["current_state"], "in_progress");
+
+        // in_progress → implemented
+        let app = create_router(state.clone());
+        let resp = app
+            .oneshot(authed_post(
+                &format!("/api/rfcs/{}/transition", rfc_id),
+                serde_json::json!({"action": "complete"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), AxumStatus::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["current_state"], "implemented");
+    }
+
+    #[tokio::test]
+    async fn test_transition_rfc_invalid_trigger() {
+        let (state, project_id) = mock_server_with_project().await;
+        let rfc_id = seed_rfc(&state, project_id).await;
+
+        // First bootstrap with a valid transition
+        let app = create_router(state.clone());
+        let resp = app
+            .oneshot(authed_post(
+                &format!("/api/rfcs/{}/transition", rfc_id),
+                serde_json::json!({"action": "propose"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), AxumStatus::OK);
+
+        // Try invalid trigger from proposed state (accept is not valid from proposed)
+        let app = create_router(state.clone());
+        let resp = app
+            .oneshot(authed_post(
+                &format!("/api/rfcs/{}/transition", rfc_id),
+                serde_json::json!({"action": "accept"}),
+            ))
+            .await
+            .unwrap();
+        // Should fail — accept is not valid from proposed
+        assert_ne!(resp.status(), AxumStatus::OK);
+    }
+
+    #[tokio::test]
+    async fn test_transition_rfc_reject_from_proposed() {
+        let (state, project_id) = mock_server_with_project().await;
+        let rfc_id = seed_rfc(&state, project_id).await;
+
+        // draft → proposed
+        let app = create_router(state.clone());
+        app.oneshot(authed_post(
+            &format!("/api/rfcs/{}/transition", rfc_id),
+            serde_json::json!({"action": "propose"}),
+        ))
+        .await
+        .unwrap();
+
+        // proposed → rejected
+        let app = create_router(state.clone());
+        let resp = app
+            .oneshot(authed_post(
+                &format!("/api/rfcs/{}/transition", rfc_id),
+                serde_json::json!({"action": "reject"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), AxumStatus::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["current_state"], "rejected");
+    }
+
+    #[tokio::test]
+    async fn test_transition_rfc_supersede_from_draft() {
+        let (state, project_id) = mock_server_with_project().await;
+        let rfc_id = seed_rfc(&state, project_id).await;
+
+        // draft → superseded
+        let app = create_router(state.clone());
+        let resp = app
+            .oneshot(authed_post(
+                &format!("/api/rfcs/{}/transition", rfc_id),
+                serde_json::json!({"action": "supersede"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), AxumStatus::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["current_state"], "superseded");
+    }
+
+    #[tokio::test]
+    async fn test_transition_rfc_revise_back_to_draft() {
+        let (state, project_id) = mock_server_with_project().await;
+        let rfc_id = seed_rfc(&state, project_id).await;
+
+        // draft → proposed → under_review
+        let app = create_router(state.clone());
+        app.oneshot(authed_post(
+            &format!("/api/rfcs/{}/transition", rfc_id),
+            serde_json::json!({"action": "propose"}),
+        ))
+        .await
+        .unwrap();
+        let app = create_router(state.clone());
+        app.oneshot(authed_post(
+            &format!("/api/rfcs/{}/transition", rfc_id),
+            serde_json::json!({"action": "submit_review"}),
+        ))
+        .await
+        .unwrap();
+
+        // under_review → draft (revise)
+        let app = create_router(state.clone());
+        let resp = app
+            .oneshot(authed_post(
+                &format!("/api/rfcs/{}/transition", rfc_id),
+                serde_json::json!({"action": "revise"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), AxumStatus::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["current_state"], "draft");
+    }
+
+    #[tokio::test]
+    async fn test_transition_rfc_replan() {
+        let (state, project_id) = mock_server_with_project().await;
+        let rfc_id = seed_rfc(&state, project_id).await;
+
+        // Move to in_progress: draft → proposed → under_review → accepted → planning → in_progress
+        for action in &[
+            "propose",
+            "submit_review",
+            "accept",
+            "start_planning",
+            "start_work",
+        ] {
+            let app = create_router(state.clone());
+            let resp = app
+                .oneshot(authed_post(
+                    &format!("/api/rfcs/{}/transition", rfc_id),
+                    serde_json::json!({"action": action}),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), AxumStatus::OK);
+        }
+
+        // in_progress → planning (replan)
+        let app = create_router(state.clone());
+        let resp = app
+            .oneshot(authed_post(
+                &format!("/api/rfcs/{}/transition", rfc_id),
+                serde_json::json!({"action": "replan"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), AxumStatus::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["current_state"], "planning");
+    }
+
+    #[tokio::test]
+    async fn test_transition_rfc_not_found() {
+        let state = mock_server_state().await;
+        let app = create_router(state);
+        let fake_id = Uuid::new_v4();
+
+        let resp = app
+            .oneshot(authed_post(
+                &format!("/api/rfcs/{}/transition", fake_id),
+                serde_json::json!({"action": "propose"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), AxumStatus::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_get_rfc_with_available_transitions() {
+        let (state, project_id) = mock_server_with_project().await;
+        let rfc_id = seed_rfc(&state, project_id).await;
+
+        // Trigger a transition to create the protocol run
+        let app = create_router(state.clone());
+        app.oneshot(authed_post(
+            &format!("/api/rfcs/{}/transition", rfc_id),
+            serde_json::json!({"action": "propose"}),
+        ))
+        .await
+        .unwrap();
+
+        // Now GET should return available_transitions
+        let app = create_router(state.clone());
+        let resp = app
+            .oneshot(authed_get(&format!("/api/rfcs/{}", rfc_id)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), AxumStatus::OK);
+
+        let json = body_json(resp).await;
+        assert_eq!(json["current_state"], "proposed");
+        let transitions = json["available_transitions"].as_array().unwrap();
+        assert!(!transitions.is_empty());
+        // From proposed, we should have submit_review, reject, supersede
+        let triggers: Vec<&str> = transitions
+            .iter()
+            .map(|t| t["trigger"].as_str().unwrap())
+            .collect();
+        assert!(triggers.contains(&"submit_review"));
+        assert!(triggers.contains(&"reject"));
+        assert!(triggers.contains(&"supersede"));
+    }
+
+    #[tokio::test]
+    async fn test_list_rfcs_enriches_current_state() {
+        let (state, project_id) = mock_server_with_project().await;
+        let rfc_id = seed_rfc(&state, project_id).await;
+
+        // Transition to proposed
+        let app = create_router(state.clone());
+        app.oneshot(authed_post(
+            &format!("/api/rfcs/{}/transition", rfc_id),
+            serde_json::json!({"action": "propose"}),
+        ))
+        .await
+        .unwrap();
+
+        // List should show current_state
+        let app = create_router(state.clone());
+        let resp = app.oneshot(authed_get("/api/rfcs")).await.unwrap();
+        assert_eq!(resp.status(), AxumStatus::OK);
+
+        let json = body_json(resp).await;
+        let items = json["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["current_state"], "proposed");
+    }
+
+    // ----------------------------------------------------------------
+    // Bootstrap tests
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_bootstrap_creates_protocol() {
+        let app_state = mock_app_state();
+        let project = test_project();
+        let project_id = project.id;
+        app_state.neo4j.create_project(&project).await.unwrap();
+
+        // Should have no protocols initially
+        let (protocols, _) = app_state
+            .neo4j
+            .list_protocols(project_id, None, 100, 0)
+            .await
+            .unwrap();
+        assert_eq!(protocols.len(), 0);
+
+        // Bootstrap
+        let protocol = find_or_create_rfc_lifecycle(app_state.neo4j.as_ref(), project_id)
+            .await
+            .unwrap();
+        assert_eq!(protocol.name, "rfc-lifecycle");
+
+        // Verify states
+        let states = app_state
+            .neo4j
+            .get_protocol_states(protocol.id)
+            .await
+            .unwrap();
+        assert_eq!(states.len(), 9);
+
+        let state_names: Vec<&str> = states.iter().map(|s| s.name.as_str()).collect();
+        assert!(state_names.contains(&"draft"));
+        assert!(state_names.contains(&"proposed"));
+        assert!(state_names.contains(&"under_review"));
+        assert!(state_names.contains(&"accepted"));
+        assert!(state_names.contains(&"planning"));
+        assert!(state_names.contains(&"in_progress"));
+        assert!(state_names.contains(&"implemented"));
+        assert!(state_names.contains(&"rejected"));
+        assert!(state_names.contains(&"superseded"));
+
+        // Verify transitions
+        let transitions = app_state
+            .neo4j
+            .get_protocol_transitions(protocol.id)
+            .await
+            .unwrap();
+        assert_eq!(transitions.len(), 16);
+
+        // Verify entry state is draft
+        let entry = states
+            .iter()
+            .find(|s| s.id == protocol.entry_state)
+            .unwrap();
+        assert_eq!(entry.name, "draft");
+
+        // Verify terminal states
+        assert_eq!(protocol.terminal_states.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_bootstrap_idempotent() {
+        let app_state = mock_app_state();
+        let project = test_project();
+        let project_id = project.id;
+        app_state.neo4j.create_project(&project).await.unwrap();
+
+        // Bootstrap twice
+        let p1 = find_or_create_rfc_lifecycle(app_state.neo4j.as_ref(), project_id)
+            .await
+            .unwrap();
+        let p2 = find_or_create_rfc_lifecycle(app_state.neo4j.as_ref(), project_id)
+            .await
+            .unwrap();
+
+        // Should return the same protocol
+        assert_eq!(p1.id, p2.id);
+
+        // Should still have exactly 1 protocol
+        let (protocols, _) = app_state
+            .neo4j
+            .list_protocols(project_id, None, 100, 0)
+            .await
+            .unwrap();
+        assert_eq!(protocols.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_bootstrap_start_state_is_start_type() {
+        let app_state = mock_app_state();
+        let project = test_project();
+        app_state.neo4j.create_project(&project).await.unwrap();
+
+        let protocol = find_or_create_rfc_lifecycle(app_state.neo4j.as_ref(), project.id)
+            .await
+            .unwrap();
+        let states = app_state
+            .neo4j
+            .get_protocol_states(protocol.id)
+            .await
+            .unwrap();
+
+        let draft = states.iter().find(|s| s.name == "draft").unwrap();
+        assert_eq!(draft.state_type, StateType::Start);
+    }
+
+    #[tokio::test]
+    async fn test_bootstrap_terminal_states() {
+        let app_state = mock_app_state();
+        let project = test_project();
+        app_state.neo4j.create_project(&project).await.unwrap();
+
+        let protocol = find_or_create_rfc_lifecycle(app_state.neo4j.as_ref(), project.id)
+            .await
+            .unwrap();
+        let states = app_state
+            .neo4j
+            .get_protocol_states(protocol.id)
+            .await
+            .unwrap();
+
+        for name in &["implemented", "rejected", "superseded"] {
+            let s = states.iter().find(|s| s.name == *name).unwrap();
+            assert_eq!(
+                s.state_type,
+                StateType::Terminal,
+                "{} should be terminal",
+                name
+            );
+        }
+    }
+
+    // ----------------------------------------------------------------
+    // Edge cases
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_create_rfc_without_project_id() {
+        let state = mock_server_state().await;
+        let app = create_router(state);
+
+        let body = serde_json::json!({
+            "title": "Orphan RFC",
+            "sections": [{"title": "Problem", "content": "No project"}]
+        });
+
+        let resp = app.oneshot(authed_post("/api/rfcs", body)).await.unwrap();
+        assert_eq!(resp.status(), AxumStatus::CREATED);
+
+        let json = body_json(resp).await;
+        assert_eq!(json["title"], "Orphan RFC");
+    }
+
+    #[tokio::test]
+    async fn test_create_rfc_default_importance() {
+        let state = mock_server_state().await;
+        let app = create_router(state);
+
+        let body = serde_json::json!({
+            "title": "RFC No Importance",
+            "sections": [{"title": "Problem", "content": "Default importance"}]
+        });
+
+        let resp = app.oneshot(authed_post("/api/rfcs", body)).await.unwrap();
+        assert_eq!(resp.status(), AxumStatus::CREATED);
+
+        let json = body_json(resp).await;
+        // Default importance should be medium
+        assert_eq!(json["importance"], "medium");
+    }
+
+    #[tokio::test]
+    async fn test_update_rfc_preserves_status_tags() {
+        let (state, project_id) = mock_server_with_project().await;
+        let rfc_id = seed_rfc(&state, project_id).await;
+        let app = create_router(state);
+
+        // Update tags — internal rfc-status tag should be preserved
+        let body = serde_json::json!({"tags": ["new-tag"]});
+        let resp = app
+            .oneshot(authed_patch(&format!("/api/rfcs/{}", rfc_id), body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), AxumStatus::OK);
+
+        let json = body_json(resp).await;
+        let tags = json["tags"].as_array().unwrap();
+        assert!(tags.iter().any(|t| t.as_str() == Some("new-tag")));
+        // Status should still be draft (preserved internally)
+        assert_eq!(json["status"], "draft");
+    }
+
+    #[tokio::test]
+    async fn test_list_rfcs_pagination() {
+        let (state, project_id) = mock_server_with_project().await;
+
+        // Create 3 RFCs
+        for _ in 0..3 {
+            seed_rfc(&state, project_id).await;
+        }
+
+        let app = create_router(state);
+
+        // Request with limit=2
+        let resp = app.oneshot(authed_get("/api/rfcs?limit=2")).await.unwrap();
+        assert_eq!(resp.status(), AxumStatus::OK);
+
+        let json = body_json(resp).await;
+        assert_eq!(json["total"], 3);
+        assert_eq!(json["items"].as_array().unwrap().len(), 2);
     }
 }
