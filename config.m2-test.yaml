@@ -1,0 +1,26 @@
+server:
+  port: 6601
+  workspace_path: /tmp/m2-workspace
+neo4j:
+  uri: bolt://localhost:17687
+  user: neo4j
+  password: orchestrator123
+meilisearch:
+  url: http://localhost:17700
+  key: orchestrator-meili-key-m2
+nats:
+  url: nats://localhost:14222
+chat:
+  default_model: claude-opus-4-6
+  max_sessions: 5
+  session_timeout_secs: 600
+  max_turns: 50
+  prompt_builder_model: claude-opus-4-6
+  permissions:
+    mode: bypassPermissions
+    allowed_tools:
+    - mcp__project-orchestrator__*
+    - Bash(git *)
+    - Bash(cargo *)
+    - Read
+    - Edit

@@ -1,0 +1,73 @@
+# Temporary docker-compose for M2 testing — 2nd PO instance with isolated services
+# Usage: docker compose -f docker-compose.test-m2.yml up -d
+# Cleanup: docker compose -f docker-compose.test-m2.yml down -v
+
+services:
+  neo4j-m2:
+    image: neo4j:5.26.20-community
+    container_name: orchestrator-neo4j-m2
+    ports:
+      - "17474:7474"  # HTTP Browser
+      - "17687:7687"  # Bolt
+    environment:
+      - NEO4J_AUTH=neo4j/orchestrator123
+      - NEO4J_PLUGINS=["apoc"]
+      - NEO4J_dbms_security_procedures_unrestricted=apoc.*
+      - NEO4J_dbms_memory_heap_initial__size=512M
+      - NEO4J_dbms_memory_heap_max__size=1G
+    volumes:
+      - neo4j_data_m2:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:7474 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - m2-net
+
+  meilisearch-m2:
+    image: getmeili/meilisearch:v1.34.2
+    container_name: orchestrator-meilisearch-m2
+    ports:
+      - "17700:7700"
+    environment:
+      - MEILI_MASTER_KEY=orchestrator-meili-key-m2
+      - MEILI_ENV=development
+      - MEILI_LOG_LEVEL=INFO
+      - MEILI_MAX_INDEXING_MEMORY=256MiB
+    volumes:
+      - meilisearch_data_m2:/meili_data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7700/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - m2-net
+
+  nats-m2:
+    image: nats:2.11-alpine
+    container_name: orchestrator-nats-m2
+    ports:
+      - "14222:4222"   # Client connections
+      - "18222:8222"   # HTTP monitoring
+    command: ["--http_port", "8222", "--jetstream"]
+    volumes:
+      - nats_data_m2:/data/jetstream
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8222/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - m2-net
+
+volumes:
+  neo4j_data_m2:
+  meilisearch_data_m2:
+  nats_data_m2:
+
+networks:
+  m2-net:
+    driver: bridge
