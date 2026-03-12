@@ -5,7 +5,9 @@
 //! - **did:key identifier**: decentralized identifier derived from the public key
 //! - **PASETO v4.public tokens**: for authenticating P2P messages
 //!
-//! The identity is persisted to `~/.openclaw/identity.key` and loaded on startup.
+//! The identity is persisted to the platform config directory
+//! (e.g. `~/Library/Application Support/project-orchestrator/identity.key` on macOS)
+//! and loaded on startup.
 
 pub mod did;
 pub mod rotation;
@@ -21,8 +23,7 @@ use tracing::info;
 
 use self::rotation::KeyHistory;
 
-/// Default identity file location relative to home.
-const IDENTITY_DIR: &str = ".openclaw";
+/// Default identity file name.
 const IDENTITY_FILE: &str = "identity.key";
 
 /// Core identity of a Project Orchestrator instance.
@@ -77,6 +78,9 @@ impl InstanceIdentity {
     }
 
     /// Load identity from file, or generate a new one if not found.
+    ///
+    /// On first startup, generates a fresh Ed25519 keypair and persists it.
+    /// Subsequent startups reload the same identity.
     pub fn load_or_generate(path: Option<&Path>) -> Result<Self> {
         let storage_path = path.map(PathBuf::from).unwrap_or_else(default_storage_path);
 
@@ -234,11 +238,26 @@ impl InstanceIdentity {
 }
 
 /// Get the default storage path for identity files.
+///
+/// Uses the platform-specific app config directory:
+/// - macOS: `~/Library/Application Support/project-orchestrator/identity.key`
+/// - Linux: `~/.config/project-orchestrator/identity.key`
+/// - Windows: `%APPDATA%\ProjectOrchestrator\identity.key`
+///
+/// Falls back to `~/.project-orchestrator/identity.key` if `dirs::config_dir()` is unavailable.
 fn default_storage_path() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(IDENTITY_DIR)
-        .join(IDENTITY_FILE)
+    if let Some(config_dir) = dirs::config_dir() {
+        #[cfg(target_os = "windows")]
+        let app_dir = config_dir.join("ProjectOrchestrator");
+        #[cfg(not(target_os = "windows"))]
+        let app_dir = config_dir.join("project-orchestrator");
+        app_dir.join(IDENTITY_FILE)
+    } else {
+        dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".project-orchestrator")
+            .join(IDENTITY_FILE)
+    }
 }
 
 #[cfg(test)]
