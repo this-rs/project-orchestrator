@@ -125,7 +125,10 @@ fn extract_title_from_markdown(content: &str) -> Option<String> {
     for line in content.lines() {
         let trimmed = line.trim();
         // Match lines starting with # or ##
-        if let Some(rest) = trimmed.strip_prefix("## ").or_else(|| trimmed.strip_prefix("# ")) {
+        if let Some(rest) = trimmed
+            .strip_prefix("## ")
+            .or_else(|| trimmed.strip_prefix("# "))
+        {
             // Strip optional "RFC —" or "RFC:" prefix
             let title = rest
                 .strip_prefix("RFC")
