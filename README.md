@@ -9,11 +9,11 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/this-rs/project-orchestrator/releases/latest/download/Project.Orchestrator_0.0.8_aarch64.dmg"><img src="https://img.shields.io/badge/Download_for_macOS-000000?style=for-the-badge&logo=apple&logoColor=white" alt="Download for macOS" height="40"></a>
+  <a href="https://github.com/this-rs/project-orchestrator/releases/latest/download/Project.Orchestrator_0.0.9_aarch64.dmg"><img src="https://img.shields.io/badge/Download_for_macOS-000000?style=for-the-badge&logo=apple&logoColor=white" alt="Download for macOS" height="40"></a>
   &nbsp;&nbsp;
-  <a href="https://github.com/this-rs/project-orchestrator/releases/latest/download/Project.Orchestrator_0.0.8_x64-setup.exe"><img src="https://img.shields.io/badge/Download_for_Windows-0078D4?style=for-the-badge&logo=windows&logoColor=white" alt="Download for Windows" height="40"></a>
+  <a href="https://github.com/this-rs/project-orchestrator/releases/latest/download/Project.Orchestrator_0.0.9_x64-setup.exe"><img src="https://img.shields.io/badge/Download_for_Windows-0078D4?style=for-the-badge&logo=windows&logoColor=white" alt="Download for Windows" height="40"></a>
   &nbsp;&nbsp;
-  <a href="https://github.com/this-rs/project-orchestrator/releases/latest/download/Project.Orchestrator_0.0.8_amd64.AppImage"><img src="https://img.shields.io/badge/Download_for_Linux-FCC624?style=for-the-badge&logo=linux&logoColor=black" alt="Download for Linux" height="40"></a>
+  <a href="https://github.com/this-rs/project-orchestrator/releases/latest/download/Project.Orchestrator_0.0.9_amd64.AppImage"><img src="https://img.shields.io/badge/Download_for_Linux-FCC624?style=for-the-badge&logo=linux&logoColor=black" alt="Download for Linux" height="40"></a>
 </p>
 
 <p align="center">
@@ -61,13 +61,13 @@ Download the desktop app for your platform:
 
 | Platform | Download | Type |
 |----------|----------|------|
-| **macOS** (Apple Silicon) | [Download .dmg](https://github.com/this-rs/project-orchestrator/releases/latest/download/Project.Orchestrator_0.0.8_aarch64.dmg) | M1/M2/M3/M4 |
-| **macOS** (Intel) | [Download .dmg](https://github.com/this-rs/project-orchestrator/releases/latest/download/Project.Orchestrator_0.0.8_x64.dmg) | Intel Mac |
-| **Windows** (64-bit) | [Download .exe](https://github.com/this-rs/project-orchestrator/releases/latest/download/Project.Orchestrator_0.0.8_x64-setup.exe) | Installer |
-| **Windows** (64-bit MSI) | [Download .msi](https://github.com/this-rs/project-orchestrator/releases/latest/download/Project.Orchestrator_0.0.8_x64_en-US.msi) | MSI |
-| **Linux** (64-bit) | [Download .AppImage](https://github.com/this-rs/project-orchestrator/releases/latest/download/Project.Orchestrator_0.0.8_amd64.AppImage) | Universal |
-| **Linux** (Debian/Ubuntu) | [Download .deb](https://github.com/this-rs/project-orchestrator/releases/latest/download/project-orchestrator_0.0.8-1_amd64.deb) | apt/dpkg |
-| **Linux** (Fedora/RHEL) | [Download .rpm](https://github.com/this-rs/project-orchestrator/releases/latest/download/project-orchestrator-0.0.8-1.x86_64.rpm) | dnf/rpm |
+| **macOS** (Apple Silicon) | [Download .dmg](https://github.com/this-rs/project-orchestrator/releases/latest/download/Project.Orchestrator_0.0.9_aarch64.dmg) | M1/M2/M3/M4 |
+| **macOS** (Intel) | [Download .dmg](https://github.com/this-rs/project-orchestrator/releases/latest/download/Project.Orchestrator_0.0.9_x64.dmg) | Intel Mac |
+| **Windows** (64-bit) | [Download .exe](https://github.com/this-rs/project-orchestrator/releases/latest/download/Project.Orchestrator_0.0.9_x64-setup.exe) | Installer |
+| **Windows** (64-bit MSI) | [Download .msi](https://github.com/this-rs/project-orchestrator/releases/latest/download/Project.Orchestrator_0.0.9_x64_en-US.msi) | MSI |
+| **Linux** (64-bit) | [Download .AppImage](https://github.com/this-rs/project-orchestrator/releases/latest/download/Project.Orchestrator_0.0.9_amd64.AppImage) | Universal |
+| **Linux** (Debian/Ubuntu) | [Download .deb](https://github.com/this-rs/project-orchestrator/releases/latest/download/project-orchestrator_0.0.9-1_amd64.deb) | apt/dpkg |
+| **Linux** (Fedora/RHEL) | [Download .rpm](https://github.com/this-rs/project-orchestrator/releases/latest/download/project-orchestrator-0.0.9-1.x86_64.rpm) | dnf/rpm |
 
 > All releases are available on the [Releases page](https://github.com/this-rs/project-orchestrator/releases/latest).
 
@@ -93,7 +93,7 @@ Options:
 
 ```bash
 # Install a specific version
-curl -fsSL https://…/install.sh | sh -s -- --version 0.0.8
+curl -fsSL https://…/install.sh | sh -s -- --version 0.0.9
 
 # Install without the embedded frontend (lighter)
 curl -fsSL https://…/install.sh | sh -s -- --no-frontend
@@ -136,8 +136,8 @@ docker compose up -d
 
 ```bash
 # Download and install the .deb package
-curl -LO https://github.com/this-rs/project-orchestrator/releases/latest/download/project-orchestrator_0.0.8-1_amd64.deb
-sudo dpkg -i project-orchestrator_0.0.8-1_amd64.deb
+curl -LO https://github.com/this-rs/project-orchestrator/releases/latest/download/project-orchestrator_0.0.9-1_amd64.deb
+sudo dpkg -i project-orchestrator_0.0.9-1_amd64.deb
 
 # Start the service
 sudo systemctl enable --now project-orchestrator
@@ -149,8 +149,8 @@ sudo systemctl enable --now project-orchestrator
 
 ```bash
 # Download and install the .rpm package
-curl -LO https://github.com/this-rs/project-orchestrator/releases/latest/download/project-orchestrator-0.0.8-1.x86_64.rpm
-sudo rpm -i project-orchestrator-0.0.8-1.x86_64.rpm
+curl -LO https://github.com/this-rs/project-orchestrator/releases/latest/download/project-orchestrator-0.0.9-1.x86_64.rpm
+sudo rpm -i project-orchestrator-0.0.9-1.x86_64.rpm
 ```
 
 ---
@@ -574,6 +574,7 @@ code(action: "get_node_importance", project_slug: "my-project",
 
 | Version | Date | Highlights |
 |---------|------|------------|
+| **v0.0.9** | 2026-03-12 | Episodic Memory, M4 MVP P2P Knowledge Exchange, Intent-Adaptive Retrieval (biomimetic memory routing), RFC REST endpoints with lifecycle FSM, auto-roadmap endpoint, transitive knowledge propagation (FeatureGraph, Protocol, Skill) |
 | **v0.0.8** | 2026-03-10 | Protocol v2 (hierarchical FSM, generator states, RFC lifecycle), Runner v2+v3 (parallel waves, agent personas), Knowledge Scars & biomimicry, streaming WebSocket events, intelligent hooks |
 | **v0.0.7** | 2026-03-06 | Pattern Federation (skill registry, cross-instance discovery), compose & simulate, context-aware routing, wave execution, analytics statistical rigor |
 | **v0.0.6** | 2026-02-28 | Conversational intelligence, reasoning trees, VizBlock, smart system prompt, knowledge reconstruction |
