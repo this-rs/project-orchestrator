@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use uuid::Uuid;
 
+use crate::episodes::PortableEpisode;
 use crate::neo4j::traits::GraphStore;
 use crate::notes::models::{MemoryHorizon, Note, NoteImportance, NoteScope, NoteStatus, NoteType};
 use crate::protocol::models::{
@@ -109,6 +110,8 @@ pub struct ImportResult {
     pub synapses_created: usize,
     /// Number of protocols recreated (v2 only).
     pub protocols_imported: usize,
+    /// Number of episodes imported as lesson notes (v3 only).
+    pub episodes_imported: usize,
     /// Conflict information (if any name collision was detected).
     pub conflict: Option<ImportConflict>,
     /// Whether this was a merge into an existing skill.
@@ -221,6 +224,30 @@ pub async fn import_skill(
         0
     };
 
+    // 7b. Import episodes as lesson notes (v3 only — skipped for v1/v2 packages)
+    let mut episodes_imported = 0;
+    for portable_episode in &package.episodes {
+        if let Some(lesson) = &portable_episode.lesson {
+            let note = episode_to_note(
+                portable_episode,
+                lesson,
+                target_project_id,
+                &package.skill.name,
+            )?;
+            let note_id = note.id;
+            graph_store
+                .create_note(&note)
+                .await
+                .context("Failed to create imported episode-lesson note")?;
+            graph_store
+                .add_skill_member(skill_id, "note", note_id)
+                .await
+                .context("Failed to link episode-lesson note to skill")?;
+            created_note_ids.push(note_id);
+            episodes_imported += 1;
+        }
+    }
+
     // 8. Update skill counts
     let notes_created = package.notes.len();
     if !was_merged {
@@ -243,6 +270,7 @@ pub async fn import_skill(
         decisions_imported,
         synapses_created,
         protocols_imported,
+        episodes_imported,
         conflict,
         was_merged,
         source_project: package.metadata.source_project.clone(),
@@ -458,6 +486,89 @@ fn decision_to_note(
         last_activated: Some(now),
         scar_intensity: 0.0,
         memory_horizon: MemoryHorizon::Operational, // Imported decisions are operational
+        supersedes: None,
+        superseded_by: None,
+        changes: vec![],
+        assertion_rule: None,
+        last_assertion_result: None,
+    })
+}
+
+/// Convert a PortableEpisode's Lesson into a local note.
+///
+/// Episodes with lessons become `pattern` notes — they capture the abstract
+/// knowledge extracted from a cognitive episode on another instance.
+/// The note content includes the lesson, the process trace (FSM states),
+/// and the stimulus for context.
+fn episode_to_note(
+    episode: &PortableEpisode,
+    lesson: &crate::episodes::PortableLesson,
+    project_id: Uuid,
+    skill_name: &str,
+) -> Result<Note> {
+    let mut content = format!(
+        "**Episodic Lesson** (imported from skill '{}')\n\n",
+        skill_name
+    );
+    content.push_str(&format!("**Pattern**: {}\n\n", lesson.abstract_pattern));
+
+    // Add context from stimulus
+    content.push_str(&format!(
+        "**Original stimulus**: {}\n",
+        episode.stimulus.request
+    ));
+    content.push_str(&format!("**Trigger**: {:?}\n\n", episode.stimulus.trigger));
+
+    // Add process trace
+    if !episode.process.states_visited.is_empty() {
+        content.push_str("**FSM states**: ");
+        content.push_str(&episode.process.states_visited.join(" → "));
+        content.push('\n');
+    }
+
+    // Add outcome summary
+    content.push_str(&format!(
+        "**Produced**: {} notes, {} decisions, {} commits\n",
+        episode.outcome.notes_produced,
+        episode.outcome.decisions_made,
+        episode.outcome.commits_made,
+    ));
+
+    // Add portability info
+    let portability = match lesson.portability_layer {
+        1 => "project-specific",
+        2 => "language-specific",
+        3 => "universal",
+        _ => "unknown",
+    };
+    content.push_str(&format!(
+        "**Portability**: {} (layer {})\n",
+        portability, lesson.portability_layer
+    ));
+
+    let mut tags = vec!["imported".to_string(), "imported_episode".to_string()];
+    tags.extend(lesson.domain_tags.iter().cloned());
+
+    let now = Utc::now();
+    Ok(Note {
+        id: Uuid::new_v4(),
+        project_id: Some(project_id),
+        note_type: NoteType::Pattern, // Lessons are patterns
+        status: NoteStatus::Active,
+        importance: NoteImportance::High,
+        scope: NoteScope::Project,
+        content,
+        tags,
+        anchors: vec![],
+        created_at: now,
+        created_by: IMPORT_CREATOR.to_string(),
+        last_confirmed_at: None,
+        last_confirmed_by: None,
+        staleness_score: 0.0,
+        energy: IMPORT_NOTE_ENERGY,
+        last_activated: Some(now),
+        scar_intensity: 0.0,
+        memory_horizon: MemoryHorizon::Operational,
         supersedes: None,
         superseded_by: None,
         changes: vec![],

@@ -1052,6 +1052,10 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/episodes/anonymize",
             post(episode_handlers::anonymize_episode),
         )
+        .route(
+            "/api/episodes/export-artifact",
+            post(episode_handlers::export_artifact),
+        )
         // ================================================================
         // Admin — Embedding Backfill
         // ================================================================

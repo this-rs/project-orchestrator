@@ -4,6 +4,7 @@
 //! - `POST /api/episodes/collect` — Collect an episode from a completed ProtocolRun
 //! - `GET /api/episodes` — List episodes for a project
 //! - `POST /api/episodes/anonymize` — Convert an episode to portable format
+//! - `POST /api/episodes/export-artifact` — Export enriched artifact (structure + episodes)
 
 use crate::api::handlers::{AppError, OrchestratorState};
 use crate::episodes::collector;
@@ -130,4 +131,143 @@ pub async fn anonymize_episode(
     let portable_episode = episode.map(|ep| ep.to_portable());
 
     Ok(Json(AnonymizeEpisodeResponse { portable_episode }))
+}
+
+// ============================================================================
+// Enriched Artifact Export
+// ============================================================================
+
+/// Request body for `POST /api/episodes/export-artifact`.
+#[derive(Debug, Deserialize)]
+pub struct ExportArtifactRequest {
+    /// The project ID to export an artifact for.
+    pub project_id: Uuid,
+    /// Maximum number of episodes to include (default: 50).
+    pub max_episodes: Option<usize>,
+    /// Whether to include structural edges (co-change, SYNAPSE weights).
+    #[serde(default = "default_true")]
+    pub include_structure: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// A structural edge in the exported artifact.
+#[derive(Debug, Serialize)]
+pub struct ArtifactEdge {
+    pub source: String,
+    pub target: String,
+    pub relation: String,
+    pub weight: f64,
+}
+
+/// The enriched artifact — hybrid structure + episodes.
+#[derive(Debug, Serialize)]
+pub struct EnrichedArtifact {
+    /// Schema version.
+    pub schema_version: u32,
+    /// When the artifact was exported.
+    pub exported_at: chrono::DateTime<chrono::Utc>,
+    /// Source project slug.
+    pub source_project: String,
+    /// Structural edges (co-change, SYNAPSE).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub structure: Vec<ArtifactEdge>,
+    /// Portable episodes.
+    pub episodes: Vec<crate::episodes::PortableEpisode>,
+    /// Stats.
+    pub stats: ArtifactStats,
+}
+
+/// Stats about the exported artifact.
+#[derive(Debug, Serialize)]
+pub struct ArtifactStats {
+    pub edge_count: usize,
+    pub episode_count: usize,
+    pub episodes_with_lessons: usize,
+    pub total_notes_produced: usize,
+    pub total_decisions_made: usize,
+}
+
+/// Export an enriched artifact for a project.
+///
+/// POST /api/episodes/export-artifact
+///
+/// Produces a JSON artifact combining:
+/// 1. Structural edges (co-change graph, SYNAPSE weights)
+/// 2. Portable episodes (anonymized cognitive episodes)
+///
+/// This is the M2 deliverable — proving episodic enrichment adds value.
+pub async fn export_artifact(
+    State(state): State<OrchestratorState>,
+    Json(body): Json<ExportArtifactRequest>,
+) -> Result<Json<EnrichedArtifact>, AppError> {
+    let neo4j = state.orchestrator.neo4j();
+    let max_episodes = body.max_episodes.unwrap_or(50).min(200);
+
+    // 1. Get project info
+    let project = neo4j
+        .get_project(body.project_id)
+        .await
+        .map_err(AppError::Internal)?
+        .ok_or_else(|| AppError::NotFound("Project not found".to_string()))?;
+
+    // 2. Collect episodes and convert to portable
+    let episodes = collector::list_episodes(neo4j, body.project_id, max_episodes)
+        .await
+        .map_err(AppError::Internal)?;
+
+    let portable_episodes: Vec<crate::episodes::PortableEpisode> =
+        episodes.iter().map(|ep| ep.to_portable()).collect();
+
+    // 3. Collect structural edges if requested
+    let mut structure = Vec::new();
+    if body.include_structure {
+        // Co-change edges (files that change together)
+        if let Ok(co_changes) = neo4j.get_co_change_graph(body.project_id, 2, 100).await {
+            for pair in co_changes {
+                structure.push(ArtifactEdge {
+                    source: pair.file_a,
+                    target: pair.file_b,
+                    relation: "CO_CHANGED".to_string(),
+                    weight: pair.count as f64,
+                });
+            }
+        }
+    }
+
+    // 4. Compute stats
+    let episodes_with_lessons = portable_episodes
+        .iter()
+        .filter(|ep| ep.lesson.is_some())
+        .count();
+    let total_notes_produced: usize = portable_episodes
+        .iter()
+        .map(|ep| ep.outcome.notes_produced)
+        .sum();
+    let total_decisions_made: usize = portable_episodes
+        .iter()
+        .map(|ep| ep.outcome.decisions_made)
+        .sum();
+
+    let edge_count = structure.len();
+    let episode_count = episodes.len();
+
+    let artifact = EnrichedArtifact {
+        schema_version: 1,
+        exported_at: chrono::Utc::now(),
+        source_project: project.slug,
+        structure,
+        episodes: portable_episodes,
+        stats: ArtifactStats {
+            edge_count,
+            episode_count,
+            episodes_with_lessons,
+            total_notes_produced,
+            total_decisions_made,
+        },
+    };
+
+    Ok(Json(artifact))
 }

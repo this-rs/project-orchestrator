@@ -899,18 +899,21 @@ fn code_tool() -> ToolDefinition {
 fn episode_tool() -> ToolDefinition {
     ToolDefinition {
         name: "episode".to_string(),
-        description: "Manage episodic memory. Actions: collect, list, anonymize".to_string(),
+        description: "Manage episodic memory. Actions: collect, list, anonymize, export_artifact"
+            .to_string(),
         input_schema: InputSchema {
             schema_type: "object".to_string(),
             properties: Some(json!({
                 "action": {
                     "type": "string",
-                    "enum": ["collect", "list", "anonymize"],
+                    "enum": ["collect", "list", "anonymize", "export_artifact"],
                     "description": "Operation to perform"
                 },
                 "run_id": {"type": "string", "description": "ProtocolRun UUID to collect episode from (collect/anonymize)"},
-                "project_id": {"type": "string", "description": "Project UUID (collect/list/anonymize)"},
-                "limit": {"type": "integer", "description": "Max episodes to return (list, default 20)"}
+                "project_id": {"type": "string", "description": "Project UUID (collect/list/anonymize/export_artifact)"},
+                "limit": {"type": "integer", "description": "Max episodes to return (list, default 20)"},
+                "max_episodes": {"type": "integer", "description": "Max episodes in artifact (export_artifact, default 50)"},
+                "include_structure": {"type": "boolean", "description": "Include structural edges in artifact (export_artifact, default true)"}
             })),
             required: Some(vec!["action".to_string()]),
         },

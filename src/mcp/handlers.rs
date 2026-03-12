@@ -461,6 +461,7 @@ impl ToolHandler {
             ("episode", "collect") => "collect_episode",
             ("episode", "list") => "list_episodes",
             ("episode", "anonymize") => "anonymize_episode",
+            ("episode", "export_artifact") => "export_artifact",
 
             // Analysis Profile
             ("analysis_profile", "list") => "list_analysis_profiles",
@@ -4098,6 +4099,10 @@ impl ToolHandler {
             }
             "anonymize_episode" => {
                 let result = http.post("/api/episodes/anonymize", args).await?;
+                Ok(Some(result))
+            }
+            "export_artifact" => {
+                let result = http.post("/api/episodes/export-artifact", args).await?;
                 Ok(Some(result))
             }
 
