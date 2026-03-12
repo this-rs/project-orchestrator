@@ -369,6 +369,7 @@ mod tests {
             package_trust: None,
             privacy_report: None,
             privacy_mode: None,
+            signature: None,
         }
     }
 

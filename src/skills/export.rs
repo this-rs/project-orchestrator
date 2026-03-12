@@ -8,10 +8,11 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use uuid::Uuid;
 
+use crate::identity::InstanceIdentity;
 use crate::neo4j::traits::GraphStore;
 use crate::protocol::models::RunStatus;
 use crate::skills::package::{
-    ExecutionHistory, PackageMetadata, PackageStats, PortableDecision, PortableNote,
+    sign_package, ExecutionHistory, PackageMetadata, PackageStats, PortableDecision, PortableNote,
     PortableProtocol, PortableRelevanceVector, PortableSkill, PortableState, PortableTransition,
     SkillPackage, SourceMetadata, CURRENT_SCHEMA_VERSION, FORMAT_ID,
 };
@@ -23,6 +24,10 @@ use crate::skills::package::{
 /// 2. Load member notes and decisions via `get_skill_members`
 /// 3. Convert to portable format (strip internal IDs)
 /// 4. Assemble the SkillPackage with metadata
+/// 5. Sign with the instance identity (if provided)
+///
+/// When `identity` is provided, the package is cryptographically signed
+/// with Ed25519. Receivers can verify authenticity via `verify_package_signature()`.
 ///
 /// # Errors
 ///
@@ -31,6 +36,7 @@ pub async fn export_skill(
     skill_id: Uuid,
     graph_store: &dyn GraphStore,
     source_project_name: Option<String>,
+    identity: Option<&InstanceIdentity>,
 ) -> Result<SkillPackage> {
     // 1. Load the skill
     let skill = graph_store
@@ -237,7 +243,7 @@ pub async fn export_skill(
         instance_id: None,
     });
 
-    let package = SkillPackage {
+    let mut package = SkillPackage {
         schema_version: CURRENT_SCHEMA_VERSION,
         metadata: PackageMetadata {
             format: FORMAT_ID.to_string(),
@@ -261,7 +267,13 @@ pub async fn export_skill(
         package_trust: None,
         privacy_report: None,
         privacy_mode: None,
+        signature: None,
     };
+
+    // 5. Sign the package if identity is provided
+    if let Some(id) = identity {
+        sign_package(&mut package, id).context("Failed to sign package")?;
+    }
 
     Ok(package)
 }
@@ -362,7 +374,7 @@ mod tests {
         // (The mock store returns mock data, so we verify the export logic)
 
         // Export
-        let package = export_skill(skill_id, &store, Some("test-project".to_string()))
+        let package = export_skill(skill_id, &store, Some("test-project".to_string()), None)
             .await
             .unwrap();
 
@@ -388,7 +400,7 @@ mod tests {
     #[tokio::test]
     async fn test_export_skill_not_found() {
         let store = MockGraphStore::new();
-        let result = export_skill(Uuid::new_v4(), &store, None).await;
+        let result = export_skill(Uuid::new_v4(), &store, None, None).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("not found"));
     }
@@ -403,7 +415,7 @@ mod tests {
         let skill_id = skill.id;
         store.create_skill(&skill).await.unwrap();
 
-        let package = export_skill(skill_id, &store, None).await.unwrap();
+        let package = export_skill(skill_id, &store, None, None).await.unwrap();
 
         // The mock returns empty members, so notes will be empty.
         // For a real integration test, we'd populate the mock.
@@ -421,7 +433,7 @@ mod tests {
         let skill_id = skill.id;
         store.create_skill(&skill).await.unwrap();
 
-        let package = export_skill(skill_id, &store, None).await.unwrap();
+        let package = export_skill(skill_id, &store, None, None).await.unwrap();
         let json = serde_json::to_string(&package).unwrap();
 
         // A typical skill package should be well under 100KB

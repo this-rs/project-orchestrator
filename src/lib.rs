@@ -1246,6 +1246,20 @@ pub async fn start_server(mut config: Config) -> Result<()> {
         ws_ticket_store,
         registry_remote_url: config.registry_remote_url.clone(),
         oidc_client,
+        identity: {
+            match identity::InstanceIdentity::load_or_generate(None) {
+                Ok(id) => {
+                    tracing::info!(did = %id.did_key(), "Instance identity loaded");
+                    Some(Arc::new(id))
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to load instance identity: {e} — package signing disabled"
+                    );
+                    None
+                }
+            }
+        },
     });
 
     // Create router

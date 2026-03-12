@@ -7,6 +7,7 @@ use crate::api::{
 use crate::chat::ChatManager;
 use crate::events::{EventEmitter, HybridEmitter, NatsEmitter};
 use crate::graph::algorithms::add_thermal_noise;
+use crate::identity::InstanceIdentity;
 use crate::neo4j::models::{
     AffectsRelation, CommitNode, ConstraintNode, DecisionNode, DecisionStatus,
     DecisionTimelineEntry, MilestoneNode, MilestoneStatus, PlanNode, PlanStatus, ReleaseNode,
@@ -56,6 +57,9 @@ pub struct ServerState {
     /// Remote skill registry URL (optional — enables cross-instance skill search).
     /// When set, registry search merges local + remote results.
     pub registry_remote_url: Option<String>,
+    /// Instance identity for Ed25519 signing (skill packages, P2P messages).
+    /// Loaded or generated at startup.
+    pub identity: Option<Arc<InstanceIdentity>>,
     /// Pre-built OIDC client — constructed once at server startup.
     /// None when OIDC is not configured (legacy Google-only or no auth).
     pub oidc_client: Option<Arc<crate::auth::oidc::OidcClient>>,
@@ -5274,6 +5278,7 @@ mod tests {
             ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
             registry_remote_url: None,
             oidc_client: None,
+            identity: None,
         });
         (create_router(state), milestone.id, task1.id, task2.id)
     }
@@ -5479,6 +5484,7 @@ mod tests {
             ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
             registry_remote_url: None,
             oidc_client: None,
+            identity: None,
         }
     }
 
@@ -5631,6 +5637,7 @@ mod tests {
             ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
             registry_remote_url: None,
             oidc_client: None,
+            identity: None,
         });
         create_router(state)
     }
@@ -6400,6 +6407,7 @@ mod tests {
             ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
             registry_remote_url: None,
             oidc_client: None,
+            identity: None,
         });
         (create_router(state), plan.id, task1.id, task2.id)
     }
@@ -6501,6 +6509,7 @@ mod tests {
             ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
             registry_remote_url: None,
             oidc_client: None,
+            identity: None,
         });
         let app = create_router(state);
 

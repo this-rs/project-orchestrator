@@ -16,9 +16,14 @@
 //! }
 //! ```
 
+use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
+use ed25519_dalek::{Signature, Verifier};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
+use crate::identity::did::from_did_key;
+use crate::identity::InstanceIdentity;
 use crate::skills::models::{SkillTrigger, TriggerType};
 use crate::skills::{REGEX_DFA_SIZE_LIMIT, REGEX_SIZE_LIMIT};
 
@@ -82,6 +87,36 @@ pub struct SkillPackage {
     /// Privacy mode used during distillation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub privacy_mode: Option<crate::episodes::distill_models::PrivacyMode>,
+
+    // --- Cryptographic signature (v3) ---
+    /// Ed25519 signature over the package content.
+    /// When present, import MUST verify the signature against source_did
+    /// before accepting the package. Unsigned packages from v1/v2 are
+    /// accepted for backward compatibility but flagged as untrusted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<PackageSignature>,
+}
+
+// ============================================================================
+// PackageSignature — cryptographic proof of authorship
+// ============================================================================
+
+/// Cryptographic signature proving the package was created by a specific
+/// identity and has not been tampered with.
+///
+/// The signature covers the SHA-256 hash of the canonical JSON of the
+/// "signable content" — i.e., all package fields EXCEPT the `signature`
+/// field itself (which is set to `None` before hashing).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PackageSignature {
+    /// DID:key of the signing instance (e.g., `did:key:z6Mk...`).
+    pub source_did: String,
+    /// Hex-encoded Ed25519 signature over the content_hash.
+    pub signature_hex: String,
+    /// SHA-256 hex digest of the canonical signable JSON.
+    pub content_hash: String,
+    /// When the package was signed.
+    pub signed_at: DateTime<Utc>,
 }
 
 // ============================================================================
@@ -298,6 +333,119 @@ pub struct SourceMetadata {
     /// PO instance identifier (for federation routing).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instance_id: Option<String>,
+}
+
+// ============================================================================
+// Package Signing & Verification
+// ============================================================================
+
+/// Compute the content hash for signing: SHA-256 of the canonical JSON
+/// of the package with the `signature` field set to `None`.
+fn compute_signable_hash(package: &SkillPackage) -> Result<String> {
+    // Clone and strip signature to get the signable content
+    let mut signable = package.clone();
+    signable.signature = None;
+
+    let canonical_json =
+        serde_json::to_string(&signable).context("Failed to serialize package for signing")?;
+
+    let mut hasher = Sha256::new();
+    hasher.update(canonical_json.as_bytes());
+    Ok(hex::encode(hasher.finalize()))
+}
+
+/// Sign a SkillPackage with the local instance identity.
+///
+/// Computes a SHA-256 hash of the canonical JSON (with `signature: None`),
+/// then signs the hash with the instance's Ed25519 private key.
+/// Sets the `signature` field on the package in-place.
+///
+/// # Example
+/// ```ignore
+/// let identity = InstanceIdentity::load_or_generate(None)?;
+/// sign_package(&mut package, &identity)?;
+/// assert!(package.signature.is_some());
+/// ```
+pub fn sign_package(package: &mut SkillPackage, identity: &InstanceIdentity) -> Result<()> {
+    // Ensure we hash without any prior signature
+    package.signature = None;
+
+    let content_hash = compute_signable_hash(package)?;
+
+    // Sign the content hash with Ed25519
+    let signature = identity.sign(content_hash.as_bytes());
+    let signature_hex = hex::encode(signature.to_bytes());
+
+    package.signature = Some(PackageSignature {
+        source_did: identity.did_key().to_string(),
+        signature_hex,
+        content_hash,
+        signed_at: Utc::now(),
+    });
+
+    Ok(())
+}
+
+/// Verification result for a signed package.
+#[derive(Debug, Clone)]
+pub struct VerifiedPackage {
+    /// The DID of the signer.
+    pub source_did: String,
+    /// When the signature was created.
+    pub signed_at: DateTime<Utc>,
+    /// When the verification was performed.
+    pub verified_at: DateTime<Utc>,
+}
+
+/// Verify the cryptographic signature on a SkillPackage.
+///
+/// Performs two checks:
+/// 1. **Signature verification** — the `signature_hex` is a valid Ed25519
+///    signature over `content_hash`, signed by the key in `source_did`.
+/// 2. **Content integrity** — `content_hash` matches the SHA-256 of the
+///    canonical JSON of the package (with `signature: None`).
+///
+/// Returns `Err` if:
+/// - The package has no signature
+/// - The DID cannot be parsed
+/// - The signature is invalid
+/// - The content hash doesn't match (package was tampered with)
+pub fn verify_package_signature(package: &SkillPackage) -> Result<VerifiedPackage> {
+    let sig = package
+        .signature
+        .as_ref()
+        .ok_or_else(|| anyhow!("Package has no signature"))?;
+
+    // 1. Parse the source DID to extract the Ed25519 verifying key
+    let verifying_key = from_did_key(&sig.source_did)
+        .with_context(|| format!("Failed to parse source DID: {}", sig.source_did))?;
+
+    // 2. Decode the hex signature
+    let sig_bytes =
+        hex::decode(&sig.signature_hex).with_context(|| "Failed to decode signature_hex")?;
+
+    let ed_signature = Signature::from_slice(&sig_bytes)
+        .map_err(|e| anyhow!("Invalid Ed25519 signature format: {e}"))?;
+
+    // 3. Verify signature over content_hash
+    verifying_key
+        .verify(sig.content_hash.as_bytes(), &ed_signature)
+        .map_err(|_| anyhow!("Signature verification failed for DID {}", sig.source_did))?;
+
+    // 4. Verify content integrity: recompute hash and compare
+    let computed_hash = compute_signable_hash(package)?;
+    if computed_hash != sig.content_hash {
+        return Err(anyhow!(
+            "Content hash mismatch: computed {computed_hash}, expected {}. Package may have been tampered with.",
+            sig.content_hash
+        ));
+    }
+
+    Ok(VerifiedPackage {
+        source_did: sig.source_did.clone(),
+        signed_at: sig.signed_at,
+        verified_at: Utc::now(),
+    })
 }
 
 // ============================================================================
@@ -551,6 +699,7 @@ mod tests {
             package_trust: None,
             privacy_report: None,
             privacy_mode: None,
+            signature: None,
         }
     }
 
@@ -935,5 +1084,131 @@ mod tests {
         );
         assert_eq!(restored.package_trust, Some(0.85));
         assert_eq!(restored.privacy_mode, Some(PrivacyMode::Standard));
+    }
+
+    // ── Package Signature Tests ─────────────────────────────────────────
+
+    #[test]
+    fn test_sign_and_verify_package() {
+        let identity = InstanceIdentity::generate();
+        let mut package = make_valid_package();
+
+        sign_package(&mut package, &identity).unwrap();
+
+        // Signature should be set
+        assert!(package.signature.is_some());
+        let sig = package.signature.as_ref().unwrap();
+        assert!(sig.source_did.starts_with("did:key:z"));
+        assert!(!sig.signature_hex.is_empty());
+        assert!(!sig.content_hash.is_empty());
+
+        // Verification should succeed
+        let verified = verify_package_signature(&package).unwrap();
+        assert_eq!(verified.source_did, identity.did_key());
+    }
+
+    #[test]
+    fn test_verify_unsigned_package_fails() {
+        let package = make_valid_package();
+        let result = verify_package_signature(&package);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("no signature"),
+            "Should fail with 'no signature' error"
+        );
+    }
+
+    #[test]
+    fn test_verify_tampered_content_fails() {
+        let identity = InstanceIdentity::generate();
+        let mut package = make_valid_package();
+        sign_package(&mut package, &identity).unwrap();
+
+        // Tamper with the package content after signing
+        package.skill.name = "Tampered Name".to_string();
+
+        let result = verify_package_signature(&package);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Content hash mismatch"),
+            "Should detect content tampering"
+        );
+    }
+
+    #[test]
+    fn test_verify_wrong_signer_fails() {
+        let identity1 = InstanceIdentity::generate();
+        let identity2 = InstanceIdentity::generate();
+        let mut package = make_valid_package();
+        sign_package(&mut package, &identity1).unwrap();
+
+        // Replace source_did with a different identity's DID
+        // (signature won't match the new DID's public key)
+        package.signature.as_mut().unwrap().source_did = identity2.did_key().to_string();
+
+        let result = verify_package_signature(&package);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Signature verification failed"),
+            "Should fail when DID doesn't match signer"
+        );
+    }
+
+    #[test]
+    fn test_signed_package_serde_roundtrip() {
+        let identity = InstanceIdentity::generate();
+        let mut package = make_valid_package();
+        sign_package(&mut package, &identity).unwrap();
+
+        // Serialize to JSON and back
+        let json = serde_json::to_string_pretty(&package).unwrap();
+        let restored: SkillPackage = serde_json::from_str(&json).unwrap();
+
+        // Verification should still pass after roundtrip
+        let verified = verify_package_signature(&restored).unwrap();
+        assert_eq!(verified.source_did, identity.did_key());
+    }
+
+    #[test]
+    fn test_signed_package_yaml_roundtrip() {
+        let identity = InstanceIdentity::generate();
+        let mut package = make_valid_package();
+        sign_package(&mut package, &identity).unwrap();
+
+        // Serialize to YAML and back
+        let yaml = serde_yaml::to_string(&package).unwrap();
+        let restored: SkillPackage = serde_yaml::from_str(&yaml).unwrap();
+
+        // Verification should still pass after YAML roundtrip
+        let verified = verify_package_signature(&restored).unwrap();
+        assert_eq!(verified.source_did, identity.did_key());
+    }
+
+    #[test]
+    fn test_sign_replaces_existing_signature() {
+        let identity1 = InstanceIdentity::generate();
+        let identity2 = InstanceIdentity::generate();
+        let mut package = make_valid_package();
+
+        // Sign with identity1
+        sign_package(&mut package, &identity1).unwrap();
+        let hash1 = package.signature.as_ref().unwrap().content_hash.clone();
+
+        // Re-sign with identity2 — should replace
+        sign_package(&mut package, &identity2).unwrap();
+        let sig = package.signature.as_ref().unwrap();
+        assert_eq!(sig.source_did, identity2.did_key());
+        // Content hash should be the same (same content, different signer)
+        assert_eq!(sig.content_hash, hash1);
+
+        // Verify with identity2's key
+        let verified = verify_package_signature(&package).unwrap();
+        assert_eq!(verified.source_did, identity2.did_key());
     }
 }

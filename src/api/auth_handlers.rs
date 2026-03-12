@@ -1012,6 +1012,7 @@ mod tests {
             ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
             registry_remote_url: None,
             oidc_client: None,
+            identity: None,
         })
     }
 
