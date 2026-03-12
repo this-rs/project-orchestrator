@@ -349,6 +349,15 @@ impl Neo4jClient {
             EntityType::Constraint => "Constraint",
             EntityType::Milestone => "Milestone",
             EntityType::Release => "Release",
+            EntityType::FeatureGraph => "FeatureGraph",
+            EntityType::Protocol => "Protocol",
+            EntityType::ProtocolState => "ProtocolState",
+            EntityType::ProtocolRun => "ProtocolRun",
+            EntityType::PlanRun => "PlanRun",
+            EntityType::Skill => "Skill",
+            EntityType::Note => "Note",
+            EntityType::ChatSession => "ChatSession",
+            EntityType::Process => "Process",
         };
 
         // Determine the match field based on entity type
@@ -408,6 +417,15 @@ impl Neo4jClient {
             EntityType::Constraint => "Constraint",
             EntityType::Milestone => "Milestone",
             EntityType::Release => "Release",
+            EntityType::FeatureGraph => "FeatureGraph",
+            EntityType::Protocol => "Protocol",
+            EntityType::ProtocolState => "ProtocolState",
+            EntityType::ProtocolRun => "ProtocolRun",
+            EntityType::PlanRun => "PlanRun",
+            EntityType::Skill => "Skill",
+            EntityType::Note => "Note",
+            EntityType::ChatSession => "ChatSession",
+            EntityType::Process => "Process",
         };
 
         let (match_field, match_value) = match entity_type {
@@ -626,6 +644,15 @@ impl Neo4jClient {
             EntityType::Constraint => "Constraint",
             EntityType::Milestone => "Milestone",
             EntityType::Release => "Release",
+            EntityType::FeatureGraph => "FeatureGraph",
+            EntityType::Protocol => "Protocol",
+            EntityType::ProtocolState => "ProtocolState",
+            EntityType::ProtocolRun => "ProtocolRun",
+            EntityType::PlanRun => "PlanRun",
+            EntityType::Skill => "Skill",
+            EntityType::Note => "Note",
+            EntityType::ChatSession => "ChatSession",
+            EntityType::Process => "Process",
         };
 
         let (match_field, match_value) = match entity_type {
@@ -831,6 +858,15 @@ impl Neo4jClient {
             EntityType::Constraint => "Constraint",
             EntityType::Milestone => "Milestone",
             EntityType::Release => "Release",
+            EntityType::FeatureGraph => "FeatureGraph",
+            EntityType::Protocol => "Protocol",
+            EntityType::ProtocolState => "ProtocolState",
+            EntityType::ProtocolRun => "ProtocolRun",
+            EntityType::PlanRun => "PlanRun",
+            EntityType::Skill => "Skill",
+            EntityType::Note => "Note",
+            EntityType::ChatSession => "ChatSession",
+            EntityType::Process => "Process",
         };
 
         let (match_field, match_value) = match entity_type {

@@ -244,6 +244,16 @@ pub enum EntityType {
     WorkspaceMilestone,
     Resource,
     Component,
+    // Knowledge & Protocol entities
+    FeatureGraph,
+    Protocol,
+    ProtocolState,
+    ProtocolRun,
+    PlanRun,
+    Skill,
+    Note,
+    ChatSession,
+    Process,
 }
 
 impl fmt::Display for EntityType {
@@ -269,6 +279,15 @@ impl fmt::Display for EntityType {
             Self::WorkspaceMilestone => write!(f, "workspace_milestone"),
             Self::Resource => write!(f, "resource"),
             Self::Component => write!(f, "component"),
+            Self::FeatureGraph => write!(f, "feature_graph"),
+            Self::Protocol => write!(f, "protocol"),
+            Self::ProtocolState => write!(f, "protocol_state"),
+            Self::ProtocolRun => write!(f, "protocol_run"),
+            Self::PlanRun => write!(f, "plan_run"),
+            Self::Skill => write!(f, "skill"),
+            Self::Note => write!(f, "note"),
+            Self::ChatSession => write!(f, "chat_session"),
+            Self::Process => write!(f, "process"),
         }
     }
 }
@@ -298,6 +317,15 @@ impl FromStr for EntityType {
             "workspacemilestone" => Ok(Self::WorkspaceMilestone),
             "resource" => Ok(Self::Resource),
             "component" => Ok(Self::Component),
+            "featuregraph" => Ok(Self::FeatureGraph),
+            "protocol" => Ok(Self::Protocol),
+            "protocolstate" => Ok(Self::ProtocolState),
+            "protocolrun" => Ok(Self::ProtocolRun),
+            "planrun" => Ok(Self::PlanRun),
+            "skill" => Ok(Self::Skill),
+            "note" => Ok(Self::Note),
+            "chatsession" => Ok(Self::ChatSession),
+            "process" => Ok(Self::Process),
             _ => Err(format!("Unknown entity type: {}", s)),
         }
     }
