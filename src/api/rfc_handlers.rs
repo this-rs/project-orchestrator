@@ -266,7 +266,24 @@ pub async fn list_rfcs(
         .list_notes(query.project_id, None, &filters)
         .await?;
 
-    let items: Vec<RfcResponse> = notes.iter().map(note_to_rfc).collect();
+    let mut items: Vec<RfcResponse> = notes.iter().map(note_to_rfc).collect();
+
+    // Enrich current_state for each RFC that has a linked protocol run.
+    // This lets the frontend show correct fallback transitions based on
+    // the real FSM state instead of the simplified rfc-status.
+    for rfc in items.iter_mut() {
+        if let Some(ref run_id_str) = rfc.protocol_run_id {
+            if let Ok(run_id) = run_id_str.parse::<Uuid>() {
+                if let Ok(Some(run)) =
+                    state.orchestrator.neo4j().get_protocol_run(run_id).await
+                {
+                    if let Some(last_visit) = run.states_visited.last() {
+                        rfc.current_state = Some(last_visit.state_name.clone());
+                    }
+                }
+            }
+        }
+    }
 
     Ok(Json(PaginatedResponse::new(items, total, limit, offset)))
 }
