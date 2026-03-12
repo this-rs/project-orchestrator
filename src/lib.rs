@@ -26,6 +26,7 @@ pub mod parser;
 pub mod plan;
 pub mod protocol;
 pub mod reasoning;
+pub mod reception;
 pub mod resolver;
 pub mod runner;
 pub mod setup_claude;
