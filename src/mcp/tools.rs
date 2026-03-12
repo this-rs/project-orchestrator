@@ -899,8 +899,7 @@ fn code_tool() -> ToolDefinition {
 fn episode_tool() -> ToolDefinition {
     ToolDefinition {
         name: "episode".to_string(),
-        description:
-            "Manage episodic memory. Actions: collect, list, anonymize".to_string(),
+        description: "Manage episodic memory. Actions: collect, list, anonymize".to_string(),
         input_schema: InputSchema {
             schema_type: "object".to_string(),
             properties: Some(json!({

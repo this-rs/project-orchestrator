@@ -2565,10 +2565,7 @@ pub trait GraphStore: Send + Sync {
     ) -> Result<Vec<crate::neo4j::protocol::ProducedArtefact>>;
 
     /// Find the most recently started active (running) protocol run for a project.
-    async fn find_active_run_for_project(
-        &self,
-        project_id: Uuid,
-    ) -> Result<Option<Uuid>>;
+    async fn find_active_run_for_project(&self, project_id: Uuid) -> Result<Option<Uuid>>;
 
     /// Persist a ReasoningTree to Neo4j as a PersistedReasoningTree node.
     /// Optionally links it to an entity via REASONING_FOR relation.

@@ -430,10 +430,9 @@ mod tests {
         let json = serde_json::to_string(&portable).unwrap();
 
         // Portable should not contain any UUID pattern (8-4-4-4-12 hex)
-        let uuid_regex = regex::Regex::new(
-            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
-        )
-        .unwrap();
+        let uuid_regex =
+            regex::Regex::new(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+                .unwrap();
         assert!(
             !uuid_regex.is_match(&json),
             "PortableEpisode JSON should not contain UUIDs: {}",

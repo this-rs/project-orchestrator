@@ -85,13 +85,10 @@ pub async fn collect_episode(
     State(state): State<OrchestratorState>,
     Json(body): Json<CollectEpisodeRequest>,
 ) -> Result<Json<CollectEpisodeResponse>, AppError> {
-    let episode = collector::collect_episode(
-        state.orchestrator.neo4j(),
-        body.run_id,
-        body.project_id,
-    )
-    .await
-    .map_err(AppError::Internal)?;
+    let episode =
+        collector::collect_episode(state.orchestrator.neo4j(), body.run_id, body.project_id)
+            .await
+            .map_err(AppError::Internal)?;
 
     Ok(Json(CollectEpisodeResponse { episode }))
 }
@@ -107,13 +104,9 @@ pub async fn list_episodes(
 ) -> Result<Json<ListEpisodesResponse>, AppError> {
     let limit = query.limit.unwrap_or(20).min(100);
 
-    let episodes = collector::list_episodes(
-        state.orchestrator.neo4j(),
-        query.project_id,
-        limit,
-    )
-    .await
-    .map_err(AppError::Internal)?;
+    let episodes = collector::list_episodes(state.orchestrator.neo4j(), query.project_id, limit)
+        .await
+        .map_err(AppError::Internal)?;
 
     let count = episodes.len();
     Ok(Json(ListEpisodesResponse { episodes, count }))
@@ -129,13 +122,10 @@ pub async fn anonymize_episode(
     State(state): State<OrchestratorState>,
     Json(body): Json<AnonymizeEpisodeRequest>,
 ) -> Result<Json<AnonymizeEpisodeResponse>, AppError> {
-    let episode = collector::collect_episode(
-        state.orchestrator.neo4j(),
-        body.run_id,
-        body.project_id,
-    )
-    .await
-    .map_err(AppError::Internal)?;
+    let episode =
+        collector::collect_episode(state.orchestrator.neo4j(), body.run_id, body.project_id)
+            .await
+            .map_err(AppError::Internal)?;
 
     let portable_episode = episode.map(|ep| ep.to_portable());
 

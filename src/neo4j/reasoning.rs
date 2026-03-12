@@ -71,12 +71,13 @@ impl Neo4jClient {
         .param("created_at", tree.created_at.to_rfc3339())
         .param(
             "project_id",
-            tree.project_id
-                .map(|id| id.to_string())
-                .unwrap_or_default(),
+            tree.project_id.map(|id| id.to_string()).unwrap_or_default(),
         );
 
-        self.graph.run(q).await.context("Failed to persist reasoning tree")?;
+        self.graph
+            .run(q)
+            .await
+            .context("Failed to persist reasoning tree")?;
 
         // Create REASONING_FOR relation if a linked entity is specified
         if let (Some(entity_type), Some(entity_id)) = (linked_entity_type, linked_entity_id) {
@@ -139,10 +140,7 @@ impl Neo4jClient {
     }
 
     /// Get the reasoning tree associated with a protocol run (via REASONING_FOR).
-    pub async fn get_run_reasoning_tree(
-        &self,
-        run_id: Uuid,
-    ) -> Result<Option<ReasoningTree>> {
+    pub async fn get_run_reasoning_tree(&self, run_id: Uuid) -> Result<Option<ReasoningTree>> {
         let q = query(
             r#"
             MATCH (t:PersistedReasoningTree)-[:REASONING_FOR]->(r:ProtocolRun {id: $run_id})

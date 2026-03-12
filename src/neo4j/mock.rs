@@ -9127,10 +9127,7 @@ impl GraphStore for MockGraphStore {
         Ok(Vec::new())
     }
 
-    async fn find_active_run_for_project(
-        &self,
-        _project_id: Uuid,
-    ) -> anyhow::Result<Option<Uuid>> {
+    async fn find_active_run_for_project(&self, _project_id: Uuid) -> anyhow::Result<Option<Uuid>> {
         // Mock: no active run
         Ok(None)
     }
@@ -9145,10 +9142,7 @@ impl GraphStore for MockGraphStore {
         Ok(tree.id)
     }
 
-    async fn get_run_reasoning_tree_id(
-        &self,
-        _run_id: Uuid,
-    ) -> anyhow::Result<Option<Uuid>> {
+    async fn get_run_reasoning_tree_id(&self, _run_id: Uuid) -> anyhow::Result<Option<Uuid>> {
         // Mock: no persisted reasoning tree
         Ok(None)
     }

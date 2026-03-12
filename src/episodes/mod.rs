@@ -11,6 +11,6 @@ pub mod collector;
 pub mod models;
 
 pub use models::{
-    Episode, Lesson, Outcome, PortableEpisode, PortableLesson, PortableOutcome,
-    PortableProcess, PortableStimulus, PortableValidation, Process, Stimulus, Validation,
+    Episode, Lesson, Outcome, PortableEpisode, PortableLesson, PortableOutcome, PortableProcess,
+    PortableStimulus, PortableValidation, Process, Stimulus, Validation,
 };

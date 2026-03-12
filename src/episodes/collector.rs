@@ -90,21 +90,20 @@ pub async fn collect_episode(
     // 5. Build Validation — check for reasoning feedback
     // For now, use implicit signals: if the run completed successfully
     // and produced artefacts, that's implicit positive feedback.
-    let validation = if !artefacts.is_empty()
-        && run.status == crate::protocol::models::RunStatus::Completed
-    {
-        Validation {
-            feedback_type: FeedbackType::ImplicitPositive,
-            score: None,
-            evidence_count: artefacts.len(),
-        }
-    } else {
-        Validation {
-            feedback_type: FeedbackType::None,
-            score: None,
-            evidence_count: 0,
-        }
-    };
+    let validation =
+        if !artefacts.is_empty() && run.status == crate::protocol::models::RunStatus::Completed {
+            Validation {
+                feedback_type: FeedbackType::ImplicitPositive,
+                score: None,
+                evidence_count: artefacts.len(),
+            }
+        } else {
+            Validation {
+                feedback_type: FeedbackType::None,
+                score: None,
+                evidence_count: 0,
+            }
+        };
 
     // 6. Assemble the Episode
     let episode = Episode {

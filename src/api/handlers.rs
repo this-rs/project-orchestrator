@@ -1051,13 +1051,18 @@ pub async fn add_decision(
         Some(rid) => Some(rid),
         None => {
             // Auto-detect: resolve project_id from task, then find active run
-            match state.orchestrator.neo4j().get_project_for_task(task_id).await {
-                Ok(Some(project)) => {
-                    state.orchestrator.neo4j()
-                        .find_active_run_for_project(project.id)
-                        .await
-                        .unwrap_or(None)
-                }
+            match state
+                .orchestrator
+                .neo4j()
+                .get_project_for_task(task_id)
+                .await
+            {
+                Ok(Some(project)) => state
+                    .orchestrator
+                    .neo4j()
+                    .find_active_run_for_project(project.id)
+                    .await
+                    .unwrap_or(None),
                 _ => None,
             }
         }

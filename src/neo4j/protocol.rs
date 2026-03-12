@@ -1149,10 +1149,7 @@ impl Neo4jClient {
     /// Get all artefacts (notes + decisions) produced during a protocol run.
     ///
     /// Returns a list of `(entity_type, entity_id, produced_at)` tuples.
-    pub async fn get_run_outcomes(
-        &self,
-        run_id: Uuid,
-    ) -> Result<Vec<ProducedArtefact>> {
+    pub async fn get_run_outcomes(&self, run_id: Uuid) -> Result<Vec<ProducedArtefact>> {
         let q = query(
             r#"
             MATCH (e)-[rel:PRODUCED_DURING]->(r:ProtocolRun {id: $run_id})
@@ -1197,10 +1194,7 @@ impl Neo4jClient {
     ///
     /// Traverses: ProtocolRun -[:INSTANCE_OF]-> Protocol {project_id}.
     /// Returns the run_id if found, None otherwise.
-    pub async fn find_active_run_for_project(
-        &self,
-        project_id: Uuid,
-    ) -> Result<Option<Uuid>> {
+    pub async fn find_active_run_for_project(&self, project_id: Uuid) -> Result<Option<Uuid>> {
         let q = query(
             r#"
             MATCH (r:ProtocolRun {status: 'running'})-[:INSTANCE_OF]->(p:Protocol {project_id: $project_id})
@@ -1222,10 +1216,7 @@ impl Neo4jClient {
 
     /// Get the ID of a persisted reasoning tree linked to a protocol run.
     /// Returns the tree UUID if found, None otherwise.
-    pub async fn get_run_reasoning_tree_id(
-        &self,
-        run_id: Uuid,
-    ) -> Result<Option<Uuid>> {
+    pub async fn get_run_reasoning_tree_id(&self, run_id: Uuid) -> Result<Option<Uuid>> {
         let q = query(
             r#"
             MATCH (t:PersistedReasoningTree)-[:REASONING_FOR]->(r:ProtocolRun {id: $run_id})

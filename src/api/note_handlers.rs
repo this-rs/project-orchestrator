@@ -229,7 +229,12 @@ pub async fn create_note(
         None => {
             // Auto-detect: find active run for the same project
             if let Some(pid) = project_id {
-                match state.orchestrator.neo4j().find_active_run_for_project(pid).await {
+                match state
+                    .orchestrator
+                    .neo4j()
+                    .find_active_run_for_project(pid)
+                    .await
+                {
                     Ok(active_run) => active_run,
                     Err(e) => {
                         tracing::debug!(
