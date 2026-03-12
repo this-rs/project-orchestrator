@@ -56,10 +56,10 @@ pub async fn collect_episode(
         .map(|end| (end - run.started_at).num_milliseconds());
 
     // Check for a persisted reasoning tree linked to this run
-    let reasoning_tree_id = match neo4j.get_run_reasoning_tree_id(run_id).await {
-        Ok(tree_id) => tree_id,
-        _ => None,
-    };
+    let reasoning_tree_id: Option<Uuid> = neo4j
+        .get_run_reasoning_tree_id(run_id)
+        .await
+        .unwrap_or_default();
 
     let process = Process {
         reasoning_tree_id,

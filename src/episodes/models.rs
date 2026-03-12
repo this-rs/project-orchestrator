@@ -143,7 +143,7 @@ pub struct Validation {
 }
 
 /// Type of feedback for an episode.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum FeedbackType {
     /// Explicit positive feedback (reason_feedback outcome=success)
@@ -153,13 +153,8 @@ pub enum FeedbackType {
     /// Implicit positive (note created, task completed)
     ImplicitPositive,
     /// No feedback received
+    #[default]
     None,
-}
-
-impl Default for FeedbackType {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 /// The abstract lesson extracted from an episode.
