@@ -35,6 +35,7 @@ pub fn all_tools() -> Vec<ToolDefinition> {
         admin_tool(),
         skill_tool(),
         protocol_tool(),
+        persona_tool(),
     ]
 }
 
@@ -1111,6 +1112,48 @@ fn protocol_tool() -> ToolDefinition {
     }
 }
 
+fn persona_tool() -> ToolDefinition {
+    ToolDefinition {
+        name: "persona".to_string(),
+        description: "Manage living personas (adaptive knowledge agents). Actions: create, get, list, update, delete, add_skill, remove_skill, add_protocol, remove_protocol, add_file, remove_file, add_function, remove_function, add_note, remove_note, add_decision, remove_decision, scope_to_feature_graph, unscope_feature_graph, add_extends, remove_extends, get_subgraph, find_for_file, list_global".to_string(),
+        input_schema: InputSchema {
+            schema_type: "object".to_string(),
+            properties: Some(json!({
+                "action": {
+                    "type": "string",
+                    "enum": ["create", "get", "list", "update", "delete", "add_skill", "remove_skill", "add_protocol", "remove_protocol", "add_file", "remove_file", "add_function", "remove_function", "add_note", "remove_note", "add_decision", "remove_decision", "scope_to_feature_graph", "unscope_feature_graph", "add_extends", "remove_extends", "get_subgraph", "find_for_file", "list_global"],
+                    "description": "Operation to perform"
+                },
+                "persona_id": {"type": "string", "description": "Persona UUID (get/update/delete/add_*/remove_*/get_subgraph)"},
+                "project_id": {"type": "string", "description": "Project UUID (create/list)"},
+                "name": {"type": "string", "description": "Persona name (create/update)"},
+                "description": {"type": "string", "description": "Persona description (create/update)"},
+                "status": {"type": "string", "description": "Status (update): active, dormant, emerging, archived"},
+                "complexity_default": {"type": "string", "description": "Default complexity (create/update): simple, complex, creative"},
+                "timeout_secs": {"type": "integer", "description": "Execution timeout in seconds (create/update)"},
+                "max_cost_usd": {"type": "number", "description": "Max cost in USD (create/update)"},
+                "model_preference": {"type": "string", "description": "Preferred model (create/update): opus, sonnet, haiku"},
+                "system_prompt_override": {"type": "string", "description": "Custom system prompt override (create/update)"},
+                "energy": {"type": "number", "description": "Energy 0-1 (update)"},
+                "cohesion": {"type": "number", "description": "Cohesion 0-1 (update)"},
+                "origin": {"type": "string", "description": "Origin (create): manual, auto_build, imported. Default: manual"},
+                "skill_id": {"type": "string", "description": "Skill UUID (add_skill/remove_skill)"},
+                "protocol_id": {"type": "string", "description": "Protocol UUID (add_protocol/remove_protocol)"},
+                "feature_graph_id": {"type": "string", "description": "FeatureGraph UUID (scope_to_feature_graph/unscope_feature_graph)"},
+                "file_path": {"type": "string", "description": "File path (add_file/remove_file/find_for_file)"},
+                "function_name": {"type": "string", "description": "Function name (add_function/remove_function)"},
+                "note_id": {"type": "string", "description": "Note UUID (add_note/remove_note)"},
+                "decision_id": {"type": "string", "description": "Decision UUID (add_decision/remove_decision)"},
+                "parent_persona_id": {"type": "string", "description": "Parent persona UUID (add_extends/remove_extends)"},
+                "weight": {"type": "number", "description": "Relation weight 0-1 (add_file/add_function/add_note/add_decision). Default: 1.0"},
+                "limit": {"type": "integer", "description": "Max items (list/list_global)"},
+                "offset": {"type": "integer", "description": "Skip items (list/list_global)"}
+            })),
+            required: Some(vec!["action".to_string()]),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1120,8 +1163,8 @@ mod tests {
         let tools = all_tools();
         assert_eq!(
             tools.len(),
-            23,
-            "Expected 23 mega-tools, got {}",
+            24,
+            "Expected 24 mega-tools, got {}",
             tools.len()
         );
     }
@@ -1404,6 +1447,7 @@ mod tests {
             "code",
             "admin",
             "skill",
+            "persona",
         ];
         for name in &mega_names {
             assert!(
