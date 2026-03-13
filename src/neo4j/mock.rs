@@ -8356,8 +8356,8 @@ impl GraphStore for MockGraphStore {
 
     async fn update_persona(&self, persona: &PersonaNode) -> Result<()> {
         let mut store = self.personas.write().await;
-        if store.contains_key(&persona.id) {
-            store.insert(persona.id, persona.clone());
+        if let std::collections::hash_map::Entry::Occupied(mut e) = store.entry(persona.id) {
+            e.insert(persona.clone());
             Ok(())
         } else {
             anyhow::bail!("Persona {} not found", persona.id)
@@ -8391,7 +8391,7 @@ impl GraphStore for MockGraphStore {
         let mut all: Vec<PersonaNode> = store
             .values()
             .filter(|p| p.project_id == Some(project_id))
-            .filter(|p| status.map_or(true, |s| p.status == s))
+            .filter(|p| status.is_none_or(|s| p.status == s))
             .cloned()
             .collect();
         all.sort_by(|a, b| {
