@@ -24,6 +24,8 @@ pub enum PromptSection {
     Constraints(String),
     /// Knowledge notes (guidelines, gotchas, patterns)
     KnowledgeNotes(String),
+    /// Persona context (knowledge subgraph from PersonaStack)
+    PersonaContext(String),
     /// Activated skill context
     SkillContext(String),
     /// File context (symbols, dependencies)
@@ -47,11 +49,12 @@ impl PromptSection {
             Self::Constraints(_) => 2,
             Self::KnowledgeNotes(_) => 3,
             Self::PropagatedNotes(_) => 4,
-            Self::SkillContext(_) => 5,
-            Self::FileContext(_) => 6,
-            Self::Enrichment(_) => 7,
-            Self::RunnerConstraints(_) => 8,
-            Self::Custom(_) => 9,
+            Self::PersonaContext(_) => 5,
+            Self::SkillContext(_) => 6,
+            Self::FileContext(_) => 7,
+            Self::Enrichment(_) => 8,
+            Self::RunnerConstraints(_) => 9,
+            Self::Custom(_) => 10,
         }
     }
 
@@ -63,6 +66,7 @@ impl PromptSection {
             Self::Constraints(_) => "Constraints",
             Self::KnowledgeNotes(_) => "Knowledge Notes",
             Self::PropagatedNotes(_) => "Propagated Knowledge",
+            Self::PersonaContext(_) => "Persona Context",
             Self::SkillContext(_) => "Skill Context",
             Self::FileContext(_) => "Files to Modify",
             Self::Enrichment(_) => "Enrichment Context",
@@ -79,6 +83,7 @@ impl PromptSection {
             | Self::Constraints(s)
             | Self::KnowledgeNotes(s)
             | Self::PropagatedNotes(s)
+            | Self::PersonaContext(s)
             | Self::SkillContext(s)
             | Self::FileContext(s)
             | Self::Enrichment(s)
@@ -136,6 +141,11 @@ impl PromptBuilder {
     /// Add a knowledge notes section.
     pub fn with_knowledge_notes(self, notes: impl Into<String>) -> Self {
         self.add_section(PromptSection::KnowledgeNotes(notes.into()))
+    }
+
+    /// Add a persona context section (from PersonaStack rendering).
+    pub fn with_persona_context(self, context: impl Into<String>) -> Self {
+        self.add_section(PromptSection::PersonaContext(context.into()))
     }
 
     /// Add a skill context section.
@@ -383,6 +393,7 @@ mod tests {
         let prompt = PromptBuilder::new()
             .with_task("task")
             .with_knowledge_notes("- Note 1\n- Note 2")
+            .with_persona_context("### Primary Persona — neo4j-expert")
             .with_skill_context("Use async/await")
             .with_file_context("src/main.rs: rust, symbols: main")
             .with_enrichment("<enrichment>content</enrichment>")
@@ -391,6 +402,7 @@ mod tests {
 
         assert!(prompt.contains("# Task"));
         assert!(prompt.contains("## Knowledge Notes"));
+        assert!(prompt.contains("## Persona Context"));
         assert!(prompt.contains("## Skill Context"));
         assert!(prompt.contains("## Files to Modify"));
         assert!(prompt.contains("## Enrichment Context"));

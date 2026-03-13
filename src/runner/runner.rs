@@ -100,6 +100,8 @@ struct TaskExecutionResult {
     pub session_id: Option<Uuid>,
     /// Skill IDs activated during this task (for post-task feedback).
     pub activated_skill_ids: Vec<Uuid>,
+    /// Persona IDs activated during this task (for post-task feedback).
+    pub persona_ids: Vec<Uuid>,
     /// AgentExecution UUID created for this task (for USED_SKILL relations).
     pub agent_execution_id: Uuid,
     /// Persona profile string used for this agent.
@@ -858,6 +860,12 @@ impl PlanRunner {
 
             let task_agent_execution_id = task_result.as_ref().ok().map(|r| r.agent_execution_id);
 
+            let task_persona_ids = task_result
+                .as_ref()
+                .ok()
+                .map(|r| r.persona_ids.clone())
+                .unwrap_or_default();
+
             let task_persona = task_result
                 .as_ref()
                 .ok()
@@ -961,6 +969,18 @@ impl PlanRunner {
                             }
                         });
                     }
+
+                    // Fire-and-forget persona feedback (success)
+                    if !task_persona_ids.is_empty() {
+                        let graph = self.graph.clone();
+                        let pids = task_persona_ids;
+                        tokio::spawn(async move {
+                            crate::runner::persona::record_persona_feedback(
+                                graph, pids, true,
+                            )
+                            .await;
+                        });
+                    }
                 }
                 Ok(TaskResult::Failed {
                     reason,
@@ -1028,6 +1048,18 @@ impl PlanRunner {
                                     }
                                 }
                             }
+                        });
+                    }
+
+                    // Fire-and-forget persona feedback (failure)
+                    if !task_persona_ids.is_empty() {
+                        let graph = self.graph.clone();
+                        let pids = task_persona_ids;
+                        tokio::spawn(async move {
+                            crate::runner::persona::record_persona_feedback(
+                                graph, pids, false,
+                            )
+                            .await;
                         });
                     }
                 }
@@ -1111,6 +1143,18 @@ impl PlanRunner {
                                     }
                                 }
                             }
+                        });
+                    }
+
+                    // Fire-and-forget persona feedback (timeout = failure)
+                    if !task_persona_ids.is_empty() {
+                        let graph = self.graph.clone();
+                        let pids = task_persona_ids;
+                        tokio::spawn(async move {
+                            crate::runner::persona::record_persona_feedback(
+                                graph, pids, false,
+                            )
+                            .await;
                         });
                     }
                 }
@@ -1276,6 +1320,30 @@ impl PlanRunner {
             .map(|sa| sa.context_text)
             .filter(|s| !s.is_empty());
 
+        // --- Step 2b: Load PersonaStack ---
+        let persona_stack = if let (Some(pid), Some(ref tn)) = (project_id_for_skills, &task_node)
+        {
+            crate::runner::persona::load_persona_stack(
+                self.graph.as_ref(),
+                tn,
+                pid,
+                &steps,
+            )
+            .await
+        } else {
+            None
+        };
+
+        let persona_ids_for_feedback: Vec<Uuid> = persona_stack
+            .as_ref()
+            .map(|ps| ps.entries().iter().map(|e| e.persona_id).collect())
+            .unwrap_or_default();
+
+        let persona_context = persona_stack
+            .as_ref()
+            .map(|ps| ps.render_for_prompt(ps.max_context_tokens))
+            .filter(|s| !s.is_empty());
+
         // Build the prompt — use prompt_cache if available (pre-enrichment), else build from scratch
         let cached_prompt = task_node.as_ref().and_then(|t| t.prompt_cache.clone());
         let (mut prompt, affected_files_for_ctx) = if let Some(ref cached) = cached_prompt {
@@ -1318,6 +1386,11 @@ impl PlanRunner {
         };
         prompt.push_str(&build_runner_constraints(&runner_ctx));
 
+        // --- Step 2c: Inject persona context ---
+        if let Some(ref pc) = persona_context {
+            prompt.push_str(&format!("\n## Persona Context\n{}\n", pc));
+        }
+
         // --- Step 3: Inject complexity directive ---
         prompt.push_str(&format!(
             "\n## Cognitive Profile: {}\n{}\n",
@@ -1353,7 +1426,11 @@ impl PlanRunner {
 
         // Create an AgentExecution ID for this task
         let agent_execution_id = Uuid::new_v4();
-        let persona_str = task_profile.complexity.to_string();
+        let persona_str = persona_stack
+            .as_ref()
+            .and_then(|ps| ps.get_primary())
+            .map(|p| format!("{}:{}", p.persona_name, task_profile.complexity))
+            .unwrap_or_else(|| task_profile.complexity.to_string());
 
         // Create AgentExecution node in Neo4j (fire-and-forget)
         {
@@ -1382,14 +1459,16 @@ impl PlanRunner {
             });
         }
 
-        // Helper to wrap TaskResult with session_id and activated skills
+        // Helper to wrap TaskResult with session_id and activated skills/personas
         let activated_ids = activated_skill_ids.clone();
+        let persona_ids_clone = persona_ids_for_feedback.clone();
         let persona_clone = persona_str.clone();
         let wrap = move |result: TaskResult| -> TaskExecutionResult {
             TaskExecutionResult {
                 result,
                 session_id: session_uuid,
                 activated_skill_ids: activated_ids.clone(),
+                persona_ids: persona_ids_clone.clone(),
                 agent_execution_id,
                 persona_profile: persona_clone.clone(),
             }
