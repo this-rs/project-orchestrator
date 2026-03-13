@@ -9300,7 +9300,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result["method"], "POST");
-        assert_eq!(result["path"], format!("/api/personas/{}/skills/{}", pid, sid));
+        assert_eq!(
+            result["path"],
+            format!("/api/personas/{}/skills/{}", pid, sid)
+        );
     }
 
     #[tokio::test]
@@ -9316,7 +9319,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result["method"], "DELETE");
-        assert_eq!(result["path"], format!("/api/personas/{}/skills/{}", pid, sid));
+        assert_eq!(
+            result["path"],
+            format!("/api/personas/{}/skills/{}", pid, sid)
+        );
     }
 
     #[tokio::test]
@@ -9378,7 +9384,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result["method"], "POST");
-        assert_eq!(result["path"], format!("/api/personas/{}/notes/{}", pid, nid));
+        assert_eq!(
+            result["path"],
+            format!("/api/personas/{}/notes/{}", pid, nid)
+        );
         assert_eq!(result["body"]["weight"], 0.7);
     }
 
