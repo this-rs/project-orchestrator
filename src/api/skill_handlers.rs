@@ -662,15 +662,22 @@ pub async fn get_skill_health(
     State(state): State<OrchestratorState>,
     Path(skill_id): Path<Uuid>,
 ) -> Result<Json<crate::skills::SkillHealthMetrics>, AppError> {
-    let skill = state
-        .orchestrator
-        .neo4j()
+    let neo4j = state.orchestrator.neo4j();
+
+    let skill = neo4j
         .get_skill(skill_id)
         .await
         .map_err(AppError::Internal)?
         .ok_or_else(|| AppError::NotFound(format!("Skill {} not found", skill_id)))?;
 
-    let health = crate::skills::validation::compute_health(&skill, Utc::now());
+    let mut health = crate::skills::validation::compute_health(&skill, Utc::now());
+
+    // Enrich with project-level percentile context.
+    // Loads all skills for the project so we can rank this skill among its peers.
+    // Falls back gracefully (percentiles stay None) on any error.
+    if let Ok(peers) = neo4j.get_skills_for_project(skill.project_id).await {
+        crate::skills::validation::enrich_with_project_context(&mut health, &peers);
+    }
 
     Ok(Json(health))
 }

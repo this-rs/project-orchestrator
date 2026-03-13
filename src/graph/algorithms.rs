@@ -764,6 +764,11 @@ pub fn compute_health(
         avg_coupling,
         max_coupling,
         coupling_dist,
+        // rs-stats enriched fields — populated downstream by the analytics engine
+        pagerank_distribution: None,
+        community_risk_anova: None,
+        risk_score_p95_threshold: None,
+        risk_score_distribution: None,
     }
 }
 

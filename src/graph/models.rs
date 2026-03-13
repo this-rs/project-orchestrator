@@ -17,6 +17,8 @@
 //! ## Configuration
 //! - [`AnalyticsConfig`] — tuning parameters for the analytics algorithms
 
+use crate::analytics::distribution::DistributionAnalysis;
+use crate::analytics::hypothesis::AnovaResult;
 use petgraph::graph::{DiGraph, NodeIndex};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -422,6 +424,29 @@ pub struct CodeHealthReport {
     /// Distribution summary of coupling (clustering coefficient) values
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coupling_dist: Option<DistributionSummary>,
+
+    // ── rs-stats enriched fields ──────────────────────────────────────────────
+
+    /// Full distribution analysis of PageRank values across all nodes.
+    /// Identifies whether the graph follows a power-law (scale-free) or normal structure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pagerank_distribution: Option<DistributionAnalysis>,
+
+    /// ANOVA result testing whether Louvain communities have homogeneous risk profiles.
+    /// A significant result (p < 0.05) indicates structurally fragile communities.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub community_risk_anova: Option<AnovaResult>,
+
+    /// Adaptive "critical" threshold for risk scores, computed as the actual p95
+    /// of the distribution instead of the hardcoded 0.75 value.
+    /// Use this to classify `risk_level = "critical"` in a data-driven way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub risk_score_p95_threshold: Option<f64>,
+
+    /// Full distribution analysis of risk scores across all files.
+    /// Reveals whether risk is concentrated in a few hotspots or evenly spread.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub risk_score_distribution: Option<DistributionAnalysis>,
 }
 
 impl Default for CodeHealthReport {
@@ -433,6 +458,10 @@ impl Default for CodeHealthReport {
             avg_coupling: 0.0,
             max_coupling: 0.0,
             coupling_dist: None,
+            pagerank_distribution: None,
+            community_risk_anova: None,
+            risk_score_p95_threshold: None,
+            risk_score_distribution: None,
         }
     }
 }

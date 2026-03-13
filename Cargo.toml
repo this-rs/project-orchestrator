@@ -121,6 +121,9 @@ fastembed = "5.11"
 # Dimensionality reduction (UMAP projection for embedding visualization)
 rag-umap = "0.0"
 
+# Statistical analysis engine — distribution fitting, hypothesis testing, regression
+rs-stats = { path = "../../crates/rs-stats", features = ["parallel"] }
+
 # openssl-sys is a transitive dep (via ort-sys build script → ureq → native-tls,
 # and neo4rs → native-tls). The "vendored" feature builds OpenSSL from source,
 # avoiding cross-compilation conflicts between host and target libssl-dev packages.

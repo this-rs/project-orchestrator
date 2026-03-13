@@ -1735,7 +1735,14 @@ impl Neo4jClient {
         let pr_pct = crate::graph::algorithms::to_log_percentiles(&pr_vals);
         let bw_pct = crate::graph::algorithms::to_linear_percentiles(&bw_vals);
 
-        let scores: Vec<FileRiskScore> = raw_files
+        // Step 1 — compute raw risk scores for all files (formula unchanged)
+        struct InterimScore {
+            path: String,
+            risk_score: f64,
+            factors: RiskFactors,
+        }
+
+        let interim: Vec<InterimScore> = raw_files
             .iter()
             .enumerate()
             .map(|(i, f)| {
@@ -1746,21 +1753,9 @@ impl Neo4jClient {
                     + 0.25 * (1.0 - f.density)
                     + 0.15 * bw_percentile;
 
-                let risk_level = if risk_score >= 0.75 {
-                    "critical"
-                } else if risk_score >= 0.5 {
-                    "high"
-                } else if risk_score >= 0.25 {
-                    "medium"
-                } else {
-                    "low"
-                }
-                .to_string();
-
-                FileRiskScore {
+                InterimScore {
                     path: f.path.clone(),
                     risk_score,
-                    risk_level,
                     factors: RiskFactors {
                         pagerank: pr_percentile,
                         churn: f.churn,
@@ -1771,7 +1766,50 @@ impl Neo4jClient {
             })
             .collect();
 
-        let mut scores = scores;
+        // Step 2 — derive adaptive thresholds from the actual risk distribution
+        // rather than hardcoded constants (0.75 / 0.5 / 0.25).
+        // Fallbacks match the previous defaults so behaviour is unchanged
+        // when n < 4 (adaptive_threshold returns fallback on empty/tiny slices).
+        let risk_vals: Vec<f64> = interim.iter().map(|s| s.risk_score).collect();
+        let critical_threshold =
+            crate::analytics::distribution::adaptive_threshold(&risk_vals, 0.90, 0.75);
+        let high_threshold =
+            crate::analytics::distribution::adaptive_threshold(&risk_vals, 0.70, 0.50);
+        let medium_threshold =
+            crate::analytics::distribution::adaptive_threshold(&risk_vals, 0.40, 0.25);
+
+        tracing::debug!(
+            critical_threshold,
+            high_threshold,
+            medium_threshold,
+            n = risk_vals.len(),
+            "compute_risk_scores: adaptive thresholds derived from distribution"
+        );
+
+        // Step 3 — classify each file using the project-specific thresholds
+        let mut scores: Vec<FileRiskScore> = interim
+            .into_iter()
+            .map(|s| {
+                let risk_level = if s.risk_score >= critical_threshold {
+                    "critical"
+                } else if s.risk_score >= high_threshold {
+                    "high"
+                } else if s.risk_score >= medium_threshold {
+                    "medium"
+                } else {
+                    "low"
+                }
+                .to_string();
+
+                FileRiskScore {
+                    path: s.path,
+                    risk_score: s.risk_score,
+                    risk_level,
+                    factors: s.factors,
+                }
+            })
+            .collect();
+
         scores.sort_by(|a, b| {
             b.risk_score
                 .partial_cmp(&a.risk_score)
@@ -2804,6 +2842,81 @@ impl Neo4jClient {
             warning_count,
             critical_count,
         })
+    }
+    // =========================================================================
+    // rs-stats data providers — bulk metric retrieval for statistical analysis
+    // =========================================================================
+
+    /// Fetch all PageRank values for a project as a flat vector.
+    ///
+    /// Returns an empty Vec if no analytics have been computed yet.
+    /// Used by `analytics::distribution::analyze_distribution` to produce a
+    /// full distribution analysis (best-fit model, p95 threshold, etc.).
+    pub async fn get_all_pagerank_values(&self, project_id: Uuid) -> Result<Vec<f64>> {
+        let q = query(
+            r#"
+            MATCH (p:Project {id: $pid})-[:CONTAINS]->(n)
+            WHERE (n:File OR n:Function) AND n.pagerank IS NOT NULL
+            RETURN toFloat(n.pagerank) AS pr
+            "#,
+        )
+        .param("pid", project_id.to_string());
+
+        let rows = self.execute_with_params(q).await?;
+        Ok(rows
+            .iter()
+            .filter_map(|r| r.get::<f64>("pr").ok())
+            .collect())
+    }
+
+    /// Fetch risk scores grouped by community for ANOVA analysis.
+    ///
+    /// Returns a Vec of Vecs — each inner Vec is the risk scores of one community.
+    /// Communities with fewer than 2 files are excluded (ANOVA precondition).
+    /// Returns an empty Vec if risk scores have not been computed yet.
+    pub async fn get_community_risk_vectors(
+        &self,
+        project_id: Uuid,
+    ) -> Result<Vec<Vec<f64>>> {
+        let q = query(
+            r#"
+            MATCH (p:Project {id: $pid})-[:CONTAINS]->(f:File)
+            WHERE f.risk_score IS NOT NULL AND f.community_id IS NOT NULL
+            WITH f.community_id AS cid, collect(toFloat(f.risk_score)) AS scores
+            WHERE size(scores) >= 2
+            RETURN scores
+            ORDER BY cid
+            "#,
+        )
+        .param("pid", project_id.to_string());
+
+        let rows = self.execute_with_params(q).await?;
+        let groups = rows
+            .iter()
+            .filter_map(|r| r.get::<Vec<f64>>("scores").ok())
+            .filter(|g| g.len() >= 2)
+            .collect();
+        Ok(groups)
+    }
+
+    /// Fetch all risk scores for a project as a flat vector.
+    ///
+    /// Returns an empty Vec if risk scores have not been computed yet.
+    pub async fn get_all_risk_score_values(&self, project_id: Uuid) -> Result<Vec<f64>> {
+        let q = query(
+            r#"
+            MATCH (p:Project {id: $pid})-[:CONTAINS]->(f:File)
+            WHERE f.risk_score IS NOT NULL
+            RETURN toFloat(f.risk_score) AS rs
+            "#,
+        )
+        .param("pid", project_id.to_string());
+
+        let rows = self.execute_with_params(q).await?;
+        Ok(rows
+            .iter()
+            .filter_map(|r| r.get::<f64>("rs").ok())
+            .collect())
     }
 }
 

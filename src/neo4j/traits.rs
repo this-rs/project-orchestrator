@@ -2755,4 +2755,17 @@ pub trait GraphStore: Send + Sync {
         skill_id: Uuid,
         result: &str,
     ) -> Result<()>;
+
+    // ========================================================================
+    // rs-stats data providers — bulk metric retrieval for statistical analysis
+    // ========================================================================
+
+    /// Fetch all PageRank values for a project as a flat vector.
+    async fn get_all_pagerank_values(&self, project_id: Uuid) -> Result<Vec<f64>>;
+
+    /// Fetch risk scores grouped by community (for ANOVA analysis).
+    async fn get_community_risk_vectors(&self, project_id: Uuid) -> Result<Vec<Vec<f64>>>;
+
+    /// Fetch all risk scores for a project as a flat vector.
+    async fn get_all_risk_score_values(&self, project_id: Uuid) -> Result<Vec<f64>>;
 }

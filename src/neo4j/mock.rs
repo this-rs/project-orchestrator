@@ -9514,6 +9514,21 @@ impl GraphStore for MockGraphStore {
     ) -> anyhow::Result<()> {
         Ok(())
     }
+
+    async fn get_all_pagerank_values(&self, _project_id: Uuid) -> anyhow::Result<Vec<f64>> {
+        Ok(Vec::new())
+    }
+
+    async fn get_community_risk_vectors(
+        &self,
+        _project_id: Uuid,
+    ) -> anyhow::Result<Vec<Vec<f64>>> {
+        Ok(Vec::new())
+    }
+
+    async fn get_all_risk_score_values(&self, _project_id: Uuid) -> anyhow::Result<Vec<f64>> {
+        Ok(Vec::new())
+    }
 }
 
 #[cfg(test)]

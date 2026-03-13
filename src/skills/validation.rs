@@ -64,6 +64,15 @@ pub struct SkillHealthMetrics {
     pub recommendation: HealthRecommendation,
     /// Human-readable explanation.
     pub explanation: String,
+    /// Percentile rank of this skill's energy among all active skills in the
+    /// project (0.0 = lowest, 1.0 = highest). None when project context is
+    /// unavailable (e.g. single-skill queries without peer data).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub energy_percentile: Option<f64>,
+    /// Percentile rank of this skill's cohesion among all active skills in the
+    /// project. None when project context is unavailable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cohesion_percentile: Option<f64>,
 }
 
 /// Health recommendation for a skill.
@@ -151,7 +160,41 @@ pub fn compute_health(skill: &SkillNode, now: DateTime<Utc>) -> SkillHealthMetri
         probation_days_remaining,
         recommendation,
         explanation,
+        // Percentile context is populated separately via enrich_with_project_context.
+        energy_percentile: None,
+        cohesion_percentile: None,
     }
+}
+
+/// Enrich a `SkillHealthMetrics` with percentile context derived from all
+/// active skills in the same project.
+///
+/// Computes the fraction of `peer_skills` whose energy/cohesion is strictly
+/// below this skill's value (i.e. a rank-order percentile in [0, 1]).
+///
+/// Call this after `compute_health` when peer data is available:
+/// ```rust,ignore
+/// let mut health = compute_health(&skill, now);
+/// enrich_with_project_context(&mut health, &all_project_skills);
+/// ```
+pub fn enrich_with_project_context(metrics: &mut SkillHealthMetrics, peer_skills: &[SkillNode]) {
+    if peer_skills.is_empty() {
+        return;
+    }
+
+    let n = peer_skills.len() as f64;
+
+    let energy_rank = peer_skills
+        .iter()
+        .filter(|s| s.energy < metrics.energy)
+        .count() as f64;
+    metrics.energy_percentile = Some(energy_rank / n);
+
+    let cohesion_rank = peer_skills
+        .iter()
+        .filter(|s| s.cohesion < metrics.cohesion)
+        .count() as f64;
+    metrics.cohesion_percentile = Some(cohesion_rank / n);
 }
 
 /// Assess the health recommendation for a skill.

@@ -62,6 +62,55 @@ impl Default for SkillLifecycleConfig {
     }
 }
 
+/// Compute a `SkillLifecycleConfig` with thresholds derived from the actual
+/// energy and cohesion distributions of the given skills.
+///
+/// This replaces the one-size-fits-all defaults with per-project values:
+/// - `promotion_energy_threshold` = p60 of current energies (top 40% promoted)
+/// - `promotion_cohesion_threshold` = p60 of current cohesions
+/// - `demotion_energy_threshold` = p10 of energies (bottom 10% demoted)
+/// - `demotion_cohesion_threshold` = p10 of cohesions
+///
+/// Fixed thresholds (`promotion_min_members`, `promotion_min_activations`,
+/// `demotion_inactivity_days`, `archive_inactivity_days`) are unchanged from
+/// `SkillLifecycleConfig::default()`.
+///
+/// Falls back to the default hardcoded values when `skills` is empty or the
+/// distribution has fewer than 4 data points (adaptive_threshold guarantee).
+pub fn compute_adaptive_lifecycle_config(skills: &[SkillNode]) -> SkillLifecycleConfig {
+    use crate::analytics::distribution::adaptive_threshold;
+
+    let energies: Vec<f64> = skills.iter().map(|s| s.energy).collect();
+    let cohesions: Vec<f64> = skills.iter().map(|s| s.cohesion).collect();
+
+    let promotion_energy = adaptive_threshold(&energies, 0.60, 0.3);
+    let promotion_cohesion = adaptive_threshold(&cohesions, 0.60, 0.4);
+    let demotion_energy = adaptive_threshold(&energies, 0.10, 0.1);
+    let demotion_cohesion = adaptive_threshold(&cohesions, 0.10, 0.2);
+
+    debug!(
+        n_skills = skills.len(),
+        promotion_energy,
+        promotion_cohesion,
+        demotion_energy,
+        demotion_cohesion,
+        "compute_adaptive_lifecycle_config: thresholds derived from skill distribution"
+    );
+
+    let defaults = SkillLifecycleConfig::default();
+    SkillLifecycleConfig {
+        promotion_energy_threshold: promotion_energy,
+        promotion_cohesion_threshold: promotion_cohesion,
+        demotion_energy_threshold: demotion_energy,
+        demotion_cohesion_threshold: demotion_cohesion,
+        // structural thresholds remain unchanged
+        promotion_min_members: defaults.promotion_min_members,
+        promotion_min_activations: defaults.promotion_min_activations,
+        demotion_inactivity_days: defaults.demotion_inactivity_days,
+        archive_inactivity_days: defaults.archive_inactivity_days,
+    }
+}
+
 // ============================================================================
 // Promotion (Emerging → Active)
 // ============================================================================
