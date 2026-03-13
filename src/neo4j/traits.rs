@@ -2292,6 +2292,123 @@ pub trait GraphStore: Send + Sync {
     ) -> Result<Vec<(String, String, f64)>>;
 
     // ========================================================================
+    // Persona operations (Living Personas)
+    // ========================================================================
+
+    /// Create a new persona node. If project_id is Some, links it via BELONGS_TO.
+    async fn create_persona(&self, persona: &PersonaNode) -> Result<()>;
+
+    /// Get a persona by ID.
+    async fn get_persona(&self, id: Uuid) -> Result<Option<PersonaNode>>;
+
+    /// Update a persona node (replaces all mutable fields).
+    async fn update_persona(&self, persona: &PersonaNode) -> Result<()>;
+
+    /// Delete a persona and all its relationships.
+    /// Returns true if the persona existed and was deleted.
+    async fn delete_persona(&self, id: Uuid) -> Result<bool>;
+
+    /// List personas for a project with optional status filter and pagination.
+    /// Returns (personas, total_count).
+    async fn list_personas(
+        &self,
+        project_id: Uuid,
+        status: Option<PersonaStatus>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<PersonaNode>, usize)>;
+
+    /// List global personas (project_id IS NULL) — portable personas.
+    async fn list_global_personas(&self) -> Result<Vec<PersonaNode>>;
+
+    // ========================================================================
+    // Persona relation operations
+    // ========================================================================
+
+    /// Add MASTERS relation: Persona -> Skill
+    async fn add_persona_skill(&self, persona_id: Uuid, skill_id: Uuid) -> Result<()>;
+
+    /// Remove MASTERS relation: Persona -> Skill
+    async fn remove_persona_skill(&self, persona_id: Uuid, skill_id: Uuid) -> Result<()>;
+
+    /// Add FOLLOWS relation: Persona -> Protocol
+    async fn add_persona_protocol(&self, persona_id: Uuid, protocol_id: Uuid) -> Result<()>;
+
+    /// Remove FOLLOWS relation: Persona -> Protocol
+    async fn remove_persona_protocol(&self, persona_id: Uuid, protocol_id: Uuid) -> Result<()>;
+
+    /// Add SCOPED_TO relation: Persona -> FeatureGraph
+    async fn set_persona_feature_graph(
+        &self,
+        persona_id: Uuid,
+        feature_graph_id: Uuid,
+    ) -> Result<()>;
+
+    /// Remove SCOPED_TO relation: Persona -> FeatureGraph
+    async fn remove_persona_feature_graph(&self, persona_id: Uuid) -> Result<()>;
+
+    /// Add KNOWS relation: Persona -> File (with weight)
+    async fn add_persona_file(
+        &self,
+        persona_id: Uuid,
+        file_path: &str,
+        weight: f64,
+    ) -> Result<()>;
+
+    /// Remove KNOWS relation: Persona -> File
+    async fn remove_persona_file(&self, persona_id: Uuid, file_path: &str) -> Result<()>;
+
+    /// Add KNOWS relation: Persona -> Function (with weight)
+    async fn add_persona_function(
+        &self,
+        persona_id: Uuid,
+        function_id: &str,
+        weight: f64,
+    ) -> Result<()>;
+
+    /// Remove KNOWS relation: Persona -> Function
+    async fn remove_persona_function(&self, persona_id: Uuid, function_id: &str) -> Result<()>;
+
+    /// Add USES relation: Persona -> Note (with weight)
+    async fn add_persona_note(&self, persona_id: Uuid, note_id: Uuid, weight: f64) -> Result<()>;
+
+    /// Remove USES relation: Persona -> Note
+    async fn remove_persona_note(&self, persona_id: Uuid, note_id: Uuid) -> Result<()>;
+
+    /// Add USES relation: Persona -> Decision (with weight)
+    async fn add_persona_decision(
+        &self,
+        persona_id: Uuid,
+        decision_id: Uuid,
+        weight: f64,
+    ) -> Result<()>;
+
+    /// Remove USES relation: Persona -> Decision
+    async fn remove_persona_decision(&self, persona_id: Uuid, decision_id: Uuid) -> Result<()>;
+
+    /// Add EXTENDS relation: child Persona -> parent Persona
+    async fn add_persona_extends(&self, child_id: Uuid, parent_id: Uuid) -> Result<()>;
+
+    /// Remove EXTENDS relation: child Persona -> parent Persona
+    async fn remove_persona_extends(&self, child_id: Uuid, parent_id: Uuid) -> Result<()>;
+
+    // ========================================================================
+    // Persona subgraph (knowledge assembly)
+    // ========================================================================
+
+    /// Assemble the full knowledge subgraph for a persona.
+    /// Includes all KNOWS, USES, MASTERS, FOLLOWS, SCOPED_TO, EXTENDS entities.
+    async fn get_persona_subgraph(&self, persona_id: Uuid) -> Result<PersonaSubgraph>;
+
+    /// Find personas that KNOW a given file (for activation by file match).
+    /// Returns (persona, weight) sorted by weight descending.
+    async fn find_personas_for_file(
+        &self,
+        file_path: &str,
+        project_id: Uuid,
+    ) -> Result<Vec<(PersonaNode, f64)>>;
+
+    // ========================================================================
     // Analysis Profile operations
     // ========================================================================
 

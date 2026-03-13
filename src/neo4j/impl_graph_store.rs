@@ -2641,6 +2641,170 @@ impl GraphStore for Neo4jClient {
     }
 
     // ========================================================================
+    // Persona operations (delegates to neo4j/persona.rs)
+    // ========================================================================
+
+    async fn create_persona(&self, persona: &PersonaNode) -> anyhow::Result<()> {
+        self.create_persona(persona).await
+    }
+
+    async fn get_persona(&self, id: Uuid) -> anyhow::Result<Option<PersonaNode>> {
+        self.get_persona(id).await
+    }
+
+    async fn update_persona(&self, persona: &PersonaNode) -> anyhow::Result<()> {
+        self.update_persona(persona).await
+    }
+
+    async fn delete_persona(&self, id: Uuid) -> anyhow::Result<bool> {
+        self.delete_persona(id).await
+    }
+
+    async fn list_personas(
+        &self,
+        project_id: Uuid,
+        status: Option<PersonaStatus>,
+        limit: usize,
+        offset: usize,
+    ) -> anyhow::Result<(Vec<PersonaNode>, usize)> {
+        self.list_personas(project_id, status, limit, offset).await
+    }
+
+    async fn list_global_personas(&self) -> anyhow::Result<Vec<PersonaNode>> {
+        self.list_global_personas().await
+    }
+
+    async fn add_persona_skill(&self, persona_id: Uuid, skill_id: Uuid) -> anyhow::Result<()> {
+        self.add_persona_skill(persona_id, skill_id).await
+    }
+
+    async fn remove_persona_skill(&self, persona_id: Uuid, skill_id: Uuid) -> anyhow::Result<()> {
+        self.remove_persona_skill(persona_id, skill_id).await
+    }
+
+    async fn add_persona_protocol(
+        &self,
+        persona_id: Uuid,
+        protocol_id: Uuid,
+    ) -> anyhow::Result<()> {
+        self.add_persona_protocol(persona_id, protocol_id).await
+    }
+
+    async fn remove_persona_protocol(
+        &self,
+        persona_id: Uuid,
+        protocol_id: Uuid,
+    ) -> anyhow::Result<()> {
+        self.remove_persona_protocol(persona_id, protocol_id).await
+    }
+
+    async fn set_persona_feature_graph(
+        &self,
+        persona_id: Uuid,
+        feature_graph_id: Uuid,
+    ) -> anyhow::Result<()> {
+        self.set_persona_feature_graph(persona_id, feature_graph_id)
+            .await
+    }
+
+    async fn remove_persona_feature_graph(&self, persona_id: Uuid) -> anyhow::Result<()> {
+        self.remove_persona_feature_graph(persona_id).await
+    }
+
+    async fn add_persona_file(
+        &self,
+        persona_id: Uuid,
+        file_path: &str,
+        weight: f64,
+    ) -> anyhow::Result<()> {
+        self.add_persona_file(persona_id, file_path, weight).await
+    }
+
+    async fn remove_persona_file(&self, persona_id: Uuid, file_path: &str) -> anyhow::Result<()> {
+        self.remove_persona_file(persona_id, file_path).await
+    }
+
+    async fn add_persona_function(
+        &self,
+        persona_id: Uuid,
+        function_id: &str,
+        weight: f64,
+    ) -> anyhow::Result<()> {
+        self.add_persona_function(persona_id, function_id, weight)
+            .await
+    }
+
+    async fn remove_persona_function(
+        &self,
+        persona_id: Uuid,
+        function_id: &str,
+    ) -> anyhow::Result<()> {
+        self.remove_persona_function(persona_id, function_id).await
+    }
+
+    async fn add_persona_note(
+        &self,
+        persona_id: Uuid,
+        note_id: Uuid,
+        weight: f64,
+    ) -> anyhow::Result<()> {
+        self.add_persona_note(persona_id, note_id, weight).await
+    }
+
+    async fn remove_persona_note(&self, persona_id: Uuid, note_id: Uuid) -> anyhow::Result<()> {
+        self.remove_persona_note(persona_id, note_id).await
+    }
+
+    async fn add_persona_decision(
+        &self,
+        persona_id: Uuid,
+        decision_id: Uuid,
+        weight: f64,
+    ) -> anyhow::Result<()> {
+        self.add_persona_decision(persona_id, decision_id, weight)
+            .await
+    }
+
+    async fn remove_persona_decision(
+        &self,
+        persona_id: Uuid,
+        decision_id: Uuid,
+    ) -> anyhow::Result<()> {
+        self.remove_persona_decision(persona_id, decision_id).await
+    }
+
+    async fn add_persona_extends(
+        &self,
+        child_id: Uuid,
+        parent_id: Uuid,
+    ) -> anyhow::Result<()> {
+        self.add_persona_extends(child_id, parent_id).await
+    }
+
+    async fn remove_persona_extends(
+        &self,
+        child_id: Uuid,
+        parent_id: Uuid,
+    ) -> anyhow::Result<()> {
+        self.remove_persona_extends(child_id, parent_id).await
+    }
+
+    async fn get_persona_subgraph(
+        &self,
+        persona_id: Uuid,
+    ) -> anyhow::Result<PersonaSubgraph> {
+        self.get_persona_subgraph(persona_id).await
+    }
+
+    async fn find_personas_for_file(
+        &self,
+        file_path: &str,
+        project_id: Uuid,
+    ) -> anyhow::Result<Vec<(PersonaNode, f64)>> {
+        self.find_personas_for_file(file_path, project_id).await
+    }
+
+    // ========================================================================
     // Analysis Profile operations (delegates to neo4j/profile.rs)
     // ========================================================================
 

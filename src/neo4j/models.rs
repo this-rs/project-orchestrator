@@ -1806,6 +1806,203 @@ pub struct RiskFactors {
     pub betweenness: f64,
 }
 
+// ============================================================================
+// Persona Node (Living Personas — Adaptive Knowledge Agents)
+// ============================================================================
+
+/// Origin of a persona: how it was created.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PersonaOrigin {
+    /// Created automatically from graph analysis (communities, call graph, etc.)
+    AutoBuild,
+    /// Created manually by the user or agent
+    #[default]
+    Manual,
+    /// Imported from another project via PersonaPackage
+    Imported,
+}
+
+impl std::fmt::Display for PersonaOrigin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AutoBuild => write!(f, "auto_build"),
+            Self::Manual => write!(f, "manual"),
+            Self::Imported => write!(f, "imported"),
+        }
+    }
+}
+
+impl std::str::FromStr for PersonaOrigin {
+    type Err = String;
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "auto_build" => Ok(Self::AutoBuild),
+            "manual" => Ok(Self::Manual),
+            "imported" => Ok(Self::Imported),
+            _ => Err(format!("Unknown PersonaOrigin: {s}")),
+        }
+    }
+}
+
+
+/// Status of a persona lifecycle.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PersonaStatus {
+    /// Recently used, ready for activation
+    Active,
+    /// Not used recently, still available
+    Dormant,
+    /// Newly created, accumulating knowledge
+    #[default]
+    Emerging,
+    /// Archived, no longer available for activation
+    Archived,
+}
+
+impl std::fmt::Display for PersonaStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Active => write!(f, "active"),
+            Self::Dormant => write!(f, "dormant"),
+            Self::Emerging => write!(f, "emerging"),
+            Self::Archived => write!(f, "archived"),
+        }
+    }
+}
+
+impl std::str::FromStr for PersonaStatus {
+    type Err = String;
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "active" => Ok(Self::Active),
+            "dormant" => Ok(Self::Dormant),
+            "emerging" => Ok(Self::Emerging),
+            "archived" => Ok(Self::Archived),
+            _ => Err(format!("Unknown PersonaStatus: {s}")),
+        }
+    }
+}
+
+
+/// A Living Persona — an adaptive knowledge agent connected to the graph.
+///
+/// Personas aggregate domain-specific knowledge (skills, protocols, files,
+/// notes, decisions) into a coherent "expert profile" that evolves over time.
+/// They form a runtime stack (PersonaStack) that switches dynamically based
+/// on what files/functions the agent is touching.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersonaNode {
+    pub id: Uuid,
+    /// Project this persona belongs to. None = global/portable persona.
+    pub project_id: Option<Uuid>,
+    /// Human-readable name (e.g., "neo4j-expert", "threejs-specialist")
+    pub name: String,
+    /// Description of the persona's domain of expertise
+    #[serde(default)]
+    pub description: String,
+    /// Current lifecycle status
+    #[serde(default)]
+    pub status: PersonaStatus,
+
+    // --- Execution parameters ---
+    /// Default complexity classification: "simple", "complex", "creative"
+    #[serde(default)]
+    pub complexity_default: Option<String>,
+    /// Guard timeout in seconds (overrides RunnerConfig.task_timeout_secs)
+    pub timeout_secs: Option<u64>,
+    /// Maximum cost in USD for tasks using this persona
+    pub max_cost_usd: Option<f64>,
+    /// Preferred model (e.g., "opus", "sonnet"). None = use default.
+    pub model_preference: Option<String>,
+    /// System prompt override/addition. None = use default.
+    pub system_prompt_override: Option<String>,
+
+    // --- Living metrics (evolve over time) ---
+    /// Energy level [0,1] — reinforced on success, decayed on failure
+    #[serde(default = "default_energy")]
+    pub energy: f64,
+    /// Knowledge cohesion [0,1] — how tightly connected its knowledge subgraph is
+    #[serde(default)]
+    pub cohesion: f64,
+    /// Number of times this persona has been activated
+    #[serde(default)]
+    pub activation_count: i64,
+    /// Success rate of tasks executed with this persona [0,1]
+    #[serde(default)]
+    pub success_rate: f64,
+    /// Average task duration in seconds when this persona is active
+    #[serde(default)]
+    pub avg_duration_secs: f64,
+    /// Last time this persona was activated
+    pub last_activated: Option<DateTime<Utc>>,
+
+    // --- Bootstrap tracking ---
+    /// How this persona was created
+    #[serde(default)]
+    pub origin: PersonaOrigin,
+
+    // --- Timestamps ---
+    pub created_at: DateTime<Utc>,
+    pub updated_at: Option<DateTime<Utc>>,
+}
+
+fn default_energy() -> f64 {
+    0.5
+}
+
+/// A weighted relation from a Persona to a knowledge entity.
+///
+/// Used for KNOWS (File/Function), USES (Note/Decision) relations
+/// that carry a relevance weight.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersonaWeightedRelation {
+    /// Target entity type (e.g., "file", "function", "note", "decision")
+    pub entity_type: String,
+    /// Target entity identifier (path for files/functions, UUID string for notes/decisions)
+    pub entity_id: String,
+    /// Relevance weight [0,1] — evolves with usage
+    pub weight: f64,
+}
+
+/// Summary of a persona's knowledge subgraph — the full "expert context".
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersonaSubgraph {
+    /// Persona identity
+    pub persona_id: Uuid,
+    pub persona_name: String,
+    /// Files this persona KNOWS (with weights)
+    pub files: Vec<PersonaWeightedRelation>,
+    /// Functions this persona KNOWS (with weights)
+    pub functions: Vec<PersonaWeightedRelation>,
+    /// Notes this persona USES (with weights)
+    pub notes: Vec<PersonaWeightedRelation>,
+    /// Decisions this persona USES (with weights)
+    pub decisions: Vec<PersonaWeightedRelation>,
+    /// Skills this persona MASTERS (IDs)
+    pub skill_ids: Vec<Uuid>,
+    /// Protocols this persona FOLLOWS (IDs)
+    pub protocol_ids: Vec<Uuid>,
+    /// FeatureGraph this persona is SCOPED_TO (if any)
+    pub feature_graph_id: Option<Uuid>,
+    /// Parent personas via EXTENDS chain (ordered from direct parent to root)
+    pub parent_ids: Vec<Uuid>,
+    /// Statistics
+    pub stats: PersonaSubgraphStats,
+}
+
+/// Statistics about a persona's knowledge subgraph.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersonaSubgraphStats {
+    /// Total number of entities in the subgraph
+    pub total_entities: usize,
+    /// Coverage score: how much of the project this persona covers [0,1]
+    pub coverage_score: f64,
+    /// Freshness: average recency of relations (based on last_activated and note timestamps)
+    pub freshness: f64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
