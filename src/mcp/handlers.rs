@@ -9126,6 +9126,473 @@ mod tests {
         }
     }
 
+    // -- Persona -----------------------------------------------------------
+
+    #[test]
+    fn test_resolve_mega_tool_persona_actions() {
+        let handler = make_handler();
+        for (action, expected) in [
+            ("create", "create_persona"),
+            ("get", "get_persona"),
+            ("list", "list_personas"),
+            ("update", "update_persona"),
+            ("delete", "delete_persona"),
+            ("add_skill", "add_persona_skill"),
+            ("remove_skill", "remove_persona_skill"),
+            ("add_protocol", "add_persona_protocol"),
+            ("remove_protocol", "remove_persona_protocol"),
+            ("add_file", "add_persona_file"),
+            ("remove_file", "remove_persona_file"),
+            ("add_function", "add_persona_function"),
+            ("remove_function", "remove_persona_function"),
+            ("add_note", "add_persona_note"),
+            ("remove_note", "remove_persona_note"),
+            ("add_decision", "add_persona_decision"),
+            ("remove_decision", "remove_persona_decision"),
+            ("scope_to_feature_graph", "scope_persona_feature_graph"),
+            ("unscope_feature_graph", "unscope_persona_feature_graph"),
+            ("add_extends", "add_persona_extends"),
+            ("remove_extends", "remove_persona_extends"),
+            ("get_subgraph", "get_persona_subgraph"),
+            ("find_for_file", "find_personas_for_file"),
+            ("list_global", "list_global_personas"),
+            ("export", "export_persona"),
+            ("import", "import_persona"),
+            ("activate", "activate_persona"),
+            ("auto_build", "auto_build_persona"),
+            ("maintain", "maintain_personas"),
+            ("detect", "detect_personas"),
+        ] {
+            let args = json!({"action": action});
+            let (name, _) = handler.resolve_mega_tool("persona", &args).unwrap();
+            assert_eq!(
+                name, expected,
+                "persona action '{}' should resolve to '{}'",
+                action, expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_http_list_personas() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "list_personas",
+                Some(json!({"project_id": "550e8400-e29b-41d4-a716-446655440000"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert_eq!(result["path"], "/api/personas");
+        let query = result["query"].as_str().unwrap();
+        assert!(query.contains("project_id=550e8400"));
+    }
+
+    #[tokio::test]
+    async fn test_http_list_personas_with_filters() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "list_personas",
+                Some(json!({
+                    "project_id": "550e8400-e29b-41d4-a716-446655440000",
+                    "status": "active",
+                    "limit": 10,
+                    "offset": 5
+                })),
+            )
+            .await
+            .unwrap();
+        let query = result["query"].as_str().unwrap();
+        assert!(query.contains("status=active"), "query: {}", query);
+        assert!(query.contains("limit=10"), "query: {}", query);
+        assert!(query.contains("offset=5"), "query: {}", query);
+    }
+
+    #[tokio::test]
+    async fn test_http_create_persona() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "create_persona",
+                Some(json!({
+                    "project_id": "550e8400-e29b-41d4-a716-446655440000",
+                    "name": "neo4j-expert",
+                    "description": "Expert in Neo4j"
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert_eq!(result["path"], "/api/personas");
+        assert_eq!(result["body"]["name"], "neo4j-expert");
+    }
+
+    #[tokio::test]
+    async fn test_http_get_persona() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "get_persona",
+                Some(json!({"persona_id": "550e8400-e29b-41d4-a716-446655440000"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert_eq!(
+            result["path"],
+            "/api/personas/550e8400-e29b-41d4-a716-446655440000"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_http_update_persona() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "update_persona",
+                Some(json!({
+                    "persona_id": "550e8400-e29b-41d4-a716-446655440000",
+                    "name": "updated-name",
+                    "status": "active",
+                    "energy": 0.9
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "PUT");
+        assert_eq!(
+            result["path"],
+            "/api/personas/550e8400-e29b-41d4-a716-446655440000"
+        );
+        assert_eq!(result["body"]["name"], "updated-name");
+        assert_eq!(result["body"]["status"], "active");
+    }
+
+    #[tokio::test]
+    async fn test_http_delete_persona() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "delete_persona",
+                Some(json!({"persona_id": "550e8400-e29b-41d4-a716-446655440000"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "DELETE");
+        assert_eq!(
+            result["path"],
+            "/api/personas/550e8400-e29b-41d4-a716-446655440000"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_http_add_persona_skill() {
+        let (handler, _) = make_http_handler().await;
+        let pid = "550e8400-e29b-41d4-a716-446655440000";
+        let sid = "660e8400-e29b-41d4-a716-446655440000";
+        let result = handler
+            .handle(
+                "add_persona_skill",
+                Some(json!({"persona_id": pid, "skill_id": sid})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert_eq!(result["path"], format!("/api/personas/{}/skills/{}", pid, sid));
+    }
+
+    #[tokio::test]
+    async fn test_http_remove_persona_skill() {
+        let (handler, _) = make_http_handler().await;
+        let pid = "550e8400-e29b-41d4-a716-446655440000";
+        let sid = "660e8400-e29b-41d4-a716-446655440000";
+        let result = handler
+            .handle(
+                "remove_persona_skill",
+                Some(json!({"persona_id": pid, "skill_id": sid})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "DELETE");
+        assert_eq!(result["path"], format!("/api/personas/{}/skills/{}", pid, sid));
+    }
+
+    #[tokio::test]
+    async fn test_http_add_persona_file() {
+        let (handler, _) = make_http_handler().await;
+        let pid = "550e8400-e29b-41d4-a716-446655440000";
+        let result = handler
+            .handle(
+                "add_persona_file",
+                Some(json!({"persona_id": pid, "file_path": "/src/main.rs", "weight": 0.8})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert_eq!(result["path"], format!("/api/personas/{}/files", pid));
+        assert_eq!(result["body"]["file_path"], "/src/main.rs");
+        assert_eq!(result["body"]["weight"], 0.8);
+    }
+
+    #[tokio::test]
+    async fn test_http_add_persona_file_default_weight() {
+        let (handler, _) = make_http_handler().await;
+        let pid = "550e8400-e29b-41d4-a716-446655440000";
+        let result = handler
+            .handle(
+                "add_persona_file",
+                Some(json!({"persona_id": pid, "file_path": "/src/lib.rs"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["body"]["weight"], 1.0);
+    }
+
+    #[tokio::test]
+    async fn test_http_remove_persona_file() {
+        let (handler, _) = make_http_handler().await;
+        let pid = "550e8400-e29b-41d4-a716-446655440000";
+        let result = handler
+            .handle(
+                "remove_persona_file",
+                Some(json!({"persona_id": pid, "file_path": "/src/main.rs"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "DELETE");
+        assert_eq!(result["path"], format!("/api/personas/{}/files", pid));
+    }
+
+    #[tokio::test]
+    async fn test_http_add_persona_note() {
+        let (handler, _) = make_http_handler().await;
+        let pid = "550e8400-e29b-41d4-a716-446655440000";
+        let nid = "770e8400-e29b-41d4-a716-446655440000";
+        let result = handler
+            .handle(
+                "add_persona_note",
+                Some(json!({"persona_id": pid, "note_id": nid, "weight": 0.7})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert_eq!(result["path"], format!("/api/personas/{}/notes/{}", pid, nid));
+        assert_eq!(result["body"]["weight"], 0.7);
+    }
+
+    #[tokio::test]
+    async fn test_http_add_persona_decision() {
+        let (handler, _) = make_http_handler().await;
+        let pid = "550e8400-e29b-41d4-a716-446655440000";
+        let did = "880e8400-e29b-41d4-a716-446655440000";
+        let result = handler
+            .handle(
+                "add_persona_decision",
+                Some(json!({"persona_id": pid, "decision_id": did})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert_eq!(
+            result["path"],
+            format!("/api/personas/{}/decisions/{}", pid, did)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_http_get_persona_subgraph() {
+        let (handler, _) = make_http_handler().await;
+        let pid = "550e8400-e29b-41d4-a716-446655440000";
+        let result = handler
+            .handle("get_persona_subgraph", Some(json!({"persona_id": pid})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert_eq!(result["path"], format!("/api/personas/{}/subgraph", pid));
+    }
+
+    #[tokio::test]
+    async fn test_http_find_personas_for_file() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "find_personas_for_file",
+                Some(json!({
+                    "file_path": "/src/neo4j/persona.rs",
+                    "project_id": "550e8400-e29b-41d4-a716-446655440000"
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert_eq!(result["path"], "/api/personas/find-for-file");
+    }
+
+    #[tokio::test]
+    async fn test_http_list_global_personas() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("list_global_personas", Some(json!({"limit": 5})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert_eq!(result["path"], "/api/personas/global");
+        let query = result["query"].as_str().unwrap();
+        assert!(query.contains("limit=5"), "query: {}", query);
+    }
+
+    #[tokio::test]
+    async fn test_http_export_persona() {
+        let (handler, _) = make_http_handler().await;
+        let pid = "550e8400-e29b-41d4-a716-446655440000";
+        let result = handler
+            .handle("export_persona", Some(json!({"persona_id": pid})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert_eq!(result["path"], format!("/api/personas/{}/export", pid));
+    }
+
+    #[tokio::test]
+    async fn test_http_export_persona_with_source() {
+        let (handler, _) = make_http_handler().await;
+        let pid = "550e8400-e29b-41d4-a716-446655440000";
+        let result = handler
+            .handle(
+                "export_persona",
+                Some(json!({"persona_id": pid, "source_project_name": "my-project"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        let query = result["query"].as_str().unwrap();
+        assert!(
+            query.contains("source_project_name=my-project"),
+            "query: {}",
+            query
+        );
+    }
+
+    #[tokio::test]
+    async fn test_http_import_persona() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "import_persona",
+                Some(json!({
+                    "project_id": "550e8400-e29b-41d4-a716-446655440000",
+                    "package": {"schema_version": 1}
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert_eq!(result["path"], "/api/personas/import");
+    }
+
+    #[tokio::test]
+    async fn test_http_activate_persona() {
+        let (handler, _) = make_http_handler().await;
+        let pid = "550e8400-e29b-41d4-a716-446655440000";
+        let result = handler
+            .handle("activate_persona", Some(json!({"persona_id": pid})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert_eq!(result["path"], format!("/api/personas/{}/activate", pid));
+    }
+
+    #[tokio::test]
+    async fn test_http_auto_build_persona() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "auto_build_persona",
+                Some(json!({
+                    "project_id": "550e8400-e29b-41d4-a716-446655440000",
+                    "name": "auto-persona"
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert_eq!(result["path"], "/api/personas/auto-build");
+    }
+
+    #[tokio::test]
+    async fn test_http_maintain_personas() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "maintain_personas",
+                Some(json!({"project_id": "550e8400-e29b-41d4-a716-446655440000"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert!(result["path"]
+            .as_str()
+            .unwrap()
+            .starts_with("/api/personas/maintain"));
+    }
+
+    #[tokio::test]
+    async fn test_http_detect_personas() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "detect_personas",
+                Some(json!({"project_id": "550e8400-e29b-41d4-a716-446655440000"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert!(result["path"]
+            .as_str()
+            .unwrap()
+            .starts_with("/api/personas/detect"));
+    }
+
+    #[tokio::test]
+    async fn test_http_scope_persona_feature_graph() {
+        let (handler, _) = make_http_handler().await;
+        let pid = "550e8400-e29b-41d4-a716-446655440000";
+        let fgid = "660e8400-e29b-41d4-a716-446655440000";
+        let result = handler
+            .handle(
+                "scope_persona_feature_graph",
+                Some(json!({"persona_id": pid, "feature_graph_id": fgid})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert_eq!(
+            result["path"],
+            format!("/api/personas/{}/feature-graphs/{}", pid, fgid)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_http_add_persona_extends() {
+        let (handler, _) = make_http_handler().await;
+        let pid = "550e8400-e29b-41d4-a716-446655440000";
+        let parent = "660e8400-e29b-41d4-a716-446655440000";
+        let result = handler
+            .handle(
+                "add_persona_extends",
+                Some(json!({"persona_id": pid, "parent_persona_id": parent})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert_eq!(
+            result["path"],
+            format!("/api/personas/{}/extends/{}", pid, parent)
+        );
+    }
+
     // ========================================================================
     // unstringify_json_values tests
     // ========================================================================

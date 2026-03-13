@@ -9,11 +9,9 @@ coverage:
         threshold: 1%
     patch:
       default:
-        # The chat module contains WebSocket handlers and streaming logic
-        # that requires a live CLI subprocess and WS connections.
-        # Unit tests cover the testable business logic but cannot cover
-        # infrastructure code (ws_chat_handler.rs, stream_response internals).
-        target: 30%
+        # Patch coverage gate: new/modified code must be ≥80% covered.
+        # Raises the bar from 30% to enforce quality on all new contributions.
+        target: 80%
         threshold: 5%
 
 ignore:
@@ -47,6 +45,7 @@ ignore:
   - "src/neo4j/task.rs"
   - "src/neo4j/user.rs"
   - "src/neo4j/workspace.rs"
+  - "src/neo4j/persona.rs"
   # Server bootstrap — start_server / start_setup_server bind Axum servers,
   # read env vars, and configure middleware. Pure infrastructure, not unit-testable.
   # Covered by integration/API tests (ci.yml jobs).
