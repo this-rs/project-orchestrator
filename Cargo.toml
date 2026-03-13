@@ -122,7 +122,7 @@ fastembed = "5.11"
 rag-umap = "0.0"
 
 # Statistical analysis engine — distribution fitting, hypothesis testing, regression
-rs-stats = { path = "../../crates/rs-stats", features = ["parallel"] }
+rs-stats = { version = "2.0.3", features = ["parallel"] }
 
 # openssl-sys is a transitive dep (via ort-sys build script → ureq → native-tls,
 # and neo4rs → native-tls). The "vendored" feature builds OpenSSL from source,

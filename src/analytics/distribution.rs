@@ -102,10 +102,11 @@ pub fn analyze_distribution(values: &[f64]) -> Option<DistributionAnalysis> {
     let mut sorted = values.to_vec();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
-    // ── Basic statistics ──────────────────────────────────────────────────────
-    let mean = sorted.iter().sum::<f64>() / n as f64;
-    let variance = sorted.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / n as f64;
-    let std_dev = variance.sqrt();
+    // ── Basic statistics — delegate to rs-stats rather than reimplementing ────
+    let mean = rs_stats::prob::average(values).unwrap_or_else(|_| {
+        values.iter().sum::<f64>() / n as f64
+    });
+    let std_dev = rs_stats::prob::std_dev(values).unwrap_or(0.0);
 
     let skewness = if std_dev > 0.0 && n >= 3 {
         sorted

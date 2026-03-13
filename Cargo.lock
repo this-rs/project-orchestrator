@@ -3886,6 +3886,8 @@ dependencies = [
 [[package]]
 name = "rs-stats"
 version = "2.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0740c547eb78a9bcadc27afdd4b7040fe28f4511c191d0daad75fa9985745225"
 dependencies = [
  "bincode",
  "num",
