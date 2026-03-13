@@ -876,12 +876,21 @@ impl Neo4jClient {
         file_path: &str,
         project_id: Uuid,
     ) -> Result<Vec<(PersonaNode, f64)>> {
+        // Match via direct KNOWS relation OR via SCOPED_TO FeatureGraph
         let q = query(
             r#"
-            MATCH (p:Persona {project_id: $project_id})-[r:KNOWS]->(f:File {path: $file_path})
-            WHERE p.status <> 'archived'
-            RETURN p, r.weight AS weight
-            ORDER BY r.weight DESC
+            CALL {
+                MATCH (p:Persona {project_id: $project_id})-[r:KNOWS]->(f:File {path: $file_path})
+                WHERE p.status <> 'archived'
+                RETURN p, r.weight AS weight
+                UNION
+                MATCH (p:Persona {project_id: $project_id})-[:SCOPED_TO]->(fg:FeatureGraph)-[:HAS_ENTITY]->(f:File {path: $file_path})
+                WHERE p.status <> 'archived'
+                RETURN p, 0.5 AS weight
+            }
+            WITH p, max(weight) AS weight
+            RETURN p, weight
+            ORDER BY weight DESC
             "#,
         )
         .param("project_id", project_id.to_string())
