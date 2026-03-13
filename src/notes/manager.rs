@@ -1489,15 +1489,32 @@ impl NoteManager {
         cancel: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<SynapseBackfillProgress> {
         let batch_size = if batch_size == 0 { 50 } else { batch_size };
-        let min_similarity = if min_similarity <= 0.0 {
-            0.75
-        } else {
+        let max_neighbors = if max_neighbors == 0 { 10 } else { max_neighbors };
+
+        // Calibrate min_similarity from existing synapse weights when no explicit
+        // value was provided (min_similarity <= 0.0).
+        //
+        // Synapse weights are initialised from cosine similarities at creation,
+        // so their distribution approximates the embedding density of this project.
+        // Using the p70 of existing weights as the floor keeps only the top-30%
+        // most similar connections — adapting to each project rather than a fixed 0.75.
+        // Falls back to 0.75 on first-ever backfill (no synapses yet).
+        let min_similarity = if min_similarity > 0.0 {
             min_similarity
-        };
-        let max_neighbors = if max_neighbors == 0 {
-            10
         } else {
-            max_neighbors
+            match self.neo4j.get_all_synapse_weights(None).await {
+                Ok(weights) if weights.len() >= 4 => {
+                    let calibrated =
+                        crate::analytics::distribution::adaptive_threshold(&weights, 0.70, 0.75);
+                    tracing::info!(
+                        calibrated_min_similarity = calibrated,
+                        n_existing_synapses = weights.len(),
+                        "backfill_synapses: min_similarity calibrated from weight distribution"
+                    );
+                    calibrated
+                }
+                _ => 0.75,
+            }
         };
 
         // Phase 1: init energy on all notes that don't have it yet

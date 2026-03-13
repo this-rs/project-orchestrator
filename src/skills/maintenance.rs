@@ -138,9 +138,34 @@ pub async fn run_daily_maintenance(
         ..Default::default()
     };
 
-    // Step 1: Decay synapses (global — not project-scoped)
+    // Step 1: Decay synapses (global — not project-scoped).
+    // The prune threshold is derived from the actual weight distribution
+    // (p5 of all weights, fallback to configured default) so it adapts to
+    // each project's synapse density instead of using a hardcoded constant.
+    let adaptive_prune_threshold = match graph_store
+        .get_all_synapse_weights(Some(project_id))
+        .await
+    {
+        Ok(weights) if !weights.is_empty() => {
+            let threshold = crate::analytics::distribution::adaptive_threshold(
+                &weights,
+                0.05,
+                config.synapse_prune_threshold,
+            );
+            info!(
+                project_id = %project_id,
+                adaptive_prune_threshold = threshold,
+                n_synapses = weights.len(),
+                config_default = config.synapse_prune_threshold,
+                "Daily maintenance: adaptive prune threshold derived from distribution"
+            );
+            threshold
+        }
+        _ => config.synapse_prune_threshold,
+    };
+
     match graph_store
-        .decay_synapses(config.synapse_decay_amount, config.synapse_prune_threshold)
+        .decay_synapses(config.synapse_decay_amount, adaptive_prune_threshold)
         .await
     {
         Ok((decayed, pruned)) => {
@@ -153,14 +178,67 @@ pub async fn run_daily_maintenance(
         }
     }
 
-    // Step 2: Update energy scores (half-life decay for note energies, global)
+    // Step 2: Update energy scores (half-life decay for note energies, global).
+    // Capture mean synapse weight before update to detect stagnation afterward.
+    let pre_update_mean: Option<f64> = match graph_store
+        .get_all_synapse_weights(Some(project_id))
+        .await
+    {
+        Ok(ws) if !ws.is_empty() => Some(ws.iter().sum::<f64>() / ws.len() as f64),
+        _ => None,
+    };
+
     if let Err(e) = graph_store.update_energy_scores(90.0).await {
         warn!(error = %e, "Failed to update energy scores");
         result.warnings.push(format!("Energy update failed: {}", e));
     }
 
-    // Step 3: Lifecycle evaluation (promotions/demotions)
-    match update_skill_lifecycle(graph_store, project_id, &config.lifecycle).await {
+    // T7 — Stagnation detection: test whether post-update synapse weights have
+    // drifted significantly from the pre-update mean (one-sample t-test p < 0.05).
+    if let Some(ref_mean) = pre_update_mean {
+        if let Ok(post_weights) = graph_store
+            .get_all_synapse_weights(Some(project_id))
+            .await
+        {
+            if post_weights.len() >= 4 {
+                if let Some(test_result) =
+                    crate::analytics::hypothesis::test_stagnation(&post_weights, ref_mean)
+                {
+                    use crate::analytics::hypothesis::SignificanceLevel;
+                    if matches!(
+                        test_result.significance,
+                        SignificanceLevel::Significant | SignificanceLevel::HighlySignificant
+                    ) {
+                        warn!(
+                            project_id = %project_id,
+                            p_value = test_result.p_value,
+                            t_stat = test_result.t_statistic,
+                            ref_mean,
+                            "Significant synapse weight drift detected after energy update \
+                             (p={:.4}). Consider running reinforce_neurons on low-energy clusters.",
+                            test_result.p_value
+                        );
+                        result.warnings.push(format!(
+                            "Synapse energy drift detected: p={:.4} (t={:.3}). \
+                             Run reinforce_neurons on related notes.",
+                            test_result.p_value, test_result.t_statistic
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    // Step 3: Lifecycle evaluation (promotions/demotions).
+    // Use adaptive lifecycle thresholds derived from the current skill distribution.
+    let adaptive_lifecycle = match graph_store.get_skills_for_project(project_id).await {
+        Ok(skills) if !skills.is_empty() => {
+            crate::skills::lifecycle::compute_adaptive_lifecycle_config(&skills)
+        }
+        _ => config.lifecycle.clone(),
+    };
+
+    match update_skill_lifecycle(graph_store, project_id, &adaptive_lifecycle).await {
         Ok(lifecycle) => {
             result.lifecycle = Some(lifecycle);
         }

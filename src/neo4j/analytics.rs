@@ -1417,11 +1417,51 @@ impl Neo4jClient {
         Ok(edges)
     }
 
+    /// Retrieve all SYNAPSE weights for notes in a project.
+    ///
+    /// Used to calibrate adaptive thresholds (e.g. `weak_synapse` boundary)
+    /// from the real distribution instead of a hardcoded constant.
+    /// Returns an empty vec when no synapses exist yet.
+    async fn get_project_synapse_weights(&self, project_id: Uuid) -> Result<Vec<f64>> {
+        let q = query(
+            r#"
+            MATCH (p:Project {id: $project_id})-[:HAS_NOTE]->(n1:Note)-[s:SYNAPSE]->(n2:Note)
+            RETURN s.weight AS weight
+            "#,
+        )
+        .param("project_id", project_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut weights = Vec::new();
+        while let Some(row) = result.next().await? {
+            if let Ok(w) = row.get::<f64>("weight") {
+                weights.push(w);
+            }
+        }
+        Ok(weights)
+    }
+
     /// Get neural network metrics for a project's SYNAPSE layer.
     ///
     /// Returns aggregate statistics about the note-level neural connections:
     /// active synapse count, average energy, weak synapse ratio, and dead note count.
+    ///
+    /// The `weak_synapse` boundary is now derived from the actual weight
+    /// distribution (p25 of all weights, fallback 0.3) instead of a hardcoded
+    /// constant, so it adapts to each project's synapse density.
     pub async fn get_neural_metrics(&self, project_id: Uuid) -> Result<NeuralMetrics> {
+        // Derive an adaptive weak-synapse threshold from the weight distribution.
+        // Falls back to 0.3 when fewer than 4 synapses exist.
+        let weights = self.get_project_synapse_weights(project_id).await.unwrap_or_default();
+        let weak_threshold =
+            crate::analytics::distribution::adaptive_threshold(&weights, 0.25, 0.3);
+
+        tracing::debug!(
+            weak_threshold,
+            n_synapses = weights.len(),
+            "get_neural_metrics: adaptive weak-synapse threshold"
+        );
+
         let q = query(
             r#"
             MATCH (p:Project {id: $project_id})-[:CONTAINS]->(f:File)
@@ -1429,7 +1469,7 @@ impl Neo4jClient {
             WITH count(DISTINCT n) AS total_notes
             OPTIONAL MATCH (n1:Note)-[s:SYNAPSE]->(n2:Note) WHERE s.weight >= 0.1
             WITH total_notes, count(s) AS active_synapses, avg(s.weight) AS avg_weight,
-                 sum(CASE WHEN s.weight < 0.3 THEN 1 ELSE 0 END) AS weak_synapses
+                 sum(CASE WHEN s.weight < $weak_threshold THEN 1 ELSE 0 END) AS weak_synapses
             OPTIONAL MATCH (n:Note) WHERE n.energy IS NOT NULL AND n.energy < 0.05
             WITH total_notes, active_synapses, coalesce(avg_weight, 0) AS avg_weight,
                  coalesce(weak_synapses, 0) AS weak_synapses, count(n) AS dead_notes
@@ -1438,7 +1478,8 @@ impl Neo4jClient {
                    dead_notes AS dead_notes_count
             "#,
         )
-        .param("project_id", project_id.to_string());
+        .param("project_id", project_id.to_string())
+        .param("weak_threshold", weak_threshold);
 
         let mut result = self.graph.execute(q).await?;
 

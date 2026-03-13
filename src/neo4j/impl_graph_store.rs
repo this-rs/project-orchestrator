@@ -2077,6 +2077,13 @@ impl GraphStore for Neo4jClient {
         self.list_decisions_needing_synapses(limit, offset).await
     }
 
+    async fn get_all_synapse_weights(
+        &self,
+        project_id: Option<Uuid>,
+    ) -> anyhow::Result<Vec<f64>> {
+        self.get_all_synapse_weights(project_id).await
+    }
+
     // ========================================================================
     // Chat session operations
     // ========================================================================

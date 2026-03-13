@@ -1722,6 +1722,13 @@ pub trait GraphStore: Send + Sync {
         offset: usize,
     ) -> Result<(Vec<DecisionNode>, usize)>;
 
+    /// Retrieve all SYNAPSE weights for a project (or globally when `project_id` is None).
+    ///
+    /// Used to calibrate adaptive thresholds (prune threshold, weak-synapse
+    /// boundary, backfill min_similarity) from the real distribution instead of
+    /// hardcoded constants. Returns an empty vec when no synapses exist yet.
+    async fn get_all_synapse_weights(&self, project_id: Option<Uuid>) -> Result<Vec<f64>>;
+
     // ========================================================================
     // Chat session operations
     // ========================================================================

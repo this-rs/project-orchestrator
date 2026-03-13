@@ -6268,6 +6268,30 @@ impl GraphStore for MockGraphStore {
         Ok((vec![], 0))
     }
 
+    async fn get_all_synapse_weights(&self, project_id: Option<Uuid>) -> Result<Vec<f64>> {
+        // Return weights from the in-memory synapse map, optionally filtered by project.
+        let note_synapses = self.note_synapses.read().await;
+        let notes = self.notes.read().await;
+
+        let weights: Vec<f64> = note_synapses
+            .iter()
+            .filter(|(src_id, _neighbors)| {
+                if let Some(pid) = project_id {
+                    notes
+                        .get(*src_id)
+                        .and_then(|n| n.project_id)
+                        .map(|p| p == pid)
+                        .unwrap_or(false)
+                } else {
+                    true
+                }
+            })
+            .flat_map(|(_src_id, neighbors)| neighbors.iter().map(|(_dst, w)| *w))
+            .collect();
+
+        Ok(weights)
+    }
+
     async fn get_project_note_entity_links(
         &self,
         project_id: Uuid,
