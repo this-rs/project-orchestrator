@@ -2363,20 +2363,22 @@ impl Neo4jClient {
         &self,
         project_id: Option<uuid::Uuid>,
     ) -> Result<Vec<f64>> {
-        let (cypher, q) = if let Some(pid) = project_id {
-            let cypher = r#"
+        let q = if let Some(pid) = project_id {
+            query(
+                r#"
                 MATCH (p:Project {id: $project_id})-[:HAS_NOTE]->(n1:Note)-[s:SYNAPSE]->(n2:Note)
                 RETURN s.weight AS weight
-            "#;
-            (cypher, query(cypher).param("project_id", pid.to_string()))
+                "#,
+            )
+            .param("project_id", pid.to_string())
         } else {
-            let cypher = r#"
+            query(
+                r#"
                 MATCH ()-[s:SYNAPSE]->()
                 RETURN s.weight AS weight
-            "#;
-            (cypher, query(cypher))
+                "#,
+            )
         };
-        let _ = cypher; // silence unused warning
 
         let mut result = self.graph.execute(q).await?;
         let mut weights = Vec::new();

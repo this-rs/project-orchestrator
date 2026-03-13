@@ -1417,42 +1417,21 @@ impl Neo4jClient {
         Ok(edges)
     }
 
-    /// Retrieve all SYNAPSE weights for notes in a project.
-    ///
-    /// Used to calibrate adaptive thresholds (e.g. `weak_synapse` boundary)
-    /// from the real distribution instead of a hardcoded constant.
-    /// Returns an empty vec when no synapses exist yet.
-    async fn get_project_synapse_weights(&self, project_id: Uuid) -> Result<Vec<f64>> {
-        let q = query(
-            r#"
-            MATCH (p:Project {id: $project_id})-[:HAS_NOTE]->(n1:Note)-[s:SYNAPSE]->(n2:Note)
-            RETURN s.weight AS weight
-            "#,
-        )
-        .param("project_id", project_id.to_string());
-
-        let mut result = self.graph.execute(q).await?;
-        let mut weights = Vec::new();
-        while let Some(row) = result.next().await? {
-            if let Ok(w) = row.get::<f64>("weight") {
-                weights.push(w);
-            }
-        }
-        Ok(weights)
-    }
-
     /// Get neural network metrics for a project's SYNAPSE layer.
     ///
     /// Returns aggregate statistics about the note-level neural connections:
     /// active synapse count, average energy, weak synapse ratio, and dead note count.
     ///
-    /// The `weak_synapse` boundary is now derived from the actual weight
-    /// distribution (p25 of all weights, fallback 0.3) instead of a hardcoded
-    /// constant, so it adapts to each project's synapse density.
+    /// The `weak_synapse` boundary is derived from the actual weight distribution
+    /// (p25 of all weights, fallback 0.3) instead of a hardcoded constant.
     pub async fn get_neural_metrics(&self, project_id: Uuid) -> Result<NeuralMetrics> {
         // Derive an adaptive weak-synapse threshold from the weight distribution.
+        // Reuses get_all_synapse_weights from the note module — no duplicate query.
         // Falls back to 0.3 when fewer than 4 synapses exist.
-        let weights = self.get_project_synapse_weights(project_id).await.unwrap_or_default();
+        let weights = self
+            .get_all_synapse_weights(Some(project_id))
+            .await
+            .unwrap_or_default();
         let weak_threshold =
             crate::analytics::distribution::adaptive_threshold(&weights, 0.25, 0.3);
 
@@ -2915,10 +2894,7 @@ impl Neo4jClient {
     /// Returns a Vec of Vecs — each inner Vec is the risk scores of one community.
     /// Communities with fewer than 2 files are excluded (ANOVA precondition).
     /// Returns an empty Vec if risk scores have not been computed yet.
-    pub async fn get_community_risk_vectors(
-        &self,
-        project_id: Uuid,
-    ) -> Result<Vec<Vec<f64>>> {
+    pub async fn get_community_risk_vectors(&self, project_id: Uuid) -> Result<Vec<Vec<f64>>> {
         let q = query(
             r#"
             MATCH (p:Project {id: $pid})-[:CONTAINS]->(f:File)

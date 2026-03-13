@@ -138,30 +138,31 @@ pub async fn run_daily_maintenance(
         ..Default::default()
     };
 
-    // Step 1: Decay synapses (global — not project-scoped).
-    // The prune threshold is derived from the actual weight distribution
-    // (p5 of all weights, fallback to configured default) so it adapts to
-    // each project's synapse density instead of using a hardcoded constant.
-    let adaptive_prune_threshold = match graph_store
+    // Step 1: Fetch synapse weights once — reused for prune threshold and
+    // stagnation detection below. A single round-trip covers both use cases.
+    let synapse_weights = graph_store
         .get_all_synapse_weights(Some(project_id))
         .await
-    {
-        Ok(weights) if !weights.is_empty() => {
-            let threshold = crate::analytics::distribution::adaptive_threshold(
-                &weights,
-                0.05,
-                config.synapse_prune_threshold,
-            );
-            info!(
-                project_id = %project_id,
-                adaptive_prune_threshold = threshold,
-                n_synapses = weights.len(),
-                config_default = config.synapse_prune_threshold,
-                "Daily maintenance: adaptive prune threshold derived from distribution"
-            );
-            threshold
-        }
-        _ => config.synapse_prune_threshold,
+        .unwrap_or_default();
+
+    // Derive adaptive prune threshold from p5 of the weight distribution
+    // (fallback = configured default when fewer than 4 synapses exist).
+    let adaptive_prune_threshold = if synapse_weights.is_empty() {
+        config.synapse_prune_threshold
+    } else {
+        let threshold = crate::analytics::distribution::adaptive_threshold(
+            &synapse_weights,
+            0.05,
+            config.synapse_prune_threshold,
+        );
+        info!(
+            project_id = %project_id,
+            adaptive_prune_threshold = threshold,
+            n_synapses = synapse_weights.len(),
+            config_default = config.synapse_prune_threshold,
+            "Daily maintenance: adaptive prune threshold derived from distribution"
+        );
+        threshold
     };
 
     match graph_store
@@ -179,52 +180,43 @@ pub async fn run_daily_maintenance(
     }
 
     // Step 2: Update energy scores (half-life decay for note energies, global).
-    // Capture mean synapse weight before update to detect stagnation afterward.
-    let pre_update_mean: Option<f64> = match graph_store
-        .get_all_synapse_weights(Some(project_id))
-        .await
-    {
-        Ok(ws) if !ws.is_empty() => Some(ws.iter().sum::<f64>() / ws.len() as f64),
-        _ => None,
-    };
-
     if let Err(e) = graph_store.update_energy_scores(90.0).await {
         warn!(error = %e, "Failed to update energy scores");
         result.warnings.push(format!("Energy update failed: {}", e));
     }
 
-    // T7 — Stagnation detection: test whether post-update synapse weights have
-    // drifted significantly from the pre-update mean (one-sample t-test p < 0.05).
-    if let Some(ref_mean) = pre_update_mean {
-        if let Ok(post_weights) = graph_store
-            .get_all_synapse_weights(Some(project_id))
-            .await
+    // Stagnation detection: test whether current synapse weights are
+    // significantly below the healthy midpoint (0.5).
+    //
+    // `update_energy_scores` decays note energies, not synapse weights, so a
+    // pre/post comparison on weights would always be non-significant. Instead
+    // we test the absolute level: weights significantly below 0.5 indicate a
+    // degrading knowledge graph that needs reinforcement.
+    if synapse_weights.len() >= 4 {
+        if let Some(test_result) =
+            crate::analytics::hypothesis::test_stagnation(&synapse_weights, 0.5)
         {
-            if post_weights.len() >= 4 {
-                if let Some(test_result) =
-                    crate::analytics::hypothesis::test_stagnation(&post_weights, ref_mean)
-                {
-                    use crate::analytics::hypothesis::SignificanceLevel;
-                    if matches!(
-                        test_result.significance,
-                        SignificanceLevel::Significant | SignificanceLevel::HighlySignificant
-                    ) {
-                        warn!(
-                            project_id = %project_id,
-                            p_value = test_result.p_value,
-                            t_stat = test_result.t_statistic,
-                            ref_mean,
-                            "Significant synapse weight drift detected after energy update \
-                             (p={:.4}). Consider running reinforce_neurons on low-energy clusters.",
-                            test_result.p_value
-                        );
-                        result.warnings.push(format!(
-                            "Synapse energy drift detected: p={:.4} (t={:.3}). \
-                             Run reinforce_neurons on related notes.",
-                            test_result.p_value, test_result.t_statistic
-                        ));
-                    }
-                }
+            use crate::analytics::hypothesis::SignificanceLevel;
+            let mean = rs_stats::prob::average(&synapse_weights).unwrap_or(0.0);
+            if mean < 0.5
+                && matches!(
+                    test_result.significance,
+                    SignificanceLevel::Significant | SignificanceLevel::HighlySignificant
+                )
+            {
+                warn!(
+                    project_id = %project_id,
+                    mean_weight = mean,
+                    t_stat = test_result.t_statistic,
+                    "Synapse weights significantly below healthy midpoint (mean={:.3}, \
+                     t={:.3}). Consider running reinforce_neurons on low-energy clusters.",
+                    mean, test_result.t_statistic
+                );
+                result.warnings.push(format!(
+                    "Synapse energy below healthy baseline: mean={:.3} (t={:.3}). \
+                     Run reinforce_neurons on related notes.",
+                    mean, test_result.t_statistic
+                ));
             }
         }
     }
