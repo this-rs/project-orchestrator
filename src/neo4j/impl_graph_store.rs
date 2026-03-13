@@ -2804,6 +2804,47 @@ impl GraphStore for Neo4jClient {
         self.find_personas_for_file(file_path, project_id).await
     }
 
+    async fn maintain_personas(&self, project_id: Uuid) -> anyhow::Result<(usize, usize, usize)> {
+        self.maintain_personas(project_id).await
+    }
+
+    async fn detect_personas(
+        &self,
+        project_id: Uuid,
+    ) -> anyhow::Result<Vec<crate::neo4j::persona::PersonaProposal>> {
+        self.detect_personas(project_id).await
+    }
+
+    async fn auto_link_note_to_persona(
+        &self,
+        persona_id: Uuid,
+        note_id: Uuid,
+        weight: f64,
+    ) -> anyhow::Result<()> {
+        self.auto_link_note_to_persona(persona_id, note_id, weight)
+            .await
+    }
+
+    async fn auto_link_decision_to_persona(
+        &self,
+        persona_id: Uuid,
+        decision_id: Uuid,
+        weight: f64,
+    ) -> anyhow::Result<()> {
+        self.auto_link_decision_to_persona(persona_id, decision_id, weight)
+            .await
+    }
+
+    async fn auto_link_file_to_persona(
+        &self,
+        persona_id: Uuid,
+        file_path: &str,
+        weight: f64,
+    ) -> anyhow::Result<()> {
+        self.auto_link_file_to_persona(persona_id, file_path, weight)
+            .await
+    }
+
     // ========================================================================
     // Analysis Profile operations (delegates to neo4j/profile.rs)
     // ========================================================================

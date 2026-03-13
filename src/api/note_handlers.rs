@@ -298,6 +298,41 @@ pub async fn create_note(
         }
     }
 
+    // Growth hook: auto-link note to active personas for this project
+    if let Some(pid) = project_id {
+        let neo4j = state.orchestrator.neo4j_arc();
+        let note_id = note.id;
+        tokio::spawn(async move {
+            // Find active personas for this project, then link to each
+            match neo4j.list_personas(pid, None, 50, 0).await {
+                Ok((personas, _)) => {
+                    for persona in personas
+                        .iter()
+                        .filter(|p| p.status == crate::neo4j::models::PersonaStatus::Active)
+                    {
+                        if let Err(e) =
+                            neo4j.auto_link_note_to_persona(persona.id, note_id, 0.5).await
+                        {
+                            tracing::debug!(
+                                persona_id = %persona.id,
+                                note_id = %note_id,
+                                error = %e,
+                                "Growth hook: auto_link_note failed (non-fatal)"
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        project_id = %pid,
+                        error = %e,
+                        "Growth hook: list_personas failed (non-fatal)"
+                    );
+                }
+            }
+        });
+    }
+
     Ok((StatusCode::CREATED, Json(note)))
 }
 

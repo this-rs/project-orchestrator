@@ -8720,6 +8720,44 @@ impl GraphStore for MockGraphStore {
         Ok(results)
     }
 
+    async fn maintain_personas(&self, _project_id: Uuid) -> Result<(usize, usize, usize)> {
+        Ok((0, 0, 0))
+    }
+
+    async fn detect_personas(
+        &self,
+        _project_id: Uuid,
+    ) -> Result<Vec<crate::neo4j::persona::PersonaProposal>> {
+        Ok(vec![])
+    }
+
+    async fn auto_link_note_to_persona(
+        &self,
+        _persona_id: Uuid,
+        _note_id: Uuid,
+        _weight: f64,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    async fn auto_link_decision_to_persona(
+        &self,
+        _persona_id: Uuid,
+        _decision_id: Uuid,
+        _weight: f64,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    async fn auto_link_file_to_persona(
+        &self,
+        _persona_id: Uuid,
+        _file_path: &str,
+        _weight: f64,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     // ========================================================================
     // Analysis Profile operations
     // ========================================================================

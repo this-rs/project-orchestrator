@@ -521,6 +521,8 @@ impl ToolHandler {
             ("persona", "import") => "import_persona",
             ("persona", "activate") => "activate_persona",
             ("persona", "auto_build") => "auto_build_persona",
+            ("persona", "maintain") => "maintain_personas",
+            ("persona", "detect") => "detect_personas",
 
             // Reasoning Tree
             ("reasoning", "reason") => "reason",
@@ -4808,6 +4810,28 @@ impl ToolHandler {
 
             "auto_build_persona" => {
                 let result = http.post("/api/personas/auto-build", args).await?;
+                Ok(Some(result))
+            }
+
+            "maintain_personas" => {
+                let project_id = extract_id(args, "project_id")?;
+                let result = http
+                    .post(
+                        &format!("/api/personas/maintain?project_id={}", project_id),
+                        &json!({}),
+                    )
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "detect_personas" => {
+                let project_id = extract_id(args, "project_id")?;
+                let result = http
+                    .post(
+                        &format!("/api/personas/detect?project_id={}", project_id),
+                        &json!({}),
+                    )
+                    .await?;
                 Ok(Some(result))
             }
 

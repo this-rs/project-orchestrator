@@ -1089,6 +1089,44 @@ pub async fn add_decision(
         }
     }
 
+    // Growth hook: auto-link decision to active personas for this task's project
+    {
+        let neo4j = state.orchestrator.neo4j_arc();
+        let decision_id = decision.id;
+        tokio::spawn(async move {
+            // Resolve project from task, then find active personas
+            if let Ok(Some(project)) = neo4j.get_project_for_task(task_id).await {
+                match neo4j.list_personas(project.id, None, 50, 0).await {
+                    Ok((personas, _)) => {
+                        for persona in personas
+                            .iter()
+                            .filter(|p| p.status == crate::neo4j::models::PersonaStatus::Active)
+                        {
+                            if let Err(e) = neo4j
+                                .auto_link_decision_to_persona(persona.id, decision_id, 0.5)
+                                .await
+                            {
+                                tracing::debug!(
+                                    persona_id = %persona.id,
+                                    decision_id = %decision_id,
+                                    error = %e,
+                                    "Growth hook: auto_link_decision failed (non-fatal)"
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            project_id = %project.id,
+                            error = %e,
+                            "Growth hook: list_personas failed (non-fatal)"
+                        );
+                    }
+                }
+            }
+        });
+    }
+
     Ok(Json(decision))
 }
 

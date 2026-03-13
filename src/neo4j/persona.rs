@@ -910,6 +910,304 @@ impl Neo4jClient {
         }
         Ok(personas)
     }
+
+    // ========================================================================
+    // Maintenance & Detection
+    // ========================================================================
+
+    /// Maintain all personas for a project: decay weights, prune, recalculate cohesion.
+    ///
+    /// Returns (decayed_count, pruned_count, personas_updated).
+    pub async fn maintain_personas(&self, project_id: Uuid) -> Result<(usize, usize, usize)> {
+        // 1. Decay all KNOWS/USES weights by *= 0.95
+        let decay_q = query(
+            r#"
+            MATCH (p:Persona {project_id: $project_id})-[r:KNOWS|USES]->()
+            WHERE r.weight IS NOT NULL
+            SET r.weight = r.weight * 0.95
+            RETURN count(r) AS decayed
+            "#,
+        )
+        .param("project_id", project_id.to_string());
+
+        let mut decay_result = self
+            .graph
+            .execute(decay_q)
+            .await
+            .context("maintain_personas: decay")?;
+        let decayed_count: usize = if let Some(row) = decay_result.next().await? {
+            row.get::<i64>("decayed").unwrap_or(0) as usize
+        } else {
+            0
+        };
+
+        // 2. Prune relations with weight < 0.1
+        let prune_q = query(
+            r#"
+            MATCH (p:Persona {project_id: $project_id})-[r:KNOWS|USES]->()
+            WHERE r.weight IS NOT NULL AND r.weight < 0.1
+            DELETE r
+            RETURN count(r) AS pruned
+            "#,
+        )
+        .param("project_id", project_id.to_string());
+
+        let mut prune_result = self
+            .graph
+            .execute(prune_q)
+            .await
+            .context("maintain_personas: prune")?;
+        let pruned_count: usize = if let Some(row) = prune_result.next().await? {
+            row.get::<i64>("pruned").unwrap_or(0) as usize
+        } else {
+            0
+        };
+
+        // 3. Recalculate cohesion for each persona from SYNAPSE density between USES notes
+        let cohesion_q = query(
+            r#"
+            MATCH (p:Persona {project_id: $project_id})
+            OPTIONAL MATCH (p)-[:USES]->(n:Note)
+            WITH p, collect(n.id) AS note_ids, count(n) AS note_count
+            OPTIONAL MATCH (n1:Note)-[s:SYNAPSE]->(n2:Note)
+            WHERE n1.id IN note_ids AND n2.id IN note_ids
+            WITH p, note_count,
+                 CASE WHEN note_count > 1
+                      THEN toFloat(count(s)) / toFloat(note_count * (note_count - 1) / 2)
+                      ELSE 0.0
+                 END AS cohesion
+            SET p.cohesion = CASE WHEN cohesion > 1.0 THEN 1.0 ELSE cohesion END,
+                p.updated_at = $now
+            RETURN count(p) AS updated
+            "#,
+        )
+        .param("project_id", project_id.to_string())
+        .param("now", chrono::Utc::now().to_rfc3339());
+
+        let mut cohesion_result = self
+            .graph
+            .execute(cohesion_q)
+            .await
+            .context("maintain_personas: cohesion")?;
+        let personas_updated: usize = if let Some(row) = cohesion_result.next().await? {
+            row.get::<i64>("updated").unwrap_or(0) as usize
+        } else {
+            0
+        };
+
+        // 4. Update success_rate from AgentExecution history (last 30 days)
+        let _success_q = query(
+            r#"
+            MATCH (p:Persona {project_id: $project_id})
+            OPTIONAL MATCH (ae:AgentExecution)-[:EXECUTED_TASK]->(t:Task {persona: p.id})
+            WHERE ae.started_at > datetime() - duration('P30D')
+            WITH p,
+                 count(ae) AS total_executions,
+                 count(CASE WHEN ae.status = 'completed' THEN 1 END) AS successes
+            WHERE total_executions > 0
+            SET p.success_rate = toFloat(successes) / toFloat(total_executions),
+                p.updated_at = $now
+            "#,
+        )
+        .param("project_id", project_id.to_string())
+        .param("now", chrono::Utc::now().to_rfc3339());
+
+        // Best-effort — AgentExecution schema may not match exactly
+        let _ = self.graph.execute(_success_q).await;
+
+        Ok((decayed_count, pruned_count, personas_updated))
+    }
+
+    /// Detect potential personas from Louvain communities.
+    ///
+    /// Returns proposals: Vec<(community_label, file_count, suggested_name, confidence)>.
+    pub async fn detect_personas(
+        &self,
+        project_id: Uuid,
+    ) -> Result<Vec<PersonaProposal>> {
+        // Find communities with enough files that don't already have a persona
+        let q = query(
+            r#"
+            MATCH (f:File)<-[:CONTAINS]-(p:Project {id: $project_id})
+            WHERE f.community_id IS NOT NULL
+            WITH f.community_id AS cid,
+                 f.community_label AS label,
+                 collect(f.path) AS files,
+                 count(f) AS file_count
+            WHERE file_count >= 3
+            OPTIONAL MATCH (persona:Persona {project_id: $project_id})-[:SCOPED_TO]->(fg:FeatureGraph)-[:HAS_ENTITY]->(covered:File)
+            WHERE covered.community_id = cid
+            WITH cid, label, files, file_count,
+                 count(DISTINCT persona) AS existing_personas
+            WHERE existing_personas = 0
+            RETURN cid, label, files, file_count
+            ORDER BY file_count DESC
+            LIMIT 10
+            "#,
+        )
+        .param("project_id", project_id.to_string());
+
+        let mut result = self
+            .graph
+            .execute(q)
+            .await
+            .context("detect_personas")?;
+
+        let mut proposals = Vec::new();
+        while let Some(row) = result.next().await? {
+            let community_id: i64 = row.get("cid").unwrap_or(0);
+            let label: String = row.get("label").unwrap_or_default();
+            let file_count: i64 = row.get("file_count").unwrap_or(0);
+            let files: Vec<String> = row.get("files").unwrap_or_default();
+
+            // Derive a suggested name from the community label or common path prefix
+            let suggested_name = if !label.is_empty() && label != "unknown" {
+                label
+                    .to_lowercase()
+                    .replace(' ', "-")
+                    .chars()
+                    .filter(|c| c.is_alphanumeric() || *c == '-')
+                    .collect::<String>()
+            } else {
+                // Use common path prefix as name
+                derive_name_from_paths(&files)
+            };
+
+            // Confidence: based on file count (more files = higher confidence)
+            let confidence = ((file_count as f64) / 20.0).min(1.0);
+
+            proposals.push(PersonaProposal {
+                community_id,
+                suggested_name: format!("{}-expert", suggested_name),
+                file_count: file_count as usize,
+                sample_files: files.into_iter().take(5).collect(),
+                confidence,
+            });
+        }
+
+        Ok(proposals)
+    }
+
+    /// Auto-link a note to the active persona for a task (growth hook).
+    pub async fn auto_link_note_to_persona(
+        &self,
+        persona_id: Uuid,
+        note_id: Uuid,
+        weight: f64,
+    ) -> Result<()> {
+        let q = query(
+            r#"
+            MATCH (p:Persona {id: $persona_id}), (n:Note {id: $note_id})
+            MERGE (p)-[r:USES]->(n)
+            ON CREATE SET r.weight = $weight
+            ON MATCH SET r.weight = CASE WHEN r.weight < $weight THEN $weight ELSE r.weight END
+            "#,
+        )
+        .param("persona_id", persona_id.to_string())
+        .param("note_id", note_id.to_string())
+        .param("weight", weight);
+
+        let _ = self
+            .graph
+            .execute(q)
+            .await
+            .context("auto_link_note_to_persona")?;
+        Ok(())
+    }
+
+    /// Auto-link a decision to the active persona (growth hook).
+    pub async fn auto_link_decision_to_persona(
+        &self,
+        persona_id: Uuid,
+        decision_id: Uuid,
+        weight: f64,
+    ) -> Result<()> {
+        let q = query(
+            r#"
+            MATCH (p:Persona {id: $persona_id}), (d:Decision {id: $decision_id})
+            MERGE (p)-[r:USES]->(d)
+            ON CREATE SET r.weight = $weight
+            ON MATCH SET r.weight = CASE WHEN r.weight < $weight THEN $weight ELSE r.weight END
+            "#,
+        )
+        .param("persona_id", persona_id.to_string())
+        .param("decision_id", decision_id.to_string())
+        .param("weight", weight);
+
+        let _ = self
+            .graph
+            .execute(q)
+            .await
+            .context("auto_link_decision_to_persona")?;
+        Ok(())
+    }
+
+    /// Auto-link a new file (adjacent to scope) to persona (growth hook).
+    pub async fn auto_link_file_to_persona(
+        &self,
+        persona_id: Uuid,
+        file_path: &str,
+        weight: f64,
+    ) -> Result<()> {
+        let q = query(
+            r#"
+            MATCH (p:Persona {id: $persona_id}), (f:File {path: $file_path})
+            MERGE (p)-[r:KNOWS]->(f)
+            ON CREATE SET r.weight = $weight
+            ON MATCH SET r.weight = CASE WHEN r.weight < $weight THEN $weight ELSE r.weight END
+            "#,
+        )
+        .param("persona_id", persona_id.to_string())
+        .param("file_path", file_path)
+        .param("weight", weight);
+
+        let _ = self
+            .graph
+            .execute(q)
+            .await
+            .context("auto_link_file_to_persona")?;
+        Ok(())
+    }
+}
+
+/// Persona detection proposal — a candidate persona from community analysis.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PersonaProposal {
+    pub community_id: i64,
+    pub suggested_name: String,
+    pub file_count: usize,
+    pub sample_files: Vec<String>,
+    pub confidence: f64,
+}
+
+/// Derive a persona name from common path prefix of files.
+fn derive_name_from_paths(paths: &[String]) -> String {
+    if paths.is_empty() {
+        return "unknown".to_string();
+    }
+
+    // Find the longest common path prefix
+    let first = &paths[0];
+    let parts: Vec<&str> = first.split('/').collect();
+
+    let mut common_depth = parts.len();
+    for path in paths.iter().skip(1) {
+        let other_parts: Vec<&str> = path.split('/').collect();
+        let matching = parts
+            .iter()
+            .zip(other_parts.iter())
+            .take_while(|(a, b)| a == b)
+            .count();
+        common_depth = common_depth.min(matching);
+    }
+
+    if common_depth > 0 {
+        // Use the deepest common directory component
+        let name = parts[common_depth - 1];
+        name.to_string()
+    } else {
+        "mixed".to_string()
+    }
 }
 
 // ============================================================================

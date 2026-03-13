@@ -970,6 +970,14 @@ fn protected_routes() -> Router<OrchestratorState> {
             post(persona_handlers::auto_build_persona),
         )
         .route(
+            "/api/personas/maintain",
+            post(persona_handlers::maintain_personas),
+        )
+        .route(
+            "/api/personas/detect",
+            post(persona_handlers::detect_personas),
+        )
+        .route(
             "/api/personas/{persona_id}",
             get(persona_handlers::get_persona)
                 .put(persona_handlers::update_persona)

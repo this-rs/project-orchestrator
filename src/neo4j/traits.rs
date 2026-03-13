@@ -2408,6 +2408,40 @@ pub trait GraphStore: Send + Sync {
         project_id: Uuid,
     ) -> Result<Vec<(PersonaNode, f64)>>;
 
+    /// Maintain all personas for a project: decay weights, prune, recalculate cohesion.
+    /// Returns (decayed_count, pruned_count, personas_updated).
+    async fn maintain_personas(&self, project_id: Uuid) -> Result<(usize, usize, usize)>;
+
+    /// Detect potential personas from Louvain communities.
+    async fn detect_personas(
+        &self,
+        project_id: Uuid,
+    ) -> Result<Vec<crate::neo4j::persona::PersonaProposal>>;
+
+    /// Auto-link a note to an active persona (growth hook).
+    async fn auto_link_note_to_persona(
+        &self,
+        persona_id: Uuid,
+        note_id: Uuid,
+        weight: f64,
+    ) -> Result<()>;
+
+    /// Auto-link a decision to an active persona (growth hook).
+    async fn auto_link_decision_to_persona(
+        &self,
+        persona_id: Uuid,
+        decision_id: Uuid,
+        weight: f64,
+    ) -> Result<()>;
+
+    /// Auto-link a file to an active persona (growth hook).
+    async fn auto_link_file_to_persona(
+        &self,
+        persona_id: Uuid,
+        file_path: &str,
+        weight: f64,
+    ) -> Result<()>;
+
     // ========================================================================
     // Analysis Profile operations
     // ========================================================================

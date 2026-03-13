@@ -1256,6 +1256,67 @@ pub async fn auto_build_persona(
 }
 
 // ============================================================================
+// Maintenance & Detection
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct ProjectIdQuery {
+    pub project_id: Uuid,
+}
+
+/// Maintain personas: decay weights, prune dead relations, recalculate cohesion
+/// POST /api/personas/maintain?project_id=<uuid>
+pub async fn maintain_personas(
+    State(state): State<OrchestratorState>,
+    Query(query): Query<ProjectIdQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let neo4j = state.orchestrator.neo4j();
+    let (decayed, pruned, updated) = neo4j
+        .maintain_personas(query.project_id)
+        .await
+        .map_err(AppError::Internal)?;
+
+    Ok(Json(serde_json::json!({
+        "decayed": decayed,
+        "pruned": pruned,
+        "cohesion_updated": updated,
+        "project_id": query.project_id,
+    })))
+}
+
+/// Detect persona candidates from code communities (Louvain)
+/// POST /api/personas/detect?project_id=<uuid>
+pub async fn detect_personas(
+    State(state): State<OrchestratorState>,
+    Query(query): Query<ProjectIdQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let neo4j = state.orchestrator.neo4j();
+    let proposals = neo4j
+        .detect_personas(query.project_id)
+        .await
+        .map_err(AppError::Internal)?;
+
+    let proposals_json: Vec<serde_json::Value> = proposals
+        .iter()
+        .map(|p| {
+            serde_json::json!({
+                "suggested_name": p.suggested_name,
+                "sample_files": p.sample_files,
+                "file_count": p.file_count,
+                "community_id": p.community_id,
+                "confidence": p.confidence,
+            })
+        })
+        .collect();
+
+    Ok(Json(serde_json::json!({
+        "proposals": proposals_json,
+        "count": proposals.len(),
+        "project_id": query.project_id,
+    })))
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
