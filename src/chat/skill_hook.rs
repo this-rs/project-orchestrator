@@ -500,7 +500,7 @@ mod tests {
             entries,
             loaded_at: std::time::Instant::now(),
         };
-        assert!(index.entries.get("src/lib.rs").is_none());
+        assert!(!index.entries.contains_key("src/lib.rs"));
     }
 
     #[test]
