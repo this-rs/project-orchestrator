@@ -1980,14 +1980,17 @@ pub struct PersonaSubgraph {
     pub notes: Vec<PersonaWeightedRelation>,
     /// Decisions this persona USES (with weights)
     pub decisions: Vec<PersonaWeightedRelation>,
-    /// Skills this persona MASTERS (IDs)
-    pub skill_ids: Vec<Uuid>,
-    /// Protocols this persona FOLLOWS (IDs)
-    pub protocol_ids: Vec<Uuid>,
+    /// Skills this persona MASTERS (with entity_type = "skill")
+    pub skills: Vec<PersonaWeightedRelation>,
+    /// Protocols this persona FOLLOWS (with entity_type = "protocol")
+    pub protocols: Vec<PersonaWeightedRelation>,
     /// FeatureGraph this persona is SCOPED_TO (if any)
     pub feature_graph_id: Option<Uuid>,
-    /// Parent personas via EXTENDS chain (ordered from direct parent to root)
-    pub parent_ids: Vec<Uuid>,
+    /// Parent personas via EXTENDS chain (with entity_type = "persona")
+    pub parents: Vec<PersonaWeightedRelation>,
+    /// Children personas that EXTEND this one (with entity_type = "persona")
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub children: Vec<PersonaWeightedRelation>,
     /// Statistics
     pub stats: PersonaSubgraphStats,
 }

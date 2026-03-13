@@ -782,9 +782,11 @@ pub async fn export_persona(
 
     // 5. Resolve skill IDs → names for portability
     let mut skill_names = Vec::new();
-    for skill_id in &subgraph.skill_ids {
-        if let Ok(Some(skill)) = neo4j.get_skill(*skill_id).await {
-            skill_names.push(skill.name);
+    for rel in &subgraph.skills {
+        if let Ok(skill_uuid) = rel.entity_id.parse::<Uuid>() {
+            if let Ok(Some(skill)) = neo4j.get_skill(skill_uuid).await {
+                skill_names.push(skill.name);
+            }
         }
     }
 

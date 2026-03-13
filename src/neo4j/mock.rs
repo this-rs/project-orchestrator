@@ -8640,20 +8640,36 @@ impl GraphStore for MockGraphStore {
             })
             .unwrap_or_default();
 
-        let skill_ids: Vec<Uuid> = self
+        let skills: Vec<PersonaWeightedRelation> = self
             .persona_skills
             .read()
             .await
             .get(&persona_id)
-            .map(|s| s.iter().copied().collect())
+            .map(|s| {
+                s.iter()
+                    .map(|sid| PersonaWeightedRelation {
+                        entity_type: "skill".to_string(),
+                        entity_id: sid.to_string(),
+                        weight: 1.0,
+                    })
+                    .collect()
+            })
             .unwrap_or_default();
 
-        let protocol_ids: Vec<Uuid> = self
+        let protocols: Vec<PersonaWeightedRelation> = self
             .persona_protocols
             .read()
             .await
             .get(&persona_id)
-            .map(|s| s.iter().copied().collect())
+            .map(|s| {
+                s.iter()
+                    .map(|pid| PersonaWeightedRelation {
+                        entity_type: "protocol".to_string(),
+                        entity_id: pid.to_string(),
+                        weight: 1.0,
+                    })
+                    .collect()
+            })
             .unwrap_or_default();
 
         let feature_graph_id = self
@@ -8663,20 +8679,30 @@ impl GraphStore for MockGraphStore {
             .get(&persona_id)
             .copied();
 
-        let parent_ids: Vec<Uuid> = self
+        let parents: Vec<PersonaWeightedRelation> = self
             .persona_extends
             .read()
             .await
             .get(&persona_id)
-            .cloned()
+            .map(|ids| {
+                ids.iter()
+                    .map(|pid| PersonaWeightedRelation {
+                        entity_type: "persona".to_string(),
+                        entity_id: pid.to_string(),
+                        weight: 1.0,
+                    })
+                    .collect()
+            })
             .unwrap_or_default();
+
+        let children: Vec<PersonaWeightedRelation> = Vec::new(); // Mock doesn't track reverse extends
 
         let total_entities = files.len()
             + functions.len()
             + notes.len()
             + decisions.len()
-            + skill_ids.len()
-            + protocol_ids.len()
+            + skills.len()
+            + protocols.len()
             + if feature_graph_id.is_some() { 1 } else { 0 };
 
         Ok(PersonaSubgraph {
@@ -8686,10 +8712,11 @@ impl GraphStore for MockGraphStore {
             functions,
             notes,
             decisions,
-            skill_ids,
-            protocol_ids,
+            skills,
+            protocols,
             feature_graph_id,
-            parent_ids,
+            parents,
+            children,
             stats: PersonaSubgraphStats {
                 total_entities,
                 coverage_score: 0.0,

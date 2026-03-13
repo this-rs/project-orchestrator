@@ -357,16 +357,18 @@ pub async fn load_persona_stack(
 
     // 4. Inherited — follow EXTENDS chain of primary persona
     if let Some(primary) = stack.get_primary().cloned() {
-        let parent_ids = primary.cached_subgraph.parent_ids.clone();
-        for (i, parent_id) in parent_ids.iter().enumerate() {
+        let parents = primary.cached_subgraph.parents.clone();
+        for (i, parent_rel) in parents.iter().enumerate() {
             // Weight decreases with distance: 0.4, 0.2, 0.1...
             let w = 0.4 / (i as f64 + 1.0);
             if w < 0.05 {
                 break;
             }
-            let _ =
-                load_and_push(graph, *parent_id, PersonaTrigger::Inherited, w, now, &mut stack)
-                    .await;
+            if let Ok(parent_id) = parent_rel.entity_id.parse::<Uuid>() {
+                let _ =
+                    load_and_push(graph, parent_id, PersonaTrigger::Inherited, w, now, &mut stack)
+                        .await;
+            }
         }
     }
 

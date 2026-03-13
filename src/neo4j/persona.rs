@@ -158,7 +158,7 @@ impl Neo4jClient {
                 .unwrap_or(neo4rs::BoltType::Null(neo4rs::BoltNull)),
         );
 
-        let _ = self.graph.execute(q).await.context("create_persona")?;
+        self.graph.run(q).await.context("create_persona")?;
         Ok(())
     }
 
@@ -254,7 +254,7 @@ impl Neo4jClient {
         )
         .param("updated_at", chrono::Utc::now().to_rfc3339());
 
-        let _ = self.graph.execute(q).await.context("update_persona")?;
+        self.graph.run(q).await.context("update_persona")?;
         Ok(())
     }
 
@@ -375,7 +375,7 @@ impl Neo4jClient {
         .param("persona_id", persona_id.to_string())
         .param("skill_id", skill_id.to_string());
 
-        let _ = self.graph.execute(q).await.context("add_persona_skill")?;
+        self.graph.run(q).await.context("add_persona_skill")?;
         Ok(())
     }
 
@@ -390,10 +390,7 @@ impl Neo4jClient {
         .param("persona_id", persona_id.to_string())
         .param("skill_id", skill_id.to_string());
 
-        let _ = self.graph
-            .execute(q)
-            .await
-            .context("remove_persona_skill")?;
+        self.graph.run(q).await.context("remove_persona_skill")?;
         Ok(())
     }
 
@@ -408,10 +405,7 @@ impl Neo4jClient {
         .param("persona_id", persona_id.to_string())
         .param("protocol_id", protocol_id.to_string());
 
-        let _ = self.graph
-            .execute(q)
-            .await
-            .context("add_persona_protocol")?;
+        self.graph.run(q).await.context("add_persona_protocol")?;
         Ok(())
     }
 
@@ -430,10 +424,7 @@ impl Neo4jClient {
         .param("persona_id", persona_id.to_string())
         .param("protocol_id", protocol_id.to_string());
 
-        let _ = self.graph
-            .execute(q)
-            .await
-            .context("remove_persona_protocol")?;
+        self.graph.run(q).await.context("remove_persona_protocol")?;
         Ok(())
     }
 
@@ -456,10 +447,7 @@ impl Neo4jClient {
         .param("persona_id", persona_id.to_string())
         .param("fg_id", feature_graph_id.to_string());
 
-        let _ = self.graph
-            .execute(q)
-            .await
-            .context("set_persona_feature_graph")?;
+        self.graph.run(q).await.context("set_persona_feature_graph")?;
         Ok(())
     }
 
@@ -473,50 +461,65 @@ impl Neo4jClient {
         )
         .param("persona_id", persona_id.to_string());
 
-        let _ = self.graph
-            .execute(q)
-            .await
-            .context("remove_persona_feature_graph")?;
+        self.graph.run(q).await.context("remove_persona_feature_graph")?;
         Ok(())
     }
 
     /// Add KNOWS relation: Persona -> File (with weight, MERGE + SET)
+    /// Accepts both absolute paths (/Users/.../src/foo.rs) and relative paths (src/foo.rs).
+    /// Relative paths are matched with ENDS WITH + '/' prefix guard to avoid partial matches.
     pub async fn add_persona_file(
         &self,
         persona_id: Uuid,
         file_path: &str,
         weight: f64,
     ) -> Result<()> {
-        let q = query(
+        let is_absolute = file_path.starts_with('/');
+        let cypher = if is_absolute {
             r#"
             MATCH (p:Persona {id: $persona_id}), (f:File {path: $file_path})
             MERGE (p)-[r:KNOWS]->(f)
             SET r.weight = $weight
-            "#,
-        )
-        .param("persona_id", persona_id.to_string())
-        .param("file_path", file_path)
-        .param("weight", weight);
+            "#
+        } else {
+            r#"
+            MATCH (p:Persona {id: $persona_id}), (f:File)
+            WHERE f.path ENDS WITH $file_path AND f.path ENDS WITH ('/' + $file_path)
+            WITH p, f ORDER BY length(f.path) LIMIT 1
+            MERGE (p)-[r:KNOWS]->(f)
+            SET r.weight = $weight
+            "#
+        };
+        let q = query(cypher)
+            .param("persona_id", persona_id.to_string())
+            .param("file_path", file_path)
+            .param("weight", weight);
 
-        let _ = self.graph.execute(q).await.context("add_persona_file")?;
+        self.graph.run(q).await.context("add_persona_file")?;
         Ok(())
     }
 
     /// Remove KNOWS relation: Persona -> File
+    /// Accepts both absolute and relative paths (same logic as add_persona_file).
     pub async fn remove_persona_file(&self, persona_id: Uuid, file_path: &str) -> Result<()> {
-        let q = query(
+        let is_absolute = file_path.starts_with('/');
+        let cypher = if is_absolute {
             r#"
             MATCH (p:Persona {id: $persona_id})-[r:KNOWS]->(f:File {path: $file_path})
             DELETE r
-            "#,
-        )
-        .param("persona_id", persona_id.to_string())
-        .param("file_path", file_path);
+            "#
+        } else {
+            r#"
+            MATCH (p:Persona {id: $persona_id})-[r:KNOWS]->(f:File)
+            WHERE f.path ENDS WITH $file_path AND f.path ENDS WITH ('/' + $file_path)
+            DELETE r
+            "#
+        };
+        let q = query(cypher)
+            .param("persona_id", persona_id.to_string())
+            .param("file_path", file_path);
 
-        let _ = self.graph
-            .execute(q)
-            .await
-            .context("remove_persona_file")?;
+        self.graph.run(q).await.context("remove_persona_file")?;
         Ok(())
     }
 
@@ -538,10 +541,7 @@ impl Neo4jClient {
         .param("function_id", function_id)
         .param("weight", weight);
 
-        let _ = self.graph
-            .execute(q)
-            .await
-            .context("add_persona_function")?;
+        self.graph.run(q).await.context("add_persona_function")?;
         Ok(())
     }
 
@@ -560,10 +560,7 @@ impl Neo4jClient {
         .param("persona_id", persona_id.to_string())
         .param("function_id", function_id);
 
-        let _ = self.graph
-            .execute(q)
-            .await
-            .context("remove_persona_function")?;
+        self.graph.run(q).await.context("remove_persona_function")?;
         Ok(())
     }
 
@@ -585,7 +582,7 @@ impl Neo4jClient {
         .param("note_id", note_id.to_string())
         .param("weight", weight);
 
-        let _ = self.graph.execute(q).await.context("add_persona_note")?;
+        self.graph.run(q).await.context("add_persona_note")?;
         Ok(())
     }
 
@@ -600,10 +597,7 @@ impl Neo4jClient {
         .param("persona_id", persona_id.to_string())
         .param("note_id", note_id.to_string());
 
-        let _ = self.graph
-            .execute(q)
-            .await
-            .context("remove_persona_note")?;
+        self.graph.run(q).await.context("remove_persona_note")?;
         Ok(())
     }
 
@@ -625,10 +619,7 @@ impl Neo4jClient {
         .param("decision_id", decision_id.to_string())
         .param("weight", weight);
 
-        let _ = self.graph
-            .execute(q)
-            .await
-            .context("add_persona_decision")?;
+        self.graph.run(q).await.context("add_persona_decision")?;
         Ok(())
     }
 
@@ -647,10 +638,7 @@ impl Neo4jClient {
         .param("persona_id", persona_id.to_string())
         .param("decision_id", decision_id.to_string());
 
-        let _ = self.graph
-            .execute(q)
-            .await
-            .context("remove_persona_decision")?;
+        self.graph.run(q).await.context("remove_persona_decision")?;
         Ok(())
     }
 
@@ -665,10 +653,7 @@ impl Neo4jClient {
         .param("child_id", child_id.to_string())
         .param("parent_id", parent_id.to_string());
 
-        let _ = self.graph
-            .execute(q)
-            .await
-            .context("add_persona_extends")?;
+        self.graph.run(q).await.context("add_persona_extends")?;
         Ok(())
     }
 
@@ -683,10 +668,7 @@ impl Neo4jClient {
         .param("child_id", child_id.to_string())
         .param("parent_id", parent_id.to_string());
 
-        let _ = self.graph
-            .execute(q)
-            .await
-            .context("remove_persona_extends")?;
+        self.graph.run(q).await.context("remove_persona_extends")?;
         Ok(())
     }
 
@@ -756,28 +738,30 @@ impl Neo4jClient {
             self.collect_persona_weighted_rels(q, "decision").await?
         };
 
-        // MASTERS -> Skill (ids only)
-        let skill_ids = {
+        // MASTERS -> Skill (as weighted relations with name)
+        let skills = {
             let q = query(
                 r#"
                 MATCH (p:Persona {id: $pid})-[:MASTERS]->(s:Skill)
-                RETURN s.id AS id
+                RETURN s.id AS entity_id, 1.0 AS weight
+                ORDER BY s.name ASC
                 "#,
             )
             .param("pid", pid.clone());
-            self.collect_persona_rel_ids(q).await?
+            self.collect_persona_weighted_rels(q, "skill").await?
         };
 
-        // FOLLOWS -> Protocol (ids only)
-        let protocol_ids = {
+        // FOLLOWS -> Protocol (as weighted relations with name)
+        let protocols = {
             let q = query(
                 r#"
                 MATCH (p:Persona {id: $pid})-[:FOLLOWS]->(pr:Protocol)
-                RETURN pr.id AS id
+                RETURN pr.id AS entity_id, 1.0 AS weight
+                ORDER BY pr.name ASC
                 "#,
             )
             .param("pid", pid.clone());
-            self.collect_persona_rel_ids(q).await?
+            self.collect_persona_weighted_rels(q, "protocol").await?
         };
 
         // SCOPED_TO -> FeatureGraph (at most one)
@@ -799,25 +783,37 @@ impl Neo4jClient {
         };
 
         // EXTENDS chain (transitive parents)
-        let parent_ids = {
+        let parents = {
             let q = query(
                 r#"
                 MATCH path = (p:Persona {id: $pid})-[:EXTENDS*1..10]->(ancestor:Persona)
                 WITH ancestor, length(path) AS depth
                 ORDER BY depth ASC
-                RETURN DISTINCT ancestor.id AS id
+                RETURN DISTINCT ancestor.id AS entity_id, 1.0 AS weight
+                "#,
+            )
+            .param("pid", pid.clone());
+            self.collect_persona_weighted_rels(q, "persona").await?
+        };
+
+        // Children (personas that EXTEND this one)
+        let children = {
+            let q = query(
+                r#"
+                MATCH (child:Persona)-[:EXTENDS]->(p:Persona {id: $pid})
+                RETURN child.id AS entity_id, 1.0 AS weight
                 "#,
             )
             .param("pid", pid);
-            self.collect_persona_rel_ids(q).await?
+            self.collect_persona_weighted_rels(q, "persona").await?
         };
 
         let total_entities = files.len()
             + functions.len()
             + notes.len()
             + decisions.len()
-            + skill_ids.len()
-            + protocol_ids.len()
+            + skills.len()
+            + protocols.len()
             + if feature_graph_id.is_some() { 1 } else { 0 };
 
         Ok(PersonaSubgraph {
@@ -827,10 +823,11 @@ impl Neo4jClient {
             functions,
             notes,
             decisions,
-            skill_ids,
-            protocol_ids,
+            skills,
+            protocols,
             feature_graph_id,
-            parent_ids,
+            parents,
+            children,
             stats: PersonaSubgraphStats {
                 total_entities,
                 coverage_score: 0.0, // Computed by GDS later
@@ -859,17 +856,6 @@ impl Neo4jClient {
         Ok(rels)
     }
 
-    /// Helper: collect IDs from a query returning `id` column.
-    async fn collect_persona_rel_ids(&self, q: neo4rs::Query) -> Result<Vec<Uuid>> {
-        let mut result = self.graph.execute(q).await?;
-        let mut ids = Vec::new();
-        while let Some(row) = result.next().await? {
-            let id_str: String = row.get("id")?;
-            ids.push(id_str.parse()?);
-        }
-        Ok(ids)
-    }
-
     /// Find personas that KNOW a given file (for activation by file match).
     pub async fn find_personas_for_file(
         &self,
@@ -877,7 +863,9 @@ impl Neo4jClient {
         project_id: Uuid,
     ) -> Result<Vec<(PersonaNode, f64)>> {
         // Match via direct KNOWS relation OR via SCOPED_TO FeatureGraph
-        let q = query(
+        // Supports both absolute (/Users/.../src/foo.rs) and relative (src/foo.rs) paths
+        let is_absolute = file_path.starts_with('/');
+        let cypher = if is_absolute {
             r#"
             CALL {
                 MATCH (p:Persona {project_id: $project_id})-[r:KNOWS]->(f:File {path: $file_path})
@@ -891,10 +879,26 @@ impl Neo4jClient {
             WITH p, max(weight) AS weight
             RETURN p, weight
             ORDER BY weight DESC
-            "#,
-        )
-        .param("project_id", project_id.to_string())
-        .param("file_path", file_path);
+            "#
+        } else {
+            r#"
+            CALL {
+                MATCH (p:Persona {project_id: $project_id})-[r:KNOWS]->(f:File)
+                WHERE f.path ENDS WITH $file_path AND f.path ENDS WITH ('/' + $file_path) AND p.status <> 'archived'
+                RETURN p, r.weight AS weight
+                UNION
+                MATCH (p:Persona {project_id: $project_id})-[:SCOPED_TO]->(fg:FeatureGraph)-[:HAS_ENTITY]->(f:File)
+                WHERE f.path ENDS WITH $file_path AND f.path ENDS WITH ('/' + $file_path) AND p.status <> 'archived'
+                RETURN p, 0.5 AS weight
+            }
+            WITH p, max(weight) AS weight
+            RETURN p, weight
+            ORDER BY weight DESC
+            "#
+        };
+        let q = query(cypher)
+            .param("project_id", project_id.to_string())
+            .param("file_path", file_path);
 
         let mut result = self
             .graph
@@ -1013,7 +1017,7 @@ impl Neo4jClient {
         .param("now", chrono::Utc::now().to_rfc3339());
 
         // Best-effort — AgentExecution schema may not match exactly
-        let _ = self.graph.execute(_success_q).await;
+        let _ = self.graph.run(_success_q).await;
 
         Ok((decayed_count, pruned_count, personas_updated))
     }
@@ -1356,13 +1360,13 @@ mod tests {
 
         // Subgraph should reflect skills
         let sg = store.get_persona_subgraph(persona.id).await.unwrap();
-        assert_eq!(sg.skill_ids.len(), 2);
+        assert_eq!(sg.skills.len(), 2);
 
         // Remove one
         store.remove_persona_skill(persona.id, skill_id1).await.unwrap();
         let sg = store.get_persona_subgraph(persona.id).await.unwrap();
-        assert_eq!(sg.skill_ids.len(), 1);
-        assert!(sg.skill_ids.contains(&skill_id2));
+        assert_eq!(sg.skills.len(), 1);
+        assert!(sg.skills.iter().any(|r| r.entity_id == skill_id2.to_string()));
     }
 
     #[tokio::test]
@@ -1375,12 +1379,12 @@ mod tests {
         store.add_persona_protocol(persona.id, proto_id).await.unwrap();
 
         let sg = store.get_persona_subgraph(persona.id).await.unwrap();
-        assert_eq!(sg.protocol_ids.len(), 1);
-        assert_eq!(sg.protocol_ids[0], proto_id);
+        assert_eq!(sg.protocols.len(), 1);
+        assert_eq!(sg.protocols[0].entity_id, proto_id.to_string());
 
         store.remove_persona_protocol(persona.id, proto_id).await.unwrap();
         let sg = store.get_persona_subgraph(persona.id).await.unwrap();
-        assert!(sg.protocol_ids.is_empty());
+        assert!(sg.protocols.is_empty());
     }
 
     #[tokio::test]
@@ -1464,13 +1468,13 @@ mod tests {
         store.add_persona_extends(mid.id, root.id).await.unwrap();
 
         let sg = store.get_persona_subgraph(child.id).await.unwrap();
-        assert_eq!(sg.parent_ids.len(), 1); // Mock doesn't do transitive
-        assert!(sg.parent_ids.contains(&mid.id));
+        assert_eq!(sg.parents.len(), 1); // Mock doesn't do transitive
+        assert!(sg.parents.iter().any(|r| r.entity_id == mid.id.to_string()));
 
         // Remove
         store.remove_persona_extends(child.id, mid.id).await.unwrap();
         let sg = store.get_persona_subgraph(child.id).await.unwrap();
-        assert!(sg.parent_ids.is_empty());
+        assert!(sg.parents.is_empty());
     }
 
     #[tokio::test]
