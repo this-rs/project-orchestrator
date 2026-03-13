@@ -46,6 +46,12 @@ ignore:
   - "src/neo4j/user.rs"
   - "src/neo4j/workspace.rs"
   - "src/neo4j/persona.rs"
+  # Route registration — pure infrastructure (just .route() wiring).
+  # No business logic to unit-test; covered by integration/API tests.
+  - "src/api/routes.rs"
+  # GraphStore trait definition — only trait signatures + async_trait.
+  # No logic to test; implementations are tested via MockGraphStore and integration tests.
+  - "src/neo4j/traits.rs"
   # Server bootstrap — start_server / start_setup_server bind Axum servers,
   # read env vars, and configure middleware. Pure infrastructure, not unit-testable.
   # Covered by integration/API tests (ci.yml jobs).

@@ -1314,6 +1314,10 @@ pub async fn detect_personas(
 mod tests {
     use super::*;
 
+    // ================================================================
+    // Unit tests (deserialization / parsing)
+    // ================================================================
+
     #[test]
     fn test_default_weight() {
         assert!((default_weight() - 1.0).abs() < f64::EPSILON);
@@ -1383,6 +1387,32 @@ mod tests {
     }
 
     #[test]
+    fn test_create_body_all_fields() {
+        let json = serde_json::json!({
+            "project_id": "00000000-0000-0000-0000-000000000001",
+            "name": "full-persona",
+            "description": "Full description",
+            "complexity_default": "complex",
+            "timeout_secs": 300,
+            "max_cost_usd": 5.0,
+            "model_preference": "opus",
+            "system_prompt_override": "You are an expert.",
+            "origin": "auto_build"
+        });
+        let body: CreatePersonaBody = serde_json::from_value(json).unwrap();
+        assert_eq!(body.name, "full-persona");
+        assert_eq!(body.complexity_default.as_deref(), Some("complex"));
+        assert_eq!(body.timeout_secs, Some(300));
+        assert_eq!(body.max_cost_usd, Some(5.0));
+        assert_eq!(body.model_preference.as_deref(), Some("opus"));
+        assert_eq!(
+            body.system_prompt_override.as_deref(),
+            Some("You are an expert.")
+        );
+        assert_eq!(body.origin.as_deref(), Some("auto_build"));
+    }
+
+    #[test]
     fn test_update_body_partial() {
         let json = serde_json::json!({
             "energy": 0.8,
@@ -1392,6 +1422,44 @@ mod tests {
         assert!(body.name.is_none());
         assert_eq!(body.energy, Some(0.8));
         assert_eq!(body.status.as_deref(), Some("active"));
+    }
+
+    #[test]
+    fn test_update_body_all_fields() {
+        let json = serde_json::json!({
+            "name": "Updated",
+            "description": "New desc",
+            "status": "dormant",
+            "complexity_default": "simple",
+            "timeout_secs": 120,
+            "max_cost_usd": 2.5,
+            "model_preference": "sonnet",
+            "system_prompt_override": "Override",
+            "energy": 0.9,
+            "cohesion": 0.7
+        });
+        let body: UpdatePersonaBody = serde_json::from_value(json).unwrap();
+        assert_eq!(body.name.as_deref(), Some("Updated"));
+        assert_eq!(body.description.as_deref(), Some("New desc"));
+        assert_eq!(body.status.as_deref(), Some("dormant"));
+        assert_eq!(body.complexity_default.as_deref(), Some("simple"));
+        assert_eq!(body.timeout_secs, Some(120));
+        assert_eq!(body.max_cost_usd, Some(2.5));
+        assert_eq!(body.model_preference.as_deref(), Some("sonnet"));
+        assert_eq!(body.system_prompt_override.as_deref(), Some("Override"));
+        assert_eq!(body.energy, Some(0.9));
+        assert_eq!(body.cohesion, Some(0.7));
+    }
+
+    #[test]
+    fn test_update_body_empty() {
+        let json = serde_json::json!({});
+        let body: UpdatePersonaBody = serde_json::from_value(json).unwrap();
+        assert!(body.name.is_none());
+        assert!(body.description.is_none());
+        assert!(body.status.is_none());
+        assert!(body.energy.is_none());
+        assert!(body.cohesion.is_none());
     }
 
     #[test]
@@ -1405,9 +1473,1356 @@ mod tests {
     }
 
     #[test]
+    fn test_add_file_body_custom_weight() {
+        let json = serde_json::json!({
+            "file_path": "src/lib.rs",
+            "weight": 0.75
+        });
+        let body: AddFileBody = serde_json::from_value(json).unwrap();
+        assert_eq!(body.file_path, "src/lib.rs");
+        assert!((body.weight - 0.75).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_remove_file_body() {
+        let json = serde_json::json!({
+            "file_path": "src/old.rs"
+        });
+        let body: RemoveFileBody = serde_json::from_value(json).unwrap();
+        assert_eq!(body.file_path, "src/old.rs");
+    }
+
+    #[test]
+    fn test_add_function_body_default_weight() {
+        let json = serde_json::json!({
+            "function_name": "my_func"
+        });
+        let body: AddFunctionBody = serde_json::from_value(json).unwrap();
+        assert_eq!(body.function_name, "my_func");
+        assert!((body.weight - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_add_function_body_custom_weight() {
+        let json = serde_json::json!({
+            "function_name": "my_func",
+            "weight": 0.5
+        });
+        let body: AddFunctionBody = serde_json::from_value(json).unwrap();
+        assert!((body.weight - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_remove_function_body() {
+        let json = serde_json::json!({
+            "function_name": "old_func"
+        });
+        let body: RemoveFunctionBody = serde_json::from_value(json).unwrap();
+        assert_eq!(body.function_name, "old_func");
+    }
+
+    #[test]
     fn test_add_weighted_body_default() {
         let json = serde_json::json!({});
         let body: AddWeightedBody = serde_json::from_value(json).unwrap();
         assert!((body.weight - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_add_weighted_body_custom() {
+        let json = serde_json::json!({"weight": 0.3});
+        let body: AddWeightedBody = serde_json::from_value(json).unwrap();
+        assert!((body.weight - 0.3).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_find_for_file_query() {
+        let json = serde_json::json!({
+            "file_path": "src/api/mod.rs",
+            "project_id": "00000000-0000-0000-0000-000000000001"
+        });
+        let query: FindForFileQuery = serde_json::from_value(json).unwrap();
+        assert_eq!(query.file_path, "src/api/mod.rs");
+    }
+
+    #[test]
+    fn test_export_persona_query() {
+        let json = serde_json::json!({
+            "source_project_name": "my-project"
+        });
+        let query: ExportPersonaQuery = serde_json::from_value(json).unwrap();
+        assert_eq!(query.source_project_name.as_deref(), Some("my-project"));
+    }
+
+    #[test]
+    fn test_export_persona_query_empty() {
+        let json = serde_json::json!({});
+        let query: ExportPersonaQuery = serde_json::from_value(json).unwrap();
+        assert!(query.source_project_name.is_none());
+    }
+
+    #[test]
+    fn test_import_persona_body_deserialization() {
+        let json = serde_json::json!({
+            "project_id": "00000000-0000-0000-0000-000000000001",
+            "package": {
+                "schema_version": 1,
+                "persona": {
+                    "name": "imported-persona",
+                    "description": "Imported desc",
+                    "energy": 0.5,
+                    "cohesion": 0.3,
+                    "activation_count": 10,
+                    "success_rate": 0.9
+                },
+                "notes": [],
+                "decisions": [],
+                "skill_names": ["neo4j-expert"]
+            },
+            "conflict_strategy": "skip"
+        });
+        let body: ImportPersonaBody = serde_json::from_value(json).unwrap();
+        assert_eq!(body.package.persona.name, "imported-persona");
+        assert_eq!(body.conflict_strategy.as_deref(), Some("skip"));
+        assert_eq!(body.package.skill_names, vec!["neo4j-expert"]);
+    }
+
+    #[test]
+    fn test_auto_build_body_deserialization() {
+        let json = serde_json::json!({
+            "project_id": "00000000-0000-0000-0000-000000000001",
+            "name": "api-specialist",
+            "file_pattern": "src/api/**",
+            "entry_function": "main",
+            "depth": 5
+        });
+        let body: AutoBuildPersonaBody = serde_json::from_value(json).unwrap();
+        assert_eq!(body.name, "api-specialist");
+        assert_eq!(body.file_pattern.as_deref(), Some("src/api/**"));
+        assert_eq!(body.entry_function.as_deref(), Some("main"));
+        assert_eq!(body.depth, Some(5));
+    }
+
+    #[test]
+    fn test_auto_build_body_minimal() {
+        let json = serde_json::json!({
+            "project_id": "00000000-0000-0000-0000-000000000001",
+            "name": "minimal"
+        });
+        let body: AutoBuildPersonaBody = serde_json::from_value(json).unwrap();
+        assert!(body.file_pattern.is_none());
+        assert!(body.entry_function.is_none());
+        assert!(body.depth.is_none());
+    }
+
+    #[test]
+    fn test_project_id_query() {
+        let json = serde_json::json!({
+            "project_id": "00000000-0000-0000-0000-000000000001"
+        });
+        let query: ProjectIdQuery = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            query.project_id,
+            "00000000-0000-0000-0000-000000000001"
+                .parse::<Uuid>()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn test_global_persona_list_query() {
+        let json = serde_json::json!({});
+        let _query: GlobalPersonaListQuery = serde_json::from_value(json).unwrap();
+    }
+
+    // ================================================================
+    // Async integration tests (mock backends)
+    // ================================================================
+
+    use crate::api::handlers::ServerState;
+    use crate::api::routes::create_router;
+    use crate::orchestrator::{FileWatcher, Orchestrator};
+    use crate::test_helpers::{mock_app_state, test_bearer_token, test_project};
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode as HttpStatus};
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    fn auth_get(uri: &str) -> Request<Body> {
+        Request::builder()
+            .uri(uri)
+            .header("authorization", test_bearer_token())
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    fn auth_post_json(uri: &str, body: serde_json::Value) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("authorization", test_bearer_token())
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap()
+    }
+
+    fn auth_put_json(uri: &str, body: serde_json::Value) -> Request<Body> {
+        Request::builder()
+            .method("PUT")
+            .uri(uri)
+            .header("authorization", test_bearer_token())
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap()
+    }
+
+    fn auth_delete(uri: &str) -> Request<Body> {
+        Request::builder()
+            .method("DELETE")
+            .uri(uri)
+            .header("authorization", test_bearer_token())
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    fn auth_delete_json(uri: &str, body: serde_json::Value) -> Request<Body> {
+        Request::builder()
+            .method("DELETE")
+            .uri(uri)
+            .header("authorization", test_bearer_token())
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap()
+    }
+
+    async fn body_json(resp: axum::http::Response<Body>) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    async fn test_app() -> axum::Router {
+        let app_state = mock_app_state();
+        let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
+        let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
+            orchestrator.clone(),
+        )));
+        let state = Arc::new(ServerState {
+            orchestrator,
+            watcher,
+            chat_manager: None,
+            event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(
+                crate::events::EventBus::default(),
+            ))),
+            nats_emitter: None,
+            auth_config: Some(crate::test_helpers::test_auth_config()),
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+            setup_completed: true,
+            server_port: 6600,
+            public_url: None,
+            ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
+            registry_remote_url: None,
+            oidc_client: None,
+            identity: None,
+        });
+        create_router(state)
+    }
+
+    async fn test_app_with_project() -> (axum::Router, uuid::Uuid) {
+        let app_state = mock_app_state();
+        let project = test_project();
+        let project_id = project.id;
+        app_state.neo4j.create_project(&project).await.unwrap();
+        let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
+        let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
+            orchestrator.clone(),
+        )));
+        let state = Arc::new(ServerState {
+            orchestrator,
+            watcher,
+            chat_manager: None,
+            event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(
+                crate::events::EventBus::default(),
+            ))),
+            nats_emitter: None,
+            auth_config: Some(crate::test_helpers::test_auth_config()),
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+            setup_completed: true,
+            server_port: 6600,
+            public_url: None,
+            ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
+            registry_remote_url: None,
+            oidc_client: None,
+            identity: None,
+        });
+        (create_router(state), project_id)
+    }
+
+    /// Build an app with a project and a pre-seeded persona, returning
+    /// (router, project_id, persona_id).
+    async fn test_app_with_persona() -> (axum::Router, uuid::Uuid, uuid::Uuid) {
+        let app_state = mock_app_state();
+        let project = test_project();
+        let project_id = project.id;
+        app_state.neo4j.create_project(&project).await.unwrap();
+
+        let persona = PersonaNode {
+            id: Uuid::new_v4(),
+            project_id: Some(project_id),
+            name: "Test Persona".to_string(),
+            description: "A test persona".to_string(),
+            status: PersonaStatus::Emerging,
+            complexity_default: None,
+            timeout_secs: None,
+            max_cost_usd: None,
+            model_preference: None,
+            system_prompt_override: None,
+            energy: 0.5,
+            cohesion: 0.0,
+            activation_count: 0,
+            success_rate: 0.0,
+            avg_duration_secs: 0.0,
+            last_activated: None,
+            origin: PersonaOrigin::Manual,
+            created_at: Utc::now(),
+            updated_at: None,
+        };
+        let persona_id = persona.id;
+        app_state.neo4j.create_persona(&persona).await.unwrap();
+
+        let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
+        let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
+            orchestrator.clone(),
+        )));
+        let state = Arc::new(ServerState {
+            orchestrator,
+            watcher,
+            chat_manager: None,
+            event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(
+                crate::events::EventBus::default(),
+            ))),
+            nats_emitter: None,
+            auth_config: Some(crate::test_helpers::test_auth_config()),
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+            setup_completed: true,
+            server_port: 6600,
+            public_url: None,
+            ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
+            registry_remote_url: None,
+            oidc_client: None,
+            identity: None,
+        });
+        (create_router(state), project_id, persona_id)
+    }
+
+    // ----------------------------------------------------------------
+    // CRUD: create_persona
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_create_persona() {
+        let (app, project_id) = test_app_with_project().await;
+        let resp = app
+            .oneshot(auth_post_json(
+                "/api/personas",
+                serde_json::json!({
+                    "project_id": project_id,
+                    "name": "Neo4j Expert",
+                    "description": "Knows all about Neo4j"
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::CREATED);
+        let json = body_json(resp).await;
+        assert_eq!(json["name"], "Neo4j Expert");
+        assert_eq!(json["description"], "Knows all about Neo4j");
+        assert_eq!(json["status"], "emerging");
+        assert_eq!(json["origin"], "manual");
+    }
+
+    #[tokio::test]
+    async fn test_create_persona_with_origin() {
+        let (app, project_id) = test_app_with_project().await;
+        let resp = app
+            .oneshot(auth_post_json(
+                "/api/personas",
+                serde_json::json!({
+                    "project_id": project_id,
+                    "name": "Auto Persona",
+                    "origin": "auto_build"
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::CREATED);
+        let json = body_json(resp).await;
+        assert_eq!(json["origin"], "auto_build");
+    }
+
+    #[tokio::test]
+    async fn test_create_persona_global_no_project() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_post_json(
+                "/api/personas",
+                serde_json::json!({
+                    "name": "Global Persona",
+                    "description": "Available everywhere"
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::CREATED);
+        let json = body_json(resp).await;
+        assert_eq!(json["name"], "Global Persona");
+        assert!(json["project_id"].is_null());
+    }
+
+    #[tokio::test]
+    async fn test_create_persona_empty_name_fails() {
+        let (app, project_id) = test_app_with_project().await;
+        let resp = app
+            .oneshot(auth_post_json(
+                "/api/personas",
+                serde_json::json!({
+                    "project_id": project_id,
+                    "name": ""
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_create_persona_whitespace_name_fails() {
+        let (app, project_id) = test_app_with_project().await;
+        let resp = app
+            .oneshot(auth_post_json(
+                "/api/personas",
+                serde_json::json!({
+                    "project_id": project_id,
+                    "name": "   "
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_create_persona_name_too_long_fails() {
+        let (app, project_id) = test_app_with_project().await;
+        let long_name = "a".repeat(MAX_NAME_LEN + 1);
+        let resp = app
+            .oneshot(auth_post_json(
+                "/api/personas",
+                serde_json::json!({
+                    "project_id": project_id,
+                    "name": long_name
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_create_persona_description_too_long_fails() {
+        let (app, project_id) = test_app_with_project().await;
+        let long_desc = "a".repeat(MAX_DESCRIPTION_LEN + 1);
+        let resp = app
+            .oneshot(auth_post_json(
+                "/api/personas",
+                serde_json::json!({
+                    "project_id": project_id,
+                    "name": "Valid Name",
+                    "description": long_desc
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_create_persona_system_prompt_too_long_fails() {
+        let (app, project_id) = test_app_with_project().await;
+        let long_sp = "a".repeat(MAX_SYSTEM_PROMPT_LEN + 1);
+        let resp = app
+            .oneshot(auth_post_json(
+                "/api/personas",
+                serde_json::json!({
+                    "project_id": project_id,
+                    "name": "Valid Name",
+                    "system_prompt_override": long_sp
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_create_persona_invalid_origin_fails() {
+        let (app, project_id) = test_app_with_project().await;
+        let resp = app
+            .oneshot(auth_post_json(
+                "/api/personas",
+                serde_json::json!({
+                    "project_id": project_id,
+                    "name": "Valid",
+                    "origin": "bogus_origin"
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::BAD_REQUEST);
+    }
+
+    // ----------------------------------------------------------------
+    // CRUD: get_persona
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_get_persona() {
+        let (app, _project_id, persona_id) = test_app_with_persona().await;
+        let resp = app
+            .oneshot(auth_get(&format!("/api/personas/{}", persona_id)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["name"], "Test Persona");
+        assert_eq!(json["id"], persona_id.to_string());
+    }
+
+    #[tokio::test]
+    async fn test_get_persona_not_found() {
+        let app = test_app().await;
+        let fake_id = Uuid::new_v4();
+        let resp = app
+            .oneshot(auth_get(&format!("/api/personas/{}", fake_id)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::NOT_FOUND);
+    }
+
+    // ----------------------------------------------------------------
+    // CRUD: list_personas
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_list_personas_empty() {
+        let (app, project_id) = test_app_with_project().await;
+        let resp = app
+            .oneshot(auth_get(&format!(
+                "/api/personas?project_id={}",
+                project_id
+            )))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["total"], 0);
+        assert_eq!(json["items"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_list_personas_with_results() {
+        let (app, project_id, _persona_id) = test_app_with_persona().await;
+        let resp = app
+            .oneshot(auth_get(&format!(
+                "/api/personas?project_id={}",
+                project_id
+            )))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["total"], 1);
+        assert_eq!(json["items"].as_array().unwrap().len(), 1);
+        assert_eq!(json["items"][0]["name"], "Test Persona");
+    }
+
+    // ----------------------------------------------------------------
+    // CRUD: update_persona
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_update_persona() {
+        let (app, _project_id, persona_id) = test_app_with_persona().await;
+        let resp = app
+            .oneshot(auth_put_json(
+                &format!("/api/personas/{}", persona_id),
+                serde_json::json!({
+                    "name": "Updated Persona",
+                    "description": "Updated description",
+                    "status": "active",
+                    "energy": 0.9,
+                    "cohesion": 0.7
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["name"], "Updated Persona");
+        assert_eq!(json["description"], "Updated description");
+        assert_eq!(json["status"], "active");
+    }
+
+    #[tokio::test]
+    async fn test_update_persona_partial() {
+        let (app, _project_id, persona_id) = test_app_with_persona().await;
+        let resp = app
+            .oneshot(auth_put_json(
+                &format!("/api/personas/{}", persona_id),
+                serde_json::json!({
+                    "energy": 0.8
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let json = body_json(resp).await;
+        // Name should be unchanged
+        assert_eq!(json["name"], "Test Persona");
+    }
+
+    #[tokio::test]
+    async fn test_update_persona_not_found() {
+        let app = test_app().await;
+        let fake_id = Uuid::new_v4();
+        let resp = app
+            .oneshot(auth_put_json(
+                &format!("/api/personas/{}", fake_id),
+                serde_json::json!({"name": "Nope"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_update_persona_empty_name_fails() {
+        let (app, _project_id, persona_id) = test_app_with_persona().await;
+        let resp = app
+            .oneshot(auth_put_json(
+                &format!("/api/personas/{}", persona_id),
+                serde_json::json!({"name": ""}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_update_persona_name_too_long_fails() {
+        let (app, _project_id, persona_id) = test_app_with_persona().await;
+        let long_name = "a".repeat(MAX_NAME_LEN + 1);
+        let resp = app
+            .oneshot(auth_put_json(
+                &format!("/api/personas/{}", persona_id),
+                serde_json::json!({"name": long_name}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_update_persona_description_too_long_fails() {
+        let (app, _project_id, persona_id) = test_app_with_persona().await;
+        let long_desc = "a".repeat(MAX_DESCRIPTION_LEN + 1);
+        let resp = app
+            .oneshot(auth_put_json(
+                &format!("/api/personas/{}", persona_id),
+                serde_json::json!({"description": long_desc}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_update_persona_system_prompt_too_long_fails() {
+        let (app, _project_id, persona_id) = test_app_with_persona().await;
+        let long_sp = "a".repeat(MAX_SYSTEM_PROMPT_LEN + 1);
+        let resp = app
+            .oneshot(auth_put_json(
+                &format!("/api/personas/{}", persona_id),
+                serde_json::json!({"system_prompt_override": long_sp}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_update_persona_invalid_status_fails() {
+        let (app, _project_id, persona_id) = test_app_with_persona().await;
+        let resp = app
+            .oneshot(auth_put_json(
+                &format!("/api/personas/{}", persona_id),
+                serde_json::json!({"status": "nonexistent"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::BAD_REQUEST);
+    }
+
+    // ----------------------------------------------------------------
+    // CRUD: delete_persona
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_delete_persona() {
+        let (app, _project_id, persona_id) = test_app_with_persona().await;
+        let resp = app
+            .oneshot(auth_delete(&format!("/api/personas/{}", persona_id)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn test_delete_persona_not_found() {
+        let app = test_app().await;
+        let fake_id = Uuid::new_v4();
+        let resp = app
+            .oneshot(auth_delete(&format!("/api/personas/{}", fake_id)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::NOT_FOUND);
+    }
+
+    // ----------------------------------------------------------------
+    // Relations: add/remove skill
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_add_skill_relation() {
+        let (app, _project_id, persona_id) = test_app_with_persona().await;
+        let skill_id = Uuid::new_v4();
+        let resp = app
+            .oneshot(auth_post_json(
+                &format!("/api/personas/{}/skills/{}", persona_id, skill_id),
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn test_remove_skill_relation() {
+        let (app, _project_id, persona_id) = test_app_with_persona().await;
+        let skill_id = Uuid::new_v4();
+        let resp = app
+            .oneshot(auth_delete(&format!(
+                "/api/personas/{}/skills/{}",
+                persona_id, skill_id
+            )))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::NO_CONTENT);
+    }
+
+    // ----------------------------------------------------------------
+    // Relations: add/remove protocol
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_add_protocol_relation() {
+        let (app, _project_id, persona_id) = test_app_with_persona().await;
+        let protocol_id = Uuid::new_v4();
+        let resp = app
+            .oneshot(auth_post_json(
+                &format!("/api/personas/{}/protocols/{}", persona_id, protocol_id),
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn test_remove_protocol_relation() {
+        let (app, _project_id, persona_id) = test_app_with_persona().await;
+        let protocol_id = Uuid::new_v4();
+        let resp = app
+            .oneshot(auth_delete(&format!(
+                "/api/personas/{}/protocols/{}",
+                persona_id, protocol_id
+            )))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::NO_CONTENT);
+    }
+
+    // ----------------------------------------------------------------
+    // Relations: scope/unscope feature graph
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_scope_feature_graph() {
+        let (app, _project_id, persona_id) = test_app_with_persona().await;
+        let fg_id = Uuid::new_v4();
+        let resp = app
+            .oneshot(auth_post_json(
+                &format!("/api/personas/{}/feature-graphs/{}", persona_id, fg_id),
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn test_unscope_feature_graph() {
+        let (app, _project_id, persona_id) = test_app_with_persona().await;
+        let fg_id = Uuid::new_v4();
+        let resp = app
+            .oneshot(auth_delete(&format!(
+                "/api/personas/{}/feature-graphs/{}",
+                persona_id, fg_id
+            )))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::NO_CONTENT);
+    }
+
+    // ----------------------------------------------------------------
+    // Relations: add/remove file
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_add_file() {
+        let (app, _project_id, persona_id) = test_app_with_persona().await;
+        let resp = app
+            .oneshot(auth_post_json(
+                &format!("/api/personas/{}/files", persona_id),
+                serde_json::json!({
+                    "file_path": "src/main.rs",
+                    "weight": 0.8
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn test_add_file_empty_path_fails() {
+        let (app, _project_id, persona_id) = test_app_with_persona().await;
+        let resp = app
+            .oneshot(auth_post_json(
+                &format!("/api/personas/{}/files", persona_id),
+                serde_json::json!({
+                    "file_path": "  "
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_remove_file() {
+        let (app, _project_id, persona_id) = test_app_with_persona().await;
+        let resp = app
+            .oneshot(auth_delete_json(
+                &format!("/api/personas/{}/files", persona_id),
+                serde_json::json!({
+                    "file_path": "src/main.rs"
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::NO_CONTENT);
+    }
+
+    // ----------------------------------------------------------------
+    // Relations: add/remove function
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_add_function() {
+        let (app, _project_id, persona_id) = test_app_with_persona().await;
+        let resp = app
+            .oneshot(auth_post_json(
+                &format!("/api/personas/{}/functions", persona_id),
+                serde_json::json!({
+                    "function_name": "handle_request",
+                    "weight": 0.9
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn test_add_function_empty_name_fails() {
+        let (app, _project_id, persona_id) = test_app_with_persona().await;
+        let resp = app
+            .oneshot(auth_post_json(
+                &format!("/api/personas/{}/functions", persona_id),
+                serde_json::json!({
+                    "function_name": "  "
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_remove_function() {
+        let (app, _project_id, persona_id) = test_app_with_persona().await;
+        let resp = app
+            .oneshot(auth_delete_json(
+                &format!("/api/personas/{}/functions", persona_id),
+                serde_json::json!({
+                    "function_name": "handle_request"
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::NO_CONTENT);
+    }
+
+    // ----------------------------------------------------------------
+    // Relations: add/remove note
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_add_note_relation() {
+        let (app, _project_id, persona_id) = test_app_with_persona().await;
+        let note_id = Uuid::new_v4();
+        let resp = app
+            .oneshot(auth_post_json(
+                &format!("/api/personas/{}/notes/{}", persona_id, note_id),
+                serde_json::json!({"weight": 0.7}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn test_add_note_relation_default_weight() {
+        let (app, _project_id, persona_id) = test_app_with_persona().await;
+        let note_id = Uuid::new_v4();
+        let resp = app
+            .oneshot(auth_post_json(
+                &format!("/api/personas/{}/notes/{}", persona_id, note_id),
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn test_remove_note_relation() {
+        let (app, _project_id, persona_id) = test_app_with_persona().await;
+        let note_id = Uuid::new_v4();
+        let resp = app
+            .oneshot(auth_delete(&format!(
+                "/api/personas/{}/notes/{}",
+                persona_id, note_id
+            )))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::NO_CONTENT);
+    }
+
+    // ----------------------------------------------------------------
+    // Relations: add/remove decision
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_add_decision_relation() {
+        let (app, _project_id, persona_id) = test_app_with_persona().await;
+        let decision_id = Uuid::new_v4();
+        let resp = app
+            .oneshot(auth_post_json(
+                &format!("/api/personas/{}/decisions/{}", persona_id, decision_id),
+                serde_json::json!({"weight": 0.6}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn test_remove_decision_relation() {
+        let (app, _project_id, persona_id) = test_app_with_persona().await;
+        let decision_id = Uuid::new_v4();
+        let resp = app
+            .oneshot(auth_delete(&format!(
+                "/api/personas/{}/decisions/{}",
+                persona_id, decision_id
+            )))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::NO_CONTENT);
+    }
+
+    // ----------------------------------------------------------------
+    // Relations: add/remove extends
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_add_extends_relation() {
+        let (app, _project_id, persona_id) = test_app_with_persona().await;
+        let parent_id = Uuid::new_v4();
+        let resp = app
+            .oneshot(auth_post_json(
+                &format!("/api/personas/{}/extends/{}", persona_id, parent_id),
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn test_add_extends_self_fails() {
+        let (app, _project_id, persona_id) = test_app_with_persona().await;
+        let resp = app
+            .oneshot(auth_post_json(
+                &format!("/api/personas/{}/extends/{}", persona_id, persona_id),
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_remove_extends_relation() {
+        let (app, _project_id, persona_id) = test_app_with_persona().await;
+        let parent_id = Uuid::new_v4();
+        let resp = app
+            .oneshot(auth_delete(&format!(
+                "/api/personas/{}/extends/{}",
+                persona_id, parent_id
+            )))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::NO_CONTENT);
+    }
+
+    // ----------------------------------------------------------------
+    // Subgraph
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_get_subgraph_empty() {
+        let (app, _project_id, persona_id) = test_app_with_persona().await;
+        let resp = app
+            .oneshot(auth_get(&format!("/api/personas/{}/subgraph", persona_id)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["persona_id"], persona_id.to_string());
+        assert_eq!(json["persona_name"], "Test Persona");
+        assert_eq!(json["files"].as_array().unwrap().len(), 0);
+        assert_eq!(json["functions"].as_array().unwrap().len(), 0);
+        assert_eq!(json["notes"].as_array().unwrap().len(), 0);
+        assert_eq!(json["decisions"].as_array().unwrap().len(), 0);
+        assert_eq!(json["skills"].as_array().unwrap().len(), 0);
+        assert_eq!(json["protocols"].as_array().unwrap().len(), 0);
+    }
+
+    // ----------------------------------------------------------------
+    // find_for_file
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_find_for_file_empty() {
+        let (app, project_id) = test_app_with_project().await;
+        let resp = app
+            .oneshot(auth_get(&format!(
+                "/api/personas/find-for-file?file_path=src/main.rs&project_id={}",
+                project_id
+            )))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json.as_array().unwrap().len(), 0);
+    }
+
+    // ----------------------------------------------------------------
+    // list_global_personas
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_list_global_personas_empty() {
+        let app = test_app().await;
+        let resp = app.oneshot(auth_get("/api/personas/global")).await.unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json.as_array().unwrap().len(), 0);
+    }
+
+    // ----------------------------------------------------------------
+    // activate_persona
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_activate_persona() {
+        let (app, _project_id, persona_id) = test_app_with_persona().await;
+        let resp = app
+            .oneshot(auth_post_json(
+                &format!("/api/personas/{}/activate", persona_id),
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["persona_id"], persona_id.to_string());
+        assert_eq!(json["persona_name"], "Test Persona");
+        assert!(json["rendered_context"]
+            .as_str()
+            .unwrap()
+            .contains("Test Persona"));
+        assert_eq!(json["notes_count"], 0);
+        assert_eq!(json["decisions_count"], 0);
+    }
+
+    #[tokio::test]
+    async fn test_activate_persona_not_found() {
+        let app = test_app().await;
+        let fake_id = Uuid::new_v4();
+        let resp = app
+            .oneshot(auth_post_json(
+                &format!("/api/personas/{}/activate", fake_id),
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::NOT_FOUND);
+    }
+
+    // ----------------------------------------------------------------
+    // export_persona
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_export_persona() {
+        let (app, _project_id, persona_id) = test_app_with_persona().await;
+        let resp = app
+            .oneshot(auth_get(&format!(
+                "/api/personas/{}/export?source_project_name=test-project",
+                persona_id
+            )))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["schema_version"], 1);
+        assert_eq!(json["persona"]["name"], "Test Persona");
+        assert_eq!(json["source"]["project_name"], "test-project");
+        // notes, decisions, skill_names are skipped when empty (skip_serializing_if)
+        assert!(json.get("notes").is_none() || json["notes"].as_array().unwrap().is_empty());
+        assert!(
+            json.get("decisions").is_none() || json["decisions"].as_array().unwrap().is_empty()
+        );
+        assert!(
+            json.get("skill_names").is_none() || json["skill_names"].as_array().unwrap().is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_export_persona_not_found() {
+        let app = test_app().await;
+        let fake_id = Uuid::new_v4();
+        let resp = app
+            .oneshot(auth_get(&format!("/api/personas/{}/export", fake_id)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::NOT_FOUND);
+    }
+
+    // ----------------------------------------------------------------
+    // import_persona
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_import_persona() {
+        let (app, project_id) = test_app_with_project().await;
+        let resp = app
+            .oneshot(auth_post_json(
+                "/api/personas/import",
+                serde_json::json!({
+                    "project_id": project_id,
+                    "package": {
+                        "schema_version": 1,
+                        "persona": {
+                            "name": "Imported Expert",
+                            "description": "Imported from another project",
+                            "energy": 0.7,
+                            "cohesion": 0.5,
+                            "activation_count": 42,
+                            "success_rate": 0.95
+                        },
+                        "notes": [],
+                        "decisions": [],
+                        "skill_names": []
+                    }
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::CREATED);
+        let json = body_json(resp).await;
+        assert_eq!(json["persona_name"], "Imported Expert");
+        assert_eq!(json["notes_imported"], 0);
+        assert_eq!(json["decisions_imported"], 0);
+        assert_eq!(json["skills_linked"], 0);
+    }
+
+    #[tokio::test]
+    async fn test_import_persona_skip_conflict() {
+        let (app, project_id, _persona_id) = test_app_with_persona().await;
+        // Import with the same name "Test Persona" — should skip
+        let resp = app
+            .oneshot(auth_post_json(
+                "/api/personas/import",
+                serde_json::json!({
+                    "project_id": project_id,
+                    "package": {
+                        "schema_version": 1,
+                        "persona": {
+                            "name": "Test Persona",
+                            "description": "Duplicate",
+                            "energy": 0.5,
+                            "cohesion": 0.0,
+                            "activation_count": 0,
+                            "success_rate": 0.0
+                        },
+                        "notes": [],
+                        "decisions": [],
+                        "skill_names": []
+                    },
+                    "conflict_strategy": "skip"
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["persona_name"], "Test Persona");
+        assert_eq!(json["notes_imported"], 0);
+    }
+
+    // ----------------------------------------------------------------
+    // auto_build_persona
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_auto_build_persona_empty_name_fails() {
+        let (app, project_id) = test_app_with_project().await;
+        let resp = app
+            .oneshot(auth_post_json(
+                "/api/personas/auto-build",
+                serde_json::json!({
+                    "project_id": project_id,
+                    "name": "",
+                    "file_pattern": "src/**"
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_auto_build_persona_no_pattern_no_function_fails() {
+        let (app, project_id) = test_app_with_project().await;
+        let resp = app
+            .oneshot(auth_post_json(
+                "/api/personas/auto-build",
+                serde_json::json!({
+                    "project_id": project_id,
+                    "name": "Empty Builder"
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_auto_build_persona_with_pattern() {
+        let (app, project_id) = test_app_with_project().await;
+        let resp = app
+            .oneshot(auth_post_json(
+                "/api/personas/auto-build",
+                serde_json::json!({
+                    "project_id": project_id,
+                    "name": "API Expert",
+                    "description": "Auto-built from api pattern",
+                    "file_pattern": "src/api/**"
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::CREATED);
+        let json = body_json(resp).await;
+        assert_eq!(json["name"], "API Expert");
+        assert_eq!(json["origin"], "auto_build");
+    }
+
+    // ----------------------------------------------------------------
+    // maintain_personas
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_maintain_personas() {
+        let (app, project_id) = test_app_with_project().await;
+        let resp = app
+            .oneshot(auth_post_json(
+                &format!("/api/personas/maintain?project_id={}", project_id),
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["project_id"], project_id.to_string());
+    }
+
+    // ----------------------------------------------------------------
+    // detect_personas
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_detect_personas() {
+        let (app, project_id) = test_app_with_project().await;
+        let resp = app
+            .oneshot(auth_post_json(
+                &format!("/api/personas/detect?project_id={}", project_id),
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["project_id"], project_id.to_string());
+        assert!(json["proposals"].as_array().unwrap().is_empty());
+        assert_eq!(json["count"], 0);
     }
 }

@@ -452,4 +452,315 @@ mod tests {
             _ => panic!("Expected Sync output"),
         }
     }
+
+    // ========================================================================
+    // PersonaFileIndex tests
+    // ========================================================================
+
+    #[test]
+    fn test_persona_file_index_creation_empty() {
+        let index = PersonaFileIndex {
+            entries: HashMap::new(),
+            loaded_at: std::time::Instant::now(),
+        };
+        assert!(index.entries.is_empty());
+        assert!(index.loaded_at.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn test_persona_file_index_lookup_hit() {
+        let persona_id = Uuid::new_v4();
+        let mut entries = HashMap::new();
+        entries.insert(
+            "src/main.rs".to_string(),
+            vec![(persona_id, "rust-expert".to_string(), 0.95)],
+        );
+        let index = PersonaFileIndex {
+            entries,
+            loaded_at: std::time::Instant::now(),
+        };
+        let result = index.entries.get("src/main.rs");
+        assert!(result.is_some());
+        let vec = result.unwrap();
+        assert_eq!(vec.len(), 1);
+        assert_eq!(vec[0].0, persona_id);
+        assert_eq!(vec[0].1, "rust-expert");
+        assert!((vec[0].2 - 0.95).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_persona_file_index_lookup_miss() {
+        let persona_id = Uuid::new_v4();
+        let mut entries = HashMap::new();
+        entries.insert(
+            "src/main.rs".to_string(),
+            vec![(persona_id, "rust-expert".to_string(), 0.9)],
+        );
+        let index = PersonaFileIndex {
+            entries,
+            loaded_at: std::time::Instant::now(),
+        };
+        assert!(index.entries.get("src/lib.rs").is_none());
+    }
+
+    #[test]
+    fn test_persona_file_index_multiple_personas_per_file() {
+        let p1 = Uuid::new_v4();
+        let p2 = Uuid::new_v4();
+        let mut entries = HashMap::new();
+        entries.insert(
+            "src/shared.rs".to_string(),
+            vec![
+                (p1, "persona-a".to_string(), 0.9),
+                (p2, "persona-b".to_string(), 0.6),
+            ],
+        );
+        let index = PersonaFileIndex {
+            entries,
+            loaded_at: std::time::Instant::now(),
+        };
+        let result = index.entries.get("src/shared.rs").unwrap();
+        assert_eq!(result.len(), 2);
+        // First entry should have the higher weight (pre-sorted by caller)
+        assert!(result[0].2 > result[1].2);
+    }
+
+    #[test]
+    fn test_persona_index_ttl_constant() {
+        // Verify the TTL is 120 seconds (2 minutes)
+        assert_eq!(PERSONA_INDEX_TTL, std::time::Duration::from_secs(120));
+    }
+
+    #[test]
+    fn test_persona_file_index_fresh_within_ttl() {
+        let index = PersonaFileIndex {
+            entries: HashMap::new(),
+            loaded_at: std::time::Instant::now(),
+        };
+        // Freshly created index should be within TTL
+        assert!(index.loaded_at.elapsed() < PERSONA_INDEX_TTL);
+    }
+
+    // ========================================================================
+    // match_persona_for_file tests
+    // ========================================================================
+
+    /// Helper to create a PersonaNode for tests
+    fn test_persona(project_id: Uuid, name: &str) -> crate::neo4j::models::PersonaNode {
+        crate::neo4j::models::PersonaNode {
+            id: Uuid::new_v4(),
+            project_id: Some(project_id),
+            name: name.to_string(),
+            description: format!("Test persona: {}", name),
+            status: crate::neo4j::models::PersonaStatus::Active,
+            complexity_default: None,
+            timeout_secs: None,
+            max_cost_usd: None,
+            model_preference: None,
+            system_prompt_override: None,
+            energy: 0.8,
+            cohesion: 0.5,
+            activation_count: 0,
+            success_rate: 0.0,
+            avg_duration_secs: 0.0,
+            last_activated: None,
+            origin: crate::neo4j::models::PersonaOrigin::Manual,
+            created_at: chrono::Utc::now(),
+            updated_at: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_match_persona_for_file_cache_miss_no_match() {
+        let mock_store = Arc::new(MockGraphStore::new());
+        let hook = SkillActivationHook::new(mock_store);
+
+        let project_id = Uuid::new_v4();
+        let result = hook
+            .match_persona_for_file(project_id, "src/unknown.rs")
+            .await;
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_match_persona_for_file_found() {
+        let mock_store = Arc::new(MockGraphStore::new());
+        let project_id = Uuid::new_v4();
+
+        // Set up a persona with a file relation
+        let persona = test_persona(project_id, "neo4j-expert");
+        mock_store.create_persona(&persona).await.unwrap();
+        mock_store
+            .add_persona_file(persona.id, "src/neo4j/client.rs", 0.85)
+            .await
+            .unwrap();
+
+        let hook = SkillActivationHook::new(mock_store);
+        let result = hook
+            .match_persona_for_file(project_id, "src/neo4j/client.rs")
+            .await;
+
+        assert!(result.is_some());
+        let (pid, pname, weight) = result.unwrap();
+        assert_eq!(pid, persona.id);
+        assert_eq!(pname, "neo4j-expert");
+        assert!((weight - 0.85).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn test_match_persona_for_file_populates_cache() {
+        let mock_store = Arc::new(MockGraphStore::new());
+        let project_id = Uuid::new_v4();
+
+        let persona = test_persona(project_id, "cache-test");
+        mock_store.create_persona(&persona).await.unwrap();
+        mock_store
+            .add_persona_file(persona.id, "src/cached.rs", 0.7)
+            .await
+            .unwrap();
+
+        let hook = SkillActivationHook::new(mock_store);
+
+        // First call: cache miss → loads from store
+        let result1 = hook
+            .match_persona_for_file(project_id, "src/cached.rs")
+            .await;
+        assert!(result1.is_some());
+
+        // Verify cache was populated
+        let cache = hook.persona_index.read().await;
+        assert!(cache.contains_key(&project_id));
+        let index = cache.get(&project_id).unwrap();
+        assert!(index.entries.contains_key("src/cached.rs"));
+    }
+
+    #[tokio::test]
+    async fn test_match_persona_for_file_uses_cache_on_second_call() {
+        let mock_store = Arc::new(MockGraphStore::new());
+        let project_id = Uuid::new_v4();
+
+        let persona = test_persona(project_id, "double-hit");
+        mock_store.create_persona(&persona).await.unwrap();
+        mock_store
+            .add_persona_file(persona.id, "src/double.rs", 0.75)
+            .await
+            .unwrap();
+
+        let hook = SkillActivationHook::new(mock_store);
+
+        // First call populates cache
+        let r1 = hook
+            .match_persona_for_file(project_id, "src/double.rs")
+            .await;
+        assert!(r1.is_some());
+
+        // Second call should hit cache (same result, no store access needed)
+        let r2 = hook
+            .match_persona_for_file(project_id, "src/double.rs")
+            .await;
+        assert!(r2.is_some());
+        assert_eq!(r1.unwrap().0, r2.unwrap().0);
+    }
+
+    #[tokio::test]
+    async fn test_match_persona_wrong_project_returns_none() {
+        let mock_store = Arc::new(MockGraphStore::new());
+        let project_a = Uuid::new_v4();
+        let project_b = Uuid::new_v4();
+
+        let persona = test_persona(project_a, "project-a-expert");
+        mock_store.create_persona(&persona).await.unwrap();
+        mock_store
+            .add_persona_file(persona.id, "src/shared.rs", 0.9)
+            .await
+            .unwrap();
+
+        let hook = SkillActivationHook::new(mock_store);
+
+        // Query with wrong project ID → should not find the persona
+        let result = hook
+            .match_persona_for_file(project_b, "src/shared.rs")
+            .await;
+        assert!(result.is_none());
+    }
+
+    // ========================================================================
+    // build_persona_context tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_build_persona_context_with_subgraph() {
+        let mock_store = Arc::new(MockGraphStore::new());
+        let project_id = Uuid::new_v4();
+
+        let persona = test_persona(project_id, "context-builder");
+        mock_store.create_persona(&persona).await.unwrap();
+
+        // Add some file and note relations to build a richer subgraph
+        mock_store
+            .add_persona_file(persona.id, "src/main.rs", 0.9)
+            .await
+            .unwrap();
+        mock_store
+            .add_persona_file(persona.id, "src/lib.rs", 0.7)
+            .await
+            .unwrap();
+
+        let hook = SkillActivationHook::new(mock_store);
+        let ctx = hook
+            .build_persona_context(persona.id, "context-builder", 0.85)
+            .await;
+
+        assert!(ctx.is_some());
+        let context_str = ctx.unwrap();
+        assert!(context_str.contains("Persona: context-builder"));
+        assert!(context_str.contains("weight: 0.85"));
+        assert!(context_str.contains("Known files:"));
+        assert!(context_str.contains("src/main.rs"));
+    }
+
+    #[tokio::test]
+    async fn test_build_persona_context_nonexistent_persona() {
+        let mock_store = Arc::new(MockGraphStore::new());
+        let hook = SkillActivationHook::new(mock_store);
+
+        // Persona does not exist → should return None (error handled gracefully)
+        let ctx = hook
+            .build_persona_context(Uuid::new_v4(), "ghost", 0.5)
+            .await;
+        assert!(ctx.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_build_persona_context_truncates_long_output() {
+        let mock_store = Arc::new(MockGraphStore::new());
+        let project_id = Uuid::new_v4();
+
+        // Create persona with a very long name to test truncation logic
+        let long_name = "x".repeat(500);
+        let persona = test_persona(project_id, &long_name);
+        mock_store.create_persona(&persona).await.unwrap();
+
+        // Add many files to inflate context size
+        for i in 0..100 {
+            let path = format!(
+                "src/very/deep/nested/module{}/file_with_long_name_{}.rs",
+                i, i
+            );
+            mock_store
+                .add_persona_file(persona.id, &path, 0.5)
+                .await
+                .unwrap();
+        }
+
+        let hook = SkillActivationHook::new(mock_store);
+        let ctx = hook
+            .build_persona_context(persona.id, &long_name, 0.9)
+            .await;
+
+        assert!(ctx.is_some());
+        let context_str = ctx.unwrap();
+        // Context should be truncated to ~2000 chars
+        assert!(context_str.len() <= 2001);
+    }
 }
