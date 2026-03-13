@@ -962,6 +962,14 @@ fn protected_routes() -> Router<OrchestratorState> {
             get(persona_handlers::find_for_file),
         )
         .route(
+            "/api/personas/import",
+            post(persona_handlers::import_persona),
+        )
+        .route(
+            "/api/personas/auto-build",
+            post(persona_handlers::auto_build_persona),
+        )
+        .route(
             "/api/personas/{persona_id}",
             get(persona_handlers::get_persona)
                 .put(persona_handlers::update_persona)
@@ -970,6 +978,14 @@ fn protected_routes() -> Router<OrchestratorState> {
         .route(
             "/api/personas/{persona_id}/subgraph",
             get(persona_handlers::get_subgraph),
+        )
+        .route(
+            "/api/personas/{persona_id}/export",
+            get(persona_handlers::export_persona),
+        )
+        .route(
+            "/api/personas/{persona_id}/activate",
+            post(persona_handlers::activate_persona),
         )
         // Relation routes — Skills (MASTERS)
         .route(

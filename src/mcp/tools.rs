@@ -1115,19 +1115,19 @@ fn protocol_tool() -> ToolDefinition {
 fn persona_tool() -> ToolDefinition {
     ToolDefinition {
         name: "persona".to_string(),
-        description: "Manage living personas (adaptive knowledge agents). Actions: create, get, list, update, delete, add_skill, remove_skill, add_protocol, remove_protocol, add_file, remove_file, add_function, remove_function, add_note, remove_note, add_decision, remove_decision, scope_to_feature_graph, unscope_feature_graph, add_extends, remove_extends, get_subgraph, find_for_file, list_global".to_string(),
+        description: "Manage living personas (adaptive knowledge agents). Actions: create, get, list, update, delete, add_skill, remove_skill, add_protocol, remove_protocol, add_file, remove_file, add_function, remove_function, add_note, remove_note, add_decision, remove_decision, scope_to_feature_graph, unscope_feature_graph, add_extends, remove_extends, get_subgraph, find_for_file, list_global, export, import, activate, auto_build".to_string(),
         input_schema: InputSchema {
             schema_type: "object".to_string(),
             properties: Some(json!({
                 "action": {
                     "type": "string",
-                    "enum": ["create", "get", "list", "update", "delete", "add_skill", "remove_skill", "add_protocol", "remove_protocol", "add_file", "remove_file", "add_function", "remove_function", "add_note", "remove_note", "add_decision", "remove_decision", "scope_to_feature_graph", "unscope_feature_graph", "add_extends", "remove_extends", "get_subgraph", "find_for_file", "list_global"],
+                    "enum": ["create", "get", "list", "update", "delete", "add_skill", "remove_skill", "add_protocol", "remove_protocol", "add_file", "remove_file", "add_function", "remove_function", "add_note", "remove_note", "add_decision", "remove_decision", "scope_to_feature_graph", "unscope_feature_graph", "add_extends", "remove_extends", "get_subgraph", "find_for_file", "list_global", "export", "import", "activate", "auto_build"],
                     "description": "Operation to perform"
                 },
-                "persona_id": {"type": "string", "description": "Persona UUID (get/update/delete/add_*/remove_*/get_subgraph)"},
-                "project_id": {"type": "string", "description": "Project UUID (create/list)"},
-                "name": {"type": "string", "description": "Persona name (create/update)"},
-                "description": {"type": "string", "description": "Persona description (create/update)"},
+                "persona_id": {"type": "string", "description": "Persona UUID (get/update/delete/add_*/remove_*/get_subgraph/export/activate)"},
+                "project_id": {"type": "string", "description": "Project UUID (create/list/import/auto_build)"},
+                "name": {"type": "string", "description": "Persona name (create/update/auto_build)"},
+                "description": {"type": "string", "description": "Persona description (create/update/auto_build)"},
                 "status": {"type": "string", "description": "Status (update): active, dormant, emerging, archived"},
                 "complexity_default": {"type": "string", "description": "Default complexity (create/update): simple, complex, creative"},
                 "timeout_secs": {"type": "integer", "description": "Execution timeout in seconds (create/update)"},
@@ -1147,7 +1147,13 @@ fn persona_tool() -> ToolDefinition {
                 "parent_persona_id": {"type": "string", "description": "Parent persona UUID (add_extends/remove_extends)"},
                 "weight": {"type": "number", "description": "Relation weight 0-1 (add_file/add_function/add_note/add_decision). Default: 1.0"},
                 "limit": {"type": "integer", "description": "Max items (list/list_global)"},
-                "offset": {"type": "integer", "description": "Skip items (list/list_global)"}
+                "offset": {"type": "integer", "description": "Skip items (list/list_global)"},
+                "source_project_name": {"type": "string", "description": "Source project name for export metadata (export)"},
+                "package": {"type": "object", "description": "PersonaPackage JSON to import (import)"},
+                "conflict_strategy": {"type": "string", "description": "Conflict strategy (import): skip, merge, replace. Default: skip"},
+                "file_pattern": {"type": "string", "description": "Glob pattern to discover files (auto_build). E.g. 'src/neo4j/**'"},
+                "entry_function": {"type": "string", "description": "Entry function to explore call graph from (auto_build)"},
+                "depth": {"type": "integer", "description": "Exploration depth from entry point (auto_build). Default: 3"}
             })),
             required: Some(vec!["action".to_string()]),
         },

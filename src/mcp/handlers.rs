@@ -517,6 +517,10 @@ impl ToolHandler {
             ("persona", "get_subgraph") => "get_persona_subgraph",
             ("persona", "find_for_file") => "find_personas_for_file",
             ("persona", "list_global") => "list_global_personas",
+            ("persona", "export") => "export_persona",
+            ("persona", "import") => "import_persona",
+            ("persona", "activate") => "activate_persona",
+            ("persona", "auto_build") => "auto_build_persona",
 
             // Reasoning Tree
             ("reasoning", "reason") => "reason",
@@ -4764,6 +4768,46 @@ impl ToolHandler {
                 let result = http
                     .get_with_query("/api/personas/global", &query)
                     .await?;
+                Ok(Some(result))
+            }
+
+            "export_persona" => {
+                let persona_id = extract_id(args, "persona_id")?;
+                let mut query = Vec::new();
+                if let Some(name) = extract_optional_string(args, "source_project_name") {
+                    query.push(("source_project_name".to_string(), name));
+                }
+                let result = if query.is_empty() {
+                    http.get(&format!("/api/personas/{}/export", persona_id))
+                        .await?
+                } else {
+                    http.get_with_query(
+                        &format!("/api/personas/{}/export", persona_id),
+                        &query,
+                    )
+                    .await?
+                };
+                Ok(Some(result))
+            }
+
+            "import_persona" => {
+                let result = http.post("/api/personas/import", args).await?;
+                Ok(Some(result))
+            }
+
+            "activate_persona" => {
+                let persona_id = extract_id(args, "persona_id")?;
+                let result = http
+                    .post(
+                        &format!("/api/personas/{}/activate", persona_id),
+                        &json!({}),
+                    )
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "auto_build_persona" => {
+                let result = http.post("/api/personas/auto-build", args).await?;
                 Ok(Some(result))
             }
 

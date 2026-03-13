@@ -2003,6 +2003,86 @@ pub struct PersonaSubgraphStats {
     pub freshness: f64,
 }
 
+/// Portable persona package for export/import across projects.
+///
+/// Contains the persona definition and all its portable knowledge
+/// (notes, decisions). Files/functions are project-specific and NOT included —
+/// they are reconstructed on import via `auto_bind`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersonaPackage {
+    /// Schema version for forward compatibility
+    pub schema_version: u32,
+    /// Persona identity (without project-specific IDs)
+    pub persona: PortablePersona,
+    /// Notes this persona USES (content, not IDs)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<PortablePersonaNote>,
+    /// Decisions this persona USES (content, not IDs)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub decisions: Vec<PortablePersonaDecision>,
+    /// Skill names this persona MASTERS (for re-linking on import)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skill_names: Vec<String>,
+    /// Source metadata for provenance tracking
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<PersonaPackageSource>,
+}
+
+/// Portable persona definition (no project-specific IDs).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PortablePersona {
+    pub name: String,
+    pub description: String,
+    pub complexity_default: Option<String>,
+    pub timeout_secs: Option<u64>,
+    pub max_cost_usd: Option<f64>,
+    pub model_preference: Option<String>,
+    pub system_prompt_override: Option<String>,
+    pub energy: f64,
+    pub cohesion: f64,
+    pub activation_count: i64,
+    pub success_rate: f64,
+}
+
+/// A note carried inside a PersonaPackage.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PortablePersonaNote {
+    pub note_type: String,
+    pub content: String,
+    pub importance: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// Weight of the USES relation
+    pub weight: f64,
+}
+
+/// A decision carried inside a PersonaPackage.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PortablePersonaDecision {
+    pub description: String,
+    pub rationale: String,
+    pub chosen_option: String,
+    /// Weight of the USES relation
+    pub weight: f64,
+}
+
+/// Source metadata for provenance tracking in PersonaPackage.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersonaPackageSource {
+    pub project_name: Option<String>,
+    pub exported_at: DateTime<Utc>,
+}
+
+/// Result of importing a PersonaPackage.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersonaImportResult {
+    pub persona_id: Uuid,
+    pub persona_name: String,
+    pub notes_imported: usize,
+    pub decisions_imported: usize,
+    pub skills_linked: usize,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
