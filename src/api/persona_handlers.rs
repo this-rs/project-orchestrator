@@ -4,8 +4,8 @@ use super::handlers::{AppError, OrchestratorState};
 use super::{PaginatedResponse, PaginationParams};
 use crate::neo4j::models::{
     DecisionNode, PersonaImportResult, PersonaNode, PersonaOrigin, PersonaPackage,
-    PersonaPackageSource, PersonaStatus, PersonaSubgraph, PortablePersona,
-    PortablePersonaDecision, PortablePersonaNote,
+    PersonaPackageSource, PersonaStatus, PersonaSubgraph, PortablePersona, PortablePersonaDecision,
+    PortablePersonaNote,
 };
 use axum::{
     extract::{Path, Query, State},
@@ -917,9 +917,7 @@ pub async fn import_persona(
         note.tags = pn.tags.clone();
 
         if neo4j.create_note(&note).await.is_ok() {
-            let _ = neo4j
-                .add_persona_note(persona.id, note.id, pn.weight)
-                .await;
+            let _ = neo4j.add_persona_note(persona.id, note.id, pn.weight).await;
             notes_imported += 1;
         }
     }
@@ -944,11 +942,7 @@ pub async fn import_persona(
         };
 
         // Create decision with a nil task_id (the trait requires it, but it just creates the node)
-        if neo4j
-            .create_decision(Uuid::nil(), &decision)
-            .await
-            .is_ok()
-        {
+        if neo4j.create_decision(Uuid::nil(), &decision).await.is_ok() {
             let _ = neo4j
                 .add_persona_decision(persona.id, decision.id, pd.weight)
                 .await;
@@ -965,11 +959,7 @@ pub async fn import_persona(
 
     for skill_name in &body.package.skill_names {
         if let Some(skill) = all_skills.iter().find(|s| &s.name == skill_name) {
-            if neo4j
-                .add_persona_skill(persona.id, skill.id)
-                .await
-                .is_ok()
-            {
+            if neo4j.add_persona_skill(persona.id, skill.id).await.is_ok() {
                 skills_linked += 1;
             }
         }
@@ -1222,7 +1212,9 @@ pub async fn auto_build_persona(
                 .iter()
                 .filter(|f| {
                     let fl = f.to_lowercase();
-                    parts.iter().all(|part| part.is_empty() || fl.contains(part))
+                    parts
+                        .iter()
+                        .all(|part| part.is_empty() || fl.contains(part))
                 })
                 .collect()
         } else {
@@ -1233,9 +1225,7 @@ pub async fn auto_build_persona(
         };
 
         for file_path in matched {
-            let _ = neo4j
-                .add_persona_file(persona.id, file_path, 1.0)
-                .await;
+            let _ = neo4j.add_persona_file(persona.id, file_path, 1.0).await;
         }
     }
 
@@ -1248,9 +1238,7 @@ pub async fn auto_build_persona(
                     .await;
             }
             // Also add the entry function itself
-            let _ = neo4j
-                .add_persona_function(persona.id, entry_fn, 1.0)
-                .await;
+            let _ = neo4j.add_persona_function(persona.id, entry_fn, 1.0).await;
         }
     }
 
@@ -1333,18 +1321,39 @@ mod tests {
 
     #[test]
     fn test_persona_origin_parse() {
-        assert_eq!("manual".parse::<PersonaOrigin>().unwrap(), PersonaOrigin::Manual);
-        assert_eq!("auto_build".parse::<PersonaOrigin>().unwrap(), PersonaOrigin::AutoBuild);
-        assert_eq!("imported".parse::<PersonaOrigin>().unwrap(), PersonaOrigin::Imported);
+        assert_eq!(
+            "manual".parse::<PersonaOrigin>().unwrap(),
+            PersonaOrigin::Manual
+        );
+        assert_eq!(
+            "auto_build".parse::<PersonaOrigin>().unwrap(),
+            PersonaOrigin::AutoBuild
+        );
+        assert_eq!(
+            "imported".parse::<PersonaOrigin>().unwrap(),
+            PersonaOrigin::Imported
+        );
         assert!("unknown".parse::<PersonaOrigin>().is_err());
     }
 
     #[test]
     fn test_persona_status_parse() {
-        assert_eq!("active".parse::<PersonaStatus>().unwrap(), PersonaStatus::Active);
-        assert_eq!("dormant".parse::<PersonaStatus>().unwrap(), PersonaStatus::Dormant);
-        assert_eq!("emerging".parse::<PersonaStatus>().unwrap(), PersonaStatus::Emerging);
-        assert_eq!("archived".parse::<PersonaStatus>().unwrap(), PersonaStatus::Archived);
+        assert_eq!(
+            "active".parse::<PersonaStatus>().unwrap(),
+            PersonaStatus::Active
+        );
+        assert_eq!(
+            "dormant".parse::<PersonaStatus>().unwrap(),
+            PersonaStatus::Dormant
+        );
+        assert_eq!(
+            "emerging".parse::<PersonaStatus>().unwrap(),
+            PersonaStatus::Emerging
+        );
+        assert_eq!(
+            "archived".parse::<PersonaStatus>().unwrap(),
+            PersonaStatus::Archived
+        );
         assert!("invalid".parse::<PersonaStatus>().is_err());
     }
 

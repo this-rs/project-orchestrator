@@ -2348,12 +2348,7 @@ pub trait GraphStore: Send + Sync {
     async fn remove_persona_feature_graph(&self, persona_id: Uuid) -> Result<()>;
 
     /// Add KNOWS relation: Persona -> File (with weight)
-    async fn add_persona_file(
-        &self,
-        persona_id: Uuid,
-        file_path: &str,
-        weight: f64,
-    ) -> Result<()>;
+    async fn add_persona_file(&self, persona_id: Uuid, file_path: &str, weight: f64) -> Result<()>;
 
     /// Remove KNOWS relation: Persona -> File
     async fn remove_persona_file(&self, persona_id: Uuid, file_path: &str) -> Result<()>;

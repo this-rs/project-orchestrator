@@ -93,15 +93,21 @@ impl PersonaStack {
     /// Push a persona entry onto the stack, maintaining weight-descending order.
     pub fn push(&mut self, entry: PersonaEntry) {
         // Don't add duplicates — update weight if already present
-        if let Some(existing) = self.entries.iter_mut().find(|e| e.persona_id == entry.persona_id)
+        if let Some(existing) = self
+            .entries
+            .iter_mut()
+            .find(|e| e.persona_id == entry.persona_id)
         {
             existing.weight = existing.weight.max(entry.weight);
             existing.trigger = entry.trigger;
         } else {
             self.entries.push(entry);
         }
-        self.entries
-            .sort_by(|a, b| b.weight.partial_cmp(&a.weight).unwrap_or(std::cmp::Ordering::Equal));
+        self.entries.sort_by(|a, b| {
+            b.weight
+                .partial_cmp(&a.weight)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
     }
 
     /// Get the primary (highest-weight) persona, if any.
@@ -283,8 +289,15 @@ pub async fn load_persona_stack(
     // 1. Task-level persona assignment
     if let Some(ref persona_json) = task.persona {
         if let Ok(persona_id) = persona_json.trim_matches('"').parse::<Uuid>() {
-            match load_and_push(graph, persona_id, PersonaTrigger::TaskAssign, 1.0, now, &mut stack)
-                .await
+            match load_and_push(
+                graph,
+                persona_id,
+                PersonaTrigger::TaskAssign,
+                1.0,
+                now,
+                &mut stack,
+            )
+            .await
             {
                 Ok(true) => {
                     info!(persona_id = %persona_id, "Persona loaded from task assignment");
@@ -335,11 +348,7 @@ pub async fn load_persona_stack(
         if let Some(ref hint_json) = step.persona {
             if let Ok(hint_id) = hint_json.trim_matches('"').parse::<Uuid>() {
                 // Don't duplicate the primary persona
-                if stack
-                    .entries()
-                    .iter()
-                    .any(|e| e.persona_id == hint_id)
-                {
+                if stack.entries().iter().any(|e| e.persona_id == hint_id) {
                     continue;
                 }
                 let _ = load_and_push(
@@ -365,9 +374,15 @@ pub async fn load_persona_stack(
                 break;
             }
             if let Ok(parent_id) = parent_rel.entity_id.parse::<Uuid>() {
-                let _ =
-                    load_and_push(graph, parent_id, PersonaTrigger::Inherited, w, now, &mut stack)
-                        .await;
+                let _ = load_and_push(
+                    graph,
+                    parent_id,
+                    PersonaTrigger::Inherited,
+                    w,
+                    now,
+                    &mut stack,
+                )
+                .await;
             }
         }
     }
@@ -889,7 +904,11 @@ mod tests {
     fn test_persona_stack_render() {
         let mut stack = PersonaStack::new(4000);
         stack.push(make_entry("neo4j-expert", 0.9, PersonaTrigger::TaskAssign));
-        stack.push(make_entry("rust-specialist", 0.4, PersonaTrigger::FileMatch));
+        stack.push(make_entry(
+            "rust-specialist",
+            0.4,
+            PersonaTrigger::FileMatch,
+        ));
 
         let rendered = stack.render_for_prompt(4000);
         assert!(rendered.contains("Primary Persona"));

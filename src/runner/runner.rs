@@ -975,10 +975,8 @@ impl PlanRunner {
                         let graph = self.graph.clone();
                         let pids = task_persona_ids;
                         tokio::spawn(async move {
-                            crate::runner::persona::record_persona_feedback(
-                                graph, pids, true,
-                            )
-                            .await;
+                            crate::runner::persona::record_persona_feedback(graph, pids, true)
+                                .await;
                         });
                     }
                 }
@@ -1056,10 +1054,8 @@ impl PlanRunner {
                         let graph = self.graph.clone();
                         let pids = task_persona_ids;
                         tokio::spawn(async move {
-                            crate::runner::persona::record_persona_feedback(
-                                graph, pids, false,
-                            )
-                            .await;
+                            crate::runner::persona::record_persona_feedback(graph, pids, false)
+                                .await;
                         });
                     }
                 }
@@ -1151,10 +1147,8 @@ impl PlanRunner {
                         let graph = self.graph.clone();
                         let pids = task_persona_ids;
                         tokio::spawn(async move {
-                            crate::runner::persona::record_persona_feedback(
-                                graph, pids, false,
-                            )
-                            .await;
+                            crate::runner::persona::record_persona_feedback(graph, pids, false)
+                                .await;
                         });
                     }
                 }
@@ -1321,15 +1315,8 @@ impl PlanRunner {
             .filter(|s| !s.is_empty());
 
         // --- Step 2b: Load PersonaStack ---
-        let persona_stack = if let (Some(pid), Some(ref tn)) = (project_id_for_skills, &task_node)
-        {
-            crate::runner::persona::load_persona_stack(
-                self.graph.as_ref(),
-                tn,
-                pid,
-                &steps,
-            )
-            .await
+        let persona_stack = if let (Some(pid), Some(ref tn)) = (project_id_for_skills, &task_node) {
+            crate::runner::persona::load_persona_stack(self.graph.as_ref(), tn, pid, &steps).await
         } else {
             None
         };

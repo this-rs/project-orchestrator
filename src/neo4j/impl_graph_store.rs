@@ -2773,26 +2773,15 @@ impl GraphStore for Neo4jClient {
         self.remove_persona_decision(persona_id, decision_id).await
     }
 
-    async fn add_persona_extends(
-        &self,
-        child_id: Uuid,
-        parent_id: Uuid,
-    ) -> anyhow::Result<()> {
+    async fn add_persona_extends(&self, child_id: Uuid, parent_id: Uuid) -> anyhow::Result<()> {
         self.add_persona_extends(child_id, parent_id).await
     }
 
-    async fn remove_persona_extends(
-        &self,
-        child_id: Uuid,
-        parent_id: Uuid,
-    ) -> anyhow::Result<()> {
+    async fn remove_persona_extends(&self, child_id: Uuid, parent_id: Uuid) -> anyhow::Result<()> {
         self.remove_persona_extends(child_id, parent_id).await
     }
 
-    async fn get_persona_subgraph(
-        &self,
-        persona_id: Uuid,
-    ) -> anyhow::Result<PersonaSubgraph> {
+    async fn get_persona_subgraph(&self, persona_id: Uuid) -> anyhow::Result<PersonaSubgraph> {
         self.get_persona_subgraph(persona_id).await
     }
 

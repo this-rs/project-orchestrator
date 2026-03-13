@@ -1845,7 +1845,6 @@ impl std::str::FromStr for PersonaOrigin {
     }
 }
 
-
 /// Status of a persona lifecycle.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1884,7 +1883,6 @@ impl std::str::FromStr for PersonaStatus {
         }
     }
 }
-
 
 /// A Living Persona — an adaptive knowledge agent connected to the graph.
 ///

@@ -4473,10 +4473,7 @@ impl ToolHandler {
                 let persona_id = extract_id(args, "persona_id")?;
                 let skill_id = extract_id(args, "skill_id")?;
                 let result = http
-                    .delete(&format!(
-                        "/api/personas/{}/skills/{}",
-                        persona_id, skill_id
-                    ))
+                    .delete(&format!("/api/personas/{}/skills/{}", persona_id, skill_id))
                     .await?;
                 Ok(Some(if result.is_null() {
                     json!({"removed": true})
@@ -4490,10 +4487,7 @@ impl ToolHandler {
                 let protocol_id = extract_id(args, "protocol_id")?;
                 let result = http
                     .post(
-                        &format!(
-                            "/api/personas/{}/protocols/{}",
-                            persona_id, protocol_id
-                        ),
+                        &format!("/api/personas/{}/protocols/{}", persona_id, protocol_id),
                         &json!({}),
                     )
                     .await?;
@@ -4523,10 +4517,7 @@ impl ToolHandler {
             "add_persona_file" => {
                 let persona_id = extract_id(args, "persona_id")?;
                 let file_path = extract_string(args, "file_path")?;
-                let weight = args
-                    .get("weight")
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(1.0);
+                let weight = args.get("weight").and_then(|v| v.as_f64()).unwrap_or(1.0);
                 let body = json!({"file_path": file_path, "weight": weight});
                 let result = http
                     .post(&format!("/api/personas/{}/files", persona_id), &body)
@@ -4543,10 +4534,7 @@ impl ToolHandler {
                 let file_path = extract_string(args, "file_path")?;
                 let body = json!({"file_path": file_path});
                 let result = http
-                    .delete_with_body(
-                        &format!("/api/personas/{}/files", persona_id),
-                        &body,
-                    )
+                    .delete_with_body(&format!("/api/personas/{}/files", persona_id), &body)
                     .await?;
                 Ok(Some(if result.is_null() {
                     json!({"removed": true})
@@ -4558,16 +4546,10 @@ impl ToolHandler {
             "add_persona_function" => {
                 let persona_id = extract_id(args, "persona_id")?;
                 let function_name = extract_string(args, "function_name")?;
-                let weight = args
-                    .get("weight")
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(1.0);
+                let weight = args.get("weight").and_then(|v| v.as_f64()).unwrap_or(1.0);
                 let body = json!({"function_name": function_name, "weight": weight});
                 let result = http
-                    .post(
-                        &format!("/api/personas/{}/functions", persona_id),
-                        &body,
-                    )
+                    .post(&format!("/api/personas/{}/functions", persona_id), &body)
                     .await?;
                 Ok(Some(if result.is_null() {
                     json!({"added": true})
@@ -4581,10 +4563,7 @@ impl ToolHandler {
                 let function_name = extract_string(args, "function_name")?;
                 let body = json!({"function_name": function_name});
                 let result = http
-                    .delete_with_body(
-                        &format!("/api/personas/{}/functions", persona_id),
-                        &body,
-                    )
+                    .delete_with_body(&format!("/api/personas/{}/functions", persona_id), &body)
                     .await?;
                 Ok(Some(if result.is_null() {
                     json!({"removed": true})
@@ -4596,10 +4575,7 @@ impl ToolHandler {
             "add_persona_note" => {
                 let persona_id = extract_id(args, "persona_id")?;
                 let note_id = extract_id(args, "note_id")?;
-                let weight = args
-                    .get("weight")
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(1.0);
+                let weight = args.get("weight").and_then(|v| v.as_f64()).unwrap_or(1.0);
                 let result = http
                     .post(
                         &format!("/api/personas/{}/notes/{}", persona_id, note_id),
@@ -4617,10 +4593,7 @@ impl ToolHandler {
                 let persona_id = extract_id(args, "persona_id")?;
                 let note_id = extract_id(args, "note_id")?;
                 let result = http
-                    .delete(&format!(
-                        "/api/personas/{}/notes/{}",
-                        persona_id, note_id
-                    ))
+                    .delete(&format!("/api/personas/{}/notes/{}", persona_id, note_id))
                     .await?;
                 Ok(Some(if result.is_null() {
                     json!({"removed": true})
@@ -4632,16 +4605,10 @@ impl ToolHandler {
             "add_persona_decision" => {
                 let persona_id = extract_id(args, "persona_id")?;
                 let decision_id = extract_id(args, "decision_id")?;
-                let weight = args
-                    .get("weight")
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(1.0);
+                let weight = args.get("weight").and_then(|v| v.as_f64()).unwrap_or(1.0);
                 let result = http
                     .post(
-                        &format!(
-                            "/api/personas/{}/decisions/{}",
-                            persona_id, decision_id
-                        ),
+                        &format!("/api/personas/{}/decisions/{}", persona_id, decision_id),
                         &json!({"weight": weight}),
                     )
                     .await?;
@@ -4708,10 +4675,7 @@ impl ToolHandler {
                 let parent_persona_id = extract_id(args, "parent_persona_id")?;
                 let result = http
                     .post(
-                        &format!(
-                            "/api/personas/{}/extends/{}",
-                            persona_id, parent_persona_id
-                        ),
+                        &format!("/api/personas/{}/extends/{}", persona_id, parent_persona_id),
                         &json!({}),
                     )
                     .await?;
@@ -4767,9 +4731,7 @@ impl ToolHandler {
                 if let Some(o) = args.get("offset").and_then(|v| v.as_u64()) {
                     query.push(("offset".to_string(), o.to_string()));
                 }
-                let result = http
-                    .get_with_query("/api/personas/global", &query)
-                    .await?;
+                let result = http.get_with_query("/api/personas/global", &query).await?;
                 Ok(Some(result))
             }
 
@@ -4783,11 +4745,8 @@ impl ToolHandler {
                     http.get(&format!("/api/personas/{}/export", persona_id))
                         .await?
                 } else {
-                    http.get_with_query(
-                        &format!("/api/personas/{}/export", persona_id),
-                        &query,
-                    )
-                    .await?
+                    http.get_with_query(&format!("/api/personas/{}/export", persona_id), &query)
+                        .await?
                 };
                 Ok(Some(result))
             }

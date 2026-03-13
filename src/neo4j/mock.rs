@@ -8343,7 +8343,10 @@ impl GraphStore for MockGraphStore {
     // ========================================================================
 
     async fn create_persona(&self, persona: &PersonaNode) -> Result<()> {
-        self.personas.write().await.insert(persona.id, persona.clone());
+        self.personas
+            .write()
+            .await
+            .insert(persona.id, persona.clone());
         Ok(())
     }
 
@@ -8391,7 +8394,11 @@ impl GraphStore for MockGraphStore {
             .filter(|p| status.map_or(true, |s| p.status == s))
             .cloned()
             .collect();
-        all.sort_by(|a, b| b.energy.partial_cmp(&a.energy).unwrap_or(std::cmp::Ordering::Equal));
+        all.sort_by(|a, b| {
+            b.energy
+                .partial_cmp(&a.energy)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         let total = all.len();
         let page = all.into_iter().skip(offset).take(limit).collect();
         Ok((page, total))
@@ -8457,12 +8464,7 @@ impl GraphStore for MockGraphStore {
         Ok(())
     }
 
-    async fn add_persona_file(
-        &self,
-        persona_id: Uuid,
-        file_path: &str,
-        weight: f64,
-    ) -> Result<()> {
+    async fn add_persona_file(&self, persona_id: Uuid, file_path: &str, weight: f64) -> Result<()> {
         self.persona_files
             .write()
             .await
@@ -8494,23 +8496,14 @@ impl GraphStore for MockGraphStore {
         Ok(())
     }
 
-    async fn remove_persona_function(
-        &self,
-        persona_id: Uuid,
-        function_id: &str,
-    ) -> Result<()> {
+    async fn remove_persona_function(&self, persona_id: Uuid, function_id: &str) -> Result<()> {
         if let Some(map) = self.persona_functions.write().await.get_mut(&persona_id) {
             map.remove(function_id);
         }
         Ok(())
     }
 
-    async fn add_persona_note(
-        &self,
-        persona_id: Uuid,
-        note_id: Uuid,
-        weight: f64,
-    ) -> Result<()> {
+    async fn add_persona_note(&self, persona_id: Uuid, note_id: Uuid, weight: f64) -> Result<()> {
         self.persona_notes
             .write()
             .await
@@ -8542,11 +8535,7 @@ impl GraphStore for MockGraphStore {
         Ok(())
     }
 
-    async fn remove_persona_decision(
-        &self,
-        persona_id: Uuid,
-        decision_id: Uuid,
-    ) -> Result<()> {
+    async fn remove_persona_decision(&self, persona_id: Uuid, decision_id: Uuid) -> Result<()> {
         if let Some(map) = self.persona_decisions.write().await.get_mut(&persona_id) {
             map.remove(&decision_id);
         }

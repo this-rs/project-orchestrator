@@ -310,8 +310,9 @@ pub async fn create_note(
                         .iter()
                         .filter(|p| p.status == crate::neo4j::models::PersonaStatus::Active)
                     {
-                        if let Err(e) =
-                            neo4j.auto_link_note_to_persona(persona.id, note_id, 0.5).await
+                        if let Err(e) = neo4j
+                            .auto_link_note_to_persona(persona.id, note_id, 0.5)
+                            .await
                         {
                             tracing::debug!(
                                 persona_id = %persona.id,

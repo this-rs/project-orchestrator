@@ -343,9 +343,8 @@ impl Neo4jClient {
 
     /// List global personas (project_id IS NULL).
     pub async fn list_global_personas(&self) -> Result<Vec<PersonaNode>> {
-        let q = query(
-            "MATCH (p:Persona) WHERE p.project_id IS NULL RETURN p ORDER BY p.energy DESC",
-        );
+        let q =
+            query("MATCH (p:Persona) WHERE p.project_id IS NULL RETURN p ORDER BY p.energy DESC");
         let mut result = self
             .graph
             .execute(q)
@@ -410,11 +409,7 @@ impl Neo4jClient {
     }
 
     /// Remove FOLLOWS relation: Persona -> Protocol
-    pub async fn remove_persona_protocol(
-        &self,
-        persona_id: Uuid,
-        protocol_id: Uuid,
-    ) -> Result<()> {
+    pub async fn remove_persona_protocol(&self, persona_id: Uuid, protocol_id: Uuid) -> Result<()> {
         let q = query(
             r#"
             MATCH (p:Persona {id: $persona_id})-[r:FOLLOWS]->(pr:Protocol {id: $protocol_id})
@@ -447,7 +442,10 @@ impl Neo4jClient {
         .param("persona_id", persona_id.to_string())
         .param("fg_id", feature_graph_id.to_string());
 
-        self.graph.run(q).await.context("set_persona_feature_graph")?;
+        self.graph
+            .run(q)
+            .await
+            .context("set_persona_feature_graph")?;
         Ok(())
     }
 
@@ -461,7 +459,10 @@ impl Neo4jClient {
         )
         .param("persona_id", persona_id.to_string());
 
-        self.graph.run(q).await.context("remove_persona_feature_graph")?;
+        self.graph
+            .run(q)
+            .await
+            .context("remove_persona_feature_graph")?;
         Ok(())
     }
 
@@ -546,11 +547,7 @@ impl Neo4jClient {
     }
 
     /// Remove KNOWS relation: Persona -> Function
-    pub async fn remove_persona_function(
-        &self,
-        persona_id: Uuid,
-        function_id: &str,
-    ) -> Result<()> {
+    pub async fn remove_persona_function(&self, persona_id: Uuid, function_id: &str) -> Result<()> {
         let q = query(
             r#"
             MATCH (p:Persona {id: $persona_id})-[r:KNOWS]->(fn:Function {id: $function_id})
@@ -624,11 +621,7 @@ impl Neo4jClient {
     }
 
     /// Remove USES relation: Persona -> Decision
-    pub async fn remove_persona_decision(
-        &self,
-        persona_id: Uuid,
-        decision_id: Uuid,
-    ) -> Result<()> {
+    pub async fn remove_persona_decision(&self, persona_id: Uuid, decision_id: Uuid) -> Result<()> {
         let q = query(
             r#"
             MATCH (p:Persona {id: $persona_id})-[r:USES]->(d:Decision {id: $decision_id})
@@ -1025,10 +1018,7 @@ impl Neo4jClient {
     /// Detect potential personas from Louvain communities.
     ///
     /// Returns proposals: Vec<(community_label, file_count, suggested_name, confidence)>.
-    pub async fn detect_personas(
-        &self,
-        project_id: Uuid,
-    ) -> Result<Vec<PersonaProposal>> {
+    pub async fn detect_personas(&self, project_id: Uuid) -> Result<Vec<PersonaProposal>> {
         // Find communities with enough files that don't already have a persona
         let q = query(
             r#"
@@ -1051,11 +1041,7 @@ impl Neo4jClient {
         )
         .param("project_id", project_id.to_string());
 
-        let mut result = self
-            .graph
-            .execute(q)
-            .await
-            .context("detect_personas")?;
+        let mut result = self.graph.execute(q).await.context("detect_personas")?;
 
         let mut proposals = Vec::new();
         while let Some(row) = result.next().await? {
@@ -1352,21 +1338,36 @@ mod tests {
         let skill_id2 = Uuid::new_v4();
 
         // Add skills
-        store.add_persona_skill(persona.id, skill_id1).await.unwrap();
-        store.add_persona_skill(persona.id, skill_id2).await.unwrap();
+        store
+            .add_persona_skill(persona.id, skill_id1)
+            .await
+            .unwrap();
+        store
+            .add_persona_skill(persona.id, skill_id2)
+            .await
+            .unwrap();
 
         // Idempotent — adding same skill again is fine
-        store.add_persona_skill(persona.id, skill_id1).await.unwrap();
+        store
+            .add_persona_skill(persona.id, skill_id1)
+            .await
+            .unwrap();
 
         // Subgraph should reflect skills
         let sg = store.get_persona_subgraph(persona.id).await.unwrap();
         assert_eq!(sg.skills.len(), 2);
 
         // Remove one
-        store.remove_persona_skill(persona.id, skill_id1).await.unwrap();
+        store
+            .remove_persona_skill(persona.id, skill_id1)
+            .await
+            .unwrap();
         let sg = store.get_persona_subgraph(persona.id).await.unwrap();
         assert_eq!(sg.skills.len(), 1);
-        assert!(sg.skills.iter().any(|r| r.entity_id == skill_id2.to_string()));
+        assert!(sg
+            .skills
+            .iter()
+            .any(|r| r.entity_id == skill_id2.to_string()));
     }
 
     #[tokio::test]
@@ -1376,13 +1377,19 @@ mod tests {
         store.create_persona(&persona).await.unwrap();
 
         let proto_id = Uuid::new_v4();
-        store.add_persona_protocol(persona.id, proto_id).await.unwrap();
+        store
+            .add_persona_protocol(persona.id, proto_id)
+            .await
+            .unwrap();
 
         let sg = store.get_persona_subgraph(persona.id).await.unwrap();
         assert_eq!(sg.protocols.len(), 1);
         assert_eq!(sg.protocols[0].entity_id, proto_id.to_string());
 
-        store.remove_persona_protocol(persona.id, proto_id).await.unwrap();
+        store
+            .remove_persona_protocol(persona.id, proto_id)
+            .await
+            .unwrap();
         let sg = store.get_persona_subgraph(persona.id).await.unwrap();
         assert!(sg.protocols.is_empty());
     }
@@ -1413,11 +1420,18 @@ mod tests {
             .await
             .unwrap();
         let sg = store.get_persona_subgraph(persona.id).await.unwrap();
-        let client_rel = sg.files.iter().find(|f| f.entity_id == "src/neo4j/client.rs").unwrap();
+        let client_rel = sg
+            .files
+            .iter()
+            .find(|f| f.entity_id == "src/neo4j/client.rs")
+            .unwrap();
         assert!((client_rel.weight - 0.95).abs() < f64::EPSILON);
 
         // Remove
-        store.remove_persona_file(persona.id, "src/neo4j/client.rs").await.unwrap();
+        store
+            .remove_persona_file(persona.id, "src/neo4j/client.rs")
+            .await
+            .unwrap();
         let sg = store.get_persona_subgraph(persona.id).await.unwrap();
         assert_eq!(sg.files.len(), 1);
     }
@@ -1431,8 +1445,14 @@ mod tests {
         let note_id = Uuid::new_v4();
         let decision_id = Uuid::new_v4();
 
-        store.add_persona_note(persona.id, note_id, 0.8).await.unwrap();
-        store.add_persona_decision(persona.id, decision_id, 0.6).await.unwrap();
+        store
+            .add_persona_note(persona.id, note_id, 0.8)
+            .await
+            .unwrap();
+        store
+            .add_persona_decision(persona.id, decision_id, 0.6)
+            .await
+            .unwrap();
 
         let sg = store.get_persona_subgraph(persona.id).await.unwrap();
         assert_eq!(sg.notes.len(), 1);
@@ -1443,8 +1463,14 @@ mod tests {
         assert_eq!(sg.decisions[0].entity_id, decision_id.to_string());
 
         // Remove
-        store.remove_persona_note(persona.id, note_id).await.unwrap();
-        store.remove_persona_decision(persona.id, decision_id).await.unwrap();
+        store
+            .remove_persona_note(persona.id, note_id)
+            .await
+            .unwrap();
+        store
+            .remove_persona_decision(persona.id, decision_id)
+            .await
+            .unwrap();
         let sg = store.get_persona_subgraph(persona.id).await.unwrap();
         assert!(sg.notes.is_empty());
         assert!(sg.decisions.is_empty());
@@ -1472,7 +1498,10 @@ mod tests {
         assert!(sg.parents.iter().any(|r| r.entity_id == mid.id.to_string()));
 
         // Remove
-        store.remove_persona_extends(child.id, mid.id).await.unwrap();
+        store
+            .remove_persona_extends(child.id, mid.id)
+            .await
+            .unwrap();
         let sg = store.get_persona_subgraph(child.id).await.unwrap();
         assert!(sg.parents.is_empty());
     }
@@ -1484,19 +1513,28 @@ mod tests {
         store.create_persona(&persona).await.unwrap();
 
         let fg_id = Uuid::new_v4();
-        store.set_persona_feature_graph(persona.id, fg_id).await.unwrap();
+        store
+            .set_persona_feature_graph(persona.id, fg_id)
+            .await
+            .unwrap();
 
         let sg = store.get_persona_subgraph(persona.id).await.unwrap();
         assert_eq!(sg.feature_graph_id, Some(fg_id));
 
         // Replace
         let fg_id2 = Uuid::new_v4();
-        store.set_persona_feature_graph(persona.id, fg_id2).await.unwrap();
+        store
+            .set_persona_feature_graph(persona.id, fg_id2)
+            .await
+            .unwrap();
         let sg = store.get_persona_subgraph(persona.id).await.unwrap();
         assert_eq!(sg.feature_graph_id, Some(fg_id2));
 
         // Remove
-        store.remove_persona_feature_graph(persona.id).await.unwrap();
+        store
+            .remove_persona_feature_graph(persona.id)
+            .await
+            .unwrap();
         let sg = store.get_persona_subgraph(persona.id).await.unwrap();
         assert!(sg.feature_graph_id.is_none());
     }
@@ -1508,10 +1546,22 @@ mod tests {
         store.create_persona(&persona).await.unwrap();
 
         // Add various relations
-        store.add_persona_file(persona.id, "a.rs", 0.9).await.unwrap();
-        store.add_persona_file(persona.id, "b.rs", 0.7).await.unwrap();
-        store.add_persona_note(persona.id, Uuid::new_v4(), 0.8).await.unwrap();
-        store.add_persona_skill(persona.id, Uuid::new_v4()).await.unwrap();
+        store
+            .add_persona_file(persona.id, "a.rs", 0.9)
+            .await
+            .unwrap();
+        store
+            .add_persona_file(persona.id, "b.rs", 0.7)
+            .await
+            .unwrap();
+        store
+            .add_persona_note(persona.id, Uuid::new_v4(), 0.8)
+            .await
+            .unwrap();
+        store
+            .add_persona_skill(persona.id, Uuid::new_v4())
+            .await
+            .unwrap();
 
         let sg = store.get_persona_subgraph(persona.id).await.unwrap();
         assert_eq!(sg.stats.total_entities, 4); // 2 files + 1 note + 1 skill
@@ -1534,9 +1584,18 @@ mod tests {
         store.create_persona(&p3).await.unwrap();
 
         // Both p1 and p2 know the file, p3 is archived
-        store.add_persona_file(p1.id, "src/neo4j/client.rs", 0.9).await.unwrap();
-        store.add_persona_file(p2.id, "src/neo4j/client.rs", 0.5).await.unwrap();
-        store.add_persona_file(p3.id, "src/neo4j/client.rs", 1.0).await.unwrap();
+        store
+            .add_persona_file(p1.id, "src/neo4j/client.rs", 0.9)
+            .await
+            .unwrap();
+        store
+            .add_persona_file(p2.id, "src/neo4j/client.rs", 0.5)
+            .await
+            .unwrap();
+        store
+            .add_persona_file(p3.id, "src/neo4j/client.rs", 1.0)
+            .await
+            .unwrap();
 
         let results = store
             .find_personas_for_file("src/neo4j/client.rs", project_id)
@@ -1559,9 +1618,18 @@ mod tests {
         store.create_persona(&persona).await.unwrap();
 
         // Add various relations
-        store.add_persona_skill(persona.id, Uuid::new_v4()).await.unwrap();
-        store.add_persona_file(persona.id, "a.rs", 0.9).await.unwrap();
-        store.add_persona_note(persona.id, Uuid::new_v4(), 0.8).await.unwrap();
+        store
+            .add_persona_skill(persona.id, Uuid::new_v4())
+            .await
+            .unwrap();
+        store
+            .add_persona_file(persona.id, "a.rs", 0.9)
+            .await
+            .unwrap();
+        store
+            .add_persona_note(persona.id, Uuid::new_v4(), 0.8)
+            .await
+            .unwrap();
 
         // Delete should clean everything
         store.delete_persona(persona.id).await.unwrap();
@@ -1578,14 +1646,20 @@ mod tests {
         assert_eq!(PersonaOrigin::AutoBuild.to_string(), "auto_build");
         assert_eq!(PersonaOrigin::Manual.to_string(), "manual");
         assert_eq!(PersonaOrigin::Imported.to_string(), "imported");
-        assert_eq!("auto_build".parse::<PersonaOrigin>().unwrap(), PersonaOrigin::AutoBuild);
+        assert_eq!(
+            "auto_build".parse::<PersonaOrigin>().unwrap(),
+            PersonaOrigin::AutoBuild
+        );
         assert!("invalid".parse::<PersonaOrigin>().is_err());
 
         assert_eq!(PersonaStatus::Active.to_string(), "active");
         assert_eq!(PersonaStatus::Dormant.to_string(), "dormant");
         assert_eq!(PersonaStatus::Emerging.to_string(), "emerging");
         assert_eq!(PersonaStatus::Archived.to_string(), "archived");
-        assert_eq!("active".parse::<PersonaStatus>().unwrap(), PersonaStatus::Active);
+        assert_eq!(
+            "active".parse::<PersonaStatus>().unwrap(),
+            PersonaStatus::Active
+        );
         assert!("invalid".parse::<PersonaStatus>().is_err());
 
         // Defaults

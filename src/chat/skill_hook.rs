@@ -161,7 +161,10 @@ impl SkillActivationHook {
         if !subgraph.notes.is_empty() {
             ctx.push_str("**Knowledge notes:**\n");
             for rel in subgraph.notes.iter().take(5) {
-                ctx.push_str(&format!("- [note:{}] (w:{:.2})\n", rel.entity_id, rel.weight));
+                ctx.push_str(&format!(
+                    "- [note:{}] (w:{:.2})\n",
+                    rel.entity_id, rel.weight
+                ));
             }
         }
 
