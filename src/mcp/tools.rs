@@ -1115,13 +1115,13 @@ fn protocol_tool() -> ToolDefinition {
 fn persona_tool() -> ToolDefinition {
     ToolDefinition {
         name: "persona".to_string(),
-        description: "Manage living personas (adaptive knowledge agents). Actions: create, get, list, update, delete, add_skill, remove_skill, add_protocol, remove_protocol, add_file, remove_file, add_function, remove_function, add_note, remove_note, add_decision, remove_decision, scope_to_feature_graph, unscope_feature_graph, add_extends, remove_extends, get_subgraph, find_for_file, list_global, export, import, activate, auto_build".to_string(),
+        description: "Manage living personas (adaptive knowledge agents). Actions: create, get, list, update, delete, add_skill, remove_skill, add_protocol, remove_protocol, add_file, remove_file, add_function, remove_function, add_note, remove_note, add_decision, remove_decision, scope_to_feature_graph, unscope_feature_graph, add_extends, remove_extends, get_subgraph, find_for_file, list_global, export, import, activate, auto_build, maintain, detect".to_string(),
         input_schema: InputSchema {
             schema_type: "object".to_string(),
             properties: Some(json!({
                 "action": {
                     "type": "string",
-                    "enum": ["create", "get", "list", "update", "delete", "add_skill", "remove_skill", "add_protocol", "remove_protocol", "add_file", "remove_file", "add_function", "remove_function", "add_note", "remove_note", "add_decision", "remove_decision", "scope_to_feature_graph", "unscope_feature_graph", "add_extends", "remove_extends", "get_subgraph", "find_for_file", "list_global", "export", "import", "activate", "auto_build"],
+                    "enum": ["create", "get", "list", "update", "delete", "add_skill", "remove_skill", "add_protocol", "remove_protocol", "add_file", "remove_file", "add_function", "remove_function", "add_note", "remove_note", "add_decision", "remove_decision", "scope_to_feature_graph", "unscope_feature_graph", "add_extends", "remove_extends", "get_subgraph", "find_for_file", "list_global", "export", "import", "activate", "auto_build", "maintain", "detect"],
                     "description": "Operation to perform"
                 },
                 "persona_id": {"type": "string", "description": "Persona UUID (get/update/delete/add_*/remove_*/get_subgraph/export/activate)"},

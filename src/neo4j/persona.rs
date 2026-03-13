@@ -1097,9 +1097,8 @@ impl Neo4jClient {
         .param("note_id", note_id.to_string())
         .param("weight", weight);
 
-        let _ = self
-            .graph
-            .execute(q)
+        self.graph
+            .run(q)
             .await
             .context("auto_link_note_to_persona")?;
         Ok(())
@@ -1124,9 +1123,8 @@ impl Neo4jClient {
         .param("decision_id", decision_id.to_string())
         .param("weight", weight);
 
-        let _ = self
-            .graph
-            .execute(q)
+        self.graph
+            .run(q)
             .await
             .context("auto_link_decision_to_persona")?;
         Ok(())
@@ -1151,9 +1149,8 @@ impl Neo4jClient {
         .param("file_path", file_path)
         .param("weight", weight);
 
-        let _ = self
-            .graph
-            .execute(q)
+        self.graph
+            .run(q)
             .await
             .context("auto_link_file_to_persona")?;
         Ok(())
