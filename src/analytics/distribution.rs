@@ -103,9 +103,8 @@ pub fn analyze_distribution(values: &[f64]) -> Option<DistributionAnalysis> {
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
     // ── Basic statistics — delegate to rs-stats rather than reimplementing ────
-    let mean = rs_stats::prob::average(values).unwrap_or_else(|_| {
-        values.iter().sum::<f64>() / n as f64
-    });
+    let mean =
+        rs_stats::prob::average(values).unwrap_or_else(|_| values.iter().sum::<f64>() / n as f64);
     let std_dev = rs_stats::prob::std_dev(values).unwrap_or(0.0);
 
     let skewness = if std_dev > 0.0 && n >= 3 {
@@ -131,14 +130,13 @@ pub fn analyze_distribution(values: &[f64]) -> Option<DistributionAnalysis> {
     };
 
     // ── Distribution fitting via rs-stats ─────────────────────────────────────
-    let fit_results: Vec<FitResult> = rs_stats::fit_all(values)
-        .unwrap_or_else(|e| {
-            warn!(
-                "rs-stats fit_all failed (n={}): {} — using empty fit list",
-                n, e
-            );
-            vec![]
-        });
+    let fit_results: Vec<FitResult> = rs_stats::fit_all(values).unwrap_or_else(|e| {
+        warn!(
+            "rs-stats fit_all failed (n={}): {} — using empty fit list",
+            n, e
+        );
+        vec![]
+    });
 
     let all_fits: Vec<DistributionFit> = fit_results
         .iter()

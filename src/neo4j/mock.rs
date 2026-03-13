@@ -9543,10 +9543,7 @@ impl GraphStore for MockGraphStore {
         Ok(Vec::new())
     }
 
-    async fn get_community_risk_vectors(
-        &self,
-        _project_id: Uuid,
-    ) -> anyhow::Result<Vec<Vec<f64>>> {
+    async fn get_community_risk_vectors(&self, _project_id: Uuid) -> anyhow::Result<Vec<Vec<f64>>> {
         Ok(Vec::new())
     }
 

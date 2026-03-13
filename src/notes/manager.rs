@@ -1489,7 +1489,11 @@ impl NoteManager {
         cancel: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<SynapseBackfillProgress> {
         let batch_size = if batch_size == 0 { 50 } else { batch_size };
-        let max_neighbors = if max_neighbors == 0 { 10 } else { max_neighbors };
+        let max_neighbors = if max_neighbors == 0 {
+            10
+        } else {
+            max_neighbors
+        };
 
         // Calibrate min_similarity from existing synapse weights when no explicit
         // value was provided (min_similarity <= 0.0).

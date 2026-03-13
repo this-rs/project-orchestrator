@@ -426,7 +426,6 @@ pub struct CodeHealthReport {
     pub coupling_dist: Option<DistributionSummary>,
 
     // ── rs-stats enriched fields ──────────────────────────────────────────────
-
     /// Full distribution analysis of PageRank values across all nodes.
     /// Identifies whether the graph follows a power-law (scale-free) or normal structure.
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -123,19 +123,17 @@ pub fn test_community_homogeneity(groups: &[Vec<f64>]) -> Option<AnovaResult> {
     // Convert to slices for rs-stats (expects &[&[T]])
     let group_slices: Vec<&[f64]> = valid_groups.iter().map(|g| g.as_slice()).collect();
 
-    one_way_anova(&group_slices)
-        .ok()
-        .map(|r| AnovaResult {
-            f_statistic: r.f_statistic,
-            df_between: r.df_between,
-            df_within: r.df_within,
-            p_value: r.p_value,
-            ss_between: r.ss_between,
-            ss_within: r.ss_within,
-            ms_between: r.ms_between,
-            ms_within: r.ms_within,
-            significance: SignificanceLevel::from_p_value(r.p_value),
-        })
+    one_way_anova(&group_slices).ok().map(|r| AnovaResult {
+        f_statistic: r.f_statistic,
+        df_between: r.df_between,
+        df_within: r.df_within,
+        p_value: r.p_value,
+        ss_between: r.ss_between,
+        ss_within: r.ss_within,
+        ms_between: r.ms_between,
+        ms_within: r.ms_within,
+        significance: SignificanceLevel::from_p_value(r.p_value),
+    })
 }
 
 /// Compare metric distributions of two projects (or two snapshots) via a
@@ -236,9 +234,9 @@ mod tests {
     fn test_community_homogeneity_distinct_groups() {
         // Three communities with clearly different risk profiles
         let groups = vec![
-            vec![0.1, 0.12, 0.11, 0.13, 0.10],  // low-risk community
-            vec![0.5, 0.55, 0.52, 0.48, 0.51],  // medium-risk community
-            vec![0.9, 0.88, 0.92, 0.91, 0.89],  // high-risk community
+            vec![0.1, 0.12, 0.11, 0.13, 0.10], // low-risk community
+            vec![0.5, 0.55, 0.52, 0.48, 0.51], // medium-risk community
+            vec![0.9, 0.88, 0.92, 0.91, 0.89], // high-risk community
         ];
         let result = test_community_homogeneity(&groups).unwrap();
         // F-statistic should be very large for clearly distinct groups
