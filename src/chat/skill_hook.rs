@@ -194,7 +194,20 @@ impl SkillActivationHook {
                 // No exact/community match — try directory-prefix from existing cache
                 let cache = self.persona_index.read().await;
                 if let Some(index) = cache.get(&project_id) {
-                    return Self::directory_prefix_match(index, file_path, 2);
+                    if let Some((pid, pname, weight)) =
+                        Self::directory_prefix_match(index, file_path, 2)
+                    {
+                        drop(cache);
+                        // Cache the dir-prefix hit for future exact lookups
+                        let mut wcache = self.persona_index.write().await;
+                        if let Some(idx) = wcache.get_mut(&project_id) {
+                            idx.entries.insert(
+                                file_path.to_string(),
+                                vec![(pid, pname.clone(), weight, PersonaMatchSource::DirectoryPrefix)],
+                            );
+                        }
+                        return Some((pid, pname, weight));
+                    }
                 }
                 None
             }
