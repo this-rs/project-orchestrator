@@ -34,6 +34,7 @@ use uuid::Uuid;
 
 /// Source of a persona-file match (for distinguishing fallback levels).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // CommunityMatch and DirectoryPrefix are used in tests
 pub(crate) enum PersonaMatchSource {
     /// Direct KNOWS relation between persona and file.
     DirectKnows,
