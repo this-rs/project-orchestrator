@@ -5,7 +5,7 @@
 //! and requests pass through freely (open access).
 
 use crate::api::handlers::{AppError, OrchestratorState};
-use crate::auth::jwt::{decode_jwt, Claims};
+use crate::auth::jwt::{decode_jwt, Claims, ANONYMOUS_USER_ID};
 use axum::{
     extract::{Request, State},
     middleware::Next,
@@ -51,8 +51,12 @@ pub async fn require_auth(
     let claims = decode_jwt(token, &auth_config.jwt_secret)
         .map_err(|e| AppError::Unauthorized(format!("Invalid token: {}", e)))?;
 
-    // 4. Check email restrictions (domain + individual whitelist)
-    if !auth_config.is_email_allowed(&claims.email) {
+    // 4. Check email restrictions (domain + individual whitelist).
+    //    Bypass for the anonymous/MCP system user (ANONYMOUS_USER_ID = UUID nil)
+    //    since it's a machine identity used by `mcp_server` auto-auth, not a human
+    //    subject to email policies.
+    let is_system_user = claims.sub == ANONYMOUS_USER_ID.to_string();
+    if !is_system_user && !auth_config.is_email_allowed(&claims.email) {
         return Err(AppError::Forbidden(
             "Email not allowed by server policy".to_string(),
         ));
@@ -305,6 +309,34 @@ mod tests {
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn test_anonymous_user_bypasses_email_policy() {
+        // MCP system user (ANONYMOUS_USER_ID) should bypass email restrictions
+        // even when allowed_email_domain is set.
+        let mut config = test_auth_config();
+        config.allowed_email_domain = Some("ffs.holdings".to_string());
+
+        let app = test_app(Some(config)).await;
+
+        let token = encode_jwt(
+            crate::auth::jwt::ANONYMOUS_USER_ID,
+            "mcp-server@local",
+            "MCP Server",
+            TEST_SECRET,
+            3600,
+        )
+        .unwrap();
+
+        let req = HttpRequest::builder()
+            .uri("/test")
+            .header("authorization", format!("Bearer {}", token))
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]
