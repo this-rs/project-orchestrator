@@ -87,9 +87,7 @@ impl SkillActivationHook {
     /// Extract the parent directory from a file path (with trailing slash).
     /// Returns None for root-level files without a directory.
     fn parent_dir(file_path: &str) -> Option<String> {
-        file_path
-            .rsplit_once('/')
-            .map(|(dir, _)| format!("{dir}/"))
+        file_path.rsplit_once('/').map(|(dir, _)| format!("{dir}/"))
     }
 
     /// Directory-prefix match: check if the persona KNOWS ≥ threshold files in the same directory.
@@ -203,7 +201,12 @@ impl SkillActivationHook {
                         if let Some(idx) = wcache.get_mut(&project_id) {
                             idx.entries.insert(
                                 file_path.to_string(),
-                                vec![(pid, pname.clone(), weight, PersonaMatchSource::DirectoryPrefix)],
+                                vec![(
+                                    pid,
+                                    pname.clone(),
+                                    weight,
+                                    PersonaMatchSource::DirectoryPrefix,
+                                )],
                             );
                         }
                         return Some((pid, pname, weight));
@@ -235,10 +238,7 @@ impl SkillActivationHook {
             HashMap::new();
 
         for (path, personas) in &index.entries {
-            if let Some(dir) = path
-                .rsplit_once('/')
-                .map(|(d, _)| format!("{d}/"))
-            {
+            if let Some(dir) = path.rsplit_once('/').map(|(d, _)| format!("{d}/")) {
                 for (persona_id, persona_name, weight, source) in personas {
                     // Only count DirectKnows for directory index (not community matches)
                     if *source == PersonaMatchSource::DirectKnows {
@@ -656,7 +656,12 @@ mod tests {
         let mut entries = HashMap::new();
         entries.insert(
             "src/main.rs".to_string(),
-            vec![(persona_id, "rust-expert".to_string(), 0.95, PersonaMatchSource::DirectKnows)],
+            vec![(
+                persona_id,
+                "rust-expert".to_string(),
+                0.95,
+                PersonaMatchSource::DirectKnows,
+            )],
         );
         let index = PersonaFileIndex {
             entries,
@@ -679,7 +684,12 @@ mod tests {
         let mut entries = HashMap::new();
         entries.insert(
             "src/community_file.rs".to_string(),
-            vec![(persona_id, "community-persona".to_string(), 0.3, PersonaMatchSource::CommunityMatch)],
+            vec![(
+                persona_id,
+                "community-persona".to_string(),
+                0.3,
+                PersonaMatchSource::CommunityMatch,
+            )],
         );
         let index = PersonaFileIndex {
             entries,
@@ -697,7 +707,12 @@ mod tests {
         let mut entries = HashMap::new();
         entries.insert(
             "src/main.rs".to_string(),
-            vec![(persona_id, "rust-expert".to_string(), 0.9, PersonaMatchSource::DirectKnows)],
+            vec![(
+                persona_id,
+                "rust-expert".to_string(),
+                0.9,
+                PersonaMatchSource::DirectKnows,
+            )],
         );
         let index = PersonaFileIndex {
             entries,
@@ -715,8 +730,18 @@ mod tests {
         entries.insert(
             "src/shared.rs".to_string(),
             vec![
-                (p1, "persona-a".to_string(), 0.9, PersonaMatchSource::DirectKnows),
-                (p2, "persona-b".to_string(), 0.3, PersonaMatchSource::CommunityMatch),
+                (
+                    p1,
+                    "persona-a".to_string(),
+                    0.9,
+                    PersonaMatchSource::DirectKnows,
+                ),
+                (
+                    p2,
+                    "persona-b".to_string(),
+                    0.3,
+                    PersonaMatchSource::CommunityMatch,
+                ),
             ],
         );
         let index = PersonaFileIndex {
@@ -788,11 +813,8 @@ mod tests {
             loaded_at: std::time::Instant::now(),
         };
 
-        let result = SkillActivationHook::directory_prefix_match(
-            &index,
-            "src/neo4j/new_file.rs",
-            2,
-        );
+        let result =
+            SkillActivationHook::directory_prefix_match(&index, "src/neo4j/new_file.rs", 2);
         assert!(result.is_some());
         let (id, name, weight) = result.unwrap();
         assert_eq!(id, p1);
@@ -816,11 +838,8 @@ mod tests {
             loaded_at: std::time::Instant::now(),
         };
 
-        let result = SkillActivationHook::directory_prefix_match(
-            &index,
-            "src/api/new_handler.rs",
-            2,
-        );
+        let result =
+            SkillActivationHook::directory_prefix_match(&index, "src/api/new_handler.rs", 2);
         assert!(result.is_none(), "Should not match with only 1 file in dir");
     }
 
@@ -839,11 +858,8 @@ mod tests {
             loaded_at: std::time::Instant::now(),
         };
 
-        let result = SkillActivationHook::directory_prefix_match(
-            &index,
-            "src/chat/new_module.rs",
-            2,
-        );
+        let result =
+            SkillActivationHook::directory_prefix_match(&index, "src/chat/new_module.rs", 2);
         assert!(result.is_some());
         let (_, _, weight) = result.unwrap();
         assert!((weight - 0.42).abs() < f64::EPSILON);
@@ -870,11 +886,7 @@ mod tests {
             loaded_at: std::time::Instant::now(),
         };
         // Dir not in index → None
-        let result = SkillActivationHook::directory_prefix_match(
-            &index,
-            "src/unknown/file.rs",
-            2,
-        );
+        let result = SkillActivationHook::directory_prefix_match(&index, "src/unknown/file.rs", 2);
         assert!(result.is_none());
     }
 
@@ -897,11 +909,8 @@ mod tests {
             loaded_at: std::time::Instant::now(),
         };
 
-        let result = SkillActivationHook::directory_prefix_match(
-            &index,
-            "src/neo4j/something.rs",
-            2,
-        );
+        let result =
+            SkillActivationHook::directory_prefix_match(&index, "src/neo4j/something.rs", 2);
         assert!(result.is_some());
         let (id, _, _) = result.unwrap();
         // Should pick p1 (first in sorted order, most files)
@@ -918,10 +927,7 @@ mod tests {
             SkillActivationHook::parent_dir("/abs/path/file.rs"),
             Some("/abs/path/".to_string())
         );
-        assert_eq!(
-            SkillActivationHook::parent_dir("file.rs"),
-            None
-        );
+        assert_eq!(SkillActivationHook::parent_dir("file.rs"), None);
     }
 
     #[test]
@@ -931,20 +937,40 @@ mod tests {
         // p1 KNOWS 3 files in src/neo4j/
         entries.insert(
             "src/neo4j/client.rs".to_string(),
-            vec![(p1, "neo4j-expert".to_string(), 0.9, PersonaMatchSource::DirectKnows)],
+            vec![(
+                p1,
+                "neo4j-expert".to_string(),
+                0.9,
+                PersonaMatchSource::DirectKnows,
+            )],
         );
         entries.insert(
             "src/neo4j/traits.rs".to_string(),
-            vec![(p1, "neo4j-expert".to_string(), 0.8, PersonaMatchSource::DirectKnows)],
+            vec![(
+                p1,
+                "neo4j-expert".to_string(),
+                0.8,
+                PersonaMatchSource::DirectKnows,
+            )],
         );
         entries.insert(
             "src/neo4j/mock.rs".to_string(),
-            vec![(p1, "neo4j-expert".to_string(), 0.7, PersonaMatchSource::DirectKnows)],
+            vec![(
+                p1,
+                "neo4j-expert".to_string(),
+                0.7,
+                PersonaMatchSource::DirectKnows,
+            )],
         );
         // Community match should NOT be counted in dir_index
         entries.insert(
             "src/api/handlers.rs".to_string(),
-            vec![(p1, "neo4j-expert".to_string(), 0.3, PersonaMatchSource::CommunityMatch)],
+            vec![(
+                p1,
+                "neo4j-expert".to_string(),
+                0.3,
+                PersonaMatchSource::CommunityMatch,
+            )],
         );
 
         let mut index = PersonaFileIndex {
@@ -962,7 +988,7 @@ mod tests {
         assert_eq!(neo4j_entries.len(), 1);
         assert_eq!(neo4j_entries[0].0, p1);
         assert_eq!(neo4j_entries[0].3, 3); // 3 files
-        // avg weight = (0.9 + 0.8 + 0.7) / 3 = 0.8
+                                           // avg weight = (0.9 + 0.8 + 0.7) / 3 = 0.8
         assert!((neo4j_entries[0].2 - 0.8).abs() < f64::EPSILON);
 
         // src/api/ should NOT be in dir_index (only CommunityMatch, not DirectKnows)
