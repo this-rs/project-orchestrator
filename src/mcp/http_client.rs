@@ -1,8 +1,14 @@
 //! HTTP client for MCP → REST API proxy
 //!
 //! Used in HTTP mode where the MCP server delegates tool calls to the REST API
-//! instead of directly using the Orchestrator. The auth token (JWT session token)
-//! is read from the `PO_AUTH_TOKEN` env var and injected as `Authorization: Bearer`.
+//! instead of directly using the Orchestrator.
+//!
+//! # Token resolution order
+//!
+//! 1. `PO_AUTH_TOKEN` — explicit JWT (injected by ChatManager for subprocess MCP)
+//! 2. `PO_JWT_SECRET` — auto-generate a 7-day token at startup (for standalone MCP,
+//!    e.g. Claude Code direct launch via mcp.json)
+//! 3. No auth — warn and proceed without authentication
 
 use anyhow::{anyhow, Context, Result};
 use reqwest::{Client, Response, StatusCode};
@@ -47,10 +53,13 @@ impl McpHttpClient {
     /// This is the primary constructor used by `mcp_server` binary.
     pub fn from_env() -> Option<Self> {
         let base_url = std::env::var("PO_SERVER_URL").ok()?;
-        let auth_token = std::env::var("PO_AUTH_TOKEN").ok();
+        let auth_token = Self::resolve_auth_token();
 
         if auth_token.is_none() {
-            warn!("PO_AUTH_TOKEN not set — HTTP client will operate without authentication");
+            warn!(
+                "No auth token available — HTTP client will operate without authentication. \
+                 Set PO_AUTH_TOKEN or PO_JWT_SECRET."
+            );
         }
 
         debug!(
@@ -60,6 +69,42 @@ impl McpHttpClient {
         );
 
         Some(Self::new(base_url, auth_token))
+    }
+
+    /// Resolve auth token from environment.
+    ///
+    /// Priority: `PO_AUTH_TOKEN` (explicit) > `PO_JWT_SECRET` (auto-generate).
+    fn resolve_auth_token() -> Option<String> {
+        // 1. Explicit token (from ChatManager injection or manual config)
+        if let Ok(token) = std::env::var("PO_AUTH_TOKEN") {
+            if !token.is_empty() {
+                debug!("Using explicit PO_AUTH_TOKEN");
+                return Some(token);
+            }
+        }
+
+        // 2. Auto-generate from jwt_secret (for standalone MCP usage)
+        if let Ok(secret) = std::env::var("PO_JWT_SECRET") {
+            if !secret.is_empty() {
+                match crate::auth::jwt::encode_jwt(
+                    crate::auth::jwt::ANONYMOUS_USER_ID,
+                    "mcp-server@local",
+                    "MCP Server",
+                    &secret,
+                    7 * 86400, // 7 days
+                ) {
+                    Ok(token) => {
+                        debug!("Auto-generated auth token from PO_JWT_SECRET (7-day expiry)");
+                        return Some(token);
+                    }
+                    Err(e) => {
+                        warn!("Failed to generate token from PO_JWT_SECRET: {}", e);
+                    }
+                }
+            }
+        }
+
+        None
     }
 
     /// GET request returning JSON.
@@ -439,6 +484,53 @@ mod tests {
         let client = McpHttpClient::new(base_url, Some("my-secret-jwt".to_string()));
         let result = client.get("/auth-check").await.unwrap();
         assert_eq!(result["auth"], "Bearer my-secret-jwt");
+    }
+
+    // ── resolve_auth_token ─────────────────────────────────────────────
+
+    #[test]
+    fn test_resolve_auth_token_explicit_takes_priority() {
+        // PO_AUTH_TOKEN should be preferred over PO_JWT_SECRET
+        std::env::set_var("PO_AUTH_TOKEN", "explicit-token-123");
+        std::env::set_var("PO_JWT_SECRET", "some-secret-key-minimum-32-chars!!");
+        let token = McpHttpClient::resolve_auth_token();
+        assert_eq!(token, Some("explicit-token-123".to_string()));
+        std::env::remove_var("PO_AUTH_TOKEN");
+        std::env::remove_var("PO_JWT_SECRET");
+    }
+
+    #[test]
+    fn test_resolve_auth_token_from_jwt_secret() {
+        // When PO_AUTH_TOKEN is not set, auto-generate from PO_JWT_SECRET
+        std::env::remove_var("PO_AUTH_TOKEN");
+        std::env::set_var("PO_JWT_SECRET", "test-secret-key-minimum-32-chars!!");
+        let token = McpHttpClient::resolve_auth_token();
+        assert!(token.is_some(), "should auto-generate token from secret");
+        // Verify the token is a valid JWT (3 dot-separated parts)
+        let t = token.unwrap();
+        assert_eq!(t.split('.').count(), 3, "should be a valid JWT format");
+        std::env::remove_var("PO_JWT_SECRET");
+    }
+
+    #[test]
+    fn test_resolve_auth_token_none_when_no_env() {
+        std::env::remove_var("PO_AUTH_TOKEN");
+        std::env::remove_var("PO_JWT_SECRET");
+        let token = McpHttpClient::resolve_auth_token();
+        assert!(token.is_none());
+    }
+
+    #[test]
+    fn test_resolve_auth_token_ignores_empty_values() {
+        std::env::set_var("PO_AUTH_TOKEN", "");
+        std::env::set_var("PO_JWT_SECRET", "");
+        let token = McpHttpClient::resolve_auth_token();
+        assert!(
+            token.is_none(),
+            "empty env vars should be treated as absent"
+        );
+        std::env::remove_var("PO_AUTH_TOKEN");
+        std::env::remove_var("PO_JWT_SECRET");
     }
 
     /// Verify no Authorization header is sent when auth_token is None.
