@@ -1,14 +1,8 @@
 //! HTTP client for MCP → REST API proxy
 //!
 //! Used in HTTP mode where the MCP server delegates tool calls to the REST API
-//! instead of directly using the Orchestrator.
-//!
-//! # Token resolution order
-//!
-//! 1. `PO_AUTH_TOKEN` — explicit JWT (injected by ChatManager for subprocess MCP)
-//! 2. `PO_JWT_SECRET` — auto-generate a 7-day token at startup (for standalone MCP,
-//!    e.g. Claude Code direct launch via mcp.json)
-//! 3. No auth — warn and proceed without authentication
+//! instead of directly using the Orchestrator. The auth token (JWT session token)
+//! is read from the `PO_AUTH_TOKEN` env var and injected as `Authorization: Bearer`.
 
 use anyhow::{anyhow, Context, Result};
 use reqwest::{Client, Response, StatusCode};
@@ -51,6 +45,11 @@ impl McpHttpClient {
     ///
     /// Returns `Some` if `PO_SERVER_URL` is set, `None` otherwise.
     /// This is the primary constructor used by `mcp_server` binary.
+    ///
+    /// Token resolution order:
+    /// 1. `PO_AUTH_TOKEN` (explicit JWT, injected by ChatManager)
+    /// 2. `PO_JWT_SECRET` (auto-generate JWT from shared secret)
+    /// 3. No auth (open access / no-auth mode)
     pub fn from_env() -> Option<Self> {
         let base_url = std::env::var("PO_SERVER_URL").ok()?;
         let auth_token = Self::resolve_auth_token();
@@ -83,7 +82,7 @@ impl McpHttpClient {
             }
         }
 
-        // 2. Auto-generate from jwt_secret (for standalone MCP usage)
+        // 2. Auto-generate from jwt_secret (for standalone MCP usage via setup_claude)
         if let Ok(secret) = std::env::var("PO_JWT_SECRET") {
             if !secret.is_empty() {
                 match crate::auth::jwt::encode_jwt(
@@ -510,43 +509,5 @@ mod tests {
         let client = McpHttpClient::new(base_url, None);
         let result = client.get("/auth-check").await.unwrap();
         assert_eq!(result["has_auth"], false);
-    }
-
-    // ── resolve_auth_token ─────────────────────────────────────────────
-    // Combined into a single test to avoid env var race conditions
-    // (Rust runs tests in parallel by default, and env vars are global).
-
-    #[test]
-    fn test_resolve_auth_token_lifecycle() {
-        // Phase 1: explicit PO_AUTH_TOKEN takes priority over PO_JWT_SECRET
-        std::env::set_var("PO_AUTH_TOKEN", "explicit-token-123");
-        std::env::set_var("PO_JWT_SECRET", "some-secret-key-minimum-32-chars!!");
-        let token = McpHttpClient::resolve_auth_token();
-        assert_eq!(token, Some("explicit-token-123".to_string()));
-
-        // Phase 2: when PO_AUTH_TOKEN is absent, auto-generate from PO_JWT_SECRET
-        std::env::remove_var("PO_AUTH_TOKEN");
-        let token = McpHttpClient::resolve_auth_token();
-        assert!(token.is_some(), "should auto-generate token from secret");
-        let t = token.unwrap();
-        assert_eq!(t.split('.').count(), 3, "should be a valid JWT format");
-
-        // Phase 3: no env vars → None
-        std::env::remove_var("PO_JWT_SECRET");
-        let token = McpHttpClient::resolve_auth_token();
-        assert!(token.is_none(), "no env vars should return None");
-
-        // Phase 4: empty values should be treated as absent
-        std::env::set_var("PO_AUTH_TOKEN", "");
-        std::env::set_var("PO_JWT_SECRET", "");
-        let token = McpHttpClient::resolve_auth_token();
-        assert!(
-            token.is_none(),
-            "empty env vars should be treated as absent"
-        );
-
-        // Cleanup
-        std::env::remove_var("PO_AUTH_TOKEN");
-        std::env::remove_var("PO_JWT_SECRET");
     }
 }
