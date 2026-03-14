@@ -60,10 +60,14 @@ async fn main() -> Result<()> {
     })?;
 
     info!("MCP server starting in HTTP proxy mode");
-    info!(
-        "Proxying tool calls to REST API (auth={})",
-        std::env::var("PO_AUTH_TOKEN").is_ok()
-    );
+    let auth_source = if std::env::var("PO_AUTH_TOKEN").map_or(false, |v| !v.is_empty()) {
+        "PO_AUTH_TOKEN"
+    } else if std::env::var("PO_JWT_SECRET").map_or(false, |v| !v.is_empty()) {
+        "PO_JWT_SECRET (auto-generated)"
+    } else {
+        "none"
+    };
+    info!("Proxying tool calls to REST API (auth={})", auth_source);
 
     let mut server = McpServer::new(http_client);
 

@@ -312,6 +312,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_anonymous_user_bypasses_email_policy() {
+        // MCP system user (ANONYMOUS_USER_ID) should bypass email restrictions
+        // even when allowed_email_domain is set.
+        let mut config = test_auth_config();
+        config.allowed_email_domain = Some("ffs.holdings".to_string());
+
+        let app = test_app(Some(config)).await;
+
+        let token = encode_jwt(
+            crate::auth::jwt::ANONYMOUS_USER_ID,
+            "mcp-server@local",
+            "MCP Server",
+            TEST_SECRET,
+            3600,
+        )
+        .unwrap();
+
+        let req = HttpRequest::builder()
+            .uri("/test")
+            .header("authorization", format!("Bearer {}", token))
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
     async fn test_correct_domain_passes() {
         let mut config = test_auth_config();
         config.allowed_email_domain = Some("ffs.holdings".to_string());
