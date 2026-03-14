@@ -8,6 +8,7 @@
 //! - Plan management for coordinated multi-agent development
 //! - MCP server for Claude Code integration
 
+pub mod analytics;
 pub mod api;
 pub mod auth;
 pub mod chat;
@@ -33,6 +34,7 @@ pub mod setup_claude;
 pub mod skills;
 pub mod transport;
 pub mod update;
+pub(crate) mod utils;
 
 #[cfg(test)]
 pub(crate) mod test_helpers;

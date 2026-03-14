@@ -10,6 +10,8 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use super::handlers::{AppError, OrchestratorState};
+use crate::analytics::distribution::{adaptive_threshold, analyze_distribution};
+use crate::analytics::hypothesis::test_community_homogeneity;
 use crate::graph::algorithms::into_ranked;
 use crate::graph::models::{FusionWeights, MultiSignalImpact, MultiSignalScore, RankedList};
 use crate::neo4j::models::{ConnectedFileNode, DecisionNode};
@@ -2001,6 +2003,51 @@ pub async fn get_code_health(
         })
     });
 
+    // ── rs-stats Statistical Analytics (best-effort — graceful degradation) ──
+    //
+    // Fetch raw metric vectors from Neo4j and run statistical analysis.
+    // All calls are best-effort: failures return None and don't block the response.
+
+    // PageRank distribution analysis
+    let pagerank_distribution = {
+        let pr_vals = state
+            .orchestrator
+            .neo4j()
+            .get_all_pagerank_values(project.id)
+            .await
+            .unwrap_or_default();
+        analyze_distribution(&pr_vals)
+    };
+
+    // Risk score distribution + adaptive p95 threshold
+    let (risk_score_distribution, risk_score_p95_threshold) = {
+        let risk_vals = state
+            .orchestrator
+            .neo4j()
+            .get_all_risk_score_values(project.id)
+            .await
+            .unwrap_or_default();
+
+        let dist = analyze_distribution(&risk_vals);
+        let p95 = if !risk_vals.is_empty() {
+            Some(adaptive_threshold(&risk_vals, 0.95, 0.75))
+        } else {
+            None
+        };
+        (dist, p95)
+    };
+
+    // Community risk ANOVA — detect structurally fragile communities
+    let community_risk_anova = {
+        let groups = state
+            .orchestrator
+            .neo4j()
+            .get_community_risk_vectors(project.id)
+            .await
+            .unwrap_or_default();
+        test_community_homogeneity(&groups)
+    };
+
     Ok(Json(serde_json::json!({
         "god_functions": god_functions_json,
         "god_function_count": god_functions_json.len(),
@@ -2017,6 +2064,11 @@ pub async fn get_code_health(
         "avg_impact_score": avg_impact_score,
         "topology_violations": topology_violations,
         "homeostasis": homeostasis_json,
+        // Statistical analytics (rs-stats engine)
+        "pagerank_distribution": pagerank_distribution,
+        "risk_score_distribution": risk_score_distribution,
+        "risk_score_p95_threshold": risk_score_p95_threshold,
+        "community_risk_anova": community_risk_anova,
     })))
 }
 

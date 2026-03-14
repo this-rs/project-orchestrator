@@ -138,9 +138,35 @@ pub async fn run_daily_maintenance(
         ..Default::default()
     };
 
-    // Step 1: Decay synapses (global — not project-scoped)
+    // Step 1: Fetch synapse weights once — reused for prune threshold and
+    // stagnation detection below. A single round-trip covers both use cases.
+    let synapse_weights = graph_store
+        .get_all_synapse_weights(Some(project_id))
+        .await
+        .unwrap_or_default();
+
+    // Derive adaptive prune threshold from p5 of the weight distribution
+    // (fallback = configured default when fewer than 4 synapses exist).
+    let adaptive_prune_threshold = if synapse_weights.is_empty() {
+        config.synapse_prune_threshold
+    } else {
+        let threshold = crate::analytics::distribution::adaptive_threshold(
+            &synapse_weights,
+            0.05,
+            config.synapse_prune_threshold,
+        );
+        info!(
+            project_id = %project_id,
+            adaptive_prune_threshold = threshold,
+            n_synapses = synapse_weights.len(),
+            config_default = config.synapse_prune_threshold,
+            "Daily maintenance: adaptive prune threshold derived from distribution"
+        );
+        threshold
+    };
+
     match graph_store
-        .decay_synapses(config.synapse_decay_amount, config.synapse_prune_threshold)
+        .decay_synapses(config.synapse_decay_amount, adaptive_prune_threshold)
         .await
     {
         Ok((decayed, pruned)) => {
@@ -153,14 +179,58 @@ pub async fn run_daily_maintenance(
         }
     }
 
-    // Step 2: Update energy scores (half-life decay for note energies, global)
+    // Step 2: Update energy scores (half-life decay for note energies, global).
     if let Err(e) = graph_store.update_energy_scores(90.0).await {
         warn!(error = %e, "Failed to update energy scores");
         result.warnings.push(format!("Energy update failed: {}", e));
     }
 
-    // Step 3: Lifecycle evaluation (promotions/demotions)
-    match update_skill_lifecycle(graph_store, project_id, &config.lifecycle).await {
+    // Stagnation detection: test whether current synapse weights are
+    // significantly below the healthy midpoint (0.5).
+    //
+    // `update_energy_scores` decays note energies, not synapse weights, so a
+    // pre/post comparison on weights would always be non-significant. Instead
+    // we test the absolute level: weights significantly below 0.5 indicate a
+    // degrading knowledge graph that needs reinforcement.
+    if synapse_weights.len() >= 4 {
+        if let Some(test_result) =
+            crate::analytics::hypothesis::test_stagnation(&synapse_weights, 0.5)
+        {
+            use crate::analytics::hypothesis::SignificanceLevel;
+            let mean = rs_stats::prob::average(&synapse_weights).unwrap_or(0.0);
+            if mean < 0.5
+                && matches!(
+                    test_result.significance,
+                    SignificanceLevel::Significant | SignificanceLevel::HighlySignificant
+                )
+            {
+                warn!(
+                    project_id = %project_id,
+                    mean_weight = mean,
+                    t_stat = test_result.t_statistic,
+                    "Synapse weights significantly below healthy midpoint (mean={:.3}, \
+                     t={:.3}). Consider running reinforce_neurons on low-energy clusters.",
+                    mean, test_result.t_statistic
+                );
+                result.warnings.push(format!(
+                    "Synapse energy below healthy baseline: mean={:.3} (t={:.3}). \
+                     Run reinforce_neurons on related notes.",
+                    mean, test_result.t_statistic
+                ));
+            }
+        }
+    }
+
+    // Step 3: Lifecycle evaluation (promotions/demotions).
+    // Use adaptive lifecycle thresholds derived from the current skill distribution.
+    let adaptive_lifecycle = match graph_store.get_skills_for_project(project_id).await {
+        Ok(skills) if !skills.is_empty() => {
+            crate::skills::lifecycle::compute_adaptive_lifecycle_config(&skills)
+        }
+        _ => config.lifecycle.clone(),
+    };
+
+    match update_skill_lifecycle(graph_store, project_id, &adaptive_lifecycle).await {
         Ok(lifecycle) => {
             result.lifecycle = Some(lifecycle);
         }

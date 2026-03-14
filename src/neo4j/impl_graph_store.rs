@@ -2077,6 +2077,10 @@ impl GraphStore for Neo4jClient {
         self.list_decisions_needing_synapses(limit, offset).await
     }
 
+    async fn get_all_synapse_weights(&self, project_id: Option<Uuid>) -> anyhow::Result<Vec<f64>> {
+        self.get_all_synapse_weights(project_id).await
+    }
+
     // ========================================================================
     // Chat session operations
     // ========================================================================
@@ -3518,5 +3522,17 @@ impl GraphStore for Neo4jClient {
     ) -> anyhow::Result<()> {
         self.create_used_skill_relation_impl(agent_execution_id, skill_id, result)
             .await
+    }
+
+    async fn get_all_pagerank_values(&self, project_id: Uuid) -> anyhow::Result<Vec<f64>> {
+        self.get_all_pagerank_values(project_id).await
+    }
+
+    async fn get_community_risk_vectors(&self, project_id: Uuid) -> anyhow::Result<Vec<Vec<f64>>> {
+        self.get_community_risk_vectors(project_id).await
+    }
+
+    async fn get_all_risk_score_values(&self, project_id: Uuid) -> anyhow::Result<Vec<f64>> {
+        self.get_all_risk_score_values(project_id).await
     }
 }

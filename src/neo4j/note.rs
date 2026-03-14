@@ -2356,6 +2356,40 @@ impl Neo4jClient {
     // Energy operations (Phase 2 — Neural Network)
     // ========================================================================
 
+    /// Retrieve all SYNAPSE weights for a project (or globally when `project_id` is None).
+    ///
+    /// Used to calibrate adaptive thresholds from the real weight distribution.
+    pub async fn get_all_synapse_weights(
+        &self,
+        project_id: Option<uuid::Uuid>,
+    ) -> Result<Vec<f64>> {
+        let q = if let Some(pid) = project_id {
+            query(
+                r#"
+                MATCH (p:Project {id: $project_id})-[:HAS_NOTE]->(n1:Note)-[s:SYNAPSE]->(n2:Note)
+                RETURN s.weight AS weight
+                "#,
+            )
+            .param("project_id", pid.to_string())
+        } else {
+            query(
+                r#"
+                MATCH ()-[s:SYNAPSE]->()
+                RETURN s.weight AS weight
+                "#,
+            )
+        };
+
+        let mut result = self.graph.execute(q).await?;
+        let mut weights = Vec::new();
+        while let Some(row) = result.next().await? {
+            if let Ok(w) = row.get::<f64>("weight") {
+                weights.push(w);
+            }
+        }
+        Ok(weights)
+    }
+
     /// Apply exponential energy decay to all active notes.
     ///
     /// Formula: `energy = energy × exp(-days_idle / half_life)`

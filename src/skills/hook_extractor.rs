@@ -20,6 +20,8 @@
 use regex::Regex;
 use std::sync::LazyLock;
 
+use crate::utils::floor_char_boundary;
+
 // ============================================================================
 // Compiled regex patterns for Bash command parsing
 // ============================================================================
@@ -305,7 +307,7 @@ fn extract_mcp_pattern(tool_name: &str, tool_input: &serde_json::Value) -> Optio
             if !trimmed.is_empty() {
                 // Truncate long values to keep pattern manageable for trigger matching
                 let capped = if trimmed.len() > 200 {
-                    &trimmed[..trimmed.floor_char_boundary(200)]
+                    &trimmed[..floor_char_boundary(trimmed, 200)]
                 } else {
                     trimmed
                 };

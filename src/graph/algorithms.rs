@@ -764,6 +764,11 @@ pub fn compute_health(
         avg_coupling,
         max_coupling,
         coupling_dist,
+        // rs-stats enriched fields — populated downstream by the analytics engine
+        pagerank_distribution: None,
+        community_risk_anova: None,
+        risk_score_p95_threshold: None,
+        risk_score_distribution: None,
     }
 }
 
@@ -7706,6 +7711,7 @@ mod tests {
             avg_coupling: 0.3,
             max_coupling: 0.5,
             coupling_dist: None,
+            ..CodeHealthReport::default()
         };
         let current = CodeHealthReport {
             god_functions: vec!["a".to_string(), "b".to_string(), "c".to_string()],
@@ -7714,6 +7720,7 @@ mod tests {
             avg_coupling: 0.5,
             max_coupling: 0.7,
             coupling_dist: None,
+            ..CodeHealthReport::default()
         };
 
         let deltas = compute_health_deltas(&current, &previous);
@@ -7736,6 +7743,7 @@ mod tests {
             avg_coupling: 0.5,
             max_coupling: 0.7,
             coupling_dist: None,
+            ..CodeHealthReport::default()
         };
         let current = CodeHealthReport {
             god_functions: vec!["a".to_string()],
@@ -7744,6 +7752,7 @@ mod tests {
             avg_coupling: 0.3,
             max_coupling: 0.5,
             coupling_dist: None,
+            ..CodeHealthReport::default()
         };
 
         let deltas = compute_health_deltas(&current, &previous);
@@ -7765,6 +7774,7 @@ mod tests {
             avg_coupling: 0.5,
             max_coupling: 0.7,
             coupling_dist: None,
+            ..CodeHealthReport::default()
         };
 
         let deltas = compute_health_deltas(&report, &report);
@@ -7790,6 +7800,7 @@ mod tests {
             avg_coupling: 0.1,
             max_coupling: 0.2,
             coupling_dist: None,
+            ..CodeHealthReport::default()
         };
 
         let deltas = compute_health_deltas(&current, &previous);

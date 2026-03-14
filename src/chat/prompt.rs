@@ -1014,6 +1014,8 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
+use crate::utils::floor_char_boundary;
+
 // ============================================================================
 // Fabric metrics TTL cache — avoids N Neo4j queries per conversation
 // ============================================================================
@@ -1964,7 +1966,7 @@ pub fn context_to_json(ctx: &ProjectContext) -> String {
             .map(|fg| {
                 let desc = fg.description.as_deref().unwrap_or("");
                 let desc_truncated = if desc.len() > 60 {
-                    format!("{}…", &desc[..desc.floor_char_boundary(60)])
+                    format!("{}…", &desc[..floor_char_boundary(desc, 60)])
                 } else {
                     desc.to_string()
                 };
@@ -2180,7 +2182,7 @@ pub fn context_to_markdown(ctx: &ProjectContext, user_message: Option<&str>) -> 
         for fg in &ctx.feature_graphs {
             let desc = fg.description.as_deref().unwrap_or("");
             let desc_display = if desc.len() > 80 {
-                format!("{}…", &desc[..desc.floor_char_boundary(80)])
+                format!("{}…", &desc[..floor_char_boundary(desc, 80)])
             } else {
                 desc.to_string()
             };
