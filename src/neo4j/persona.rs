@@ -865,7 +865,7 @@ impl Neo4jClient {
                 WHERE p.status <> 'archived'
                 RETURN p, r.weight AS weight
                 UNION
-                MATCH (p:Persona {project_id: $project_id})-[:SCOPED_TO]->(fg:FeatureGraph)-[:HAS_ENTITY]->(f:File {path: $file_path})
+                MATCH (p:Persona {project_id: $project_id})-[:SCOPED_TO]->(fg:FeatureGraph)-[:INCLUDES_ENTITY]->(f:File {path: $file_path})
                 WHERE p.status <> 'archived'
                 RETURN p, 0.3 AS weight
             }
@@ -880,7 +880,7 @@ impl Neo4jClient {
                 WHERE f.path ENDS WITH $file_path AND f.path ENDS WITH ('/' + $file_path) AND p.status <> 'archived'
                 RETURN p, r.weight AS weight
                 UNION
-                MATCH (p:Persona {project_id: $project_id})-[:SCOPED_TO]->(fg:FeatureGraph)-[:HAS_ENTITY]->(f:File)
+                MATCH (p:Persona {project_id: $project_id})-[:SCOPED_TO]->(fg:FeatureGraph)-[:INCLUDES_ENTITY]->(f:File)
                 WHERE f.path ENDS WITH $file_path AND f.path ENDS WITH ('/' + $file_path) AND p.status <> 'archived'
                 RETURN p, 0.3 AS weight
             }
@@ -908,9 +908,91 @@ impl Neo4jClient {
         Ok(personas)
     }
 
+    /// Load ALL persona KNOWS relations for a project in a single query.
+    /// Returns Vec<(PersonaNode, file_path, weight)> for building a complete PersonaFileIndex
+    /// without cold-start issues.
+    pub async fn get_all_persona_knows(
+        &self,
+        project_id: Uuid,
+    ) -> Result<Vec<(PersonaNode, String, f64)>> {
+        let cypher = r#"
+            MATCH (p:Persona {project_id: $project_id})-[r:KNOWS]->(f:File)
+            WHERE p.status <> 'archived'
+            RETURN p, f.path AS file_path, r.weight AS weight
+            ORDER BY p.name, weight DESC
+        "#;
+        let q = query(cypher).param("project_id", project_id.to_string());
+
+        let mut result = self
+            .graph
+            .execute(q)
+            .await
+            .context("get_all_persona_knows")?;
+
+        let mut entries = Vec::new();
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("p")?;
+            let file_path: String = row.get("file_path")?;
+            let weight: f64 = row.get("weight").unwrap_or(1.0);
+            entries.push((Self::node_to_persona(&node)?, file_path, weight));
+        }
+        Ok(entries)
+    }
+
     // ========================================================================
     // Maintenance & Detection
     // ========================================================================
+
+    /// Auto-scope each persona to the FeatureGraph that best matches its KNOWS files.
+    ///
+    /// For each active persona with KNOWS relations:
+    /// 1. Find the dominant community_id among its KNOWS files
+    /// 2. Find the FeatureGraph that contains the most files from that community
+    /// 3. Create SCOPED_TO relation (replacing any existing one)
+    ///
+    /// Returns the number of personas that were scoped.
+    pub async fn auto_scope_to_feature_graphs(&self, project_id: Uuid) -> Result<usize> {
+        // Single Cypher query:
+        // For each persona, find the dominant community from its KNOWS files,
+        // then find the best matching FeatureGraph for that community.
+        let q = query(
+            r#"
+            MATCH (p:Persona {project_id: $project_id})-[r:KNOWS]->(f:File)
+            WHERE p.status <> 'archived' AND f.community_id IS NOT NULL
+            WITH p, f.community_id AS cid, count(f) AS file_count, sum(r.weight) AS total_weight
+            ORDER BY p.id, file_count DESC, total_weight DESC
+            WITH p, collect({cid: cid, cnt: file_count})[0] AS dominant
+            WITH p, dominant.cid AS dominant_cid
+            WHERE dominant_cid IS NOT NULL
+            MATCH (fg:FeatureGraph {project_id: $project_id})-[:INCLUDES_ENTITY]->(f2:File)
+            WHERE f2.community_id = dominant_cid
+            WITH p, fg, count(f2) AS overlap
+            ORDER BY p.id, overlap DESC
+            WITH p, collect(fg)[0] AS best_fg
+            WHERE best_fg IS NOT NULL
+            OPTIONAL MATCH (p)-[old:SCOPED_TO]->()
+            DELETE old
+            WITH p, best_fg
+            CREATE (p)-[:SCOPED_TO]->(best_fg)
+            RETURN count(p) AS scoped
+            "#,
+        )
+        .param("project_id", project_id.to_string());
+
+        let mut result = self
+            .graph
+            .execute(q)
+            .await
+            .context("auto_scope_to_feature_graphs")?;
+
+        let scoped: usize = if let Some(row) = result.next().await? {
+            row.get::<i64>("scoped").unwrap_or(0) as usize
+        } else {
+            0
+        };
+
+        Ok(scoped)
+    }
 
     /// Maintain all personas for a project: decay weights, prune, recalculate cohesion.
     ///
@@ -1012,6 +1094,10 @@ impl Neo4jClient {
         // Best-effort — AgentExecution schema may not match exactly
         let _ = self.graph.run(_success_q).await;
 
+        // 5. Auto-scope personas to their best-matching FeatureGraph
+        // Best-effort — if no FeatureGraphs exist yet, this is a no-op
+        let _ = self.auto_scope_to_feature_graphs(project_id).await;
+
         Ok((decayed_count, pruned_count, personas_updated))
     }
 
@@ -1029,7 +1115,7 @@ impl Neo4jClient {
                  collect(f.path) AS files,
                  count(f) AS file_count
             WHERE file_count >= 3
-            OPTIONAL MATCH (persona:Persona {project_id: $project_id})-[:SCOPED_TO]->(fg:FeatureGraph)-[:HAS_ENTITY]->(covered:File)
+            OPTIONAL MATCH (persona:Persona {project_id: $project_id})-[:SCOPED_TO]->(fg:FeatureGraph)-[:INCLUDES_ENTITY]->(covered:File)
             WHERE covered.community_id = cid
             WITH cid, label, files, file_count,
                  count(DISTINCT persona) AS existing_personas

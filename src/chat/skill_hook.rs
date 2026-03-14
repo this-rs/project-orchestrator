@@ -34,7 +34,7 @@ use uuid::Uuid;
 
 /// Source of a persona-file match (for distinguishing fallback levels).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PersonaMatchSource {
+pub(crate) enum PersonaMatchSource {
     /// Direct KNOWS relation between persona and file.
     DirectKnows,
     /// Community-based match via SCOPED_TO FeatureGraph (lower confidence).
@@ -45,12 +45,12 @@ enum PersonaMatchSource {
 
 /// In-memory cache entry for persona file index.
 /// Maps file_path → Vec<(persona_id, persona_name, weight, source)>.
-struct PersonaFileIndex {
-    entries: HashMap<String, Vec<(Uuid, String, f64, PersonaMatchSource)>>,
+pub(crate) struct PersonaFileIndex {
+    pub entries: HashMap<String, Vec<(Uuid, String, f64, PersonaMatchSource)>>,
     /// Directory index: dir_path → Vec<(persona_id, persona_name, avg_weight, file_count)>.
     /// Built from KNOWS entries for directory-prefix fallback.
-    dir_index: HashMap<String, Vec<(Uuid, String, f64, usize)>>,
-    loaded_at: std::time::Instant,
+    pub dir_index: HashMap<String, Vec<(Uuid, String, f64, usize)>>,
+    pub loaded_at: std::time::Instant,
 }
 
 /// TTL for persona file index cache (2 minutes).
@@ -92,7 +92,7 @@ impl SkillActivationHook {
 
     /// Directory-prefix match: check if the persona KNOWS ≥ threshold files in the same directory.
     /// Returns (persona_id, persona_name, weight) where weight = avg(KNOWS weights in dir) * 0.7.
-    fn directory_prefix_match(
+    pub(crate) fn directory_prefix_match(
         index: &PersonaFileIndex,
         file_path: &str,
         threshold: usize,
@@ -145,99 +145,75 @@ impl SkillActivationHook {
             }
         }
 
-        // Cache miss or expired — load from Neo4j
-        // find_personas_for_file already includes UNION with SCOPED_TO FeatureGraph
-        // (community match at weight 0.3). We tag each result by its source:
-        // - weight > 0.3 → DirectKnows (came from the KNOWS branch)
-        // - weight == 0.3 → CommunityMatch (came from the SCOPED_TO branch)
+        // Cache miss or expired — load ALL KNOWS for the project in one query.
+        // This builds a complete PersonaFileIndex with both entries and dir_index,
+        // eliminating the cold-start problem where dir_index was empty on first call.
         match self
             .graph_store
-            .find_personas_for_file(file_path, project_id)
+            .get_all_persona_knows(project_id)
             .await
         {
-            Ok(matches) if !matches.is_empty() => {
-                let first = matches.first().map(|(p, w)| (p.id, p.name.clone(), *w));
+            Ok(all_knows) => {
+                // Build complete index from all KNOWS relations
+                let mut entries: HashMap<String, Vec<(Uuid, String, f64, PersonaMatchSource)>> =
+                    HashMap::new();
+                for (persona, path, weight) in &all_knows {
+                    entries
+                        .entry(path.clone())
+                        .or_default()
+                        .push((persona.id, persona.name.clone(), *weight, PersonaMatchSource::DirectKnows));
+                }
+                // Sort each file's personas by weight desc
+                for v in entries.values_mut() {
+                    v.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+                }
 
-                // Populate cache (write lock) — tag each entry with its source
+                // Build dir_index from all entries
+                let dir_index = Self::build_dir_index(&entries);
+
+                let index = PersonaFileIndex {
+                    entries,
+                    dir_index,
+                    loaded_at: std::time::Instant::now(),
+                };
+
+                // Lookup result from the freshly built index
+                let result = index
+                    .entries
+                    .get(file_path)
+                    .and_then(|v| v.first())
+                    .map(|(id, name, w, _)| (*id, name.clone(), *w))
+                    .or_else(|| Self::directory_prefix_match(&index, file_path, 2));
+
+                // Store index in cache
                 {
                     let mut cache = self.persona_index.write().await;
-                    let index = cache.entry(project_id).or_insert_with(|| PersonaFileIndex {
-                        entries: HashMap::new(),
-                        dir_index: HashMap::new(),
-                        loaded_at: std::time::Instant::now(),
-                    });
-                    index.entries.insert(
-                        file_path.to_string(),
-                        matches
-                            .iter()
-                            .map(|(p, w)| {
-                                let source = if (*w - 0.3).abs() < f64::EPSILON {
-                                    PersonaMatchSource::CommunityMatch
-                                } else {
-                                    PersonaMatchSource::DirectKnows
-                                };
-                                (p.id, p.name.clone(), *w, source)
-                            })
-                            .collect(),
-                    );
-
-                    // Also populate dir_index: aggregate KNOWS files by directory
-                    // for directory-prefix fallback
-                    Self::update_dir_index(index, file_path, &matches);
+                    cache.insert(project_id, index);
                 }
 
-                first
-            }
-            Ok(_) => {
-                // No exact/community match — try directory-prefix from existing cache
-                let cache = self.persona_index.read().await;
-                if let Some(index) = cache.get(&project_id) {
-                    if let Some((pid, pname, weight)) =
-                        Self::directory_prefix_match(index, file_path, 2)
-                    {
-                        drop(cache);
-                        // Cache the dir-prefix hit for future exact lookups
-                        let mut wcache = self.persona_index.write().await;
-                        if let Some(idx) = wcache.get_mut(&project_id) {
-                            idx.entries.insert(
-                                file_path.to_string(),
-                                vec![(
-                                    pid,
-                                    pname.clone(),
-                                    weight,
-                                    PersonaMatchSource::DirectoryPrefix,
-                                )],
-                            );
-                        }
-                        return Some((pid, pname, weight));
-                    }
-                }
-                None
+                result
             }
             Err(e) => {
                 debug!(
                     file_path = %file_path,
                     error = %e,
-                    "Persona file match failed"
+                    "Persona file match failed (get_all_persona_knows)"
                 );
                 None
             }
         }
     }
 
-    /// Update the directory index in PersonaFileIndex from KNOWS entries.
+    /// Build the directory index from a complete entries map.
     /// Aggregates persona presence per directory for directory-prefix fallback.
-    fn update_dir_index(
-        index: &mut PersonaFileIndex,
-        _current_file: &str,
-        _matches: &[(crate::neo4j::models::PersonaNode, f64)],
-    ) {
-        // Rebuild dir_index from all cached entries (not just current file)
-        // This ensures the dir_index reflects the full set of cached KNOWS relations
+    /// Pure function — returns a new dir_index without mutating anything.
+    pub(crate) fn build_dir_index(
+        entries: &HashMap<String, Vec<(Uuid, String, f64, PersonaMatchSource)>>,
+    ) -> HashMap<String, Vec<(Uuid, String, f64, usize)>> {
         let mut dir_persona_data: HashMap<String, HashMap<Uuid, (String, Vec<f64>)>> =
             HashMap::new();
 
-        for (path, personas) in &index.entries {
+        for (path, personas) in entries {
             if let Some(dir) = path.rsplit_once('/').map(|(d, _)| format!("{d}/")) {
                 for (persona_id, persona_name, weight, source) in personas {
                     // Only count DirectKnows for directory index (not community matches)
@@ -253,7 +229,7 @@ impl SkillActivationHook {
         }
 
         // Convert to dir_index format: dir → Vec<(persona_id, name, avg_weight, file_count)>
-        index.dir_index.clear();
+        let mut dir_index = HashMap::new();
         for (dir, persona_map) in dir_persona_data {
             let mut dir_entries: Vec<(Uuid, String, f64, usize)> = persona_map
                 .into_iter()
@@ -268,8 +244,9 @@ impl SkillActivationHook {
                 b.3.cmp(&a.3)
                     .then_with(|| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
             });
-            index.dir_index.insert(dir, dir_entries);
+            dir_index.insert(dir, dir_entries);
         }
+        dir_index
     }
 
     /// Build persona context string for injection into additionalContext.
@@ -931,7 +908,7 @@ mod tests {
     }
 
     #[test]
-    fn test_update_dir_index_from_entries() {
+    fn test_build_dir_index_from_entries() {
         let p1 = Uuid::new_v4();
         let mut entries = HashMap::new();
         // p1 KNOWS 3 files in src/neo4j/
@@ -973,16 +950,10 @@ mod tests {
             )],
         );
 
-        let mut index = PersonaFileIndex {
-            entries,
-            dir_index: HashMap::new(),
-            loaded_at: std::time::Instant::now(),
-        };
-
-        SkillActivationHook::update_dir_index(&mut index, "", &[]);
+        let dir_index = SkillActivationHook::build_dir_index(&entries);
 
         // src/neo4j/ should have 3 DirectKnows files for p1
-        let neo4j_dir = index.dir_index.get("src/neo4j/");
+        let neo4j_dir = dir_index.get("src/neo4j/");
         assert!(neo4j_dir.is_some());
         let neo4j_entries = neo4j_dir.unwrap();
         assert_eq!(neo4j_entries.len(), 1);
@@ -992,7 +963,7 @@ mod tests {
         assert!((neo4j_entries[0].2 - 0.8).abs() < f64::EPSILON);
 
         // src/api/ should NOT be in dir_index (only CommunityMatch, not DirectKnows)
-        assert!(!index.dir_index.contains_key("src/api/"));
+        assert!(!dir_index.contains_key("src/api/"));
     }
 
     // ========================================================================
@@ -1136,6 +1107,119 @@ mod tests {
             .match_persona_for_file(project_b, "src/shared.rs")
             .await;
         assert!(result.is_none());
+    }
+
+    // ========================================================================
+    // cold start / dir_index preloading tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_cold_start_dir_prefix_match_on_first_call() {
+        // Regression test: directory-prefix fallback must work on the very first call
+        // (no warm-up needed). get_all_persona_knows loads everything in one shot.
+        let mock_store = Arc::new(MockGraphStore::new());
+        let project_id = Uuid::new_v4();
+
+        let persona = test_persona(project_id, "neo4j-guru");
+        mock_store.create_persona(&persona).await.unwrap();
+        // Add 3 files in src/neo4j/ — threshold is 2
+        mock_store
+            .add_persona_file(persona.id, "src/neo4j/client.rs", 0.9)
+            .await
+            .unwrap();
+        mock_store
+            .add_persona_file(persona.id, "src/neo4j/code.rs", 0.8)
+            .await
+            .unwrap();
+        mock_store
+            .add_persona_file(persona.id, "src/neo4j/note.rs", 0.7)
+            .await
+            .unwrap();
+
+        let hook = SkillActivationHook::new(mock_store);
+
+        // First ever call — query a file NOT in KNOWS but in the same directory
+        let result = hook
+            .match_persona_for_file(project_id, "src/neo4j/persona.rs")
+            .await;
+
+        assert!(result.is_some(), "Directory-prefix should match on cold start");
+        let (pid, pname, weight) = result.unwrap();
+        assert_eq!(pid, persona.id);
+        assert_eq!(pname, "neo4j-guru");
+        // weight = avg(0.9, 0.8, 0.7) * 0.7 = 0.8 * 0.7 = 0.56
+        assert!(
+            (weight - 0.56).abs() < 0.01,
+            "Expected ~0.56, got {}",
+            weight
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cold_start_dir_index_complete_after_first_call() {
+        // After the first match_persona_for_file call, the cache should contain
+        // ALL KNOWS entries and a complete dir_index.
+        let mock_store = Arc::new(MockGraphStore::new());
+        let project_id = Uuid::new_v4();
+
+        let persona = test_persona(project_id, "full-loader");
+        mock_store.create_persona(&persona).await.unwrap();
+        mock_store
+            .add_persona_file(persona.id, "src/api/handlers.rs", 1.0)
+            .await
+            .unwrap();
+        mock_store
+            .add_persona_file(persona.id, "src/api/routes.rs", 0.9)
+            .await
+            .unwrap();
+        mock_store
+            .add_persona_file(persona.id, "src/neo4j/client.rs", 0.8)
+            .await
+            .unwrap();
+
+        let hook = SkillActivationHook::new(mock_store);
+
+        // Trigger cache build by querying ANY file
+        let _ = hook
+            .match_persona_for_file(project_id, "src/api/handlers.rs")
+            .await;
+
+        // Verify cache is complete
+        let cache = hook.persona_index.read().await;
+        let index = cache.get(&project_id).expect("Cache should be populated");
+        assert_eq!(index.entries.len(), 3, "All 3 KNOWS should be cached");
+        assert!(
+            index.dir_index.contains_key("src/api/"),
+            "dir_index should have src/api/"
+        );
+        assert!(
+            index.dir_index.contains_key("src/neo4j/"),
+            "dir_index should have src/neo4j/"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cold_start_below_threshold_no_dir_match() {
+        // If persona KNOWS only 1 file in a directory, dir-prefix should NOT match (threshold=2)
+        let mock_store = Arc::new(MockGraphStore::new());
+        let project_id = Uuid::new_v4();
+
+        let persona = test_persona(project_id, "lonely");
+        mock_store.create_persona(&persona).await.unwrap();
+        mock_store
+            .add_persona_file(persona.id, "src/chat/manager.rs", 0.9)
+            .await
+            .unwrap();
+
+        let hook = SkillActivationHook::new(mock_store);
+
+        let result = hook
+            .match_persona_for_file(project_id, "src/chat/skill_hook.rs")
+            .await;
+        assert!(
+            result.is_none(),
+            "1 file in dir should be below threshold (2)"
+        );
     }
 
     // ========================================================================

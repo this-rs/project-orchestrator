@@ -2410,6 +2410,18 @@ pub trait GraphStore: Send + Sync {
         project_id: Uuid,
     ) -> Result<Vec<(PersonaNode, f64)>>;
 
+    /// Load ALL persona KNOWS relations for a project in a single query.
+    /// Returns Vec<(PersonaNode, file_path, weight)> for building a complete
+    /// PersonaFileIndex without cold-start issues.
+    async fn get_all_persona_knows(
+        &self,
+        project_id: Uuid,
+    ) -> Result<Vec<(PersonaNode, String, f64)>>;
+
+    /// Auto-scope each persona to the FeatureGraph that best matches its KNOWS files.
+    /// Returns the number of personas that were scoped.
+    async fn auto_scope_to_feature_graphs(&self, project_id: Uuid) -> Result<usize>;
+
     /// Maintain all personas for a project: decay weights, prune, recalculate cohesion.
     /// Returns (decayed_count, pruned_count, personas_updated).
     async fn maintain_personas(&self, project_id: Uuid) -> Result<(usize, usize, usize)>;

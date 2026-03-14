@@ -8760,6 +8760,36 @@ impl GraphStore for MockGraphStore {
         Ok(results)
     }
 
+    async fn get_all_persona_knows(
+        &self,
+        project_id: Uuid,
+    ) -> Result<Vec<(PersonaNode, String, f64)>> {
+        let personas = self.personas.read().await;
+        let files = self.persona_files.read().await;
+        let mut results: Vec<(PersonaNode, String, f64)> = Vec::new();
+        for persona in personas.values() {
+            if persona.project_id != Some(project_id) {
+                continue;
+            }
+            if let Some(file_map) = files.get(&persona.id) {
+                for (path, &weight) in file_map {
+                    results.push((persona.clone(), path.clone(), weight));
+                }
+            }
+        }
+        results.sort_by(|a, b| {
+            a.0.name
+                .cmp(&b.0.name)
+                .then_with(|| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
+        });
+        Ok(results)
+    }
+
+    async fn auto_scope_to_feature_graphs(&self, _project_id: Uuid) -> Result<usize> {
+        // Mock: no-op, return 0 scoped
+        Ok(0)
+    }
+
     async fn maintain_personas(&self, _project_id: Uuid) -> Result<(usize, usize, usize)> {
         Ok((0, 0, 0))
     }

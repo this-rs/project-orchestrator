@@ -2797,6 +2797,17 @@ impl GraphStore for Neo4jClient {
         self.find_personas_for_file(file_path, project_id).await
     }
 
+    async fn get_all_persona_knows(
+        &self,
+        project_id: Uuid,
+    ) -> anyhow::Result<Vec<(PersonaNode, String, f64)>> {
+        self.get_all_persona_knows(project_id).await
+    }
+
+    async fn auto_scope_to_feature_graphs(&self, project_id: Uuid) -> anyhow::Result<usize> {
+        self.auto_scope_to_feature_graphs(project_id).await
+    }
+
     async fn maintain_personas(&self, project_id: Uuid) -> anyhow::Result<(usize, usize, usize)> {
         self.maintain_personas(project_id).await
     }

@@ -660,10 +660,19 @@ pub async fn get_subgraph(
 /// Find personas that KNOW a given file
 ///
 /// GET /api/personas/find-for-file?file_path=...&project_id=...
+///
+/// Fallback chain (same as PreToolUse hook):
+/// 1. Exact KNOWS match (direct persona-file relation)
+/// 2. Directory-prefix match (persona KNOWS ≥ 2 files in same dir, weight = avg * 0.7)
+/// 3. Community match via SCOPED_TO FeatureGraph (weight 0.3)
 pub async fn find_for_file(
     State(state): State<OrchestratorState>,
     Query(query): Query<FindForFileQuery>,
 ) -> Result<Json<Vec<PersonaMatch>>, AppError> {
+    use crate::chat::skill_hook::{PersonaFileIndex, PersonaMatchSource, SkillActivationHook};
+    use std::collections::HashMap;
+
+    // Step 1: Try exact KNOWS + community match via Cypher
     let matches = state
         .orchestrator
         .neo4j()
@@ -671,12 +680,54 @@ pub async fn find_for_file(
         .await
         .map_err(AppError::Internal)?;
 
-    let result: Vec<PersonaMatch> = matches
-        .into_iter()
-        .map(|(persona, weight)| PersonaMatch { persona, weight })
-        .collect();
+    if !matches.is_empty() {
+        let result: Vec<PersonaMatch> = matches
+            .into_iter()
+            .map(|(persona, weight)| PersonaMatch { persona, weight })
+            .collect();
+        return Ok(Json(result));
+    }
 
-    Ok(Json(result))
+    // Step 2: No exact/community match — try directory-prefix fallback
+    // Load ALL KNOWS for the project and build dir_index
+    let all_knows = state
+        .orchestrator
+        .neo4j()
+        .get_all_persona_knows(query.project_id)
+        .await
+        .map_err(AppError::Internal)?;
+
+    if all_knows.is_empty() {
+        return Ok(Json(vec![]));
+    }
+
+    // Build entries map from all KNOWS
+    let mut entries: HashMap<String, Vec<(uuid::Uuid, String, f64, PersonaMatchSource)>> =
+        HashMap::new();
+    for (persona, path, weight) in &all_knows {
+        entries
+            .entry(path.clone())
+            .or_default()
+            .push((persona.id, persona.name.clone(), *weight, PersonaMatchSource::DirectKnows));
+    }
+
+    let dir_index = SkillActivationHook::build_dir_index(&entries);
+    let index = PersonaFileIndex {
+        entries,
+        dir_index,
+        loaded_at: std::time::Instant::now(),
+    };
+
+    if let Some((persona_id, _name, weight)) =
+        SkillActivationHook::directory_prefix_match(&index, &query.file_path, 2)
+    {
+        // Fetch the full PersonaNode for the matched persona
+        if let Ok(Some(persona)) = state.orchestrator.neo4j().get_persona(persona_id).await {
+            return Ok(Json(vec![PersonaMatch { persona, weight }]));
+        }
+    }
+
+    Ok(Json(vec![]))
 }
 
 /// A persona match with its relevance weight for a file query.
@@ -2824,5 +2875,206 @@ mod tests {
         assert_eq!(json["project_id"], project_id.to_string());
         assert!(json["proposals"].as_array().unwrap().is_empty());
         assert_eq!(json["count"], 0);
+    }
+
+    // ----------------------------------------------------------------
+    // find_for_file — fallback chain integration tests
+    // ----------------------------------------------------------------
+
+    /// Helper: build app with persona + KNOWS files seeded via mock
+    async fn test_app_with_persona_files(
+        files: Vec<(&str, f64)>,
+    ) -> (axum::Router, uuid::Uuid, uuid::Uuid) {
+        let app_state = mock_app_state();
+        let project = test_project();
+        let project_id = project.id;
+        app_state.neo4j.create_project(&project).await.unwrap();
+
+        let persona = PersonaNode {
+            id: Uuid::new_v4(),
+            project_id: Some(project_id),
+            name: "Neo4j Expert".to_string(),
+            description: "Knows neo4j files".to_string(),
+            status: PersonaStatus::Active,
+            complexity_default: None,
+            timeout_secs: None,
+            max_cost_usd: None,
+            model_preference: None,
+            system_prompt_override: None,
+            energy: 0.8,
+            cohesion: 0.5,
+            activation_count: 10,
+            success_rate: 0.9,
+            avg_duration_secs: 30.0,
+            last_activated: None,
+            origin: PersonaOrigin::Manual,
+            created_at: Utc::now(),
+            updated_at: None,
+        };
+        let persona_id = persona.id;
+        app_state.neo4j.create_persona(&persona).await.unwrap();
+
+        for (path, weight) in files {
+            app_state
+                .neo4j
+                .add_persona_file(persona_id, path, weight)
+                .await
+                .unwrap();
+        }
+
+        let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
+        let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
+            orchestrator.clone(),
+        )));
+        let state = Arc::new(ServerState {
+            orchestrator,
+            watcher,
+            chat_manager: None,
+            event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(
+                crate::events::EventBus::default(),
+            ))),
+            nats_emitter: None,
+            auth_config: Some(crate::test_helpers::test_auth_config()),
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+            setup_completed: true,
+            server_port: 6600,
+            public_url: None,
+            ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
+            registry_remote_url: None,
+            oidc_client: None,
+            identity: None,
+        });
+        (create_router(state), project_id, persona_id)
+    }
+
+    #[tokio::test]
+    async fn test_find_for_file_exact_knows_match() {
+        // Persona KNOWS exactly "src/neo4j/persona.rs" → exact match
+        let (app, project_id, _persona_id) = test_app_with_persona_files(vec![
+            ("src/neo4j/persona.rs", 0.95),
+            ("src/neo4j/client.rs", 0.8),
+        ])
+        .await;
+
+        let resp = app
+            .oneshot(auth_get(&format!(
+                "/api/personas/find-for-file?file_path=src/neo4j/persona.rs&project_id={}",
+                project_id
+            )))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let json = body_json(resp).await;
+        let matches = json.as_array().unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0]["persona"]["name"], "Neo4j Expert");
+        let weight = matches[0]["weight"].as_f64().unwrap();
+        assert!((weight - 0.95).abs() < 0.01, "expected exact weight 0.95, got {}", weight);
+    }
+
+    #[tokio::test]
+    async fn test_find_for_file_directory_prefix_fallback() {
+        // Persona KNOWS 2 files in src/neo4j/ but NOT src/neo4j/analytics.rs
+        // → directory-prefix match should kick in
+        let (app, project_id, _persona_id) = test_app_with_persona_files(vec![
+            ("src/neo4j/persona.rs", 0.9),
+            ("src/neo4j/client.rs", 0.8),
+        ])
+        .await;
+
+        let resp = app
+            .oneshot(auth_get(&format!(
+                "/api/personas/find-for-file?file_path=src/neo4j/analytics.rs&project_id={}",
+                project_id
+            )))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let json = body_json(resp).await;
+        let matches = json.as_array().unwrap();
+        assert_eq!(matches.len(), 1, "expected dir-prefix fallback match");
+        assert_eq!(matches[0]["persona"]["name"], "Neo4j Expert");
+        // Weight should be avg(0.9, 0.8) * 0.7 = 0.595
+        let weight = matches[0]["weight"].as_f64().unwrap();
+        assert!(weight > 0.5 && weight < 0.7, "expected dir-prefix weight ~0.595, got {}", weight);
+    }
+
+    #[tokio::test]
+    async fn test_find_for_file_no_match() {
+        // Persona KNOWS files in src/neo4j/ only
+        // Query for a completely different directory → no match
+        let (app, project_id, _persona_id) = test_app_with_persona_files(vec![
+            ("src/neo4j/persona.rs", 0.9),
+            ("src/neo4j/client.rs", 0.8),
+        ])
+        .await;
+
+        let resp = app
+            .oneshot(auth_get(&format!(
+                "/api/personas/find-for-file?file_path=src/api/routes.rs&project_id={}",
+                project_id
+            )))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json.as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_find_for_file_dir_prefix_needs_min_2_files() {
+        // Persona KNOWS only 1 file in src/api/ → dir-prefix needs >= 2 files
+        // Should NOT match via dir-prefix
+        let (app, project_id, _persona_id) = test_app_with_persona_files(vec![
+            ("src/api/routes.rs", 0.9),
+        ])
+        .await;
+
+        let resp = app
+            .oneshot(auth_get(&format!(
+                "/api/personas/find-for-file?file_path=src/api/handlers.rs&project_id={}",
+                project_id
+            )))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let json = body_json(resp).await;
+        assert_eq!(
+            json.as_array().unwrap().len(),
+            0,
+            "should not match with only 1 file in directory"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_find_for_file_exact_takes_priority_over_dir_prefix() {
+        // Persona KNOWS both the exact file AND other files in the same dir
+        // Exact match should be returned (higher weight)
+        let (app, project_id, _persona_id) = test_app_with_persona_files(vec![
+            ("src/neo4j/persona.rs", 0.95),
+            ("src/neo4j/client.rs", 0.8),
+            ("src/neo4j/mock.rs", 0.7),
+        ])
+        .await;
+
+        let resp = app
+            .oneshot(auth_get(&format!(
+                "/api/personas/find-for-file?file_path=src/neo4j/persona.rs&project_id={}",
+                project_id
+            )))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let json = body_json(resp).await;
+        let matches = json.as_array().unwrap();
+        assert_eq!(matches.len(), 1);
+        // Should be exact weight (0.95), not dir-prefix weight
+        let weight = matches[0]["weight"].as_f64().unwrap();
+        assert!(
+            (weight - 0.95).abs() < 0.01,
+            "exact match should take priority, got weight {}",
+            weight
+        );
     }
 }
