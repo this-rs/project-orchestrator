@@ -32,10 +32,24 @@ use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+/// Source of a persona-file match (for distinguishing fallback levels).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PersonaMatchSource {
+    /// Direct KNOWS relation between persona and file.
+    DirectKnows,
+    /// Community-based match via SCOPED_TO FeatureGraph (lower confidence).
+    CommunityMatch,
+    /// Directory-prefix match (persona KNOWS ≥ 2 files in the same directory).
+    DirectoryPrefix,
+}
+
 /// In-memory cache entry for persona file index.
-/// Maps file_path → Vec<(persona_id, persona_name, weight)>.
+/// Maps file_path → Vec<(persona_id, persona_name, weight, source)>.
 struct PersonaFileIndex {
-    entries: HashMap<String, Vec<(Uuid, String, f64)>>,
+    entries: HashMap<String, Vec<(Uuid, String, f64, PersonaMatchSource)>>,
+    /// Directory index: dir_path → Vec<(persona_id, persona_name, avg_weight, file_count)>.
+    /// Built from KNOWS entries for directory-prefix fallback.
+    dir_index: HashMap<String, Vec<(Uuid, String, f64, usize)>>,
     loaded_at: std::time::Instant,
 }
 
@@ -72,6 +86,9 @@ impl SkillActivationHook {
 
     /// Match a file path against the persona file index.
     /// Returns the best matching persona (highest weight) if found.
+    ///
+    /// Fallback chain: exact KNOWS → community match (SCOPED_TO FeatureGraph, weight 0.3).
+    /// Both levels are cached in PersonaFileIndex with their source tag.
     async fn match_persona_for_file(
         &self,
         project_id: Uuid,
@@ -85,12 +102,17 @@ impl SkillActivationHook {
                     return index
                         .entries
                         .get(file_path)
-                        .and_then(|v| v.first().cloned());
+                        .and_then(|v| v.first())
+                        .map(|(id, name, w, _source)| (*id, name.clone(), *w));
                 }
             }
         }
 
         // Cache miss or expired — load from Neo4j
+        // find_personas_for_file already includes UNION with SCOPED_TO FeatureGraph
+        // (community match at weight 0.3). We tag each result by its source:
+        // - weight > 0.3 → DirectKnows (came from the KNOWS branch)
+        // - weight == 0.3 → CommunityMatch (came from the SCOPED_TO branch)
         match self
             .graph_store
             .find_personas_for_file(file_path, project_id)
@@ -99,19 +121,26 @@ impl SkillActivationHook {
             Ok(matches) if !matches.is_empty() => {
                 let first = matches.first().map(|(p, w)| (p.id, p.name.clone(), *w));
 
-                // Populate cache (write lock) — just for this file, not full index
-                // Full index load would be done on first access per project
+                // Populate cache (write lock) — tag each entry with its source
                 {
                     let mut cache = self.persona_index.write().await;
                     let index = cache.entry(project_id).or_insert_with(|| PersonaFileIndex {
                         entries: HashMap::new(),
+                        dir_index: HashMap::new(),
                         loaded_at: std::time::Instant::now(),
                     });
                     index.entries.insert(
                         file_path.to_string(),
                         matches
                             .iter()
-                            .map(|(p, w)| (p.id, p.name.clone(), *w))
+                            .map(|(p, w)| {
+                                let source = if (*w - 0.3).abs() < f64::EPSILON {
+                                    PersonaMatchSource::CommunityMatch
+                                } else {
+                                    PersonaMatchSource::DirectKnows
+                                };
+                                (p.id, p.name.clone(), *w, source)
+                            })
                             .collect(),
                     );
                 }
@@ -500,22 +529,25 @@ mod tests {
     fn test_persona_file_index_creation_empty() {
         let index = PersonaFileIndex {
             entries: HashMap::new(),
+            dir_index: HashMap::new(),
             loaded_at: std::time::Instant::now(),
         };
         assert!(index.entries.is_empty());
+        assert!(index.dir_index.is_empty());
         assert!(index.loaded_at.elapsed() < std::time::Duration::from_secs(1));
     }
 
     #[test]
-    fn test_persona_file_index_lookup_hit() {
+    fn test_persona_file_index_lookup_hit_with_source() {
         let persona_id = Uuid::new_v4();
         let mut entries = HashMap::new();
         entries.insert(
             "src/main.rs".to_string(),
-            vec![(persona_id, "rust-expert".to_string(), 0.95)],
+            vec![(persona_id, "rust-expert".to_string(), 0.95, PersonaMatchSource::DirectKnows)],
         );
         let index = PersonaFileIndex {
             entries,
+            dir_index: HashMap::new(),
             loaded_at: std::time::Instant::now(),
         };
         let result = index.entries.get("src/main.rs");
@@ -525,6 +557,25 @@ mod tests {
         assert_eq!(vec[0].0, persona_id);
         assert_eq!(vec[0].1, "rust-expert");
         assert!((vec[0].2 - 0.95).abs() < f64::EPSILON);
+        assert_eq!(vec[0].3, PersonaMatchSource::DirectKnows);
+    }
+
+    #[test]
+    fn test_persona_file_index_community_match_tagged() {
+        let persona_id = Uuid::new_v4();
+        let mut entries = HashMap::new();
+        entries.insert(
+            "src/community_file.rs".to_string(),
+            vec![(persona_id, "community-persona".to_string(), 0.3, PersonaMatchSource::CommunityMatch)],
+        );
+        let index = PersonaFileIndex {
+            entries,
+            dir_index: HashMap::new(),
+            loaded_at: std::time::Instant::now(),
+        };
+        let result = index.entries.get("src/community_file.rs").unwrap();
+        assert_eq!(result[0].3, PersonaMatchSource::CommunityMatch);
+        assert!((result[0].2 - 0.3).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -533,10 +584,11 @@ mod tests {
         let mut entries = HashMap::new();
         entries.insert(
             "src/main.rs".to_string(),
-            vec![(persona_id, "rust-expert".to_string(), 0.9)],
+            vec![(persona_id, "rust-expert".to_string(), 0.9, PersonaMatchSource::DirectKnows)],
         );
         let index = PersonaFileIndex {
             entries,
+            dir_index: HashMap::new(),
             loaded_at: std::time::Instant::now(),
         };
         assert!(!index.entries.contains_key("src/lib.rs"));
@@ -550,18 +602,21 @@ mod tests {
         entries.insert(
             "src/shared.rs".to_string(),
             vec![
-                (p1, "persona-a".to_string(), 0.9),
-                (p2, "persona-b".to_string(), 0.6),
+                (p1, "persona-a".to_string(), 0.9, PersonaMatchSource::DirectKnows),
+                (p2, "persona-b".to_string(), 0.3, PersonaMatchSource::CommunityMatch),
             ],
         );
         let index = PersonaFileIndex {
             entries,
+            dir_index: HashMap::new(),
             loaded_at: std::time::Instant::now(),
         };
         let result = index.entries.get("src/shared.rs").unwrap();
         assert_eq!(result.len(), 2);
-        // First entry should have the higher weight (pre-sorted by caller)
+        // First entry (DirectKnows) should have higher weight than second (CommunityMatch)
         assert!(result[0].2 > result[1].2);
+        assert_eq!(result[0].3, PersonaMatchSource::DirectKnows);
+        assert_eq!(result[1].3, PersonaMatchSource::CommunityMatch);
     }
 
     #[test]
@@ -574,10 +629,31 @@ mod tests {
     fn test_persona_file_index_fresh_within_ttl() {
         let index = PersonaFileIndex {
             entries: HashMap::new(),
+            dir_index: HashMap::new(),
             loaded_at: std::time::Instant::now(),
         };
         // Freshly created index should be within TTL
         assert!(index.loaded_at.elapsed() < PERSONA_INDEX_TTL);
+    }
+
+    #[test]
+    fn test_persona_file_index_dir_index_populated() {
+        let p1 = Uuid::new_v4();
+        let mut dir_index = HashMap::new();
+        dir_index.insert(
+            "src/neo4j/".to_string(),
+            vec![(p1, "neo4j-expert".to_string(), 0.85, 3)],
+        );
+        let index = PersonaFileIndex {
+            entries: HashMap::new(),
+            dir_index,
+            loaded_at: std::time::Instant::now(),
+        };
+        let dir_matches = index.dir_index.get("src/neo4j/");
+        assert!(dir_matches.is_some());
+        let matches = dir_matches.unwrap();
+        assert_eq!(matches[0].0, p1);
+        assert_eq!(matches[0].3, 3); // 3 files in dir
     }
 
     // ========================================================================
