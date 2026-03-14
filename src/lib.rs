@@ -34,6 +34,7 @@ pub mod setup_claude;
 pub mod skills;
 pub mod transport;
 pub mod update;
+pub(crate) mod utils;
 
 #[cfg(test)]
 pub(crate) mod test_helpers;

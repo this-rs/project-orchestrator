@@ -1014,15 +1014,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
-/// Stable equivalent of the nightly-only `str::floor_char_boundary`.
-/// Returns the largest byte index <= `index` that is a valid UTF-8 char boundary.
-fn floor_char_boundary(s: &str, index: usize) -> usize {
-    let index = index.min(s.len());
-    (0..=index)
-        .rev()
-        .find(|&i| s.is_char_boundary(i))
-        .unwrap_or(0)
-}
+use crate::utils::floor_char_boundary;
 
 // ============================================================================
 // Fabric metrics TTL cache — avoids N Neo4j queries per conversation
