@@ -1119,9 +1119,11 @@ impl Neo4jClient {
         .param("file_paths", normalized)
         .param("project_id", project_id.to_string());
 
-        let mut result = self.graph.execute(q).await.context(
-            "find_relevant_personas_for_note",
-        )?;
+        let mut result = self
+            .graph
+            .execute(q)
+            .await
+            .context("find_relevant_personas_for_note")?;
 
         let mut personas = Vec::new();
         while let Some(row) = result.next().await? {
@@ -1163,9 +1165,11 @@ impl Neo4jClient {
         .param("decision_id", decision_id.to_string())
         .param("project_id", project_id.to_string());
 
-        let mut result = self.graph.execute(q).await.context(
-            "find_relevant_personas_for_decision",
-        )?;
+        let mut result = self
+            .graph
+            .execute(q)
+            .await
+            .context("find_relevant_personas_for_decision")?;
 
         let mut personas = Vec::new();
         while let Some(row) = result.next().await? {
@@ -1263,10 +1267,7 @@ impl Neo4jClient {
         .param("file_path", file_path)
         .param("weight", weight);
 
-        self.graph
-            .run(q)
-            .await
-            .context("auto_grow_file_knows")?;
+        self.graph.run(q).await.context("auto_grow_file_knows")?;
 
         Ok(())
     }
@@ -1943,11 +1944,11 @@ mod tests {
     fn test_link_weight_calculation() {
         // Growth hook calculates link_weight = (avg_weight * 0.8).max(0.3)
         let test_cases: Vec<(f64, f64)> = vec![
-            (1.0, 0.8),   // high weight → 0.8
-            (0.5, 0.4),   // medium weight → 0.4
-            (0.3, 0.3),   // low weight → clamped to 0.3
-            (0.1, 0.3),   // very low → clamped to 0.3
-            (0.0, 0.3),   // zero → clamped to 0.3
+            (1.0, 0.8), // high weight → 0.8
+            (0.5, 0.4), // medium weight → 0.4
+            (0.3, 0.3), // low weight → clamped to 0.3
+            (0.1, 0.3), // very low → clamped to 0.3
+            (0.0, 0.3), // zero → clamped to 0.3
         ];
 
         for (avg_weight, expected) in test_cases {
@@ -2036,7 +2037,7 @@ mod tests {
         let test_cases = vec![
             ("/src/api/handlers.rs", "/src/api/"),
             ("/src/main.rs", "/src/"),
-            ("file.rs", ""),  // no directory → empty
+            ("file.rs", ""), // no directory → empty
         ];
 
         for (input, expected_dir) in test_cases {
