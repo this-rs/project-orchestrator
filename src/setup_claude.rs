@@ -447,10 +447,7 @@ fn configure_via_file(
     let formatted = serde_json::to_string_pretty(&json).context("Failed to serialize JSON")?;
     std::fs::write(&path, formatted).context("Failed to write mcp.json")?;
 
-    tracing::info!(
-        "MCP server configured in stdio mode: {}",
-        path.display()
-    );
+    tracing::info!("MCP server configured in stdio mode: {}", path.display());
     Ok(path)
 }
 
@@ -584,7 +581,10 @@ mod tests {
 
         // Temporarily override mcp_json_path by writing directly
         let mut env = std::collections::HashMap::new();
-        env.insert("PO_SERVER_URL".to_string(), "http://127.0.0.1:8080".to_string());
+        env.insert(
+            "PO_SERVER_URL".to_string(),
+            "http://127.0.0.1:8080".to_string(),
+        );
         env.insert("PO_JWT_SECRET".to_string(), "test-secret".to_string());
 
         // Write directly to the tmp path
@@ -643,10 +643,7 @@ mod tests {
         });
 
         // Check that SSE type is correctly identified as stale
-        assert_eq!(
-            sse_config.get("type").and_then(|t| t.as_str()),
-            Some("sse")
-        );
+        assert_eq!(sse_config.get("type").and_then(|t| t.as_str()), Some("sse"));
     }
 
     // ========================================================================
