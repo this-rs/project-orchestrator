@@ -2804,6 +2804,42 @@ impl GraphStore for Neo4jClient {
         self.detect_personas(project_id).await
     }
 
+    async fn find_adjacent_personas(
+        &self,
+        file_path: &str,
+        project_id: Uuid,
+    ) -> anyhow::Result<Vec<(Uuid, String)>> {
+        self.find_adjacent_personas(file_path, project_id).await
+    }
+
+    async fn auto_grow_file_knows(
+        &self,
+        persona_id: Uuid,
+        file_path: &str,
+        weight: f64,
+    ) -> anyhow::Result<()> {
+        self.auto_grow_file_knows(persona_id, file_path, weight)
+            .await
+    }
+
+    async fn find_relevant_personas_for_note(
+        &self,
+        file_paths: &[String],
+        project_id: Uuid,
+    ) -> anyhow::Result<Vec<(Uuid, f64)>> {
+        self.find_relevant_personas_for_note(file_paths, project_id)
+            .await
+    }
+
+    async fn find_relevant_personas_for_decision(
+        &self,
+        decision_id: Uuid,
+        project_id: Uuid,
+    ) -> anyhow::Result<Vec<(Uuid, f64)>> {
+        self.find_relevant_personas_for_decision(decision_id, project_id)
+            .await
+    }
+
     async fn auto_link_note_to_persona(
         &self,
         persona_id: Uuid,

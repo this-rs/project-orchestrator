@@ -8747,6 +8747,39 @@ impl GraphStore for MockGraphStore {
         Ok(vec![])
     }
 
+    async fn find_adjacent_personas(
+        &self,
+        _file_path: &str,
+        _project_id: Uuid,
+    ) -> Result<Vec<(Uuid, String)>> {
+        Ok(vec![])
+    }
+
+    async fn auto_grow_file_knows(
+        &self,
+        _persona_id: Uuid,
+        _file_path: &str,
+        _weight: f64,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    async fn find_relevant_personas_for_note(
+        &self,
+        _file_paths: &[String],
+        _project_id: Uuid,
+    ) -> Result<Vec<(Uuid, f64)>> {
+        Ok(vec![])
+    }
+
+    async fn find_relevant_personas_for_decision(
+        &self,
+        _decision_id: Uuid,
+        _project_id: Uuid,
+    ) -> Result<Vec<(Uuid, f64)>> {
+        Ok(vec![])
+    }
+
     async fn auto_link_note_to_persona(
         &self,
         _persona_id: Uuid,
