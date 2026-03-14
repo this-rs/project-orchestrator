@@ -992,7 +992,7 @@ mod tests {
         assert!((neo4j_entries[0].2 - 0.8).abs() < f64::EPSILON);
 
         // src/api/ should NOT be in dir_index (only CommunityMatch, not DirectKnows)
-        assert!(index.dir_index.get("src/api/").is_none());
+        assert!(!index.dir_index.contains_key("src/api/"));
     }
 
     // ========================================================================

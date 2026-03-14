@@ -60,9 +60,9 @@ async fn main() -> Result<()> {
     })?;
 
     info!("MCP server starting in HTTP proxy mode");
-    let auth_source = if std::env::var("PO_AUTH_TOKEN").map_or(false, |v| !v.is_empty()) {
+    let auth_source = if std::env::var("PO_AUTH_TOKEN").is_ok_and(|v| !v.is_empty()) {
         "PO_AUTH_TOKEN"
-    } else if std::env::var("PO_JWT_SECRET").map_or(false, |v| !v.is_empty()) {
+    } else if std::env::var("PO_JWT_SECRET").is_ok_and(|v| !v.is_empty()) {
         "PO_JWT_SECRET (auto-generated)"
     } else {
         "none"
