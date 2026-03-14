@@ -148,20 +148,18 @@ impl SkillActivationHook {
         // Cache miss or expired — load ALL KNOWS for the project in one query.
         // This builds a complete PersonaFileIndex with both entries and dir_index,
         // eliminating the cold-start problem where dir_index was empty on first call.
-        match self
-            .graph_store
-            .get_all_persona_knows(project_id)
-            .await
-        {
+        match self.graph_store.get_all_persona_knows(project_id).await {
             Ok(all_knows) => {
                 // Build complete index from all KNOWS relations
                 let mut entries: HashMap<String, Vec<(Uuid, String, f64, PersonaMatchSource)>> =
                     HashMap::new();
                 for (persona, path, weight) in &all_knows {
-                    entries
-                        .entry(path.clone())
-                        .or_default()
-                        .push((persona.id, persona.name.clone(), *weight, PersonaMatchSource::DirectKnows));
+                    entries.entry(path.clone()).or_default().push((
+                        persona.id,
+                        persona.name.clone(),
+                        *weight,
+                        PersonaMatchSource::DirectKnows,
+                    ));
                 }
                 // Sort each file's personas by weight desc
                 for v in entries.values_mut() {
@@ -1143,7 +1141,10 @@ mod tests {
             .match_persona_for_file(project_id, "src/neo4j/persona.rs")
             .await;
 
-        assert!(result.is_some(), "Directory-prefix should match on cold start");
+        assert!(
+            result.is_some(),
+            "Directory-prefix should match on cold start"
+        );
         let (pid, pname, weight) = result.unwrap();
         assert_eq!(pid, persona.id);
         assert_eq!(pname, "neo4j-guru");

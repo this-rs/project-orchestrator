@@ -705,10 +705,12 @@ pub async fn find_for_file(
     let mut entries: HashMap<String, Vec<(uuid::Uuid, String, f64, PersonaMatchSource)>> =
         HashMap::new();
     for (persona, path, weight) in &all_knows {
-        entries
-            .entry(path.clone())
-            .or_default()
-            .push((persona.id, persona.name.clone(), *weight, PersonaMatchSource::DirectKnows));
+        entries.entry(path.clone()).or_default().push((
+            persona.id,
+            persona.name.clone(),
+            *weight,
+            PersonaMatchSource::DirectKnows,
+        ));
     }
 
     let dir_index = SkillActivationHook::build_dir_index(&entries);
@@ -2970,7 +2972,11 @@ mod tests {
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0]["persona"]["name"], "Neo4j Expert");
         let weight = matches[0]["weight"].as_f64().unwrap();
-        assert!((weight - 0.95).abs() < 0.01, "expected exact weight 0.95, got {}", weight);
+        assert!(
+            (weight - 0.95).abs() < 0.01,
+            "expected exact weight 0.95, got {}",
+            weight
+        );
     }
 
     #[tokio::test]
@@ -2997,7 +3003,11 @@ mod tests {
         assert_eq!(matches[0]["persona"]["name"], "Neo4j Expert");
         // Weight should be avg(0.9, 0.8) * 0.7 = 0.595
         let weight = matches[0]["weight"].as_f64().unwrap();
-        assert!(weight > 0.5 && weight < 0.7, "expected dir-prefix weight ~0.595, got {}", weight);
+        assert!(
+            weight > 0.5 && weight < 0.7,
+            "expected dir-prefix weight ~0.595, got {}",
+            weight
+        );
     }
 
     #[tokio::test]
@@ -3026,10 +3036,8 @@ mod tests {
     async fn test_find_for_file_dir_prefix_needs_min_2_files() {
         // Persona KNOWS only 1 file in src/api/ → dir-prefix needs >= 2 files
         // Should NOT match via dir-prefix
-        let (app, project_id, _persona_id) = test_app_with_persona_files(vec![
-            ("src/api/routes.rs", 0.9),
-        ])
-        .await;
+        let (app, project_id, _persona_id) =
+            test_app_with_persona_files(vec![("src/api/routes.rs", 0.9)]).await;
 
         let resp = app
             .oneshot(auth_get(&format!(
