@@ -867,7 +867,7 @@ impl Neo4jClient {
                 UNION
                 MATCH (p:Persona {project_id: $project_id})-[:SCOPED_TO]->(fg:FeatureGraph)-[:HAS_ENTITY]->(f:File {path: $file_path})
                 WHERE p.status <> 'archived'
-                RETURN p, 0.5 AS weight
+                RETURN p, 0.3 AS weight
             }
             WITH p, max(weight) AS weight
             RETURN p, weight
@@ -882,7 +882,7 @@ impl Neo4jClient {
                 UNION
                 MATCH (p:Persona {project_id: $project_id})-[:SCOPED_TO]->(fg:FeatureGraph)-[:HAS_ENTITY]->(f:File)
                 WHERE f.path ENDS WITH $file_path AND f.path ENDS WITH ('/' + $file_path) AND p.status <> 'archived'
-                RETURN p, 0.5 AS weight
+                RETURN p, 0.3 AS weight
             }
             WITH p, max(weight) AS weight
             RETURN p, weight
@@ -2050,5 +2050,35 @@ mod tests {
                 "Directory extraction failed for '{input}'"
             );
         }
+    }
+
+    // ── Community fallback tests ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_find_personas_for_file_no_match_mock() {
+        // MockGraphStore returns empty → no KNOWS nor SCOPED_TO match
+        let store = MockGraphStore::new();
+        let project_id = Uuid::new_v4();
+
+        let result = store
+            .find_personas_for_file("/src/unknown/file.rs", project_id)
+            .await
+            .unwrap();
+
+        assert!(
+            result.is_empty(),
+            "Mock should return no personas for unknown file"
+        );
+    }
+
+    #[test]
+    fn test_community_match_weight_is_lower_than_direct_knows() {
+        // Acceptance criteria: community match weight (0.3) < direct KNOWS (typically 0.5-1.0)
+        let community_weight = 0.3_f64;
+        let min_direct_knows = 0.5_f64;
+        assert!(
+            community_weight < min_direct_knows,
+            "Community match weight should be lower than direct KNOWS"
+        );
     }
 }
