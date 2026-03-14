@@ -1178,6 +1178,99 @@ impl Neo4jClient {
         Ok(personas)
     }
 
+    /// Check if a file is adjacent to a persona's KNOWS scope.
+    ///
+    /// Adjacent means:
+    /// 1. Same directory as a file the persona KNOWS, OR
+    /// 2. 1 hop via IMPORTS from a file the persona KNOWS
+    ///
+    /// Returns the list of personas (id, name) that are adjacent to this file.
+    /// File paths are ABSOLUTE (matching File node convention).
+    pub async fn find_adjacent_personas(
+        &self,
+        file_path: &str,
+        project_id: Uuid,
+    ) -> Result<Vec<(Uuid, String)>> {
+        // Extract directory from file path for same-dir matching
+        let dir = file_path
+            .rsplit_once('/')
+            .map(|(d, _)| format!("{d}/"))
+            .unwrap_or_default();
+
+        if dir.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let q = query(
+            r#"
+            // Strategy 1: Same directory — persona KNOWS a file in the same directory
+            OPTIONAL MATCH (p1:Persona {project_id: $project_id, status: "active"})-[:KNOWS]->(f1:File)
+            WHERE f1.path STARTS WITH $dir AND f1.path <> $file_path
+            WITH collect(DISTINCT p1) AS dir_personas
+
+            // Strategy 2: 1-hop IMPORTS — file imports or is imported by a KNOWS file
+            OPTIONAL MATCH (target:File {path: $file_path})-[:IMPORTS|IMPORTED_BY]-(neighbor:File)<-[:KNOWS]-(p2:Persona {project_id: $project_id, status: "active"})
+            WITH dir_personas, collect(DISTINCT p2) AS import_personas
+
+            // Union both sets
+            WITH dir_personas + import_personas AS all_personas
+            UNWIND all_personas AS p
+            WITH DISTINCT p
+            WHERE p IS NOT NULL
+            RETURN p.id AS persona_id, p.name AS persona_name
+            "#,
+        )
+        .param("file_path", file_path)
+        .param("dir", dir)
+        .param("project_id", project_id.to_string());
+
+        let mut result = self
+            .graph
+            .execute(q)
+            .await
+            .context("find_adjacent_personas")?;
+
+        let mut personas = Vec::new();
+        while let Some(row) = result.next().await? {
+            let id_str: String = row.get("persona_id")?;
+            let id: Uuid = id_str.parse()?;
+            let name: String = row.get("persona_name")?;
+            personas.push((id, name));
+        }
+
+        Ok(personas)
+    }
+
+    /// Auto-grow: create a KNOWS relation between a persona and a file with low weight.
+    ///
+    /// Used when an agent touches a file that is adjacent to a persona's scope
+    /// but not yet in KNOWS. Creates a weak KNOWS (weight 0.3) via MERGE.
+    pub async fn auto_grow_file_knows(
+        &self,
+        persona_id: Uuid,
+        file_path: &str,
+        weight: f64,
+    ) -> Result<()> {
+        let q = query(
+            r#"
+            MATCH (p:Persona {id: $persona_id}), (f:File {path: $file_path})
+            MERGE (p)-[k:KNOWS]->(f)
+            ON CREATE SET k.weight = $weight, k.source = "auto-grow"
+            ON MATCH SET k.weight = CASE WHEN k.weight < $weight THEN $weight ELSE k.weight END
+            "#,
+        )
+        .param("persona_id", persona_id.to_string())
+        .param("file_path", file_path)
+        .param("weight", weight);
+
+        self.graph
+            .run(q)
+            .await
+            .context("auto_grow_file_knows")?;
+
+        Ok(())
+    }
+
     /// Auto-link a note to the active persona for a task (growth hook).
     pub async fn auto_link_note_to_persona(
         &self,
@@ -1902,5 +1995,59 @@ mod tests {
             .auto_link_decision_to_persona(persona_id, decision_id, 0.8)
             .await
             .unwrap();
+    }
+
+    // ── Auto-grow tests ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_find_adjacent_personas_no_match() {
+        let store = MockGraphStore::new();
+        let project_id = Uuid::new_v4();
+
+        let result = store
+            .find_adjacent_personas("/src/some/unknown.rs", project_id)
+            .await
+            .unwrap();
+
+        assert!(result.is_empty(), "Mock should return no adjacent personas");
+    }
+
+    #[tokio::test]
+    async fn test_auto_grow_file_knows_idempotent() {
+        let store = MockGraphStore::new();
+        let persona_id = Uuid::new_v4();
+
+        // First call — create
+        store
+            .auto_grow_file_knows(persona_id, "/src/new_file.rs", 0.3)
+            .await
+            .unwrap();
+
+        // Second call — idempotent (MERGE)
+        store
+            .auto_grow_file_knows(persona_id, "/src/new_file.rs", 0.3)
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn test_directory_extraction_for_adjacency() {
+        // Verify the directory extraction logic used in find_adjacent_personas
+        let test_cases = vec![
+            ("/src/api/handlers.rs", "/src/api/"),
+            ("/src/main.rs", "/src/"),
+            ("file.rs", ""),  // no directory → empty
+        ];
+
+        for (input, expected_dir) in test_cases {
+            let dir = input
+                .rsplit_once('/')
+                .map(|(d, _)| format!("{d}/"))
+                .unwrap_or_default();
+            assert_eq!(
+                dir, expected_dir,
+                "Directory extraction failed for '{input}'"
+            );
+        }
     }
 }

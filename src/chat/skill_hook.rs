@@ -253,7 +253,46 @@ impl nexus_claude::HookCallback for SkillActivationHook {
                     );
                     self.build_persona_context(pid, &pname, weight).await
                 }
-                None => None,
+                None => {
+                    // Auto-grow: file not in KNOWS, check if adjacent to a persona's scope
+                    // Fire-and-forget — must not slow down the PreToolUse response
+                    let graph = self.graph_store.clone();
+                    let fp_owned = fp.clone();
+                    tokio::spawn(async move {
+                        match graph.find_adjacent_personas(&fp_owned, project_id).await {
+                            Ok(adjacent) if !adjacent.is_empty() => {
+                                for (persona_id, persona_name) in &adjacent {
+                                    if let Err(e) = graph
+                                        .auto_grow_file_knows(*persona_id, &fp_owned, 0.3)
+                                        .await
+                                    {
+                                        tracing::debug!(
+                                            persona_id = %persona_id,
+                                            file_path = %fp_owned,
+                                            error = %e,
+                                            "Auto-grow KNOWS failed (non-fatal)"
+                                        );
+                                    } else {
+                                        tracing::debug!(
+                                            persona_name = %persona_name,
+                                            file_path = %fp_owned,
+                                            "Auto-grow: added KNOWS(0.3) for adjacent file"
+                                        );
+                                    }
+                                }
+                            }
+                            Ok(_) => {} // not adjacent to any persona
+                            Err(e) => {
+                                tracing::debug!(
+                                    file_path = %fp_owned,
+                                    error = %e,
+                                    "Auto-grow: find_adjacent_personas failed (non-fatal)"
+                                );
+                            }
+                        }
+                    });
+                    None
+                }
             }
         } else {
             None
