@@ -2702,6 +2702,10 @@ impl GraphStore for Neo4jClient {
         self.remove_persona_protocol(persona_id, protocol_id).await
     }
 
+    async fn increment_persona_activation(&self, persona_id: Uuid) -> anyhow::Result<()> {
+        self.increment_persona_activation(persona_id).await
+    }
+
     async fn set_persona_feature_graph(
         &self,
         persona_id: Uuid,

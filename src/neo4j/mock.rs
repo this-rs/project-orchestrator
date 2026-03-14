@@ -8471,6 +8471,15 @@ impl GraphStore for MockGraphStore {
         Ok(())
     }
 
+    async fn increment_persona_activation(&self, persona_id: Uuid) -> Result<()> {
+        let mut personas = self.personas.write().await;
+        if let Some(persona) = personas.get_mut(&persona_id) {
+            persona.activation_count += 1;
+            persona.last_activated = Some(chrono::Utc::now());
+        }
+        Ok(())
+    }
+
     async fn set_persona_feature_graph(
         &self,
         persona_id: Uuid,

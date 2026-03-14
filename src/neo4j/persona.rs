@@ -449,6 +449,22 @@ impl Neo4jClient {
         Ok(())
     }
 
+    /// Increment activation_count and update last_activated for a Persona.
+    /// Best-effort (fire-and-forget from hooks).
+    pub async fn increment_persona_activation(&self, persona_id: Uuid) -> Result<()> {
+        let q = query(
+            r#"
+            MATCH (p:Persona {id: $persona_id})
+            SET p.activation_count = p.activation_count + 1,
+                p.last_activated = datetime(),
+                p.updated_at = datetime()
+            "#,
+        )
+        .param("persona_id", persona_id.to_string());
+        let _ = self.graph.run(q).await; // Best-effort
+        Ok(())
+    }
+
     /// Remove SCOPED_TO relation from a Persona
     pub async fn remove_persona_feature_graph(&self, persona_id: Uuid) -> Result<()> {
         let q = query(

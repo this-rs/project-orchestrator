@@ -369,6 +369,20 @@ impl nexus_claude::HookCallback for SkillActivationHook {
                         file_path = %fp,
                         "Persona matched via file access"
                     );
+                    // Increment activation_count (fire-and-forget)
+                    let graph = self.graph_store.clone();
+                    let persona_id_for_increment = pid;
+                    tokio::spawn(async move {
+                        if let Err(e) = graph
+                            .increment_persona_activation(persona_id_for_increment)
+                            .await
+                        {
+                            tracing::debug!(
+                                persona_id = %persona_id_for_increment,
+                                "Persona activation increment failed (non-fatal): {}", e
+                            );
+                        }
+                    });
                     self.build_persona_context(pid, &pname, weight).await
                 }
                 None => {

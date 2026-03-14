@@ -2344,6 +2344,9 @@ pub trait GraphStore: Send + Sync {
     /// Remove FOLLOWS relation: Persona -> Protocol
     async fn remove_persona_protocol(&self, persona_id: Uuid, protocol_id: Uuid) -> Result<()>;
 
+    /// Increment activation_count and update last_activated for a Persona.
+    async fn increment_persona_activation(&self, persona_id: Uuid) -> Result<()>;
+
     /// Add SCOPED_TO relation: Persona -> FeatureGraph
     async fn set_persona_feature_graph(
         &self,
