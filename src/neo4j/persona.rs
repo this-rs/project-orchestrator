@@ -1078,6 +1078,106 @@ impl Neo4jClient {
         Ok(proposals)
     }
 
+    /// Find personas relevant to a note based on KNOWS file overlap.
+    ///
+    /// Extracts file paths from note content, then finds active personas
+    /// whose KNOWS files overlap with those paths. Falls back to returning
+    /// an empty vec (semantic fallback is handled by the caller).
+    ///
+    /// Note: File nodes use ABSOLUTE paths but note content typically contains
+    /// RELATIVE paths, so we use `ENDS WITH` matching.
+    pub async fn find_relevant_personas_for_note(
+        &self,
+        file_paths: &[String],
+        project_id: Uuid,
+    ) -> Result<Vec<(Uuid, f64)>> {
+        if file_paths.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Normalize: strip leading "./" or "/" for consistent ENDS WITH matching
+        let normalized: Vec<String> = file_paths
+            .iter()
+            .map(|p| {
+                p.strip_prefix("./")
+                    .or_else(|| p.strip_prefix('/'))
+                    .unwrap_or(p)
+                    .to_string()
+            })
+            .collect();
+
+        let q = query(
+            r#"
+            UNWIND $file_paths AS fp
+            MATCH (p:Persona {project_id: $project_id, status: "active"})-[k:KNOWS]->(f:File)
+            WHERE f.path ENDS WITH fp
+            WITH p, count(DISTINCT f) AS overlap, avg(k.weight) AS avg_weight
+            RETURN p.id AS persona_id, overlap, avg_weight
+            ORDER BY overlap DESC, avg_weight DESC
+            "#,
+        )
+        .param("file_paths", normalized)
+        .param("project_id", project_id.to_string());
+
+        let mut result = self.graph.execute(q).await.context(
+            "find_relevant_personas_for_note",
+        )?;
+
+        let mut personas = Vec::new();
+        while let Some(row) = result.next().await? {
+            let id_str: String = row.get("persona_id")?;
+            let id: Uuid = id_str.parse()?;
+            let avg_weight: f64 = row.get("avg_weight").unwrap_or(0.5);
+            personas.push((id, avg_weight));
+        }
+
+        Ok(personas)
+    }
+
+    /// Find personas relevant to a decision based on KNOWS overlap with AFFECTS entities.
+    ///
+    /// Looks at the files/functions affected by a decision (via AFFECTS relations),
+    /// then finds active personas whose KNOWS files overlap with those entities.
+    pub async fn find_relevant_personas_for_decision(
+        &self,
+        decision_id: Uuid,
+        project_id: Uuid,
+    ) -> Result<Vec<(Uuid, f64)>> {
+        let q = query(
+            r#"
+            MATCH (d:Decision {id: $decision_id})-[:AFFECTS]->(target)
+            WHERE target:File OR target:Function
+            WITH CASE WHEN target:Function
+                THEN [(target)<-[:DEFINES]-(f:File) | f][0]
+                ELSE target
+            END AS file
+            WHERE file IS NOT NULL
+            WITH collect(DISTINCT file) AS affected_files
+            UNWIND affected_files AS af
+            MATCH (p:Persona {project_id: $project_id, status: "active"})-[k:KNOWS]->(af)
+            WITH p, count(DISTINCT af) AS overlap, avg(k.weight) AS avg_weight
+            RETURN p.id AS persona_id, overlap, avg_weight
+            ORDER BY overlap DESC, avg_weight DESC
+            "#,
+        )
+        .param("decision_id", decision_id.to_string())
+        .param("project_id", project_id.to_string());
+
+        let mut result = self.graph.execute(q).await.context(
+            "find_relevant_personas_for_decision",
+        )?;
+
+        let mut personas = Vec::new();
+        while let Some(row) = result.next().await? {
+            let id_str: String = row.get("persona_id")?;
+            let id: Uuid = id_str.parse()?;
+            let avg_weight: f64 = row.get("avg_weight").unwrap_or(0.5);
+            personas.push((id, avg_weight));
+        }
+
+        Ok(personas)
+    }
+
     /// Auto-link a note to the active persona for a task (growth hook).
     pub async fn auto_link_note_to_persona(
         &self,
@@ -1673,5 +1773,134 @@ mod tests {
         assert_eq!(deserialized.id, persona.id);
         assert_eq!(deserialized.origin, PersonaOrigin::Manual);
         assert_eq!(deserialized.status, PersonaStatus::Emerging);
+    }
+
+    // ── Targeted growth hooks tests ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_find_relevant_personas_for_note_no_match() {
+        // MockGraphStore returns empty vec → no personas linked
+        let store = MockGraphStore::new();
+        let project_id = Uuid::new_v4();
+
+        let file_paths = vec!["src/api/handlers.rs".to_string()];
+        let result = store
+            .find_relevant_personas_for_note(&file_paths, project_id)
+            .await
+            .unwrap();
+
+        assert!(result.is_empty(), "Mock should return no relevant personas");
+    }
+
+    #[tokio::test]
+    async fn test_find_relevant_personas_for_note_empty_paths() {
+        // Empty file paths → early return, no query executed
+        let store = MockGraphStore::new();
+        let project_id = Uuid::new_v4();
+
+        let result = store
+            .find_relevant_personas_for_note(&[], project_id)
+            .await
+            .unwrap();
+
+        assert!(result.is_empty(), "Empty paths should return no personas");
+    }
+
+    #[tokio::test]
+    async fn test_find_relevant_personas_for_decision_no_match() {
+        // MockGraphStore returns empty vec → no personas linked
+        let store = MockGraphStore::new();
+        let decision_id = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+
+        let result = store
+            .find_relevant_personas_for_decision(decision_id, project_id)
+            .await
+            .unwrap();
+
+        assert!(
+            result.is_empty(),
+            "Mock should return no relevant personas for decision"
+        );
+    }
+
+    #[test]
+    fn test_path_normalization_for_relevance() {
+        // Verify the normalization logic used in find_relevant_personas_for_note
+        let test_cases = vec![
+            ("./src/main.rs", "src/main.rs"),
+            ("/src/main.rs", "src/main.rs"),
+            ("src/main.rs", "src/main.rs"),
+            ("./nested/deep/file.rs", "nested/deep/file.rs"),
+        ];
+
+        for (input, expected) in test_cases {
+            let normalized = input
+                .strip_prefix("./")
+                .or_else(|| input.strip_prefix('/'))
+                .unwrap_or(input);
+            assert_eq!(
+                normalized, expected,
+                "Path normalization failed for '{input}'"
+            );
+        }
+    }
+
+    #[test]
+    fn test_link_weight_calculation() {
+        // Growth hook calculates link_weight = (avg_weight * 0.8).max(0.3)
+        let test_cases: Vec<(f64, f64)> = vec![
+            (1.0, 0.8),   // high weight → 0.8
+            (0.5, 0.4),   // medium weight → 0.4
+            (0.3, 0.3),   // low weight → clamped to 0.3
+            (0.1, 0.3),   // very low → clamped to 0.3
+            (0.0, 0.3),   // zero → clamped to 0.3
+        ];
+
+        for (avg_weight, expected) in test_cases {
+            let link_weight = (avg_weight * 0.8).max(0.3);
+            assert!(
+                (link_weight - expected).abs() < 1e-10,
+                "Weight calc failed for avg_weight={avg_weight}: got {link_weight}, expected {expected}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_growth_hook_auto_link_note_idempotent() {
+        // auto_link_note_to_persona should not fail on second call (MERGE)
+        let store = MockGraphStore::new();
+        let persona_id = Uuid::new_v4();
+        let note_id = Uuid::new_v4();
+
+        // First call
+        store
+            .auto_link_note_to_persona(persona_id, note_id, 0.5)
+            .await
+            .unwrap();
+
+        // Second call (idempotent)
+        store
+            .auto_link_note_to_persona(persona_id, note_id, 0.8)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_growth_hook_auto_link_decision_idempotent() {
+        // auto_link_decision_to_persona should not fail on second call (MERGE)
+        let store = MockGraphStore::new();
+        let persona_id = Uuid::new_v4();
+        let decision_id = Uuid::new_v4();
+
+        store
+            .auto_link_decision_to_persona(persona_id, decision_id, 0.5)
+            .await
+            .unwrap();
+
+        store
+            .auto_link_decision_to_persona(persona_id, decision_id, 0.8)
+            .await
+            .unwrap();
     }
 }

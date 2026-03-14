@@ -2413,6 +2413,20 @@ pub trait GraphStore: Send + Sync {
         project_id: Uuid,
     ) -> Result<Vec<crate::neo4j::persona::PersonaProposal>>;
 
+    /// Find personas relevant to a note based on KNOWS file overlap.
+    async fn find_relevant_personas_for_note(
+        &self,
+        file_paths: &[String],
+        project_id: Uuid,
+    ) -> Result<Vec<(Uuid, f64)>>;
+
+    /// Find personas relevant to a decision based on KNOWS overlap with AFFECTS entities.
+    async fn find_relevant_personas_for_decision(
+        &self,
+        decision_id: Uuid,
+        project_id: Uuid,
+    ) -> Result<Vec<(Uuid, f64)>>;
+
     /// Auto-link a note to an active persona (growth hook).
     async fn auto_link_note_to_persona(
         &self,

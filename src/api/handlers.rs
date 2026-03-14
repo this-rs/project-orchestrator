@@ -1089,37 +1089,54 @@ pub async fn add_decision(
         }
     }
 
-    // Growth hook: auto-link decision to active personas for this task's project
+    // Growth hook: auto-link decision to RELEVANT personas only (not all active ones).
+    // Relevance = persona KNOWS files that overlap with decision's AFFECTS entities.
     {
         let neo4j = state.orchestrator.neo4j_arc();
         let decision_id = decision.id;
         tokio::spawn(async move {
-            // Resolve project from task, then find active personas
+            // Resolve project from task
             if let Ok(Some(project)) = neo4j.get_project_for_task(task_id).await {
-                match neo4j.list_personas(project.id, None, 50, 0).await {
-                    Ok((personas, _)) => {
-                        for persona in personas
-                            .iter()
-                            .filter(|p| p.status == crate::neo4j::models::PersonaStatus::Active)
-                        {
+                match neo4j
+                    .find_relevant_personas_for_decision(decision_id, project.id)
+                    .await
+                {
+                    Ok(relevant) if !relevant.is_empty() => {
+                        for (persona_id, avg_weight) in &relevant {
+                            let link_weight = (*avg_weight * 0.8).max(0.3);
                             if let Err(e) = neo4j
-                                .auto_link_decision_to_persona(persona.id, decision_id, 0.5)
+                                .auto_link_decision_to_persona(
+                                    *persona_id,
+                                    decision_id,
+                                    link_weight,
+                                )
                                 .await
                             {
                                 tracing::debug!(
-                                    persona_id = %persona.id,
+                                    persona_id = %persona_id,
                                     decision_id = %decision_id,
                                     error = %e,
                                     "Growth hook: auto_link_decision failed (non-fatal)"
                                 );
                             }
                         }
+                        tracing::debug!(
+                            decision_id = %decision_id,
+                            count = relevant.len(),
+                            "Growth hook: linked decision to relevant personas"
+                        );
+                    }
+                    Ok(_) => {
+                        tracing::debug!(
+                            decision_id = %decision_id,
+                            "Growth hook: no relevant personas found for decision (skipped)"
+                        );
                     }
                     Err(e) => {
                         tracing::debug!(
                             project_id = %project.id,
                             error = %e,
-                            "Growth hook: list_personas failed (non-fatal)"
+                            "Growth hook: find_relevant_personas_for_decision failed (non-fatal)"
                         );
                     }
                 }
