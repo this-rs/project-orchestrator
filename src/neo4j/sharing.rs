@@ -13,10 +13,7 @@ impl Neo4jClient {
     // ========================================================================
 
     /// Get the sharing policy for a project.
-    pub async fn get_sharing_policy(
-        &self,
-        project_id: Uuid,
-    ) -> Result<Option<SharingPolicy>> {
+    pub async fn get_sharing_policy(&self, project_id: Uuid) -> Result<Option<SharingPolicy>> {
         let q = query(
             r#"
             MATCH (p:Project {id: $id})
@@ -64,10 +61,7 @@ impl Neo4jClient {
     // ========================================================================
 
     /// Get the sharing consent for a note.
-    pub async fn get_sharing_consent(
-        &self,
-        note_id: Uuid,
-    ) -> Result<SharingConsent> {
+    pub async fn get_sharing_consent(&self, note_id: Uuid) -> Result<SharingConsent> {
         let q = query(
             r#"
             MATCH (n:Note {id: $id})
@@ -79,8 +73,8 @@ impl Neo4jClient {
         let mut result = self.graph.execute(q).await?;
         if let Some(row) = result.next().await? {
             let consent_str: String = row.get("consent").unwrap_or_default();
-            let consent: SharingConsent = serde_json::from_str(&format!("\"{}\"", consent_str))
-                .unwrap_or_default();
+            let consent: SharingConsent =
+                serde_json::from_str(&format!("\"{}\"", consent_str)).unwrap_or_default();
             Ok(consent)
         } else {
             Ok(SharingConsent::default())
@@ -138,8 +132,20 @@ impl Neo4jClient {
         .param("source_did", event.source_did.clone())
         .param("target_did", event.target_did.clone())
         .param("timestamp", event.timestamp.to_rfc3339())
-        .param("consent", serde_json::to_string(&event.consent).unwrap_or_default().trim_matches('"').to_string())
-        .param("privacy_mode", serde_json::to_string(&event.privacy_mode).unwrap_or_default().trim_matches('"').to_string())
+        .param(
+            "consent",
+            serde_json::to_string(&event.consent)
+                .unwrap_or_default()
+                .trim_matches('"')
+                .to_string(),
+        )
+        .param(
+            "privacy_mode",
+            serde_json::to_string(&event.privacy_mode)
+                .unwrap_or_default()
+                .trim_matches('"')
+                .to_string(),
+        )
         .param("reason", event.reason.clone().unwrap_or_default());
 
         self.graph.run(q).await?;
@@ -190,11 +196,14 @@ impl Neo4jClient {
                 timestamp: chrono::DateTime::parse_from_rfc3339(&timestamp_str)
                     .map(|dt| dt.with_timezone(&chrono::Utc))
                     .unwrap_or_else(|_| chrono::Utc::now()),
-                consent: serde_json::from_str(&format!("\"{}\"", consent_str))
-                    .unwrap_or_default(),
+                consent: serde_json::from_str(&format!("\"{}\"", consent_str)).unwrap_or_default(),
                 privacy_mode: serde_json::from_str(&format!("\"{}\"", privacy_mode_str))
                     .unwrap_or_default(),
-                reason: if reason.is_empty() { None } else { Some(reason) },
+                reason: if reason.is_empty() {
+                    None
+                } else {
+                    Some(reason)
+                },
             });
         }
         Ok(events)
@@ -251,7 +260,11 @@ impl Neo4jClient {
                 issued_at: chrono::DateTime::parse_from_rfc3339(&issued_at_str)
                     .map(|dt| dt.with_timezone(&chrono::Utc))
                     .unwrap_or_else(|_| chrono::Utc::now()),
-                reason: if reason.is_empty() { None } else { Some(reason) },
+                reason: if reason.is_empty() {
+                    None
+                } else {
+                    Some(reason)
+                },
             });
         }
         Ok(tombstones)

@@ -77,7 +77,13 @@ pub fn build_broadcast_messages(
     let payload = serde_json::to_vec(request).unwrap_or_default();
     target_dids
         .iter()
-        .map(|_| Message::new(MessageType::Tombstone, sender_did.to_string(), payload.clone()))
+        .map(|_| {
+            Message::new(
+                MessageType::Tombstone,
+                sender_did.to_string(),
+                payload.clone(),
+            )
+        })
         .collect()
 }
 

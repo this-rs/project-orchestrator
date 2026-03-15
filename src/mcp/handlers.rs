@@ -5209,14 +5209,20 @@ impl ToolHandler {
             "enable_sharing" => {
                 let slug = extract_string(args, "project_slug")?;
                 let result = http
-                    .post(&format!("/api/projects/{}/sharing/enable", slug), &json!({}))
+                    .post(
+                        &format!("/api/projects/{}/sharing/enable", slug),
+                        &json!({}),
+                    )
                     .await?;
                 Ok(Some(result))
             }
             "disable_sharing" => {
                 let slug = extract_string(args, "project_slug")?;
                 let result = http
-                    .post(&format!("/api/projects/{}/sharing/disable", slug), &json!({}))
+                    .post(
+                        &format!("/api/projects/{}/sharing/disable", slug),
+                        &json!({}),
+                    )
                     .await?;
                 Ok(Some(result))
             }
@@ -5269,11 +5275,8 @@ impl ToolHandler {
                     http.get(&format!("/api/projects/{}/sharing/history", slug))
                         .await?
                 } else {
-                    http.get_with_query(
-                        &format!("/api/projects/{}/sharing/history", slug),
-                        &query,
-                    )
-                    .await?
+                    http.get_with_query(&format!("/api/projects/{}/sharing/history", slug), &query)
+                        .await?
                 };
                 Ok(Some(result))
             }

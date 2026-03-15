@@ -90,8 +90,7 @@ impl TombstoneScheduler {
         guard
             .values()
             .filter(|entry| {
-                entry.broadcast_count < self.max_retries
-                    && (now - entry.last_broadcast) >= interval
+                entry.broadcast_count < self.max_retries && (now - entry.last_broadcast) >= interval
             })
             .cloned()
             .collect()

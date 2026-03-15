@@ -201,7 +201,10 @@ mod tests {
         let mut note = Note::new(
             None,
             nt,
-            format!("Test content for {} note with enough text to have a decent score", note_type),
+            format!(
+                "Test content for {} note with enough text to have a decent score",
+                note_type
+            ),
             "test-agent".to_string(),
         );
         note.tags = vec!["rust".to_string(), "testing".to_string()];
@@ -229,7 +232,10 @@ mod tests {
         let (stats, decisions) = run_consent_gate(&notes, &policy);
         assert_eq!(stats.consent_denied, 1);
         assert_eq!(stats.consent_allowed, 0);
-        assert_eq!(decisions[0].1, ConsentDecision::Deny(DenialReason::SharingDisabled));
+        assert_eq!(
+            decisions[0].1,
+            ConsentDecision::Deny(DenialReason::SharingDisabled)
+        );
     }
 
     #[test]
@@ -250,17 +256,25 @@ mod tests {
         let notes = vec![make_test_note("guideline", SharingConsent::ExplicitDeny)];
         let (stats, decisions) = run_consent_gate(&notes, &policy);
         assert_eq!(stats.consent_denied, 1);
-        assert_eq!(decisions[0].1, ConsentDecision::Deny(DenialReason::ExplicitDeny));
+        assert_eq!(
+            decisions[0].1,
+            ConsentDecision::Deny(DenialReason::ExplicitDeny)
+        );
     }
 
     #[test]
     fn test_type_never_policy() {
         let mut policy = auto_policy();
-        policy.type_overrides.insert("gotcha".to_string(), SharingAction::Never);
+        policy
+            .type_overrides
+            .insert("gotcha".to_string(), SharingAction::Never);
         let notes = vec![make_test_note("gotcha", SharingConsent::NotSet)];
         let (stats, decisions) = run_consent_gate(&notes, &policy);
         assert_eq!(stats.consent_denied, 1);
-        assert_eq!(decisions[0].1, ConsentDecision::Deny(DenialReason::TypeNeverPolicy));
+        assert_eq!(
+            decisions[0].1,
+            ConsentDecision::Deny(DenialReason::TypeNeverPolicy)
+        );
     }
 
     #[test]
@@ -273,7 +287,10 @@ mod tests {
         let notes = vec![make_test_note("guideline", SharingConsent::NotSet)];
         let (stats, decisions) = run_consent_gate(&notes, &policy);
         assert_eq!(stats.consent_denied, 1);
-        assert_eq!(decisions[0].1, ConsentDecision::Deny(DenialReason::ManualRequired));
+        assert_eq!(
+            decisions[0].1,
+            ConsentDecision::Deny(DenialReason::ManualRequired)
+        );
     }
 
     #[test]
@@ -309,7 +326,10 @@ mod tests {
         let notes = vec![make_test_note("context", SharingConsent::NotSet)];
         let (stats, decisions) = run_consent_gate(&notes, &policy);
         assert_eq!(stats.consent_denied, 1);
-        assert_eq!(decisions[0].1, ConsentDecision::Deny(DenialReason::InsufficientScore));
+        assert_eq!(
+            decisions[0].1,
+            ConsentDecision::Deny(DenialReason::InsufficientScore)
+        );
     }
 
     #[test]
