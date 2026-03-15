@@ -64,6 +64,7 @@ pub fn relativize(path: &str, root_path: &str) -> String {
 /// use std::path::PathBuf;
 /// assert_eq!(resolve("src/main.rs", "/Users/foo/project"), PathBuf::from("/Users/foo/project/src/main.rs"));
 /// ```
+#[allow(dead_code)]
 pub fn resolve(relative: &str, root_path: &str) -> PathBuf {
     let p = Path::new(relative);
     if p.is_absolute() {
@@ -110,8 +111,9 @@ pub fn sanitize_pattern(pattern: &str, root_path: &str) -> String {
 }
 
 /// Check whether a path looks relative (does not start with `/` or a Windows drive letter).
+#[allow(dead_code)]
 pub fn is_relative(path: &str) -> bool {
-    !path.starts_with('/') && !path.as_bytes().get(1).is_some_and(|&b| b == b':')
+    !path.starts_with('/') && path.as_bytes().get(1).is_none_or(|&b| b != b':')
 }
 
 #[cfg(test)]
