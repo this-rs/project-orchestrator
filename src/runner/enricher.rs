@@ -256,7 +256,10 @@ impl TaskEnricher {
                 .link_note_to_entity(note_id, &EntityType::File, &normalized, None, None)
                 .await
             {
-                warn!("Enricher: failed to link note to file {}: {}", normalized, e);
+                warn!(
+                    "Enricher: failed to link note to file {}: {}",
+                    normalized, e
+                );
             }
         }
 

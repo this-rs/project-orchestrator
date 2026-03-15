@@ -274,8 +274,7 @@ fn protected_routes() -> Router<OrchestratorState> {
         )
         .route(
             "/api/projects/{slug}/sharing/policy",
-            get(sharing_handlers::get_sharing_policy)
-                .put(sharing_handlers::set_sharing_policy),
+            get(sharing_handlers::get_sharing_policy).put(sharing_handlers::set_sharing_policy),
         )
         .route(
             "/api/notes/{note_id}/sharing/consent",

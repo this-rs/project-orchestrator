@@ -456,7 +456,8 @@ pub async fn link_note_to_entity(
         // Try to load the note's project_id, then the project root_path
         if let Ok(Some(note)) = state.orchestrator.note_manager().get_note(note_id).await {
             if let Some(project_id) = note.project_id {
-                if let Ok(Some(project)) = state.orchestrator.neo4j().get_project(project_id).await {
+                if let Ok(Some(project)) = state.orchestrator.neo4j().get_project(project_id).await
+                {
                     crate::utils::paths::relativize(&body.entity_id, &project.root_path)
                 } else {
                     body.entity_id

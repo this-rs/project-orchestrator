@@ -35,7 +35,8 @@ pub struct PolicyUpdateRequest {
     pub mode: Option<SharingMode>,
     pub min_shareability_score: Option<f64>,
     #[serde(default)]
-    pub type_overrides: Option<std::collections::HashMap<String, crate::episodes::distill_models::SharingAction>>,
+    pub type_overrides:
+        Option<std::collections::HashMap<String, crate::episodes::distill_models::SharingAction>>,
 }
 
 /// Request body for PUT /api/notes/{note_id}/sharing/consent
@@ -121,7 +122,10 @@ async fn load_project_notes(
 }
 
 /// Load the sharing policy for a project, falling back to defaults.
-async fn load_policy(state: &OrchestratorState, project_id: Uuid) -> Result<SharingPolicy, AppError> {
+async fn load_policy(
+    state: &OrchestratorState,
+    project_id: Uuid,
+) -> Result<SharingPolicy, AppError> {
     let policy = state
         .orchestrator
         .neo4j()
@@ -296,8 +300,7 @@ pub async fn preview_sharing(
     let items: Vec<PreviewItem> = decisions
         .into_iter()
         .map(|(note, decision)| {
-            let score =
-                crate::sharing::consent_gate::compute_shareability_score(note);
+            let score = crate::sharing::consent_gate::compute_shareability_score(note);
             PreviewItem {
                 note_id: note.id.to_string(),
                 note_type: format!("{:?}", note.note_type),
@@ -325,8 +328,7 @@ pub async fn suggest_sharing(
     let mut suggestions = Vec::new();
     for note in &notes {
         let score = crate::sharing::consent_gate::compute_shareability_score(note);
-        if score >= policy.min_shareability_score
-            && note.sharing_consent == SharingConsent::NotSet
+        if score >= policy.min_shareability_score && note.sharing_consent == SharingConsent::NotSet
         {
             suggestions.push(SuggestionItem {
                 note_id: note.id.to_string(),
@@ -341,7 +343,11 @@ pub async fn suggest_sharing(
     }
 
     // Sort by score descending
-    suggestions.sort_by(|a, b| b.shareability_score.partial_cmp(&a.shareability_score).unwrap_or(std::cmp::Ordering::Equal));
+    suggestions.sort_by(|a, b| {
+        b.shareability_score
+            .partial_cmp(&a.shareability_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     Ok(Json(suggestions))
 }

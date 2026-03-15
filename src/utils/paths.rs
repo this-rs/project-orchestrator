@@ -111,11 +111,7 @@ pub fn sanitize_pattern(pattern: &str, root_path: &str) -> String {
 
 /// Check whether a path looks relative (does not start with `/` or a Windows drive letter).
 pub fn is_relative(path: &str) -> bool {
-    !path.starts_with('/')
-        && !path
-            .as_bytes()
-            .get(1)
-            .is_some_and(|&b| b == b':')
+    !path.starts_with('/') && !path.as_bytes().get(1).is_some_and(|&b| b == b':')
 }
 
 #[cfg(test)]
