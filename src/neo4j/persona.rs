@@ -963,27 +963,33 @@ impl Neo4jClient {
 
     /// Auto-scope each persona to the FeatureGraph that best matches its KNOWS files.
     ///
-    /// For each active persona with KNOWS relations:
-    /// 1. Find the dominant community_id among its KNOWS files
-    /// 2. Find the FeatureGraph that contains the most files from that community
-    /// 3. Create SCOPED_TO relation (replacing any existing one)
+    /// Two-phase approach:
+    /// 1. **Match existing**: scope personas to existing FeatureGraphs when one
+    ///    covers their dominant community
+    /// 2. **Auto-create**: for personas whose dominant community has no FeatureGraph,
+    ///    create one automatically (MERGE by name, idempotent) with all community
+    ///    files linked via INCLUDES_ENTITY
     ///
-    /// Returns the number of personas that were scoped.
+    /// Uses `COALESCE(fabric_community_id, community_id)` to prefer multi-layer
+    /// communities when available.
+    ///
+    /// Returns the total number of personas that were scoped.
     pub async fn auto_scope_to_feature_graphs(&self, project_id: Uuid) -> Result<usize> {
-        // Single Cypher query:
-        // For each persona, find the dominant community from its KNOWS files,
-        // then find the best matching FeatureGraph for that community.
-        let q = query(
+        // Two-phase approach:
+        // Phase 1: scope to existing FeatureGraphs
+        // Phase 2: auto-create FeatureGraphs for unscoped personas
+        // ── Phase 1: Scope to existing FeatureGraphs ──────────────────
+        let existing_q = query(
             r#"
             MATCH (p:Persona {project_id: $project_id})-[r:KNOWS]->(f:File)
-            WHERE p.status <> 'archived' AND f.community_id IS NOT NULL
-            WITH p, f.community_id AS cid, count(f) AS file_count, sum(r.weight) AS total_weight
+            WHERE p.status <> 'archived' AND COALESCE(f.fabric_community_id, f.community_id) IS NOT NULL
+            WITH p, COALESCE(f.fabric_community_id, f.community_id) AS cid, count(f) AS file_count, sum(r.weight) AS total_weight
             ORDER BY p.id, file_count DESC, total_weight DESC
             WITH p, collect({cid: cid, cnt: file_count})[0] AS dominant
             WITH p, dominant.cid AS dominant_cid
             WHERE dominant_cid IS NOT NULL
             MATCH (fg:FeatureGraph {project_id: $project_id})-[:INCLUDES_ENTITY]->(f2:File)
-            WHERE f2.community_id = dominant_cid
+            WHERE COALESCE(f2.fabric_community_id, f2.community_id) = dominant_cid
             WITH p, fg, count(f2) AS overlap
             ORDER BY p.id, overlap DESC
             WITH p, collect(fg)[0] AS best_fg
@@ -997,19 +1003,94 @@ impl Neo4jClient {
         )
         .param("project_id", project_id.to_string());
 
-        let mut result = self
+        let mut existing_result = self
             .graph
-            .execute(q)
+            .execute(existing_q)
             .await
-            .context("auto_scope_to_feature_graphs")?;
+            .context("auto_scope_to_feature_graphs: phase 1")?;
 
-        let scoped: usize = if let Some(row) = result.next().await? {
+        let scoped_existing: usize = if let Some(row) = existing_result.next().await? {
             row.get::<i64>("scoped").unwrap_or(0) as usize
         } else {
             0
         };
 
-        Ok(scoped)
+        // ── Phase 2: Auto-create FeatureGraphs for unscoped personas ────
+        // Find personas that still have no SCOPED_TO after phase 1, determine
+        // their dominant community, and create a FeatureGraph (idempotent by name).
+        let autocreate_q = query(
+            r#"
+            MATCH (p:Persona {project_id: $project_id})-[r:KNOWS]->(f:File)
+            WHERE p.status <> 'archived'
+              AND COALESCE(f.fabric_community_id, f.community_id) IS NOT NULL
+              AND NOT (p)-[:SCOPED_TO]->()
+            WITH p, COALESCE(f.fabric_community_id, f.community_id) AS cid,
+                 count(f) AS file_count, sum(r.weight) AS total_weight
+            ORDER BY p.id, file_count DESC, total_weight DESC
+            WITH p, collect({cid: cid, cnt: file_count})[0] AS dominant
+            WITH p, dominant.cid AS dominant_cid
+            WHERE dominant_cid IS NOT NULL
+
+            // Collect community files + derive a name
+            MATCH (cf:File)<-[:CONTAINS]-(proj:Project {id: $project_id})
+            WHERE COALESCE(cf.fabric_community_id, cf.community_id) = dominant_cid
+            WITH p, dominant_cid, collect(cf) AS community_files, proj,
+                 COALESCE(
+                     head(collect(DISTINCT cf.fabric_community_label)),
+                     head(collect(DISTINCT cf.community_label)),
+                     'community-' + toString(dominant_cid)
+                 ) AS fg_name
+
+            // Idempotent: MERGE FeatureGraph by name + project_id
+            MERGE (fg:FeatureGraph {name: fg_name, project_id: $project_id})
+            ON CREATE SET fg.id = randomUUID(),
+                          fg.description = 'Auto-created from fabric community ' + toString(dominant_cid),
+                          fg.created_at = datetime(),
+                          fg.updated_at = datetime(),
+                          fg.source = 'auto_community',
+                          fg.entry_function = '',
+                          fg.build_depth = 0,
+                          fg.include_relations = ''
+
+            // Link community files to the FeatureGraph
+            WITH p, fg, community_files, proj
+            UNWIND community_files AS cf
+            MERGE (fg)-[:INCLUDES_ENTITY]->(cf)
+
+            // Link FeatureGraph to project
+            WITH DISTINCT p, fg, proj
+            MERGE (fg)-[:BELONGS_TO]->(proj)
+
+            // Scope persona to the new FeatureGraph
+            WITH p, fg
+            CREATE (p)-[:SCOPED_TO]->(fg)
+            RETURN count(DISTINCT p) AS auto_scoped
+            "#,
+        )
+        .param("project_id", project_id.to_string());
+
+        let mut autocreate_result = self
+            .graph
+            .execute(autocreate_q)
+            .await
+            .context("auto_scope_to_feature_graphs: phase 2 auto-create")?;
+
+        let scoped_auto: usize = if let Some(row) = autocreate_result.next().await? {
+            row.get::<i64>("auto_scoped").unwrap_or(0) as usize
+        } else {
+            0
+        };
+
+        if scoped_auto > 0 {
+            tracing::info!(
+                scoped_existing,
+                scoped_auto,
+                "auto_scope: created FeatureGraphs for {} personas without existing scope",
+                scoped_auto
+            );
+        }
+
+        Ok(scoped_existing + scoped_auto)
     }
 
     /// Maintain all personas for a project: decay weights, prune, recalculate cohesion.
@@ -1160,14 +1241,14 @@ impl Neo4jClient {
         let q = query(
             r#"
             MATCH (f:File)<-[:CONTAINS]-(p:Project {id: $project_id})
-            WHERE f.community_id IS NOT NULL
-            WITH f.community_id AS cid,
-                 f.community_label AS label,
+            WHERE COALESCE(f.fabric_community_id, f.community_id) IS NOT NULL
+            WITH COALESCE(f.fabric_community_id, f.community_id) AS cid,
+                 COALESCE(f.fabric_community_label, f.community_label) AS label,
                  collect(f.path) AS files,
                  count(f) AS file_count
             WHERE file_count >= 3
             OPTIONAL MATCH (persona:Persona {project_id: $project_id})-[:SCOPED_TO]->(fg:FeatureGraph)-[:INCLUDES_ENTITY]->(covered:File)
-            WHERE covered.community_id = cid
+            WHERE COALESCE(covered.fabric_community_id, covered.community_id) = cid
             WITH cid, label, files, file_count,
                  count(DISTINCT persona) AS existing_personas
             WHERE existing_personas = 0
@@ -1632,8 +1713,8 @@ impl Neo4jClient {
         let fc_q = query(
             r#"
             MATCH (f:File)<-[:CONTAINS]-(proj:Project {id: $project_id})
-            WHERE f.community_id IS NOT NULL
-            WITH f.community_id AS cid, count(f) AS file_count
+            WHERE COALESCE(f.fabric_community_id, f.community_id) IS NOT NULL
+            WITH COALESCE(f.fabric_community_id, f.community_id) AS cid, count(f) AS file_count
             WHERE file_count >= 3
             RETURN file_count
             "#,
