@@ -2425,6 +2425,13 @@ pub trait GraphStore: Send + Sync {
     /// Returns the number of personas that were scoped.
     async fn auto_scope_to_feature_graphs(&self, project_id: Uuid) -> Result<usize>;
 
+    /// Compute adaptive thresholds from actual KNOWS/USES weight distributions.
+    /// Falls back to hardcoded defaults when there are fewer than 10 data points.
+    async fn compute_adaptive_thresholds(
+        &self,
+        project_id: Uuid,
+    ) -> Result<crate::neo4j::persona::AdaptivePersonaThresholds>;
+
     /// Maintain all personas for a project: decay weights, prune, recalculate cohesion.
     /// Returns (decayed_count, pruned_count, personas_updated).
     async fn maintain_personas(&self, project_id: Uuid) -> Result<(usize, usize, usize)>;

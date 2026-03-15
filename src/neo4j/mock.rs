@@ -8799,6 +8799,43 @@ impl GraphStore for MockGraphStore {
         Ok(0)
     }
 
+    async fn compute_adaptive_thresholds(
+        &self,
+        _project_id: Uuid,
+    ) -> Result<crate::neo4j::persona::AdaptivePersonaThresholds> {
+        // Mock: compute from in-memory persona KNOWS weights
+        use crate::analytics::distribution::{adaptive_threshold, detect_outliers};
+
+        let personas = self.personas.read().await;
+        let persona_files = self.persona_files.read().await;
+
+        let mut weights: Vec<f64> = Vec::new();
+        for (pid, _) in personas.iter() {
+            if let Some(files) = persona_files.get(pid) {
+                for (_, w) in files {
+                    weights.push(*w);
+                }
+            }
+        }
+
+        if weights.len() < 10 {
+            return Ok(crate::neo4j::persona::AdaptivePersonaThresholds {
+                sample_size: weights.len(),
+                ..Default::default()
+            });
+        }
+
+        let prune_cutoff = adaptive_threshold(&weights, 0.05, 0.1);
+        let outliers = detect_outliers(&weights, 1.5);
+
+        Ok(crate::neo4j::persona::AdaptivePersonaThresholds {
+            prune_cutoff,
+            confidence_p90: 20.0, // Mock: no community data
+            weight_outlier_count: outliers.len(),
+            sample_size: weights.len(),
+        })
+    }
+
     async fn maintain_personas(&self, _project_id: Uuid) -> Result<(usize, usize, usize)> {
         Ok((0, 0, 0))
     }

@@ -2812,6 +2812,13 @@ impl GraphStore for Neo4jClient {
         self.auto_scope_to_feature_graphs(project_id).await
     }
 
+    async fn compute_adaptive_thresholds(
+        &self,
+        project_id: Uuid,
+    ) -> anyhow::Result<crate::neo4j::persona::AdaptivePersonaThresholds> {
+        self.compute_adaptive_thresholds(project_id).await
+    }
+
     async fn maintain_personas(&self, project_id: Uuid) -> anyhow::Result<(usize, usize, usize)> {
         self.maintain_personas(project_id).await
     }

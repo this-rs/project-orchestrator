@@ -5,6 +5,7 @@
 
 use super::client::Neo4jClient;
 use super::models::DecisionNode;
+use crate::analytics::distribution::adaptive_threshold;
 use crate::neurons::activation::{ActivatedNote, ActivationSource};
 use crate::notes::Note;
 use crate::skills::{
@@ -716,10 +717,11 @@ impl Neo4jClient {
     ///
     /// Steps:
     /// 1. Retrieve the skill
-    /// 2. Fetch member notes with energy > 0.05 (min activation threshold)
-    /// 3. Fetch member decisions
-    /// 4. Assemble context text from notes content
-    /// 5. Increment activation_count and update last_activated
+    /// 2. Compute adaptive energy threshold (p5 of member note energies, fallback 0.05)
+    /// 3. Fetch member notes with energy > adaptive threshold
+    /// 4. Fetch member decisions
+    /// 5. Assemble context text from notes content
+    /// 6. Increment activation_count and update last_activated
     pub async fn activate_skill(
         &self,
         skill_id: Uuid,
@@ -731,17 +733,48 @@ impl Neo4jClient {
             .await?
             .ok_or_else(|| anyhow::anyhow!("Skill not found: {}", skill_id))?;
 
-        // Get active member notes (energy > 0.05)
+        // Compute adaptive energy threshold from member note distribution
+        let energy_threshold = {
+            let energy_q = query(
+                r#"
+                MATCH (n:Note)-[:MEMBER_OF]->(s:Skill {id: $skill_id})
+                WHERE n.energy IS NOT NULL
+                RETURN n.energy AS energy
+                "#,
+            )
+            .param("skill_id", skill_id.to_string());
+
+            let mut energy_result = self.graph.execute(energy_q).await?;
+            let mut energies: Vec<f64> = Vec::new();
+            while let Some(row) = energy_result.next().await? {
+                if let Ok(e) = row.get::<f64>("energy") {
+                    energies.push(e);
+                }
+            }
+
+            // p5 of actual distribution, fallback to 0.05
+            let threshold = adaptive_threshold(&energies, 0.05, 0.05);
+            tracing::debug!(
+                skill_id = %skill_id,
+                sample_size = energies.len(),
+                energy_threshold = threshold,
+                "activate_skill: adaptive energy threshold"
+            );
+            threshold
+        };
+
+        // Get active member notes (energy > adaptive threshold)
         let notes_q = query(
             r#"
             MATCH (n:Note)-[:MEMBER_OF]->(s:Skill {id: $skill_id})
-            WHERE n.energy > 0.05
+            WHERE n.energy > $energy_threshold
             RETURN n
             ORDER BY n.energy DESC
             LIMIT 500
             "#,
         )
-        .param("skill_id", skill_id.to_string());
+        .param("skill_id", skill_id.to_string())
+        .param("energy_threshold", energy_threshold);
 
         let mut notes_result = self.graph.execute(notes_q).await?;
         let mut activated_notes = Vec::new();

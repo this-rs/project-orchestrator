@@ -4,11 +4,13 @@
 //! for the Living Personas system on the Neo4j graph.
 
 use super::client::Neo4jClient;
+use crate::analytics::distribution::{adaptive_threshold, detect_outliers};
 use crate::neo4j::models::{
     PersonaNode, PersonaStatus, PersonaSubgraph, PersonaSubgraphStats, PersonaWeightedRelation,
 };
 use anyhow::{Context, Result};
 use neo4rs::query;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 impl Neo4jClient {
@@ -1012,8 +1014,31 @@ impl Neo4jClient {
 
     /// Maintain all personas for a project: decay weights, prune, recalculate cohesion.
     ///
+    /// Uses adaptive thresholds from rs-stats when enough data is available,
+    /// falling back to hardcoded defaults for small projects.
+    ///
     /// Returns (decayed_count, pruned_count, personas_updated).
     pub async fn maintain_personas(&self, project_id: Uuid) -> Result<(usize, usize, usize)> {
+        // 0. Compute adaptive thresholds from actual weight distribution
+        let thresholds = self
+            .compute_adaptive_thresholds(project_id)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(
+                    "Failed to compute adaptive thresholds: {} — using defaults",
+                    e
+                );
+                AdaptivePersonaThresholds::default()
+            });
+
+        tracing::info!(
+            prune_cutoff = thresholds.prune_cutoff,
+            confidence_p90 = thresholds.confidence_p90,
+            sample_size = thresholds.sample_size,
+            outliers = thresholds.weight_outlier_count,
+            "maintain_personas: using adaptive thresholds"
+        );
+
         // 1. Decay all KNOWS/USES weights by *= 0.95
         let decay_q = query(
             r#"
@@ -1036,16 +1061,17 @@ impl Neo4jClient {
             0
         };
 
-        // 2. Prune relations with weight < 0.1
+        // 2. Prune relations with weight < adaptive prune_cutoff (default 0.1)
         let prune_q = query(
             r#"
             MATCH (p:Persona {project_id: $project_id})-[r:KNOWS|USES]->()
-            WHERE r.weight IS NOT NULL AND r.weight < 0.1
+            WHERE r.weight IS NOT NULL AND r.weight < $prune_cutoff
             DELETE r
             RETURN count(r) AS pruned
             "#,
         )
-        .param("project_id", project_id.to_string());
+        .param("project_id", project_id.to_string())
+        .param("prune_cutoff", thresholds.prune_cutoff);
 
         let mut prune_result = self
             .graph
@@ -1119,8 +1145,17 @@ impl Neo4jClient {
 
     /// Detect potential personas from Louvain communities.
     ///
+    /// Uses adaptive thresholds: confidence is normalized by the p90 of community
+    /// file counts (from `compute_adaptive_thresholds`) instead of a hardcoded /20.
+    ///
     /// Returns proposals: Vec<(community_label, file_count, suggested_name, confidence)>.
     pub async fn detect_personas(&self, project_id: Uuid) -> Result<Vec<PersonaProposal>> {
+        // Compute adaptive confidence normalization
+        let thresholds = self
+            .compute_adaptive_thresholds(project_id)
+            .await
+            .unwrap_or_default();
+
         // Find communities with enough files that don't already have a persona
         let q = query(
             r#"
@@ -1165,8 +1200,9 @@ impl Neo4jClient {
                 derive_name_from_paths(&files)
             };
 
-            // Confidence: based on file count (more files = higher confidence)
-            let confidence = ((file_count as f64) / 20.0).min(1.0);
+            // Confidence: normalized by p90 of actual file count distribution
+            // (adaptive, fallback to /20.0 when not enough data)
+            let confidence = ((file_count as f64) / thresholds.confidence_p90).min(1.0);
 
             proposals.push(PersonaProposal {
                 community_id,
@@ -1490,6 +1526,149 @@ fn derive_name_from_paths(paths: &[String]) -> String {
         name.to_string()
     } else {
         "mixed".to_string()
+    }
+}
+
+// ============================================================================
+// Adaptive thresholds (rs-stats integration)
+// ============================================================================
+
+/// Data-driven thresholds computed from actual KNOWS/USES weight distributions.
+///
+/// Replaces hardcoded values (0.1 prune, file_count/20 confidence, etc.) with
+/// percentile-derived thresholds that adapt to each project's unique characteristics.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdaptivePersonaThresholds {
+    /// Prune cutoff: KNOWS/USES relations with weight below this are removed.
+    /// Computed as p5 of all weights (fallback: 0.1).
+    pub prune_cutoff: f64,
+    /// p90 of community file counts — used to normalize detect_personas confidence.
+    /// Confidence = (file_count / confidence_p90).min(1.0) (fallback: 20.0).
+    pub confidence_p90: f64,
+    /// Indices of outlier weights (Tukey k=1.5) — logged for review.
+    pub weight_outlier_count: usize,
+    /// Number of KNOWS/USES weights used for computation.
+    pub sample_size: usize,
+}
+
+impl Default for AdaptivePersonaThresholds {
+    fn default() -> Self {
+        Self {
+            prune_cutoff: 0.1,
+            confidence_p90: 20.0,
+            weight_outlier_count: 0,
+            sample_size: 0,
+        }
+    }
+}
+
+impl Neo4jClient {
+    /// Compute adaptive thresholds from the actual KNOWS/USES weight distribution.
+    ///
+    /// Fetches all relation weights for a project, then uses `adaptive_threshold`
+    /// and `detect_outliers` from rs-stats to derive data-driven cutoffs.
+    ///
+    /// Falls back to hardcoded defaults when there are fewer than 10 data points
+    /// (not enough for a meaningful distribution).
+    pub async fn compute_adaptive_thresholds(
+        &self,
+        project_id: Uuid,
+    ) -> Result<AdaptivePersonaThresholds> {
+        // Collect all KNOWS/USES weights for this project
+        let q = query(
+            r#"
+            MATCH (p:Persona {project_id: $project_id})-[r:KNOWS|USES]->()
+            WHERE r.weight IS NOT NULL
+            RETURN r.weight AS w
+            "#,
+        )
+        .param("project_id", project_id.to_string());
+
+        let mut result = self
+            .graph
+            .execute(q)
+            .await
+            .context("compute_adaptive_thresholds: fetch weights")?;
+
+        let mut weights: Vec<f64> = Vec::new();
+        while let Some(row) = result.next().await? {
+            if let Ok(w) = row.get::<f64>("w") {
+                weights.push(w);
+            }
+        }
+
+        let sample_size = weights.len();
+
+        // Not enough data for meaningful statistics — use defaults
+        if sample_size < 10 {
+            tracing::debug!(
+                sample_size,
+                "Not enough KNOWS/USES weights for adaptive thresholds, using defaults"
+            );
+            return Ok(AdaptivePersonaThresholds {
+                sample_size,
+                ..Default::default()
+            });
+        }
+
+        // Prune cutoff = p5 of weights (bottom 5% are pruned)
+        let prune_cutoff = adaptive_threshold(&weights, 0.05, 0.1);
+
+        // Outlier detection (Tukey k=1.5)
+        let outliers = detect_outliers(&weights, 1.5);
+        let weight_outlier_count = outliers.len();
+
+        if weight_outlier_count > 0 {
+            tracing::info!(
+                weight_outlier_count,
+                prune_cutoff,
+                sample_size,
+                "Adaptive thresholds: detected {} outlier KNOWS/USES weights",
+                weight_outlier_count
+            );
+        }
+
+        // Confidence normalization: collect community file counts
+        let fc_q = query(
+            r#"
+            MATCH (f:File)<-[:CONTAINS]-(proj:Project {id: $project_id})
+            WHERE f.community_id IS NOT NULL
+            WITH f.community_id AS cid, count(f) AS file_count
+            WHERE file_count >= 3
+            RETURN file_count
+            "#,
+        )
+        .param("project_id", project_id.to_string());
+
+        let mut fc_result = self
+            .graph
+            .execute(fc_q)
+            .await
+            .context("compute_adaptive_thresholds: fetch file counts")?;
+
+        let mut file_counts: Vec<f64> = Vec::new();
+        while let Some(row) = fc_result.next().await? {
+            if let Ok(fc) = row.get::<i64>("file_count") {
+                file_counts.push(fc as f64);
+            }
+        }
+
+        let confidence_p90 = adaptive_threshold(&file_counts, 0.90, 20.0);
+
+        tracing::debug!(
+            prune_cutoff,
+            confidence_p90,
+            weight_outlier_count,
+            sample_size,
+            "Computed adaptive persona thresholds"
+        );
+
+        Ok(AdaptivePersonaThresholds {
+            prune_cutoff,
+            confidence_p90,
+            weight_outlier_count,
+            sample_size,
+        })
     }
 }
 
