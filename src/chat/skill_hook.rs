@@ -155,10 +155,12 @@ impl SkillActivationHook {
                 let mut entries: HashMap<String, Vec<(Uuid, String, f64, PersonaMatchSource)>> =
                     HashMap::new();
                 for (persona, path, weight) in &all_knows {
+                    // Weight persona activation by success_rate (floor 0.5 for new personas)
+                    let effective_weight = *weight * (0.5 + 0.5 * persona.success_rate.max(0.0).min(1.0));
                     entries.entry(path.clone()).or_default().push((
                         persona.id,
                         persona.name.clone(),
-                        *weight,
+                        effective_weight,
                         PersonaMatchSource::DirectKnows,
                     ));
                 }
@@ -292,6 +294,23 @@ impl SkillActivationHook {
             for rel in subgraph.files.iter().take(5) {
                 ctx.push_str(&format!("- `{}` (w:{:.2})\n", rel.entity_id, rel.weight));
             }
+        }
+
+        // Pre-warm: load related persona context via SYNAPSE links
+        match self.graph_store.find_synapse_linked_personas(persona_id).await {
+            Ok(linked) if !linked.is_empty() => {
+                ctx.push_str("\n**Related personas (via SYNAPSE links):**\n");
+                for (linked_id, linked_name, syn_weight) in linked.iter().take(2) {
+                    ctx.push_str(&format!("- {} (synapse: {:.2})\n", linked_name, syn_weight));
+                    // Load top 3 notes from linked persona
+                    if let Ok(linked_subgraph) = self.graph_store.get_persona_subgraph(*linked_id).await {
+                        for note_rel in linked_subgraph.notes.iter().take(3) {
+                            ctx.push_str(&format!("  - [note:{}] (w:{:.2})\n", note_rel.entity_id, note_rel.weight));
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
 
         // Truncate to ~2000 chars for additionalContext budget
@@ -1002,6 +1021,8 @@ mod tests {
             success_rate: 0.0,
             avg_duration_secs: 0.0,
             last_activated: None,
+            energy_boost_accumulated: 0.0,
+            energy_history: vec![],
             origin: crate::neo4j::models::PersonaOrigin::Manual,
             created_at: chrono::Utc::now(),
             updated_at: None,
@@ -1042,7 +1063,8 @@ mod tests {
         let (pid, pname, weight) = result.unwrap();
         assert_eq!(pid, persona.id);
         assert_eq!(pname, "neo4j-expert");
-        assert!((weight - 0.85).abs() < f64::EPSILON);
+        // effective_weight = 0.85 * (0.5 + 0.5 * 0.0) = 0.425 (success_rate=0.0)
+        assert!((weight - 0.425).abs() < f64::EPSILON);
     }
 
     #[tokio::test]
@@ -1163,10 +1185,11 @@ mod tests {
         let (pid, pname, weight) = result.unwrap();
         assert_eq!(pid, persona.id);
         assert_eq!(pname, "neo4j-guru");
-        // weight = avg(0.9, 0.8, 0.7) * 0.7 = 0.8 * 0.7 = 0.56
+        // effective weights with success_rate=0.0: 0.9*0.5=0.45, 0.8*0.5=0.40, 0.7*0.5=0.35
+        // dir prefix weight = avg(0.45, 0.40, 0.35) * 0.7 = 0.4 * 0.7 = 0.28
         assert!(
-            (weight - 0.56).abs() < 0.01,
-            "Expected ~0.56, got {}",
+            (weight - 0.28).abs() < 0.01,
+            "Expected ~0.28, got {}",
             weight
         );
     }

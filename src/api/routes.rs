@@ -978,6 +978,10 @@ fn protected_routes() -> Router<OrchestratorState> {
             post(persona_handlers::detect_personas),
         )
         .route(
+            "/api/personas/learning-health",
+            get(persona_handlers::get_learning_health),
+        )
+        .route(
             "/api/personas/{persona_id}",
             get(persona_handlers::get_persona)
                 .put(persona_handlers::update_persona)

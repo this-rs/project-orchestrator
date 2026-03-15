@@ -214,6 +214,8 @@ pub async fn create_persona(
         success_rate: 0.0,
         avg_duration_secs: 0.0,
         last_activated: None,
+        energy_boost_accumulated: 0.0,
+        energy_history: vec![],
         origin,
         created_at: Utc::now(),
         updated_at: None,
@@ -938,6 +940,8 @@ pub async fn import_persona(
         success_rate: 0.0,
         avg_duration_secs: 0.0,
         last_activated: None,
+        energy_boost_accumulated: 0.0,
+        energy_history: vec![],
         origin: PersonaOrigin::Imported,
         created_at: Utc::now(),
         updated_at: None,
@@ -1239,6 +1243,8 @@ pub async fn auto_build_persona(
         success_rate: 0.0,
         avg_duration_secs: 0.0,
         last_activated: None,
+        energy_boost_accumulated: 0.0,
+        energy_history: vec![],
         origin: PersonaOrigin::AutoBuild,
         created_at: Utc::now(),
         updated_at: None,
@@ -1357,6 +1363,32 @@ pub async fn detect_personas(
         "count": proposals.len(),
         "project_id": query.project_id,
     })))
+}
+
+// ============================================================================
+// Learning Health
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct LearningHealthQuery {
+    pub project_id: Uuid,
+}
+
+/// Get learning health metrics for a project's persona system.
+///
+/// GET /api/personas/learning-health?project_id=...
+pub async fn get_learning_health(
+    State(state): State<OrchestratorState>,
+    Query(query): Query<LearningHealthQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let report = state
+        .orchestrator
+        .neo4j()
+        .get_learning_health(query.project_id)
+        .await
+        .map_err(AppError::Internal)?;
+
+    Ok(Json(serde_json::json!(report)))
 }
 
 // ============================================================================
@@ -1839,6 +1871,8 @@ mod tests {
             success_rate: 0.0,
             avg_duration_secs: 0.0,
             last_activated: None,
+            energy_boost_accumulated: 0.0,
+            energy_history: vec![],
             origin: PersonaOrigin::Manual,
             created_at: Utc::now(),
             updated_at: None,
@@ -2909,6 +2943,8 @@ mod tests {
             success_rate: 0.9,
             avg_duration_secs: 30.0,
             last_activated: None,
+            energy_boost_accumulated: 0.0,
+            energy_history: vec![],
             origin: PersonaOrigin::Manual,
             created_at: Utc::now(),
             updated_at: None,

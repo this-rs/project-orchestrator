@@ -2496,6 +2496,48 @@ pub trait GraphStore: Send + Sync {
     ) -> Result<()>;
 
     // ========================================================================
+    // Persona learning methods (CO_CHANGED, merge, SYNAPSE, energy)
+    // ========================================================================
+
+    /// Propagate KNOWS to co-changed files (attenuated weight).
+    async fn propagate_knows_via_co_change(
+        &self,
+        persona_id: Uuid,
+        file_path: &str,
+        base_weight: f64,
+    ) -> Result<usize>;
+
+    /// Compute affinity between two personas for merge detection.
+    async fn compute_persona_affinity(
+        &self,
+        persona_a: Uuid,
+        persona_b: Uuid,
+    ) -> Result<crate::neo4j::persona::PersonaAffinityScore>;
+
+    /// Merge persona B into persona A: transfer all KNOWS/USES, then delete B.
+    async fn merge_personas(&self, keep_id: Uuid, merge_id: Uuid) -> Result<()>;
+
+    /// Find personas linked via strong SYNAPSE connections between their USES notes.
+    async fn find_synapse_linked_personas(
+        &self,
+        persona_id: Uuid,
+    ) -> Result<Vec<(Uuid, String, f64)>>;
+
+    /// Apply rate-limited energy boost to a persona. Returns true if applied.
+    async fn rate_limited_energy_boost(
+        &self,
+        persona_id: Uuid,
+        boost: f64,
+        max_per_cycle: f64,
+    ) -> Result<bool>;
+
+    /// Get learning health metrics for a project's persona system.
+    async fn get_learning_health(
+        &self,
+        project_id: Uuid,
+    ) -> Result<crate::neo4j::analytics::LearningHealthReport>;
+
+    // ========================================================================
     // Analysis Profile operations
     // ========================================================================
 

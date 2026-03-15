@@ -2897,6 +2897,56 @@ impl GraphStore for Neo4jClient {
     }
 
     // ========================================================================
+    // Persona learning methods
+    // ========================================================================
+
+    async fn propagate_knows_via_co_change(
+        &self,
+        persona_id: Uuid,
+        file_path: &str,
+        base_weight: f64,
+    ) -> anyhow::Result<usize> {
+        self.propagate_knows_via_co_change(persona_id, file_path, base_weight)
+            .await
+    }
+
+    async fn compute_persona_affinity(
+        &self,
+        persona_a: Uuid,
+        persona_b: Uuid,
+    ) -> anyhow::Result<crate::neo4j::persona::PersonaAffinityScore> {
+        self.compute_persona_affinity(persona_a, persona_b).await
+    }
+
+    async fn merge_personas(&self, keep_id: Uuid, merge_id: Uuid) -> anyhow::Result<()> {
+        self.merge_personas(keep_id, merge_id).await
+    }
+
+    async fn find_synapse_linked_personas(
+        &self,
+        persona_id: Uuid,
+    ) -> anyhow::Result<Vec<(Uuid, String, f64)>> {
+        self.find_synapse_linked_personas(persona_id).await
+    }
+
+    async fn rate_limited_energy_boost(
+        &self,
+        persona_id: Uuid,
+        boost: f64,
+        max_per_cycle: f64,
+    ) -> anyhow::Result<bool> {
+        self.rate_limited_energy_boost(persona_id, boost, max_per_cycle)
+            .await
+    }
+
+    async fn get_learning_health(
+        &self,
+        project_id: Uuid,
+    ) -> anyhow::Result<crate::neo4j::analytics::LearningHealthReport> {
+        self.get_learning_health(project_id).await
+    }
+
+    // ========================================================================
     // Analysis Profile operations (delegates to neo4j/profile.rs)
     // ========================================================================
 

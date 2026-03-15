@@ -1936,6 +1936,14 @@ pub struct PersonaNode {
     /// Last time this persona was activated
     pub last_activated: Option<DateTime<Utc>>,
 
+    // --- Rate-limiting & history ---
+    /// Accumulated energy boost this maintenance cycle (reset each cycle)
+    #[serde(default)]
+    pub energy_boost_accumulated: f64,
+    /// Last 5 energy values for stagnation detection
+    #[serde(default)]
+    pub energy_history: Vec<f64>,
+
     // --- Bootstrap tracking ---
     /// How this persona was created
     #[serde(default)]
@@ -2456,6 +2464,8 @@ mod tests {
             success_rate: 0.95,
             avg_duration_secs: 120.5,
             last_activated: Some(Utc::now()),
+            energy_boost_accumulated: 0.0,
+            energy_history: vec![],
             origin: PersonaOrigin::Manual,
             created_at: Utc::now(),
             updated_at: Some(Utc::now()),
@@ -2512,6 +2522,8 @@ mod tests {
             success_rate: 0.0,
             avg_duration_secs: 0.0,
             last_activated: None,
+            energy_boost_accumulated: 0.0,
+            energy_history: vec![],
             origin: PersonaOrigin::Manual,
             created_at: Utc::now(),
             updated_at: None,

@@ -56,6 +56,12 @@ impl Neo4jClient {
                 .get::<String>("last_activated")
                 .ok()
                 .and_then(|s| s.parse().ok()),
+            energy_boost_accumulated: node.get("energy_boost_accumulated").unwrap_or(0.0),
+            energy_history: node
+                .get::<String>("energy_history")
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default(),
             origin: node
                 .get::<String>("origin")
                 .ok()
@@ -93,6 +99,8 @@ impl Neo4jClient {
                 success_rate: $success_rate,
                 avg_duration_secs: $avg_duration_secs,
                 origin: $origin,
+                energy_boost_accumulated: $energy_boost_accumulated,
+                energy_history: $energy_history,
                 created_at: $created_at
             })
             WITH p
@@ -151,6 +159,8 @@ impl Neo4jClient {
         .param("success_rate", persona.success_rate)
         .param("avg_duration_secs", persona.avg_duration_secs)
         .param("origin", persona.origin.to_string())
+        .param("energy_boost_accumulated", persona.energy_boost_accumulated)
+        .param("energy_history", serde_json::to_string(&persona.energy_history).unwrap_or_else(|_| "[]".to_string()))
         .param("created_at", persona.created_at.to_rfc3339())
         .param(
             "project_id",
@@ -1120,16 +1130,40 @@ impl Neo4jClient {
             "maintain_personas: using adaptive thresholds"
         );
 
-        // 1. Decay all KNOWS/USES weights by *= 0.95
+        // 0b. Check global stagnation — if stagnating, use accelerated decay
+        let stagnation = self.detect_global_stagnation(project_id).await.unwrap_or_else(|e| {
+            tracing::warn!("Failed to check stagnation: {} — using normal decay", e);
+            crate::neo4j::models::StagnationReport {
+                is_stagnating: false,
+                tasks_completed_48h: 0,
+                avg_frustration: 0.0,
+                energy_trend: 0.0,
+                commits_48h: 0,
+                signals_triggered: 0,
+                recommendations: vec![],
+            }
+        });
+
+        let decay_factor = if stagnation.is_stagnating { 0.85 } else { 0.95 };
+
+        tracing::info!(
+            stagnating = stagnation.is_stagnating,
+            decay_factor,
+            signals = stagnation.signals_triggered,
+            "maintain_personas: stagnation check"
+        );
+
+        // 1. Decay all KNOWS/USES weights by *= decay_factor
         let decay_q = query(
             r#"
             MATCH (p:Persona {project_id: $project_id})-[r:KNOWS|USES]->()
             WHERE r.weight IS NOT NULL
-            SET r.weight = r.weight * 0.95
+            SET r.weight = r.weight * $decay_factor
             RETURN count(r) AS decayed
             "#,
         )
-        .param("project_id", project_id.to_string());
+        .param("project_id", project_id.to_string())
+        .param("decay_factor", decay_factor);
 
         let mut decay_result = self
             .graph
@@ -1165,6 +1199,49 @@ impl Neo4jClient {
             0
         };
 
+        // 1b. If stagnating, boost personas linked to recently committed files
+        if stagnation.is_stagnating {
+            let boost_q = query(r#"
+                MATCH (c:Commit)-[:TOUCHES]->(f:File)<-[:KNOWS]-(p:Persona {project_id: $project_id})
+                WHERE c.created_at IS NOT NULL
+                  AND datetime(c.created_at) > datetime() - duration('P7D')
+                WITH DISTINCT p
+                SET p.energy = CASE WHEN p.energy + 0.1 > 1.0 THEN 1.0 ELSE p.energy + 0.1 END
+                RETURN count(p) AS boosted
+            "#)
+            .param("project_id", project_id.to_string());
+
+            let _ = self.graph.run(boost_q).await;
+        }
+
+        // 2b. Prune KNOWS outliers (low-weight anomalies inactive for >14 days)
+        if thresholds.sample_size >= 10 {
+            let outlier_prune_q = query(r#"
+                MATCH (p:Persona {project_id: $project_id})-[r:KNOWS]->(f:File)
+                WHERE r.weight IS NOT NULL AND r.weight < $lower_fence
+                  AND (r.last_activated IS NULL
+                       OR r.last_activated < $cutoff_date)
+                DELETE r
+                RETURN count(r) AS outlier_pruned
+            "#)
+            .param("project_id", project_id.to_string())
+            .param("lower_fence", thresholds.lower_fence)
+            .param("cutoff_date", (chrono::Utc::now() - chrono::Duration::days(14)).to_rfc3339());
+
+            let outlier_pruned: usize = match self.graph.execute(outlier_prune_q).await {
+                Ok(mut result) => {
+                    if let Ok(Some(row)) = result.next().await {
+                        row.get::<i64>("outlier_pruned").unwrap_or(0) as usize
+                    } else { 0 }
+                }
+                Err(_) => 0,
+            };
+
+            if outlier_pruned > 0 {
+                tracing::info!(outlier_pruned, "maintain_personas: pruned outlier KNOWS (inactive >14d)");
+            }
+        }
+
         // 3. Recalculate cohesion for each persona from SYNAPSE density between USES notes
         let cohesion_q = query(
             r#"
@@ -1197,6 +1274,98 @@ impl Neo4jClient {
             0
         };
 
+        // 3b. Detect merge candidates via affinity score
+        let merge_q = query(r#"
+            MATCH (a:Persona {project_id: $project_id}), (b:Persona {project_id: $project_id})
+            WHERE a.status <> 'archived' AND b.status <> 'archived'
+              AND a.id < b.id
+            RETURN a.id AS aid, b.id AS bid
+        "#)
+        .param("project_id", project_id.to_string());
+
+        if let Ok(mut merge_result) = self.graph.execute(merge_q).await {
+            let mut merge_pairs = Vec::new();
+            while let Ok(Some(row)) = merge_result.next().await {
+                if let (Ok(aid), Ok(bid)) = (row.get::<String>("aid"), row.get::<String>("bid")) {
+                    if let (Ok(a_id), Ok(b_id)) = (aid.parse::<Uuid>(), bid.parse::<Uuid>()) {
+                        merge_pairs.push((a_id, b_id));
+                    }
+                }
+            }
+
+            for (a_id, b_id) in merge_pairs {
+                match self.compute_persona_affinity(a_id, b_id).await {
+                    Ok(score) if score.combined >= 0.8 => {
+                        tracing::info!(
+                            persona_a = %a_id, persona_b = %b_id,
+                            jaccard = score.jaccard_files, synapse = score.synapse_density,
+                            combined = score.combined,
+                            "Auto-merging personas (affinity >= 0.8)"
+                        );
+                        let _ = self.merge_personas(a_id, b_id).await;
+                    }
+                    Ok(score) if score.combined >= 0.65 => {
+                        tracing::info!(
+                            persona_a = %a_id, persona_b = %b_id,
+                            combined = score.combined,
+                            "Merge candidate detected (0.65-0.8) — not auto-merging"
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // 3c. Track energy_history and auto-dormant stagnant personas
+        let history_q = query(r#"
+            MATCH (p:Persona {project_id: $project_id})
+            WHERE p.status IN ['active', 'emerging']
+            RETURN p.id AS pid, p.energy AS energy,
+                   COALESCE(p.energy_history, '[]') AS hist
+        "#).param("project_id", project_id.to_string());
+
+        if let Ok(mut hist_result) = self.graph.execute(history_q).await {
+            while let Ok(Some(row)) = hist_result.next().await {
+                let pid: String = match row.get("pid") {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let energy: f64 = row.get("energy").unwrap_or(0.5);
+                let hist_str: String = row.get::<String>("hist").unwrap_or_else(|_| "[]".to_string());
+                let mut history: Vec<f64> = serde_json::from_str(&hist_str).unwrap_or_default();
+
+                history.push(energy);
+                if history.len() > 5 {
+                    history = history[history.len()-5..].to_vec();
+                }
+
+                let hist_json = serde_json::to_string(&history).unwrap_or_else(|_| "[]".to_string());
+
+                // Detect persistent low energy: all 5 values below 0.15
+                let all_low = history.len() >= 5 && history.iter().all(|e| *e < 0.15);
+
+                if all_low {
+                    let dormant_q = query(r#"
+                        MATCH (p:Persona {id: $pid})
+                        SET p.status = 'dormant', p.energy_history = $hist, p.updated_at = $now
+                    "#)
+                    .param("pid", pid.clone())
+                    .param("hist", hist_json)
+                    .param("now", chrono::Utc::now().to_rfc3339());
+                    let _ = self.graph.run(dormant_q).await;
+                    tracing::info!(persona_id = %pid, "Auto-dormant: energy below threshold for 5 cycles");
+                } else {
+                    let update_q = query(r#"
+                        MATCH (p:Persona {id: $pid})
+                        SET p.energy_history = $hist
+                    "#)
+                    .param("pid", pid.clone())
+                    .param("hist", hist_json);
+                    let _ = self.graph.run(update_q).await;
+                }
+            }
+        }
+
         // 4. Update success_rate from AgentExecution history (last 30 days)
         let _success_q = query(
             r#"
@@ -1220,6 +1389,14 @@ impl Neo4jClient {
         // 5. Auto-scope personas to their best-matching FeatureGraph
         // Best-effort — if no FeatureGraphs exist yet, this is a no-op
         let _ = self.auto_scope_to_feature_graphs(project_id).await;
+
+        // 6. Reset energy_boost_accumulated for all personas (end of cycle)
+        let reset_q = query(r#"
+            MATCH (p:Persona {project_id: $project_id})
+            SET p.energy_boost_accumulated = 0.0
+        "#)
+        .param("project_id", project_id.to_string());
+        let _ = self.graph.run(reset_q).await;
 
         Ok((decayed_count, pruned_count, personas_updated))
     }
@@ -1488,7 +1665,210 @@ impl Neo4jClient {
 
         self.graph.run(q).await.context("auto_grow_file_knows")?;
 
+        // Propagate to CO_CHANGED neighbors (best-effort)
+        let _ = self.propagate_knows_via_co_change(persona_id, file_path, weight).await;
+
         Ok(())
+    }
+
+    // ========================================================================
+    // CO_CHANGED propagation
+    // ========================================================================
+
+    /// Propagate KNOWS to files co-changed with the target file.
+    /// Creates attenuated KNOWS (weight * 0.4) for the top 5 co-changed neighbors.
+    pub async fn propagate_knows_via_co_change(
+        &self,
+        persona_id: Uuid,
+        file_path: &str,
+        base_weight: f64,
+    ) -> Result<usize> {
+        const CO_CHANGE_ATTENUATION: f64 = 0.4;
+        const CO_CHANGE_MIN_COUNT: i64 = 3;
+        const CO_CHANGE_MAX_FILES: i64 = 5;
+
+        let attenuated_weight = base_weight * CO_CHANGE_ATTENUATION;
+        let q = query(r#"
+            MATCH (f:File {path: $file_path})-[cc:CO_CHANGED]-(neighbor:File)
+            WHERE cc.count >= $min_count
+            WITH neighbor, cc.count AS co_count
+            ORDER BY co_count DESC
+            LIMIT $max_files
+            MATCH (p:Persona {id: $persona_id})
+            MERGE (p)-[k:KNOWS]->(neighbor)
+            ON CREATE SET k.weight = $weight, k.source = "co-change"
+            ON MATCH SET k.weight = CASE WHEN k.weight < $weight THEN $weight ELSE k.weight END
+            RETURN count(neighbor) AS propagated
+        "#)
+        .param("persona_id", persona_id.to_string())
+        .param("file_path", file_path)
+        .param("weight", attenuated_weight)
+        .param("min_count", CO_CHANGE_MIN_COUNT)
+        .param("max_files", CO_CHANGE_MAX_FILES);
+
+        let mut result = self.graph.execute(q).await.context("propagate_knows_via_co_change")?;
+        let count = if let Some(row) = result.next().await? {
+            row.get::<i64>("propagated").unwrap_or(0) as usize
+        } else {
+            0
+        };
+
+        if count > 0 {
+            tracing::debug!(persona_id = %persona_id, file_path, count, "Propagated KNOWS via CO_CHANGED");
+        }
+        Ok(count)
+    }
+
+    // ========================================================================
+    // Persona Affinity & Merge
+    // ========================================================================
+
+    /// Compute affinity between two personas for merge detection.
+    /// Score = 0.6 * jaccard_files + 0.4 * synapse_density
+    pub async fn compute_persona_affinity(
+        &self,
+        persona_a: Uuid,
+        persona_b: Uuid,
+    ) -> Result<PersonaAffinityScore> {
+        let q = query(r#"
+            // Jaccard on KNOWS files
+            MATCH (a:Persona {id: $pa})-[:KNOWS]->(fa:File)
+            WITH a, collect(DISTINCT fa) AS files_a
+            MATCH (b:Persona {id: $pb})-[:KNOWS]->(fb:File)
+            WITH a, b, files_a, collect(DISTINCT fb) AS files_b
+            WITH a, b, files_a, files_b,
+                 size([f IN files_a WHERE f IN files_b]) AS intersection,
+                 size(files_a) + size(files_b) - size([f IN files_a WHERE f IN files_b]) AS union_size
+            WITH a, b,
+                 CASE WHEN union_size > 0 THEN toFloat(intersection) / union_size ELSE 0.0 END AS jaccard
+
+            // SYNAPSE density between USES notes
+            OPTIONAL MATCH (a)-[:USES]->(na:Note)
+            WITH a, b, jaccard, collect(DISTINCT na) AS notes_a
+            OPTIONAL MATCH (b)-[:USES]->(nb:Note)
+            WITH a, b, jaccard, notes_a, collect(DISTINCT nb) AS notes_b
+            WITH a, b, jaccard, notes_a, notes_b,
+                 [na IN notes_a | na.id] AS note_ids_a,
+                 [nb IN notes_b | nb.id] AS note_ids_b
+            OPTIONAL MATCH (s1:Note)-[syn:SYNAPSE]->(s2:Note)
+            WHERE s1.id IN note_ids_a AND s2.id IN note_ids_b
+            WITH jaccard,
+                 CASE WHEN size(note_ids_a) > 0 AND size(note_ids_b) > 0
+                      THEN toFloat(count(syn)) / toFloat(size(note_ids_a) * size(note_ids_b))
+                      ELSE 0.0
+                 END AS synapse_density
+            RETURN jaccard, synapse_density
+        "#)
+        .param("pa", persona_a.to_string())
+        .param("pb", persona_b.to_string());
+
+        let mut result = self.graph.execute(q).await.context("compute_persona_affinity")?;
+        let (jaccard, synapse_density) = if let Some(row) = result.next().await? {
+            (
+                row.get::<f64>("jaccard").unwrap_or(0.0),
+                row.get::<f64>("synapse_density").unwrap_or(0.0),
+            )
+        } else {
+            (0.0, 0.0)
+        };
+
+        let combined = 0.6 * jaccard + 0.4 * synapse_density;
+
+        Ok(PersonaAffinityScore {
+            persona_a_id: persona_a,
+            persona_b_id: persona_b,
+            jaccard_files: jaccard,
+            synapse_density,
+            combined,
+        })
+    }
+
+    /// Merge persona B into persona A: transfer all KNOWS/USES, then delete B.
+    pub async fn merge_personas(&self, keep_id: Uuid, merge_id: Uuid) -> Result<()> {
+        let q = query(r#"
+            // Transfer KNOWS from merge -> keep (MERGE to avoid duplicates)
+            MATCH (merge:Persona {id: $merge_id})-[k:KNOWS]->(f)
+            MATCH (keep:Persona {id: $keep_id})
+            MERGE (keep)-[nk:KNOWS]->(f)
+            ON CREATE SET nk.weight = k.weight, nk.source = "merged"
+            ON MATCH SET nk.weight = CASE WHEN nk.weight < k.weight THEN k.weight ELSE nk.weight END
+            WITH merge, keep
+
+            // Transfer USES from merge -> keep
+            OPTIONAL MATCH (merge)-[u:USES]->(n)
+            MERGE (keep)-[nu:USES]->(n)
+            ON CREATE SET nu.weight = u.weight
+            ON MATCH SET nu.weight = CASE WHEN nu.weight < u.weight THEN u.weight ELSE nu.weight END
+            WITH DISTINCT merge
+
+            // Delete merged persona
+            DETACH DELETE merge
+        "#)
+        .param("keep_id", keep_id.to_string())
+        .param("merge_id", merge_id.to_string());
+
+        self.graph.run(q).await.context("merge_personas")?;
+        tracing::info!(keep = %keep_id, merged = %merge_id, "Merged personas");
+        Ok(())
+    }
+
+    // ========================================================================
+    // SYNAPSE-linked personas (pre-warming)
+    // ========================================================================
+
+    /// Find personas linked via strong SYNAPSE connections between their USES notes.
+    pub async fn find_synapse_linked_personas(
+        &self,
+        persona_id: Uuid,
+    ) -> Result<Vec<(Uuid, String, f64)>> {
+        let q = query(r#"
+            MATCH (a:Persona {id: $pid})-[:USES]->(na:Note)-[syn:SYNAPSE]-(nb:Note)<-[:USES]-(b:Persona)
+            WHERE b.id <> $pid AND b.status <> 'archived'
+            WITH b, avg(syn.weight) AS avg_weight, count(syn) AS syn_count
+            WHERE avg_weight >= 0.3 AND syn_count >= 2
+            RETURN b.id AS pid, b.name AS name, avg_weight
+            ORDER BY avg_weight DESC
+            LIMIT 3
+        "#)
+        .param("pid", persona_id.to_string());
+
+        let mut result = self.graph.execute(q).await.context("find_synapse_linked_personas")?;
+        let mut linked = Vec::new();
+        while let Some(row) = result.next().await? {
+            let id: Uuid = row.get::<String>("pid")?.parse()?;
+            let name: String = row.get("name")?;
+            let weight: f64 = row.get("avg_weight").unwrap_or(0.0);
+            linked.push((id, name, weight));
+        }
+        Ok(linked)
+    }
+
+    // ========================================================================
+    // Rate-limited energy boost
+    // ========================================================================
+
+    /// Check if a persona can receive more energy boost this cycle.
+    /// Returns true if boost was applied, false if rate-limited.
+    pub async fn rate_limited_energy_boost(
+        &self,
+        persona_id: Uuid,
+        boost: f64,
+        max_per_cycle: f64,
+    ) -> Result<bool> {
+        let q = query(r#"
+            MATCH (p:Persona {id: $pid})
+            WHERE COALESCE(p.energy_boost_accumulated, 0.0) + $boost <= $max
+            SET p.energy_boost_accumulated = COALESCE(p.energy_boost_accumulated, 0.0) + $boost,
+                p.energy = CASE WHEN p.energy + $boost > 1.0 THEN 1.0 ELSE p.energy + $boost END,
+                p.updated_at = datetime()
+            RETURN p.id AS updated
+        "#)
+        .param("pid", persona_id.to_string())
+        .param("boost", boost)
+        .param("max", max_per_cycle);
+
+        let mut result = self.graph.execute(q).await.context("rate_limited_energy_boost")?;
+        Ok(result.next().await?.is_some())
     }
 
     /// Auto-link a note to the active persona for a task (growth hook).
@@ -1570,6 +1950,16 @@ impl Neo4jClient {
     }
 }
 
+/// Affinity score between two personas for merge detection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersonaAffinityScore {
+    pub persona_a_id: Uuid,
+    pub persona_b_id: Uuid,
+    pub jaccard_files: f64,
+    pub synapse_density: f64,
+    pub combined: f64,
+}
+
 /// Persona detection proposal — a candidate persona from community analysis.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PersonaProposal {
@@ -1630,6 +2020,8 @@ pub struct AdaptivePersonaThresholds {
     pub weight_outlier_count: usize,
     /// Number of KNOWS/USES weights used for computation.
     pub sample_size: usize,
+    /// Lower fence (Q1 - 1.5*IQR) for outlier pruning.
+    pub lower_fence: f64,
 }
 
 impl Default for AdaptivePersonaThresholds {
@@ -1639,6 +2031,7 @@ impl Default for AdaptivePersonaThresholds {
             confidence_p90: 20.0,
             weight_outlier_count: 0,
             sample_size: 0,
+            lower_fence: 0.0,
         }
     }
 }
@@ -1695,6 +2088,14 @@ impl Neo4jClient {
         // Prune cutoff = p5 of weights (bottom 5% are pruned)
         let prune_cutoff = adaptive_threshold(&weights, 0.05, 0.1);
 
+        // Compute lower fence for outlier pruning (Q1 - 1.5*IQR)
+        let mut sorted = weights.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let q1 = adaptive_threshold(&sorted, 0.25, 0.0);
+        let q3 = adaptive_threshold(&sorted, 0.75, 1.0);
+        let iqr = q3 - q1;
+        let lower_fence = (q1 - 1.5 * iqr).max(0.0);
+
         // Outlier detection (Tukey k=1.5)
         let outliers = detect_outliers(&weights, 1.5);
         let weight_outlier_count = outliers.len();
@@ -1749,6 +2150,7 @@ impl Neo4jClient {
             confidence_p90,
             weight_outlier_count,
             sample_size,
+            lower_fence,
         })
     }
 }
@@ -1783,6 +2185,8 @@ mod tests {
             success_rate: 0.0,
             avg_duration_secs: 0.0,
             last_activated: None,
+            energy_boost_accumulated: 0.0,
+            energy_history: vec![],
             origin: PersonaOrigin::Manual,
             created_at: Utc::now(),
             updated_at: None,
