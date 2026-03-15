@@ -1487,9 +1487,15 @@ impl ChatManager {
             self.config.meilisearch_key.clone(),
         );
 
-        // Inject session token + server URL for MCP HTTP wrapper mode.
-        // Only when auth is enabled (jwt_secret present) AND user claims are available.
-        // PO_SERVER_URL is ALWAYS 127.0.0.1:{port} — the MCP server is a local subprocess.
+        // PO_SERVER_URL is always injected — mcp_server runs as an HTTP proxy
+        // regardless of whether auth is enabled.
+        env.insert(
+            "PO_SERVER_URL".into(),
+            format!("http://127.0.0.1:{}", self.config.server_port),
+        );
+
+        // Inject session token only when auth is enabled (jwt_secret present)
+        // AND user claims are available.
         if let (Some(ref secret), Some(claims)) = (&self.config.jwt_secret, user_claims) {
             match crate::auth::jwt::generate_session_token(
                 claims,
@@ -1498,15 +1504,11 @@ impl ChatManager {
             ) {
                 Ok(token) => {
                     env.insert("PO_AUTH_TOKEN".into(), token);
-                    env.insert(
-                        "PO_SERVER_URL".into(),
-                        format!("http://127.0.0.1:{}", self.config.server_port),
-                    );
                     tracing::debug!(
                         user = %claims.email,
                         expiry_secs = self.config.session_token_expiry_secs,
                         server_port = self.config.server_port,
-                        "Injected PO_AUTH_TOKEN + PO_SERVER_URL into MCP env"
+                        "Injected PO_AUTH_TOKEN into MCP env"
                     );
                 }
                 Err(e) => {
