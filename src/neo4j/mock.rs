@@ -8812,7 +8812,7 @@ impl GraphStore for MockGraphStore {
         let mut weights: Vec<f64> = Vec::new();
         for (pid, _) in personas.iter() {
             if let Some(files) = persona_files.get(pid) {
-                for (_, w) in files {
+                for w in files.values() {
                     weights.push(*w);
                 }
             }
