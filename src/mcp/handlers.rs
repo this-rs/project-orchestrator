@@ -448,6 +448,7 @@ impl ToolHandler {
             ("code", "get_fingerprint") => "get_fingerprint",
             ("code", "find_isomorphic") => "find_isomorphic",
             ("code", "suggest_structural_templates") => "suggest_structural_templates",
+            ("code", "get_learning_health") => "get_learning_health",
 
             // Skill
             ("skill", "list") => "list_skills",
@@ -4037,6 +4038,15 @@ impl ToolHandler {
                 }
                 let result = http
                     .get_with_query("/api/code/structural-templates", &query)
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "get_learning_health" => {
+                let project_slug = extract_string(args, "project_slug")?;
+                let query = vec![("project_slug".to_string(), project_slug)];
+                let result = http
+                    .get_with_query("/api/personas/learning-health", &query)
                     .await?;
                 Ok(Some(result))
             }
