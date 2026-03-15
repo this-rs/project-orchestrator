@@ -380,9 +380,73 @@ pub async fn run_full_maintenance(
     config: &SkillMaintenanceConfig,
 ) -> anyhow::Result<MaintenanceResult> {
     info!(project_id = %project_id, "Starting full skill maintenance");
+
+    // Pre-pass: clean up any absolute paths in existing triggers
+    match cleanup_absolute_triggers(graph_store, project_id).await {
+        Ok(count) if count > 0 => {
+            info!(project_id = %project_id, count, "Cleaned up absolute triggers");
+        }
+        Err(e) => {
+            warn!(project_id = %project_id, "cleanup_absolute_triggers failed: {}", e);
+        }
+        _ => {}
+    }
+
     let mut result = run_weekly_maintenance(graph_store, project_id, config).await?;
     result.level = "full".to_string();
     Ok(result)
+}
+
+// ============================================================================
+// Absolute Trigger Cleanup
+// ============================================================================
+
+/// Scan all skills for a project and relativize any FileGlob trigger patterns
+/// that still contain absolute paths. Returns the number of triggers corrected.
+///
+/// This is a migration/cleanup function for existing data that was created
+/// before path agnosticism was implemented.
+pub async fn cleanup_absolute_triggers(
+    graph_store: &dyn GraphStore,
+    project_id: Uuid,
+) -> anyhow::Result<usize> {
+    use crate::skills::models::TriggerType;
+    use crate::utils::paths::sanitize_pattern;
+
+    // Load project root_path
+    let root_path = match graph_store.get_project(project_id).await? {
+        Some(p) => p.root_path,
+        None => return Ok(0),
+    };
+
+    if root_path.is_empty() {
+        return Ok(0);
+    }
+
+    let skills = graph_store.get_skills_for_project(project_id).await?;
+    let mut total_fixed = 0;
+
+    for mut skill in skills {
+        let mut changed = false;
+        for trigger in &mut skill.trigger_patterns {
+            if trigger.pattern_type == TriggerType::FileGlob
+                && trigger.pattern_value.starts_with('/')
+            {
+                let sanitized = sanitize_pattern(&trigger.pattern_value, &root_path);
+                if sanitized != trigger.pattern_value {
+                    trigger.pattern_value = sanitized;
+                    changed = true;
+                    total_fixed += 1;
+                }
+            }
+        }
+        if changed {
+            skill.updated_at = chrono::Utc::now();
+            graph_store.update_skill(&skill).await?;
+        }
+    }
+
+    Ok(total_fixed)
 }
 
 // ============================================================================

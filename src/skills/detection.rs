@@ -619,6 +619,14 @@ pub async fn detect_skills_pipeline(
 ) -> anyhow::Result<DetectSkillsPipelineResult> {
     let project_id_str = project_id.to_string();
 
+    // Load project root_path for path relativization in trigger generation
+    let root_path = graph_store
+        .get_project(project_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|p| p.root_path);
+
     // Step 0: Auto-anchor notes to files mentioned in their content.
     // This ensures all notes have fresh LINKED_TO relations before clustering,
     // so that generated FileGlob triggers reference correct files.
@@ -759,6 +767,7 @@ pub async fn detect_skills_pipeline(
                 &member_notes,
                 &all_project_notes,
                 &embeddings,
+                root_path.as_deref(),
             );
             skill.trigger_patterns = trigger_result.triggers;
 

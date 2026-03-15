@@ -8,6 +8,7 @@
 
 use crate::notes::{EntityType, Note};
 use crate::skills::{SkillTrigger, TriggerType};
+use crate::utils::paths::relativize;
 use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
@@ -32,26 +33,37 @@ use std::sync::LazyLock;
 pub fn generate_file_glob_triggers(
     notes: &[Note],
     all_project_notes: &[Note],
+    root_path: Option<&str>,
 ) -> Vec<SkillTrigger> {
-    // Extract file paths from this skill's notes
-    let file_paths: Vec<&str> = notes
+    // Extract file paths from this skill's notes, relativized against project root
+    let file_paths_owned: Vec<String> = notes
         .iter()
         .flat_map(|n| n.anchors.iter())
         .filter(|a| a.entity_type == EntityType::File)
-        .map(|a| a.entity_id.as_str())
+        .map(|a| match root_path {
+            Some(root) => relativize(&a.entity_id, root),
+            None => a.entity_id.clone(),
+        })
         .collect();
 
-    if file_paths.is_empty() {
+    if file_paths_owned.is_empty() {
         return Vec::new();
     }
 
-    // Extract file paths from ALL project notes (for distinctiveness)
-    let all_paths: Vec<&str> = all_project_notes
+    let file_paths: Vec<&str> = file_paths_owned.iter().map(|s| s.as_str()).collect();
+
+    // Extract file paths from ALL project notes (for distinctiveness), also relativized
+    let all_paths_owned: Vec<String> = all_project_notes
         .iter()
         .flat_map(|n| n.anchors.iter())
         .filter(|a| a.entity_type == EntityType::File)
-        .map(|a| a.entity_id.as_str())
+        .map(|a| match root_path {
+            Some(root) => relativize(&a.entity_id, root),
+            None => a.entity_id.clone(),
+        })
         .collect();
+
+    let all_paths: Vec<&str> = all_paths_owned.iter().map(|s| s.as_str()).collect();
 
     let globs = find_common_glob_patterns(&file_paths, &all_paths);
 
@@ -772,11 +784,12 @@ pub fn generate_all_triggers(
     skill_notes: &[Note],
     all_project_notes: &[Note],
     embeddings: &HashMap<String, Vec<f64>>,
+    root_path: Option<&str>,
 ) -> TriggerGenerationResult {
     let mut all_triggers = Vec::new();
 
     // 1. FileGlob from file anchors (with distinctiveness against project)
-    let mut file_globs = generate_file_glob_triggers(skill_notes, all_project_notes);
+    let mut file_globs = generate_file_glob_triggers(skill_notes, all_project_notes, root_path);
     for trigger in &mut file_globs {
         trigger.quality_score = evaluate_trigger_quality(trigger, skill_notes, all_project_notes);
     }
@@ -881,7 +894,7 @@ mod tests {
             ),
         ];
 
-        let triggers = generate_file_glob_triggers(&notes, &notes);
+        let triggers = generate_file_glob_triggers(&notes, &notes, None);
         assert!(!triggers.is_empty(), "Should generate at least one glob");
 
         let glob_values: Vec<&str> = triggers.iter().map(|t| t.pattern_value.as_str()).collect();
@@ -903,7 +916,7 @@ mod tests {
             vec![],
         )];
 
-        let triggers = generate_file_glob_triggers(&notes, &notes);
+        let triggers = generate_file_glob_triggers(&notes, &notes, None);
         assert!(triggers.is_empty());
     }
 
@@ -918,7 +931,7 @@ mod tests {
             )],
         )];
 
-        let triggers = generate_file_glob_triggers(&notes, &notes);
+        let triggers = generate_file_glob_triggers(&notes, &notes, None);
         assert!(triggers.is_empty());
     }
 
@@ -1165,7 +1178,7 @@ mod tests {
         ];
 
         let embeddings = HashMap::new(); // No embeddings
-        let result = generate_all_triggers(&notes, &notes, &embeddings);
+        let result = generate_all_triggers(&notes, &notes, &embeddings, None);
 
         assert!(
             result.file_glob_count >= 1,
@@ -1191,7 +1204,7 @@ mod tests {
         embeddings.insert("note-1".to_string(), vec![1.0, 0.0]);
         embeddings.insert("note-2".to_string(), vec![0.0, 1.0]);
 
-        let result = generate_all_triggers(&notes, &notes, &embeddings);
+        let result = generate_all_triggers(&notes, &notes, &embeddings, None);
         assert_eq!(result.semantic_count, 1);
     }
 
@@ -1321,7 +1334,7 @@ mod tests {
         let all_notes = skill_notes.clone();
         let embeddings = HashMap::new();
 
-        let result = generate_all_triggers(&skill_notes, &all_notes, &embeddings);
+        let result = generate_all_triggers(&skill_notes, &all_notes, &embeddings, None);
 
         // Regex triggers should have quality scores set
         for trigger in &result.triggers {
@@ -1416,7 +1429,7 @@ mod tests {
         all_notes.extend(skill_b_notes.clone());
 
         // Skill A should get src/graph/**, NOT src/** (src/ covers B too)
-        let triggers_a = generate_file_glob_triggers(&skill_a_notes, &all_notes);
+        let triggers_a = generate_file_glob_triggers(&skill_a_notes, &all_notes, None);
         assert!(
             !triggers_a.is_empty(),
             "Skill A should have file glob triggers"
@@ -1429,7 +1442,7 @@ mod tests {
         );
 
         // Skill B should get src/chat/**, NOT src/**
-        let triggers_b = generate_file_glob_triggers(&skill_b_notes, &all_notes);
+        let triggers_b = generate_file_glob_triggers(&skill_b_notes, &all_notes, None);
         assert!(
             !triggers_b.is_empty(),
             "Skill B should have file glob triggers"
@@ -1462,7 +1475,7 @@ mod tests {
             }
         }
 
-        let triggers = generate_file_glob_triggers(&skill_notes, &all_notes);
+        let triggers = generate_file_glob_triggers(&skill_notes, &all_notes, None);
         assert!(!triggers.is_empty());
 
         // Should get src/neo4j/**, not the broad src/**

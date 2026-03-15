@@ -450,9 +450,30 @@ pub async fn link_note_to_entity(
     Path(note_id): Path<Uuid>,
     Json(body): Json<LinkNoteBody>,
 ) -> Result<StatusCode, AppError> {
+    // For File entities, normalize absolute paths to relative using the project root.
+    // This ensures note anchors are always project-agnostic for portability.
+    let entity_id = if body.entity_type == EntityType::File && body.entity_id.starts_with('/') {
+        // Try to load the note's project_id, then the project root_path
+        if let Ok(Some(note)) = state.orchestrator.note_manager().get_note(note_id).await {
+            if let Some(project_id) = note.project_id {
+                if let Ok(Some(project)) = state.orchestrator.neo4j().get_project(project_id).await {
+                    crate::utils::paths::relativize(&body.entity_id, &project.root_path)
+                } else {
+                    body.entity_id
+                }
+            } else {
+                body.entity_id
+            }
+        } else {
+            body.entity_id
+        }
+    } else {
+        body.entity_id
+    };
+
     let request = LinkNoteRequest {
         entity_type: body.entity_type,
-        entity_id: body.entity_id,
+        entity_id,
     };
 
     state

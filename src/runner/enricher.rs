@@ -248,14 +248,15 @@ impl TaskEnricher {
             return None;
         }
 
-        // Link note to each modified file
+        // Link note to each modified file (defensive relativize for edge cases)
         for file_path in all_modified_files {
+            let normalized = crate::utils::paths::relativize(file_path, cwd);
             if let Err(e) = self
                 .graph
-                .link_note_to_entity(note_id, &EntityType::File, file_path, None, None)
+                .link_note_to_entity(note_id, &EntityType::File, &normalized, None, None)
                 .await
             {
-                warn!("Enricher: failed to link note to file {}: {}", file_path, e);
+                warn!("Enricher: failed to link note to file {}: {}", normalized, e);
             }
         }
 

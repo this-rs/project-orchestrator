@@ -1,5 +1,7 @@
 //! Shared utility helpers.
 
+pub mod paths;
+
 /// Stable equivalent of the nightly-only `str::floor_char_boundary`.
 /// Returns the largest byte index `<= index` that is a valid UTF-8 char boundary.
 ///
