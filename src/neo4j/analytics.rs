@@ -2958,7 +2958,8 @@ impl Neo4jClient {
     /// Get learning health metrics for a project's persona system.
     pub async fn get_learning_health(&self, project_id: Uuid) -> Result<LearningHealthReport> {
         // Q1: KNOWS weight variance + count
-        let q1 = query(r#"
+        let q1 = query(
+            r#"
             MATCH (p:Persona {project_id: $pid})-[r:KNOWS]->(f:File)
             WHERE r.weight IS NOT NULL
             WITH collect(r.weight) AS weights, count(r) AS total
@@ -2969,7 +2970,9 @@ impl Neo4jClient {
                      reduce(s = 0.0, w IN weights | s + (w - mean) * (w - mean)) / total
                  ELSE 0.0 END AS variance
             RETURN variance, total
-        "#).param("pid", project_id.to_string());
+        "#,
+        )
+        .param("pid", project_id.to_string());
 
         // Q2: File coverage
         let q2 = query(r#"
@@ -2981,7 +2984,8 @@ impl Neo4jClient {
         "#).param("pid", project_id.to_string());
 
         // Q3: Synapse health between persona notes
-        let q3 = query(r#"
+        let q3 = query(
+            r#"
             MATCH (p:Persona {project_id: $pid})-[:USES]->(n:Note)
             WITH collect(DISTINCT n.id) AS note_ids, count(DISTINCT n) AS note_count
             OPTIONAL MATCH (n1:Note)-[s:SYNAPSE]->(n2:Note)
@@ -2993,10 +2997,13 @@ impl Neo4jClient {
                       ELSE 0.0
                  END AS health
             RETURN health, synapse_count
-        "#).param("pid", project_id.to_string());
+        "#,
+        )
+        .param("pid", project_id.to_string());
 
         // Q4: CO_CHANGED coverage
-        let q4 = query(r#"
+        let q4 = query(
+            r#"
             MATCH (f1:File)-[:CO_CHANGED]-(f2:File)
             WHERE EXISTS { MATCH (proj:Project {id: $pid})-[:CONTAINS]->(f1) }
               AND f1.path < f2.path
@@ -3005,14 +3012,19 @@ impl Neo4jClient {
                            (p)-[:KNOWS]->(f2)
             WITH count(DISTINCT f1.path + '|' + f2.path) AS covered_pairs
             RETURN covered_pairs
-        "#).param("pid", project_id.to_string());
+        "#,
+        )
+        .param("pid", project_id.to_string());
 
         // Q5: Persona count
-        let q5 = query(r#"
+        let q5 = query(
+            r#"
             MATCH (p:Persona {project_id: $pid})
             WHERE p.status <> 'archived'
             RETURN count(p) AS cnt
-        "#).param("pid", project_id.to_string());
+        "#,
+        )
+        .param("pid", project_id.to_string());
 
         let (r1, r2, r3, r4, r5) = tokio::join!(
             self.execute_with_params(q1),
@@ -3022,30 +3034,37 @@ impl Neo4jClient {
             self.execute_with_params(q5),
         );
 
-        let (variance, total_knows) = r1.ok()
+        let (variance, total_knows) = r1
+            .ok()
             .and_then(|rows| rows.into_iter().next())
-            .map(|r| (
-                r.get::<f64>("variance").unwrap_or(0.0),
-                r.get::<i64>("total").unwrap_or(0) as usize,
-            ))
+            .map(|r| {
+                (
+                    r.get::<f64>("variance").unwrap_or(0.0),
+                    r.get::<i64>("total").unwrap_or(0) as usize,
+                )
+            })
             .unwrap_or((0.0, 0));
 
-        let coverage = r2.ok()
+        let coverage = r2
+            .ok()
             .and_then(|rows| rows.into_iter().next())
             .and_then(|r| r.get::<f64>("coverage").ok())
             .unwrap_or(0.0);
 
-        let synapse_health = r3.ok()
+        let synapse_health = r3
+            .ok()
             .and_then(|rows| rows.into_iter().next())
             .and_then(|r| r.get::<f64>("health").ok())
             .unwrap_or(0.0);
 
-        let co_change_coverage_raw = r4.ok()
+        let co_change_coverage_raw = r4
+            .ok()
             .and_then(|rows| rows.into_iter().next())
             .and_then(|r| r.get::<i64>("covered_pairs").ok())
             .unwrap_or(0);
 
-        let persona_count = r5.ok()
+        let persona_count = r5
+            .ok()
             .and_then(|rows| rows.into_iter().next())
             .and_then(|r| r.get::<i64>("cnt").ok())
             .unwrap_or(0) as usize;

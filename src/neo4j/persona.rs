@@ -160,7 +160,10 @@ impl Neo4jClient {
         .param("avg_duration_secs", persona.avg_duration_secs)
         .param("origin", persona.origin.to_string())
         .param("energy_boost_accumulated", persona.energy_boost_accumulated)
-        .param("energy_history", serde_json::to_string(&persona.energy_history).unwrap_or_else(|_| "[]".to_string()))
+        .param(
+            "energy_history",
+            serde_json::to_string(&persona.energy_history).unwrap_or_else(|_| "[]".to_string()),
+        )
         .param("created_at", persona.created_at.to_rfc3339())
         .param(
             "project_id",
@@ -1131,18 +1134,21 @@ impl Neo4jClient {
         );
 
         // 0b. Check global stagnation — if stagnating, use accelerated decay
-        let stagnation = self.detect_global_stagnation(project_id).await.unwrap_or_else(|e| {
-            tracing::warn!("Failed to check stagnation: {} — using normal decay", e);
-            crate::neo4j::models::StagnationReport {
-                is_stagnating: false,
-                tasks_completed_48h: 0,
-                avg_frustration: 0.0,
-                energy_trend: 0.0,
-                commits_48h: 0,
-                signals_triggered: 0,
-                recommendations: vec![],
-            }
-        });
+        let stagnation = self
+            .detect_global_stagnation(project_id)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!("Failed to check stagnation: {} — using normal decay", e);
+                crate::neo4j::models::StagnationReport {
+                    is_stagnating: false,
+                    tasks_completed_48h: 0,
+                    avg_frustration: 0.0,
+                    energy_trend: 0.0,
+                    commits_48h: 0,
+                    signals_triggered: 0,
+                    recommendations: vec![],
+                }
+            });
 
         let decay_factor = if stagnation.is_stagnating { 0.85 } else { 0.95 };
 
@@ -1216,29 +1222,39 @@ impl Neo4jClient {
 
         // 2b. Prune KNOWS outliers (low-weight anomalies inactive for >14 days)
         if thresholds.sample_size >= 10 {
-            let outlier_prune_q = query(r#"
+            let outlier_prune_q = query(
+                r#"
                 MATCH (p:Persona {project_id: $project_id})-[r:KNOWS]->(f:File)
                 WHERE r.weight IS NOT NULL AND r.weight < $lower_fence
                   AND (r.last_activated IS NULL
                        OR r.last_activated < $cutoff_date)
                 DELETE r
                 RETURN count(r) AS outlier_pruned
-            "#)
+            "#,
+            )
             .param("project_id", project_id.to_string())
             .param("lower_fence", thresholds.lower_fence)
-            .param("cutoff_date", (chrono::Utc::now() - chrono::Duration::days(14)).to_rfc3339());
+            .param(
+                "cutoff_date",
+                (chrono::Utc::now() - chrono::Duration::days(14)).to_rfc3339(),
+            );
 
             let outlier_pruned: usize = match self.graph.execute(outlier_prune_q).await {
                 Ok(mut result) => {
                     if let Ok(Some(row)) = result.next().await {
                         row.get::<i64>("outlier_pruned").unwrap_or(0) as usize
-                    } else { 0 }
+                    } else {
+                        0
+                    }
                 }
                 Err(_) => 0,
             };
 
             if outlier_pruned > 0 {
-                tracing::info!(outlier_pruned, "maintain_personas: pruned outlier KNOWS (inactive >14d)");
+                tracing::info!(
+                    outlier_pruned,
+                    "maintain_personas: pruned outlier KNOWS (inactive >14d)"
+                );
             }
         }
 
@@ -1275,12 +1291,14 @@ impl Neo4jClient {
         };
 
         // 3b. Detect merge candidates via affinity score
-        let merge_q = query(r#"
+        let merge_q = query(
+            r#"
             MATCH (a:Persona {project_id: $project_id}), (b:Persona {project_id: $project_id})
             WHERE a.status <> 'archived' AND b.status <> 'archived'
               AND a.id < b.id
             RETURN a.id AS aid, b.id AS bid
-        "#)
+        "#,
+        )
         .param("project_id", project_id.to_string());
 
         if let Ok(mut merge_result) = self.graph.execute(merge_q).await {
@@ -1317,12 +1335,15 @@ impl Neo4jClient {
         }
 
         // 3c. Track energy_history and auto-dormant stagnant personas
-        let history_q = query(r#"
+        let history_q = query(
+            r#"
             MATCH (p:Persona {project_id: $project_id})
             WHERE p.status IN ['active', 'emerging']
             RETURN p.id AS pid, p.energy AS energy,
                    COALESCE(p.energy_history, '[]') AS hist
-        "#).param("project_id", project_id.to_string());
+        "#,
+        )
+        .param("project_id", project_id.to_string());
 
         if let Ok(mut hist_result) = self.graph.execute(history_q).await {
             while let Ok(Some(row)) = hist_result.next().await {
@@ -1331,34 +1352,41 @@ impl Neo4jClient {
                     Err(_) => continue,
                 };
                 let energy: f64 = row.get("energy").unwrap_or(0.5);
-                let hist_str: String = row.get::<String>("hist").unwrap_or_else(|_| "[]".to_string());
+                let hist_str: String = row
+                    .get::<String>("hist")
+                    .unwrap_or_else(|_| "[]".to_string());
                 let mut history: Vec<f64> = serde_json::from_str(&hist_str).unwrap_or_default();
 
                 history.push(energy);
                 if history.len() > 5 {
-                    history = history[history.len()-5..].to_vec();
+                    history = history[history.len() - 5..].to_vec();
                 }
 
-                let hist_json = serde_json::to_string(&history).unwrap_or_else(|_| "[]".to_string());
+                let hist_json =
+                    serde_json::to_string(&history).unwrap_or_else(|_| "[]".to_string());
 
                 // Detect persistent low energy: all 5 values below 0.15
                 let all_low = history.len() >= 5 && history.iter().all(|e| *e < 0.15);
 
                 if all_low {
-                    let dormant_q = query(r#"
+                    let dormant_q = query(
+                        r#"
                         MATCH (p:Persona {id: $pid})
                         SET p.status = 'dormant', p.energy_history = $hist, p.updated_at = $now
-                    "#)
+                    "#,
+                    )
                     .param("pid", pid.clone())
                     .param("hist", hist_json)
                     .param("now", chrono::Utc::now().to_rfc3339());
                     let _ = self.graph.run(dormant_q).await;
                     tracing::info!(persona_id = %pid, "Auto-dormant: energy below threshold for 5 cycles");
                 } else {
-                    let update_q = query(r#"
+                    let update_q = query(
+                        r#"
                         MATCH (p:Persona {id: $pid})
                         SET p.energy_history = $hist
-                    "#)
+                    "#,
+                    )
                     .param("pid", pid.clone())
                     .param("hist", hist_json);
                     let _ = self.graph.run(update_q).await;
@@ -1391,10 +1419,12 @@ impl Neo4jClient {
         let _ = self.auto_scope_to_feature_graphs(project_id).await;
 
         // 6. Reset energy_boost_accumulated for all personas (end of cycle)
-        let reset_q = query(r#"
+        let reset_q = query(
+            r#"
             MATCH (p:Persona {project_id: $project_id})
             SET p.energy_boost_accumulated = 0.0
-        "#)
+        "#,
+        )
         .param("project_id", project_id.to_string());
         let _ = self.graph.run(reset_q).await;
 
@@ -1666,7 +1696,9 @@ impl Neo4jClient {
         self.graph.run(q).await.context("auto_grow_file_knows")?;
 
         // Propagate to CO_CHANGED neighbors (best-effort)
-        let _ = self.propagate_knows_via_co_change(persona_id, file_path, weight).await;
+        let _ = self
+            .propagate_knows_via_co_change(persona_id, file_path, weight)
+            .await;
 
         Ok(())
     }
@@ -1688,7 +1720,8 @@ impl Neo4jClient {
         const CO_CHANGE_MAX_FILES: i64 = 5;
 
         let attenuated_weight = base_weight * CO_CHANGE_ATTENUATION;
-        let q = query(r#"
+        let q = query(
+            r#"
             MATCH (f:File {path: $file_path})-[cc:CO_CHANGED]-(neighbor:File)
             WHERE cc.count >= $min_count
             WITH neighbor, cc.count AS co_count
@@ -1699,14 +1732,19 @@ impl Neo4jClient {
             ON CREATE SET k.weight = $weight, k.source = "co-change"
             ON MATCH SET k.weight = CASE WHEN k.weight < $weight THEN $weight ELSE k.weight END
             RETURN count(neighbor) AS propagated
-        "#)
+        "#,
+        )
         .param("persona_id", persona_id.to_string())
         .param("file_path", file_path)
         .param("weight", attenuated_weight)
         .param("min_count", CO_CHANGE_MIN_COUNT)
         .param("max_files", CO_CHANGE_MAX_FILES);
 
-        let mut result = self.graph.execute(q).await.context("propagate_knows_via_co_change")?;
+        let mut result = self
+            .graph
+            .execute(q)
+            .await
+            .context("propagate_knows_via_co_change")?;
         let count = if let Some(row) = result.next().await? {
             row.get::<i64>("propagated").unwrap_or(0) as usize
         } else {
@@ -1762,7 +1800,11 @@ impl Neo4jClient {
         .param("pa", persona_a.to_string())
         .param("pb", persona_b.to_string());
 
-        let mut result = self.graph.execute(q).await.context("compute_persona_affinity")?;
+        let mut result = self
+            .graph
+            .execute(q)
+            .await
+            .context("compute_persona_affinity")?;
         let (jaccard, synapse_density) = if let Some(row) = result.next().await? {
             (
                 row.get::<f64>("jaccard").unwrap_or(0.0),
@@ -1785,7 +1827,8 @@ impl Neo4jClient {
 
     /// Merge persona B into persona A: transfer all KNOWS/USES, then delete B.
     pub async fn merge_personas(&self, keep_id: Uuid, merge_id: Uuid) -> Result<()> {
-        let q = query(r#"
+        let q = query(
+            r#"
             // Transfer KNOWS from merge -> keep (MERGE to avoid duplicates)
             MATCH (merge:Persona {id: $merge_id})-[k:KNOWS]->(f)
             MATCH (keep:Persona {id: $keep_id})
@@ -1803,7 +1846,8 @@ impl Neo4jClient {
 
             // Delete merged persona
             DETACH DELETE merge
-        "#)
+        "#,
+        )
         .param("keep_id", keep_id.to_string())
         .param("merge_id", merge_id.to_string());
 
@@ -1832,7 +1876,11 @@ impl Neo4jClient {
         "#)
         .param("pid", persona_id.to_string());
 
-        let mut result = self.graph.execute(q).await.context("find_synapse_linked_personas")?;
+        let mut result = self
+            .graph
+            .execute(q)
+            .await
+            .context("find_synapse_linked_personas")?;
         let mut linked = Vec::new();
         while let Some(row) = result.next().await? {
             let id: Uuid = row.get::<String>("pid")?.parse()?;
@@ -1855,19 +1903,25 @@ impl Neo4jClient {
         boost: f64,
         max_per_cycle: f64,
     ) -> Result<bool> {
-        let q = query(r#"
+        let q = query(
+            r#"
             MATCH (p:Persona {id: $pid})
             WHERE COALESCE(p.energy_boost_accumulated, 0.0) + $boost <= $max
             SET p.energy_boost_accumulated = COALESCE(p.energy_boost_accumulated, 0.0) + $boost,
                 p.energy = CASE WHEN p.energy + $boost > 1.0 THEN 1.0 ELSE p.energy + $boost END,
                 p.updated_at = datetime()
             RETURN p.id AS updated
-        "#)
+        "#,
+        )
         .param("pid", persona_id.to_string())
         .param("boost", boost)
         .param("max", max_per_cycle);
 
-        let mut result = self.graph.execute(q).await.context("rate_limited_energy_boost")?;
+        let mut result = self
+            .graph
+            .execute(q)
+            .await
+            .context("rate_limited_energy_boost")?;
         Ok(result.next().await?.is_some())
     }
 

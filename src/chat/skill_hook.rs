@@ -156,7 +156,8 @@ impl SkillActivationHook {
                     HashMap::new();
                 for (persona, path, weight) in &all_knows {
                     // Weight persona activation by success_rate (floor 0.5 for new personas)
-                    let effective_weight = *weight * (0.5 + 0.5 * persona.success_rate.max(0.0).min(1.0));
+                    let effective_weight =
+                        *weight * (0.5 + 0.5 * persona.success_rate.max(0.0).min(1.0));
                     entries.entry(path.clone()).or_default().push((
                         persona.id,
                         persona.name.clone(),
@@ -297,15 +298,24 @@ impl SkillActivationHook {
         }
 
         // Pre-warm: load related persona context via SYNAPSE links
-        match self.graph_store.find_synapse_linked_personas(persona_id).await {
+        match self
+            .graph_store
+            .find_synapse_linked_personas(persona_id)
+            .await
+        {
             Ok(linked) if !linked.is_empty() => {
                 ctx.push_str("\n**Related personas (via SYNAPSE links):**\n");
                 for (linked_id, linked_name, syn_weight) in linked.iter().take(2) {
                     ctx.push_str(&format!("- {} (synapse: {:.2})\n", linked_name, syn_weight));
                     // Load top 3 notes from linked persona
-                    if let Ok(linked_subgraph) = self.graph_store.get_persona_subgraph(*linked_id).await {
+                    if let Ok(linked_subgraph) =
+                        self.graph_store.get_persona_subgraph(*linked_id).await
+                    {
                         for note_rel in linked_subgraph.notes.iter().take(3) {
-                            ctx.push_str(&format!("  - [note:{}] (w:{:.2})\n", note_rel.entity_id, note_rel.weight));
+                            ctx.push_str(&format!(
+                                "  - [note:{}] (w:{:.2})\n",
+                                note_rel.entity_id, note_rel.weight
+                            ));
                         }
                     }
                 }
