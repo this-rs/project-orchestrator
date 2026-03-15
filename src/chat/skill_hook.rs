@@ -157,7 +157,7 @@ impl SkillActivationHook {
                 for (persona, path, weight) in &all_knows {
                     // Weight persona activation by success_rate (floor 0.5 for new personas)
                     let effective_weight =
-                        *weight * (0.5 + 0.5 * persona.success_rate.max(0.0).min(1.0));
+                        *weight * (0.5 + 0.5 * persona.success_rate.clamp(0.0, 1.0));
                     entries.entry(path.clone()).or_default().push((
                         persona.id,
                         persona.name.clone(),
