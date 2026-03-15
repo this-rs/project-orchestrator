@@ -380,6 +380,10 @@ impl Neo4jClient {
                 .get::<i64>("scaffolding_override")
                 .ok()
                 .map(|v| v as u8),
+            sharing_policy: node
+                .get::<String>("sharing_policy")
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok()),
         })
     }
 

@@ -365,6 +365,7 @@ mod tests {
             last_assertion_result: None,
             memory_horizon: crate::notes::MemoryHorizon::Operational,
             scar_intensity: 0.0,
+            sharing_consent: Default::default(),
         };
         store
             .add_skill_member(skill_id, "note", note1.id)

@@ -1891,6 +1891,7 @@ mod tests {
             analytics_computed_at: None,
             last_co_change_computed_at: None,
             scaffolding_override: None,
+            sharing_policy: None,
         };
         let pid = project.id;
         graph.create_project(&project).await.unwrap();
@@ -2816,6 +2817,7 @@ mod tests {
             analytics_computed_at: None,
             last_co_change_computed_at: None,
             scaffolding_override: None,
+            sharing_policy: None,
         };
         let pid = project.id;
         graph.create_project(&project).await.unwrap();
@@ -3140,6 +3142,7 @@ mod tests {
             analytics_computed_at: None,
             last_co_change_computed_at: None,
             scaffolding_override: None,
+            sharing_policy: None,
         };
         let pid = project.id;
         graph.create_project(&project).await.unwrap();
@@ -3353,6 +3356,7 @@ mod tests {
             analytics_computed_at: None,
             last_co_change_computed_at: None,
             scaffolding_override: None,
+            sharing_policy: None,
         };
         let pid = project.id;
         graph.create_project(&project).await.unwrap();

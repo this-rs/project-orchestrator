@@ -429,6 +429,7 @@ mod tests {
             redacted_count: 3,
             patterns_applied: vec!["H8-abs-path".to_string()],
             blocked_l3: false,
+            consent_stats: None,
         };
 
         let envelope = create_envelope(&identity, "redacted content", lesson, Some(report));

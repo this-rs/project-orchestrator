@@ -564,6 +564,7 @@ async fn trace_evolution_note(graph_store: &dyn GraphStore, project_id: Uuid, co
         changes: vec![],
         assertion_rule: None,
         last_assertion_result: None,
+        sharing_consent: Default::default(),
     };
     if let Err(e) = graph_store.create_note(&note).await {
         warn!(error = %e, "Failed to create evolution observation note");

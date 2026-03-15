@@ -324,6 +324,15 @@ impl NoteManager {
             input.content
         };
 
+        // L3 scan: block persistence of secrets (RFC Privacy §2.3).
+        // This is non-disableable — no flag can bypass it.
+        if let Err(e) = crate::episodes::anonymize::scan_for_l3(&content) {
+            return Err(anyhow::anyhow!(
+                "Content contains secrets ({}). Remove them before saving.",
+                e.patterns.join(", ")
+            ));
+        }
+
         let note = Note::new_full(
             input.project_id,
             input.note_type,
@@ -483,6 +492,16 @@ impl NoteManager {
     /// Update a note
     pub async fn update_note(&self, id: Uuid, input: UpdateNoteRequest) -> Result<Option<Note>> {
         let content_changed = input.content.is_some();
+
+        // L3 scan on updated content: block persistence of secrets (RFC Privacy §2.3).
+        if let Some(ref content) = input.content {
+            if let Err(e) = crate::episodes::anonymize::scan_for_l3(content) {
+                return Err(anyhow::anyhow!(
+                    "Content contains secrets ({}). Remove them before saving.",
+                    e.patterns.join(", ")
+                ));
+            }
+        }
 
         let updated = self
             .neo4j

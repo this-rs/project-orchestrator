@@ -3014,4 +3014,60 @@ pub trait GraphStore: Send + Sync {
 
     /// Fetch all risk scores for a project as a flat vector.
     async fn get_all_risk_score_values(&self, project_id: Uuid) -> Result<Vec<f64>>;
+
+    // ========================================================================
+    // Sharing & Privacy operations (RFC Privacy MVP)
+    // ========================================================================
+
+    /// Get the sharing policy for a project. Returns None if no policy is set.
+    async fn get_sharing_policy(
+        &self,
+        project_id: Uuid,
+    ) -> Result<Option<crate::episodes::distill_models::SharingPolicy>>;
+
+    /// Update the sharing policy for a project.
+    async fn update_sharing_policy(
+        &self,
+        project_id: Uuid,
+        policy: &crate::episodes::distill_models::SharingPolicy,
+    ) -> Result<()>;
+
+    /// Get the sharing consent for a note.
+    async fn get_sharing_consent(
+        &self,
+        note_id: Uuid,
+    ) -> Result<crate::episodes::distill_models::SharingConsent>;
+
+    /// Update the sharing consent for a note.
+    async fn update_sharing_consent(
+        &self,
+        note_id: Uuid,
+        consent: &crate::episodes::distill_models::SharingConsent,
+    ) -> Result<()>;
+
+    /// Create a sharing event (audit trail).
+    async fn create_sharing_event(
+        &self,
+        event: &crate::episodes::distill_models::SharingEvent,
+    ) -> Result<()>;
+
+    /// List sharing events for a project (newest first).
+    async fn list_sharing_events(
+        &self,
+        project_id: Uuid,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<crate::episodes::distill_models::SharingEvent>>;
+
+    /// Persist a signed tombstone to the graph.
+    async fn persist_tombstone(
+        &self,
+        tombstone: &crate::reception::anchor::SignedTombstone,
+    ) -> Result<()>;
+
+    /// List all persisted tombstones.
+    async fn list_tombstones(&self) -> Result<Vec<crate::reception::anchor::SignedTombstone>>;
+
+    /// Check if a content hash has been tombstoned.
+    async fn is_tombstoned(&self, content_hash: &str) -> Result<bool>;
 }

@@ -60,6 +60,47 @@ impl Message {
 }
 
 // ---------------------------------------------------------------------------
+// Tombstone & Ack payloads (P2P retraction protocol)
+// ---------------------------------------------------------------------------
+
+/// Payload for a tombstone broadcast message sent over P2P transport.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TombstonePayload {
+    /// Content hash being revoked.
+    pub content_hash: String,
+    /// DID of the issuer who signed the tombstone.
+    pub issuer_did: String,
+    /// Hex-encoded Ed25519 signature over the content hash.
+    pub signature_hex: String,
+    /// When the tombstone was issued.
+    pub issued_at: DateTime<Utc>,
+    /// Optional human-readable reason for revocation.
+    pub reason: Option<String>,
+    /// Whether the sender expects an acknowledgement from each peer.
+    pub ack_requested: bool,
+}
+
+/// Status reported in an ack response to a tombstone.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum AckStatus {
+    /// The content was found and deleted locally.
+    Deleted,
+    /// The content hash was not found in the local store.
+    NotFound,
+    /// The peer refused to apply the tombstone (e.g. policy mismatch).
+    Refused,
+}
+
+/// Payload for an acknowledgement message in response to a tombstone.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AckPayload {
+    /// The content hash this ack refers to.
+    pub content_hash: String,
+    /// Outcome of applying the tombstone locally.
+    pub status: AckStatus,
+}
+
+// ---------------------------------------------------------------------------
 // Peer info & registry
 // ---------------------------------------------------------------------------
 
@@ -246,6 +287,46 @@ mod tests {
         assert_eq!(deser.header.sender_did, "did:key:alice");
         assert_eq!(deser.payload, b"hello");
         assert_eq!(deser.header.correlation_id.as_deref(), Some("corr-123"));
+    }
+
+    #[test]
+    fn tombstone_payload_serialization_roundtrip() {
+        let payload = TombstonePayload {
+            content_hash: "abc123".to_string(),
+            issuer_did: "did:key:zAlice".to_string(),
+            signature_hex: "deadbeef".to_string(),
+            issued_at: Utc::now(),
+            reason: Some("GDPR erasure".to_string()),
+            ack_requested: true,
+        };
+        let json = serde_json::to_string(&payload).unwrap();
+        let deser: TombstonePayload = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser.content_hash, "abc123");
+        assert_eq!(deser.issuer_did, "did:key:zAlice");
+        assert!(deser.ack_requested);
+        assert_eq!(deser.reason.as_deref(), Some("GDPR erasure"));
+    }
+
+    #[test]
+    fn ack_payload_serialization_roundtrip() {
+        let payload = AckPayload {
+            content_hash: "abc123".to_string(),
+            status: AckStatus::Deleted,
+        };
+        let json = serde_json::to_string(&payload).unwrap();
+        let deser: AckPayload = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser.content_hash, "abc123");
+        assert_eq!(deser.status, AckStatus::Deleted);
+    }
+
+    #[test]
+    fn ack_status_all_variants_serialize() {
+        let variants = vec![AckStatus::Deleted, AckStatus::NotFound, AckStatus::Refused];
+        for status in variants {
+            let json = serde_json::to_string(&status).unwrap();
+            let deser: AckStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(deser, status);
+        }
     }
 
     #[test]

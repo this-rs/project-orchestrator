@@ -10186,6 +10186,73 @@ impl GraphStore for MockGraphStore {
     async fn get_all_risk_score_values(&self, _project_id: Uuid) -> anyhow::Result<Vec<f64>> {
         Ok(Vec::new())
     }
+
+    // ========================================================================
+    // Sharing & Privacy operations
+    // ========================================================================
+
+    async fn get_sharing_policy(
+        &self,
+        _project_id: Uuid,
+    ) -> anyhow::Result<Option<crate::episodes::distill_models::SharingPolicy>> {
+        Ok(None)
+    }
+
+    async fn update_sharing_policy(
+        &self,
+        _project_id: Uuid,
+        _policy: &crate::episodes::distill_models::SharingPolicy,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn get_sharing_consent(
+        &self,
+        _note_id: Uuid,
+    ) -> anyhow::Result<crate::episodes::distill_models::SharingConsent> {
+        Ok(crate::episodes::distill_models::SharingConsent::default())
+    }
+
+    async fn update_sharing_consent(
+        &self,
+        _note_id: Uuid,
+        _consent: &crate::episodes::distill_models::SharingConsent,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn create_sharing_event(
+        &self,
+        _event: &crate::episodes::distill_models::SharingEvent,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn list_sharing_events(
+        &self,
+        _project_id: Uuid,
+        _limit: i64,
+        _offset: i64,
+    ) -> anyhow::Result<Vec<crate::episodes::distill_models::SharingEvent>> {
+        Ok(Vec::new())
+    }
+
+    async fn persist_tombstone(
+        &self,
+        _tombstone: &crate::reception::anchor::SignedTombstone,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn list_tombstones(
+        &self,
+    ) -> anyhow::Result<Vec<crate::reception::anchor::SignedTombstone>> {
+        Ok(Vec::new())
+    }
+
+    async fn is_tombstoned(&self, _content_hash: &str) -> anyhow::Result<bool> {
+        Ok(false)
+    }
 }
 
 #[cfg(test)]

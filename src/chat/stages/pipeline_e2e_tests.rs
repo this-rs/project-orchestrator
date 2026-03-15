@@ -68,6 +68,7 @@ mod tests {
             analytics_computed_at: None,
             last_co_change_computed_at: None,
             scaffolding_override: None,
+            sharing_policy: None,
         };
         graph.projects.write().await.insert(project_id, project);
         (project_id, slug)
@@ -120,6 +121,7 @@ mod tests {
             last_assertion_result: None,
             memory_horizon: crate::notes::MemoryHorizon::Operational,
             scar_intensity: 0.0,
+            sharing_consent: Default::default(),
         };
         graph.notes.write().await.insert(note_id, note);
 

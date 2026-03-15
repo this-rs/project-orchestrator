@@ -12,6 +12,7 @@
 pub mod anchor;
 pub mod replay;
 pub mod score;
+pub mod tombstone_scheduler;
 pub mod trust;
 pub mod verify;
 

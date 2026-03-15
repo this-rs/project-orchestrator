@@ -1294,6 +1294,19 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
             description: "Manage personas (create/get/list/update/delete/add_skill/remove_skill/add_protocol/remove_protocol/add_file/remove_file/add_function/remove_function/add_note/remove_note/add_decision/remove_decision/scope_to_feature_graph/unscope_feature_graph/add_extends/remove_extends/get_subgraph/find_for_file/list_global/export/import/activate/auto_build/maintain/detect)",
         }],
     },
+    // ── Sharing (Privacy) ──────────────────────────────────────────
+    ToolGroup {
+        name: "sharing",
+        description: "Privacy controls: sharing policies, consent management, audit trail",
+        keywords: &[
+            "sharing", "privacy", "consent", "gdpr", "policy", "retract",
+            "tombstone", "audit", "partage", "consentement",
+        ],
+        tools: &[ToolRef {
+            name: "sharing",
+            description: "Sharing & consent (status/enable/disable/set_policy/get_policy/set_consent/history)",
+        }],
+    },
     // ── Admin & Sync ────────────────────────────────────────────────
     ToolGroup {
         name: "sync_admin",
@@ -2569,6 +2582,7 @@ mod tests {
                 analytics_computed_at: None,
                 last_co_change_computed_at: None,
                 scaffolding_override: None,
+                sharing_policy: None,
             }),
             ..Default::default()
         };
@@ -2599,6 +2613,7 @@ mod tests {
                 analytics_computed_at: None,
                 last_co_change_computed_at: None,
                 scaffolding_override: None,
+                sharing_policy: None,
             }),
             ..Default::default()
         };
@@ -2622,6 +2637,7 @@ mod tests {
                 analytics_computed_at: None,
                 last_co_change_computed_at: None,
                 scaffolding_override: None,
+                sharing_policy: None,
             }),
             language_stats: vec![LanguageStatsNode {
                 language: "Rust".into(),
@@ -2794,6 +2810,7 @@ mod tests {
                 analytics_computed_at: None,
                 last_co_change_computed_at: None,
                 scaffolding_override: None,
+                sharing_policy: None,
             }),
             sibling_projects: vec![
                 ProjectNode {
@@ -2807,6 +2824,7 @@ mod tests {
                     analytics_computed_at: None,
                     last_co_change_computed_at: None,
                     scaffolding_override: None,
+                    sharing_policy: None,
                 },
                 ProjectNode {
                     id: uuid::Uuid::new_v4(),
@@ -2819,6 +2837,7 @@ mod tests {
                     analytics_computed_at: None,
                     last_co_change_computed_at: None,
                     scaffolding_override: None,
+                    sharing_policy: None,
                 },
             ],
             ..Default::default()
@@ -2849,6 +2868,7 @@ mod tests {
                 analytics_computed_at: None,
                 last_co_change_computed_at: None,
                 scaffolding_override: None,
+                sharing_policy: None,
             }),
             workspace: Some(WorkspaceNode {
                 id: uuid::Uuid::new_v4(),
@@ -2871,6 +2891,7 @@ mod tests {
                     analytics_computed_at: None,
                     last_co_change_computed_at: None,
                     scaffolding_override: None,
+                    sharing_policy: None,
                 },
                 ProjectNode {
                     id: uuid::Uuid::new_v4(),
@@ -2883,6 +2904,7 @@ mod tests {
                     analytics_computed_at: None,
                     last_co_change_computed_at: None,
                     scaffolding_override: None,
+                    sharing_policy: None,
                 },
             ],
             ..Default::default()
@@ -2961,6 +2983,7 @@ mod tests {
                 analytics_computed_at: None,
                 last_co_change_computed_at: None,
                 scaffolding_override: None,
+                sharing_policy: None,
             }),
             global_guidelines: vec![{
                 let mut n = crate::notes::Note::new(
@@ -2995,8 +3018,8 @@ mod tests {
     fn test_tool_groups_cover_all_23_mega_tools() {
         let count = tool_catalog_tool_count();
         assert_eq!(
-            count, 24,
-            "TOOL_GROUPS must cover exactly 24 unique mega-tools (got {}). \
+            count, 25,
+            "TOOL_GROUPS must cover exactly 25 unique mega-tools (got {}). \
              Update the catalog when adding/removing MCP tools.",
             count
         );
@@ -3046,7 +3069,7 @@ mod tests {
 
     #[test]
     fn test_tool_groups_count() {
-        assert_eq!(TOOL_GROUPS.len(), 14, "Expected 14 tool groups");
+        assert_eq!(TOOL_GROUPS.len(), 15, "Expected 15 tool groups");
     }
 
     #[test]
@@ -3195,6 +3218,7 @@ mod tests {
                 analytics_computed_at: None,
                 last_co_change_computed_at: None,
                 scaffolding_override: None,
+                sharing_policy: None,
             }),
             ..Default::default()
         };
@@ -3253,6 +3277,7 @@ mod tests {
                 analytics_computed_at: None,
                 last_co_change_computed_at: None,
                 scaffolding_override: None,
+                sharing_policy: None,
             }),
             feature_graphs: make_feature_graphs(3),
             ..Default::default()
@@ -3282,6 +3307,7 @@ mod tests {
                 analytics_computed_at: None,
                 last_co_change_computed_at: None,
                 scaffolding_override: None,
+                sharing_policy: None,
             }),
             ..Default::default()
         };
@@ -3319,6 +3345,7 @@ mod tests {
                 analytics_computed_at: None,
                 last_co_change_computed_at: None,
                 scaffolding_override: None,
+                sharing_policy: None,
             }),
             feature_graphs: fgs,
             ..Default::default()

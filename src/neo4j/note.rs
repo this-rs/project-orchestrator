@@ -2980,6 +2980,11 @@ impl Neo4jClient {
             changes,
             assertion_rule,
             last_assertion_result: None, // Loaded separately if needed
+            sharing_consent: node
+                .get::<String>("sharing_consent")
+                .ok()
+                .and_then(|s| serde_json::from_str(&format!("\"{}\"", s)).ok())
+                .unwrap_or_default(),
         })
     }
 

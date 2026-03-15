@@ -4542,6 +4542,7 @@ mod tests {
             analytics_computed_at: None,
             last_co_change_computed_at: None,
             scaffolding_override: None,
+            sharing_policy: None,
         };
         app_state.neo4j.create_project(&project).await.unwrap();
         app_state
@@ -4692,6 +4693,7 @@ mod tests {
             analytics_computed_at: None,
             last_co_change_computed_at: None,
             scaffolding_override: None,
+            sharing_policy: None,
         };
         graph.create_project(&project).await.unwrap();
 
@@ -4877,6 +4879,7 @@ mod tests {
             analytics_computed_at: None,
             last_co_change_computed_at: None,
             scaffolding_override: None,
+            sharing_policy: None,
         };
         graph.create_project(&project).await.unwrap();
 
@@ -5079,6 +5082,7 @@ mod tests {
             analytics_computed_at: None,
             last_co_change_computed_at: None,
             scaffolding_override: None,
+            sharing_policy: None,
         };
         graph.create_project(&project).await.unwrap();
 
@@ -5221,6 +5225,7 @@ mod tests {
             analytics_computed_at: None,
             last_co_change_computed_at: None,
             scaffolding_override: None,
+            sharing_policy: None,
         };
         graph.create_project(&project).await.unwrap();
 

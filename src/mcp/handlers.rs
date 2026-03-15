@@ -161,6 +161,7 @@ impl ToolHandler {
             "protocol",
             "episode",
             "persona",
+            "sharing",
         ];
 
         if !mega_tools.contains(&name) {
@@ -524,6 +525,20 @@ impl ToolHandler {
             ("persona", "auto_build") => "auto_build_persona",
             ("persona", "maintain") => "maintain_personas",
             ("persona", "detect") => "detect_personas",
+
+            // Sharing (Privacy MVP)
+            ("sharing", "status") => "get_sharing_status",
+            ("sharing", "enable") => "enable_sharing",
+            ("sharing", "disable") => "disable_sharing",
+            ("sharing", "set_policy") => "set_sharing_policy",
+            ("sharing", "get_policy") => "get_sharing_policy",
+            ("sharing", "set_consent") => "set_sharing_consent",
+            ("sharing", "history") => "get_sharing_history",
+            ("sharing", "preview") => "preview_sharing",
+            ("sharing", "suggest") => "suggest_sharing",
+            ("sharing", "retract") => "retract_sharing",
+            ("sharing", "list_tombstones") => "list_tombstones",
+            ("sharing", "last_report") => "get_last_privacy_report",
 
             // Reasoning Tree
             ("reasoning", "reason") => "reason",
@@ -5182,6 +5197,132 @@ impl ToolHandler {
                     body["plan_id"] = v.clone();
                 }
                 let result = http.post("/api/protocols/simulate", &body).await?;
+                Ok(Some(result))
+            }
+
+            // ── Sharing (Privacy MVP) ─────────────────────────────────
+            "get_sharing_status" => {
+                let slug = extract_string(args, "project_slug")?;
+                let result = http.get(&format!("/api/projects/{}/sharing", slug)).await?;
+                Ok(Some(result))
+            }
+            "enable_sharing" => {
+                let slug = extract_string(args, "project_slug")?;
+                let result = http
+                    .post(&format!("/api/projects/{}/sharing/enable", slug), &json!({}))
+                    .await?;
+                Ok(Some(result))
+            }
+            "disable_sharing" => {
+                let slug = extract_string(args, "project_slug")?;
+                let result = http
+                    .post(&format!("/api/projects/{}/sharing/disable", slug), &json!({}))
+                    .await?;
+                Ok(Some(result))
+            }
+            "set_sharing_policy" => {
+                let slug = extract_string(args, "project_slug")?;
+                let mut body = serde_json::Map::new();
+                if let Some(v) = args.get("mode") {
+                    body.insert("mode".to_string(), v.clone());
+                }
+                if let Some(v) = args.get("type_overrides") {
+                    body.insert("type_overrides".to_string(), v.clone());
+                }
+                if let Some(v) = args.get("min_shareability_score") {
+                    body.insert("min_shareability_score".to_string(), v.clone());
+                }
+                let result = http
+                    .put(
+                        &format!("/api/projects/{}/sharing/policy", slug),
+                        &Value::Object(body),
+                    )
+                    .await?;
+                Ok(Some(result))
+            }
+            "get_sharing_policy" => {
+                let slug = extract_string(args, "project_slug")?;
+                let result = http
+                    .get(&format!("/api/projects/{}/sharing/policy", slug))
+                    .await?;
+                Ok(Some(result))
+            }
+            "set_sharing_consent" => {
+                let note_id = extract_id(args, "note_id")?;
+                let consent = extract_string(args, "consent")?;
+                let body = json!({"consent": consent});
+                let result = http
+                    .put(&format!("/api/notes/{}/consent", note_id), &body)
+                    .await?;
+                Ok(Some(result))
+            }
+            "get_sharing_history" => {
+                let slug = extract_string(args, "project_slug")?;
+                let mut query = Vec::new();
+                if let Some(l) = args.get("limit").and_then(|v| v.as_u64()) {
+                    query.push(("limit".to_string(), l.to_string()));
+                }
+                if let Some(o) = args.get("offset").and_then(|v| v.as_u64()) {
+                    query.push(("offset".to_string(), o.to_string()));
+                }
+                let result = if query.is_empty() {
+                    http.get(&format!("/api/projects/{}/sharing/history", slug))
+                        .await?
+                } else {
+                    http.get_with_query(
+                        &format!("/api/projects/{}/sharing/history", slug),
+                        &query,
+                    )
+                    .await?
+                };
+                Ok(Some(result))
+            }
+            "preview_sharing" => {
+                let slug = extract_string(args, "project_slug")?;
+                let result = http
+                    .get(&format!("/api/projects/{}/sharing/preview", slug))
+                    .await?;
+                Ok(Some(result))
+            }
+            "suggest_sharing" => {
+                let slug = extract_string(args, "project_slug")?;
+                let result = http
+                    .get(&format!("/api/projects/{}/sharing/suggest", slug))
+                    .await?;
+                Ok(Some(result))
+            }
+            "retract_sharing" => {
+                let mut body = serde_json::Map::new();
+                if let Some(v) = args.get("note_id") {
+                    body.insert("note_id".to_string(), v.clone());
+                }
+                if let Some(v) = args.get("content_hash") {
+                    body.insert("content_hash".to_string(), v.clone());
+                }
+                if let Some(v) = args.get("urgent") {
+                    body.insert("urgent".to_string(), v.clone());
+                }
+                let slug = extract_string(args, "project_slug")?;
+                let result = http
+                    .post(
+                        &format!("/api/projects/{}/sharing/retract", slug),
+                        &Value::Object(body),
+                    )
+                    .await?;
+                Ok(Some(result))
+            }
+            "list_tombstones" => {
+                let slug = extract_string(args, "project_slug")?;
+                let result = http
+                    .get(&format!("/api/projects/{}/sharing/tombstones", slug))
+                    .await?;
+                Ok(Some(result))
+            }
+            "get_last_privacy_report" => {
+                let slug = extract_string(args, "project_slug")?;
+                let result = http
+                    .get(&format!("/api/projects/{}/sharing/last-report", slug))
+                    .await?;
                 Ok(Some(result))
             }
 

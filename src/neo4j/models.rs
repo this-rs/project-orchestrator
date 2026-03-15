@@ -29,6 +29,10 @@ pub struct ProjectNode {
     /// Biomimicry T8: allows forcing a specific cognitive level.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub scaffolding_override: Option<u8>,
+    /// Sharing policy for P2P knowledge exchange (RFC Privacy §2.4).
+    /// Serialized as JSON string in Neo4j. None = sharing disabled (opt-in default).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub sharing_policy: Option<crate::episodes::distill_models::SharingPolicy>,
 }
 
 // ============================================================================

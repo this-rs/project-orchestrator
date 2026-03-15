@@ -43,6 +43,169 @@ pub enum PrivacyMode {
 }
 
 // ============================================================================
+// Sharing policy & consent (RFC Privacy §2.4)
+// ============================================================================
+
+/// How the project handles sharing of knowledge artifacts.
+///
+/// Controls the default behavior for notes/decisions in the distillation
+/// pipeline. Stored on `ProjectNode.sharing_policy`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SharingPolicy {
+    /// Global sharing mode: manual (human approves each), suggest (AI suggests,
+    /// human confirms), auto (AI decides based on score thresholds).
+    #[serde(default)]
+    pub mode: SharingMode,
+    /// Per-type overrides: key = note_type (e.g. "guideline", "gotcha"),
+    /// value = action (auto/never/review).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub type_overrides: HashMap<String, SharingAction>,
+    /// Whether the L3 scan is enabled at write time (always true, non-overridable).
+    #[serde(default = "default_true")]
+    pub l3_scan_enabled: bool,
+    /// Minimum shareability score (0.0-1.0) for auto mode.
+    #[serde(default = "default_min_score")]
+    pub min_shareability_score: f64,
+    /// Whether sharing is globally enabled for this project.
+    /// Fresh install = false (opt-in strict, GDPR Art. 25).
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_min_score() -> f64 {
+    0.7
+}
+
+impl Default for SharingPolicy {
+    fn default() -> Self {
+        Self {
+            mode: SharingMode::Manual,
+            type_overrides: HashMap::new(),
+            l3_scan_enabled: true,
+            min_shareability_score: 0.7,
+            enabled: false, // opt-in by default
+        }
+    }
+}
+
+/// Global sharing mode for a project.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SharingMode {
+    /// Human must approve every sharing action.
+    #[default]
+    Manual,
+    /// AI suggests, human confirms.
+    Suggest,
+    /// AI decides automatically based on score thresholds.
+    Auto,
+}
+
+/// Per-type sharing action override.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SharingAction {
+    /// Automatically shared if score >= threshold.
+    Auto,
+    /// Never shared regardless of score.
+    Never,
+    /// Always requires human review.
+    Review,
+}
+
+/// Consent status for an individual artifact (note or decision).
+///
+/// Stored on `NoteNode.sharing_consent`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SharingConsent {
+    /// No consent decision has been made yet (default).
+    #[default]
+    NotSet,
+    /// User explicitly allowed sharing of this artifact.
+    ExplicitAllow,
+    /// User explicitly denied sharing of this artifact.
+    ExplicitDeny,
+    /// Consent was automatically granted by policy (auto mode + score above threshold).
+    PolicyAuto,
+}
+
+/// Audit trail entry for a sharing event (GDPR Art. 30).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SharingEvent {
+    /// Unique event identifier.
+    pub id: String,
+    /// What was shared (content hash of the artifact).
+    pub content_hash: String,
+    /// Type of artifact shared (note, decision, skill_package).
+    pub artifact_type: String,
+    /// Action performed (shared, retracted, consent_changed).
+    pub action: String,
+    /// DID of the source instance.
+    pub source_did: String,
+    /// DID of the target peer (if point-to-point) or "broadcast".
+    pub target_did: String,
+    /// When the event occurred.
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+    /// Consent status at the time of sharing.
+    pub consent: SharingConsent,
+    /// Privacy mode active at the time.
+    pub privacy_mode: PrivacyMode,
+    /// Optional human-readable reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+// ============================================================================
+// Consent stats for enriched privacy report (RFC Privacy §2.3)
+// ============================================================================
+
+/// Statistics about consent gate filtering during distillation.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ConsentStats {
+    /// Number of artifacts that passed the consent gate.
+    pub consent_allowed: u32,
+    /// Number of artifacts denied by consent/policy.
+    pub consent_denied: u32,
+    /// Number of artifacts pending review (suggest mode).
+    pub consent_pending: u32,
+    /// Details for each denied artifact.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub denied_reasons: Vec<DenialDetail>,
+}
+
+/// Detail about why a specific artifact was denied sharing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DenialDetail {
+    /// Identifier of the denied artifact (content hash or note id).
+    pub artifact_id: String,
+    /// Type of artifact (note, decision).
+    pub artifact_type: String,
+    /// Reason for denial.
+    pub reason: DenialReason,
+}
+
+/// Reason an artifact was denied sharing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DenialReason {
+    /// User explicitly denied sharing (SharingConsent::ExplicitDeny).
+    ExplicitDeny,
+    /// Type is set to "never" in the project's SharingPolicy.
+    TypeNeverPolicy,
+    /// Shareability score below the policy threshold.
+    InsufficientScore,
+    /// Sharing mode requires manual review.
+    ManualRequired,
+    /// Sharing is globally disabled for this project.
+    SharingDisabled,
+}
+
+// ============================================================================
 // Portability layer
 // ============================================================================
 
@@ -96,6 +259,9 @@ pub struct AnonymizationReport {
     pub patterns_applied: Vec<String>,
     /// Whether an L3-FORBIDDEN pattern was detected (export should be blocked).
     pub blocked_l3: bool,
+    /// Consent gate statistics (populated when consent gate runs in the pipeline).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consent_stats: Option<ConsentStats>,
 }
 
 // ============================================================================
@@ -232,6 +398,7 @@ mod tests {
                 redacted_count: 2,
                 patterns_applied: vec!["H8-abs-path".to_string()],
                 blocked_l3: false,
+                consent_stats: None,
             }),
         };
         let json = serde_json::to_string_pretty(&envelope).unwrap();

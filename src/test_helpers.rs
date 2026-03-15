@@ -251,6 +251,7 @@ pub fn test_project() -> ProjectNode {
         analytics_computed_at: None,
         last_co_change_computed_at: None,
         scaffolding_override: None,
+        sharing_policy: None,
     }
 }
 
@@ -267,6 +268,7 @@ pub fn test_project_named(name: &str) -> ProjectNode {
         analytics_computed_at: None,
         last_co_change_computed_at: None,
         scaffolding_override: None,
+        sharing_policy: None,
     }
 }
 

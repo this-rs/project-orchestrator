@@ -100,6 +100,51 @@ static RE_H13_GIT_SHA: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\b[0-9a-fA-F]{40}\b").unwrap());
 
 // ============================================================================
+// L3 scan — reusable secret detection (RFC Privacy §2.3)
+// ============================================================================
+
+/// Scan content for L3-FORBIDDEN secrets (H1-H7).
+///
+/// This is a lightweight check that can be used independently of the full
+/// anonymization pipeline — e.g., at note creation/update time to prevent
+/// secrets from being persisted in the graph.
+///
+/// # Returns
+/// - `Ok(())` if no L3 patterns detected.
+/// - `Err(L3BlockedError)` listing all detected L3 patterns.
+pub fn scan_for_l3(content: &str) -> Result<(), L3BlockedError> {
+    let mut blocked = Vec::new();
+
+    if RE_H1_API_KEY.is_match(content) {
+        blocked.push("H1-api-key".to_string());
+    }
+    if RE_H2_PREFIXED_TOKEN.is_match(content) {
+        blocked.push("H2-prefixed-token".to_string());
+    }
+    if RE_H3_PRIVATE_KEY.is_match(content) {
+        blocked.push("H3-private-key".to_string());
+    }
+    if RE_H4_CONN_STRING.is_match(content) {
+        blocked.push("H4-conn-string".to_string());
+    }
+    if RE_H5_JWT.is_match(content) {
+        blocked.push("H5-jwt".to_string());
+    }
+    if RE_H6_PASS_HASH.is_match(content) {
+        blocked.push("H6-pass-hash".to_string());
+    }
+    if RE_H7_ENV_SECRET.is_match(content) {
+        blocked.push("H7-env-secret".to_string());
+    }
+
+    if blocked.is_empty() {
+        Ok(())
+    } else {
+        Err(L3BlockedError { patterns: blocked })
+    }
+}
+
+// ============================================================================
 // Anonymization entry point
 // ============================================================================
 
@@ -110,36 +155,10 @@ static RE_H13_GIT_SHA: LazyLock<Regex> =
 /// - `Err(L3BlockedError)` if L3-FORBIDDEN content is detected.
 pub fn anonymize(content: &str) -> Result<(String, AnonymizationReport), L3BlockedError> {
     let mut patterns_applied = Vec::new();
-    let mut blocked_l3_patterns = Vec::new();
 
     // --- Phase 1: Check L3-FORBIDDEN patterns (block export) ---
-    if RE_H1_API_KEY.is_match(content) {
-        blocked_l3_patterns.push("H1-api-key".to_string());
-    }
-    if RE_H2_PREFIXED_TOKEN.is_match(content) {
-        blocked_l3_patterns.push("H2-prefixed-token".to_string());
-    }
-    if RE_H3_PRIVATE_KEY.is_match(content) {
-        blocked_l3_patterns.push("H3-private-key".to_string());
-    }
-    if RE_H4_CONN_STRING.is_match(content) {
-        blocked_l3_patterns.push("H4-conn-string".to_string());
-    }
-    if RE_H5_JWT.is_match(content) {
-        blocked_l3_patterns.push("H5-jwt".to_string());
-    }
-    if RE_H6_PASS_HASH.is_match(content) {
-        blocked_l3_patterns.push("H6-pass-hash".to_string());
-    }
-    if RE_H7_ENV_SECRET.is_match(content) {
-        blocked_l3_patterns.push("H7-env-secret".to_string());
-    }
-
-    if !blocked_l3_patterns.is_empty() {
-        return Err(L3BlockedError {
-            patterns: blocked_l3_patterns,
-        });
-    }
+    // Delegates to the reusable scan_for_l3() function.
+    scan_for_l3(content)?;
 
     // --- Phase 2: Replace L2-CONFIDENTIAL patterns ---
     let mut result = content.to_string();
@@ -214,6 +233,7 @@ pub fn anonymize(content: &str) -> Result<(String, AnonymizationReport), L3Block
         redacted_count,
         patterns_applied,
         blocked_l3: false,
+        consent_stats: None,
     };
 
     Ok((result, report))

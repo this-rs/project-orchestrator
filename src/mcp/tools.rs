@@ -36,6 +36,7 @@ pub fn all_tools() -> Vec<ToolDefinition> {
         skill_tool(),
         protocol_tool(),
         persona_tool(),
+        sharing_tool(),
     ]
 }
 
@@ -1160,6 +1161,62 @@ fn persona_tool() -> ToolDefinition {
     }
 }
 
+// ============================================================================
+// Sharing (Privacy MVP)
+// ============================================================================
+
+fn sharing_tool() -> ToolDefinition {
+    ToolDefinition {
+        name: "sharing".to_string(),
+        description: "Manage sharing policies and consent for P2P knowledge federation. Actions: status, enable, disable, set_policy, get_policy, set_consent, history".to_string(),
+        input_schema: InputSchema {
+            schema_type: "object".to_string(),
+            properties: Some(json!({
+                "action": {
+                    "type": "string",
+                    "description": "The operation to perform",
+                    "enum": ["status", "enable", "disable", "set_policy", "get_policy", "set_consent", "history"]
+                },
+                "project_slug": {
+                    "type": "string",
+                    "description": "Project slug (required for status/enable/disable/set_policy/get_policy/history)"
+                },
+                "note_id": {
+                    "type": "string",
+                    "description": "Note UUID (required for set_consent)"
+                },
+                "consent": {
+                    "type": "string",
+                    "description": "Consent value for set_consent: explicit_allow, explicit_deny, not_set",
+                    "enum": ["explicit_allow", "explicit_deny", "not_set"]
+                },
+                "mode": {
+                    "type": "string",
+                    "description": "Sharing mode for set_policy: manual, suggest, auto",
+                    "enum": ["manual", "suggest", "auto"]
+                },
+                "type_overrides": {
+                    "type": "object",
+                    "description": "Per note-type overrides for set_policy. Keys are note types, values are: auto, never, review"
+                },
+                "min_shareability_score": {
+                    "type": "number",
+                    "description": "Minimum shareability score (0.0-1.0) for auto mode"
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max results for history"
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "Offset for history pagination"
+                }
+            })),
+            required: Some(vec!["action".to_string()]),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1169,8 +1226,8 @@ mod tests {
         let tools = all_tools();
         assert_eq!(
             tools.len(),
-            24,
-            "Expected 24 mega-tools, got {}",
+            25,
+            "Expected 25 mega-tools, got {}",
             tools.len()
         );
     }
@@ -1454,6 +1511,7 @@ mod tests {
             "admin",
             "skill",
             "persona",
+            "sharing",
         ];
         for name in &mega_names {
             assert!(

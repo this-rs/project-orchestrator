@@ -452,6 +452,7 @@ fn portable_note_to_note(
         changes: vec![],
         assertion_rule: None,
         last_assertion_result: None,
+        sharing_consent: Default::default(),
     })
 }
 
@@ -508,6 +509,7 @@ fn decision_to_note(
         changes: vec![],
         assertion_rule: None,
         last_assertion_result: None,
+        sharing_consent: Default::default(),
     })
 }
 
@@ -591,6 +593,7 @@ fn episode_to_note(
         changes: vec![],
         assertion_rule: None,
         last_assertion_result: None,
+        sharing_consent: Default::default(),
     })
 }
 
@@ -1278,6 +1281,7 @@ mod tests {
             analytics_computed_at: None,
             last_co_change_computed_at: None,
             scaffolding_override: None,
+            sharing_policy: None,
         };
         store.create_project(&source_project).await.unwrap();
 
@@ -1293,6 +1297,7 @@ mod tests {
             analytics_computed_at: None,
             last_co_change_computed_at: None,
             scaffolding_override: None,
+            sharing_policy: None,
         };
         store.create_project(&target_project).await.unwrap();
 
@@ -1330,6 +1335,7 @@ mod tests {
             last_assertion_result: None,
             memory_horizon: MemoryHorizon::Operational,
             scar_intensity: 0.0,
+            sharing_consent: Default::default(),
         };
         let note_id = note.id;
         store.create_note(&note).await.unwrap();

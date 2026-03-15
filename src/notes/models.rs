@@ -679,6 +679,12 @@ pub struct Note {
     pub assertion_rule: Option<AssertionRule>,
     /// Last assertion result (for assertion notes)
     pub last_assertion_result: Option<AssertionResult>,
+
+    // Privacy / Sharing consent (RFC Privacy §2.4)
+    /// Sharing consent for P2P knowledge exchange.
+    /// Controls whether this note can be shared via the distillation pipeline.
+    #[serde(default)]
+    pub sharing_consent: crate::episodes::distill_models::SharingConsent,
 }
 
 impl Note {
@@ -718,6 +724,7 @@ impl Note {
             changes: vec![NoteChange::new(ChangeType::Created, created_by)],
             assertion_rule: None,
             last_assertion_result: None,
+            sharing_consent: crate::episodes::distill_models::SharingConsent::NotSet,
         }
     }
 
@@ -764,6 +771,7 @@ impl Note {
             changes: vec![NoteChange::new(ChangeType::Created, created_by)],
             assertion_rule: None,
             last_assertion_result: None,
+            sharing_consent: crate::episodes::distill_models::SharingConsent::NotSet,
         }
     }
 

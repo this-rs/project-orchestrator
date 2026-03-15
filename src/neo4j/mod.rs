@@ -23,6 +23,7 @@ mod protocol;
 pub(crate) mod reasoning;
 mod registry;
 mod release;
+mod sharing;
 mod skill;
 mod step;
 mod task;

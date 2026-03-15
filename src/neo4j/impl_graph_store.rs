@@ -3607,4 +3607,71 @@ impl GraphStore for Neo4jClient {
     async fn get_all_risk_score_values(&self, project_id: Uuid) -> anyhow::Result<Vec<f64>> {
         self.get_all_risk_score_values(project_id).await
     }
+
+    // ========================================================================
+    // Sharing & Privacy operations
+    // ========================================================================
+
+    async fn get_sharing_policy(
+        &self,
+        project_id: Uuid,
+    ) -> anyhow::Result<Option<crate::episodes::distill_models::SharingPolicy>> {
+        self.get_sharing_policy(project_id).await
+    }
+
+    async fn update_sharing_policy(
+        &self,
+        project_id: Uuid,
+        policy: &crate::episodes::distill_models::SharingPolicy,
+    ) -> anyhow::Result<()> {
+        self.update_sharing_policy(project_id, policy).await
+    }
+
+    async fn get_sharing_consent(
+        &self,
+        note_id: Uuid,
+    ) -> anyhow::Result<crate::episodes::distill_models::SharingConsent> {
+        self.get_sharing_consent(note_id).await
+    }
+
+    async fn update_sharing_consent(
+        &self,
+        note_id: Uuid,
+        consent: &crate::episodes::distill_models::SharingConsent,
+    ) -> anyhow::Result<()> {
+        self.update_sharing_consent(note_id, consent).await
+    }
+
+    async fn create_sharing_event(
+        &self,
+        event: &crate::episodes::distill_models::SharingEvent,
+    ) -> anyhow::Result<()> {
+        self.create_sharing_event(event).await
+    }
+
+    async fn list_sharing_events(
+        &self,
+        project_id: Uuid,
+        limit: i64,
+        offset: i64,
+    ) -> anyhow::Result<Vec<crate::episodes::distill_models::SharingEvent>> {
+        self.list_sharing_events(project_id, limit, offset).await
+    }
+
+    async fn persist_tombstone(
+        &self,
+        tombstone: &crate::reception::anchor::SignedTombstone,
+    ) -> anyhow::Result<()> {
+        self.persist_tombstone(tombstone).await
+    }
+
+    async fn list_tombstones(
+        &self,
+    ) -> anyhow::Result<Vec<crate::reception::anchor::SignedTombstone>> {
+        self.list_tombstones().await
+    }
+
+    async fn is_tombstoned(&self, content_hash: &str) -> anyhow::Result<bool> {
+        self.is_tombstoned(content_hash).await
+    }
 }

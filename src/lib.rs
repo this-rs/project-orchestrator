@@ -31,6 +31,7 @@ pub mod reception;
 pub mod resolver;
 pub mod runner;
 pub mod setup_claude;
+pub mod sharing;
 pub mod skills;
 pub mod transport;
 pub mod update;
