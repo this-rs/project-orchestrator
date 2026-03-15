@@ -8833,6 +8833,7 @@ impl GraphStore for MockGraphStore {
             confidence_p90: 20.0, // Mock: no community data
             weight_outlier_count: outliers.len(),
             sample_size: weights.len(),
+            lower_fence: 0.0,
         })
     }
 
@@ -8905,6 +8906,68 @@ impl GraphStore for MockGraphStore {
         _weight: f64,
     ) -> Result<()> {
         Ok(())
+    }
+
+    // ========================================================================
+    // Persona learning methods (mock stubs)
+    // ========================================================================
+
+    async fn propagate_knows_via_co_change(
+        &self,
+        _persona_id: Uuid,
+        _file_path: &str,
+        _base_weight: f64,
+    ) -> Result<usize> {
+        Ok(0)
+    }
+
+    async fn compute_persona_affinity(
+        &self,
+        _persona_a: Uuid,
+        _persona_b: Uuid,
+    ) -> Result<crate::neo4j::persona::PersonaAffinityScore> {
+        Ok(crate::neo4j::persona::PersonaAffinityScore {
+            persona_a_id: _persona_a,
+            persona_b_id: _persona_b,
+            jaccard_files: 0.0,
+            synapse_density: 0.0,
+            combined: 0.0,
+        })
+    }
+
+    async fn merge_personas(&self, _keep_id: Uuid, _merge_id: Uuid) -> Result<()> {
+        Ok(())
+    }
+
+    async fn find_synapse_linked_personas(
+        &self,
+        _persona_id: Uuid,
+    ) -> Result<Vec<(Uuid, String, f64)>> {
+        Ok(vec![])
+    }
+
+    async fn rate_limited_energy_boost(
+        &self,
+        _persona_id: Uuid,
+        _boost: f64,
+        _max_per_cycle: f64,
+    ) -> Result<bool> {
+        Ok(true)
+    }
+
+    async fn get_learning_health(
+        &self,
+        _project_id: Uuid,
+    ) -> Result<crate::neo4j::analytics::LearningHealthReport> {
+        Ok(crate::neo4j::analytics::LearningHealthReport {
+            knows_convergence: 0.0,
+            knows_coverage: 0.0,
+            decay_rate: 0.0,
+            synapse_health: 0.0,
+            co_change_coverage: 0.0,
+            persona_count: 0,
+            total_knows: 0,
+        })
     }
 
     // ========================================================================

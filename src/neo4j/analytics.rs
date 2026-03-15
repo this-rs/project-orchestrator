@@ -37,6 +37,25 @@ pub fn level_info(level: u8) -> (u8, String, String) {
     }
 }
 
+/// Learning health metrics for a project's persona system.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct LearningHealthReport {
+    /// Variance of KNOWS weights (low = converged)
+    pub knows_convergence: f64,
+    /// Percentage of project files covered by at least 1 persona
+    pub knows_coverage: f64,
+    /// Ratio of pruned KNOWS / total KNOWS per cycle (placeholder)
+    pub decay_rate: f64,
+    /// Ratio of active synapses / total possible between persona notes
+    pub synapse_health: f64,
+    /// Number of CO_CHANGED pairs where both are KNOWS by same persona
+    pub co_change_coverage: f64,
+    /// Number of active personas
+    pub persona_count: usize,
+    /// Total number of KNOWS relations
+    pub total_knows: usize,
+}
+
 impl Neo4jClient {
     /// Get distinct communities for a project (from graph analytics Louvain clustering).
     /// Returns communities sorted by file_count descending.
@@ -2934,6 +2953,131 @@ impl Neo4jClient {
             .iter()
             .filter_map(|r| r.get::<f64>("rs").ok())
             .collect())
+    }
+
+    /// Get learning health metrics for a project's persona system.
+    pub async fn get_learning_health(&self, project_id: Uuid) -> Result<LearningHealthReport> {
+        // Q1: KNOWS weight variance + count
+        let q1 = query(
+            r#"
+            MATCH (p:Persona {project_id: $pid})-[r:KNOWS]->(f:File)
+            WHERE r.weight IS NOT NULL
+            WITH collect(r.weight) AS weights, count(r) AS total
+            WITH weights, total,
+                 reduce(s = 0.0, w IN weights | s + w) / total AS mean
+            WITH weights, total, mean,
+                 CASE WHEN total > 1 THEN
+                     reduce(s = 0.0, w IN weights | s + (w - mean) * (w - mean)) / total
+                 ELSE 0.0 END AS variance
+            RETURN variance, total
+        "#,
+        )
+        .param("pid", project_id.to_string());
+
+        // Q2: File coverage
+        let q2 = query(r#"
+            MATCH (proj:Project {id: $pid})-[:CONTAINS]->(f:File)
+            WITH count(f) AS total_files
+            OPTIONAL MATCH (p:Persona {project_id: $pid})-[:KNOWS]->(kf:File)
+            WITH total_files, count(DISTINCT kf) AS known_files
+            RETURN CASE WHEN total_files > 0 THEN toFloat(known_files) / total_files ELSE 0.0 END AS coverage
+        "#).param("pid", project_id.to_string());
+
+        // Q3: Synapse health between persona notes
+        let q3 = query(
+            r#"
+            MATCH (p:Persona {project_id: $pid})-[:USES]->(n:Note)
+            WITH collect(DISTINCT n.id) AS note_ids, count(DISTINCT n) AS note_count
+            OPTIONAL MATCH (n1:Note)-[s:SYNAPSE]->(n2:Note)
+            WHERE n1.id IN note_ids AND n2.id IN note_ids
+            WITH note_count, count(s) AS synapse_count
+            WITH note_count, synapse_count,
+                 CASE WHEN note_count > 1
+                      THEN toFloat(synapse_count) / toFloat(note_count * (note_count - 1) / 2)
+                      ELSE 0.0
+                 END AS health
+            RETURN health, synapse_count
+        "#,
+        )
+        .param("pid", project_id.to_string());
+
+        // Q4: CO_CHANGED coverage
+        let q4 = query(
+            r#"
+            MATCH (f1:File)-[:CO_CHANGED]-(f2:File)
+            WHERE EXISTS { MATCH (proj:Project {id: $pid})-[:CONTAINS]->(f1) }
+              AND f1.path < f2.path
+            WITH DISTINCT f1, f2
+            OPTIONAL MATCH (p:Persona {project_id: $pid})-[:KNOWS]->(f1),
+                           (p)-[:KNOWS]->(f2)
+            WITH count(DISTINCT f1.path + '|' + f2.path) AS covered_pairs
+            RETURN covered_pairs
+        "#,
+        )
+        .param("pid", project_id.to_string());
+
+        // Q5: Persona count
+        let q5 = query(
+            r#"
+            MATCH (p:Persona {project_id: $pid})
+            WHERE p.status <> 'archived'
+            RETURN count(p) AS cnt
+        "#,
+        )
+        .param("pid", project_id.to_string());
+
+        let (r1, r2, r3, r4, r5) = tokio::join!(
+            self.execute_with_params(q1),
+            self.execute_with_params(q2),
+            self.execute_with_params(q3),
+            self.execute_with_params(q4),
+            self.execute_with_params(q5),
+        );
+
+        let (variance, total_knows) = r1
+            .ok()
+            .and_then(|rows| rows.into_iter().next())
+            .map(|r| {
+                (
+                    r.get::<f64>("variance").unwrap_or(0.0),
+                    r.get::<i64>("total").unwrap_or(0) as usize,
+                )
+            })
+            .unwrap_or((0.0, 0));
+
+        let coverage = r2
+            .ok()
+            .and_then(|rows| rows.into_iter().next())
+            .and_then(|r| r.get::<f64>("coverage").ok())
+            .unwrap_or(0.0);
+
+        let synapse_health = r3
+            .ok()
+            .and_then(|rows| rows.into_iter().next())
+            .and_then(|r| r.get::<f64>("health").ok())
+            .unwrap_or(0.0);
+
+        let co_change_coverage_raw = r4
+            .ok()
+            .and_then(|rows| rows.into_iter().next())
+            .and_then(|r| r.get::<i64>("covered_pairs").ok())
+            .unwrap_or(0);
+
+        let persona_count = r5
+            .ok()
+            .and_then(|rows| rows.into_iter().next())
+            .and_then(|r| r.get::<i64>("cnt").ok())
+            .unwrap_or(0) as usize;
+
+        Ok(LearningHealthReport {
+            knows_convergence: variance,
+            knows_coverage: coverage,
+            decay_rate: 0.0, // Would need historical data
+            synapse_health,
+            co_change_coverage: co_change_coverage_raw as f64,
+            persona_count,
+            total_knows,
+        })
     }
 }
 

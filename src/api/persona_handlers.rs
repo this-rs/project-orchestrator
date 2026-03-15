@@ -214,6 +214,8 @@ pub async fn create_persona(
         success_rate: 0.0,
         avg_duration_secs: 0.0,
         last_activated: None,
+        energy_boost_accumulated: 0.0,
+        energy_history: vec![],
         origin,
         created_at: Utc::now(),
         updated_at: None,
@@ -938,6 +940,8 @@ pub async fn import_persona(
         success_rate: 0.0,
         avg_duration_secs: 0.0,
         last_activated: None,
+        energy_boost_accumulated: 0.0,
+        energy_history: vec![],
         origin: PersonaOrigin::Imported,
         created_at: Utc::now(),
         updated_at: None,
@@ -1239,6 +1243,8 @@ pub async fn auto_build_persona(
         success_rate: 0.0,
         avg_duration_secs: 0.0,
         last_activated: None,
+        energy_boost_accumulated: 0.0,
+        energy_history: vec![],
         origin: PersonaOrigin::AutoBuild,
         created_at: Utc::now(),
         updated_at: None,
@@ -1357,6 +1363,53 @@ pub async fn detect_personas(
         "count": proposals.len(),
         "project_id": query.project_id,
     })))
+}
+
+// ============================================================================
+// Learning Health
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct LearningHealthQuery {
+    pub project_id: Option<Uuid>,
+    pub project_slug: Option<String>,
+}
+
+/// Get learning health metrics for a project's persona system.
+///
+/// GET /api/personas/learning-health?project_id=...
+/// GET /api/personas/learning-health?project_slug=...
+pub async fn get_learning_health(
+    State(state): State<OrchestratorState>,
+    Query(query): Query<LearningHealthQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let project_id = match (query.project_id, &query.project_slug) {
+        (Some(id), _) => id,
+        (None, Some(slug)) => {
+            let project = state
+                .orchestrator
+                .neo4j()
+                .get_project_by_slug(slug)
+                .await
+                .map_err(AppError::Internal)?
+                .ok_or_else(|| AppError::NotFound(format!("Project not found: {slug}")))?;
+            project.id
+        }
+        (None, None) => {
+            return Err(AppError::BadRequest(
+                "Either project_id or project_slug is required".to_string(),
+            ));
+        }
+    };
+
+    let report = state
+        .orchestrator
+        .neo4j()
+        .get_learning_health(project_id)
+        .await
+        .map_err(AppError::Internal)?;
+
+    Ok(Json(serde_json::json!(report)))
 }
 
 // ============================================================================
@@ -1839,6 +1892,8 @@ mod tests {
             success_rate: 0.0,
             avg_duration_secs: 0.0,
             last_activated: None,
+            energy_boost_accumulated: 0.0,
+            energy_history: vec![],
             origin: PersonaOrigin::Manual,
             created_at: Utc::now(),
             updated_at: None,
@@ -2909,6 +2964,8 @@ mod tests {
             success_rate: 0.9,
             avg_duration_secs: 30.0,
             last_activated: None,
+            energy_boost_accumulated: 0.0,
+            energy_history: vec![],
             origin: PersonaOrigin::Manual,
             created_at: Utc::now(),
             updated_at: None,
@@ -3084,5 +3141,61 @@ mod tests {
             "exact match should take priority, got weight {}",
             weight
         );
+    }
+
+    // ----------------------------------------------------------------
+    // Learning Health
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_get_learning_health_with_project_id() {
+        let (app, project_id) = test_app_with_project().await;
+        let resp = app
+            .oneshot(auth_get(&format!(
+                "/api/personas/learning-health?project_id={}",
+                project_id
+            )))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["persona_count"], 0);
+        assert_eq!(json["knows_convergence"], 0.0);
+    }
+
+    #[tokio::test]
+    async fn test_get_learning_health_with_slug() {
+        let (app, _project_id) = test_app_with_project().await;
+        let resp = app
+            .oneshot(auth_get(
+                "/api/personas/learning-health?project_slug=test-project",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["persona_count"], 0);
+    }
+
+    #[tokio::test]
+    async fn test_get_learning_health_missing_params() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_get("/api/personas/learning-health"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_get_learning_health_slug_not_found() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_get(
+                "/api/personas/learning-health?project_slug=nonexistent",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::NOT_FOUND);
     }
 }
