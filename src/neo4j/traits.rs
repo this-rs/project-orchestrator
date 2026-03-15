@@ -2299,6 +2299,203 @@ pub trait GraphStore: Send + Sync {
     ) -> Result<Vec<(String, String, f64)>>;
 
     // ========================================================================
+    // Persona operations (Living Personas)
+    // ========================================================================
+
+    /// Create a new persona node. If project_id is Some, links it via BELONGS_TO.
+    async fn create_persona(&self, persona: &PersonaNode) -> Result<()>;
+
+    /// Get a persona by ID.
+    async fn get_persona(&self, id: Uuid) -> Result<Option<PersonaNode>>;
+
+    /// Update a persona node (replaces all mutable fields).
+    async fn update_persona(&self, persona: &PersonaNode) -> Result<()>;
+
+    /// Delete a persona and all its relationships.
+    /// Returns true if the persona existed and was deleted.
+    async fn delete_persona(&self, id: Uuid) -> Result<bool>;
+
+    /// List personas for a project with optional status filter and pagination.
+    /// Returns (personas, total_count).
+    async fn list_personas(
+        &self,
+        project_id: Uuid,
+        status: Option<PersonaStatus>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<PersonaNode>, usize)>;
+
+    /// List global personas (project_id IS NULL) — portable personas.
+    async fn list_global_personas(&self) -> Result<Vec<PersonaNode>>;
+
+    // ========================================================================
+    // Persona relation operations
+    // ========================================================================
+
+    /// Add MASTERS relation: Persona -> Skill
+    async fn add_persona_skill(&self, persona_id: Uuid, skill_id: Uuid) -> Result<()>;
+
+    /// Remove MASTERS relation: Persona -> Skill
+    async fn remove_persona_skill(&self, persona_id: Uuid, skill_id: Uuid) -> Result<()>;
+
+    /// Add FOLLOWS relation: Persona -> Protocol
+    async fn add_persona_protocol(&self, persona_id: Uuid, protocol_id: Uuid) -> Result<()>;
+
+    /// Remove FOLLOWS relation: Persona -> Protocol
+    async fn remove_persona_protocol(&self, persona_id: Uuid, protocol_id: Uuid) -> Result<()>;
+
+    /// Increment activation_count and update last_activated for a Persona.
+    async fn increment_persona_activation(&self, persona_id: Uuid) -> Result<()>;
+
+    /// Add SCOPED_TO relation: Persona -> FeatureGraph
+    async fn set_persona_feature_graph(
+        &self,
+        persona_id: Uuid,
+        feature_graph_id: Uuid,
+    ) -> Result<()>;
+
+    /// Remove SCOPED_TO relation: Persona -> FeatureGraph
+    async fn remove_persona_feature_graph(&self, persona_id: Uuid) -> Result<()>;
+
+    /// Add KNOWS relation: Persona -> File (with weight)
+    async fn add_persona_file(&self, persona_id: Uuid, file_path: &str, weight: f64) -> Result<()>;
+
+    /// Remove KNOWS relation: Persona -> File
+    async fn remove_persona_file(&self, persona_id: Uuid, file_path: &str) -> Result<()>;
+
+    /// Add KNOWS relation: Persona -> Function (with weight)
+    async fn add_persona_function(
+        &self,
+        persona_id: Uuid,
+        function_id: &str,
+        weight: f64,
+    ) -> Result<()>;
+
+    /// Remove KNOWS relation: Persona -> Function
+    async fn remove_persona_function(&self, persona_id: Uuid, function_id: &str) -> Result<()>;
+
+    /// Add USES relation: Persona -> Note (with weight)
+    async fn add_persona_note(&self, persona_id: Uuid, note_id: Uuid, weight: f64) -> Result<()>;
+
+    /// Remove USES relation: Persona -> Note
+    async fn remove_persona_note(&self, persona_id: Uuid, note_id: Uuid) -> Result<()>;
+
+    /// Add USES relation: Persona -> Decision (with weight)
+    async fn add_persona_decision(
+        &self,
+        persona_id: Uuid,
+        decision_id: Uuid,
+        weight: f64,
+    ) -> Result<()>;
+
+    /// Remove USES relation: Persona -> Decision
+    async fn remove_persona_decision(&self, persona_id: Uuid, decision_id: Uuid) -> Result<()>;
+
+    /// Add EXTENDS relation: child Persona -> parent Persona
+    async fn add_persona_extends(&self, child_id: Uuid, parent_id: Uuid) -> Result<()>;
+
+    /// Remove EXTENDS relation: child Persona -> parent Persona
+    async fn remove_persona_extends(&self, child_id: Uuid, parent_id: Uuid) -> Result<()>;
+
+    // ========================================================================
+    // Persona subgraph (knowledge assembly)
+    // ========================================================================
+
+    /// Assemble the full knowledge subgraph for a persona.
+    /// Includes all KNOWS, USES, MASTERS, FOLLOWS, SCOPED_TO, EXTENDS entities.
+    async fn get_persona_subgraph(&self, persona_id: Uuid) -> Result<PersonaSubgraph>;
+
+    /// Find personas that KNOW a given file (for activation by file match).
+    /// Returns (persona, weight) sorted by weight descending.
+    async fn find_personas_for_file(
+        &self,
+        file_path: &str,
+        project_id: Uuid,
+    ) -> Result<Vec<(PersonaNode, f64)>>;
+
+    /// Load ALL persona KNOWS relations for a project in a single query.
+    /// Returns Vec<(PersonaNode, file_path, weight)> for building a complete
+    /// PersonaFileIndex without cold-start issues.
+    async fn get_all_persona_knows(
+        &self,
+        project_id: Uuid,
+    ) -> Result<Vec<(PersonaNode, String, f64)>>;
+
+    /// Auto-scope each persona to the FeatureGraph that best matches its KNOWS files.
+    /// Returns the number of personas that were scoped.
+    async fn auto_scope_to_feature_graphs(&self, project_id: Uuid) -> Result<usize>;
+
+    /// Compute adaptive thresholds from actual KNOWS/USES weight distributions.
+    /// Falls back to hardcoded defaults when there are fewer than 10 data points.
+    async fn compute_adaptive_thresholds(
+        &self,
+        project_id: Uuid,
+    ) -> Result<crate::neo4j::persona::AdaptivePersonaThresholds>;
+
+    /// Maintain all personas for a project: decay weights, prune, recalculate cohesion.
+    /// Returns (decayed_count, pruned_count, personas_updated).
+    async fn maintain_personas(&self, project_id: Uuid) -> Result<(usize, usize, usize)>;
+
+    /// Detect potential personas from Louvain communities.
+    async fn detect_personas(
+        &self,
+        project_id: Uuid,
+    ) -> Result<Vec<crate::neo4j::persona::PersonaProposal>>;
+
+    /// Find personas adjacent to a file (same dir or 1-hop IMPORTS).
+    async fn find_adjacent_personas(
+        &self,
+        file_path: &str,
+        project_id: Uuid,
+    ) -> Result<Vec<(Uuid, String)>>;
+
+    /// Auto-grow: create a weak KNOWS relation between persona and file.
+    async fn auto_grow_file_knows(
+        &self,
+        persona_id: Uuid,
+        file_path: &str,
+        weight: f64,
+    ) -> Result<()>;
+
+    /// Find personas relevant to a note based on KNOWS file overlap.
+    async fn find_relevant_personas_for_note(
+        &self,
+        file_paths: &[String],
+        project_id: Uuid,
+    ) -> Result<Vec<(Uuid, f64)>>;
+
+    /// Find personas relevant to a decision based on KNOWS overlap with AFFECTS entities.
+    async fn find_relevant_personas_for_decision(
+        &self,
+        decision_id: Uuid,
+        project_id: Uuid,
+    ) -> Result<Vec<(Uuid, f64)>>;
+
+    /// Auto-link a note to an active persona (growth hook).
+    async fn auto_link_note_to_persona(
+        &self,
+        persona_id: Uuid,
+        note_id: Uuid,
+        weight: f64,
+    ) -> Result<()>;
+
+    /// Auto-link a decision to an active persona (growth hook).
+    async fn auto_link_decision_to_persona(
+        &self,
+        persona_id: Uuid,
+        decision_id: Uuid,
+        weight: f64,
+    ) -> Result<()>;
+
+    /// Auto-link a file to an active persona (growth hook).
+    async fn auto_link_file_to_persona(
+        &self,
+        persona_id: Uuid,
+        file_path: &str,
+        weight: f64,
+    ) -> Result<()>;
+
+    // ========================================================================
     // Analysis Profile operations
     // ========================================================================
 

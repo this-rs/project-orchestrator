@@ -153,6 +153,25 @@ pub struct MockGraphStore {
     /// Decision AFFECTS relations: decision_id -> Vec<AffectsRelation>
     pub decision_affects: RwLock<HashMap<Uuid, Vec<AffectsRelation>>>,
 
+    // Persona stores (Living Personas)
+    pub personas: RwLock<HashMap<Uuid, PersonaNode>>,
+    /// persona_id -> Set<skill_id>
+    pub persona_skills: RwLock<HashMap<Uuid, std::collections::HashSet<Uuid>>>,
+    /// persona_id -> Set<protocol_id>
+    pub persona_protocols: RwLock<HashMap<Uuid, std::collections::HashSet<Uuid>>>,
+    /// persona_id -> feature_graph_id
+    pub persona_feature_graph: RwLock<HashMap<Uuid, Uuid>>,
+    /// persona_id -> Map<file_path, weight>
+    pub persona_files: RwLock<HashMap<Uuid, HashMap<String, f64>>>,
+    /// persona_id -> Map<function_id, weight>
+    pub persona_functions: RwLock<HashMap<Uuid, HashMap<String, f64>>>,
+    /// persona_id -> Map<note_id, weight>
+    pub persona_notes: RwLock<HashMap<Uuid, HashMap<Uuid, f64>>>,
+    /// persona_id -> Map<decision_id, weight>
+    pub persona_decisions: RwLock<HashMap<Uuid, HashMap<Uuid, f64>>>,
+    /// persona_id -> Vec<parent_persona_id> (EXTENDS chain)
+    pub persona_extends: RwLock<HashMap<Uuid, Vec<Uuid>>>,
+
     // Test flags
     /// Controls what `has_context_cards()` returns (default: false)
     pub mock_has_context_cards: std::sync::atomic::AtomicBool,
@@ -242,6 +261,15 @@ impl MockGraphStore {
             analysis_profiles: RwLock::new(HashMap::new()),
             topology_rules: RwLock::new(HashMap::new()),
             decision_affects: RwLock::new(HashMap::new()),
+            personas: RwLock::new(HashMap::new()),
+            persona_skills: RwLock::new(HashMap::new()),
+            persona_protocols: RwLock::new(HashMap::new()),
+            persona_feature_graph: RwLock::new(HashMap::new()),
+            persona_files: RwLock::new(HashMap::new()),
+            persona_functions: RwLock::new(HashMap::new()),
+            persona_notes: RwLock::new(HashMap::new()),
+            persona_decisions: RwLock::new(HashMap::new()),
+            persona_extends: RwLock::new(HashMap::new()),
             mock_has_context_cards: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -8332,6 +8360,551 @@ impl GraphStore for MockGraphStore {
 
     async fn health_check(&self) -> anyhow::Result<bool> {
         Ok(true)
+    }
+
+    // ========================================================================
+    // Persona operations (Living Personas)
+    // ========================================================================
+
+    async fn create_persona(&self, persona: &PersonaNode) -> Result<()> {
+        self.personas
+            .write()
+            .await
+            .insert(persona.id, persona.clone());
+        Ok(())
+    }
+
+    async fn get_persona(&self, id: Uuid) -> Result<Option<PersonaNode>> {
+        Ok(self.personas.read().await.get(&id).cloned())
+    }
+
+    async fn update_persona(&self, persona: &PersonaNode) -> Result<()> {
+        let mut store = self.personas.write().await;
+        if let std::collections::hash_map::Entry::Occupied(mut e) = store.entry(persona.id) {
+            e.insert(persona.clone());
+            Ok(())
+        } else {
+            anyhow::bail!("Persona {} not found", persona.id)
+        }
+    }
+
+    async fn delete_persona(&self, id: Uuid) -> Result<bool> {
+        let existed = self.personas.write().await.remove(&id).is_some();
+        if existed {
+            // Clean up relations
+            self.persona_skills.write().await.remove(&id);
+            self.persona_protocols.write().await.remove(&id);
+            self.persona_feature_graph.write().await.remove(&id);
+            self.persona_files.write().await.remove(&id);
+            self.persona_functions.write().await.remove(&id);
+            self.persona_notes.write().await.remove(&id);
+            self.persona_decisions.write().await.remove(&id);
+            self.persona_extends.write().await.remove(&id);
+        }
+        Ok(existed)
+    }
+
+    async fn list_personas(
+        &self,
+        project_id: Uuid,
+        status: Option<PersonaStatus>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<PersonaNode>, usize)> {
+        let store = self.personas.read().await;
+        let mut all: Vec<PersonaNode> = store
+            .values()
+            .filter(|p| p.project_id == Some(project_id))
+            .filter(|p| status.is_none_or(|s| p.status == s))
+            .cloned()
+            .collect();
+        all.sort_by(|a, b| {
+            b.energy
+                .partial_cmp(&a.energy)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let total = all.len();
+        let page = all.into_iter().skip(offset).take(limit).collect();
+        Ok((page, total))
+    }
+
+    async fn list_global_personas(&self) -> Result<Vec<PersonaNode>> {
+        let store = self.personas.read().await;
+        Ok(store
+            .values()
+            .filter(|p| p.project_id.is_none())
+            .cloned()
+            .collect())
+    }
+
+    async fn add_persona_skill(&self, persona_id: Uuid, skill_id: Uuid) -> Result<()> {
+        self.persona_skills
+            .write()
+            .await
+            .entry(persona_id)
+            .or_default()
+            .insert(skill_id);
+        Ok(())
+    }
+
+    async fn remove_persona_skill(&self, persona_id: Uuid, skill_id: Uuid) -> Result<()> {
+        if let Some(set) = self.persona_skills.write().await.get_mut(&persona_id) {
+            set.remove(&skill_id);
+        }
+        Ok(())
+    }
+
+    async fn add_persona_protocol(&self, persona_id: Uuid, protocol_id: Uuid) -> Result<()> {
+        self.persona_protocols
+            .write()
+            .await
+            .entry(persona_id)
+            .or_default()
+            .insert(protocol_id);
+        Ok(())
+    }
+
+    async fn remove_persona_protocol(&self, persona_id: Uuid, protocol_id: Uuid) -> Result<()> {
+        if let Some(set) = self.persona_protocols.write().await.get_mut(&persona_id) {
+            set.remove(&protocol_id);
+        }
+        Ok(())
+    }
+
+    async fn increment_persona_activation(&self, persona_id: Uuid) -> Result<()> {
+        let mut personas = self.personas.write().await;
+        if let Some(persona) = personas.get_mut(&persona_id) {
+            persona.activation_count += 1;
+            persona.last_activated = Some(chrono::Utc::now());
+        }
+        Ok(())
+    }
+
+    async fn set_persona_feature_graph(
+        &self,
+        persona_id: Uuid,
+        feature_graph_id: Uuid,
+    ) -> Result<()> {
+        self.persona_feature_graph
+            .write()
+            .await
+            .insert(persona_id, feature_graph_id);
+        Ok(())
+    }
+
+    async fn remove_persona_feature_graph(&self, persona_id: Uuid) -> Result<()> {
+        self.persona_feature_graph.write().await.remove(&persona_id);
+        Ok(())
+    }
+
+    async fn add_persona_file(&self, persona_id: Uuid, file_path: &str, weight: f64) -> Result<()> {
+        self.persona_files
+            .write()
+            .await
+            .entry(persona_id)
+            .or_default()
+            .insert(file_path.to_string(), weight);
+        Ok(())
+    }
+
+    async fn remove_persona_file(&self, persona_id: Uuid, file_path: &str) -> Result<()> {
+        if let Some(map) = self.persona_files.write().await.get_mut(&persona_id) {
+            map.remove(file_path);
+        }
+        Ok(())
+    }
+
+    async fn add_persona_function(
+        &self,
+        persona_id: Uuid,
+        function_id: &str,
+        weight: f64,
+    ) -> Result<()> {
+        self.persona_functions
+            .write()
+            .await
+            .entry(persona_id)
+            .or_default()
+            .insert(function_id.to_string(), weight);
+        Ok(())
+    }
+
+    async fn remove_persona_function(&self, persona_id: Uuid, function_id: &str) -> Result<()> {
+        if let Some(map) = self.persona_functions.write().await.get_mut(&persona_id) {
+            map.remove(function_id);
+        }
+        Ok(())
+    }
+
+    async fn add_persona_note(&self, persona_id: Uuid, note_id: Uuid, weight: f64) -> Result<()> {
+        self.persona_notes
+            .write()
+            .await
+            .entry(persona_id)
+            .or_default()
+            .insert(note_id, weight);
+        Ok(())
+    }
+
+    async fn remove_persona_note(&self, persona_id: Uuid, note_id: Uuid) -> Result<()> {
+        if let Some(map) = self.persona_notes.write().await.get_mut(&persona_id) {
+            map.remove(&note_id);
+        }
+        Ok(())
+    }
+
+    async fn add_persona_decision(
+        &self,
+        persona_id: Uuid,
+        decision_id: Uuid,
+        weight: f64,
+    ) -> Result<()> {
+        self.persona_decisions
+            .write()
+            .await
+            .entry(persona_id)
+            .or_default()
+            .insert(decision_id, weight);
+        Ok(())
+    }
+
+    async fn remove_persona_decision(&self, persona_id: Uuid, decision_id: Uuid) -> Result<()> {
+        if let Some(map) = self.persona_decisions.write().await.get_mut(&persona_id) {
+            map.remove(&decision_id);
+        }
+        Ok(())
+    }
+
+    async fn add_persona_extends(&self, child_id: Uuid, parent_id: Uuid) -> Result<()> {
+        self.persona_extends
+            .write()
+            .await
+            .entry(child_id)
+            .or_default()
+            .push(parent_id);
+        Ok(())
+    }
+
+    async fn remove_persona_extends(&self, child_id: Uuid, parent_id: Uuid) -> Result<()> {
+        if let Some(vec) = self.persona_extends.write().await.get_mut(&child_id) {
+            vec.retain(|&id| id != parent_id);
+        }
+        Ok(())
+    }
+
+    async fn get_persona_subgraph(&self, persona_id: Uuid) -> Result<PersonaSubgraph> {
+        let persona = self
+            .get_persona(persona_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Persona {} not found", persona_id))?;
+
+        let files: Vec<PersonaWeightedRelation> = self
+            .persona_files
+            .read()
+            .await
+            .get(&persona_id)
+            .map(|m| {
+                m.iter()
+                    .map(|(path, &w)| PersonaWeightedRelation {
+                        entity_type: "file".to_string(),
+                        entity_id: path.clone(),
+                        weight: w,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let functions: Vec<PersonaWeightedRelation> = self
+            .persona_functions
+            .read()
+            .await
+            .get(&persona_id)
+            .map(|m| {
+                m.iter()
+                    .map(|(fid, &w)| PersonaWeightedRelation {
+                        entity_type: "function".to_string(),
+                        entity_id: fid.clone(),
+                        weight: w,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let notes: Vec<PersonaWeightedRelation> = self
+            .persona_notes
+            .read()
+            .await
+            .get(&persona_id)
+            .map(|m| {
+                m.iter()
+                    .map(|(nid, &w)| PersonaWeightedRelation {
+                        entity_type: "note".to_string(),
+                        entity_id: nid.to_string(),
+                        weight: w,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let decisions: Vec<PersonaWeightedRelation> = self
+            .persona_decisions
+            .read()
+            .await
+            .get(&persona_id)
+            .map(|m| {
+                m.iter()
+                    .map(|(did, &w)| PersonaWeightedRelation {
+                        entity_type: "decision".to_string(),
+                        entity_id: did.to_string(),
+                        weight: w,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let skills: Vec<PersonaWeightedRelation> = self
+            .persona_skills
+            .read()
+            .await
+            .get(&persona_id)
+            .map(|s| {
+                s.iter()
+                    .map(|sid| PersonaWeightedRelation {
+                        entity_type: "skill".to_string(),
+                        entity_id: sid.to_string(),
+                        weight: 1.0,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let protocols: Vec<PersonaWeightedRelation> = self
+            .persona_protocols
+            .read()
+            .await
+            .get(&persona_id)
+            .map(|s| {
+                s.iter()
+                    .map(|pid| PersonaWeightedRelation {
+                        entity_type: "protocol".to_string(),
+                        entity_id: pid.to_string(),
+                        weight: 1.0,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let feature_graph_id = self
+            .persona_feature_graph
+            .read()
+            .await
+            .get(&persona_id)
+            .copied();
+
+        let parents: Vec<PersonaWeightedRelation> = self
+            .persona_extends
+            .read()
+            .await
+            .get(&persona_id)
+            .map(|ids| {
+                ids.iter()
+                    .map(|pid| PersonaWeightedRelation {
+                        entity_type: "persona".to_string(),
+                        entity_id: pid.to_string(),
+                        weight: 1.0,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let children: Vec<PersonaWeightedRelation> = Vec::new(); // Mock doesn't track reverse extends
+
+        let total_entities = files.len()
+            + functions.len()
+            + notes.len()
+            + decisions.len()
+            + skills.len()
+            + protocols.len()
+            + if feature_graph_id.is_some() { 1 } else { 0 };
+
+        Ok(PersonaSubgraph {
+            persona_id,
+            persona_name: persona.name,
+            files,
+            functions,
+            notes,
+            decisions,
+            skills,
+            protocols,
+            feature_graph_id,
+            parents,
+            children,
+            stats: PersonaSubgraphStats {
+                total_entities,
+                coverage_score: 0.0,
+                freshness: 0.0,
+            },
+        })
+    }
+
+    async fn find_personas_for_file(
+        &self,
+        file_path: &str,
+        project_id: Uuid,
+    ) -> Result<Vec<(PersonaNode, f64)>> {
+        let personas = self.personas.read().await;
+        let files = self.persona_files.read().await;
+        let mut results: Vec<(PersonaNode, f64)> = Vec::new();
+        for persona in personas.values() {
+            if persona.project_id != Some(project_id) {
+                continue;
+            }
+            if let Some(file_map) = files.get(&persona.id) {
+                if let Some(&weight) = file_map.get(file_path) {
+                    results.push((persona.clone(), weight));
+                }
+            }
+        }
+        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        Ok(results)
+    }
+
+    async fn get_all_persona_knows(
+        &self,
+        project_id: Uuid,
+    ) -> Result<Vec<(PersonaNode, String, f64)>> {
+        let personas = self.personas.read().await;
+        let files = self.persona_files.read().await;
+        let mut results: Vec<(PersonaNode, String, f64)> = Vec::new();
+        for persona in personas.values() {
+            if persona.project_id != Some(project_id) {
+                continue;
+            }
+            if let Some(file_map) = files.get(&persona.id) {
+                for (path, &weight) in file_map {
+                    results.push((persona.clone(), path.clone(), weight));
+                }
+            }
+        }
+        results.sort_by(|a, b| {
+            a.0.name
+                .cmp(&b.0.name)
+                .then_with(|| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
+        });
+        Ok(results)
+    }
+
+    async fn auto_scope_to_feature_graphs(&self, _project_id: Uuid) -> Result<usize> {
+        // Mock: no-op, return 0 scoped
+        Ok(0)
+    }
+
+    async fn compute_adaptive_thresholds(
+        &self,
+        _project_id: Uuid,
+    ) -> Result<crate::neo4j::persona::AdaptivePersonaThresholds> {
+        // Mock: compute from in-memory persona KNOWS weights
+        use crate::analytics::distribution::{adaptive_threshold, detect_outliers};
+
+        let personas = self.personas.read().await;
+        let persona_files = self.persona_files.read().await;
+
+        let mut weights: Vec<f64> = Vec::new();
+        for (pid, _) in personas.iter() {
+            if let Some(files) = persona_files.get(pid) {
+                for w in files.values() {
+                    weights.push(*w);
+                }
+            }
+        }
+
+        if weights.len() < 10 {
+            return Ok(crate::neo4j::persona::AdaptivePersonaThresholds {
+                sample_size: weights.len(),
+                ..Default::default()
+            });
+        }
+
+        let prune_cutoff = adaptive_threshold(&weights, 0.05, 0.1);
+        let outliers = detect_outliers(&weights, 1.5);
+
+        Ok(crate::neo4j::persona::AdaptivePersonaThresholds {
+            prune_cutoff,
+            confidence_p90: 20.0, // Mock: no community data
+            weight_outlier_count: outliers.len(),
+            sample_size: weights.len(),
+        })
+    }
+
+    async fn maintain_personas(&self, _project_id: Uuid) -> Result<(usize, usize, usize)> {
+        Ok((0, 0, 0))
+    }
+
+    async fn detect_personas(
+        &self,
+        _project_id: Uuid,
+    ) -> Result<Vec<crate::neo4j::persona::PersonaProposal>> {
+        Ok(vec![])
+    }
+
+    async fn find_adjacent_personas(
+        &self,
+        _file_path: &str,
+        _project_id: Uuid,
+    ) -> Result<Vec<(Uuid, String)>> {
+        Ok(vec![])
+    }
+
+    async fn auto_grow_file_knows(
+        &self,
+        _persona_id: Uuid,
+        _file_path: &str,
+        _weight: f64,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    async fn find_relevant_personas_for_note(
+        &self,
+        _file_paths: &[String],
+        _project_id: Uuid,
+    ) -> Result<Vec<(Uuid, f64)>> {
+        Ok(vec![])
+    }
+
+    async fn find_relevant_personas_for_decision(
+        &self,
+        _decision_id: Uuid,
+        _project_id: Uuid,
+    ) -> Result<Vec<(Uuid, f64)>> {
+        Ok(vec![])
+    }
+
+    async fn auto_link_note_to_persona(
+        &self,
+        _persona_id: Uuid,
+        _note_id: Uuid,
+        _weight: f64,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    async fn auto_link_decision_to_persona(
+        &self,
+        _persona_id: Uuid,
+        _decision_id: Uuid,
+        _weight: f64,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    async fn auto_link_file_to_persona(
+        &self,
+        _persona_id: Uuid,
+        _file_path: &str,
+        _weight: f64,
+    ) -> Result<()> {
+        Ok(())
     }
 
     // ========================================================================

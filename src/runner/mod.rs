@@ -40,8 +40,9 @@ pub use models::{
     TriggerType,
 };
 pub use persona::{
-    activate_skills_for_task, complexity_directive, profile_task, record_skill_feedback,
-    Complexity, SkillActivationResult, TaskProfile,
+    activate_skills_for_task, complexity_directive, load_persona_stack, profile_task,
+    record_persona_feedback, record_skill_feedback, Complexity, PersonaEntry, PersonaStack,
+    PersonaTrigger, SkillActivationResult, TaskProfile,
 };
 pub use prompt::{
     build_runner_constraints, PromptBuilder, PromptSection, RunnerPromptContext, StructuredPrompt,

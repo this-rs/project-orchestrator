@@ -8,6 +8,7 @@ pub mod graph_types;
 pub mod handlers;
 pub mod hook_handlers;
 pub mod note_handlers;
+pub mod persona_handlers;
 pub mod profile_handlers;
 pub mod project_handlers;
 pub mod protocol_handlers;

@@ -298,6 +298,58 @@ pub async fn create_note(
         }
     }
 
+    // Growth hook: auto-link note to RELEVANT personas only (not all active ones).
+    // Relevance = persona KNOWS files that overlap with files mentioned in note content.
+    if let Some(pid) = project_id {
+        let neo4j = state.orchestrator.neo4j_arc();
+        let note_id = note.id;
+        let note_content = note.content.clone();
+        tokio::spawn(async move {
+            let file_paths =
+                crate::skills::activation::extract_file_paths_from_content(&note_content);
+            match neo4j
+                .find_relevant_personas_for_note(&file_paths, pid)
+                .await
+            {
+                Ok(relevant) if !relevant.is_empty() => {
+                    for (persona_id, avg_weight) in &relevant {
+                        let link_weight = (*avg_weight * 0.8).max(0.3);
+                        if let Err(e) = neo4j
+                            .auto_link_note_to_persona(*persona_id, note_id, link_weight)
+                            .await
+                        {
+                            tracing::debug!(
+                                persona_id = %persona_id,
+                                note_id = %note_id,
+                                error = %e,
+                                "Growth hook: auto_link_note failed (non-fatal)"
+                            );
+                        }
+                    }
+                    tracing::debug!(
+                        note_id = %note_id,
+                        count = relevant.len(),
+                        "Growth hook: linked note to relevant personas"
+                    );
+                }
+                Ok(_) => {
+                    tracing::debug!(
+                        note_id = %note_id,
+                        file_paths = ?file_paths,
+                        "Growth hook: no relevant personas found for note (skipped)"
+                    );
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        project_id = %pid,
+                        error = %e,
+                        "Growth hook: find_relevant_personas_for_note failed (non-fatal)"
+                    );
+                }
+            }
+        });
+    }
+
     Ok((StatusCode::CREATED, Json(note)))
 }
 

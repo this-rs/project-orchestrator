@@ -252,6 +252,8 @@ impl Neo4jClient {
             "CREATE CONSTRAINT protocol_state_id IF NOT EXISTS FOR (ps:ProtocolState) REQUIRE ps.id IS UNIQUE",
             "CREATE CONSTRAINT protocol_transition_id IF NOT EXISTS FOR (pt:ProtocolTransition) REQUIRE pt.id IS UNIQUE",
             "CREATE CONSTRAINT protocol_run_id IF NOT EXISTS FOR (r:ProtocolRun) REQUIRE r.id IS UNIQUE",
+            // Living Personas
+            "CREATE CONSTRAINT persona_id IF NOT EXISTS FOR (p:Persona) REQUIRE p.id IS UNIQUE",
         ];
 
         let indexes = vec![

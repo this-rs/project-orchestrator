@@ -14,6 +14,7 @@ mod impl_graph_store;
 mod milestone;
 pub mod models;
 mod note;
+mod persona;
 pub mod plan;
 mod plan_run;
 mod profile;

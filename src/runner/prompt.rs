@@ -24,6 +24,8 @@ pub enum PromptSection {
     Constraints(String),
     /// Knowledge notes (guidelines, gotchas, patterns)
     KnowledgeNotes(String),
+    /// Persona context (knowledge subgraph from PersonaStack)
+    PersonaContext(String),
     /// Activated skill context
     SkillContext(String),
     /// File context (symbols, dependencies)
@@ -47,11 +49,12 @@ impl PromptSection {
             Self::Constraints(_) => 2,
             Self::KnowledgeNotes(_) => 3,
             Self::PropagatedNotes(_) => 4,
-            Self::SkillContext(_) => 5,
-            Self::FileContext(_) => 6,
-            Self::Enrichment(_) => 7,
-            Self::RunnerConstraints(_) => 8,
-            Self::Custom(_) => 9,
+            Self::PersonaContext(_) => 5,
+            Self::SkillContext(_) => 6,
+            Self::FileContext(_) => 7,
+            Self::Enrichment(_) => 8,
+            Self::RunnerConstraints(_) => 9,
+            Self::Custom(_) => 10,
         }
     }
 
@@ -63,6 +66,7 @@ impl PromptSection {
             Self::Constraints(_) => "Constraints",
             Self::KnowledgeNotes(_) => "Knowledge Notes",
             Self::PropagatedNotes(_) => "Propagated Knowledge",
+            Self::PersonaContext(_) => "Persona Context",
             Self::SkillContext(_) => "Skill Context",
             Self::FileContext(_) => "Files to Modify",
             Self::Enrichment(_) => "Enrichment Context",
@@ -79,6 +83,7 @@ impl PromptSection {
             | Self::Constraints(s)
             | Self::KnowledgeNotes(s)
             | Self::PropagatedNotes(s)
+            | Self::PersonaContext(s)
             | Self::SkillContext(s)
             | Self::FileContext(s)
             | Self::Enrichment(s)
@@ -136,6 +141,11 @@ impl PromptBuilder {
     /// Add a knowledge notes section.
     pub fn with_knowledge_notes(self, notes: impl Into<String>) -> Self {
         self.add_section(PromptSection::KnowledgeNotes(notes.into()))
+    }
+
+    /// Add a persona context section (from PersonaStack rendering).
+    pub fn with_persona_context(self, context: impl Into<String>) -> Self {
+        self.add_section(PromptSection::PersonaContext(context.into()))
     }
 
     /// Add a skill context section.
@@ -383,6 +393,7 @@ mod tests {
         let prompt = PromptBuilder::new()
             .with_task("task")
             .with_knowledge_notes("- Note 1\n- Note 2")
+            .with_persona_context("### Primary Persona — neo4j-expert")
             .with_skill_context("Use async/await")
             .with_file_context("src/main.rs: rust, symbols: main")
             .with_enrichment("<enrichment>content</enrichment>")
@@ -391,6 +402,7 @@ mod tests {
 
         assert!(prompt.contains("# Task"));
         assert!(prompt.contains("## Knowledge Notes"));
+        assert!(prompt.contains("## Persona Context"));
         assert!(prompt.contains("## Skill Context"));
         assert!(prompt.contains("## Files to Modify"));
         assert!(prompt.contains("## Enrichment Context"));
@@ -487,5 +499,175 @@ mod tests {
         ctx.wave_number = 2;
         let result = build_runner_constraints(&ctx);
         assert!(result.contains("l'agent 2 parmi 3 agents parallèles"));
+    }
+
+    // ========================================================================
+    // PersonaContext section tests
+    // ========================================================================
+
+    #[test]
+    fn test_persona_context_section_priority() {
+        let section = PromptSection::PersonaContext("test".to_string());
+        // PersonaContext priority = 5 (after PropagatedNotes=4, before SkillContext=6)
+        assert_eq!(section.priority(), 5);
+    }
+
+    #[test]
+    fn test_persona_context_section_title() {
+        let section = PromptSection::PersonaContext("test".to_string());
+        assert_eq!(section.title(), "Persona Context");
+    }
+
+    #[test]
+    fn test_persona_context_section_content() {
+        let content = "### Primary Persona — neo4j-expert\nEnergy: 0.85";
+        let section = PromptSection::PersonaContext(content.to_string());
+        assert_eq!(section.content(), content);
+    }
+
+    #[test]
+    fn test_with_persona_context_builder() {
+        let prompt = PromptBuilder::new()
+            .with_persona_context("### Primary Persona — rust-expert\nEnergy: 0.9")
+            .build();
+        assert!(prompt.contains("## Persona Context"));
+        assert!(prompt.contains("rust-expert"));
+        assert!(prompt.contains("Energy: 0.9"));
+    }
+
+    #[test]
+    fn test_persona_context_ordering_after_knowledge_notes() {
+        let prompt = PromptBuilder::new()
+            .with_persona_context("persona content")
+            .with_knowledge_notes("knowledge content")
+            .build();
+
+        let knowledge_pos = prompt.find("## Knowledge Notes").unwrap();
+        let persona_pos = prompt.find("## Persona Context").unwrap();
+        assert!(
+            knowledge_pos < persona_pos,
+            "KnowledgeNotes (priority 3) should render before PersonaContext (priority 5)"
+        );
+    }
+
+    #[test]
+    fn test_persona_context_ordering_before_skill_context() {
+        let prompt = PromptBuilder::new()
+            .with_skill_context("skill content")
+            .with_persona_context("persona content")
+            .build();
+
+        let persona_pos = prompt.find("## Persona Context").unwrap();
+        let skill_pos = prompt.find("## Skill Context").unwrap();
+        assert!(
+            persona_pos < skill_pos,
+            "PersonaContext (priority 5) should render before SkillContext (priority 6)"
+        );
+    }
+
+    #[test]
+    fn test_persona_context_ordering_after_propagated_notes() {
+        let prompt = PromptBuilder::new()
+            .with_persona_context("persona content")
+            .with_propagated_notes("propagated content")
+            .build();
+
+        let propagated_pos = prompt.find("## Propagated Knowledge").unwrap();
+        let persona_pos = prompt.find("## Persona Context").unwrap();
+        assert!(
+            propagated_pos < persona_pos,
+            "PropagatedNotes (priority 4) should render before PersonaContext (priority 5)"
+        );
+    }
+
+    #[test]
+    fn test_persona_context_empty_skipped() {
+        let prompt = PromptBuilder::new()
+            .with_task("task")
+            .with_persona_context("")
+            .build();
+        assert!(prompt.contains("# Task"));
+        assert!(!prompt.contains("Persona Context"));
+    }
+
+    #[test]
+    fn test_persona_context_in_full_prompt() {
+        // Simulate a full runner prompt with persona context included
+        let prompt = PromptBuilder::new()
+            .with_task("Implement cache layer")
+            .with_steps("1. Add Redis\n2. Wire up")
+            .with_constraints("- Must be async")
+            .with_knowledge_notes("- Use tokio::sync")
+            .with_propagated_notes("- [gotcha] Watch TTL")
+            .with_persona_context(
+                "### Primary Persona — cache-expert\nEnergy: 0.92\nFiles: src/cache.rs",
+            )
+            .with_skill_context("Skill: redis-patterns")
+            .with_file_context("src/cache.rs")
+            .with_runner_constraints("Branch: feat/cache")
+            .build();
+
+        // Verify all sections present and in order
+        let positions: Vec<usize> = vec![
+            prompt.find("# Task").unwrap(),
+            prompt.find("## Steps").unwrap(),
+            prompt.find("## Constraints").unwrap(),
+            prompt.find("## Knowledge Notes").unwrap(),
+            prompt.find("## Propagated Knowledge").unwrap(),
+            prompt.find("## Persona Context").unwrap(),
+            prompt.find("## Skill Context").unwrap(),
+            prompt.find("## Files to Modify").unwrap(),
+            prompt.find("## Runner Constraints").unwrap(),
+        ];
+        // Verify strictly increasing order
+        for i in 1..positions.len() {
+            assert!(
+                positions[i] > positions[i - 1],
+                "Section at index {} should come after section at index {}",
+                i,
+                i - 1
+            );
+        }
+    }
+
+    #[test]
+    fn test_persona_context_serialization_roundtrip() {
+        let section =
+            PromptSection::PersonaContext("### Persona — expert\nEnergy: 0.8".to_string());
+        let json = serde_json::to_string(&section).unwrap();
+        assert!(json.contains("PersonaContext"));
+        let deserialized: PromptSection = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.content(), "### Persona — expert\nEnergy: 0.8");
+    }
+
+    #[test]
+    fn test_persona_context_structured_output() {
+        let structured = PromptBuilder::new()
+            .with_task("task")
+            .with_persona_context("persona data")
+            .build_structured();
+
+        assert_eq!(structured.sections.len(), 2);
+        assert!(structured.rendered.contains("## Persona Context"));
+        assert!(structured.rendered.contains("persona data"));
+
+        // Verify PersonaContext is the second section (after TaskDescription)
+        match &structured.sections[1] {
+            PromptSection::PersonaContext(s) => assert_eq!(s, "persona data"),
+            other => panic!("Expected PersonaContext, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_multiple_persona_contexts_both_rendered() {
+        // Edge case: what happens if two PersonaContext sections are added?
+        let prompt = PromptBuilder::new()
+            .with_persona_context("Persona A context")
+            .with_persona_context("Persona B context")
+            .build();
+
+        // Both should appear (PromptBuilder doesn't deduplicate)
+        assert!(prompt.contains("Persona A context"));
+        assert!(prompt.contains("Persona B context"));
     }
 }

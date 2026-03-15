@@ -10,6 +10,7 @@ use super::episode_handlers;
 use super::handlers::{self, OrchestratorState};
 use super::hook_handlers;
 use super::note_handlers;
+use super::persona_handlers;
 use super::profile_handlers;
 use super::project_handlers;
 use super::protocol_handlers;
@@ -944,6 +945,97 @@ fn protected_routes() -> Router<OrchestratorState> {
             post(skill_handlers::split_skill),
         )
         .route("/api/skills/merge", post(skill_handlers::merge_skills))
+        // ================================================================
+        // Personas (Living Personas — Adaptive Knowledge Agents)
+        // ================================================================
+        .route(
+            "/api/personas",
+            get(persona_handlers::list_personas).post(persona_handlers::create_persona),
+        )
+        // Static sub-paths MUST come before /{persona_id} to avoid capture
+        .route(
+            "/api/personas/global",
+            get(persona_handlers::list_global_personas),
+        )
+        .route(
+            "/api/personas/find-for-file",
+            get(persona_handlers::find_for_file),
+        )
+        .route(
+            "/api/personas/import",
+            post(persona_handlers::import_persona),
+        )
+        .route(
+            "/api/personas/auto-build",
+            post(persona_handlers::auto_build_persona),
+        )
+        .route(
+            "/api/personas/maintain",
+            post(persona_handlers::maintain_personas),
+        )
+        .route(
+            "/api/personas/detect",
+            post(persona_handlers::detect_personas),
+        )
+        .route(
+            "/api/personas/{persona_id}",
+            get(persona_handlers::get_persona)
+                .put(persona_handlers::update_persona)
+                .delete(persona_handlers::delete_persona),
+        )
+        .route(
+            "/api/personas/{persona_id}/subgraph",
+            get(persona_handlers::get_subgraph),
+        )
+        .route(
+            "/api/personas/{persona_id}/export",
+            get(persona_handlers::export_persona),
+        )
+        .route(
+            "/api/personas/{persona_id}/activate",
+            post(persona_handlers::activate_persona),
+        )
+        // Relation routes — Skills (MASTERS)
+        .route(
+            "/api/personas/{persona_id}/skills/{skill_id}",
+            post(persona_handlers::add_skill).delete(persona_handlers::remove_skill),
+        )
+        // Relation routes — Protocols (FOLLOWS)
+        .route(
+            "/api/personas/{persona_id}/protocols/{protocol_id}",
+            post(persona_handlers::add_protocol).delete(persona_handlers::remove_protocol),
+        )
+        // Relation routes — FeatureGraph (SCOPED_TO)
+        .route(
+            "/api/personas/{persona_id}/feature-graphs/{feature_graph_id}",
+            post(persona_handlers::scope_to_feature_graph)
+                .delete(persona_handlers::unscope_feature_graph),
+        )
+        // Relation routes — Files (KNOWS)
+        .route(
+            "/api/personas/{persona_id}/files",
+            post(persona_handlers::add_file).delete(persona_handlers::remove_file),
+        )
+        // Relation routes — Functions (KNOWS)
+        .route(
+            "/api/personas/{persona_id}/functions",
+            post(persona_handlers::add_function).delete(persona_handlers::remove_function),
+        )
+        // Relation routes — Notes (USES)
+        .route(
+            "/api/personas/{persona_id}/notes/{note_id}",
+            post(persona_handlers::add_note).delete(persona_handlers::remove_note),
+        )
+        // Relation routes — Decisions (USES)
+        .route(
+            "/api/personas/{persona_id}/decisions/{decision_id}",
+            post(persona_handlers::add_decision).delete(persona_handlers::remove_decision),
+        )
+        // Relation routes — Extends (EXTENDS)
+        .route(
+            "/api/personas/{persona_id}/extends/{parent_persona_id}",
+            post(persona_handlers::add_extends).delete(persona_handlers::remove_extends),
+        )
         // ================================================================
         // Skill Registry (Pattern Federation)
         // ================================================================

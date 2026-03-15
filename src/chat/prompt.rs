@@ -1279,6 +1279,21 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
             description: "Manage protocols & runs (list/create/get/update/delete/add_state/delete_state/list_states/add_transition/delete_transition/list_transitions/link_to_skill/start_run/transition/get_run/list_runs/cancel_run/fail_run/report_progress/route)",
         }],
     },
+    // ── Living Personas ─────────────────────────────────────────────
+    ToolGroup {
+        name: "personas",
+        description: "Living Personas — autonomous knowledge agents scoped to code regions, with file/function KNOWS relations, subgraph views, auto-build, maintenance and detection",
+        keywords: &[
+            "persona", "expert", "agent", "living", "vivant",
+            "subgraph", "sous-graphe", "auto-build", "auto-construire",
+            "maintain", "detect", "detection", "détection",
+            "activate", "activer", "extends", "héritage",
+        ],
+        tools: &[ToolRef {
+            name: "persona",
+            description: "Manage personas (create/get/list/update/delete/add_skill/remove_skill/add_protocol/remove_protocol/add_file/remove_file/add_function/remove_function/add_note/remove_note/add_decision/remove_decision/scope_to_feature_graph/unscope_feature_graph/add_extends/remove_extends/get_subgraph/find_for_file/list_global/export/import/activate/auto_build/maintain/detect)",
+        }],
+    },
     // ── Admin & Sync ────────────────────────────────────────────────
     ToolGroup {
         name: "sync_admin",
@@ -1296,7 +1311,7 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
 ];
 
 /// Total number of unique tools across all groups.
-/// Must match the MCP tools.rs count (currently 23 mega-tools).
+/// Must match the MCP tools.rs count (currently 24 mega-tools).
 pub fn tool_catalog_tool_count() -> usize {
     let mut names: Vec<&str> = TOOL_GROUPS
         .iter()
@@ -2980,8 +2995,8 @@ mod tests {
     fn test_tool_groups_cover_all_23_mega_tools() {
         let count = tool_catalog_tool_count();
         assert_eq!(
-            count, 23,
-            "TOOL_GROUPS must cover exactly 23 unique mega-tools (got {}). \
+            count, 24,
+            "TOOL_GROUPS must cover exactly 24 unique mega-tools (got {}). \
              Update the catalog when adding/removing MCP tools.",
             count
         );
@@ -3031,7 +3046,7 @@ mod tests {
 
     #[test]
     fn test_tool_groups_count() {
-        assert_eq!(TOOL_GROUPS.len(), 13, "Expected 13 tool groups");
+        assert_eq!(TOOL_GROUPS.len(), 14, "Expected 14 tool groups");
     }
 
     #[test]

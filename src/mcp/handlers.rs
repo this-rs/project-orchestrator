@@ -160,6 +160,7 @@ impl ToolHandler {
             "analysis_profile",
             "protocol",
             "episode",
+            "persona",
         ];
 
         if !mega_tools.contains(&name) {
@@ -490,6 +491,38 @@ impl ToolHandler {
             ("protocol", "simulate") => "simulate_protocol",
             ("protocol", "get_run_tree") => "get_protocol_run_tree",
             ("protocol", "get_run_children") => "get_protocol_run_children",
+
+            // Persona (Living Personas)
+            ("persona", "create") => "create_persona",
+            ("persona", "get") => "get_persona",
+            ("persona", "list") => "list_personas",
+            ("persona", "update") => "update_persona",
+            ("persona", "delete") => "delete_persona",
+            ("persona", "add_skill") => "add_persona_skill",
+            ("persona", "remove_skill") => "remove_persona_skill",
+            ("persona", "add_protocol") => "add_persona_protocol",
+            ("persona", "remove_protocol") => "remove_persona_protocol",
+            ("persona", "add_file") => "add_persona_file",
+            ("persona", "remove_file") => "remove_persona_file",
+            ("persona", "add_function") => "add_persona_function",
+            ("persona", "remove_function") => "remove_persona_function",
+            ("persona", "add_note") => "add_persona_note",
+            ("persona", "remove_note") => "remove_persona_note",
+            ("persona", "add_decision") => "add_persona_decision",
+            ("persona", "remove_decision") => "remove_persona_decision",
+            ("persona", "scope_to_feature_graph") => "scope_persona_feature_graph",
+            ("persona", "unscope_feature_graph") => "unscope_persona_feature_graph",
+            ("persona", "add_extends") => "add_persona_extends",
+            ("persona", "remove_extends") => "remove_persona_extends",
+            ("persona", "get_subgraph") => "get_persona_subgraph",
+            ("persona", "find_for_file") => "find_personas_for_file",
+            ("persona", "list_global") => "list_global_personas",
+            ("persona", "export") => "export_persona",
+            ("persona", "import") => "import_persona",
+            ("persona", "activate") => "activate_persona",
+            ("persona", "auto_build") => "auto_build_persona",
+            ("persona", "maintain") => "maintain_personas",
+            ("persona", "detect") => "detect_personas",
 
             // Reasoning Tree
             ("reasoning", "reason") => "reason",
@@ -4348,6 +4381,419 @@ impl ToolHandler {
                 Ok(Some(result))
             }
 
+            // ── Persona (Living Personas) ──────────────────────────────
+            "list_personas" => {
+                let project_id = extract_id(args, "project_id")?;
+                let mut query = vec![("project_id".to_string(), project_id)];
+                if let Some(s) = args.get("status").and_then(|v| v.as_str()) {
+                    query.push(("status".to_string(), s.to_string()));
+                }
+                if let Some(l) = args.get("limit").and_then(|v| v.as_u64()) {
+                    query.push(("limit".to_string(), l.to_string()));
+                }
+                if let Some(o) = args.get("offset").and_then(|v| v.as_u64()) {
+                    query.push(("offset".to_string(), o.to_string()));
+                }
+                let result = http.get_with_query("/api/personas", &query).await?;
+                Ok(Some(result))
+            }
+
+            "create_persona" => {
+                let result = http.post("/api/personas", args).await?;
+                Ok(Some(result))
+            }
+
+            "get_persona" => {
+                let persona_id = extract_id(args, "persona_id")?;
+                let result = http.get(&format!("/api/personas/{}", persona_id)).await?;
+                Ok(Some(result))
+            }
+
+            "update_persona" => {
+                let persona_id = extract_id(args, "persona_id")?;
+                let mut body = serde_json::Map::new();
+                for field in &[
+                    "name",
+                    "description",
+                    "status",
+                    "complexity_default",
+                    "model_preference",
+                    "system_prompt_override",
+                ] {
+                    if let Some(v) = args.get(*field) {
+                        body.insert(field.to_string(), v.clone());
+                    }
+                }
+                for field in &["energy", "cohesion", "max_cost_usd"] {
+                    if let Some(v) = args.get(*field) {
+                        body.insert(field.to_string(), v.clone());
+                    }
+                }
+                if let Some(v) = args.get("timeout_secs") {
+                    body.insert("timeout_secs".to_string(), v.clone());
+                }
+                let result = http
+                    .put(
+                        &format!("/api/personas/{}", persona_id),
+                        &Value::Object(body),
+                    )
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "delete_persona" => {
+                let persona_id = extract_id(args, "persona_id")?;
+                let result = http
+                    .delete(&format!("/api/personas/{}", persona_id))
+                    .await?;
+                Ok(Some(if result.is_null() {
+                    json!({"deleted": true})
+                } else {
+                    result
+                }))
+            }
+
+            "add_persona_skill" => {
+                let persona_id = extract_id(args, "persona_id")?;
+                let skill_id = extract_id(args, "skill_id")?;
+                let result = http
+                    .post(
+                        &format!("/api/personas/{}/skills/{}", persona_id, skill_id),
+                        &json!({}),
+                    )
+                    .await?;
+                Ok(Some(if result.is_null() {
+                    json!({"added": true})
+                } else {
+                    result
+                }))
+            }
+
+            "remove_persona_skill" => {
+                let persona_id = extract_id(args, "persona_id")?;
+                let skill_id = extract_id(args, "skill_id")?;
+                let result = http
+                    .delete(&format!("/api/personas/{}/skills/{}", persona_id, skill_id))
+                    .await?;
+                Ok(Some(if result.is_null() {
+                    json!({"removed": true})
+                } else {
+                    result
+                }))
+            }
+
+            "add_persona_protocol" => {
+                let persona_id = extract_id(args, "persona_id")?;
+                let protocol_id = extract_id(args, "protocol_id")?;
+                let result = http
+                    .post(
+                        &format!("/api/personas/{}/protocols/{}", persona_id, protocol_id),
+                        &json!({}),
+                    )
+                    .await?;
+                Ok(Some(if result.is_null() {
+                    json!({"added": true})
+                } else {
+                    result
+                }))
+            }
+
+            "remove_persona_protocol" => {
+                let persona_id = extract_id(args, "persona_id")?;
+                let protocol_id = extract_id(args, "protocol_id")?;
+                let result = http
+                    .delete(&format!(
+                        "/api/personas/{}/protocols/{}",
+                        persona_id, protocol_id
+                    ))
+                    .await?;
+                Ok(Some(if result.is_null() {
+                    json!({"removed": true})
+                } else {
+                    result
+                }))
+            }
+
+            "add_persona_file" => {
+                let persona_id = extract_id(args, "persona_id")?;
+                let file_path = extract_string(args, "file_path")?;
+                let weight = args.get("weight").and_then(|v| v.as_f64()).unwrap_or(1.0);
+                let body = json!({"file_path": file_path, "weight": weight});
+                let result = http
+                    .post(&format!("/api/personas/{}/files", persona_id), &body)
+                    .await?;
+                Ok(Some(if result.is_null() {
+                    json!({"added": true})
+                } else {
+                    result
+                }))
+            }
+
+            "remove_persona_file" => {
+                let persona_id = extract_id(args, "persona_id")?;
+                let file_path = extract_string(args, "file_path")?;
+                let body = json!({"file_path": file_path});
+                let result = http
+                    .delete_with_body(&format!("/api/personas/{}/files", persona_id), &body)
+                    .await?;
+                Ok(Some(if result.is_null() {
+                    json!({"removed": true})
+                } else {
+                    result
+                }))
+            }
+
+            "add_persona_function" => {
+                let persona_id = extract_id(args, "persona_id")?;
+                let function_name = extract_string(args, "function_name")?;
+                let weight = args.get("weight").and_then(|v| v.as_f64()).unwrap_or(1.0);
+                let body = json!({"function_name": function_name, "weight": weight});
+                let result = http
+                    .post(&format!("/api/personas/{}/functions", persona_id), &body)
+                    .await?;
+                Ok(Some(if result.is_null() {
+                    json!({"added": true})
+                } else {
+                    result
+                }))
+            }
+
+            "remove_persona_function" => {
+                let persona_id = extract_id(args, "persona_id")?;
+                let function_name = extract_string(args, "function_name")?;
+                let body = json!({"function_name": function_name});
+                let result = http
+                    .delete_with_body(&format!("/api/personas/{}/functions", persona_id), &body)
+                    .await?;
+                Ok(Some(if result.is_null() {
+                    json!({"removed": true})
+                } else {
+                    result
+                }))
+            }
+
+            "add_persona_note" => {
+                let persona_id = extract_id(args, "persona_id")?;
+                let note_id = extract_id(args, "note_id")?;
+                let weight = args.get("weight").and_then(|v| v.as_f64()).unwrap_or(1.0);
+                let result = http
+                    .post(
+                        &format!("/api/personas/{}/notes/{}", persona_id, note_id),
+                        &json!({"weight": weight}),
+                    )
+                    .await?;
+                Ok(Some(if result.is_null() {
+                    json!({"added": true})
+                } else {
+                    result
+                }))
+            }
+
+            "remove_persona_note" => {
+                let persona_id = extract_id(args, "persona_id")?;
+                let note_id = extract_id(args, "note_id")?;
+                let result = http
+                    .delete(&format!("/api/personas/{}/notes/{}", persona_id, note_id))
+                    .await?;
+                Ok(Some(if result.is_null() {
+                    json!({"removed": true})
+                } else {
+                    result
+                }))
+            }
+
+            "add_persona_decision" => {
+                let persona_id = extract_id(args, "persona_id")?;
+                let decision_id = extract_id(args, "decision_id")?;
+                let weight = args.get("weight").and_then(|v| v.as_f64()).unwrap_or(1.0);
+                let result = http
+                    .post(
+                        &format!("/api/personas/{}/decisions/{}", persona_id, decision_id),
+                        &json!({"weight": weight}),
+                    )
+                    .await?;
+                Ok(Some(if result.is_null() {
+                    json!({"added": true})
+                } else {
+                    result
+                }))
+            }
+
+            "remove_persona_decision" => {
+                let persona_id = extract_id(args, "persona_id")?;
+                let decision_id = extract_id(args, "decision_id")?;
+                let result = http
+                    .delete(&format!(
+                        "/api/personas/{}/decisions/{}",
+                        persona_id, decision_id
+                    ))
+                    .await?;
+                Ok(Some(if result.is_null() {
+                    json!({"removed": true})
+                } else {
+                    result
+                }))
+            }
+
+            "scope_persona_feature_graph" => {
+                let persona_id = extract_id(args, "persona_id")?;
+                let feature_graph_id = extract_id(args, "feature_graph_id")?;
+                let result = http
+                    .post(
+                        &format!(
+                            "/api/personas/{}/feature-graphs/{}",
+                            persona_id, feature_graph_id
+                        ),
+                        &json!({}),
+                    )
+                    .await?;
+                Ok(Some(if result.is_null() {
+                    json!({"scoped": true})
+                } else {
+                    result
+                }))
+            }
+
+            "unscope_persona_feature_graph" => {
+                let persona_id = extract_id(args, "persona_id")?;
+                let feature_graph_id = extract_id(args, "feature_graph_id")?;
+                let result = http
+                    .delete(&format!(
+                        "/api/personas/{}/feature-graphs/{}",
+                        persona_id, feature_graph_id
+                    ))
+                    .await?;
+                Ok(Some(if result.is_null() {
+                    json!({"unscoped": true})
+                } else {
+                    result
+                }))
+            }
+
+            "add_persona_extends" => {
+                let persona_id = extract_id(args, "persona_id")?;
+                let parent_persona_id = extract_id(args, "parent_persona_id")?;
+                let result = http
+                    .post(
+                        &format!("/api/personas/{}/extends/{}", persona_id, parent_persona_id),
+                        &json!({}),
+                    )
+                    .await?;
+                Ok(Some(if result.is_null() {
+                    json!({"added": true})
+                } else {
+                    result
+                }))
+            }
+
+            "remove_persona_extends" => {
+                let persona_id = extract_id(args, "persona_id")?;
+                let parent_persona_id = extract_id(args, "parent_persona_id")?;
+                let result = http
+                    .delete(&format!(
+                        "/api/personas/{}/extends/{}",
+                        persona_id, parent_persona_id
+                    ))
+                    .await?;
+                Ok(Some(if result.is_null() {
+                    json!({"removed": true})
+                } else {
+                    result
+                }))
+            }
+
+            "get_persona_subgraph" => {
+                let persona_id = extract_id(args, "persona_id")?;
+                let result = http
+                    .get(&format!("/api/personas/{}/subgraph", persona_id))
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "find_personas_for_file" => {
+                let file_path = extract_string(args, "file_path")?;
+                let project_id = extract_id(args, "project_id")?;
+                let query = vec![
+                    ("file_path".to_string(), file_path),
+                    ("project_id".to_string(), project_id),
+                ];
+                let result = http
+                    .get_with_query("/api/personas/find-for-file", &query)
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "list_global_personas" => {
+                let mut query = Vec::new();
+                if let Some(l) = args.get("limit").and_then(|v| v.as_u64()) {
+                    query.push(("limit".to_string(), l.to_string()));
+                }
+                if let Some(o) = args.get("offset").and_then(|v| v.as_u64()) {
+                    query.push(("offset".to_string(), o.to_string()));
+                }
+                let result = http.get_with_query("/api/personas/global", &query).await?;
+                Ok(Some(result))
+            }
+
+            "export_persona" => {
+                let persona_id = extract_id(args, "persona_id")?;
+                let mut query = Vec::new();
+                if let Some(name) = extract_optional_string(args, "source_project_name") {
+                    query.push(("source_project_name".to_string(), name));
+                }
+                let result = if query.is_empty() {
+                    http.get(&format!("/api/personas/{}/export", persona_id))
+                        .await?
+                } else {
+                    http.get_with_query(&format!("/api/personas/{}/export", persona_id), &query)
+                        .await?
+                };
+                Ok(Some(result))
+            }
+
+            "import_persona" => {
+                let result = http.post("/api/personas/import", args).await?;
+                Ok(Some(result))
+            }
+
+            "activate_persona" => {
+                let persona_id = extract_id(args, "persona_id")?;
+                let result = http
+                    .post(
+                        &format!("/api/personas/{}/activate", persona_id),
+                        &json!({}),
+                    )
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "auto_build_persona" => {
+                let result = http.post("/api/personas/auto-build", args).await?;
+                Ok(Some(result))
+            }
+
+            "maintain_personas" => {
+                let project_id = extract_id(args, "project_id")?;
+                let result = http
+                    .post(
+                        &format!("/api/personas/maintain?project_id={}", project_id),
+                        &json!({}),
+                    )
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "detect_personas" => {
+                let project_id = extract_id(args, "project_id")?;
+                let result = http
+                    .post(
+                        &format!("/api/personas/detect?project_id={}", project_id),
+                        &json!({}),
+                    )
+                    .await?;
+                Ok(Some(result))
+            }
+
             // ── Protocol (Pattern Federation) (12 tools) ───────────────
             "list_protocols" => {
                 let project_id = extract_id(args, "project_id")?;
@@ -4958,6 +5404,7 @@ mod tests {
             ("skill", "list"),
             ("analysis_profile", "list"),
             ("protocol", "list"),
+            ("persona", "list"),
         ];
 
         for (tool, action) in mega_tools_with_action {
@@ -8677,6 +9124,482 @@ mod tests {
             let (name, _) = handler.resolve_mega_tool("feature_graph", &args).unwrap();
             assert_eq!(name, expected);
         }
+    }
+
+    // -- Persona -----------------------------------------------------------
+
+    #[test]
+    fn test_resolve_mega_tool_persona_actions() {
+        let handler = make_handler();
+        for (action, expected) in [
+            ("create", "create_persona"),
+            ("get", "get_persona"),
+            ("list", "list_personas"),
+            ("update", "update_persona"),
+            ("delete", "delete_persona"),
+            ("add_skill", "add_persona_skill"),
+            ("remove_skill", "remove_persona_skill"),
+            ("add_protocol", "add_persona_protocol"),
+            ("remove_protocol", "remove_persona_protocol"),
+            ("add_file", "add_persona_file"),
+            ("remove_file", "remove_persona_file"),
+            ("add_function", "add_persona_function"),
+            ("remove_function", "remove_persona_function"),
+            ("add_note", "add_persona_note"),
+            ("remove_note", "remove_persona_note"),
+            ("add_decision", "add_persona_decision"),
+            ("remove_decision", "remove_persona_decision"),
+            ("scope_to_feature_graph", "scope_persona_feature_graph"),
+            ("unscope_feature_graph", "unscope_persona_feature_graph"),
+            ("add_extends", "add_persona_extends"),
+            ("remove_extends", "remove_persona_extends"),
+            ("get_subgraph", "get_persona_subgraph"),
+            ("find_for_file", "find_personas_for_file"),
+            ("list_global", "list_global_personas"),
+            ("export", "export_persona"),
+            ("import", "import_persona"),
+            ("activate", "activate_persona"),
+            ("auto_build", "auto_build_persona"),
+            ("maintain", "maintain_personas"),
+            ("detect", "detect_personas"),
+        ] {
+            let args = json!({"action": action});
+            let (name, _) = handler.resolve_mega_tool("persona", &args).unwrap();
+            assert_eq!(
+                name, expected,
+                "persona action '{}' should resolve to '{}'",
+                action, expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_http_list_personas() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "list_personas",
+                Some(json!({"project_id": "550e8400-e29b-41d4-a716-446655440000"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert_eq!(result["path"], "/api/personas");
+        let query = result["query"].as_str().unwrap();
+        assert!(query.contains("project_id=550e8400"));
+    }
+
+    #[tokio::test]
+    async fn test_http_list_personas_with_filters() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "list_personas",
+                Some(json!({
+                    "project_id": "550e8400-e29b-41d4-a716-446655440000",
+                    "status": "active",
+                    "limit": 10,
+                    "offset": 5
+                })),
+            )
+            .await
+            .unwrap();
+        let query = result["query"].as_str().unwrap();
+        assert!(query.contains("status=active"), "query: {}", query);
+        assert!(query.contains("limit=10"), "query: {}", query);
+        assert!(query.contains("offset=5"), "query: {}", query);
+    }
+
+    #[tokio::test]
+    async fn test_http_create_persona() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "create_persona",
+                Some(json!({
+                    "project_id": "550e8400-e29b-41d4-a716-446655440000",
+                    "name": "neo4j-expert",
+                    "description": "Expert in Neo4j"
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert_eq!(result["path"], "/api/personas");
+        assert_eq!(result["body"]["name"], "neo4j-expert");
+    }
+
+    #[tokio::test]
+    async fn test_http_get_persona() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "get_persona",
+                Some(json!({"persona_id": "550e8400-e29b-41d4-a716-446655440000"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert_eq!(
+            result["path"],
+            "/api/personas/550e8400-e29b-41d4-a716-446655440000"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_http_update_persona() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "update_persona",
+                Some(json!({
+                    "persona_id": "550e8400-e29b-41d4-a716-446655440000",
+                    "name": "updated-name",
+                    "status": "active",
+                    "energy": 0.9
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "PUT");
+        assert_eq!(
+            result["path"],
+            "/api/personas/550e8400-e29b-41d4-a716-446655440000"
+        );
+        assert_eq!(result["body"]["name"], "updated-name");
+        assert_eq!(result["body"]["status"], "active");
+    }
+
+    #[tokio::test]
+    async fn test_http_delete_persona() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "delete_persona",
+                Some(json!({"persona_id": "550e8400-e29b-41d4-a716-446655440000"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "DELETE");
+        assert_eq!(
+            result["path"],
+            "/api/personas/550e8400-e29b-41d4-a716-446655440000"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_http_add_persona_skill() {
+        let (handler, _) = make_http_handler().await;
+        let pid = "550e8400-e29b-41d4-a716-446655440000";
+        let sid = "660e8400-e29b-41d4-a716-446655440000";
+        let result = handler
+            .handle(
+                "add_persona_skill",
+                Some(json!({"persona_id": pid, "skill_id": sid})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert_eq!(
+            result["path"],
+            format!("/api/personas/{}/skills/{}", pid, sid)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_http_remove_persona_skill() {
+        let (handler, _) = make_http_handler().await;
+        let pid = "550e8400-e29b-41d4-a716-446655440000";
+        let sid = "660e8400-e29b-41d4-a716-446655440000";
+        let result = handler
+            .handle(
+                "remove_persona_skill",
+                Some(json!({"persona_id": pid, "skill_id": sid})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "DELETE");
+        assert_eq!(
+            result["path"],
+            format!("/api/personas/{}/skills/{}", pid, sid)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_http_add_persona_file() {
+        let (handler, _) = make_http_handler().await;
+        let pid = "550e8400-e29b-41d4-a716-446655440000";
+        let result = handler
+            .handle(
+                "add_persona_file",
+                Some(json!({"persona_id": pid, "file_path": "/src/main.rs", "weight": 0.8})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert_eq!(result["path"], format!("/api/personas/{}/files", pid));
+        assert_eq!(result["body"]["file_path"], "/src/main.rs");
+        assert_eq!(result["body"]["weight"], 0.8);
+    }
+
+    #[tokio::test]
+    async fn test_http_add_persona_file_default_weight() {
+        let (handler, _) = make_http_handler().await;
+        let pid = "550e8400-e29b-41d4-a716-446655440000";
+        let result = handler
+            .handle(
+                "add_persona_file",
+                Some(json!({"persona_id": pid, "file_path": "/src/lib.rs"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["body"]["weight"], 1.0);
+    }
+
+    #[tokio::test]
+    async fn test_http_remove_persona_file() {
+        let (handler, _) = make_http_handler().await;
+        let pid = "550e8400-e29b-41d4-a716-446655440000";
+        let result = handler
+            .handle(
+                "remove_persona_file",
+                Some(json!({"persona_id": pid, "file_path": "/src/main.rs"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "DELETE");
+        assert_eq!(result["path"], format!("/api/personas/{}/files", pid));
+    }
+
+    #[tokio::test]
+    async fn test_http_add_persona_note() {
+        let (handler, _) = make_http_handler().await;
+        let pid = "550e8400-e29b-41d4-a716-446655440000";
+        let nid = "770e8400-e29b-41d4-a716-446655440000";
+        let result = handler
+            .handle(
+                "add_persona_note",
+                Some(json!({"persona_id": pid, "note_id": nid, "weight": 0.7})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert_eq!(
+            result["path"],
+            format!("/api/personas/{}/notes/{}", pid, nid)
+        );
+        assert_eq!(result["body"]["weight"], 0.7);
+    }
+
+    #[tokio::test]
+    async fn test_http_add_persona_decision() {
+        let (handler, _) = make_http_handler().await;
+        let pid = "550e8400-e29b-41d4-a716-446655440000";
+        let did = "880e8400-e29b-41d4-a716-446655440000";
+        let result = handler
+            .handle(
+                "add_persona_decision",
+                Some(json!({"persona_id": pid, "decision_id": did})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert_eq!(
+            result["path"],
+            format!("/api/personas/{}/decisions/{}", pid, did)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_http_get_persona_subgraph() {
+        let (handler, _) = make_http_handler().await;
+        let pid = "550e8400-e29b-41d4-a716-446655440000";
+        let result = handler
+            .handle("get_persona_subgraph", Some(json!({"persona_id": pid})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert_eq!(result["path"], format!("/api/personas/{}/subgraph", pid));
+    }
+
+    #[tokio::test]
+    async fn test_http_find_personas_for_file() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "find_personas_for_file",
+                Some(json!({
+                    "file_path": "/src/neo4j/persona.rs",
+                    "project_id": "550e8400-e29b-41d4-a716-446655440000"
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert_eq!(result["path"], "/api/personas/find-for-file");
+    }
+
+    #[tokio::test]
+    async fn test_http_list_global_personas() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("list_global_personas", Some(json!({"limit": 5})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert_eq!(result["path"], "/api/personas/global");
+        let query = result["query"].as_str().unwrap();
+        assert!(query.contains("limit=5"), "query: {}", query);
+    }
+
+    #[tokio::test]
+    async fn test_http_export_persona() {
+        let (handler, _) = make_http_handler().await;
+        let pid = "550e8400-e29b-41d4-a716-446655440000";
+        let result = handler
+            .handle("export_persona", Some(json!({"persona_id": pid})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert_eq!(result["path"], format!("/api/personas/{}/export", pid));
+    }
+
+    #[tokio::test]
+    async fn test_http_export_persona_with_source() {
+        let (handler, _) = make_http_handler().await;
+        let pid = "550e8400-e29b-41d4-a716-446655440000";
+        let result = handler
+            .handle(
+                "export_persona",
+                Some(json!({"persona_id": pid, "source_project_name": "my-project"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        let query = result["query"].as_str().unwrap();
+        assert!(
+            query.contains("source_project_name=my-project"),
+            "query: {}",
+            query
+        );
+    }
+
+    #[tokio::test]
+    async fn test_http_import_persona() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "import_persona",
+                Some(json!({
+                    "project_id": "550e8400-e29b-41d4-a716-446655440000",
+                    "package": {"schema_version": 1}
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert_eq!(result["path"], "/api/personas/import");
+    }
+
+    #[tokio::test]
+    async fn test_http_activate_persona() {
+        let (handler, _) = make_http_handler().await;
+        let pid = "550e8400-e29b-41d4-a716-446655440000";
+        let result = handler
+            .handle("activate_persona", Some(json!({"persona_id": pid})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert_eq!(result["path"], format!("/api/personas/{}/activate", pid));
+    }
+
+    #[tokio::test]
+    async fn test_http_auto_build_persona() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "auto_build_persona",
+                Some(json!({
+                    "project_id": "550e8400-e29b-41d4-a716-446655440000",
+                    "name": "auto-persona"
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert_eq!(result["path"], "/api/personas/auto-build");
+    }
+
+    #[tokio::test]
+    async fn test_http_maintain_personas() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "maintain_personas",
+                Some(json!({"project_id": "550e8400-e29b-41d4-a716-446655440000"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert!(result["path"]
+            .as_str()
+            .unwrap()
+            .starts_with("/api/personas/maintain"));
+    }
+
+    #[tokio::test]
+    async fn test_http_detect_personas() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "detect_personas",
+                Some(json!({"project_id": "550e8400-e29b-41d4-a716-446655440000"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert!(result["path"]
+            .as_str()
+            .unwrap()
+            .starts_with("/api/personas/detect"));
+    }
+
+    #[tokio::test]
+    async fn test_http_scope_persona_feature_graph() {
+        let (handler, _) = make_http_handler().await;
+        let pid = "550e8400-e29b-41d4-a716-446655440000";
+        let fgid = "660e8400-e29b-41d4-a716-446655440000";
+        let result = handler
+            .handle(
+                "scope_persona_feature_graph",
+                Some(json!({"persona_id": pid, "feature_graph_id": fgid})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert_eq!(
+            result["path"],
+            format!("/api/personas/{}/feature-graphs/{}", pid, fgid)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_http_add_persona_extends() {
+        let (handler, _) = make_http_handler().await;
+        let pid = "550e8400-e29b-41d4-a716-446655440000";
+        let parent = "660e8400-e29b-41d4-a716-446655440000";
+        let result = handler
+            .handle(
+                "add_persona_extends",
+                Some(json!({"persona_id": pid, "parent_persona_id": parent})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert_eq!(
+            result["path"],
+            format!("/api/personas/{}/extends/{}", pid, parent)
+        );
     }
 
     // ========================================================================

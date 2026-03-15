@@ -1806,6 +1806,284 @@ pub struct RiskFactors {
     pub betweenness: f64,
 }
 
+// ============================================================================
+// Persona Node (Living Personas — Adaptive Knowledge Agents)
+// ============================================================================
+
+/// Origin of a persona: how it was created.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PersonaOrigin {
+    /// Created automatically from graph analysis (communities, call graph, etc.)
+    AutoBuild,
+    /// Created manually by the user or agent
+    #[default]
+    Manual,
+    /// Imported from another project via PersonaPackage
+    Imported,
+}
+
+impl std::fmt::Display for PersonaOrigin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AutoBuild => write!(f, "auto_build"),
+            Self::Manual => write!(f, "manual"),
+            Self::Imported => write!(f, "imported"),
+        }
+    }
+}
+
+impl std::str::FromStr for PersonaOrigin {
+    type Err = String;
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "auto_build" => Ok(Self::AutoBuild),
+            "manual" => Ok(Self::Manual),
+            "imported" => Ok(Self::Imported),
+            _ => Err(format!("Unknown PersonaOrigin: {s}")),
+        }
+    }
+}
+
+/// Status of a persona lifecycle.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PersonaStatus {
+    /// Recently used, ready for activation
+    Active,
+    /// Not used recently, still available
+    Dormant,
+    /// Newly created, accumulating knowledge
+    #[default]
+    Emerging,
+    /// Archived, no longer available for activation
+    Archived,
+}
+
+impl std::fmt::Display for PersonaStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Active => write!(f, "active"),
+            Self::Dormant => write!(f, "dormant"),
+            Self::Emerging => write!(f, "emerging"),
+            Self::Archived => write!(f, "archived"),
+        }
+    }
+}
+
+impl std::str::FromStr for PersonaStatus {
+    type Err = String;
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "active" => Ok(Self::Active),
+            "dormant" => Ok(Self::Dormant),
+            "emerging" => Ok(Self::Emerging),
+            "archived" => Ok(Self::Archived),
+            _ => Err(format!("Unknown PersonaStatus: {s}")),
+        }
+    }
+}
+
+/// A Living Persona — an adaptive knowledge agent connected to the graph.
+///
+/// Personas aggregate domain-specific knowledge (skills, protocols, files,
+/// notes, decisions) into a coherent "expert profile" that evolves over time.
+/// They form a runtime stack (PersonaStack) that switches dynamically based
+/// on what files/functions the agent is touching.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersonaNode {
+    pub id: Uuid,
+    /// Project this persona belongs to. None = global/portable persona.
+    pub project_id: Option<Uuid>,
+    /// Human-readable name (e.g., "neo4j-expert", "threejs-specialist")
+    pub name: String,
+    /// Description of the persona's domain of expertise
+    #[serde(default)]
+    pub description: String,
+    /// Current lifecycle status
+    #[serde(default)]
+    pub status: PersonaStatus,
+
+    // --- Execution parameters ---
+    /// Default complexity classification: "simple", "complex", "creative"
+    #[serde(default)]
+    pub complexity_default: Option<String>,
+    /// Guard timeout in seconds (overrides RunnerConfig.task_timeout_secs)
+    pub timeout_secs: Option<u64>,
+    /// Maximum cost in USD for tasks using this persona
+    pub max_cost_usd: Option<f64>,
+    /// Preferred model (e.g., "opus", "sonnet"). None = use default.
+    pub model_preference: Option<String>,
+    /// System prompt override/addition. None = use default.
+    pub system_prompt_override: Option<String>,
+
+    // --- Living metrics (evolve over time) ---
+    /// Energy level [0,1] — reinforced on success, decayed on failure
+    #[serde(default = "default_energy")]
+    pub energy: f64,
+    /// Knowledge cohesion [0,1] — how tightly connected its knowledge subgraph is
+    #[serde(default)]
+    pub cohesion: f64,
+    /// Number of times this persona has been activated
+    #[serde(default)]
+    pub activation_count: i64,
+    /// Success rate of tasks executed with this persona [0,1]
+    #[serde(default)]
+    pub success_rate: f64,
+    /// Average task duration in seconds when this persona is active
+    #[serde(default)]
+    pub avg_duration_secs: f64,
+    /// Last time this persona was activated
+    pub last_activated: Option<DateTime<Utc>>,
+
+    // --- Bootstrap tracking ---
+    /// How this persona was created
+    #[serde(default)]
+    pub origin: PersonaOrigin,
+
+    // --- Timestamps ---
+    pub created_at: DateTime<Utc>,
+    pub updated_at: Option<DateTime<Utc>>,
+}
+
+fn default_energy() -> f64 {
+    0.5
+}
+
+/// A weighted relation from a Persona to a knowledge entity.
+///
+/// Used for KNOWS (File/Function), USES (Note/Decision) relations
+/// that carry a relevance weight.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersonaWeightedRelation {
+    /// Target entity type (e.g., "file", "function", "note", "decision")
+    pub entity_type: String,
+    /// Target entity identifier (path for files/functions, UUID string for notes/decisions)
+    pub entity_id: String,
+    /// Relevance weight [0,1] — evolves with usage
+    pub weight: f64,
+}
+
+/// Summary of a persona's knowledge subgraph — the full "expert context".
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersonaSubgraph {
+    /// Persona identity
+    pub persona_id: Uuid,
+    pub persona_name: String,
+    /// Files this persona KNOWS (with weights)
+    pub files: Vec<PersonaWeightedRelation>,
+    /// Functions this persona KNOWS (with weights)
+    pub functions: Vec<PersonaWeightedRelation>,
+    /// Notes this persona USES (with weights)
+    pub notes: Vec<PersonaWeightedRelation>,
+    /// Decisions this persona USES (with weights)
+    pub decisions: Vec<PersonaWeightedRelation>,
+    /// Skills this persona MASTERS (with entity_type = "skill")
+    pub skills: Vec<PersonaWeightedRelation>,
+    /// Protocols this persona FOLLOWS (with entity_type = "protocol")
+    pub protocols: Vec<PersonaWeightedRelation>,
+    /// FeatureGraph this persona is SCOPED_TO (if any)
+    pub feature_graph_id: Option<Uuid>,
+    /// Parent personas via EXTENDS chain (with entity_type = "persona")
+    pub parents: Vec<PersonaWeightedRelation>,
+    /// Children personas that EXTEND this one (with entity_type = "persona")
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub children: Vec<PersonaWeightedRelation>,
+    /// Statistics
+    pub stats: PersonaSubgraphStats,
+}
+
+/// Statistics about a persona's knowledge subgraph.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersonaSubgraphStats {
+    /// Total number of entities in the subgraph
+    pub total_entities: usize,
+    /// Coverage score: how much of the project this persona covers [0,1]
+    pub coverage_score: f64,
+    /// Freshness: average recency of relations (based on last_activated and note timestamps)
+    pub freshness: f64,
+}
+
+/// Portable persona package for export/import across projects.
+///
+/// Contains the persona definition and all its portable knowledge
+/// (notes, decisions). Files/functions are project-specific and NOT included —
+/// they are reconstructed on import via `auto_bind`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersonaPackage {
+    /// Schema version for forward compatibility
+    pub schema_version: u32,
+    /// Persona identity (without project-specific IDs)
+    pub persona: PortablePersona,
+    /// Notes this persona USES (content, not IDs)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<PortablePersonaNote>,
+    /// Decisions this persona USES (content, not IDs)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub decisions: Vec<PortablePersonaDecision>,
+    /// Skill names this persona MASTERS (for re-linking on import)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skill_names: Vec<String>,
+    /// Source metadata for provenance tracking
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<PersonaPackageSource>,
+}
+
+/// Portable persona definition (no project-specific IDs).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PortablePersona {
+    pub name: String,
+    pub description: String,
+    pub complexity_default: Option<String>,
+    pub timeout_secs: Option<u64>,
+    pub max_cost_usd: Option<f64>,
+    pub model_preference: Option<String>,
+    pub system_prompt_override: Option<String>,
+    pub energy: f64,
+    pub cohesion: f64,
+    pub activation_count: i64,
+    pub success_rate: f64,
+}
+
+/// A note carried inside a PersonaPackage.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PortablePersonaNote {
+    pub note_type: String,
+    pub content: String,
+    pub importance: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// Weight of the USES relation
+    pub weight: f64,
+}
+
+/// A decision carried inside a PersonaPackage.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PortablePersonaDecision {
+    pub description: String,
+    pub rationale: String,
+    pub chosen_option: String,
+    /// Weight of the USES relation
+    pub weight: f64,
+}
+
+/// Source metadata for provenance tracking in PersonaPackage.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersonaPackageSource {
+    pub project_name: Option<String>,
+    pub exported_at: DateTime<Utc>,
+}
+
+/// Result of importing a PersonaPackage.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersonaImportResult {
+    pub persona_id: Uuid,
+    pub persona_name: String,
+    pub notes_imported: usize,
+    pub decisions_imported: usize,
+    pub skills_linked: usize,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2113,5 +2391,309 @@ mod tests {
         let session: ChatSessionNode = serde_json::from_str(json).unwrap();
         assert!(session.workspace_slug.is_none());
         assert!(session.add_dirs.is_none());
+    }
+
+    // ========================================================================
+    // Persona model tests
+    // ========================================================================
+
+    #[test]
+    fn test_persona_origin_display_and_from_str() {
+        for (variant, expected_str) in [
+            (PersonaOrigin::AutoBuild, "auto_build"),
+            (PersonaOrigin::Manual, "manual"),
+            (PersonaOrigin::Imported, "imported"),
+        ] {
+            assert_eq!(variant.to_string(), expected_str);
+            let parsed: PersonaOrigin = expected_str.parse().unwrap();
+            assert_eq!(parsed, variant);
+        }
+        // Unknown value should error
+        assert!("unknown".parse::<PersonaOrigin>().is_err());
+    }
+
+    #[test]
+    fn test_persona_origin_default() {
+        assert_eq!(PersonaOrigin::default(), PersonaOrigin::Manual);
+    }
+
+    #[test]
+    fn test_persona_status_display_and_from_str() {
+        for (variant, expected_str) in [
+            (PersonaStatus::Active, "active"),
+            (PersonaStatus::Dormant, "dormant"),
+            (PersonaStatus::Emerging, "emerging"),
+            (PersonaStatus::Archived, "archived"),
+        ] {
+            assert_eq!(variant.to_string(), expected_str);
+            let parsed: PersonaStatus = expected_str.parse().unwrap();
+            assert_eq!(parsed, variant);
+        }
+        assert!("invalid".parse::<PersonaStatus>().is_err());
+    }
+
+    #[test]
+    fn test_persona_status_default() {
+        assert_eq!(PersonaStatus::default(), PersonaStatus::Emerging);
+    }
+
+    #[test]
+    fn test_persona_node_serialization_roundtrip() {
+        let persona = PersonaNode {
+            id: Uuid::new_v4(),
+            project_id: Some(Uuid::new_v4()),
+            name: "neo4j-expert".to_string(),
+            description: "Expert in Neo4j graph queries".to_string(),
+            status: PersonaStatus::Active,
+            complexity_default: Some("complex".to_string()),
+            timeout_secs: Some(300),
+            max_cost_usd: Some(0.50),
+            model_preference: Some("opus".to_string()),
+            system_prompt_override: None,
+            energy: 0.8,
+            cohesion: 0.65,
+            activation_count: 42,
+            success_rate: 0.95,
+            avg_duration_secs: 120.5,
+            last_activated: Some(Utc::now()),
+            origin: PersonaOrigin::Manual,
+            created_at: Utc::now(),
+            updated_at: Some(Utc::now()),
+        };
+
+        let json = serde_json::to_string(&persona).unwrap();
+        let de: PersonaNode = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(persona.id, de.id);
+        assert_eq!(persona.name, de.name);
+        assert_eq!(persona.status, de.status);
+        assert_eq!(persona.energy, de.energy);
+        assert_eq!(persona.activation_count, de.activation_count);
+        assert_eq!(persona.origin, de.origin);
+        assert_eq!(persona.complexity_default, de.complexity_default);
+        assert_eq!(persona.model_preference, de.model_preference);
+    }
+
+    #[test]
+    fn test_persona_node_defaults_on_minimal_json() {
+        // Ensure serde defaults work for optional/defaulted fields
+        let json = r#"{
+            "id": "550e8400-e29b-41d4-a716-446655440000",
+            "name": "minimal-persona",
+            "description": "",
+            "created_at": "2026-01-01T00:00:00Z"
+        }"#;
+        let persona: PersonaNode = serde_json::from_str(json).unwrap();
+        assert_eq!(persona.status, PersonaStatus::Emerging);
+        assert_eq!(persona.origin, PersonaOrigin::Manual);
+        assert!((persona.energy - 0.5).abs() < f64::EPSILON); // default_energy()
+        assert_eq!(persona.cohesion, 0.0);
+        assert_eq!(persona.activation_count, 0);
+        assert!(persona.project_id.is_none());
+        assert!(persona.complexity_default.is_none());
+    }
+
+    #[test]
+    fn test_persona_node_global_persona_no_project_id() {
+        let persona = PersonaNode {
+            id: Uuid::new_v4(),
+            project_id: None,
+            name: "global-expert".to_string(),
+            description: "A global persona".to_string(),
+            status: PersonaStatus::Active,
+            complexity_default: None,
+            timeout_secs: None,
+            max_cost_usd: None,
+            model_preference: None,
+            system_prompt_override: None,
+            energy: 0.5,
+            cohesion: 0.0,
+            activation_count: 0,
+            success_rate: 0.0,
+            avg_duration_secs: 0.0,
+            last_activated: None,
+            origin: PersonaOrigin::Manual,
+            created_at: Utc::now(),
+            updated_at: None,
+        };
+        let json = serde_json::to_string(&persona).unwrap();
+        let de: PersonaNode = serde_json::from_str(&json).unwrap();
+        assert!(de.project_id.is_none());
+    }
+
+    #[test]
+    fn test_persona_weighted_relation_serialization() {
+        let rel = PersonaWeightedRelation {
+            entity_type: "file".to_string(),
+            entity_id: "/src/main.rs".to_string(),
+            weight: 0.85,
+        };
+        let json = serde_json::to_string(&rel).unwrap();
+        let de: PersonaWeightedRelation = serde_json::from_str(&json).unwrap();
+        assert_eq!(de.entity_type, "file");
+        assert_eq!(de.entity_id, "/src/main.rs");
+        assert!((de.weight - 0.85).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_persona_subgraph_stats_serialization() {
+        let stats = PersonaSubgraphStats {
+            total_entities: 42,
+            coverage_score: 0.73,
+            freshness: 0.91,
+        };
+        let json = serde_json::to_string(&stats).unwrap();
+        let de: PersonaSubgraphStats = serde_json::from_str(&json).unwrap();
+        assert_eq!(de.total_entities, 42);
+        assert!((de.coverage_score - 0.73).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_persona_subgraph_serialization() {
+        let subgraph = PersonaSubgraph {
+            persona_id: Uuid::new_v4(),
+            persona_name: "test-persona".to_string(),
+            files: vec![PersonaWeightedRelation {
+                entity_type: "file".to_string(),
+                entity_id: "/src/lib.rs".to_string(),
+                weight: 1.0,
+            }],
+            functions: vec![],
+            notes: vec![],
+            decisions: vec![],
+            skills: vec![],
+            protocols: vec![],
+            feature_graph_id: None,
+            parents: vec![],
+            children: vec![],
+            stats: PersonaSubgraphStats {
+                total_entities: 1,
+                coverage_score: 0.1,
+                freshness: 1.0,
+            },
+        };
+        let json = serde_json::to_string(&subgraph).unwrap();
+        let de: PersonaSubgraph = serde_json::from_str(&json).unwrap();
+        assert_eq!(de.persona_name, "test-persona");
+        assert_eq!(de.files.len(), 1);
+        assert!(de.children.is_empty());
+    }
+
+    #[test]
+    fn test_persona_package_serialization_roundtrip() {
+        let package = PersonaPackage {
+            schema_version: 1,
+            persona: PortablePersona {
+                name: "neo4j-expert".to_string(),
+                description: "Expert in graph queries".to_string(),
+                complexity_default: Some("complex".to_string()),
+                timeout_secs: None,
+                max_cost_usd: Some(1.0),
+                model_preference: None,
+                system_prompt_override: None,
+                energy: 0.8,
+                cohesion: 0.7,
+                activation_count: 10,
+                success_rate: 0.9,
+            },
+            notes: vec![PortablePersonaNote {
+                note_type: "gotcha".to_string(),
+                content: "Use run() not execute() for writes".to_string(),
+                importance: "critical".to_string(),
+                tags: vec!["neo4j".to_string()],
+                weight: 1.0,
+            }],
+            decisions: vec![PortablePersonaDecision {
+                description: "Use neo4rs".to_string(),
+                rationale: "Best async driver".to_string(),
+                chosen_option: "neo4rs".to_string(),
+                weight: 0.9,
+            }],
+            skill_names: vec!["graph-queries".to_string()],
+            source: Some(PersonaPackageSource {
+                project_name: Some("project-orchestrator".to_string()),
+                exported_at: Utc::now(),
+            }),
+        };
+
+        let json = serde_json::to_string(&package).unwrap();
+        let de: PersonaPackage = serde_json::from_str(&json).unwrap();
+        assert_eq!(de.schema_version, 1);
+        assert_eq!(de.persona.name, "neo4j-expert");
+        assert_eq!(de.notes.len(), 1);
+        assert_eq!(de.decisions.len(), 1);
+        assert_eq!(de.skill_names, vec!["graph-queries"]);
+        assert!(de.source.is_some());
+    }
+
+    #[test]
+    fn test_persona_package_minimal() {
+        // Empty notes/decisions/skills should be omitted from JSON
+        let package = PersonaPackage {
+            schema_version: 1,
+            persona: PortablePersona {
+                name: "minimal".to_string(),
+                description: "".to_string(),
+                complexity_default: None,
+                timeout_secs: None,
+                max_cost_usd: None,
+                model_preference: None,
+                system_prompt_override: None,
+                energy: 0.5,
+                cohesion: 0.0,
+                activation_count: 0,
+                success_rate: 0.0,
+            },
+            notes: vec![],
+            decisions: vec![],
+            skill_names: vec![],
+            source: None,
+        };
+        let json = serde_json::to_string(&package).unwrap();
+        // skip_serializing_if = "Vec::is_empty" should omit empty vecs
+        assert!(!json.contains("\"notes\""));
+        assert!(!json.contains("\"decisions\""));
+        assert!(!json.contains("\"skill_names\""));
+        assert!(!json.contains("\"source\""));
+    }
+
+    #[test]
+    fn test_persona_import_result_serialization() {
+        let result = PersonaImportResult {
+            persona_id: Uuid::new_v4(),
+            persona_name: "imported-expert".to_string(),
+            notes_imported: 3,
+            decisions_imported: 2,
+            skills_linked: 1,
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let de: PersonaImportResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(de.persona_name, "imported-expert");
+        assert_eq!(de.notes_imported, 3);
+        assert_eq!(de.skills_linked, 1);
+    }
+
+    #[test]
+    fn test_persona_origin_serde_snake_case() {
+        // Verify serde rename_all = "snake_case" works correctly
+        let json = r#""auto_build""#;
+        let origin: PersonaOrigin = serde_json::from_str(json).unwrap();
+        assert_eq!(origin, PersonaOrigin::AutoBuild);
+
+        let serialized = serde_json::to_string(&PersonaOrigin::AutoBuild).unwrap();
+        assert_eq!(serialized, r#""auto_build""#);
+    }
+
+    #[test]
+    fn test_persona_status_serde_snake_case() {
+        for (json_str, expected) in [
+            (r#""active""#, PersonaStatus::Active),
+            (r#""dormant""#, PersonaStatus::Dormant),
+            (r#""emerging""#, PersonaStatus::Emerging),
+            (r#""archived""#, PersonaStatus::Archived),
+        ] {
+            let de: PersonaStatus = serde_json::from_str(json_str).unwrap();
+            assert_eq!(de, expected);
+        }
     }
 }
