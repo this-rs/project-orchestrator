@@ -17,6 +17,7 @@ use super::protocol_handlers;
 use super::reason_handlers;
 use super::registry_handlers;
 use super::rfc_handlers;
+use super::sharing_handlers;
 use super::skill_handlers;
 use super::workspace_handlers;
 use super::ws_chat_handler;
@@ -255,6 +256,54 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/projects/{slug}/scaffolding",
             get(project_handlers::get_scaffolding_level)
                 .put(project_handlers::set_scaffolding_level),
+        )
+        // ================================================================
+        // Sharing & Privacy (Privacy MVP)
+        // ================================================================
+        .route(
+            "/api/projects/{slug}/sharing",
+            get(sharing_handlers::get_sharing_status),
+        )
+        .route(
+            "/api/projects/{slug}/sharing/enable",
+            post(sharing_handlers::enable_sharing),
+        )
+        .route(
+            "/api/projects/{slug}/sharing/disable",
+            post(sharing_handlers::disable_sharing),
+        )
+        .route(
+            "/api/projects/{slug}/sharing/policy",
+            get(sharing_handlers::get_sharing_policy)
+                .put(sharing_handlers::set_sharing_policy),
+        )
+        .route(
+            "/api/notes/{note_id}/sharing/consent",
+            axum::routing::put(sharing_handlers::set_sharing_consent),
+        )
+        .route(
+            "/api/projects/{slug}/sharing/history",
+            get(sharing_handlers::get_sharing_history),
+        )
+        .route(
+            "/api/projects/{slug}/sharing/preview",
+            get(sharing_handlers::preview_sharing),
+        )
+        .route(
+            "/api/projects/{slug}/sharing/suggest",
+            get(sharing_handlers::suggest_sharing),
+        )
+        .route(
+            "/api/projects/{slug}/sharing/retract",
+            post(sharing_handlers::retract_sharing),
+        )
+        .route(
+            "/api/projects/{slug}/sharing/tombstones",
+            get(sharing_handlers::list_tombstones),
+        )
+        .route(
+            "/api/projects/{slug}/sharing/last-report",
+            get(sharing_handlers::get_last_privacy_report),
         )
         // Releases (by project_id)
         .route(
