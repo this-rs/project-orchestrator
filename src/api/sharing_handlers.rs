@@ -65,6 +65,7 @@ pub struct HistoryQuery {
 pub struct PreviewItem {
     pub note_id: String,
     pub note_type: String,
+    pub content_preview: String,
     pub consent: SharingConsent,
     pub shareability_score: f64,
     pub decision: String, // "allow" | "deny"
@@ -75,8 +76,21 @@ pub struct PreviewItem {
 pub struct SuggestionItem {
     pub note_id: String,
     pub note_type: String,
+    pub content_preview: String,
     pub shareability_score: f64,
     pub reason: String,
+}
+
+/// Truncate content to a short preview (first line, max 120 chars).
+fn content_preview(content: &str) -> String {
+    let first_line = content.lines().next().unwrap_or("");
+    // Strip leading markdown headers
+    let trimmed = first_line.trim_start_matches('#').trim();
+    if trimmed.len() > 120 {
+        format!("{}…", &trimmed[..120])
+    } else {
+        trimmed.to_string()
+    }
 }
 
 /// Last privacy report response
@@ -304,6 +318,7 @@ pub async fn preview_sharing(
             PreviewItem {
                 note_id: note.id.to_string(),
                 note_type: format!("{:?}", note.note_type),
+                content_preview: content_preview(&note.content),
                 consent: note.sharing_consent,
                 shareability_score: score,
                 decision: format!("{:?}", decision).to_lowercase(),
@@ -333,6 +348,7 @@ pub async fn suggest_sharing(
             suggestions.push(SuggestionItem {
                 note_id: note.id.to_string(),
                 note_type: format!("{:?}", note.note_type),
+                content_preview: content_preview(&note.content),
                 shareability_score: score,
                 reason: format!(
                     "Score {:.2} >= threshold {:.2}, consent not yet set",
