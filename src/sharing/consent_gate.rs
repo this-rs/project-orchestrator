@@ -336,7 +336,7 @@ mod tests {
     fn test_shareability_score_range() {
         let note = make_test_note("guideline", SharingConsent::NotSet);
         let score = compute_shareability_score(&note);
-        assert!(score >= 0.0 && score <= 1.0, "Score {} out of range", score);
+        assert!((0.0..=1.0).contains(&score), "Score {} out of range", score);
     }
 
     #[test]

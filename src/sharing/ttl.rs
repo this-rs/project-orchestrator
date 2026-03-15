@@ -11,12 +11,13 @@ use serde::{Deserialize, Serialize};
 // ============================================================================
 
 /// Pre-defined TTL durations for shared artifacts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TtlPreset {
     /// 7 days — ephemeral content.
     Ephemeral,
     /// 90 days — standard retention (default).
+    #[default]
     Standard,
     /// 365 days — long-lived content.
     Durable,
@@ -41,11 +42,6 @@ impl TtlPreset {
     }
 }
 
-impl Default for TtlPreset {
-    fn default() -> Self {
-        TtlPreset::Standard
-    }
-}
 
 // ============================================================================
 // Shared artifact metadata
