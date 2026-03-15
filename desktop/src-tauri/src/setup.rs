@@ -841,28 +841,73 @@ pub struct ClaudeSetupResult {
     pub allowed_tools_configured: bool,
 }
 
-/// Configure Claude Code to use the Project Orchestrator MCP server.
+/// Configure Claude Code to use the Project Orchestrator MCP server (stdio mode).
 ///
 /// Reuses the shared logic from `project_orchestrator::setup_claude`:
-/// 1. If already configured → returns immediately
-/// 2. Tries `claude mcp add` if CLI is available
-/// 3. Falls back to editing `~/.claude/mcp.json` directly
+/// 1. If already configured with correct settings → returns immediately
+/// 2. If stale/wrong config → updates it in-place
+/// 3. Tries `claude mcp add` if CLI is available (new install)
+/// 4. Falls back to editing `~/.claude/mcp.json` directly
+///
+/// The MCP server is configured in stdio mode with `PO_SERVER_URL` and
+/// `PO_JWT_SECRET` env vars, supporting multi-instance setups.
 ///
 /// Also configures `~/.claude/settings.json` to pre-approve all MCP tools.
 #[tauri::command]
 pub fn setup_claude_code(server_url: Option<String>, port: Option<u16>) -> ClaudeSetupResult {
-    match project_orchestrator::setup_claude::setup_claude_code(server_url.as_deref(), port) {
+    use project_orchestrator::chat::ChatConfig;
+    use project_orchestrator::setup_claude::{SetupConfig, SetupResult};
+
+    // Auto-detect the mcp_server binary path
+    let mcp_server_path = ChatConfig::detect_mcp_server_path_public();
+    let effective_port = port.unwrap_or(8080);
+
+    // Read jwt_secret from config.yaml if available
+    let jwt_secret = {
+        let config_path = config_path();
+        if config_path.exists() {
+            std::fs::read_to_string(&config_path)
+                .ok()
+                .and_then(|contents| {
+                    serde_yaml::from_str::<project_orchestrator::YamlConfig>(&contents).ok()
+                })
+                .and_then(|yaml| yaml.auth.map(|a| a.jwt_secret))
+        } else {
+            None
+        }
+    };
+
+    // If server_url is provided, try to extract port from it (backward compat)
+    let effective_port = if let Some(ref url) = server_url {
+        // Simple port extraction: look for `:PORT` before any path
+        url.split("://")
+            .last()
+            .and_then(|host_port| host_port.split('/').next())
+            .and_then(|host_port| host_port.rsplit(':').next())
+            .and_then(|p| p.parse::<u16>().ok())
+            .unwrap_or(effective_port)
+    } else {
+        effective_port
+    };
+
+    let setup_config = SetupConfig {
+        mcp_server_path,
+        server_port: effective_port,
+        jwt_secret,
+    };
+
+    match project_orchestrator::setup_claude::setup_claude_code(&setup_config) {
         Ok(result) => match result {
-            project_orchestrator::setup_claude::SetupResult::ConfiguredViaCli {
+            SetupResult::ConfiguredViaCli {
                 allowed_tools_configured,
             } => ClaudeSetupResult {
                 success: true,
                 method: "cli".into(),
-                message: "Claude Code configured via CLI (claude mcp add)".into(),
+                message: "Claude Code configured via CLI (stdio mode)".into(),
                 file_path: None,
                 allowed_tools_configured,
             },
-            project_orchestrator::setup_claude::SetupResult::ConfiguredViaFile {
+            SetupResult::ConfiguredViaFile {
                 path,
                 allowed_tools_configured,
             } => ClaudeSetupResult {
@@ -872,7 +917,20 @@ pub fn setup_claude_code(server_url: Option<String>, port: Option<u16>) -> Claud
                 file_path: Some(path.display().to_string()),
                 allowed_tools_configured,
             },
-            project_orchestrator::setup_claude::SetupResult::AlreadyConfigured {
+            SetupResult::Updated {
+                path,
+                allowed_tools_configured,
+            } => ClaudeSetupResult {
+                success: true,
+                method: "file".into(),
+                message: format!(
+                    "Claude Code config updated (stale → stdio) in {}",
+                    path.display()
+                ),
+                file_path: Some(path.display().to_string()),
+                allowed_tools_configured,
+            },
+            SetupResult::AlreadyConfigured {
                 allowed_tools_configured,
             } => ClaudeSetupResult {
                 success: true,

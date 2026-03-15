@@ -273,6 +273,14 @@ impl ChatConfig {
         }
     }
 
+    /// Public accessor for MCP server path detection.
+    ///
+    /// Used by `setup_claude` to auto-detect the binary path when configuring
+    /// Claude Code's mcp.json from the CLI `setup-claude` subcommand.
+    pub fn detect_mcp_server_path_public() -> PathBuf {
+        Self::detect_mcp_server_path()
+    }
+
     fn detect_mcp_server_path() -> PathBuf {
         // Try environment variable first
         if let Ok(path) = std::env::var("MCP_SERVER_PATH") {

@@ -53,11 +53,7 @@ enum Commands {
 
     /// Configure Claude Code to use this server as MCP provider
     SetupClaude {
-        /// MCP server URL (default: http://localhost:{port}/mcp/sse)
-        #[arg(long)]
-        url: Option<String>,
-
-        /// Port used to build the default MCP server URL (default: from config or 8080)
+        /// Override the server port (default: from config or 8080)
         #[arg(long)]
         port: Option<u16>,
     },
@@ -99,25 +95,34 @@ async fn main() -> Result<()> {
         }
         Commands::Sync { path } => run_sync(config, &path).await,
         Commands::Update { check } => run_update(check).await,
-        Commands::SetupClaude { url, port } => {
+        Commands::SetupClaude { port } => {
             let effective_port = port.unwrap_or(config.server_port);
-            run_setup_claude(url.as_deref(), effective_port);
+            run_setup_claude(&config, effective_port);
             Ok(())
         }
     }
 }
 
-fn run_setup_claude(url: Option<&str>, port: u16) {
-    println!("Configuring Claude Code MCP server...");
+fn run_setup_claude(config: &Config, port: u16) {
+    use project_orchestrator::chat::ChatConfig;
+
+    println!("Configuring Claude Code MCP server (stdio mode)...");
     println!();
 
-    let default_url = format!("http://localhost:{}/mcp/sse", port);
+    // Auto-detect the mcp_server binary path using the same logic as ChatManager
+    let mcp_server_path = ChatConfig::detect_mcp_server_path_public();
 
-    match setup_claude::setup_claude_code(url, Some(port)) {
+    let setup_config = setup_claude::SetupConfig {
+        mcp_server_path,
+        server_port: port,
+        jwt_secret: config.auth_config.as_ref().map(|a| a.jwt_secret.clone()),
+    };
+
+    match setup_claude::setup_claude_code(&setup_config) {
         Ok(setup_claude::SetupResult::ConfiguredViaCli {
             allowed_tools_configured,
         }) => {
-            println!("  Claude Code configured via CLI.");
+            println!("  Claude Code configured via CLI (stdio mode).");
             if allowed_tools_configured {
                 println!("  MCP tools pre-approved in settings.json.");
             }
@@ -137,6 +142,18 @@ fn run_setup_claude(url: Option<&str>, port: u16) {
             println!("  The MCP server entry has been added to your mcp.json.");
             println!("  Restart Claude Code to pick up the changes.");
         }
+        Ok(setup_claude::SetupResult::Updated {
+            path,
+            allowed_tools_configured,
+        }) => {
+            println!("  Claude Code config updated in {}.", path.display());
+            if allowed_tools_configured {
+                println!("  MCP tools pre-approved in settings.json.");
+            }
+            println!();
+            println!("  Stale SSE config replaced with stdio mode.");
+            println!("  Restart Claude Code to pick up the changes.");
+        }
         Ok(setup_claude::SetupResult::AlreadyConfigured {
             allowed_tools_configured,
         }) => {
@@ -148,24 +165,14 @@ fn run_setup_claude(url: Option<&str>, port: u16) {
             }
         }
         Err(e) => {
-            let fallback_url = url.unwrap_or(&default_url);
             eprintln!("  Failed to configure Claude Code: {}", e);
             eprintln!();
             eprintln!("  You can configure it manually:");
             eprintln!(
-                "    claude mcp add project-orchestrator --transport sse --url {}",
-                fallback_url
+                "    claude mcp add -e PO_SERVER_URL=http://127.0.0.1:{} -e PO_JWT_SECRET=<secret> project-orchestrator -- {}",
+                port,
+                setup_config.mcp_server_path.display()
             );
-            eprintln!();
-            eprintln!("  Or add to ~/.claude/mcp.json:");
-            eprintln!("    {{");
-            eprintln!("      \"mcpServers\": {{");
-            eprintln!("        \"project-orchestrator\": {{");
-            eprintln!("          \"type\": \"sse\",");
-            eprintln!("          \"url\": \"{}\"", fallback_url);
-            eprintln!("        }}");
-            eprintln!("      }}");
-            eprintln!("    }}");
         }
     }
 }

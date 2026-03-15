@@ -1112,6 +1112,34 @@ pub async fn start_server(mut config: Config) -> Result<()> {
         Some(cm)
     };
 
+    // Auto-configure Claude Code MCP integration (idempotent — safe to call on every start).
+    // Configures ~/.claude/mcp.json with stdio mode pointing to this instance,
+    // and updates it if the config is stale (e.g., was SSE mode from an older version).
+    {
+        let setup_config = setup_claude::SetupConfig {
+            mcp_server_path: chat::ChatConfig::detect_mcp_server_path_public(),
+            server_port: config.server_port,
+            jwt_secret: config.auth_config.as_ref().map(|a| a.jwt_secret.clone()),
+        };
+        match setup_claude::setup_claude_code(&setup_config) {
+            Ok(setup_claude::SetupResult::AlreadyConfigured { .. }) => {
+                tracing::debug!("Claude Code MCP: already configured");
+            }
+            Ok(setup_claude::SetupResult::Updated { path, .. }) => {
+                tracing::info!(
+                    "Claude Code MCP: updated stale config → stdio mode ({})",
+                    path.display()
+                );
+            }
+            Ok(result) => {
+                tracing::info!("Claude Code MCP: {:?}", result);
+            }
+            Err(e) => {
+                tracing::warn!("Claude Code MCP auto-setup failed (non-fatal): {}", e);
+            }
+        }
+    }
+
     // Create WS ticket store (in-memory, for WKWebView cookie workaround)
     let ws_ticket_store = Arc::new(api::ws_auth::WsTicketStore::new());
 
