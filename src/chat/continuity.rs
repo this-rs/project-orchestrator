@@ -70,6 +70,15 @@ pub struct NoteSummary {
     pub content_preview: String,
 }
 
+/// Lightweight alert summary for session resume.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AlertSummary {
+    pub alert_id: uuid::Uuid,
+    pub alert_type: String,
+    pub severity: String,
+    pub message: String,
+}
+
 /// Current active work context for the project.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ActiveWorkContext {
@@ -77,6 +86,9 @@ pub struct ActiveWorkContext {
     pub active_plans: Vec<ActivePlanSummary>,
     /// Notes recently modified (last 48h)
     pub recent_notes: Vec<NoteSummary>,
+    /// Pending (unacknowledged) heartbeat alerts
+    #[serde(default)]
+    pub pending_alerts: Vec<AlertSummary>,
 }
 
 /// Combined session resume — everything an agent needs to pick up where it left off.
@@ -114,11 +126,12 @@ pub async fn load_session_context(
     };
     let project_id = project.id;
 
-    // Run all queries in parallel
-    let (last_session_result, active_plans_result, recent_notes_result) = tokio::join!(
+    // Run all queries in parallel (including pending alerts)
+    let (last_session_result, active_plans_result, recent_notes_result, alerts_result) = tokio::join!(
         load_last_session_context(graph, project_slug, project_id),
         load_active_plans(graph, project_id),
         load_recent_notes(graph, project_id),
+        load_pending_alerts(graph, project_id),
     );
 
     let last_session = last_session_result.unwrap_or_else(|e| {
@@ -136,13 +149,19 @@ pub async fn load_session_context(
         vec![]
     });
 
+    let pending_alerts = alerts_result.unwrap_or_else(|e| {
+        warn!("[continuity] Failed to load pending alerts: {}", e);
+        vec![]
+    });
+
     let load_time_ms = start.elapsed().as_millis() as u64;
     debug!(
-        "[continuity] Context loaded in {}ms — {} discussed entities, {} active plans, {} recent notes",
+        "[continuity] Context loaded in {}ms — {} discussed entities, {} active plans, {} recent notes, {} pending alerts",
         load_time_ms,
         last_session.discussed_entities.len(),
         active_plans.len(),
         recent_notes.len(),
+        pending_alerts.len(),
     );
 
     Ok(SessionResume {
@@ -150,6 +169,7 @@ pub async fn load_session_context(
         active_work: ActiveWorkContext {
             active_plans,
             recent_notes,
+            pending_alerts,
         },
         load_time_ms,
     })
@@ -301,6 +321,27 @@ fn note_to_summary(note: &Note) -> NoteSummary {
         importance: format!("{:?}", note.importance),
         content_preview: preview,
     }
+}
+
+// ============================================================================
+// Query: Pending Alerts (Heartbeat Engine)
+// ============================================================================
+
+async fn load_pending_alerts(
+    graph: &Arc<dyn GraphStore>,
+    project_id: Uuid,
+) -> Result<Vec<AlertSummary>> {
+    let alerts = graph.list_pending_alerts(Some(project_id), 10).await?;
+
+    Ok(alerts
+        .into_iter()
+        .map(|a| AlertSummary {
+            alert_id: a.id,
+            alert_type: a.alert_type,
+            severity: a.severity.to_string(),
+            message: a.message,
+        })
+        .collect())
 }
 
 // ============================================================================
@@ -479,6 +520,7 @@ mod tests {
                     pending_tasks: vec![],
                 }],
                 recent_notes: vec![],
+                pending_alerts: vec![],
             },
             ..Default::default()
         };
@@ -552,6 +594,7 @@ mod tests {
                         content_preview: format!("Important note content #{}", i),
                     })
                     .collect(),
+                pending_alerts: vec![],
             },
             load_time_ms: 42,
         };
@@ -629,6 +672,7 @@ mod tests {
                     importance: "Critical".to_string(),
                     content_preview: "Never use git add -A in backend".to_string(),
                 }],
+                pending_alerts: vec![],
             },
             load_time_ms: 42,
         };

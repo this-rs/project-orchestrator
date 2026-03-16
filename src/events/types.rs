@@ -24,6 +24,7 @@ pub enum EntityType {
     ChatSession,
     ProtocolRun,
     Runner,
+    Alert,
 }
 
 /// The CRUD action performed

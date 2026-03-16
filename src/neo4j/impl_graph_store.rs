@@ -3674,4 +3674,73 @@ impl GraphStore for Neo4jClient {
     async fn is_tombstoned(&self, content_hash: &str) -> anyhow::Result<bool> {
         self.is_tombstoned(content_hash).await
     }
+
+    // ========================================================================
+    // UserProfile operations
+    // ========================================================================
+
+    async fn create_or_get_user_profile(
+        &self,
+        user_id: &str,
+    ) -> anyhow::Result<crate::profile::UserProfile> {
+        self.create_or_get_user_profile(user_id).await
+    }
+
+    async fn update_user_profile(
+        &self,
+        profile: &crate::profile::UserProfile,
+    ) -> anyhow::Result<()> {
+        self.update_user_profile(profile).await
+    }
+
+    async fn get_user_profile(
+        &self,
+        user_id: &str,
+    ) -> anyhow::Result<Option<crate::profile::UserProfile>> {
+        self.get_user_profile(user_id).await
+    }
+
+    async fn upsert_works_on(&self, user_id: &str, project_id: uuid::Uuid) -> anyhow::Result<()> {
+        self.upsert_works_on(user_id, project_id).await
+    }
+
+    async fn get_works_on(
+        &self,
+        user_id: &str,
+    ) -> anyhow::Result<Vec<crate::profile::WorksOnRelation>> {
+        self.get_works_on(user_id).await
+    }
+
+    // ========================================================================
+    // Alert operations (Heartbeat Engine)
+    // ========================================================================
+
+    async fn create_alert(&self, alert: &AlertNode) -> anyhow::Result<()> {
+        self.create_alert_node(alert).await
+    }
+
+    async fn list_pending_alerts(
+        &self,
+        project_id: Option<Uuid>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<AlertNode>> {
+        self.list_pending_alerts_impl(project_id, limit).await
+    }
+
+    async fn acknowledge_alert(&self, alert_id: Uuid, acknowledged_by: &str) -> anyhow::Result<()> {
+        self.acknowledge_alert_impl(alert_id, acknowledged_by).await
+    }
+
+    async fn get_alert(&self, alert_id: Uuid) -> anyhow::Result<Option<AlertNode>> {
+        self.get_alert_impl(alert_id).await
+    }
+
+    async fn list_alerts(
+        &self,
+        project_id: Option<Uuid>,
+        limit: usize,
+        offset: usize,
+    ) -> anyhow::Result<(Vec<AlertNode>, usize)> {
+        self.list_alerts_impl(project_id, limit, offset).await
+    }
 }

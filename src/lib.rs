@@ -15,7 +15,9 @@ pub mod chat;
 pub mod embeddings;
 pub mod episodes;
 pub mod events;
+pub mod feedback;
 pub mod graph;
+pub mod heartbeat;
 pub mod identity;
 pub mod mcp;
 pub mod meilisearch;
@@ -25,9 +27,11 @@ pub mod notes;
 pub mod orchestrator;
 pub mod parser;
 pub mod plan;
+pub mod profile;
 pub mod protocol;
 pub mod reasoning;
 pub mod reception;
+pub mod reflex;
 pub mod resolver;
 pub mod runner;
 pub mod setup_claude;
@@ -1238,6 +1242,35 @@ pub async fn start_server(mut config: Config) -> Result<()> {
         // WebhookProvider — no setup needed, the POST /api/webhooks/:trigger_id
         // endpoint handles validation and evaluation inline.
         tracing::info!("TriggerEngine booted with 2 active providers (schedule, event)");
+    }
+
+    // Boot HeartbeatEngine — background daemon for periodic health checks.
+    // Runs independently of chat sessions (like ScheduleProvider).
+    {
+        use heartbeat::checks::{
+            convention_guard::ConventionGuardCheck, git_drift::GitDriftCheck,
+            maintenance::MaintenanceCheck, staleness::StalenessCheck,
+            synapse_decay::SynapseDecayCheck,
+        };
+        use heartbeat::engine::HeartbeatEngine;
+
+        let graph = orchestrator.neo4j_arc();
+        let emitter: Option<Arc<dyn events::EventEmitter>> =
+            Some(event_bus.clone() as Arc<dyn events::EventEmitter>);
+
+        let checks: Vec<Box<dyn heartbeat::HeartbeatCheck>> = vec![
+            Box::new(GitDriftCheck),
+            Box::new(StalenessCheck),
+            Box::new(SynapseDecayCheck),
+            Box::new(ConventionGuardCheck),
+            Box::new(MaintenanceCheck),
+        ];
+
+        let engine = HeartbeatEngine::new(graph, emitter, checks);
+        let handle = engine.start_owned();
+        // Keep handle alive for the lifetime of the process
+        std::mem::forget(handle);
+        tracing::info!("HeartbeatEngine started (5 checks)");
     }
 
     // Pre-build OIDC client once (avoids fetching discovery document on every request)

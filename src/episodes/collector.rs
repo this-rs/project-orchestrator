@@ -116,6 +116,7 @@ pub async fn collect_episode(
         lesson: None, // Lessons are extracted later (optionally by LLM)
         collected_at: Utc::now(),
         source_run_id: Some(run_id),
+        embedding: None, // Computed later if embedding pipeline is available
     };
 
     Ok(Some(episode))
@@ -242,6 +243,7 @@ mod tests {
             lesson: None,
             collected_at: Utc::now(),
             source_run_id: None,
+            embedding: None,
         }
     }
 

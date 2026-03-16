@@ -38,6 +38,12 @@ pub struct EnrichmentConfig {
     /// Enable the biomimicry stage (stagnation detection, homeostasis check).
     #[serde(default)]
     pub biomimicry: bool,
+    /// Enable the reflex stage (co-change reminders, episode recall, scar warnings).
+    #[serde(default)]
+    pub reflex: bool,
+    /// Enable the user profile stage (adaptive behavioral profile injection).
+    #[serde(default)]
+    pub user_profile: bool,
     /// Enable the reasoning tree injection stage.
     pub reasoning_tree: bool,
     /// Enable debug mode (logs timing and content of each stage).
@@ -53,6 +59,8 @@ impl Default for EnrichmentConfig {
             knowledge_injection: true,
             status_injection: true,
             biomimicry: false, // Disabled by default — opt-in via ENRICHMENT_BIOMIMICRY=true
+            reflex: false,     // Disabled by default — opt-in via ENRICHMENT_REFLEX=true
+            user_profile: false, // Disabled by default — opt-in via ENRICHMENT_USER_PROFILE=true
             reasoning_tree: true,
             debug: false,
             max_pipeline_ms: 500,
@@ -82,6 +90,12 @@ impl EnrichmentConfig {
                 .map(|v| v != "false" && v != "0")
                 .unwrap_or(true),
             biomimicry: std::env::var("ENRICHMENT_BIOMIMICRY")
+                .map(|v| v == "true" || v == "1")
+                .unwrap_or(false),
+            reflex: std::env::var("ENRICHMENT_REFLEX")
+                .map(|v| v == "true" || v == "1")
+                .unwrap_or(false),
+            user_profile: std::env::var("ENRICHMENT_USER_PROFILE")
                 .map(|v| v == "true" || v == "1")
                 .unwrap_or(false),
             reasoning_tree: std::env::var("ENRICHMENT_REASONING_TREE")
@@ -669,6 +683,8 @@ mod tests {
             knowledge_injection: true,
             status_injection: false,
             biomimicry: false,
+            reflex: false,
+            user_profile: false,
             reasoning_tree: true,
             debug: true,
             max_pipeline_ms: 1000,

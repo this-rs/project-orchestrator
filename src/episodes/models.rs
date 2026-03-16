@@ -56,6 +56,11 @@ pub struct Episode {
     /// The ProtocolRun that generated this episode (if any)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_run_id: Option<Uuid>,
+
+    /// Embedding vector for semantic similarity search (ReflexEngine).
+    /// Computed from the stimulus request + lesson abstract_pattern during collection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding: Option<Vec<f32>>,
 }
 
 /// What triggered the episode.
@@ -383,6 +388,7 @@ mod tests {
             }),
             collected_at: Utc::now(),
             source_run_id: Some(Uuid::new_v4()),
+            embedding: None,
         }
     }
 

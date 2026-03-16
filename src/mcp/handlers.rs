@@ -593,6 +593,7 @@ impl ToolHandler {
             ("admin", "detect_stagnation") => "detect_stagnation",
             ("admin", "deep_maintenance") => "deep_maintenance",
             ("admin", "install_hooks") => "install_hooks",
+            ("admin", "get_learning_stats") => "get_learning_stats",
 
             _ => {
                 return Err(anyhow!(
@@ -2703,6 +2704,12 @@ impl ToolHandler {
                     "message": "Hooks are now managed automatically via the Nexus SDK. No installation needed. Skill activation happens in-process during create_session/resume_session.",
                     "deprecated": true
                 })))
+            }
+
+            "get_learning_stats" => {
+                let tracker = crate::feedback::OutcomeTracker::global();
+                let stats = tracker.get_learning_stats().await;
+                Ok(Some(serde_json::to_value(stats).unwrap_or(json!({}))))
             }
 
             // ── P8: Workspaces (34 tools) ──────────────────────────────────

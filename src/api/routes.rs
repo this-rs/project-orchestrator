@@ -7,6 +7,7 @@ use super::auth_handlers;
 use super::chat_handlers;
 use super::code_handlers;
 use super::episode_handlers;
+use super::feedback_handlers;
 use super::handlers::{self, OrchestratorState};
 use super::hook_handlers;
 use super::note_handlers;
@@ -839,6 +840,17 @@ fn protected_routes() -> Router<OrchestratorState> {
             post(code_handlers::plan_implementation),
         )
         // ================================================================
+        // Feedback (OutcomeTracker — closed-loop learning)
+        // ================================================================
+        .route(
+            "/api/feedback",
+            get(feedback_handlers::list_feedback).post(feedback_handlers::create_feedback),
+        )
+        .route(
+            "/api/feedback/stats",
+            get(feedback_handlers::get_feedback_stats),
+        )
+        // ================================================================
         // Knowledge Notes
         // ================================================================
         // Notes CRUD
@@ -1350,6 +1362,14 @@ fn protected_routes() -> Router<OrchestratorState> {
         )
         // NOTE: /api/admin/install-hooks removed — hooks are now managed
         // in-process via SkillActivationHook (zero config required)
+        // ================================================================
+        // Alerts (HeartbeatEngine)
+        // ================================================================
+        .route("/api/alerts", get(handlers::list_alerts))
+        .route(
+            "/api/alerts/{alert_id}/acknowledge",
+            post(handlers::acknowledge_alert),
+        )
         // ================================================================
         // Workspaces
         // ================================================================

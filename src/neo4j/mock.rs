@@ -172,6 +172,16 @@ pub struct MockGraphStore {
     /// persona_id -> Vec<parent_persona_id> (EXTENDS chain)
     pub persona_extends: RwLock<HashMap<Uuid, Vec<Uuid>>>,
 
+    // UserProfile stores
+    /// user_id -> UserProfile
+    pub user_profiles: RwLock<HashMap<String, crate::profile::UserProfile>>,
+    /// (user_id, project_id) -> WorksOnRelation
+    pub works_on: RwLock<HashMap<(String, Uuid), crate::profile::WorksOnRelation>>,
+
+    // Alert stores
+    /// alert_id -> AlertNode
+    pub alerts: RwLock<HashMap<Uuid, AlertNode>>,
+
     // Test flags
     /// Controls what `has_context_cards()` returns (default: false)
     pub mock_has_context_cards: std::sync::atomic::AtomicBool,
@@ -270,6 +280,9 @@ impl MockGraphStore {
             persona_notes: RwLock::new(HashMap::new()),
             persona_decisions: RwLock::new(HashMap::new()),
             persona_extends: RwLock::new(HashMap::new()),
+            user_profiles: RwLock::new(HashMap::new()),
+            works_on: RwLock::new(HashMap::new()),
+            alerts: RwLock::new(HashMap::new()),
             mock_has_context_cards: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -10252,6 +10265,134 @@ impl GraphStore for MockGraphStore {
 
     async fn is_tombstoned(&self, _content_hash: &str) -> anyhow::Result<bool> {
         Ok(false)
+    }
+
+    // ========================================================================
+    // UserProfile operations
+    // ========================================================================
+
+    async fn create_or_get_user_profile(
+        &self,
+        user_id: &str,
+    ) -> anyhow::Result<crate::profile::UserProfile> {
+        let mut profiles = self.user_profiles.write().await;
+        if let Some(profile) = profiles.get(user_id) {
+            return Ok(profile.clone());
+        }
+        let profile = crate::profile::UserProfile::new(user_id);
+        profiles.insert(user_id.to_string(), profile.clone());
+        Ok(profile)
+    }
+
+    async fn update_user_profile(
+        &self,
+        profile: &crate::profile::UserProfile,
+    ) -> anyhow::Result<()> {
+        let mut profiles = self.user_profiles.write().await;
+        profiles.insert(profile.user_id.clone(), profile.clone());
+        Ok(())
+    }
+
+    async fn get_user_profile(
+        &self,
+        user_id: &str,
+    ) -> anyhow::Result<Option<crate::profile::UserProfile>> {
+        let profiles = self.user_profiles.read().await;
+        Ok(profiles.get(user_id).cloned())
+    }
+
+    async fn upsert_works_on(&self, user_id: &str, project_id: Uuid) -> anyhow::Result<()> {
+        let mut works = self.works_on.write().await;
+        let key = (user_id.to_string(), project_id);
+        let entry = works
+            .entry(key)
+            .or_insert_with(|| crate::profile::WorksOnRelation {
+                user_id: user_id.to_string(),
+                project_id,
+                frequency: 0,
+                last_active: chrono::Utc::now(),
+            });
+        entry.frequency += 1;
+        entry.last_active = chrono::Utc::now();
+        Ok(())
+    }
+
+    async fn get_works_on(
+        &self,
+        user_id: &str,
+    ) -> anyhow::Result<Vec<crate::profile::WorksOnRelation>> {
+        let works = self.works_on.read().await;
+        let mut result: Vec<_> = works
+            .iter()
+            .filter(|((uid, _), _)| uid == user_id)
+            .map(|(_, rel)| rel.clone())
+            .collect();
+        result.sort_by(|a, b| b.last_active.cmp(&a.last_active));
+        Ok(result)
+    }
+
+    // ========================================================================
+    // Alert operations (Heartbeat Engine)
+    // ========================================================================
+
+    async fn create_alert(&self, alert: &AlertNode) -> anyhow::Result<()> {
+        self.alerts.write().await.insert(alert.id, alert.clone());
+        Ok(())
+    }
+
+    async fn list_pending_alerts(
+        &self,
+        project_id: Option<Uuid>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<AlertNode>> {
+        let alerts = self.alerts.read().await;
+        let mut result: Vec<_> = alerts
+            .values()
+            .filter(|a| !a.acknowledged)
+            .filter(|a| match project_id {
+                Some(pid) => a.project_id == Some(pid),
+                None => true,
+            })
+            .cloned()
+            .collect();
+        result.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        result.truncate(limit);
+        Ok(result)
+    }
+
+    async fn acknowledge_alert(&self, alert_id: Uuid, acknowledged_by: &str) -> anyhow::Result<()> {
+        let mut alerts = self.alerts.write().await;
+        if let Some(alert) = alerts.get_mut(&alert_id) {
+            alert.acknowledged = true;
+            alert.acknowledged_by = Some(acknowledged_by.to_string());
+            alert.acknowledged_at = Some(Utc::now());
+        }
+        Ok(())
+    }
+
+    async fn get_alert(&self, alert_id: Uuid) -> anyhow::Result<Option<AlertNode>> {
+        Ok(self.alerts.read().await.get(&alert_id).cloned())
+    }
+
+    async fn list_alerts(
+        &self,
+        project_id: Option<Uuid>,
+        limit: usize,
+        offset: usize,
+    ) -> anyhow::Result<(Vec<AlertNode>, usize)> {
+        let alerts = self.alerts.read().await;
+        let mut all: Vec<_> = alerts
+            .values()
+            .filter(|a| match project_id {
+                Some(pid) => a.project_id == Some(pid),
+                None => true,
+            })
+            .cloned()
+            .collect();
+        all.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        let total = all.len();
+        let page = all.into_iter().skip(offset).take(limit).collect();
+        Ok((page, total))
     }
 }
 

@@ -3070,4 +3070,77 @@ pub trait GraphStore: Send + Sync {
 
     /// Check if a content hash has been tombstoned.
     async fn is_tombstoned(&self, content_hash: &str) -> Result<bool>;
+
+    // ========================================================================
+    // UserProfile operations (adaptive behavioral profiles)
+    // ========================================================================
+
+    /// Create or get an existing user profile by user_id.
+    /// Uses MERGE semantics — idempotent for the same user_id.
+    async fn create_or_get_user_profile(
+        &self,
+        user_id: &str,
+    ) -> Result<crate::profile::UserProfile>;
+
+    /// Update a user profile with new dimension values.
+    async fn update_user_profile(&self, profile: &crate::profile::UserProfile) -> Result<()>;
+
+    /// Get a user profile by user_id.
+    async fn get_user_profile(&self, user_id: &str) -> Result<Option<crate::profile::UserProfile>>;
+
+    /// Upsert a WORKS_ON relationship between a user and a project.
+    /// Increments frequency and updates last_active.
+    async fn upsert_works_on(&self, user_id: &str, project_id: Uuid) -> Result<()>;
+
+    /// Get all WORKS_ON relationships for a user.
+    async fn get_works_on(&self, user_id: &str) -> Result<Vec<crate::profile::WorksOnRelation>>;
+
+    // ========================================================================
+    // Episode embedding search (ReflexEngine)
+    // ========================================================================
+
+    /// Search episodes by embedding similarity (cosine).
+    ///
+    /// Returns up to `limit` episodes with their cosine similarity score (0.0-1.0).
+    /// Used by the ReflexEngine for episode recall suggestions.
+    ///
+    /// Default implementation returns an empty vec (graceful fallback for
+    /// implementations that don't support embedding search yet).
+    async fn search_episodes_by_embedding(
+        &self,
+        _project_id: Uuid,
+        _embedding: &[f32],
+        _limit: usize,
+    ) -> Result<Vec<(crate::episodes::models::Episode, f64)>> {
+        Ok(Vec::new())
+    }
+
+    // ========================================================================
+    // Alert operations (Heartbeat Engine)
+    // ========================================================================
+
+    /// Create a new alert node.
+    async fn create_alert(&self, alert: &AlertNode) -> Result<()>;
+
+    /// List pending (unacknowledged) alerts, optionally filtered by project.
+    /// Returns alerts ordered by created_at DESC.
+    async fn list_pending_alerts(
+        &self,
+        project_id: Option<Uuid>,
+        limit: usize,
+    ) -> Result<Vec<AlertNode>>;
+
+    /// Acknowledge an alert by ID. Sets acknowledged=true and records who/when.
+    async fn acknowledge_alert(&self, alert_id: Uuid, acknowledged_by: &str) -> Result<()>;
+
+    /// Get a single alert by ID.
+    async fn get_alert(&self, alert_id: Uuid) -> Result<Option<AlertNode>>;
+
+    /// List all alerts (including acknowledged), optionally filtered by project.
+    async fn list_alerts(
+        &self,
+        project_id: Option<Uuid>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<AlertNode>, usize)>;
 }

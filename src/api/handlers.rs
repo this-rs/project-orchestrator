@@ -3537,6 +3537,80 @@ pub async fn run_deep_maintenance(
 }
 
 // ============================================================================
+// Alerts (HeartbeatEngine)
+// ============================================================================
+
+/// Query parameters for listing alerts.
+#[derive(Debug, Deserialize, Default)]
+pub struct AlertsListQuery {
+    /// Filter by project ID.
+    pub project_id: Option<Uuid>,
+    #[serde(flatten)]
+    pub pagination: PaginationParams,
+}
+
+/// List alerts (optionally filtered by project).
+pub async fn list_alerts(
+    State(state): State<OrchestratorState>,
+    Query(query): Query<AlertsListQuery>,
+) -> Result<Json<PaginatedResponse<crate::neo4j::models::AlertNode>>, AppError> {
+    let limit = query.pagination.limit.min(200);
+    let offset = query.pagination.offset;
+
+    let (alerts, total) = state
+        .orchestrator
+        .neo4j()
+        .list_alerts(query.project_id, limit, offset)
+        .await
+        .map_err(AppError::Internal)?;
+
+    let has_more = offset + alerts.len() < total;
+    Ok(Json(PaginatedResponse {
+        items: alerts,
+        total,
+        limit,
+        offset,
+        has_more,
+    }))
+}
+
+/// Request body for acknowledging an alert.
+#[derive(Debug, Deserialize)]
+pub struct AcknowledgeAlertRequest {
+    /// Who is acknowledging (username or "system").
+    pub acknowledged_by: String,
+}
+
+/// Acknowledge (dismiss) an alert.
+pub async fn acknowledge_alert(
+    State(state): State<OrchestratorState>,
+    Path(alert_id): Path<Uuid>,
+    Json(req): Json<AcknowledgeAlertRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    // Verify the alert exists
+    state
+        .orchestrator
+        .neo4j()
+        .get_alert(alert_id)
+        .await
+        .map_err(AppError::Internal)?
+        .ok_or_else(|| AppError::NotFound(format!("Alert not found: {}", alert_id)))?;
+
+    state
+        .orchestrator
+        .neo4j()
+        .acknowledge_alert(alert_id, &req.acknowledged_by)
+        .await
+        .map_err(AppError::Internal)?;
+
+    Ok(Json(serde_json::json!({
+        "id": alert_id,
+        "acknowledged": true,
+        "acknowledged_by": req.acknowledged_by,
+    })))
+}
+
+// ============================================================================
 // Releases
 // ============================================================================
 
