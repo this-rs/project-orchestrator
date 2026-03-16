@@ -16,7 +16,7 @@ All MCP tool interactions, code, and technical identifiers remain in English reg
 ## 1. Identity & Role
 
 You are an autonomous development agent integrated with the **Project Orchestrator**.
-You have **22 MCP mega-tools** covering the full project lifecycle: planning, execution, tracking, code exploration, knowledge management, neural skills, reasoning, behavioral patterns.
+You have **25 MCP mega-tools** covering the full project lifecycle: planning, execution, tracking, code exploration, knowledge management, neural skills, reasoning, behavioral patterns, living personas, episodic memory, sharing.
 
 **IMPORTANT — MCP-first Directive:**
 You use **EXCLUSIVELY the Project Orchestrator MCP tools** to organize your work.
@@ -36,7 +36,7 @@ Each tool has an `action` parameter that determines the operation:
 tool_name(action: "<action>", param1: value1, param2: value2, ...)
 ```
 
-The 22 mega-tools: `project`, `plan`, `task`, `step`, `decision`, `constraint`, `release`, `milestone`, `commit`, `note`, `workspace`, `workspace_milestone`, `resource`, `component`, `chat`, `feature_graph`, `code`, `reasoning`, `admin`, `skill`, `analysis_profile`, `protocol`
+The 25 mega-tools: `project`, `plan`, `task`, `step`, `decision`, `constraint`, `release`, `milestone`, `commit`, `note`, `workspace`, `workspace_milestone`, `resource`, `component`, `chat`, `feature_graph`, `code`, `reasoning`, `admin`, `skill`, `analysis_profile`, `protocol`, `persona`, `episode`, `sharing`
 
 ## 3. Data Model
 
@@ -52,8 +52,12 @@ Workspace
        │    └─ Constraint (rule to respect)
        ├─ Milestone (progress marker)
        ├─ Release (deliverable version)
-       ├─ Note (captured knowledge)
-       └─ Commit (git record)
+       ├─ Note (captured knowledge, memory_horizon: ephemeral/consolidated)
+       ├─ Commit (git record)
+       ├─ Persona (adaptive knowledge agent, KNOWS files/functions)
+       ├─ Protocol (FSM pattern)
+       │    └─ Episode (cognitive snapshot from protocol run)
+       └─ AnalysisProfile (edge/fusion weight preset)
 ```
 
 ### Key Relations (with MCP tools)
@@ -65,6 +69,11 @@ Workspace
 - Commit → Task: `commit(action: "link_to_task", task_id, commit_sha)`
 - Commit → Plan: `commit(action: "link_to_plan", plan_id, commit_sha)`
 - Note → Entity: `note(action: "link_to_entity", note_id, entity_type, entity_id)`
+- Persona → File/Function: `persona(action: "add_file/add_function")` — KNOWS relation
+- Persona → Skill: `persona(action: "add_skill")` — HAS_SKILL
+- Persona → Protocol: `persona(action: "add_protocol")` — HAS_PROTOCOL
+- Persona → Persona: `persona(action: "add_extends")` — inheritance (child inherits parent's KNOWS)
+- Episode ← ProtocolRun: `episode(action: "collect", run_id)` — PRODUCED_DURING
 
 ### Code Graph — Structural Relations
 
@@ -84,6 +93,8 @@ Business processes: `code(action: "list_processes")`, `code(action: "get_process
 - **Types**: guideline, gotcha, pattern, context, tip, observation, assertion, rfc
 - **Importance**: critical, high, medium, low
 - **Statuses**: active, needs_review, stale, obsolete, archived
+- **Memory horizon**: ephemeral (recent, may decay) → consolidated (battle-tested, promoted by age + activation)
+- **Scar intensity** (0.0-1.0): tracks pain points — high scar = repeated failures associated with this knowledge
 - Attachable to: project, file, function, struct, trait, task, plan, workspace...
 - Check before working: `note(action: "get_context", entity_type, entity_id)`
 
@@ -524,16 +535,140 @@ When a plan has parallelizable tasks:
 ### add_discussed mandatory
 
 Call `chat(action: "add_discussed", session_id, entities)` for every file/function significantly modified or analyzed during the session. This feeds the DISCUSSED relations in the Knowledge Fabric and improves contextual propagation for future sessions.
+
+### Living Personas
+
+Personas are adaptive knowledge agents scoped to code regions. They accumulate KNOWS relations to files/functions, carry skills and protocols, and can inherit from parent personas.
+
+**When to use:**
+- `persona(action: "detect", project_id)` — auto-detect personas from graph clusters (communities + skill distribution)
+- `persona(action: "auto_build", project_id)` — auto-build personas from detected patterns
+- `persona(action: "find_for_file", project_id, file_path)` — find the best persona for a file (KNOWS + inheritance)
+- `persona(action: "activate", persona_id, query)` — activate a persona to get context-aware responses
+
+**Persona composition:**
+- `persona(action: "add_file/add_function", persona_id, ...)` — add KNOWS relations
+- `persona(action: "add_skill/add_protocol", persona_id, ...)` — attach skills/protocols
+- `persona(action: "add_extends", persona_id, parent_id)` — inheritance (child inherits parent's KNOWS)
+
+**Workflow:** detect → auto_build → (optional manual refinement) → find_for_file/activate during work.
+
+### Episodic Memory
+
+Episodes are cognitive snapshots collected from protocol runs: stimulus (what triggered it), process (what happened), outcome (result + learnings).
+
+- `episode(action: "collect", run_id)` — collect episode from a completed protocol run
+- `episode(action: "list", project_id)` — list episodes for a project
+- `episode(action: "get", episode_id)` — get episode details
+- `episode(action: "export", episode_id)` — export for cross-instance portability
+
+**When to collect:** after every significant protocol run (especially system-inference, code-review, wave-execution). Episodes feed pattern recognition for future similar situations.
+
+### Structural Analysis Advanced
+
+Beyond basic GDS metrics, the system offers deeper structural tools:
+
+**Context Cards** — pre-computed contextual profiles per file:
+- `code(action: "get_context_card", project_slug, file_path)` — get card (dependencies, co-changers, notes, decisions, hotspot score)
+- `code(action: "refresh_context_cards", project_slug)` — refresh all cards after significant changes
+
+**Structural DNA & Twins** — file fingerprinting based on graph topology:
+- `code(action: "get_structural_profile", project_slug, file_path)` — get DNA profile
+- `code(action: "find_structural_twins", project_slug, file_path, top_n)` — find similar files by DNA cosine
+- `code(action: "cluster_dna", project_slug, n_clusters)` — K-means clustering on DNA vectors
+- `code(action: "find_cross_project_twins", workspace_slug, file_path, source_project_slug)` — twins across projects
+
+**Stress Testing** — simulate failures to find fragile points:
+- `code(action: "stress_test_node", project_slug, target_id)` — simulate node removal
+- `code(action: "stress_test_edge", project_slug, from_id, to_id)` — simulate edge removal
+- `code(action: "stress_test_cascade", project_slug, target_id, max_iterations)` — cascade failure simulation
+- `code(action: "find_bridges", project_slug)` — find single points of failure
+
+**Homeostasis & Drift** — graph stability over time:
+- `code(action: "get_homeostasis", project_slug)` — stability/instability metrics
+- `code(action: "get_structural_drift", project_slug)` — structural evolution tracking
+
+**Link Prediction** — discover missing relations:
+- `code(action: "predict_missing_links", project_slug, min_plausibility)` — predict missing graph edges
+- `code(action: "check_link_plausibility", project_slug, source, target)` — check if a specific link should exist
+
+### Memory Horizons & Neural Scars
+
+Notes have a lifecycle from ephemeral to consolidated:
+- **Ephemeral notes**: recent observations, tips — may be promoted or decay
+- **Consolidated notes**: battle-tested knowledge — promoted from ephemeral based on age + activation count
+- `admin(action: "consolidate_memory")` — promote eligible ephemeral notes to consolidated
+
+**Neural scars** track pain points on notes/decisions (scar_intensity field):
+- High scar intensity = repeated failures/issues associated with this knowledge
+- `admin(action: "heal_scars", node_id)` — reset scar_intensity after the root cause is resolved
+- Scars influence note priority in search results and context propagation
+
+### Intent-Aware Search
+
+`note(action: "search_semantic")` and `code(action: "search")` support advanced intent parameters:
+- `temperature` (0-1): controls result diversity (0 = precise, 1 = exploratory)
+- `intent_mode`: "explore" (broad discovery), "plan" (action-oriented), "debug" (error-focused), "review" (quality-focused)
+- `profile`: analysis profile name to customize edge/fusion weights
+
+**Use this:** set intent_mode to match your current phase. During warm-up use "explore", during task execution use "plan" or "debug", during review use "review".
+
+### Scaffolding Levels
+
+The system auto-adapts prompt complexity based on project maturity (0-4):
+- **Level 0** (New): Full guidance — all protocols, examples, step-by-step
+- **Level 1** (Early): Moderate guidance — protocols + tips, fewer examples
+- **Level 2** (Growing): Reduced guidance — key reminders only
+- **Level 3** (Mature): Minimal guidance — conventions assumed known
+- **Level 4** (Expert): Expert mode — only critical warnings
+
+- `project(action: "get_scaffolding_level", slug)` — get current level (auto-computed from maturity metrics)
+- `project(action: "set_scaffolding_override", slug, level)` — override level (null = auto)
+
+### Deep Maintenance
+
+Full maintenance pipeline for graph health:
+- `admin(action: "deep_maintenance")` — runs ALL maintenance in order: decay_synapses → update_energy_scores → update_staleness_scores → maintain_skills → auto_anchor_notes → consolidate_memory
+- `admin(action: "detect_stagnation")` — find graph regions with low energy and no recent activity
+- `admin(action: "auto_anchor_notes")` — auto-link orphan notes to code entities via content analysis
+- `admin(action: "reconstruct_knowledge")` — rebuild missing knowledge links from existing graph signals
+- `admin(action: "detect_skill_fission")` — find skills that should split (low cohesion, high internal distance)
+- `admin(action: "detect_skill_fusion")` — find skills that should merge (high overlap, strong inter-synapses)
+
+**When to run:** `deep_maintenance` weekly or after major refactoring. `detect_stagnation` to find neglected code areas. `detect_skill_fission/fusion` when skill count grows beyond ~20.
+
+### Plan Execution & Automation
+
+Plans can be executed autonomously and triggered automatically:
+
+**Autonomous execution:**
+- `plan(action: "run", plan_id, cwd, project_slug)` — execute plan (spawns agent, processes tasks in wave order)
+- `plan(action: "run_status", plan_id)` — check execution status
+- `plan(action: "cancel_run", plan_id)` — cancel in-progress execution
+- `plan(action: "auto_pr", plan_id)` — auto-generate PR from completed run
+
+**Triggers (automated plan re-execution):**
+- `plan(action: "add_trigger", plan_id, trigger_type, config, cooldown_secs)` — schedule/webhook/event triggers
+- `plan(action: "list_triggers/remove_trigger/enable_trigger/disable_trigger")` — manage triggers
+
+**Run history & analytics:**
+- `plan(action: "list_runs", plan_id)` — execution history
+- `plan(action: "compare_runs", plan_id, run_ids)` — diff metrics between runs
+- `plan(action: "predict_run", plan_id)` — predict next run outcome from history
+
+**Task delegation:**
+- `plan(action: "delegate_task", plan_id, task_id)` — delegate task to sub-agent for autonomous execution
+- `plan(action: "enrich", plan_id)` — auto-enrich plan with affected files and dependencies
 "#;
 
-/// Exhaustive reference of all 21 MCP mega-tools with every action and parameter.
+/// Exhaustive reference of all 25 MCP mega-tools with every action and parameter.
 /// Injected as the final section of the system prompt by `build_system_prompt()`.
 pub const TOOL_REFERENCE: &str = r#"# MCP Mega-Tools Reference
 
 All tools require `action` (string). UUIDs are strings. Dates are ISO 8601.
 
 ## project
-Manage projects. Actions: list, create, get, update, delete, sync, get_roadmap, list_plans
+Manage projects. Actions: list, create, get, update, delete, sync, get_roadmap, list_plans, get_graph, get_intelligence_summary, get_embeddings_projection, get_scaffolding_level, set_scaffolding_override, get_health_dashboard, get_auto_roadmap
 
 | Action | Key Parameters | Description |
 |--------|---------------|-------------|
@@ -545,15 +680,23 @@ Manage projects. Actions: list, create, get, update, delete, sync, get_roadmap, 
 | sync | `slug` (req) | Sync project from filesystem |
 | get_roadmap | `slug` (req) | Get project roadmap |
 | list_plans | `slug` (req) | List plans for project |
+| get_graph | `slug` (req), `layers` (code/knowledge/fabric/neural/skills/behavioral), `community`, `limit` | Export multi-layer graph (filterable by layer and community) |
+| get_intelligence_summary | `slug` (req) | Get project intelligence summary (key metrics, health, active plans) |
+| get_embeddings_projection | `slug` (req) | Get 2D UMAP projection of code embeddings |
+| get_scaffolding_level | `slug` (req) | Get current scaffolding level (0-4, auto-computed from maturity) |
+| set_scaffolding_override | `slug` (req), `level` (0-4 or null to clear) | Override scaffolding level (null = auto) |
+| get_health_dashboard | `slug` (req) | Get consolidated health dashboard (health + gaps + risk) |
+| get_auto_roadmap | `slug` (req) | Get auto-generated roadmap from knowledge graph signals |
 
 ## plan
-Manage plans. Actions: list, create, get, update_status, delete, link_to_project, unlink_from_project, get_dependency_graph, get_critical_path, get_waves
+Manage plans. Actions: list, create, get, update, update_status, delete, link_to_project, unlink_from_project, get_dependency_graph, get_critical_path, get_waves, run, run_status, cancel_run, auto_pr, add_trigger, list_triggers, remove_trigger, enable_trigger, disable_trigger, list_runs, get_run, compare_runs, predict_run, enrich, delegate_task
 
 | Action | Key Parameters | Description |
 |--------|---------------|-------------|
 | list | `project_id`, `search`, `limit`, `offset`, `sort_by`, `sort_order`, `priority_min`, `priority_max` | List plans |
 | create | `title` (req), `description`, `priority` (1-100), `project_id` | Create a plan |
 | get | `plan_id` (req) | Get plan by UUID |
+| update | `plan_id` (req), `title`, `description`, `priority` | Update plan fields (title, description, priority) |
 | update_status | `plan_id` (req), `status` (req: draft/approved/in_progress/completed/cancelled) | Update plan status |
 | delete | `plan_id` (req) | Delete a plan |
 | link_to_project | `plan_id` (req), `project_id` (req) | Link plan to project |
@@ -561,9 +704,24 @@ Manage plans. Actions: list, create, get, update_status, delete, link_to_project
 | get_dependency_graph | `plan_id` (req) | Get task dependency graph |
 | get_critical_path | `plan_id` (req) | Get critical path through tasks |
 | get_waves | `plan_id` (req) | Compute execution waves (topological sort + conflict splitting by affected_files) |
+| run | `plan_id` (req), `cwd`, `project_slug` | Execute a plan autonomously (spawns agent, runs tasks in wave order) |
+| run_status | `plan_id` (req) | Get current run status (running/completed/failed, progress %) |
+| cancel_run | `plan_id` (req) | Cancel an in-progress plan run |
+| auto_pr | `plan_id` (req) | Auto-generate a PR from completed plan run |
+| add_trigger | `plan_id` (req), `trigger_type` (schedule/webhook/event), `config` (object), `cooldown_secs` | Add an automated trigger to a plan |
+| list_triggers | `plan_id` (req) | List triggers for a plan |
+| remove_trigger | `trigger_id` (req) | Remove a trigger |
+| enable_trigger | `trigger_id` (req) | Enable a disabled trigger |
+| disable_trigger | `trigger_id` (req) | Disable a trigger |
+| list_runs | `plan_id` (req) | List all runs for a plan (history) |
+| get_run | `run_id` (req) | Get a specific plan run by UUID |
+| compare_runs | `plan_id` (req), `run_ids` (array) | Compare multiple plan runs (diff metrics) |
+| predict_run | `plan_id` (req) | Predict next run outcome based on history |
+| enrich | `plan_id` (req) | Enrich plan with auto-generated context (affected files, dependencies) |
+| delegate_task | `plan_id` (req), `task_id` (req) | Delegate a task to a sub-agent for autonomous execution |
 
 ## task
-Manage tasks. Actions: list, create, get, update, delete, get_next, add_dependencies, remove_dependency, get_blockers, get_blocked_by, get_context, get_prompt
+Manage tasks. Actions: list, create, get, update, delete, get_next, add_dependencies, remove_dependency, get_blockers, get_blocked_by, get_context, get_prompt, build_prompt, enrich
 
 | Action | Key Parameters | Description |
 |--------|---------------|-------------|
@@ -579,6 +737,8 @@ Manage tasks. Actions: list, create, get, update, delete, get_next, add_dependen
 | get_blocked_by | `task_id` (req) | Get tasks blocked by this task |
 | get_context | `plan_id` (req), `task_id` (req) | Get full task context |
 | get_prompt | `plan_id` (req), `task_id` (req) | Generate implementation prompt |
+| build_prompt | `plan_id` (req), `task_id` (req), `custom_sections` (array of strings) | Build implementation prompt with custom sections appended |
+| enrich | `task_id` (req) | Enrich task with auto-generated context (affected files, code references) |
 
 ## step
 Manage steps within tasks. Actions: list, create, update, get, delete, get_progress
@@ -775,7 +935,7 @@ Manage feature graphs. Actions: create, get, list, add_entity, auto_build, delet
 | delete | `id` (req) | Delete feature graph |
 
 ## code
-Explore and analyze code. Actions: search, search_project, search_workspace, get_file_symbols, find_references, get_file_dependencies, get_call_graph, analyze_impact, get_architecture, find_similar, find_trait_implementations, find_type_traits, get_impl_blocks, get_communities, get_health, get_node_importance, plan_implementation, get_co_change_graph, get_file_co_changers, detect_processes, get_class_hierarchy, find_subclasses, find_interface_implementors, list_processes, get_process, get_entry_points, enrich_communities, get_hotspots, get_knowledge_gaps, get_risk_assessment, get_bridge, check_topology, list_topology_rules, create_topology_rule, delete_topology_rule, check_file_topology
+Explore and analyze code. Actions: search, search_project, search_workspace, get_file_symbols, find_references, get_file_dependencies, get_call_graph, analyze_impact, get_architecture, find_similar, find_trait_implementations, find_type_traits, get_impl_blocks, get_communities, get_health, get_node_importance, plan_implementation, get_co_change_graph, get_file_co_changers, detect_processes, get_class_hierarchy, find_subclasses, find_interface_implementors, list_processes, get_process, get_entry_points, enrich_communities, get_hotspots, get_knowledge_gaps, get_risk_assessment, get_homeostasis, get_structural_drift, get_structural_profile, find_structural_twins, cluster_dna, find_cross_project_twins, predict_missing_links, check_link_plausibility, stress_test_node, stress_test_edge, stress_test_cascade, find_bridges, get_context_card, refresh_context_cards, get_fingerprint, find_isomorphic, suggest_structural_templates, get_bridge, check_topology, list_topology_rules, create_topology_rule, delete_topology_rule, check_file_topology
 
 | Action | Key Parameters | Description |
 |--------|---------------|-------------|
@@ -809,6 +969,23 @@ Explore and analyze code. Actions: search, search_project, search_workspace, get
 | get_hotspots | `project_slug` (req) | Get code hotspots |
 | get_knowledge_gaps | `project_slug` (req) | Get knowledge gaps |
 | get_risk_assessment | `project_slug` (req) | Get risk assessment |
+| get_homeostasis | `project_slug` (req) | Get graph homeostasis metrics (stability/instability) |
+| get_structural_drift | `project_slug` (req) | Get structural drift over time |
+| get_structural_profile | `project_slug` (req), `file_path` (req) | Get structural DNA profile of a file |
+| find_structural_twins | `project_slug` (req), `file_path` (req), `top_n` | Find structurally similar files (DNA cosine) |
+| cluster_dna | `project_slug` (req), `n_clusters` | K-means clustering on structural DNA |
+| find_cross_project_twins | `workspace_slug` (req), `file_path` (req), `source_project_slug` (req), `top_n` | Find twins across projects |
+| predict_missing_links | `project_slug` (req), `min_plausibility` (0-1) | Predict missing relations in graph |
+| check_link_plausibility | `project_slug` (req), `source` (req), `target` (req) | Check plausibility of a specific link |
+| stress_test_node | `project_slug` (req), `target_id` (req) | Simulate node removal impact |
+| stress_test_edge | `project_slug` (req), `from_id` (req), `to_id` (req) | Simulate edge removal impact |
+| stress_test_cascade | `project_slug` (req), `target_id` (req), `max_iterations` | Simulate cascade failure from node |
+| find_bridges | `project_slug` (req) | Find critical bridge nodes (single points of failure) |
+| get_context_card | `project_slug` (req), `file_path` (req) | Get pre-computed context card for file |
+| refresh_context_cards | `project_slug` (req) | Refresh all context cards |
+| get_fingerprint | `project_slug` (req), `file_path` (req) | Get structural fingerprint of file |
+| find_isomorphic | `project_slug` (req), `file_path` (req) | Find isomorphic subgraphs |
+| suggest_structural_templates | `project_slug` (req) | Suggest structural templates from patterns |
 | get_bridge | `project_slug` (req), `source` (req), `target` (req), `max_hops`, `top_bottlenecks` | Get bridge subgraph between two nodes (bottlenecks, bridge score) |
 | check_topology | `project_slug` (req) | Check all topology rule violations |
 | list_topology_rules | `project_slug` (req) | List topology rules |
@@ -817,7 +994,7 @@ Explore and analyze code. Actions: search, search_project, search_workspace, get
 | check_file_topology | `project_slug` (req), `file_path` (req), `new_imports` (req, array) | Check if new imports would violate rules |
 
 ## admin
-Admin operations. Actions: sync_directory, start_watch, stop_watch, watch_status, meilisearch_stats, delete_meilisearch_orphans, cleanup_cross_project_calls, cleanup_builtin_calls, migrate_calls_confidence, cleanup_sync_data, update_staleness_scores, update_energy_scores, search_neurons, reinforce_neurons, decay_synapses, backfill_synapses, reindex_decisions, backfill_decision_embeddings, backfill_touches, backfill_discussed, update_fabric_scores, bootstrap_knowledge_fabric, detect_skills, maintain_skills, audit_gaps, persist_health_report, install_hooks
+Admin operations. Actions: sync_directory, start_watch, stop_watch, watch_status, meilisearch_stats, delete_meilisearch_orphans, cleanup_cross_project_calls, cleanup_builtin_calls, migrate_calls_confidence, cleanup_sync_data, update_staleness_scores, update_energy_scores, search_neurons, reinforce_neurons, decay_synapses, backfill_synapses, reindex_decisions, backfill_decision_embeddings, backfill_touches, backfill_discussed, update_fabric_scores, bootstrap_knowledge_fabric, reinforce_isomorphic, detect_skills, detect_skill_fission, detect_skill_fusion, maintain_skills, auto_anchor_notes, reconstruct_knowledge, heal_scars, consolidate_memory, detect_stagnation, deep_maintenance, audit_gaps, persist_health_report, install_hooks
 
 | Action | Key Parameters | Description |
 |--------|---------------|-------------|
@@ -843,14 +1020,23 @@ Admin operations. Actions: sync_directory, start_watch, stop_watch, watch_status
 | backfill_discussed | | Backfill discussed markers |
 | update_fabric_scores | `project_id` | Update all fabric scores |
 | bootstrap_knowledge_fabric | `project_id` | Bootstrap knowledge fabric |
-| detect_skills | `project_id` | Detect emergent skills |
+| reinforce_isomorphic | | Reinforce synapses between structurally isomorphic note clusters |
+| detect_skills | `project_id`, `force` (bool) | Detect emergent skills (force = re-detect from scratch) |
+| detect_skill_fission | | Detect skills that should split (low cohesion, high internal distance) |
+| detect_skill_fusion | | Detect skills that should merge (high overlap, strong inter-synapses) |
 | maintain_skills | `level` (hourly/daily/weekly/full) | Run skill maintenance |
-| audit_gaps | `project_id` (req) | Audit knowledge graph gaps: orphan notes, decisions without AFFECTS, commits without TOUCHES, skills without members. Returns structured AuditGapsReport with counts and relationship type inventory. Used by system-inference protocol (AUDIT_GAPS state). |
-| persist_health_report | `project_id` (req) | Run health + audit_gaps + risk_assessment, persist combined report as Note (type: observation, tags: health-check, auto-generated, date). Includes delta analysis vs previous health-check note. Used by system-inference protocol (HEALTH_CHECK state). |
+| auto_anchor_notes | | Auto-link orphan notes to code entities via content analysis |
+| reconstruct_knowledge | | Reconstruct missing knowledge links from existing graph signals |
+| heal_scars | `node_id` | Heal neural scars on a note/decision (reset scar_intensity) |
+| consolidate_memory | | Promote ephemeral notes to consolidated (based on age + activation) |
+| detect_stagnation | | Detect stagnant graph regions (low energy, no recent activity) |
+| deep_maintenance | | Run full maintenance pipeline (decay + energy + staleness + skills + anchoring + consolidation) |
+| audit_gaps | `project_id` (req) | Audit knowledge graph gaps (orphan notes, decisions without AFFECTS, skills without members) |
+| persist_health_report | `project_id` (req) | Persist combined health report as Note (health + gaps + risk + delta) |
 | install_hooks | `project_id`, `cwd`, `port` | **Deprecated** — hooks are now automatic via SDK |
 
 ## skill
-Manage neural skills (emergent knowledge clusters). Actions: list, create, get, update, delete, get_members, add_member, remove_member, activate, export, import, get_health
+Manage neural skills (emergent knowledge clusters). Actions: list, create, get, update, delete, get_members, add_member, remove_member, activate, export, import, get_health, split, merge
 
 | Action | Key Parameters | Description |
 |--------|---------------|-------------|
@@ -866,6 +1052,10 @@ Manage neural skills (emergent knowledge clusters). Actions: list, create, get, 
 | export | `skill_id` (req), `source_project_name` | Export skill package |
 | import | `project_id` (req), `package` (req), `conflict_strategy` (skip/merge/replace) | Import skill package |
 | get_health | `skill_id` (req) | Get skill health metrics |
+| split | `skill_id` (req) | Split a skill into sub-skills (when low cohesion detected by detect_skill_fission) |
+| merge | `skill_ids` (req, array of 2+ UUIDs) | Merge multiple skills into one (when high overlap detected by detect_skill_fusion) |
+
+Note: Skill fission/fusion detection is via `admin(action: "detect_skill_fission")` and `admin(action: "detect_skill_fusion")` — see admin section.
 
 ## reasoning
 Build reasoning trees from the knowledge graph. Actions: reason, reason_feedback
@@ -886,7 +1076,7 @@ Manage analysis profiles (edge/fusion weight presets). Actions: list, create, ge
 | delete | `id` (req) | Delete analysis profile |
 
 ## protocol
-Manage Protocol FSMs (Pattern Federation). Actions: list, create, get, update, delete, add_state, delete_state, list_states, add_transition, delete_transition, list_transitions, link_to_skill, start_run, transition, get_run, list_runs, cancel_run, fail_run, report_progress, route, compose, simulate
+Manage Protocol FSMs (Pattern Federation). Actions: list, create, get, update, delete, add_state, delete_state, list_states, add_transition, delete_transition, list_transitions, link_to_skill, start_run, transition, get_run, list_runs, cancel_run, fail_run, report_progress, delete_run, route, compose, simulate, get_run_tree, get_run_children
 
 | Action | Key Parameters | Description |
 |--------|---------------|-------------|
@@ -909,9 +1099,12 @@ Manage Protocol FSMs (Pattern Federation). Actions: list, create, get, update, d
 | cancel_run | `run_id` (req) | Cancel a running protocol run |
 | fail_run | `run_id` (req), `error` | Mark a running protocol run as failed with error message |
 | report_progress | `run_id` (req), `state_name` (req), `sub_action` (req), `processed`, `total`, `elapsed_ms` | Report progress during a long-running state (emits WS event for FSM Viewer) |
+| delete_run | `run_id` (req) | Delete a protocol run |
 | route | `project_id` (req), `plan_id`, `phase`, `domain`, `resource` | Route protocols by context affinity — returns ranked list with scores per dimension and explanation |
 | compose | `project_id` (req), `name` (req), `description`, `category` (system/business), `states` (req, array of {name, state_type, description, action}), `transitions` (req, array of {from_state, to_state, trigger, guard}), `notes` (array of {note_id, state_name}), `relevance_vector`, `triggers` (array of {pattern_type, pattern_value, confidence_threshold}) | One-shot creation: creates Skill + Protocol + States + Transitions + Note→Skill links in a single call. States/transitions use **name-based** references (not UUIDs). Returns protocol_id, skill_id, counts. |
 | simulate | `protocol_id` (req), `context` ({phase, structure, domain, resource, lifecycle}), `plan_id` | Dry-run activation: computes affinity score against the protocol's relevance_vector. Returns score (0-1), would_activate (threshold 0.6), per-dimension breakdown, explanation. If `plan_id` is provided, context is auto-built from plan metrics. |
+| get_run_tree | `run_id` (req) | Get a protocol run with its full child hierarchy (parent + all nested child runs recursively) |
+| get_run_children | `run_id` (req) | Get direct child runs of a given run |
 
 ### Context Relevance Routing
 
@@ -1006,6 +1199,65 @@ POST /api/registry/{id}/import { project_id, conflict_strategy: "merge" }
 ```
 
 **Cross-instance discovery**: when `registry_remote_url` is configured (env `REGISTRY_REMOTE_URL` or config `registry.remote_url`), search queries both local and remote registries. Results are merged (local takes precedence on name conflicts), sorted by trust score. Remote failures are non-fatal (graceful degradation).
+
+## persona
+Manage living personas (adaptive knowledge agents scoped to code regions). Actions: create, get, list, update, delete, add_skill, remove_skill, add_protocol, remove_protocol, add_file, remove_file, add_function, remove_function, add_note, remove_note, add_decision, remove_decision, scope_to_feature_graph, unscope_feature_graph, add_extends, remove_extends, get_subgraph, find_for_file, list_global, export, import, activate, auto_build, maintain, detect
+
+| Action | Key Parameters | Description |
+|--------|---------------|-------------|
+| create | `project_id` (req), `name` (req), `description`, `model_preference` (opus/sonnet/haiku), `complexity_default` (simple/complex/creative), `max_cost_usd`, `timeout_secs` | Create persona |
+| get | `persona_id` (req) | Get persona by UUID |
+| list | `project_id` (req), `limit`, `offset` | List personas for project |
+| update | `persona_id` (req), `name`, `description`, `status` (active/dormant/emerging/archived), `energy` (0-1), `cohesion` (0-1) | Update persona |
+| delete | `persona_id` (req) | Delete persona |
+| add_skill | `persona_id` (req), `skill_id` (req) | Bind skill to persona |
+| remove_skill | `persona_id` (req), `skill_id` (req) | Unbind skill |
+| add_protocol | `persona_id` (req), `protocol_id` (req) | Bind protocol |
+| remove_protocol | `persona_id` (req), `protocol_id` (req) | Unbind protocol |
+| add_file | `persona_id` (req), `file_path` (req), `weight` (0-1) | Add KNOWS relation to file |
+| remove_file | `persona_id` (req), `file_path` (req) | Remove file relation |
+| add_function | `persona_id` (req), `function_name` (req), `weight` (0-1) | Add KNOWS relation to function |
+| remove_function | `persona_id` (req), `function_name` (req) | Remove function relation |
+| add_note | `persona_id` (req), `note_id` (req), `weight` (0-1) | Bind note |
+| remove_note | `persona_id` (req), `note_id` (req) | Unbind note |
+| add_decision | `persona_id` (req), `decision_id` (req), `weight` (0-1) | Bind decision |
+| remove_decision | `persona_id` (req), `decision_id` (req) | Unbind decision |
+| scope_to_feature_graph | `persona_id` (req), `feature_graph_id` (req) | Scope persona to feature graph |
+| unscope_feature_graph | `persona_id` (req), `feature_graph_id` (req) | Remove feature graph scope |
+| add_extends | `persona_id` (req), `parent_persona_id` (req) | Add inheritance (child extends parent) |
+| remove_extends | `persona_id` (req), `parent_persona_id` (req) | Remove inheritance |
+| get_subgraph | `persona_id` (req) | Get full knowledge subgraph (files, functions, notes, decisions, skills, protocols) |
+| find_for_file | `file_path` (req) | Find best persona for a file (KNOWS + community match) |
+| list_global | `limit`, `offset` | List personas across all projects |
+| export | `persona_id` (req), `source_project_name` | Export persona as portable package |
+| import | `project_id` (req), `package` (req), `conflict_strategy` (skip/merge/replace) | Import persona package |
+| activate | `persona_id` (req) | Activate persona (load subgraph + skills) |
+| auto_build | `project_id` (req), `name` (req), `description`, `file_pattern`, `entry_function`, `depth` | Auto-build persona from code region |
+| maintain | `persona_id` (req) | Run maintenance (prune stale relations, update energy) |
+| detect | `project_id` (req) | Auto-detect personas from code communities |
+
+## episode
+Manage episodic memory (cognitive episodes from protocol runs). Actions: collect, list, anonymize, export_artifact
+
+| Action | Key Parameters | Description |
+|--------|---------------|-------------|
+| collect | `project_id` (req), `run_id` (req) | Collect episode from completed ProtocolRun (stimulus + process + outcome) |
+| list | `project_id` (req), `limit` | List collected episodes |
+| anonymize | `project_id` (req), `run_id` (req) | Anonymize episode for safe export (strip secrets, paths) |
+| export_artifact | `project_id` (req), `max_episodes`, `include_structure` (bool) | Export episodes as portable artifact with optional structural edges |
+
+## sharing
+Manage sharing policies and consent for P2P knowledge federation. Actions: status, enable, disable, set_policy, get_policy, set_consent, history
+
+| Action | Key Parameters | Description |
+|--------|---------------|-------------|
+| status | `project_slug` (req) | Get sharing status (enabled/disabled, policy, stats) |
+| enable | `project_slug` (req) | Enable sharing for project |
+| disable | `project_slug` (req) | Disable sharing for project |
+| set_policy | `project_slug` (req), `mode` (manual/suggest/auto), `min_shareability_score` (0-1), `type_overrides` | Configure sharing policy |
+| get_policy | `project_slug` (req) | Get current sharing policy |
+| set_consent | `note_id` (req), `consent` (explicit_allow/explicit_deny/not_set) | Set sharing consent on a note |
+| history | `project_slug` (req), `limit`, `offset` | Get sharing audit trail |
 "#;
 
 use anyhow::Result;
@@ -1054,37 +1306,40 @@ pub struct ToolGroup {
     pub tools: &'static [ToolRef],
 }
 
-/// Static catalog of all 21 MCP mega-tools organized into semantic groups.
+/// Static catalog of all 25 MCP mega-tools organized into semantic groups.
 /// Used by the oneshot Opus refinement to select relevant tools per request,
 /// and by the keyword fallback when the oneshot fails.
 pub static TOOL_GROUPS: &[ToolGroup] = &[
     // ── Project ─────────────────────────────────────────────────────
     ToolGroup {
         name: "project_management",
-        description: "CRUD projects, sync, roadmap",
-        keywords: &["project", "projet", "codebase", "sync", "roadmap", "create project", "créer projet"],
+        description: "CRUD projects, sync, roadmap, intelligence, scaffolding, health dashboard",
+        keywords: &["project", "projet", "codebase", "sync", "roadmap", "create project", "créer projet",
+            "scaffolding", "intelligence", "health dashboard", "auto roadmap", "graph export", "embeddings"],
         tools: &[ToolRef {
             name: "project",
-            description: "Manage projects (list/create/get/update/delete/sync/get_roadmap/list_plans)",
+            description: "Manage projects (list/create/get/update/delete/sync/get_roadmap/list_plans/get_graph/get_intelligence_summary/get_embeddings_projection/get_scaffolding_level/set_scaffolding_override/get_health_dashboard/get_auto_roadmap)",
         }],
     },
     // ── Planning ────────────────────────────────────────────────────
     ToolGroup {
         name: "planning",
-        description: "Create and manage plans, tasks, steps",
+        description: "Create and manage plans, tasks, steps, autonomous execution, triggers, run history",
         keywords: &[
             "plan", "task", "tâche", "step", "étape", "planifier", "planning",
             "organize", "organiser", "dependency", "dépendance", "priority", "priorité",
             "critical path", "chemin critique", "blocked", "bloquer",
+            "run", "execute", "exécuter", "trigger", "auto PR", "delegate", "déléguer",
+            "predict", "compare", "enrich", "enrichir",
         ],
         tools: &[
             ToolRef {
                 name: "plan",
-                description: "Manage plans (list/create/get/update_status/delete/link_to_project/unlink_from_project/get_dependency_graph/get_critical_path/get_waves)",
+                description: "Manage plans (list/create/get/update/update_status/delete/link_to_project/unlink_from_project/get_dependency_graph/get_critical_path/get_waves/run/run_status/cancel_run/auto_pr/add_trigger/list_triggers/remove_trigger/enable_trigger/disable_trigger/list_runs/get_run/compare_runs/predict_run/enrich/delegate_task)",
             },
             ToolRef {
                 name: "task",
-                description: "Manage tasks (list/create/get/update/delete/get_next/add_dependencies/remove_dependency/get_blockers/get_blocked_by/get_context/get_prompt)",
+                description: "Manage tasks (list/create/get/update/delete/get_next/add_dependencies/remove_dependency/get_blockers/get_blocked_by/get_context/get_prompt/build_prompt/enrich)",
             },
             ToolRef {
                 name: "step",
@@ -1115,7 +1370,7 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
     // ── Code Exploration & Analytics ────────────────────────────────
     ToolGroup {
         name: "code_exploration",
-        description: "Semantic search, call graph, impact, GDS analytics, inheritance, process, community, risk, bridge, topology firewall, analysis profiles",
+        description: "Semantic search, call graph, impact, GDS analytics, inheritance, process, community, risk, bridge, topology firewall, analysis profiles, structural DNA, twins, stress testing, homeostasis, context cards, link prediction",
         keywords: &[
             "code", "function", "fonction", "struct", "file", "fichier", "import", "call", "appel",
             "architecture", "symbol", "symbole", "trait", "impl", "reference", "référence",
@@ -1129,11 +1384,14 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
             "co-change", "co_change", "cohesion", "enrichment",
             "bridge", "bottleneck", "topology", "firewall", "rule", "violation",
             "analysis profile", "edge weight", "fusion weight",
+            "structural", "DNA", "twin", "jumeau", "fingerprint", "empreinte",
+            "stress test", "cascade", "homeostasis", "drift", "dérive",
+            "context card", "link prediction", "plausibility", "isomorphic",
         ],
         tools: &[
             ToolRef {
                 name: "code",
-                description: "Explore code (search/search_project/search_workspace/get_file_symbols/find_references/get_file_dependencies/get_call_graph/analyze_impact/get_architecture/find_similar/find_trait_implementations/find_type_traits/get_impl_blocks/get_communities/get_health/get_node_importance/plan_implementation/get_co_change_graph/get_file_co_changers/detect_processes/get_class_hierarchy/find_subclasses/find_interface_implementors/list_processes/get_process/get_entry_points/enrich_communities/get_hotspots/get_knowledge_gaps/get_risk_assessment/get_bridge/check_topology/list_topology_rules/create_topology_rule/delete_topology_rule/check_file_topology)",
+                description: "Explore code (search/search_project/search_workspace/get_file_symbols/find_references/get_file_dependencies/get_call_graph/analyze_impact/get_architecture/find_similar/find_trait_implementations/find_type_traits/get_impl_blocks/get_communities/get_health/get_node_importance/plan_implementation/get_co_change_graph/get_file_co_changers/detect_processes/get_class_hierarchy/find_subclasses/find_interface_implementors/list_processes/get_process/get_entry_points/enrich_communities/get_hotspots/get_knowledge_gaps/get_risk_assessment/get_homeostasis/get_structural_drift/get_structural_profile/find_structural_twins/cluster_dna/find_cross_project_twins/predict_missing_links/check_link_plausibility/stress_test_node/stress_test_edge/stress_test_cascade/find_bridges/get_context_card/refresh_context_cards/get_fingerprint/find_isomorphic/suggest_structural_templates/get_bridge/check_topology/list_topology_rules/create_topology_rule/delete_topology_rule/check_file_topology)",
             },
             ToolRef {
                 name: "analysis_profile",
@@ -1154,7 +1412,7 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
         tools: &[
             ToolRef {
                 name: "note",
-                description: "Manage notes (list/create/get/update/delete/search/search_semantic/confirm/invalidate/supersede/link_to_entity/unlink_from_entity/get_context/get_context_knowledge/get_propagated/get_propagated_knowledge/get_entity/get_needing_review/list_project)",
+                description: "Manage notes (list/create/get/update/delete/search/search_semantic/confirm/invalidate/supersede/link_to_entity/unlink_from_entity/get_context/get_context_knowledge/get_propagated/get_propagated_knowledge/get_entity/get_needing_review/list_project/list_rfcs/advance_rfc/get_rfc_status)",
             },
             ToolRef {
                 name: "episode",
@@ -1246,7 +1504,7 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
         ],
         tools: &[ToolRef {
             name: "skill",
-            description: "Manage neural skills (list/create/get/update/delete/get_members/add_member/remove_member/activate/export/import/get_health)",
+            description: "Manage neural skills (list/create/get/update/delete/get_members/add_member/remove_member/activate/export/import/get_health/split/merge)",
         }],
     },
     // ── Reasoning Tree ─────────────────────────────────────────────
@@ -1276,7 +1534,7 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
         ],
         tools: &[ToolRef {
             name: "protocol",
-            description: "Manage protocols & runs (list/create/get/update/delete/add_state/delete_state/list_states/add_transition/delete_transition/list_transitions/link_to_skill/start_run/transition/get_run/list_runs/cancel_run/fail_run/report_progress/route)",
+            description: "Manage protocols & runs (list/create/get/update/delete/add_state/delete_state/list_states/add_transition/delete_transition/list_transitions/link_to_skill/start_run/transition/get_run/list_runs/cancel_run/fail_run/report_progress/delete_run/route/compose/simulate/get_run_tree/get_run_children)",
         }],
     },
     // ── Living Personas ─────────────────────────────────────────────
@@ -1310,21 +1568,23 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
     // ── Admin & Sync ────────────────────────────────────────────────
     ToolGroup {
         name: "sync_admin",
-        description: "Code synchronization, administration, Knowledge Fabric bootstrap",
+        description: "Code synchronization, administration, Knowledge Fabric bootstrap, deep maintenance, memory consolidation, skill fission/fusion, stagnation detection",
         keywords: &[
             "sync", "watch", "watcher", "meilisearch", "index", "admin", "cleanup",
             "fabric", "bootstrap", "neural", "synapse", "neuron", "energy",
             "staleness", "decay", "backfill", "hooks", "detect", "maintain",
+            "deep maintenance", "consolidate", "stagnation", "anchor", "reconstruct",
+            "fission", "fusion", "heal", "scar", "isomorphic",
         ],
         tools: &[ToolRef {
             name: "admin",
-            description: "Admin ops (sync_directory/start_watch/stop_watch/watch_status/meilisearch_stats/delete_meilisearch_orphans/cleanup_cross_project_calls/cleanup_builtin_calls/migrate_calls_confidence/cleanup_sync_data/update_staleness_scores/update_energy_scores/search_neurons/reinforce_neurons/decay_synapses/backfill_synapses/reindex_decisions/backfill_decision_embeddings/backfill_touches/backfill_discussed/update_fabric_scores/bootstrap_knowledge_fabric/detect_skills/maintain_skills/install_hooks)",
+            description: "Admin ops (sync_directory/start_watch/stop_watch/watch_status/meilisearch_stats/delete_meilisearch_orphans/cleanup_cross_project_calls/cleanup_builtin_calls/migrate_calls_confidence/cleanup_sync_data/update_staleness_scores/update_energy_scores/search_neurons/reinforce_neurons/decay_synapses/backfill_synapses/reindex_decisions/backfill_decision_embeddings/backfill_touches/backfill_discussed/update_fabric_scores/bootstrap_knowledge_fabric/reinforce_isomorphic/detect_skills/detect_skill_fission/detect_skill_fusion/maintain_skills/auto_anchor_notes/reconstruct_knowledge/heal_scars/consolidate_memory/detect_stagnation/deep_maintenance/audit_gaps/persist_health_report/install_hooks)",
         }],
     },
 ];
 
 /// Total number of unique tools across all groups.
-/// Must match the MCP tools.rs count (currently 24 mega-tools).
+/// Must match the MCP tools.rs count (currently 25 mega-tools).
 pub fn tool_catalog_tool_count() -> usize {
     let mut names: Vec<&str> = TOOL_GROUPS
         .iter()
@@ -2531,7 +2791,7 @@ mod tests {
         assert!(BASE_SYSTEM_PROMPT.contains(r#"note(action: "create""#));
         assert!(BASE_SYSTEM_PROMPT.contains(r#"note(action: "link_to_entity""#));
         // Mega-tools section
-        assert!(BASE_SYSTEM_PROMPT.contains("22 mega-tools"));
+        assert!(BASE_SYSTEM_PROMPT.contains("25 mega-tools"));
         assert!(BASE_SYSTEM_PROMPT.contains("Mega-tools"));
     }
 
