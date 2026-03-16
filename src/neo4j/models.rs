@@ -2096,6 +2096,91 @@ pub struct PersonaImportResult {
     pub skills_linked: usize,
 }
 
+// ============================================================================
+// Alert Node (Heartbeat Engine alerts)
+// ============================================================================
+
+/// Severity level for heartbeat alerts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AlertSeverity {
+    Info,
+    Warning,
+    Critical,
+}
+
+impl std::fmt::Display for AlertSeverity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Info => write!(f, "info"),
+            Self::Warning => write!(f, "warning"),
+            Self::Critical => write!(f, "critical"),
+        }
+    }
+}
+
+impl std::str::FromStr for AlertSeverity {
+    type Err = String;
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "info" => Ok(Self::Info),
+            "warning" => Ok(Self::Warning),
+            "critical" => Ok(Self::Critical),
+            _ => Err(format!("Unknown AlertSeverity: {s}")),
+        }
+    }
+}
+
+/// An alert raised by a HeartbeatCheck.
+///
+/// Stored as `(:Alert)` node in Neo4j, optionally linked to a project
+/// via `(:Project)-[:HAS_ALERT]->(:Alert)`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AlertNode {
+    pub id: Uuid,
+    /// Type of check that raised this alert (e.g., "git_drift", "stagnation").
+    pub alert_type: String,
+    /// Severity level.
+    pub severity: AlertSeverity,
+    /// Human-readable alert message.
+    pub message: String,
+    /// Optional project this alert relates to.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<Uuid>,
+    /// Whether this alert has been acknowledged by a user.
+    pub acknowledged: bool,
+    /// Who acknowledged the alert (if any).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acknowledged_by: Option<String>,
+    /// When the alert was acknowledged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acknowledged_at: Option<DateTime<Utc>>,
+    /// When the alert was created.
+    pub created_at: DateTime<Utc>,
+}
+
+impl AlertNode {
+    /// Create a new pending (unacknowledged) alert.
+    pub fn new(
+        alert_type: String,
+        severity: AlertSeverity,
+        message: String,
+        project_id: Option<Uuid>,
+    ) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            alert_type,
+            severity,
+            message,
+            project_id,
+            acknowledged: false,
+            acknowledged_by: None,
+            acknowledged_at: None,
+            created_at: Utc::now(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

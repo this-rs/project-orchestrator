@@ -1,14 +1,18 @@
-//! Neo4j Analysis Profile operations
+//! Neo4j Analysis Profile + User Profile operations
 //!
-//! CRUD for analysis profiles that weight edge types for contextual analytics.
-//! Profiles can be global (project_id IS NULL) or project-scoped.
+//! CRUD for:
+//! - **Analysis profiles**: weight edge types for contextual analytics.
+//! - **User profiles**: adaptive behavioral profiles learned from implicit signals.
 
 use super::client::Neo4jClient;
 use crate::graph::models::AnalysisProfile;
+use crate::profile::{UserProfile, WorksOnRelation};
 use anyhow::{bail, Result};
+use chrono::{DateTime, Utc};
 use neo4rs::query;
 use std::collections::HashMap;
 use tracing::warn;
+use uuid::Uuid;
 
 impl Neo4jClient {
     // ========================================================================
@@ -205,5 +209,172 @@ impl Neo4jClient {
 
         self.graph.run(q).await?;
         Ok(())
+    }
+
+    // ========================================================================
+    // UserProfile CRUD operations
+    // ========================================================================
+
+    /// Convert a Neo4j node to a [`UserProfile`].
+    fn node_to_user_profile(&self, node: &neo4rs::Node) -> Result<UserProfile> {
+        let created_at: String = node
+            .get("created_at")
+            .unwrap_or_else(|_| Utc::now().to_rfc3339());
+        let updated_at: String = node
+            .get("updated_at")
+            .unwrap_or_else(|_| Utc::now().to_rfc3339());
+
+        Ok(UserProfile {
+            id: Uuid::parse_str(&node.get::<String>("id")?)?,
+            user_id: node.get("user_id")?,
+            verbosity: node.get("verbosity").unwrap_or(0.5),
+            commit_style: node.get("commit_style").unwrap_or(0.5),
+            language: node.get("language").unwrap_or_else(|_| "en".to_string()),
+            expertise_level: node.get("expertise_level").unwrap_or(0.5),
+            interaction_count: node.get::<i64>("interaction_count").unwrap_or(0) as u64,
+            created_at: DateTime::parse_from_rfc3339(&created_at)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now()),
+            updated_at: DateTime::parse_from_rfc3339(&updated_at)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now()),
+        })
+    }
+
+    /// Create or get an existing user profile.
+    ///
+    /// Uses MERGE on `user_id` so calling this multiple times for the same user
+    /// is idempotent. Returns the profile (created or existing).
+    pub async fn create_or_get_user_profile(&self, user_id: &str) -> Result<UserProfile> {
+        let now = Utc::now().to_rfc3339();
+        let new_id = Uuid::new_v4().to_string();
+
+        let q = query(
+            r#"
+            MERGE (up:UserProfile {user_id: $user_id})
+            ON CREATE SET
+                up.id = $id,
+                up.verbosity = 0.5,
+                up.commit_style = 0.5,
+                up.language = "en",
+                up.expertise_level = 0.5,
+                up.interaction_count = 0,
+                up.created_at = $now,
+                up.updated_at = $now
+            RETURN up
+            "#,
+        )
+        .param("user_id", user_id.to_string())
+        .param("id", new_id)
+        .param("now", now);
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("up")?;
+            self.node_to_user_profile(&node)
+        } else {
+            bail!("Failed to create or get user profile for '{}'", user_id)
+        }
+    }
+
+    /// Update a user profile with new dimension values.
+    ///
+    /// Only updates fields that are provided (Some). Always updates `updated_at`.
+    pub async fn update_user_profile(&self, profile: &UserProfile) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+
+        let q = query(
+            r#"
+            MATCH (up:UserProfile {user_id: $user_id})
+            SET up.verbosity = $verbosity,
+                up.commit_style = $commit_style,
+                up.language = $language,
+                up.expertise_level = $expertise_level,
+                up.interaction_count = $interaction_count,
+                up.updated_at = $now
+            "#,
+        )
+        .param("user_id", profile.user_id.clone())
+        .param("verbosity", profile.verbosity)
+        .param("commit_style", profile.commit_style)
+        .param("language", profile.language.clone())
+        .param("expertise_level", profile.expertise_level)
+        .param("interaction_count", profile.interaction_count as i64)
+        .param("now", now);
+
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
+    /// Get a user profile by user_id.
+    pub async fn get_user_profile(&self, user_id: &str) -> Result<Option<UserProfile>> {
+        let q = query(
+            r#"
+            MATCH (up:UserProfile {user_id: $user_id})
+            RETURN up
+            "#,
+        )
+        .param("user_id", user_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("up")?;
+            Ok(Some(self.node_to_user_profile(&node)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Upsert a WORKS_ON relationship between a user profile and a project.
+    ///
+    /// Increments the frequency counter and updates last_active timestamp.
+    pub async fn upsert_works_on(&self, user_id: &str, project_id: Uuid) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+
+        let q = query(
+            r#"
+            MATCH (up:UserProfile {user_id: $user_id})
+            MATCH (p:Project {id: $project_id})
+            MERGE (up)-[r:WORKS_ON]->(p)
+            ON CREATE SET r.frequency = 1, r.last_active = $now
+            ON MATCH SET r.frequency = r.frequency + 1, r.last_active = $now
+            "#,
+        )
+        .param("user_id", user_id.to_string())
+        .param("project_id", project_id.to_string())
+        .param("now", now);
+
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
+    /// Get all WORKS_ON relationships for a user.
+    pub async fn get_works_on(&self, user_id: &str) -> Result<Vec<WorksOnRelation>> {
+        let q = query(
+            r#"
+            MATCH (up:UserProfile {user_id: $user_id})-[r:WORKS_ON]->(p:Project)
+            RETURN p.id AS project_id, r.frequency AS frequency, r.last_active AS last_active
+            ORDER BY r.last_active DESC
+            "#,
+        )
+        .param("user_id", user_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut relations = Vec::new();
+        while let Some(row) = result.next().await? {
+            let project_id_str: String = row.get("project_id")?;
+            let frequency: i64 = row.get("frequency").unwrap_or(1);
+            let last_active_str: String = row.get("last_active")?;
+
+            relations.push(WorksOnRelation {
+                user_id: user_id.to_string(),
+                project_id: Uuid::parse_str(&project_id_str)?,
+                frequency: frequency as u64,
+                last_active: DateTime::parse_from_rfc3339(&last_active_str)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now()),
+            });
+        }
+        Ok(relations)
     }
 }

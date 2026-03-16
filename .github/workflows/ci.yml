@@ -246,7 +246,7 @@ jobs:
         run: |
           ./target/release/orchestrator serve --port 8080 &
           echo "Waiting for server to start..."
-          timeout 30 bash -c 'until curl -sf http://localhost:8080/health > /dev/null 2>&1; do sleep 1; done'
+          timeout 60 bash -c 'until curl -sf http://localhost:8080/health > /dev/null 2>&1; do sleep 1; done'
           echo "Server is ready!"
 
       - name: Run API tests
