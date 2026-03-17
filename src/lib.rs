@@ -1267,7 +1267,7 @@ pub async fn start_server(mut config: Config) -> Result<()> {
             Box::new(ConventionGuardCheck),
             Box::new(MaintenanceCheck),
             Box::new(ConsolidationCheck),
-            Box::new(HomeostasisCheck),
+            Box::new(HomeostasisCheck::new()),
         ];
 
         let engine = HeartbeatEngine::new(graph, search, emitter, checks);

@@ -35,8 +35,10 @@ pub struct HeartbeatContext {
 /// A periodic health check executed by the HeartbeatEngine.
 ///
 /// Each check defines its own interval and logic. The engine
-/// calls `run()` at most once per interval, with a 5s timeout.
-/// If a check exceeds the timeout, it is skipped (not retried).
+/// calls `run()` at most once per interval, with a default 5s timeout.
+/// Checks can override the timeout via `timeout_override()` for
+/// operations that need more time (e.g., paginated backfill).
+/// If a check exceeds its timeout, it is skipped (not retried).
 #[async_trait]
 pub trait HeartbeatCheck: Send + Sync {
     /// Human-readable name for logging.
@@ -44,6 +46,13 @@ pub trait HeartbeatCheck: Send + Sync {
 
     /// How often this check should run.
     fn interval(&self) -> Duration;
+
+    /// Optional per-check timeout override.
+    /// Returns `None` to use the engine's default (5s).
+    /// Override this for checks that need more time (e.g., paginated backfill).
+    fn timeout_override(&self) -> Option<Duration> {
+        None
+    }
 
     /// Execute the check. Returns Ok(()) on success, or an error
     /// that will be logged but won't crash the engine.

@@ -18,7 +18,8 @@ use super::{HeartbeatCheck, HeartbeatContext};
 ///
 /// Each check has its own interval. The engine ticks every `tick_interval` (default 30s)
 /// and evaluates any check whose interval has elapsed since its last run.
-/// Checks that exceed 5s are skipped via `tokio::time::timeout`.
+/// Checks that exceed their timeout are skipped. The default timeout is 5s,
+/// but checks can override it via `HeartbeatCheck::timeout_override()`.
 pub struct HeartbeatEngine {
     graph: Arc<dyn GraphStore>,
     search: Option<Arc<dyn SearchStore>>,
@@ -94,9 +95,14 @@ impl HeartbeatEngine {
                                 continue;
                             }
 
-                            debug!("HeartbeatEngine: running check '{}'", check.name());
+                            let default_timeout = Duration::from_secs(5);
+                            let check_timeout = check.timeout_override().unwrap_or(default_timeout);
+                            debug!(
+                                "HeartbeatEngine: running check '{}' (timeout: {:?})",
+                                check.name(),
+                                check_timeout
+                            );
 
-                            let check_timeout = Duration::from_secs(5);
                             match tokio::time::timeout(check_timeout, check.run(&ctx)).await {
                                 Ok(Ok(())) => {
                                     debug!("HeartbeatEngine: check '{}' completed OK", check.name());
@@ -112,8 +118,9 @@ impl HeartbeatEngine {
                                 }
                                 Err(_) => {
                                     warn!(
-                                        "HeartbeatEngine: check '{}' timed out (>5s), skipping",
-                                        check.name()
+                                        "HeartbeatEngine: check '{}' timed out (>{:?}), skipping",
+                                        check.name(),
+                                        check_timeout
                                     );
                                     // Don't update last_run — retry next tick
                                 }
