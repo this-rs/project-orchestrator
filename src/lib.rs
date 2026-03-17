@@ -18,6 +18,7 @@ pub mod events;
 pub mod feedback;
 pub mod graph;
 pub mod heartbeat;
+pub mod homeostasis;
 pub mod identity;
 pub mod mcp;
 pub mod meilisearch;
