@@ -1468,6 +1468,9 @@ pub struct NeuralMetrics {
     pub avg_energy: f64,
     pub weak_synapses_ratio: f64,
     pub dead_notes_count: i64,
+    /// Average reactivation rate across active notes.
+    /// High value = knowledge routes are frequently useful and stable.
+    pub avg_reactivation_rate: f64,
 }
 
 /// A note with its embedding vector, for UMAP 2D projection.

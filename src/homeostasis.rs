@@ -12,6 +12,12 @@
 //! Max 3 corrective actions per cycle to prevent runaway corrections.
 
 use std::fmt;
+use std::sync::Arc;
+
+use anyhow::Result;
+use tracing::{debug, info, warn};
+
+use crate::neo4j::traits::GraphStore;
 
 /// Maximum number of corrective actions per evaluation cycle.
 const MAX_ACTIONS_PER_CYCLE: usize = 3;
@@ -132,6 +138,83 @@ impl HomeostasisController {
 }
 
 // ============================================================================
+// Action executor
+// ============================================================================
+
+/// Execute a list of corrective actions against the graph store.
+///
+/// Each action maps to a specific GraphStore method:
+/// - `DecaySynapses` → `graph.decay_synapses(amount, prune_threshold)`
+/// - `BackfillSynapses` → logged only (requires NoteManager + SearchStore)
+/// - `ArchiveDeadNotes` → `graph.consolidate_memory()` (promotes + archives)
+/// - `ReduceInitialEnergy` → logged only (informational, caller adjusts defaults)
+///
+/// Returns the count of successfully executed actions.
+pub async fn execute_actions(
+    graph: &Arc<dyn GraphStore>,
+    actions: &[HomeostasisAction],
+) -> Result<usize> {
+    let mut executed = 0;
+
+    for action in actions {
+        match action {
+            HomeostasisAction::DecaySynapses {
+                amount,
+                prune_threshold,
+            } => {
+                info!(
+                    amount,
+                    prune_threshold, "homeostasis: executing DecaySynapses"
+                );
+                match graph.decay_synapses(*amount, *prune_threshold).await {
+                    Ok((decayed, pruned)) => {
+                        debug!(decayed, pruned, "homeostasis: DecaySynapses completed");
+                        executed += 1;
+                    }
+                    Err(e) => {
+                        warn!("homeostasis: DecaySynapses failed: {}", e);
+                    }
+                }
+            }
+            HomeostasisAction::BackfillSynapses => {
+                // BackfillSynapses requires NoteManager (embedding search) which
+                // is not available from GraphStore alone. Log for the caller.
+                info!(
+                    "homeostasis: BackfillSynapses recommended — \
+                     requires NoteManager, skipping in graph-only context"
+                );
+            }
+            HomeostasisAction::ArchiveDeadNotes => {
+                info!("homeostasis: executing ArchiveDeadNotes via consolidate_memory");
+                match graph.consolidate_memory().await {
+                    Ok((promoted, archived)) => {
+                        debug!(
+                            promoted,
+                            archived, "homeostasis: consolidate_memory completed"
+                        );
+                        executed += 1;
+                    }
+                    Err(e) => {
+                        warn!("homeostasis: ArchiveDeadNotes failed: {}", e);
+                    }
+                }
+            }
+            HomeostasisAction::ReduceInitialEnergy(energy) => {
+                info!(
+                    energy,
+                    "homeostasis: ReduceInitialEnergy recommended — \
+                     new notes should start at this energy level"
+                );
+                // Informational only: the caller (e.g., NoteManager) should
+                // read this and adjust its default energy for new notes.
+            }
+        }
+    }
+
+    Ok(executed)
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -152,7 +235,10 @@ mod tests {
     #[test]
     fn test_all_healthy_returns_no_actions() {
         let actions = HomeostasisController::evaluate(&healthy_metrics());
-        assert!(actions.is_empty(), "healthy metrics should produce no actions");
+        assert!(
+            actions.is_empty(),
+            "healthy metrics should produce no actions"
+        );
     }
 
     #[test]

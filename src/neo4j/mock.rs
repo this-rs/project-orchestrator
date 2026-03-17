@@ -8285,6 +8285,7 @@ impl GraphStore for MockGraphStore {
             avg_energy: 0.0,
             weak_synapses_ratio: 0.0,
             dead_notes_count: 0,
+            avg_reactivation_rate: 0.0,
         })
     }
 
@@ -13942,7 +13943,10 @@ mod tests {
             .ping_freshness_for_files(&["src/main.rs".to_string()])
             .await
             .unwrap();
-        assert_eq!(pinged, 1, "Should ping exactly 1 note linked to src/main.rs");
+        assert_eq!(
+            pinged, 1,
+            "Should ping exactly 1 note linked to src/main.rs"
+        );
 
         // Verify note1 was pinged
         let n1 = store.get_note(note1_id).await.unwrap().unwrap();

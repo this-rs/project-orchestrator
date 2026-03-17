@@ -1471,9 +1471,13 @@ impl Neo4jClient {
             OPTIONAL MATCH (n:Note) WHERE n.energy IS NOT NULL AND n.energy < 0.05
             WITH total_notes, active_synapses, coalesce(avg_weight, 0) AS avg_weight,
                  coalesce(weak_synapses, 0) AS weak_synapses, count(n) AS dead_notes
+            OPTIONAL MATCH (rn:Note) WHERE rn.reactivation_count IS NOT NULL AND rn.reactivation_count > 0
+            WITH active_synapses, avg_weight, weak_synapses, dead_notes,
+                 avg(coalesce(rn.reactivation_count, 0)) AS avg_reactivation
             RETURN active_synapses, avg_weight AS avg_energy,
                    CASE WHEN active_synapses > 0 THEN toFloat(weak_synapses) / active_synapses ELSE 0.0 END AS weak_synapses_ratio,
-                   dead_notes AS dead_notes_count
+                   dead_notes AS dead_notes_count,
+                   coalesce(avg_reactivation, 0.0) AS avg_reactivation_rate
             "#,
         )
         .param("project_id", project_id.to_string())
@@ -1487,6 +1491,7 @@ impl Neo4jClient {
                 avg_energy: row.get::<f64>("avg_energy").unwrap_or(0.0),
                 weak_synapses_ratio: row.get::<f64>("weak_synapses_ratio").unwrap_or(0.0),
                 dead_notes_count: row.get::<i64>("dead_notes_count").unwrap_or(0),
+                avg_reactivation_rate: row.get::<f64>("avg_reactivation_rate").unwrap_or(0.0),
             })
         } else {
             Ok(NeuralMetrics {
@@ -1494,6 +1499,7 @@ impl Neo4jClient {
                 avg_energy: 0.0,
                 weak_synapses_ratio: 0.0,
                 dead_notes_count: 0,
+                avg_reactivation_rate: 0.0,
             })
         }
     }

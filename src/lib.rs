@@ -1249,7 +1249,8 @@ pub async fn start_server(mut config: Config) -> Result<()> {
     // Runs independently of chat sessions (like ScheduleProvider).
     {
         use heartbeat::checks::{
-            convention_guard::ConventionGuardCheck, git_drift::GitDriftCheck,
+            consolidation::ConsolidationCheck, convention_guard::ConventionGuardCheck,
+            git_drift::GitDriftCheck, homeostasis::HomeostasisCheck,
             maintenance::MaintenanceCheck, staleness::StalenessCheck,
             synapse_decay::SynapseDecayCheck,
         };
@@ -1265,13 +1266,15 @@ pub async fn start_server(mut config: Config) -> Result<()> {
             Box::new(SynapseDecayCheck),
             Box::new(ConventionGuardCheck),
             Box::new(MaintenanceCheck),
+            Box::new(ConsolidationCheck),
+            Box::new(HomeostasisCheck),
         ];
 
         let engine = HeartbeatEngine::new(graph, emitter, checks);
         let handle = engine.start_owned();
         // Keep handle alive for the lifetime of the process
         std::mem::forget(handle);
-        tracing::info!("HeartbeatEngine started (5 checks)");
+        tracing::info!("HeartbeatEngine started (7 checks)");
     }
 
     // Pre-build OIDC client once (avoids fetching discovery document on every request)

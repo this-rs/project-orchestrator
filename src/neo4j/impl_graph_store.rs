@@ -1991,7 +1991,6 @@ impl GraphStore for Neo4jClient {
         self.track_reactivation(note_ids).await
     }
 
-
     async fn reinforce_synapses(&self, note_ids: &[Uuid], boost: f64) -> anyhow::Result<usize> {
         self.reinforce_synapses(note_ids, boost).await
     }

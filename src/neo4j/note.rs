@@ -1452,8 +1452,7 @@ impl Neo4jClient {
                         }
                         let score: f64 = row.get("score").unwrap_or(0.0);
                         let distance: i64 = row.get("distance").unwrap_or(1);
-                        let path_rel_weight: Option<f64> =
-                            row.get::<f64>("path_rel_weight").ok();
+                        let path_rel_weight: Option<f64> = row.get::<f64>("path_rel_weight").ok();
                         let scar_intensity = note.scar_intensity;
                         propagated_notes.push(PropagatedNote {
                             note,

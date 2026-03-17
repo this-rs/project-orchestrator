@@ -1446,7 +1446,9 @@ mod tests {
         let ce = note.computed_energy();
         assert!(
             (ce - note.energy).abs() < 0.01,
-            "Fresh note computed_energy ({}) should be ~{}", ce, note.energy
+            "Fresh note computed_energy ({}) should be ~{}",
+            ce,
+            note.energy
         );
     }
 
@@ -1463,7 +1465,8 @@ mod tests {
         let ce = note.computed_energy();
         assert!(
             (ce - 0.5).abs() < 0.05,
-            "90-day-old note computed_energy ({}) should be ~0.5", ce
+            "90-day-old note computed_energy ({}) should be ~0.5",
+            ce
         );
     }
 
@@ -1480,8 +1483,8 @@ mod tests {
         let ce = note.computed_energy();
         assert!(
             (ce - 0.7).abs() < f64::EPSILON,
-            "No last_activated: computed_energy ({}) should equal stored energy (0.7)", ce
+            "No last_activated: computed_energy ({}) should equal stored energy (0.7)",
+            ce
         );
     }
-
 }
