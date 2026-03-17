@@ -8285,6 +8285,7 @@ impl GraphStore for MockGraphStore {
             avg_energy: 0.0,
             weak_synapses_ratio: 0.0,
             dead_notes_count: 0,
+            total_notes_count: 0,
             avg_reactivation_rate: 0.0,
         })
     }
