@@ -231,6 +231,23 @@ pub fn compute_backfill_params(total_notes: usize, synapse_health: f64) -> Backf
 }
 
 // ============================================================================
+// Execution context
+// ============================================================================
+
+/// Optional context for `execute_actions`, grouping cursor, project and params.
+///
+/// Use `Default::default()` in tests when no context is needed.
+#[derive(Debug, Default)]
+pub struct ExecuteContext<'a> {
+    /// Backfill cursor for paginated processing (resume from previous cycle).
+    pub cursor: Option<&'a BackfillCursor>,
+    /// Project ID for persisting ReduceInitialEnergy on the Project node.
+    pub project_id: Option<Uuid>,
+    /// Adaptive backfill params (batch_size, max_neighbors). Falls back to defaults if None.
+    pub backfill_params: Option<&'a BackfillParams>,
+}
+
+// ============================================================================
 // Action executor
 // ============================================================================
 
@@ -242,7 +259,7 @@ pub fn compute_backfill_params(total_notes: usize, synapse_health: f64) -> Backf
 /// - `ReduceInitialEnergy` → logged only (informational, caller adjusts defaults)
 ///
 /// When `search` is `Some`, BackfillSynapses processes one batch of notes
-/// starting from `cursor.offset`. The returned `ExecuteResult` contains
+/// starting from `ctx.cursor.offset`. The returned `ExecuteResult` contains
 /// the updated cursor for the next cycle.
 ///
 /// When `None`, BackfillSynapses is logged as a recommendation only.
@@ -253,9 +270,7 @@ pub async fn execute_actions(
     graph: &Arc<dyn GraphStore>,
     search: Option<&Arc<dyn SearchStore>>,
     actions: &[HomeostasisAction],
-    cursor: Option<&BackfillCursor>,
-    project_id: Option<Uuid>,
-    backfill_params: Option<&BackfillParams>,
+    ctx: ExecuteContext<'_>,
 ) -> Result<ExecuteResult> {
     let mut executed = 0;
     let mut new_cursor: Option<BackfillCursor> = None;
@@ -282,12 +297,12 @@ pub async fn execute_actions(
             }
             HomeostasisAction::BackfillSynapses => {
                 if let Some(search) = search {
-                    let offset = cursor.map(|c| c.offset).unwrap_or(0);
+                    let offset = ctx.cursor.map(|c| c.offset).unwrap_or(0);
                     let default_params = BackfillParams {
                         batch_size: DEFAULT_BACKFILL_BATCH_SIZE,
                         max_neighbors: 3,
                     };
-                    let params = backfill_params.unwrap_or(&default_params);
+                    let params = ctx.backfill_params.unwrap_or(&default_params);
                     info!(
                         offset,
                         batch_size = params.batch_size,
@@ -332,7 +347,7 @@ pub async fn execute_actions(
                             warn!("homeostasis: BackfillSynapses failed: {}", e);
                             // Preserve cursor position on failure — retry same offset next cycle
                             new_cursor = Some(BackfillCursor {
-                                offset: cursor.map(|c| c.offset).unwrap_or(0),
+                                offset: ctx.cursor.map(|c| c.offset).unwrap_or(0),
                                 completed: false,
                             });
                         }
@@ -345,7 +360,7 @@ pub async fn execute_actions(
                 }
             }
             HomeostasisAction::ReduceInitialEnergy(energy) => {
-                if let Some(pid) = project_id {
+                if let Some(pid) = ctx.project_id {
                     info!(
                         energy,
                         project_id = %pid,
@@ -625,7 +640,7 @@ mod tests {
             amount: 0.02,
             prune_threshold: 0.15,
         }];
-        let result = execute_actions(&graph, None, &actions, None, None, None)
+        let result = execute_actions(&graph, None, &actions, ExecuteContext::default())
             .await
             .unwrap();
         assert_eq!(result.executed, 1);
@@ -637,7 +652,7 @@ mod tests {
         let graph: Arc<dyn GraphStore> = Arc::new(MockGraphStore::new());
         let actions = vec![HomeostasisAction::ReduceInitialEnergy(0.5)];
         // No project_id → skips persistence
-        let result = execute_actions(&graph, None, &actions, None, None, None)
+        let result = execute_actions(&graph, None, &actions, ExecuteContext::default())
             .await
             .unwrap();
         assert_eq!(result.executed, 0);
@@ -653,9 +668,17 @@ mod tests {
         let graph: Arc<dyn GraphStore> = mock.clone();
 
         let actions = vec![HomeostasisAction::ReduceInitialEnergy(0.5)];
-        let result = execute_actions(&graph, None, &actions, None, Some(project.id), None)
-            .await
-            .unwrap();
+        let result = execute_actions(
+            &graph,
+            None,
+            &actions,
+            ExecuteContext {
+                project_id: Some(project.id),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
         assert_eq!(result.executed, 1);
 
         // Verify the value was persisted
@@ -667,7 +690,7 @@ mod tests {
     async fn test_execute_backfill_without_search_skips() {
         let graph: Arc<dyn GraphStore> = Arc::new(MockGraphStore::new());
         let actions = vec![HomeostasisAction::BackfillSynapses];
-        let result = execute_actions(&graph, None, &actions, None, None, None)
+        let result = execute_actions(&graph, None, &actions, ExecuteContext::default())
             .await
             .unwrap();
         assert_eq!(result.executed, 0);
@@ -683,7 +706,7 @@ mod tests {
         let search: Arc<dyn crate::meilisearch::SearchStore> = Arc::new(MockSearchStore::new());
         let actions = vec![HomeostasisAction::BackfillSynapses];
 
-        let result = execute_actions(&graph, Some(&search), &actions, None, None, None)
+        let result = execute_actions(&graph, Some(&search), &actions, ExecuteContext::default())
             .await
             .unwrap();
         assert_eq!(result.executed, 1);
@@ -704,9 +727,17 @@ mod tests {
             offset: 10,
             completed: false,
         };
-        let result = execute_actions(&graph, Some(&search), &actions, Some(&cursor), None, None)
-            .await
-            .unwrap();
+        let result = execute_actions(
+            &graph,
+            Some(&search),
+            &actions,
+            ExecuteContext {
+                cursor: Some(&cursor),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
         let new_cursor = result.backfill_cursor.expect("should have cursor");
         assert!(new_cursor.completed);
     }
@@ -723,7 +754,7 @@ mod tests {
             HomeostasisAction::BackfillSynapses,
         ];
 
-        let result = execute_actions(&graph, Some(&search), &actions, None, None, None)
+        let result = execute_actions(&graph, Some(&search), &actions, ExecuteContext::default())
             .await
             .unwrap();
         assert_eq!(result.executed, 2);
@@ -828,9 +859,17 @@ mod tests {
             max_neighbors: 5,
         };
 
-        let result = execute_actions(&graph, Some(&search), &actions, None, None, Some(&params))
-            .await
-            .unwrap();
+        let result = execute_actions(
+            &graph,
+            Some(&search),
+            &actions,
+            ExecuteContext {
+                backfill_params: Some(&params),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
         assert_eq!(result.executed, 1);
         let cursor = result
             .backfill_cursor

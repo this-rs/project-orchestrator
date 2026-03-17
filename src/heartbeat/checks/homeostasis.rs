@@ -27,8 +27,8 @@ use tracing::{debug, info, warn};
 
 use crate::heartbeat::{HeartbeatCheck, HeartbeatContext};
 use crate::homeostasis::{
-    compute_backfill_params, execute_actions, BackfillCursor, HomeostasisController,
-    HomeostasisMetrics,
+    compute_backfill_params, execute_actions, BackfillCursor, ExecuteContext,
+    HomeostasisController, HomeostasisMetrics,
 };
 
 /// Pain score below which we consider the system dormant/stable.
@@ -203,9 +203,11 @@ impl HeartbeatCheck for HomeostasisCheck {
                 &graph_arc,
                 ctx.search.as_ref(),
                 &actions,
-                Some(&current_cursor),
-                Some(project.id),
-                backfill_params.as_ref(),
+                ExecuteContext {
+                    cursor: Some(&current_cursor),
+                    project_id: Some(project.id),
+                    backfill_params: backfill_params.as_ref(),
+                },
             )
             .await
             {
