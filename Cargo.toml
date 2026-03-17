@@ -1,3 +1,52 @@
+[workspace]
+members = [".", "crates/*"]
+resolver = "2"
+
+# =============================================================================
+# Shared dependencies — use `dep = { workspace = true }` in member crates
+# =============================================================================
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1.49", features = ["full"] }
+tokio-util = "0.7"
+tokio-stream = "0.1"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+
+# Neo4j
+neo4rs = "0.8"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Error handling
+anyhow = "1.0"
+thiserror = "2.0"
+
+# Utilities
+uuid = { version = "1.11", features = ["v4", "v5", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+async-trait = "0.1"
+futures = "0.3"
+
+# ML — candle (always compiled, runtime-controlled)
+candle-core = "0.8"
+candle-nn = "0.8"
+safetensors = "0.4"
+
+# Cache
+moka = { version = "0.12", features = ["future"] }
+
+# CPU monitoring
+sysinfo = "0.33"
+
+# =============================================================================
+# Main crate
+# =============================================================================
 [package]
 name = "project-orchestrator"
 version = "0.1.0"
@@ -8,8 +57,8 @@ license = "MIT AND BUSL-1.1"
 
 [dependencies]
 # Async runtime
-tokio = { version = "1.49", features = ["full"] }
-tokio-util = "0.7"
+tokio = { workspace = true }
+tokio-util = { workspace = true }
 
 # Web framework for webhook listener
 axum = { version = "0.8", features = ["macros", "ws"] }
@@ -17,12 +66,12 @@ tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace", "fs", "set-header"] }
 
 # Serialization
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-serde_yaml = "0.9"
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
 
 # Neo4j
-neo4rs = "0.8"
+neo4rs = { workspace = true }
 
 # Meilisearch
 meilisearch-sdk = "0.30"
@@ -50,12 +99,12 @@ tree-sitter-hcl = { path = "crates/tree-sitter-hcl" }
 clap = { version = "4.5", features = ["derive", "env"] }
 
 # Logging
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 # Error handling
-anyhow = "1.0"
-thiserror = "2.0"
+anyhow = { workspace = true }
+thiserror = { workspace = true }
 
 # Graph analytics
 petgraph = "0.7"
@@ -65,23 +114,23 @@ rustworkx-core = "0.16"
 lru = "0.12"
 
 # Utilities
-uuid = { version = "1.11", features = ["v4", "v5", "serde"] }
-chrono = { version = "0.4", features = ["serde"] }
+uuid = { workspace = true }
+chrono = { workspace = true }
 walkdir = "2.5"
 glob = "0.3"
 sha2 = "0.10"
 hmac = "0.12"
 hex = "0.4"
 rayon = "1.10"
-futures = "0.3"
-async-trait = "0.1"
+futures = { workspace = true }
+async-trait = { workspace = true }
 
 # HTTP client (for CLI) — rustls-only for cross-compilation (no OpenSSL dependency)
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 # Chat / Claude Code SDK
 nexus-claude = { git = "https://github.com/this-rs/nexus.git", rev = "ab9610c", features = ["memory", "auto-download"] }
-tokio-stream = "0.1"
+tokio-stream = { workspace = true }
 
 # Auth
 jsonwebtoken = "9"
