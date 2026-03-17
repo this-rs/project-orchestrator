@@ -1532,6 +1532,7 @@ pub struct ReconstructReport {
     pub decisions_processed: usize,
     pub affects_created: usize,
     pub structural_propagated: usize,
+    pub transitive_propagated: usize,
     pub semantic_linked: usize,
     pub elapsed_ms: u64,
 }
@@ -1564,6 +1565,15 @@ pub async fn reconstruct_knowledge_links(
     // 3. Structural propagation (IMPORTS/CALLS/CO_CHANGED → LINKED_TO propagated)
     let structural_propagated = graph_store.propagate_structural_links(project_id).await?;
 
+    // 3b. Transitive propagation via IMPORTS graph (LINKED_TO_TRANSITIVE)
+    let transitive_propagated = graph_store
+        .propagate_linked_to_transitive(project_id)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(%project_id, error = %e, "Transitive propagation failed (non-fatal)");
+            0
+        });
+
     // 4. Semantic propagation (file embeddings ↔ note embeddings via HNSW)
     let semantic_linked = graph_store
         .propagate_semantic_links(project_id, 0.7)
@@ -1590,6 +1600,7 @@ pub async fn reconstruct_knowledge_links(
         decisions_processed,
         affects_created,
         structural_propagated: structural_propagated + high_level_propagated,
+        transitive_propagated,
         semantic_linked,
         elapsed_ms: elapsed.as_millis() as u64,
     };
@@ -4120,6 +4131,7 @@ mod tests {
         assert_eq!(report.affects_created, 1);
         // Mock propagation returns 0
         assert_eq!(report.structural_propagated, 0);
+        assert_eq!(report.transitive_propagated, 0);
         assert_eq!(report.semantic_linked, 0);
         assert!(report.elapsed_ms < 5000); // Should be fast
     }
@@ -4155,6 +4167,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_propagate_linked_to_transitive_mock_returns_zero() {
+        // MockGraphStore.propagate_linked_to_transitive is a no-op returning Ok(0).
+        // This test verifies the trait method is callable and the integration
+        // into reconstruct_knowledge_links works correctly.
+        let store = crate::neo4j::mock::MockGraphStore::new();
+        let project_id = Uuid::new_v4();
+
+        let project = crate::neo4j::models::ProjectNode {
+            id: project_id,
+            name: "transitive-test".to_string(),
+            slug: "transitive-test".to_string(),
+            description: None,
+            root_path: "/tmp/transitive-test".to_string(),
+            created_at: Utc::now(),
+            last_synced: None,
+            analytics_computed_at: None,
+            last_co_change_computed_at: None,
+            scaffolding_override: None,
+            sharing_policy: None,
+        };
+        store.create_project(&project).await.unwrap();
+
+        // Direct call to the trait method
+        let result = store.propagate_linked_to_transitive(project_id).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 0);
+
+        // Through reconstruct_knowledge_links — transitive_propagated should be 0
+        let report = reconstruct_knowledge_links(&store, project_id).await.unwrap();
+        assert_eq!(report.transitive_propagated, 0);
+    }
+
+    #[tokio::test]
     async fn test_reconstruct_report_is_serializable() {
         let report = ReconstructReport {
             notes_processed: 10,
@@ -4162,6 +4207,7 @@ mod tests {
             decisions_processed: 3,
             affects_created: 2,
             structural_propagated: 1,
+            transitive_propagated: 3,
             semantic_linked: 0,
             elapsed_ms: 42,
         };

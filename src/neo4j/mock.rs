@@ -5463,6 +5463,10 @@ impl GraphStore for MockGraphStore {
         Ok(0)
     }
 
+    async fn propagate_linked_to_transitive(&self, _project_id: Uuid) -> Result<usize> {
+        Ok(0)
+    }
+
     async fn propagate_high_level_links(&self, _project_id: Uuid) -> Result<usize> {
         Ok(0)
     }

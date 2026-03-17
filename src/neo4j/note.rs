@@ -567,6 +567,104 @@ impl Neo4jClient {
         Ok(total as usize)
     }
 
+    /// Propagate LINKED_TO_TRANSITIVE relationships along the IMPORTS graph.
+    ///
+    /// Idempotent: deletes existing transitive links for the project, then
+    /// recreates them at depth 1 (weight = 0.8 × parent) and depth 2
+    /// (weight = 0.64 × parent). Weight cutoff at 0.3.
+    ///
+    /// Returns the total number of transitive links created.
+    pub async fn propagate_linked_to_transitive(&self, project_id: Uuid) -> Result<usize> {
+        // Step 0: Delete existing transitive links for this project
+        let delete_q = query(
+            r#"
+            MATCH (n:Note {project_id: $project_id})-[r:LINKED_TO_TRANSITIVE]->(:File)
+            DELETE r
+            RETURN count(r) AS deleted
+            "#,
+        )
+        .param("project_id", project_id.to_string());
+
+        let deleted = if let Ok(mut result) = self.graph.execute(delete_q).await {
+            if let Ok(Some(row)) = result.next().await {
+                row.get::<i64>("deleted").unwrap_or(0)
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+
+        if deleted > 0 {
+            tracing::debug!(
+                %project_id,
+                deleted,
+                "Deleted existing LINKED_TO_TRANSITIVE links"
+            );
+        }
+
+        let mut total = 0i64;
+
+        // Step 1: Depth 1 — Note -[:LINKED_TO]-> File -[:IMPORTS]-> File
+        let depth1_q = query(
+            r#"
+            MATCH (p:Project {id: $project_id})-[:CONTAINS]->(f1:File)
+            MATCH (n:Note)-[lt:LINKED_TO]->(f1)
+            MATCH (f1)-[:IMPORTS]->(f2:File)<-[:CONTAINS]-(p)
+            WHERE f1 <> f2
+            WITH n, f2,
+                 CASE WHEN lt.weight IS NOT NULL THEN lt.weight ELSE 1.0 END * 0.8 AS w
+            WHERE w >= 0.3
+            MERGE (n)-[t:LINKED_TO_TRANSITIVE]->(f2)
+            ON CREATE SET t.weight = w, t.created_at = datetime(), t.depth = 1
+            ON MATCH SET t.weight = CASE WHEN w > t.weight THEN w ELSE t.weight END
+            RETURN count(t) AS cnt
+            "#,
+        )
+        .param("project_id", project_id.to_string());
+
+        if let Ok(mut result) = self.graph.execute(depth1_q).await {
+            if let Ok(Some(row)) = result.next().await {
+                total += row.get::<i64>("cnt").unwrap_or(0);
+            }
+        }
+
+        // Step 2: Depth 2 — Note -[:LINKED_TO]-> File -[:IMPORTS]-> File -[:IMPORTS]-> File
+        let depth2_q = query(
+            r#"
+            MATCH (p:Project {id: $project_id})-[:CONTAINS]->(f1:File)
+            MATCH (n:Note)-[lt:LINKED_TO]->(f1)
+            MATCH (f1)-[:IMPORTS]->(f2:File)-[:IMPORTS]->(f3:File)<-[:CONTAINS]-(p)
+            WHERE f1 <> f2 AND f1 <> f3 AND f2 <> f3
+            WITH n, f3,
+                 CASE WHEN lt.weight IS NOT NULL THEN lt.weight ELSE 1.0 END * 0.64 AS w
+            WHERE w >= 0.3
+            MERGE (n)-[t:LINKED_TO_TRANSITIVE]->(f3)
+            ON CREATE SET t.weight = w, t.created_at = datetime(), t.depth = 2
+            ON MATCH SET t.weight = CASE WHEN w > t.weight THEN w ELSE t.weight END
+            RETURN count(t) AS cnt
+            "#,
+        )
+        .param("project_id", project_id.to_string());
+
+        if let Ok(mut result) = self.graph.execute(depth2_q).await {
+            if let Ok(Some(row)) = result.next().await {
+                total += row.get::<i64>("cnt").unwrap_or(0);
+            }
+        }
+
+        if total > 0 {
+            tracing::info!(
+                %project_id,
+                propagated = total,
+                "Propagated {} LINKED_TO_TRANSITIVE links via IMPORTS graph",
+                total
+            );
+        }
+
+        Ok(total as usize)
+    }
+
     /// Propagate knowledge links via semantic similarity (embeddings).
     ///
     /// For each File in the project that has an embedding, queries the
@@ -1347,7 +1445,7 @@ impl Neo4jClient {
         );
 
         let q = query(&cypher)
-            .param("entity_id", match_value)
+            .param("entity_id", match_value.clone())
             .param("min_score", min_score);
 
         let mut result = self.graph.execute(q).await?;
@@ -1400,6 +1498,84 @@ impl Neo4jClient {
                 scar_intensity,
             });
         }
+
+        // Also include notes reached via LINKED_TO_TRANSITIVE (pre-computed
+        // transitive links along the IMPORTS graph). These have a stored weight
+        // that attenuates the score.
+        let seen_note_ids: std::collections::HashSet<Uuid> =
+            propagated_notes.iter().map(|pn| pn.note.id).collect();
+
+        let transitive_cypher = format!(
+            r#"
+            {}
+            MATCH (n:Note)-[t:LINKED_TO_TRANSITIVE]->(target)
+            WHERE n.status = 'active'
+            WITH n, t,
+                 CASE n.importance
+                     WHEN 'critical' THEN 1.0
+                     WHEN 'high' THEN 0.8
+                     WHEN 'medium' THEN 0.5
+                     ELSE 0.3
+                 END AS importance_weight
+            WITH n,
+                 coalesce(t.weight, 0.5) * importance_weight
+                 * (1.0 - COALESCE(n.scar_intensity, 0.0) * 0.5) AS score,
+                 t.depth AS depth, t.weight AS tw
+            WHERE score >= $min_score
+            RETURN DISTINCT n, score, 'transitive' AS source_entity,
+                   [] AS path_names, coalesce(depth, 1) AS distance,
+                   null AS avg_path_pagerank,
+                   ['LINKED_TO_TRANSITIVE'] AS relation_path,
+                   tw AS path_rel_weight,
+                   [] AS hop_weights
+            ORDER BY score DESC
+            LIMIT 10
+            "#,
+            target_match
+        );
+
+        let tq = query(&transitive_cypher)
+            .param("entity_id", match_value.clone())
+            .param("min_score", min_score);
+
+        if let Ok(mut tresult) = self.graph.execute(tq).await {
+            while let Ok(Some(row)) = tresult.next().await {
+                if let Ok(node) = row.get::<neo4rs::Node>("n") {
+                    if let Ok(note) = self.node_to_note(&node) {
+                        // Deduplicate: skip if already found via direct path
+                        if seen_note_ids.contains(&note.id) {
+                            continue;
+                        }
+                        let score: f64 = row.get("score").unwrap_or(0.0);
+                        let distance: i64 = row.get("distance").unwrap_or(1);
+                        let path_rel_weight: Option<f64> =
+                            row.get::<f64>("path_rel_weight").ok();
+                        let scar_intensity = note.scar_intensity;
+                        propagated_notes.push(PropagatedNote {
+                            note,
+                            relevance_score: score,
+                            source_entity: "transitive".to_string(),
+                            propagation_path: vec![],
+                            distance: distance as u32,
+                            path_pagerank: None,
+                            relation_path: vec![crate::notes::RelationHop::structural(
+                                "LINKED_TO_TRANSITIVE".to_string(),
+                            )],
+                            path_rel_weight,
+                            scar_intensity,
+                        });
+                    }
+                }
+            }
+        }
+
+        // Re-sort after merging transitive results
+        propagated_notes.sort_by(|a, b| {
+            b.relevance_score
+                .partial_cmp(&a.relevance_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        propagated_notes.truncate(20);
 
         // Cross-project coupling weighting (biomimicry P2P coupling)
         // If source_project_id is set, weight notes from other projects by coupling_strength.

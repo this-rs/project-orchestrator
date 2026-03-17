@@ -1359,6 +1359,18 @@ pub trait GraphStore: Send + Sync {
     /// Returns the number of propagated links created.
     async fn propagate_structural_links(&self, project_id: Uuid) -> Result<usize>;
 
+    /// Propagate LINKED_TO_TRANSITIVE relationships along the IMPORTS graph.
+    ///
+    /// When Note N is LINKED_TO File A, and File A IMPORTS File B:
+    ///   → create LINKED_TO_TRANSITIVE(N, B, weight=0.8×parent_weight)
+    /// When File B IMPORTS File C:
+    ///   → create LINKED_TO_TRANSITIVE(N, C, weight=0.64×parent_weight)
+    ///
+    /// Idempotent: deletes existing transitive links then recreates.
+    /// Max depth = 2 hops, weight cutoff at 0.3.
+    /// Returns the number of transitive links created.
+    async fn propagate_linked_to_transitive(&self, project_id: Uuid) -> Result<usize>;
+
     /// Propagate LINKED_TO via high-level entities (FeatureGraph, Skill, Protocol).
     /// Returns the number of propagated links created.
     async fn propagate_high_level_links(&self, project_id: Uuid) -> Result<usize>;

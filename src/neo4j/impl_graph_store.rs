@@ -1749,6 +1749,10 @@ impl GraphStore for Neo4jClient {
         self.propagate_structural_links(project_id).await
     }
 
+    async fn propagate_linked_to_transitive(&self, project_id: Uuid) -> anyhow::Result<usize> {
+        self.propagate_linked_to_transitive(project_id).await
+    }
+
     async fn propagate_high_level_links(&self, project_id: Uuid) -> anyhow::Result<usize> {
         self.propagate_high_level_links(project_id).await
     }
