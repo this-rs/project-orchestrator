@@ -2146,10 +2146,12 @@ impl Neo4jClient {
             UNWIND [{}] AS neighbor
             MATCH (target:Note {{id: neighbor.id}})
             MERGE (source)-[s1:SYNAPSE]->(target)
-            ON CREATE SET s1.weight = neighbor.weight, s1.created_at = datetime()
+            ON CREATE SET s1.weight = neighbor.weight, s1.created_at = datetime(),
+              s1.source = 'cosine'
             ON MATCH SET s1.weight = neighbor.weight
             MERGE (target)-[s2:SYNAPSE]->(source)
-            ON CREATE SET s2.weight = neighbor.weight, s2.created_at = datetime()
+            ON CREATE SET s2.weight = neighbor.weight, s2.created_at = datetime(),
+              s2.source = 'cosine'
             ON MATCH SET s2.weight = neighbor.weight
             RETURN count(s1) + count(s2) AS total
             "#,
@@ -2248,10 +2250,12 @@ impl Neo4jClient {
             MATCH (target {{id: neighbor.id}})
             WHERE target:Note OR target:Decision
             MERGE (source)-[s1:SYNAPSE]->(target)
-            ON CREATE SET s1.weight = neighbor.weight, s1.created_at = datetime()
+            ON CREATE SET s1.weight = neighbor.weight, s1.created_at = datetime(),
+              s1.source = 'cosine'
             ON MATCH SET s1.weight = neighbor.weight
             MERGE (target)-[s2:SYNAPSE]->(source)
-            ON CREATE SET s2.weight = neighbor.weight, s2.created_at = datetime()
+            ON CREATE SET s2.weight = neighbor.weight, s2.created_at = datetime(),
+              s2.source = 'cosine'
             ON MATCH SET s2.weight = neighbor.weight
             RETURN count(s1) + count(s2) AS total
             "#,
@@ -2485,22 +2489,26 @@ impl Neo4jClient {
             MATCH (a:Note {id: pair.a}), (b:Note {id: pair.b})
             MERGE (a)-[s1:SYNAPSE]->(b)
               ON CREATE SET s1.weight = 0.5, s1.created_at = datetime(),
-                s1.last_reinforced_at = datetime(), s1.reinforcement_count = 1
+                s1.last_reinforced_at = datetime(), s1.reinforcement_count = 1,
+                s1.source = 'coactivation'
               ON MATCH SET s1.weight = CASE
                   WHEN s1.weight + $boost > 1.0 THEN 1.0
                   ELSE s1.weight + $boost
               END,
                 s1.last_reinforced_at = datetime(),
-                s1.reinforcement_count = coalesce(s1.reinforcement_count, 0) + 1
+                s1.reinforcement_count = coalesce(s1.reinforcement_count, 0) + 1,
+                s1.source = CASE WHEN s1.source IS NULL OR s1.source = 'cosine' THEN 'coactivation' ELSE s1.source END
             MERGE (b)-[s2:SYNAPSE]->(a)
               ON CREATE SET s2.weight = 0.5, s2.created_at = datetime(),
-                s2.last_reinforced_at = datetime(), s2.reinforcement_count = 1
+                s2.last_reinforced_at = datetime(), s2.reinforcement_count = 1,
+                s2.source = 'coactivation'
               ON MATCH SET s2.weight = CASE
                   WHEN s2.weight + $boost > 1.0 THEN 1.0
                   ELSE s2.weight + $boost
               END,
                 s2.last_reinforced_at = datetime(),
-                s2.reinforcement_count = coalesce(s2.reinforcement_count, 0) + 1
+                s2.reinforcement_count = coalesce(s2.reinforcement_count, 0) + 1,
+                s2.source = CASE WHEN s2.source IS NULL OR s2.source = 'cosine' THEN 'coactivation' ELSE s2.source END
             "#,
             |q| q.param("boost", boost),
         )
@@ -2511,20 +2519,30 @@ impl Neo4jClient {
     }
 
     /// Decay all synapses and prune weak ones.
+    ///
+    /// Applies differentiated decay based on synapse source:
+    /// - `coactivation` synapses (validated by real usage) decay at `decay_amount`
+    /// - `cosine` synapses (statistical seed) decay at `2 × decay_amount`
+    /// - Synapses without a source tag decay at `2 × decay_amount` (legacy, treated as cosine)
     pub async fn decay_synapses(
         &self,
         decay_amount: f64,
         prune_threshold: f64,
     ) -> Result<(usize, usize)> {
-        // Step 1: Decay all synapses
+        // Step 1: Decay all synapses with differentiated rates
+        // Coactivation synapses (validated by usage) decay slower
         let decay_q = query(
             r#"
             MATCH ()-[s:SYNAPSE]->()
-            SET s.weight = s.weight - $decay_amount
+            SET s.weight = s.weight - CASE
+                WHEN s.source = 'coactivation' THEN $decay_amount
+                ELSE $decay_amount_cosine
+            END
             RETURN count(s) AS decayed
             "#,
         )
-        .param("decay_amount", decay_amount);
+        .param("decay_amount", decay_amount)
+        .param("decay_amount_cosine", decay_amount * 2.0);
 
         let mut result = self.graph.execute(decay_q).await?;
         let decayed = if let Some(row) = result.next().await? {

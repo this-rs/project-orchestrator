@@ -124,6 +124,9 @@ pub struct MockGraphStore {
     pub note_embeddings: RwLock<HashMap<Uuid, (Vec<f32>, String)>>,
     /// Note synapses: bidirectional adjacency list (note_id -> Vec<(neighbor_id, weight)>)
     pub note_synapses: RwLock<HashMap<Uuid, Vec<(Uuid, f64)>>>,
+    /// Synapse source tags: (note_a, note_b) -> source ("cosine" | "coactivation")
+    /// Sorted key pair (min, max) to ensure canonical ordering.
+    pub synapse_sources: RwLock<HashMap<(Uuid, Uuid), String>>,
     /// File embeddings (file_path -> (embedding, model_name))
     pub file_embeddings: RwLock<HashMap<String, (Vec<f32>, String)>>,
     /// Function embeddings ("file_path::func_name" -> (embedding, model_name))
@@ -258,6 +261,7 @@ impl MockGraphStore {
             function_analytics: RwLock::new(HashMap::new()),
             note_embeddings: RwLock::new(HashMap::new()),
             note_synapses: RwLock::new(HashMap::new()),
+            synapse_sources: RwLock::new(HashMap::new()),
             file_embeddings: RwLock::new(HashMap::new()),
             function_embeddings: RwLock::new(HashMap::new()),
             skills: RwLock::new(HashMap::new()),
@@ -5870,6 +5874,7 @@ impl GraphStore for MockGraphStore {
         }
 
         let mut synapses = self.note_synapses.write().await;
+        let mut sources = self.synapse_sources.write().await;
         let mut count = 0;
 
         for &(neighbor_id, weight) in neighbors {
@@ -5890,6 +5895,14 @@ impl GraphStore for MockGraphStore {
                 entry.push((note_id, weight));
             }
             count += 1;
+
+            // Tag source as cosine (backfill origin)
+            let key = if note_id < neighbor_id {
+                (note_id, neighbor_id)
+            } else {
+                (neighbor_id, note_id)
+            };
+            sources.entry(key).or_insert_with(|| "cosine".to_string());
         }
 
         Ok(count)
@@ -5964,6 +5977,7 @@ impl GraphStore for MockGraphStore {
         }
 
         let mut synapses = self.note_synapses.write().await;
+        let mut sources = self.synapse_sources.write().await;
         let mut count = 0usize;
 
         for i in 0..note_ids.len() {
@@ -5988,6 +6002,10 @@ impl GraphStore for MockGraphStore {
                     entry_b.push((a, 0.5));
                 }
                 count += 1;
+
+                // Tag source as coactivation (upgrade from cosine if applicable)
+                let key = if a < b { (a, b) } else { (b, a) };
+                sources.insert(key, "coactivation".to_string());
             }
         }
 
@@ -6000,16 +6018,33 @@ impl GraphStore for MockGraphStore {
         prune_threshold: f64,
     ) -> Result<(usize, usize)> {
         let mut synapses = self.note_synapses.write().await;
+        let sources = self.synapse_sources.read().await;
         let mut decayed = 0usize;
         let mut pruned = 0usize;
 
-        // Decay all synapses
-        for neighbors in synapses.values_mut() {
+        // Decay with differentiated rates: coactivation decays at base rate,
+        // cosine/unknown decays at 2x base rate
+        for (note_id, neighbors) in synapses.iter_mut() {
             for syn in neighbors.iter_mut() {
-                syn.1 -= decay_amount;
+                let key = if *note_id < syn.0 {
+                    (*note_id, syn.0)
+                } else {
+                    (syn.0, *note_id)
+                };
+                let is_coactivation = sources
+                    .get(&key)
+                    .map(|s| s == "coactivation")
+                    .unwrap_or(false);
+                let effective_decay = if is_coactivation {
+                    decay_amount
+                } else {
+                    decay_amount * 2.0
+                };
+                syn.1 -= effective_decay;
                 decayed += 1;
             }
         }
+        drop(sources);
 
         // Prune weak synapses
         for neighbors in synapses.values_mut() {
