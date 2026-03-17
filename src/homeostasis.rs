@@ -351,15 +351,9 @@ pub async fn execute_actions(
                         project_id = %pid,
                         "homeostasis: persisting ReduceInitialEnergy on project"
                     );
-                    match graph
-                        .set_default_note_energy(pid, Some(*energy))
-                        .await
-                    {
+                    match graph.set_default_note_energy(pid, Some(*energy)).await {
                         Ok(()) => {
-                            debug!(
-                                energy,
-                                "homeostasis: default_note_energy persisted"
-                            );
+                            debug!(energy, "homeostasis: default_note_energy persisted");
                             executed += 1;
                         }
                         Err(e) => {
@@ -693,7 +687,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.executed, 1);
-        let cursor = result.backfill_cursor.expect("backfill should return cursor");
+        let cursor = result
+            .backfill_cursor
+            .expect("backfill should return cursor");
         assert!(cursor.completed, "empty graph → backfill done immediately");
         assert_eq!(cursor.offset, 0);
     }
@@ -814,12 +810,12 @@ mod tests {
     #[test]
     fn test_backfill_params_synapse_boundaries() {
         // Exact boundary values for max_neighbors
-        assert_eq!(compute_backfill_params(100, 0.0).max_neighbors, 5);   // < 0.1
-        assert_eq!(compute_backfill_params(100, 0.1).max_neighbors, 4);   // 0.1-0.5
-        assert_eq!(compute_backfill_params(100, 0.5).max_neighbors, 3);   // 0.5-1.5
-        assert_eq!(compute_backfill_params(100, 1.5).max_neighbors, 2);   // 1.5-3.0
-        assert_eq!(compute_backfill_params(100, 3.0).max_neighbors, 2);   // <= 3.0
-        assert_eq!(compute_backfill_params(100, 3.01).max_neighbors, 1);  // > 3.0
+        assert_eq!(compute_backfill_params(100, 0.0).max_neighbors, 5); // < 0.1
+        assert_eq!(compute_backfill_params(100, 0.1).max_neighbors, 4); // 0.1-0.5
+        assert_eq!(compute_backfill_params(100, 0.5).max_neighbors, 3); // 0.5-1.5
+        assert_eq!(compute_backfill_params(100, 1.5).max_neighbors, 2); // 1.5-3.0
+        assert_eq!(compute_backfill_params(100, 3.0).max_neighbors, 2); // <= 3.0
+        assert_eq!(compute_backfill_params(100, 3.01).max_neighbors, 1); // > 3.0
     }
 
     #[tokio::test]
@@ -836,7 +832,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.executed, 1);
-        let cursor = result.backfill_cursor.expect("backfill should return cursor");
+        let cursor = result
+            .backfill_cursor
+            .expect("backfill should return cursor");
         assert!(cursor.completed, "empty graph → done immediately");
     }
 }

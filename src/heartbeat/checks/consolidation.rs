@@ -14,6 +14,10 @@ use crate::heartbeat::{HeartbeatCheck, HeartbeatContext};
 
 /// Consolidate ephemeral notes into long-term memory (every 2 hours).
 ///
+/// **Responsibility boundary**: this check is the SOLE owner of `consolidate_memory`.
+/// `HomeostasisCheck` does NOT call `consolidate_memory` — it focuses on synapse
+/// health and note density only. This avoids duplicate Neo4j calls per cycle.
+///
 /// This is idempotent: if no notes are eligible for promotion or archival,
 /// the operation is a no-op. Safe to run frequently.
 pub struct ConsolidationCheck;

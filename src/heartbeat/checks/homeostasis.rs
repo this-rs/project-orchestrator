@@ -167,11 +167,7 @@ impl HeartbeatCheck for HomeostasisCheck {
 
             // Reset default_note_energy when density drops back to normal
             if metrics.note_density <= 2.5 {
-                if let Err(e) = ctx
-                    .graph
-                    .set_default_note_energy(project.id, None)
-                    .await
-                {
+                if let Err(e) = ctx.graph.set_default_note_energy(project.id, None).await {
                     warn!(
                         "HomeostasisCheck: failed to reset default_note_energy for '{}': {}",
                         project.name, e
