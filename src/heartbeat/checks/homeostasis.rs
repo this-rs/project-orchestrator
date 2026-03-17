@@ -17,6 +17,7 @@
 //!
 //! Creates alerts when corrective actions are taken.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -24,6 +25,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
+use uuid::Uuid;
 
 use crate::heartbeat::{HeartbeatCheck, HeartbeatContext};
 use crate::homeostasis::{
@@ -45,19 +47,21 @@ const HOMEOSTASIS_TIMEOUT: Duration = Duration::from_secs(30);
 /// stable and no corrective actions are executed. This prevents erosion of a
 /// quiet graph (e.g., synapse decay with no new input to compensate).
 ///
-/// Backfill is paginated: each cycle processes one batch of notes, persisting
-/// a cursor in memory. The cursor resets when all notes have been processed
-/// or when the system becomes dormant.
+/// Backfill is paginated: each cycle processes one batch of notes per project,
+/// persisting a per-project cursor in memory. The cursor resets when all notes
+/// have been processed or when the system becomes dormant. Stale cursors for
+/// deleted projects are cleaned up lazily at the end of each run.
 pub struct HomeostasisCheck {
-    /// Backfill cursor persisted across cycles (in-memory only).
+    /// Per-project backfill cursors persisted across cycles (in-memory only).
     /// Uses a Mutex because HeartbeatCheck::run takes &self.
-    cursor: Mutex<BackfillCursor>,
+    /// Key = project UUID, value = that project's backfill cursor.
+    cursors: Mutex<HashMap<Uuid, BackfillCursor>>,
 }
 
 impl HomeostasisCheck {
     pub fn new() -> Self {
         Self {
-            cursor: Mutex::new(BackfillCursor::new()),
+            cursors: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -112,8 +116,8 @@ impl HeartbeatCheck for HomeostasisCheck {
                     project.name
                 );
                 // Reset cursor when dormant — stale offset is meaningless
-                let mut cursor = self.cursor.lock().await;
-                cursor.reset();
+                let mut cursors = self.cursors.lock().await;
+                cursors.remove(&project.id);
                 continue;
             }
 
@@ -161,8 +165,8 @@ impl HeartbeatCheck for HomeostasisCheck {
 
             // 5. Execute corrective actions (paginated backfill)
             let current_cursor = {
-                let cursor = self.cursor.lock().await;
-                cursor.clone()
+                let cursors = self.cursors.lock().await;
+                cursors.get(&project.id).cloned().unwrap_or_default()
             };
 
             // Reset default_note_energy when density drops back to normal
@@ -207,22 +211,22 @@ impl HeartbeatCheck for HomeostasisCheck {
                         project.name
                     );
 
-                    // Update the persisted cursor
+                    // Update the persisted cursor for this project
                     if let Some(new_cursor) = result.backfill_cursor {
-                        let mut cursor = self.cursor.lock().await;
+                        let mut cursors = self.cursors.lock().await;
                         if new_cursor.completed {
                             debug!(
                                 "HomeostasisCheck: backfill completed for '{}', resetting cursor",
                                 project.name
                             );
-                            cursor.reset();
+                            cursors.remove(&project.id);
                         } else {
                             debug!(
                                 offset = new_cursor.offset,
                                 "HomeostasisCheck: backfill partial for '{}', cursor advanced",
                                 project.name
                             );
-                            *cursor = new_cursor;
+                            cursors.insert(project.id, new_cursor);
                         }
                     }
 
@@ -251,6 +255,15 @@ impl HeartbeatCheck for HomeostasisCheck {
                     );
                 }
             }
+        }
+
+        // Lazy cleanup: remove cursors for projects that no longer exist.
+        // This prevents unbounded growth if projects are deleted.
+        {
+            let project_ids: std::collections::HashSet<Uuid> =
+                projects.iter().map(|p| p.id).collect();
+            let mut cursors = self.cursors.lock().await;
+            cursors.retain(|pid, _| project_ids.contains(pid));
         }
 
         Ok(())
