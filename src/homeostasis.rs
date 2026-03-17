@@ -178,6 +178,59 @@ pub struct ExecuteResult {
 }
 
 // ============================================================================
+// Adaptive backfill parameters
+// ============================================================================
+
+/// Computed backfill parameters adapted to the project size and synapse health.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BackfillParams {
+    /// Number of notes to process per backfill cycle.
+    pub batch_size: usize,
+    /// Maximum number of synapse neighbors per note (top-K).
+    pub max_neighbors: usize,
+}
+
+/// Compute adaptive backfill parameters based on project size and health.
+///
+/// # Batch size formula
+/// - Small projects (≤ 100 notes): `max(5, total / 10)` — process quickly
+/// - Medium projects (101-1000): `max(10, total / 20)` — moderate pace
+/// - Large projects (> 1000): `min(50, total / 50)` — controlled pagination
+///
+/// # Max neighbors formula
+/// - Very sparse (synapse_health < 0.1): 5 — aggressively connect
+/// - Sparse (0.1 - 0.5): 4
+/// - Moderate (0.5 - 1.5): 3 — standard density target
+/// - Dense (1.5 - 3.0): 2 — light touch
+/// - Very dense (> 3.0): 1 — minimal (should be decaying, not backfilling)
+pub fn compute_backfill_params(total_notes: usize, synapse_health: f64) -> BackfillParams {
+    let batch_size = if total_notes <= 100 {
+        (total_notes / 10).max(5)
+    } else if total_notes <= 1000 {
+        (total_notes / 20).max(10)
+    } else {
+        (total_notes / 50).min(50).max(10)
+    };
+
+    let max_neighbors = if synapse_health < 0.1 {
+        5
+    } else if synapse_health < 0.5 {
+        4
+    } else if synapse_health < 1.5 {
+        3
+    } else if synapse_health <= 3.0 {
+        2
+    } else {
+        1
+    };
+
+    BackfillParams {
+        batch_size,
+        max_neighbors,
+    }
+}
+
+// ============================================================================
 // Action executor
 // ============================================================================
 
@@ -202,6 +255,7 @@ pub async fn execute_actions(
     actions: &[HomeostasisAction],
     cursor: Option<&BackfillCursor>,
     project_id: Option<Uuid>,
+    backfill_params: Option<&BackfillParams>,
 ) -> Result<ExecuteResult> {
     let mut executed = 0;
     let mut new_cursor: Option<BackfillCursor> = None;
@@ -229,18 +283,24 @@ pub async fn execute_actions(
             HomeostasisAction::BackfillSynapses => {
                 if let Some(search) = search {
                     let offset = cursor.map(|c| c.offset).unwrap_or(0);
+                    let default_params = BackfillParams {
+                        batch_size: DEFAULT_BACKFILL_BATCH_SIZE,
+                        max_neighbors: 3,
+                    };
+                    let params = backfill_params.unwrap_or(&default_params);
                     info!(
                         offset,
-                        batch_size = DEFAULT_BACKFILL_BATCH_SIZE,
-                        "homeostasis: executing BackfillSynapses (paginated)"
+                        batch_size = params.batch_size,
+                        max_neighbors = params.max_neighbors,
+                        "homeostasis: executing BackfillSynapses (adaptive, paginated)"
                     );
                     let note_manager = NoteManager::new(Arc::clone(graph), Arc::clone(search));
-                    // Use conservative parameters for heartbeat context:
-                    // - batch_size from constant (paginated per cycle)
-                    // - min_similarity=0.0 (auto-calibrate from existing weights)
-                    // - max_neighbors=3 (top-K=3, recommended density target)
+                    // Parameters are adaptive when backfill_params is provided:
+                    // - batch_size: scaled by total_notes (small → fast, large → paginated)
+                    // - min_similarity=0.0: auto-calibrate from existing weights
+                    // - max_neighbors: scaled by synapse_health (sparse → more, dense → less)
                     match note_manager
-                        .backfill_synapses(DEFAULT_BACKFILL_BATCH_SIZE, 0.0, 3, None)
+                        .backfill_synapses(params.batch_size, 0.0, params.max_neighbors, None)
                         .await
                     {
                         Ok(progress) => {
@@ -571,7 +631,7 @@ mod tests {
             amount: 0.02,
             prune_threshold: 0.15,
         }];
-        let result = execute_actions(&graph, None, &actions, None, None)
+        let result = execute_actions(&graph, None, &actions, None, None, None)
             .await
             .unwrap();
         assert_eq!(result.executed, 1);
@@ -583,7 +643,7 @@ mod tests {
         let graph: Arc<dyn GraphStore> = Arc::new(MockGraphStore::new());
         let actions = vec![HomeostasisAction::ReduceInitialEnergy(0.5)];
         // No project_id → skips persistence
-        let result = execute_actions(&graph, None, &actions, None, None)
+        let result = execute_actions(&graph, None, &actions, None, None, None)
             .await
             .unwrap();
         assert_eq!(result.executed, 0);
@@ -599,7 +659,7 @@ mod tests {
         let graph: Arc<dyn GraphStore> = mock.clone();
 
         let actions = vec![HomeostasisAction::ReduceInitialEnergy(0.5)];
-        let result = execute_actions(&graph, None, &actions, None, Some(project.id))
+        let result = execute_actions(&graph, None, &actions, None, Some(project.id), None)
             .await
             .unwrap();
         assert_eq!(result.executed, 1);
@@ -613,7 +673,7 @@ mod tests {
     async fn test_execute_backfill_without_search_skips() {
         let graph: Arc<dyn GraphStore> = Arc::new(MockGraphStore::new());
         let actions = vec![HomeostasisAction::BackfillSynapses];
-        let result = execute_actions(&graph, None, &actions, None, None)
+        let result = execute_actions(&graph, None, &actions, None, None, None)
             .await
             .unwrap();
         assert_eq!(result.executed, 0);
@@ -629,7 +689,7 @@ mod tests {
         let search: Arc<dyn crate::meilisearch::SearchStore> = Arc::new(MockSearchStore::new());
         let actions = vec![HomeostasisAction::BackfillSynapses];
 
-        let result = execute_actions(&graph, Some(&search), &actions, None, None)
+        let result = execute_actions(&graph, Some(&search), &actions, None, None, None)
             .await
             .unwrap();
         assert_eq!(result.executed, 1);
@@ -648,7 +708,7 @@ mod tests {
             offset: 10,
             completed: false,
         };
-        let result = execute_actions(&graph, Some(&search), &actions, Some(&cursor), None)
+        let result = execute_actions(&graph, Some(&search), &actions, Some(&cursor), None, None)
             .await
             .unwrap();
         let new_cursor = result.backfill_cursor.expect("should have cursor");
@@ -667,7 +727,7 @@ mod tests {
             HomeostasisAction::BackfillSynapses,
         ];
 
-        let result = execute_actions(&graph, Some(&search), &actions, None, None)
+        let result = execute_actions(&graph, Some(&search), &actions, None, None, None)
             .await
             .unwrap();
         assert_eq!(result.executed, 2);
@@ -677,5 +737,106 @@ mod tests {
     #[test]
     fn test_default_backfill_batch_size() {
         assert_eq!(DEFAULT_BACKFILL_BATCH_SIZE, 20);
+    }
+
+    // ========================================================================
+    // compute_backfill_params tests
+    // ========================================================================
+
+    #[test]
+    fn test_backfill_params_small_project() {
+        // ≤ 100 notes: batch = max(5, total / 10)
+        let params = compute_backfill_params(50, 0.05);
+        assert_eq!(params.batch_size, 5); // 50/10 = 5
+        assert_eq!(params.max_neighbors, 5); // very sparse (<0.1)
+    }
+
+    #[test]
+    fn test_backfill_params_small_project_min_batch() {
+        // Very small project: batch floors at 5
+        let params = compute_backfill_params(20, 1.0);
+        assert_eq!(params.batch_size, 5); // max(5, 20/10=2) = 5
+        assert_eq!(params.max_neighbors, 3); // moderate (0.5-1.5)
+    }
+
+    #[test]
+    fn test_backfill_params_medium_project() {
+        // 101-1000: batch = max(10, total / 20)
+        let params = compute_backfill_params(500, 0.3);
+        assert_eq!(params.batch_size, 25); // 500/20 = 25
+        assert_eq!(params.max_neighbors, 4); // sparse (0.1-0.5)
+    }
+
+    #[test]
+    fn test_backfill_params_medium_project_min_batch() {
+        // Small medium project: batch floors at 10
+        let params = compute_backfill_params(150, 2.0);
+        assert_eq!(params.batch_size, 10); // max(10, 150/20=7) = 10
+        assert_eq!(params.max_neighbors, 2); // dense (1.5-3.0)
+    }
+
+    #[test]
+    fn test_backfill_params_large_project() {
+        // > 1000: batch = min(50, total / 50), floored at 10
+        let params = compute_backfill_params(5000, 0.8);
+        assert_eq!(params.batch_size, 50); // min(50, 5000/50=100) = 50
+        assert_eq!(params.max_neighbors, 3); // moderate (0.5-1.5)
+    }
+
+    #[test]
+    fn test_backfill_params_large_project_moderate() {
+        let params = compute_backfill_params(2000, 4.0);
+        assert_eq!(params.batch_size, 40); // min(50, 2000/50=40) = 40
+        assert_eq!(params.max_neighbors, 1); // very dense (>3.0)
+    }
+
+    #[test]
+    fn test_backfill_params_boundary_100() {
+        let params = compute_backfill_params(100, 1.0);
+        assert_eq!(params.batch_size, 10); // 100/10 = 10 (small path)
+        assert_eq!(params.max_neighbors, 3);
+    }
+
+    #[test]
+    fn test_backfill_params_boundary_1000() {
+        let params = compute_backfill_params(1000, 0.15);
+        assert_eq!(params.batch_size, 50); // 1000/20 = 50 (medium path)
+        assert_eq!(params.max_neighbors, 4); // sparse (0.1-0.5)
+    }
+
+    #[test]
+    fn test_backfill_params_zero_notes() {
+        let params = compute_backfill_params(0, 0.0);
+        assert_eq!(params.batch_size, 5); // max(5, 0/10=0) = 5
+        assert_eq!(params.max_neighbors, 5); // very sparse
+    }
+
+    #[test]
+    fn test_backfill_params_synapse_boundaries() {
+        // Exact boundary values for max_neighbors
+        assert_eq!(compute_backfill_params(100, 0.0).max_neighbors, 5);   // < 0.1
+        assert_eq!(compute_backfill_params(100, 0.1).max_neighbors, 4);   // 0.1-0.5
+        assert_eq!(compute_backfill_params(100, 0.5).max_neighbors, 3);   // 0.5-1.5
+        assert_eq!(compute_backfill_params(100, 1.5).max_neighbors, 2);   // 1.5-3.0
+        assert_eq!(compute_backfill_params(100, 3.0).max_neighbors, 2);   // <= 3.0
+        assert_eq!(compute_backfill_params(100, 3.01).max_neighbors, 1);  // > 3.0
+    }
+
+    #[tokio::test]
+    async fn test_execute_backfill_with_custom_params() {
+        let graph: Arc<dyn GraphStore> = Arc::new(MockGraphStore::new());
+        let search: Arc<dyn crate::meilisearch::SearchStore> = Arc::new(MockSearchStore::new());
+        let actions = vec![HomeostasisAction::BackfillSynapses];
+        let params = BackfillParams {
+            batch_size: 10,
+            max_neighbors: 5,
+        };
+
+        let result = execute_actions(&graph, Some(&search), &actions, None, None, Some(&params))
+            .await
+            .unwrap();
+        assert_eq!(result.executed, 1);
+        let cursor = result.backfill_cursor.expect("backfill should return cursor");
+        assert!(cursor.completed, "empty graph → done immediately");
     }
 }

@@ -27,7 +27,8 @@ use tracing::{debug, info, warn};
 
 use crate::heartbeat::{HeartbeatCheck, HeartbeatContext};
 use crate::homeostasis::{
-    execute_actions, BackfillCursor, HomeostasisController, HomeostasisMetrics,
+    compute_backfill_params, execute_actions, BackfillCursor, HomeostasisController,
+    HomeostasisMetrics,
 };
 
 /// Pain score below which we consider the system dormant/stable.
@@ -178,6 +179,29 @@ impl HeartbeatCheck for HomeostasisCheck {
                 }
             }
 
+            // 5b. Compute adaptive backfill parameters from neural metrics
+            let backfill_params = match ctx.graph.get_neural_metrics(project.id).await {
+                Ok(neural) => {
+                    let total_notes = neural.total_notes_count as usize;
+                    let params = compute_backfill_params(total_notes, metrics.synapse_health);
+                    debug!(
+                        total_notes,
+                        batch_size = params.batch_size,
+                        max_neighbors = params.max_neighbors,
+                        "HomeostasisCheck: computed adaptive backfill params for '{}'",
+                        project.name
+                    );
+                    Some(params)
+                }
+                Err(e) => {
+                    warn!(
+                        "HomeostasisCheck: get_neural_metrics failed for '{}': {}, using defaults",
+                        project.name, e
+                    );
+                    None
+                }
+            };
+
             let graph_arc: Arc<dyn crate::neo4j::traits::GraphStore> = Arc::clone(&ctx.graph);
             match execute_actions(
                 &graph_arc,
@@ -185,6 +209,7 @@ impl HeartbeatCheck for HomeostasisCheck {
                 &actions,
                 Some(&current_cursor),
                 Some(project.id),
+                backfill_params.as_ref(),
             )
             .await
             {
