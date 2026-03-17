@@ -176,7 +176,8 @@ pub async fn run_augmentation(
                 }
             }
 
-            if report.source_count.is_multiple_of(config.log_interval) {
+            #[allow(clippy::manual_is_multiple_of)]
+            if config.log_interval > 0 && report.source_count % config.log_interval == 0 {
                 tracing::info!(
                     source_count = report.source_count,
                     generated = report.generated_count,
@@ -239,5 +240,126 @@ mod tests {
             errors: vec![],
         };
         assert_eq!(report.errors.len(), 0);
+    }
+
+    #[test]
+    fn test_augmentation_config_custom() {
+        let mcts_config = MctsConfig {
+            expansion_width: 8,
+            num_rollouts: 100,
+            exploration_c: 1.5,
+            max_alternatives: 3,
+            gamma: 0.95,
+        };
+
+        let config = AugmentationConfig {
+            max_sim_ratio: 5.0,
+            sim_weight: 0.5,
+            mcts: mcts_config,
+            batch_size: 25,
+            log_interval: 50,
+        };
+
+        assert!((config.max_sim_ratio - 5.0).abs() < 1e-10);
+        assert!((config.sim_weight - 0.5).abs() < 1e-10);
+        assert_eq!(config.batch_size, 25);
+        assert_eq!(config.log_interval, 50);
+        assert_eq!(config.mcts.expansion_width, 8);
+        assert_eq!(config.mcts.num_rollouts, 100);
+        assert!((config.mcts.exploration_c - 1.5).abs() < 1e-10);
+        assert_eq!(config.mcts.max_alternatives, 3);
+        assert!((config.mcts.gamma - 0.95).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_report_accumulation() {
+        let mut report = AugmentationReport {
+            source_count: 10,
+            generated_count: 45,
+            persisted_count: 40,
+            skipped_count: 2,
+            duration_ms: 1500,
+            errors: vec![],
+        };
+
+        // Simulate accumulating errors during a batch run
+        report
+            .errors
+            .push("Failed to persist simulated trajectory abc: connection timeout".to_string());
+        report
+            .errors
+            .push("MCTS failed for trajectory def: invalid state".to_string());
+
+        assert_eq!(report.source_count, 10);
+        assert_eq!(report.generated_count, 45);
+        assert_eq!(report.persisted_count, 40);
+        assert_eq!(report.skipped_count, 2);
+        assert_eq!(report.duration_ms, 1500);
+        assert_eq!(report.errors.len(), 2);
+        assert!(report.errors[0].contains("connection timeout"));
+        assert!(report.errors[1].contains("invalid state"));
+
+        // Verify the difference between generated and persisted matches expectations
+        let failed_or_skipped = report.generated_count - report.persisted_count;
+        assert_eq!(
+            failed_or_skipped, 5,
+            "5 trajectories were generated but not persisted"
+        );
+    }
+
+    #[test]
+    fn test_max_sim_ratio_computation() {
+        // Mirrors the formula from run_augmentation:
+        // max_new_sims = (real_count as f64 * max_sim_ratio) as usize - sim_count
+
+        let config = AugmentationConfig {
+            max_sim_ratio: 10.0,
+            ..Default::default()
+        };
+
+        // Case 1: No existing simulations — full budget available
+        let real_count: usize = 100;
+        let sim_count: usize = 0;
+        let max_new_sims =
+            ((real_count as f64 * config.max_sim_ratio) as usize).saturating_sub(sim_count);
+        assert_eq!(
+            max_new_sims, 1000,
+            "100 real * 10.0 ratio - 0 existing = 1000"
+        );
+
+        // Case 2: Some simulations already exist
+        let sim_count: usize = 300;
+        let max_new_sims =
+            ((real_count as f64 * config.max_sim_ratio) as usize).saturating_sub(sim_count);
+        assert_eq!(
+            max_new_sims, 700,
+            "100 real * 10.0 ratio - 300 existing = 700"
+        );
+
+        // Case 3: Ratio limit already reached
+        let sim_count: usize = 1000;
+        let max_new_sims =
+            ((real_count as f64 * config.max_sim_ratio) as usize).saturating_sub(sim_count);
+        assert_eq!(
+            max_new_sims, 0,
+            "Limit reached: no more simulations allowed"
+        );
+
+        // Case 4: Over the limit (saturating_sub prevents underflow)
+        let sim_count: usize = 1500;
+        let max_new_sims =
+            ((real_count as f64 * config.max_sim_ratio) as usize).saturating_sub(sim_count);
+        assert_eq!(max_new_sims, 0, "Over limit: saturating_sub returns 0");
+
+        // Case 5: Different ratio
+        let config_low = AugmentationConfig {
+            max_sim_ratio: 2.0,
+            ..Default::default()
+        };
+        let real_count: usize = 50;
+        let sim_count: usize = 30;
+        let max_new_sims =
+            ((real_count as f64 * config_low.max_sim_ratio) as usize).saturating_sub(sim_count);
+        assert_eq!(max_new_sims, 70, "50 real * 2.0 ratio - 30 existing = 70");
     }
 }

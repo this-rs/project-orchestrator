@@ -205,3 +205,211 @@ pub async fn search_similar(
 
     Ok(Json(SimilarSearchResponse { results, count }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::handlers::ServerState;
+    use crate::events::EventBus;
+    use crate::orchestrator::{FileWatcher, Orchestrator};
+    use crate::test_helpers::{mock_app_state, mock_neural_router, mock_trajectory_store};
+    use std::sync::Arc;
+
+    /// Build a minimal `OrchestratorState` with trajectory_store = None.
+    async fn test_state_no_store() -> OrchestratorState {
+        let app_state = mock_app_state();
+        let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
+        let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
+            orchestrator.clone(),
+        )));
+        Arc::new(ServerState {
+            orchestrator,
+            watcher,
+            chat_manager: None,
+            event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(
+                EventBus::default(),
+            ))),
+            nats_emitter: None,
+            auth_config: None,
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+            setup_completed: true,
+            server_port: 0,
+            public_url: None,
+            ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
+            registry_remote_url: None,
+            oidc_client: None,
+            neural_router: mock_neural_router(),
+            trajectory_collector: None,
+            trajectory_store: None,
+            identity: None,
+        })
+    }
+
+    /// Build a minimal `OrchestratorState` with a NoopStore trajectory store.
+    async fn test_state_with_store() -> OrchestratorState {
+        let app_state = mock_app_state();
+        let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
+        let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
+            orchestrator.clone(),
+        )));
+        Arc::new(ServerState {
+            orchestrator,
+            watcher,
+            chat_manager: None,
+            event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(
+                EventBus::default(),
+            ))),
+            nats_emitter: None,
+            auth_config: None,
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+            setup_completed: true,
+            server_port: 0,
+            public_url: None,
+            ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
+            registry_remote_url: None,
+            oidc_client: None,
+            neural_router: mock_neural_router(),
+            trajectory_collector: None,
+            trajectory_store: Some(mock_trajectory_store()),
+            identity: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn test_get_store_returns_error_when_none() {
+        let state = test_state_no_store().await;
+        let result = get_store(&state);
+        assert!(result.is_err());
+        match result {
+            Err(AppError::BadRequest(msg)) => {
+                assert!(msg.contains("Trajectory store not available"));
+            }
+            Err(other) => panic!("Expected BadRequest, got {:?}", other),
+            Ok(_) => panic!("Expected error, got Ok"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_store_succeeds_with_store() {
+        let state = test_state_with_store().await;
+        let result = get_store(&state);
+        assert!(
+            result.is_ok(),
+            "get_store should succeed when store is present"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_trajectories_default_params() {
+        let state = test_state_with_store().await;
+
+        // Call with default/empty query params
+        let query = ListTrajectoriesQuery {
+            session_id: None,
+            min_reward: None,
+            max_reward: None,
+            min_steps: None,
+            max_steps: None,
+            limit: None,
+            offset: None,
+        };
+
+        let result = list_trajectories(State(state), Query(query)).await;
+        assert!(
+            result.is_ok(),
+            "list_trajectories should succeed with default params"
+        );
+
+        let resp = result.unwrap().0;
+        // NoopStore returns empty vec
+        assert_eq!(resp.count, 0);
+        assert!(resp.trajectories.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_list_trajectories_no_store() {
+        let state = test_state_no_store().await;
+
+        let query = ListTrajectoriesQuery {
+            session_id: None,
+            min_reward: None,
+            max_reward: None,
+            min_steps: None,
+            max_steps: None,
+            limit: Some(10),
+            offset: Some(0),
+        };
+
+        let result = list_trajectories(State(state), Query(query)).await;
+        assert!(result.is_err(), "should fail when store is None");
+    }
+
+    #[tokio::test]
+    async fn test_search_similar_validates_embedding_dim() {
+        let state = test_state_with_store().await;
+
+        // Send a wrong-dimension embedding (e.g. 10d instead of TOTAL_DIM=256)
+        let req = SimilarSearchRequest {
+            embedding: vec![0.0f32; 10],
+            top_k: None,
+            min_similarity: None,
+        };
+
+        let result = search_similar(State(state), Json(req)).await;
+        assert!(result.is_err(), "wrong dimension should return an error");
+
+        match result.unwrap_err() {
+            AppError::BadRequest(msg) => {
+                assert!(
+                    msg.contains("256d")
+                        || msg.contains(&neural_routing_runtime::TOTAL_DIM.to_string())
+                );
+                assert!(msg.contains("10d"));
+            }
+            other => panic!("Expected BadRequest, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_search_similar_correct_dim() {
+        let state = test_state_with_store().await;
+
+        let req = SimilarSearchRequest {
+            embedding: vec![0.0f32; neural_routing_runtime::TOTAL_DIM],
+            top_k: Some(5),
+            min_similarity: Some(0.5),
+        };
+
+        let result = search_similar(State(state), Json(req)).await;
+        assert!(result.is_ok(), "correct dimension should succeed");
+
+        let resp = result.unwrap().0;
+        // NoopStore returns empty results
+        assert_eq!(resp.count, 0);
+        assert!(resp.results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_stats_with_store() {
+        let state = test_state_with_store().await;
+
+        let result = get_stats(State(state)).await;
+        assert!(
+            result.is_ok(),
+            "get_stats should succeed with store present"
+        );
+
+        let resp = result.unwrap().0;
+        assert_eq!(resp.stats.total_count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_get_stats_no_store() {
+        let state = test_state_no_store().await;
+
+        let result = get_stats(State(state)).await;
+        assert!(result.is_err(), "get_stats should fail when store is None");
+    }
+}

@@ -496,4 +496,199 @@ mod tests {
             }
         }
     }
+
+    #[tokio::test]
+    async fn test_mcts_single_node_source() {
+        let proxy = GdsHeuristicProxy::default();
+        let config = MctsConfig {
+            expansion_width: 5,
+            num_rollouts: 20,
+            max_alternatives: 5,
+            ..Default::default()
+        };
+        let engine = MctsEngine::new(config, proxy);
+        let source = make_source_trajectory(1);
+
+        let alternatives = engine.generate_alternatives(&source).await.unwrap();
+
+        // With a single node source, we may get empty results (path_differs_from_source
+        // rejects single-step paths that match the source length but don't differ enough)
+        // or valid alternatives — either way, no panics and results are well-formed.
+        for alt in &alternatives {
+            assert_eq!(alt.step_count, alt.nodes.len());
+            assert!(alt.session_id.starts_with("mcts-sim-"));
+            assert!(alt.total_reward.is_finite());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_mcts_deep_tree() {
+        let proxy = GdsHeuristicProxy::default();
+        let config = MctsConfig {
+            expansion_width: 5,
+            num_rollouts: 200,
+            max_alternatives: 10,
+            ..Default::default()
+        };
+        let engine = MctsEngine::new(config, proxy);
+        let source = make_source_trajectory(12);
+
+        let alternatives = engine.generate_alternatives(&source).await.unwrap();
+
+        assert!(
+            !alternatives.is_empty(),
+            "Deep tree with 200 rollouts should produce at least 1 alternative"
+        );
+
+        // Verify diversity: not all alternatives should have the same action sequence
+        if alternatives.len() >= 2 {
+            let first_actions: Vec<&str> = alternatives[0]
+                .nodes
+                .iter()
+                .map(|n| n.action_type.as_str())
+                .collect();
+            let all_same = alternatives[1..].iter().all(|alt| {
+                let actions: Vec<&str> = alt.nodes.iter().map(|n| n.action_type.as_str()).collect();
+                actions == first_actions
+            });
+            assert!(
+                !all_same,
+                "Multiple alternatives should have diverse action sequences"
+            );
+        }
+
+        // Verify tree depth: at least some alternatives should have multiple nodes
+        let max_depth = alternatives
+            .iter()
+            .map(|a| a.nodes.len())
+            .max()
+            .unwrap_or(0);
+        assert!(
+            max_depth >= 2,
+            "At least one alternative should have depth >= 2, got {}",
+            max_depth
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mcts_max_alternatives_limit() {
+        let proxy = GdsHeuristicProxy::default();
+        let config = MctsConfig {
+            expansion_width: 5,
+            num_rollouts: 50,
+            max_alternatives: 1,
+            ..Default::default()
+        };
+        let engine = MctsEngine::new(config, proxy);
+        let source = make_source_trajectory(5);
+
+        let alternatives = engine.generate_alternatives(&source).await.unwrap();
+
+        assert!(
+            alternatives.len() <= 1,
+            "max_alternatives=1 should produce at most 1 result, got {}",
+            alternatives.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mcts_simulated_session_id_format() {
+        let proxy = GdsHeuristicProxy::default();
+        let config = MctsConfig {
+            expansion_width: 5,
+            num_rollouts: 30,
+            max_alternatives: 5,
+            ..Default::default()
+        };
+        let engine = MctsEngine::new(config, proxy);
+        let source = make_source_trajectory(4);
+        let source_id = source.id;
+
+        let alternatives = engine.generate_alternatives(&source).await.unwrap();
+
+        for alt in &alternatives {
+            assert!(
+                alt.session_id.starts_with("mcts-sim-"),
+                "Session ID should start with 'mcts-sim-', got '{}'",
+                alt.session_id
+            );
+            let expected_suffix = source_id.to_string();
+            assert!(
+                alt.session_id.ends_with(&expected_suffix),
+                "Session ID should end with source trajectory id '{}', got '{}'",
+                expected_suffix,
+                alt.session_id
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_mcts_gamma_zero() {
+        let proxy = GdsHeuristicProxy::default();
+        let config = MctsConfig {
+            expansion_width: 5,
+            num_rollouts: 30,
+            max_alternatives: 5,
+            gamma: 0.0,
+            ..Default::default()
+        };
+        let engine = MctsEngine::new(config, proxy);
+        let source = make_source_trajectory(4);
+
+        let alternatives = engine.generate_alternatives(&source).await.unwrap();
+
+        // gamma=0.0 means no discount — engine should still produce valid results
+        for alt in &alternatives {
+            assert!(
+                alt.total_reward.is_finite(),
+                "Reward should be finite even with gamma=0.0, got {}",
+                alt.total_reward
+            );
+            assert_eq!(alt.step_count, alt.nodes.len());
+            for node in &alt.nodes {
+                assert!(node.local_reward.is_finite());
+                assert!(node.cumulative_reward.is_finite());
+            }
+        }
+    }
+
+    #[test]
+    fn test_mcts_expansion_width() {
+        let proxy = GdsHeuristicProxy::default();
+        let expansion_width = 4;
+        let config = MctsConfig {
+            expansion_width,
+            ..Default::default()
+        };
+        let engine = MctsEngine::new(config, proxy);
+        let source = make_source_trajectory(3);
+
+        // Create a root node and expand it
+        let mut root = MctsNode::new(
+            source.nodes[0].action_type.clone(),
+            source.nodes[0].action_params.clone(),
+            0,
+        );
+
+        engine.expand(&mut root, &source);
+
+        // generate_action_alternatives filters out the source action from tool_actions,
+        // takes up to expansion_width, then adds the original action back.
+        // So children count should be <= expansion_width + 1 (alternatives + original).
+        assert!(
+            !root.children.is_empty(),
+            "Expansion should create at least 1 child"
+        );
+        assert!(
+            root.children.len() <= expansion_width + 1,
+            "Expansion should create at most expansion_width + 1 children, got {}",
+            root.children.len()
+        );
+
+        // Verify all children are at depth 1
+        for child in root.children.values() {
+            assert_eq!(child.depth, 1, "Children should be at depth 1");
+            assert_eq!(child.visit_count, 0, "New children should have 0 visits");
+        }
+    }
 }

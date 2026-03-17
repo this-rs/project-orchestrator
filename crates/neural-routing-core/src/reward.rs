@@ -302,4 +302,161 @@ mod tests {
         let rewards = strategy.decompose(&[], 1.0).await.unwrap();
         assert!(rewards.is_empty());
     }
+
+    #[tokio::test]
+    async fn test_create_reward_strategy_td() {
+        let config = RewardConfig {
+            strategy: "td".to_string(),
+            gamma: 0.99,
+        };
+        let strategy = create_reward_strategy(&config);
+        assert_eq!(strategy.name(), "td");
+
+        let nodes = make_nodes(3);
+        let rewards = strategy.decompose(&nodes, 1.0).await.unwrap();
+        assert_eq!(rewards.len(), 3);
+        let sum: f64 = rewards.iter().sum();
+        assert!(
+            (sum - 1.0).abs() < 0.05,
+            "TD rewards should sum to ~1.0, got {}",
+            sum
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_reward_strategy_hindsight() {
+        let config = RewardConfig {
+            strategy: "hindsight".to_string(),
+            gamma: 0.99,
+        };
+        let strategy = create_reward_strategy(&config);
+        assert_eq!(strategy.name(), "hindsight");
+
+        let nodes = make_nodes(3);
+        let rewards = strategy.decompose(&nodes, 1.0).await.unwrap();
+        assert_eq!(rewards.len(), 3);
+        let sum: f64 = rewards.iter().sum();
+        assert!(
+            (sum - 1.0).abs() < 0.01,
+            "Hindsight rewards should sum to ~1.0, got {}",
+            sum
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_reward_strategy_attention() {
+        let config = RewardConfig {
+            strategy: "attention".to_string(),
+            gamma: 0.99,
+        };
+        let strategy = create_reward_strategy(&config);
+        assert_eq!(strategy.name(), "attention");
+
+        let nodes = make_nodes(3);
+        let rewards = strategy.decompose(&nodes, 1.0).await.unwrap();
+        assert_eq!(rewards.len(), 3);
+        let sum: f64 = rewards.iter().sum();
+        assert!(
+            (sum - 1.0).abs() < 0.01,
+            "Attention rewards should sum to ~1.0, got {}",
+            sum
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_reward_strategy_unknown_fallback() {
+        let config = RewardConfig {
+            strategy: "nonexistent_strategy".to_string(),
+            gamma: 0.95,
+        };
+        let strategy = create_reward_strategy(&config);
+        // Should fall back to TD
+        assert_eq!(strategy.name(), "td");
+
+        let nodes = make_nodes(3);
+        let rewards = strategy.decompose(&nodes, 1.0).await.unwrap();
+        assert_eq!(rewards.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_td_zero_confidences() {
+        let strategy = TDRewardStrategy::default();
+        let nodes: Vec<TrajectoryNode> = (0..4)
+            .map(|i| TrajectoryNode {
+                id: Uuid::new_v4(),
+                context_embedding: vec![],
+                action_type: format!("action_{}", i),
+                action_params: serde_json::Value::Null,
+                alternatives_count: 3,
+                chosen_index: 0,
+                confidence: 0.0, // all zero
+                local_reward: 0.0,
+                cumulative_reward: 0.0,
+                delta_ms: 100,
+                order: i,
+            })
+            .collect();
+
+        let total = 2.0;
+        let rewards = strategy.decompose(&nodes, total).await.unwrap();
+        assert_eq!(rewards.len(), 4);
+        // With all-zero confidences, should distribute equally
+        for r in &rewards {
+            assert!(
+                (r - 0.5).abs() < 0.01,
+                "Each node should get equal reward (~0.5), got {}",
+                r
+            );
+        }
+        let sum: f64 = rewards.iter().sum();
+        assert!((sum - total).abs() < 0.01, "Sum should equal total reward");
+    }
+
+    #[tokio::test]
+    async fn test_single_node_trajectory() {
+        let td = TDRewardStrategy::default();
+        let hindsight = HindsightRewardStrategy;
+        let attention = AttentionRewardStrategy;
+
+        let nodes = vec![TrajectoryNode {
+            id: Uuid::new_v4(),
+            context_embedding: vec![],
+            action_type: "only_action".to_string(),
+            action_params: serde_json::Value::Null,
+            alternatives_count: 2,
+            chosen_index: 0,
+            confidence: 0.9,
+            local_reward: 0.0,
+            cumulative_reward: 0.0,
+            delta_ms: 200,
+            order: 0,
+        }];
+
+        let total = 1.0;
+
+        // All strategies should assign 100% of reward to the single node
+        let td_rewards = td.decompose(&nodes, total).await.unwrap();
+        assert_eq!(td_rewards.len(), 1);
+        assert!(
+            (td_rewards[0] - total).abs() < 0.01,
+            "TD: single node should get 100% reward, got {}",
+            td_rewards[0]
+        );
+
+        let hs_rewards = hindsight.decompose(&nodes, total).await.unwrap();
+        assert_eq!(hs_rewards.len(), 1);
+        assert!(
+            (hs_rewards[0] - total).abs() < 0.01,
+            "Hindsight: single node should get 100% reward, got {}",
+            hs_rewards[0]
+        );
+
+        let att_rewards = attention.decompose(&nodes, total).await.unwrap();
+        assert_eq!(att_rewards.len(), 1);
+        assert!(
+            (att_rewards[0] - total).abs() < 0.01,
+            "Attention: single node should get 100% reward, got {}",
+            att_rewards[0]
+        );
+    }
 }

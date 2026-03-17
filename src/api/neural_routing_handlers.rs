@@ -224,3 +224,138 @@ pub async fn update_config(
         message: "Neural routing configuration updated".to_string(),
     }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::handlers::ServerState;
+    use crate::events::EventBus;
+    use crate::orchestrator::{FileWatcher, Orchestrator};
+    use crate::test_helpers::{mock_app_state, mock_neural_router};
+    use std::sync::Arc;
+
+    /// Build a minimal `OrchestratorState` for handler-level tests.
+    async fn test_state() -> OrchestratorState {
+        let app_state = mock_app_state();
+        let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
+        let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
+            orchestrator.clone(),
+        )));
+        Arc::new(ServerState {
+            orchestrator,
+            watcher,
+            chat_manager: None,
+            event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(
+                EventBus::default(),
+            ))),
+            nats_emitter: None,
+            auth_config: None,
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+            setup_completed: true,
+            server_port: 0,
+            public_url: None,
+            ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
+            registry_remote_url: None,
+            oidc_client: None,
+            neural_router: mock_neural_router(),
+            trajectory_collector: None,
+            trajectory_store: None,
+            identity: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn test_get_status() {
+        let state = test_state().await;
+
+        let result = get_status(State(state)).await;
+        assert!(result.is_ok(), "get_status should succeed");
+
+        let resp = result.unwrap().0;
+        // mock_neural_router creates a router with enabled=false and default mode (NN)
+        assert!(!resp.enabled);
+        assert_eq!(resp.mode, "nn");
+        // metrics should be zeroed on a fresh router
+        assert_eq!(resp.metrics.total_queries, 0);
+        assert_eq!(resp.metrics.hits, 0);
+    }
+
+    #[tokio::test]
+    async fn test_enable_disable_roundtrip() {
+        let state = test_state().await;
+
+        // Initially disabled (mock default)
+        let status = get_status(State(state.clone())).await.unwrap().0;
+        assert!(!status.enabled);
+
+        // Disable explicitly (should be idempotent)
+        let resp = disable(State(state.clone())).await.unwrap().0;
+        assert!(resp.ok);
+
+        let status = get_status(State(state.clone())).await.unwrap().0;
+        assert!(!status.enabled);
+
+        // Enable
+        let resp = enable(State(state.clone())).await.unwrap().0;
+        assert!(resp.ok);
+        assert!(resp.message.contains("enabled"));
+
+        let status = get_status(State(state.clone())).await.unwrap().0;
+        assert!(status.enabled);
+
+        // Disable again
+        let resp = disable(State(state.clone())).await.unwrap().0;
+        assert!(resp.ok);
+
+        let status = get_status(State(state.clone())).await.unwrap().0;
+        assert!(!status.enabled);
+    }
+
+    #[tokio::test]
+    async fn test_set_mode_nn() {
+        let state = test_state().await;
+
+        // Set mode to "nn"
+        let req = SetModeRequest {
+            mode: "nn".to_string(),
+        };
+        let resp = set_mode(State(state.clone()), Json(req)).await.unwrap().0;
+        assert!(resp.ok);
+        assert!(resp.message.contains("nn"));
+
+        // Verify config reflects the change
+        let config_resp = get_config(State(state.clone())).await.unwrap().0;
+        assert_eq!(config_resp.config.mode, RoutingMode::NN);
+
+        // Set mode to "full"
+        let req = SetModeRequest {
+            mode: "full".to_string(),
+        };
+        let resp = set_mode(State(state.clone()), Json(req)).await.unwrap().0;
+        assert!(resp.ok);
+        assert!(resp.message.contains("full"));
+
+        let config_resp = get_config(State(state.clone())).await.unwrap().0;
+        assert_eq!(config_resp.config.mode, RoutingMode::Full);
+    }
+
+    #[tokio::test]
+    async fn test_set_mode_invalid() {
+        let state = test_state().await;
+
+        let req = SetModeRequest {
+            mode: "invalid_mode".to_string(),
+        };
+        let result = set_mode(State(state), Json(req)).await;
+        assert!(result.is_err(), "invalid mode should return an error");
+
+        match result.unwrap_err() {
+            AppError::BadRequest(msg) => {
+                assert!(msg.contains("invalid_mode"));
+                assert!(msg.contains("expected 'nn' or 'full'"));
+            }
+            other => panic!("Expected BadRequest, got {:?}", other),
+        }
+    }
+}
