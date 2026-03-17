@@ -167,7 +167,7 @@ pub async fn activate_for_hook(
         // Filter by energy
         let mut active_notes: Vec<_> = all_notes
             .into_iter()
-            .filter(|n| n.energy >= config.min_note_energy)
+            .filter(|n| n.computed_energy() >= config.min_note_energy)
             .collect();
 
         // Contextual scoring: sort by relevance when file/pattern context available
@@ -229,7 +229,7 @@ pub async fn activate_for_hook(
 
         let mut active_notes: Vec<_> = notes
             .into_iter()
-            .filter(|n| n.energy >= config.min_note_energy)
+            .filter(|n| n.computed_energy() >= config.min_note_energy)
             .collect();
 
         // Contextual scoring: sort by relevance when file/pattern context available
@@ -376,7 +376,7 @@ pub async fn activate_for_hook_cached(
 
         let mut active_notes: Vec<_> = all_notes
             .into_iter()
-            .filter(|n| n.energy >= config.min_note_energy)
+            .filter(|n| n.computed_energy() >= config.min_note_energy)
             .collect();
 
         // Contextual scoring: sort by relevance when file/pattern context available
@@ -437,7 +437,7 @@ pub async fn activate_for_hook_cached(
 
         let mut active_notes: Vec<_> = notes
             .into_iter()
-            .filter(|n| n.energy >= config.min_note_energy)
+            .filter(|n| n.computed_energy() >= config.min_note_energy)
             .collect();
 
         // Contextual scoring: sort by relevance when file/pattern context available

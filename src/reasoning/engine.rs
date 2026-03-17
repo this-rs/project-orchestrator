@@ -275,7 +275,7 @@ impl ReasoningTreeEngine {
         // Process note results
         if let Ok(notes) = note_results {
             for (note, score) in notes {
-                if note.energy < 0.05 {
+                if note.computed_energy() < 0.05 {
                     continue; // Skip dead neurons
                 }
 
@@ -422,12 +422,12 @@ impl ReasoningTreeEngine {
                     } else {
                         match self.graph_store.get_note(neighbor_id).await {
                             Ok(Some(n)) => {
-                                if n.energy < 0.05 {
+                                if n.computed_energy() < 0.05 {
                                     continue; // Dead neuron
                                 }
                                 (
                                     truncate_content(&n.content, 80),
-                                    n.energy,
+                                    n.computed_energy(),
                                     EntitySource::Note,
                                 )
                             }

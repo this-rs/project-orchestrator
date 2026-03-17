@@ -748,14 +748,14 @@ impl NoteLifecycleManager {
 
         match &note.memory_horizon {
             MemoryHorizon::Ephemeral => {
-                if activation_count >= 3 || note.energy >= 0.5 {
+                if activation_count >= 3 || note.computed_energy() >= 0.5 {
                     PromotionResult {
                         note_id,
                         current_horizon: current,
                         new_horizon: Some(MemoryHorizon::Operational),
                         reason: format!(
                             "Ephemeral→Operational: activations={}, energy={:.2}",
-                            activation_count, note.energy
+                            activation_count, note.computed_energy()
                         ),
                     }
                 } else {
@@ -775,7 +775,7 @@ impl NoteLifecycleManager {
                     .count();
 
                 if activation_count >= 10
-                    || note.energy >= 0.8
+                    || note.computed_energy() >= 0.8
                     || confirm_count >= 2
                     || note.importance == NoteImportance::Critical
                 {
@@ -785,7 +785,7 @@ impl NoteLifecycleManager {
                         new_horizon: Some(MemoryHorizon::Consolidated),
                         reason: format!(
                             "Operational→Consolidated: activations={}, energy={:.2}, confirms={}, critical={}",
-                            activation_count, note.energy, confirm_count,
+                            activation_count, note.computed_energy(), confirm_count,
                             note.importance == NoteImportance::Critical
                         ),
                     }

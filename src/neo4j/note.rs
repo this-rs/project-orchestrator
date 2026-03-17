@@ -2434,10 +2434,12 @@ impl Neo4jClient {
         let q = query(
             r#"
             MATCH (n:Note {id: $id})
-            SET n.energy = CASE
-                    WHEN n.energy + $amount > 1.0 THEN 1.0
-                    ELSE n.energy + $amount
-                END,
+            WITH n,
+                 CASE WHEN n.last_activated IS NOT NULL
+                      THEN n.energy * (0.5 ^ (duration.between(n.last_activated, datetime()).days / 90.0))
+                      ELSE coalesce(n.energy, 1.0)
+                 END AS current_e
+            SET n.energy = CASE WHEN current_e + $amount > 1.0 THEN 1.0 ELSE current_e + $amount END,
                 n.last_activated = datetime()
             "#,
         )

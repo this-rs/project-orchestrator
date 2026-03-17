@@ -775,6 +775,19 @@ impl Note {
         }
     }
 
+    /// Compute current energy using lazy decay formula.
+    /// E(t) = energy × 0.5^((now - last_activated).days / 90.0)
+    /// Falls back to stored energy if last_activated is None.
+    pub fn computed_energy(&self) -> f64 {
+        match self.last_activated {
+            Some(last) => {
+                let days_idle = (Utc::now() - last).num_seconds() as f64 / 86400.0;
+                self.energy * (0.5_f64).powf(days_idle / 90.0)
+            }
+            None => self.energy,
+        }
+    }
+
     /// Add an anchor to this note
     pub fn add_anchor(&mut self, anchor: NoteAnchor, actor: &str) {
         self.anchors.push(anchor);
@@ -1390,5 +1403,56 @@ mod tests {
         };
         assert_eq!(pn.path_pagerank, Some(0.15));
         assert!(pn.relevance_score > 0.4);
+    }
+
+    #[test]
+    fn test_computed_energy_fresh_note() {
+        let note = Note::new(
+            None,
+            NoteType::Guideline,
+            "fresh note".to_string(),
+            "test".to_string(),
+        );
+        // last_activated = now, so computed energy should equal stored energy
+        let ce = note.computed_energy();
+        assert!(
+            (ce - note.energy).abs() < 0.01,
+            "Fresh note computed_energy ({ce}) should be ~{}", note.energy
+        );
+    }
+
+    #[test]
+    fn test_computed_energy_90_days_old() {
+        let mut note = Note::new(
+            None,
+            NoteType::Guideline,
+            "old note".to_string(),
+            "test".to_string(),
+        );
+        note.energy = 1.0;
+        note.last_activated = Some(Utc::now() - chrono::Duration::days(90));
+        let ce = note.computed_energy();
+        // After 90 days (one half-life), energy should be ~0.5
+        assert!(
+            (ce - 0.5).abs() < 0.05,
+            "90-day-old note computed_energy ({ce}) should be ~0.5"
+        );
+    }
+
+    #[test]
+    fn test_computed_energy_no_last_activated() {
+        let mut note = Note::new(
+            None,
+            NoteType::Guideline,
+            "no activation".to_string(),
+            "test".to_string(),
+        );
+        note.energy = 0.7;
+        note.last_activated = None;
+        let ce = note.computed_energy();
+        assert!(
+            (ce - 0.7).abs() < f64::EPSILON,
+            "No last_activated: computed_energy ({ce}) should equal stored energy (0.7)"
+        );
     }
 }

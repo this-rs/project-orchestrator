@@ -5952,7 +5952,9 @@ impl GraphStore for MockGraphStore {
     async fn boost_energy(&self, note_id: Uuid, amount: f64) -> Result<()> {
         let mut notes = self.notes.write().await;
         if let Some(note) = notes.get_mut(&note_id) {
-            note.energy = (note.energy + amount).min(1.0);
+            // Lazy decay: compute current energy before adding boost
+            let current_e = note.computed_energy();
+            note.energy = (current_e + amount).min(1.0);
             note.last_activated = Some(chrono::Utc::now());
         }
         Ok(())

@@ -208,7 +208,7 @@ pub fn cluster_to_skill(
     // Compute weighted energy: sum(energy × importance_weight) / sum(importance_weight)
     let (weighted_sum, weight_sum) = notes.iter().fold((0.0_f64, 0.0_f64), |(ws, wt), note| {
         let w = note.importance.weight();
-        (ws + note.energy * w, wt + w)
+        (ws + note.computed_energy() * w, wt + w)
     });
     let energy = if weight_sum > 0.0 {
         (weighted_sum / weight_sum).clamp(0.0, 1.0)
@@ -385,7 +385,7 @@ pub async fn persist_detected_skills(
                             .iter()
                             .fold((0.0_f64, 0.0_f64), |(ws, wt), note| {
                                 let w = note.importance.weight();
-                                (ws + note.energy * w, wt + w)
+                                (ws + note.computed_energy() * w, wt + w)
                             });
                     if weight_sum > 0.0 {
                         skill.energy = (weighted_sum / weight_sum).clamp(0.0, 1.0);

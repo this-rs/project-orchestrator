@@ -566,7 +566,7 @@ pub async fn update_skill_lifecycle(
                     .iter()
                     .fold((0.0_f64, 0.0_f64), |(ws, wt), note| {
                         let w = note.importance.weight();
-                        (ws + note.energy * w, wt + w)
+                        (ws + note.computed_energy() * w, wt + w)
                     });
             let new_energy = if weight_sum > 0.0 {
                 (weighted_sum / weight_sum).clamp(0.0, 1.0)
