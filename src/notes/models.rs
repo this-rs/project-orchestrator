@@ -650,6 +650,24 @@ pub struct Note {
     /// Used to compute energy decay: energy × exp(-days_idle / half_life).
     pub last_activated: Option<DateTime<Utc>>,
 
+    // Re-activation tracking (boucle-3: knowledge route quality proxy)
+    /// Number of times this note was re-injected within 7 days of previous activation.
+    /// High reactivation_count = reliable, frequently useful knowledge route.
+    #[serde(default)]
+    pub reactivation_count: i64,
+    /// Last time this note was re-activated (injected again within 7 days).
+    pub last_reactivated: Option<DateTime<Utc>>,
+
+    // Freshness tracking (boucle-4: git → freshness signal)
+    /// Last time a file linked to this note was touched by a commit.
+    pub freshness_pinged_at: Option<DateTime<Utc>>,
+
+    // Activation tracking (T7: auto-promote and auto-archive thresholds)
+    /// Total number of times this note has been activated (retrieved/used/confirmed).
+    /// Used for automatic promotion (ephemeral->consolidated) and archival thresholds.
+    #[serde(default)]
+    pub activation_count: i64,
+
     // Knowledge Scars (biomimicry: Elun HypersphereIdentity.Scar)
     /// Scar intensity from negative reasoning feedback (0.0 = no scar, 1.0 = max scar).
     /// Scarred notes are penalized in search scoring: final_score = raw_score × (1 - scar_intensity × 0.7).
@@ -713,6 +731,10 @@ impl Note {
             staleness_score: 0.0,
             energy: 1.0,
             last_activated: Some(now),
+            reactivation_count: 0,
+            last_reactivated: None,
+            freshness_pinged_at: None,
+            activation_count: 0,
             scar_intensity: 0.0,
             memory_horizon: if project_id.is_some() {
                 MemoryHorizon::Operational
@@ -725,6 +747,23 @@ impl Note {
             assertion_rule: None,
             last_assertion_result: None,
             sharing_consent: crate::episodes::distill_models::SharingConsent::NotSet,
+        }
+    }
+
+    /// Compute current energy using lazy decay formula (boucle-1).
+    /// E(t) = energy × 0.5^((now - last_activated).days / 90.0)
+    /// Falls back to stored energy if last_activated is None.
+    pub fn computed_energy(&self) -> f64 {
+        match self.last_activated {
+            Some(last) => {
+                let days_idle = (Utc::now() - last).num_seconds() as f64 / 86400.0;
+                if days_idle <= 0.0 {
+                    self.energy
+                } else {
+                    self.energy * (0.5_f64).powf(days_idle / 90.0)
+                }
+            }
+            None => self.energy,
         }
     }
 
@@ -764,6 +803,10 @@ impl Note {
             staleness_score: 0.0,
             energy: 1.0,
             last_activated: Some(now),
+            reactivation_count: 0,
+            last_reactivated: None,
+            freshness_pinged_at: None,
+            activation_count: 0,
             scar_intensity: 0.0,
             memory_horizon,
             supersedes: None,
@@ -1391,4 +1434,54 @@ mod tests {
         assert_eq!(pn.path_pagerank, Some(0.15));
         assert!(pn.relevance_score > 0.4);
     }
+
+    #[test]
+    fn test_computed_energy_fresh_note() {
+        let note = Note::new(
+            None,
+            NoteType::Guideline,
+            "fresh note".to_string(),
+            "test".to_string(),
+        );
+        let ce = note.computed_energy();
+        assert!(
+            (ce - note.energy).abs() < 0.01,
+            "Fresh note computed_energy ({}) should be ~{}", ce, note.energy
+        );
+    }
+
+    #[test]
+    fn test_computed_energy_90_days_old() {
+        let mut note = Note::new(
+            None,
+            NoteType::Guideline,
+            "old note".to_string(),
+            "test".to_string(),
+        );
+        note.energy = 1.0;
+        note.last_activated = Some(Utc::now() - chrono::Duration::days(90));
+        let ce = note.computed_energy();
+        assert!(
+            (ce - 0.5).abs() < 0.05,
+            "90-day-old note computed_energy ({}) should be ~0.5", ce
+        );
+    }
+
+    #[test]
+    fn test_computed_energy_no_last_activated() {
+        let mut note = Note::new(
+            None,
+            NoteType::Guideline,
+            "no activation".to_string(),
+            "test".to_string(),
+        );
+        note.energy = 0.7;
+        note.last_activated = None;
+        let ce = note.computed_energy();
+        assert!(
+            (ce - 0.7).abs() < f64::EPSILON,
+            "No last_activated: computed_energy ({}) should equal stored energy (0.7)", ce
+        );
+    }
+
 }

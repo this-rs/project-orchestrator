@@ -4584,6 +4584,29 @@ impl GraphStore for MockGraphStore {
         Ok(vec![])
     }
 
+    async fn ping_freshness_for_files(&self, file_paths: &[String]) -> Result<usize> {
+        let anchors = self.note_anchors.read().await;
+        let mut notes = self.notes.write().await;
+        let mut pinged_ids = std::collections::HashSet::new();
+
+        for (note_id, note_anchors) in anchors.iter() {
+            for anchor in note_anchors {
+                if file_paths.contains(&anchor.entity_id) {
+                    pinged_ids.insert(*note_id);
+                }
+            }
+        }
+
+        let now = chrono::Utc::now();
+        for note_id in &pinged_ids {
+            if let Some(note) = notes.get_mut(note_id) {
+                note.freshness_pinged_at = Some(now);
+            }
+        }
+
+        Ok(pinged_ids.len())
+    }
+
     // ========================================================================
     // CO_CHANGED operations (File ↔ File) — mock stubs
     // ========================================================================
@@ -5965,7 +5988,9 @@ impl GraphStore for MockGraphStore {
     async fn boost_energy(&self, note_id: Uuid, amount: f64) -> Result<()> {
         let mut notes = self.notes.write().await;
         if let Some(note) = notes.get_mut(&note_id) {
-            note.energy = (note.energy + amount).min(1.0);
+            // Lazy decay: compute current energy before adding boost
+            let current_e = note.computed_energy();
+            note.energy = (current_e + amount).min(1.0);
             note.last_activated = Some(chrono::Utc::now());
         }
         Ok(())
@@ -6105,15 +6130,24 @@ impl GraphStore for MockGraphStore {
 
         let ids: Vec<Uuid> = notes
             .values()
-            .filter(|n| {
-                n.status == crate::notes::NoteStatus::Active
-                    && n.memory_horizon != crate::notes::MemoryHorizon::Consolidated
-            })
+            .filter(|n| n.status == crate::notes::NoteStatus::Active)
             .map(|n| n.id)
             .collect();
 
         for id in ids {
             if let Some(note) = notes.get(&id).cloned() {
+                let activation_count = note.activation_count;
+
+                // Check auto-archival (threshold-based rules)
+                if lifecycle.should_auto_archive(&note, activation_count, now) {
+                    if let Some(n) = notes.get_mut(&id) {
+                        n.status = crate::notes::NoteStatus::Archived;
+                        archived += 1;
+                    }
+                    continue;
+                }
+
+                // Check archival for ephemeral (legacy: >48h idle)
                 if lifecycle.should_archive_ephemeral(&note, now) {
                     if let Some(n) = notes.get_mut(&id) {
                         n.status = crate::notes::NoteStatus::Archived;
@@ -6121,7 +6155,23 @@ impl GraphStore for MockGraphStore {
                     }
                     continue;
                 }
-                let promo = lifecycle.evaluate_promotion(&note, 0);
+
+                // Skip already-consolidated notes for promotion
+                if note.memory_horizon == crate::notes::MemoryHorizon::Consolidated {
+                    continue;
+                }
+
+                // Check direct ephemeral -> consolidated promotion (new threshold-based)
+                if lifecycle.should_promote_to_consolidated(&note, activation_count, now) {
+                    if let Some(n) = notes.get_mut(&id) {
+                        n.memory_horizon = crate::notes::MemoryHorizon::Consolidated;
+                        promoted += 1;
+                    }
+                    continue;
+                }
+
+                // Evaluate existing promotion rules
+                let promo = lifecycle.evaluate_promotion(&note, activation_count as u64);
                 if let Some(new_horizon) = promo.new_horizon {
                     if let Some(n) = notes.get_mut(&id) {
                         n.memory_horizon = new_horizon;
@@ -13822,6 +13872,128 @@ mod tests {
         assert!(
             !calls.contains(&"println".to_string()),
             "Should remove built-in call 'println'"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ping_freshness_for_files() {
+        use crate::notes::models::{EntityType, NoteType};
+        use crate::test_helpers::test_note;
+
+        let store = MockGraphStore::new();
+        let project_id = Uuid::new_v4();
+
+        // Create two notes
+        let note1 = test_note(project_id, NoteType::Guideline, "Use proper error handling");
+        let note2 = test_note(project_id, NoteType::Pattern, "Repository pattern");
+        let note3 = test_note(project_id, NoteType::Tip, "Unlinked tip");
+
+        assert!(note1.freshness_pinged_at.is_none());
+        assert!(note2.freshness_pinged_at.is_none());
+
+        let note1_id = note1.id;
+        let note2_id = note2.id;
+        let note3_id = note3.id;
+
+        store.create_note(&note1).await.unwrap();
+        store.create_note(&note2).await.unwrap();
+        store.create_note(&note3).await.unwrap();
+
+        // Link note1 to file "src/main.rs"
+        store
+            .link_note_to_entity(note1_id, &EntityType::File, "src/main.rs", None, None)
+            .await
+            .unwrap();
+
+        // Link note2 to file "src/lib.rs"
+        store
+            .link_note_to_entity(note2_id, &EntityType::File, "src/lib.rs", None, None)
+            .await
+            .unwrap();
+
+        // note3 is not linked to any file
+
+        // Ping freshness for src/main.rs only
+        let pinged = store
+            .ping_freshness_for_files(&["src/main.rs".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(pinged, 1, "Should ping exactly 1 note linked to src/main.rs");
+
+        // Verify note1 was pinged
+        let n1 = store.get_note(note1_id).await.unwrap().unwrap();
+        assert!(
+            n1.freshness_pinged_at.is_some(),
+            "note1 should have freshness_pinged_at set"
+        );
+
+        // Verify note2 was NOT pinged
+        let n2 = store.get_note(note2_id).await.unwrap().unwrap();
+        assert!(
+            n2.freshness_pinged_at.is_none(),
+            "note2 should not be pinged (different file)"
+        );
+
+        // Verify note3 was NOT pinged
+        let n3 = store.get_note(note3_id).await.unwrap().unwrap();
+        assert!(
+            n3.freshness_pinged_at.is_none(),
+            "note3 should not be pinged (not linked)"
+        );
+
+        // Ping both files
+        let pinged = store
+            .ping_freshness_for_files(&["src/main.rs".to_string(), "src/lib.rs".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(pinged, 2, "Should ping 2 notes");
+
+        // Now verify note2 is also pinged
+        let n2 = store.get_note(note2_id).await.unwrap().unwrap();
+        assert!(n2.freshness_pinged_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_staleness_with_freshness_discount() {
+        use crate::notes::models::NoteType;
+        use crate::test_helpers::test_note;
+
+        let store = MockGraphStore::new();
+        let project_id = Uuid::new_v4();
+
+        // Create a note confirmed 60 days ago
+        let mut note = test_note(project_id, NoteType::Tip, "Old tip");
+        note.last_confirmed_at = Some(Utc::now() - chrono::Duration::days(60));
+        note.staleness_score = 0.0;
+        note.freshness_pinged_at = None;
+        let note_id = note.id;
+        store.create_note(&note).await.unwrap();
+
+        // Update staleness without freshness ping
+        store.update_staleness_scores().await.unwrap();
+        let n = store.get_note(note_id).await.unwrap().unwrap();
+        let staleness_without_ping = n.staleness_score;
+        assert!(
+            staleness_without_ping > 0.0,
+            "Note confirmed 60d ago should have positive staleness"
+        );
+
+        // Now set freshness_pinged_at to now (simulating a recent commit touch)
+        {
+            let mut notes = store.notes.write().await;
+            let n = notes.get_mut(&note_id).unwrap();
+            n.freshness_pinged_at = Some(Utc::now());
+        }
+
+        store.update_staleness_scores().await.unwrap();
+        let n = store.get_note(note_id).await.unwrap().unwrap();
+        let staleness_with_ping = n.staleness_score;
+
+        assert!(
+            staleness_with_ping < staleness_without_ping,
+            "Freshness ping should reduce staleness: {} < {}",
+            staleness_with_ping,
+            staleness_without_ping
         );
     }
 }

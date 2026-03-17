@@ -39,7 +39,8 @@ impl Neo4jClient {
                 changes_json: $changes_json,
                 assertion_rule_json: $assertion_rule_json,
                 scar_intensity: $scar_intensity,
-                memory_horizon: $memory_horizon
+                memory_horizon: $memory_horizon,
+                activation_count: $activation_count
             })
             "#,
         )
@@ -82,7 +83,8 @@ impl Neo4jClient {
                 .unwrap_or_default(),
         )
         .param("scar_intensity", note.scar_intensity)
-        .param("memory_horizon", note.memory_horizon.to_string());
+        .param("memory_horizon", note.memory_horizon.to_string())
+        .param("activation_count", note.activation_count);
 
         self.graph.run(q).await?;
 
@@ -1347,7 +1349,7 @@ impl Neo4jClient {
         );
 
         let q = query(&cypher)
-            .param("entity_id", match_value)
+            .param("entity_id", match_value.clone())
             .param("min_score", min_score);
 
         let mut result = self.graph.execute(q).await?;
@@ -1400,6 +1402,84 @@ impl Neo4jClient {
                 scar_intensity,
             });
         }
+
+        // Also include notes reached via LINKED_TO_TRANSITIVE (pre-computed
+        // transitive links along the IMPORTS graph). These have a stored weight
+        // that attenuates the score.
+        let seen_note_ids: std::collections::HashSet<Uuid> =
+            propagated_notes.iter().map(|pn| pn.note.id).collect();
+
+        let transitive_cypher = format!(
+            r#"
+            {}
+            MATCH (n:Note)-[t:LINKED_TO_TRANSITIVE]->(target)
+            WHERE n.status = 'active'
+            WITH n, t,
+                 CASE n.importance
+                     WHEN 'critical' THEN 1.0
+                     WHEN 'high' THEN 0.8
+                     WHEN 'medium' THEN 0.5
+                     ELSE 0.3
+                 END AS importance_weight
+            WITH n,
+                 coalesce(t.weight, 0.5) * importance_weight
+                 * (1.0 - COALESCE(n.scar_intensity, 0.0) * 0.5) AS score,
+                 t.depth AS depth, t.weight AS tw
+            WHERE score >= $min_score
+            RETURN DISTINCT n, score, 'transitive' AS source_entity,
+                   [] AS path_names, coalesce(depth, 1) AS distance,
+                   null AS avg_path_pagerank,
+                   ['LINKED_TO_TRANSITIVE'] AS relation_path,
+                   tw AS path_rel_weight,
+                   [] AS hop_weights
+            ORDER BY score DESC
+            LIMIT 10
+            "#,
+            target_match
+        );
+
+        let tq = query(&transitive_cypher)
+            .param("entity_id", match_value)
+            .param("min_score", min_score);
+
+        if let Ok(mut tresult) = self.graph.execute(tq).await {
+            while let Ok(Some(row)) = tresult.next().await {
+                if let Ok(node) = row.get::<neo4rs::Node>("n") {
+                    if let Ok(note) = self.node_to_note(&node) {
+                        // Deduplicate: skip if already found via direct path
+                        if seen_note_ids.contains(&note.id) {
+                            continue;
+                        }
+                        let score: f64 = row.get("score").unwrap_or(0.0);
+                        let distance: i64 = row.get("distance").unwrap_or(1);
+                        let path_rel_weight: Option<f64> =
+                            row.get::<f64>("path_rel_weight").ok();
+                        let scar_intensity = note.scar_intensity;
+                        propagated_notes.push(PropagatedNote {
+                            note,
+                            relevance_score: score,
+                            source_entity: "transitive".to_string(),
+                            propagation_path: vec![],
+                            distance: distance as u32,
+                            path_pagerank: None,
+                            relation_path: vec![crate::notes::RelationHop::structural(
+                                "LINKED_TO_TRANSITIVE".to_string(),
+                            )],
+                            path_rel_weight,
+                            scar_intensity,
+                        });
+                    }
+                }
+            }
+        }
+
+        // Re-sort after merging transitive results
+        propagated_notes.sort_by(|a, b| {
+            b.relevance_score
+                .partial_cmp(&a.relevance_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        propagated_notes.truncate(20);
 
         // Cross-project coupling weighting (biomimicry P2P coupling)
         // If source_project_id is set, weight notes from other projects by coupling_strength.
@@ -2438,10 +2518,12 @@ impl Neo4jClient {
         let q = query(
             r#"
             MATCH (n:Note {id: $id})
-            SET n.energy = CASE
-                    WHEN n.energy + $amount > 1.0 THEN 1.0
-                    ELSE n.energy + $amount
-                END,
+            WITH n,
+                 CASE WHEN n.last_activated IS NOT NULL
+                      THEN n.energy * (0.5 ^ (duration.between(n.last_activated, datetime()).days / 90.0))
+                      ELSE coalesce(n.energy, 1.0)
+                 END AS current_e
+            SET n.energy = CASE WHEN current_e + $amount > 1.0 THEN 1.0 ELSE current_e + $amount END,
                 n.last_activated = datetime()
             "#,
         )
@@ -2725,7 +2807,18 @@ impl Neo4jClient {
         Ok(decision_healed)
     }
 
-    /// Consolidate memory: promote eligible notes and archive stale ephemeral ones.
+    /// Consolidate memory: promote eligible notes and archive stale/dead ones.
+    ///
+    /// Promotion (ephemeral -> consolidated):
+    ///   activation_count > 5 AND age > 14 days AND energy > 0.3
+    ///
+    /// Auto-archival:
+    ///   activation_count == 0 AND age > 90 days -> archive
+    ///   energy < 0.05 AND age > 60 days -> archive
+    ///
+    /// Also keeps legacy behavior: archive stale ephemerals (>48h idle)
+    /// and evaluate existing promotion rules.
+    ///
     /// Returns (promoted_count, archived_count).
     pub async fn consolidate_memory(&self) -> Result<(usize, usize)> {
         use crate::notes::lifecycle::NoteLifecycleManager;
@@ -2733,14 +2826,13 @@ impl Neo4jClient {
         let lifecycle = NoteLifecycleManager::new();
         let now = chrono::Utc::now();
 
-        // 1. Fetch all non-consolidated, active notes
+        // 1. Fetch all active notes (not just non-consolidated, since we also archive)
         let q = query(
             r#"
             MATCH (n:Note)
             WHERE n.status = 'active'
-              AND (n.memory_horizon IS NULL OR n.memory_horizon <> 'consolidated')
             OPTIONAL MATCH (n)-[s:SYNAPSE]-()
-            RETURN n, count(s) AS activation_count
+            RETURN n, count(s) AS synapse_count
             ORDER BY n.energy DESC
             LIMIT 500
             "#,
@@ -2753,9 +2845,48 @@ impl Neo4jClient {
         while let Some(row) = result.next().await? {
             let node = row.get::<neo4rs::Node>("n")?;
             let note = self.node_to_note(&node)?;
-            let activation_count = row.get::<i64>("activation_count").unwrap_or(0) as u64;
+            let synapse_count = row.get::<i64>("synapse_count").unwrap_or(0);
+            // Use the stored activation_count, falling back to synapse_count for legacy notes
+            let activation_count = if note.activation_count > 0 {
+                note.activation_count
+            } else {
+                synapse_count
+            };
 
-            // Check archival for ephemeral
+            // Check auto-archival (new threshold-based rules)
+            if lifecycle.should_auto_archive(&note, activation_count, now) {
+                let age_days = now.signed_duration_since(note.created_at).num_days();
+                let reason = if activation_count == 0 && age_days > 90 {
+                    "dead_note_no_activations_90d"
+                } else {
+                    "low_energy_60d"
+                };
+                let archive_q = query(
+                    r#"
+                    MATCH (n:Note {id: $id})
+                    SET n.status = 'archived',
+                        n.changes_json = $changes_json
+                    "#,
+                )
+                .param("id", note.id.to_string())
+                .param(
+                    "changes_json",
+                    serde_json::to_string(&{
+                        let mut changes = note.changes.clone();
+                        changes.push(NoteChange::with_details(
+                            crate::notes::ChangeType::StatusChanged,
+                            "consolidate_memory".to_string(),
+                            serde_json::json!({"reason": reason, "activation_count": activation_count, "energy": note.energy, "age_days": age_days}),
+                        ));
+                        changes
+                    })?,
+                );
+                self.graph.run(archive_q).await?;
+                archived += 1;
+                continue;
+            }
+
+            // Check archival for ephemeral (legacy: >48h idle)
             if lifecycle.should_archive_ephemeral(&note, now) {
                 let archive_q = query(
                     r#"
@@ -2782,8 +2913,44 @@ impl Neo4jClient {
                 continue;
             }
 
-            // Evaluate promotion
-            let promo = lifecycle.evaluate_promotion(&note, activation_count);
+            // Skip already-consolidated notes for promotion
+            if note.memory_horizon == crate::notes::MemoryHorizon::Consolidated {
+                continue;
+            }
+
+            // Check direct ephemeral -> consolidated promotion (new threshold-based)
+            if lifecycle.should_promote_to_consolidated(&note, activation_count, now) {
+                let promote_q = query(
+                    r#"
+                    MATCH (n:Note {id: $id})
+                    SET n.memory_horizon = 'consolidated',
+                        n.changes_json = $changes_json
+                    "#,
+                )
+                .param("id", note.id.to_string())
+                .param(
+                    "changes_json",
+                    serde_json::to_string(&{
+                        let mut changes = note.changes.clone();
+                        changes.push(NoteChange::with_details(
+                            crate::notes::ChangeType::Promoted,
+                            "consolidate_memory".to_string(),
+                            serde_json::json!({
+                                "from": "ephemeral",
+                                "to": "consolidated",
+                                "reason": format!("auto-promote: activations={}, age>14d, energy={:.2}", activation_count, note.energy)
+                            }),
+                        ));
+                        changes
+                    })?,
+                );
+                self.graph.run(promote_q).await?;
+                promoted += 1;
+                continue;
+            }
+
+            // Evaluate existing promotion rules (ephemeral->operational, operational->consolidated)
+            let promo = lifecycle.evaluate_promotion(&note, activation_count as u64);
             if let Some(new_horizon) = promo.new_horizon {
                 let promote_q = query(
                     r#"
@@ -2983,6 +3150,7 @@ impl Neo4jClient {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(MemoryHorizon::Consolidated), // Existing notes default to consolidated
+            activation_count: node.get::<i64>("activation_count").unwrap_or(0),
             last_activated: node
                 .get::<String>("last_activated")
                 .ok()
@@ -2998,6 +3166,16 @@ impl Neo4jClient {
             changes,
             assertion_rule,
             last_assertion_result: None, // Loaded separately if needed
+            reactivation_count: node.get("reactivation_count").unwrap_or(0),
+            last_reactivated: node
+                .get::<String>("last_reactivated")
+                .ok()
+                .and_then(|s| s.parse().ok()),
+            freshness_pinged_at: node
+                .get::<String>("freshness_pinged_at")
+                .ok()
+                .and_then(|s| s.parse().ok()),
+            activation_count: node.get("activation_count").unwrap_or(0),
             sharing_consent: node
                 .get::<String>("sharing_consent")
                 .ok()

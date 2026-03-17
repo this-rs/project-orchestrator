@@ -557,6 +557,10 @@ async fn trace_evolution_note(graph_store: &dyn GraphStore, project_id: Uuid, co
         staleness_score: 0.0,
         energy: 0.5, // Moderate initial energy — not critical knowledge
         last_activated: Some(Utc::now()),
+        reactivation_count: 0,
+        last_reactivated: None,
+        freshness_pinged_at: None,
+        activation_count: 0,
         scar_intensity: 0.0,
         memory_horizon: MemoryHorizon::Ephemeral, // Auto-generated trace notes are ephemeral
         supersedes: None,

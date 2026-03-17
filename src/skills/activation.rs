@@ -167,7 +167,7 @@ pub async fn activate_for_hook(
         // Filter by energy
         let mut active_notes: Vec<_> = all_notes
             .into_iter()
-            .filter(|n| n.energy >= config.min_note_energy)
+            .filter(|n| n.computed_energy() >= config.min_note_energy)
             .collect();
 
         // Contextual scoring: sort by relevance when file/pattern context available
@@ -229,7 +229,7 @@ pub async fn activate_for_hook(
 
         let mut active_notes: Vec<_> = notes
             .into_iter()
-            .filter(|n| n.energy >= config.min_note_energy)
+            .filter(|n| n.computed_energy() >= config.min_note_energy)
             .collect();
 
         // Contextual scoring: sort by relevance when file/pattern context available
@@ -376,7 +376,7 @@ pub async fn activate_for_hook_cached(
 
         let mut active_notes: Vec<_> = all_notes
             .into_iter()
-            .filter(|n| n.energy >= config.min_note_energy)
+            .filter(|n| n.computed_energy() >= config.min_note_energy)
             .collect();
 
         // Contextual scoring: sort by relevance when file/pattern context available
@@ -437,7 +437,7 @@ pub async fn activate_for_hook_cached(
 
         let mut active_notes: Vec<_> = notes
             .into_iter()
-            .filter(|n| n.energy >= config.min_note_energy)
+            .filter(|n| n.computed_energy() >= config.min_note_energy)
             .collect();
 
         // Contextual scoring: sort by relevance when file/pattern context available
@@ -1638,6 +1638,10 @@ mod tests {
             staleness_score: 0.0,
             energy,
             last_activated: None,
+            reactivation_count: 0,
+            last_reactivated: None,
+            freshness_pinged_at: None,
+            activation_count: 0,
             supersedes: None,
             superseded_by: None,
             changes: vec![],

@@ -437,6 +437,37 @@ impl Neo4jClient {
         Ok(changers)
     }
 
+    /// Ping freshness on all Notes LINKED_TO the given file paths.
+    ///
+    /// Sets `freshness_pinged_at = datetime()` on each note that has a
+    /// LINKED_TO relationship to a File whose path is in `file_paths`.
+    /// Returns the number of distinct notes pinged.
+    pub async fn ping_freshness_for_files(&self, file_paths: &[String]) -> Result<usize> {
+        if file_paths.is_empty() {
+            return Ok(0);
+        }
+
+        let paths: Vec<String> = file_paths.to_vec();
+
+        let q = query(
+            r#"
+            UNWIND $paths AS path
+            MATCH (n:Note)-[:LINKED_TO]->(f:File {path: path})
+            SET n.freshness_pinged_at = datetime()
+            RETURN count(DISTINCT n) AS pinged
+            "#,
+        )
+        .param("paths", paths);
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let pinged: i64 = row.get("pinged")?;
+            Ok(pinged as usize)
+        } else {
+            Ok(0)
+        }
+    }
+
     /// Delete a commit
     pub async fn delete_commit(&self, hash: &str) -> Result<()> {
         let q = query(

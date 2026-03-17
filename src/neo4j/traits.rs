@@ -1090,6 +1090,10 @@ pub trait GraphStore: Send + Sync {
         limit: Option<i64>,
     ) -> Result<Vec<FileHistoryEntry>>;
 
+    /// Ping freshness on all Notes LINKED_TO the given file paths.
+    /// Returns the number of distinct notes pinged.
+    async fn ping_freshness_for_files(&self, file_paths: &[String]) -> Result<usize>;
+
     // ========================================================================
     // CO_CHANGED operations (File ↔ File)
     // ========================================================================

@@ -1372,6 +1372,10 @@ impl GraphStore for Neo4jClient {
         self.get_file_history(file_path, limit).await
     }
 
+    async fn ping_freshness_for_files(&self, file_paths: &[String]) -> anyhow::Result<usize> {
+        self.ping_freshness_for_files(file_paths).await
+    }
+
     // ========================================================================
     // CO_CHANGED operations (File ↔ File)
     // ========================================================================

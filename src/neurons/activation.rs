@@ -182,7 +182,7 @@ impl SpreadingActivationEngine {
 
         for (note, score) in &seed_notes {
             // Skip dead neurons
-            if note.energy < config.min_energy {
+            if note.computed_energy() < config.min_energy {
                 continue;
             }
             // Knowledge Scars: penalize scarred notes (biomimicry: Elun Scar)
@@ -247,7 +247,7 @@ impl SpreadingActivationEngine {
                             // Note neighbor: use real Note with energy
                             match self.graph_store.get_note(neighbor_id).await {
                                 Ok(Some(n)) => {
-                                    let energy = n.energy;
+                                    let energy = n.computed_energy();
                                     (n, energy, "note".to_string())
                                 }
                                 _ => continue,
