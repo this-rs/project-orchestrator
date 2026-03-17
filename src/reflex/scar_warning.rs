@@ -58,14 +58,15 @@ pub async fn fetch_scar_suggestions(graph: &dyn GraphStore, ctx: &RefContext) ->
 
 /// Truncate content to a maximum length, preserving word boundaries.
 fn truncate_content(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
+    if s.chars().count() <= max_len {
         return s.to_string();
     }
 
-    // Find last space before max_len
-    let truncated = &s[..max_len];
+    // Collect first max_len characters (char-safe, no byte slicing on original)
+    let truncated: String = s.chars().take(max_len).collect();
+    // Find last space for cleaner word boundary
     match truncated.rfind(' ') {
-        Some(pos) if pos > max_len / 2 => format!("{}...", &s[..pos]),
+        Some(pos) if pos > truncated.len() / 2 => format!("{}...", &truncated[..pos]),
         _ => format!("{}...", truncated),
     }
 }
@@ -103,6 +104,38 @@ mod tests {
     #[test]
     fn test_truncate_content_empty() {
         assert_eq!(truncate_content("", 100), "");
+    }
+
+    #[test]
+    fn test_truncate_content_multibyte_utf8() {
+        // French accented characters are multi-byte in UTF-8
+        let text = "Les résultats à vérifier sont très élevés";
+        let result = truncate_content(text, 20);
+        assert!(result.ends_with("..."));
+        // Must not panic on multi-byte boundaries
+        assert!(result.chars().count() <= 24); // 20 chars + "..."
+    }
+
+    #[test]
+    fn test_truncate_content_emoji() {
+        let text = "🔥 Fix critical bug ✅ Tests pass 🎉 Released";
+        let result = truncate_content(text, 25);
+        assert!(result.ends_with("..."));
+    }
+
+    #[test]
+    fn test_truncate_content_cjk() {
+        let text = "代码分析工具非常有用 code analysis tool";
+        let result = truncate_content(text, 8);
+        assert!(result.ends_with("..."));
+    }
+
+    #[test]
+    fn test_truncate_content_mixed_scripts_exact_boundary() {
+        let text = "café";
+        let result = truncate_content(text, 4);
+        assert_eq!(result, "café");
+        assert!(!result.ends_with("..."));
     }
 
     #[test]

@@ -258,9 +258,10 @@ impl PersonaStack {
             }
         }
 
-        // Truncate if over budget
-        if out.len() > budget_chars {
-            out.truncate(budget_chars.saturating_sub(4));
+        // Truncate if over budget (char-safe to avoid panic on multi-byte UTF-8)
+        if out.chars().count() > budget_chars {
+            let safe: String = out.chars().take(budget_chars.saturating_sub(4)).collect();
+            out = safe;
             out.push_str("...\n");
         }
 
@@ -929,6 +930,23 @@ mod tests {
         assert!(rendered.contains("Primary Persona"));
         assert!(rendered.contains("solo"));
         assert!(!rendered.contains("Secondary Persona"));
+    }
+
+    #[test]
+    fn test_persona_stack_render_truncation_multibyte_utf8() {
+        // Verify char-safe truncation in render_for_prompt doesn't panic on multi-byte UTF-8
+        let mut stack = PersonaStack::new(4000);
+        // Use a persona name with accented chars to ensure multi-byte safety
+        stack.push(make_entry(
+            "néo4j-spécialiste",
+            0.9,
+            PersonaTrigger::TaskAssign,
+        ));
+
+        // Very small budget forces the truncation path (line 262)
+        let rendered = stack.render_for_prompt(10);
+        // Should not panic and should contain the truncation marker
+        assert!(rendered.ends_with("...\n") || rendered.chars().count() <= 14);
     }
 
     #[test]

@@ -770,13 +770,16 @@ fn truncate_content(content: &str, max_chars: usize) -> String {
         .collect();
     let trimmed = normalized.trim();
 
-    if trimmed.len() <= max_chars {
+    if trimmed.chars().count() <= max_chars {
         trimmed.to_string()
     } else {
-        // Find a word boundary near max_chars
-        let truncated = &trimmed[..max_chars];
+        // Collect the first max_chars characters (char-safe, no byte slicing)
+        let truncated: String = trimmed.chars().take(max_chars).collect();
+        // Find a word boundary near max_chars for cleaner truncation
         match truncated.rfind(' ') {
-            Some(pos) if pos > max_chars / 2 => format!("{}…", &trimmed[..pos]),
+            Some(pos) if pos > truncated.len() / 2 => {
+                format!("{}…", &truncated[..pos])
+            }
             _ => format!("{}…", truncated),
         }
     }
@@ -949,6 +952,44 @@ mod tests {
     fn test_truncate_content_empty() {
         let result = truncate_content("", 100);
         assert_eq!(result, "");
+    }
+
+    #[test]
+    fn test_truncate_content_multibyte_utf8() {
+        // French accents: "é" = 2 bytes, "à" = 2 bytes
+        let text = "Les résultats à vérifier sont très élevés";
+        let result = truncate_content(text, 20);
+        assert!(result.ends_with('…'));
+        // Must not panic on multi-byte chars
+        assert!(result.chars().count() <= 21); // 20 + ellipsis
+    }
+
+    #[test]
+    fn test_truncate_content_emoji() {
+        // Emojis: "🔥" = 4 bytes, "✅" = 3 bytes
+        let text = "🔥 Fix critical bug ✅ Tests pass 🎉 Released";
+        let result = truncate_content(text, 25);
+        assert!(result.ends_with('…'));
+        // Must not panic on 4-byte emoji boundaries
+        assert!(result.chars().count() <= 26);
+    }
+
+    #[test]
+    fn test_truncate_content_cjk() {
+        // CJK characters: each 3 bytes in UTF-8
+        let text = "代码分析工具非常有用 code analysis tool";
+        let result = truncate_content(text, 8);
+        assert!(result.ends_with('…'));
+        assert!(result.chars().count() <= 9);
+    }
+
+    #[test]
+    fn test_truncate_content_mixed_scripts_exact_boundary() {
+        // Exactly at boundary — no truncation needed
+        let text = "café"; // 4 chars, 5 bytes (é = 2 bytes)
+        let result = truncate_content(text, 4);
+        assert_eq!(result, "café");
+        assert!(!result.ends_with('…'));
     }
 
     // ── KnowledgeInjectionConfig tests ──────────────────────────────────
