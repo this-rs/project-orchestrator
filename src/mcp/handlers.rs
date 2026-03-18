@@ -696,6 +696,8 @@ impl ToolHandler {
                 tool_usages: vec![tool_usage],
                 touched_entities: vec![],
                 timestamp_ms: elapsed_ms,
+                query_embedding: vec![],
+                node_features: vec![],
             });
         }
 

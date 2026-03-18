@@ -1014,6 +1014,8 @@ pub async fn fire_transition(
                 relevance: Some(1.0),
             }],
             timestamp_ms: 0,
+            query_embedding: vec![],
+            node_features: vec![],
         });
     }
 

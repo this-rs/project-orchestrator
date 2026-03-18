@@ -638,6 +638,166 @@ impl TrajectoryStore for Neo4jTrajectoryStore {
         }
     }
 
+    async fn store_trajectories_batch(&self, trajectories: &[Trajectory]) -> Result<usize> {
+        if trajectories.is_empty() {
+            return Ok(0);
+        }
+
+        let mut txn = self
+            .graph
+            .start_txn()
+            .await
+            .map_err(|e| NeuralRoutingError::Neo4j(e.to_string()))?;
+
+        // ---------------------------------------------------------------
+        // Query 1: UNWIND to create all Trajectory nodes in one shot.
+        // Uses parallel arrays (one per field) indexed together.
+        // ---------------------------------------------------------------
+        let ids: Vec<String> = trajectories.iter().map(|t| t.id.to_string()).collect();
+        let session_ids: Vec<String> = trajectories.iter().map(|t| t.session_id.clone()).collect();
+        let embeddings: Vec<Vec<f32>> = trajectories
+            .iter()
+            .map(|t| t.query_embedding.clone())
+            .collect();
+        let rewards: Vec<f64> = trajectories.iter().map(|t| t.total_reward).collect();
+        let step_counts: Vec<i64> = trajectories.iter().map(|t| t.step_count as i64).collect();
+        let durations: Vec<i64> = trajectories.iter().map(|t| t.duration_ms as i64).collect();
+        let created_ats: Vec<String> = trajectories
+            .iter()
+            .map(|t| t.created_at.to_rfc3339())
+            .collect();
+
+        let create_trajectories = query(
+            "UNWIND range(0, size($ids) - 1) AS i
+             CREATE (t:Trajectory {
+                 id: $ids[i],
+                 session_id: $session_ids[i],
+                 query_embedding: $embeddings[i],
+                 total_reward: $rewards[i],
+                 step_count: $step_counts[i],
+                 duration_ms: $durations[i],
+                 created_at: datetime($created_ats[i])
+             })",
+        )
+        .param("ids", ids)
+        .param("session_ids", session_ids)
+        .param("embeddings", embeddings)
+        .param("rewards", rewards)
+        .param("step_counts", step_counts)
+        .param("durations", durations)
+        .param("created_ats", created_ats);
+
+        txn.run(create_trajectories)
+            .await
+            .map_err(|e| NeuralRoutingError::Neo4j(e.to_string()))?;
+
+        // ---------------------------------------------------------------
+        // Query 2: UNWIND to create all TrajectoryNodes + CONTAINS edges.
+        // Flattens all nodes across all trajectories into parallel arrays.
+        // ---------------------------------------------------------------
+        let mut all_traj_ids: Vec<String> = Vec::new();
+        let mut all_node_ids: Vec<String> = Vec::new();
+        let mut all_ctx_embeddings: Vec<Vec<f32>> = Vec::new();
+        let mut all_action_types: Vec<String> = Vec::new();
+        let mut all_action_params: Vec<String> = Vec::new();
+        let mut all_alt_counts: Vec<i64> = Vec::new();
+        let mut all_chosen: Vec<i64> = Vec::new();
+        let mut all_confidences: Vec<f64> = Vec::new();
+        let mut all_local_rewards: Vec<f64> = Vec::new();
+        let mut all_cum_rewards: Vec<f64> = Vec::new();
+        let mut all_deltas: Vec<i64> = Vec::new();
+        let mut all_orders: Vec<i64> = Vec::new();
+
+        for trajectory in trajectories {
+            for node in &trajectory.nodes {
+                all_traj_ids.push(trajectory.id.to_string());
+                all_node_ids.push(node.id.to_string());
+                all_ctx_embeddings.push(node.context_embedding.clone());
+                all_action_types.push(node.action_type.clone());
+                all_action_params.push(node.action_params.to_string());
+                all_alt_counts.push(node.alternatives_count as i64);
+                all_chosen.push(node.chosen_index as i64);
+                all_confidences.push(node.confidence);
+                all_local_rewards.push(node.local_reward);
+                all_cum_rewards.push(node.cumulative_reward);
+                all_deltas.push(node.delta_ms as i64);
+                all_orders.push(node.order as i64);
+            }
+        }
+
+        if !all_node_ids.is_empty() {
+            let create_nodes = query(
+                "UNWIND range(0, size($node_ids) - 1) AS i
+                 MATCH (t:Trajectory {id: $traj_ids[i]})
+                 CREATE (tn:TrajectoryNode {
+                     id: $node_ids[i],
+                     context_embedding: $ctx_embeddings[i],
+                     action_type: $action_types[i],
+                     action_params: $action_params[i],
+                     alternatives_count: $alt_counts[i],
+                     chosen_index: $chosen[i],
+                     confidence: $confidences[i],
+                     local_reward: $local_rewards[i],
+                     cumulative_reward: $cum_rewards[i],
+                     delta_ms: $deltas[i],
+                     order_idx: $orders[i]
+                 })
+                 CREATE (t)-[:CONTAINS {order_idx: $orders[i]}]->(tn)",
+            )
+            .param("traj_ids", all_traj_ids)
+            .param("node_ids", all_node_ids)
+            .param("ctx_embeddings", all_ctx_embeddings)
+            .param("action_types", all_action_types)
+            .param("action_params", all_action_params)
+            .param("alt_counts", all_alt_counts)
+            .param("chosen", all_chosen)
+            .param("confidences", all_confidences)
+            .param("local_rewards", all_local_rewards)
+            .param("cum_rewards", all_cum_rewards)
+            .param("deltas", all_deltas)
+            .param("orders", all_orders);
+
+            txn.run(create_nodes)
+                .await
+                .map_err(|e| NeuralRoutingError::Neo4j(e.to_string()))?;
+
+            // ---------------------------------------------------------------
+            // Query 3: UNWIND trajectory IDs to create NEXT_DECISION chains.
+            // For each trajectory, orders its nodes and links consecutive pairs.
+            // ---------------------------------------------------------------
+            let chain_ids: Vec<String> = trajectories
+                .iter()
+                .filter(|t| t.nodes.len() >= 2)
+                .map(|t| t.id.to_string())
+                .collect();
+
+            if !chain_ids.is_empty() {
+                let chain_query = query(
+                    "UNWIND $traj_ids AS tid
+                     MATCH (t:Trajectory {id: tid})-[:CONTAINS]->(tn:TrajectoryNode)
+                     WITH t, tn ORDER BY tn.order_idx
+                     WITH t, collect(tn) AS nodes
+                     WHERE size(nodes) >= 2
+                     UNWIND range(0, size(nodes) - 2) AS i
+                     CREATE (nodes[i])-[:NEXT_DECISION {delta_ms: nodes[i+1].delta_ms}]->(nodes[i+1])",
+                )
+                .param("traj_ids", chain_ids);
+
+                txn.run(chain_query)
+                    .await
+                    .map_err(|e| NeuralRoutingError::Neo4j(e.to_string()))?;
+            }
+        }
+
+        txn.commit()
+            .await
+            .map_err(|e| NeuralRoutingError::Neo4j(e.to_string()))?;
+
+        let count = trajectories.len();
+        tracing::debug!(count, "Batch-stored trajectories via UNWIND");
+        Ok(count)
+    }
+
     async fn delete_trajectory(&self, id: &Uuid) -> Result<bool> {
         let q = query(
             "MATCH (t:Trajectory {id: $id})

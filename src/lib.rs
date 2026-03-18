@@ -822,6 +822,7 @@ impl AppState {
             let (collector, _handle) = neural_routing_runtime::TrajectoryCollector::new(
                 nr_store,
                 &config.neural_routing.collection,
+                None, // use default DecisionVectorBuilder
             );
             tracing::info!(
                 "Trajectory collector initialized (buffer_size={})",

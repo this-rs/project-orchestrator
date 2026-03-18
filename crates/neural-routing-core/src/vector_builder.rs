@@ -239,7 +239,7 @@ impl DecisionVectorBuilder {
     /// Block 1: Project 768d query embedding → 64d.
     fn build_query_block(&self, query_embedding: &[f32]) -> Vec<f32> {
         if query_embedding.is_empty() {
-            return vec![0.0; QUERY_DIM];
+            return sentinel_vector(QUERY_DIM, SENTINEL_SEED);
         }
         self.query_projection.project(query_embedding)
     }
@@ -249,7 +249,7 @@ impl DecisionVectorBuilder {
     /// We expand each node's 6d features into a 64d space via tiling + position encoding.
     fn build_graph_block(&self, node_features: &[NodeFeatures]) -> Vec<f32> {
         if node_features.is_empty() {
-            return vec![0.0; GRAPH_DIM];
+            return sentinel_vector(GRAPH_DIM, SENTINEL_SEED.wrapping_add(1));
         }
 
         // Mean-pool raw features (6d)
@@ -292,7 +292,7 @@ impl DecisionVectorBuilder {
     /// If they're already 768d source embeddings, we use the history projection.
     fn build_history_block(&self, previous_embeddings: &[Vec<f32>]) -> Vec<f32> {
         if previous_embeddings.is_empty() {
-            return vec![0.0; HISTORY_DIM];
+            return sentinel_vector(HISTORY_DIM, SENTINEL_SEED.wrapping_add(2));
         }
 
         let mut mean = vec![0.0_f32; HISTORY_DIM];
@@ -443,8 +443,37 @@ fn l2_normalize(v: &mut [f32]) {
     }
 }
 
+/// Generate a deterministic sentinel vector for empty contexts.
+///
+/// Instead of returning a zero vector (which causes NaN in cosine similarity
+/// and collapses all empty contexts to the same point), we generate a
+/// low-magnitude deterministic pseudo-random vector with a given seed.
+/// The result is L2-normalized so it sits on the unit sphere.
+pub fn sentinel_vector(dim: usize, seed: u64) -> Vec<f32> {
+    let mut v = Vec::with_capacity(dim);
+    let mut rng_state = seed;
+    for _ in 0..dim {
+        rng_state = rng_state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let u = (rng_state >> 33) as f64 / (1u64 << 31) as f64;
+        rng_state = rng_state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let u2 = (rng_state >> 33) as f64 / (1u64 << 31) as f64;
+        let z = (-2.0 * u.clamp(1e-10, 1.0 - 1e-10).ln()).sqrt()
+            * (2.0 * std::f64::consts::PI * u2).cos();
+        v.push(z as f32);
+    }
+    l2_normalize(&mut v);
+    v
+}
+
+/// Seed used for the sentinel vector (deterministic, reproducible).
+const SENTINEL_SEED: u64 = 0xDEAD_BEEF_CAFE_BABE;
+
 /// Simple deterministic hash for strings (FNV-1a).
-fn simple_hash(s: &str) -> u64 {
+pub fn simple_hash(s: &str) -> u64 {
     let mut hash: u64 = 0xcbf29ce484222325;
     for byte in s.bytes() {
         hash ^= byte as u64;
@@ -582,7 +611,45 @@ mod tests {
 
         let vector = builder.build(&ctx);
         assert_eq!(vector.len(), 256);
-        // Should not panic, and norm should be valid (might be 0 if all inputs empty)
+
+        // With sentinel vectors, empty context should produce a non-zero, normalized vector
+        let norm: f32 = vector.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!(
+            (norm - 1.0).abs() < 1e-4,
+            "Empty context should produce L2-normalized vector, got norm={}",
+            norm
+        );
+        // Should NOT be all zeros (sentinel replaces zero vectors)
+        let all_zero = vector.iter().all(|&x| x.abs() < 1e-10);
+        assert!(
+            !all_zero,
+            "Empty context must not produce zero vector (sentinel expected)"
+        );
+    }
+
+    #[test]
+    fn test_sentinel_vector_is_deterministic() {
+        let v1 = sentinel_vector(64, 42);
+        let v2 = sentinel_vector(64, 42);
+        assert_eq!(v1, v2, "Same seed must produce identical sentinels");
+    }
+
+    #[test]
+    fn test_sentinel_vector_is_normalized() {
+        let v = sentinel_vector(256, 0xCAFE);
+        let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!(
+            (norm - 1.0).abs() < 1e-5,
+            "Sentinel should be L2-normalized, got norm={}",
+            norm
+        );
+    }
+
+    #[test]
+    fn test_sentinel_different_seeds_differ() {
+        let v1 = sentinel_vector(64, 1);
+        let v2 = sentinel_vector(64, 2);
+        assert_ne!(v1, v2, "Different seeds must produce different sentinels");
     }
 
     #[test]

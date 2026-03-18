@@ -279,6 +279,8 @@ impl EnrichmentStage for SkillActivationStage {
                 }],
                 touched_entities: touched,
                 timestamp_ms: 0,
+                query_embedding: vec![],
+                node_features: vec![],
             });
         }
 

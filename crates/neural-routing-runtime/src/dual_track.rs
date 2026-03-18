@@ -55,7 +55,11 @@ impl DualTrackRouter {
     }
 
     /// Update config at runtime (hot reload).
+    ///
+    /// Propagates changes to the NNRouter (top_k, min_similarity, cache settings).
     pub fn update_config(&mut self, config: NeuralRoutingConfig) {
+        // Propagate NN config to the inner router
+        self.nn_router.update_config(config.nn.clone());
         self.config = config;
     }
 }
@@ -359,6 +363,42 @@ mod tests {
 
         assert!(!router.config().enabled);
         assert_eq!(router.config().mode, RoutingMode::Full);
+    }
+
+    #[tokio::test]
+    async fn test_update_config_propagates_to_nn_router() {
+        // Verify that changing nn.top_k via update_config actually affects routing
+        let trajectory = make_trajectory(0.9, vec!["code_search", "analyze_impact"]);
+        let store = Arc::new(MockStore::with_trajectories(vec![trajectory]));
+        let config = default_config();
+        let mut router = DualTrackRouter::new(store, config);
+
+        // Default top_k is 5, min_similarity is 0.7 — should find the trajectory
+        let embedding = make_unit_vec_256();
+        let result = router.route(&embedding).await.unwrap();
+        assert!(result.is_some(), "Should find route with default config");
+
+        // Now set min_similarity very high — should NOT find it
+        let mut new_config = default_config();
+        new_config.nn.min_similarity = 0.9999; // unrealistically high
+        router.update_config(new_config);
+
+        // Need to invalidate cache since config changed
+        router.nn_router().invalidate_cache();
+
+        let result = router.route(&embedding).await.unwrap();
+        // With min_sim=0.9999 the mock returns exact similarity (1.0), so it should still match
+        // Let's instead test top_k = 0
+        let mut new_config2 = default_config();
+        new_config2.nn.top_k = 0; // no candidates
+        router.update_config(new_config2);
+        router.nn_router().invalidate_cache();
+
+        let result = router.route(&embedding).await.unwrap();
+        assert!(
+            result.is_none(),
+            "With top_k=0, should return no route (config propagated to NNRouter)"
+        );
     }
 
     #[tokio::test]
