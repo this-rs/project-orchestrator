@@ -2,15 +2,6 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Result of a single benchmark run.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BenchmarkResult {
-    pub benchmark_name: String,
-    pub embedding_source: String,
-    pub metrics: MetricSet,
-    pub sample_count: usize,
-}
-
 /// Set of evaluation metrics.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct MetricSet {

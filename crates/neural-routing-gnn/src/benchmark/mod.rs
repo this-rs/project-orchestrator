@@ -291,13 +291,24 @@ impl Benchmark for ImpactPredictionBenchmark {
                     .filter(|id| predicted.contains(*id))
                     .count();
 
+                // Compute per-query F1 (consistent with run() which reports F1)
+                let precision = if self.top_k > 0 {
+                    hits as f64 / self.top_k as f64
+                } else {
+                    0.0
+                };
                 let recall = if tc.impacted_ids.is_empty() {
                     0.0
                 } else {
                     hits as f64 / tc.impacted_ids.len() as f64
                 };
+                let f1 = if precision + recall > 0.0 {
+                    2.0 * precision * recall / (precision + recall)
+                } else {
+                    0.0
+                };
 
-                Some(recall)
+                Some(f1)
             })
             .collect()
     }
@@ -920,7 +931,7 @@ pub fn generate_synthetic_data(
             // Add some wrong candidates from other communities
             for j in 0..3 {
                 let wrong_idx = (i + j * num_communities / 2 + 1) % num_nodes;
-                if wrong_idx != correct_idx {
+                if wrong_idx != correct_idx && wrong_idx != i {
                     candidates.push((
                         format!("action_{}", wrong_idx),
                         format!("node_{}", wrong_idx),
