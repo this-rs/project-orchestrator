@@ -321,8 +321,11 @@ impl ChatManager {
                 graph.clone(),
                 search.clone(),
             )));
-            pipeline.add_stage(Box::new(super::stages::StatusInjectionStage::new(
+            pipeline.add_stage(Box::new(super::stages::StatusInjectionStage::with_config(
                 graph.clone(),
+                None,
+                Arc::new(super::stages::GraphProtocolProvider::new(graph.clone())),
+                super::stages::StatusInjectionConfig::default(),
             )));
             pipeline.add_stage(Box::new(super::stages::FileContextStage::new(
                 graph.clone(),
@@ -392,8 +395,11 @@ impl ChatManager {
                 graph.clone(),
                 search.clone(),
             )));
-            pipeline.add_stage(Box::new(super::stages::StatusInjectionStage::new(
+            pipeline.add_stage(Box::new(super::stages::StatusInjectionStage::with_config(
                 graph.clone(),
+                None,
+                Arc::new(super::stages::GraphProtocolProvider::new(graph.clone())),
+                super::stages::StatusInjectionConfig::default(),
             )));
             pipeline.add_stage(Box::new(super::stages::FileContextStage::new(
                 graph.clone(),
@@ -464,8 +470,13 @@ impl ChatManager {
             super::stages::KnowledgeInjectionStage::new(self.graph.clone(), self.search.clone())
                 .with_collector(collector.clone()),
         ));
-        pipeline.add_stage(Box::new(super::stages::StatusInjectionStage::new(
+        pipeline.add_stage(Box::new(super::stages::StatusInjectionStage::with_config(
             self.graph.clone(),
+            None,
+            Arc::new(super::stages::GraphProtocolProvider::new(
+                self.graph.clone(),
+            )),
+            super::stages::StatusInjectionConfig::default(),
         )));
         pipeline.add_stage(Box::new(super::stages::FileContextStage::new(
             self.graph.clone(),

@@ -16,5 +16,5 @@ pub use biomimicry::BiomimicryStage;
 pub use file_context::FileContextStage;
 pub use knowledge_injection::KnowledgeInjectionStage;
 pub use skill_activation::SkillActivationStage;
-pub use status_injection::StatusInjectionStage;
+pub use status_injection::{GraphProtocolProvider, StatusInjectionConfig, StatusInjectionStage};
 pub use user_profile::UserProfileStage;
