@@ -1974,4 +1974,296 @@ mod tests {
             other => panic!("Expected NotFound, got {:?}", other),
         }
     }
+
+    // ================================================================
+    // Handler integration tests (with mock OrchestratorState)
+    // ================================================================
+
+    use crate::events::{EventBus, HybridEmitter};
+    use crate::meilisearch::mock::MockSearchStore;
+    use crate::neo4j::mock::MockGraphStore;
+    use crate::orchestrator::watcher::FileWatcher;
+    use crate::orchestrator::Orchestrator;
+    use crate::test_helpers::{mock_app_state_with, test_project};
+    use axum::extract::State;
+    use std::sync::Arc;
+
+    /// Build a server state from a MockGraphStore (shared helper).
+    async fn build_server_state(mock: MockGraphStore) -> OrchestratorState {
+        let app_state = mock_app_state_with(mock, MockSearchStore::new());
+        let orchestrator = Orchestrator::new(app_state).await.unwrap();
+        let orc = Arc::new(orchestrator);
+        let watcher = FileWatcher::new(orc.clone());
+        let event_bus = HybridEmitter::new(Arc::new(EventBus::new(100)));
+        Arc::new(super::super::handlers::ServerState {
+            orchestrator: orc,
+            watcher: Arc::new(tokio::sync::RwLock::new(watcher)),
+            chat_manager: None,
+            event_bus: Arc::new(event_bus),
+            nats_emitter: None,
+            auth_config: None,
+            setup_completed: true,
+            serve_frontend: false,
+            frontend_path: String::new(),
+            server_port: 0,
+            public_url: None,
+            ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
+            registry_remote_url: None,
+            identity: None,
+            oidc_client: None,
+            neural_router: crate::test_helpers::mock_neural_router(),
+            trajectory_collector: None,
+            trajectory_store: None,
+        })
+    }
+
+    /// Build a minimal OrchestratorState for handler tests.
+    async fn make_test_server_state() -> OrchestratorState {
+        build_server_state(MockGraphStore::new()).await
+    }
+
+    /// Build a test state with a pre-seeded project and protocol.
+    async fn make_state_with_protocol() -> (OrchestratorState, Uuid, Uuid) {
+        let mock = MockGraphStore::new();
+        let mut project = test_project();
+        let project_id = project.id;
+        project.name = "test-project".to_string();
+        project.slug = "test-project".to_string();
+        mock.projects.write().await.insert(project_id, project);
+
+        // Seed a protocol with states
+        let start_id = Uuid::new_v4();
+        let mid_id = Uuid::new_v4();
+        let end_id = Uuid::new_v4();
+        let proto = crate::protocol::Protocol::new(project_id, "existing-proto", start_id);
+        let proto_id = proto.id;
+        mock.protocols.write().await.insert(proto_id, proto);
+
+        // Seed states
+        for (id, name, st) in [
+            (start_id, "start", StateType::Start),
+            (mid_id, "work", StateType::Intermediate),
+            (end_id, "done", StateType::Terminal),
+        ] {
+            let ps = ProtocolState {
+                id,
+                protocol_id: proto_id,
+                name: name.to_string(),
+                description: String::new(),
+                action: None,
+                state_type: st,
+                sub_protocol_id: None,
+                completion_strategy: None,
+                on_failure_strategy: None,
+                generator_config: None,
+            };
+            mock.protocol_states.write().await.insert(id, ps);
+        }
+
+        let state = build_server_state(mock).await;
+        (state, project_id, proto_id)
+    }
+
+    #[tokio::test]
+    async fn test_handler_create_protocol_name_uniqueness() {
+        let (state, project_id, _proto_id) = make_state_with_protocol().await;
+
+        // Try to create a protocol with the same name → should Conflict
+        let body = CreateProtocolBody {
+            project_id,
+            name: "existing-proto".to_string(),
+            description: None,
+            skill_id: None,
+            protocol_category: None,
+            trigger_mode: None,
+            trigger_config: None,
+            relevance_vector: None,
+            states: None,
+            transitions: None,
+        };
+        let result = create_protocol(State(state.clone()), Json(body)).await;
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            AppError::Conflict(msg) => {
+                assert!(msg.contains("existing-proto"));
+                assert!(msg.contains("already exists"));
+            }
+            other => panic!("Expected Conflict, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handler_create_protocol_with_new_name_succeeds() {
+        let (state, project_id, _) = make_state_with_protocol().await;
+
+        let body = CreateProtocolBody {
+            project_id,
+            name: "brand-new-proto".to_string(),
+            description: Some("A new protocol".to_string()),
+            skill_id: None,
+            protocol_category: None,
+            trigger_mode: None,
+            trigger_config: None,
+            relevance_vector: None,
+            states: None,
+            transitions: None,
+        };
+        let result = create_protocol(State(state.clone()), Json(body)).await;
+        assert!(result.is_ok(), "Create should succeed: {:?}", result.err());
+    }
+
+    #[tokio::test]
+    async fn test_handler_add_transition_rejects_from_terminal() {
+        let (state, _project_id, proto_id) = make_state_with_protocol().await;
+
+        // Get the state IDs
+        let states = state
+            .orchestrator
+            .neo4j()
+            .get_protocol_states(proto_id)
+            .await
+            .unwrap();
+        let terminal_id = states.iter().find(|s| s.name == "done").unwrap().id;
+        let mid_id = states.iter().find(|s| s.name == "work").unwrap().id;
+
+        let body = AddTransitionBody {
+            from_state: terminal_id,
+            to_state: mid_id,
+            trigger: "go_back".to_string(),
+            guard: None,
+        };
+        let result = add_transition(State(state.clone()), Path(proto_id), Json(body)).await;
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            AppError::BadRequest(msg) => {
+                assert!(msg.contains("terminal state"));
+            }
+            other => panic!("Expected BadRequest, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handler_add_transition_rejects_to_start() {
+        let (state, _project_id, proto_id) = make_state_with_protocol().await;
+
+        let states = state
+            .orchestrator
+            .neo4j()
+            .get_protocol_states(proto_id)
+            .await
+            .unwrap();
+        let start_id = states.iter().find(|s| s.name == "start").unwrap().id;
+        let mid_id = states.iter().find(|s| s.name == "work").unwrap().id;
+
+        let body = AddTransitionBody {
+            from_state: mid_id,
+            to_state: start_id,
+            trigger: "restart".to_string(),
+            guard: None,
+        };
+        let result = add_transition(State(state.clone()), Path(proto_id), Json(body)).await;
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            AppError::BadRequest(msg) => {
+                assert!(msg.contains("start state"));
+            }
+            other => panic!("Expected BadRequest, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handler_add_transition_succeeds() {
+        let (state, _project_id, proto_id) = make_state_with_protocol().await;
+
+        let states = state
+            .orchestrator
+            .neo4j()
+            .get_protocol_states(proto_id)
+            .await
+            .unwrap();
+        let start_id = states.iter().find(|s| s.name == "start").unwrap().id;
+        let mid_id = states.iter().find(|s| s.name == "work").unwrap().id;
+
+        let body = AddTransitionBody {
+            from_state: start_id,
+            to_state: mid_id,
+            trigger: "begin".to_string(),
+            guard: None,
+        };
+        let result = add_transition(State(state.clone()), Path(proto_id), Json(body)).await;
+        assert!(result.is_ok(), "Should succeed: {:?}", result.err());
+    }
+
+    #[tokio::test]
+    async fn test_handler_fire_transition_run_not_found() {
+        let state = make_test_server_state().await;
+        let fake_run_id = Uuid::new_v4();
+
+        let body = FireTransitionBody {
+            trigger: "go".to_string(),
+        };
+        let result = fire_transition(State(state), Path(fake_run_id), Json(body)).await;
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            AppError::NotFound(msg) => {
+                assert!(msg.contains("not found"));
+            }
+            other => panic!("Expected NotFound, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handler_fire_transition_succeeds_with_event_emission() {
+        let (state, _project_id, proto_id) = make_state_with_protocol().await;
+
+        // Add a transition first
+        let states = state
+            .orchestrator
+            .neo4j()
+            .get_protocol_states(proto_id)
+            .await
+            .unwrap();
+        let start_id = states.iter().find(|s| s.name == "start").unwrap().id;
+        let mid_id = states.iter().find(|s| s.name == "work").unwrap().id;
+
+        let transition = ProtocolTransition {
+            id: Uuid::new_v4(),
+            protocol_id: proto_id,
+            from_state: start_id,
+            to_state: mid_id,
+            trigger: "begin".to_string(),
+            guard: None,
+        };
+        state
+            .orchestrator
+            .neo4j()
+            .upsert_protocol_transition(&transition)
+            .await
+            .unwrap();
+
+        // Start a run
+        let run = crate::protocol::engine::start_run(
+            state.orchestrator.neo4j(),
+            proto_id,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Fire transition via handler (covers event emission + trajectory collection)
+        let body = FireTransitionBody {
+            trigger: "begin".to_string(),
+        };
+        let result = fire_transition(State(state.clone()), Path(run.id), Json(body)).await;
+        assert!(
+            result.is_ok(),
+            "Fire transition should succeed: {:?}",
+            result.err()
+        );
+        let response = result.unwrap();
+        assert!(response.success);
+        assert_eq!(response.current_state_name, "work");
+    }
 }
