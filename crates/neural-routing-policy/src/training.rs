@@ -18,6 +18,7 @@ use tracing::{debug, info};
 
 use crate::dataloader::{Split, TrajectoryDataLoader};
 use crate::dataset::PolicyNormStats;
+use crate::ewc::EWCRegularizer;
 use crate::transformer::{DecisionTransformer, DecisionTransformerConfig};
 
 // ---------------------------------------------------------------------------
@@ -299,6 +300,9 @@ pub struct TrainingResult {
     pub config: TrainingConfig,
     pub model_config: DecisionTransformerConfig,
     pub history: Vec<EpochMetrics>,
+    /// Whether EWC regularization was active during training.
+    #[serde(skip)]
+    pub ewc_was_active: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -313,19 +317,53 @@ pub fn train_decision_transformer(
     dataloader: &TrajectoryDataLoader,
     config: &TrainingConfig,
 ) -> CandleResult<TrainingResult> {
+    train_decision_transformer_with_ewc(model_config, dataloader, config, None, None)
+}
+
+/// Train a Decision Transformer with optional EWC regularization and checkpoint reload.
+///
+/// - `ewc`: if Some, adds the EWC penalty term to the loss at each training step
+/// - `checkpoint_load_path`: if Some, loads pre-trained weights from safetensors file (fine-tuning)
+///
+/// Returns the training result with metrics and checkpoint path.
+pub fn train_decision_transformer_with_ewc(
+    model_config: DecisionTransformerConfig,
+    dataloader: &TrajectoryDataLoader,
+    config: &TrainingConfig,
+    ewc: Option<&EWCRegularizer>,
+    checkpoint_load_path: Option<&Path>,
+) -> CandleResult<TrainingResult> {
     let device = Device::Cpu;
 
     // Initialize model
-    let varmap = VarMap::new();
+    let mut varmap = VarMap::new();
     let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
     let model = DecisionTransformer::new(model_config.clone(), vb)?;
 
-    info!(
-        "Decision Transformer initialized: ~{}K params, {} layers, hidden={}",
-        model.param_count() / 1000,
-        model_config.num_layers,
-        model_config.hidden_dim,
-    );
+    // Load pre-trained weights if checkpoint provided (fine-tuning mode)
+    if let Some(ckpt_path) = checkpoint_load_path {
+        if ckpt_path.exists() {
+            varmap.load(ckpt_path)?;
+            info!(
+                "Loaded checkpoint from {:?} for fine-tuning (~{}K params)",
+                ckpt_path,
+                model.param_count() / 1000,
+            );
+        } else {
+            info!(
+                "Checkpoint {:?} not found, training from scratch (~{}K params)",
+                ckpt_path,
+                model.param_count() / 1000,
+            );
+        }
+    } else {
+        info!(
+            "Decision Transformer initialized from scratch: ~{}K params, {} layers, hidden={}",
+            model.param_count() / 1000,
+            model_config.num_layers,
+            model_config.hidden_dim,
+        );
+    }
 
     // Initialize optimizer
     let mut adamw = AdamWState::new(&varmap)?;
@@ -365,7 +403,7 @@ pub fn train_decision_transformer(
             )?;
 
             // Compute loss
-            let (loss, mse_val, cos_val) = compute_loss(
+            let (task_loss, mse_val, cos_val) = compute_loss(
                 &pred_actions,
                 &batch.actions,
                 &batch.attention_mask,
@@ -373,6 +411,18 @@ pub fn train_decision_transformer(
                 config.mse_weight,
                 config.cosine_weight,
             )?;
+
+            // Add EWC penalty if active
+            let loss = if let Some(ewc_reg) = ewc {
+                if ewc_reg.is_active() {
+                    let penalty = ewc_reg.penalty(&varmap)?;
+                    (task_loss + penalty)?
+                } else {
+                    task_loss
+                }
+            } else {
+                task_loss
+            };
 
             // Backward pass
             let grads = loss.backward()?;
@@ -522,6 +572,7 @@ pub fn train_decision_transformer(
         config: config.clone(),
         model_config,
         history,
+        ewc_was_active: ewc.is_some_and(|e| e.is_active()),
     })
 }
 
@@ -723,6 +774,174 @@ mod tests {
             result.epochs_completed
         );
         assert!(result.early_stopped);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_train_with_ewc_penalty() -> CandleResult<()> {
+        use crate::ewc::{EWCConfig, EWCRegularizer};
+        use candle_core::Device;
+
+        let dl = make_test_dataloader(50);
+
+        let model_config = DecisionTransformerConfig {
+            state_dim: STATE_DIM,
+            action_dim: ACTION_DIM,
+            hidden_dim: 64,
+            num_layers: 1,
+            num_heads: 2,
+            max_timesteps: 16,
+            dropout: 0.0,
+        };
+
+        let config = TrainingConfig {
+            epochs: 3,
+            learning_rate: 1e-3,
+            batch_size: 8,
+            patience: 100,
+            checkpoint_dir: "/tmp/policy_test_ewc".to_string(),
+            checkpoint_every: 0,
+            ..Default::default()
+        };
+
+        // Train once without EWC
+        let result1 =
+            train_decision_transformer_with_ewc(model_config.clone(), &dl, &config, None, None)?;
+        assert_eq!(result1.epochs_completed, 3);
+        assert!(!result1.ewc_was_active);
+
+        // Create EWC with a snapshot (simulate: Fisher = uniform)
+        let mut ewc = EWCRegularizer::new(EWCConfig {
+            lambda: 10.0,
+            fisher_samples: 1,
+        });
+
+        // Build a temporary model to get param names and create fake gradients
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &Device::Cpu);
+        let _model = DecisionTransformer::new(model_config.clone(), vb)?;
+
+        let data = varmap.data().lock().unwrap();
+        let sample_grads: Vec<(String, Vec<Tensor>)> = data
+            .iter()
+            .map(|(name, var)| {
+                let grad = Tensor::ones(var.shape(), DType::F32, &Device::Cpu).unwrap();
+                (name.clone(), vec![grad])
+            })
+            .collect();
+        drop(data);
+        ewc.snapshot_from_gradients(&varmap, &sample_grads)?;
+        assert!(ewc.is_active());
+
+        // Train with EWC active
+        let result2 =
+            train_decision_transformer_with_ewc(model_config, &dl, &config, Some(&ewc), None)?;
+        assert_eq!(result2.epochs_completed, 3);
+        assert!(result2.ewc_was_active);
+
+        // Both should produce finite losses
+        for m in &result2.history {
+            assert!(m.train_loss.is_finite(), "EWC train loss should be finite");
+            assert!(m.val_loss.is_finite(), "EWC val loss should be finite");
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_train_with_checkpoint_reload() -> CandleResult<()> {
+        let dl = make_test_dataloader(50);
+        let ckpt_dir = "/tmp/policy_test_ckpt_reload";
+        let _ = std::fs::create_dir_all(ckpt_dir);
+
+        let model_config = DecisionTransformerConfig {
+            state_dim: STATE_DIM,
+            action_dim: ACTION_DIM,
+            hidden_dim: 64,
+            num_layers: 1,
+            num_heads: 2,
+            max_timesteps: 16,
+            dropout: 0.0,
+        };
+
+        let config = TrainingConfig {
+            epochs: 3,
+            learning_rate: 1e-3,
+            batch_size: 8,
+            patience: 100,
+            checkpoint_dir: ckpt_dir.to_string(),
+            checkpoint_every: 0,
+            ..Default::default()
+        };
+
+        // Train once — produces a checkpoint
+        let result1 = train_decision_transformer(model_config.clone(), &dl, &config)?;
+        assert!(result1.checkpoint_path.is_some());
+        let ckpt_path = result1.checkpoint_path.unwrap();
+        assert!(ckpt_path.exists(), "Checkpoint file should exist");
+
+        // Train again, loading from checkpoint (fine-tuning)
+        let result2 = train_decision_transformer_with_ewc(
+            model_config,
+            &dl,
+            &config,
+            None,
+            Some(ckpt_path.as_path()),
+        )?;
+        assert_eq!(result2.epochs_completed, 3);
+
+        // Fine-tuned model should start with a lower loss than random init
+        // (not guaranteed but very likely)
+        let first_loss_1 = result1.history.first().unwrap().val_loss;
+        let first_loss_2 = result2.history.first().unwrap().val_loss;
+        info!(
+            "Random init first val_loss={:.4}, checkpoint reload first val_loss={:.4}",
+            first_loss_1, first_loss_2
+        );
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(ckpt_dir);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_train_with_nonexistent_checkpoint() -> CandleResult<()> {
+        let dl = make_test_dataloader(30);
+
+        let model_config = DecisionTransformerConfig {
+            state_dim: STATE_DIM,
+            action_dim: ACTION_DIM,
+            hidden_dim: 32,
+            num_layers: 1,
+            num_heads: 2,
+            max_timesteps: 8,
+            dropout: 0.0,
+        };
+
+        let config = TrainingConfig {
+            epochs: 2,
+            learning_rate: 1e-3,
+            batch_size: 8,
+            patience: 100,
+            checkpoint_dir: "/tmp/policy_test_noexist".to_string(),
+            checkpoint_every: 0,
+            ..Default::default()
+        };
+
+        // Should gracefully fall back to random init
+        let result = train_decision_transformer_with_ewc(
+            model_config,
+            &dl,
+            &config,
+            None,
+            Some(std::path::Path::new(
+                "/tmp/nonexistent_checkpoint.safetensors",
+            )),
+        )?;
+        assert_eq!(result.epochs_completed, 2);
+        assert!(!result.ewc_was_active);
 
         Ok(())
     }
