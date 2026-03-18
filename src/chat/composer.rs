@@ -245,7 +245,12 @@ impl FsmPromptComposer {
         lines.join("\n")
     }
 
-    /// Build the dynamic context section (continuity + project context), truncated.
+    /// Build the dynamic context section (continuity + project context) with semantic truncation.
+    ///
+    /// Instead of blindly cutting at a character boundary, this function:
+    /// 1. Parses the markdown into sections (## headers) with their list items (- lines)
+    /// 2. Scores each item by importance markers ([Critical] > [High] > [Medium] > [Low])
+    /// 3. When over budget, keeps only the top-N items per section (never drops entire sections)
     fn build_dynamic_section(continuity: &str, project_context: &str) -> String {
         let mut parts = Vec::new();
 
@@ -262,14 +267,13 @@ impl FsmPromptComposer {
 
         let full = parts.join("\n\n");
 
-        // Truncate to budget
+        // Under budget → return as-is
         if full.len() <= DYNAMIC_CONTEXT_CHAR_BUDGET {
-            full
-        } else {
-            // Simple truncation: cut at char boundary, add ellipsis
-            let truncated = &full[..floor_char_boundary(&full, DYNAMIC_CONTEXT_CHAR_BUDGET)];
-            format!("{}\n\n[... dynamic context truncated to fit token budget]", truncated)
+            return full;
         }
+
+        // Over budget → semantic truncation
+        truncate_markdown_semantically(&full, DYNAMIC_CONTEXT_CHAR_BUDGET)
     }
 
     /// Estimate token count (~4 chars per token).
@@ -310,6 +314,196 @@ fn floor_char_boundary(s: &str, index: usize) -> usize {
         i -= 1;
     }
     i
+}
+
+/// A parsed markdown section with header and scored items.
+struct MdSection {
+    /// The header line (e.g., "## Guidelines\n")
+    header: String,
+    /// Non-item lines (description text between header and items)
+    preamble: Vec<String>,
+    /// List items with importance scores (higher = more important)
+    items: Vec<(u8, String)>,
+}
+
+/// Score a markdown list item by importance markers.
+///
+/// Recognizes patterns like `[Critical]`, `[High]`, `[Medium]`, `[Low]`
+/// and also priority numbers (priority 90 > priority 10).
+fn score_item(line: &str) -> u8 {
+    let lower = line.to_lowercase();
+    if lower.contains("[critical]") || lower.contains("critical") {
+        return 100;
+    }
+    if lower.contains("[high]") {
+        return 80;
+    }
+    if lower.contains("[medium]") {
+        return 50;
+    }
+    if lower.contains("[low]") {
+        return 20;
+    }
+    // Check for priority numbers: "priority 90" → score 90
+    if let Some(pos) = lower.find("priority ") {
+        let rest = &lower[pos + 9..];
+        if let Some(num_str) = rest.split(|c: char| !c.is_ascii_digit()).next() {
+            if let Ok(n) = num_str.parse::<u8>() {
+                return n;
+            }
+        }
+    }
+    // Default: medium importance
+    40
+}
+
+/// Parse markdown into sections (## headers) with their list items.
+fn parse_markdown_sections(text: &str) -> Vec<MdSection> {
+    let mut sections: Vec<MdSection> = Vec::new();
+    let mut current: Option<MdSection> = None;
+    let mut in_items = false;
+
+    for line in text.lines() {
+        if line.starts_with("## ") {
+            // Save previous section
+            if let Some(sec) = current.take() {
+                sections.push(sec);
+            }
+            current = Some(MdSection {
+                header: line.to_string(),
+                preamble: Vec::new(),
+                items: Vec::new(),
+            });
+            in_items = false;
+        } else if let Some(ref mut sec) = current {
+            if line.starts_with("- ") || line.starts_with("* ") {
+                in_items = true;
+                let score = score_item(line);
+                sec.items.push((score, line.to_string()));
+            } else if in_items && (line.starts_with("  ") || line.is_empty()) {
+                // Continuation of previous item or blank between items
+                if let Some(last) = sec.items.last_mut() {
+                    last.1.push('\n');
+                    last.1.push_str(line);
+                }
+            } else {
+                sec.preamble.push(line.to_string());
+            }
+        } else {
+            // Lines before any section header — treat as preamble of a virtual section
+            if current.is_none() {
+                current = Some(MdSection {
+                    header: String::new(),
+                    preamble: vec![line.to_string()],
+                    items: Vec::new(),
+                });
+            }
+        }
+    }
+
+    if let Some(sec) = current {
+        sections.push(sec);
+    }
+
+    sections
+}
+
+/// Render sections back to markdown, keeping only top-N items per section.
+fn render_sections_budgeted(sections: &mut [MdSection], char_budget: usize) -> String {
+    // First pass: calculate total size with all items
+    let total: usize = sections
+        .iter()
+        .map(|s| {
+            s.header.len()
+                + s.preamble.iter().map(|l| l.len() + 1).sum::<usize>()
+                + s.items.iter().map(|(_, l)| l.len() + 1).sum::<usize>()
+                + 2 // newlines
+        })
+        .sum();
+
+    if total <= char_budget {
+        // Everything fits
+        return sections
+            .iter()
+            .map(|s| render_section(s, s.items.len()))
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+
+    // Over budget: progressively reduce items per section
+    // Sort items within each section by score (descending)
+    for sec in sections.iter_mut() {
+        sec.items.sort_by(|a, b| b.0.cmp(&a.0));
+    }
+
+    // Binary search for max items per section that fits
+    let max_items = sections.iter().map(|s| s.items.len()).max().unwrap_or(0);
+    let mut best_n = 1; // Keep at least 1 item per section
+
+    for n in (1..=max_items).rev() {
+        let size: usize = sections
+            .iter()
+            .map(|s| {
+                let kept = s.items.len().min(n);
+                s.header.len()
+                    + s.preamble.iter().map(|l| l.len() + 1).sum::<usize>()
+                    + s.items.iter().take(kept).map(|(_, l)| l.len() + 1).sum::<usize>()
+                    + if kept < s.items.len() { 40 } else { 0 } // "[N more items omitted]"
+                    + 2
+            })
+            .sum();
+
+        if size <= char_budget {
+            best_n = n;
+            break;
+        }
+    }
+
+    let mut result: Vec<String> = Vec::new();
+    for sec in sections.iter() {
+        result.push(render_section(sec, best_n));
+    }
+
+    let mut output = result.join("\n");
+    if output.len() > char_budget {
+        // Final safety: hard truncate if still over (shouldn't happen normally)
+        let boundary = floor_char_boundary(&output, char_budget);
+        output.truncate(boundary);
+        output.push_str("\n\n[... context truncated]");
+    }
+    output
+}
+
+/// Render a single section with at most `max_items` items (sorted by score descending).
+fn render_section(sec: &MdSection, max_items: usize) -> String {
+    let mut lines = Vec::new();
+    if !sec.header.is_empty() {
+        lines.push(sec.header.clone());
+    }
+    for p in &sec.preamble {
+        lines.push(p.clone());
+    }
+    let total_items = sec.items.len();
+    let kept = total_items.min(max_items);
+    for (_, item_line) in sec.items.iter().take(kept) {
+        lines.push(item_line.clone());
+    }
+    let omitted = total_items.saturating_sub(kept);
+    if omitted > 0 {
+        lines.push(format!("  [{} more items omitted]", omitted));
+    }
+    lines.join("\n")
+}
+
+/// Semantically truncate markdown by parsing sections and keeping top-N items by importance.
+///
+/// Unlike blind character truncation, this:
+/// - Never drops entire sections (headers are always kept)
+/// - Prioritizes items by importance markers ([Critical] > [High] > [Medium] > [Low])
+/// - Uniformly reduces items per section to fit the budget
+fn truncate_markdown_semantically(text: &str, char_budget: usize) -> String {
+    let mut sections = parse_markdown_sections(text);
+    render_sections_budgeted(&mut sections, char_budget)
 }
 
 // ============================================================================
@@ -412,16 +606,20 @@ mod tests {
 
     #[test]
     fn test_compose_dynamic_truncation() {
-        let big_context = "x".repeat(20_000);
+        // Build a large structured markdown context
+        let mut big_context = String::from("## Items\n");
+        for i in 0..500 {
+            big_context.push_str(&format!("- [Low] Item {} with padding text to make it much longer\n", i));
+        }
         let input = ComposerInput {
             project_context_markdown: &big_context,
             ..Default::default()
         };
         let prompt = FsmPromptComposer::compose(&input);
 
-        // The dynamic section should be truncated
+        // The dynamic section should be semantically truncated
         assert!(
-            prompt.contains("truncated to fit token budget"),
+            prompt.contains("more items omitted") || prompt.contains("context truncated"),
             "Should indicate truncation"
         );
         // Total prompt should be reasonable (base + tool_ref + truncated dynamic)
@@ -488,5 +686,153 @@ mod tests {
             "FSM whitelist should limit groups, got {}",
             groups
         );
+    }
+
+    // ── Semantic truncation tests ────────────────────────────────────
+
+    #[test]
+    fn test_score_item_importance_ordering() {
+        assert!(score_item("- [Critical] Never do X") > score_item("- [High] Avoid Y"));
+        assert!(score_item("- [High] Avoid Y") > score_item("- [Medium] Consider Z"));
+        assert!(score_item("- [Medium] Consider Z") > score_item("- [Low] Maybe W"));
+    }
+
+    #[test]
+    fn test_score_item_priority_number() {
+        let score = score_item("- **Plan A** (InProgress, priority 90)");
+        assert!(score == 90, "Should extract priority 90, got {}", score);
+    }
+
+    #[test]
+    fn test_parse_markdown_sections() {
+        let md = "## Guidelines\n- [Critical] Rule 1\n- [Low] Rule 2\n\n## Gotchas\n- Watch out for X\n";
+        let sections = parse_markdown_sections(md);
+        assert_eq!(sections.len(), 2, "Should parse 2 sections");
+        assert_eq!(sections[0].items.len(), 2, "Guidelines should have 2 items");
+        assert_eq!(sections[1].items.len(), 1, "Gotchas should have 1 item");
+    }
+
+    #[test]
+    fn test_semantic_truncation_keeps_critical_drops_low() {
+        // Build a dynamic context with 8 guidelines of varying importance
+        let mut md = String::from("## Guidelines\n");
+        md.push_str("- [Critical] Never expose API keys\n");
+        md.push_str("- [Critical] Always validate input\n");
+        md.push_str("- [Critical] Use parameterized queries\n");
+        md.push_str("- [High] Log all errors\n");
+        md.push_str("- [High] Use structured logging\n");
+        md.push_str("- [Medium] Prefer composition over inheritance\n");
+        md.push_str("- [Low] Use snake_case for variables\n");
+        md.push_str("- [Low] Max line length 100\n");
+
+        // Set a very tight budget that can only fit ~3 items
+        let budget = md.len() / 2;
+        let result = truncate_markdown_semantically(&md, budget);
+
+        // Should keep the Critical items, drop Low items
+        assert!(
+            result.contains("Never expose API keys"),
+            "Should keep Critical item"
+        );
+        assert!(
+            result.contains("Always validate input"),
+            "Should keep Critical item"
+        );
+        assert!(
+            result.contains("## Guidelines"),
+            "Should keep section header"
+        );
+        // Should indicate omitted items
+        assert!(
+            result.contains("more items omitted"),
+            "Should show omission indicator"
+        );
+    }
+
+    #[test]
+    fn test_semantic_truncation_preserves_all_section_headers() {
+        let md = "## Guidelines\n- [Low] Rule 1\n- [Low] Rule 2\n- [Low] Rule 3\n- [Low] Rule 4\n\n\
+                   ## Gotchas\n- [Low] Gotcha 1\n- [Low] Gotcha 2\n- [Low] Gotcha 3\n- [Low] Gotcha 4\n\n\
+                   ## Plans\n- [Low] Plan 1\n- [Low] Plan 2\n- [Low] Plan 3\n- [Low] Plan 4\n";
+
+        // Budget that fits headers + 1 item each but not all items
+        let budget = md.len() * 2 / 3;
+        let result = truncate_markdown_semantically(&md, budget);
+
+        // All section headers must be preserved
+        assert!(
+            result.contains("## Guidelines"),
+            "Must keep Guidelines header"
+        );
+        assert!(result.contains("## Gotchas"), "Must keep Gotchas header");
+        assert!(result.contains("## Plans"), "Must keep Plans header");
+        // Should have omitted some items
+        assert!(
+            result.contains("more items omitted"),
+            "Should indicate omitted items"
+        );
+    }
+
+    #[test]
+    fn test_semantic_truncation_under_budget_unchanged() {
+        let md = "## Small\n- Item 1\n- Item 2\n";
+        let result = truncate_markdown_semantically(md, 10_000);
+        // Should return as-is (no omission markers)
+        assert!(
+            !result.contains("omitted"),
+            "Under budget should not truncate"
+        );
+        assert!(result.contains("Item 1"));
+        assert!(result.contains("Item 2"));
+    }
+
+    #[test]
+    fn test_dynamic_section_uses_semantic_truncation() {
+        // Build a big project context that exceeds DYNAMIC_CONTEXT_CHAR_BUDGET
+        let mut big_context = String::new();
+        big_context.push_str("## Guidelines\n");
+        for i in 0..100 {
+            let importance = if i < 10 {
+                "Critical"
+            } else if i < 30 {
+                "High"
+            } else {
+                "Low"
+            };
+            big_context.push_str(&format!(
+                "- [{}] Guideline number {} with some padding text to make it longer and exceed the budget easily\n",
+                importance, i
+            ));
+        }
+        big_context.push_str("\n## Gotchas\n");
+        for i in 0..50 {
+            big_context.push_str(&format!(
+                "- [Medium] Gotcha number {} with extra text\n",
+                i
+            ));
+        }
+
+        assert!(
+            big_context.len() > DYNAMIC_CONTEXT_CHAR_BUDGET,
+            "Test context should exceed budget"
+        );
+
+        let result =
+            FsmPromptComposer::build_dynamic_section("", &big_context);
+
+        // Should be within budget (with some margin for omission markers)
+        assert!(
+            result.len() <= DYNAMIC_CONTEXT_CHAR_BUDGET + 200,
+            "Result ({} chars) should be near budget ({})",
+            result.len(),
+            DYNAMIC_CONTEXT_CHAR_BUDGET
+        );
+
+        // Should keep section headers
+        assert!(result.contains("## Guidelines"));
+        assert!(result.contains("## Gotchas"));
+
+        // Should indicate truncation
+        assert!(result.contains("more items omitted"));
     }
 }
