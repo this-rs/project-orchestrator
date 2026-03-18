@@ -39,28 +39,12 @@
 //! ```
 
 use super::prompt::TOOL_REFERENCE;
-use super::prompt_sections::{
-    assemble_sections, extract_tool_reference, select_sections, select_tool_groups,
-    ComposerContext, ToolGroupSelectionContext,
-};
+use super::prompt_sections::{assemble_sections, extract_tool_reference};
+use super::routing::{HeuristicRouter, RoutingContext, RoutingProvider};
 use super::stages::status_injection::ProtocolRunStatus;
 
-// ============================================================================
-// SectionHint — future routing interface for DualTrackRouter
-// ============================================================================
-
-/// A hint from the routing system about a specific prompt section.
-///
-/// Future: the DualTrackRouter will produce these to influence which sections
-/// are included and with what token budget. For now, this is a placeholder.
-#[derive(Debug, Clone)]
-pub struct SectionHint {
-    pub section_id: super::prompt_sections::PromptSectionId,
-    /// Weight: 0.0 = exclude, 1.0 = must include.
-    pub weight: f32,
-    /// Optional per-section token budget.
-    pub token_budget: Option<usize>,
-}
+// Re-export SectionHint from routing for backward compatibility
+pub use super::routing::SectionHint;
 
 // ============================================================================
 // FsmPromptComposer — the central prompt assembly engine
@@ -79,9 +63,12 @@ pub struct ComposerInput<'a> {
     pub project_context_markdown: &'a str,
     /// Session continuity rendered as markdown (from `load_session_context`).
     pub continuity_markdown: &'a str,
+    /// Enrichment pipeline output rendered as markdown (from `to_system_prompt_markdown`).
+    /// Integrated into the system prompt instead of being prepended to the user message.
+    pub enrichment_markdown: &'a str,
     /// The user's current message (for intent detection).
     pub user_message: &'a str,
-    /// Optional routing hints from DualTrackRouter (future).
+    /// Optional routing hints (ignored by HeuristicRouter, used by DualTrackRouter).
     pub routing_hints: Option<&'a [SectionHint]>,
     /// Whether the project has sibling projects (multi-project workspace).
     pub is_multi_project: bool,
@@ -98,6 +85,7 @@ impl<'a> Default for ComposerInput<'a> {
             protocol_runs: &[],
             project_context_markdown: "",
             continuity_markdown: "",
+            enrichment_markdown: "",
             user_message: "",
             routing_hints: None,
             is_multi_project: false,
@@ -117,32 +105,38 @@ const DYNAMIC_CONTEXT_CHAR_BUDGET: usize = 10_000;
 pub struct FsmPromptComposer;
 
 impl FsmPromptComposer {
-    /// Compose the full system prompt from the given inputs.
+    /// Compose the full system prompt using the default [`HeuristicRouter`].
+    ///
+    /// This is the standard entry point. For custom routing (e.g., DualTrackRouter),
+    /// use [`compose_with_router()`] instead.
+    pub fn compose(input: &ComposerInput<'_>) -> String {
+        Self::compose_with_router(input, &HeuristicRouter)
+    }
+
+    /// Compose the full system prompt using a custom [`RoutingProvider`].
     ///
     /// Assembly pipeline:
-    /// 1. Select base sections (scaffolding + context filtering)
-    /// 2. Assemble base sections into markdown
-    /// 3. Inject FSM prompt fragments (from active protocol runs)
-    /// 4. Select and render tool reference groups
-    /// 5. Append dynamic context (project + continuity), truncated
-    /// 6. Join everything into the final prompt
-    pub fn compose(input: &ComposerInput<'_>) -> String {
-        // ── Step 1: Select base sections ──────────────────────────────
-        let composer_ctx = ComposerContext {
-            scaffolding_level: input.scaffolding_level,
-            has_active_plan: input.has_active_plan,
-            has_active_protocol: !input.protocol_runs.is_empty(),
-            task_count: input.task_count,
-        };
-        let sections = select_sections(&composer_ctx);
-
-        // ── Step 2: Assemble base sections ────────────────────────────
-        let base_prompt = assemble_sections(&sections);
-
-        // ── Step 3: Inject FSM prompt fragments ───────────────────────
-        let fsm_section = Self::build_fsm_section(input.protocol_runs);
-
-        // ── Step 4: Select and render tool reference ──────────────────
+    /// 1. Build [`RoutingContext`] from the input
+    /// 2. Call `router.route()` to get section + tool group decisions
+    /// 3. Assemble base sections into markdown
+    /// 4. Inject FSM prompt fragments (from active protocol runs)
+    /// 5. Render selected tool reference groups
+    /// 6. Append dynamic context (project + continuity + enrichment), truncated
+    /// 7. Join everything into the final prompt
+    ///
+    /// ## Integrating a custom router (e.g., DualTrackRouter)
+    ///
+    /// ```rust,ignore
+    /// use crate::chat::routing::{RoutingProvider, RoutingContext, RoutingDecision};
+    ///
+    /// let dual_track = DualTrackRouter::new(model_weights);
+    /// let prompt = FsmPromptComposer::compose_with_router(&input, &dual_track);
+    /// ```
+    pub fn compose_with_router(
+        input: &ComposerInput<'_>,
+        router: &dyn RoutingProvider,
+    ) -> String {
+        // ── Step 1: Build routing context ─────────────────────────────
         let fsm_tools: Vec<String> = input
             .protocol_runs
             .iter()
@@ -151,23 +145,37 @@ impl FsmPromptComposer {
             .cloned()
             .collect();
 
-        let tool_group_ctx = ToolGroupSelectionContext {
+        let routing_ctx = RoutingContext {
             scaffolding_level: input.scaffolding_level,
+            has_active_plan: input.has_active_plan,
             has_active_protocol: !input.protocol_runs.is_empty(),
+            task_count: input.task_count,
             is_multi_project: input.is_multi_project,
             fsm_available_tools: fsm_tools,
-            user_intent_keywords: vec![input.user_message.to_string()],
+            user_message: input.user_message.to_string(),
+            detected_intent: None, // Future: from enrichment hints
         };
-        let tool_groups = select_tool_groups(&tool_group_ctx);
-        let tool_ref = extract_tool_reference(TOOL_REFERENCE, &tool_groups);
 
-        // ── Step 5: Build dynamic context (truncated) ─────────────────
+        // ── Step 2: Route — get section + tool group decisions ────────
+        let decision = router.route(&routing_ctx);
+
+        // ── Step 3: Assemble base sections ────────────────────────────
+        let base_prompt = assemble_sections(&decision.sections);
+
+        // ── Step 4: Inject FSM prompt fragments ───────────────────────
+        let fsm_section = Self::build_fsm_section(input.protocol_runs);
+
+        // ── Step 5: Render selected tool reference groups ─────────────
+        let tool_ref = extract_tool_reference(TOOL_REFERENCE, &decision.tool_groups);
+
+        // ── Step 6: Build dynamic context (truncated) ─────────────────
         let dynamic = Self::build_dynamic_section(
             input.continuity_markdown,
             input.project_context_markdown,
+            input.enrichment_markdown,
         );
 
-        // ── Step 6: Assemble final prompt ─────────────────────────────
+        // ── Step 7: Assemble final prompt ─────────────────────────────
         let mut parts: Vec<&str> = Vec::with_capacity(4);
         parts.push(&base_prompt);
 
@@ -245,17 +253,21 @@ impl FsmPromptComposer {
         lines.join("\n")
     }
 
-    /// Build the dynamic context section (continuity + project context) with semantic truncation.
+    /// Build the dynamic context section (continuity + project context + enrichment)
+    /// with semantic truncation.
     ///
     /// Instead of blindly cutting at a character boundary, this function:
     /// 1. Parses the markdown into sections (## headers) with their list items (- lines)
     /// 2. Scores each item by importance markers ([Critical] > [High] > [Medium] > [Low])
     /// 3. When over budget, keeps only the top-N items per section (never drops entire sections)
-    fn build_dynamic_section(continuity: &str, project_context: &str) -> String {
+    fn build_dynamic_section(continuity: &str, project_context: &str, enrichment: &str) -> String {
         let mut parts = Vec::new();
 
         if !continuity.is_empty() {
             parts.push(continuity);
+        }
+        if !enrichment.is_empty() {
+            parts.push(enrichment);
         }
         if !project_context.is_empty() {
             parts.push(project_context);
@@ -285,6 +297,15 @@ impl FsmPromptComposer {
     /// Count total tool groups selected (for metrics/logging).
     #[allow(dead_code)]
     pub fn count_tool_groups(input: &ComposerInput<'_>) -> usize {
+        Self::count_tool_groups_with_router(input, &HeuristicRouter)
+    }
+
+    /// Count tool groups using a custom router.
+    #[allow(dead_code)]
+    pub fn count_tool_groups_with_router(
+        input: &ComposerInput<'_>,
+        router: &dyn RoutingProvider,
+    ) -> usize {
         let fsm_tools: Vec<String> = input
             .protocol_runs
             .iter()
@@ -293,14 +314,17 @@ impl FsmPromptComposer {
             .cloned()
             .collect();
 
-        let ctx = ToolGroupSelectionContext {
+        let routing_ctx = RoutingContext {
             scaffolding_level: input.scaffolding_level,
+            has_active_plan: input.has_active_plan,
             has_active_protocol: !input.protocol_runs.is_empty(),
+            task_count: input.task_count,
             is_multi_project: input.is_multi_project,
             fsm_available_tools: fsm_tools,
-            user_intent_keywords: vec![input.user_message.to_string()],
+            user_message: input.user_message.to_string(),
+            detected_intent: None,
         };
-        select_tool_groups(&ctx).len()
+        router.route(&routing_ctx).tool_groups.len()
     }
 }
 
@@ -818,7 +842,7 @@ mod tests {
         );
 
         let result =
-            FsmPromptComposer::build_dynamic_section("", &big_context);
+            FsmPromptComposer::build_dynamic_section("", &big_context, "");
 
         // Should be within budget (with some margin for omission markers)
         assert!(

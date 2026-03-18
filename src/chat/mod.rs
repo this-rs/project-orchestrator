@@ -17,6 +17,7 @@ pub mod path_detect;
 pub(crate) mod post_tool_hook;
 pub mod prompt;
 pub mod prompt_sections;
+pub mod routing;
 pub(crate) mod skill_hook;
 pub mod stages;
 pub mod types;
