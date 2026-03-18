@@ -10,6 +10,7 @@
 //! - Progressive rollout (configurable split ratio)
 //! - Decision logging for feedback loop
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -80,6 +81,96 @@ pub enum RoutingSource {
     PolicyNet,
 }
 
+// ---------------------------------------------------------------------------
+// Routing metrics (atomic A/B counters)
+// ---------------------------------------------------------------------------
+
+/// Atomic counters for A/B routing metrics. Lock-free, zero overhead.
+pub struct RoutingMetrics {
+    /// Number of routes served by the Policy Net.
+    model_hits: AtomicU64,
+    /// Number of routes served by the NN fallback.
+    fallback_hits: AtomicU64,
+    /// Cumulative raw confidence for model routes (divide by model_hits for avg).
+    cumulative_confidence: AtomicU64,
+    /// Cumulative latency in microseconds for model routes.
+    cumulative_latency_us: AtomicU64,
+}
+
+impl RoutingMetrics {
+    fn new() -> Self {
+        Self {
+            model_hits: AtomicU64::new(0),
+            fallback_hits: AtomicU64::new(0),
+            cumulative_confidence: AtomicU64::new(0),
+            cumulative_latency_us: AtomicU64::new(0),
+        }
+    }
+
+    fn record_model_hit(&self, confidence: f32, latency_us: u64) {
+        self.model_hits.fetch_add(1, Ordering::Relaxed);
+        // Store confidence as fixed-point: multiply by 1_000_000 for 6 decimal precision
+        self.cumulative_confidence
+            .fetch_add((confidence as f64 * 1_000_000.0) as u64, Ordering::Relaxed);
+        self.cumulative_latency_us
+            .fetch_add(latency_us, Ordering::Relaxed);
+    }
+
+    fn record_fallback_hit(&self) {
+        self.fallback_hits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Take a point-in-time snapshot of the metrics.
+    pub fn snapshot(&self) -> RoutingMetricsSnapshot {
+        let model_hits = self.model_hits.load(Ordering::Relaxed);
+        let fallback_hits = self.fallback_hits.load(Ordering::Relaxed);
+        let total = model_hits + fallback_hits;
+
+        let avg_confidence = if model_hits > 0 {
+            self.cumulative_confidence.load(Ordering::Relaxed) as f64
+                / (model_hits as f64 * 1_000_000.0)
+        } else {
+            0.0
+        };
+
+        let avg_latency_us = if model_hits > 0 {
+            self.cumulative_latency_us.load(Ordering::Relaxed) as f64 / model_hits as f64
+        } else {
+            0.0
+        };
+
+        RoutingMetricsSnapshot {
+            model_hits,
+            fallback_hits,
+            total_routes: total,
+            model_ratio: if total > 0 {
+                model_hits as f64 / total as f64
+            } else {
+                0.0
+            },
+            avg_model_confidence: avg_confidence,
+            avg_model_latency_us: avg_latency_us,
+        }
+    }
+}
+
+/// Serializable point-in-time snapshot of routing metrics.
+#[derive(Debug, Clone, Serialize)]
+pub struct RoutingMetricsSnapshot {
+    /// Number of routes served by the Policy Net.
+    pub model_hits: u64,
+    /// Number of routes served by the NN fallback.
+    pub fallback_hits: u64,
+    /// Total routes served.
+    pub total_routes: u64,
+    /// Fraction of routes served by the model (0.0 - 1.0).
+    pub model_ratio: f64,
+    /// Average raw confidence on model-served routes.
+    pub avg_model_confidence: f64,
+    /// Average latency (μs) on model-served routes.
+    pub avg_model_latency_us: f64,
+}
+
 /// DualTrack Router — orchestrates policy net and NN router with timeout + fallback.
 pub struct DualTrackRouter {
     nn_router: NNRouter,
@@ -91,6 +182,8 @@ pub struct DualTrackRouter {
     calibrator: PlattCalibrator,
     /// Progressive rollout configuration.
     rollout: RolloutConfig,
+    /// A/B routing metrics (atomic, lock-free).
+    metrics: Arc<RoutingMetrics>,
 }
 
 impl DualTrackRouter {
@@ -105,6 +198,7 @@ impl DualTrackRouter {
             inference_engine: None,
             calibrator: PlattCalibrator::default(),
             rollout: RolloutConfig::default(),
+            metrics: Arc::new(RoutingMetrics::new()),
         }
     }
 
@@ -148,6 +242,16 @@ impl DualTrackRouter {
         &self.rollout
     }
 
+    /// Get a snapshot of the A/B routing metrics.
+    pub fn get_metrics(&self) -> RoutingMetricsSnapshot {
+        self.metrics.snapshot()
+    }
+
+    /// Get the shared metrics handle (for external monitoring).
+    pub fn metrics(&self) -> &Arc<RoutingMetrics> {
+        &self.metrics
+    }
+
     /// Update config at runtime (hot reload).
     ///
     /// Propagates changes to the NNRouter (top_k, min_similarity, cache settings).
@@ -162,6 +266,36 @@ impl DualTrackRouter {
     /// This is the main entry point for the feedback loop — it returns both
     /// the route and the routing decision for logging.
     pub async fn route_with_decision(
+        &self,
+        query_embedding: &[f32],
+        session_hash: u64,
+    ) -> Result<(Option<NNRoute>, RoutingDecision)> {
+        let result = self.route_inner(query_embedding, session_hash).await;
+
+        // Record A/B metrics from the decision
+        if let Ok((_, ref decision)) = result {
+            match decision.source {
+                RoutingSource::PolicyNet => {
+                    let confidence = match &decision.reason {
+                        RoutingReason::PolicySelected {
+                            raw_confidence, ..
+                        } => *raw_confidence,
+                        _ => 0.0,
+                    };
+                    self.metrics
+                        .record_model_hit(confidence, decision.latency_us);
+                }
+                RoutingSource::NnRouter => {
+                    self.metrics.record_fallback_hit();
+                }
+            }
+        }
+
+        result
+    }
+
+    /// Inner routing logic (uninstrumented).
+    async fn route_inner(
         &self,
         query_embedding: &[f32],
         session_hash: u64,
@@ -683,6 +817,73 @@ mod tests {
         assert_eq!(cfg.inference.timeout_ms, 42);
         assert_eq!(cfg.nn.top_k, 10);
         assert!(cfg.enabled);
+    }
+
+    // ── Routing metrics tests ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_metrics_fallback_increments_on_nn_mode() {
+        let trajectory = make_trajectory(0.9, vec!["code_search", "analyze_impact"]);
+        let store = Arc::new(MockStore::with_trajectories(vec![trajectory]));
+        let config = default_config(); // NN mode by default
+
+        let router = DualTrackRouter::new(store, config);
+        let embedding = make_unit_vec_256();
+
+        // Route twice
+        let _ = router.route_with_decision(&embedding, 0).await.unwrap();
+        let _ = router.route_with_decision(&embedding, 1).await.unwrap();
+
+        let snap = router.get_metrics();
+        assert_eq!(snap.fallback_hits, 2, "NN mode should count as fallback");
+        assert_eq!(snap.model_hits, 0);
+        assert_eq!(snap.total_routes, 2);
+        assert!((snap.model_ratio - 0.0).abs() < 1e-10);
+    }
+
+    #[tokio::test]
+    async fn test_metrics_disabled_counts_as_fallback() {
+        let store = Arc::new(MockStore::new());
+        let mut config = default_config();
+        config.enabled = false;
+
+        let router = DualTrackRouter::new(store, config);
+        let embedding = make_unit_vec_256();
+
+        let _ = router.route_with_decision(&embedding, 0).await.unwrap();
+
+        let snap = router.get_metrics();
+        assert_eq!(snap.fallback_hits, 1);
+        assert_eq!(snap.model_hits, 0);
+    }
+
+    #[test]
+    fn test_metrics_snapshot_empty() {
+        let metrics = RoutingMetrics::new();
+        let snap = metrics.snapshot();
+        assert_eq!(snap.model_hits, 0);
+        assert_eq!(snap.fallback_hits, 0);
+        assert_eq!(snap.total_routes, 0);
+        assert_eq!(snap.model_ratio, 0.0);
+        assert_eq!(snap.avg_model_confidence, 0.0);
+        assert_eq!(snap.avg_model_latency_us, 0.0);
+    }
+
+    #[test]
+    fn test_metrics_record_and_snapshot() {
+        let metrics = RoutingMetrics::new();
+
+        metrics.record_model_hit(0.9, 1000);
+        metrics.record_model_hit(0.8, 2000);
+        metrics.record_fallback_hit();
+
+        let snap = metrics.snapshot();
+        assert_eq!(snap.model_hits, 2);
+        assert_eq!(snap.fallback_hits, 1);
+        assert_eq!(snap.total_routes, 3);
+        assert!((snap.model_ratio - 2.0 / 3.0).abs() < 0.01);
+        assert!((snap.avg_model_confidence - 0.85).abs() < 0.01);
+        assert!((snap.avg_model_latency_us - 1500.0).abs() < 1.0);
     }
 
     // ── Review-fix regression tests ──────────────────────────────────────

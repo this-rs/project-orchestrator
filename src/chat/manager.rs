@@ -160,8 +160,6 @@ pub struct ChatManager {
     /// When Some, `close_session()` calls `end_session()` to finalize trajectories.
     pub(crate) trajectory_collector:
         Option<std::sync::Arc<neural_routing_runtime::TrajectoryCollector>>,
-    /// Reward computer for computing session reward on close.
-    pub(crate) reward_computer: neural_routing_runtime::SessionRewardComputer,
 }
 
 // ============================================================================
@@ -283,7 +281,6 @@ impl ChatManager {
             env_config,
             enrichment_pipeline,
             trajectory_collector: None,
-            reward_computer: neural_routing_runtime::SessionRewardComputer::default(),
         }
     }
 
@@ -355,7 +352,6 @@ impl ChatManager {
             env_config,
             enrichment_pipeline,
             trajectory_collector: None,
-            reward_computer: neural_routing_runtime::SessionRewardComputer::default(),
         }
     }
 
@@ -419,14 +415,6 @@ impl ChatManager {
     }
 
     /// Set a custom reward computer for session reward computation.
-    pub fn with_reward_computer(
-        mut self,
-        computer: neural_routing_runtime::SessionRewardComputer,
-    ) -> Self {
-        self.reward_computer = computer;
-        self
-    }
-
     /// Replace the enrichment pipeline with a custom-configured one.
     ///
     /// Use this to configure which enrichment stages are enabled/disabled,
@@ -4921,27 +4909,15 @@ impl ChatManager {
         };
 
         // 4. Finalize trajectory — fire-and-forget (non-blocking)
-        //    The collector's end_session uses try_send internally (<1ms).
-        //    Reward is computed from signals available to the collector (tool success,
-        //    confidence). Task completion signals come from the stale-session auto-flush.
+        //    Uses end_session_auto() so the collector computes the reward from
+        //    actual buffered DecisionRecords (tool success rate, confidence, duration).
+        //    SessionHints provides optional task metadata not available inside the loop.
         if let Some(ref collector) = self.trajectory_collector {
-            // We don't have direct access to the DecisionRecords here (they live
-            // inside the collector's background loop). The collector will compute
-            // reward via its auto-flush mechanism. We send end_session with a
-            // sentinel reward of -1.0 to signal "compute reward from buffered data".
-            // However, the collector API expects a concrete reward. For now, we
-            // use a heuristic: sessions that were explicitly closed (not timed out)
-            // are likely successful — use a baseline of 0.5 that the collector's
-            // stale-flush will override if it has better signal.
-            //
-            // TODO(Phase 7): Pass actual signals from the session (e.g., via
-            // ActiveSession metadata) to compute a precise reward here.
-            let reward = 0.5; // baseline for explicitly-closed sessions
-            collector.end_session(session_id.to_string(), reward);
+            let hints = neural_routing_runtime::SessionHints::default();
+            collector.end_session_auto(session_id.to_string(), hints);
             tracing::info!(
                 session_id = %session_id,
-                reward = %format!("{:.3}", reward),
-                "Trajectory finalized on session close"
+                "Trajectory finalized with auto-computed reward on session close"
             );
         }
 

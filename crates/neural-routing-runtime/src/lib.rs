@@ -20,7 +20,7 @@ pub mod exploration;
 pub mod inference_engine;
 pub mod reward;
 
-pub use collector::{CollectorEvent, DecisionRecord, TrajectoryCollector};
+pub use collector::{CollectorEvent, DecisionRecord, SessionHints, TrajectoryCollector};
 pub use confidence::{PlattCalibrator, RolloutConfig};
 pub use config::NeuralRoutingConfig;
 pub use continual::{
@@ -28,7 +28,7 @@ pub use continual::{
 };
 pub use cpu_guard::CpuGuard;
 pub use drift::{DriftAction, DriftConfig, DriftDetector, DriftEvent, DriftType};
-pub use dual_track::DualTrackRouter;
+pub use dual_track::{DualTrackRouter, RoutingMetricsSnapshot};
 pub use exploration::{ExplorationConfig, ExplorationDecision, ExplorationScheduler};
 pub use inference_engine::{
     InferenceEngine, InferenceEngineConfig, InferenceError, InferenceResult, InferenceSource,

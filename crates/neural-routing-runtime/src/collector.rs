@@ -19,21 +19,42 @@ use neural_routing_core::{
 };
 
 use crate::config::CollectionConfig;
+use crate::continual::{BufferEntry, ContinualTrainer};
 use crate::reward::{SessionRewardComputer, SessionSignals};
 
 // ---------------------------------------------------------------------------
 // Events sent through the mpsc channel
 // ---------------------------------------------------------------------------
 
+/// Optional hints from the caller to improve reward computation.
+///
+/// These signals are not available inside the collector loop (which only sees
+/// `DecisionRecord`s). The caller (e.g. `ChatManager`) may know about task
+/// completion status from the broader session context.
+#[derive(Debug, Clone, Default)]
+pub struct SessionHints {
+    /// Number of MCP tasks completed during this session.
+    pub tasks_completed: usize,
+    /// Total number of MCP tasks active during this session.
+    pub tasks_total: usize,
+}
+
 /// A decision event sent from the hot path to the background collector.
 #[derive(Debug, Clone)]
 pub enum CollectorEvent {
     /// Record a single decision point.
     Decision(DecisionRecord),
-    /// End a session — triggers trajectory finalization and flush.
+    /// End a session with an explicit reward — triggers trajectory finalization and flush.
     EndSession {
         session_id: String,
         total_reward: f64,
+    },
+    /// End a session with auto-computed reward from buffered DecisionRecords.
+    /// The collector loop computes the reward using `SessionRewardComputer`,
+    /// the same way it does for stale sessions.
+    EndSessionAuto {
+        session_id: String,
+        hints: SessionHints,
     },
     /// Graceful shutdown — flush all pending data.
     Shutdown,
@@ -90,6 +111,8 @@ pub struct TrajectoryCollector {
     enabled: Arc<std::sync::atomic::AtomicBool>,
     /// Shared vector builder for computing context embeddings.
     vector_builder: Arc<DecisionVectorBuilder>,
+    /// Optional trainer — when set, flushed trajectories are auto-submitted for training.
+    trainer: Option<Arc<ContinualTrainer>>,
 }
 
 impl TrajectoryCollector {
@@ -119,6 +142,21 @@ impl TrajectoryCollector {
         vector_builder: Option<Arc<DecisionVectorBuilder>>,
         reward_computer: SessionRewardComputer,
     ) -> (Self, tokio::task::JoinHandle<()>) {
+        Self::new_full(store, config, vector_builder, reward_computer, None)
+    }
+
+    /// Create a collector with a custom reward computer and optional trainer.
+    ///
+    /// When `trainer` is `Some`, flushed trajectories are automatically converted
+    /// to `BufferEntry` and submitted to the `ContinualTrainer`. Training triggers
+    /// when the replay buffer reaches `trigger_threshold`.
+    pub fn new_full(
+        store: Arc<Neo4jTrajectoryStore>,
+        config: &CollectionConfig,
+        vector_builder: Option<Arc<DecisionVectorBuilder>>,
+        reward_computer: SessionRewardComputer,
+        trainer: Option<Arc<ContinualTrainer>>,
+    ) -> (Self, tokio::task::JoinHandle<()>) {
         let buffer_size = config.buffer_size;
         let stale_timeout_secs = config.stale_session_timeout_secs;
         // Channel capacity = 2x buffer to absorb bursts without blocking
@@ -128,24 +166,24 @@ impl TrajectoryCollector {
         let enabled_clone = enabled.clone();
         let builder = vector_builder.unwrap_or_else(|| Arc::new(DecisionVectorBuilder::new()));
         let builder_clone = builder.clone();
+        let trainer_clone = trainer.clone();
+
+        let loop_config = CollectorLoopConfig {
+            buffer_size,
+            stale_timeout_secs,
+            reward_computer,
+            trainer: trainer_clone,
+        };
 
         let handle = tokio::spawn(async move {
-            run_collector_loop(
-                rx,
-                store,
-                buffer_size,
-                enabled_clone,
-                builder_clone,
-                stale_timeout_secs,
-                reward_computer,
-            )
-            .await;
+            run_collector_loop(rx, store, enabled_clone, builder_clone, loop_config).await;
         });
 
         let collector = Self {
             tx,
             enabled,
             vector_builder: builder,
+            trainer,
         };
         (collector, handle)
     }
@@ -170,7 +208,7 @@ impl TrajectoryCollector {
         let _ = self.tx.try_send(CollectorEvent::Decision(record));
     }
 
-    /// End a session — triggers finalization and flush of the trajectory.
+    /// End a session with an explicit reward — triggers finalization and flush.
     pub fn end_session(&self, session_id: String, total_reward: f64) {
         if !self.enabled.load(std::sync::atomic::Ordering::Relaxed) {
             return;
@@ -184,6 +222,30 @@ impl TrajectoryCollector {
                 session_id = %session_id,
                 error = %e,
                 "Failed to send EndSession event — trajectory will be lost"
+            );
+        }
+    }
+
+    /// End a session with auto-computed reward from buffered DecisionRecords.
+    ///
+    /// The collector loop will compute the reward using `SessionRewardComputer`
+    /// from the actual decisions (tool success rate, confidence, duration, etc.).
+    /// Optional `hints` provide task completion data not available inside the loop.
+    ///
+    /// This is the preferred method for callers that don't have a pre-computed reward.
+    pub fn end_session_auto(&self, session_id: String, hints: SessionHints) {
+        if !self.enabled.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+
+        if let Err(e) = self.tx.try_send(CollectorEvent::EndSessionAuto {
+            session_id: session_id.clone(),
+            hints,
+        }) {
+            tracing::warn!(
+                session_id = %session_id,
+                error = %e,
+                "Failed to send EndSessionAuto event — trajectory will be lost"
             );
         }
     }
@@ -203,11 +265,24 @@ impl TrajectoryCollector {
     pub fn is_enabled(&self) -> bool {
         self.enabled.load(std::sync::atomic::Ordering::Relaxed)
     }
+
+    /// Check if a ContinualTrainer is wired for auto-training.
+    pub fn has_trainer(&self) -> bool {
+        self.trainer.is_some()
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Background collector loop
 // ---------------------------------------------------------------------------
+
+/// Configuration for the collector loop (avoids too-many-arguments clippy lint).
+struct CollectorLoopConfig {
+    buffer_size: usize,
+    stale_timeout_secs: u64,
+    reward_computer: SessionRewardComputer,
+    trainer: Option<Arc<ContinualTrainer>>,
+}
 
 /// In-flight session state (buffered decisions before finalization).
 struct SessionBuffer {
@@ -220,12 +295,17 @@ struct SessionBuffer {
 async fn run_collector_loop(
     mut rx: mpsc::Receiver<CollectorEvent>,
     store: Arc<Neo4jTrajectoryStore>,
-    buffer_size: usize,
     _enabled: Arc<std::sync::atomic::AtomicBool>,
     vector_builder: Arc<DecisionVectorBuilder>,
-    stale_timeout_secs: u64,
-    reward_computer: SessionRewardComputer,
+    config: CollectorLoopConfig,
 ) {
+    let CollectorLoopConfig {
+        buffer_size,
+        stale_timeout_secs,
+        reward_computer,
+        trainer,
+    } = config;
+
     let mut sessions: HashMap<String, SessionBuffer> = HashMap::new();
     let mut pending_flush: Vec<PendingTrajectory> = Vec::new();
 
@@ -265,7 +345,32 @@ async fn run_collector_loop(
                             // Flush if we've accumulated enough
                             if pending_flush.len() >= buffer_size {
                                 let to_flush = std::mem::take(&mut pending_flush);
-                                flush_batch(&store, to_flush).await;
+                                flush_batch(&store, to_flush, &trainer).await;
+                            }
+                        }
+                    }
+
+                    CollectorEvent::EndSessionAuto {
+                        session_id,
+                        hints,
+                    } => {
+                        if let Some(buffer) = sessions.remove(&session_id) {
+                            let reward = compute_auto_reward(&buffer, &reward_computer, &hints);
+                            tracing::info!(
+                                session_id = %session_id,
+                                decisions = buffer.decisions.len(),
+                                reward = %format!("{:.3}", reward),
+                                tasks = %format!("{}/{}", hints.tasks_completed, hints.tasks_total),
+                                "Trajectory finalized with auto-computed reward"
+                            );
+                            let trajectory =
+                                build_trajectory(&session_id, &buffer, reward, &vector_builder);
+                            pending_flush.push(trajectory);
+
+                            // Flush if we've accumulated enough
+                            if pending_flush.len() >= buffer_size {
+                                let to_flush = std::mem::take(&mut pending_flush);
+                                flush_batch(&store, to_flush, &trainer).await;
                             }
                         }
                     }
@@ -274,7 +379,7 @@ async fn run_collector_loop(
                         // Finalize any open sessions with auto-computed reward
                         let open_sessions: Vec<_> = sessions.drain().collect();
                         for (session_id, buffer) in open_sessions {
-                            let reward = compute_auto_reward(&buffer, &reward_computer);
+                            let reward = compute_auto_reward(&buffer, &reward_computer, &SessionHints::default());
                             let trajectory = build_trajectory(&session_id, &buffer, reward, &vector_builder);
                             pending_flush.push(trajectory);
                         }
@@ -282,7 +387,7 @@ async fn run_collector_loop(
                         // Final flush
                         if !pending_flush.is_empty() {
                             let to_flush = std::mem::take(&mut pending_flush);
-                            flush_batch(&store, to_flush).await;
+                            flush_batch(&store, to_flush, &trainer).await;
                         }
 
                         tracing::info!("TrajectoryCollector shutdown complete");
@@ -302,7 +407,7 @@ async fn run_collector_loop(
 
                 for session_id in stale_ids {
                     if let Some(buffer) = sessions.remove(&session_id) {
-                        let reward = compute_auto_reward(&buffer, &reward_computer);
+                        let reward = compute_auto_reward(&buffer, &reward_computer, &SessionHints::default());
                         tracing::info!(
                             session_id = %session_id,
                             decisions = buffer.decisions.len(),
@@ -317,7 +422,7 @@ async fn run_collector_loop(
                 // Flush if we have pending trajectories from stale sessions
                 if pending_flush.len() >= buffer_size {
                     let to_flush = std::mem::take(&mut pending_flush);
-                    flush_batch(&store, to_flush).await;
+                    flush_batch(&store, to_flush, &trainer).await;
                 }
             }
         }
@@ -325,11 +430,22 @@ async fn run_collector_loop(
 }
 
 /// Compute reward from buffered decisions using the SessionRewardComputer.
-fn compute_auto_reward(buffer: &SessionBuffer, computer: &SessionRewardComputer) -> f64 {
+///
+/// `hints` provides optional task completion metadata from the caller.
+fn compute_auto_reward(
+    buffer: &SessionBuffer,
+    computer: &SessionRewardComputer,
+    hints: &SessionHints,
+) -> f64 {
     let duration = (Utc::now() - buffer.started_at)
         .to_std()
         .unwrap_or(std::time::Duration::ZERO);
-    let signals = SessionSignals::from_decisions(&buffer.decisions, duration, 0, 0);
+    let signals = SessionSignals::from_decisions(
+        &buffer.decisions,
+        duration,
+        hints.tasks_completed,
+        hints.tasks_total,
+    );
     computer.compute(&signals)
 }
 
@@ -517,7 +633,11 @@ fn build_trajectory(
     }
 }
 
-async fn flush_batch(store: &Neo4jTrajectoryStore, batch: Vec<PendingTrajectory>) {
+async fn flush_batch(
+    store: &Neo4jTrajectoryStore,
+    batch: Vec<PendingTrajectory>,
+    trainer: &Option<Arc<ContinualTrainer>>,
+) {
     let count = batch.len();
     tracing::debug!(count, "Flushing trajectory batch");
 
@@ -580,6 +700,30 @@ async fn flush_batch(store: &Neo4jTrajectoryStore, batch: Vec<PendingTrajectory>
         );
     }
 
+    // 3. Submit to ContinualTrainer for auto-training (if wired)
+    if let Some(ref trainer) = trainer {
+        let mut submitted = 0usize;
+        for pending in &batch {
+            if let Some(tensors) =
+                neural_routing_policy::dataset::trajectory_to_tensors(&pending.trajectory)
+            {
+                let source = neural_routing_policy::dataset::TrajectorySource::from_session_id(
+                    &pending.trajectory.session_id,
+                );
+                trainer.submit(BufferEntry {
+                    tensors,
+                    collected_at: pending.trajectory.created_at,
+                    reward: pending.trajectory.total_reward,
+                    exploratory: source == neural_routing_policy::dataset::TrajectorySource::Simulated,
+                });
+                submitted += 1;
+            }
+        }
+        if submitted > 0 {
+            tracing::info!(submitted, "Submitted trajectories to ContinualTrainer");
+        }
+    }
+
     tracing::info!(count, "Trajectory batch flush complete");
 }
 
@@ -636,6 +780,7 @@ mod tests {
                 tx,
                 enabled,
                 vector_builder: Arc::new(DecisionVectorBuilder::new()),
+                trainer: None,
             };
 
             // These should never block
@@ -655,6 +800,7 @@ mod tests {
             tx,
             enabled,
             vector_builder: Arc::new(DecisionVectorBuilder::new()),
+            trainer: None,
         };
 
         collector.record_decision(make_decision("s1", "code.search", 0));
@@ -672,6 +818,7 @@ mod tests {
             tx,
             enabled,
             vector_builder: Arc::new(DecisionVectorBuilder::new()),
+            trainer: None,
         };
 
         assert!(collector.is_enabled());
@@ -733,6 +880,7 @@ mod tests {
             tx,
             enabled,
             vector_builder: Arc::new(DecisionVectorBuilder::new()),
+            trainer: None,
         };
 
         let mut durations = Vec::with_capacity(1000);
@@ -771,6 +919,7 @@ mod tests {
             tx,
             enabled,
             vector_builder: Arc::new(DecisionVectorBuilder::new()),
+            trainer: None,
         };
 
         let mut durations = Vec::with_capacity(1000);
@@ -1137,6 +1286,7 @@ mod tests {
             tx,
             enabled,
             vector_builder: Arc::new(DecisionVectorBuilder::new()),
+            trainer: None,
         };
 
         // Send 3 decisions for session "flow-test"
@@ -1199,8 +1349,8 @@ mod tests {
         };
 
         // Compute rewards
-        let reward1 = compute_auto_reward(&buf1, &computer);
-        let reward2 = compute_auto_reward(&buf2, &computer);
+        let reward1 = compute_auto_reward(&buf1, &computer, &SessionHints::default());
+        let reward2 = compute_auto_reward(&buf2, &computer, &SessionHints::default());
 
         // Session 1 (all success, high confidence) should have higher reward
         assert!(
@@ -1259,7 +1409,7 @@ mod tests {
             started_at: Utc::now(),
             last_decision_at: Instant::now(),
         };
-        let reward = compute_auto_reward(&buf, &computer);
+        let reward = compute_auto_reward(&buf, &computer, &SessionHints::default());
         assert_eq!(reward, 0.0, "Empty session should have 0 reward");
     }
 
@@ -1290,8 +1440,8 @@ mod tests {
             last_decision_at: Instant::now(),
         };
 
-        let reward_ok = compute_auto_reward(&buf_ok, &computer);
-        let reward_fail = compute_auto_reward(&buf_fail, &computer);
+        let reward_ok = compute_auto_reward(&buf_ok, &computer, &SessionHints::default());
+        let reward_fail = compute_auto_reward(&buf_fail, &computer, &SessionHints::default());
 
         assert!(
             reward_ok > reward_fail,
@@ -1312,6 +1462,7 @@ mod tests {
             tx,
             enabled,
             vector_builder: Arc::new(DecisionVectorBuilder::new()),
+            trainer: None,
         };
 
         // Session A: 3 decisions
@@ -1352,5 +1503,119 @@ mod tests {
         assert_eq!(decisions_a, 3);
         assert_eq!(decisions_b, 2);
         assert_eq!(ends, 2);
+    }
+
+    #[tokio::test]
+    async fn test_end_session_auto_sends_correct_event() {
+        let (tx, mut rx) = mpsc::channel::<CollectorEvent>(100);
+        let enabled = Arc::new(std::sync::atomic::AtomicBool::new(true));
+
+        let collector = TrajectoryCollector {
+            tx,
+            enabled,
+            vector_builder: Arc::new(DecisionVectorBuilder::new()),
+            trainer: None,
+        };
+
+        // Send decisions then end_session_auto with hints
+        collector.record_decision(make_decision("auto-test", "code.search", 0));
+        collector.record_decision(make_decision("auto-test", "note.create", 100));
+        collector.end_session_auto(
+            "auto-test".to_string(),
+            SessionHints {
+                tasks_completed: 2,
+                tasks_total: 3,
+            },
+        );
+
+        // Verify 3 events: 2 decisions + 1 EndSessionAuto
+        let mut decision_count = 0;
+        let mut got_auto_end = false;
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                CollectorEvent::Decision(_) => decision_count += 1,
+                CollectorEvent::EndSessionAuto {
+                    session_id, hints, ..
+                } => {
+                    assert_eq!(session_id, "auto-test");
+                    assert_eq!(hints.tasks_completed, 2);
+                    assert_eq!(hints.tasks_total, 3);
+                    got_auto_end = true;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(decision_count, 2);
+        assert!(got_auto_end, "Expected EndSessionAuto event");
+    }
+
+    #[test]
+    fn test_compute_auto_reward_with_task_hints() {
+        let computer = SessionRewardComputer::default();
+
+        let buf = SessionBuffer {
+            decisions: vec![
+                make_decision("hints", "code.search", 0),
+                make_decision("hints", "task.update", 50),
+            ],
+            started_at: Utc::now() - chrono::Duration::seconds(300),
+            last_decision_at: Instant::now(),
+        };
+
+        // With no task hints (neutral 0.5 for task component)
+        let reward_no_hints =
+            compute_auto_reward(&buf, &computer, &SessionHints::default());
+
+        // With 100% task completion (1.0 for task component)
+        let reward_full = compute_auto_reward(
+            &buf,
+            &computer,
+            &SessionHints {
+                tasks_completed: 3,
+                tasks_total: 3,
+            },
+        );
+
+        // With 0% task completion (0.0 for task component)
+        let reward_zero = compute_auto_reward(
+            &buf,
+            &computer,
+            &SessionHints {
+                tasks_completed: 0,
+                tasks_total: 3,
+            },
+        );
+
+        // 100% completion should beat neutral which should beat 0%
+        assert!(
+            reward_full > reward_no_hints,
+            "Full completion {} should beat neutral {}",
+            reward_full,
+            reward_no_hints
+        );
+        assert!(
+            reward_no_hints > reward_zero,
+            "Neutral {} should beat zero completion {}",
+            reward_no_hints,
+            reward_zero
+        );
+    }
+
+    #[test]
+    fn test_end_session_auto_disabled_is_noop() {
+        let (tx, mut rx) = mpsc::channel::<CollectorEvent>(10);
+        let enabled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let collector = TrajectoryCollector {
+            tx,
+            enabled,
+            vector_builder: Arc::new(DecisionVectorBuilder::new()),
+            trainer: None,
+        };
+
+        collector.end_session_auto("disabled".to_string(), SessionHints::default());
+
+        // Channel should be empty since collection is disabled
+        assert!(rx.try_recv().is_err());
     }
 }
