@@ -147,7 +147,6 @@ pub fn gather_rows(x: &Tensor, indices: &[u32]) -> Result<Tensor> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::DType;
 
     #[test]
     fn test_scatter_add_basic() -> Result<()> {

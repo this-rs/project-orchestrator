@@ -79,16 +79,14 @@ impl NodeEmbeddings {
                         self.gnn.clone()
                     };
                 }
-                // Weighted mean: need same dimension — project both to min dimension
-                let dim = self.voyage.len().min(self.gnn.len());
-                let w = *gnn_weight as f64;
-                (0..dim)
-                    .map(|i| {
-                        let v = if i < self.voyage.len() { self.voyage[i] as f64 } else { 0.0 };
-                        let g = if i < self.gnn.len() { self.gnn[i] as f64 } else { 0.0 };
-                        ((1.0 - w) * v + w * g) as f32
-                    })
-                    .collect()
+                // Weighted concatenation: scale each source by its weight, then concat.
+                // Output dim = voyage_dim + gnn_dim (preserves all information).
+                let w = *gnn_weight;
+                let vw = 1.0 - w;
+                let mut fused = Vec::with_capacity(self.voyage.len() + self.gnn.len());
+                fused.extend(self.voyage.iter().map(|v| v * vw));
+                fused.extend(self.gnn.iter().map(|g| g * w));
+                fused
             }
         }
     }
@@ -458,16 +456,21 @@ impl Benchmark for CommunityPredictionBenchmark {
     }
 
     fn run(&self, embeddings: &[NodeEmbeddings], source: &EmbeddingSource) -> MetricSet {
-        let scores = self.per_query_scores(embeddings, source);
-        let accuracy = if scores.is_empty() {
+        let predictions = self.predict_all(embeddings, source);
+
+        // Accuracy
+        let correct = predictions.iter().filter(|(p, a)| p == a).count();
+        let accuracy = if predictions.is_empty() {
             0.0
         } else {
-            scores.iter().sum::<f64>() / scores.len() as f64
+            correct as f64 / predictions.len() as f64
         };
 
-        // Use accuracy as F1 proxy (macro-F1 would need per-class computation)
+        // Macro-F1: average F1 across all classes
+        let macro_f1 = compute_macro_f1(&predictions);
+
         MetricSet {
-            f1: Some(accuracy),
+            f1: Some(macro_f1),
             accuracy: Some(accuracy),
             ..Default::default()
         }
@@ -478,6 +481,23 @@ impl Benchmark for CommunityPredictionBenchmark {
         embeddings: &[NodeEmbeddings],
         source: &EmbeddingSource,
     ) -> Vec<f64> {
+        let predictions = self.predict_all(embeddings, source);
+        // Per-query: 1.0 if correct, 0.0 if wrong (used for bootstrap CI on accuracy)
+        predictions
+            .iter()
+            .map(|(predicted, actual)| if predicted == actual { 1.0 } else { 0.0 })
+            .collect()
+    }
+}
+
+impl CommunityPredictionBenchmark {
+    /// Predict community for each test case via K-NN majority vote.
+    /// Returns Vec<(predicted_community, actual_community)>.
+    fn predict_all(
+        &self,
+        embeddings: &[NodeEmbeddings],
+        source: &EmbeddingSource,
+    ) -> Vec<(usize, usize)> {
         let emb_map = build_embedding_map(embeddings, source);
         let community_map: HashMap<String, usize> = self
             .test_cases
@@ -490,7 +510,6 @@ impl Benchmark for CommunityPredictionBenchmark {
             .filter_map(|tc| {
                 let query_emb = emb_map.get(&tc.node_id)?;
 
-                // Find K nearest neighbors
                 let mut scored: Vec<(String, f64)> = emb_map
                     .iter()
                     .filter(|(id, _)| **id != tc.node_id)
@@ -499,7 +518,6 @@ impl Benchmark for CommunityPredictionBenchmark {
 
                 scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-                // Majority vote on community among K-NN
                 let mut votes: HashMap<usize, usize> = HashMap::new();
                 for (id, _) in scored.iter().take(self.k_neighbors) {
                     if let Some(&comm) = community_map.get(id) {
@@ -513,14 +531,57 @@ impl Benchmark for CommunityPredictionBenchmark {
                     .map(|(comm, _)| *comm)
                     .unwrap_or(usize::MAX);
 
-                Some(if predicted == tc.community_id {
-                    1.0
-                } else {
-                    0.0
-                })
+                Some((predicted, tc.community_id))
             })
             .collect()
     }
+}
+
+/// Compute macro-F1: average of per-class F1 scores.
+fn compute_macro_f1(predictions: &[(usize, usize)]) -> f64 {
+    if predictions.is_empty() {
+        return 0.0;
+    }
+
+    // Collect all unique classes
+    let mut classes: Vec<usize> = predictions
+        .iter()
+        .flat_map(|(p, a)| [*p, *a])
+        .collect();
+    classes.sort();
+    classes.dedup();
+
+    if classes.is_empty() {
+        return 0.0;
+    }
+
+    // Per-class F1
+    let mut f1_sum = 0.0;
+    for &cls in &classes {
+        let tp = predictions
+            .iter()
+            .filter(|(p, a)| *p == cls && *a == cls)
+            .count() as f64;
+        let fp = predictions
+            .iter()
+            .filter(|(p, a)| *p == cls && *a != cls)
+            .count() as f64;
+        let fn_ = predictions
+            .iter()
+            .filter(|(p, a)| *p != cls && *a == cls)
+            .count() as f64;
+
+        let precision = if tp + fp > 0.0 { tp / (tp + fp) } else { 0.0 };
+        let recall = if tp + fn_ > 0.0 { tp / (tp + fn_) } else { 0.0 };
+        let f1 = if precision + recall > 0.0 {
+            2.0 * precision * recall / (precision + recall)
+        } else {
+            0.0
+        };
+        f1_sum += f1;
+    }
+
+    f1_sum / classes.len() as f64
 }
 
 // ---------------------------------------------------------------------------
@@ -1133,9 +1194,17 @@ mod tests {
         assert_eq!(ne.get(&EmbeddingSource::Voyage).len(), 768);
         assert_eq!(ne.get(&EmbeddingSource::Gnn).len(), 256);
         assert_eq!(ne.get(&EmbeddingSource::Concatenated).len(), 768 + 256);
+        // Fused = weighted concat: (768 * vw) ++ (256 * w) → 1024d
         assert_eq!(
             ne.get(&EmbeddingSource::Fused { gnn_weight: 0.5 }).len(),
-            256
+            768 + 256
+        );
+        // Verify weighting: voyage scaled by 0.5, gnn scaled by 0.5
+        let fused = ne.get(&EmbeddingSource::Fused { gnn_weight: 0.5 });
+        assert!((fused[0] - 0.5).abs() < 1e-6, "Voyage component should be 1.0 * 0.5 = 0.5");
+        assert!(
+            (fused[768] - 1.0).abs() < 1e-6,
+            "GNN component should be 2.0 * 0.5 = 1.0"
         );
     }
 }
