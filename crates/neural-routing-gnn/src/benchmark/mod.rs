@@ -267,7 +267,7 @@ impl Benchmark for ImpactPredictionBenchmark {
 
         self.test_cases
             .iter()
-            .filter_map(|tc| {
+            .map(|tc| {
                 let top_k = self.rank_top_k(&emb_map, &tc.modified_id);
                 let hits = tc
                     .impacted_ids
@@ -286,13 +286,11 @@ impl Benchmark for ImpactPredictionBenchmark {
                 } else {
                     hits as f64 / tc.impacted_ids.len() as f64
                 };
-                let f1 = if precision + recall > 0.0 {
+                if precision + recall > 0.0 {
                     2.0 * precision * recall / (precision + recall)
                 } else {
                     0.0
-                };
-
-                Some(f1)
+                }
             })
             .collect()
     }

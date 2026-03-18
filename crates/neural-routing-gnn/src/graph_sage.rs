@@ -137,8 +137,8 @@ impl MessagePassing for GraphSAGELayer {
         // Gather source features
         let source_features = gather_rows(x, &sources)?;
 
-        if self.config.use_attention && edge_type.is_some() {
-            let edge_types = edge_type.unwrap().to_vec1::<u8>()?;
+        if let (true, Some(et)) = (self.config.use_attention, edge_type) {
+            let edge_types = et.to_vec1::<u8>()?;
             let scores = self.compute_attention(&source_features, &edge_types)?;
 
             // Softmax per target node would require grouping — for simplicity,

@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 
 use crate::encoder::{GNNArchitecture, GraphEncoder, GraphEncoderConfig};
-use crate::features::{NodeFeatureBuilder, NormStats, RawNodeData, TOTAL_FEATURE_DIM};
+use crate::features::{simple_hash, NodeFeatureBuilder, NormStats, RawNodeData, TOTAL_FEATURE_DIM};
 use crate::sampler::{PyGData, SubGraph, export_to_pyg};
 
 // ---------------------------------------------------------------------------
@@ -235,14 +235,16 @@ impl DataLoader {
             attempts += 1;
         }
 
-        // If we couldn't generate enough, pad with random pairs
+        // If we couldn't generate enough, pad with random pairs (still guard self-loops)
         while neg_sources.len() < num_neg {
             hash_state = simple_hash(hash_state, neg_sources.len() as u64 + 99999);
             let s = (hash_state % num_nodes as u64) as usize;
             hash_state = simple_hash(hash_state, neg_sources.len() as u64 + 99998);
             let t = (hash_state % num_nodes as u64) as usize;
-            neg_sources.push(s as i64);
-            neg_targets.push(t as i64);
+            if s != t {
+                neg_sources.push(s as i64);
+                neg_targets.push(t as i64);
+            }
         }
 
         let actual_neg = neg_sources.len();
@@ -427,6 +429,8 @@ pub fn train(
     let total_params = count_params(&varmap);
     info!("Model parameters: {}", total_params);
 
+    let mut adamw = AdamWState::new(&varmap)?;
+
     let mut best_val_loss = f64::INFINITY;
     let mut best_val_auc = 0.0;
     let mut best_epoch = 0;
@@ -460,8 +464,8 @@ pub fn train(
         // --- Backward pass ---
         let grads = train_loss_tensor.backward()?;
 
-        // Gradient clipping + AdamW update
-        apply_adamw_step(&varmap, &grads, lr, config.weight_decay, config.max_grad_norm, epoch)?;
+        // AdamW update with gradient clipping
+        adamw.step(&varmap, &grads, lr, config.weight_decay, config.max_grad_norm)?;
 
         let train_loss = train_loss_tensor.to_scalar::<f32>()? as f64;
 
@@ -595,52 +599,107 @@ pub fn train(
 }
 
 // ---------------------------------------------------------------------------
-// AdamW optimizer (manual step on VarMap)
+// AdamW optimizer (manual step on VarMap with moment estimates)
 // ---------------------------------------------------------------------------
 
-/// Apply a single AdamW step to all parameters in the VarMap.
+/// AdamW optimizer state: stores per-parameter first and second moment estimates.
 ///
-/// Uses the standard AdamW formulation with gradient clipping.
-fn apply_adamw_step(
-    varmap: &VarMap,
-    grads: &candle_core::backprop::GradStore,
-    lr: f64,
-    weight_decay: f64,
-    max_grad_norm: f64,
-    _step: usize,
-) -> CandleResult<()> {
-    let all_vars = varmap.all_vars();
+/// Implements the AdamW algorithm (Loshchilov & Hutter, 2019):
+/// - m_t = β1 * m_{t-1} + (1 - β1) * g_t         (first moment)
+/// - v_t = β2 * v_{t-1} + (1 - β2) * g_t²         (second moment)
+/// - m̂_t = m_t / (1 - β1^t)                        (bias correction)
+/// - v̂_t = v_t / (1 - β2^t)                        (bias correction)
+/// - θ_t = θ_{t-1} * (1 - lr * λ) - lr * m̂_t / (√v̂_t + ε)
+struct AdamWState {
+    /// First moment estimates (one per parameter tensor).
+    m: Vec<Tensor>,
+    /// Second moment estimates (one per parameter tensor).
+    v: Vec<Tensor>,
+    /// β1 (exponential decay rate for first moment).
+    beta1: f64,
+    /// β2 (exponential decay rate for second moment).
+    beta2: f64,
+    /// ε (numerical stability).
+    eps: f64,
+    /// Number of steps taken (for bias correction).
+    t: usize,
+}
 
-    // Compute global gradient norm for clipping
-    let mut total_norm_sq = 0.0f64;
-    for var in &all_vars {
-        if let Some(grad) = grads.get(var) {
-            let norm_sq = grad.sqr()?.sum_all()?.to_scalar::<f32>()? as f64;
-            total_norm_sq += norm_sq;
+impl AdamWState {
+    fn new(varmap: &VarMap) -> CandleResult<Self> {
+        let all_vars = varmap.all_vars();
+        let mut m = Vec::with_capacity(all_vars.len());
+        let mut v = Vec::with_capacity(all_vars.len());
+
+        for var in &all_vars {
+            m.push(Tensor::zeros_like(var.as_tensor())?);
+            v.push(Tensor::zeros_like(var.as_tensor())?);
         }
+
+        Ok(Self {
+            m,
+            v,
+            beta1: 0.9,
+            beta2: 0.999,
+            eps: 1e-8,
+            t: 0,
+        })
     }
-    let total_norm = total_norm_sq.sqrt();
-    let clip_coef = if total_norm > max_grad_norm {
-        max_grad_norm / (total_norm + 1e-6)
-    } else {
-        1.0
-    };
 
-    // Apply AdamW update: param = param * (1 - lr * weight_decay) - lr * clipped_grad
-    for var in &all_vars {
-        if let Some(grad) = grads.get(var) {
-            let clipped_grad = (grad * clip_coef)?;
+    /// Apply a single AdamW step with gradient clipping.
+    fn step(
+        &mut self,
+        varmap: &VarMap,
+        grads: &candle_core::backprop::GradStore,
+        lr: f64,
+        weight_decay: f64,
+        max_grad_norm: f64,
+    ) -> CandleResult<()> {
+        self.t += 1;
+        let all_vars = varmap.all_vars();
 
-            // Weight decay (decoupled from gradient)
-            let decayed = (var.as_tensor() * (1.0 - lr * weight_decay))?;
-
-            // Gradient descent step
-            let new_val = (decayed - (clipped_grad * lr)?)?;
-            var.set(&new_val)?;
+        // Compute global gradient norm for clipping
+        let mut total_norm_sq = 0.0f64;
+        for var in &all_vars {
+            if let Some(grad) = grads.get(var) {
+                let norm_sq = grad.sqr()?.sum_all()?.to_scalar::<f32>()? as f64;
+                total_norm_sq += norm_sq;
+            }
         }
-    }
+        let total_norm = total_norm_sq.sqrt();
+        let clip_coef = if total_norm > max_grad_norm {
+            max_grad_norm / (total_norm + 1e-6)
+        } else {
+            1.0
+        };
 
-    Ok(())
+        // Bias correction factors
+        let bc1 = 1.0 - self.beta1.powi(self.t as i32);
+        let bc2 = 1.0 - self.beta2.powi(self.t as i32);
+
+        for (i, var) in all_vars.iter().enumerate() {
+            if let Some(grad) = grads.get(var) {
+                let g = (grad * clip_coef)?;
+
+                // Update biased first moment: m = β1*m + (1-β1)*g
+                self.m[i] = ((&self.m[i] * self.beta1)? + (&g * (1.0 - self.beta1))?)?;
+                // Update biased second moment: v = β2*v + (1-β2)*g²
+                self.v[i] = ((&self.v[i] * self.beta2)? + (g.sqr()? * (1.0 - self.beta2))?)?;
+
+                // Bias-corrected estimates
+                let m_hat = (&self.m[i] / bc1)?;
+                let v_hat = (&self.v[i] / bc2)?;
+
+                // AdamW update: θ = θ*(1 - lr*λ) - lr * m̂/(√v̂ + ε)
+                let decayed = (var.as_tensor() * (1.0 - lr * weight_decay))?;
+                let update = (m_hat / (v_hat.sqrt()? + self.eps)?)?;
+                let new_val = (decayed - (update * lr)?)?;
+                var.set(&new_val)?;
+            }
+        }
+
+        Ok(())
+    }
 }
 
 /// Count total parameters in the VarMap.
@@ -997,16 +1056,6 @@ fn deterministic_shuffle(arr: &mut [usize], seed: u64) {
     }
 }
 
-/// Simple deterministic hash (same as features.rs).
-fn simple_hash(seed: u64, index: u64) -> u64 {
-    let mut h = seed.wrapping_mul(6364136223846793005).wrapping_add(index);
-    h ^= h >> 33;
-    h = h.wrapping_mul(0xff51afd7ed558ccd);
-    h ^= h >> 33;
-    h = h.wrapping_mul(0xc4ceb9fe1a85ec53);
-    h ^= h >> 33;
-    h
-}
 
 // ---------------------------------------------------------------------------
 // Tests

@@ -216,8 +216,11 @@ impl ProjectionMatrix {
     }
 }
 
-/// Simple deterministic hash (same as in vector_builder).
-fn simple_hash(seed: u64, index: u64) -> u64 {
+/// Simple deterministic hash (splitmix64-inspired).
+///
+/// Used for deterministic pseudo-random operations: projection matrix,
+/// shuffle, negative sampling. Not cryptographic.
+pub fn simple_hash(seed: u64, index: u64) -> u64 {
     let mut h = seed.wrapping_mul(6364136223846793005).wrapping_add(index);
     h ^= h >> 33;
     h = h.wrapping_mul(0xff51afd7ed558ccd);

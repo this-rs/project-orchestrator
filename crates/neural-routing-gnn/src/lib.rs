@@ -19,7 +19,8 @@ pub mod training;
 /// Re-export key types
 pub use encoder::{GNNArchitecture, GraphEncoder, GraphEncoderConfig};
 pub use features::{
-    NodeFeatureBuilder, NodeType, NormStats, ProjectionMatrix, RawNodeData, TOTAL_FEATURE_DIM,
+    simple_hash, NodeFeatureBuilder, NodeType, NormStats, ProjectionMatrix, RawNodeData,
+    TOTAL_FEATURE_DIM,
 };
 pub use graph_sage::GraphSAGE;
 pub use message_passing::{scatter_add, scatter_mean, MessagePassing};

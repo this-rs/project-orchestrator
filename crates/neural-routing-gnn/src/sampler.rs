@@ -49,7 +49,7 @@ impl RelationType {
         8
     }
 
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s {
             "IMPORTS" => Some(Self::Imports),
             "CALLS" => Some(Self::Calls),
@@ -404,7 +404,7 @@ impl GraphSampler {
             let rel_str: String = row.get("rel_type").unwrap_or_default();
             let weight: f64 = row.get("weight").unwrap_or(1.0);
 
-            if let Some(rel_type) = RelationType::from_str(&rel_str) {
+            if let Some(rel_type) = RelationType::parse(&rel_str) {
                 edges.push(SubGraphEdge {
                     source_element_id: src,
                     target_element_id: tgt,
@@ -497,8 +497,8 @@ impl GraphSampler {
             )
         };
 
-        let q = if project_slug.is_some() {
-            query(&cypher).param("slug", project_slug.unwrap().to_string())
+        let q = if let Some(slug) = project_slug {
+            query(&cypher).param("slug", slug.to_string())
         } else {
             query(&cypher)
         };
@@ -775,7 +775,7 @@ mod tests {
     fn test_relation_type_roundtrip() {
         for rt in RelationType::ALL {
             let s = rt.as_str();
-            let parsed = RelationType::from_str(s).unwrap();
+            let parsed = RelationType::parse(s).unwrap();
             assert_eq!(rt, parsed);
         }
     }
@@ -797,8 +797,8 @@ mod tests {
 
     #[test]
     fn test_relation_type_from_str_unknown() {
-        assert!(RelationType::from_str("UNKNOWN").is_none());
-        assert!(RelationType::from_str("").is_none());
+        assert!(RelationType::parse("UNKNOWN").is_none());
+        assert!(RelationType::parse("").is_none());
     }
 
     #[test]
