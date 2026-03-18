@@ -1503,6 +1503,7 @@ impl ChatManager {
             protocol_runs: &protocol_runs,
             project_context_markdown: &dynamic_section,
             continuity_markdown: &continuity_section,
+            enrichment_markdown: "", // enrichment injected later in stream_response
             user_message,
             routing_hints: None,
             is_multi_project,
@@ -2523,11 +2524,19 @@ impl ChatManager {
                 let ctx = enrichment_pipeline.execute(&input).await;
                 if ctx.has_content() {
                     debug!(
-                        "[enrichment] Prompt enriched: {} sections, {}ms",
+                        "[enrichment] Prompt enriched: {} sections, {}ms (hints: {:?})",
                         ctx.sections.len(),
-                        ctx.total_time_ms
+                        ctx.total_time_ms,
+                        ctx.hints.keys().collect::<Vec<_>>()
                     );
-                    super::enrichment::enrich_prompt(&prompt, &ctx)
+                    // Integrate enrichment as clean markdown prepended to user message
+                    // (replaces old XML-wrapped <enrichment_context> format)
+                    let enrichment_md = ctx.to_system_prompt_markdown();
+                    if enrichment_md.is_empty() {
+                        prompt
+                    } else {
+                        format!("{}\n\n---\n\n{}", enrichment_md, prompt)
+                    }
                 } else {
                     prompt
                 }
