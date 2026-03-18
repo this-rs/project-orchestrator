@@ -51,6 +51,23 @@ pub async fn collect_episode(
         .map(|sv| sv.state_name.clone())
         .collect();
 
+    // Build enriched StateVisitRecords from the run's StateVisits
+    let state_visits: Vec<StateVisitRecord> = run
+        .states_visited
+        .iter()
+        .map(|sv| StateVisitRecord {
+            state_name: sv.state_name.clone(),
+            entered_at: sv.entered_at,
+            exited_at: sv.exited_at,
+            duration_ms: sv.duration_ms.or_else(|| {
+                // Compute duration from timestamps if not already set
+                sv.exited_at
+                    .map(|exit| (exit - sv.entered_at).num_milliseconds())
+            }),
+            trigger: sv.trigger.clone(),
+        })
+        .collect();
+
     let duration_ms = run
         .completed_at
         .map(|end| (end - run.started_at).num_milliseconds());
@@ -64,6 +81,7 @@ pub async fn collect_episode(
     let process = Process {
         reasoning_tree_id,
         states_visited,
+        state_visits,
         duration_ms,
     };
 
@@ -227,6 +245,7 @@ mod tests {
             process: Process {
                 reasoning_tree_id: None,
                 states_visited: vec![],
+                state_visits: vec![],
                 duration_ms: None,
             },
             outcome: Outcome {

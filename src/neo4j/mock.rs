@@ -9726,6 +9726,20 @@ impl GraphStore for MockGraphStore {
         Ok(states)
     }
 
+    async fn get_protocol_by_name_and_project(
+        &self,
+        name: &str,
+        project_id: Uuid,
+    ) -> anyhow::Result<Option<Uuid>> {
+        let store = self.protocols.read().await;
+        for proto in store.values() {
+            if proto.name == name && proto.project_id == project_id {
+                return Ok(Some(proto.id));
+            }
+        }
+        Ok(None)
+    }
+
     async fn delete_protocol_state(&self, state_id: Uuid) -> anyhow::Result<bool> {
         Ok(self
             .protocol_states

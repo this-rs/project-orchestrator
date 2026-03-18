@@ -2759,6 +2759,14 @@ pub trait GraphStore: Send + Sync {
     /// Get all states for a protocol.
     async fn get_protocol_states(&self, protocol_id: Uuid) -> Result<Vec<ProtocolState>>;
 
+    /// Check if a protocol with the given name already exists in the project.
+    /// Returns the existing protocol's UUID if found.
+    async fn get_protocol_by_name_and_project(
+        &self,
+        name: &str,
+        project_id: Uuid,
+    ) -> Result<Option<Uuid>>;
+
     /// Delete a protocol state and its relationships.
     async fn delete_protocol_state(&self, state_id: Uuid) -> Result<bool>;
 

@@ -394,6 +394,7 @@ pub fn generate_fake_enriched(
             process: PortableProcess {
                 had_reasoning_tree: i % 2 == 0,
                 states_visited: states,
+                state_visits: Vec::new(),
                 duration_ms: Some(5000 + (i as i64 * 1500)),
             },
             outcome: PortableOutcome {
