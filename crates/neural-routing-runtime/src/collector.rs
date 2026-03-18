@@ -714,7 +714,8 @@ async fn flush_batch(
                     tensors,
                     collected_at: pending.trajectory.created_at,
                     reward: pending.trajectory.total_reward,
-                    exploratory: source == neural_routing_policy::dataset::TrajectorySource::Simulated,
+                    exploratory: source
+                        == neural_routing_policy::dataset::TrajectorySource::Simulated,
                 });
                 submitted += 1;
             }
@@ -1563,8 +1564,7 @@ mod tests {
         };
 
         // With no task hints (neutral 0.5 for task component)
-        let reward_no_hints =
-            compute_auto_reward(&buf, &computer, &SessionHints::default());
+        let reward_no_hints = compute_auto_reward(&buf, &computer, &SessionHints::default());
 
         // With 100% task completion (1.0 for task component)
         let reward_full = compute_auto_reward(

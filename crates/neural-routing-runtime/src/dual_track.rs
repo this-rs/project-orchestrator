@@ -277,9 +277,7 @@ impl DualTrackRouter {
             match decision.source {
                 RoutingSource::PolicyNet => {
                     let confidence = match &decision.reason {
-                        RoutingReason::PolicySelected {
-                            raw_confidence, ..
-                        } => *raw_confidence,
+                        RoutingReason::PolicySelected { raw_confidence, .. } => *raw_confidence,
                         _ => 0.0,
                     };
                     self.metrics
