@@ -210,6 +210,66 @@ impl EnrichmentContext {
         !self.sections.is_empty()
     }
 
+    /// Convert enrichment sections to PromptSection variants.
+    ///
+    /// This bridges the EnrichmentPipeline → PromptBuilder unification:
+    /// stages continue producing EnrichmentSections internally, but the
+    /// output can be consumed as PromptSections by the FsmPromptComposer.
+    ///
+    /// Mapping:
+    /// - "Activated Skills" → PromptSection::SkillContext
+    /// - "Relevant Notes" / "Contextual Notes" → PromptSection::KnowledgeNotes
+    /// - "Propagated Notes" → PromptSection::PropagatedNotes
+    /// - "File Context" / "Symbols" → PromptSection::FileContext
+    /// - "Persona" → PromptSection::PersonaContext
+    /// - Other → PromptSection::Enrichment
+    pub fn to_prompt_sections(&self) -> Vec<crate::runner::prompt::PromptSection> {
+        use crate::runner::prompt::PromptSection;
+
+        self.sections
+            .iter()
+            .map(|section| {
+                let title_lower = section.title.to_lowercase();
+                if title_lower.contains("skill") {
+                    PromptSection::SkillContext(section.content.clone())
+                } else if title_lower.contains("propagated") {
+                    PromptSection::PropagatedNotes(section.content.clone())
+                } else if title_lower.contains("note")
+                    || title_lower.contains("guideline")
+                    || title_lower.contains("gotcha")
+                    || title_lower.contains("knowledge")
+                {
+                    PromptSection::KnowledgeNotes(section.content.clone())
+                } else if title_lower.contains("file")
+                    || title_lower.contains("symbol")
+                    || title_lower.contains("dependency")
+                {
+                    PromptSection::FileContext(section.content.clone())
+                } else if title_lower.contains("persona") {
+                    PromptSection::PersonaContext(section.content.clone())
+                } else {
+                    PromptSection::Enrichment(section.content.clone())
+                }
+            })
+            .collect()
+    }
+
+    /// Render enrichment as a single markdown string for system prompt injection.
+    ///
+    /// Unlike `render()` which wraps in XML tags for user message prepending,
+    /// this produces clean markdown sections for direct system prompt inclusion.
+    pub fn to_system_prompt_markdown(&self) -> String {
+        if self.sections.is_empty() {
+            return String::new();
+        }
+
+        let mut output = String::new();
+        for section in &self.sections {
+            output.push_str(&format!("## {}\n{}\n\n", section.title, section.content));
+        }
+        output.trim_end().to_string()
+    }
+
     /// Render all sections into a single string for prompt injection.
     ///
     /// Output format:
@@ -729,5 +789,51 @@ mod tests {
         assert_eq!(deserialized.knowledge_injection, config.knowledge_injection);
         assert_eq!(deserialized.debug, config.debug);
         assert_eq!(deserialized.max_pipeline_ms, config.max_pipeline_ms);
+    }
+
+    // ── PromptSection bridge tests ──────────────────────────────────
+
+    #[tokio::test]
+    async fn test_to_prompt_sections_mapping() {
+        use crate::runner::prompt::PromptSection;
+
+        let mut ctx = EnrichmentContext::default();
+        ctx.add_section("Activated Skills", "skill content", "skill_stage");
+        ctx.add_section("Relevant Notes", "note content", "knowledge_stage");
+        ctx.add_section("Propagated Notes", "propagated content", "knowledge_stage");
+        ctx.add_section("File Context", "file content", "file_stage");
+        ctx.add_section("Persona Context", "persona content", "persona_stage");
+        ctx.add_section("Active Work", "task content", "status_stage");
+
+        let sections = ctx.to_prompt_sections();
+        assert_eq!(sections.len(), 6, "Should produce 6 PromptSections");
+
+        // Check correct mapping
+        assert!(matches!(&sections[0], PromptSection::SkillContext(_)));
+        assert!(matches!(&sections[1], PromptSection::KnowledgeNotes(_)));
+        assert!(matches!(&sections[2], PromptSection::PropagatedNotes(_)));
+        assert!(matches!(&sections[3], PromptSection::FileContext(_)));
+        assert!(matches!(&sections[4], PromptSection::PersonaContext(_)));
+        assert!(matches!(&sections[5], PromptSection::Enrichment(_)));
+    }
+
+    #[tokio::test]
+    async fn test_to_system_prompt_markdown() {
+        let mut ctx = EnrichmentContext::default();
+        ctx.add_section("Skills", "- Skill A", "test");
+        ctx.add_section("Notes", "- Note 1", "test");
+
+        let md = ctx.to_system_prompt_markdown();
+        assert!(md.contains("## Skills"));
+        assert!(md.contains("- Skill A"));
+        assert!(md.contains("## Notes"));
+        assert!(md.contains("- Note 1"));
+        assert!(!md.contains("<enrichment_context>"), "No XML wrapper");
+    }
+
+    #[tokio::test]
+    async fn test_to_system_prompt_markdown_empty() {
+        let ctx = EnrichmentContext::default();
+        assert_eq!(ctx.to_system_prompt_markdown(), "");
     }
 }
