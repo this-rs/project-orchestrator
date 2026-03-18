@@ -1912,39 +1912,55 @@ impl ChatManager {
             .context("Failed to persist chat session")?;
 
         // If this session was spawned by another, create the SPAWNED_BY relation in Neo4j
-        if let Some(ref spawned_by_json) = request.spawned_by {
-            if let Ok(spawned_by) = serde_json::from_str::<serde_json::Value>(spawned_by_json) {
-                if let Some(parent_id) =
-                    spawned_by.get("parent_session_id").and_then(|v| v.as_str())
-                {
-                    let spawn_type = spawned_by
-                        .get("type")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("runner");
-                    let run_id = spawned_by
-                        .get("run_id")
-                        .and_then(|v| v.as_str())
-                        .and_then(|s| s.parse::<Uuid>().ok());
-                    let task_id = spawned_by
-                        .get("task_id")
-                        .and_then(|v| v.as_str())
-                        .and_then(|s| s.parse::<Uuid>().ok());
-                    if let Err(e) = self
-                        .graph
-                        .create_spawned_by_relation(
-                            &session_id.to_string(),
-                            parent_id,
-                            spawn_type,
-                            run_id,
-                            task_id,
-                        )
-                        .await
+        // and extract protocol FSM context (run_id + state) for trajectory tagging.
+        let (spawned_protocol_run_id, spawned_protocol_state) =
+            if let Some(ref spawned_by_json) = request.spawned_by {
+                if let Ok(spawned_by) = serde_json::from_str::<serde_json::Value>(spawned_by_json) {
+                    if let Some(parent_id) =
+                        spawned_by.get("parent_session_id").and_then(|v| v.as_str())
                     {
-                        warn!("Failed to create SPAWNED_BY relation: {e}");
+                        let spawn_type = spawned_by
+                            .get("type")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("runner");
+                        let run_id = spawned_by
+                            .get("run_id")
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| s.parse::<Uuid>().ok());
+                        let task_id = spawned_by
+                            .get("task_id")
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| s.parse::<Uuid>().ok());
+                        if let Err(e) = self
+                            .graph
+                            .create_spawned_by_relation(
+                                &session_id.to_string(),
+                                parent_id,
+                                spawn_type,
+                                run_id,
+                                task_id,
+                            )
+                            .await
+                        {
+                            warn!("Failed to create SPAWNED_BY relation: {e}");
+                        }
                     }
+                    // Extract protocol context from spawned_by JSON
+                    let proto_run_id = spawned_by
+                        .get("protocol_run_id")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| s.parse::<Uuid>().ok());
+                    let proto_state = spawned_by
+                        .get("protocol_state")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    (proto_run_id, proto_state)
+                } else {
+                    (None, None)
                 }
-            }
-        }
+            } else {
+                (None, None)
+            };
 
         // Create broadcast channel early so CompactionNotifier can use the sender
         let (events_tx, _) = broadcast::channel(BROADCAST_BUFFER);
@@ -2129,8 +2145,8 @@ impl ChatManager {
                     rfc_accumulator: Arc::new(Mutex::new(
                         super::observation_detector::RfcAccumulator::new(),
                     )),
-                    protocol_run_id: None,
-                    protocol_state: None,
+                    protocol_run_id: spawned_protocol_run_id,
+                    protocol_state: spawned_protocol_state.clone(),
                 },
             );
             interrupt_flag
@@ -2368,13 +2384,25 @@ impl ChatManager {
             let enrichment_input = if let Some(uuid) = session_uuid {
                 // Load session node to get project_slug
                 match graph.get_chat_session(uuid).await {
-                    Ok(Some(node)) => Some(super::enrichment::EnrichmentInput {
-                        message: prompt.clone(),
-                        session_id: uuid,
-                        project_slug: node.project_slug,
-                        project_id: None, // Resolved from slug inside stages
-                        cwd: Some(node.cwd),
-                    }),
+                    Ok(Some(node)) => {
+                        // Read protocol context from the active session (if any)
+                        let (proto_run_id, proto_state) = {
+                            let sessions = active_sessions.read().await;
+                            sessions
+                                .get(&uuid.to_string())
+                                .map(|s| (s.protocol_run_id, s.protocol_state.clone()))
+                                .unwrap_or((None, None))
+                        };
+                        Some(super::enrichment::EnrichmentInput {
+                            message: prompt.clone(),
+                            session_id: uuid,
+                            project_slug: node.project_slug,
+                            project_id: None, // Resolved from slug inside stages
+                            cwd: Some(node.cwd),
+                            protocol_run_id: proto_run_id,
+                            protocol_state: proto_state,
+                        })
+                    }
                     _ => None,
                 }
             } else {

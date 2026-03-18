@@ -946,8 +946,8 @@ impl EnrichmentStage for KnowledgeInjectionStage {
                 timestamp_ms: 0,
                 query_embedding: vec![],
                 node_features: vec![],
-                protocol_run_id: None,
-                protocol_state: None,
+                protocol_run_id: input.protocol_run_id,
+                protocol_state: input.protocol_state.clone(),
             });
         }
 
@@ -1189,6 +1189,8 @@ mod tests {
             project_slug: None, // No project
             project_id: None,
             cwd: None,
+            protocol_run_id: None,
+            protocol_state: None,
         };
         let mut ctx = EnrichmentContext::default();
         stage.execute(&input, &mut ctx).await.unwrap();
@@ -1226,6 +1228,8 @@ mod tests {
             project_slug: Some("test-project".to_string()),
             project_id: None,
             cwd: None,
+            protocol_run_id: None,
+            protocol_state: None,
         };
         let mut ctx = EnrichmentContext::default();
 

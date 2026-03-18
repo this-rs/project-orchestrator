@@ -129,6 +129,10 @@ pub struct EnrichmentInput {
     pub project_id: Option<Uuid>,
     /// Working directory.
     pub cwd: Option<String>,
+    /// Active protocol run ID (if session runs within a protocol FSM context).
+    pub protocol_run_id: Option<Uuid>,
+    /// Current protocol state name (e.g. "implement", "review").
+    pub protocol_state: Option<String>,
 }
 
 /// Mutable context that accumulates enrichment data across stages.
@@ -407,6 +411,8 @@ mod tests {
             project_slug: Some("test-project".to_string()),
             project_id: None,
             cwd: None,
+            protocol_run_id: None,
+            protocol_state: None,
         }
     }
 
