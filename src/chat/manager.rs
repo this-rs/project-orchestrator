@@ -1327,20 +1327,24 @@ impl ChatManager {
     /// 2. FSM context — injected from active protocol runs
     /// 3. Dynamic context — oneshot Opus or markdown, + session continuity
     /// 4. Tool reference — selectively rendered by intent + FSM + scaffolding
+    /// Build the system prompt and return the set of note IDs included
+    /// (from guidelines/gotchas) for deduplication with the enrichment pipeline.
     pub async fn build_system_prompt(
         &self,
         project_slug: Option<&str>,
         user_message: &str,
-    ) -> String {
+    ) -> (String, std::collections::HashSet<String>) {
         use super::composer::{ComposerInput, FsmPromptComposer};
         use super::prompt::{context_to_json, context_to_markdown, fetch_project_context};
         use super::stages::status_injection::GraphProtocolProvider;
         use super::stages::status_injection::ProtocolStatusProvider;
 
+        let empty_ids = std::collections::HashSet::new();
+
         // No project → compose with defaults (L0, no FSM, no dynamic context)
         let Some(slug) = project_slug else {
             let input = ComposerInput::default();
-            return FsmPromptComposer::compose(&input);
+            return (FsmPromptComposer::compose(&input), empty_ids);
         };
 
         // Fetch raw context from Neo4j
@@ -1352,9 +1356,19 @@ impl ChatManager {
                     slug, e
                 );
                 let input = ComposerInput::default();
-                return FsmPromptComposer::compose(&input);
+                return (FsmPromptComposer::compose(&input), empty_ids);
             }
         };
+
+        // Collect note IDs from guidelines/gotchas for deduplication with enrichment
+        let included_note_ids: std::collections::HashSet<String> = ctx
+            .guidelines
+            .iter()
+            .chain(ctx.gotchas.iter())
+            .chain(ctx.global_guidelines.iter())
+            .chain(ctx.global_gotchas.iter())
+            .map(|n| n.id.to_string())
+            .collect();
 
         // Hook Niveau 3: auto-boost notes included in the system prompt context
         {
@@ -1511,7 +1525,7 @@ impl ChatManager {
             task_count,
         };
 
-        FsmPromptComposer::compose(&input)
+        (FsmPromptComposer::compose(&input), included_note_ids)
     }
 
     /// Use a oneshot Opus call to refine raw project context into a concise,
@@ -2005,7 +2019,7 @@ impl ChatManager {
 
         let session_id = Uuid::new_v4();
         let model = self.resolve_model(request.model.as_deref());
-        let system_prompt = self
+        let (system_prompt, _included_note_ids) = self
             .build_system_prompt(request.project_slug.as_deref(), &request.message)
             .await;
 
@@ -2512,6 +2526,7 @@ impl ChatManager {
                             cwd: Some(node.cwd),
                             protocol_run_id: proto_run_id,
                             protocol_state: proto_state,
+                            excluded_note_ids: Default::default(), // no dedup in send_message path
                         })
                     }
                     _ => None,
@@ -4286,7 +4301,7 @@ impl ChatManager {
         }
 
         // Build options - with resume flag only if we have a cli_session_id
-        let system_prompt = self
+        let (system_prompt, _included_note_ids) = self
             .build_system_prompt(session_node.project_slug.as_deref(), message)
             .await;
 
@@ -5490,10 +5505,11 @@ mod tests {
         let state = mock_app_state();
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
 
-        let prompt = manager.build_system_prompt(None, "test").await;
+        let (prompt, note_ids) = manager.build_system_prompt(None, "test").await;
         assert!(prompt.contains("Project Orchestrator"));
         assert!(prompt.contains("EXCLUSIVELY the Project Orchestrator MCP tools"));
         assert!(!prompt.contains("Active Project"));
+        assert!(note_ids.is_empty(), "No project → no included note IDs");
     }
 
     #[tokio::test]
@@ -5503,7 +5519,7 @@ mod tests {
         state.neo4j.create_project(&project).await.unwrap();
 
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
-        let prompt = manager
+        let (prompt, _note_ids) = manager
             .build_system_prompt(Some(&project.slug), "help me plan")
             .await;
 
@@ -6292,7 +6308,7 @@ mod tests {
             .unwrap();
 
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
-        let prompt = manager
+        let (prompt, _note_ids) = manager
             .build_system_prompt(Some(&project.slug), "check the plan")
             .await;
 

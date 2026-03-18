@@ -16,7 +16,7 @@
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 use tracing::{debug, warn};
 use uuid::Uuid;
@@ -134,6 +134,9 @@ pub struct EnrichmentInput {
     pub protocol_run_id: Option<Uuid>,
     /// Current protocol state name (e.g. "implement", "review").
     pub protocol_state: Option<String>,
+    /// Note IDs already included in the system prompt (from ProjectContext guidelines/gotchas).
+    /// Used by KnowledgeInjectionStage to avoid duplicating notes that are already present.
+    pub excluded_note_ids: HashSet<String>,
 }
 
 /// Mutable context that accumulates enrichment data across stages.
@@ -501,6 +504,7 @@ mod tests {
             cwd: None,
             protocol_run_id: None,
             protocol_state: None,
+            excluded_note_ids: Default::default(),
         }
     }
 

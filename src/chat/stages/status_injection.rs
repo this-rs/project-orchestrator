@@ -806,6 +806,7 @@ mod tests {
             cwd: None,
             protocol_run_id: None,
             protocol_state: None,
+            excluded_note_ids: Default::default(),
         };
         let mut ctx = EnrichmentContext::default();
         stage.execute(&input, &mut ctx).await.unwrap();
@@ -823,6 +824,7 @@ mod tests {
             cwd: None,
             protocol_run_id: None,
             protocol_state: None,
+            excluded_note_ids: Default::default(),
         };
         let mut ctx = EnrichmentContext::default();
 
