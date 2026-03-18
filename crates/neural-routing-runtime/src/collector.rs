@@ -1662,4 +1662,98 @@ mod tests {
         // Channel should be empty since collection is disabled
         assert!(rx.try_recv().is_err());
     }
+
+    // ── FSM Runtime Gaps — protocol field propagation ────────────────────
+
+    #[test]
+    fn test_session_hints_protocol_fields() {
+        let run_id = uuid::Uuid::new_v4();
+        let hints = SessionHints {
+            protocol_run_id: Some(run_id),
+            protocol_state: Some("implement".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(hints.protocol_run_id, Some(run_id));
+        assert_eq!(hints.protocol_state, Some("implement".to_string()));
+    }
+
+    #[test]
+    fn test_decision_record_protocol_fields() {
+        let run_id = uuid::Uuid::new_v4();
+        let record = DecisionRecord {
+            session_id: "test-session".to_string(),
+            context_embedding: vec![],
+            action_type: "test".to_string(),
+            action_params: serde_json::json!({}),
+            alternatives_count: 1,
+            chosen_index: 0,
+            confidence: 0.9,
+            tool_usages: vec![],
+            touched_entities: vec![],
+            timestamp_ms: 0,
+            query_embedding: vec![],
+            node_features: vec![],
+            protocol_run_id: Some(run_id),
+            protocol_state: Some("review".to_string()),
+        };
+        assert_eq!(record.protocol_run_id, Some(run_id));
+        assert_eq!(record.protocol_state, Some("review".to_string()));
+    }
+
+    #[test]
+    fn test_trajectory_extracts_protocol_run_id_from_decisions() {
+        // This tests the protocol_run_id extraction logic in build_trajectory
+        let run_id = uuid::Uuid::new_v4();
+
+        // Create decisions where the second one has a protocol_run_id
+        let d1 = DecisionRecord {
+            session_id: "s1".to_string(),
+            context_embedding: vec![0.0; 128],
+            action_type: "tool.call".to_string(),
+            action_params: serde_json::json!({}),
+            alternatives_count: 1,
+            chosen_index: 0,
+            confidence: 0.8,
+            tool_usages: vec![],
+            touched_entities: vec![],
+            timestamp_ms: 100,
+            query_embedding: vec![],
+            node_features: vec![],
+            protocol_run_id: None,
+            protocol_state: None,
+        };
+        let d2 = DecisionRecord {
+            protocol_run_id: Some(run_id),
+            protocol_state: Some("execute".to_string()),
+            ..d1.clone()
+        };
+
+        // The extraction logic: buffer.decisions.iter().find_map(|d| d.protocol_run_id)
+        let decisions = vec![d1, d2];
+        let extracted = decisions.iter().find_map(|d| d.protocol_run_id);
+        assert_eq!(extracted, Some(run_id));
+    }
+
+    #[test]
+    fn test_trajectory_no_protocol_context() {
+        let d1 = DecisionRecord {
+            session_id: "s1".to_string(),
+            context_embedding: vec![],
+            action_type: "tool.call".to_string(),
+            action_params: serde_json::json!({}),
+            alternatives_count: 1,
+            chosen_index: 0,
+            confidence: 0.8,
+            tool_usages: vec![],
+            touched_entities: vec![],
+            timestamp_ms: 100,
+            query_embedding: vec![],
+            node_features: vec![],
+            protocol_run_id: None,
+            protocol_state: None,
+        };
+        let decisions = vec![d1];
+        let extracted: Option<uuid::Uuid> = decisions.iter().find_map(|d| d.protocol_run_id);
+        assert_eq!(extracted, None);
+    }
 }

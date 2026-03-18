@@ -567,4 +567,65 @@ mod tests {
         };
         assert_eq!(lesson.portability_layer, 2);
     }
+
+    #[test]
+    fn test_state_visit_record_serde_roundtrip() {
+        let record = StateVisitRecord {
+            state_name: "implement".to_string(),
+            entered_at: chrono::Utc::now(),
+            exited_at: Some(chrono::Utc::now()),
+            duration_ms: Some(5000),
+            trigger: Some("plan_approved".to_string()),
+        };
+        let json = serde_json::to_string(&record).unwrap();
+        let deserialized: StateVisitRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.state_name, "implement");
+        assert_eq!(deserialized.duration_ms, Some(5000));
+        assert_eq!(deserialized.trigger, Some("plan_approved".to_string()));
+    }
+
+    #[test]
+    fn test_portable_state_visit_record_strips_timestamps() {
+        let record = PortableStateVisitRecord {
+            state_name: "review".to_string(),
+            duration_ms: Some(3000),
+            trigger: Some("code_ready".to_string()),
+        };
+        let json = serde_json::to_string(&record).unwrap();
+        let deserialized: PortableStateVisitRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.state_name, "review");
+        assert_eq!(deserialized.duration_ms, Some(3000));
+        // No timestamp fields in portable version
+        assert!(!json.contains("entered_at"));
+        assert!(!json.contains("exited_at"));
+    }
+
+    #[test]
+    fn test_process_state_visits_field() {
+        let process = Process {
+            reasoning_tree_id: None,
+            states_visited: vec!["A".to_string(), "B".to_string()],
+            state_visits: vec![
+                StateVisitRecord {
+                    state_name: "A".to_string(),
+                    entered_at: chrono::Utc::now(),
+                    exited_at: Some(chrono::Utc::now()),
+                    duration_ms: Some(100),
+                    trigger: None,
+                },
+                StateVisitRecord {
+                    state_name: "B".to_string(),
+                    entered_at: chrono::Utc::now(),
+                    exited_at: None,
+                    duration_ms: None,
+                    trigger: Some("go".to_string()),
+                },
+            ],
+            duration_ms: Some(200),
+        };
+        assert_eq!(process.state_visits.len(), 2);
+        assert_eq!(process.state_visits[0].state_name, "A");
+        assert!(process.state_visits[0].duration_ms.is_some());
+        assert_eq!(process.state_visits[1].trigger, Some("go".to_string()));
+    }
 }

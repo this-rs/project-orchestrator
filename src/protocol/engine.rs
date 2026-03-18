@@ -1601,4 +1601,137 @@ mod tests {
             .unwrap()
             .contains("after 2 retries"));
     }
+
+    #[tokio::test]
+    async fn test_fire_transition_closes_previous_state_visit() {
+        let store = MockGraphStore::new();
+        let (_, protocol) = setup_protocol(&store).await;
+
+        let run = start_run(&store, protocol.id, None, None, None)
+            .await
+            .unwrap();
+
+        // Fire "begin" → Processing
+        fire_transition(&store, run.id, "begin").await.unwrap();
+
+        let updated = store.get_protocol_run(run.id).await.unwrap().unwrap();
+        // First state (Start) should have exited_at and duration_ms filled
+        assert!(
+            updated.states_visited[0].exited_at.is_some(),
+            "Start state should have exited_at after transition"
+        );
+        assert!(
+            updated.states_visited[0].duration_ms.is_some(),
+            "Start state should have duration_ms after transition"
+        );
+        // Second state (Processing) should still be open
+        assert!(updated.states_visited[1].exited_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_fire_transition_to_terminal_closes_all_states() {
+        let store = MockGraphStore::new();
+        let (_, protocol) = setup_protocol(&store).await;
+
+        let run = start_run(&store, protocol.id, None, None, None)
+            .await
+            .unwrap();
+        fire_transition(&store, run.id, "begin").await.unwrap();
+        fire_transition(&store, run.id, "finish").await.unwrap();
+
+        let updated = store.get_protocol_run(run.id).await.unwrap().unwrap();
+        assert_eq!(updated.status, RunStatus::Completed);
+        // ALL state visits should be closed
+        for (i, sv) in updated.states_visited.iter().enumerate() {
+            assert!(
+                sv.exited_at.is_some(),
+                "State visit {} ({}) should have exited_at",
+                i,
+                sv.state_name
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cas_version_increments_on_transition() {
+        let store = MockGraphStore::new();
+        let (_, protocol) = setup_protocol(&store).await;
+
+        let run = start_run(&store, protocol.id, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(run.version, 0);
+
+        fire_transition(&store, run.id, "begin").await.unwrap();
+
+        let updated = store.get_protocol_run(run.id).await.unwrap().unwrap();
+        assert!(
+            updated.version > 0,
+            "Version should have incremented after transition"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cas_rejects_stale_version() {
+        let store = MockGraphStore::new();
+        let (_, protocol) = setup_protocol(&store).await;
+
+        let run = start_run(&store, protocol.id, None, None, None)
+            .await
+            .unwrap();
+
+        // Manually create a stale copy with wrong version
+        let mut stale_run = run.clone();
+        // First, do a real transition to bump the version in the store
+        fire_transition(&store, run.id, "begin").await.unwrap();
+
+        // Now try to update with the stale version (0)
+        stale_run.status = RunStatus::Failed;
+        let result = store.update_protocol_run(&mut stale_run).await;
+        assert!(result.is_err(), "Should reject stale version");
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("OptimisticLockError"),
+            "Error should mention OptimisticLockError"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_protocol_by_name_and_project_found() {
+        let store = MockGraphStore::new();
+        let (project_id, protocol) = setup_protocol(&store).await;
+
+        let result = store
+            .get_protocol_by_name_and_project(&protocol.name, project_id)
+            .await
+            .unwrap();
+        assert_eq!(result, Some(protocol.id));
+    }
+
+    #[tokio::test]
+    async fn test_get_protocol_by_name_and_project_not_found() {
+        let store = MockGraphStore::new();
+        let (project_id, _) = setup_protocol(&store).await;
+
+        let result = store
+            .get_protocol_by_name_and_project("nonexistent", project_id)
+            .await
+            .unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn test_get_protocol_by_name_wrong_project() {
+        let store = MockGraphStore::new();
+        let (_, protocol) = setup_protocol(&store).await;
+
+        // Different project ID
+        let result = store
+            .get_protocol_by_name_and_project(&protocol.name, Uuid::new_v4())
+            .await
+            .unwrap();
+        assert_eq!(result, None);
+    }
 }

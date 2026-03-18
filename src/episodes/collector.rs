@@ -296,4 +296,151 @@ mod tests {
         assert_eq!(ec.tags, vec!["tag".to_string()]);
         assert_eq!(ec.content, "content");
     }
+
+    #[tokio::test]
+    async fn test_collect_episode_from_completed_run() {
+        use crate::neo4j::mock::MockGraphStore;
+        use crate::protocol::models::ProtocolRun;
+
+        let store = MockGraphStore::new();
+        let project_id = Uuid::new_v4();
+
+        // Create a completed run with enriched state visits
+        let mut run = ProtocolRun::new(Uuid::new_v4(), Uuid::new_v4(), "Start");
+        let state2 = Uuid::new_v4();
+        run.visit_state(state2, "Processing", "begin");
+        run.complete();
+        let run_id = run.id;
+
+        // Persist in mock store
+        store.protocol_runs.write().await.insert(run_id, run);
+
+        // Collect episode
+        let episode = collect_episode(&store, run_id, project_id)
+            .await
+            .unwrap()
+            .expect("Should collect an episode");
+
+        // Verify stimulus
+        assert_eq!(episode.stimulus.request, "manual");
+        assert_eq!(episode.stimulus.trigger, StimulusTrigger::Manual);
+
+        // Verify process — states visited names
+        assert_eq!(episode.process.states_visited, vec!["Start", "Processing"]);
+
+        // Verify enriched state_visits
+        assert_eq!(episode.process.state_visits.len(), 2);
+        assert_eq!(episode.process.state_visits[0].state_name, "Start");
+        assert!(
+            episode.process.state_visits[0].exited_at.is_some(),
+            "First state should have exited_at"
+        );
+        assert!(
+            episode.process.state_visits[0].duration_ms.is_some(),
+            "First state should have duration_ms"
+        );
+        assert_eq!(
+            episode.process.state_visits[1].trigger,
+            Some("begin".to_string())
+        );
+
+        // Verify duration is computed from timestamps
+        assert!(episode.process.duration_ms.is_some());
+
+        // Verify source run linkage
+        assert_eq!(episode.source_run_id, Some(run_id));
+
+        // Verify validation — no artefacts → FeedbackType::None
+        assert_eq!(episode.validation.feedback_type, FeedbackType::None);
+    }
+
+    #[tokio::test]
+    async fn test_collect_episode_run_not_found() {
+        use crate::neo4j::mock::MockGraphStore;
+
+        let store = MockGraphStore::new();
+        let result = collect_episode(&store, Uuid::new_v4(), Uuid::new_v4())
+            .await
+            .unwrap();
+        assert!(result.is_none(), "Non-existent run should return None");
+    }
+
+    #[tokio::test]
+    async fn test_collect_episode_event_triggered_stimulus() {
+        use crate::neo4j::mock::MockGraphStore;
+        use crate::protocol::models::ProtocolRun;
+
+        let store = MockGraphStore::new();
+        let project_id = Uuid::new_v4();
+
+        let mut run = ProtocolRun::new(Uuid::new_v4(), Uuid::new_v4(), "Start");
+        run.triggered_by = "event:post_sync".to_string();
+        run.complete();
+        let run_id = run.id;
+        store.protocol_runs.write().await.insert(run_id, run);
+
+        let episode = collect_episode(&store, run_id, project_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(episode.stimulus.trigger, StimulusTrigger::SystemEvent);
+        assert_eq!(episode.stimulus.request, "event:post_sync");
+    }
+
+    #[tokio::test]
+    async fn test_collect_episode_schedule_triggered_stimulus() {
+        use crate::neo4j::mock::MockGraphStore;
+        use crate::protocol::models::ProtocolRun;
+
+        let store = MockGraphStore::new();
+        let project_id = Uuid::new_v4();
+
+        let mut run = ProtocolRun::new(Uuid::new_v4(), Uuid::new_v4(), "Start");
+        run.triggered_by = "schedule:daily".to_string();
+        run.complete();
+        let run_id = run.id;
+        store.protocol_runs.write().await.insert(run_id, run);
+
+        let episode = collect_episode(&store, run_id, project_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(episode.stimulus.trigger, StimulusTrigger::SystemEvent);
+    }
+
+    #[tokio::test]
+    async fn test_collect_episode_state_visit_duration_fallback() {
+        use crate::neo4j::mock::MockGraphStore;
+        use crate::protocol::models::ProtocolRun;
+
+        let store = MockGraphStore::new();
+        let project_id = Uuid::new_v4();
+
+        // Create a run with a manually crafted state visit that has exited_at
+        // but no duration_ms — the collector should compute it from timestamps
+        let now = Utc::now();
+        let mut run = ProtocolRun::new(Uuid::new_v4(), Uuid::new_v4(), "OnlyState");
+        run.states_visited[0].exited_at = Some(now + chrono::Duration::seconds(5));
+        run.states_visited[0].duration_ms = None; // Not pre-computed
+        run.status = crate::protocol::models::RunStatus::Completed;
+        run.completed_at = Some(now + chrono::Duration::seconds(5));
+        let run_id = run.id;
+        store.protocol_runs.write().await.insert(run_id, run);
+
+        let episode = collect_episode(&store, run_id, project_id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // The collector should have computed duration from exited_at - entered_at
+        let sv = &episode.process.state_visits[0];
+        assert!(
+            sv.duration_ms.is_some(),
+            "Duration should be computed from timestamps"
+        );
+        assert!(
+            sv.duration_ms.unwrap() >= 4000,
+            "Duration should be ~5000ms"
+        );
+    }
 }
