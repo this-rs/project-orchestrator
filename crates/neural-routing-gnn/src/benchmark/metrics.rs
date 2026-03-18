@@ -18,6 +18,8 @@ pub struct MetricSet {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub precision: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub recall: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub accuracy: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auc_roc: Option<f64>,

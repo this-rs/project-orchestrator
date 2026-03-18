@@ -248,11 +248,12 @@ impl Benchmark for ImpactPredictionBenchmark {
     fn run(&self, embeddings: &[NodeEmbeddings], source: &EmbeddingSource) -> MetricSet {
         let emb_map = build_embedding_map(embeddings, source);
         let predictions = self.predict(&emb_map);
-        let (precision, _, f1) = metrics::f1_score(&predictions);
+        let (precision, recall, f1) = metrics::f1_score(&predictions);
 
         MetricSet {
             f1: Some(f1),
             precision: Some(precision),
+            recall: Some(recall),
             ..Default::default()
         }
     }
@@ -267,26 +268,11 @@ impl Benchmark for ImpactPredictionBenchmark {
         self.test_cases
             .iter()
             .filter_map(|tc| {
-                let mod_emb = emb_map.get(&tc.modified_id)?;
-
-                let mut scored: Vec<(String, f64)> = emb_map
-                    .iter()
-                    .filter(|(id, _)| **id != tc.modified_id)
-                    .map(|(id, emb)| (id.clone(), cosine_similarity(mod_emb, emb)))
-                    .collect();
-
-                scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-                let predicted: std::collections::HashSet<String> = scored
-                    .iter()
-                    .take(self.top_k)
-                    .map(|(id, _)| id.clone())
-                    .collect();
-
+                let top_k = self.rank_top_k(&emb_map, &tc.modified_id);
                 let hits = tc
                     .impacted_ids
                     .iter()
-                    .filter(|id| predicted.contains(*id))
+                    .filter(|id| top_k.contains(*id))
                     .count();
 
                 // Compute per-query F1 (consistent with run() which reports F1)
@@ -313,32 +299,48 @@ impl Benchmark for ImpactPredictionBenchmark {
 }
 
 impl ImpactPredictionBenchmark {
+    /// Rank all nodes by cosine similarity to `query_id` and return the top-K as a set.
+    /// Returns None if `query_id` is not found in the embedding map.
+    fn rank_top_k(
+        &self,
+        emb_map: &HashMap<String, Vec<f32>>,
+        query_id: &str,
+    ) -> std::collections::HashSet<String> {
+        let query_emb = match emb_map.get(query_id) {
+            Some(e) => e,
+            None => return std::collections::HashSet::new(),
+        };
+
+        let mut scored: Vec<(String, f64)> = emb_map
+            .iter()
+            .filter(|(id, _)| id.as_str() != query_id)
+            .map(|(id, emb)| (id.clone(), cosine_similarity(query_emb, emb)))
+            .collect();
+
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        scored
+            .iter()
+            .take(self.top_k)
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
     fn predict(&self, emb_map: &HashMap<String, Vec<f32>>) -> Vec<(bool, bool)> {
         let mut predictions = Vec::new();
 
         for tc in &self.test_cases {
-            let mod_emb = match emb_map.get(&tc.modified_id) {
-                Some(e) => e,
-                None => continue,
-            };
-
-            let mut scored: Vec<(String, f64)> = emb_map
-                .iter()
-                .filter(|(id, _)| **id != tc.modified_id)
-                .map(|(id, emb)| (id.clone(), cosine_similarity(mod_emb, emb)))
-                .collect();
-
-            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-            let predicted_top_k: std::collections::HashSet<String> = scored
-                .iter()
-                .take(self.top_k)
-                .map(|(id, _)| id.clone())
-                .collect();
+            let top_k = self.rank_top_k(emb_map, &tc.modified_id);
+            if top_k.is_empty() && emb_map.get(&tc.modified_id).is_none() {
+                continue;
+            }
 
             // For each candidate, generate a (predicted, actual) pair
-            for (id, _) in &scored {
-                let predicted = predicted_top_k.contains(id);
+            for id in emb_map.keys() {
+                if id == &tc.modified_id {
+                    continue;
+                }
+                let predicted = top_k.contains(id);
                 let actual = tc.impacted_ids.contains(id);
                 predictions.push((predicted, actual));
             }
@@ -1183,6 +1185,44 @@ mod tests {
     }
 
     #[test]
+    fn test_macro_f1_perfect() {
+        // All predictions correct: 3 classes, each predicted perfectly
+        let predictions = vec![
+            (0, 0), (0, 0),
+            (1, 1), (1, 1),
+            (2, 2), (2, 2),
+        ];
+        let f1 = compute_macro_f1(&predictions);
+        assert!((f1 - 1.0).abs() < 1e-10, "Perfect predictions → macro-F1=1.0, got {}", f1);
+    }
+
+    #[test]
+    fn test_macro_f1_partial() {
+        // Class 0: TP=2, FP=1, FN=0 → P=2/3, R=1.0, F1=0.8
+        // Class 1: TP=1, FP=0, FN=1 → P=1.0, R=0.5, F1=2/3
+        let predictions = vec![
+            (0, 0), (0, 0), (0, 1), // 2 correct class-0, 1 class-1 misclassified as 0
+            (1, 1),                  // 1 correct class-1
+        ];
+        let f1 = compute_macro_f1(&predictions);
+        let expected = (0.8 + 2.0 / 3.0) / 2.0; // avg of per-class F1
+        assert!(
+            (f1 - expected).abs() < 1e-10,
+            "Partial predictions → macro-F1={:.4}, got {:.4}",
+            expected,
+            f1
+        );
+    }
+
+    #[test]
+    fn test_macro_f1_all_wrong() {
+        // Every prediction is wrong class
+        let predictions = vec![(0, 1), (1, 0)];
+        let f1 = compute_macro_f1(&predictions);
+        assert!((f1 - 0.0).abs() < 1e-10, "All wrong → macro-F1=0.0, got {}", f1);
+    }
+
+    #[test]
     fn test_embedding_source_get() {
         let ne = NodeEmbeddings {
             node_id: "test".to_string(),
@@ -1206,5 +1246,17 @@ mod tests {
             (fused[768] - 1.0).abs() < 1e-6,
             "GNN component should be 2.0 * 0.5 = 1.0"
         );
+
+        // Edge case: gnn_weight = 0.0 → 100% Voyage, 0% GNN
+        let fused_voyage_only = ne.get(&EmbeddingSource::Fused { gnn_weight: 0.0 });
+        assert_eq!(fused_voyage_only.len(), 768 + 256);
+        assert!((fused_voyage_only[0] - 1.0).abs() < 1e-6, "Voyage should be unscaled");
+        assert!((fused_voyage_only[768]).abs() < 1e-6, "GNN should be zeroed");
+
+        // Edge case: gnn_weight = 1.0 → 0% Voyage, 100% GNN
+        let fused_gnn_only = ne.get(&EmbeddingSource::Fused { gnn_weight: 1.0 });
+        assert_eq!(fused_gnn_only.len(), 768 + 256);
+        assert!((fused_gnn_only[0]).abs() < 1e-6, "Voyage should be zeroed");
+        assert!((fused_gnn_only[768] - 2.0).abs() < 1e-6, "GNN should be unscaled");
     }
 }
