@@ -126,6 +126,32 @@ impl Neo4jClient {
     // Protocol CRUD
     // ========================================================================
 
+    /// Check if a protocol with the given name already exists in the project.
+    /// Returns the existing protocol's ID if found.
+    pub async fn get_protocol_by_name_and_project(
+        &self,
+        name: &str,
+        project_id: Uuid,
+    ) -> Result<Option<Uuid>> {
+        let q = query(
+            r#"
+            MATCH (proto:Protocol {name: $name, project_id: $project_id})
+            RETURN proto.id AS id
+            LIMIT 1
+            "#,
+        )
+        .param("name", name.to_string())
+        .param("project_id", project_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let id_str: String = row.get("id")?;
+            Ok(Some(id_str.parse()?))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Create or update a protocol node and link it to its project.
     pub async fn upsert_protocol(&self, protocol: &Protocol) -> Result<()> {
         let terminal_states_json = serde_json::to_string(&protocol.terminal_states)?;

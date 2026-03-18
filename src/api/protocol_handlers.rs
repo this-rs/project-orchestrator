@@ -381,6 +381,20 @@ pub async fn create_protocol(
         None => ProtocolCategory::default(),
     };
 
+    // Check name uniqueness within the project
+    if let Some(existing_id) = state
+        .orchestrator
+        .neo4j()
+        .get_protocol_by_name_and_project(&body.name, body.project_id)
+        .await
+        .map_err(AppError::Internal)?
+    {
+        return Err(AppError::Conflict(format!(
+            "Protocol '{}' already exists in this project (id: {})",
+            body.name, existing_id
+        )));
+    }
+
     // Create protocol — placeholder entry_state, will be updated if inline states are provided
     let placeholder_entry = Uuid::new_v4();
     let mut protocol = Protocol::new(body.project_id, &body.name, placeholder_entry);
@@ -474,6 +488,23 @@ pub async fn create_protocol(
                     t.trigger.len(),
                     MAX_TRIGGER_LEN
                 )));
+            }
+            // Validate state types: no transition FROM terminal or TO start
+            if let Some(from_s) = created_states.iter().find(|s| s.id == t.from_state) {
+                if from_s.state_type == crate::protocol::StateType::Terminal {
+                    return Err(AppError::BadRequest(format!(
+                        "Cannot add transition from terminal state '{}'",
+                        from_s.name
+                    )));
+                }
+            }
+            if let Some(to_s) = created_states.iter().find(|s| s.id == t.to_state) {
+                if to_s.state_type == crate::protocol::StateType::Start {
+                    return Err(AppError::BadRequest(format!(
+                        "Cannot add transition to start state '{}'",
+                        to_s.name
+                    )));
+                }
             }
             let pt = ProtocolTransition {
                 id: Uuid::new_v4(),
@@ -786,6 +817,40 @@ pub async fn add_transition(
             "trigger too long ({} > {} chars)",
             body.trigger.len(),
             MAX_TRIGGER_LEN
+        )));
+    }
+
+    // Validate state types: cannot transition FROM a terminal state or TO a start state
+    let states = state
+        .orchestrator
+        .neo4j()
+        .get_protocol_states(protocol_id)
+        .await
+        .map_err(AppError::Internal)?;
+
+    let from_state = states
+        .iter()
+        .find(|s| s.id == body.from_state)
+        .ok_or_else(|| {
+            AppError::BadRequest(format!("from_state {} not found in protocol", body.from_state))
+        })?;
+    let to_state = states
+        .iter()
+        .find(|s| s.id == body.to_state)
+        .ok_or_else(|| {
+            AppError::BadRequest(format!("to_state {} not found in protocol", body.to_state))
+        })?;
+
+    if from_state.state_type == crate::protocol::StateType::Terminal {
+        return Err(AppError::BadRequest(format!(
+            "Cannot add transition from terminal state '{}' ({})",
+            from_state.name, from_state.id
+        )));
+    }
+    if to_state.state_type == crate::protocol::StateType::Start {
+        return Err(AppError::BadRequest(format!(
+            "Cannot add transition to start state '{}' ({})",
+            to_state.name, to_state.id
         )));
     }
 
@@ -1465,6 +1530,18 @@ pub async fn compose_protocol(
 
     let neo4j = state.orchestrator.neo4j();
 
+    // Check name uniqueness within the project
+    if let Some(existing_id) = neo4j
+        .get_protocol_by_name_and_project(&body.name, body.project_id)
+        .await
+        .map_err(AppError::Internal)?
+    {
+        return Err(AppError::Conflict(format!(
+            "Protocol '{}' already exists in this project (id: {})",
+            body.name, existing_id
+        )));
+    }
+
     // ── 1. Create Skill ─────────────────────────────────────────────
     let skill_id = Uuid::new_v4();
     let skill = crate::skills::SkillNode {
@@ -1572,6 +1649,24 @@ pub async fn compose_protocol(
         let to_id = name_to_id
             .get(&t.to_state)
             .ok_or_else(|| AppError::BadRequest(format!("state '{}' not found", t.to_state)))?;
+
+        // Validate state types: no transition FROM terminal or TO start
+        if let Some(from_s) = created_states.iter().find(|s| s.id == *from_id) {
+            if from_s.state_type == crate::protocol::StateType::Terminal {
+                return Err(AppError::BadRequest(format!(
+                    "Cannot add transition from terminal state '{}'",
+                    from_s.name
+                )));
+            }
+        }
+        if let Some(to_s) = created_states.iter().find(|s| s.id == *to_id) {
+            if to_s.state_type == crate::protocol::StateType::Start {
+                return Err(AppError::BadRequest(format!(
+                    "Cannot add transition to start state '{}'",
+                    to_s.name
+                )));
+            }
+        }
 
         let pt = ProtocolTransition {
             id: Uuid::new_v4(),
