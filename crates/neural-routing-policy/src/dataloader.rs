@@ -298,16 +298,7 @@ fn weighted_shuffle(data: &[TrajectoryTensors], seed: u64) -> Vec<usize> {
     scored.into_iter().map(|(i, _)| i).collect()
 }
 
-/// Simple deterministic hash (splitmix64).
-fn splitmix64(seed: u64, index: u64) -> u64 {
-    let mut h = seed.wrapping_mul(6364136223846793005).wrapping_add(index);
-    h ^= h >> 30;
-    h = h.wrapping_mul(0xbf58476d1ce4e5b9);
-    h ^= h >> 27;
-    h = h.wrapping_mul(0x94d049bb133111eb);
-    h ^= h >> 31;
-    h
-}
+use crate::dataset::splitmix64;
 
 // ---------------------------------------------------------------------------
 // Helpers

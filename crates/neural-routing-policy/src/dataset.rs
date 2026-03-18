@@ -366,7 +366,14 @@ pub fn pad_and_batch(
 
     // Optional jitter for data augmentation
     if jitter_std > 0.0 {
-        apply_jitter(&mut states_flat, &mask_flat, max_len, STATE_DIM, jitter_std, seed);
+        apply_jitter(
+            &mut states_flat,
+            &mask_flat,
+            max_len,
+            STATE_DIM,
+            jitter_std,
+            seed,
+        );
         apply_jitter(
             &mut actions_flat,
             &mask_flat,
@@ -414,14 +421,7 @@ fn pad_or_truncate(v: &[f32], target_dim: usize) -> Vec<f32> {
 
 /// Apply Gaussian jitter to flattened data, respecting the attention mask.
 /// Uses a simple deterministic PRNG (splitmix64-inspired) for reproducibility.
-fn apply_jitter(
-    data: &mut [f32],
-    mask: &[f32],
-    max_len: usize,
-    dim: usize,
-    std: f32,
-    seed: u64,
-) {
+fn apply_jitter(data: &mut [f32], mask: &[f32], max_len: usize, dim: usize, std: f32, seed: u64) {
     let batch_size = mask.len() / max_len;
     for b in 0..batch_size {
         for t in 0..max_len {
@@ -435,9 +435,15 @@ fn apply_jitter(
                 let h = splitmix64(seed, (b * max_len * dim + t * dim + d) as u64);
                 let u = (h as f64) / (u64::MAX as f64);
                 // Approximate Gaussian via Irwin-Hall (sum of 3 uniforms - 1.5) / sqrt(0.25)
-                let h2 = splitmix64(seed.wrapping_add(1), (b * max_len * dim + t * dim + d) as u64);
+                let h2 = splitmix64(
+                    seed.wrapping_add(1),
+                    (b * max_len * dim + t * dim + d) as u64,
+                );
                 let u2 = (h2 as f64) / (u64::MAX as f64);
-                let h3 = splitmix64(seed.wrapping_add(2), (b * max_len * dim + t * dim + d) as u64);
+                let h3 = splitmix64(
+                    seed.wrapping_add(2),
+                    (b * max_len * dim + t * dim + d) as u64,
+                );
                 let u3 = (h3 as f64) / (u64::MAX as f64);
                 let noise = ((u + u2 + u3 - 1.5) / 0.5) as f32 * std;
                 data[data_offset + d] += noise;
@@ -447,7 +453,7 @@ fn apply_jitter(
 }
 
 /// Simple deterministic hash (splitmix64-inspired).
-fn splitmix64(seed: u64, index: u64) -> u64 {
+pub(crate) fn splitmix64(seed: u64, index: u64) -> u64 {
     let mut h = seed.wrapping_mul(6364136223846793005).wrapping_add(index);
     h ^= h >> 30;
     h = h.wrapping_mul(0xbf58476d1ce4e5b9);
@@ -467,7 +473,11 @@ mod tests {
     use chrono::Utc;
     use uuid::Uuid;
 
-    fn make_test_trajectory(num_nodes: usize, total_reward: f64, session_prefix: &str) -> Trajectory {
+    fn make_test_trajectory(
+        num_nodes: usize,
+        total_reward: f64,
+        session_prefix: &str,
+    ) -> Trajectory {
         let mut nodes = Vec::with_capacity(num_nodes);
         let per_step_reward = total_reward / num_nodes as f64;
 

@@ -346,7 +346,7 @@ impl Default for CodebookBuilder {
 // ---------------------------------------------------------------------------
 
 /// L2 norm of a vector.
-fn l2_norm(v: &[f32]) -> f32 {
+pub(crate) fn l2_norm(v: &[f32]) -> f32 {
     v.iter().map(|x| x * x).sum::<f32>().sqrt()
 }
 
