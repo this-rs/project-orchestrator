@@ -107,6 +107,20 @@ impl Neo4jClient {
                 .ok()
                 .filter(|s| !s.is_empty())
                 .and_then(|s| serde_json::from_str(&s).ok()),
+            prompt_fragment: node
+                .get::<String>("prompt_fragment")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            available_tools: node
+                .get::<String>("available_tools_json")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .and_then(|s| serde_json::from_str(&s).ok()),
+            forbidden_actions: node
+                .get::<String>("forbidden_actions_json")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .and_then(|s| serde_json::from_str(&s).ok()),
         })
     }
 
@@ -391,7 +405,10 @@ impl Neo4jClient {
                 s.sub_protocol_id = $sub_protocol_id,
                 s.completion_strategy = $completion_strategy,
                 s.on_failure_strategy = $on_failure_strategy,
-                s.generator_config_json = $generator_config_json
+                s.generator_config_json = $generator_config_json,
+                s.prompt_fragment = $prompt_fragment,
+                s.available_tools_json = $available_tools_json,
+                s.forbidden_actions_json = $forbidden_actions_json
             MERGE (proto)-[:HAS_STATE]->(s)
             "#,
         )
@@ -428,6 +445,26 @@ impl Neo4jClient {
                 .generator_config
                 .as_ref()
                 .map(|c| serde_json::to_string(c).unwrap_or_default())
+                .unwrap_or_default(),
+        )
+        .param(
+            "prompt_fragment",
+            state.prompt_fragment.clone().unwrap_or_default(),
+        )
+        .param(
+            "available_tools_json",
+            state
+                .available_tools
+                .as_ref()
+                .map(|v| serde_json::to_string(v).unwrap_or_default())
+                .unwrap_or_default(),
+        )
+        .param(
+            "forbidden_actions_json",
+            state
+                .forbidden_actions
+                .as_ref()
+                .map(|v| serde_json::to_string(v).unwrap_or_default())
                 .unwrap_or_default(),
         );
 

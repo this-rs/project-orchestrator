@@ -472,6 +472,16 @@ pub struct ProtocolState {
     /// Configuration for Generator states (only used when state_type == Generator)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generator_config: Option<GeneratorConfig>,
+    /// Contextual prompt fragment injected when the agent is in this state.
+    /// Typically 50-150 words of state-specific instructions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_fragment: Option<String>,
+    /// Whitelist of MCP tools allowed in this state (empty = all allowed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub available_tools: Option<Vec<String>>,
+    /// Actions explicitly forbidden in this state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forbidden_actions: Option<Vec<String>>,
 }
 
 impl ProtocolState {
@@ -488,6 +498,9 @@ impl ProtocolState {
             completion_strategy: None,
             on_failure_strategy: None,
             generator_config: None,
+            prompt_fragment: None,
+            available_tools: None,
+            forbidden_actions: None,
         }
     }
 

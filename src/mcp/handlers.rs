@@ -4992,6 +4992,15 @@ impl ToolHandler {
                 if let Some(v) = args.get("action_name") {
                     body.insert("action".to_string(), v.clone());
                 }
+                if let Some(v) = args.get("prompt_fragment") {
+                    body.insert("prompt_fragment".to_string(), v.clone());
+                }
+                if let Some(v) = args.get("available_tools") {
+                    body.insert("available_tools".to_string(), v.clone());
+                }
+                if let Some(v) = args.get("forbidden_actions") {
+                    body.insert("forbidden_actions".to_string(), v.clone());
+                }
                 let result = http
                     .post(
                         &format!("/api/protocols/{}/states", protocol_id),
