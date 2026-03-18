@@ -1404,6 +1404,10 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/admin/deep-maintenance/{project_id}",
             post(handlers::run_deep_maintenance),
         )
+        .route(
+            "/api/admin/seed-prompt-fragments/{project_id}",
+            post(handlers::seed_prompt_fragments),
+        )
         // NOTE: /api/admin/install-hooks removed — hooks are now managed
         // in-process via SkillActivationHook (zero config required)
         // ================================================================

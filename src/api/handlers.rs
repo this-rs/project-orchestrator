@@ -3566,6 +3566,32 @@ pub async fn run_deep_maintenance(
     Ok(Json(serde_json::to_value(&report).unwrap_or_default()))
 }
 
+/// Seed prompt fragments for the 5 critical protocols.
+///
+/// Populates `prompt_fragment`, `available_tools`, and `forbidden_actions`
+/// on existing protocol states. Idempotent — safe to run multiple times.
+pub async fn seed_prompt_fragments(
+    State(state): State<OrchestratorState>,
+    Path(project_id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    state
+        .orchestrator
+        .neo4j()
+        .get_project(project_id)
+        .await
+        .map_err(AppError::Internal)?
+        .ok_or_else(|| AppError::NotFound(format!("Project not found: {}", project_id)))?;
+
+    let result = crate::protocol::seed::seed_prompt_fragments(
+        state.orchestrator.neo4j(),
+        project_id,
+    )
+    .await
+    .map_err(AppError::Internal)?;
+
+    Ok(Json(serde_json::to_value(&result).unwrap_or_default()))
+}
+
 // ============================================================================
 // Alerts (HeartbeatEngine)
 // ============================================================================

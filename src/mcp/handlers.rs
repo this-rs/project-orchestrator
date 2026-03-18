@@ -623,6 +623,7 @@ impl ToolHandler {
             ("admin", "persist_health_report") => "persist_health_report",
             ("admin", "detect_stagnation") => "detect_stagnation",
             ("admin", "deep_maintenance") => "deep_maintenance",
+            ("admin", "seed_prompt_fragments") => "seed_prompt_fragments",
             ("admin", "install_hooks") => "install_hooks",
             ("admin", "get_learning_stats") => "get_learning_stats",
 
@@ -2685,6 +2686,20 @@ impl ToolHandler {
                 let result = http
                     .post(
                         &format!("/api/admin/deep-maintenance/{}", pid),
+                        &Value::Object(serde_json::Map::new()),
+                    )
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "seed_prompt_fragments" => {
+                let pid = args
+                    .get("project_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("project_id is required"))?;
+                let result = http
+                    .post(
+                        &format!("/api/admin/seed-prompt-fragments/{}", pid),
                         &Value::Object(serde_json::Map::new()),
                     )
                     .await?;

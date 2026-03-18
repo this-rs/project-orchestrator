@@ -26,5 +26,6 @@ pub mod generator;
 pub mod hooks;
 pub mod models;
 pub mod routing;
+pub mod seed;
 
 pub use models::*;
