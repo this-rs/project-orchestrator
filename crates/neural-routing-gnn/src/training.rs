@@ -17,7 +17,7 @@ use tracing::{debug, info};
 
 use crate::encoder::{GNNArchitecture, GraphEncoder, GraphEncoderConfig};
 use crate::features::{simple_hash, NodeFeatureBuilder, NormStats, RawNodeData, TOTAL_FEATURE_DIM};
-use crate::sampler::{PyGData, SubGraph, export_to_pyg};
+use crate::sampler::{export_to_pyg, PyGData, SubGraph};
 
 // ---------------------------------------------------------------------------
 // DataLoader — SubGraph → Tensors + negative sampling
@@ -146,8 +146,7 @@ impl DataLoader {
         let test_indices = &edge_perm[n_train + n_val..];
 
         // Build message-passing edges (train only — no data leakage)
-        let (train_edge_index, train_edge_type) =
-            build_edge_tensors(&pyg, train_indices, &device)?;
+        let (train_edge_index, train_edge_type) = build_edge_tensors(&pyg, train_indices, &device)?;
 
         // Build supervision edges for each split
         let train_pos = build_pos_edges(&pyg, train_indices, &device)?;
@@ -390,10 +389,7 @@ fn log1p_exp(x: &Tensor) -> CandleResult<Tensor> {
 }
 
 /// Compute edge scores (dot products) for evaluation.
-fn compute_edge_scores(
-    embeddings: &Tensor,
-    edges: &Tensor,
-) -> CandleResult<Vec<f32>> {
+fn compute_edge_scores(embeddings: &Tensor, edges: &Tensor) -> CandleResult<Vec<f32>> {
     let src = edges.get(0)?;
     let tgt = edges.get(1)?;
     let src_emb = embeddings.index_select(&src, 0)?;
@@ -465,7 +461,13 @@ pub fn train(
         let grads = train_loss_tensor.backward()?;
 
         // AdamW update with gradient clipping
-        adamw.step(&varmap, &grads, lr, config.weight_decay, config.max_grad_norm)?;
+        adamw.step(
+            &varmap,
+            &grads,
+            lr,
+            config.weight_decay,
+            config.max_grad_norm,
+        )?;
 
         let train_loss = train_loss_tensor.to_scalar::<f32>()? as f64;
 
@@ -477,11 +479,8 @@ pub fn train(
             val_split.num_nodes,
         )?;
 
-        let val_loss_tensor = link_prediction_loss(
-            &val_embeddings,
-            &val_split.pos_edges,
-            &val_split.neg_edges,
-        )?;
+        let val_loss_tensor =
+            link_prediction_loss(&val_embeddings, &val_split.pos_edges, &val_split.neg_edges)?;
         let val_loss = val_loss_tensor.to_scalar::<f32>()? as f64;
 
         // Compute AUC-ROC on validation
@@ -503,7 +502,13 @@ pub fn train(
         if epoch % 10 == 0 || epoch == config.epochs - 1 {
             info!(
                 "Epoch {}/{}: train_loss={:.4}, val_loss={:.4}, val_auc={:.4}, lr={:.6}, {}ms",
-                epoch + 1, config.epochs, train_loss, val_loss, val_auc, lr, elapsed_ms
+                epoch + 1,
+                config.epochs,
+                train_loss,
+                val_loss,
+                val_auc,
+                lr,
+                elapsed_ms
             );
         }
 
@@ -547,7 +552,10 @@ pub fn train(
 
     // --- Final evaluation on test set ---
     // Load best model
-    load_checkpoint(&mut varmap, &config.output_dir.join("best_model.safetensors"))?;
+    load_checkpoint(
+        &mut varmap,
+        &config.output_dir.join("best_model.safetensors"),
+    )?;
 
     let test_embeddings = encoder.forward(
         &test_split.x,
@@ -578,7 +586,10 @@ pub fn train(
     );
 
     // Save training log as JSONL
-    save_training_log(&epoch_history, &config.output_dir.join("training_log.jsonl"))?;
+    save_training_log(
+        &epoch_history,
+        &config.output_dir.join("training_log.jsonl"),
+    )?;
 
     let arch_name = match config.encoder_config.architecture {
         GNNArchitecture::RGCN => "R-GCN",
@@ -951,10 +962,7 @@ pub struct BenchmarkReport {
 }
 
 impl BenchmarkReport {
-    pub fn new(
-        rgcn: Option<TrainingResult>,
-        graphsage: Option<TrainingResult>,
-    ) -> Self {
+    pub fn new(rgcn: Option<TrainingResult>, graphsage: Option<TrainingResult>) -> Self {
         let (winner, summary) = match (&rgcn, &graphsage) {
             (Some(r), Some(g)) => {
                 let w = if g.final_test_auc > r.final_test_auc {
@@ -1027,11 +1035,7 @@ fn build_edge_tensors(
 }
 
 /// Build positive edge tensor [2, num_edges] from selected indices.
-fn build_pos_edges(
-    pyg: &PyGData,
-    indices: &[usize],
-    device: &Device,
-) -> CandleResult<Tensor> {
+fn build_pos_edges(pyg: &PyGData, indices: &[usize], device: &Device) -> CandleResult<Tensor> {
     let mut sources: Vec<i64> = Vec::with_capacity(indices.len());
     let mut targets: Vec<i64> = Vec::with_capacity(indices.len());
 
@@ -1055,7 +1059,6 @@ fn deterministic_shuffle(arr: &mut [usize], seed: u64) {
         arr.swap(i, j);
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -1152,7 +1155,11 @@ mod tests {
         let neg_src = train.neg_edges.get(0)?.to_vec1::<i64>()?;
         let neg_tgt = train.neg_edges.get(1)?.to_vec1::<i64>()?;
         for i in 0..neg_src.len() {
-            assert_ne!(neg_src[i], neg_tgt[i], "Self-loop in negative sample at idx {}", i);
+            assert_ne!(
+                neg_src[i], neg_tgt[i],
+                "Self-loop in negative sample at idx {}",
+                i
+            );
         }
         Ok(())
     }
@@ -1162,7 +1169,11 @@ mod tests {
         let pos = vec![0.9, 0.8, 0.7, 0.95];
         let neg = vec![0.1, 0.2, 0.3, 0.05];
         let auc = auc_roc(&pos, &neg);
-        assert!((auc - 1.0).abs() < 1e-10, "Perfect separation should give AUC=1.0, got {}", auc);
+        assert!(
+            (auc - 1.0).abs() < 1e-10,
+            "Perfect separation should give AUC=1.0, got {}",
+            auc
+        );
     }
 
     #[test]
@@ -1171,7 +1182,11 @@ mod tests {
         let pos = vec![0.2, 0.4, 0.6, 0.8];
         let neg = vec![0.1, 0.3, 0.5, 0.7];
         let auc = auc_roc(&pos, &neg);
-        assert!((auc - 0.5).abs() < 0.3, "Interleaved scores should give AUC near 0.5, got {}", auc);
+        assert!(
+            (auc - 0.5).abs() < 0.3,
+            "Interleaved scores should give AUC near 0.5, got {}",
+            auc
+        );
     }
 
     #[test]
@@ -1185,7 +1200,11 @@ mod tests {
         let a = vec![1.0, 2.0, 3.0, 4.0, 5.0];
         let b = vec![10.0, 20.0, 30.0, 40.0, 50.0];
         let rho = spearman_correlation(&a, &b);
-        assert!((rho - 1.0).abs() < 1e-10, "Perfect correlation should give ρ=1.0, got {}", rho);
+        assert!(
+            (rho - 1.0).abs() < 1e-10,
+            "Perfect correlation should give ρ=1.0, got {}",
+            rho
+        );
     }
 
     #[test]
@@ -1193,7 +1212,11 @@ mod tests {
         let a = vec![1.0, 2.0, 3.0, 4.0, 5.0];
         let b = vec![50.0, 40.0, 30.0, 20.0, 10.0];
         let rho = spearman_correlation(&a, &b);
-        assert!((rho + 1.0).abs() < 1e-10, "Perfect negative should give ρ=-1.0, got {}", rho);
+        assert!(
+            (rho + 1.0).abs() < 1e-10,
+            "Perfect negative should give ρ=-1.0, got {}",
+            rho
+        );
     }
 
     #[test]
@@ -1209,7 +1232,11 @@ mod tests {
         ];
         let labels = vec![0, 0, 0, 1, 1, 1];
         let score = silhouette_score(&embeddings, &labels);
-        assert!(score > 0.9, "Well-separated clusters should have silhouette > 0.9, got {}", score);
+        assert!(
+            score > 0.9,
+            "Well-separated clusters should have silhouette > 0.9, got {}",
+            score
+        );
     }
 
     #[test]

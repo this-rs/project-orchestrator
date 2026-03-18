@@ -8,16 +8,14 @@
 //! - Mean aggregation with attention weighting
 //! - Residual connections when dimensions match
 
-use candle_core::{Module, Result, Tensor, D};
 #[cfg(test)]
 use candle_core::{DType, Device};
-use candle_nn::{linear, Linear, VarBuilder};
+use candle_core::{Module, Result, Tensor, D};
 #[cfg(test)]
 use candle_nn::VarMap;
+use candle_nn::{linear, Linear, VarBuilder};
 
-use crate::message_passing::{
-    extract_edge_indices, gather_rows, scatter_mean, MessagePassing,
-};
+use crate::message_passing::{extract_edge_indices, gather_rows, scatter_mean, MessagePassing};
 
 /// GraphSAGE layer configuration.
 #[derive(Debug, Clone)]
@@ -62,17 +60,9 @@ pub struct GraphSAGELayer {
 
 impl GraphSAGELayer {
     pub fn new(config: GraphSAGEConfig, vb: VarBuilder<'_>) -> Result<Self> {
-        let neigh_linear = linear(
-            config.input_dim,
-            config.output_dim,
-            vb.pp("neigh"),
-        )?;
+        let neigh_linear = linear(config.input_dim, config.output_dim, vb.pp("neigh"))?;
 
-        let self_linear = linear(
-            config.input_dim,
-            config.output_dim,
-            vb.pp("self"),
-        )?;
+        let self_linear = linear(config.input_dim, config.output_dim, vb.pp("self"))?;
 
         let attention_weights = if config.use_attention {
             let attn = vb.get_with_hints(
@@ -97,11 +87,7 @@ impl GraphSAGELayer {
     }
 
     /// Compute attention scores for edges based on relation type.
-    fn compute_attention(
-        &self,
-        source_features: &Tensor,
-        edge_types: &[u8],
-    ) -> Result<Tensor> {
+    fn compute_attention(&self, source_features: &Tensor, edge_types: &[u8]) -> Result<Tensor> {
         let attn = self
             .attention_weights
             .as_ref()
@@ -293,11 +279,8 @@ mod tests {
         let input_dim = 8;
 
         let x = Tensor::randn(0.0f32, 1.0, (num_nodes, input_dim), &device).unwrap();
-        let edge_index = Tensor::new(
-            &[[0i64, 1, 2, 3, 0, 1], [1, 2, 3, 4, 2, 3]],
-            &device,
-        )
-        .unwrap();
+        let edge_index =
+            Tensor::new(&[[0i64, 1, 2, 3, 0, 1], [1, 2, 3, 4, 2, 3]], &device).unwrap();
         let edge_type = Tensor::new(&[0u8, 1, 2, 0, 3, 1], &device).unwrap();
 
         (x, edge_index, Some(edge_type), num_nodes)

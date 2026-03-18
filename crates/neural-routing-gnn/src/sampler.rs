@@ -356,8 +356,7 @@ impl GraphSampler {
             let labels: Vec<String> = row.get("lbls").unwrap_or_default();
 
             // Properties come as a Neo4j map — extract to JSON
-            let props: HashMap<String, serde_json::Value> =
-                row.get("props").unwrap_or_default();
+            let props: HashMap<String, serde_json::Value> = row.get("props").unwrap_or_default();
 
             element_ids.push(eid.clone());
             nodes.push(SubGraphNode {
@@ -422,10 +421,7 @@ impl GraphSampler {
         };
 
         // Cache the result
-        self.cache
-            .lock()
-            .unwrap()
-            .put(cache_key, subgraph.clone());
+        self.cache.lock().unwrap().put(cache_key, subgraph.clone());
 
         tracing::debug!(
             center_id,

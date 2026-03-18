@@ -275,7 +275,11 @@ impl NormStats {
             .map(|&v| {
                 let variance = v / n.max(1.0);
                 let s = variance.sqrt();
-                if s < 1e-8 { 1.0 } else { s } // Avoid division by zero
+                if s < 1e-8 {
+                    1.0
+                } else {
+                    s
+                } // Avoid division by zero
             })
             .collect();
 
@@ -388,8 +392,7 @@ impl NodeFeatureBuilder {
         } else {
             0.0
         };
-        let modification_freq = data.modification_count.unwrap_or(0) as f64
-            / age_days.max(1.0);
+        let modification_freq = data.modification_count.unwrap_or(0) as f64 / age_days.max(1.0);
         let recency = 1.0 / (1.0 + last_accessed_days); // decay: recent = close to 1
 
         features.push((age_days + 1.0).ln() as f32); // log(age + 1)
@@ -688,13 +691,12 @@ mod tests {
     #[test]
     fn test_norm_stats_constant_dimension() {
         // If a dimension is constant, std should be 1.0 (not 0 to avoid div by zero)
-        let batch = vec![
-            vec![5.0f32, 1.0],
-            vec![5.0, 2.0],
-            vec![5.0, 3.0],
-        ];
+        let batch = vec![vec![5.0f32, 1.0], vec![5.0, 2.0], vec![5.0, 3.0]];
         let stats = NormStats::from_batch(&batch);
-        assert!((stats.std[0] - 1.0).abs() < 1e-10, "Constant dim std should be 1.0");
+        assert!(
+            (stats.std[0] - 1.0).abs() < 1e-10,
+            "Constant dim std should be 1.0"
+        );
     }
 
     #[test]

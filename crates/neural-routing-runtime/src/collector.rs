@@ -559,10 +559,10 @@ mod tests {
             let enabled = Arc::new(std::sync::atomic::AtomicBool::new(true));
 
             let collector = TrajectoryCollector {
-            tx,
-            enabled,
-            vector_builder: Arc::new(DecisionVectorBuilder::new()),
-        };
+                tx,
+                enabled,
+                vector_builder: Arc::new(DecisionVectorBuilder::new()),
+            };
 
             // These should never block
             collector.record_decision(make_decision("s1", "code.search", 0));
@@ -936,8 +936,7 @@ mod tests {
 
         // The trajectory's query_embedding should equal the first node's embedding
         assert_eq!(
-            pending.trajectory.query_embedding,
-            pending.trajectory.nodes[0].context_embedding,
+            pending.trajectory.query_embedding, pending.trajectory.nodes[0].context_embedding,
             "Trajectory query_embedding should match first node's embedding"
         );
     }

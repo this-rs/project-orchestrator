@@ -105,11 +105,8 @@ pub trait Benchmark: Send + Sync {
     fn run(&self, embeddings: &[NodeEmbeddings], source: &EmbeddingSource) -> MetricSet;
 
     /// Get per-query scores (for bootstrap CI). Each f64 is the query-level metric.
-    fn per_query_scores(
-        &self,
-        embeddings: &[NodeEmbeddings],
-        source: &EmbeddingSource,
-    ) -> Vec<f64>;
+    fn per_query_scores(&self, embeddings: &[NodeEmbeddings], source: &EmbeddingSource)
+        -> Vec<f64>;
 }
 
 // ---------------------------------------------------------------------------
@@ -195,10 +192,7 @@ impl Benchmark for CodeRetrievalBenchmark {
 }
 
 impl CodeRetrievalBenchmark {
-    fn rank_results(
-        &self,
-        emb_map: &HashMap<String, Vec<f32>>,
-    ) -> Vec<Vec<(usize, bool)>> {
+    fn rank_results(&self, emb_map: &HashMap<String, Vec<f32>>) -> Vec<Vec<(usize, bool)>> {
         self.test_cases
             .iter()
             .filter_map(|tc| {
@@ -544,10 +538,7 @@ fn compute_macro_f1(predictions: &[(usize, usize)]) -> f64 {
     }
 
     // Collect all unique classes
-    let mut classes: Vec<usize> = predictions
-        .iter()
-        .flat_map(|(p, a)| [*p, *a])
-        .collect();
+    let mut classes: Vec<usize> = predictions.iter().flat_map(|(p, a)| [*p, *a]).collect();
     classes.sort();
     classes.dedup();
 
@@ -757,8 +748,7 @@ pub fn run_benchmarks(
             let key_a = (source.name().to_string(), bench.name().to_string());
             let key_b = (voyage.name().to_string(), bench.name().to_string());
 
-            if let (Some(scores_a), Some(scores_b)) =
-                (per_query.get(&key_a), per_query.get(&key_b))
+            if let (Some(scores_a), Some(scores_b)) = (per_query.get(&key_a), per_query.get(&key_b))
             {
                 let mean_a = if scores_a.is_empty() {
                     0.0
@@ -795,10 +785,8 @@ pub fn run_benchmarks(
     }
 
     // 3. Compute summary (count GNN wins ≥15%)
-    let gnn_comparisons: Vec<&ComparisonResult> = comparisons
-        .iter()
-        .filter(|c| c.source_a == "GNN")
-        .collect();
+    let gnn_comparisons: Vec<&ComparisonResult> =
+        comparisons.iter().filter(|c| c.source_a == "GNN").collect();
 
     let gnn_wins = gnn_comparisons
         .iter()
@@ -868,7 +856,9 @@ fn compute_verdict(
             format!(
                 "GNN wins: {}/{}. Win ratio: {:.0}%. No significant improvement detected. \
                  Structural encoding may need more training data or architectural changes.",
-                gnn_wins, total, win_ratio * 100.0
+                gnn_wins,
+                total,
+                win_ratio * 100.0
             ),
         )
     }
@@ -1134,7 +1124,10 @@ mod tests {
         assert!(gnn_auc >= 0.0 && gnn_auc <= 1.0);
         assert!(voyage_auc >= 0.0 && voyage_auc <= 1.0);
 
-        info!("Co-change AUC: GNN={:.3}, Voyage={:.3}", gnn_auc, voyage_auc);
+        info!(
+            "Co-change AUC: GNN={:.3}, Voyage={:.3}",
+            gnn_auc, voyage_auc
+        );
     }
 
     #[test]
@@ -1185,13 +1178,13 @@ mod tests {
     #[test]
     fn test_macro_f1_perfect() {
         // All predictions correct: 3 classes, each predicted perfectly
-        let predictions = vec![
-            (0, 0), (0, 0),
-            (1, 1), (1, 1),
-            (2, 2), (2, 2),
-        ];
+        let predictions = vec![(0, 0), (0, 0), (1, 1), (1, 1), (2, 2), (2, 2)];
         let f1 = compute_macro_f1(&predictions);
-        assert!((f1 - 1.0).abs() < 1e-10, "Perfect predictions → macro-F1=1.0, got {}", f1);
+        assert!(
+            (f1 - 1.0).abs() < 1e-10,
+            "Perfect predictions → macro-F1=1.0, got {}",
+            f1
+        );
     }
 
     #[test]
@@ -1199,8 +1192,10 @@ mod tests {
         // Class 0: TP=2, FP=1, FN=0 → P=2/3, R=1.0, F1=0.8
         // Class 1: TP=1, FP=0, FN=1 → P=1.0, R=0.5, F1=2/3
         let predictions = vec![
-            (0, 0), (0, 0), (0, 1), // 2 correct class-0, 1 class-1 misclassified as 0
-            (1, 1),                  // 1 correct class-1
+            (0, 0),
+            (0, 0),
+            (0, 1), // 2 correct class-0, 1 class-1 misclassified as 0
+            (1, 1), // 1 correct class-1
         ];
         let f1 = compute_macro_f1(&predictions);
         let expected = (0.8 + 2.0 / 3.0) / 2.0; // avg of per-class F1
@@ -1217,7 +1212,11 @@ mod tests {
         // Every prediction is wrong class
         let predictions = vec![(0, 1), (1, 0)];
         let f1 = compute_macro_f1(&predictions);
-        assert!((f1 - 0.0).abs() < 1e-10, "All wrong → macro-F1=0.0, got {}", f1);
+        assert!(
+            (f1 - 0.0).abs() < 1e-10,
+            "All wrong → macro-F1=0.0, got {}",
+            f1
+        );
     }
 
     #[test]
@@ -1239,7 +1238,10 @@ mod tests {
         );
         // Verify weighting: voyage scaled by 0.5, gnn scaled by 0.5
         let fused = ne.get(&EmbeddingSource::Fused { gnn_weight: 0.5 });
-        assert!((fused[0] - 0.5).abs() < 1e-6, "Voyage component should be 1.0 * 0.5 = 0.5");
+        assert!(
+            (fused[0] - 0.5).abs() < 1e-6,
+            "Voyage component should be 1.0 * 0.5 = 0.5"
+        );
         assert!(
             (fused[768] - 1.0).abs() < 1e-6,
             "GNN component should be 2.0 * 0.5 = 1.0"
@@ -1248,13 +1250,22 @@ mod tests {
         // Edge case: gnn_weight = 0.0 → 100% Voyage, 0% GNN
         let fused_voyage_only = ne.get(&EmbeddingSource::Fused { gnn_weight: 0.0 });
         assert_eq!(fused_voyage_only.len(), 768 + 256);
-        assert!((fused_voyage_only[0] - 1.0).abs() < 1e-6, "Voyage should be unscaled");
-        assert!((fused_voyage_only[768]).abs() < 1e-6, "GNN should be zeroed");
+        assert!(
+            (fused_voyage_only[0] - 1.0).abs() < 1e-6,
+            "Voyage should be unscaled"
+        );
+        assert!(
+            (fused_voyage_only[768]).abs() < 1e-6,
+            "GNN should be zeroed"
+        );
 
         // Edge case: gnn_weight = 1.0 → 0% Voyage, 100% GNN
         let fused_gnn_only = ne.get(&EmbeddingSource::Fused { gnn_weight: 1.0 });
         assert_eq!(fused_gnn_only.len(), 768 + 256);
         assert!((fused_gnn_only[0]).abs() < 1e-6, "Voyage should be zeroed");
-        assert!((fused_gnn_only[768] - 2.0).abs() < 1e-6, "GNN should be unscaled");
+        assert!(
+            (fused_gnn_only[768] - 2.0).abs() < 1e-6,
+            "GNN should be unscaled"
+        );
     }
 }

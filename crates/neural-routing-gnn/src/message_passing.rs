@@ -3,9 +3,9 @@
 //! Provides `scatter_add` for aggregating messages and the `MessagePassing` trait
 //! that R-GCN and GraphSAGE build upon.
 
-use candle_core::{Result, Tensor};
 #[cfg(test)]
 use candle_core::Device;
+use candle_core::{Result, Tensor};
 
 /// Trait for message passing layers in graph neural networks.
 ///
@@ -27,12 +27,8 @@ pub trait MessagePassing {
     ) -> Result<Tensor>;
 
     /// Aggregate messages at each target node via scatter_add.
-    fn aggregate(
-        &self,
-        messages: &Tensor,
-        edge_index: &Tensor,
-        num_nodes: usize,
-    ) -> Result<Tensor>;
+    fn aggregate(&self, messages: &Tensor, edge_index: &Tensor, num_nodes: usize)
+        -> Result<Tensor>;
 
     /// Update node representations with aggregated messages.
     fn update(&self, x: &Tensor, aggregated: &Tensor) -> Result<Tensor>;
@@ -199,10 +195,7 @@ mod tests {
     #[test]
     fn test_scatter_mean() -> Result<()> {
         let device = Device::Cpu;
-        let src = Tensor::new(
-            &[[2.0f32, 4.0], [6.0, 8.0], [10.0, 12.0]],
-            &device,
-        )?;
+        let src = Tensor::new(&[[2.0f32, 4.0], [6.0, 8.0], [10.0, 12.0]], &device)?;
         let index = vec![0u32, 0, 1]; // two messages to node 0, one to node 1
 
         let result = scatter_mean(&src, &index, 2)?;
@@ -219,10 +212,7 @@ mod tests {
     #[test]
     fn test_gather_rows() -> Result<()> {
         let device = Device::Cpu;
-        let x = Tensor::new(
-            &[[1.0f32, 2.0], [3.0, 4.0], [5.0, 6.0]],
-            &device,
-        )?;
+        let x = Tensor::new(&[[1.0f32, 2.0], [3.0, 4.0], [5.0, 6.0]], &device)?;
         let indices = vec![2u32, 0, 1, 2];
 
         let result = gather_rows(&x, &indices)?;

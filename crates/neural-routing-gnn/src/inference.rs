@@ -16,11 +16,11 @@ use candle_nn::{VarBuilder, VarMap};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 
-use crate::encoder::{GraphEncoder, GraphEncoderConfig};
 #[cfg(test)]
 use crate::encoder::GNNArchitecture;
+use crate::encoder::{GraphEncoder, GraphEncoderConfig};
 use crate::features::{NodeFeatureBuilder, NormStats, RawNodeData, TOTAL_FEATURE_DIM};
-use crate::sampler::{SubGraph, export_to_pyg};
+use crate::sampler::{export_to_pyg, SubGraph};
 
 // ---------------------------------------------------------------------------
 // GnnEncoder trait
@@ -47,18 +47,11 @@ pub enum GnnError {
 /// Produces fixed-dimension embeddings for nodes in a subgraph.
 pub trait GnnEncoder: Send + Sync {
     /// Encode all nodes in a subgraph, returning [num_nodes × output_dim] embeddings.
-    fn encode_subgraph(
-        &self,
-        subgraph: &SubGraph,
-    ) -> Result<Vec<Vec<f32>>, GnnError>;
+    fn encode_subgraph(&self, subgraph: &SubGraph) -> Result<Vec<Vec<f32>>, GnnError>;
 
     /// Encode a single node by its ID in the subgraph.
     /// Returns the embedding for the target node.
-    fn encode_node(
-        &self,
-        subgraph: &SubGraph,
-        target_node_id: &str,
-    ) -> Result<Vec<f32>, GnnError>;
+    fn encode_node(&self, subgraph: &SubGraph, target_node_id: &str) -> Result<Vec<f32>, GnnError>;
 
     /// Get the output embedding dimension.
     fn output_dim(&self) -> usize;
@@ -151,7 +144,8 @@ impl CandleGnnEncoder {
             .collect();
 
         let features = if let Some(ref stats) = self.norm_stats {
-            self.feature_builder.build_batch_with_stats(&raw_nodes, stats)
+            self.feature_builder
+                .build_batch_with_stats(&raw_nodes, stats)
         } else {
             // Without norm stats, build without normalization
             raw_nodes
@@ -167,10 +161,7 @@ impl CandleGnnEncoder {
 }
 
 impl GnnEncoder for CandleGnnEncoder {
-    fn encode_subgraph(
-        &self,
-        subgraph: &SubGraph,
-    ) -> Result<Vec<Vec<f32>>, GnnError> {
+    fn encode_subgraph(&self, subgraph: &SubGraph) -> Result<Vec<Vec<f32>>, GnnError> {
         if subgraph.nodes.is_empty() {
             return Ok(vec![]);
         }
@@ -188,7 +179,9 @@ impl GnnEncoder for CandleGnnEncoder {
         if num_edges == 0 {
             let edge_index = Tensor::zeros((2, 0), DType::I64, &device)?;
             let edge_type = Tensor::zeros(0, DType::U8, &device)?;
-            let embeddings = self.encoder.forward(&x, &edge_index, Some(&edge_type), pyg.num_nodes)?;
+            let embeddings =
+                self.encoder
+                    .forward(&x, &edge_index, Some(&edge_type), pyg.num_nodes)?;
             return Ok(embeddings.to_vec2::<f32>()?);
         }
 
@@ -204,21 +197,14 @@ impl GnnEncoder for CandleGnnEncoder {
         let edge_type = Tensor::from_vec(pyg.edge_type.clone(), num_edges, &device)?;
 
         // Forward pass
-        let embeddings = self.encoder.forward(
-            &x,
-            &edge_index,
-            Some(&edge_type),
-            pyg.num_nodes,
-        )?;
+        let embeddings = self
+            .encoder
+            .forward(&x, &edge_index, Some(&edge_type), pyg.num_nodes)?;
 
         Ok(embeddings.to_vec2::<f32>()?)
     }
 
-    fn encode_node(
-        &self,
-        subgraph: &SubGraph,
-        target_node_id: &str,
-    ) -> Result<Vec<f32>, GnnError> {
+    fn encode_node(&self, subgraph: &SubGraph, target_node_id: &str) -> Result<Vec<f32>, GnnError> {
         let all_embeddings = self.encode_subgraph(subgraph)?;
 
         // Find the target node index
@@ -271,11 +257,7 @@ impl CachedGnnEncoder {
     }
 
     /// Create with custom capacity and TTL.
-    pub fn with_config(
-        inner: Arc<dyn GnnEncoder>,
-        max_capacity: u64,
-        ttl_secs: u64,
-    ) -> Self {
+    pub fn with_config(inner: Arc<dyn GnnEncoder>, max_capacity: u64, ttl_secs: u64) -> Self {
         let cache = moka::sync::Cache::builder()
             .max_capacity(max_capacity)
             .time_to_live(Duration::from_secs(ttl_secs))
@@ -326,10 +308,7 @@ pub struct CacheStats {
 }
 
 impl GnnEncoder for CachedGnnEncoder {
-    fn encode_subgraph(
-        &self,
-        subgraph: &SubGraph,
-    ) -> Result<Vec<Vec<f32>>, GnnError> {
+    fn encode_subgraph(&self, subgraph: &SubGraph) -> Result<Vec<Vec<f32>>, GnnError> {
         let key = Self::cache_key(subgraph);
 
         // Check cache
@@ -344,11 +323,7 @@ impl GnnEncoder for CachedGnnEncoder {
         Ok(embeddings)
     }
 
-    fn encode_node(
-        &self,
-        subgraph: &SubGraph,
-        target_node_id: &str,
-    ) -> Result<Vec<f32>, GnnError> {
+    fn encode_node(&self, subgraph: &SubGraph, target_node_id: &str) -> Result<Vec<f32>, GnnError> {
         let all = self.encode_subgraph(subgraph)?;
 
         let idx = subgraph
@@ -447,9 +422,11 @@ impl GnnGraphStateBuilder {
         // Extract embeddings for touched nodes only
         let mut touched_embeddings = Vec::new();
         for target_id in touched_node_ids {
-            if let Some(idx) = subgraph.nodes.iter().position(|n| {
-                n.app_id == *target_id || n.element_id == *target_id
-            }) {
+            if let Some(idx) = subgraph
+                .nodes
+                .iter()
+                .position(|n| n.app_id == *target_id || n.element_id == *target_id)
+            {
                 touched_embeddings.push(all_embeddings[idx].clone());
             }
         }
@@ -724,7 +701,11 @@ mod tests {
         let subgraph = make_test_subgraph(20, 40);
         let gs_builder = GnnGraphStateBuilder::new();
 
-        let touched = vec!["app_0".to_string(), "app_3".to_string(), "app_7".to_string()];
+        let touched = vec![
+            "app_0".to_string(),
+            "app_3".to_string(),
+            "app_7".to_string(),
+        ];
         let block = gs_builder.build_from_encoder(&encoder, &subgraph, &touched)?;
         assert_eq!(block.len(), 64);
 

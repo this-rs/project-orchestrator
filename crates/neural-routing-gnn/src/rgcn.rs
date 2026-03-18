@@ -5,12 +5,12 @@
 //!
 //! Architecture: 3 layers, GELU activation, dropout, residual connections.
 
-use candle_core::{DType, Module, Result, Tensor};
 #[cfg(test)]
 use candle_core::Device;
-use candle_nn::{linear, Linear, VarBuilder};
+use candle_core::{DType, Module, Result, Tensor};
 #[cfg(test)]
 use candle_nn::VarMap;
+use candle_nn::{linear, Linear, VarBuilder};
 
 use crate::message_passing::{extract_edge_indices, gather_rows, scatter_add, MessagePassing};
 
@@ -79,11 +79,7 @@ impl RGCNLayer {
             },
         )?;
 
-        let self_loop = linear(
-            config.input_dim,
-            config.output_dim,
-            vb.pp("self_loop"),
-        )?;
+        let self_loop = linear(config.input_dim, config.output_dim, vb.pp("self_loop"))?;
 
         Ok(Self {
             bases,
@@ -95,11 +91,7 @@ impl RGCNLayer {
 
     /// Compute the effective weight matrix for a given relation type.
     /// W_r = Σ_b a_{rb} × V_b(x)
-    fn compute_relation_message(
-        &self,
-        x: &Tensor,
-        relation_type: usize,
-    ) -> Result<Tensor> {
+    fn compute_relation_message(&self, x: &Tensor, relation_type: usize) -> Result<Tensor> {
         // Get coefficients for this relation: [num_bases]
         let coeffs = self.coefficients.get(relation_type)?;
 
@@ -145,11 +137,8 @@ impl MessagePassing for RGCNLayer {
 
         // For each relation type, compute messages in batch
         let device = x.device();
-        let mut all_messages = Tensor::zeros(
-            (num_edges, self.config.output_dim),
-            DType::F32,
-            device,
-        )?;
+        let mut all_messages =
+            Tensor::zeros((num_edges, self.config.output_dim), DType::F32, device)?;
 
         for (rel, edge_indices) in groups.iter().enumerate() {
             if edge_indices.is_empty() {
@@ -157,10 +146,7 @@ impl MessagePassing for RGCNLayer {
             }
 
             // Gather source features for this relation's edges
-            let rel_source_indices: Vec<u32> = edge_indices
-                .iter()
-                .map(|&i| sources[i])
-                .collect();
+            let rel_source_indices: Vec<u32> = edge_indices.iter().map(|&i| sources[i]).collect();
             let rel_sources = gather_rows(x, &rel_source_indices)?;
 
             // Compute W_r × x for this relation
@@ -292,11 +278,8 @@ mod tests {
         let x = Tensor::randn(0.0f32, 1.0, (num_nodes, input_dim), &device).unwrap();
 
         // Edges: 0->1, 1->2, 2->3, 3->4, 0->2, 1->3
-        let edge_index = Tensor::new(
-            &[[0i64, 1, 2, 3, 0, 1], [1, 2, 3, 4, 2, 3]],
-            &device,
-        )
-        .unwrap();
+        let edge_index =
+            Tensor::new(&[[0i64, 1, 2, 3, 0, 1], [1, 2, 3, 4, 2, 3]], &device).unwrap();
 
         // Edge types: mixed relations
         let edge_type = Tensor::new(&[0u8, 1, 2, 0, 3, 1], &device).unwrap();

@@ -4,11 +4,11 @@
 //! and paired permutation tests (10,000 permutations).
 //! Outputs a structured JSON report to stdout and validates the verdict logic.
 
+use neural_routing_gnn::benchmark::Benchmark;
 use neural_routing_gnn::benchmark::{
-    self, CodeRetrievalBenchmark, CoChangePredictionBenchmark, CommunityPredictionBenchmark,
+    self, CoChangePredictionBenchmark, CodeRetrievalBenchmark, CommunityPredictionBenchmark,
     EmbeddingSource, GnnBenchmarkConfig, ImpactPredictionBenchmark, RoutePredictionBenchmark,
 };
-use neural_routing_gnn::benchmark::Benchmark;
 
 #[test]
 fn benchmark_gnn_vs_voyage_full_report() {
@@ -41,7 +41,10 @@ fn benchmark_gnn_vs_voyage_full_report() {
 
     // === Structural validations ===
     assert_eq!(report.results.len(), 3, "Should have 3 source results");
-    assert_eq!(report.summary.total_tasks, 5, "Should have 5 benchmark tasks");
+    assert_eq!(
+        report.summary.total_tasks, 5,
+        "Should have 5 benchmark tasks"
+    );
 
     // Verify all 5 benchmarks ran for each source
     for source_result in &report.results {
@@ -54,8 +57,12 @@ fn benchmark_gnn_vs_voyage_full_report() {
         assert!(source_result.benchmarks.contains_key("code_retrieval"));
         assert!(source_result.benchmarks.contains_key("impact_prediction"));
         assert!(source_result.benchmarks.contains_key("route_prediction"));
-        assert!(source_result.benchmarks.contains_key("community_prediction"));
-        assert!(source_result.benchmarks.contains_key("co_change_prediction"));
+        assert!(source_result
+            .benchmarks
+            .contains_key("community_prediction"));
+        assert!(source_result
+            .benchmarks
+            .contains_key("co_change_prediction"));
     }
 
     // Verify comparisons: GNN vs Voyage (5) + Concat vs Voyage (5) = 10

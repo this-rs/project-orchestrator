@@ -244,7 +244,10 @@ mod tests {
         let neighbors = Tensor::randn(0.0f32, 1.0, (3, 16), &device)?;
 
         let result = encoder.encode_new_node(&node, &neighbors);
-        assert!(result.is_err(), "R-GCN should not support inductive encoding");
+        assert!(
+            result.is_err(),
+            "R-GCN should not support inductive encoding"
+        );
         Ok(())
     }
 }

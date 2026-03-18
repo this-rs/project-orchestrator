@@ -200,8 +200,8 @@ mod tests {
     fn test_recall_at_k() {
         let ranked = vec![
             vec![(0, false), (1, true), (2, false)],  // hit at rank 2
-            vec![(0, true), (1, false), (2, false)],   // hit at rank 1
-            vec![(0, false), (1, false), (2, false)],  // no hit
+            vec![(0, true), (1, false), (2, false)],  // hit at rank 1
+            vec![(0, false), (1, false), (2, false)], // no hit
         ];
 
         assert!((recall_at_k(&ranked, 1) - 1.0 / 3.0).abs() < 1e-10);
@@ -213,8 +213,8 @@ mod tests {
     fn test_mrr() {
         let ranked = vec![
             vec![(0, false), (1, true)],  // first relevant at rank 2 → 1/2
-            vec![(0, true)],               // first relevant at rank 1 → 1/1
-            vec![(0, false), (1, false)],  // no relevant → 0
+            vec![(0, true)],              // first relevant at rank 1 → 1/1
+            vec![(0, false), (1, false)], // no relevant → 0
         ];
 
         let result = mrr(&ranked);
@@ -243,7 +243,11 @@ mod tests {
     fn test_auc_roc_perfect() {
         let scores = vec![(0.9, true), (0.8, true), (0.2, false), (0.1, false)];
         let auc = auc_roc(&scores);
-        assert!((auc - 1.0).abs() < 1e-10, "Perfect separation → AUC=1.0, got {}", auc);
+        assert!(
+            (auc - 1.0).abs() < 1e-10,
+            "Perfect separation → AUC=1.0, got {}",
+            auc
+        );
     }
 
     #[test]
@@ -261,7 +265,11 @@ mod tests {
         ];
         let auc = auc_roc(&scores);
         // With perfectly interleaved scores, AUC should be close to 0.5
-        assert!((auc - 0.5).abs() < 0.15, "Interleaved scores → AUC≈0.5, got {}", auc);
+        assert!(
+            (auc - 0.5).abs() < 0.15,
+            "Interleaved scores → AUC≈0.5, got {}",
+            auc
+        );
     }
 
     #[test]
