@@ -22,8 +22,9 @@ chrono = { workspace = true }
 # Neo4j — for graph sampling
 neo4rs = { workspace = true }
 
-# Caching — LRU for subgraph cache
+# Caching — LRU for subgraph cache, moka for concurrent inference cache
 lru = "0.12"
+moka = { version = "0.12", features = ["sync"] }
 
 # ML — always compiled (build full, runtime-controlled)
 candle-core = { workspace = true }

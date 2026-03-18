@@ -8,8 +8,12 @@
 //! - Mean aggregation with attention weighting
 //! - Residual connections when dimensions match
 
-use candle_core::{DType, Device, Module, Result, Tensor, D};
-use candle_nn::{linear, Linear, VarBuilder, VarMap};
+use candle_core::{Module, Result, Tensor, D};
+#[cfg(test)]
+use candle_core::{DType, Device};
+use candle_nn::{linear, Linear, VarBuilder};
+#[cfg(test)]
+use candle_nn::VarMap;
 
 use crate::message_passing::{
     extract_edge_indices, gather_rows, scatter_mean, MessagePassing,

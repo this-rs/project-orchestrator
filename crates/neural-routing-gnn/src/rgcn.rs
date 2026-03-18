@@ -5,8 +5,12 @@
 //!
 //! Architecture: 3 layers, GELU activation, dropout, residual connections.
 
-use candle_core::{DType, Device, Module, Result, Tensor};
-use candle_nn::{linear, Linear, VarBuilder, VarMap};
+use candle_core::{DType, Module, Result, Tensor};
+#[cfg(test)]
+use candle_core::Device;
+use candle_nn::{linear, Linear, VarBuilder};
+#[cfg(test)]
+use candle_nn::VarMap;
 
 use crate::message_passing::{extract_edge_indices, gather_rows, scatter_add, MessagePassing};
 

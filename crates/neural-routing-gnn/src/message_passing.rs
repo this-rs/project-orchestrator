@@ -3,7 +3,9 @@
 //! Provides `scatter_add` for aggregating messages and the `MessagePassing` trait
 //! that R-GCN and GraphSAGE build upon.
 
-use candle_core::{Device, Result, Tensor};
+use candle_core::{Result, Tensor};
+#[cfg(test)]
+use candle_core::Device;
 
 /// Trait for message passing layers in graph neural networks.
 ///
