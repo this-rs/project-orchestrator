@@ -47,6 +47,16 @@ pub trait TrajectoryStore: Send + Sync {
         }
         Ok(stored)
     }
+
+    /// Link a trajectory to a protocol run via a DURING_RUN relation.
+    /// Default implementation is a no-op (for stores that don't support graph relations).
+    async fn link_trajectory_to_run(
+        &self,
+        _trajectory_id: &Uuid,
+        _run_id: &Uuid,
+    ) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Trait for intercepting decisions during a session to build trajectories.

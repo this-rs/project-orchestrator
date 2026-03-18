@@ -37,6 +37,10 @@ pub struct SessionHints {
     pub tasks_completed: usize,
     /// Total number of MCP tasks active during this session.
     pub tasks_total: usize,
+    /// Active protocol run ID (if the session is executing within a protocol FSM).
+    pub protocol_run_id: Option<Uuid>,
+    /// Current protocol state name (e.g., "implement", "review").
+    pub protocol_state: Option<String>,
 }
 
 /// A decision event sent from the hot path to the background collector.
@@ -92,6 +96,13 @@ pub struct DecisionRecord {
     /// VectorBuilder to compute the 64d graph_state block.
     #[serde(default)]
     pub node_features: Vec<neural_routing_core::NodeFeatures>,
+    /// Protocol run ID if this decision was made during an active FSM run.
+    /// Injected by the ChatManager from the current session context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_run_id: Option<Uuid>,
+    /// Protocol state name at the time of this decision (e.g., "implement", "review").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_state: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -617,6 +628,12 @@ fn build_trajectory(
         .map(|n| n.context_embedding.clone())
         .unwrap_or_else(|| neural_routing_core::sentinel_vector(TOTAL_DIM, 0xCAFE_BABE));
 
+    // Extract protocol_run_id from the first decision that has one
+    let protocol_run_id = buffer
+        .decisions
+        .iter()
+        .find_map(|d| d.protocol_run_id);
+
     PendingTrajectory {
         trajectory: Trajectory {
             id: trajectory_id,
@@ -627,6 +644,7 @@ fn build_trajectory(
             duration_ms,
             nodes,
             created_at: now,
+            protocol_run_id,
         },
         tool_usages,
         touched_entities,
@@ -690,6 +708,21 @@ async fn flush_batch(
                         "Failed to link touched entities"
                     );
                 }
+            }
+        }
+
+        // Link trajectory to protocol run if present (DURING_RUN relation)
+        if let Some(run_id) = pending.trajectory.protocol_run_id {
+            if let Err(e) = store
+                .link_trajectory_to_run(&pending.trajectory.id, &run_id)
+                .await
+            {
+                tracing::warn!(
+                    trajectory_id = %pending.trajectory.id,
+                    run_id = %run_id,
+                    error = %e,
+                    "Failed to link trajectory to protocol run"
+                );
             }
         }
 

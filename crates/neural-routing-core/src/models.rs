@@ -20,6 +20,9 @@ pub struct Trajectory {
     /// Ordered list of decision nodes.
     pub nodes: Vec<TrajectoryNode>,
     pub created_at: DateTime<Utc>,
+    /// Protocol run ID if this trajectory was produced during an active FSM run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_run_id: Option<Uuid>,
 }
 
 /// A single decision point in a reasoning trajectory.

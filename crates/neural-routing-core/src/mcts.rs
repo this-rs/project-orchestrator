@@ -378,6 +378,7 @@ impl<P: ProxyModel> MctsEngine<P> {
             duration_ms: source.duration_ms,
             nodes,
             created_at: now,
+            protocol_run_id: None,
         }
     }
 }
