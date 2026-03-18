@@ -23,3 +23,6 @@ candle-core = { workspace = true }
 candle-nn = { workspace = true }
 safetensors = { workspace = true }
 chrono = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

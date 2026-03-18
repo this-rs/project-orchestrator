@@ -17,6 +17,7 @@ pub mod cql;
 pub mod dataloader;
 pub mod dataset;
 pub mod ewc;
+pub mod registry;
 pub mod training;
 pub mod transformer;
 
@@ -28,6 +29,7 @@ pub use dataset::{
     pad_and_batch, trajectories_to_tensors, trajectory_to_tensors, PolicyNormStats,
     TrajectoryBatch, TrajectoryTensors, ACTION_DIM, CONTEXT_DIM, QUERY_DIM, STATE_DIM,
 };
+pub use registry::{ModelRegistry, ModelStage, ModelVersion};
 pub use training::TrainingConfig;
 /// Re-export key types
 pub use transformer::DecisionTransformer;
