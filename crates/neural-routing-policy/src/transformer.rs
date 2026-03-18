@@ -12,9 +12,9 @@
 //! ~3M parameters with default config, optimized for CPU inference (<15ms for 8 steps).
 
 use candle_core::{DType, Device, Module, Result as CandleResult, Tensor, D};
-use candle_nn::{layer_norm, linear, Activation, LayerNorm, Linear, VarBuilder};
 #[cfg(test)]
 use candle_nn::VarMap;
+use candle_nn::{layer_norm, linear, Activation, LayerNorm, Linear, VarBuilder};
 use serde::{Deserialize, Serialize};
 
 use crate::dataset::{ACTION_DIM, STATE_DIM};
@@ -105,7 +105,11 @@ impl CausalSelfAttention {
 
         // Split into Q, K, V: each [B, T, H]
         let q = qkv.narrow(2, 0, self.num_heads * self.head_dim)?;
-        let k = qkv.narrow(2, self.num_heads * self.head_dim, self.num_heads * self.head_dim)?;
+        let k = qkv.narrow(
+            2,
+            self.num_heads * self.head_dim,
+            self.num_heads * self.head_dim,
+        )?;
         let v = qkv.narrow(
             2,
             2 * self.num_heads * self.head_dim,
@@ -142,9 +146,9 @@ impl CausalSelfAttention {
         let out = attn_weights.matmul(&v)?;
 
         // Reshape back to [B, T, hidden_dim]
-        let out = out
-            .transpose(1, 2)?
-            .reshape((batch_size, seq_len, self.num_heads * self.head_dim))?;
+        let out =
+            out.transpose(1, 2)?
+                .reshape((batch_size, seq_len, self.num_heads * self.head_dim))?;
 
         // Output projection
         self.out_proj.forward(&out)
@@ -179,9 +183,17 @@ struct TransformerBlock {
 
 impl TransformerBlock {
     fn new(hidden_dim: usize, num_heads: usize, vb: VarBuilder<'_>) -> CandleResult<Self> {
-        let ln1 = layer_norm(hidden_dim, candle_nn::LayerNormConfig::default(), vb.pp("ln1"))?;
+        let ln1 = layer_norm(
+            hidden_dim,
+            candle_nn::LayerNormConfig::default(),
+            vb.pp("ln1"),
+        )?;
         let attn = CausalSelfAttention::new(hidden_dim, num_heads, vb.pp("attn"))?;
-        let ln2 = layer_norm(hidden_dim, candle_nn::LayerNormConfig::default(), vb.pp("ln2"))?;
+        let ln2 = layer_norm(
+            hidden_dim,
+            candle_nn::LayerNormConfig::default(),
+            vb.pp("ln2"),
+        )?;
         let ffn_dim = hidden_dim * 4; // Standard GPT-2: 4x expansion
         let mlp_fc = linear(hidden_dim, ffn_dim, vb.pp("mlp_fc"))?;
         let mlp_proj = linear(ffn_dim, hidden_dim, vb.pp("mlp_proj"))?;
@@ -274,8 +286,7 @@ impl DecisionTransformer {
         // Transformer blocks
         let mut blocks = Vec::with_capacity(config.num_layers);
         for i in 0..config.num_layers {
-            let block =
-                TransformerBlock::new(h, config.num_heads, vb.pp(format!("block_{}", i)))?;
+            let block = TransformerBlock::new(h, config.num_heads, vb.pp(format!("block_{}", i)))?;
             blocks.push(block);
         }
 
@@ -385,8 +396,7 @@ impl DecisionTransformer {
         // Extract state token positions (index 1, 4, 7, ...) for action prediction
         // In the interleaved sequence, state tokens are at positions 3*t + 1
         let state_positions: Vec<i64> = (0..seq_len as i64).map(|t| 3 * t + 1).collect();
-        let pos_tensor =
-            Tensor::from_vec(state_positions, seq_len, h.device())?.unsqueeze(0)?; // [1, T]
+        let pos_tensor = Tensor::from_vec(state_positions, seq_len, h.device())?.unsqueeze(0)?; // [1, T]
         let pos_tensor = pos_tensor
             .broadcast_as((batch_size, seq_len))?
             .contiguous()?; // [B, T]
@@ -422,8 +432,7 @@ impl DecisionTransformer {
         let mut rtg_remaining = rtg_target;
 
         // Initialize with zeros for first action (will be predicted)
-        let zero_action =
-            Tensor::zeros((1, 1, self.config.action_dim), DType::F32, device)?;
+        let zero_action = Tensor::zeros((1, 1, self.config.action_dim), DType::F32, device)?;
         let state = initial_state.unsqueeze(0)?.unsqueeze(0)?; // [1, 1, state_dim]
 
         for step in 0..max_steps {
@@ -440,7 +449,9 @@ impl DecisionTransformer {
             let rtg = Tensor::from_vec(rtg_vec, (1, t), device)?;
 
             // Build states: repeat initial_state for now (real inference would update)
-            let states = state.broadcast_as((1, t, self.config.state_dim))?.contiguous()?;
+            let states = state
+                .broadcast_as((1, t, self.config.state_dim))?
+                .contiguous()?;
 
             // Build actions: previous predicted actions + zero for current
             let action_list: Vec<Tensor> = actions
@@ -448,7 +459,9 @@ impl DecisionTransformer {
                 .map(|a: &Tensor| a.unsqueeze(0).unwrap().unsqueeze(0).unwrap())
                 .collect();
             let mut all_actions = if action_list.is_empty() {
-                zero_action.broadcast_as((1, 1, self.config.action_dim))?.contiguous()?
+                zero_action
+                    .broadcast_as((1, 1, self.config.action_dim))?
+                    .contiguous()?
             } else {
                 let prev = Tensor::cat(&action_list, 1)?;
                 Tensor::cat(&[prev, zero_action.clone()], 1)?
@@ -505,7 +518,9 @@ fn expand_mask(mask: &Tensor, seq_len: usize) -> CandleResult<Tensor> {
     let batch_size = mask.dim(0)?;
     // [B, T] → [B, T, 1] → broadcast [B, T, 3] → reshape [B, 3*T]
     let expanded = mask.unsqueeze(D::Minus1)?; // [B, T, 1]
-    let expanded = expanded.broadcast_as((batch_size, seq_len, 3))?.contiguous()?;
+    let expanded = expanded
+        .broadcast_as((batch_size, seq_len, 3))?
+        .contiguous()?;
     expanded.reshape((batch_size, 3 * seq_len))
 }
 
@@ -537,7 +552,7 @@ mod tests {
 
     fn make_model() -> (DecisionTransformer, VarMap) {
         let config = DecisionTransformerConfig {
-            state_dim: STATE_DIM, // 512
+            state_dim: STATE_DIM,   // 512
             action_dim: ACTION_DIM, // 256
             hidden_dim: 128,
             num_layers: 2,
@@ -599,18 +614,8 @@ mod tests {
         let seq_len = 5;
 
         let rtg = Tensor::randn(0.0f32, 1.0, (batch_size, seq_len), &device)?;
-        let states = Tensor::randn(
-            0.0f32,
-            1.0,
-            (batch_size, seq_len, STATE_DIM),
-            &device,
-        )?;
-        let actions = Tensor::randn(
-            0.0f32,
-            1.0,
-            (batch_size, seq_len, ACTION_DIM),
-            &device,
-        )?;
+        let states = Tensor::randn(0.0f32, 1.0, (batch_size, seq_len, STATE_DIM), &device)?;
+        let actions = Tensor::randn(0.0f32, 1.0, (batch_size, seq_len, ACTION_DIM), &device)?;
         let timesteps = Tensor::zeros((batch_size, seq_len), DType::U32, &device)?;
         let mask = Tensor::ones((batch_size, seq_len), DType::F32, &device)?;
 

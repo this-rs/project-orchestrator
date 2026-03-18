@@ -20,7 +20,7 @@ pub mod transformer;
 pub use cql::CQLPolicy;
 pub use dataloader::{TrajectoryDataLoader, TrajectoryDataLoaderConfig};
 pub use dataset::{
-    pad_and_batch, trajectory_to_tensors, trajectories_to_tensors, PolicyNormStats,
+    pad_and_batch, trajectories_to_tensors, trajectory_to_tensors, PolicyNormStats,
     TrajectoryBatch, TrajectoryTensors, ACTION_DIM, CONTEXT_DIM, QUERY_DIM, STATE_DIM,
 };
 pub use training::TrainingConfig;

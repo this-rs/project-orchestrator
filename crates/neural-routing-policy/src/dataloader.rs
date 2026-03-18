@@ -399,10 +399,26 @@ mod tests {
         // Verify that test set contains the most recent trajectories
         let dl = make_test_dataloader(100);
 
-        let train_max_ts = dl.split_slice(Split::Train).last().unwrap().created_at_epoch;
-        let val_min_ts = dl.split_slice(Split::Validation).first().unwrap().created_at_epoch;
-        let val_max_ts = dl.split_slice(Split::Validation).last().unwrap().created_at_epoch;
-        let test_min_ts = dl.split_slice(Split::Test).first().unwrap().created_at_epoch;
+        let train_max_ts = dl
+            .split_slice(Split::Train)
+            .last()
+            .unwrap()
+            .created_at_epoch;
+        let val_min_ts = dl
+            .split_slice(Split::Validation)
+            .first()
+            .unwrap()
+            .created_at_epoch;
+        let val_max_ts = dl
+            .split_slice(Split::Validation)
+            .last()
+            .unwrap()
+            .created_at_epoch;
+        let test_min_ts = dl
+            .split_slice(Split::Test)
+            .first()
+            .unwrap()
+            .created_at_epoch;
 
         assert!(
             train_max_ts <= val_min_ts,
