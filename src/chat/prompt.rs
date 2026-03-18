@@ -1605,26 +1605,6 @@ pub fn tool_catalog_tool_count() -> usize {
     names.len()
 }
 
-/// Serialize the full tool catalog to compact JSON for the oneshot Opus prompt.
-pub fn tools_catalog_to_json(groups: &[ToolGroup]) -> String {
-    let json_groups: Vec<serde_json::Value> = groups
-        .iter()
-        .map(|g| {
-            let tools: Vec<serde_json::Value> = g
-                .tools
-                .iter()
-                .map(|t| serde_json::json!({ "n": t.name, "d": t.description }))
-                .collect();
-            serde_json::json!({
-                "group": g.name,
-                "desc": g.description,
-                "tools": tools,
-            })
-        })
-        .collect();
-    serde_json::to_string(&json_groups).unwrap_or_default()
-}
-
 /// Format selected tool groups as concise markdown for injection into the system prompt.
 pub fn format_tool_groups_markdown(groups: &[&ToolGroup]) -> String {
     let mut md = String::from("## Recommended Tools\n\n");
@@ -2063,241 +2043,13 @@ async fn build_gds_topology_section(
 }
 
 // ============================================================================
-// Serializers — JSON (for oneshot) and Markdown (for fallback)
+// Serializer — Markdown rendering of ProjectContext
 // ============================================================================
 
-/// Serialize ProjectContext to compact JSON for the oneshot Opus prompt.
-/// Only includes non-empty fields to reduce payload size.
-pub fn context_to_json(ctx: &ProjectContext) -> String {
-    let mut map = serde_json::Map::new();
+// context_to_json was removed along with the oneshot Opus refinement pipeline.
+// The FsmPromptComposer with modular sections supersedes the oneshot approach.
 
-    if let Some(ref p) = ctx.project {
-        map.insert(
-            "project".into(),
-            serde_json::json!({
-                "name": p.name,
-                "slug": p.slug,
-                "root_path": p.root_path,
-                "description": p.description,
-            }),
-        );
-    }
-
-    if let Some(ref w) = ctx.workspace {
-        map.insert(
-            "workspace".into(),
-            serde_json::json!({
-                "name": w.name,
-                "slug": w.slug,
-                "description": w.description,
-            }),
-        );
-    }
-
-    if !ctx.sibling_projects.is_empty() {
-        let siblings: Vec<_> = ctx
-            .sibling_projects
-            .iter()
-            .map(|p| {
-                serde_json::json!({
-                    "name": p.name,
-                    "slug": p.slug,
-                    "description": p.description,
-                })
-            })
-            .collect();
-        map.insert(
-            "sibling_projects".into(),
-            serde_json::Value::Array(siblings),
-        );
-    }
-
-    if !ctx.active_plans.is_empty() {
-        let plans: Vec<_> = ctx
-            .active_plans
-            .iter()
-            .map(|p| {
-                serde_json::json!({
-                    "title": p.title,
-                    "status": format!("{:?}", p.status),
-                    "priority": p.priority,
-                    "description": p.description,
-                })
-            })
-            .collect();
-        map.insert("active_plans".into(), serde_json::Value::Array(plans));
-    }
-
-    if !ctx.plan_constraints.is_empty() {
-        let constraints: Vec<_> = ctx
-            .plan_constraints
-            .iter()
-            .map(|c| {
-                serde_json::json!({
-                    "type": format!("{:?}", c.constraint_type),
-                    "description": c.description,
-                })
-            })
-            .collect();
-        map.insert("constraints".into(), serde_json::Value::Array(constraints));
-    }
-
-    if !ctx.guidelines.is_empty() {
-        let notes: Vec<_> = ctx
-            .guidelines
-            .iter()
-            .map(|n| {
-                serde_json::json!({
-                    "content": n.content,
-                    "importance": format!("{:?}", n.importance),
-                })
-            })
-            .collect();
-        map.insert("guidelines".into(), serde_json::Value::Array(notes));
-    }
-
-    if !ctx.gotchas.is_empty() {
-        let notes: Vec<_> = ctx
-            .gotchas
-            .iter()
-            .map(|n| serde_json::json!({ "content": n.content }))
-            .collect();
-        map.insert("gotchas".into(), serde_json::Value::Array(notes));
-    }
-
-    if !ctx.global_guidelines.is_empty() {
-        let notes: Vec<_> = ctx
-            .global_guidelines
-            .iter()
-            .map(|n| {
-                serde_json::json!({
-                    "content": n.content,
-                    "importance": format!("{:?}", n.importance),
-                })
-            })
-            .collect();
-        map.insert("global_guidelines".into(), serde_json::Value::Array(notes));
-    }
-
-    if !ctx.global_gotchas.is_empty() {
-        let notes: Vec<_> = ctx
-            .global_gotchas
-            .iter()
-            .map(|n| serde_json::json!({ "content": n.content }))
-            .collect();
-        map.insert("global_gotchas".into(), serde_json::Value::Array(notes));
-    }
-
-    if !ctx.milestones.is_empty() {
-        let ms: Vec<_> = ctx
-            .milestones
-            .iter()
-            .map(|m| {
-                serde_json::json!({
-                    "title": m.title,
-                    "status": format!("{:?}", m.status),
-                    "target_date": m.target_date,
-                })
-            })
-            .collect();
-        map.insert("milestones".into(), serde_json::Value::Array(ms));
-    }
-
-    if !ctx.releases.is_empty() {
-        let rs: Vec<_> = ctx
-            .releases
-            .iter()
-            .map(|r| {
-                serde_json::json!({
-                    "version": r.version,
-                    "status": format!("{:?}", r.status),
-                    "target_date": r.target_date,
-                })
-            })
-            .collect();
-        map.insert("releases".into(), serde_json::Value::Array(rs));
-    }
-
-    if !ctx.language_stats.is_empty() {
-        let ls: Vec<_> = ctx
-            .language_stats
-            .iter()
-            .map(|l| serde_json::json!({ "language": l.language, "file_count": l.file_count }))
-            .collect();
-        map.insert("language_stats".into(), serde_json::Value::Array(ls));
-    }
-
-    if !ctx.key_files.is_empty() {
-        let kf: Vec<_> = ctx
-            .key_files
-            .iter()
-            .map(|f| {
-                serde_json::json!({
-                    "path": f.path,
-                    "imports": f.imports,
-                    "dependents": f.dependents,
-                })
-            })
-            .collect();
-        map.insert("key_files".into(), serde_json::Value::Array(kf));
-    }
-
-    if !ctx.feature_graphs.is_empty() {
-        let fgs: Vec<_> = ctx
-            .feature_graphs
-            .iter()
-            .map(|fg| {
-                let desc = fg.description.as_deref().unwrap_or("");
-                let desc_truncated = if desc.len() > 60 {
-                    format!("{}…", &desc[..floor_char_boundary(desc, 60)])
-                } else {
-                    desc.to_string()
-                };
-                serde_json::json!({
-                    "id": fg.id.to_string(),
-                    "name": fg.name,
-                    "description": desc_truncated,
-                    "entity_count": fg.entity_count.unwrap_or(0),
-                })
-            })
-            .collect();
-        map.insert("feature_graphs".into(), serde_json::Value::Array(fgs));
-    }
-
-    if let Some(ref topo) = ctx.structural_topology {
-        map.insert(
-            "structural_topology".into(),
-            serde_json::Value::String(topo.clone()),
-        );
-    }
-
-    if let Some(ref fm) = ctx.fabric_metrics {
-        let mut fabric = serde_json::Map::new();
-        fabric.insert("synapse_count".into(), serde_json::json!(fm.synapse_count));
-        fabric.insert("avg_energy".into(), serde_json::json!(fm.avg_energy));
-        if !fm.top_hotspots.is_empty() {
-            fabric.insert("top_hotspots".into(), serde_json::json!(fm.top_hotspots));
-        }
-        if !fm.critical_risk_files.is_empty() {
-            fabric.insert(
-                "risk_summary".into(),
-                serde_json::json!(fm.critical_risk_files),
-            );
-        }
-        map.insert("knowledge_fabric".into(), serde_json::Value::Object(fabric));
-    }
-
-    if let Some(ref ts) = ctx.last_synced {
-        map.insert(
-            "last_synced".into(),
-            serde_json::Value::String(ts.to_rfc3339()),
-        );
-    }
-
-    serde_json::to_string(&serde_json::Value::Object(map)).unwrap_or_default()
-}
-
-/// Format ProjectContext as markdown for fallback (when oneshot fails).
+/// Format ProjectContext as markdown for the system prompt dynamic section.
 /// Only includes sections that have data.
 /// When `user_message` is provided, appends a "Recommended Tools" section
 /// selected by keyword heuristic matching.
@@ -2522,62 +2274,6 @@ pub fn context_to_markdown(ctx: &ProjectContext, user_message: Option<&str>) -> 
 // ============================================================================
 // Oneshot refinement prompt
 // ============================================================================
-
-/// Build the prompt sent to the oneshot Opus model for context refinement.
-/// The oneshot analyzes the user's request + raw project context JSON + tool catalog
-/// and produces a concise "## Active Context" section (<500 words) including recommended tools.
-pub fn build_refinement_prompt(
-    user_message: &str,
-    context_json: &str,
-    tools_catalog_json: &str,
-) -> String {
-    format!(
-        "You are a context builder for a development agent.\n\
-         \n\
-         ## User request\n\
-         ---\n\
-         {user_message}\n\
-         ---\n\
-         \n\
-         ## Active project data (JSON)\n\
-         ---\n\
-         {context_json}\n\
-         ---\n\
-         \n\
-         ## Available MCP tools catalog (JSON)\n\
-         ---\n\
-         {tools_catalog_json}\n\
-         ---\n\
-         \n\
-         Generate a single \"## Active Context\" section for the agent's system prompt.\n\
-         This section must contain EXACTLY two parts:\n\
-         \n\
-         **1. Project context** (only what is relevant to the request):\n\
-         - Project info (name, slug, sync status)\n\
-         - Active plans if the request relates to planning\n\
-         - Relevant guidelines and gotchas\n\
-         - Milestones/releases if the request relates to the roadmap\n\
-         - Code stats if the request relates to code\n\
-         \n\
-         **2. Recommended tools**: select the relevant tool groups\n\
-         for this specific request from the catalog. For each selected group,\n\
-         list the tools as `- \\`name\\` — description`.\n\
-         ALWAYS include the most relevant group. Do NOT include irrelevant groups.\n\
-         Examples:\n\
-         - Code-related request → code_exploration + knowledge\n\
-         - Planning request → planning + steps + constraints\n\
-         - Debugging request → code_exploration + knowledge + git_tracking\n\
-         - General/vague request → planning + code_exploration\n\
-         \n\
-         Format: markdown, bullet points, short and actionable.\n\
-         Total budget: <500 words (context + tools combined).\n\
-         Trade-off: if the project context is rich, reduce tool descriptions.\n\
-         If the context is sparse, provide more detail on the tools.",
-        user_message = user_message,
-        context_json = context_json,
-        tools_catalog_json = tools_catalog_json,
-    )
-}
 
 // ============================================================================
 // Assembler — combines base + dynamic context
@@ -2832,38 +2528,6 @@ mod tests {
     }
 
     #[test]
-    fn test_context_to_json_empty() {
-        let ctx = ProjectContext::default();
-        let json = context_to_json(&ctx);
-        assert_eq!(json, "{}");
-    }
-
-    #[test]
-    fn test_context_to_json_with_project() {
-        let ctx = ProjectContext {
-            project: Some(ProjectNode {
-                id: uuid::Uuid::new_v4(),
-                name: "TestProject".into(),
-                slug: "test-project".into(),
-                root_path: "/tmp/test".into(),
-                description: Some("A test project".into()),
-                created_at: Utc::now(),
-                last_synced: None,
-                analytics_computed_at: None,
-                last_co_change_computed_at: None,
-                default_note_energy: None,
-                scaffolding_override: None,
-                sharing_policy: None,
-            }),
-            ..Default::default()
-        };
-        let json = context_to_json(&ctx);
-        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed["project"]["name"], "TestProject");
-        assert_eq!(parsed["project"]["slug"], "test-project");
-    }
-
-    #[test]
     fn test_context_to_markdown_empty() {
         let ctx = ProjectContext::default();
         let md = context_to_markdown(&ctx, None);
@@ -2926,26 +2590,6 @@ mod tests {
         assert!(!md.contains("Guidelines"));
         assert!(!md.contains("Gotchas"));
         assert!(!md.contains("Milestones"));
-    }
-
-    #[test]
-    fn test_build_refinement_prompt_contains_inputs() {
-        let tools_json = tools_catalog_to_json(TOOL_GROUPS);
-        let prompt =
-            build_refinement_prompt("Implémente le login", r#"{"project":"test"}"#, &tools_json);
-        // User message & context JSON are injected
-        assert!(prompt.contains("Implémente le login"));
-        assert!(prompt.contains(r#"{"project":"test"}"#));
-        // Tools catalog JSON is injected
-        assert!(prompt.contains("planning"));
-        assert!(prompt.contains("code_exploration"));
-        assert!(prompt.contains("plan"));
-        // Instructions for Opus to select tool groups
-        assert!(prompt.contains("Recommended tools"));
-        assert!(prompt.contains("relevant tool groups"));
-        // Budget constraint
-        assert!(prompt.contains("500 words"));
-        assert!(prompt.contains("## Active Context"));
     }
 
     #[test]
@@ -3068,67 +2712,6 @@ mod tests {
     // ================================================================
     // sibling_projects tests
     // ================================================================
-
-    #[test]
-    fn test_context_to_json_with_sibling_projects() {
-        let ctx = ProjectContext {
-            project: Some(ProjectNode {
-                id: uuid::Uuid::new_v4(),
-                name: "Current".into(),
-                slug: "current".into(),
-                root_path: "/tmp/current".into(),
-                description: None,
-                created_at: Utc::now(),
-                last_synced: None,
-                analytics_computed_at: None,
-                last_co_change_computed_at: None,
-                default_note_energy: None,
-                scaffolding_override: None,
-                sharing_policy: None,
-            }),
-            sibling_projects: vec![
-                ProjectNode {
-                    id: uuid::Uuid::new_v4(),
-                    name: "SiblingA".into(),
-                    slug: "sibling-a".into(),
-                    root_path: "/tmp/a".into(),
-                    description: Some("First sibling".into()),
-                    created_at: Utc::now(),
-                    last_synced: None,
-                    analytics_computed_at: None,
-                    last_co_change_computed_at: None,
-                    default_note_energy: None,
-                    scaffolding_override: None,
-                    sharing_policy: None,
-                },
-                ProjectNode {
-                    id: uuid::Uuid::new_v4(),
-                    name: "SiblingB".into(),
-                    slug: "sibling-b".into(),
-                    root_path: "/tmp/b".into(),
-                    description: None,
-                    created_at: Utc::now(),
-                    last_synced: None,
-                    analytics_computed_at: None,
-                    last_co_change_computed_at: None,
-                    default_note_energy: None,
-                    scaffolding_override: None,
-                    sharing_policy: None,
-                },
-            ],
-            ..Default::default()
-        };
-        let json = context_to_json(&ctx);
-        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-        let siblings = parsed["sibling_projects"].as_array().unwrap();
-        assert_eq!(siblings.len(), 2);
-        assert_eq!(siblings[0]["name"], "SiblingA");
-        assert_eq!(siblings[0]["slug"], "sibling-a");
-        assert_eq!(siblings[0]["description"], "First sibling");
-        assert_eq!(siblings[1]["name"], "SiblingB");
-        assert_eq!(siblings[1]["slug"], "sibling-b");
-        assert!(siblings[1]["description"].is_null());
-    }
 
     #[test]
     fn test_context_to_markdown_with_sibling_projects() {
@@ -3369,16 +2952,6 @@ mod tests {
     }
 
     #[test]
-    fn test_tools_catalog_to_json() {
-        let json = tools_catalog_to_json(TOOL_GROUPS);
-        let parsed: Vec<serde_json::Value> = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.len(), TOOL_GROUPS.len());
-        // First group is project_management
-        assert_eq!(parsed[0]["group"], "project_management");
-        assert!(!parsed[0]["tools"].as_array().unwrap().is_empty());
-    }
-
-    #[test]
     fn test_format_tool_groups_markdown() {
         let groups: Vec<&ToolGroup> = vec![&TOOL_GROUPS[0], &TOOL_GROUPS[2]];
         let md = format_tool_groups_markdown(&groups);
@@ -3524,24 +3097,6 @@ mod tests {
                 include_relations: None,
             })
             .collect()
-    }
-
-    #[test]
-    fn test_context_to_json_with_feature_graphs() {
-        let ctx = ProjectContext {
-            feature_graphs: make_feature_graphs(3),
-            ..Default::default()
-        };
-        let json = context_to_json(&ctx);
-        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-        let fgs = parsed["feature_graphs"].as_array().unwrap();
-        assert_eq!(fgs.len(), 3);
-        assert_eq!(fgs[0]["name"], "Feature-0");
-        assert_eq!(fgs[0]["entity_count"], 10);
-        assert_eq!(fgs[1]["name"], "Feature-1");
-        assert_eq!(fgs[2]["entity_count"], 30);
-        // Verify id is present as a string
-        assert!(fgs[0]["id"].as_str().is_some());
     }
 
     #[test]
@@ -3845,14 +3400,20 @@ mod tests {
             .await
             .unwrap();
 
-        let json_str = context_to_json(&ctx);
         assert!(
-            json_str.contains("structural_topology"),
-            "JSON should contain structural_topology key"
+            ctx.structural_topology.is_some(),
+            "Context should contain structural_topology"
         );
+        let topo = ctx.structural_topology.as_ref().unwrap();
         assert!(
-            json_str.contains("Code Communities"),
-            "JSON should contain communities data"
+            topo.contains("Code Communities"),
+            "Topology should contain communities data"
+        );
+        // Also verify markdown rendering includes the topology
+        let md = context_to_markdown(&ctx, None);
+        assert!(
+            md.contains("Code Communities"),
+            "Markdown should contain communities data"
         );
     }
 

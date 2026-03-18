@@ -38,7 +38,6 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::expand_tilde;
-use nexus_claude::ToolsConfig;
 
 /// Broadcast channel buffer size for WebSocket subscribers
 const BROADCAST_BUFFER: usize = 256;
@@ -1325,7 +1324,7 @@ impl ChatManager {
     /// Modular architecture via FsmPromptComposer:
     /// 1. Base sections — selected by scaffolding level (0-4)
     /// 2. FSM context — injected from active protocol runs
-    /// 3. Dynamic context — oneshot Opus or markdown, + session continuity
+    /// 3. Dynamic context — markdown rendering of project context + session continuity
     /// 4. Tool reference — selectively rendered by intent + FSM + scaffolding
     /// Build the system prompt and return the set of note IDs included
     /// (from guidelines/gotchas) for deduplication with the enrichment pipeline.
@@ -1335,7 +1334,7 @@ impl ChatManager {
         user_message: &str,
     ) -> (String, std::collections::HashSet<String>) {
         use super::composer::{ComposerInput, FsmPromptComposer};
-        use super::prompt::{context_to_json, context_to_markdown, fetch_project_context};
+        use super::prompt::{context_to_markdown, fetch_project_context};
         use super::stages::status_injection::GraphProtocolProvider;
         use super::stages::status_injection::ProtocolStatusProvider;
 
@@ -1463,28 +1462,8 @@ impl ChatManager {
             Vec::new()
         };
 
-        // ── Build dynamic context (oneshot Opus or markdown fallback) ───
-        let dynamic_section = if self.config.enable_oneshot_refinement {
-            let context_json = context_to_json(&ctx);
-            let tools_catalog_json =
-                super::prompt::tools_catalog_to_json(super::prompt::TOOL_GROUPS);
-            match self
-                .refine_context_with_oneshot(user_message, &context_json, &tools_catalog_json)
-                .await
-            {
-                Ok(refined) => refined,
-                Err(e) => {
-                    warn!(
-                        "Oneshot context refinement failed: {} — using markdown fallback",
-                        e
-                    );
-                    context_to_markdown(&ctx, Some(user_message))
-                }
-            }
-        } else {
-            info!("Oneshot refinement disabled — using markdown fallback");
-            context_to_markdown(&ctx, Some(user_message))
-        };
+        // ── Build dynamic context (markdown) ─────────────────────────────
+        let dynamic_section = context_to_markdown(&ctx, Some(user_message));
 
         // ── Load session continuity context ─────────────────────────────
         let continuity_section = {
@@ -1526,66 +1505,6 @@ impl ChatManager {
         };
 
         (FsmPromptComposer::compose(&input), included_note_ids)
-    }
-
-    /// Use a oneshot Opus call to refine raw project context into a concise,
-    /// relevant contextual section for the system prompt.
-    async fn refine_context_with_oneshot(
-        &self,
-        user_message: &str,
-        context_json: &str,
-        tools_catalog_json: &str,
-    ) -> Result<String> {
-        use super::prompt::build_refinement_prompt;
-
-        let refinement_prompt =
-            build_refinement_prompt(user_message, context_json, tools_catalog_json);
-
-        // Build options: no MCP server, max_turns=1, just text generation.
-        // NOTE: Intentionally hardcoded to BypassPermissions — this is an internal
-        // one-shot context refinement call with no user-facing tool interaction.
-        // It must NOT use the user-configured permission mode.
-        #[allow(deprecated)]
-        let options = ClaudeCodeOptions::builder()
-            .model(&self.config.prompt_builder_model)
-            .system_prompt("You are an assistant that builds concise context sections.")
-            .permission_mode(PermissionMode::Plan)
-            .tools(ToolsConfig::none())
-            .max_turns(1)
-            .build();
-
-        let mut client = InteractiveClient::new(options)
-            .map_err(|e| anyhow!("Failed to create oneshot client: {}", e))?;
-
-        client
-            .connect()
-            .await
-            .map_err(|e| anyhow!("Failed to connect oneshot client: {}", e))?;
-
-        let messages = client
-            .send_and_receive(refinement_prompt)
-            .await
-            .map_err(|e| anyhow!("Oneshot send_and_receive failed: {}", e))?;
-
-        // Extract text from assistant messages
-        let mut result = String::new();
-        for msg in &messages {
-            if let Message::Assistant { message, .. } = msg {
-                for block in &message.content {
-                    if let ContentBlock::Text(text) = block {
-                        result.push_str(&text.text);
-                    }
-                }
-            }
-        }
-
-        let _ = client.disconnect().await;
-
-        if result.is_empty() {
-            return Err(anyhow!("Oneshot returned empty response"));
-        }
-
-        Ok(result)
     }
 
     /// Check if a session is currently active (subprocess alive)
@@ -5277,9 +5196,7 @@ mod tests {
             meilisearch_key: "key".into(),
             nats_url: None,
             max_turns: 10,
-            prompt_builder_model: "claude-opus-4-6".into(),
             permission: crate::chat::config::PermissionConfig::default(),
-            enable_oneshot_refinement: false,
             auto_continue: false,
             retry: crate::chat::config::RetryConfig::default(),
             process_path: None,

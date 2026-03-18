@@ -193,7 +193,6 @@ pub struct ChatYamlConfig {
     pub max_sessions: Option<usize>,
     pub session_timeout_secs: Option<u64>,
     pub max_turns: Option<i32>,
-    pub prompt_builder_model: Option<String>,
     /// Permission configuration (mode + allowed/disallowed tool patterns).
     /// When absent, falls back to env vars or defaults (BypassPermissions).
     #[serde(default)]

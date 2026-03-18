@@ -157,14 +157,8 @@ pub struct ChatConfig {
     pub nats_url: Option<String>,
     /// Maximum number of agentic turns (tool calls) per message
     pub max_turns: i32,
-    /// Model used for the oneshot prompt builder (context refinement)
-    pub prompt_builder_model: String,
     /// Permission configuration (mode + allowed/disallowed tool patterns)
     pub permission: PermissionConfig,
-    /// Whether to use an oneshot LLM call to refine project context in the system prompt.
-    /// When `false`, falls back to static markdown rendering (useful in tests to avoid
-    /// spawning a real Claude CLI subprocess).
-    pub enable_oneshot_refinement: bool,
     /// Whether auto-continue is enabled by default for new sessions.
     /// When `true`, the backend automatically sends "Continue" after error_max_turns.
     /// Can be toggled per-session via WebSocket.
@@ -223,8 +217,6 @@ impl ChatConfig {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(50),
-            prompt_builder_model: std::env::var("PROMPT_BUILDER_MODEL")
-                .unwrap_or_else(|_| "claude-opus-4-6".into()),
             permission: PermissionConfig {
                 mode: std::env::var("CHAT_PERMISSION_MODE").unwrap_or_else(|_| "default".into()),
                 allowed_tools: std::env::var("CHAT_ALLOWED_TOOLS")
@@ -246,9 +238,6 @@ impl ChatConfig {
                     })
                     .unwrap_or_default(),
             },
-            enable_oneshot_refinement: std::env::var("CHAT_ENABLE_ONESHOT_REFINEMENT")
-                .map(|v| v != "false" && v != "0")
-                .unwrap_or(true),
             auto_continue: std::env::var("CHAT_AUTO_CONTINUE")
                 .map(|v| v == "true" || v == "1")
                 .unwrap_or(false),
@@ -350,9 +339,7 @@ mod tests {
             meilisearch_key: "test-key".into(),
             nats_url: None,
             max_turns: 10,
-            prompt_builder_model: "claude-opus-4-6".into(),
             permission: PermissionConfig::default(),
-            enable_oneshot_refinement: true,
             auto_continue: false,
             retry: RetryConfig::default(),
             process_path: None,
@@ -507,9 +494,7 @@ mod tests {
             meilisearch_key: "key".into(),
             nats_url: Some("nats://localhost:4222".into()),
             max_turns: 10,
-            prompt_builder_model: "claude-opus-4-6".into(),
             permission: PermissionConfig::default(),
-            enable_oneshot_refinement: true,
             auto_continue: false,
             retry: RetryConfig::default(),
             process_path: None,
@@ -542,9 +527,7 @@ mod tests {
             meilisearch_key: "key".into(),
             nats_url: None,
             max_turns: 10,
-            prompt_builder_model: "claude-opus-4-6".into(),
             permission: PermissionConfig::default(),
-            enable_oneshot_refinement: true,
             auto_continue: false,
             retry: RetryConfig::default(),
             process_path: None,
