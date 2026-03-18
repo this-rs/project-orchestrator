@@ -12,13 +12,15 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, Mutex};
 
+use neural_routing_policy::dataloader::{TrajectoryDataLoader, TrajectoryDataLoaderConfig};
 use neural_routing_policy::dataset::TrajectoryTensors;
+use neural_routing_policy::training::{train_decision_transformer, TrainingConfig};
+use neural_routing_policy::transformer::DecisionTransformerConfig;
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -295,6 +297,34 @@ impl ContinualTrainer {
     }
 }
 
+/// Collect trajectory tensors from the buffer for a training cycle.
+///
+/// Returns (all_tensors, new_count, replay_count).
+async fn collect_training_data(
+    buffer: &Arc<Mutex<ReplayBuffer>>,
+    config: &ContinualConfig,
+) -> (Vec<TrajectoryTensors>, usize, usize) {
+    let mut buf = buffer.lock().await;
+    let new_count = buf.new_count();
+
+    // Sample replay data (weighted by recency)
+    let replay_sample = buf.sample_weighted(config.replay_sample_size, config.decay_halflife_days);
+    let replay_count = replay_sample.len();
+
+    // Collect all tensors: recent entries (new data) + replay sample
+    let mut tensors: Vec<TrajectoryTensors> = buf
+        .recent(new_count)
+        .into_iter()
+        .map(|e| e.tensors.clone())
+        .collect();
+    for entry in &replay_sample {
+        tensors.push(entry.tensors.clone());
+    }
+
+    buf.reset_new_count();
+    (tensors, new_count, replay_count)
+}
+
 /// Background training loop.
 async fn training_loop(
     mut rx: mpsc::Receiver<TrainingEvent>,
@@ -310,30 +340,21 @@ async fn training_loop(
 
                 // Check if threshold reached
                 if buf.new_count() >= config.trigger_threshold {
-                    let new_count = buf.new_count();
-                    let replay_sample =
-                        buf.sample_weighted(config.replay_sample_size, config.decay_halflife_days);
-                    let replay_count = replay_sample.len();
-                    buf.reset_new_count();
                     drop(buf);
+                    let (tensors, new_count, replay_count) =
+                        collect_training_data(&buffer, &config).await;
 
-                    // Run training (placeholder — real impl would run candle fine-tuning)
-                    let result = run_training_cycle(new_count, replay_count, &config).await;
-
+                    let result =
+                        run_training_cycle(tensors, new_count, replay_count, &config).await;
                     history.lock().await.push(result);
                 }
             }
 
             TrainingEvent::ForceTraining => {
-                let mut buf = buffer.lock().await;
-                let new_count = buf.new_count();
-                let replay_sample =
-                    buf.sample_weighted(config.replay_sample_size, config.decay_halflife_days);
-                let replay_count = replay_sample.len();
-                buf.reset_new_count();
-                drop(buf);
+                let (tensors, new_count, replay_count) =
+                    collect_training_data(&buffer, &config).await;
 
-                let result = run_training_cycle(new_count, replay_count, &config).await;
+                let result = run_training_cycle(tensors, new_count, replay_count, &config).await;
                 history.lock().await.push(result);
             }
 
@@ -345,16 +366,17 @@ async fn training_loop(
     }
 }
 
-/// Execute a single training cycle.
+/// Execute a single training cycle using candle Decision Transformer training.
 ///
-/// In a real implementation, this would:
-/// 1. Convert BufferEntries to candle tensors
-/// 2. Run fine-tuning with EWC penalty
-/// 3. Evaluate on validation set
-/// 4. Promote or discard via Model Registry
+/// Pipeline:
+/// 1. Build a TrajectoryDataLoader from the collected tensors
+/// 2. Run a short fine-tuning pass (`new_data_epochs` epochs)
+/// 3. Evaluate on the validation split
+/// 4. If improvement >= `min_improvement_pct` → promoted, else discarded
 ///
-/// For now, this is a structured placeholder that simulates the pipeline.
+/// Training runs on CPU via `spawn_blocking` to avoid blocking the async runtime.
 async fn run_training_cycle(
+    tensors: Vec<TrajectoryTensors>,
     new_count: usize,
     replay_count: usize,
     config: &ContinualConfig,
@@ -365,38 +387,124 @@ async fn run_training_cycle(
     tracing::info!(
         new_data = new_count,
         replay = replay_count,
-        epochs_new = config.new_data_epochs,
-        epochs_replay = config.replay_epochs,
+        total_tensors = tensors.len(),
+        epochs = config.new_data_epochs,
         ewc_lambda = config.ewc_lambda,
         "Starting continual training cycle"
     );
 
-    // Simulate training time (in real impl: candle forward/backward passes)
-    tokio::time::sleep(Duration::from_millis(10)).await;
+    // Need at least a few trajectories for a meaningful train/val split
+    if tensors.len() < 10 {
+        tracing::warn!(
+            count = tensors.len(),
+            "Not enough trajectories for training, skipping cycle"
+        );
+        return TrainingRunResult {
+            promoted: false,
+            val_loss_before: 0.0,
+            val_loss_after: 0.0,
+            improvement_pct: 0.0,
+            new_data_count: new_count,
+            replay_count,
+            duration_ms: start.elapsed().as_millis() as u64,
+            started_at,
+        };
+    }
 
-    let val_loss_before = 0.5; // Placeholder
-    let val_loss_after = 0.48; // Placeholder — slightly improved
-    let improvement_pct = (val_loss_before - val_loss_after) / val_loss_before * 100.0;
-    let promoted = improvement_pct >= config.min_improvement_pct;
+    let epochs = config.new_data_epochs;
+    let min_improvement = config.min_improvement_pct;
+
+    // Run training on a blocking thread (candle is CPU-bound)
+    let training_result = tokio::task::spawn_blocking(move || {
+        // Build DataLoader with temporal split
+        let dl_config = TrajectoryDataLoaderConfig {
+            batch_size: 32.min(tensors.len() / 2).max(1),
+            ..Default::default()
+        };
+        let dataloader = TrajectoryDataLoader::new(tensors, dl_config);
+
+        // Build training config — short fine-tuning run
+        let training_config = TrainingConfig {
+            epochs,
+            learning_rate: 1e-4, // Lower LR for fine-tuning (vs 3e-4 for full training)
+            patience: 3,         // Short patience for incremental updates
+            ..Default::default()
+        };
+
+        let model_config = DecisionTransformerConfig::default();
+
+        // Run the actual candle training loop
+        train_decision_transformer(model_config, &dataloader, &training_config)
+    })
+    .await;
 
     let duration_ms = start.elapsed().as_millis() as u64;
 
-    tracing::info!(
-        promoted,
-        improvement_pct = format!("{:.2}%", improvement_pct),
-        duration_ms,
-        "Continual training cycle complete"
-    );
+    match training_result {
+        Ok(Ok(result)) => {
+            // Use the first and best epoch val_loss to compute improvement
+            let val_loss_before = result
+                .history
+                .first()
+                .map(|m| m.val_loss as f64)
+                .unwrap_or(1.0);
+            let val_loss_after = result.best_val_loss as f64;
+            let improvement_pct = if val_loss_before > 0.0 {
+                (val_loss_before - val_loss_after) / val_loss_before * 100.0
+            } else {
+                0.0
+            };
+            let promoted = improvement_pct >= min_improvement;
 
-    TrainingRunResult {
-        promoted,
-        val_loss_before,
-        val_loss_after,
-        improvement_pct,
-        new_data_count: new_count,
-        replay_count,
-        duration_ms,
-        started_at,
+            tracing::info!(
+                promoted,
+                best_epoch = result.best_epoch,
+                epochs_completed = result.epochs_completed,
+                early_stopped = result.early_stopped,
+                val_loss_before = format!("{:.4}", val_loss_before),
+                val_loss_after = format!("{:.4}", val_loss_after),
+                improvement_pct = format!("{:.2}%", improvement_pct),
+                duration_ms,
+                "Continual training cycle complete"
+            );
+
+            TrainingRunResult {
+                promoted,
+                val_loss_before,
+                val_loss_after,
+                improvement_pct,
+                new_data_count: new_count,
+                replay_count,
+                duration_ms,
+                started_at,
+            }
+        }
+        Ok(Err(candle_err)) => {
+            tracing::error!(error = %candle_err, "Candle training failed");
+            TrainingRunResult {
+                promoted: false,
+                val_loss_before: 0.0,
+                val_loss_after: 0.0,
+                improvement_pct: 0.0,
+                new_data_count: new_count,
+                replay_count,
+                duration_ms,
+                started_at,
+            }
+        }
+        Err(join_err) => {
+            tracing::error!(error = %join_err, "Training task panicked");
+            TrainingRunResult {
+                promoted: false,
+                val_loss_before: 0.0,
+                val_loss_after: 0.0,
+                improvement_pct: 0.0,
+                new_data_count: new_count,
+                replay_count,
+                duration_ms,
+                started_at,
+            }
+        }
     }
 }
 
@@ -408,6 +516,7 @@ async fn run_training_cycle(
 mod tests {
     use super::*;
     use neural_routing_policy::dataset::{ACTION_DIM, STATE_DIM};
+    use std::time::Duration;
 
     fn make_tensors() -> TrajectoryTensors {
         // Create minimal valid TrajectoryTensors matching the actual struct layout

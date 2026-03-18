@@ -36,6 +36,7 @@ pub use evaluation::{
     action_accuracy, importance_weighted_eval, pearson_correlation, shannon_entropy,
     spearman_correlation, EvaluationReport, McDropoutEstimator, OodDetector, OodResult,
 };
+pub use ewc::{EWCConfig, EWCRegularizer};
 pub use registry::{ModelRegistry, ModelStage, ModelVersion};
 pub use training::TrainingConfig;
 /// Re-export key types

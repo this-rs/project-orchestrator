@@ -366,42 +366,12 @@ fn inference_result_to_nn_route(result: &InferenceResult) -> NNRoute {
 #[async_trait]
 impl Router for DualTrackRouter {
     async fn route(&self, query_embedding: &[f32]) -> Result<Option<NNRoute>> {
-        if !self.config.enabled {
-            return Ok(None);
-        }
-
-        match self.config.mode {
-            RoutingMode::NN => {
-                // NN-only mode — direct to nearest neighbor router
-                self.nn_router.route(query_embedding).await
-            }
-            RoutingMode::Full => {
-                // Full mode — try policy net with timeout, fallback to NN
-                // Phase 3+ will add policy net here. For now, fallback to NN.
-                //
-                // Future implementation:
-                // 1. Check CpuGuard — if paused, skip to NN
-                // 2. Try policy net with timeout (inference.timeout_ms)
-                // 3. If timeout/OOD/error → fallback to NN
-                //
-                // For now: always NN (policy net not yet implemented)
-                if self.cpu_guard.is_paused() {
-                    tracing::debug!("DualTrack: CPU guard paused, using NN Router");
-                }
-
-                let timeout = Duration::from_millis(self.config.inference.timeout_ms);
-                match tokio::time::timeout(timeout, self.nn_router.route(query_embedding)).await {
-                    Ok(result) => result,
-                    Err(_) => {
-                        tracing::warn!(
-                            "DualTrack: NN Router timed out after {}ms",
-                            self.config.inference.timeout_ms
-                        );
-                        Ok(None)
-                    }
-                }
-            }
-        }
+        // Delegate to route_with_decision (the full dual-track logic),
+        // then discard the decision metadata for the simple Router trait.
+        let (route, _decision) = self
+            .route_with_decision(query_embedding, 0) // session_hash=0 → deterministic rollout
+            .await?;
+        Ok(route)
     }
 
     async fn route_with_context(
@@ -413,6 +383,8 @@ impl Router for DualTrackRouter {
             return Ok(None);
         }
 
+        // In NN mode, use the NN router's tool filtering directly
+        // In Full mode, use route_with_decision then filter tools client-side
         match self.config.mode {
             RoutingMode::NN => {
                 self.nn_router
@@ -420,21 +392,19 @@ impl Router for DualTrackRouter {
                     .await
             }
             RoutingMode::Full => {
-                // Same as above — policy net will be added in Phase 3
-                let timeout = Duration::from_millis(self.config.inference.timeout_ms);
-                match tokio::time::timeout(
-                    timeout,
-                    self.nn_router
-                        .route_with_context(query_embedding, available_tools),
-                )
-                .await
-                {
-                    Ok(result) => result,
-                    Err(_) => {
-                        tracing::warn!("DualTrack: timed out, returning None");
-                        Ok(None)
+                // Use full dual-track, then filter actions to available tools
+                let (route, _decision) = self.route_with_decision(query_embedding, 0).await?;
+
+                // Filter route actions to only include available tools
+                Ok(route.map(|mut r| {
+                    if !available_tools.is_empty() {
+                        r.actions.retain(|a| {
+                            // action_type is "tool.action" format
+                            available_tools.iter().any(|t| a.action_type.starts_with(t))
+                        });
                     }
-                }
+                    r
+                }))
             }
         }
     }
