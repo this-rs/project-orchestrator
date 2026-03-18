@@ -17,6 +17,13 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
+chrono = { workspace = true }
+
+# Neo4j — for graph sampling
+neo4rs = { workspace = true }
+
+# Caching — LRU for subgraph cache
+lru = "0.12"
 
 # ML — always compiled (build full, runtime-controlled)
 candle-core = { workspace = true }
