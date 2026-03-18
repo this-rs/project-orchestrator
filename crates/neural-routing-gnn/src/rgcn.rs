@@ -203,6 +203,7 @@ impl RGCN {
     /// * `num_relations` — number of relation types
     /// * `num_bases` — basis decomposition rank
     /// * `dropout` — dropout rate
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         input_dim: usize,
         hidden_dim: usize,

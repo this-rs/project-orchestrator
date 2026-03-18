@@ -882,18 +882,21 @@ fn build_embedding_map(
 ///
 /// Creates N nodes with random Voyage (768d) and GNN (256d) embeddings,
 /// plus ground-truth labels based on known structure.
-pub fn generate_synthetic_data(
-    num_nodes: usize,
-    num_communities: usize,
-    seed: u64,
-) -> (
+/// Return type for `generate_synthetic_data`.
+pub type SyntheticBenchmarkData = (
     Vec<NodeEmbeddings>,
     Vec<RetrievalTestCase>,
     Vec<ImpactTestCase>,
     Vec<RouteTestCase>,
     Vec<CommunityTestCase>,
     Vec<CoChangeTestCase>,
-) {
+);
+
+pub fn generate_synthetic_data(
+    num_nodes: usize,
+    num_communities: usize,
+    seed: u64,
+) -> SyntheticBenchmarkData {
     let mut rng = SimpleRng::new(seed);
 
     // Generate community centers (both in Voyage and GNN space)

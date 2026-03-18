@@ -205,12 +205,12 @@ impl ProjectionMatrix {
     pub fn project(&self, input: &[f32]) -> Vec<f32> {
         assert_eq!(input.len(), self.input_dim);
         let mut output = vec![0.0f32; self.output_dim];
-        for row in 0..self.output_dim {
+        for (row, out_val) in output.iter_mut().enumerate().take(self.output_dim) {
             let mut sum = 0.0f32;
-            for col in 0..self.input_dim {
-                sum += self.weights[row * self.input_dim + col] * input[col];
+            for (col, in_val) in input.iter().enumerate().take(self.input_dim) {
+                sum += self.weights[row * self.input_dim + col] * in_val;
             }
-            output[row] = sum;
+            *out_val = sum;
         }
         output
     }

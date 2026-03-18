@@ -65,7 +65,7 @@ pub trait GnnEncoder: Send + Sync {
 // ---------------------------------------------------------------------------
 
 /// Configuration for the CandleGnnEncoder.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CandleGnnEncoderConfig {
     /// GNN encoder configuration.
     pub encoder_config: GraphEncoderConfig,
@@ -75,15 +75,7 @@ pub struct CandleGnnEncoderConfig {
     pub norm_stats: Option<NormStats>,
 }
 
-impl Default for CandleGnnEncoderConfig {
-    fn default() -> Self {
-        Self {
-            encoder_config: GraphEncoderConfig::default(),
-            norm_stats: None,
-            checkpoint_path: None,
-        }
-    }
-}
+// Default derived: all fields implement Default (GraphEncoderConfig, Option<_>).
 
 /// CandleGnnEncoder — production GNN encoder using candle.
 ///
@@ -106,9 +98,7 @@ impl CandleGnnEncoder {
 
         // Load checkpoint if path is provided
         if let Some(ref path) = config.checkpoint_path {
-            varmap
-                .load(Path::new(path))
-                .map_err(|e| GnnError::Candle(e))?;
+            varmap.load(Path::new(path)).map_err(GnnError::Candle)?;
             info!("Loaded GNN checkpoint from {}", path);
         }
 
@@ -123,7 +113,7 @@ impl CandleGnnEncoder {
 
     /// Load a checkpoint from a safetensors file.
     pub fn load_checkpoint(&mut self, path: &Path) -> Result<(), GnnError> {
-        self.varmap.load(path).map_err(|e| GnnError::Candle(e))?;
+        self.varmap.load(path).map_err(GnnError::Candle)?;
         info!("Loaded GNN checkpoint from {}", path.display());
         Ok(())
     }
