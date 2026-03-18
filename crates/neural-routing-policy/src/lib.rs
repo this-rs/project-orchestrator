@@ -10,7 +10,9 @@
 //! Built on candle (HuggingFace) — pure Rust, no Python dependency.
 //! Always compiled (build full), activation controlled at runtime via settings.
 
+pub mod action_decoder;
 pub mod benchmark;
+pub mod codebook;
 pub mod cql;
 pub mod dataloader;
 pub mod dataset;
@@ -18,6 +20,8 @@ pub mod ewc;
 pub mod training;
 pub mod transformer;
 
+pub use action_decoder::{ActionDecoder, DecodeResult, DecodedAction};
+pub use codebook::{ActionCodebook, CodebookBuilder, CodebookEntry};
 pub use cql::CQLPolicy;
 pub use dataloader::{TrajectoryDataLoader, TrajectoryDataLoaderConfig};
 pub use dataset::{
