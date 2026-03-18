@@ -812,11 +812,7 @@ impl TrajectoryStore for Neo4jTrajectoryStore {
         Ok(count)
     }
 
-    async fn link_trajectory_to_run(
-        &self,
-        trajectory_id: &Uuid,
-        run_id: &Uuid,
-    ) -> Result<()> {
+    async fn link_trajectory_to_run(&self, trajectory_id: &Uuid, run_id: &Uuid) -> Result<()> {
         let q = query(
             "MATCH (t:Trajectory {id: $trajectory_id})
              MATCH (r:ProtocolRun {id: $run_id})

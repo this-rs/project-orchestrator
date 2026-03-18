@@ -9819,7 +9819,10 @@ impl GraphStore for MockGraphStore {
         Ok(self.protocol_runs.read().await.get(&run_id).cloned())
     }
 
-    async fn update_protocol_run(&self, run: &mut crate::protocol::ProtocolRun) -> anyhow::Result<()> {
+    async fn update_protocol_run(
+        &self,
+        run: &mut crate::protocol::ProtocolRun,
+    ) -> anyhow::Result<()> {
         let mut store = self.protocol_runs.write().await;
         if let std::collections::hash_map::Entry::Occupied(mut e) = store.entry(run.id) {
             let existing = e.get();

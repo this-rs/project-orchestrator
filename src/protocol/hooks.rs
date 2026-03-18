@@ -1359,8 +1359,7 @@ mod tests {
         .await;
 
         // Create a run triggered by event, stuck for 9 hours (> 8h timeout)
-        let mut run =
-            crate::protocol::ProtocolRun::new(protocol.id, protocol.entry_state, "Start");
+        let mut run = crate::protocol::ProtocolRun::new(protocol.id, protocol.entry_state, "Start");
         run.triggered_by = "event:post_sync".to_string();
         run.started_at = chrono::Utc::now() - chrono::Duration::hours(9);
         // Also backdate the state visit entry
@@ -1390,8 +1389,7 @@ mod tests {
         .await;
 
         // Create a run triggered by event, only 1 hour old (< 8h timeout)
-        let mut run =
-            crate::protocol::ProtocolRun::new(protocol.id, protocol.entry_state, "Start");
+        let mut run = crate::protocol::ProtocolRun::new(protocol.id, protocol.entry_state, "Start");
         run.triggered_by = "event:post_sync".to_string();
         run.started_at = chrono::Utc::now() - chrono::Duration::hours(1);
         if let Some(sv) = run.states_visited.first_mut() {
@@ -1409,16 +1407,11 @@ mod tests {
     #[tokio::test]
     async fn test_timeout_skips_manual_runs() {
         let store = MockGraphStore::new();
-        let (_, protocol) = setup_event_triggered_protocol(
-            &store,
-            TriggerMode::Manual,
-            vec![],
-        )
-        .await;
+        let (_, protocol) =
+            setup_event_triggered_protocol(&store, TriggerMode::Manual, vec![]).await;
 
         // Create a manual run stuck for 10 hours — should NOT be timed out
-        let mut run =
-            crate::protocol::ProtocolRun::new(protocol.id, protocol.entry_state, "Start");
+        let mut run = crate::protocol::ProtocolRun::new(protocol.id, protocol.entry_state, "Start");
         run.triggered_by = "manual".to_string();
         run.started_at = chrono::Utc::now() - chrono::Duration::hours(10);
         if let Some(sv) = run.states_visited.first_mut() {
@@ -1440,8 +1433,7 @@ mod tests {
             setup_scheduled_protocol(&store, TriggerMode::Scheduled, Some("daily")).await;
 
         // Create a scheduled run stuck for 9 hours
-        let mut run =
-            crate::protocol::ProtocolRun::new(protocol.id, protocol.entry_state, "Start");
+        let mut run = crate::protocol::ProtocolRun::new(protocol.id, protocol.entry_state, "Start");
         run.triggered_by = "schedule:daily".to_string();
         run.started_at = chrono::Utc::now() - chrono::Duration::hours(9);
         if let Some(sv) = run.states_visited.first_mut() {

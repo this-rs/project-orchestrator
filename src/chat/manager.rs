@@ -4914,7 +4914,11 @@ impl ChatManager {
             let session = sessions
                 .remove(session_id)
                 .ok_or_else(|| anyhow!("Session {} not found or inactive", session_id))?;
-            (session.client, session.protocol_run_id, session.protocol_state)
+            (
+                session.client,
+                session.protocol_run_id,
+                session.protocol_state,
+            )
         };
 
         // 4. Finalize trajectory — fire-and-forget (non-blocking)

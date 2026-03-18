@@ -3323,7 +3323,10 @@ impl GraphStore for Neo4jClient {
         self.get_protocol_run(run_id).await
     }
 
-    async fn update_protocol_run(&self, run: &mut crate::protocol::ProtocolRun) -> anyhow::Result<()> {
+    async fn update_protocol_run(
+        &self,
+        run: &mut crate::protocol::ProtocolRun,
+    ) -> anyhow::Result<()> {
         self.update_protocol_run(run).await
     }
 

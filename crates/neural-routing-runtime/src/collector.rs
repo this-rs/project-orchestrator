@@ -629,10 +629,7 @@ fn build_trajectory(
         .unwrap_or_else(|| neural_routing_core::sentinel_vector(TOTAL_DIM, 0xCAFE_BABE));
 
     // Extract protocol_run_id from the first decision that has one
-    let protocol_run_id = buffer
-        .decisions
-        .iter()
-        .find_map(|d| d.protocol_run_id);
+    let protocol_run_id = buffer.decisions.iter().find_map(|d| d.protocol_run_id);
 
     PendingTrajectory {
         trajectory: Trajectory {

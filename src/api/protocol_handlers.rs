@@ -832,7 +832,10 @@ pub async fn add_transition(
         .iter()
         .find(|s| s.id == body.from_state)
         .ok_or_else(|| {
-            AppError::BadRequest(format!("from_state {} not found in protocol", body.from_state))
+            AppError::BadRequest(format!(
+                "from_state {} not found in protocol",
+                body.from_state
+            ))
         })?;
     let to_state = states
         .iter()
