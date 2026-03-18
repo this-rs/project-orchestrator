@@ -3180,6 +3180,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "candle-core",
+ "candle-nn",
  "chrono",
  "neural-routing-core",
  "neural-routing-gnn",

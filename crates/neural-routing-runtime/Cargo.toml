@@ -22,6 +22,10 @@ tracing = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
 
+# Candle (via policy crate, but also needed directly for InferenceEngine)
+candle-core = { workspace = true }
+candle-nn = { workspace = true }
+
 # CPU monitoring for CpuGuard
 sysinfo = { workspace = true }
 

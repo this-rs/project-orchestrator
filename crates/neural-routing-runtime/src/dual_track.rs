@@ -3,23 +3,92 @@
 //! In "nn" mode: only uses the Nearest Neighbor Router.
 //! In "full" mode: tries the Policy Net first, falls back to NN Router
 //! if the policy net times out, returns OOD, or the CpuGuard is paused.
+//!
+//! Phase 4 additions:
+//! - InferenceEngine integration for Policy Net inference
+//! - Confidence calibration via Platt scaling
+//! - Progressive rollout (configurable split ratio)
+//! - Decision logging for feedback loop
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use serde::Serialize;
 
 use neural_routing_core::{error::Result, NNRoute, Router, TrajectoryStore};
 use neural_routing_nn::NNRouter;
 
+use crate::confidence::{PlattCalibrator, RolloutConfig};
 use crate::config::{NeuralRoutingConfig, RoutingMode};
 use crate::cpu_guard::CpuGuard;
+use crate::inference_engine::{InferenceEngine, InferenceResult};
+
+// ---------------------------------------------------------------------------
+// Routing decision metadata
+// ---------------------------------------------------------------------------
+
+/// Why a particular routing source was chosen.
+#[derive(Debug, Clone, Serialize)]
+pub enum RoutingReason {
+    /// Neural routing disabled.
+    Disabled,
+    /// NN-only mode configured.
+    NnMode,
+    /// CPU guard paused — using NN fallback.
+    CpuGuardPaused,
+    /// Policy Net not ready (no model loaded).
+    PolicyNotReady,
+    /// Progressive rollout directed to NN.
+    RolloutToNn,
+    /// Policy Net confidence below threshold.
+    LowConfidence {
+        raw_confidence: f32,
+        calibrated_confidence: f32,
+        threshold: f32,
+    },
+    /// Policy Net returned OOD actions.
+    PolicyOod,
+    /// Policy Net timed out.
+    PolicyTimeout,
+    /// Policy Net selected (high confidence, in-distribution).
+    PolicySelected {
+        raw_confidence: f32,
+        calibrated_confidence: f32,
+    },
+}
+
+/// A logged routing decision (for feedback loop and monitoring).
+#[derive(Debug, Clone, Serialize)]
+pub struct RoutingDecision {
+    /// Which source produced the route.
+    pub source: RoutingSource,
+    /// Why this source was chosen.
+    pub reason: RoutingReason,
+    /// Policy Net inference result (if attempted).
+    pub policy_result: Option<InferenceResult>,
+    /// Latency of the routing decision (microseconds).
+    pub latency_us: u64,
+}
+
+/// Source that produced the final route.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub enum RoutingSource {
+    NnRouter,
+    PolicyNet,
+}
 
 /// DualTrack Router — orchestrates policy net and NN router with timeout + fallback.
 pub struct DualTrackRouter {
     nn_router: NNRouter,
     config: NeuralRoutingConfig,
     cpu_guard: CpuGuard,
+    /// InferenceEngine for Policy Net (Phase 4).
+    inference_engine: Option<InferenceEngine>,
+    /// Confidence calibrator (Platt scaling).
+    calibrator: PlattCalibrator,
+    /// Progressive rollout configuration.
+    rollout: RolloutConfig,
 }
 
 impl DualTrackRouter {
@@ -31,7 +100,25 @@ impl DualTrackRouter {
             nn_router,
             config,
             cpu_guard,
+            inference_engine: None,
+            calibrator: PlattCalibrator::default(),
+            rollout: RolloutConfig::default(),
         }
+    }
+
+    /// Set the inference engine for Policy Net routing.
+    pub fn set_inference_engine(&mut self, engine: InferenceEngine) {
+        self.inference_engine = Some(engine);
+    }
+
+    /// Set the confidence calibrator.
+    pub fn set_calibrator(&mut self, calibrator: PlattCalibrator) {
+        self.calibrator = calibrator;
+    }
+
+    /// Set the rollout configuration.
+    pub fn set_rollout(&mut self, rollout: RolloutConfig) {
+        self.rollout = rollout;
     }
 
     /// Start the CPU guard background monitoring.
@@ -54,6 +141,11 @@ impl DualTrackRouter {
         &self.config
     }
 
+    /// Get the rollout config.
+    pub fn rollout(&self) -> &RolloutConfig {
+        &self.rollout
+    }
+
     /// Update config at runtime (hot reload).
     ///
     /// Propagates changes to the NNRouter (top_k, min_similarity, cache settings).
@@ -61,6 +153,211 @@ impl DualTrackRouter {
         // Propagate NN config to the inner router
         self.nn_router.update_config(config.nn.clone());
         self.config = config;
+    }
+
+    /// Route with full dual-track logic and return the decision metadata.
+    ///
+    /// This is the main entry point for the feedback loop — it returns both
+    /// the route and the routing decision for logging.
+    pub async fn route_with_decision(
+        &self,
+        query_embedding: &[f32],
+        session_hash: u64,
+    ) -> Result<(Option<NNRoute>, RoutingDecision)> {
+        let start = std::time::Instant::now();
+
+        if !self.config.enabled {
+            let nn_result = Ok(None);
+            return nn_result.map(|r| {
+                (
+                    r,
+                    RoutingDecision {
+                        source: RoutingSource::NnRouter,
+                        reason: RoutingReason::Disabled,
+                        policy_result: None,
+                        latency_us: start.elapsed().as_micros() as u64,
+                    },
+                )
+            });
+        }
+
+        match self.config.mode {
+            RoutingMode::NN => {
+                let result = self.nn_router.route(query_embedding).await?;
+                Ok((
+                    result,
+                    RoutingDecision {
+                        source: RoutingSource::NnRouter,
+                        reason: RoutingReason::NnMode,
+                        policy_result: None,
+                        latency_us: start.elapsed().as_micros() as u64,
+                    },
+                ))
+            }
+            RoutingMode::Full => {
+                // Check CPU guard
+                if self.cpu_guard.is_paused() {
+                    let result = self.nn_router.route(query_embedding).await?;
+                    return Ok((
+                        result,
+                        RoutingDecision {
+                            source: RoutingSource::NnRouter,
+                            reason: RoutingReason::CpuGuardPaused,
+                            policy_result: None,
+                            latency_us: start.elapsed().as_micros() as u64,
+                        },
+                    ));
+                }
+
+                // Check if inference engine is ready
+                let engine = match &self.inference_engine {
+                    Some(e) if e.is_ready() => e,
+                    _ => {
+                        let result = self.nn_router.route(query_embedding).await?;
+                        return Ok((
+                            result,
+                            RoutingDecision {
+                                source: RoutingSource::NnRouter,
+                                reason: RoutingReason::PolicyNotReady,
+                                policy_result: None,
+                                latency_us: start.elapsed().as_micros() as u64,
+                            },
+                        ));
+                    }
+                };
+
+                // Progressive rollout check
+                if !self.rollout.should_use_policy(session_hash) {
+                    let result = self.nn_router.route(query_embedding).await?;
+                    return Ok((
+                        result,
+                        RoutingDecision {
+                            source: RoutingSource::NnRouter,
+                            reason: RoutingReason::RolloutToNn,
+                            policy_result: None,
+                            latency_us: start.elapsed().as_micros() as u64,
+                        },
+                    ));
+                }
+
+                // Try Policy Net with timeout
+                let timeout = Duration::from_millis(self.config.inference.timeout_ms);
+                let inference_result = tokio::time::timeout(timeout, async {
+                    engine.infer(query_embedding, None, None)
+                })
+                .await;
+
+                match inference_result {
+                    Ok(Ok(result)) => {
+                        let raw_confidence = result.overall_confidence;
+                        let calibrated = self.calibrator.calibrate(raw_confidence);
+
+                        // Check OOD
+                        if result.has_ood_actions {
+                            let nn_result = self.nn_router.route(query_embedding).await?;
+                            return Ok((
+                                nn_result,
+                                RoutingDecision {
+                                    source: RoutingSource::NnRouter,
+                                    reason: RoutingReason::PolicyOod,
+                                    policy_result: Some(result),
+                                    latency_us: start.elapsed().as_micros() as u64,
+                                },
+                            ));
+                        }
+
+                        // Check calibrated confidence threshold
+                        if calibrated < self.rollout.confidence_threshold {
+                            let nn_result = self.nn_router.route(query_embedding).await?;
+                            return Ok((
+                                nn_result,
+                                RoutingDecision {
+                                    source: RoutingSource::NnRouter,
+                                    reason: RoutingReason::LowConfidence {
+                                        raw_confidence,
+                                        calibrated_confidence: calibrated,
+                                        threshold: self.rollout.confidence_threshold,
+                                    },
+                                    policy_result: Some(result),
+                                    latency_us: start.elapsed().as_micros() as u64,
+                                },
+                            ));
+                        }
+
+                        // Policy Net wins!
+                        // Convert InferenceResult actions to NNRoute
+                        let nn_route = inference_result_to_nn_route(&result);
+
+                        Ok((
+                            Some(nn_route),
+                            RoutingDecision {
+                                source: RoutingSource::PolicyNet,
+                                reason: RoutingReason::PolicySelected {
+                                    raw_confidence,
+                                    calibrated_confidence: calibrated,
+                                },
+                                policy_result: Some(result),
+                                latency_us: start.elapsed().as_micros() as u64,
+                            },
+                        ))
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!(error = %e, "Policy Net inference error, falling back to NN");
+                        let nn_result = self.nn_router.route(query_embedding).await?;
+                        Ok((
+                            nn_result,
+                            RoutingDecision {
+                                source: RoutingSource::NnRouter,
+                                reason: RoutingReason::PolicyTimeout,
+                                policy_result: None,
+                                latency_us: start.elapsed().as_micros() as u64,
+                            },
+                        ))
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            timeout_ms = self.config.inference.timeout_ms,
+                            "Policy Net timed out, falling back to NN"
+                        );
+                        let nn_result = self.nn_router.route(query_embedding).await?;
+                        Ok((
+                            nn_result,
+                            RoutingDecision {
+                                source: RoutingSource::NnRouter,
+                                reason: RoutingReason::PolicyTimeout,
+                                policy_result: None,
+                                latency_us: start.elapsed().as_micros() as u64,
+                            },
+                        ))
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Convert an InferenceResult (from Policy Net) to an NNRoute (common format).
+fn inference_result_to_nn_route(result: &InferenceResult) -> NNRoute {
+    use neural_routing_core::PlannedAction as CorePlannedAction;
+
+    NNRoute {
+        actions: result
+            .actions
+            .iter()
+            .map(|a| CorePlannedAction {
+                action_type: format!("{}.{}", a.tool, a.action),
+                action_params: a
+                    .param_template
+                    .as_ref()
+                    .map(|t| serde_json::Value::String(t.clone()))
+                    .unwrap_or(serde_json::Value::Null),
+                confidence: a.confidence as f64,
+            })
+            .collect(),
+        similarity: result.overall_confidence as f64,
+        score: result.overall_confidence as f64,
+        source_trajectory_id: uuid::Uuid::nil(),
+        source_reward: 0.0,
     }
 }
 
@@ -386,7 +683,7 @@ mod tests {
         // Need to invalidate cache since config changed
         router.nn_router().invalidate_cache();
 
-        let result = router.route(&embedding).await.unwrap();
+        let _result = router.route(&embedding).await.unwrap();
         // With min_sim=0.9999 the mock returns exact similarity (1.0), so it should still match
         // Let's instead test top_k = 0
         let mut new_config2 = default_config();
