@@ -698,6 +698,8 @@ impl ToolHandler {
                 timestamp_ms: elapsed_ms,
                 query_embedding: vec![],
                 node_features: vec![],
+                protocol_run_id: None,
+                protocol_state: None,
             });
         }
 

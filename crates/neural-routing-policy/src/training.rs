@@ -701,6 +701,7 @@ mod tests {
             duration_ms: 1000,
             nodes,
             created_at: Utc::now() - Duration::days(days_ago),
+            protocol_run_id: None,
         }
     }
 

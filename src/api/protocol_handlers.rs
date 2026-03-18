@@ -1003,6 +1003,8 @@ pub async fn fire_transition(
             alternatives_count: 1,
             chosen_index: 0,
             confidence: if result.success { 0.9 } else { 0.1 },
+            protocol_run_id: Some(run_id),
+            protocol_state: Some(result.current_state_name.clone()),
             tool_usages: vec![neural_routing_runtime::ToolUsage {
                 tool_name: "protocol".to_string(),
                 action: "transition".to_string(),

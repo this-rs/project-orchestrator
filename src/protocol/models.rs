@@ -632,8 +632,31 @@ pub struct StateVisit {
     pub state_name: String,
     /// When this state was entered
     pub entered_at: DateTime<Utc>,
+    /// When this state was exited (None if still current or for legacy data)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exited_at: Option<DateTime<Utc>>,
+    /// Time spent in this state in milliseconds (computed: exited_at - entered_at)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<i64>,
     /// The trigger that caused entry (None for the initial state)
     pub trigger: Option<String>,
+    /// Last progress snapshot reported while in this state (from report_progress)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress_snapshot: Option<ProgressSnapshot>,
+}
+
+/// A lightweight progress snapshot captured from `report_progress()`.
+/// Stored inside a StateVisit to preserve progress data after state exit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProgressSnapshot {
+    /// Current sub-action being executed (e.g., "backfill_synapses")
+    pub sub_action: String,
+    /// Number of sub-actions processed so far
+    pub processed: usize,
+    /// Total number of sub-actions
+    pub total: usize,
+    /// Elapsed time in milliseconds
+    pub elapsed_ms: u64,
 }
 
 /// A protocol run — an instance of a protocol FSM being executed.
@@ -710,7 +733,10 @@ impl ProtocolRun {
                 state_id: entry_state_id,
                 state_name: entry_state_name.into(),
                 entered_at: now,
+                exited_at: None,
+                duration_ms: None,
                 trigger: None,
+                progress_snapshot: None,
             }],
             status: RunStatus::Running,
             started_at: now,
@@ -733,30 +759,54 @@ impl ProtocolRun {
         !self.is_active()
     }
 
+    /// Close the current (last) state visit by filling exited_at and duration_ms.
+    fn close_current_state(&mut self) {
+        let now = Utc::now();
+        if let Some(last) = self.states_visited.last_mut() {
+            if last.exited_at.is_none() {
+                last.exited_at = Some(now);
+                last.duration_ms = Some((now - last.entered_at).num_milliseconds());
+            }
+        }
+    }
+
     /// Record a state transition.
+    ///
+    /// Closes the previous state (fills exited_at + duration_ms) before
+    /// pushing the new state visit.
     pub fn visit_state(
         &mut self,
         state_id: Uuid,
         state_name: impl Into<String>,
         trigger: impl Into<String>,
     ) {
+        // Close the previous state
+        self.close_current_state();
+
         self.current_state = state_id;
         self.states_visited.push(StateVisit {
             state_id,
             state_name: state_name.into(),
             entered_at: Utc::now(),
+            exited_at: None,
+            duration_ms: None,
             trigger: Some(trigger.into()),
+            progress_snapshot: None,
         });
     }
 
     /// Mark the run as completed (reached terminal state).
+    ///
+    /// Closes the last state visit before marking completion.
     pub fn complete(&mut self) {
+        self.close_current_state();
         self.status = RunStatus::Completed;
         self.completed_at = Some(Utc::now());
     }
 
     /// Mark the run as failed with an error message.
     pub fn fail(&mut self, error: impl Into<String>) {
+        self.close_current_state();
         self.status = RunStatus::Failed;
         self.completed_at = Some(Utc::now());
         self.error = Some(error.into());
@@ -764,6 +814,7 @@ impl ProtocolRun {
 
     /// Mark the run as cancelled.
     pub fn cancel(&mut self) {
+        self.close_current_state();
         self.status = RunStatus::Cancelled;
         self.completed_at = Some(Utc::now());
     }

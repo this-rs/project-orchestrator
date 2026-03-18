@@ -184,6 +184,8 @@ mod tests {
             timestamp_ms: 0,
             query_embedding: vec![],
             node_features: vec![],
+            protocol_run_id: None,
+            protocol_state: None,
         }
     }
 

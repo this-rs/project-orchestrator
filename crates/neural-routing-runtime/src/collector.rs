@@ -793,6 +793,8 @@ mod tests {
             timestamp_ms: ts_ms,
             query_embedding: vec![],
             node_features: vec![],
+            protocol_run_id: None,
+            protocol_state: None,
         }
     }
 
@@ -1044,6 +1046,8 @@ mod tests {
                 timestamp_ms: 0,
                 query_embedding: vec![],
                 node_features: vec![],
+                protocol_run_id: None,
+                protocol_state: None,
             },
             DecisionRecord {
                 session_id: "s2".into(),
@@ -1069,6 +1073,8 @@ mod tests {
                 timestamp_ms: 50,
                 query_embedding: vec![],
                 node_features: vec![],
+                protocol_run_id: None,
+                protocol_state: None,
             },
             DecisionRecord {
                 session_id: "s2".into(),
@@ -1102,6 +1108,8 @@ mod tests {
                 timestamp_ms: 200,
                 query_embedding: vec![],
                 node_features: vec![],
+                protocol_run_id: None,
+                protocol_state: None,
             },
         ];
 
@@ -1559,6 +1567,8 @@ mod tests {
             SessionHints {
                 tasks_completed: 2,
                 tasks_total: 3,
+                protocol_run_id: None,
+                protocol_state: None,
             },
         );
 
@@ -1606,6 +1616,8 @@ mod tests {
             &SessionHints {
                 tasks_completed: 3,
                 tasks_total: 3,
+                protocol_run_id: None,
+                protocol_state: None,
             },
         );
 
@@ -1616,6 +1628,8 @@ mod tests {
             &SessionHints {
                 tasks_completed: 0,
                 tasks_total: 3,
+                protocol_run_id: None,
+                protocol_state: None,
             },
         );
 
