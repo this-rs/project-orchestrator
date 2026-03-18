@@ -311,7 +311,7 @@ async fn fire_transition_inner(
 
     // 8. Persist the updated run
     store
-        .update_protocol_run(&run)
+        .update_protocol_run(&mut run)
         .await
         .context("Failed to update protocol run after transition")?;
 
@@ -501,7 +501,7 @@ pub async fn cancel_run(store: &dyn GraphStore, run_id: Uuid) -> Result<Protocol
     run.cancel();
 
     store
-        .update_protocol_run(&run)
+        .update_protocol_run(&mut run)
         .await
         .context("Failed to update protocol run after cancel")?;
 
@@ -541,7 +541,7 @@ async fn fail_run_inner(store: &dyn GraphStore, run_id: Uuid, error: &str) -> Re
     run.fail(error);
 
     store
-        .update_protocol_run(&run)
+        .update_protocol_run(&mut run)
         .await
         .context("Failed to update protocol run after fail")?;
 

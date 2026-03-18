@@ -2790,7 +2790,9 @@ pub trait GraphStore: Send + Sync {
     async fn get_protocol_run(&self, run_id: Uuid) -> Result<Option<ProtocolRun>>;
 
     /// Update an existing protocol run (current_state, states_visited, status, etc.).
-    async fn update_protocol_run(&self, run: &ProtocolRun) -> Result<()>;
+    /// On success, bumps `run.version` in-place to match the persisted value.
+    /// Returns `OptimisticLockError` if the run was modified concurrently.
+    async fn update_protocol_run(&self, run: &mut ProtocolRun) -> Result<()>;
 
     /// List protocol runs for a protocol with optional status filter and pagination.
     /// Returns (runs, total_count).

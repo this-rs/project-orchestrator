@@ -9819,7 +9819,7 @@ impl GraphStore for MockGraphStore {
         Ok(self.protocol_runs.read().await.get(&run_id).cloned())
     }
 
-    async fn update_protocol_run(&self, run: &crate::protocol::ProtocolRun) -> anyhow::Result<()> {
+    async fn update_protocol_run(&self, run: &mut crate::protocol::ProtocolRun) -> anyhow::Result<()> {
         let mut store = self.protocol_runs.write().await;
         if let std::collections::hash_map::Entry::Occupied(mut e) = store.entry(run.id) {
             let existing = e.get();
@@ -9831,9 +9831,12 @@ impl GraphStore for MockGraphStore {
                     existing.version
                 );
             }
+            let new_version = run.version + 1;
             let mut updated = run.clone();
-            updated.version += 1;
+            updated.version = new_version;
             e.insert(updated);
+            // Bump version in-place so the caller's struct stays in sync
+            run.version = new_version;
             Ok(())
         } else {
             anyhow::bail!("ProtocolRun not found: {}", run.id)

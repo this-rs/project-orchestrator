@@ -701,7 +701,7 @@ pub async fn transition_rfc(
                 run.status = protocol::RunStatus::Running;
                 run.error = None;
                 run.completed_at = None;
-                let _ = state.orchestrator.neo4j().update_protocol_run(&run).await;
+                let _ = state.orchestrator.neo4j().update_protocol_run(&mut run).await;
             }
         }
 

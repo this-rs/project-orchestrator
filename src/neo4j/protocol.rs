@@ -795,7 +795,7 @@ impl Neo4jClient {
     /// On success, `version` is incremented both in Neo4j and on the passed `run`.
     /// If another caller updated the run concurrently (version mismatch), returns
     /// an `OptimisticLockError`.
-    pub async fn update_protocol_run(&self, run: &ProtocolRun) -> Result<()> {
+    pub async fn update_protocol_run(&self, run: &mut ProtocolRun) -> Result<()> {
         let states_visited_json = serde_json::to_string(&run.states_visited)?;
         let new_version = run.version + 1;
 
@@ -844,6 +844,9 @@ impl Neo4jClient {
                 run.version
             );
         }
+
+        // Bump version in-place so the caller's struct stays in sync with Neo4j
+        run.version = new_version;
 
         Ok(())
     }

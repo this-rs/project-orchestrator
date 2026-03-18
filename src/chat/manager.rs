@@ -73,6 +73,11 @@ pub struct ActiveSession {
     pub permission_mode: Option<String>,
     /// Current model for this session (updated on mid-session model changes)
     pub model: Option<String>,
+    /// Active protocol run ID — set when this session runs within a protocol FSM context.
+    /// Injected into SessionHints on close and used to tag trajectories with DURING_RUN.
+    pub protocol_run_id: Option<uuid::Uuid>,
+    /// Current protocol state name (e.g., "implement", "review") at session creation time.
+    pub protocol_state: Option<String>,
     /// SDK control receiver for permission requests (`can_use_tool`).
     /// Taken once from `InteractiveClient::take_sdk_control_receiver()` at session
     /// creation and reused across all `stream_response` invocations. Wrapped in
@@ -2124,6 +2129,8 @@ impl ChatManager {
                     rfc_accumulator: Arc::new(Mutex::new(
                         super::observation_detector::RfcAccumulator::new(),
                     )),
+                    protocol_run_id: None,
+                    protocol_state: None,
                 },
             );
             interrupt_flag
@@ -4319,6 +4326,8 @@ impl ChatManager {
                     rfc_accumulator: Arc::new(Mutex::new(
                         super::observation_detector::RfcAccumulator::new(),
                     )),
+                    protocol_run_id: None,
+                    protocol_state: None,
                 },
             );
             interrupt_flag
@@ -4900,12 +4909,12 @@ impl ChatManager {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         // 3. Remove session from active map
-        let client = {
+        let (client, protocol_run_id, protocol_state) = {
             let mut sessions = self.active_sessions.write().await;
             let session = sessions
                 .remove(session_id)
                 .ok_or_else(|| anyhow!("Session {} not found or inactive", session_id))?;
-            session.client
+            (session.client, session.protocol_run_id, session.protocol_state)
         };
 
         // 4. Finalize trajectory — fire-and-forget (non-blocking)
@@ -4913,7 +4922,11 @@ impl ChatManager {
         //    actual buffered DecisionRecords (tool success rate, confidence, duration).
         //    SessionHints provides optional task metadata not available inside the loop.
         if let Some(ref collector) = self.trajectory_collector {
-            let hints = neural_routing_runtime::SessionHints::default();
+            let hints = neural_routing_runtime::SessionHints {
+                protocol_run_id,
+                protocol_state,
+                ..Default::default()
+            };
             collector.end_session_auto(session_id.to_string(), hints);
             tracing::info!(
                 session_id = %session_id,
@@ -6867,6 +6880,8 @@ mod tests {
             rfc_accumulator: Arc::new(Mutex::new(
                 crate::chat::observation_detector::RfcAccumulator::new(),
             )),
+            protocol_run_id: None,
+            protocol_state: None,
         };
 
         Some((session, pending_messages))
@@ -7755,6 +7770,8 @@ mod tests {
             rfc_accumulator: Arc::new(Mutex::new(
                 crate::chat::observation_detector::RfcAccumulator::new(),
             )),
+            protocol_run_id: None,
+            protocol_state: None,
         };
 
         (session, handle)

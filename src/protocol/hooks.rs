@@ -194,7 +194,7 @@ pub async fn recover_orphaned_runs(store: &dyn GraphStore) -> anyhow::Result<u32
                     let mut recovered_run = run.clone();
                     recovered_run.fail("Recovered: server restarted during execution");
 
-                    if let Err(e) = store.update_protocol_run(&recovered_run).await {
+                    if let Err(e) = store.update_protocol_run(&mut recovered_run).await {
                         tracing::warn!(
                             run_id = %run.id,
                             protocol_id = %protocol.id,
@@ -287,7 +287,7 @@ pub async fn timeout_stale_runs(store: &dyn GraphStore) -> anyhow::Result<u32> {
                 let mut timed_out_run = run.clone();
                 timed_out_run.fail(&error_msg);
 
-                if let Err(e) = store.update_protocol_run(&timed_out_run).await {
+                if let Err(e) = store.update_protocol_run(&mut timed_out_run).await {
                     tracing::warn!(
                         run_id = %run.id,
                         protocol_id = %protocol.id,
