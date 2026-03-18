@@ -681,6 +681,11 @@ pub struct ProtocolRun {
     /// Nesting depth (0 = root, 1 = child of root, etc.)
     #[serde(default)]
     pub depth: u32,
+    /// Optimistic lock version — incremented on every update.
+    /// Used for compare-and-swap in `update_protocol_run()` to prevent
+    /// concurrent transitions from silently overwriting each other.
+    #[serde(default)]
+    pub version: u64,
 }
 
 fn default_triggered_by() -> String {
@@ -714,6 +719,7 @@ impl ProtocolRun {
             triggered_by: "manual".to_string(),
             parent_run_id: None,
             depth: 0,
+            version: 0,
         }
     }
 

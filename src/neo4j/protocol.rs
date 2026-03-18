@@ -608,6 +608,7 @@ impl Neo4jClient {
                 .get::<String>("triggered_by")
                 .unwrap_or_else(|_| "manual".to_string()),
             depth: node.get::<i64>("depth").unwrap_or(0) as u32,
+            version: node.get::<i64>("version").unwrap_or(0) as u64,
         })
     }
 
@@ -642,7 +643,8 @@ impl Neo4jClient {
                 completed_at: $completed_at,
                 error: $error,
                 triggered_by: $triggered_by,
-                depth: $depth
+                depth: $depth,
+                version: $version
             })
             CREATE (r)-[:INSTANCE_OF]->(proto)
             RETURN r.id AS created_id
@@ -675,6 +677,7 @@ impl Neo4jClient {
         .param("error", run.error.clone().unwrap_or_default())
         .param("triggered_by", run.triggered_by.clone())
         .param("depth", run.depth as i64)
+        .param("version", run.version as i64)
         .param("is_child", run.parent_run_id.is_some());
 
         let mut result = self
@@ -760,21 +763,32 @@ impl Neo4jClient {
         }
     }
 
-    /// Update an existing protocol run.
+    /// Update an existing protocol run with optimistic locking (compare-and-swap).
+    ///
+    /// The update only succeeds if `r.version` in Neo4j matches `run.version`.
+    /// On success, `version` is incremented both in Neo4j and on the passed `run`.
+    /// If another caller updated the run concurrently (version mismatch), returns
+    /// an `OptimisticLockError`.
     pub async fn update_protocol_run(&self, run: &ProtocolRun) -> Result<()> {
         let states_visited_json = serde_json::to_string(&run.states_visited)?;
+        let new_version = run.version + 1;
 
         let q = query(
             r#"
             MATCH (r:ProtocolRun {id: $id})
+            WHERE coalesce(r.version, 0) = $expected_version
             SET r.current_state = $current_state,
                 r.states_visited_json = $states_visited_json,
                 r.status = $status,
                 r.completed_at = $completed_at,
-                r.error = $error
+                r.error = $error,
+                r.version = $new_version
+            RETURN r.id AS updated_id
             "#,
         )
         .param("id", run.id.to_string())
+        .param("expected_version", run.version as i64)
+        .param("new_version", new_version as i64)
         .param("current_state", run.current_state.to_string())
         .param("states_visited_json", states_visited_json)
         .param("status", run.status.to_string())
@@ -786,10 +800,24 @@ impl Neo4jClient {
         )
         .param("error", run.error.clone().unwrap_or_default());
 
-        self.graph
-            .run(q)
+        let mut result = self
+            .graph
+            .execute(q)
             .await
             .context("Failed to update protocol run")?;
+
+        let row = result
+            .next()
+            .await
+            .context("Failed to read update_protocol_run result")?;
+
+        if row.is_none() {
+            anyhow::bail!(
+                "OptimisticLockError: protocol run {} was modified concurrently (expected version {}, stale)",
+                run.id,
+                run.version
+            );
+        }
 
         Ok(())
     }

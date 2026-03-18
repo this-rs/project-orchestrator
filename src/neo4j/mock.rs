@@ -9808,7 +9808,18 @@ impl GraphStore for MockGraphStore {
     async fn update_protocol_run(&self, run: &crate::protocol::ProtocolRun) -> anyhow::Result<()> {
         let mut store = self.protocol_runs.write().await;
         if let std::collections::hash_map::Entry::Occupied(mut e) = store.entry(run.id) {
-            e.insert(run.clone());
+            let existing = e.get();
+            if existing.version != run.version {
+                anyhow::bail!(
+                    "OptimisticLockError: protocol run {} was modified concurrently (expected version {}, found {})",
+                    run.id,
+                    run.version,
+                    existing.version
+                );
+            }
+            let mut updated = run.clone();
+            updated.version += 1;
+            e.insert(updated);
             Ok(())
         } else {
             anyhow::bail!("ProtocolRun not found: {}", run.id)

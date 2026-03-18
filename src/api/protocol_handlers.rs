@@ -940,8 +940,11 @@ pub async fn fire_transition(
         protocol::engine::fire_transition(state.orchestrator.neo4j(), run_id, &body.trigger)
             .await
             .map_err(|e| {
-                if e.to_string().contains("not found") {
-                    AppError::NotFound(e.to_string())
+                let msg = e.to_string();
+                if msg.contains("not found") {
+                    AppError::NotFound(msg)
+                } else if msg.contains("OptimisticLockError") {
+                    AppError::Conflict(msg)
                 } else {
                     AppError::Internal(e)
                 }
