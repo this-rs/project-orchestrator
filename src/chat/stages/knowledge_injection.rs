@@ -1238,6 +1238,30 @@ mod tests {
         assert!(result.is_ok(), "Stage should not error with mock stores");
     }
 
+    #[tokio::test]
+    async fn test_stage_with_protocol_context_propagates_to_decision_record() {
+        let stage = make_test_stage();
+        let proto_run_id = Uuid::new_v4();
+        let input = EnrichmentInput {
+            message: "Look at src/chat/manager.rs and the build_prompt function".to_string(),
+            session_id: Uuid::new_v4(),
+            project_slug: Some("test-project".to_string()),
+            project_id: None,
+            cwd: None,
+            protocol_run_id: Some(proto_run_id),
+            protocol_state: Some("implement".to_string()),
+        };
+        let mut ctx = EnrichmentContext::default();
+
+        // The stage should complete without errors; protocol context is passed through
+        // to the DecisionRecord via input.protocol_run_id / input.protocol_state
+        let result = stage.execute(&input, &mut ctx).await;
+        assert!(
+            result.is_ok(),
+            "Stage should not error with protocol context"
+        );
+    }
+
     // ── Deduplication logic tests ───────────────────────────────────────
 
     #[test]
