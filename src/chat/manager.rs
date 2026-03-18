@@ -1322,22 +1322,25 @@ impl ChatManager {
 
     /// Build the system prompt with project context.
     ///
-    /// Two-layer architecture:
-    /// 1. Hardcoded base (BASE_SYSTEM_PROMPT) — protocols, data model, git, statuses
-    /// 2. Dynamic context — oneshot Opus refines raw Neo4j data, fallback to markdown
+    /// Modular architecture via FsmPromptComposer:
+    /// 1. Base sections — selected by scaffolding level (0-4)
+    /// 2. FSM context — injected from active protocol runs
+    /// 3. Dynamic context — oneshot Opus or markdown, + session continuity
+    /// 4. Tool reference — selectively rendered by intent + FSM + scaffolding
     pub async fn build_system_prompt(
         &self,
         project_slug: Option<&str>,
         user_message: &str,
     ) -> String {
-        use super::prompt::{
-            assemble_prompt, context_to_json, context_to_markdown, fetch_project_context,
-            truncate_dynamic_context_default, BASE_SYSTEM_PROMPT, TOOL_REFERENCE,
-        };
+        use super::composer::{ComposerInput, FsmPromptComposer};
+        use super::prompt::{context_to_json, context_to_markdown, fetch_project_context};
+        use super::stages::status_injection::GraphProtocolProvider;
+        use super::stages::status_injection::ProtocolStatusProvider;
 
-        // No project → base prompt + tool reference only
+        // No project → compose with defaults (L0, no FSM, no dynamic context)
         let Some(slug) = project_slug else {
-            return format!("{}\n\n---\n\n{}", BASE_SYSTEM_PROMPT, TOOL_REFERENCE);
+            let input = ComposerInput::default();
+            return FsmPromptComposer::compose(&input);
         };
 
         // Fetch raw context from Neo4j
@@ -1348,7 +1351,8 @@ impl ChatManager {
                     "Failed to fetch project context for '{}': {} — using base prompt only",
                     slug, e
                 );
-                return format!("{}\n\n---\n\n{}", BASE_SYSTEM_PROMPT, TOOL_REFERENCE);
+                let input = ComposerInput::default();
+                return FsmPromptComposer::compose(&input);
             }
         };
 
@@ -1388,7 +1392,64 @@ impl ChatManager {
             }
         }
 
-        // Try oneshot Opus refinement (with tool catalog for tool-aware prompting)
+        // ── Fetch scaffolding level (with 100ms timeout, fallback to L0) ──
+        let scaffolding_level = if let Some(ref project) = ctx.project {
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                self.graph
+                    .compute_scaffolding_level(project.id, project.scaffolding_override),
+            )
+            .await
+            {
+                Ok(Ok(level)) => {
+                    debug!(
+                        "[composer] Scaffolding L{} for '{}'",
+                        level.level, slug
+                    );
+                    level.level
+                }
+                Ok(Err(e)) => {
+                    warn!("[composer] Scaffolding computation failed: {} — defaulting to L0", e);
+                    0
+                }
+                Err(_) => {
+                    warn!("[composer] Scaffolding computation timed out — defaulting to L0");
+                    0
+                }
+            }
+        } else {
+            0
+        };
+
+        // ── Fetch active protocol runs ──────────────────────────────────
+        let protocol_runs = if let Some(ref project) = ctx.project {
+            let provider = GraphProtocolProvider::new(self.graph.clone());
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                provider.get_active_runs(project.id),
+            )
+            .await
+            {
+                Ok(Ok(runs)) => {
+                    if !runs.is_empty() {
+                        debug!("[composer] {} active protocol runs", runs.len());
+                    }
+                    runs
+                }
+                Ok(Err(e)) => {
+                    warn!("[composer] Failed to fetch protocol runs: {}", e);
+                    Vec::new()
+                }
+                Err(_) => {
+                    warn!("[composer] Protocol runs fetch timed out");
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
+
+        // ── Build dynamic context (oneshot Opus or markdown fallback) ───
         let dynamic_section = if self.config.enable_oneshot_refinement {
             let context_json = context_to_json(&ctx);
             let tools_catalog_json =
@@ -1411,7 +1472,7 @@ impl ChatManager {
             context_to_markdown(&ctx, Some(user_message))
         };
 
-        // Load session continuity context (previous session, active work)
+        // ── Load session continuity context ─────────────────────────────
         let continuity_section = {
             let graph = self.graph.clone();
             let slug_owned = slug.to_string();
@@ -1431,19 +1492,25 @@ impl ChatManager {
             }
         };
 
-        let full_dynamic = if continuity_section.is_empty() {
-            dynamic_section
-        } else {
-            format!("{}\n\n{}", continuity_section, dynamic_section)
+        // ── Derive context flags from ProjectContext ────────────────────
+        let has_active_plan = !ctx.active_plans.is_empty();
+        let task_count = ctx.active_plans.len() * 3; // rough estimate
+        let is_multi_project = !ctx.sibling_projects.is_empty();
+
+        // ── Compose via FsmPromptComposer ───────────────────────────────
+        let input = ComposerInput {
+            scaffolding_level,
+            protocol_runs: &protocol_runs,
+            project_context_markdown: &dynamic_section,
+            continuity_markdown: &continuity_section,
+            user_message,
+            routing_hints: None,
+            is_multi_project,
+            has_active_plan,
+            task_count,
         };
 
-        // Smart truncation: cap dynamic context to ~2500 tokens (~10k chars)
-        // to keep total system prompt under ~8000 tokens
-        let truncated_dynamic = truncate_dynamic_context_default(&full_dynamic);
-
-        let prompt = assemble_prompt(BASE_SYSTEM_PROMPT, &truncated_dynamic);
-        // Append exhaustive tool reference as final section
-        format!("{}\n\n---\n\n{}", prompt, TOOL_REFERENCE)
+        FsmPromptComposer::compose(&input)
     }
 
     /// Use a oneshot Opus call to refine raw project context into a concise,
