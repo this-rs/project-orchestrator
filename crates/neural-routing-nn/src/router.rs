@@ -73,6 +73,25 @@ impl NNRouter {
         &self.metrics
     }
 
+    /// Update the NN config at runtime.
+    ///
+    /// Invalidates the cache if cache settings changed, and updates
+    /// scoring parameters (top_k, min_similarity, max_route_age_days).
+    pub fn update_config(&mut self, config: NNConfig) {
+        let cache_changed = config.cache_capacity != self.config.cache_capacity
+            || config.cache_ttl_secs != self.config.cache_ttl_secs;
+
+        self.config = config;
+
+        if cache_changed {
+            // Rebuild cache with new settings
+            self.cache = Cache::builder()
+                .max_capacity(self.config.cache_capacity)
+                .time_to_live(Duration::from_secs(self.config.cache_ttl_secs))
+                .build();
+        }
+    }
+
     /// Invalidate the entire cache.
     pub fn invalidate_cache(&self) {
         self.cache.invalidate_all();

@@ -125,6 +125,11 @@ pub async fn disable(
     config.enabled = false;
     router.update_config(config);
 
+    // Also disable trajectory collection when routing is disabled
+    if let Some(ref collector) = state.trajectory_collector {
+        collector.set_enabled(false);
+    }
+
     tracing::info!("Neural routing disabled via API");
 
     Ok(Json(SuccessResponse {
@@ -213,6 +218,17 @@ pub async fn update_config(
     }
     if let Some(max_age) = req.nn_max_route_age_days {
         config.nn.max_route_age_days = max_age;
+    }
+
+    // Propagate collection.enabled to the TrajectoryCollector
+    if let Some(collection_enabled) = req.collection_enabled {
+        if let Some(ref collector) = state.trajectory_collector {
+            collector.set_enabled(collection_enabled);
+            tracing::info!(
+                enabled = collection_enabled,
+                "Trajectory collector toggled via config update"
+            );
+        }
     }
 
     router.update_config(config);

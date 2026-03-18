@@ -45,6 +45,11 @@ pub struct NeuralRoutingConfig {
     /// Reward decomposition configuration.
     #[serde(default)]
     pub reward: RewardConfig,
+
+    /// Reward heuristic configuration — weights for computing session reward
+    /// from observable signals (used by TrajectoryCollector.end_session).
+    #[serde(default)]
+    pub reward_heuristic: RewardHeuristicConfig,
 }
 
 impl Default for NeuralRoutingConfig {
@@ -58,6 +63,7 @@ impl Default for NeuralRoutingConfig {
             nn: NNConfig::default(),
             cpu_guard: CpuGuardSettings::default(),
             reward: RewardConfig::default(),
+            reward_heuristic: RewardHeuristicConfig::default(),
         }
     }
 }
@@ -102,6 +108,11 @@ pub struct CollectionConfig {
     /// Flush batch size — trajectories are buffered and flushed in batches.
     #[serde(default = "default_buffer_size")]
     pub buffer_size: usize,
+    /// Auto-finalize sessions with no new decisions after this many seconds.
+    /// Used for MCP-direct calls that don't have an explicit end_session().
+    /// Default: 60 seconds.
+    #[serde(default = "default_stale_session_timeout_secs")]
+    pub stale_session_timeout_secs: u64,
 }
 
 impl Default for CollectionConfig {
@@ -109,6 +120,52 @@ impl Default for CollectionConfig {
         Self {
             enabled: false,
             buffer_size: 50,
+            stale_session_timeout_secs: 60,
+        }
+    }
+}
+
+/// Reward heuristic configuration — weights for computing session reward
+/// from observable signals.
+///
+/// The composite reward is: Σ(weight_i × signal_i), clamped to [0.0, 1.0].
+/// All weights should sum to 1.0 for interpretability but this is not enforced.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RewardHeuristicConfig {
+    /// Weight for tool success rate (successful tool calls / total tool calls).
+    #[serde(default = "default_weight_tool_success")]
+    pub weight_tool_success: f64,
+    /// Weight for task completion rate (tasks completed during session / total tasks).
+    #[serde(default = "default_weight_task_completion")]
+    pub weight_task_completion: f64,
+    /// Weight for average model confidence across decisions.
+    #[serde(default = "default_weight_confidence")]
+    pub weight_confidence: f64,
+    /// Weight for session duration score (sigmoid centered at `duration_center_secs`).
+    #[serde(default = "default_weight_duration")]
+    pub weight_duration: f64,
+    /// Weight for decision count score (min(1.0, count / `decision_count_target`)).
+    #[serde(default = "default_weight_decision_count")]
+    pub weight_decision_count: f64,
+    /// Center of the duration sigmoid in seconds (default: 300s = 5 min).
+    /// Sessions around this duration score ~0.5, shorter < 0.5, longer > 0.5.
+    #[serde(default = "default_duration_center_secs")]
+    pub duration_center_secs: f64,
+    /// Target decision count for normalization (default: 10).
+    #[serde(default = "default_decision_count_target")]
+    pub decision_count_target: f64,
+}
+
+impl Default for RewardHeuristicConfig {
+    fn default() -> Self {
+        Self {
+            weight_tool_success: 0.3,
+            weight_task_completion: 0.3,
+            weight_confidence: 0.2,
+            weight_duration: 0.1,
+            weight_decision_count: 0.1,
+            duration_center_secs: 300.0,
+            decision_count_target: 10.0,
         }
     }
 }
@@ -168,6 +225,30 @@ fn default_resume_threshold() -> f32 {
 }
 fn default_poll_interval_secs() -> u64 {
     2
+}
+fn default_stale_session_timeout_secs() -> u64 {
+    60
+}
+fn default_weight_tool_success() -> f64 {
+    0.3
+}
+fn default_weight_task_completion() -> f64 {
+    0.3
+}
+fn default_weight_confidence() -> f64 {
+    0.2
+}
+fn default_weight_duration() -> f64 {
+    0.1
+}
+fn default_weight_decision_count() -> f64 {
+    0.1
+}
+fn default_duration_center_secs() -> f64 {
+    300.0
+}
+fn default_decision_count_target() -> f64 {
+    10.0
 }
 
 #[cfg(test)]

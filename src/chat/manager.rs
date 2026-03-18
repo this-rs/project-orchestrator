@@ -156,6 +156,10 @@ pub struct ChatManager {
     /// Pre-enrichment pipeline that runs before each LLM call.
     /// Enriches the user message with context from the knowledge graph.
     pub(crate) enrichment_pipeline: Arc<super::enrichment::EnrichmentPipeline>,
+    /// Trajectory collector for neural routing feedback loop.
+    /// When Some, `close_session()` calls `end_session()` to finalize trajectories.
+    pub(crate) trajectory_collector:
+        Option<std::sync::Arc<neural_routing_runtime::TrajectoryCollector>>,
 }
 
 // ============================================================================
@@ -276,6 +280,7 @@ impl ChatManager {
             config_yaml_path: None,
             env_config,
             enrichment_pipeline,
+            trajectory_collector: None,
         }
     }
 
@@ -346,6 +351,7 @@ impl ChatManager {
             config_yaml_path: None,
             env_config,
             enrichment_pipeline,
+            trajectory_collector: None,
         }
     }
 
@@ -394,7 +400,7 @@ impl ChatManager {
         )));
         pipeline.add_stage(Box::new(
             super::stages::KnowledgeInjectionStage::new(self.graph.clone(), self.search.clone())
-                .with_collector(collector),
+                .with_collector(collector.clone()),
         ));
         pipeline.add_stage(Box::new(super::stages::StatusInjectionStage::new(
             self.graph.clone(),
@@ -403,9 +409,12 @@ impl ChatManager {
             self.graph.clone(),
         )));
         self.enrichment_pipeline = std::sync::Arc::new(pipeline);
+        // Store collector for end_session() in close_session()
+        self.trajectory_collector = Some(collector);
         self
     }
 
+    /// Set a custom reward computer for session reward computation.
     /// Replace the enrichment pipeline with a custom-configured one.
     ///
     /// Use this to configure which enrichment stages are enabled/disabled,
@@ -4899,7 +4908,20 @@ impl ChatManager {
             session.client
         };
 
-        // 4. Disconnect with 5s timeout — if it hangs, drop(client) triggers SIGKILL via Drop
+        // 4. Finalize trajectory — fire-and-forget (non-blocking)
+        //    Uses end_session_auto() so the collector computes the reward from
+        //    actual buffered DecisionRecords (tool success rate, confidence, duration).
+        //    SessionHints provides optional task metadata not available inside the loop.
+        if let Some(ref collector) = self.trajectory_collector {
+            let hints = neural_routing_runtime::SessionHints::default();
+            collector.end_session_auto(session_id.to_string(), hints);
+            tracing::info!(
+                session_id = %session_id,
+                "Trajectory finalized with auto-computed reward on session close"
+            );
+        }
+
+        // 5. Disconnect with 5s timeout — if it hangs, drop(client) triggers SIGKILL via Drop
         let disconnect_result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             let mut c = client.lock().await;
             c.disconnect().await

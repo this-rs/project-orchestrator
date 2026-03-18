@@ -34,6 +34,19 @@ pub trait TrajectoryStore: Send + Sync {
 
     /// Delete a trajectory and all its nodes.
     async fn delete_trajectory(&self, id: &Uuid) -> Result<bool>;
+
+    /// Store multiple trajectories in a single batch operation.
+    ///
+    /// Default implementation falls back to sequential `store_trajectory` calls.
+    /// `Neo4jTrajectoryStore` overrides this with UNWIND-based batch insert (≤3 queries).
+    async fn store_trajectories_batch(&self, trajectories: &[Trajectory]) -> Result<usize> {
+        let mut stored = 0;
+        for trajectory in trajectories {
+            self.store_trajectory(trajectory).await?;
+            stored += 1;
+        }
+        Ok(stored)
+    }
 }
 
 /// Trait for intercepting decisions during a session to build trajectories.

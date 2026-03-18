@@ -29,6 +29,7 @@ pub use store::Neo4jTrajectoryStore;
 pub use traits::*;
 pub use validation::*;
 pub use vector_builder::{
-    DecisionContext, DecisionVectorBuilder, NodeFeatures, ProjectionMatrix, SessionMeta, GRAPH_DIM,
-    HISTORY_DIM, QUERY_DIM, SESSION_DIM, SOURCE_EMBED_DIM, TOOL_DIM, TOTAL_DIM,
+    sentinel_vector, DecisionContext, DecisionVectorBuilder, NodeFeatures, ProjectionMatrix,
+    SessionMeta, GRAPH_DIM, HISTORY_DIM, QUERY_DIM, SESSION_DIM, SOURCE_EMBED_DIM, TOOL_DIM,
+    TOTAL_DIM,
 };
