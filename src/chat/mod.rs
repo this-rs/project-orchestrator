@@ -5,6 +5,7 @@
 
 pub mod cli_auth;
 pub mod cli_version;
+pub mod composer;
 pub mod config;
 pub mod continuity;
 pub mod enrichment;
