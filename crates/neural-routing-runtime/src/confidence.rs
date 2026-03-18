@@ -352,4 +352,78 @@ mod tests {
         let r2 = config.should_use_policy(12345);
         assert_eq!(r1, r2);
     }
+
+    // ── Review-fix regression tests ──────────────────────────────────────
+
+    #[test]
+    fn test_platt_calibrate_sign_correctness() {
+        // Critical: calibrate(x) must use sigmoid(ax+b) = 1/(1+exp(-(ax+b))),
+        // NOT 1/(1+exp(ax+b)). With a=-2, b=1:
+        //   sigmoid(-2*0.9 + 1) = sigmoid(-0.8) ≈ 0.31
+        //   sigmoid(-2*0.1 + 1) = sigmoid(0.8) ≈ 0.69
+        // If sign were wrong, high input would give LOW output.
+        let cal = PlattCalibrator {
+            a: -2.0,
+            b: 1.0,
+            n_samples: 100,
+        };
+
+        let low_input = cal.calibrate(0.1);
+        let high_input = cal.calibrate(0.9);
+
+        // With correct sign: higher raw → lower sigmoid (because a < 0)
+        // sigmoid(-2*0.1+1) = sigmoid(0.8) ≈ 0.69
+        // sigmoid(-2*0.9+1) = sigmoid(-0.8) ≈ 0.31
+        assert!(
+            low_input > high_input,
+            "With a=-2, b=1: calibrate(0.1)={:.4} should > calibrate(0.9)={:.4}",
+            low_input,
+            high_input
+        );
+
+        // Output must be in (0, 1)
+        assert!(low_input > 0.0 && low_input < 1.0);
+        assert!(high_input > 0.0 && high_input < 1.0);
+    }
+
+    #[test]
+    fn test_platt_calibrate_boundary_values() {
+        let cal = PlattCalibrator::default(); // a=-1, b=0
+        let at_zero = cal.calibrate(0.0);
+        let at_one = cal.calibrate(1.0);
+
+        // sigmoid(0) = 0.5
+        assert!(
+            (at_zero - 0.5).abs() < 0.01,
+            "calibrate(0.0) should ≈ 0.5, got {}",
+            at_zero
+        );
+        // sigmoid(1) = 1/(1+exp(-1)) ≈ 0.73  (with default a=-1, b=0: sigmoid(-1*1+0) = sigmoid(-1) ≈ 0.27)
+        assert!(at_one > 0.0 && at_one < 1.0);
+    }
+
+    #[test]
+    fn test_platt_fit_then_calibrate_preserves_ordering() {
+        // Fit on realistic data, then verify calibrated ordering matches raw ordering
+        let data: Vec<(f32, bool)> = (0..200)
+            .map(|i| {
+                let conf = i as f32 / 200.0;
+                (conf, conf > 0.45) // slightly noisy threshold
+            })
+            .collect();
+
+        let cal = PlattCalibrator::fit(&data);
+
+        // Calibrate a range and check monotonicity
+        let calibrated: Vec<f32> = (0..20).map(|i| cal.calibrate(i as f32 / 20.0)).collect();
+        for i in 1..calibrated.len() {
+            assert!(
+                calibrated[i] >= calibrated[i - 1] - 0.01,
+                "Calibration not monotonic at {}: {:.4} < {:.4}",
+                i,
+                calibrated[i],
+                calibrated[i - 1]
+            );
+        }
+    }
 }

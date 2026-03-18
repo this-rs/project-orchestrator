@@ -4,7 +4,7 @@
 //! In "full" mode: tries the Policy Net first, falls back to NN Router
 //! if the policy net times out, returns OOD, or the CpuGuard is paused.
 //!
-//! Phase 4 additions:
+//! Features:
 //! - InferenceEngine integration for Policy Net inference
 //! - Confidence calibration via Platt scaling
 //! - Progressive rollout (configurable split ratio)
@@ -51,6 +51,8 @@ pub enum RoutingReason {
     PolicyOod,
     /// Policy Net timed out.
     PolicyTimeout,
+    /// Policy Net inference error (non-timeout failure).
+    PolicyError,
     /// Policy Net selected (high confidence, in-distribution).
     PolicySelected {
         raw_confidence: f32,
@@ -308,7 +310,7 @@ impl DualTrackRouter {
                             nn_result,
                             RoutingDecision {
                                 source: RoutingSource::NnRouter,
-                                reason: RoutingReason::PolicyTimeout,
+                                reason: RoutingReason::PolicyError,
                                 policy_result: None,
                                 latency_us: start.elapsed().as_micros() as u64,
                             },
@@ -503,7 +505,7 @@ mod tests {
                 })
                 .filter(|(_, sim)| *sim >= min_sim as f64)
                 .collect();
-            results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            results.sort_by(|a, b| b.1.total_cmp(&a.1));
             results.truncate(top_k);
             Ok(results)
         }
@@ -711,5 +713,57 @@ mod tests {
         assert_eq!(cfg.inference.timeout_ms, 42);
         assert_eq!(cfg.nn.top_k, 10);
         assert!(cfg.enabled);
+    }
+
+    // ── Review-fix regression tests ──────────────────────────────────────
+
+    #[test]
+    fn test_routing_reason_policy_error_variant_exists() {
+        // Regression: inference errors were tagged as PolicyTimeout.
+        // Now we have a distinct PolicyError variant.
+        let reason = RoutingReason::PolicyError;
+        let serialized = serde_json::to_string(&reason).unwrap();
+        assert!(
+            serialized.contains("PolicyError"),
+            "PolicyError variant should serialize correctly: {}",
+            serialized
+        );
+
+        // Verify PolicyTimeout is distinct
+        let timeout = RoutingReason::PolicyTimeout;
+        let timeout_ser = serde_json::to_string(&timeout).unwrap();
+        assert_ne!(
+            serialized, timeout_ser,
+            "PolicyError and PolicyTimeout should be distinct"
+        );
+    }
+
+    #[test]
+    fn test_routing_decision_serialization_all_reasons() {
+        // Ensure all RoutingReason variants serialize without panic
+        let reasons = vec![
+            RoutingReason::Disabled,
+            RoutingReason::NnMode,
+            RoutingReason::CpuGuardPaused,
+            RoutingReason::PolicyNotReady,
+            RoutingReason::RolloutToNn,
+            RoutingReason::LowConfidence {
+                raw_confidence: 0.3,
+                calibrated_confidence: 0.25,
+                threshold: 0.7,
+            },
+            RoutingReason::PolicyOod,
+            RoutingReason::PolicyTimeout,
+            RoutingReason::PolicyError,
+            RoutingReason::PolicySelected {
+                raw_confidence: 0.9,
+                calibrated_confidence: 0.85,
+            },
+        ];
+
+        for reason in reasons {
+            let json = serde_json::to_string(&reason);
+            assert!(json.is_ok(), "Failed to serialize {:?}", reason);
+        }
     }
 }

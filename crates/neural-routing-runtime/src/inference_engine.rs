@@ -261,8 +261,8 @@ impl InferenceEngine {
         };
 
         // Build state vector: [query_embedding(256d) || graph_embedding(256d)] = 512d
-        let default_graph_emb = vec![0.0f32; QUERY_DIM];
-        let graph_emb = graph_embedding.unwrap_or(&default_graph_emb);
+        const ZERO_GRAPH_EMB: [f32; QUERY_DIM] = [0.0; QUERY_DIM];
+        let graph_emb = graph_embedding.unwrap_or(&ZERO_GRAPH_EMB);
         let mut state_vec = Vec::with_capacity(STATE_DIM);
         state_vec.extend_from_slice(query_embedding);
         if graph_emb.len() >= QUERY_DIM {
@@ -288,11 +288,9 @@ impl InferenceEngine {
             .map_err(|e| InferenceError::Inference(format!("DT generation failed: {}", e)))?;
 
         // Decode action tensors to MCP actions
-        let available_set: Option<HashSet<String>> =
-            available_tools.map(|tools| tools.iter().cloned().collect());
-
-        let decoder = if let Some(ref available) = available_set {
-            ActionDecoder::new(codebook).with_available_actions(available.clone())
+        let decoder = if let Some(tools) = available_tools {
+            let available_set: HashSet<String> = tools.iter().cloned().collect();
+            ActionDecoder::new(codebook).with_available_actions(available_set)
         } else {
             ActionDecoder::new(codebook)
         };

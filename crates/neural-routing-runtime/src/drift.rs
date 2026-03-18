@@ -121,8 +121,8 @@ pub struct DriftDetector {
     // Cooldown
     observations_since_drift: usize,
 
-    // History
-    drift_events: Vec<DriftEvent>,
+    // History (capped to avoid unbounded growth)
+    drift_events: std::collections::VecDeque<DriftEvent>,
 }
 
 impl DriftDetector {
@@ -142,7 +142,7 @@ impl DriftDetector {
             reference_action_total: 0,
             recent_action_total: 0,
             observations_since_drift: usize::MAX, // No cooldown initially
-            drift_events: Vec::new(),
+            drift_events: std::collections::VecDeque::with_capacity(256),
         }
     }
 
@@ -181,6 +181,7 @@ impl DriftDetector {
     pub fn observe_action(&mut self, action_key: &str) {
         // Shift recent to reference periodically
         if self.recent_action_total > 0
+            && self.config.window_size > 0
             && self
                 .recent_action_total
                 .is_multiple_of(self.config.window_size)
@@ -249,6 +250,10 @@ impl DriftDetector {
         if !events.is_empty() {
             self.observations_since_drift = 0;
             self.drift_events.extend(events.clone());
+            // Cap history to 256 entries
+            while self.drift_events.len() > 256 {
+                self.drift_events.pop_front();
+            }
         }
 
         (worst_action, events)
@@ -285,8 +290,8 @@ impl DriftDetector {
 
         let mut ref_sorted: Vec<f64> = self.reference_window.iter().copied().collect();
         let mut rec_sorted: Vec<f64> = self.recent_window.iter().copied().collect();
-        ref_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        rec_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        ref_sorted.sort_by(|a, b| a.total_cmp(b));
+        rec_sorted.sort_by(|a, b| a.total_cmp(b));
 
         let n1 = ref_sorted.len() as f64;
         let n2 = rec_sorted.len() as f64;
@@ -361,12 +366,11 @@ impl DriftDetector {
         }
 
         // Collect all action keys
-        let mut all_keys: Vec<String> = self.reference_actions.keys().cloned().collect();
-        for key in self.recent_actions.keys() {
-            if !all_keys.contains(key) {
-                all_keys.push(key.clone());
-            }
-        }
+        let all_keys: std::collections::HashSet<&String> = self
+            .reference_actions
+            .keys()
+            .chain(self.recent_actions.keys())
+            .collect();
 
         // Compute KL(recent || reference) with Laplace smoothing
         let smoothing = 1.0;
@@ -375,8 +379,9 @@ impl DriftDetector {
 
         let mut kl = 0.0f64;
         for key in &all_keys {
-            let p = (*self.recent_actions.get(key).unwrap_or(&0) as f64 + smoothing) / rec_total;
-            let q = (*self.reference_actions.get(key).unwrap_or(&0) as f64 + smoothing) / ref_total;
+            let p = (*self.recent_actions.get(*key).unwrap_or(&0) as f64 + smoothing) / rec_total;
+            let q =
+                (*self.reference_actions.get(*key).unwrap_or(&0) as f64 + smoothing) / ref_total;
             kl += p * (p / q).ln();
         }
 
@@ -413,8 +418,8 @@ impl DriftDetector {
     }
 
     /// Get the history of drift events.
-    pub fn drift_events(&self) -> &[DriftEvent] {
-        &self.drift_events
+    pub fn drift_events(&self) -> Vec<&DriftEvent> {
+        self.drift_events.iter().collect()
     }
 
     /// Get the current Page-Hinkley statistic (max of upward and downward).
@@ -629,6 +634,146 @@ mod tests {
         assert!(
             !detector.drift_events().is_empty(),
             "Should have drift event history"
+        );
+    }
+
+    // ── Review-fix regression tests ──────────────────────────────────────
+
+    #[test]
+    fn test_ks_test_identical_distributions_no_drift() {
+        // Regression: tied values in KS-test must advance both pointers.
+        // Previously, identical distributions produced KS ≈ 1.0 (false positive).
+        let mut detector = DriftDetector::new(DriftConfig {
+            window_size: 50,
+            cooldown_observations: 0,
+            ..Default::default()
+        });
+
+        // Feed identical stable rewards to fill both windows
+        for _ in 0..200 {
+            detector.observe_reward(0.75);
+        }
+
+        let (action, events) = detector.check();
+        let has_ks_drift = events
+            .iter()
+            .any(|e| e.drift_type == DriftType::RewardDistributionShift);
+        assert!(
+            !has_ks_drift,
+            "Identical distributions should NOT trigger KS drift. Events: {:?}",
+            events
+        );
+        assert_eq!(action, DriftAction::None);
+    }
+
+    #[test]
+    fn test_page_hinkley_detects_downward_shift() {
+        // Regression: one-sided PH only detected upward shifts.
+        // Now two-sided: should also detect downward mean shifts.
+        let mut detector = DriftDetector::new(DriftConfig {
+            page_hinkley_threshold: 5.0,
+            page_hinkley_delta: 0.005,
+            cooldown_observations: 0,
+            window_size: 50,
+            ..Default::default()
+        });
+
+        // Start high, then shift downward
+        for _ in 0..100 {
+            detector.observe_reward(0.9);
+        }
+        for _ in 0..100 {
+            detector.observe_reward(0.2);
+        }
+
+        let (action, events) = detector.check();
+        let has_mean_shift = events
+            .iter()
+            .any(|e| e.drift_type == DriftType::RewardMeanShift);
+        assert!(
+            has_mean_shift,
+            "Downward reward shift should trigger Page-Hinkley. Action: {:?}, Events: {:?}",
+            action, events
+        );
+    }
+
+    #[test]
+    fn test_drift_events_capped_at_256() {
+        let mut detector = DriftDetector::new(DriftConfig {
+            page_hinkley_threshold: 2.0,
+            page_hinkley_delta: 0.001,
+            cooldown_observations: 0,
+            window_size: 20,
+            ..Default::default()
+        });
+
+        // Generate many drift events
+        for cycle in 0..200 {
+            let value = if cycle % 2 == 0 { 0.95 } else { 0.05 };
+            for _ in 0..30 {
+                detector.observe_reward(value);
+            }
+            let _ = detector.check();
+        }
+
+        assert!(
+            detector.drift_events().len() <= 256,
+            "Drift events should be capped at 256, got {}",
+            detector.drift_events().len()
+        );
+    }
+
+    #[test]
+    fn test_observe_action_window_size_zero_no_panic() {
+        // Regression: window_size=0 would cause division by zero with is_multiple_of.
+        // Now guarded with window_size > 0 check.
+        let mut detector = DriftDetector::new(DriftConfig {
+            window_size: 0,
+            ..Default::default()
+        });
+
+        // Should not panic
+        for _ in 0..50 {
+            detector.observe_action("code.search");
+        }
+    }
+
+    #[test]
+    fn test_action_kl_uses_all_keys_efficiently() {
+        // Verifies that the HashSet-based key collection works correctly
+        // (regression from Vec::contains → HashSet).
+        //
+        // Window shift logic: at every `window_size` observations,
+        // recent→reference and recent is cleared. Strategy:
+        // - window_size=100
+        // - 100 x "code.search" → triggers shift, reference={code.search:100}
+        // - 90 x "note.create"  → recent={note.create:90} without hitting next shift
+        // - check() sees reference=all "code.search", recent=all "note.create" → KL > 0
+        let mut detector = DriftDetector::new(DriftConfig {
+            window_size: 100,
+            cooldown_observations: 0,
+            kl_threshold: 0.1,
+            ..Default::default()
+        });
+
+        // Phase 1: fill reference with code.search
+        for _ in 0..100 {
+            detector.observe_action("code.search");
+            detector.observe_reward(0.8);
+        }
+        // Phase 2: fill recent with note.create (< window_size to avoid shift)
+        for _ in 0..90 {
+            detector.observe_action("note.create");
+            detector.observe_reward(0.8);
+        }
+
+        let (_, events) = detector.check();
+        let has_action_drift = events
+            .iter()
+            .any(|e| e.drift_type == DriftType::ActionDistributionShift);
+        assert!(
+            has_action_drift,
+            "Should detect action KL divergence with HashSet-based key collection"
         );
     }
 }

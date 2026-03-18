@@ -343,7 +343,7 @@ fn beta_sample_order_stats(alpha: usize, beta: usize, seed: u64) -> f64 {
     let mut values: Vec<f64> = (0..n)
         .map(|i| splitmix_uniform(seed.wrapping_add((i as u64).wrapping_mul(0x9E3779B97F4A7C15))))
         .collect();
-    values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    values.sort_by(|a, b| a.total_cmp(b));
     values.get(alpha - 1).copied().unwrap_or(0.5)
 }
 
@@ -582,5 +582,45 @@ mod tests {
             explore_count_early,
             explore_count_late
         );
+    }
+
+    // ── Review-fix regression tests ──────────────────────────────────────
+
+    #[test]
+    fn test_beta_sample_order_stats_no_overflow() {
+        // Regression: wrapping_mul is required for SplitMix64 constants.
+        // Previously `i as u64 * 0x9E3779B97F4A7C15` panicked in debug mode.
+        for seed in 0..50u64 {
+            let s = beta_sample_order_stats(3, 5, seed);
+            assert!(
+                s > 0.0 && s < 1.0,
+                "Beta order stats sample out of range: {} (seed={})",
+                s,
+                seed
+            );
+        }
+    }
+
+    #[test]
+    fn test_beta_sample_order_stats_large_alpha_beta() {
+        // Stress test with large alpha+beta to ensure wrapping_mul handles
+        // large indices without overflow panics.
+        let s = beta_sample_order_stats(50, 50, 42);
+        assert!(
+            s > 0.0 && s < 1.0,
+            "Large alpha/beta sample out of range: {}",
+            s
+        );
+    }
+
+    #[test]
+    fn test_sort_by_total_cmp_handles_nan() {
+        // Regression: sort_by(partial_cmp().unwrap()) panics on NaN.
+        // total_cmp handles NaN deterministically (NaN sorts after all values).
+        let mut values = vec![0.5, f64::NAN, 0.3, 0.7, f64::NAN, 0.1];
+        values.sort_by(|a, b| a.total_cmp(b));
+        // Should not panic; NaN sorts to the end
+        assert_eq!(values[0], 0.1);
+        assert_eq!(values[1], 0.3);
     }
 }
