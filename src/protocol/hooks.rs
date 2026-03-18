@@ -30,6 +30,12 @@ use uuid::Uuid;
 /// Minimum interval between auto-triggered runs of the same protocol (5 minutes).
 const MIN_TRIGGER_INTERVAL_SECS: i64 = 300;
 
+/// Maximum time a run can stay in a single state before being auto-timed-out (8 hours).
+/// Applies to runs created by auto-triggers (event/scheduled). Manual runs are not affected.
+/// Set high enough to allow agent-driven protocols to complete across long sessions,
+/// but low enough to prevent zombie runs from blocking triggers indefinitely.
+const AUTO_RUN_TIMEOUT_SECS: i64 = 28800;
+
 /// Spawn event-triggered protocol runs in the background.
 ///
 /// Finds all protocols for the given project that listen to the specified event
@@ -220,6 +226,99 @@ pub async fn recover_orphaned_runs(store: &dyn GraphStore) -> anyhow::Result<u32
 }
 
 // ============================================================================
+// Stale Run Timeout
+// ============================================================================
+
+/// Timeout stale protocol runs that have been stuck on a single state too long.
+///
+/// Scans all projects for `ProtocolRun` nodes with `status = running` whose
+/// last state entry timestamp is older than [`AUTO_RUN_TIMEOUT_SECS`].
+/// Only auto-triggered runs (event:* or schedule:*) are affected — manual runs
+/// are left alone since they may legitimately wait for human input.
+///
+/// Each timed-out run is marked as `Failed` with a descriptive error message.
+pub async fn timeout_stale_runs(store: &dyn GraphStore) -> anyhow::Result<u32> {
+    let projects = store.list_projects().await?;
+    let now = chrono::Utc::now();
+    let mut total_timed_out = 0u32;
+
+    for project in &projects {
+        let (protocols, _) = store.list_protocols(project.id, None, 100, 0).await?;
+
+        for protocol in &protocols {
+            let (running_runs, _) = store
+                .list_protocol_runs(
+                    protocol.id,
+                    Some(crate::protocol::RunStatus::Running),
+                    100,
+                    0,
+                )
+                .await?;
+
+            for run in &running_runs {
+                // Only timeout auto-triggered runs (event:* or schedule:*)
+                if run.triggered_by == "manual" {
+                    continue;
+                }
+
+                // Check how long the run has been in its current state
+                let last_state_entered = run
+                    .states_visited
+                    .last()
+                    .map(|sv| sv.entered_at)
+                    .unwrap_or(run.started_at);
+
+                let state_age_secs = (now - last_state_entered).num_seconds();
+                if state_age_secs <= AUTO_RUN_TIMEOUT_SECS {
+                    continue;
+                }
+
+                let state_name = run
+                    .states_visited
+                    .last()
+                    .map(|sv| sv.state_name.as_str())
+                    .unwrap_or("unknown");
+
+                let error_msg = format!(
+                    "Auto-timeout: state '{}' exceeded {}s (stuck for {}s)",
+                    state_name, AUTO_RUN_TIMEOUT_SECS, state_age_secs
+                );
+
+                let mut timed_out_run = run.clone();
+                timed_out_run.fail(&error_msg);
+
+                if let Err(e) = store.update_protocol_run(&timed_out_run).await {
+                    tracing::warn!(
+                        run_id = %run.id,
+                        protocol_id = %protocol.id,
+                        "Failed to timeout stale run: {}", e
+                    );
+                } else {
+                    tracing::warn!(
+                        run_id = %run.id,
+                        protocol_id = %protocol.id,
+                        protocol_name = %protocol.name,
+                        state_name,
+                        state_age_secs,
+                        "Timed out stale protocol run"
+                    );
+                    total_timed_out += 1;
+                }
+            }
+        }
+    }
+
+    if total_timed_out > 0 {
+        tracing::info!(
+            count = total_timed_out,
+            "Timed out {total_timed_out} stale protocol run(s)"
+        );
+    }
+
+    Ok(total_timed_out)
+}
+
+// ============================================================================
 // Periodic Scheduler
 // ============================================================================
 
@@ -261,10 +360,21 @@ pub fn spawn_protocol_scheduler(store: Arc<dyn GraphStore>) {
         loop {
             interval.tick().await;
 
-            tracing::debug!("Protocol scheduler: evaluating scheduled protocols");
+            tracing::debug!("Protocol scheduler: tick — orphan recovery + timeout + scheduling");
 
+            // 1. Recover orphaned runs (same logic as startup, now periodic)
+            if let Err(e) = recover_orphaned_runs(&*store).await {
+                tracing::warn!("Protocol scheduler: orphan recovery failed: {}", e);
+            }
+
+            // 2. Timeout stale auto-triggered runs stuck on a single state
+            if let Err(e) = timeout_stale_runs(&*store).await {
+                tracing::warn!("Protocol scheduler: stale run timeout failed: {}", e);
+            }
+
+            // 3. Evaluate scheduled protocols and start new runs
             if let Err(e) = run_scheduled_protocols(&*store).await {
-                tracing::warn!("Protocol scheduler tick failed: {}", e);
+                tracing::warn!("Protocol scheduler: scheduled trigger failed: {}", e);
             }
         }
     });
@@ -1232,5 +1342,117 @@ mod tests {
             total
         );
         assert_eq!(runs[0].triggered_by, "event:post_sync");
+    }
+
+    // ====================================================================
+    // Stale run timeout tests
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_timeout_stale_auto_triggered_run() {
+        let store = MockGraphStore::new();
+        let (_, protocol) = setup_event_triggered_protocol(
+            &store,
+            TriggerMode::Event,
+            vec!["post_sync".to_string()],
+        )
+        .await;
+
+        // Create a run triggered by event, stuck for 9 hours (> 8h timeout)
+        let mut run =
+            crate::protocol::ProtocolRun::new(protocol.id, protocol.entry_state, "Start");
+        run.triggered_by = "event:post_sync".to_string();
+        run.started_at = chrono::Utc::now() - chrono::Duration::hours(9);
+        // Also backdate the state visit entry
+        if let Some(sv) = run.states_visited.first_mut() {
+            sv.entered_at = run.started_at;
+        }
+        store.create_protocol_run(&run).await.unwrap();
+
+        let count = timeout_stale_runs(&store).await.unwrap();
+        assert_eq!(count, 1);
+
+        let updated = store.get_protocol_run(run.id).await.unwrap().unwrap();
+        assert_eq!(updated.status, crate::protocol::RunStatus::Failed);
+        assert!(updated.error.as_ref().unwrap().contains("Auto-timeout"));
+        assert!(updated.error.as_ref().unwrap().contains("Start"));
+        assert!(updated.completed_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_timeout_skips_recent_auto_run() {
+        let store = MockGraphStore::new();
+        let (_, protocol) = setup_event_triggered_protocol(
+            &store,
+            TriggerMode::Event,
+            vec!["post_sync".to_string()],
+        )
+        .await;
+
+        // Create a run triggered by event, only 1 hour old (< 8h timeout)
+        let mut run =
+            crate::protocol::ProtocolRun::new(protocol.id, protocol.entry_state, "Start");
+        run.triggered_by = "event:post_sync".to_string();
+        run.started_at = chrono::Utc::now() - chrono::Duration::hours(1);
+        if let Some(sv) = run.states_visited.first_mut() {
+            sv.entered_at = run.started_at;
+        }
+        store.create_protocol_run(&run).await.unwrap();
+
+        let count = timeout_stale_runs(&store).await.unwrap();
+        assert_eq!(count, 0);
+
+        let updated = store.get_protocol_run(run.id).await.unwrap().unwrap();
+        assert_eq!(updated.status, crate::protocol::RunStatus::Running);
+    }
+
+    #[tokio::test]
+    async fn test_timeout_skips_manual_runs() {
+        let store = MockGraphStore::new();
+        let (_, protocol) = setup_event_triggered_protocol(
+            &store,
+            TriggerMode::Manual,
+            vec![],
+        )
+        .await;
+
+        // Create a manual run stuck for 10 hours — should NOT be timed out
+        let mut run =
+            crate::protocol::ProtocolRun::new(protocol.id, protocol.entry_state, "Start");
+        run.triggered_by = "manual".to_string();
+        run.started_at = chrono::Utc::now() - chrono::Duration::hours(10);
+        if let Some(sv) = run.states_visited.first_mut() {
+            sv.entered_at = run.started_at;
+        }
+        store.create_protocol_run(&run).await.unwrap();
+
+        let count = timeout_stale_runs(&store).await.unwrap();
+        assert_eq!(count, 0);
+
+        let updated = store.get_protocol_run(run.id).await.unwrap().unwrap();
+        assert_eq!(updated.status, crate::protocol::RunStatus::Running);
+    }
+
+    #[tokio::test]
+    async fn test_timeout_scheduled_run() {
+        let store = MockGraphStore::new();
+        let (_, protocol) =
+            setup_scheduled_protocol(&store, TriggerMode::Scheduled, Some("daily")).await;
+
+        // Create a scheduled run stuck for 9 hours
+        let mut run =
+            crate::protocol::ProtocolRun::new(protocol.id, protocol.entry_state, "Start");
+        run.triggered_by = "schedule:daily".to_string();
+        run.started_at = chrono::Utc::now() - chrono::Duration::hours(9);
+        if let Some(sv) = run.states_visited.first_mut() {
+            sv.entered_at = run.started_at;
+        }
+        store.create_protocol_run(&run).await.unwrap();
+
+        let count = timeout_stale_runs(&store).await.unwrap();
+        assert_eq!(count, 1);
+
+        let updated = store.get_protocol_run(run.id).await.unwrap().unwrap();
+        assert_eq!(updated.status, crate::protocol::RunStatus::Failed);
     }
 }
