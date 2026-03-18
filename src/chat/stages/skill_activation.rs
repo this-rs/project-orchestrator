@@ -205,8 +205,15 @@ impl EnrichmentStage for SkillActivationStage {
         let matches = self.match_skills(&input.message, project_id).await?;
 
         if matches.is_empty() {
+            // No skill match — detect intent from message keywords as fallback
+            let intent = detect_intent_from_message(&input.message);
+            ctx.set_hint("intent", intent);
             return Ok(());
         }
+
+        // Emit intent hint based on matched skill tags/names
+        let intent = detect_intent_from_skills(&matches, &input.message);
+        ctx.set_hint("intent", intent);
 
         // Build enrichment content from activated skills
         let mut content_parts: Vec<String> = Vec::new();
@@ -332,6 +339,89 @@ impl EnrichmentStage for SkillActivationStage {
 }
 
 // ============================================================================
+// Intent detection helpers
+// ============================================================================
+
+/// Detect intent from matched skills' tags and names.
+///
+/// Returns one of: planning, code, debug, review, general
+fn detect_intent_from_skills(matches: &[(SkillNode, f64)], message: &str) -> &'static str {
+    // Check skill tags first (most specific signal)
+    for (skill, _) in matches {
+        let tags_lower: Vec<String> = skill.tags.iter().map(|t| t.to_lowercase()).collect();
+        let name_lower = skill.name.to_lowercase();
+
+        if tags_lower.iter().any(|t| t.contains("plan") || t.contains("roadmap"))
+            || name_lower.contains("plan")
+        {
+            return "planning";
+        }
+        if tags_lower
+            .iter()
+            .any(|t| t.contains("debug") || t.contains("fix") || t.contains("error"))
+            || name_lower.contains("debug")
+        {
+            return "debug";
+        }
+        if tags_lower
+            .iter()
+            .any(|t| t.contains("review") || t.contains("quality"))
+            || name_lower.contains("review")
+        {
+            return "review";
+        }
+        if tags_lower
+            .iter()
+            .any(|t| t.contains("code") || t.contains("implement") || t.contains("refactor"))
+            || name_lower.contains("code")
+            || name_lower.contains("implement")
+        {
+            return "code";
+        }
+    }
+
+    // Fallback to message-based detection
+    detect_intent_from_message(message)
+}
+
+/// Detect intent from the raw message keywords.
+///
+/// Returns one of: planning, code, debug, review, general
+fn detect_intent_from_message(message: &str) -> &'static str {
+    let lower = message.to_lowercase();
+
+    if lower.contains("plan") || lower.contains("roadmap") || lower.contains("milestone") {
+        return "planning";
+    }
+    if lower.contains("debug")
+        || lower.contains("error")
+        || lower.contains("fix")
+        || lower.contains("bug")
+        || lower.contains("crash")
+    {
+        return "debug";
+    }
+    if lower.contains("review")
+        || lower.contains("coverage")
+        || lower.contains("audit")
+        || lower.contains("quality")
+    {
+        return "review";
+    }
+    if lower.contains("implement")
+        || lower.contains("code")
+        || lower.contains("refactor")
+        || lower.contains("write")
+        || lower.contains("create")
+        || lower.contains("add")
+    {
+        return "code";
+    }
+
+    "general"
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -384,5 +474,52 @@ mod tests {
         assert!((config.confidence_threshold - 0.7).abs() < f64::EPSILON);
         assert_eq!(config.max_activated_skills, 3);
         assert!((config.energy_boost - 0.1).abs() < f64::EPSILON);
+    }
+
+    // ── Intent detection tests ──────────────────────────────────────
+
+    #[test]
+    fn test_detect_intent_planning() {
+        assert_eq!(detect_intent_from_message("crée un plan pour X"), "planning");
+        assert_eq!(detect_intent_from_message("check the roadmap"), "planning");
+        assert_eq!(detect_intent_from_message("update the milestone"), "planning");
+    }
+
+    #[test]
+    fn test_detect_intent_debug() {
+        assert_eq!(detect_intent_from_message("debug this error"), "debug");
+        assert_eq!(detect_intent_from_message("fix this bug"), "debug");
+        assert_eq!(detect_intent_from_message("the app crashes"), "debug");
+    }
+
+    #[test]
+    fn test_detect_intent_review() {
+        assert_eq!(detect_intent_from_message("review the code"), "review");
+        assert_eq!(detect_intent_from_message("check code coverage"), "review");
+        assert_eq!(detect_intent_from_message("audit the API"), "review");
+    }
+
+    #[test]
+    fn test_detect_intent_code() {
+        assert_eq!(detect_intent_from_message("implement the feature"), "code");
+        assert_eq!(detect_intent_from_message("refactor this module"), "code");
+        assert_eq!(detect_intent_from_message("add a new endpoint"), "code");
+    }
+
+    #[test]
+    fn test_detect_intent_general() {
+        assert_eq!(detect_intent_from_message("hello"), "general");
+        assert_eq!(detect_intent_from_message("how does this work?"), "general");
+    }
+
+    #[test]
+    fn test_hints_set_and_get() {
+        let mut ctx = EnrichmentContext::default();
+        assert!(ctx.get_hint("intent").is_none());
+        ctx.set_hint("intent", "planning");
+        assert_eq!(ctx.get_hint("intent"), Some("planning"));
+        // Overwrite
+        ctx.set_hint("intent", "debug");
+        assert_eq!(ctx.get_hint("intent"), Some("debug"));
     }
 }

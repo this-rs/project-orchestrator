@@ -16,6 +16,7 @@
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tracing::{debug, warn};
 use uuid::Uuid;
@@ -139,10 +140,22 @@ pub struct EnrichmentInput {
 ///
 /// Each stage can read what previous stages added and add its own data.
 /// The context is [`Serialize`] for debug logging.
+///
+/// **Hints**: stages can communicate inter-stage signals via `set_hint`/`get_hint`.
+/// For example, SkillActivationStage sets `intent=planning` which KnowledgeInjectionStage
+/// can read to filter notes by intent.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct EnrichmentContext {
     /// Sections of enriched content to prepend to the prompt.
     pub sections: Vec<EnrichmentSection>,
+    /// Inter-stage hints: key-value signals that subsequent stages can read.
+    ///
+    /// Common hints:
+    /// - `intent`: planning | code | debug | review | general
+    /// - `scaffolding_level`: 0-4 (from project maturity)
+    /// - `detected_files`: comma-separated file paths mentioned in the message
+    /// - `detected_functions`: comma-separated function names mentioned
+    pub hints: HashMap<String, String>,
     /// Timing information per stage (name, duration in ms).
     pub stage_timings: Vec<(String, u64)>,
     /// Total pipeline execution time in ms.
@@ -175,6 +188,21 @@ impl EnrichmentContext {
             content: content.into(),
             source: source.into(),
         });
+    }
+
+    /// Set an inter-stage hint that subsequent stages can read.
+    ///
+    /// Common hints:
+    /// - `intent`: planning | code | debug | review | general
+    /// - `scaffolding_level`: 0-4
+    /// - `detected_files`: comma-separated file paths
+    pub fn set_hint(&mut self, key: impl Into<String>, value: impl Into<String>) {
+        self.hints.insert(key.into(), value.into());
+    }
+
+    /// Get an inter-stage hint set by a previous stage.
+    pub fn get_hint(&self, key: &str) -> Option<&str> {
+        self.hints.get(key).map(|s| s.as_str())
     }
 
     /// Check if any enrichment content was produced.
