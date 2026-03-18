@@ -24,6 +24,56 @@ const MAX_DESCRIPTION_LEN: usize = 5000;
 const MAX_TRIGGER_LEN: usize = 500;
 
 // ============================================================================
+// Validation helpers (pure functions — unit-testable)
+// ============================================================================
+
+/// Validate that a transition does not originate from a terminal state or target a start state.
+///
+/// Looks up `from_state_id` and `to_state_id` in the provided `states` slice.
+/// Returns `Ok(())` if valid, or `Err(message)` describing the violation.
+/// If a state ID is not found in the slice, the check is silently skipped
+/// (the caller may validate existence separately).
+fn validate_transition_state_types(
+    states: &[ProtocolState],
+    from_state_id: Uuid,
+    to_state_id: Uuid,
+) -> Result<(), String> {
+    if let Some(from_s) = states.iter().find(|s| s.id == from_state_id) {
+        if from_s.state_type == crate::protocol::StateType::Terminal {
+            return Err(format!(
+                "Cannot add transition from terminal state '{}'",
+                from_s.name
+            ));
+        }
+    }
+    if let Some(to_s) = states.iter().find(|s| s.id == to_state_id) {
+        if to_s.state_type == crate::protocol::StateType::Start {
+            return Err(format!(
+                "Cannot add transition to start state '{}'",
+                to_s.name
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Map an `anyhow::Error` from `fire_transition` to the appropriate `AppError` variant.
+///
+/// - Messages containing "not found" → `AppError::NotFound`
+/// - Messages containing "OptimisticLockError" → `AppError::Conflict`
+/// - Everything else → `AppError::Internal`
+fn map_fire_transition_error(e: anyhow::Error) -> AppError {
+    let msg = e.to_string();
+    if msg.contains("not found") {
+        AppError::NotFound(msg)
+    } else if msg.contains("OptimisticLockError") {
+        AppError::Conflict(msg)
+    } else {
+        AppError::Internal(e)
+    }
+}
+
+// ============================================================================
 // Query Parameters
 // ============================================================================
 
@@ -490,22 +540,8 @@ pub async fn create_protocol(
                 )));
             }
             // Validate state types: no transition FROM terminal or TO start
-            if let Some(from_s) = created_states.iter().find(|s| s.id == t.from_state) {
-                if from_s.state_type == crate::protocol::StateType::Terminal {
-                    return Err(AppError::BadRequest(format!(
-                        "Cannot add transition from terminal state '{}'",
-                        from_s.name
-                    )));
-                }
-            }
-            if let Some(to_s) = created_states.iter().find(|s| s.id == t.to_state) {
-                if to_s.state_type == crate::protocol::StateType::Start {
-                    return Err(AppError::BadRequest(format!(
-                        "Cannot add transition to start state '{}'",
-                        to_s.name
-                    )));
-                }
-            }
+            validate_transition_state_types(&created_states, t.from_state, t.to_state)
+                .map_err(AppError::BadRequest)?;
             let pt = ProtocolTransition {
                 id: Uuid::new_v4(),
                 protocol_id: protocol.id,
@@ -828,34 +864,22 @@ pub async fn add_transition(
         .await
         .map_err(AppError::Internal)?;
 
-    let from_state = states
-        .iter()
-        .find(|s| s.id == body.from_state)
-        .ok_or_else(|| {
-            AppError::BadRequest(format!(
-                "from_state {} not found in protocol",
-                body.from_state
-            ))
-        })?;
-    let to_state = states
-        .iter()
-        .find(|s| s.id == body.to_state)
-        .ok_or_else(|| {
-            AppError::BadRequest(format!("to_state {} not found in protocol", body.to_state))
-        })?;
+    // Verify both states exist in the protocol
+    if !states.iter().any(|s| s.id == body.from_state) {
+        return Err(AppError::BadRequest(format!(
+            "from_state {} not found in protocol",
+            body.from_state
+        )));
+    }
+    if !states.iter().any(|s| s.id == body.to_state) {
+        return Err(AppError::BadRequest(format!(
+            "to_state {} not found in protocol",
+            body.to_state
+        )));
+    }
 
-    if from_state.state_type == crate::protocol::StateType::Terminal {
-        return Err(AppError::BadRequest(format!(
-            "Cannot add transition from terminal state '{}' ({})",
-            from_state.name, from_state.id
-        )));
-    }
-    if to_state.state_type == crate::protocol::StateType::Start {
-        return Err(AppError::BadRequest(format!(
-            "Cannot add transition to start state '{}' ({})",
-            to_state.name, to_state.id
-        )));
-    }
+    validate_transition_state_types(&states, body.from_state, body.to_state)
+        .map_err(AppError::BadRequest)?;
 
     let pt = ProtocolTransition {
         id: Uuid::new_v4(),
@@ -1007,16 +1031,7 @@ pub async fn fire_transition(
     let result =
         protocol::engine::fire_transition(state.orchestrator.neo4j(), run_id, &body.trigger)
             .await
-            .map_err(|e| {
-                let msg = e.to_string();
-                if msg.contains("not found") {
-                    AppError::NotFound(msg)
-                } else if msg.contains("OptimisticLockError") {
-                    AppError::Conflict(msg)
-                } else {
-                    AppError::Internal(e)
-                }
-            })?;
+            .map_err(map_fire_transition_error)?;
 
     // Emit event for successful transitions
     if result.success {
@@ -1654,22 +1669,8 @@ pub async fn compose_protocol(
             .ok_or_else(|| AppError::BadRequest(format!("state '{}' not found", t.to_state)))?;
 
         // Validate state types: no transition FROM terminal or TO start
-        if let Some(from_s) = created_states.iter().find(|s| s.id == *from_id) {
-            if from_s.state_type == crate::protocol::StateType::Terminal {
-                return Err(AppError::BadRequest(format!(
-                    "Cannot add transition from terminal state '{}'",
-                    from_s.name
-                )));
-            }
-        }
-        if let Some(to_s) = created_states.iter().find(|s| s.id == *to_id) {
-            if to_s.state_type == crate::protocol::StateType::Start {
-                return Err(AppError::BadRequest(format!(
-                    "Cannot add transition to start state '{}'",
-                    to_s.name
-                )));
-            }
-        }
+        validate_transition_state_types(&created_states, *from_id, *to_id)
+            .map_err(AppError::BadRequest)?;
 
         let pt = ProtocolTransition {
             id: Uuid::new_v4(),
@@ -1823,4 +1824,154 @@ pub async fn simulate_activation(
         explanation: affinity.explanation,
         context_used: context,
     }))
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::StateType;
+
+    /// Helper: build a minimal ProtocolState for testing.
+    fn make_state(name: &str, state_type: StateType) -> ProtocolState {
+        ProtocolState {
+            id: Uuid::new_v4(),
+            protocol_id: Uuid::new_v4(),
+            name: name.to_string(),
+            description: String::new(),
+            action: None,
+            state_type,
+            sub_protocol_id: None,
+            completion_strategy: None,
+            on_failure_strategy: None,
+            generator_config: None,
+        }
+    }
+
+    // ----------------------------------------------------------------
+    // validate_transition_state_types
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn test_validate_transition_ok_start_to_intermediate() {
+        let start = make_state("init", StateType::Start);
+        let mid = make_state("work", StateType::Intermediate);
+        let states = vec![start.clone(), mid.clone()];
+        assert!(validate_transition_state_types(&states, start.id, mid.id).is_ok());
+    }
+
+    #[test]
+    fn test_validate_transition_ok_intermediate_to_terminal() {
+        let mid = make_state("work", StateType::Intermediate);
+        let end = make_state("done", StateType::Terminal);
+        let states = vec![mid.clone(), end.clone()];
+        assert!(validate_transition_state_types(&states, mid.id, end.id).is_ok());
+    }
+
+    #[test]
+    fn test_validate_transition_rejects_from_terminal() {
+        let end = make_state("done", StateType::Terminal);
+        let mid = make_state("work", StateType::Intermediate);
+        let states = vec![end.clone(), mid.clone()];
+        let err = validate_transition_state_types(&states, end.id, mid.id).unwrap_err();
+        assert!(err.contains("Cannot add transition from terminal state"));
+        assert!(err.contains("done"));
+    }
+
+    #[test]
+    fn test_validate_transition_rejects_to_start() {
+        let start = make_state("init", StateType::Start);
+        let mid = make_state("work", StateType::Intermediate);
+        let states = vec![start.clone(), mid.clone()];
+        let err = validate_transition_state_types(&states, mid.id, start.id).unwrap_err();
+        assert!(err.contains("Cannot add transition to start state"));
+        assert!(err.contains("init"));
+    }
+
+    #[test]
+    fn test_validate_transition_unknown_ids_pass() {
+        // IDs not in the states slice → silently pass (existence validated elsewhere)
+        let states = vec![make_state("x", StateType::Intermediate)];
+        let unknown_from = Uuid::new_v4();
+        let unknown_to = Uuid::new_v4();
+        assert!(validate_transition_state_types(&states, unknown_from, unknown_to).is_ok());
+    }
+
+    #[test]
+    fn test_validate_transition_from_terminal_to_start_both_errors() {
+        // When both violations exist, the FROM-terminal error is returned first
+        let start = make_state("init", StateType::Start);
+        let end = make_state("done", StateType::Terminal);
+        let states = vec![start.clone(), end.clone()];
+        let err = validate_transition_state_types(&states, end.id, start.id).unwrap_err();
+        assert!(err.contains("terminal"));
+    }
+
+    #[test]
+    fn test_validate_transition_empty_states() {
+        // Empty states slice → both lookups miss → Ok
+        assert!(validate_transition_state_types(&[], Uuid::new_v4(), Uuid::new_v4()).is_ok());
+    }
+
+    #[test]
+    fn test_validate_transition_intermediate_to_intermediate() {
+        let a = make_state("step-a", StateType::Intermediate);
+        let b = make_state("step-b", StateType::Intermediate);
+        let states = vec![a.clone(), b.clone()];
+        assert!(validate_transition_state_types(&states, a.id, b.id).is_ok());
+    }
+
+    #[test]
+    fn test_validate_transition_start_to_terminal() {
+        let start = make_state("begin", StateType::Start);
+        let end = make_state("finish", StateType::Terminal);
+        let states = vec![start.clone(), end.clone()];
+        assert!(validate_transition_state_types(&states, start.id, end.id).is_ok());
+    }
+
+    // ----------------------------------------------------------------
+    // map_fire_transition_error
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn test_map_error_not_found() {
+        let e = anyhow::anyhow!("ProtocolRun abc123 not found");
+        match map_fire_transition_error(e) {
+            AppError::NotFound(msg) => assert!(msg.contains("not found")),
+            other => panic!("Expected NotFound, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_map_error_optimistic_lock() {
+        let e = anyhow::anyhow!(
+            "OptimisticLockError: protocol run xyz was modified concurrently (expected version 3, stale)"
+        );
+        match map_fire_transition_error(e) {
+            AppError::Conflict(msg) => assert!(msg.contains("OptimisticLockError")),
+            other => panic!("Expected Conflict, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_map_error_internal_fallback() {
+        let e = anyhow::anyhow!("Neo4j connection refused");
+        match map_fire_transition_error(e) {
+            AppError::Internal(err) => assert!(err.to_string().contains("connection refused")),
+            other => panic!("Expected Internal, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_map_error_not_found_takes_priority_over_optimistic() {
+        // If both keywords appear, "not found" is checked first
+        let e = anyhow::anyhow!("OptimisticLockError: not found something");
+        match map_fire_transition_error(e) {
+            AppError::NotFound(_) => {} // Correct: "not found" matched first
+            other => panic!("Expected NotFound, got {:?}", other),
+        }
+    }
 }

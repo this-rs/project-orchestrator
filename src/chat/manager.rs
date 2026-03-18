@@ -235,6 +235,63 @@ impl nexus_claude::HookCallback for CompactionNotifier {
     }
 }
 
+// ============================================================================
+// Pure helpers (testable without ChatManager)
+// ============================================================================
+
+/// Extracted protocol context from a `spawned_by` JSON payload.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SpawnedByContext {
+    pub parent_session_id: Option<String>,
+    pub spawn_type: String,
+    pub run_id: Option<Uuid>,
+    pub task_id: Option<Uuid>,
+    pub protocol_run_id: Option<Uuid>,
+    pub protocol_state: Option<String>,
+}
+
+/// Parse a `spawned_by` JSON string and extract parent session info + protocol FSM context.
+///
+/// Returns `None` if the JSON is invalid.
+/// The `protocol_run_id` and `protocol_state` fields are used to tag trajectories
+/// with `DURING_RUN` when a session operates within a protocol FSM.
+pub fn parse_spawned_by(json_str: &str) -> Option<SpawnedByContext> {
+    let val: serde_json::Value = serde_json::from_str(json_str).ok()?;
+    let parent_session_id = val
+        .get("parent_session_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let spawn_type = val
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("runner")
+        .to_string();
+    let run_id = val
+        .get("run_id")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<Uuid>().ok());
+    let task_id = val
+        .get("task_id")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<Uuid>().ok());
+    let protocol_run_id = val
+        .get("protocol_run_id")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<Uuid>().ok());
+    let protocol_state = val
+        .get("protocol_state")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    Some(SpawnedByContext {
+        parent_session_id,
+        spawn_type,
+        run_id,
+        task_id,
+        protocol_run_id,
+        protocol_state,
+    })
+}
+
 impl ChatManager {
     /// Create a ChatManager without memory support (for tests or when Meilisearch is unavailable)
     pub fn new_without_memory(
@@ -1913,54 +1970,29 @@ impl ChatManager {
 
         // If this session was spawned by another, create the SPAWNED_BY relation in Neo4j
         // and extract protocol FSM context (run_id + state) for trajectory tagging.
-        let (spawned_protocol_run_id, spawned_protocol_state) =
-            if let Some(ref spawned_by_json) = request.spawned_by {
-                if let Ok(spawned_by) = serde_json::from_str::<serde_json::Value>(spawned_by_json) {
-                    if let Some(parent_id) =
-                        spawned_by.get("parent_session_id").and_then(|v| v.as_str())
+        let spawned_ctx = request.spawned_by.as_deref().and_then(parse_spawned_by);
+        let (spawned_protocol_run_id, spawned_protocol_state) = match &spawned_ctx {
+            Some(ctx) => {
+                // Create SPAWNED_BY relation in graph if parent_session_id is present
+                if let Some(ref parent_id) = ctx.parent_session_id {
+                    if let Err(e) = self
+                        .graph
+                        .create_spawned_by_relation(
+                            &session_id.to_string(),
+                            parent_id,
+                            &ctx.spawn_type,
+                            ctx.run_id,
+                            ctx.task_id,
+                        )
+                        .await
                     {
-                        let spawn_type = spawned_by
-                            .get("type")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("runner");
-                        let run_id = spawned_by
-                            .get("run_id")
-                            .and_then(|v| v.as_str())
-                            .and_then(|s| s.parse::<Uuid>().ok());
-                        let task_id = spawned_by
-                            .get("task_id")
-                            .and_then(|v| v.as_str())
-                            .and_then(|s| s.parse::<Uuid>().ok());
-                        if let Err(e) = self
-                            .graph
-                            .create_spawned_by_relation(
-                                &session_id.to_string(),
-                                parent_id,
-                                spawn_type,
-                                run_id,
-                                task_id,
-                            )
-                            .await
-                        {
-                            warn!("Failed to create SPAWNED_BY relation: {e}");
-                        }
+                        warn!("Failed to create SPAWNED_BY relation: {e}");
                     }
-                    // Extract protocol context from spawned_by JSON
-                    let proto_run_id = spawned_by
-                        .get("protocol_run_id")
-                        .and_then(|v| v.as_str())
-                        .and_then(|s| s.parse::<Uuid>().ok());
-                    let proto_state = spawned_by
-                        .get("protocol_state")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string());
-                    (proto_run_id, proto_state)
-                } else {
-                    (None, None)
                 }
-            } else {
-                (None, None)
-            };
+                (ctx.protocol_run_id, ctx.protocol_state.clone())
+            }
+            None => (None, None),
+        };
 
         // Create broadcast channel early so CompactionNotifier can use the sender
         let (events_tx, _) = broadcast::channel(BROADCAST_BUFFER);
@@ -9083,5 +9115,81 @@ mod tests {
         assert!(!chat.contains_key(serde_yaml::Value::String("process_path".into())));
         assert!(!chat.contains_key(serde_yaml::Value::String("claude_cli_path".into())));
         assert!(!chat.contains_key(serde_yaml::Value::String("auto_update_cli".into())));
+    }
+
+    // ================================================================
+    // parse_spawned_by tests
+    // ================================================================
+
+    #[test]
+    fn test_parse_spawned_by_full_context() {
+        let run_id = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
+        let proto_run_id = Uuid::new_v4();
+        let json = serde_json::json!({
+            "parent_session_id": "sess-123",
+            "type": "wave-runner",
+            "run_id": run_id.to_string(),
+            "task_id": task_id.to_string(),
+            "protocol_run_id": proto_run_id.to_string(),
+            "protocol_state": "implement"
+        })
+        .to_string();
+
+        let ctx = parse_spawned_by(&json).unwrap();
+        assert_eq!(ctx.parent_session_id, Some("sess-123".to_string()));
+        assert_eq!(ctx.spawn_type, "wave-runner");
+        assert_eq!(ctx.run_id, Some(run_id));
+        assert_eq!(ctx.task_id, Some(task_id));
+        assert_eq!(ctx.protocol_run_id, Some(proto_run_id));
+        assert_eq!(ctx.protocol_state, Some("implement".to_string()));
+    }
+
+    #[test]
+    fn test_parse_spawned_by_minimal() {
+        let json = r#"{"parent_session_id": "sess-456"}"#;
+        let ctx = parse_spawned_by(json).unwrap();
+        assert_eq!(ctx.parent_session_id, Some("sess-456".to_string()));
+        assert_eq!(ctx.spawn_type, "runner"); // default
+        assert_eq!(ctx.run_id, None);
+        assert_eq!(ctx.task_id, None);
+        assert_eq!(ctx.protocol_run_id, None);
+        assert_eq!(ctx.protocol_state, None);
+    }
+
+    #[test]
+    fn test_parse_spawned_by_protocol_only() {
+        let proto_run_id = Uuid::new_v4();
+        let json = serde_json::json!({
+            "protocol_run_id": proto_run_id.to_string(),
+            "protocol_state": "review"
+        })
+        .to_string();
+
+        let ctx = parse_spawned_by(&json).unwrap();
+        assert_eq!(ctx.parent_session_id, None);
+        assert_eq!(ctx.protocol_run_id, Some(proto_run_id));
+        assert_eq!(ctx.protocol_state, Some("review".to_string()));
+    }
+
+    #[test]
+    fn test_parse_spawned_by_empty_json() {
+        let ctx = parse_spawned_by("{}").unwrap();
+        assert_eq!(ctx.parent_session_id, None);
+        assert_eq!(ctx.spawn_type, "runner");
+        assert_eq!(ctx.protocol_run_id, None);
+    }
+
+    #[test]
+    fn test_parse_spawned_by_invalid_json() {
+        assert!(parse_spawned_by("not json").is_none());
+    }
+
+    #[test]
+    fn test_parse_spawned_by_invalid_uuid() {
+        let json = r#"{"protocol_run_id": "not-a-uuid", "run_id": "also-bad"}"#;
+        let ctx = parse_spawned_by(json).unwrap();
+        assert_eq!(ctx.protocol_run_id, None);
+        assert_eq!(ctx.run_id, None);
     }
 }
