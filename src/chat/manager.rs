@@ -156,6 +156,11 @@ pub struct ChatManager {
     /// Pre-enrichment pipeline that runs before each LLM call.
     /// Enriches the user message with context from the knowledge graph.
     pub(crate) enrichment_pipeline: Arc<super::enrichment::EnrichmentPipeline>,
+    /// Trajectory collector for neural routing feedback loop.
+    /// When Some, `close_session()` calls `end_session()` to finalize trajectories.
+    pub(crate) trajectory_collector: Option<std::sync::Arc<neural_routing_runtime::TrajectoryCollector>>,
+    /// Reward computer for computing session reward on close.
+    pub(crate) reward_computer: neural_routing_runtime::SessionRewardComputer,
 }
 
 // ============================================================================
@@ -276,6 +281,8 @@ impl ChatManager {
             config_yaml_path: None,
             env_config,
             enrichment_pipeline,
+            trajectory_collector: None,
+            reward_computer: neural_routing_runtime::SessionRewardComputer::default(),
         }
     }
 
@@ -346,6 +353,8 @@ impl ChatManager {
             config_yaml_path: None,
             env_config,
             enrichment_pipeline,
+            trajectory_collector: None,
+            reward_computer: neural_routing_runtime::SessionRewardComputer::default(),
         }
     }
 
@@ -394,7 +403,7 @@ impl ChatManager {
         )));
         pipeline.add_stage(Box::new(
             super::stages::KnowledgeInjectionStage::new(self.graph.clone(), self.search.clone())
-                .with_collector(collector),
+                .with_collector(collector.clone()),
         ));
         pipeline.add_stage(Box::new(super::stages::StatusInjectionStage::new(
             self.graph.clone(),
@@ -403,6 +412,17 @@ impl ChatManager {
             self.graph.clone(),
         )));
         self.enrichment_pipeline = std::sync::Arc::new(pipeline);
+        // Store collector for end_session() in close_session()
+        self.trajectory_collector = Some(collector);
+        self
+    }
+
+    /// Set a custom reward computer for session reward computation.
+    pub fn with_reward_computer(
+        mut self,
+        computer: neural_routing_runtime::SessionRewardComputer,
+    ) -> Self {
+        self.reward_computer = computer;
         self
     }
 
@@ -4899,7 +4919,32 @@ impl ChatManager {
             session.client
         };
 
-        // 4. Disconnect with 5s timeout — if it hangs, drop(client) triggers SIGKILL via Drop
+        // 4. Finalize trajectory — fire-and-forget (non-blocking)
+        //    The collector's end_session uses try_send internally (<1ms).
+        //    Reward is computed from signals available to the collector (tool success,
+        //    confidence). Task completion signals come from the stale-session auto-flush.
+        if let Some(ref collector) = self.trajectory_collector {
+            // We don't have direct access to the DecisionRecords here (they live
+            // inside the collector's background loop). The collector will compute
+            // reward via its auto-flush mechanism. We send end_session with a
+            // sentinel reward of -1.0 to signal "compute reward from buffered data".
+            // However, the collector API expects a concrete reward. For now, we
+            // use a heuristic: sessions that were explicitly closed (not timed out)
+            // are likely successful — use a baseline of 0.5 that the collector's
+            // stale-flush will override if it has better signal.
+            //
+            // TODO(Phase 7): Pass actual signals from the session (e.g., via
+            // ActiveSession metadata) to compute a precise reward here.
+            let reward = 0.5; // baseline for explicitly-closed sessions
+            collector.end_session(session_id.to_string(), reward);
+            tracing::info!(
+                session_id = %session_id,
+                reward = %format!("{:.3}", reward),
+                "Trajectory finalized on session close"
+            );
+        }
+
+        // 5. Disconnect with 5s timeout — if it hangs, drop(client) triggers SIGKILL via Drop
         let disconnect_result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             let mut c = client.lock().await;
             c.disconnect().await

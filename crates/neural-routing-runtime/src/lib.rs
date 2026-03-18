@@ -18,6 +18,7 @@ pub mod drift;
 pub mod dual_track;
 pub mod exploration;
 pub mod inference_engine;
+pub mod reward;
 
 pub use collector::{CollectorEvent, DecisionRecord, TrajectoryCollector};
 pub use confidence::{PlattCalibrator, RolloutConfig};
@@ -29,6 +30,7 @@ pub use cpu_guard::CpuGuard;
 pub use drift::{DriftAction, DriftConfig, DriftDetector, DriftEvent, DriftType};
 pub use dual_track::DualTrackRouter;
 pub use exploration::{ExplorationConfig, ExplorationDecision, ExplorationScheduler};
+pub use reward::{SessionRewardComputer, SessionSignals};
 pub use inference_engine::{
     InferenceEngine, InferenceEngineConfig, InferenceError, InferenceResult, InferenceSource,
     PlannedAction,

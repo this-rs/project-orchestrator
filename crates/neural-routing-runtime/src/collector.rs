@@ -9,7 +9,8 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex};
+use std::time::Instant;
+use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use neural_routing_core::{
@@ -18,6 +19,7 @@ use neural_routing_core::{
 };
 
 use crate::config::CollectionConfig;
+use crate::reward::{SessionRewardComputer, SessionSignals};
 
 // ---------------------------------------------------------------------------
 // Events sent through the mpsc channel
@@ -102,7 +104,18 @@ impl TrajectoryCollector {
         config: &CollectionConfig,
         vector_builder: Option<Arc<DecisionVectorBuilder>>,
     ) -> (Self, tokio::task::JoinHandle<()>) {
+        Self::new_with_reward(store, config, vector_builder, SessionRewardComputer::default())
+    }
+
+    /// Create a collector with a custom reward computer.
+    pub fn new_with_reward(
+        store: Arc<Neo4jTrajectoryStore>,
+        config: &CollectionConfig,
+        vector_builder: Option<Arc<DecisionVectorBuilder>>,
+        reward_computer: SessionRewardComputer,
+    ) -> (Self, tokio::task::JoinHandle<()>) {
         let buffer_size = config.buffer_size;
+        let stale_timeout_secs = config.stale_session_timeout_secs;
         // Channel capacity = 2x buffer to absorb bursts without blocking
         let (tx, rx) = mpsc::channel(buffer_size * 2);
 
@@ -112,7 +125,16 @@ impl TrajectoryCollector {
         let builder_clone = builder.clone();
 
         let handle = tokio::spawn(async move {
-            run_collector_loop(rx, store, buffer_size, enabled_clone, builder_clone).await;
+            run_collector_loop(
+                rx,
+                store,
+                buffer_size,
+                enabled_clone,
+                builder_clone,
+                stale_timeout_secs,
+                reward_computer,
+            )
+            .await;
         });
 
         let collector = Self {
@@ -186,6 +208,8 @@ impl TrajectoryCollector {
 struct SessionBuffer {
     decisions: Vec<DecisionRecord>,
     started_at: chrono::DateTime<Utc>,
+    /// Monotonic instant of the last decision — used for stale session detection.
+    last_decision_at: Instant,
 }
 
 async fn run_collector_loop(
@@ -194,69 +218,114 @@ async fn run_collector_loop(
     buffer_size: usize,
     _enabled: Arc<std::sync::atomic::AtomicBool>,
     vector_builder: Arc<DecisionVectorBuilder>,
+    stale_timeout_secs: u64,
+    reward_computer: SessionRewardComputer,
 ) {
-    let sessions: Arc<Mutex<HashMap<String, SessionBuffer>>> = Arc::new(Mutex::new(HashMap::new()));
+    let mut sessions: HashMap<String, SessionBuffer> = HashMap::new();
+    let mut pending_flush: Vec<PendingTrajectory> = Vec::new();
 
-    // Batch of finalized trajectories waiting to be flushed
-    let pending_flush: Arc<Mutex<Vec<PendingTrajectory>>> = Arc::new(Mutex::new(Vec::new()));
+    // Stale session check interval = timeout/2 (minimum 5s to avoid busy-loop)
+    let check_interval = std::time::Duration::from_secs((stale_timeout_secs / 2).max(5));
+    let stale_timeout = std::time::Duration::from_secs(stale_timeout_secs);
+    let mut stale_timer = tokio::time::interval(check_interval);
+    // Don't fire immediately on startup
+    stale_timer.tick().await;
 
-    while let Some(event) = rx.recv().await {
-        match event {
-            CollectorEvent::Decision(record) => {
-                let mut sessions = sessions.lock().await;
-                let session = sessions
-                    .entry(record.session_id.clone())
-                    .or_insert_with(|| SessionBuffer {
-                        decisions: Vec::new(),
-                        started_at: Utc::now(),
-                    });
-                session.decisions.push(record);
-            }
+    loop {
+        tokio::select! {
+            event = rx.recv() => {
+                let Some(event) = event else { break };
+                match event {
+                    CollectorEvent::Decision(record) => {
+                        let session = sessions
+                            .entry(record.session_id.clone())
+                            .or_insert_with(|| SessionBuffer {
+                                decisions: Vec::new(),
+                                started_at: Utc::now(),
+                                last_decision_at: Instant::now(),
+                            });
+                        session.last_decision_at = Instant::now();
+                        session.decisions.push(record);
+                    }
 
-            CollectorEvent::EndSession {
-                session_id,
-                total_reward,
-            } => {
-                let mut sessions = sessions.lock().await;
-                if let Some(buffer) = sessions.remove(&session_id) {
-                    let trajectory =
-                        build_trajectory(&session_id, &buffer, total_reward, &vector_builder);
-                    let mut pending = pending_flush.lock().await;
-                    pending.push(trajectory);
+                    CollectorEvent::EndSession {
+                        session_id,
+                        total_reward,
+                    } => {
+                        if let Some(buffer) = sessions.remove(&session_id) {
+                            let trajectory =
+                                build_trajectory(&session_id, &buffer, total_reward, &vector_builder);
+                            pending_flush.push(trajectory);
 
-                    // Flush if we've accumulated enough
-                    if pending.len() >= buffer_size {
-                        let to_flush: Vec<_> = pending.drain(..).collect();
-                        drop(pending);
-                        flush_batch(&store, to_flush).await;
+                            // Flush if we've accumulated enough
+                            if pending_flush.len() >= buffer_size {
+                                let to_flush = std::mem::take(&mut pending_flush);
+                                flush_batch(&store, to_flush).await;
+                            }
+                        }
+                    }
+
+                    CollectorEvent::Shutdown => {
+                        // Finalize any open sessions with auto-computed reward
+                        let open_sessions: Vec<_> = sessions.drain().collect();
+                        for (session_id, buffer) in open_sessions {
+                            let reward = compute_auto_reward(&buffer, &reward_computer);
+                            let trajectory = build_trajectory(&session_id, &buffer, reward, &vector_builder);
+                            pending_flush.push(trajectory);
+                        }
+
+                        // Final flush
+                        if !pending_flush.is_empty() {
+                            let to_flush = std::mem::take(&mut pending_flush);
+                            flush_batch(&store, to_flush).await;
+                        }
+
+                        tracing::info!("TrajectoryCollector shutdown complete");
+                        break;
                     }
                 }
             }
 
-            CollectorEvent::Shutdown => {
-                // Finalize any open sessions with reward 0.0 (incomplete)
-                let mut sessions = sessions.lock().await;
-                let open_sessions: Vec<_> = sessions.drain().collect();
-                drop(sessions);
+            _ = stale_timer.tick() => {
+                // Check for stale sessions (no new decision for > stale_timeout)
+                let now = Instant::now();
+                let stale_ids: Vec<String> = sessions
+                    .iter()
+                    .filter(|(_, buf)| now.duration_since(buf.last_decision_at) > stale_timeout)
+                    .map(|(id, _)| id.clone())
+                    .collect();
 
-                let mut pending = pending_flush.lock().await;
-                for (session_id, buffer) in open_sessions {
-                    let trajectory = build_trajectory(&session_id, &buffer, 0.0, &vector_builder);
-                    pending.push(trajectory);
+                for session_id in stale_ids {
+                    if let Some(buffer) = sessions.remove(&session_id) {
+                        let reward = compute_auto_reward(&buffer, &reward_computer);
+                        tracing::info!(
+                            session_id = %session_id,
+                            decisions = buffer.decisions.len(),
+                            reward = %format!("{:.3}", reward),
+                            "Auto-finalized stale session"
+                        );
+                        let trajectory = build_trajectory(&session_id, &buffer, reward, &vector_builder);
+                        pending_flush.push(trajectory);
+                    }
                 }
 
-                // Final flush
-                let to_flush: Vec<_> = pending.drain(..).collect();
-                drop(pending);
-                if !to_flush.is_empty() {
+                // Flush if we have pending trajectories from stale sessions
+                if pending_flush.len() >= buffer_size {
+                    let to_flush = std::mem::take(&mut pending_flush);
                     flush_batch(&store, to_flush).await;
                 }
-
-                tracing::info!("TrajectoryCollector shutdown complete");
-                break;
             }
         }
     }
+}
+
+/// Compute reward from buffered decisions using the SessionRewardComputer.
+fn compute_auto_reward(buffer: &SessionBuffer, computer: &SessionRewardComputer) -> f64 {
+    let duration = (Utc::now() - buffer.started_at)
+        .to_std()
+        .unwrap_or(std::time::Duration::ZERO);
+    let signals = SessionSignals::from_decisions(&buffer.decisions, duration, 0, 0);
+    computer.compute(&signals)
 }
 
 // ---------------------------------------------------------------------------
@@ -618,6 +687,7 @@ mod tests {
                 make_decision("s1", "code.analyze_impact", 150),
             ],
             started_at: started,
+            last_decision_at: Instant::now(),
         };
 
         let pending = build_trajectory("s1", &buffer, 0.85, &builder);
@@ -726,6 +796,7 @@ mod tests {
         let buffer = SessionBuffer {
             decisions: vec![],
             started_at: Utc::now(),
+            last_decision_at: Instant::now(),
         };
 
         let pending = build_trajectory("empty", &buffer, 0.0, &builder);
@@ -849,6 +920,7 @@ mod tests {
         let buffer = SessionBuffer {
             decisions,
             started_at: started,
+            last_decision_at: Instant::now(),
         };
 
         let pending = build_trajectory("s2", &buffer, 0.78, &builder);
@@ -902,6 +974,7 @@ mod tests {
                 make_decision("embed-test", "note.get_context", 100),
             ],
             started_at: Utc::now(),
+            last_decision_at: Instant::now(),
         };
 
         let pending = build_trajectory("embed-test", &buffer, 0.9, &builder);
@@ -952,6 +1025,7 @@ mod tests {
         let buffer = SessionBuffer {
             decisions: vec![decision],
             started_at: Utc::now(),
+            last_decision_at: Instant::now(),
         };
 
         let pending = build_trajectory("precomp", &buffer, 1.0, &builder);
@@ -973,6 +1047,7 @@ mod tests {
                 make_decision("hist", "plan.create", 100),
             ],
             started_at: Utc::now(),
+            last_decision_at: Instant::now(),
         };
 
         let pending = build_trajectory("hist", &buffer, 0.8, &builder);
@@ -1001,6 +1076,7 @@ mod tests {
                 make_decision("reward-test", "code.analyze_impact", 100),
             ],
             started_at: Utc::now(),
+            last_decision_at: Instant::now(),
         };
 
         let pending = build_trajectory("reward-test", &buffer, 0.9, &builder);
@@ -1084,5 +1160,189 @@ mod tests {
             }
         }
         assert_eq!(event_count, 4);
+    }
+
+    // ── Integration tests — feedback loop ────────────────────────────────
+
+    #[test]
+    fn test_feedback_loop_two_sessions_with_reward() {
+        // Full feedback loop: record decisions across 2 sessions, end both,
+        // verify trajectories are built with correct reward decomposition.
+        let builder = DecisionVectorBuilder::new();
+        let computer = SessionRewardComputer::default();
+
+        // Session 1: 3 successful decisions, high confidence
+        let buf1 = SessionBuffer {
+            decisions: vec![
+                make_decision("s1", "code.search", 0),
+                make_decision("s1", "note.get_context", 50),
+                make_decision("s1", "code.analyze_impact", 150),
+            ],
+            started_at: Utc::now() - chrono::Duration::seconds(120),
+            last_decision_at: Instant::now(),
+        };
+
+        // Session 2: 2 decisions with mixed confidence
+        let mut d1 = make_decision("s2", "code.search", 0);
+        d1.confidence = 0.3;
+        d1.tool_usages[0].success = false;
+        let d2 = make_decision("s2", "note.create", 100);
+        let buf2 = SessionBuffer {
+            decisions: vec![d1, d2],
+            started_at: Utc::now() - chrono::Duration::seconds(30),
+            last_decision_at: Instant::now(),
+        };
+
+        // Compute rewards
+        let reward1 = compute_auto_reward(&buf1, &computer);
+        let reward2 = compute_auto_reward(&buf2, &computer);
+
+        // Session 1 (all success, high confidence) should have higher reward
+        assert!(
+            reward1 > reward2,
+            "All-success session should have higher reward: {} vs {}",
+            reward1,
+            reward2
+        );
+        assert!(reward1 > 0.0 && reward1 <= 1.0);
+        assert!(reward2 > 0.0 && reward2 <= 1.0);
+
+        // Build trajectories
+        let traj1 = build_trajectory("s1", &buf1, reward1, &builder);
+        let traj2 = build_trajectory("s2", &buf2, reward2, &builder);
+
+        // Verify trajectory 1
+        assert_eq!(traj1.trajectory.nodes.len(), 3);
+        assert_eq!(traj1.trajectory.step_count, 3);
+        assert!((traj1.trajectory.total_reward - reward1).abs() < 1e-10);
+
+        // Reward decomposition: sum of local_rewards ≈ total_reward
+        let sum1: f64 = traj1.trajectory.nodes.iter().map(|n| n.local_reward).sum();
+        assert!(
+            (sum1 - reward1).abs() < 0.05,
+            "local_rewards sum should ≈ total: {} vs {}",
+            sum1,
+            reward1
+        );
+
+        // Verify trajectory 2
+        assert_eq!(traj2.trajectory.nodes.len(), 2);
+        let sum2: f64 = traj2.trajectory.nodes.iter().map(|n| n.local_reward).sum();
+        assert!(
+            (sum2 - reward2).abs() < 0.05,
+            "local_rewards sum should ≈ total: {} vs {}",
+            sum2,
+            reward2
+        );
+
+        // Tool usages preserved
+        assert_eq!(traj1.tool_usages.len(), 3);
+        assert_eq!(traj1.tool_usages[0].len(), 1);
+        assert_eq!(traj1.tool_usages[0][0].tool_name, "code");
+        assert_eq!(traj2.tool_usages.len(), 2);
+
+        // Touched entities preserved
+        assert_eq!(traj1.touched_entities.len(), 3);
+        assert_eq!(traj2.touched_entities.len(), 2);
+    }
+
+    #[test]
+    fn test_feedback_loop_auto_reward_empty_session() {
+        let computer = SessionRewardComputer::default();
+        let buf = SessionBuffer {
+            decisions: vec![],
+            started_at: Utc::now(),
+            last_decision_at: Instant::now(),
+        };
+        let reward = compute_auto_reward(&buf, &computer);
+        assert_eq!(reward, 0.0, "Empty session should have 0 reward");
+    }
+
+    #[test]
+    fn test_feedback_loop_auto_reward_varies_with_success_rate() {
+        let computer = SessionRewardComputer::default();
+
+        // All success
+        let buf_ok = SessionBuffer {
+            decisions: vec![
+                make_decision("ok", "code.search", 0),
+                make_decision("ok", "code.search", 50),
+            ],
+            started_at: Utc::now() - chrono::Duration::seconds(300),
+            last_decision_at: Instant::now(),
+        };
+
+        // All failure
+        let mut d_fail = make_decision("fail", "code.search", 0);
+        d_fail.tool_usages[0].success = false;
+        d_fail.confidence = 0.1;
+        let mut d_fail2 = make_decision("fail", "code.search", 50);
+        d_fail2.tool_usages[0].success = false;
+        d_fail2.confidence = 0.1;
+        let buf_fail = SessionBuffer {
+            decisions: vec![d_fail, d_fail2],
+            started_at: Utc::now() - chrono::Duration::seconds(300),
+            last_decision_at: Instant::now(),
+        };
+
+        let reward_ok = compute_auto_reward(&buf_ok, &computer);
+        let reward_fail = compute_auto_reward(&buf_fail, &computer);
+
+        assert!(
+            reward_ok > reward_fail,
+            "All-success should beat all-failure: {} vs {}",
+            reward_ok,
+            reward_fail
+        );
+    }
+
+    #[tokio::test]
+    async fn test_feedback_loop_event_flow_with_reward() {
+        // Full event flow: send decisions for 2 sessions, end them with
+        // computed rewards, verify events pass through channel correctly.
+        let (tx, mut rx) = mpsc::channel::<CollectorEvent>(100);
+        let enabled = Arc::new(std::sync::atomic::AtomicBool::new(true));
+
+        let collector = TrajectoryCollector {
+            tx,
+            enabled,
+            vector_builder: Arc::new(DecisionVectorBuilder::new()),
+        };
+
+        // Session A: 3 decisions
+        collector.record_decision(make_decision("session-a", "code.search", 0));
+        collector.record_decision(make_decision("session-a", "note.get_context", 50));
+        collector.record_decision(make_decision("session-a", "plan.create", 120));
+
+        // Session B: 2 decisions
+        collector.record_decision(make_decision("session-b", "code.search", 0));
+        collector.record_decision(make_decision("session-b", "task.create", 80));
+
+        // End both sessions with rewards
+        collector.end_session("session-a".to_string(), 0.85);
+        collector.end_session("session-b".to_string(), 0.6);
+
+        // Verify 7 events: 3 + 2 decisions + 2 end_session
+        let mut decisions_a = 0;
+        let mut decisions_b = 0;
+        let mut ends = 0;
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                CollectorEvent::Decision(d) if d.session_id == "session-a" => decisions_a += 1,
+                CollectorEvent::Decision(d) if d.session_id == "session-b" => decisions_b += 1,
+                CollectorEvent::EndSession { session_id, total_reward } => {
+                    match session_id.as_str() {
+                        "session-a" => assert!((total_reward - 0.85).abs() < 1e-10),
+                        "session-b" => assert!((total_reward - 0.6).abs() < 1e-10),
+                        _ => panic!("Unexpected session: {}", session_id),
+                    }
+                    ends += 1;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(decisions_a, 3);
+        assert_eq!(decisions_b, 2);
+        assert_eq!(ends, 2);
     }
 }
