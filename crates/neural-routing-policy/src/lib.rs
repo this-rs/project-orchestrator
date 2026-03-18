@@ -10,6 +10,7 @@
 //! Built on candle (HuggingFace) — pure Rust, no Python dependency.
 //! Always compiled (build full), activation controlled at runtime via settings.
 
+pub mod benchmark;
 pub mod cql;
 pub mod dataloader;
 pub mod dataset;
