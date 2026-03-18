@@ -1082,6 +1082,247 @@ pub fn assemble_sections(sections: &[BasePromptSection]) -> String {
 }
 
 // ============================================================================
+// Tool Reference Groups — selective rendering of TOOL_REFERENCE
+// ============================================================================
+
+/// Identifies a group of related MCP tools for selective rendering.
+///
+/// Instead of always including the full ~600-line TOOL_REFERENCE, the system
+/// selects relevant groups based on intent, FSM state, and scaffolding level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ToolRefGroupId {
+    /// project, plan, task, step, constraint, release, milestone — always included
+    Core,
+    /// note, decision, commit — always included (compact)
+    Knowledge,
+    /// code, analysis_profile — included when code questions / file mentions
+    CodeExploration,
+    /// admin — included at L0-L1 or when GDS/maintenance requested
+    Structural,
+    /// protocol, skill, persona, episode — included when protocols active or L0-L1
+    Behavioral,
+    /// workspace, workspace_milestone, resource, component — included in multi-project
+    Workspace,
+    /// chat, feature_graph, sharing, reasoning — included on demand
+    Collaboration,
+}
+
+impl ToolRefGroupId {
+    /// All group IDs.
+    pub const ALL: &'static [ToolRefGroupId] = &[
+        Self::Core,
+        Self::Knowledge,
+        Self::CodeExploration,
+        Self::Structural,
+        Self::Behavioral,
+        Self::Workspace,
+        Self::Collaboration,
+    ];
+
+    /// Tool names belonging to this group.
+    pub fn tool_names(&self) -> &'static [&'static str] {
+        match self {
+            Self::Core => &["project", "plan", "task", "step", "constraint", "release", "milestone"],
+            Self::Knowledge => &["note", "decision", "commit"],
+            Self::CodeExploration => &["code", "analysis_profile"],
+            Self::Structural => &["admin"],
+            Self::Behavioral => &["protocol", "skill", "persona", "episode"],
+            Self::Workspace => &["workspace", "workspace_milestone", "resource", "component"],
+            Self::Collaboration => &["chat", "feature_graph", "sharing", "reasoning"],
+        }
+    }
+
+    /// Display name for the group header.
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            Self::Core => "Core (Project, Planning, Tracking)",
+            Self::Knowledge => "Knowledge (Notes, Decisions, Commits)",
+            Self::CodeExploration => "Code Exploration & Analytics",
+            Self::Structural => "Admin & Sync",
+            Self::Behavioral => "Behavioral (Protocols, Skills, Personas, Episodes)",
+            Self::Workspace => "Workspace (Multi-project)",
+            Self::Collaboration => "Collaboration (Chat, Features, Sharing, Reasoning)",
+        }
+    }
+}
+
+/// Context for tool group selection.
+pub struct ToolGroupSelectionContext {
+    pub scaffolding_level: u8,
+    pub has_active_protocol: bool,
+    pub is_multi_project: bool,
+    /// Tool names whitelisted by the current FSM state's `available_tools`.
+    /// Empty = no FSM restriction (include all).
+    pub fsm_available_tools: Vec<String>,
+    /// Keywords detected in the user message for intent matching.
+    pub user_intent_keywords: Vec<String>,
+}
+
+impl Default for ToolGroupSelectionContext {
+    fn default() -> Self {
+        Self {
+            scaffolding_level: 0,
+            has_active_protocol: false,
+            is_multi_project: false,
+            fsm_available_tools: vec![],
+            user_intent_keywords: vec![],
+        }
+    }
+}
+
+/// Intent keywords that trigger specific tool groups.
+const CODE_KEYWORDS: &[&str] = &[
+    "code", "function", "file", "import", "search", "find", "reference",
+    "symbol", "architecture", "impact", "call graph", "dependency",
+    "trait", "struct", "class", "cherche", "fonction", "fichier",
+];
+const STRUCTURAL_KEYWORDS: &[&str] = &[
+    "admin", "sync", "maintenance", "health", "fabric", "gds",
+    "neuron", "synapse", "energy", "staleness", "hotspot",
+];
+const BEHAVIORAL_KEYWORDS: &[&str] = &[
+    "protocol", "skill", "persona", "episode", "fsm", "state machine",
+    "transition", "protocole", "compétence",
+];
+const WORKSPACE_KEYWORDS: &[&str] = &[
+    "workspace", "component", "resource", "multi-project", "topology",
+    "cross-project",
+];
+const COLLAB_KEYWORDS: &[&str] = &[
+    "chat", "session", "feature graph", "sharing", "reasoning",
+    "reason", "conversation",
+];
+
+/// Select which tool reference groups to include in the prompt.
+///
+/// Selection logic:
+/// 1. Core + Knowledge are ALWAYS included
+/// 2. FSM available_tools whitelist overrides everything (if non-empty)
+/// 3. Intent keywords trigger relevant groups
+/// 4. Scaffolding level gates advanced groups (Structural, Behavioral at L0-L1)
+/// 5. Multi-project context triggers Workspace
+pub fn select_tool_groups(ctx: &ToolGroupSelectionContext) -> Vec<ToolRefGroupId> {
+    // If FSM restricts tools, only include groups that have at least one whitelisted tool
+    if !ctx.fsm_available_tools.is_empty() {
+        return ToolRefGroupId::ALL
+            .iter()
+            .copied()
+            .filter(|group| {
+                // Core is always included
+                if matches!(group, ToolRefGroupId::Core | ToolRefGroupId::Knowledge) {
+                    return true;
+                }
+                // Include group if any of its tools is in the whitelist
+                group.tool_names().iter().any(|tool| {
+                    ctx.fsm_available_tools.iter().any(|allowed| allowed == tool)
+                })
+            })
+            .collect();
+    }
+
+    let mut selected = vec![ToolRefGroupId::Core, ToolRefGroupId::Knowledge];
+    let msg_lower: String = ctx.user_intent_keywords.join(" ").to_lowercase();
+
+    // Intent-based inclusion
+    let has_code_intent = CODE_KEYWORDS.iter().any(|kw| msg_lower.contains(kw));
+    let has_structural_intent = STRUCTURAL_KEYWORDS.iter().any(|kw| msg_lower.contains(kw));
+    let has_behavioral_intent = BEHAVIORAL_KEYWORDS.iter().any(|kw| msg_lower.contains(kw));
+    let has_workspace_intent = WORKSPACE_KEYWORDS.iter().any(|kw| msg_lower.contains(kw));
+    let has_collab_intent = COLLAB_KEYWORDS.iter().any(|kw| msg_lower.contains(kw));
+
+    // CodeExploration: included by intent OR at L0-L2 (common need)
+    if has_code_intent || ctx.scaffolding_level <= 2 {
+        selected.push(ToolRefGroupId::CodeExploration);
+    }
+
+    // Structural: included by intent OR at L0-L1
+    if has_structural_intent || ctx.scaffolding_level <= 1 {
+        selected.push(ToolRefGroupId::Structural);
+    }
+
+    // Behavioral: included by intent OR active protocols OR L0-L1
+    if has_behavioral_intent || ctx.has_active_protocol || ctx.scaffolding_level <= 1 {
+        selected.push(ToolRefGroupId::Behavioral);
+    }
+
+    // Workspace: included by intent OR multi-project context OR L0
+    if has_workspace_intent || ctx.is_multi_project || ctx.scaffolding_level == 0 {
+        selected.push(ToolRefGroupId::Workspace);
+    }
+
+    // Collaboration: included by intent OR L0
+    if has_collab_intent || ctx.scaffolding_level == 0 {
+        selected.push(ToolRefGroupId::Collaboration);
+    }
+
+    selected
+}
+
+/// Extract tool sections from the full TOOL_REFERENCE text for a given set of groups.
+///
+/// Parses TOOL_REFERENCE by finding `## toolname` headers and extracting only
+/// the sections whose tool names match the selected groups.
+pub fn extract_tool_reference(
+    tool_reference: &str,
+    groups: &[ToolRefGroupId],
+) -> String {
+    // Collect all tool names we want
+    let wanted_tools: Vec<&str> = groups
+        .iter()
+        .flat_map(|g| g.tool_names().iter().copied())
+        .collect();
+
+    let mut result = String::from("# MCP Mega-Tools Reference\n\nAll tools require `action` (string). UUIDs are strings. Dates are ISO 8601.\n");
+    let mut current_tool: Option<&str> = None;
+    let mut current_section = String::new();
+    let mut include_current = false;
+
+    for line in tool_reference.lines() {
+        // Detect `## toolname` headers
+        if line.starts_with("## ") && !line.starts_with("### ") {
+            // Flush previous section if included
+            if include_current && !current_section.is_empty() {
+                result.push('\n');
+                result.push_str(&current_section);
+            }
+
+            // Parse new tool name
+            let tool_name = line[3..].split_whitespace().next().unwrap_or("");
+            // Tool name is the word after "## " — e.g., "## project" → "project"
+            // But some lines are "## project\n" and some are like "## workspace_milestone"
+            current_tool = Some(tool_name);
+            include_current = wanted_tools.iter().any(|w| *w == tool_name);
+            current_section.clear();
+            if include_current {
+                current_section.push_str(line);
+                current_section.push('\n');
+            }
+        } else if line.starts_with("# ") && !line.starts_with("## ") {
+            // Skip the main header (already added above)
+            // Also flush any pending section
+            if include_current && !current_section.is_empty() {
+                result.push('\n');
+                result.push_str(&current_section);
+            }
+            current_section.clear();
+            include_current = false;
+            current_tool = None;
+        } else if current_tool.is_some() && include_current {
+            current_section.push_str(line);
+            current_section.push('\n');
+        }
+    }
+
+    // Flush last section
+    if include_current && !current_section.is_empty() {
+        result.push('\n');
+        result.push_str(&current_section);
+    }
+
+    result
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -1242,5 +1483,139 @@ mod tests {
                 i, section_counts[i], i - 1, section_counts[i - 1]
             );
         }
+    }
+
+    // ── Tool Reference Group tests ───────────────────────────────────
+
+    #[test]
+    fn test_tool_groups_cover_all_25_tools() {
+        let mut all_tools: Vec<&str> = ToolRefGroupId::ALL
+            .iter()
+            .flat_map(|g| g.tool_names().iter().copied())
+            .collect();
+        all_tools.sort();
+        all_tools.dedup();
+        // 25 mega-tools + analysis_profile + neural_routing/trajectory = at least 25
+        assert!(
+            all_tools.len() >= 25,
+            "Groups should cover at least 25 tools, got {}",
+            all_tools.len()
+        );
+    }
+
+    #[test]
+    fn test_tool_groups_no_overlap() {
+        let mut seen = std::collections::HashSet::new();
+        for group in ToolRefGroupId::ALL {
+            for tool in group.tool_names() {
+                assert!(
+                    seen.insert(*tool),
+                    "Tool '{}' appears in multiple groups",
+                    tool
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_select_tool_groups_l0_all() {
+        let ctx = ToolGroupSelectionContext::default(); // L0
+        let groups = select_tool_groups(&ctx);
+        assert_eq!(
+            groups.len(), 7,
+            "L0 should include all 7 groups, got {}",
+            groups.len()
+        );
+    }
+
+    #[test]
+    fn test_select_tool_groups_l4_minimal() {
+        let ctx = ToolGroupSelectionContext {
+            scaffolding_level: 4,
+            ..Default::default()
+        };
+        let groups = select_tool_groups(&ctx);
+        // At L4 without intent: Core + Knowledge only
+        assert_eq!(groups.len(), 2, "L4 without intent should have 2 groups, got {}", groups.len());
+        assert!(groups.contains(&ToolRefGroupId::Core));
+        assert!(groups.contains(&ToolRefGroupId::Knowledge));
+    }
+
+    #[test]
+    fn test_select_tool_groups_code_intent() {
+        let ctx = ToolGroupSelectionContext {
+            scaffolding_level: 4,
+            user_intent_keywords: vec!["cherche la function X".to_string()],
+            ..Default::default()
+        };
+        let groups = select_tool_groups(&ctx);
+        assert!(
+            groups.contains(&ToolRefGroupId::CodeExploration),
+            "Code intent should include CodeExploration"
+        );
+    }
+
+    #[test]
+    fn test_select_tool_groups_fsm_whitelist() {
+        let ctx = ToolGroupSelectionContext {
+            scaffolding_level: 0,
+            fsm_available_tools: vec!["code".to_string(), "note".to_string()],
+            ..Default::default()
+        };
+        let groups = select_tool_groups(&ctx);
+        // Core + Knowledge always, plus CodeExploration (has "code") and Knowledge (has "note")
+        assert!(groups.contains(&ToolRefGroupId::Core), "Core always included");
+        assert!(groups.contains(&ToolRefGroupId::Knowledge), "Knowledge always included");
+        assert!(groups.contains(&ToolRefGroupId::CodeExploration), "CodeExploration has 'code'");
+        assert!(!groups.contains(&ToolRefGroupId::Workspace), "Workspace not in whitelist");
+    }
+
+    #[test]
+    fn test_extract_tool_reference_core_only() {
+        use crate::chat::prompt::TOOL_REFERENCE;
+        let groups = vec![ToolRefGroupId::Core];
+        let extracted = extract_tool_reference(TOOL_REFERENCE, &groups);
+
+        assert!(extracted.contains("## project"), "Should contain project");
+        assert!(extracted.contains("## plan"), "Should contain plan");
+        assert!(extracted.contains("## task"), "Should contain task");
+        assert!(extracted.contains("## step"), "Should contain step");
+        assert!(!extracted.contains("## code\n"), "Should NOT contain code");
+        assert!(!extracted.contains("## admin"), "Should NOT contain admin");
+    }
+
+    #[test]
+    fn test_extract_tool_reference_all_groups() {
+        use crate::chat::prompt::TOOL_REFERENCE;
+        let groups = ToolRefGroupId::ALL.to_vec();
+        let extracted = extract_tool_reference(TOOL_REFERENCE, &groups);
+
+        // Should contain all major tools
+        assert!(extracted.contains("## project"), "Should contain project");
+        assert!(extracted.contains("## code"), "Should contain code");
+        assert!(extracted.contains("## admin"), "Should contain admin");
+        assert!(extracted.contains("## protocol"), "Should contain protocol");
+    }
+
+    #[test]
+    fn test_extract_tool_reference_smaller_than_full() {
+        use crate::chat::prompt::TOOL_REFERENCE;
+
+        let core_only = extract_tool_reference(TOOL_REFERENCE, &[ToolRefGroupId::Core, ToolRefGroupId::Knowledge]);
+        let full = extract_tool_reference(TOOL_REFERENCE, &ToolRefGroupId::ALL.to_vec());
+
+        assert!(
+            core_only.len() < full.len(),
+            "Core-only ({}) should be smaller than full ({})",
+            core_only.len(),
+            full.len()
+        );
+        // Significant reduction expected
+        let ratio = core_only.len() as f64 / full.len() as f64;
+        assert!(
+            ratio < 0.6,
+            "Core+Knowledge should be <60% of full reference, got {:.1}%",
+            ratio * 100.0
+        );
     }
 }
