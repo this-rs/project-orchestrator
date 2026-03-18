@@ -275,6 +275,7 @@ fn make_trajectory(rng: &mut SimpleRng, dim: usize) -> Trajectory {
         duration_ms: 500 + rng.next_u64() % 2000,
         nodes,
         created_at: Utc::now() - Duration::days(age_days),
+        protocol_run_id: None,
     }
 }
 

@@ -304,6 +304,8 @@ impl ContextBuilder {
                 project_slug: project_slug.map(|s| s.to_string()),
                 project_id,
                 cwd: None,
+                protocol_run_id: None,
+                protocol_state: None,
             };
 
             let enrichment_ctx = pipeline.execute(&input).await;

@@ -2759,6 +2759,14 @@ pub trait GraphStore: Send + Sync {
     /// Get all states for a protocol.
     async fn get_protocol_states(&self, protocol_id: Uuid) -> Result<Vec<ProtocolState>>;
 
+    /// Check if a protocol with the given name already exists in the project.
+    /// Returns the existing protocol's UUID if found.
+    async fn get_protocol_by_name_and_project(
+        &self,
+        name: &str,
+        project_id: Uuid,
+    ) -> Result<Option<Uuid>>;
+
     /// Delete a protocol state and its relationships.
     async fn delete_protocol_state(&self, state_id: Uuid) -> Result<bool>;
 
@@ -2782,7 +2790,9 @@ pub trait GraphStore: Send + Sync {
     async fn get_protocol_run(&self, run_id: Uuid) -> Result<Option<ProtocolRun>>;
 
     /// Update an existing protocol run (current_state, states_visited, status, etc.).
-    async fn update_protocol_run(&self, run: &ProtocolRun) -> Result<()>;
+    /// On success, bumps `run.version` in-place to match the persisted value.
+    /// Returns `OptimisticLockError` if the run was modified concurrently.
+    async fn update_protocol_run(&self, run: &mut ProtocolRun) -> Result<()>;
 
     /// List protocol runs for a protocol with optional status filter and pagination.
     /// Returns (runs, total_count).

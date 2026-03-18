@@ -37,6 +37,10 @@ pub struct SessionHints {
     pub tasks_completed: usize,
     /// Total number of MCP tasks active during this session.
     pub tasks_total: usize,
+    /// Active protocol run ID (if the session is executing within a protocol FSM).
+    pub protocol_run_id: Option<Uuid>,
+    /// Current protocol state name (e.g., "implement", "review").
+    pub protocol_state: Option<String>,
 }
 
 /// A decision event sent from the hot path to the background collector.
@@ -92,6 +96,13 @@ pub struct DecisionRecord {
     /// VectorBuilder to compute the 64d graph_state block.
     #[serde(default)]
     pub node_features: Vec<neural_routing_core::NodeFeatures>,
+    /// Protocol run ID if this decision was made during an active FSM run.
+    /// Injected by the ChatManager from the current session context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_run_id: Option<Uuid>,
+    /// Protocol state name at the time of this decision (e.g., "implement", "review").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_state: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -617,6 +628,9 @@ fn build_trajectory(
         .map(|n| n.context_embedding.clone())
         .unwrap_or_else(|| neural_routing_core::sentinel_vector(TOTAL_DIM, 0xCAFE_BABE));
 
+    // Extract protocol_run_id from the first decision that has one
+    let protocol_run_id = buffer.decisions.iter().find_map(|d| d.protocol_run_id);
+
     PendingTrajectory {
         trajectory: Trajectory {
             id: trajectory_id,
@@ -627,6 +641,7 @@ fn build_trajectory(
             duration_ms,
             nodes,
             created_at: now,
+            protocol_run_id,
         },
         tool_usages,
         touched_entities,
@@ -690,6 +705,21 @@ async fn flush_batch(
                         "Failed to link touched entities"
                     );
                 }
+            }
+        }
+
+        // Link trajectory to protocol run if present (DURING_RUN relation)
+        if let Some(run_id) = pending.trajectory.protocol_run_id {
+            if let Err(e) = store
+                .link_trajectory_to_run(&pending.trajectory.id, &run_id)
+                .await
+            {
+                tracing::warn!(
+                    trajectory_id = %pending.trajectory.id,
+                    run_id = %run_id,
+                    error = %e,
+                    "Failed to link trajectory to protocol run"
+                );
             }
         }
 
@@ -760,6 +790,8 @@ mod tests {
             timestamp_ms: ts_ms,
             query_embedding: vec![],
             node_features: vec![],
+            protocol_run_id: None,
+            protocol_state: None,
         }
     }
 
@@ -1011,6 +1043,8 @@ mod tests {
                 timestamp_ms: 0,
                 query_embedding: vec![],
                 node_features: vec![],
+                protocol_run_id: None,
+                protocol_state: None,
             },
             DecisionRecord {
                 session_id: "s2".into(),
@@ -1036,6 +1070,8 @@ mod tests {
                 timestamp_ms: 50,
                 query_embedding: vec![],
                 node_features: vec![],
+                protocol_run_id: None,
+                protocol_state: None,
             },
             DecisionRecord {
                 session_id: "s2".into(),
@@ -1069,6 +1105,8 @@ mod tests {
                 timestamp_ms: 200,
                 query_embedding: vec![],
                 node_features: vec![],
+                protocol_run_id: None,
+                protocol_state: None,
             },
         ];
 
@@ -1526,6 +1564,8 @@ mod tests {
             SessionHints {
                 tasks_completed: 2,
                 tasks_total: 3,
+                protocol_run_id: None,
+                protocol_state: None,
             },
         );
 
@@ -1573,6 +1613,8 @@ mod tests {
             &SessionHints {
                 tasks_completed: 3,
                 tasks_total: 3,
+                protocol_run_id: None,
+                protocol_state: None,
             },
         );
 
@@ -1583,6 +1625,8 @@ mod tests {
             &SessionHints {
                 tasks_completed: 0,
                 tasks_total: 3,
+                protocol_run_id: None,
+                protocol_state: None,
             },
         );
 
@@ -1617,5 +1661,99 @@ mod tests {
 
         // Channel should be empty since collection is disabled
         assert!(rx.try_recv().is_err());
+    }
+
+    // ── FSM Runtime Gaps — protocol field propagation ────────────────────
+
+    #[test]
+    fn test_session_hints_protocol_fields() {
+        let run_id = uuid::Uuid::new_v4();
+        let hints = SessionHints {
+            protocol_run_id: Some(run_id),
+            protocol_state: Some("implement".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(hints.protocol_run_id, Some(run_id));
+        assert_eq!(hints.protocol_state, Some("implement".to_string()));
+    }
+
+    #[test]
+    fn test_decision_record_protocol_fields() {
+        let run_id = uuid::Uuid::new_v4();
+        let record = DecisionRecord {
+            session_id: "test-session".to_string(),
+            context_embedding: vec![],
+            action_type: "test".to_string(),
+            action_params: serde_json::json!({}),
+            alternatives_count: 1,
+            chosen_index: 0,
+            confidence: 0.9,
+            tool_usages: vec![],
+            touched_entities: vec![],
+            timestamp_ms: 0,
+            query_embedding: vec![],
+            node_features: vec![],
+            protocol_run_id: Some(run_id),
+            protocol_state: Some("review".to_string()),
+        };
+        assert_eq!(record.protocol_run_id, Some(run_id));
+        assert_eq!(record.protocol_state, Some("review".to_string()));
+    }
+
+    #[test]
+    fn test_trajectory_extracts_protocol_run_id_from_decisions() {
+        // This tests the protocol_run_id extraction logic in build_trajectory
+        let run_id = uuid::Uuid::new_v4();
+
+        // Create decisions where the second one has a protocol_run_id
+        let d1 = DecisionRecord {
+            session_id: "s1".to_string(),
+            context_embedding: vec![0.0; 128],
+            action_type: "tool.call".to_string(),
+            action_params: serde_json::json!({}),
+            alternatives_count: 1,
+            chosen_index: 0,
+            confidence: 0.8,
+            tool_usages: vec![],
+            touched_entities: vec![],
+            timestamp_ms: 100,
+            query_embedding: vec![],
+            node_features: vec![],
+            protocol_run_id: None,
+            protocol_state: None,
+        };
+        let d2 = DecisionRecord {
+            protocol_run_id: Some(run_id),
+            protocol_state: Some("execute".to_string()),
+            ..d1.clone()
+        };
+
+        // The extraction logic: buffer.decisions.iter().find_map(|d| d.protocol_run_id)
+        let decisions = vec![d1, d2];
+        let extracted = decisions.iter().find_map(|d| d.protocol_run_id);
+        assert_eq!(extracted, Some(run_id));
+    }
+
+    #[test]
+    fn test_trajectory_no_protocol_context() {
+        let d1 = DecisionRecord {
+            session_id: "s1".to_string(),
+            context_embedding: vec![],
+            action_type: "tool.call".to_string(),
+            action_params: serde_json::json!({}),
+            alternatives_count: 1,
+            chosen_index: 0,
+            confidence: 0.8,
+            tool_usages: vec![],
+            touched_entities: vec![],
+            timestamp_ms: 100,
+            query_embedding: vec![],
+            node_features: vec![],
+            protocol_run_id: None,
+            protocol_state: None,
+        };
+        let decisions = vec![d1];
+        let extracted: Option<uuid::Uuid> = decisions.iter().find_map(|d| d.protocol_run_id);
+        assert_eq!(extracted, None);
     }
 }

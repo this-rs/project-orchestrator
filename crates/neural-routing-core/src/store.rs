@@ -303,7 +303,8 @@ impl TrajectoryStore for Neo4jTrajectoryStore {
                 total_reward: $total_reward,
                 step_count: $step_count,
                 duration_ms: $duration_ms,
-                created_at: datetime($created_at)
+                created_at: datetime($created_at),
+                protocol_run_id: $protocol_run_id
             })",
         )
         .param("id", trajectory.id.to_string())
@@ -312,7 +313,14 @@ impl TrajectoryStore for Neo4jTrajectoryStore {
         .param("total_reward", trajectory.total_reward)
         .param("step_count", trajectory.step_count as i64)
         .param("duration_ms", trajectory.duration_ms as i64)
-        .param("created_at", trajectory.created_at.to_rfc3339());
+        .param("created_at", trajectory.created_at.to_rfc3339())
+        .param(
+            "protocol_run_id",
+            trajectory
+                .protocol_run_id
+                .map(|u| u.to_string())
+                .unwrap_or_default(),
+        );
 
         self.graph
             .run(create_trajectory)
@@ -666,6 +674,10 @@ impl TrajectoryStore for Neo4jTrajectoryStore {
             .iter()
             .map(|t| t.created_at.to_rfc3339())
             .collect();
+        let run_ids: Vec<String> = trajectories
+            .iter()
+            .map(|t| t.protocol_run_id.map(|u| u.to_string()).unwrap_or_default())
+            .collect();
 
         let create_trajectories = query(
             "UNWIND range(0, size($ids) - 1) AS i
@@ -676,7 +688,8 @@ impl TrajectoryStore for Neo4jTrajectoryStore {
                  total_reward: $rewards[i],
                  step_count: $step_counts[i],
                  duration_ms: $durations[i],
-                 created_at: datetime($created_ats[i])
+                 created_at: datetime($created_ats[i]),
+                 protocol_run_id: $run_ids[i]
              })",
         )
         .param("ids", ids)
@@ -685,7 +698,8 @@ impl TrajectoryStore for Neo4jTrajectoryStore {
         .param("rewards", rewards)
         .param("step_counts", step_counts)
         .param("durations", durations)
-        .param("created_ats", created_ats);
+        .param("created_ats", created_ats)
+        .param("run_ids", run_ids);
 
         txn.run(create_trajectories)
             .await
@@ -798,6 +812,23 @@ impl TrajectoryStore for Neo4jTrajectoryStore {
         Ok(count)
     }
 
+    async fn link_trajectory_to_run(&self, trajectory_id: &Uuid, run_id: &Uuid) -> Result<()> {
+        let q = query(
+            "MATCH (t:Trajectory {id: $trajectory_id})
+             MATCH (r:ProtocolRun {id: $run_id})
+             MERGE (t)-[:DURING_RUN]->(r)",
+        )
+        .param("trajectory_id", trajectory_id.to_string())
+        .param("run_id", run_id.to_string());
+
+        self.graph
+            .run(q)
+            .await
+            .map_err(|e| NeuralRoutingError::Neo4j(e.to_string()))?;
+
+        Ok(())
+    }
+
     async fn delete_trajectory(&self, id: &Uuid) -> Result<bool> {
         let q = query(
             "MATCH (t:Trajectory {id: $id})
@@ -859,6 +890,11 @@ fn parse_trajectory(node: &neo4rs::Node, nodes: Vec<TrajectoryNode>) -> Result<T
                 .map(|dt| dt.with_timezone(&chrono::Utc))
                 .unwrap_or_else(|_| chrono::Utc::now())
         },
+        protocol_run_id: node
+            .get::<String>("protocol_run_id")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .and_then(|s| s.parse().ok()),
     })
 }
 

@@ -378,6 +378,7 @@ impl<P: ProxyModel> MctsEngine<P> {
             duration_ms: source.duration_ms,
             nodes,
             created_at: now,
+            protocol_run_id: None,
         }
     }
 }
@@ -417,6 +418,7 @@ mod tests {
             duration_ms: 500,
             nodes,
             created_at: chrono::Utc::now(),
+            protocol_run_id: None,
         }
     }
 
@@ -463,6 +465,7 @@ mod tests {
             duration_ms: 0,
             nodes: vec![],
             created_at: chrono::Utc::now(),
+            protocol_run_id: None,
         };
 
         let alternatives = engine.generate_alternatives(&source).await.unwrap();

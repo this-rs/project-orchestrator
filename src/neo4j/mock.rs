@@ -9726,6 +9726,20 @@ impl GraphStore for MockGraphStore {
         Ok(states)
     }
 
+    async fn get_protocol_by_name_and_project(
+        &self,
+        name: &str,
+        project_id: Uuid,
+    ) -> anyhow::Result<Option<Uuid>> {
+        let store = self.protocols.read().await;
+        for proto in store.values() {
+            if proto.name == name && proto.project_id == project_id {
+                return Ok(Some(proto.id));
+            }
+        }
+        Ok(None)
+    }
+
     async fn delete_protocol_state(&self, state_id: Uuid) -> anyhow::Result<bool> {
         Ok(self
             .protocol_states
@@ -9805,10 +9819,27 @@ impl GraphStore for MockGraphStore {
         Ok(self.protocol_runs.read().await.get(&run_id).cloned())
     }
 
-    async fn update_protocol_run(&self, run: &crate::protocol::ProtocolRun) -> anyhow::Result<()> {
+    async fn update_protocol_run(
+        &self,
+        run: &mut crate::protocol::ProtocolRun,
+    ) -> anyhow::Result<()> {
         let mut store = self.protocol_runs.write().await;
         if let std::collections::hash_map::Entry::Occupied(mut e) = store.entry(run.id) {
-            e.insert(run.clone());
+            let existing = e.get();
+            if existing.version != run.version {
+                anyhow::bail!(
+                    "OptimisticLockError: protocol run {} was modified concurrently (expected version {}, found {})",
+                    run.id,
+                    run.version,
+                    existing.version
+                );
+            }
+            let new_version = run.version + 1;
+            let mut updated = run.clone();
+            updated.version = new_version;
+            e.insert(updated);
+            // Bump version in-place so the caller's struct stays in sync
+            run.version = new_version;
             Ok(())
         } else {
             anyhow::bail!("ProtocolRun not found: {}", run.id)

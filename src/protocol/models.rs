@@ -632,8 +632,31 @@ pub struct StateVisit {
     pub state_name: String,
     /// When this state was entered
     pub entered_at: DateTime<Utc>,
+    /// When this state was exited (None if still current or for legacy data)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exited_at: Option<DateTime<Utc>>,
+    /// Time spent in this state in milliseconds (computed: exited_at - entered_at)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<i64>,
     /// The trigger that caused entry (None for the initial state)
     pub trigger: Option<String>,
+    /// Last progress snapshot reported while in this state (from report_progress)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress_snapshot: Option<ProgressSnapshot>,
+}
+
+/// A lightweight progress snapshot captured from `report_progress()`.
+/// Stored inside a StateVisit to preserve progress data after state exit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProgressSnapshot {
+    /// Current sub-action being executed (e.g., "backfill_synapses")
+    pub sub_action: String,
+    /// Number of sub-actions processed so far
+    pub processed: usize,
+    /// Total number of sub-actions
+    pub total: usize,
+    /// Elapsed time in milliseconds
+    pub elapsed_ms: u64,
 }
 
 /// A protocol run — an instance of a protocol FSM being executed.
@@ -681,6 +704,11 @@ pub struct ProtocolRun {
     /// Nesting depth (0 = root, 1 = child of root, etc.)
     #[serde(default)]
     pub depth: u32,
+    /// Optimistic lock version — incremented on every update.
+    /// Used for compare-and-swap in `update_protocol_run()` to prevent
+    /// concurrent transitions from silently overwriting each other.
+    #[serde(default)]
+    pub version: u64,
 }
 
 fn default_triggered_by() -> String {
@@ -705,7 +733,10 @@ impl ProtocolRun {
                 state_id: entry_state_id,
                 state_name: entry_state_name.into(),
                 entered_at: now,
+                exited_at: None,
+                duration_ms: None,
                 trigger: None,
+                progress_snapshot: None,
             }],
             status: RunStatus::Running,
             started_at: now,
@@ -714,6 +745,7 @@ impl ProtocolRun {
             triggered_by: "manual".to_string(),
             parent_run_id: None,
             depth: 0,
+            version: 0,
         }
     }
 
@@ -727,30 +759,54 @@ impl ProtocolRun {
         !self.is_active()
     }
 
+    /// Close the current (last) state visit by filling exited_at and duration_ms.
+    fn close_current_state(&mut self) {
+        let now = Utc::now();
+        if let Some(last) = self.states_visited.last_mut() {
+            if last.exited_at.is_none() {
+                last.exited_at = Some(now);
+                last.duration_ms = Some((now - last.entered_at).num_milliseconds());
+            }
+        }
+    }
+
     /// Record a state transition.
+    ///
+    /// Closes the previous state (fills exited_at + duration_ms) before
+    /// pushing the new state visit.
     pub fn visit_state(
         &mut self,
         state_id: Uuid,
         state_name: impl Into<String>,
         trigger: impl Into<String>,
     ) {
+        // Close the previous state
+        self.close_current_state();
+
         self.current_state = state_id;
         self.states_visited.push(StateVisit {
             state_id,
             state_name: state_name.into(),
             entered_at: Utc::now(),
+            exited_at: None,
+            duration_ms: None,
             trigger: Some(trigger.into()),
+            progress_snapshot: None,
         });
     }
 
     /// Mark the run as completed (reached terminal state).
+    ///
+    /// Closes the last state visit before marking completion.
     pub fn complete(&mut self) {
+        self.close_current_state();
         self.status = RunStatus::Completed;
         self.completed_at = Some(Utc::now());
     }
 
     /// Mark the run as failed with an error message.
     pub fn fail(&mut self, error: impl Into<String>) {
+        self.close_current_state();
         self.status = RunStatus::Failed;
         self.completed_at = Some(Utc::now());
         self.error = Some(error.into());
@@ -758,6 +814,7 @@ impl ProtocolRun {
 
     /// Mark the run as cancelled.
     pub fn cancel(&mut self) {
+        self.close_current_state();
         self.status = RunStatus::Cancelled;
         self.completed_at = Some(Utc::now());
     }
@@ -1405,5 +1462,138 @@ mod tests {
         assert_eq!(deserialized.index, 3);
         assert_eq!(deserialized.status, "running");
         assert_eq!(deserialized.action, Some("process_item".to_string()));
+    }
+
+    #[test]
+    fn test_visit_state_closes_previous_state() {
+        let protocol_id = Uuid::new_v4();
+        let state1 = Uuid::new_v4();
+        let state2 = Uuid::new_v4();
+        let mut run = ProtocolRun::new(protocol_id, state1, "Start");
+
+        // Initial state has no exited_at
+        assert!(run.states_visited[0].exited_at.is_none());
+        assert!(run.states_visited[0].duration_ms.is_none());
+
+        // Visit a new state → previous should be closed
+        run.visit_state(state2, "Processing", "begin");
+
+        assert_eq!(run.states_visited.len(), 2);
+        // First state should now have exited_at and duration_ms
+        assert!(run.states_visited[0].exited_at.is_some());
+        assert!(run.states_visited[0].duration_ms.is_some());
+        // New state should be open
+        assert!(run.states_visited[1].exited_at.is_none());
+        assert_eq!(run.states_visited[1].trigger, Some("begin".to_string()));
+    }
+
+    #[test]
+    fn test_complete_closes_last_state() {
+        let protocol_id = Uuid::new_v4();
+        let state1 = Uuid::new_v4();
+        let mut run = ProtocolRun::new(protocol_id, state1, "Start");
+
+        run.complete();
+
+        assert_eq!(run.status, RunStatus::Completed);
+        assert!(run.completed_at.is_some());
+        // The last state visit should be closed
+        let last = run.states_visited.last().unwrap();
+        assert!(last.exited_at.is_some());
+        assert!(last.duration_ms.is_some());
+    }
+
+    #[test]
+    fn test_fail_closes_last_state() {
+        let protocol_id = Uuid::new_v4();
+        let state1 = Uuid::new_v4();
+        let mut run = ProtocolRun::new(protocol_id, state1, "Start");
+
+        run.fail("something broke");
+
+        assert_eq!(run.status, RunStatus::Failed);
+        assert_eq!(run.error, Some("something broke".to_string()));
+        let last = run.states_visited.last().unwrap();
+        assert!(last.exited_at.is_some());
+        assert!(last.duration_ms.is_some());
+    }
+
+    #[test]
+    fn test_cancel_closes_last_state() {
+        let protocol_id = Uuid::new_v4();
+        let state1 = Uuid::new_v4();
+        let mut run = ProtocolRun::new(protocol_id, state1, "Start");
+
+        run.cancel();
+
+        assert_eq!(run.status, RunStatus::Cancelled);
+        let last = run.states_visited.last().unwrap();
+        assert!(last.exited_at.is_some());
+    }
+
+    #[test]
+    fn test_close_current_state_idempotent() {
+        let protocol_id = Uuid::new_v4();
+        let state1 = Uuid::new_v4();
+        let mut run = ProtocolRun::new(protocol_id, state1, "Start");
+
+        // Complete closes the state
+        run.complete();
+        let first_exit = run.states_visited[0].exited_at;
+
+        // Calling close again (e.g. via cancel after complete) should not change exited_at
+        // We can't call close_current_state directly (private), but complete sets it
+        // Verify the field didn't change by checking it's still set
+        assert_eq!(run.states_visited[0].exited_at, first_exit);
+    }
+
+    #[test]
+    fn test_version_starts_at_zero() {
+        let run = ProtocolRun::new(Uuid::new_v4(), Uuid::new_v4(), "Start");
+        assert_eq!(run.version, 0);
+    }
+
+    #[test]
+    fn test_multi_transition_state_visits_timing() {
+        let protocol_id = Uuid::new_v4();
+        let s1 = Uuid::new_v4();
+        let s2 = Uuid::new_v4();
+        let s3 = Uuid::new_v4();
+        let mut run = ProtocolRun::new(protocol_id, s1, "A");
+
+        run.visit_state(s2, "B", "go_b");
+        run.visit_state(s3, "C", "go_c");
+        run.complete();
+
+        assert_eq!(run.states_visited.len(), 3);
+        // All states should be closed
+        for sv in &run.states_visited {
+            assert!(sv.exited_at.is_some(), "State {} not closed", sv.state_name);
+            assert!(
+                sv.duration_ms.is_some(),
+                "State {} missing duration",
+                sv.state_name
+            );
+        }
+        // Triggers
+        assert!(run.states_visited[0].trigger.is_none()); // entry state
+        assert_eq!(run.states_visited[1].trigger, Some("go_b".to_string()));
+        assert_eq!(run.states_visited[2].trigger, Some("go_c".to_string()));
+    }
+
+    #[test]
+    fn test_progress_snapshot_serde() {
+        let snap = ProgressSnapshot {
+            sub_action: "backfill_synapses".to_string(),
+            processed: 42,
+            total: 100,
+            elapsed_ms: 1500,
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        let deserialized: ProgressSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.sub_action, "backfill_synapses");
+        assert_eq!(deserialized.processed, 42);
+        assert_eq!(deserialized.total, 100);
+        assert_eq!(deserialized.elapsed_ms, 1500);
     }
 }

@@ -367,6 +367,7 @@ mod tests {
                 })
                 .collect(),
             created_at: Utc::now(),
+            protocol_run_id: None,
         }
     }
 

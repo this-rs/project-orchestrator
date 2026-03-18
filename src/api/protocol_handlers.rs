@@ -24,6 +24,56 @@ const MAX_DESCRIPTION_LEN: usize = 5000;
 const MAX_TRIGGER_LEN: usize = 500;
 
 // ============================================================================
+// Validation helpers (pure functions — unit-testable)
+// ============================================================================
+
+/// Validate that a transition does not originate from a terminal state or target a start state.
+///
+/// Looks up `from_state_id` and `to_state_id` in the provided `states` slice.
+/// Returns `Ok(())` if valid, or `Err(message)` describing the violation.
+/// If a state ID is not found in the slice, the check is silently skipped
+/// (the caller may validate existence separately).
+fn validate_transition_state_types(
+    states: &[ProtocolState],
+    from_state_id: Uuid,
+    to_state_id: Uuid,
+) -> Result<(), String> {
+    if let Some(from_s) = states.iter().find(|s| s.id == from_state_id) {
+        if from_s.state_type == crate::protocol::StateType::Terminal {
+            return Err(format!(
+                "Cannot add transition from terminal state '{}'",
+                from_s.name
+            ));
+        }
+    }
+    if let Some(to_s) = states.iter().find(|s| s.id == to_state_id) {
+        if to_s.state_type == crate::protocol::StateType::Start {
+            return Err(format!(
+                "Cannot add transition to start state '{}'",
+                to_s.name
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Map an `anyhow::Error` from `fire_transition` to the appropriate `AppError` variant.
+///
+/// - Messages containing "not found" → `AppError::NotFound`
+/// - Messages containing "OptimisticLockError" → `AppError::Conflict`
+/// - Everything else → `AppError::Internal`
+fn map_fire_transition_error(e: anyhow::Error) -> AppError {
+    let msg = e.to_string();
+    if msg.contains("not found") {
+        AppError::NotFound(msg)
+    } else if msg.contains("OptimisticLockError") {
+        AppError::Conflict(msg)
+    } else {
+        AppError::Internal(e)
+    }
+}
+
+// ============================================================================
 // Query Parameters
 // ============================================================================
 
@@ -381,6 +431,20 @@ pub async fn create_protocol(
         None => ProtocolCategory::default(),
     };
 
+    // Check name uniqueness within the project
+    if let Some(existing_id) = state
+        .orchestrator
+        .neo4j()
+        .get_protocol_by_name_and_project(&body.name, body.project_id)
+        .await
+        .map_err(AppError::Internal)?
+    {
+        return Err(AppError::Conflict(format!(
+            "Protocol '{}' already exists in this project (id: {})",
+            body.name, existing_id
+        )));
+    }
+
     // Create protocol — placeholder entry_state, will be updated if inline states are provided
     let placeholder_entry = Uuid::new_v4();
     let mut protocol = Protocol::new(body.project_id, &body.name, placeholder_entry);
@@ -475,6 +539,9 @@ pub async fn create_protocol(
                     MAX_TRIGGER_LEN
                 )));
             }
+            // Validate state types: no transition FROM terminal or TO start
+            validate_transition_state_types(&created_states, t.from_state, t.to_state)
+                .map_err(AppError::BadRequest)?;
             let pt = ProtocolTransition {
                 id: Uuid::new_v4(),
                 protocol_id: protocol.id,
@@ -789,6 +856,31 @@ pub async fn add_transition(
         )));
     }
 
+    // Validate state types: cannot transition FROM a terminal state or TO a start state
+    let states = state
+        .orchestrator
+        .neo4j()
+        .get_protocol_states(protocol_id)
+        .await
+        .map_err(AppError::Internal)?;
+
+    // Verify both states exist in the protocol
+    if !states.iter().any(|s| s.id == body.from_state) {
+        return Err(AppError::BadRequest(format!(
+            "from_state {} not found in protocol",
+            body.from_state
+        )));
+    }
+    if !states.iter().any(|s| s.id == body.to_state) {
+        return Err(AppError::BadRequest(format!(
+            "to_state {} not found in protocol",
+            body.to_state
+        )));
+    }
+
+    validate_transition_state_types(&states, body.from_state, body.to_state)
+        .map_err(AppError::BadRequest)?;
+
     let pt = ProtocolTransition {
         id: Uuid::new_v4(),
         protocol_id,
@@ -939,13 +1031,7 @@ pub async fn fire_transition(
     let result =
         protocol::engine::fire_transition(state.orchestrator.neo4j(), run_id, &body.trigger)
             .await
-            .map_err(|e| {
-                if e.to_string().contains("not found") {
-                    AppError::NotFound(e.to_string())
-                } else {
-                    AppError::Internal(e)
-                }
-            })?;
+            .map_err(map_fire_transition_error)?;
 
     // Emit event for successful transitions
     if result.success {
@@ -1000,6 +1086,8 @@ pub async fn fire_transition(
             alternatives_count: 1,
             chosen_index: 0,
             confidence: if result.success { 0.9 } else { 0.1 },
+            protocol_run_id: Some(run_id),
+            protocol_state: Some(result.current_state_name.clone()),
             tool_usages: vec![neural_routing_runtime::ToolUsage {
                 tool_name: "protocol".to_string(),
                 action: "transition".to_string(),
@@ -1460,6 +1548,18 @@ pub async fn compose_protocol(
 
     let neo4j = state.orchestrator.neo4j();
 
+    // Check name uniqueness within the project
+    if let Some(existing_id) = neo4j
+        .get_protocol_by_name_and_project(&body.name, body.project_id)
+        .await
+        .map_err(AppError::Internal)?
+    {
+        return Err(AppError::Conflict(format!(
+            "Protocol '{}' already exists in this project (id: {})",
+            body.name, existing_id
+        )));
+    }
+
     // ── 1. Create Skill ─────────────────────────────────────────────
     let skill_id = Uuid::new_v4();
     let skill = crate::skills::SkillNode {
@@ -1567,6 +1667,10 @@ pub async fn compose_protocol(
         let to_id = name_to_id
             .get(&t.to_state)
             .ok_or_else(|| AppError::BadRequest(format!("state '{}' not found", t.to_state)))?;
+
+        // Validate state types: no transition FROM terminal or TO start
+        validate_transition_state_types(&created_states, *from_id, *to_id)
+            .map_err(AppError::BadRequest)?;
 
         let pt = ProtocolTransition {
             id: Uuid::new_v4(),
@@ -1720,4 +1824,446 @@ pub async fn simulate_activation(
         explanation: affinity.explanation,
         context_used: context,
     }))
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::StateType;
+
+    /// Helper: build a minimal ProtocolState for testing.
+    fn make_state(name: &str, state_type: StateType) -> ProtocolState {
+        ProtocolState {
+            id: Uuid::new_v4(),
+            protocol_id: Uuid::new_v4(),
+            name: name.to_string(),
+            description: String::new(),
+            action: None,
+            state_type,
+            sub_protocol_id: None,
+            completion_strategy: None,
+            on_failure_strategy: None,
+            generator_config: None,
+        }
+    }
+
+    // ----------------------------------------------------------------
+    // validate_transition_state_types
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn test_validate_transition_ok_start_to_intermediate() {
+        let start = make_state("init", StateType::Start);
+        let mid = make_state("work", StateType::Intermediate);
+        let states = vec![start.clone(), mid.clone()];
+        assert!(validate_transition_state_types(&states, start.id, mid.id).is_ok());
+    }
+
+    #[test]
+    fn test_validate_transition_ok_intermediate_to_terminal() {
+        let mid = make_state("work", StateType::Intermediate);
+        let end = make_state("done", StateType::Terminal);
+        let states = vec![mid.clone(), end.clone()];
+        assert!(validate_transition_state_types(&states, mid.id, end.id).is_ok());
+    }
+
+    #[test]
+    fn test_validate_transition_rejects_from_terminal() {
+        let end = make_state("done", StateType::Terminal);
+        let mid = make_state("work", StateType::Intermediate);
+        let states = vec![end.clone(), mid.clone()];
+        let err = validate_transition_state_types(&states, end.id, mid.id).unwrap_err();
+        assert!(err.contains("Cannot add transition from terminal state"));
+        assert!(err.contains("done"));
+    }
+
+    #[test]
+    fn test_validate_transition_rejects_to_start() {
+        let start = make_state("init", StateType::Start);
+        let mid = make_state("work", StateType::Intermediate);
+        let states = vec![start.clone(), mid.clone()];
+        let err = validate_transition_state_types(&states, mid.id, start.id).unwrap_err();
+        assert!(err.contains("Cannot add transition to start state"));
+        assert!(err.contains("init"));
+    }
+
+    #[test]
+    fn test_validate_transition_unknown_ids_pass() {
+        // IDs not in the states slice → silently pass (existence validated elsewhere)
+        let states = vec![make_state("x", StateType::Intermediate)];
+        let unknown_from = Uuid::new_v4();
+        let unknown_to = Uuid::new_v4();
+        assert!(validate_transition_state_types(&states, unknown_from, unknown_to).is_ok());
+    }
+
+    #[test]
+    fn test_validate_transition_from_terminal_to_start_both_errors() {
+        // When both violations exist, the FROM-terminal error is returned first
+        let start = make_state("init", StateType::Start);
+        let end = make_state("done", StateType::Terminal);
+        let states = vec![start.clone(), end.clone()];
+        let err = validate_transition_state_types(&states, end.id, start.id).unwrap_err();
+        assert!(err.contains("terminal"));
+    }
+
+    #[test]
+    fn test_validate_transition_empty_states() {
+        // Empty states slice → both lookups miss → Ok
+        assert!(validate_transition_state_types(&[], Uuid::new_v4(), Uuid::new_v4()).is_ok());
+    }
+
+    #[test]
+    fn test_validate_transition_intermediate_to_intermediate() {
+        let a = make_state("step-a", StateType::Intermediate);
+        let b = make_state("step-b", StateType::Intermediate);
+        let states = vec![a.clone(), b.clone()];
+        assert!(validate_transition_state_types(&states, a.id, b.id).is_ok());
+    }
+
+    #[test]
+    fn test_validate_transition_start_to_terminal() {
+        let start = make_state("begin", StateType::Start);
+        let end = make_state("finish", StateType::Terminal);
+        let states = vec![start.clone(), end.clone()];
+        assert!(validate_transition_state_types(&states, start.id, end.id).is_ok());
+    }
+
+    // ----------------------------------------------------------------
+    // map_fire_transition_error
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn test_map_error_not_found() {
+        let e = anyhow::anyhow!("ProtocolRun abc123 not found");
+        match map_fire_transition_error(e) {
+            AppError::NotFound(msg) => assert!(msg.contains("not found")),
+            other => panic!("Expected NotFound, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_map_error_optimistic_lock() {
+        let e = anyhow::anyhow!(
+            "OptimisticLockError: protocol run xyz was modified concurrently (expected version 3, stale)"
+        );
+        match map_fire_transition_error(e) {
+            AppError::Conflict(msg) => assert!(msg.contains("OptimisticLockError")),
+            other => panic!("Expected Conflict, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_map_error_internal_fallback() {
+        let e = anyhow::anyhow!("Neo4j connection refused");
+        match map_fire_transition_error(e) {
+            AppError::Internal(err) => assert!(err.to_string().contains("connection refused")),
+            other => panic!("Expected Internal, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_map_error_not_found_takes_priority_over_optimistic() {
+        // If both keywords appear, "not found" is checked first
+        let e = anyhow::anyhow!("OptimisticLockError: not found something");
+        match map_fire_transition_error(e) {
+            AppError::NotFound(_) => {} // Correct: "not found" matched first
+            other => panic!("Expected NotFound, got {:?}", other),
+        }
+    }
+
+    // ================================================================
+    // Handler integration tests (with mock OrchestratorState)
+    // ================================================================
+
+    use crate::events::{EventBus, HybridEmitter};
+    use crate::meilisearch::mock::MockSearchStore;
+    use crate::neo4j::mock::MockGraphStore;
+    use crate::orchestrator::watcher::FileWatcher;
+    use crate::orchestrator::Orchestrator;
+    use crate::test_helpers::{mock_app_state_with, test_project};
+    use axum::extract::State;
+    use std::sync::Arc;
+
+    /// Build a server state from a MockGraphStore (shared helper).
+    async fn build_server_state(mock: MockGraphStore) -> OrchestratorState {
+        let app_state = mock_app_state_with(mock, MockSearchStore::new());
+        let orchestrator = Orchestrator::new(app_state).await.unwrap();
+        let orc = Arc::new(orchestrator);
+        let watcher = FileWatcher::new(orc.clone());
+        let event_bus = HybridEmitter::new(Arc::new(EventBus::new(100)));
+        Arc::new(super::super::handlers::ServerState {
+            orchestrator: orc,
+            watcher: Arc::new(tokio::sync::RwLock::new(watcher)),
+            chat_manager: None,
+            event_bus: Arc::new(event_bus),
+            nats_emitter: None,
+            auth_config: None,
+            setup_completed: true,
+            serve_frontend: false,
+            frontend_path: String::new(),
+            server_port: 0,
+            public_url: None,
+            ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
+            registry_remote_url: None,
+            identity: None,
+            oidc_client: None,
+            neural_router: crate::test_helpers::mock_neural_router(),
+            trajectory_collector: None,
+            trajectory_store: None,
+        })
+    }
+
+    /// Build a minimal OrchestratorState for handler tests.
+    async fn make_test_server_state() -> OrchestratorState {
+        build_server_state(MockGraphStore::new()).await
+    }
+
+    /// Build a test state with a pre-seeded project and protocol.
+    async fn make_state_with_protocol() -> (OrchestratorState, Uuid, Uuid) {
+        let mock = MockGraphStore::new();
+        let mut project = test_project();
+        let project_id = project.id;
+        project.name = "test-project".to_string();
+        project.slug = "test-project".to_string();
+        mock.projects.write().await.insert(project_id, project);
+
+        // Seed a protocol with states
+        let start_id = Uuid::new_v4();
+        let mid_id = Uuid::new_v4();
+        let end_id = Uuid::new_v4();
+        let proto = crate::protocol::Protocol::new(project_id, "existing-proto", start_id);
+        let proto_id = proto.id;
+        mock.protocols.write().await.insert(proto_id, proto);
+
+        // Seed states
+        for (id, name, st) in [
+            (start_id, "start", StateType::Start),
+            (mid_id, "work", StateType::Intermediate),
+            (end_id, "done", StateType::Terminal),
+        ] {
+            let ps = ProtocolState {
+                id,
+                protocol_id: proto_id,
+                name: name.to_string(),
+                description: String::new(),
+                action: None,
+                state_type: st,
+                sub_protocol_id: None,
+                completion_strategy: None,
+                on_failure_strategy: None,
+                generator_config: None,
+            };
+            mock.protocol_states.write().await.insert(id, ps);
+        }
+
+        let state = build_server_state(mock).await;
+        (state, project_id, proto_id)
+    }
+
+    #[tokio::test]
+    async fn test_handler_create_protocol_name_uniqueness() {
+        let (state, project_id, _proto_id) = make_state_with_protocol().await;
+
+        // Try to create a protocol with the same name → should Conflict
+        let body = CreateProtocolBody {
+            project_id,
+            name: "existing-proto".to_string(),
+            description: None,
+            skill_id: None,
+            protocol_category: None,
+            trigger_mode: None,
+            trigger_config: None,
+            relevance_vector: None,
+            states: None,
+            transitions: None,
+        };
+        let result = create_protocol(State(state.clone()), Json(body)).await;
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            AppError::Conflict(msg) => {
+                assert!(msg.contains("existing-proto"));
+                assert!(msg.contains("already exists"));
+            }
+            other => panic!("Expected Conflict, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handler_create_protocol_with_new_name_succeeds() {
+        let (state, project_id, _) = make_state_with_protocol().await;
+
+        let body = CreateProtocolBody {
+            project_id,
+            name: "brand-new-proto".to_string(),
+            description: Some("A new protocol".to_string()),
+            skill_id: None,
+            protocol_category: None,
+            trigger_mode: None,
+            trigger_config: None,
+            relevance_vector: None,
+            states: None,
+            transitions: None,
+        };
+        let result = create_protocol(State(state.clone()), Json(body)).await;
+        assert!(result.is_ok(), "Create should succeed: {:?}", result.err());
+    }
+
+    #[tokio::test]
+    async fn test_handler_add_transition_rejects_from_terminal() {
+        let (state, _project_id, proto_id) = make_state_with_protocol().await;
+
+        // Get the state IDs
+        let states = state
+            .orchestrator
+            .neo4j()
+            .get_protocol_states(proto_id)
+            .await
+            .unwrap();
+        let terminal_id = states.iter().find(|s| s.name == "done").unwrap().id;
+        let mid_id = states.iter().find(|s| s.name == "work").unwrap().id;
+
+        let body = AddTransitionBody {
+            from_state: terminal_id,
+            to_state: mid_id,
+            trigger: "go_back".to_string(),
+            guard: None,
+        };
+        let result = add_transition(State(state.clone()), Path(proto_id), Json(body)).await;
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            AppError::BadRequest(msg) => {
+                assert!(msg.contains("terminal state"));
+            }
+            other => panic!("Expected BadRequest, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handler_add_transition_rejects_to_start() {
+        let (state, _project_id, proto_id) = make_state_with_protocol().await;
+
+        let states = state
+            .orchestrator
+            .neo4j()
+            .get_protocol_states(proto_id)
+            .await
+            .unwrap();
+        let start_id = states.iter().find(|s| s.name == "start").unwrap().id;
+        let mid_id = states.iter().find(|s| s.name == "work").unwrap().id;
+
+        let body = AddTransitionBody {
+            from_state: mid_id,
+            to_state: start_id,
+            trigger: "restart".to_string(),
+            guard: None,
+        };
+        let result = add_transition(State(state.clone()), Path(proto_id), Json(body)).await;
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            AppError::BadRequest(msg) => {
+                assert!(msg.contains("start state"));
+            }
+            other => panic!("Expected BadRequest, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handler_add_transition_succeeds() {
+        let (state, _project_id, proto_id) = make_state_with_protocol().await;
+
+        let states = state
+            .orchestrator
+            .neo4j()
+            .get_protocol_states(proto_id)
+            .await
+            .unwrap();
+        let start_id = states.iter().find(|s| s.name == "start").unwrap().id;
+        let mid_id = states.iter().find(|s| s.name == "work").unwrap().id;
+
+        let body = AddTransitionBody {
+            from_state: start_id,
+            to_state: mid_id,
+            trigger: "begin".to_string(),
+            guard: None,
+        };
+        let result = add_transition(State(state.clone()), Path(proto_id), Json(body)).await;
+        assert!(result.is_ok(), "Should succeed: {:?}", result.err());
+    }
+
+    #[tokio::test]
+    async fn test_handler_fire_transition_run_not_found() {
+        let state = make_test_server_state().await;
+        let fake_run_id = Uuid::new_v4();
+
+        let body = FireTransitionBody {
+            trigger: "go".to_string(),
+        };
+        let result = fire_transition(State(state), Path(fake_run_id), Json(body)).await;
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            AppError::NotFound(msg) => {
+                assert!(msg.contains("not found"));
+            }
+            other => panic!("Expected NotFound, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handler_fire_transition_succeeds_with_event_emission() {
+        let (state, _project_id, proto_id) = make_state_with_protocol().await;
+
+        // Add a transition first
+        let states = state
+            .orchestrator
+            .neo4j()
+            .get_protocol_states(proto_id)
+            .await
+            .unwrap();
+        let start_id = states.iter().find(|s| s.name == "start").unwrap().id;
+        let mid_id = states.iter().find(|s| s.name == "work").unwrap().id;
+
+        let transition = ProtocolTransition {
+            id: Uuid::new_v4(),
+            protocol_id: proto_id,
+            from_state: start_id,
+            to_state: mid_id,
+            trigger: "begin".to_string(),
+            guard: None,
+        };
+        state
+            .orchestrator
+            .neo4j()
+            .upsert_protocol_transition(&transition)
+            .await
+            .unwrap();
+
+        // Start a run
+        let run = crate::protocol::engine::start_run(
+            state.orchestrator.neo4j(),
+            proto_id,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Fire transition via handler (covers event emission + trajectory collection)
+        let body = FireTransitionBody {
+            trigger: "begin".to_string(),
+        };
+        let result = fire_transition(State(state.clone()), Path(run.id), Json(body)).await;
+        assert!(
+            result.is_ok(),
+            "Fire transition should succeed: {:?}",
+            result.err()
+        );
+        let response = result.unwrap();
+        assert!(response.success);
+        assert_eq!(response.current_state_name, "work");
+    }
 }

@@ -116,6 +116,8 @@ mod tests {
             project_slug: None,
             project_id: None,
             cwd: None,
+            protocol_run_id: None,
+            protocol_state: None,
         }
     }
 

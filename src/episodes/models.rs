@@ -96,6 +96,31 @@ pub enum StimulusTrigger {
     Manual,
 }
 
+/// A detailed record of a single state visit within an episode's process.
+///
+/// Captures timestamps, duration, and the trigger that caused entry.
+/// This is the enriched version of the plain state name string.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StateVisitRecord {
+    /// Name of the FSM state
+    pub state_name: String,
+
+    /// When this state was entered
+    pub entered_at: DateTime<Utc>,
+
+    /// When this state was exited (None for the last/current state)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exited_at: Option<DateTime<Utc>>,
+
+    /// Time spent in this state in milliseconds
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<i64>,
+
+    /// The trigger that caused entry into this state (None for initial state)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<String>,
+}
+
 /// How the episode was processed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Process {
@@ -103,9 +128,13 @@ pub struct Process {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_tree_id: Option<Uuid>,
 
-    /// Ordered list of FSM states visited during the protocol run
+    /// Ordered list of FSM states visited during the protocol run (names only, deprecated)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub states_visited: Vec<String>,
+
+    /// Enriched state visit records with timestamps and triggers
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub state_visits: Vec<StateVisitRecord>,
 
     /// Duration of the processing phase
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -236,15 +265,34 @@ pub struct PortableStimulus {
     pub trigger: StimulusTrigger,
 }
 
+/// A portable state visit record (no absolute timestamps).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PortableStateVisitRecord {
+    /// Name of the FSM state
+    pub state_name: String,
+
+    /// Time spent in this state in milliseconds
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<i64>,
+
+    /// The trigger that caused entry into this state
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<String>,
+}
+
 /// Anonymized process trace.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PortableProcess {
     /// Whether a reasoning tree was used
     pub had_reasoning_tree: bool,
 
-    /// Ordered FSM states visited (names, not IDs)
+    /// Ordered FSM states visited (names, not IDs) — deprecated, kept for compat
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub states_visited: Vec<String>,
+
+    /// Enriched state visit records with durations (no absolute timestamps)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub state_visits: Vec<PortableStateVisitRecord>,
 
     /// Relative duration
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -316,6 +364,16 @@ impl Episode {
             process: PortableProcess {
                 had_reasoning_tree: self.process.reasoning_tree_id.is_some(),
                 states_visited: self.process.states_visited.clone(),
+                state_visits: self
+                    .process
+                    .state_visits
+                    .iter()
+                    .map(|sv| PortableStateVisitRecord {
+                        state_name: sv.state_name.clone(),
+                        duration_ms: sv.duration_ms,
+                        trigger: sv.trigger.clone(),
+                    })
+                    .collect(),
                 duration_ms: self.process.duration_ms,
             },
             outcome: PortableOutcome {
@@ -367,6 +425,29 @@ mod tests {
                     "implement".to_string(),
                     "done".to_string(),
                 ],
+                state_visits: vec![
+                    StateVisitRecord {
+                        state_name: "analyze".to_string(),
+                        entered_at: Utc::now() - chrono::Duration::seconds(15),
+                        exited_at: Some(Utc::now() - chrono::Duration::seconds(10)),
+                        duration_ms: Some(5000),
+                        trigger: None,
+                    },
+                    StateVisitRecord {
+                        state_name: "implement".to_string(),
+                        entered_at: Utc::now() - chrono::Duration::seconds(10),
+                        exited_at: Some(Utc::now() - chrono::Duration::seconds(2)),
+                        duration_ms: Some(8000),
+                        trigger: Some("analysis_complete".to_string()),
+                    },
+                    StateVisitRecord {
+                        state_name: "done".to_string(),
+                        entered_at: Utc::now() - chrono::Duration::seconds(2),
+                        exited_at: Some(Utc::now()),
+                        duration_ms: Some(2000),
+                        trigger: Some("implemented".to_string()),
+                    },
+                ],
                 duration_ms: Some(15000),
             },
             outcome: Outcome {
@@ -402,6 +483,15 @@ mod tests {
         assert_eq!(portable.stimulus.trigger, StimulusTrigger::UserRequest);
         assert!(portable.process.had_reasoning_tree);
         assert_eq!(portable.process.states_visited.len(), 3);
+        assert_eq!(portable.process.state_visits.len(), 3);
+        // Portable state visits have durations but no absolute timestamps
+        assert_eq!(portable.process.state_visits[0].state_name, "analyze");
+        assert_eq!(portable.process.state_visits[0].duration_ms, Some(5000));
+        assert!(portable.process.state_visits[0].trigger.is_none());
+        assert_eq!(
+            portable.process.state_visits[1].trigger.as_deref(),
+            Some("analysis_complete")
+        );
         assert_eq!(portable.outcome.notes_produced, 2);
         assert_eq!(portable.outcome.decisions_made, 1);
         assert_eq!(portable.outcome.commits_made, 1);
@@ -476,5 +566,66 @@ mod tests {
             confidence: None,
         };
         assert_eq!(lesson.portability_layer, 2);
+    }
+
+    #[test]
+    fn test_state_visit_record_serde_roundtrip() {
+        let record = StateVisitRecord {
+            state_name: "implement".to_string(),
+            entered_at: chrono::Utc::now(),
+            exited_at: Some(chrono::Utc::now()),
+            duration_ms: Some(5000),
+            trigger: Some("plan_approved".to_string()),
+        };
+        let json = serde_json::to_string(&record).unwrap();
+        let deserialized: StateVisitRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.state_name, "implement");
+        assert_eq!(deserialized.duration_ms, Some(5000));
+        assert_eq!(deserialized.trigger, Some("plan_approved".to_string()));
+    }
+
+    #[test]
+    fn test_portable_state_visit_record_strips_timestamps() {
+        let record = PortableStateVisitRecord {
+            state_name: "review".to_string(),
+            duration_ms: Some(3000),
+            trigger: Some("code_ready".to_string()),
+        };
+        let json = serde_json::to_string(&record).unwrap();
+        let deserialized: PortableStateVisitRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.state_name, "review");
+        assert_eq!(deserialized.duration_ms, Some(3000));
+        // No timestamp fields in portable version
+        assert!(!json.contains("entered_at"));
+        assert!(!json.contains("exited_at"));
+    }
+
+    #[test]
+    fn test_process_state_visits_field() {
+        let process = Process {
+            reasoning_tree_id: None,
+            states_visited: vec!["A".to_string(), "B".to_string()],
+            state_visits: vec![
+                StateVisitRecord {
+                    state_name: "A".to_string(),
+                    entered_at: chrono::Utc::now(),
+                    exited_at: Some(chrono::Utc::now()),
+                    duration_ms: Some(100),
+                    trigger: None,
+                },
+                StateVisitRecord {
+                    state_name: "B".to_string(),
+                    entered_at: chrono::Utc::now(),
+                    exited_at: None,
+                    duration_ms: None,
+                    trigger: Some("go".to_string()),
+                },
+            ],
+            duration_ms: Some(200),
+        };
+        assert_eq!(process.state_visits.len(), 2);
+        assert_eq!(process.state_visits[0].state_name, "A");
+        assert!(process.state_visits[0].duration_ms.is_some());
+        assert_eq!(process.state_visits[1].trigger, Some("go".to_string()));
     }
 }

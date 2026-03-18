@@ -3277,6 +3277,15 @@ impl GraphStore for Neo4jClient {
         self.get_protocol_states(protocol_id).await
     }
 
+    async fn get_protocol_by_name_and_project(
+        &self,
+        name: &str,
+        project_id: uuid::Uuid,
+    ) -> anyhow::Result<Option<uuid::Uuid>> {
+        self.get_protocol_by_name_and_project(name, project_id)
+            .await
+    }
+
     async fn delete_protocol_state(&self, state_id: uuid::Uuid) -> anyhow::Result<bool> {
         self.delete_protocol_state(state_id).await
     }
@@ -3314,7 +3323,10 @@ impl GraphStore for Neo4jClient {
         self.get_protocol_run(run_id).await
     }
 
-    async fn update_protocol_run(&self, run: &crate::protocol::ProtocolRun) -> anyhow::Result<()> {
+    async fn update_protocol_run(
+        &self,
+        run: &mut crate::protocol::ProtocolRun,
+    ) -> anyhow::Result<()> {
         self.update_protocol_run(run).await
     }
 

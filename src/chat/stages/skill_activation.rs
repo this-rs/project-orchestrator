@@ -281,6 +281,8 @@ impl EnrichmentStage for SkillActivationStage {
                 timestamp_ms: 0,
                 query_embedding: vec![],
                 node_features: vec![],
+                protocol_run_id: input.protocol_run_id,
+                protocol_state: input.protocol_state.clone(),
             });
         }
 

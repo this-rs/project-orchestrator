@@ -402,6 +402,7 @@ fn build_migrated_trajectory(session_id: &Uuid, parsed: &[ParsedToolUse]) -> Tra
         duration_ms,
         nodes,
         created_at: now,
+        protocol_run_id: None,
     }
 }
 

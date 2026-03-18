@@ -522,6 +522,8 @@ mod tests {
             project_slug: None,
             project_id: None,
             cwd: None,
+            protocol_run_id: None,
+            protocol_state: None,
         };
         let mut ctx = EnrichmentContext::default();
         stage.execute(&input, &mut ctx).await.unwrap();
@@ -537,6 +539,8 @@ mod tests {
             project_slug: Some("test-project".to_string()),
             project_id: None,
             cwd: None,
+            protocol_run_id: None,
+            protocol_state: None,
         };
         let mut ctx = EnrichmentContext::default();
 

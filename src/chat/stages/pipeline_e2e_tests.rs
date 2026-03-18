@@ -275,6 +275,8 @@ mod tests {
             project_slug: slug.map(|s| s.to_string()),
             project_id,
             cwd: None,
+            protocol_run_id: None,
+            protocol_state: None,
         }
     }
 

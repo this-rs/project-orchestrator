@@ -506,6 +506,7 @@ mod tests {
             duration_ms: 1000,
             nodes,
             created_at: Utc::now(),
+            protocol_run_id: None,
         }
     }
 
@@ -539,6 +540,7 @@ mod tests {
             duration_ms: 0,
             nodes: vec![],
             created_at: Utc::now(),
+            protocol_run_id: None,
         };
         assert!(trajectory_to_tensors(&traj).is_none());
     }

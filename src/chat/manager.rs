@@ -73,6 +73,11 @@ pub struct ActiveSession {
     pub permission_mode: Option<String>,
     /// Current model for this session (updated on mid-session model changes)
     pub model: Option<String>,
+    /// Active protocol run ID — set when this session runs within a protocol FSM context.
+    /// Injected into SessionHints on close and used to tag trajectories with DURING_RUN.
+    pub protocol_run_id: Option<uuid::Uuid>,
+    /// Current protocol state name (e.g., "implement", "review") at session creation time.
+    pub protocol_state: Option<String>,
     /// SDK control receiver for permission requests (`can_use_tool`).
     /// Taken once from `InteractiveClient::take_sdk_control_receiver()` at session
     /// creation and reused across all `stream_response` invocations. Wrapped in
@@ -228,6 +233,63 @@ impl nexus_claude::HookCallback for CompactionNotifier {
             },
         ))
     }
+}
+
+// ============================================================================
+// Pure helpers (testable without ChatManager)
+// ============================================================================
+
+/// Extracted protocol context from a `spawned_by` JSON payload.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SpawnedByContext {
+    pub parent_session_id: Option<String>,
+    pub spawn_type: String,
+    pub run_id: Option<Uuid>,
+    pub task_id: Option<Uuid>,
+    pub protocol_run_id: Option<Uuid>,
+    pub protocol_state: Option<String>,
+}
+
+/// Parse a `spawned_by` JSON string and extract parent session info + protocol FSM context.
+///
+/// Returns `None` if the JSON is invalid.
+/// The `protocol_run_id` and `protocol_state` fields are used to tag trajectories
+/// with `DURING_RUN` when a session operates within a protocol FSM.
+pub fn parse_spawned_by(json_str: &str) -> Option<SpawnedByContext> {
+    let val: serde_json::Value = serde_json::from_str(json_str).ok()?;
+    let parent_session_id = val
+        .get("parent_session_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let spawn_type = val
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("runner")
+        .to_string();
+    let run_id = val
+        .get("run_id")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<Uuid>().ok());
+    let task_id = val
+        .get("task_id")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<Uuid>().ok());
+    let protocol_run_id = val
+        .get("protocol_run_id")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<Uuid>().ok());
+    let protocol_state = val
+        .get("protocol_state")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    Some(SpawnedByContext {
+        parent_session_id,
+        spawn_type,
+        run_id,
+        task_id,
+        protocol_run_id,
+        protocol_state,
+    })
 }
 
 impl ChatManager {
@@ -1907,39 +1969,30 @@ impl ChatManager {
             .context("Failed to persist chat session")?;
 
         // If this session was spawned by another, create the SPAWNED_BY relation in Neo4j
-        if let Some(ref spawned_by_json) = request.spawned_by {
-            if let Ok(spawned_by) = serde_json::from_str::<serde_json::Value>(spawned_by_json) {
-                if let Some(parent_id) =
-                    spawned_by.get("parent_session_id").and_then(|v| v.as_str())
-                {
-                    let spawn_type = spawned_by
-                        .get("type")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("runner");
-                    let run_id = spawned_by
-                        .get("run_id")
-                        .and_then(|v| v.as_str())
-                        .and_then(|s| s.parse::<Uuid>().ok());
-                    let task_id = spawned_by
-                        .get("task_id")
-                        .and_then(|v| v.as_str())
-                        .and_then(|s| s.parse::<Uuid>().ok());
+        // and extract protocol FSM context (run_id + state) for trajectory tagging.
+        let spawned_ctx = request.spawned_by.as_deref().and_then(parse_spawned_by);
+        let (spawned_protocol_run_id, spawned_protocol_state) = match &spawned_ctx {
+            Some(ctx) => {
+                // Create SPAWNED_BY relation in graph if parent_session_id is present
+                if let Some(ref parent_id) = ctx.parent_session_id {
                     if let Err(e) = self
                         .graph
                         .create_spawned_by_relation(
                             &session_id.to_string(),
                             parent_id,
-                            spawn_type,
-                            run_id,
-                            task_id,
+                            &ctx.spawn_type,
+                            ctx.run_id,
+                            ctx.task_id,
                         )
                         .await
                     {
                         warn!("Failed to create SPAWNED_BY relation: {e}");
                     }
                 }
+                (ctx.protocol_run_id, ctx.protocol_state.clone())
             }
-        }
+            None => (None, None),
+        };
 
         // Create broadcast channel early so CompactionNotifier can use the sender
         let (events_tx, _) = broadcast::channel(BROADCAST_BUFFER);
@@ -2124,6 +2177,8 @@ impl ChatManager {
                     rfc_accumulator: Arc::new(Mutex::new(
                         super::observation_detector::RfcAccumulator::new(),
                     )),
+                    protocol_run_id: spawned_protocol_run_id,
+                    protocol_state: spawned_protocol_state.clone(),
                 },
             );
             interrupt_flag
@@ -2361,13 +2416,25 @@ impl ChatManager {
             let enrichment_input = if let Some(uuid) = session_uuid {
                 // Load session node to get project_slug
                 match graph.get_chat_session(uuid).await {
-                    Ok(Some(node)) => Some(super::enrichment::EnrichmentInput {
-                        message: prompt.clone(),
-                        session_id: uuid,
-                        project_slug: node.project_slug,
-                        project_id: None, // Resolved from slug inside stages
-                        cwd: Some(node.cwd),
-                    }),
+                    Ok(Some(node)) => {
+                        // Read protocol context from the active session (if any)
+                        let (proto_run_id, proto_state) = {
+                            let sessions = active_sessions.read().await;
+                            sessions
+                                .get(&uuid.to_string())
+                                .map(|s| (s.protocol_run_id, s.protocol_state.clone()))
+                                .unwrap_or((None, None))
+                        };
+                        Some(super::enrichment::EnrichmentInput {
+                            message: prompt.clone(),
+                            session_id: uuid,
+                            project_slug: node.project_slug,
+                            project_id: None, // Resolved from slug inside stages
+                            cwd: Some(node.cwd),
+                            protocol_run_id: proto_run_id,
+                            protocol_state: proto_state,
+                        })
+                    }
                     _ => None,
                 }
             } else {
@@ -4319,6 +4386,8 @@ impl ChatManager {
                     rfc_accumulator: Arc::new(Mutex::new(
                         super::observation_detector::RfcAccumulator::new(),
                     )),
+                    protocol_run_id: None,
+                    protocol_state: None,
                 },
             );
             interrupt_flag
@@ -4900,12 +4969,16 @@ impl ChatManager {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         // 3. Remove session from active map
-        let client = {
+        let (client, protocol_run_id, protocol_state) = {
             let mut sessions = self.active_sessions.write().await;
             let session = sessions
                 .remove(session_id)
                 .ok_or_else(|| anyhow!("Session {} not found or inactive", session_id))?;
-            session.client
+            (
+                session.client,
+                session.protocol_run_id,
+                session.protocol_state,
+            )
         };
 
         // 4. Finalize trajectory — fire-and-forget (non-blocking)
@@ -4913,7 +4986,11 @@ impl ChatManager {
         //    actual buffered DecisionRecords (tool success rate, confidence, duration).
         //    SessionHints provides optional task metadata not available inside the loop.
         if let Some(ref collector) = self.trajectory_collector {
-            let hints = neural_routing_runtime::SessionHints::default();
+            let hints = neural_routing_runtime::SessionHints {
+                protocol_run_id,
+                protocol_state,
+                ..Default::default()
+            };
             collector.end_session_auto(session_id.to_string(), hints);
             tracing::info!(
                 session_id = %session_id,
@@ -6867,6 +6944,8 @@ mod tests {
             rfc_accumulator: Arc::new(Mutex::new(
                 crate::chat::observation_detector::RfcAccumulator::new(),
             )),
+            protocol_run_id: None,
+            protocol_state: None,
         };
 
         Some((session, pending_messages))
@@ -7755,6 +7834,8 @@ mod tests {
             rfc_accumulator: Arc::new(Mutex::new(
                 crate::chat::observation_detector::RfcAccumulator::new(),
             )),
+            protocol_run_id: None,
+            protocol_state: None,
         };
 
         (session, handle)
@@ -9034,5 +9115,81 @@ mod tests {
         assert!(!chat.contains_key(serde_yaml::Value::String("process_path".into())));
         assert!(!chat.contains_key(serde_yaml::Value::String("claude_cli_path".into())));
         assert!(!chat.contains_key(serde_yaml::Value::String("auto_update_cli".into())));
+    }
+
+    // ================================================================
+    // parse_spawned_by tests
+    // ================================================================
+
+    #[test]
+    fn test_parse_spawned_by_full_context() {
+        let run_id = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
+        let proto_run_id = Uuid::new_v4();
+        let json = serde_json::json!({
+            "parent_session_id": "sess-123",
+            "type": "wave-runner",
+            "run_id": run_id.to_string(),
+            "task_id": task_id.to_string(),
+            "protocol_run_id": proto_run_id.to_string(),
+            "protocol_state": "implement"
+        })
+        .to_string();
+
+        let ctx = parse_spawned_by(&json).unwrap();
+        assert_eq!(ctx.parent_session_id, Some("sess-123".to_string()));
+        assert_eq!(ctx.spawn_type, "wave-runner");
+        assert_eq!(ctx.run_id, Some(run_id));
+        assert_eq!(ctx.task_id, Some(task_id));
+        assert_eq!(ctx.protocol_run_id, Some(proto_run_id));
+        assert_eq!(ctx.protocol_state, Some("implement".to_string()));
+    }
+
+    #[test]
+    fn test_parse_spawned_by_minimal() {
+        let json = r#"{"parent_session_id": "sess-456"}"#;
+        let ctx = parse_spawned_by(json).unwrap();
+        assert_eq!(ctx.parent_session_id, Some("sess-456".to_string()));
+        assert_eq!(ctx.spawn_type, "runner"); // default
+        assert_eq!(ctx.run_id, None);
+        assert_eq!(ctx.task_id, None);
+        assert_eq!(ctx.protocol_run_id, None);
+        assert_eq!(ctx.protocol_state, None);
+    }
+
+    #[test]
+    fn test_parse_spawned_by_protocol_only() {
+        let proto_run_id = Uuid::new_v4();
+        let json = serde_json::json!({
+            "protocol_run_id": proto_run_id.to_string(),
+            "protocol_state": "review"
+        })
+        .to_string();
+
+        let ctx = parse_spawned_by(&json).unwrap();
+        assert_eq!(ctx.parent_session_id, None);
+        assert_eq!(ctx.protocol_run_id, Some(proto_run_id));
+        assert_eq!(ctx.protocol_state, Some("review".to_string()));
+    }
+
+    #[test]
+    fn test_parse_spawned_by_empty_json() {
+        let ctx = parse_spawned_by("{}").unwrap();
+        assert_eq!(ctx.parent_session_id, None);
+        assert_eq!(ctx.spawn_type, "runner");
+        assert_eq!(ctx.protocol_run_id, None);
+    }
+
+    #[test]
+    fn test_parse_spawned_by_invalid_json() {
+        assert!(parse_spawned_by("not json").is_none());
+    }
+
+    #[test]
+    fn test_parse_spawned_by_invalid_uuid() {
+        let json = r#"{"protocol_run_id": "not-a-uuid", "run_id": "also-bad"}"#;
+        let ctx = parse_spawned_by(json).unwrap();
+        assert_eq!(ctx.protocol_run_id, None);
+        assert_eq!(ctx.run_id, None);
     }
 }
