@@ -303,6 +303,11 @@ pub struct TrainingResult {
     /// Whether EWC regularization was active during training.
     #[serde(skip)]
     pub ewc_was_active: bool,
+    /// Per-parameter sample gradients for EWC Fisher estimation.
+    /// Collected from `fisher_samples` forward+backward passes after training.
+    /// Each entry is (param_name, Vec<gradient_per_sample>).
+    #[serde(skip)]
+    pub fisher_gradients: Option<Vec<(String, Vec<Tensor>)>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -562,6 +567,83 @@ pub fn train_decision_transformer_with_ewc(
         }
     }
 
+    // Load best checkpoint back before Fisher estimation
+    // (so gradients are computed at θ* not at the last epoch's θ)
+    if let Some(ref ckpt_path) = best_checkpoint {
+        varmap.load(ckpt_path)?;
+    }
+
+    // Collect per-parameter gradients for EWC Fisher estimation.
+    // We run a few forward+backward passes on training data at θ* to compute
+    // the diagonal Fisher: F_i = (1/N) Σ_n (∂L_n/∂θ_i)²
+    let fisher_gradients = {
+        let (train_len, _, _) = dataloader.split_sizes();
+        let fisher_samples = 10.min(train_len); // cap at 10 for speed
+        if fisher_samples > 0 {
+            let all_vars = varmap.all_vars();
+            let var_names: Vec<String> = {
+                let data = varmap.data().lock().unwrap();
+                data.keys().cloned().collect()
+            };
+
+            // Initialize gradient accumulators: one Vec<Tensor> per parameter
+            let mut grad_accum: Vec<Vec<Tensor>> = vec![Vec::new(); var_names.len()];
+            let mut samples_collected = 0;
+
+            for batch_result in dataloader.batches(Split::Train, 0) {
+                if samples_collected >= fisher_samples {
+                    break;
+                }
+                let batch = match batch_result {
+                    Ok(b) => b,
+                    Err(_) => continue,
+                };
+
+                let pred = model.forward(
+                    &batch.returns_to_go,
+                    &batch.states,
+                    &batch.actions,
+                    &batch.timesteps,
+                    &batch.attention_mask,
+                )?;
+
+                let (loss, _, _) = compute_loss(
+                    &pred,
+                    &batch.actions,
+                    &batch.attention_mask,
+                    &batch.weights,
+                    config.mse_weight,
+                    config.cosine_weight,
+                )?;
+
+                let grads = loss.backward()?;
+
+                for (i, var) in all_vars.iter().enumerate() {
+                    if let Some(g) = grads.get(var) {
+                        grad_accum[i].push(g.clone());
+                    }
+                }
+
+                samples_collected += 1;
+            }
+
+            let fisher_grads: Vec<(String, Vec<Tensor>)> = var_names
+                .into_iter()
+                .zip(grad_accum)
+                .filter(|(_, grads)| !grads.is_empty())
+                .collect();
+
+            debug!(
+                "Collected Fisher gradients: {} params, {} samples each",
+                fisher_grads.len(),
+                samples_collected,
+            );
+            Some(fisher_grads)
+        } else {
+            None
+        }
+    };
+
     Ok(TrainingResult {
         epochs_completed: history.len(),
         best_val_loss,
@@ -573,6 +655,7 @@ pub fn train_decision_transformer_with_ewc(
         model_config,
         history,
         ewc_was_active: ewc.is_some_and(|e| e.is_active()),
+        fisher_gradients,
     })
 }
 

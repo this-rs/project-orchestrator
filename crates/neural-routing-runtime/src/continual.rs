@@ -516,8 +516,7 @@ async fn run_training_cycle(
             let promoted = improvement_pct >= min_improvement;
 
             if promoted {
-                // The training function already saved the best checkpoint via its own
-                // checkpoint_dir. We also save to our continual checkpoint path.
+                // Save to our continual checkpoint path for next cycle reload
                 if let Some(ref ckpt_path) = checkpoint_path {
                     if let Some(ref best_ckpt) = result.checkpoint_path {
                         if best_ckpt.exists() {
@@ -530,19 +529,53 @@ async fn run_training_cycle(
                     }
                 }
 
-                // EWC snapshot: capture Fisher information from the promoted model
-                // We can't easily get the gradients here since the training is done,
-                // but the checkpoint is saved. The next cycle will load it and the
-                // EWC penalty will protect those weights.
-                // For a full implementation, we'd need train_decision_transformer to
-                // return sample gradients. For now, we use a simplified approach:
-                // snapshot with uniform Fisher (all params equally important).
-                // This is a reasonable first approximation that still prevents
-                // catastrophic forgetting on the most-changed parameters.
-                tracing::info!(
-                    ewc_active = result.ewc_was_active,
-                    "Model promoted, EWC will protect these weights in next cycle"
-                );
+                // EWC snapshot: capture Fisher information from the promoted model.
+                // The training function returned per-parameter sample gradients
+                // collected at θ* (best checkpoint). We use these to compute
+                // F_i = mean(grad²) via snapshot_from_gradients().
+                if let Some(fisher_grads) = &result.fisher_gradients {
+                    if !fisher_grads.is_empty() {
+                        // We need a VarMap at θ* to take the EWC snapshot.
+                        // Load from the continual checkpoint we just saved.
+                        if let Some(ref ckpt_path) = checkpoint_path {
+                            if ckpt_path.exists() {
+                                let snapshot_result: Result<(), Box<dyn std::error::Error + Send + Sync>> = (|| {
+                                    let mut varmap = candle_nn::VarMap::new();
+                                    let vb = candle_nn::VarBuilder::from_varmap(
+                                        &varmap,
+                                        candle_core::DType::F32,
+                                        &candle_core::Device::Cpu,
+                                    );
+                                    // Initialize model structure in VarMap
+                                    let _ = neural_routing_policy::transformer::DecisionTransformer::new(
+                                        DecisionTransformerConfig::default(),
+                                        vb,
+                                    )?;
+                                    // Load promoted weights
+                                    varmap.load(ckpt_path)?;
+                                    Ok(varmap)
+                                })().and_then(|varmap| {
+                                    // snapshot_from_gradients is sync, but we need to
+                                    // acquire the async Mutex. Use try_lock since we know
+                                    // the training thread released it.
+                                    let mut ewc_guard = ewc.try_lock()
+                                        .map_err(|_| "EWC mutex still locked")?;
+                                    ewc_guard.snapshot_from_gradients(&varmap, fisher_grads)
+                                        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
+                                    tracing::info!(
+                                        param_count = ewc_guard.param_count(),
+                                        "EWC Fisher snapshot taken — penalty active for next cycle"
+                                    );
+                                    Ok(())
+                                });
+
+                                if let Err(e) = snapshot_result {
+                                    tracing::warn!(error = %e, "Failed to take EWC snapshot");
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
             tracing::info!(
@@ -759,15 +792,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_ewc_wiring_two_cycles() {
-        // Test that EWC is wired into the trainer and checkpoint_dir works
+        // Test that EWC snapshot is taken after first promoted cycle,
+        // and that EWC penalty is active during the second cycle.
         let tmp_dir = std::env::temp_dir().join("po_test_ewc_wiring");
         let _ = std::fs::remove_dir_all(&tmp_dir);
 
         let config = ContinualConfig {
-            trigger_threshold: 3,
-            buffer_capacity: 100,
+            trigger_threshold: 12, // Need at least 10 for train/val split
+            buffer_capacity: 200,
+            new_data_epochs: 2, // Minimal epochs for speed
             ewc_lambda: 100.0,
             ewc_fisher_samples: 5,
+            min_improvement_pct: -100.0, // Always promote (any result is "improvement")
             checkpoint_dir: Some(tmp_dir.clone()),
             ..Default::default()
         };
@@ -780,20 +816,35 @@ mod tests {
             "EWC should not be active initially"
         );
 
-        // --- Cycle 1: submit enough entries to trigger training ---
-        for _ in 0..3 {
+        // --- Cycle 1: submit enough entries to trigger training (>= 10 for train/val split) ---
+        for _ in 0..12 {
             trainer.submit(make_entry(0.8, false));
         }
-        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Wait for training cycle to complete (includes Fisher estimation)
+        // Training with candle + 12 trajectories + 2 epochs takes ~5-10s
+        tokio::time::sleep(Duration::from_secs(15)).await;
 
         let history = trainer.history().await;
         assert!(!history.is_empty(), "First training cycle should have run");
+        assert!(
+            history[0].promoted,
+            "First cycle should be promoted (min_improvement_pct=-100), got: {:?}",
+            history[0]
+        );
 
-        // --- Cycle 2: submit more entries for a second cycle ---
-        for _ in 0..3 {
+        // After a promoted cycle, EWC should have taken a Fisher snapshot
+        let ewc_active = trainer.ewc_active().await;
+        assert!(
+            ewc_active,
+            "EWC should be active after first promoted cycle (Fisher snapshot taken)"
+        );
+
+        // --- Cycle 2: submit more entries — EWC penalty should be active ---
+        for _ in 0..12 {
             trainer.submit(make_entry(0.9, false));
         }
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        tokio::time::sleep(Duration::from_secs(15)).await;
 
         let history = trainer.history().await;
         assert!(
@@ -802,10 +853,12 @@ mod tests {
             history.len()
         );
 
-        // Verify checkpoint directory was created
+        // Verify checkpoint file exists
+        let ckpt_file = tmp_dir.join("continual_best.safetensors");
         assert!(
-            tmp_dir.exists(),
-            "Checkpoint directory should have been created"
+            ckpt_file.exists(),
+            "Continual checkpoint file should exist at {:?}",
+            ckpt_file
         );
 
         // Cleanup
