@@ -627,7 +627,7 @@ mod tests {
         assert!(total_val > 0.0, "Total loss should be positive");
 
         // Loss with identical pred and target should be near zero
-        let (total_same, mse_same, cos_same) =
+        let (_total_same, mse_same, _cos_same) =
             compute_loss(&pred, &pred, &mask, &weights, 1.0, 0.1)?;
         assert!(
             mse_same < 1e-6,
