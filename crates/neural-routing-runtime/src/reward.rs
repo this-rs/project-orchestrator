@@ -164,11 +164,7 @@ mod tests {
     use super::*;
     use neural_routing_core::ToolUsage;
 
-    fn make_decision(
-        action: &str,
-        confidence: f64,
-        tool_success: bool,
-    ) -> DecisionRecord {
+    fn make_decision(action: &str, confidence: f64, tool_success: bool) -> DecisionRecord {
         DecisionRecord {
             session_id: "test".to_string(),
             context_embedding: vec![],
@@ -339,8 +335,7 @@ mod tests {
             make_decision("note.get_context", 0.8, true),
             make_decision("code.analyze_impact", 0.85, true),
         ];
-        let signals =
-            SessionSignals::from_decisions(&decisions, Duration::from_secs(120), 1, 2);
+        let signals = SessionSignals::from_decisions(&decisions, Duration::from_secs(120), 1, 2);
 
         assert!((signals.tool_success_rate - 1.0).abs() < 1e-10);
         assert!((signals.avg_confidence - 0.85).abs() < 1e-10);
@@ -355,8 +350,7 @@ mod tests {
             make_decision("code.search", 0.9, true),
             make_decision("code.search", 0.3, false),
         ];
-        let signals =
-            SessionSignals::from_decisions(&decisions, Duration::from_secs(60), 0, 0);
+        let signals = SessionSignals::from_decisions(&decisions, Duration::from_secs(60), 0, 0);
 
         assert!((signals.tool_success_rate - 0.5).abs() < 1e-10);
         assert!((signals.avg_confidence - 0.6).abs() < 1e-10);
@@ -364,8 +358,7 @@ mod tests {
 
     #[test]
     fn test_from_decisions_empty() {
-        let signals =
-            SessionSignals::from_decisions(&[], Duration::from_secs(10), 0, 0);
+        let signals = SessionSignals::from_decisions(&[], Duration::from_secs(10), 0, 0);
 
         assert_eq!(signals.tool_success_rate, 0.0);
         assert_eq!(signals.avg_confidence, 0.0);

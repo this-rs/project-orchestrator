@@ -158,7 +158,8 @@ pub struct ChatManager {
     pub(crate) enrichment_pipeline: Arc<super::enrichment::EnrichmentPipeline>,
     /// Trajectory collector for neural routing feedback loop.
     /// When Some, `close_session()` calls `end_session()` to finalize trajectories.
-    pub(crate) trajectory_collector: Option<std::sync::Arc<neural_routing_runtime::TrajectoryCollector>>,
+    pub(crate) trajectory_collector:
+        Option<std::sync::Arc<neural_routing_runtime::TrajectoryCollector>>,
     /// Reward computer for computing session reward on close.
     pub(crate) reward_computer: neural_routing_runtime::SessionRewardComputer,
 }

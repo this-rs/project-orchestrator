@@ -104,7 +104,12 @@ impl TrajectoryCollector {
         config: &CollectionConfig,
         vector_builder: Option<Arc<DecisionVectorBuilder>>,
     ) -> (Self, tokio::task::JoinHandle<()>) {
-        Self::new_with_reward(store, config, vector_builder, SessionRewardComputer::default())
+        Self::new_with_reward(
+            store,
+            config,
+            vector_builder,
+            SessionRewardComputer::default(),
+        )
     }
 
     /// Create a collector with a custom reward computer.
@@ -1330,7 +1335,10 @@ mod tests {
             match event {
                 CollectorEvent::Decision(d) if d.session_id == "session-a" => decisions_a += 1,
                 CollectorEvent::Decision(d) if d.session_id == "session-b" => decisions_b += 1,
-                CollectorEvent::EndSession { session_id, total_reward } => {
+                CollectorEvent::EndSession {
+                    session_id,
+                    total_reward,
+                } => {
                     match session_id.as_str() {
                         "session-a" => assert!((total_reward - 0.85).abs() < 1e-10),
                         "session-b" => assert!((total_reward - 0.6).abs() < 1e-10),
