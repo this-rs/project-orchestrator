@@ -356,6 +356,109 @@ pub fn build_runner_constraints(ctx: &RunnerPromptContext) -> String {
     out
 }
 
+/// Build a complete **system prompt** for runner-spawned agents.
+///
+/// Unlike the generic PO system prompt (conversational assistant), this prompt
+/// configures Claude as an **autonomous code execution agent** that writes code,
+/// tests, and commits without conversation.
+///
+/// This is injected as the `system_prompt` in `ClaudeCodeOptions`, giving it
+/// stronger behavioral anchoring than user-message constraints.
+pub fn build_runner_system_prompt(ctx: &RunnerPromptContext) -> String {
+    let base = match ctx.scaffolding_level {
+        0..=1 => RUNNER_SYSTEM_PROMPT_FULL,
+        2..=3 => RUNNER_SYSTEM_PROMPT_CONCISE,
+        _ => RUNNER_SYSTEM_PROMPT_MINIMAL,
+    };
+
+    let mut out = String::from(base);
+
+    // Branch constraint
+    if !ctx.git_branch.is_empty() {
+        out.push_str(&format!(
+            "\nAll commits must be on branch `{}`.\n",
+            ctx.git_branch
+        ));
+    }
+
+    // Forbidden files (parallel agent safety)
+    if !ctx.forbidden_files.is_empty() {
+        out.push_str(&format!(
+            "\n**DO NOT** modify these files (managed by other agents in this wave): {}\n",
+            ctx.forbidden_files.join(", ")
+        ));
+    }
+
+    // Activated skill knowledge
+    if let Some(ref skill_ctx) = ctx.skill_context {
+        out.push_str(&format!("\n## Activated Knowledge\n{}\n", skill_ctx));
+    }
+
+    // High frustration warning
+    if ctx.frustration_level > 0.7 {
+        out.push_str(
+            "\n⚠️ High frustration detected on this task — previous attempts failed. \
+             Use deep reasoning and try a DIFFERENT approach than previous attempts.\n",
+        );
+    }
+
+    // Parallel agent awareness
+    if ctx.parallel_agents > 1 {
+        out.push_str(&format!(
+            "\nYou are agent {} of {} parallel agents in this wave. \
+             Stay within your assigned files.\n",
+            ctx.wave_number, ctx.parallel_agents
+        ));
+    }
+
+    // Tag-conditional constraints
+    build_tag_constraints(&ctx.task_tags, &mut out);
+
+    out
+}
+
+/// Full runner system prompt — L0-L1 (verbose guidance for new projects).
+const RUNNER_SYSTEM_PROMPT_FULL: &str = r#"You are an **autonomous code execution agent** spawned by the PlanRunner.
+
+Your ONLY job is to **write code, test it, and commit it**. You are NOT in a conversation with a human. Do NOT greet, do NOT explain your reasoning at length, do NOT ask questions or request confirmation. Execute immediately.
+
+## Behavior Rules
+
+1. **Execute immediately** — read the task, analyze the code, implement the solution, test, commit.
+2. **DO NOT** call `task(action: "update")` or `step(action: "update")` via MCP — the Runner manages all status transitions.
+3. **DO NOT** use MCP project orchestrator tools for searching code — use Read, Grep, Glob directly for speed.
+4. Make atomic commits with conventional format: `<type>(<scope>): <short description>`.
+5. **NEVER** commit sensitive files (.env, credentials, *.key, *.pem, *.secret).
+6. After writing code, ALWAYS run `cargo check` (Rust) or the relevant build command to verify compilation.
+7. If tests are mentioned in steps, run them. If `cargo check` or tests fail, fix the errors and retry — do not give up.
+8. When done with ALL steps, make a final commit summarizing the work.
+
+## Execution Flow
+
+1. Read the task description and steps provided in the user message
+2. Read the affected files listed in the task
+3. For each step: implement → verify (cargo check / cargo test) → move to next
+4. Commit with a clear conventional message
+5. You are DONE when all steps are implemented and the code compiles
+
+## Important
+
+- The user message contains the FULL task context: description, steps, constraints, affected files, knowledge notes
+- Start coding IMMEDIATELY after reading the task — no preamble, no discussion
+- If you encounter an error, debug it yourself — read error messages, check types, fix imports
+- You have full filesystem access and bypassPermissions mode — use it
+"#;
+
+/// Concise runner system prompt — L2-L3 (reduced guidance).
+const RUNNER_SYSTEM_PROMPT_CONCISE: &str = r#"You are an autonomous code execution agent. Write code, test, commit. No conversation, no MCP status updates.
+
+Rules: Execute immediately. Read task from user message. Implement each step. Run cargo check. Commit with `<type>(<scope>): <desc>`. Never commit secrets. Fix errors yourself. No greetings, no questions.
+"#;
+
+/// Minimal runner system prompt — L4 (expert mode).
+const RUNNER_SYSTEM_PROMPT_MINIMAL: &str = r#"Autonomous code agent. Code → test → commit. No conversation. No MCP status calls. No secrets in commits.
+"#;
+
 /// Append tag-specific constraints based on task tags.
 fn build_tag_constraints(tags: &[String], out: &mut String) {
     let tag_set: std::collections::HashSet<&str> = tags.iter().map(|s| s.as_str()).collect();
@@ -908,5 +1011,114 @@ mod tests {
         // Both should appear (PromptBuilder doesn't deduplicate)
         assert!(prompt.contains("Persona A context"));
         assert!(prompt.contains("Persona B context"));
+    }
+
+    // ========================================================================
+    // build_runner_system_prompt tests
+    // ========================================================================
+
+    #[test]
+    fn test_runner_system_prompt_contains_execution_mode() {
+        let ctx = RunnerPromptContext::single_agent("main".to_string());
+        let result = build_runner_system_prompt(&ctx);
+        assert!(
+            result.contains("autonomous code execution agent"),
+            "Runner system prompt must declare autonomous mode"
+        );
+        assert!(
+            result.contains("NOT in a conversation"),
+            "Runner system prompt must explicitly state no conversation"
+        );
+        assert!(
+            result.contains("Do NOT greet"),
+            "Runner system prompt must forbid greetings"
+        );
+        assert!(
+            result.contains("Execute immediately"),
+            "Runner system prompt must instruct immediate execution"
+        );
+    }
+
+    #[test]
+    fn test_runner_system_prompt_does_not_contain_generic_po() {
+        let ctx = RunnerPromptContext::single_agent("main".to_string());
+        let result = build_runner_system_prompt(&ctx);
+        // Should NOT contain generic PO assistant phrases
+        assert!(
+            !result.contains("## Runner Execution Mode"),
+            "Runner system prompt should not use old constraint heading"
+        );
+    }
+
+    #[test]
+    fn test_runner_system_prompt_branch_injection() {
+        let ctx = RunnerPromptContext::single_agent("feat/my-feature".to_string());
+        let result = build_runner_system_prompt(&ctx);
+        assert!(result.contains("branch `feat/my-feature`"));
+    }
+
+    #[test]
+    fn test_runner_system_prompt_forbidden_files() {
+        let mut ctx = RunnerPromptContext::single_agent(String::new());
+        ctx.forbidden_files = vec!["src/main.rs".to_string()];
+        let result = build_runner_system_prompt(&ctx);
+        assert!(result.contains("DO NOT"));
+        assert!(result.contains("src/main.rs"));
+    }
+
+    #[test]
+    fn test_runner_system_prompt_scaffolding_levels() {
+        let l0 = {
+            let mut ctx = RunnerPromptContext::single_agent(String::new());
+            ctx.scaffolding_level = 0;
+            build_runner_system_prompt(&ctx)
+        };
+        let l2 = {
+            let mut ctx = RunnerPromptContext::single_agent(String::new());
+            ctx.scaffolding_level = 2;
+            build_runner_system_prompt(&ctx)
+        };
+        let l4 = {
+            let mut ctx = RunnerPromptContext::single_agent(String::new());
+            ctx.scaffolding_level = 4;
+            build_runner_system_prompt(&ctx)
+        };
+
+        // All levels should mention autonomous/code
+        assert!(l0.contains("autonomous code execution agent"));
+        assert!(l2.contains("autonomous"));
+        assert!(l4.contains("Autonomous"));
+
+        // Sizes should decrease with scaffolding level
+        assert!(
+            l0.len() > l2.len(),
+            "L0 ({}) should be longer than L2 ({})",
+            l0.len(),
+            l2.len()
+        );
+        assert!(
+            l2.len() > l4.len(),
+            "L2 ({}) should be longer than L4 ({})",
+            l2.len(),
+            l4.len()
+        );
+    }
+
+    #[test]
+    fn test_runner_system_prompt_frustration() {
+        let mut ctx = RunnerPromptContext::single_agent(String::new());
+        ctx.frustration_level = 0.9;
+        let result = build_runner_system_prompt(&ctx);
+        assert!(result.contains("frustration"));
+        assert!(result.contains("DIFFERENT approach"));
+    }
+
+    #[test]
+    fn test_runner_system_prompt_tag_constraints() {
+        let mut ctx = RunnerPromptContext::single_agent(String::new());
+        ctx.task_tags = vec!["test".to_string(), "security".to_string()];
+        let result = build_runner_system_prompt(&ctx);
+        assert!(result.contains("### Test Constraints"));
+        assert!(result.contains("### Security Constraints"));
     }
 }

@@ -920,6 +920,7 @@ pub async fn delegate_task(
         spawned_by: Some(spawned_by_json.to_string()),
         task_context: Some(task_title.clone()),
         scaffolding_override,
+        runner_context: None, // TODO: populate for delegate_task
     };
 
     let session = chat_manager

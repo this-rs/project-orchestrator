@@ -326,6 +326,7 @@ async fn execute_via_agent(
             protocol.name, state.name
         )),
         scaffolding_override: None,
+        runner_context: None,
     };
 
     let session = chat_manager

@@ -2127,22 +2127,36 @@ impl ChatManager {
                 .and_then(|ctx| ctx.scaffolding_level)
         });
 
-        // Use task_context (from delegate_task/PlanRunner) as routing signal when
-        // the message is empty — this gives the router intent awareness for sub-agents.
-        let routing_message = if request.message.is_empty() {
-            request.task_context.as_deref().unwrap_or("")
+        // Build system prompt — runner-spawned agents get a dedicated autonomous
+        // execution prompt; conversational sessions get the generic PO prompt.
+        let (system_prompt, _included_note_ids) = if let Some(ref runner_ctx) = request.runner_context
+        {
+            // Runner mode: use the runner system prompt (autonomous code execution)
+            let prompt_ctx = runner_ctx.to_prompt_context();
+            let runner_prompt =
+                crate::runner::prompt::build_runner_system_prompt(&prompt_ctx);
+            info!(
+                session_id = %session_id,
+                scaffolding = runner_ctx.scaffolding_level,
+                "Using runner system prompt (autonomous code execution mode)"
+            );
+            (runner_prompt, std::collections::HashSet::new())
         } else {
-            &request.message
-        };
-        let (system_prompt, _included_note_ids) = self
-            .build_system_prompt(
+            // Conversational mode: use the generic PO system prompt with routing
+            let routing_message = if request.message.is_empty() {
+                request.task_context.as_deref().unwrap_or("")
+            } else {
+                &request.message
+            };
+            self.build_system_prompt(
                 request.project_slug.as_deref(),
                 routing_message,
                 Some(&model),
                 Some(&session_id.to_string()),
                 scaffolding_override,
             )
-            .await;
+            .await
+        };
 
         // Persist session in Neo4j
         // Resolve add_dirs from explicit request, workspace, or empty

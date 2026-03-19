@@ -1754,7 +1754,10 @@ impl PlanRunner {
             0
         };
 
-        let runner_ctx = RunnerPromptContext {
+        // Build RunnerContext — behavioral constraints now go into the SYSTEM PROMPT
+        // (via create_session), not the user message. This prevents the generic PO
+        // system prompt from conflicting with runner execution instructions.
+        let runner_context = crate::chat::types::RunnerContext {
             git_branch,
             task_tags,
             affected_files: affected_files_for_ctx,
@@ -1765,9 +1768,9 @@ impl PlanRunner {
             parallel_agents: 1, // default, overridden by execute_wave
             scaffolding_level,
         };
-        prompt.push_str(&build_runner_constraints(&runner_ctx));
 
         // --- Step 2b.4: Inject continuity context from previous waves ---
+        // (still in user message — this is task-specific, not behavioral)
         if !continuity_context.is_empty() {
             prompt.push_str(continuity_context);
         }
@@ -1832,6 +1835,7 @@ impl PlanRunner {
             ),
             task_context: Some(task_context_str),
             scaffolding_override: None,
+            runner_context: Some(runner_context),
         };
 
         let session = self.chat_manager.create_session(&request).await?;
