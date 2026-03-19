@@ -13,8 +13,8 @@ use crate::runner::enricher::TaskEnricher;
 use crate::runner::git;
 use crate::runner::guard::{AgentGuard, ChatManagerHintSender, GuardConfig, GuardVerdict};
 use crate::runner::models::{
-    ActiveAgent, ActiveAgentSnapshot, PlanRunStatus, RunnerConfig, RunnerEvent, TaskResult,
-    TriggerSource,
+    ActiveAgent, ActiveAgentSnapshot, PlanRunStatus, RunnerConfig, RunnerEvent,
+    TaskExecutionReport, TaskResult, TriggerSource,
 };
 use crate::runner::persona::{
     activate_skills_for_task, complexity_directive, profile_task, record_skill_feedback,
@@ -824,6 +824,7 @@ impl PlanRunner {
                         &title_clone,
                         &cwd,
                         project_slug.as_deref(),
+                        None, // no retry context on first attempt
                     )
                     .await;
                 (task_id, title_clone, result)
@@ -1232,6 +1233,218 @@ impl PlanRunner {
             }
         }
 
+        // =====================================================================
+        // Retry loop — sequentially retry failed tasks with error context
+        // =====================================================================
+        if !wave_result.tasks_failed.is_empty() && self.config.max_retries > 0 && !wave_result.aborted {
+            // Build title lookup from wave tasks
+            let title_map: std::collections::HashMap<Uuid, String> = wave
+                .tasks
+                .iter()
+                .map(|t| {
+                    (
+                        t.id,
+                        t.title.clone().unwrap_or_else(|| "untitled".to_string()),
+                    )
+                })
+                .collect();
+
+            // Collect retryable tasks (those where on_task_failed returned true / status is Pending)
+            let retryable: Vec<(Uuid, String)> = {
+                let global = RUNNER_STATE.read().await;
+                wave_result
+                    .tasks_failed
+                    .iter()
+                    .filter(|(tid, _)| {
+                        // Eligible if retry_count <= max_retries (on_task_failed already incremented)
+                        global
+                            .as_ref()
+                            .map(|s| {
+                                let count = s.retry_counts.get(tid).copied().unwrap_or(0);
+                                count <= self.config.max_retries
+                            })
+                            .unwrap_or(false)
+                    })
+                    .cloned()
+                    .collect()
+            };
+
+            for (task_id, failure_reason) in &retryable {
+                // Check cancellation before each retry
+                if RUNNER_CANCEL.load(Ordering::SeqCst) {
+                    info!("Runner cancelled, skipping remaining retries");
+                    break;
+                }
+
+                // Check budget before retry
+                {
+                    let global = RUNNER_STATE.read().await;
+                    if let Some(ref s) = *global {
+                        if s.is_budget_exceeded(self.config.max_cost_usd) {
+                            info!("Budget exceeded, skipping remaining retries");
+                            break;
+                        }
+                    }
+                }
+
+                let task_title = title_map
+                    .get(task_id)
+                    .cloned()
+                    .unwrap_or_else(|| "untitled".to_string());
+
+                let retry_count = {
+                    let global = RUNNER_STATE.read().await;
+                    global
+                        .as_ref()
+                        .and_then(|s| s.retry_counts.get(task_id).copied())
+                        .unwrap_or(1)
+                };
+
+                info!(
+                    "Retrying task {} ({}) — attempt {}/{}",
+                    task_id, task_title, retry_count, self.config.max_retries
+                );
+
+                // Build retry context from failure reason
+                let retry_context = format!(
+                    "Attempt {attempt} failed with error:\n```\n{reason}\n```\n\
+                     Analyze the root cause carefully before retrying. \
+                     Do NOT repeat the same approach — adapt your strategy.",
+                    attempt = retry_count,
+                    reason = failure_reason,
+                );
+
+                // Execute the retry
+                let retry_result = self
+                    .execute_task(
+                        run_id,
+                        plan_id,
+                        *task_id,
+                        &task_title,
+                        cwd,
+                        project_slug,
+                        Some(retry_context),
+                    )
+                    .await;
+
+                match retry_result {
+                    Ok(exec_result) => match exec_result.result {
+                        TaskResult::Success {
+                            duration_secs,
+                            cost_usd,
+                        } => {
+                            info!(
+                                "Retry succeeded for task {} ({}) in {:.1}s",
+                                task_id, task_title, duration_secs
+                            );
+                            self.on_task_completed(run_id, *task_id, duration_secs, cost_usd)
+                                .await?;
+                            // Move from failed to completed
+                            wave_result
+                                .tasks_failed
+                                .retain(|(tid, _)| tid != task_id);
+                            wave_result.tasks_completed.push(*task_id);
+                            wave_result.wave_cost_usd += cost_usd;
+
+                            // Fire-and-forget enrichment for retry success
+                            let enricher = TaskEnricher::new(self.graph.clone());
+                            let enrich_plan_id = plan_id;
+                            let enrich_project_id = project_id;
+                            let enrich_session_id = exec_result.session_id();
+                            let enrich_cwd = cwd.to_string();
+                            let enrich_start = chrono::Utc::now();
+                            let retry_task_id = *task_id;
+                            tokio::spawn(async move {
+                                let result = enricher
+                                    .enrich(
+                                        retry_task_id,
+                                        enrich_plan_id,
+                                        enrich_project_id,
+                                        enrich_session_id,
+                                        enrich_start,
+                                        &enrich_cwd,
+                                    )
+                                    .await;
+                                info!(
+                                    "Enricher (retry) completed for task {}: {} commits, note={}, {} affects",
+                                    retry_task_id,
+                                    result.commits_linked,
+                                    result.note_created,
+                                    result.affects_added
+                                );
+                            });
+                        }
+                        TaskResult::Failed {
+                            reason,
+                            attempts: _,
+                            cost_usd,
+                        } => {
+                            warn!(
+                                "Retry failed again for task {} ({}): {}",
+                                task_id, task_title, reason
+                            );
+                            // Update the failure reason in wave_result
+                            if let Some(entry) = wave_result
+                                .tasks_failed
+                                .iter_mut()
+                                .find(|(tid, _)| tid == task_id)
+                            {
+                                entry.1 = format!("retry failed: {}", reason);
+                            }
+                            wave_result.wave_cost_usd += cost_usd;
+                            // Mark definitively failed
+                            self.update_task_status_with_event(*task_id, TaskStatus::Failed)
+                                .await?;
+                            {
+                                let mut global = RUNNER_STATE.write().await;
+                                if let Some(ref mut s) = *global {
+                                    s.mark_task_failed(*task_id);
+                                    self.graph.update_plan_run(s).await?;
+                                }
+                            }
+                            // Create gotcha note for future learning
+                            self.create_failure_gotcha(
+                                *task_id,
+                                &task_title,
+                                &reason,
+                                retry_count,
+                                project_id,
+                            )
+                            .await;
+                        }
+                        other => {
+                            warn!(
+                                "Retry for task {} returned unexpected result: {:?}",
+                                task_id, other
+                            );
+                        }
+                    },
+                    Err(e) => {
+                        error!("Retry execution error for task {}: {}", task_id, e);
+                        // Mark definitively failed
+                        self.update_task_status_with_event(*task_id, TaskStatus::Failed)
+                            .await?;
+                        {
+                            let mut global = RUNNER_STATE.write().await;
+                            if let Some(ref mut s) = *global {
+                                s.mark_task_failed(*task_id);
+                                self.graph.update_plan_run(s).await?;
+                            }
+                        }
+                        // Create gotcha note for future learning
+                        self.create_failure_gotcha(
+                            *task_id,
+                            &task_title,
+                            &e.to_string(),
+                            retry_count,
+                            project_id,
+                        )
+                        .await;
+                    }
+                }
+            }
+        }
+
         Ok(wave_result)
     }
 
@@ -1244,8 +1457,13 @@ impl PlanRunner {
         task_title: &str,
         cwd: &str,
         project_slug: Option<&str>,
+        retry_context: Option<String>,
     ) -> Result<TaskExecutionResult> {
-        info!("Executing task {}: {}", task_id, task_title);
+        if retry_context.is_some() {
+            info!("Retrying task {}: {} (with error context)", task_id, task_title);
+        } else {
+            info!("Executing task {}: {}", task_id, task_title);
+        }
 
         // Update global state — register active agent
         {
@@ -1398,6 +1616,21 @@ impl PlanRunner {
             parallel_agents: 1, // default, overridden by execute_wave
         };
         prompt.push_str(&build_runner_constraints(&runner_ctx));
+
+        // --- Step 2b.5: Inject retry context if this is a retry ---
+        if let Some(ref ctx) = retry_context {
+            prompt.push_str(&format!(
+                "\n## ⚠️ Previous Attempt Failed\n\
+                 This is a retry. The previous attempt failed with the following context:\n\n\
+                 {}\n\n\
+                 **Instructions for retry:**\n\
+                 - Analyze the error carefully before starting\n\
+                 - Try a DIFFERENT approach than the one that failed\n\
+                 - If the error was a compilation issue, check types and imports first\n\
+                 - If the error was a test failure, read the test expectations carefully\n",
+                ctx
+            ));
+        }
 
         // --- Step 2c: Inject persona context ---
         if let Some(ref pc) = persona_context {
@@ -1809,6 +2042,8 @@ impl PlanRunner {
         Ok(())
     }
 
+    /// Handle a task failure. Returns `true` if a retry is eligible (retry count
+    /// has been incremented and task is marked Pending, not Failed).
     async fn on_task_failed(
         &self,
         run_id: Uuid,
@@ -1817,18 +2052,17 @@ impl PlanRunner {
         reason: &str,
         duration_secs: f64,
         cost_usd: f64,
-    ) -> Result<()> {
-        // Check retry count
-        let mut should_retry = false;
-        {
+    ) -> Result<bool> {
+        // Check retry eligibility
+        let (should_retry, retry_count) = {
             let global = RUNNER_STATE.read().await;
             if let Some(ref s) = *global {
-                let retry_count = s.retry_counts.get(&task_id).copied().unwrap_or(0);
-                if retry_count < self.config.max_retries {
-                    should_retry = true;
-                }
+                let count = s.retry_counts.get(&task_id).copied().unwrap_or(0);
+                (count < self.config.max_retries, count)
+            } else {
+                (false, 0)
             }
-        }
+        };
 
         if should_retry {
             // Increment retry count
@@ -1840,29 +2074,31 @@ impl PlanRunner {
             }
 
             warn!(
-                "Task {} failed ({}), retrying with error context...",
-                task_id, reason
+                "Task {} failed ({}), retry {}/{} eligible",
+                task_id, reason, retry_count + 1, self.config.max_retries
             );
 
-            // Retry: re-execute with the error context injected
-            // For now, we just mark failed — retry logic will be enhanced in T3/T4
-            let retry_count = {
-                let global = RUNNER_STATE.read().await;
-                global
-                    .as_ref()
-                    .and_then(|s| s.retry_counts.get(&task_id).copied())
-                    .unwrap_or(0)
-            };
+            // Mark task back to Pending so retry can re-enter InProgress
+            self.update_task_status_with_event(task_id, TaskStatus::Pending)
+                .await?;
+
             self.emit_event(RunnerEvent::TaskFailed {
                 run_id,
                 task_id,
                 task_title: String::new(),
-                reason: format!("{} (will retry)", reason),
-                attempts: retry_count,
+                reason: format!("{} (will retry {}/{})", reason, retry_count + 1, self.config.max_retries),
+                attempts: retry_count + 1,
             });
+
+            error!(
+                "Task {} failed (retryable): {} (duration: {:.1}s, cost: ${:.4})",
+                task_id, reason, duration_secs, cost_usd
+            );
+
+            return Ok(true);
         }
 
-        // Mark task as failed (with CrudEvent for WebSocket)
+        // No retries left — mark as definitively Failed
         self.update_task_status_with_event(task_id, TaskStatus::Failed)
             .await?;
 
@@ -1875,27 +2111,85 @@ impl PlanRunner {
             }
         }
 
-        let attempts = {
-            let global = RUNNER_STATE.read().await;
-            global
-                .as_ref()
-                .and_then(|s| s.retry_counts.get(&task_id).copied())
-                .unwrap_or(0)
-        };
         self.emit_event(RunnerEvent::TaskFailed {
             run_id,
             task_id,
             task_title: String::new(),
             reason: reason.to_string(),
-            attempts,
+            attempts: retry_count,
         });
 
         error!(
-            "Task {} failed: {} (duration: {:.1}s, cost: ${:.4})",
+            "Task {} failed (final): {} (duration: {:.1}s, cost: ${:.4})",
             task_id, reason, duration_secs, cost_usd
         );
 
-        Ok(())
+        Ok(false)
+    }
+
+    /// Create a gotcha note when a task fails definitively after all retries.
+    ///
+    /// This captures the failure context as a knowledge artifact so future runs
+    /// (and humans) can learn from the failure pattern.
+    async fn create_failure_gotcha(
+        &self,
+        task_id: Uuid,
+        task_title: &str,
+        reason: &str,
+        retry_count: u32,
+        project_id: Option<Uuid>,
+    ) {
+        use crate::notes::models::{Note, NoteImportance, NoteType};
+
+        let content = format!(
+            "## Task Failed After {retries} Retry(ies)\n\n\
+             **Task**: {title} (`{id}`)\n\n\
+             **Final error**:\n```\n{reason}\n```\n\n\
+             **Retries attempted**: {retries}/{max}\n\n\
+             This task could not be completed autonomously. \
+             Manual investigation is recommended.",
+            title = task_title,
+            id = task_id,
+            reason = reason,
+            retries = retry_count,
+            max = self.config.max_retries,
+        );
+
+        let mut note = Note::new(
+            project_id,
+            NoteType::Gotcha,
+            content,
+            "runner-retry".to_string(),
+        );
+        note.importance = NoteImportance::High;
+        note.tags = vec![
+            "auto-generated".to_string(),
+            "task-failure".to_string(),
+            "retry-exhausted".to_string(),
+            format!("task:{}", task_id),
+        ];
+
+        let note_id = note.id;
+        if let Err(e) = self.graph.create_note(&note).await {
+            warn!("Failed to create failure gotcha note for task {}: {}", task_id, e);
+            return;
+        }
+
+        // Link note to the task
+        use crate::notes::models::EntityType as NoteEntityType;
+        let task_id_str = task_id.to_string();
+        if let Err(e) = self
+            .graph
+            .link_note_to_entity(note_id, &NoteEntityType::Task, &task_id_str, None, None)
+            .await
+        {
+            warn!("Failed to link gotcha note to task {}: {}", task_id, e);
+        }
+
+        info!(
+            "Created failure gotcha note {} for task {} ({})",
+            note_id, task_id, task_title
+        );
     }
 
     /// Create a PR automatically via `gh pr create` after plan completion.
