@@ -1775,7 +1775,20 @@ impl PlanRunner {
             prompt.push_str(continuity_context);
         }
 
-        // --- Step 2b.5: Inject retry context if this is a retry ---
+        // --- Step 2b.5: Pre-read affected files so the agent has immediate context ---
+        let file_contents = crate::orchestrator::context::pre_read_affected_files(
+            cwd,
+            &runner_context.affected_files,
+            5,
+            200,
+        )
+        .await;
+        if !file_contents.is_empty() {
+            prompt.push_str("\n");
+            prompt.push_str(&file_contents);
+        }
+
+        // --- Step 2b.6: Inject retry context if this is a retry ---
         if let Some(ref ctx) = retry_context {
             prompt.push_str(&format!(
                 "\n## ⚠️ Previous Attempt Failed\n\
