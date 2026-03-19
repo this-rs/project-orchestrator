@@ -1845,7 +1845,7 @@ impl PlanRunner {
             })
             .unwrap_or_default();
         let request = ChatRequest {
-            message: String::new(), // message sent separately via send_message
+            message: prompt, // Send the full prompt directly in create_session — avoids the ghost empty message at seq 1
             session_id: None,
             cwd: cwd.to_string(),
             project_slug: project_slug.map(|s| s.to_string()),
@@ -1926,13 +1926,11 @@ impl PlanRunner {
             }
         };
 
-        // Subscribe to events BEFORE sending message (to not miss any)
+        // Subscribe to events BEFORE the background task starts streaming
+        // (create_session spawns a tokio task that sends the message — subscribe must happen first)
         let rx = self.chat_manager.subscribe(&session_id).await?;
         // Clone a second receiver for the guard
         let guard_rx = self.chat_manager.subscribe(&session_id).await?;
-
-        // Send the prompt
-        self.chat_manager.send_message(&session_id, &prompt).await?;
 
         let start = std::time::Instant::now();
 
