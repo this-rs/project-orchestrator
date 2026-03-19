@@ -93,6 +93,88 @@ struct WaveResult {
     pub aborted: bool,
 }
 
+/// Summary of a completed task, used for inter-task continuity in a PlanRun.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct TaskSummary {
+    pub task_id: Uuid,
+    pub title: String,
+    pub wave_number: usize,
+    pub status: String, // "completed" or "failed"
+    pub commits: Vec<String>,
+    pub files_modified: Vec<String>,
+}
+
+/// Cumulative memory across waves in a PlanRun, providing continuity context
+/// to subsequent tasks so they know what was accomplished by previous tasks.
+#[derive(Debug, Clone, Default)]
+struct RunMemory {
+    pub summaries: Vec<TaskSummary>,
+}
+
+impl RunMemory {
+    /// Render the accumulated memory as a markdown section for prompt injection.
+    fn to_markdown(&self) -> String {
+        if self.summaries.is_empty() {
+            return String::new();
+        }
+        let mut md = String::from("\n## Previous Tasks (Continuity Context)\n\n");
+        md.push_str("The following tasks have already been completed in this plan run. ");
+        md.push_str("Build on their work — do NOT redo what is already done.\n\n");
+        for s in &self.summaries {
+            md.push_str(&format!(
+                "### Wave {} — {} ({})\n",
+                s.wave_number, s.title, s.status
+            ));
+            if !s.commits.is_empty() {
+                md.push_str("**Commits:**\n");
+                for c in &s.commits {
+                    md.push_str(&format!("- `{}`\n", c));
+                }
+            }
+            if !s.files_modified.is_empty() {
+                md.push_str("**Files modified:**\n");
+                for f in &s.files_modified {
+                    md.push_str(&format!("- `{}`\n", f));
+                }
+            }
+            md.push('\n');
+        }
+        md
+    }
+
+    /// Add a task summary from a completed task.
+    fn record_completed(
+        &mut self,
+        task_id: Uuid,
+        title: String,
+        wave_number: usize,
+        commits: Vec<String>,
+        files_modified: Vec<String>,
+    ) {
+        self.summaries.push(TaskSummary {
+            task_id,
+            title,
+            wave_number,
+            status: "completed".to_string(),
+            commits,
+            files_modified,
+        });
+    }
+
+    /// Add a summary for a failed task.
+    fn record_failed(&mut self, task_id: Uuid, title: String, wave_number: usize, reason: &str) {
+        self.summaries.push(TaskSummary {
+            task_id,
+            title,
+            wave_number,
+            status: format!("failed: {}", &reason[..reason.len().min(200)]),
+            commits: vec![],
+            files_modified: vec![],
+        });
+    }
+}
+
 /// Result of execute_task — wraps TaskResult with the session_id for enricher.
 #[derive(Debug)]
 struct TaskExecutionResult {
@@ -584,6 +666,8 @@ impl PlanRunner {
             }
         }
 
+        let mut run_memory = RunMemory::default();
+
         for (wave_idx, wave) in waves.iter().enumerate() {
             let wave_number = wave_idx + 1;
 
@@ -613,6 +697,7 @@ impl PlanRunner {
             let wave_base_sha = git::head_sha(&cwd).await.unwrap_or_default();
 
             // Execute all tasks in this wave in parallel via JoinSet
+            let continuity_context = run_memory.to_markdown();
             let wave_result = self
                 .execute_wave(
                     run_id,
@@ -621,6 +706,7 @@ impl PlanRunner {
                     &cwd,
                     project_slug.as_deref(),
                     project_id,
+                    &continuity_context,
                 )
                 .await?;
 
@@ -741,6 +827,52 @@ impl PlanRunner {
                 tasks_completed: tc,
                 tasks_failed: tf,
             });
+
+            // Accumulate RunMemory from completed/failed tasks in this wave
+            for &task_id in &wave_result.tasks_completed {
+                let title = wave
+                    .tasks
+                    .iter()
+                    .find(|t| t.id == task_id)
+                    .and_then(|t| t.title.clone())
+                    .unwrap_or_else(|| format!("Task {}", task_id));
+                // Collect commits for this task from the graph (best effort)
+                let (commits, files) = match self.graph.get_task_commits(task_id).await {
+                    Ok(commit_nodes) => {
+                        let commit_msgs: Vec<String> = commit_nodes
+                            .iter()
+                            .map(|c| {
+                                format!(
+                                    "{}: {}",
+                                    &c.hash[..c.hash.len().min(8)],
+                                    c.message.lines().next().unwrap_or("")
+                                )
+                            })
+                            .collect();
+                        let mut all_files: Vec<String> = Vec::new();
+                        for c in &commit_nodes {
+                            if let Ok(files) = self.graph.get_commit_files(&c.hash).await {
+                                all_files
+                                    .extend(files.into_iter().map(|f| f.path));
+                            }
+                        }
+                        all_files.sort();
+                        all_files.dedup();
+                        (commit_msgs, all_files)
+                    }
+                    Err(_) => (vec![], vec![]),
+                };
+                run_memory.record_completed(task_id, title, wave_number, commits, files);
+            }
+            for (task_id, reason) in &wave_result.tasks_failed {
+                let title = wave
+                    .tasks
+                    .iter()
+                    .find(|t| t.id == *task_id)
+                    .and_then(|t| t.title.clone())
+                    .unwrap_or_else(|| format!("Task {}", task_id));
+                run_memory.record_failed(*task_id, title, wave_number, reason);
+            }
         }
 
         // All waves completed successfully
@@ -762,6 +894,7 @@ impl PlanRunner {
         cwd: &str,
         project_slug: Option<&str>,
         project_id: Option<Uuid>,
+        continuity_context: &str,
     ) -> Result<WaveResult> {
         use tokio::task::JoinSet;
 
@@ -814,6 +947,7 @@ impl PlanRunner {
             let cwd = cwd.to_string();
             let project_slug = project_slug.map(|s| s.to_string());
             let title_clone = task_title.clone();
+            let continuity = continuity_context.to_string();
 
             join_set.spawn(async move {
                 let result = runner
@@ -825,6 +959,7 @@ impl PlanRunner {
                         &cwd,
                         project_slug.as_deref(),
                         None, // no retry context on first attempt
+                        &continuity,
                     )
                     .await;
                 (task_id, title_clone, result)
@@ -1324,6 +1459,7 @@ impl PlanRunner {
                         cwd,
                         project_slug,
                         Some(retry_context),
+                        continuity_context,
                     )
                     .await;
 
@@ -1458,6 +1594,7 @@ impl PlanRunner {
         cwd: &str,
         project_slug: Option<&str>,
         retry_context: Option<String>,
+        continuity_context: &str,
     ) -> Result<TaskExecutionResult> {
         if retry_context.is_some() {
             info!("Retrying task {}: {} (with error context)", task_id, task_title);
@@ -1616,6 +1753,11 @@ impl PlanRunner {
             parallel_agents: 1, // default, overridden by execute_wave
         };
         prompt.push_str(&build_runner_constraints(&runner_ctx));
+
+        // --- Step 2b.4: Inject continuity context from previous waves ---
+        if !continuity_context.is_empty() {
+            prompt.push_str(continuity_context);
+        }
 
         // --- Step 2b.5: Inject retry context if this is a retry ---
         if let Some(ref ctx) = retry_context {
