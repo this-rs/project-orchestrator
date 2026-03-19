@@ -464,11 +464,28 @@ pub async fn update_plan_status(
 ) -> Result<StatusCode, AppError> {
     // Handle status change if provided
     if let Some(status) = req.status {
+        // Get old status before mutation for StatusChanged event
+        let old_status = state
+            .orchestrator
+            .neo4j()
+            .get_plan(plan_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|p| format!("{:?}", p.status))
+            .unwrap_or_default();
         state
             .orchestrator
             .plan_manager()
-            .update_plan_status(plan_id, status)
+            .update_plan_status(plan_id, status.clone())
             .await?;
+        state.event_bus.emit_status_changed(
+            crate::events::EntityType::Plan,
+            &plan_id.to_string(),
+            &old_status,
+            &format!("{:?}", status),
+            None,
+        );
     }
 
     // Handle field updates (title, description, priority)
@@ -486,14 +503,14 @@ pub async fn update_plan_status(
             .plan_manager()
             .update_plan(plan_id, plan_update)
             .await?;
+        state.event_bus.emit_updated(
+            crate::events::EntityType::Plan,
+            &plan_id.to_string(),
+            serde_json::json!({}),
+            None,
+        );
     }
 
-    state.event_bus.emit_updated(
-        crate::events::EntityType::Plan,
-        &plan_id.to_string(),
-        serde_json::json!({}),
-        None,
-    );
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -577,17 +594,42 @@ pub async fn update_task(
     Path(task_id): Path<Uuid>,
     Json(req): Json<UpdateTaskRequest>,
 ) -> Result<StatusCode, AppError> {
+    let status_change = if req.status.is_some() {
+        let old_status = state
+            .orchestrator
+            .neo4j()
+            .get_task(task_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|t| format!("{:?}", t.status))
+            .unwrap_or_default();
+        let new_status = format!("{:?}", req.status.as_ref().unwrap());
+        Some((old_status, new_status))
+    } else {
+        None
+    };
     state
         .orchestrator
         .plan_manager()
         .update_task(task_id, req)
         .await?;
-    state.event_bus.emit_updated(
-        crate::events::EntityType::Task,
-        &task_id.to_string(),
-        serde_json::json!({}),
-        None,
-    );
+    if let Some((old_status, new_status)) = status_change {
+        state.event_bus.emit_status_changed(
+            crate::events::EntityType::Task,
+            &task_id.to_string(),
+            &old_status,
+            &new_status,
+            None,
+        );
+    } else {
+        state.event_bus.emit_updated(
+            crate::events::EntityType::Task,
+            &task_id.to_string(),
+            serde_json::json!({}),
+            None,
+        );
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -3910,8 +3952,22 @@ pub async fn update_release(
     Path(release_id): Path<Uuid>,
     Json(req): Json<UpdateReleaseRequest>,
 ) -> Result<StatusCode, AppError> {
+    let status_change = if req.status.is_some() {
+        let old_status = state
+            .orchestrator
+            .neo4j()
+            .get_release(release_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|r| format!("{:?}", r.status))
+            .unwrap_or_default();
+        let new_status = format!("{:?}", req.status.as_ref().unwrap());
+        Some((old_status, new_status))
+    } else {
+        None
+    };
     let payload = serde_json::json!({
-        "status": &req.status,
         "title": &req.title,
         "description": &req.description,
     });
@@ -3926,12 +3982,22 @@ pub async fn update_release(
             req.description,
         )
         .await?;
-    state.event_bus.emit_updated(
-        crate::events::EntityType::Release,
-        &release_id.to_string(),
-        payload,
-        None,
-    );
+    if let Some((old_status, new_status)) = status_change {
+        state.event_bus.emit_status_changed(
+            crate::events::EntityType::Release,
+            &release_id.to_string(),
+            &old_status,
+            &new_status,
+            None,
+        );
+    } else {
+        state.event_bus.emit_updated(
+            crate::events::EntityType::Release,
+            &release_id.to_string(),
+            payload,
+            None,
+        );
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -4126,8 +4192,22 @@ pub async fn update_milestone(
     Path(milestone_id): Path<Uuid>,
     Json(req): Json<UpdateMilestoneRequest>,
 ) -> Result<StatusCode, AppError> {
+    let status_change = if req.status.is_some() {
+        let old_status = state
+            .orchestrator
+            .neo4j()
+            .get_milestone(milestone_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|m| format!("{:?}", m.status))
+            .unwrap_or_default();
+        let new_status = format!("{:?}", req.status.as_ref().unwrap());
+        Some((old_status, new_status))
+    } else {
+        None
+    };
     let payload = serde_json::json!({
-        "status": &req.status,
         "title": &req.title,
         "description": &req.description,
     });
@@ -4142,12 +4222,22 @@ pub async fn update_milestone(
             req.description,
         )
         .await?;
-    state.event_bus.emit_updated(
-        crate::events::EntityType::Milestone,
-        &milestone_id.to_string(),
-        payload,
-        None,
-    );
+    if let Some((old_status, new_status)) = status_change {
+        state.event_bus.emit_status_changed(
+            crate::events::EntityType::Milestone,
+            &milestone_id.to_string(),
+            &old_status,
+            &new_status,
+            None,
+        );
+    } else {
+        state.event_bus.emit_updated(
+            crate::events::EntityType::Milestone,
+            &milestone_id.to_string(),
+            payload,
+            None,
+        );
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 

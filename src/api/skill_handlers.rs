@@ -349,6 +349,8 @@ pub async fn update_skill(
         .map_err(AppError::Internal)?
         .ok_or_else(|| AppError::NotFound(format!("Skill {} not found", skill_id)))?;
 
+    let old_status = format!("{}", skill.status);
+
     // Validate input limits
     validate_input_limits(
         body.name.as_deref(),
@@ -412,13 +414,24 @@ pub async fn update_skill(
     // Invalidate hook activation cache for this project
     skill_cache().invalidate_project(&skill.project_id).await;
 
-    // Emit updated event
-    state.event_bus.emit_updated(
-        crate::events::EntityType::Skill,
-        &skill.id.to_string(),
-        serde_json::json!({"name": &skill.name, "project_id": skill.project_id}),
-        Some(skill.project_id.to_string()),
-    );
+    // Emit status_changed if status transitioned, otherwise updated
+    let new_status = format!("{}", skill.status);
+    if old_status != new_status {
+        state.event_bus.emit_status_changed(
+            crate::events::EntityType::Skill,
+            &skill.id.to_string(),
+            &old_status,
+            &new_status,
+            Some(skill.project_id.to_string()),
+        );
+    } else {
+        state.event_bus.emit_updated(
+            crate::events::EntityType::Skill,
+            &skill.id.to_string(),
+            serde_json::json!({"name": &skill.name, "project_id": skill.project_id}),
+            Some(skill.project_id.to_string()),
+        );
+    }
 
     Ok(Json(skill))
 }

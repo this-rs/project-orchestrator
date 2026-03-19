@@ -277,6 +277,8 @@ pub async fn update_persona(
         .map_err(AppError::Internal)?
         .ok_or_else(|| AppError::NotFound(format!("Persona {} not found", persona_id)))?;
 
+    let old_status = format!("{:?}", persona.status);
+
     if let Some(name) = body.name {
         if name.trim().is_empty() {
             return Err(AppError::BadRequest("name cannot be empty".to_string()));
@@ -342,17 +344,27 @@ pub async fn update_persona(
         .await
         .map_err(AppError::Internal)?;
 
-    state.event_bus.emit_updated(
-        crate::events::EntityType::Persona,
-        &persona.id.to_string(),
-        serde_json::json!({
-            "name": persona.name,
-            "status": format!("{:?}", persona.status),
-            "energy": persona.energy,
-            "cohesion": persona.cohesion,
-        }),
-        persona.project_id.map(|pid| pid.to_string()),
-    );
+    let new_status = format!("{:?}", persona.status);
+    if old_status != new_status {
+        state.event_bus.emit_status_changed(
+            crate::events::EntityType::Persona,
+            &persona.id.to_string(),
+            &old_status,
+            &new_status,
+            persona.project_id.map(|pid| pid.to_string()),
+        );
+    } else {
+        state.event_bus.emit_updated(
+            crate::events::EntityType::Persona,
+            &persona.id.to_string(),
+            serde_json::json!({
+                "name": &persona.name,
+                "energy": persona.energy,
+                "cohesion": persona.cohesion,
+            }),
+            persona.project_id.map(|pid| pid.to_string()),
+        );
+    }
 
     Ok(Json(persona))
 }
