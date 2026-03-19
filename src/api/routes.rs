@@ -415,6 +415,10 @@ fn protected_routes() -> Router<OrchestratorState> {
         .route("/api/plans/{plan_id}/runs", get(handlers::list_plan_runs))
         .route("/api/runs/{run_id}", get(handlers::get_plan_run))
         .route(
+            "/api/runs/{run_id}/agent-executions",
+            get(handlers::get_run_agent_executions),
+        )
+        .route(
             "/api/plans/{plan_id}/runs/compare",
             post(handlers::compare_plan_runs),
         )

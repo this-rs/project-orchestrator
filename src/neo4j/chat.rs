@@ -527,8 +527,13 @@ impl Neo4jClient {
         }
     }
 
-    /// Get all sessions for a PlanRun via SPAWNED_BY relation metadata.
+    /// Get all sessions for a PlanRun.
+    ///
+    /// Strategy: first try SPAWNED_BY relation metadata (used by pipeline/wave executor),
+    /// then fall back to searching the `spawned_by` JSON property on ChatSession nodes
+    /// (used by the classic PlanRunner which doesn't create SPAWNED_BY relations).
     pub async fn get_run_sessions(&self, run_id: Uuid) -> Result<Vec<SessionInfo>> {
+        // Strategy 1: via SPAWNED_BY relation (pipeline/wave executor)
         let q = query(
             r#"
             MATCH (child:ChatSession)-[r:SPAWNED_BY]->(parent:ChatSession)
@@ -562,13 +567,67 @@ impl Neo4jClient {
                     .ok()
                     .and_then(|s: String| if s.is_empty() { None } else { Some(s) });
             let created_at_str: String = row.get("created_at").unwrap_or_default();
-
             sessions.push(SessionInfo {
                 session_id,
                 title,
                 model,
                 spawn_type,
                 task_id: task_id_str.and_then(|s| s.parse().ok()),
+                created_at: created_at_str
+                    .parse()
+                    .unwrap_or_else(|_| chrono::Utc::now()),
+            });
+        }
+
+        if !sessions.is_empty() {
+            return Ok(sessions);
+        }
+
+        // Strategy 2: via spawned_by JSON property on ChatSession node
+        // The classic PlanRunner stores {"type":"runner","run_id":"...","task_id":"..."}
+        // as a JSON string in the spawned_by property, without creating SPAWNED_BY relations.
+        let q2 = query(
+            r#"
+            MATCH (s:ChatSession)
+            WHERE s.spawned_by IS NOT NULL
+              AND s.spawned_by <> ''
+              AND s.spawned_by CONTAINS $run_id
+            RETURN s.id AS session_id,
+                   s.title AS title,
+                   s.model AS model,
+                   s.spawned_by AS spawned_by_json,
+                   s.created_at AS created_at
+            ORDER BY s.created_at ASC
+            "#,
+        )
+        .param("run_id", run_id.to_string());
+
+        let mut result2 = self.graph.execute(q2).await?;
+        while let Some(row) = result2.next().await? {
+            let session_id: String = row.get("session_id")?;
+            let title: Option<String> =
+                row.get("title")
+                    .ok()
+                    .and_then(|s: String| if s.is_empty() { None } else { Some(s) });
+            let model: String = row.get("model").unwrap_or_default();
+            let created_at_str: String = row.get("created_at").unwrap_or_default();
+            let spawned_by_json: String = row.get("spawned_by_json").unwrap_or_default();
+
+            // Parse task_id from the spawned_by JSON property
+            let task_id: Option<Uuid> = serde_json::from_str::<serde_json::Value>(&spawned_by_json)
+                .ok()
+                .and_then(|v| {
+                    v.get("task_id")
+                        .and_then(|t| t.as_str())
+                        .and_then(|s| s.parse::<Uuid>().ok())
+                });
+
+            sessions.push(SessionInfo {
+                session_id,
+                title,
+                model,
+                spawn_type: Some("runner".to_string()),
+                task_id,
                 created_at: created_at_str
                     .parse()
                     .unwrap_or_else(|_| chrono::Utc::now()),

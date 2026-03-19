@@ -5509,6 +5509,19 @@ pub async fn list_plan_runs(
     Ok(Json(serde_json::to_value(&runs).unwrap_or_default()))
 }
 
+/// GET /api/runs/:run_id/agent-executions — Get agent execution records for a plan run.
+pub async fn get_run_agent_executions(
+    State(state): State<OrchestratorState>,
+    Path(run_id): Path<Uuid>,
+) -> Result<Json<Vec<crate::neo4j::agent_execution::AgentExecutionNode>>, AppError> {
+    let graph = state.orchestrator.neo4j_arc();
+    let executions = graph
+        .get_agent_executions_for_run(run_id)
+        .await
+        .map_err(AppError::Internal)?;
+    Ok(Json(executions))
+}
+
 /// GET /api/runs/:run_id — Get a specific plan run.
 pub async fn get_plan_run(
     State(state): State<OrchestratorState>,
