@@ -120,7 +120,7 @@ pub async fn create_trigger(
         CrudEvent::new(
             EntityType::Trigger,
             CrudAction::Created,
-            &trigger.id.to_string(),
+            trigger.id.to_string(),
         )
         .with_payload(serde_json::json!({
             "name": trigger.name,
@@ -174,7 +174,7 @@ pub async fn update_trigger(
     state.event_bus.emit(CrudEvent::new(
         EntityType::Trigger,
         CrudAction::Updated,
-        &id.to_string(),
+        id.to_string(),
     ));
 
     Ok(Json(serde_json::json!({ "ok": true })))
@@ -195,7 +195,7 @@ pub async fn delete_trigger(
     state.event_bus.emit(CrudEvent::new(
         EntityType::Trigger,
         CrudAction::Deleted,
-        &id.to_string(),
+        id.to_string(),
     ));
 
     Ok(Json(serde_json::json!({ "ok": true })))
@@ -217,7 +217,7 @@ pub async fn enable_trigger(
     }
 
     state.event_bus.emit(
-        CrudEvent::new(EntityType::Trigger, CrudAction::Updated, &id.to_string())
+        CrudEvent::new(EntityType::Trigger, CrudAction::Updated, id.to_string())
             .with_payload(serde_json::json!({ "enabled": true })),
     );
 
@@ -240,7 +240,7 @@ pub async fn disable_trigger(
     }
 
     state.event_bus.emit(
-        CrudEvent::new(EntityType::Trigger, CrudAction::Updated, &id.to_string())
+        CrudEvent::new(EntityType::Trigger, CrudAction::Updated, id.to_string())
             .with_payload(serde_json::json!({ "enabled": false })),
     );
 

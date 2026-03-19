@@ -75,8 +75,8 @@ impl ReactionRule {
         let type_match = self
             .entity_type
             .as_ref()
-            .map_or(true, |t| t == &event.entity_type);
-        let action_match = self.action.as_ref().map_or(true, |a| a == &event.action);
+            .is_none_or(|t| t == &event.entity_type);
+        let action_match = self.action.as_ref().is_none_or(|a| a == &event.action);
         type_match && action_match
     }
 }

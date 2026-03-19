@@ -183,12 +183,15 @@ impl RegressionDetector {
             stagnation_threshold,
         }
     }
+}
 
-    /// Create a detector with default settings.
-    pub fn default() -> Self {
+impl Default for RegressionDetector {
+    fn default() -> Self {
         Self::new(1000, 100, 2, 5)
     }
+}
 
+impl RegressionDetector {
     /// Record an error occurrence.
     ///
     /// If the error is new, it is added to history. If we exceed `max_errors`,

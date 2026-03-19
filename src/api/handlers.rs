@@ -593,7 +593,7 @@ pub async fn update_task(
     Path(task_id): Path<Uuid>,
     Json(req): Json<UpdateTaskRequest>,
 ) -> Result<StatusCode, AppError> {
-    let status_change = if req.status.is_some() {
+    let status_change = if let Some(ref new_status_val) = req.status {
         let old_status = state
             .orchestrator
             .neo4j()
@@ -603,7 +603,7 @@ pub async fn update_task(
             .flatten()
             .map(|t| format!("{:?}", t.status))
             .unwrap_or_default();
-        let new_status = format!("{:?}", req.status.as_ref().unwrap());
+        let new_status = format!("{:?}", new_status_val);
         Some((old_status, new_status))
     } else {
         None
@@ -3974,7 +3974,7 @@ pub async fn update_release(
     Path(release_id): Path<Uuid>,
     Json(req): Json<UpdateReleaseRequest>,
 ) -> Result<StatusCode, AppError> {
-    let status_change = if req.status.is_some() {
+    let status_change = if let Some(ref new_status_val) = req.status {
         let old_status = state
             .orchestrator
             .neo4j()
@@ -3984,7 +3984,7 @@ pub async fn update_release(
             .flatten()
             .map(|r| format!("{:?}", r.status))
             .unwrap_or_default();
-        let new_status = format!("{:?}", req.status.as_ref().unwrap());
+        let new_status = format!("{:?}", new_status_val);
         Some((old_status, new_status))
     } else {
         None
@@ -4214,7 +4214,7 @@ pub async fn update_milestone(
     Path(milestone_id): Path<Uuid>,
     Json(req): Json<UpdateMilestoneRequest>,
 ) -> Result<StatusCode, AppError> {
-    let status_change = if req.status.is_some() {
+    let status_change = if let Some(ref new_status_val) = req.status {
         let old_status = state
             .orchestrator
             .neo4j()
@@ -4224,7 +4224,7 @@ pub async fn update_milestone(
             .flatten()
             .map(|m| format!("{:?}", m.status))
             .unwrap_or_default();
-        let new_status = format!("{:?}", req.status.as_ref().unwrap());
+        let new_status = format!("{:?}", new_status_val);
         Some((old_status, new_status))
     } else {
         None

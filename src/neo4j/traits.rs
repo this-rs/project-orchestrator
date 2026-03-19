@@ -3196,6 +3196,7 @@ pub trait GraphStore: Send + Sync {
 
     /// Update an EventTrigger's fields. Only provided fields are updated.
     /// Returns `true` if the trigger was found and updated, `false` if not found.
+    #[allow(clippy::too_many_arguments)]
     async fn update_event_trigger(
         &self,
         id: Uuid,
