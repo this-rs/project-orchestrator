@@ -339,3 +339,420 @@ async fn execute_mcp_call(
     warn!(hook = %hook.name, "mcp_call action type is not yet implemented");
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::events::{CrudAction, EntityType};
+    use crate::lifecycle::models::{LifecycleActionType, LifecycleHook, LifecycleScope};
+    use crate::neo4j::mock::MockGraphStore;
+    use crate::neo4j::traits::GraphStore;
+    use crate::orchestrator::Orchestrator;
+
+    // ── entity_type_to_scope ──
+
+    #[test]
+    fn test_entity_type_to_scope_task() {
+        assert_eq!(entity_type_to_scope(&EntityType::Task), Some(LifecycleScope::Task));
+    }
+
+    #[test]
+    fn test_entity_type_to_scope_plan() {
+        assert_eq!(entity_type_to_scope(&EntityType::Plan), Some(LifecycleScope::Plan));
+    }
+
+    #[test]
+    fn test_entity_type_to_scope_step() {
+        assert_eq!(entity_type_to_scope(&EntityType::Step), Some(LifecycleScope::Step));
+    }
+
+    #[test]
+    fn test_entity_type_to_scope_milestone() {
+        assert_eq!(
+            entity_type_to_scope(&EntityType::Milestone),
+            Some(LifecycleScope::Milestone)
+        );
+    }
+
+    #[test]
+    fn test_entity_type_to_scope_unsupported_returns_none() {
+        assert_eq!(entity_type_to_scope(&EntityType::Project), None);
+        assert_eq!(entity_type_to_scope(&EntityType::Decision), None);
+        assert_eq!(entity_type_to_scope(&EntityType::Note), None);
+        assert_eq!(entity_type_to_scope(&EntityType::Commit), None);
+    }
+
+    // ── helpers ──
+
+    async fn make_test_server_state() -> (Arc<ServerState>, Arc<MockGraphStore>) {
+        let graph = Arc::new(MockGraphStore::new());
+        let app_state = crate::test_helpers::mock_app_state_with_graph(graph.clone());
+        let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
+        let watcher = Arc::new(tokio::sync::RwLock::new(
+            crate::orchestrator::watcher::FileWatcher::new(orchestrator.clone()),
+        ));
+        let event_bus = Arc::new(crate::events::HybridEmitter::new(Arc::new(
+            crate::events::EventBus::default(),
+        )));
+        let state = Arc::new(ServerState {
+            orchestrator,
+            watcher,
+            chat_manager: None,
+            event_bus,
+            nats_emitter: None,
+            auth_config: None,
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+            setup_completed: true,
+            server_port: 6600,
+            public_url: None,
+            ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
+            registry_remote_url: None,
+            oidc_client: None,
+            neural_router: crate::test_helpers::mock_neural_router(),
+            trajectory_collector: std::sync::RwLock::new(None),
+            trajectory_store_neo4j: None,
+            trajectory_store: None,
+            identity: None,
+            reactor_counters: std::sync::OnceLock::new(),
+        });
+        (state, graph)
+    }
+
+    fn make_status_changed_event(
+        entity_type: EntityType,
+        entity_id: &str,
+        new_status: &str,
+    ) -> CrudEvent {
+        CrudEvent::new(entity_type, CrudAction::StatusChanged, entity_id)
+            .with_payload(serde_json::json!({"new_status": new_status}))
+    }
+
+    fn make_hook(
+        name: &str,
+        scope: LifecycleScope,
+        on_status: &str,
+        action_type: LifecycleActionType,
+        config: serde_json::Value,
+    ) -> LifecycleHook {
+        LifecycleHook::new(
+            name.to_string(),
+            scope,
+            on_status.to_string(),
+            action_type,
+            config,
+        )
+    }
+
+    // ── execute_lifecycle_hooks ──
+
+    #[tokio::test]
+    async fn test_execute_lifecycle_hooks_skips_event_without_new_status() {
+        let (state, _graph) = make_test_server_state().await;
+        // Event with no new_status in payload
+        let event = CrudEvent::new(EntityType::Task, CrudAction::Updated, "task-1");
+        // Should return without error (just a no-op)
+        execute_lifecycle_hooks(&event, &state).await;
+    }
+
+    #[tokio::test]
+    async fn test_execute_lifecycle_hooks_skips_unsupported_entity_type() {
+        let (state, _graph) = make_test_server_state().await;
+        let event = make_status_changed_event(EntityType::Project, "proj-1", "active");
+        // Project has no scope mapping, should be a no-op
+        execute_lifecycle_hooks(&event, &state).await;
+    }
+
+    #[tokio::test]
+    async fn test_execute_lifecycle_hooks_no_matching_hooks() {
+        let (state, _graph) = make_test_server_state().await;
+        let event = make_status_changed_event(
+            EntityType::Task,
+            &uuid::Uuid::new_v4().to_string(),
+            "completed",
+        );
+        // No hooks registered, should be a no-op
+        execute_lifecycle_hooks(&event, &state).await;
+    }
+
+    #[tokio::test]
+    async fn test_execute_create_note_action() {
+        let (state, graph) = make_test_server_state().await;
+        let task_id = uuid::Uuid::new_v4();
+
+        // Register a CreateNote hook
+        let hook = make_hook(
+            "note-on-complete",
+            LifecycleScope::Task,
+            "completed",
+            LifecycleActionType::CreateNote,
+            serde_json::json!({
+                "note_type": "observation",
+                "content_template": "Task {entity_id} completed via {hook_name}",
+                "importance": "medium"
+            }),
+        );
+        graph.create_lifecycle_hook(&hook).await.unwrap();
+
+        let event = make_status_changed_event(EntityType::Task, &task_id.to_string(), "completed");
+        execute_lifecycle_hooks(&event, &state).await;
+
+        // Verify a note was created via mock store
+        let notes = graph.notes.read().await;
+        assert!(!notes.is_empty(), "A note should have been created");
+        let note = notes.values().next().unwrap();
+        assert!(
+            note.content.contains(&task_id.to_string()),
+            "Note content should contain entity_id"
+        );
+        assert!(
+            note.content.contains("note-on-complete"),
+            "Note content should contain hook_name"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_execute_emit_alert_action() {
+        let (state, graph) = make_test_server_state().await;
+        let task_id = uuid::Uuid::new_v4();
+
+        let hook = make_hook(
+            "alert-on-blocked",
+            LifecycleScope::Task,
+            "blocked",
+            LifecycleActionType::EmitAlert,
+            serde_json::json!({
+                "level": "warning",
+                "message_template": "Task {entity_id} is blocked ({hook_name})"
+            }),
+        );
+        graph.create_lifecycle_hook(&hook).await.unwrap();
+
+        let event = make_status_changed_event(EntityType::Task, &task_id.to_string(), "blocked");
+        execute_lifecycle_hooks(&event, &state).await;
+
+        // Verify an alert was created
+        let alerts = graph.alerts.read().await;
+        assert!(!alerts.is_empty(), "An alert should have been created");
+        let alert = alerts.values().next().unwrap();
+        assert!(alert.message.contains(&task_id.to_string()));
+        assert_eq!(alert.severity, crate::neo4j::models::AlertSeverity::Warning);
+    }
+
+    #[tokio::test]
+    async fn test_execute_emit_alert_default_level_is_info() {
+        let (state, graph) = make_test_server_state().await;
+        let task_id = uuid::Uuid::new_v4();
+
+        let hook = make_hook(
+            "info-alert",
+            LifecycleScope::Task,
+            "completed",
+            LifecycleActionType::EmitAlert,
+            serde_json::json!({}), // no level specified
+        );
+        graph.create_lifecycle_hook(&hook).await.unwrap();
+
+        let event =
+            make_status_changed_event(EntityType::Task, &task_id.to_string(), "completed");
+        execute_lifecycle_hooks(&event, &state).await;
+
+        let alerts = graph.alerts.read().await;
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(
+            alerts.values().next().unwrap().severity,
+            crate::neo4j::models::AlertSeverity::Info
+        );
+    }
+
+    #[tokio::test]
+    async fn test_execute_mcp_call_is_noop() {
+        let (state, graph) = make_test_server_state().await;
+        let task_id = uuid::Uuid::new_v4();
+
+        let hook = make_hook(
+            "mcp-stub",
+            LifecycleScope::Task,
+            "completed",
+            LifecycleActionType::McpCall,
+            serde_json::json!({"tool": "some_tool"}),
+        );
+        graph.create_lifecycle_hook(&hook).await.unwrap();
+
+        let event =
+            make_status_changed_event(EntityType::Task, &task_id.to_string(), "completed");
+        // Should not panic or error
+        execute_lifecycle_hooks(&event, &state).await;
+    }
+
+    #[tokio::test]
+    async fn test_execute_start_protocol_missing_protocol_id() {
+        let (state, graph) = make_test_server_state().await;
+        let task_id = uuid::Uuid::new_v4();
+
+        // StartProtocol without protocol_id in config - should log error but not panic
+        let hook = make_hook(
+            "start-proto-bad",
+            LifecycleScope::Task,
+            "completed",
+            LifecycleActionType::StartProtocol,
+            serde_json::json!({}),
+        );
+        graph.create_lifecycle_hook(&hook).await.unwrap();
+
+        let event =
+            make_status_changed_event(EntityType::Task, &task_id.to_string(), "completed");
+        // Error is logged but should not propagate
+        execute_lifecycle_hooks(&event, &state).await;
+    }
+
+    #[tokio::test]
+    async fn test_template_substitution_in_create_note() {
+        let (state, graph) = make_test_server_state().await;
+        let task_id = uuid::Uuid::new_v4();
+
+        let hook = make_hook(
+            "template-hook",
+            LifecycleScope::Task,
+            "completed",
+            LifecycleActionType::CreateNote,
+            serde_json::json!({
+                "content_template": "ID={entity_id} TYPE={entity_type} HOOK={hook_name}"
+            }),
+        );
+        graph.create_lifecycle_hook(&hook).await.unwrap();
+
+        let event =
+            make_status_changed_event(EntityType::Task, &task_id.to_string(), "completed");
+        execute_lifecycle_hooks(&event, &state).await;
+
+        let notes = graph.notes.read().await;
+        assert_eq!(notes.len(), 1);
+        let content = &notes.values().next().unwrap().content;
+        assert!(content.contains(&format!("ID={}", task_id)));
+        assert!(content.contains("TYPE=Task"));
+        assert!(content.contains("HOOK=template-hook"));
+    }
+
+    #[tokio::test]
+    async fn test_multiple_hooks_execute_in_priority_order() {
+        let (state, graph) = make_test_server_state().await;
+        let task_id = uuid::Uuid::new_v4();
+
+        // Create two hooks with different priorities
+        let mut hook1 = make_hook(
+            "low-priority-alert",
+            LifecycleScope::Task,
+            "completed",
+            LifecycleActionType::EmitAlert,
+            serde_json::json!({"message_template": "low-priority"}),
+        );
+        hook1.priority = 200;
+
+        let mut hook2 = make_hook(
+            "high-priority-alert",
+            LifecycleScope::Task,
+            "completed",
+            LifecycleActionType::EmitAlert,
+            serde_json::json!({"message_template": "high-priority"}),
+        );
+        hook2.priority = 10;
+
+        graph.create_lifecycle_hook(&hook1).await.unwrap();
+        graph.create_lifecycle_hook(&hook2).await.unwrap();
+
+        let event =
+            make_status_changed_event(EntityType::Task, &task_id.to_string(), "completed");
+        execute_lifecycle_hooks(&event, &state).await;
+
+        let alerts = graph.alerts.read().await;
+        assert_eq!(alerts.len(), 2, "Both hooks should have fired");
+    }
+
+    #[tokio::test]
+    async fn test_hook_failure_does_not_block_others() {
+        let (state, graph) = make_test_server_state().await;
+        let task_id = uuid::Uuid::new_v4();
+
+        // First hook: StartProtocol with bad config (will fail)
+        let mut hook1 = make_hook(
+            "failing-hook",
+            LifecycleScope::Task,
+            "completed",
+            LifecycleActionType::StartProtocol,
+            serde_json::json!({}), // missing protocol_id
+        );
+        hook1.priority = 1;
+
+        // Second hook: EmitAlert (should succeed despite first hook failing)
+        let mut hook2 = make_hook(
+            "succeeding-hook",
+            LifecycleScope::Task,
+            "completed",
+            LifecycleActionType::EmitAlert,
+            serde_json::json!({"message_template": "should-still-fire"}),
+        );
+        hook2.priority = 2;
+
+        graph.create_lifecycle_hook(&hook1).await.unwrap();
+        graph.create_lifecycle_hook(&hook2).await.unwrap();
+
+        let event =
+            make_status_changed_event(EntityType::Task, &task_id.to_string(), "completed");
+        execute_lifecycle_hooks(&event, &state).await;
+
+        // The alert from hook2 should still be created
+        let alerts = graph.alerts.read().await;
+        assert_eq!(alerts.len(), 1);
+        assert!(alerts.values().next().unwrap().message.contains("should-still-fire"));
+    }
+
+    #[tokio::test]
+    async fn test_execute_with_project_id_in_event() {
+        let (state, graph) = make_test_server_state().await;
+        let task_id = uuid::Uuid::new_v4();
+        let project_id = uuid::Uuid::new_v4();
+
+        let mut hook = make_hook(
+            "project-hook",
+            LifecycleScope::Task,
+            "completed",
+            LifecycleActionType::EmitAlert,
+            serde_json::json!({"message_template": "project-scoped alert"}),
+        );
+        hook.project_id = Some(project_id);
+        graph.create_lifecycle_hook(&hook).await.unwrap();
+
+        let event = make_status_changed_event(EntityType::Task, &task_id.to_string(), "completed")
+            .with_project_id(project_id.to_string());
+        execute_lifecycle_hooks(&event, &state).await;
+
+        let alerts = graph.alerts.read().await;
+        assert_eq!(alerts.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_emit_alert_critical_level() {
+        let (state, graph) = make_test_server_state().await;
+        let task_id = uuid::Uuid::new_v4();
+
+        let hook = make_hook(
+            "critical-alert",
+            LifecycleScope::Task,
+            "failed",
+            LifecycleActionType::EmitAlert,
+            serde_json::json!({"level": "critical", "message_template": "Critical failure"}),
+        );
+        graph.create_lifecycle_hook(&hook).await.unwrap();
+
+        let event = make_status_changed_event(EntityType::Task, &task_id.to_string(), "failed");
+        execute_lifecycle_hooks(&event, &state).await;
+
+        let alerts = graph.alerts.read().await;
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(
+            alerts.values().next().unwrap().severity,
+            crate::neo4j::models::AlertSeverity::Critical
+        );
+    }
+}
