@@ -173,32 +173,34 @@ impl Neo4jClient {
     }
 
     /// List all PlanRuns across all plans, ordered by started_at desc.
+    /// If `workspace_slug` is provided, only returns runs whose plan belongs to
+    /// a project in that workspace (via `:RUNS`→`:Plan`←`:HAS_PLAN`←`:Project`→`:BELONGS_TO_WORKSPACE`→`:Workspace`).
     pub async fn list_all_plan_runs_impl(
         &self,
         limit: i64,
         offset: i64,
         status: Option<&str>,
+        workspace_slug: Option<&str>,
     ) -> Result<Vec<RunnerState>> {
-        let cypher = if status.is_some() {
-            r#"
-                MATCH (r:PlanRun)
-                WHERE r.status = $status
-                RETURN r
-                ORDER BY r.started_at DESC
-                SKIP $offset
-                LIMIT $limit
-                "#
-            .to_string()
+        let mut cypher = String::new();
+
+        if let Some(ws) = workspace_slug {
+            // Scope to workspace: traverse PlanRun→Plan←Project→Workspace
+            cypher.push_str(&format!(
+                "MATCH (w:Workspace {{slug: '{}'}})<-[:BELONGS_TO_WORKSPACE]-(proj:Project)-[:HAS_PLAN]->(plan:Plan)<-[:RUNS]-(r:PlanRun)\n",
+                ws.replace('\'', "\\'")
+            ));
         } else {
-            r#"
-            MATCH (r:PlanRun)
-            RETURN r
-            ORDER BY r.started_at DESC
-            SKIP $offset
-            LIMIT $limit
-            "#
-            .to_string()
-        };
+            cypher.push_str("MATCH (r:PlanRun)\n");
+        }
+
+        if status.is_some() {
+            cypher.push_str("WHERE r.status = $status\n");
+        }
+
+        cypher.push_str(
+            "RETURN r\nORDER BY r.started_at DESC\nSKIP $offset\nLIMIT $limit",
+        );
 
         let mut q = query(&cypher).param("limit", limit).param("offset", offset);
         if let Some(s) = status {

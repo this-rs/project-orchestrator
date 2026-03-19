@@ -66,9 +66,10 @@ pub struct ServerState {
     /// Neural routing — DualTrack router (NN + policy net fallback).
     /// Always present (build full), but only active when config.neural_routing.enabled = true.
     pub neural_router: Arc<tokio::sync::RwLock<neural_routing_runtime::DualTrackRouter>>,
-    /// Trajectory collector — fire-and-forget decision capture.
-    /// None when collection is disabled.
-    pub trajectory_collector: Option<Arc<neural_routing_runtime::TrajectoryCollector>>,
+    /// Trajectory collector — wrapped in RwLock for lazy runtime initialization.
+    pub trajectory_collector: std::sync::RwLock<Option<Arc<neural_routing_runtime::TrajectoryCollector>>>,
+    /// Concrete Neo4j trajectory store — needed to create the collector at runtime.
+    pub trajectory_store_neo4j: Option<Arc<neural_routing_runtime::Neo4jTrajectoryStore>>,
     /// Trajectory store — Neo4j CRUD + vector search for stored trajectories.
     pub trajectory_store: Option<Arc<dyn neural_routing_runtime::TrajectoryStore>>,
     /// EventReactor counters for the /api/reactor/status endpoint.
@@ -5296,6 +5297,7 @@ pub async fn receive_webhook(
 // ============================================================================
 
 /// GET /api/runs — List all plan runs across all plans.
+/// Supports optional `workspace_slug` query param to scope runs to a workspace.
 pub async fn list_all_plan_runs(
     State(state): State<OrchestratorState>,
     Query(params): Query<std::collections::HashMap<String, String>>,
@@ -5309,9 +5311,10 @@ pub async fn list_all_plan_runs(
         .and_then(|v| v.parse::<i64>().ok())
         .unwrap_or(0);
     let status = params.get("status").map(|s| s.as_str());
+    let workspace_slug = params.get("workspace_slug").map(|s| s.as_str());
     let graph = state.orchestrator.neo4j_arc();
     let runs = graph
-        .list_all_plan_runs(limit, offset, status)
+        .list_all_plan_runs(limit, offset, status, workspace_slug)
         .await
         .map_err(AppError::Internal)?;
     Ok(Json(serde_json::to_value(&runs).unwrap_or_default()))
@@ -5839,7 +5842,8 @@ mod tests {
             registry_remote_url: None,
             oidc_client: None,
             neural_router: crate::test_helpers::mock_neural_router(),
-            trajectory_collector: None,
+            trajectory_collector: std::sync::RwLock::new(None),
+            trajectory_store_neo4j: None,
             trajectory_store: None,
             identity: None,
             reactor_counters: std::sync::OnceLock::new(),
@@ -6049,7 +6053,8 @@ mod tests {
             registry_remote_url: None,
             oidc_client: None,
             neural_router: crate::test_helpers::mock_neural_router(),
-            trajectory_collector: None,
+            trajectory_collector: std::sync::RwLock::new(None),
+            trajectory_store_neo4j: None,
             trajectory_store: None,
             identity: None,
             reactor_counters: std::sync::OnceLock::new(),
@@ -6206,7 +6211,8 @@ mod tests {
             registry_remote_url: None,
             oidc_client: None,
             neural_router: crate::test_helpers::mock_neural_router(),
-            trajectory_collector: None,
+            trajectory_collector: std::sync::RwLock::new(None),
+            trajectory_store_neo4j: None,
             trajectory_store: None,
             identity: None,
             reactor_counters: std::sync::OnceLock::new(),
@@ -6980,7 +6986,8 @@ mod tests {
             registry_remote_url: None,
             oidc_client: None,
             neural_router: crate::test_helpers::mock_neural_router(),
-            trajectory_collector: None,
+            trajectory_collector: std::sync::RwLock::new(None),
+            trajectory_store_neo4j: None,
             trajectory_store: None,
             identity: None,
             reactor_counters: std::sync::OnceLock::new(),
@@ -7086,7 +7093,8 @@ mod tests {
             registry_remote_url: None,
             oidc_client: None,
             neural_router: crate::test_helpers::mock_neural_router(),
-            trajectory_collector: None,
+            trajectory_collector: std::sync::RwLock::new(None),
+            trajectory_store_neo4j: None,
             trajectory_store: None,
             identity: None,
             reactor_counters: std::sync::OnceLock::new(),
@@ -7259,7 +7267,8 @@ mod tests {
             registry_remote_url: None,
             oidc_client: None,
             neural_router: crate::test_helpers::mock_neural_router(),
-            trajectory_collector: None,
+            trajectory_collector: std::sync::RwLock::new(None),
+            trajectory_store_neo4j: None,
             trajectory_store: None,
             identity: None,
             reactor_counters,
@@ -7306,7 +7315,8 @@ mod tests {
             registry_remote_url: None,
             oidc_client: None,
             neural_router: crate::test_helpers::mock_neural_router(),
-            trajectory_collector: None,
+            trajectory_collector: std::sync::RwLock::new(None),
+            trajectory_store_neo4j: None,
             trajectory_store: None,
             identity: None,
             reactor_counters,

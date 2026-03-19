@@ -10212,6 +10212,7 @@ impl GraphStore for MockGraphStore {
         limit: i64,
         offset: i64,
         status: Option<&str>,
+        _workspace_slug: Option<&str>,
     ) -> anyhow::Result<Vec<crate::runner::RunnerState>> {
         let runs = self.plan_runs.read().await;
         let mut result: Vec<_> = runs

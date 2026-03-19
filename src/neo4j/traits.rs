@@ -2959,11 +2959,14 @@ pub trait GraphStore: Send + Sync {
     async fn list_active_plan_runs(&self) -> Result<Vec<crate::runner::RunnerState>>;
 
     /// List all PlanRuns across all plans, ordered by started_at desc.
+    /// If `workspace_slug` is provided, only returns runs for plans belonging to
+    /// projects in that workspace.
     async fn list_all_plan_runs(
         &self,
         limit: i64,
         offset: i64,
         status: Option<&str>,
+        workspace_slug: Option<&str>,
     ) -> Result<Vec<crate::runner::RunnerState>>;
 
     /// List all PlanRuns for a given plan, ordered by started_at desc.
