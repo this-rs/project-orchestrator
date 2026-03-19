@@ -387,6 +387,12 @@ pub async fn create_plan(
         .plan_manager()
         .create_plan(req, "orchestrator")
         .await?;
+    state.event_bus.emit_created(
+        crate::events::EntityType::Plan,
+        &plan.id.to_string(),
+        serde_json::json!({"title": &plan.title, "status": format!("{:?}", plan.status)}),
+        plan.project_id.map(|id| id.to_string()),
+    );
     Ok(Json(plan))
 }
 
@@ -482,6 +488,12 @@ pub async fn update_plan_status(
             .await?;
     }
 
+    state.event_bus.emit_updated(
+        crate::events::EntityType::Plan,
+        &plan_id.to_string(),
+        serde_json::json!({}),
+        None,
+    );
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -495,6 +507,11 @@ pub async fn delete_plan(
         .plan_manager()
         .delete_plan(plan_id)
         .await?;
+    state.event_bus.emit_deleted(
+        crate::events::EntityType::Plan,
+        &plan_id.to_string(),
+        None,
+    );
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -513,6 +530,12 @@ pub async fn add_task(
         .plan_manager()
         .add_task(plan_id, req)
         .await?;
+    state.event_bus.emit_created(
+        crate::events::EntityType::Task,
+        &task.id.to_string(),
+        serde_json::json!({"title": &task.title, "plan_id": plan_id}),
+        None,
+    );
     Ok(Json(task))
 }
 
@@ -540,6 +563,11 @@ pub async fn delete_task(
         .plan_manager()
         .delete_task(task_id)
         .await?;
+    state.event_bus.emit_deleted(
+        crate::events::EntityType::Task,
+        &task_id.to_string(),
+        None,
+    );
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -554,6 +582,12 @@ pub async fn update_task(
         .plan_manager()
         .update_task(task_id, req)
         .await?;
+    state.event_bus.emit_updated(
+        crate::events::EntityType::Task,
+        &task_id.to_string(),
+        serde_json::json!({}),
+        None,
+    );
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1174,6 +1208,13 @@ pub async fn add_decision(
             }
         });
     }
+
+    state.event_bus.emit_created(
+        crate::events::EntityType::Decision,
+        &decision.id.to_string(),
+        serde_json::json!({"task_id": task_id, "description": &decision.description}),
+        None,
+    );
 
     Ok(Json(decision))
 }
@@ -1854,6 +1895,7 @@ pub async fn delete_step(
     Path(step_id): Path<Uuid>,
 ) -> Result<StatusCode, AppError> {
     state.orchestrator.delete_step(step_id).await?;
+    state.event_bus.emit_deleted(crate::events::EntityType::Step, &step_id.to_string(), None);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1894,6 +1936,7 @@ pub async fn update_step(
             .update_step(step_id, &req)
             .await?;
     }
+    state.event_bus.emit_updated(crate::events::EntityType::Step, &step_id.to_string(), serde_json::json!({}), None);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1945,6 +1988,13 @@ pub async fn add_constraint(
         .plan_manager()
         .add_constraint(plan_id, &constraint)
         .await?;
+
+    state.event_bus.emit_created(
+        crate::events::EntityType::Constraint,
+        &constraint.id.to_string(),
+        serde_json::json!({"plan_id": plan_id, "constraint_type": format!("{:?}", constraint.constraint_type)}),
+        None,
+    );
 
     Ok(Json(constraint))
 }
@@ -1999,6 +2049,14 @@ pub async fn update_constraint(
             req.enforced_by,
         )
         .await?;
+
+    state.event_bus.emit_updated(
+        crate::events::EntityType::Constraint,
+        &constraint_id.to_string(),
+        serde_json::json!({"constraint_id": constraint_id}),
+        None,
+    );
+
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2008,6 +2066,13 @@ pub async fn delete_constraint(
     Path(constraint_id): Path<Uuid>,
 ) -> Result<StatusCode, AppError> {
     state.orchestrator.delete_constraint(constraint_id).await?;
+
+    state.event_bus.emit_deleted(
+        crate::events::EntityType::Constraint,
+        &constraint_id.to_string(),
+        None,
+    );
+
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2315,6 +2380,13 @@ pub async fn create_commit(
         );
     }
 
+    state.event_bus.emit_created(
+        crate::events::EntityType::Commit,
+        &commit.hash,
+        serde_json::json!({"message": &commit.message, "author": &commit.author}),
+        project_id.map(|p| p.to_string()),
+    );
+
     Ok(Json(CreateCommitResponse {
         commit,
         sync_triggered,
@@ -2337,6 +2409,13 @@ pub async fn link_commit_to_task(
         .orchestrator
         .link_commit_to_task(&req.commit_hash, task_id)
         .await?;
+    state.event_bus.emit_linked(
+        crate::events::EntityType::Commit,
+        &req.commit_hash,
+        crate::events::EntityType::Task,
+        &task_id.to_string(),
+        None,
+    );
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2359,6 +2438,13 @@ pub async fn link_commit_to_plan(
         .orchestrator
         .link_commit_to_plan(&req.commit_hash, plan_id)
         .await?;
+    state.event_bus.emit_linked(
+        crate::events::EntityType::Commit,
+        &req.commit_hash,
+        crate::events::EntityType::Plan,
+        &plan_id.to_string(),
+        None,
+    );
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -3761,6 +3847,12 @@ pub async fn create_release(
     };
 
     state.orchestrator.create_release(&release).await?;
+    state.event_bus.emit_created(
+        crate::events::EntityType::Release,
+        &release.id.to_string(),
+        serde_json::json!({"version": &release.version, "title": &release.title}),
+        Some(project_id.to_string()),
+    );
     Ok(Json(release))
 }
 
@@ -3818,6 +3910,11 @@ pub async fn update_release(
     Path(release_id): Path<Uuid>,
     Json(req): Json<UpdateReleaseRequest>,
 ) -> Result<StatusCode, AppError> {
+    let payload = serde_json::json!({
+        "status": &req.status,
+        "title": &req.title,
+        "description": &req.description,
+    });
     state
         .orchestrator
         .update_release(
@@ -3829,6 +3926,12 @@ pub async fn update_release(
             req.description,
         )
         .await?;
+    state.event_bus.emit_updated(
+        crate::events::EntityType::Release,
+        &release_id.to_string(),
+        payload,
+        None,
+    );
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -3838,6 +3941,11 @@ pub async fn delete_release(
     Path(release_id): Path<Uuid>,
 ) -> Result<StatusCode, AppError> {
     state.orchestrator.delete_release(release_id).await?;
+    state.event_bus.emit_deleted(
+        crate::events::EntityType::Release,
+        &release_id.to_string(),
+        None,
+    );
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -3857,6 +3965,13 @@ pub async fn add_task_to_release(
         .orchestrator
         .add_task_to_release(release_id, req.task_id)
         .await?;
+    state.event_bus.emit_linked(
+        crate::events::EntityType::Release,
+        &release_id.to_string(),
+        crate::events::EntityType::Task,
+        &req.task_id.to_string(),
+        None,
+    );
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -3948,6 +4063,12 @@ pub async fn create_milestone(
     };
 
     state.orchestrator.create_milestone(&milestone).await?;
+    state.event_bus.emit_created(
+        crate::events::EntityType::Milestone,
+        &milestone.id.to_string(),
+        serde_json::json!({"title": &milestone.title, "description": &milestone.description}),
+        Some(project_id.to_string()),
+    );
     Ok(Json(milestone))
 }
 
@@ -4005,6 +4126,11 @@ pub async fn update_milestone(
     Path(milestone_id): Path<Uuid>,
     Json(req): Json<UpdateMilestoneRequest>,
 ) -> Result<StatusCode, AppError> {
+    let payload = serde_json::json!({
+        "status": &req.status,
+        "title": &req.title,
+        "description": &req.description,
+    });
     state
         .orchestrator
         .update_milestone(
@@ -4016,6 +4142,12 @@ pub async fn update_milestone(
             req.description,
         )
         .await?;
+    state.event_bus.emit_updated(
+        crate::events::EntityType::Milestone,
+        &milestone_id.to_string(),
+        payload,
+        None,
+    );
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -4025,6 +4157,11 @@ pub async fn delete_milestone(
     Path(milestone_id): Path<Uuid>,
 ) -> Result<StatusCode, AppError> {
     state.orchestrator.delete_milestone(milestone_id).await?;
+    state.event_bus.emit_deleted(
+        crate::events::EntityType::Milestone,
+        &milestone_id.to_string(),
+        None,
+    );
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -4044,6 +4181,13 @@ pub async fn add_task_to_milestone(
         .orchestrator
         .add_task_to_milestone(milestone_id, req.task_id)
         .await?;
+    state.event_bus.emit_linked(
+        crate::events::EntityType::Milestone,
+        &milestone_id.to_string(),
+        crate::events::EntityType::Task,
+        &req.task_id.to_string(),
+        None,
+    );
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -4063,6 +4207,13 @@ pub async fn link_plan_to_milestone(
         .orchestrator
         .link_plan_to_milestone(req.plan_id, milestone_id)
         .await?;
+    state.event_bus.emit_linked(
+        crate::events::EntityType::Milestone,
+        &milestone_id.to_string(),
+        crate::events::EntityType::Plan,
+        &req.plan_id.to_string(),
+        None,
+    );
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -4812,6 +4963,13 @@ pub async fn create_trigger(
         .await
         .map_err(AppError::Internal)?;
 
+    state.event_bus.emit_created(
+        crate::events::EntityType::Trigger,
+        &trigger.id.to_string(),
+        serde_json::json!({"plan_id": plan_id, "trigger_type": trigger_type_str}),
+        None,
+    );
+
     Ok(Json(serde_json::to_value(&created).unwrap_or_default()))
 }
 
@@ -4840,6 +4998,12 @@ pub async fn delete_trigger(
         .await
         .map_err(AppError::Internal)?;
 
+    state.event_bus.emit_deleted(
+        crate::events::EntityType::Trigger,
+        &trigger_id.to_string(),
+        None,
+    );
+
     Ok(Json(
         serde_json::json!({ "deleted": true, "trigger_id": trigger_id }),
     ))
@@ -4857,6 +5021,13 @@ pub async fn enable_trigger(
         .map_err(AppError::Internal)?
         .ok_or_else(|| AppError::NotFound(format!("Trigger {} not found", trigger_id)))?;
 
+    state.event_bus.emit_updated(
+        crate::events::EntityType::Trigger,
+        &trigger_id.to_string(),
+        serde_json::json!({"enabled": true}),
+        None,
+    );
+
     Ok(Json(serde_json::to_value(&trigger).unwrap_or_default()))
 }
 
@@ -4871,6 +5042,13 @@ pub async fn disable_trigger(
         .await
         .map_err(AppError::Internal)?
         .ok_or_else(|| AppError::NotFound(format!("Trigger {} not found", trigger_id)))?;
+
+    state.event_bus.emit_updated(
+        crate::events::EntityType::Trigger,
+        &trigger_id.to_string(),
+        serde_json::json!({"enabled": false}),
+        None,
+    );
 
     Ok(Json(serde_json::to_value(&trigger).unwrap_or_default()))
 }
