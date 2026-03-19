@@ -1820,8 +1820,13 @@ impl PlanRunner {
         // The --system-prompt CLI flag is ignored in interactive mode (--input-format stream-json).
         // To ensure the agent receives the autonomous execution instructions, we prepend them
         // directly into the user message. This is the ONLY reliable way to reach the agent.
+        //
+        // IMPORTANT: Always use scaffolding_level=0 (FULL prompt) here regardless of project
+        // maturity. Runner agents are autonomous executors — the minimal/concise prompts are
+        // too brief and agents treat the task as "context" instead of acting on it.
         {
-            let prompt_ctx = runner_context.to_prompt_context();
+            let mut prompt_ctx = runner_context.to_prompt_context();
+            prompt_ctx.scaffolding_level = 0; // Force FULL runner prompt
             let runner_instructions =
                 crate::runner::prompt::build_runner_system_prompt(&prompt_ctx);
             let mut full_prompt =
