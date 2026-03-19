@@ -1725,6 +1725,7 @@ pub async fn sync_directory(
             state.orchestrator.neo4j_arc(),
             pid,
             "post_sync",
+            Some(state.event_bus.clone() as std::sync::Arc<dyn crate::events::EventEmitter>),
         );
     }
 
@@ -2443,6 +2444,7 @@ pub async fn create_commit(
             orchestrator.neo4j_arc(),
             pid,
             "post_sync",
+            None,
         );
     }
 

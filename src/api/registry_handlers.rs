@@ -292,6 +292,7 @@ pub async fn import_from_registry(
         state.orchestrator.neo4j_arc(),
         body.project_id,
         "post_import",
+        Some(state.event_bus.clone() as std::sync::Arc<dyn crate::events::EventEmitter>),
     );
 
     Ok((StatusCode::CREATED, Json(result)))

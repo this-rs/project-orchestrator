@@ -1272,7 +1272,14 @@ pub async fn start_server(mut config: Config) -> Result<()> {
     );
 
     // Recover orphaned protocol runs from previous server instance
-    match crate::protocol::hooks::recover_orphaned_runs(orchestrator.neo4j()).await {
+    let protocol_emitter: Option<Arc<dyn events::EventEmitter>> =
+        Some(event_bus.clone() as Arc<dyn events::EventEmitter>);
+    match crate::protocol::hooks::recover_orphaned_runs(
+        orchestrator.neo4j_arc(),
+        protocol_emitter.clone(),
+    )
+    .await
+    {
         Ok(count) => {
             if count > 0 {
                 tracing::info!("Protocol recovery: marked {count} orphaned run(s) as failed");
@@ -1284,7 +1291,10 @@ pub async fn start_server(mut config: Config) -> Result<()> {
     }
 
     // Spawn the protocol scheduler (hourly evaluation of scheduled protocols)
-    crate::protocol::hooks::spawn_protocol_scheduler(orchestrator.neo4j_arc());
+    crate::protocol::hooks::spawn_protocol_scheduler(
+        orchestrator.neo4j_arc(),
+        protocol_emitter,
+    );
 
     // Recover interrupted plan runner runs from previous server instance
     if let Some(ref cm) = chat_manager {

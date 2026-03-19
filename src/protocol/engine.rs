@@ -498,6 +498,9 @@ pub async fn cancel_run(store: &dyn GraphStore, run_id: Uuid) -> Result<Protocol
         );
     }
 
+    // Signal the runner loop to stop gracefully (if active)
+    crate::protocol::hooks::cancel_active_runner(run_id);
+
     run.cancel();
 
     store

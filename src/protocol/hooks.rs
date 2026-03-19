@@ -22,10 +22,53 @@
 //! Each protocol has a `last_triggered_at` timestamp. Auto-triggers are skipped
 //! if the protocol was triggered less than [`MIN_TRIGGER_INTERVAL_SECS`] seconds ago.
 
+use crate::events::EventEmitter;
 use crate::neo4j::traits::GraphStore;
 use crate::protocol::engine;
-use std::sync::Arc;
+use dashmap::DashMap;
+use std::sync::{Arc, LazyLock};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+
+/// Global registry of active protocol runner tasks.
+///
+/// Maps run_id -> CancellationToken. Used by `cancel_run()` to signal
+/// graceful shutdown of the runner loop, and by `spawn_protocol_runner()`
+/// to register new runners.
+static ACTIVE_RUNNERS: LazyLock<DashMap<Uuid, CancellationToken>> =
+    LazyLock::new(DashMap::new);
+
+/// Cancel an active runner by run_id (if one is registered).
+///
+/// Called from `engine::cancel_run()` to signal the runner loop
+/// to stop gracefully via its CancellationToken.
+pub fn cancel_active_runner(run_id: Uuid) {
+    if let Some((_, token)) = ACTIVE_RUNNERS.remove(&run_id) {
+        tracing::info!(%run_id, "Cancelling active protocol runner");
+        token.cancel();
+    }
+}
+
+/// Spawn a protocol runner task for the given run.
+///
+/// Registers the run in `ACTIVE_RUNNERS` and spawns a tokio task
+/// that drives the FSM to completion via `runner::run_protocol()`.
+pub fn spawn_protocol_runner(
+    store: Arc<dyn GraphStore>,
+    run_id: Uuid,
+    emitter: Arc<dyn EventEmitter>,
+) {
+    let cancel = CancellationToken::new();
+    ACTIVE_RUNNERS.insert(run_id, cancel.clone());
+    tokio::spawn(async move {
+        let result = super::runner::run_protocol(store, run_id, cancel, emitter).await;
+        ACTIVE_RUNNERS.remove(&run_id);
+        match &result {
+            Ok(run) => tracing::info!(run_id = %run_id, "Protocol run completed: {:?}", run.status),
+            Err(e) => tracing::warn!(run_id = %run_id, "Protocol run failed: {}", e),
+        }
+    });
+}
 
 /// Minimum interval between auto-triggered runs of the same protocol (5 minutes).
 const MIN_TRIGGER_INTERVAL_SECS: i64 = 300;
@@ -43,10 +86,17 @@ const AUTO_RUN_TIMEOUT_SECS: i64 = 28800;
 /// and starts a run for each one.
 ///
 /// This is a fire-and-forget operation — errors are logged, never propagated.
-pub fn spawn_event_triggered_protocols(store: Arc<dyn GraphStore>, project_id: Uuid, event: &str) {
+pub fn spawn_event_triggered_protocols(
+    store: Arc<dyn GraphStore>,
+    project_id: Uuid,
+    event: &str,
+    emitter: Option<Arc<dyn EventEmitter>>,
+) {
     let event = event.to_string();
     tokio::spawn(async move {
-        if let Err(e) = trigger_protocols_for_event(&*store, project_id, &event).await {
+        if let Err(e) =
+            trigger_protocols_for_event(store.clone(), project_id, &event, emitter).await
+        {
             tracing::warn!(
                 %project_id,
                 event = %event,
@@ -58,9 +108,10 @@ pub fn spawn_event_triggered_protocols(store: Arc<dyn GraphStore>, project_id: U
 
 /// Core logic: find matching protocols and start runs.
 async fn trigger_protocols_for_event(
-    store: &dyn GraphStore,
+    store: Arc<dyn GraphStore>,
     project_id: Uuid,
     event: &str,
+    emitter: Option<Arc<dyn EventEmitter>>,
 ) -> anyhow::Result<()> {
     // List all protocols for the project (reasonable upper bound — few protocols per project)
     let (protocols, _) = store.list_protocols(project_id, None, 100, 0).await?;
@@ -102,7 +153,7 @@ async fn trigger_protocols_for_event(
 
         // 4. Start the run with triggered_by set
         let triggered_by = format!("event:{event}");
-        match engine::start_run(store, protocol.id, None, None, Some(&triggered_by)).await {
+        match engine::start_run(&*store, protocol.id, None, None, Some(&triggered_by)).await {
             Ok(run) => {
                 tracing::info!(
                     protocol_id = %protocol.id,
@@ -121,6 +172,11 @@ async fn trigger_protocols_for_event(
                         protocol_id = %protocol.id,
                         "Failed to update last_triggered_at: {}", e
                     );
+                }
+
+                // 6. Spawn the protocol runner to drive the FSM
+                if let Some(ref emitter) = emitter {
+                    spawn_protocol_runner(store.clone(), run.id, emitter.clone());
                 }
 
                 triggered_count += 1;
@@ -167,7 +223,10 @@ const ORPHAN_RUN_MAX_AGE_SECS: i64 = 3600;
 ///
 /// This function should be called once at server startup, before spawning
 /// the scheduler or handling any requests.
-pub async fn recover_orphaned_runs(store: &dyn GraphStore) -> anyhow::Result<u32> {
+pub async fn recover_orphaned_runs(
+    store: Arc<dyn GraphStore>,
+    emitter: Option<Arc<dyn EventEmitter>>,
+) -> anyhow::Result<u32> {
     let projects = store.list_projects().await?;
     let now = chrono::Utc::now();
     let mut total_recovered = 0u32;
@@ -190,25 +249,60 @@ pub async fn recover_orphaned_runs(store: &dyn GraphStore) -> anyhow::Result<u32
             for run in &running_runs {
                 let age_secs = (now - run.started_at).num_seconds();
                 if age_secs > ORPHAN_RUN_MAX_AGE_SECS {
-                    // Mark as failed
-                    let mut recovered_run = run.clone();
-                    recovered_run.fail("Recovered: server restarted during execution");
-
-                    if let Err(e) = store.update_protocol_run(&mut recovered_run).await {
-                        tracing::warn!(
-                            run_id = %run.id,
-                            protocol_id = %protocol.id,
-                            "Failed to recover orphaned run: {}", e
-                        );
+                    if run.runner_managed {
+                        // Re-spawn the runner instead of failing
+                        if let Some(ref emitter) = emitter {
+                            tracing::info!(
+                                run_id = %run.id,
+                                protocol_id = %protocol.id,
+                                protocol_name = %protocol.name,
+                                age_secs,
+                                "Re-spawning runner for orphaned runner-managed run"
+                            );
+                            spawn_protocol_runner(
+                                store.clone(),
+                                run.id,
+                                emitter.clone(),
+                            );
+                            total_recovered += 1;
+                        } else {
+                            let mut recovered_run = run.clone();
+                            recovered_run
+                                .fail("Recovered: server restarted (no emitter for re-spawn)");
+                            if let Err(e) =
+                                store.update_protocol_run(&mut recovered_run).await
+                            {
+                                tracing::warn!(
+                                    run_id = %run.id,
+                                    "Failed to recover orphaned run: {}", e
+                                );
+                            } else {
+                                total_recovered += 1;
+                            }
+                        }
                     } else {
-                        tracing::info!(
-                            run_id = %run.id,
-                            protocol_id = %protocol.id,
-                            protocol_name = %protocol.name,
-                            age_secs,
-                            "Recovered orphaned protocol run"
-                        );
-                        total_recovered += 1;
+                        // Not runner-managed — mark as failed
+                        let mut recovered_run = run.clone();
+                        recovered_run
+                            .fail("Recovered: server restarted during execution");
+                        if let Err(e) =
+                            store.update_protocol_run(&mut recovered_run).await
+                        {
+                            tracing::warn!(
+                                run_id = %run.id,
+                                protocol_id = %protocol.id,
+                                "Failed to recover orphaned run: {}", e
+                            );
+                        } else {
+                            tracing::info!(
+                                run_id = %run.id,
+                                protocol_id = %protocol.id,
+                                protocol_name = %protocol.name,
+                                age_secs,
+                                "Recovered orphaned protocol run"
+                            );
+                            total_recovered += 1;
+                        }
                     }
                 }
             }
@@ -348,7 +442,10 @@ fn schedule_interval_secs(schedule: &str) -> Option<i64> {
 /// - `store` — shared GraphStore for querying protocols and starting runs
 ///
 /// This task runs for the lifetime of the server and never returns.
-pub fn spawn_protocol_scheduler(store: Arc<dyn GraphStore>) {
+pub fn spawn_protocol_scheduler(
+    store: Arc<dyn GraphStore>,
+    emitter: Option<Arc<dyn EventEmitter>>,
+) {
     tokio::spawn(async move {
         let mut interval =
             tokio::time::interval(std::time::Duration::from_secs(SCHEDULER_INTERVAL_SECS));
@@ -363,7 +460,7 @@ pub fn spawn_protocol_scheduler(store: Arc<dyn GraphStore>) {
             tracing::debug!("Protocol scheduler: tick — orphan recovery + timeout + scheduling");
 
             // 1. Recover orphaned runs (same logic as startup, now periodic)
-            if let Err(e) = recover_orphaned_runs(&*store).await {
+            if let Err(e) = recover_orphaned_runs(store.clone(), emitter.clone()).await {
                 tracing::warn!("Protocol scheduler: orphan recovery failed: {}", e);
             }
 
@@ -373,7 +470,9 @@ pub fn spawn_protocol_scheduler(store: Arc<dyn GraphStore>) {
             }
 
             // 3. Evaluate scheduled protocols and start new runs
-            if let Err(e) = run_scheduled_protocols(&*store).await {
+            if let Err(e) =
+                run_scheduled_protocols(store.clone(), emitter.clone()).await
+            {
                 tracing::warn!("Protocol scheduler: scheduled trigger failed: {}", e);
             }
         }
@@ -381,7 +480,10 @@ pub fn spawn_protocol_scheduler(store: Arc<dyn GraphStore>) {
 }
 
 /// Core logic: find all scheduled protocols across all projects and trigger them.
-async fn run_scheduled_protocols(store: &dyn GraphStore) -> anyhow::Result<()> {
+async fn run_scheduled_protocols(
+    store: Arc<dyn GraphStore>,
+    emitter: Option<Arc<dyn EventEmitter>>,
+) -> anyhow::Result<()> {
     let projects = store.list_projects().await?;
     let now = chrono::Utc::now();
     let mut total_triggered = 0u32;
@@ -424,7 +526,7 @@ async fn run_scheduled_protocols(store: &dyn GraphStore) -> anyhow::Result<()> {
 
             // Start the run
             let triggered_by = format!("schedule:{schedule}");
-            match engine::start_run(store, protocol.id, None, None, Some(&triggered_by)).await {
+            match engine::start_run(&*store, protocol.id, None, None, Some(&triggered_by)).await {
                 Ok(run) => {
                     tracing::info!(
                         protocol_id = %protocol.id,
@@ -443,6 +545,11 @@ async fn run_scheduled_protocols(store: &dyn GraphStore) -> anyhow::Result<()> {
                             protocol_id = %protocol.id,
                             "Failed to update last_triggered_at: {}", e
                         );
+                    }
+
+                    // Spawn the protocol runner to drive the FSM
+                    if let Some(ref emitter) = emitter {
+                        spawn_protocol_runner(store.clone(), run.id, emitter.clone());
                     }
 
                     total_triggered += 1;
@@ -545,7 +652,7 @@ mod tests {
         )
         .await;
 
-        trigger_protocols_for_event(&store, project_id, "post_sync")
+        trigger_protocols_for_event(Arc::new(store.clone()), project_id, "post_sync", None)
             .await
             .unwrap();
 
@@ -569,7 +676,7 @@ mod tests {
         .await;
 
         // post_sync should trigger
-        trigger_protocols_for_event(&store, project_id, "post_sync")
+        trigger_protocols_for_event(Arc::new(store.clone()), project_id, "post_sync", None)
             .await
             .unwrap();
 
@@ -591,7 +698,7 @@ mod tests {
         )
         .await;
 
-        trigger_protocols_for_event(&store, project_id, "post_sync")
+        trigger_protocols_for_event(Arc::new(store.clone()), project_id, "post_sync", None)
             .await
             .unwrap();
 
@@ -614,7 +721,7 @@ mod tests {
         )
         .await;
 
-        trigger_protocols_for_event(&store, project_id, "post_sync")
+        trigger_protocols_for_event(Arc::new(store.clone()), project_id, "post_sync", None)
             .await
             .unwrap();
 
@@ -636,7 +743,7 @@ mod tests {
         .await;
 
         // post_sync should NOT trigger a protocol listening only to post_import
-        trigger_protocols_for_event(&store, project_id, "post_sync")
+        trigger_protocols_for_event(Arc::new(store.clone()), project_id, "post_sync", None)
             .await
             .unwrap();
 
@@ -661,7 +768,7 @@ mod tests {
         protocol.last_triggered_at = Some(chrono::Utc::now() - chrono::Duration::seconds(60));
         store.upsert_protocol(&protocol).await.unwrap();
 
-        trigger_protocols_for_event(&store, project_id, "post_sync")
+        trigger_protocols_for_event(Arc::new(store.clone()), project_id, "post_sync", None)
             .await
             .unwrap();
 
@@ -687,7 +794,7 @@ mod tests {
         protocol.last_triggered_at = Some(chrono::Utc::now() - chrono::Duration::seconds(600));
         store.upsert_protocol(&protocol).await.unwrap();
 
-        trigger_protocols_for_event(&store, project_id, "post_sync")
+        trigger_protocols_for_event(Arc::new(store.clone()), project_id, "post_sync", None)
             .await
             .unwrap();
 
@@ -723,7 +830,7 @@ mod tests {
         store.create_project(&project).await.unwrap();
 
         // Should succeed silently (no protocols to trigger)
-        trigger_protocols_for_event(&store, project_id, "post_sync")
+        trigger_protocols_for_event(Arc::new(store.clone()), project_id, "post_sync", None)
             .await
             .unwrap();
     }
@@ -740,7 +847,7 @@ mod tests {
 
         assert!(protocol.last_triggered_at.is_none());
 
-        trigger_protocols_for_event(&store, project_id, "post_sync")
+        trigger_protocols_for_event(Arc::new(store.clone()), project_id, "post_sync", None)
             .await
             .unwrap();
 
@@ -820,9 +927,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_recover_orphaned_run() {
-        let store = MockGraphStore::new();
+        let store = Arc::new(MockGraphStore::new());
         let (_, protocol) = setup_event_triggered_protocol(
-            &store,
+            &*store,
             TriggerMode::Event,
             vec!["post_sync".to_string()],
         )
@@ -833,7 +940,7 @@ mod tests {
         run.started_at = chrono::Utc::now() - chrono::Duration::hours(2);
         store.create_protocol_run(&run).await.unwrap();
 
-        let count = recover_orphaned_runs(&store).await.unwrap();
+        let count = recover_orphaned_runs(store.clone() as Arc<dyn GraphStore>, None).await.unwrap();
         assert_eq!(count, 1);
 
         // Verify run is now Failed
@@ -848,9 +955,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_recover_skips_recent_runs() {
-        let store = MockGraphStore::new();
+        let store = Arc::new(MockGraphStore::new());
         let (_, protocol) = setup_event_triggered_protocol(
-            &store,
+            &*store,
             TriggerMode::Event,
             vec!["post_sync".to_string()],
         )
@@ -861,7 +968,7 @@ mod tests {
         run.started_at = chrono::Utc::now() - chrono::Duration::minutes(5);
         store.create_protocol_run(&run).await.unwrap();
 
-        let count = recover_orphaned_runs(&store).await.unwrap();
+        let count = recover_orphaned_runs(store.clone() as Arc<dyn GraphStore>, None).await.unwrap();
         assert_eq!(count, 0);
 
         // Run should still be Running
@@ -871,9 +978,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_recover_skips_completed_runs() {
-        let store = MockGraphStore::new();
+        let store = Arc::new(MockGraphStore::new());
         let (_, protocol) = setup_event_triggered_protocol(
-            &store,
+            &*store,
             TriggerMode::Event,
             vec!["post_sync".to_string()],
         )
@@ -885,14 +992,14 @@ mod tests {
         run.complete();
         store.create_protocol_run(&run).await.unwrap();
 
-        let count = recover_orphaned_runs(&store).await.unwrap();
+        let count = recover_orphaned_runs(store.clone() as Arc<dyn GraphStore>, None).await.unwrap();
         assert_eq!(count, 0);
     }
 
     #[tokio::test]
     async fn test_recover_no_projects() {
-        let store = MockGraphStore::new();
-        let count = recover_orphaned_runs(&store).await.unwrap();
+        let store: Arc<dyn GraphStore> = Arc::new(MockGraphStore::new());
+        let count = recover_orphaned_runs(store, None).await.unwrap();
         assert_eq!(count, 0);
     }
 
@@ -910,7 +1017,7 @@ mod tests {
         protocol.last_triggered_at = Some(chrono::Utc::now() - chrono::Duration::hours(25));
         store.upsert_protocol(&protocol).await.unwrap();
 
-        run_scheduled_protocols(&store).await.unwrap();
+        run_scheduled_protocols(Arc::new(store.clone()), None).await.unwrap();
 
         let (runs, total) = store
             .list_protocol_runs(protocol.id, None, 10, 0)
@@ -929,7 +1036,7 @@ mod tests {
         // last_triggered_at is None — should trigger (never triggered = always due)
         assert!(protocol.last_triggered_at.is_none());
 
-        run_scheduled_protocols(&store).await.unwrap();
+        run_scheduled_protocols(Arc::new(store.clone()), None).await.unwrap();
 
         let (runs, total) = store
             .list_protocol_runs(protocol.id, None, 10, 0)
@@ -949,7 +1056,7 @@ mod tests {
         protocol.last_triggered_at = Some(chrono::Utc::now() - chrono::Duration::hours(1));
         store.upsert_protocol(&protocol).await.unwrap();
 
-        run_scheduled_protocols(&store).await.unwrap();
+        run_scheduled_protocols(Arc::new(store.clone()), None).await.unwrap();
 
         let (_, total) = store
             .list_protocol_runs(protocol.id, None, 10, 0)
@@ -964,7 +1071,7 @@ mod tests {
         let (_, protocol) =
             setup_scheduled_protocol(&store, TriggerMode::Event, Some("daily")).await;
 
-        run_scheduled_protocols(&store).await.unwrap();
+        run_scheduled_protocols(Arc::new(store.clone()), None).await.unwrap();
 
         // Event-only protocols should not be triggered by scheduler
         let (_, total) = store
@@ -980,7 +1087,7 @@ mod tests {
         let (_, protocol) =
             setup_scheduled_protocol(&store, TriggerMode::Manual, Some("daily")).await;
 
-        run_scheduled_protocols(&store).await.unwrap();
+        run_scheduled_protocols(Arc::new(store.clone()), None).await.unwrap();
 
         let (_, total) = store
             .list_protocol_runs(protocol.id, None, 10, 0)
@@ -997,7 +1104,7 @@ mod tests {
 
         // Auto = Event + Scheduled, should be picked up by scheduler
         // last_triggered_at is None → always due
-        run_scheduled_protocols(&store).await.unwrap();
+        run_scheduled_protocols(Arc::new(store.clone()), None).await.unwrap();
 
         let (runs, total) = store
             .list_protocol_runs(protocol.id, None, 10, 0)
@@ -1015,7 +1122,7 @@ mod tests {
 
         assert!(protocol.last_triggered_at.is_none());
 
-        run_scheduled_protocols(&store).await.unwrap();
+        run_scheduled_protocols(Arc::new(store.clone()), None).await.unwrap();
 
         let updated = store.get_protocol(protocol.id).await.unwrap().unwrap();
         assert!(updated.last_triggered_at.is_some());
@@ -1026,7 +1133,7 @@ mod tests {
         let store = MockGraphStore::new();
         let (_, protocol) = setup_scheduled_protocol(&store, TriggerMode::Scheduled, None).await;
 
-        run_scheduled_protocols(&store).await.unwrap();
+        run_scheduled_protocols(Arc::new(store.clone()), None).await.unwrap();
 
         // No schedule in config → not triggered
         let (_, total) = store
@@ -1101,7 +1208,7 @@ mod tests {
         let (project_id, protocol) = setup_inference_protocol(&store).await;
 
         // Simulate a post_sync event (like after admin(sync_directory))
-        trigger_protocols_for_event(&store, project_id, "post_sync")
+        trigger_protocols_for_event(Arc::new(store.clone()), project_id, "post_sync", None)
             .await
             .unwrap();
 
@@ -1126,7 +1233,7 @@ mod tests {
         p.last_triggered_at = Some(chrono::Utc::now() - chrono::Duration::seconds(600));
         store.upsert_protocol(&p).await.unwrap();
 
-        trigger_protocols_for_event(&store, project_id, "post_import")
+        trigger_protocols_for_event(Arc::new(store.clone()), project_id, "post_import", None)
             .await
             .unwrap();
 
@@ -1150,7 +1257,7 @@ mod tests {
         let (_, protocol) = setup_inference_protocol(&store).await;
 
         // Protocol has never been triggered → scheduler should trigger it
-        run_scheduled_protocols(&store).await.unwrap();
+        run_scheduled_protocols(Arc::new(store.clone()), None).await.unwrap();
 
         let (runs, total) = store
             .list_protocol_runs(protocol.id, None, 10, 0)
@@ -1182,7 +1289,7 @@ mod tests {
             .unwrap();
 
         // 2. Event-triggered start (simulating post_sync)
-        trigger_protocols_for_event(&store, project_id, "post_sync")
+        trigger_protocols_for_event(Arc::new(store.clone()), project_id, "post_sync", None)
             .await
             .unwrap();
 
@@ -1204,7 +1311,7 @@ mod tests {
         p.last_triggered_at = Some(chrono::Utc::now() - chrono::Duration::hours(25));
         store.upsert_protocol(&p).await.unwrap();
 
-        run_scheduled_protocols(&store).await.unwrap();
+        run_scheduled_protocols(Arc::new(store.clone()), None).await.unwrap();
 
         // All 3 runs should exist with different triggered_by values
         let (runs, total) = store
@@ -1238,7 +1345,7 @@ mod tests {
 
         // Event trigger should be silently rejected (concurrent run guard)
         // trigger_protocols_for_event catches the error and logs it, so it returns Ok(())
-        trigger_protocols_for_event(&store, project_id, "post_sync")
+        trigger_protocols_for_event(Arc::new(store.clone()), project_id, "post_sync", None)
             .await
             .unwrap();
 
@@ -1260,7 +1367,7 @@ mod tests {
         let (project_id, protocol) = setup_inference_protocol(&store).await;
 
         // First sync triggers
-        trigger_protocols_for_event(&store, project_id, "post_sync")
+        trigger_protocols_for_event(Arc::new(store.clone()), project_id, "post_sync", None)
             .await
             .unwrap();
 
@@ -1277,13 +1384,13 @@ mod tests {
             .unwrap();
 
         // Second sync should be debounced (last_triggered_at was just set)
-        trigger_protocols_for_event(&store, project_id, "post_sync")
+        trigger_protocols_for_event(Arc::new(store.clone()), project_id, "post_sync", None)
             .await
             .unwrap();
 
         // Third sync with different event should also be debounced
         // (debounce is per-protocol, not per-event)
-        trigger_protocols_for_event(&store, project_id, "post_import")
+        trigger_protocols_for_event(Arc::new(store.clone()), project_id, "post_import", None)
             .await
             .unwrap();
 
@@ -1312,9 +1419,9 @@ mod tests {
         // Launch 10 concurrent event triggers
         let mut handles = Vec::new();
         for _ in 0..10 {
-            let store_clone = store.clone();
+            let store_clone: Arc<dyn GraphStore> = store.clone();
             let handle = tokio::spawn(async move {
-                trigger_protocols_for_event(&*store_clone, project_id, "post_sync").await
+                trigger_protocols_for_event(store_clone, project_id, "post_sync", None).await
             });
             handles.push(handle);
         }
