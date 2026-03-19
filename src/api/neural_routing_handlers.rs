@@ -246,7 +246,16 @@ pub async fn update_config(
                     &coll_config,
                     None,
                 );
-                *tc_guard = Some(Arc::new(collector));
+                let collector = Arc::new(collector);
+
+                // Propagate to the ChatManager so it can record decisions
+                // and finalize trajectories on session close.
+                if let Some(ref cm) = state.chat_manager {
+                    cm.set_trajectory_collector(collector.clone());
+                    tracing::info!("Trajectory collector propagated to ChatManager");
+                }
+
+                *tc_guard = Some(collector);
                 tracing::info!(
                     buffer_size = coll_config.buffer_size,
                     "Trajectory collector created at runtime via config update"

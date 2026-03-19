@@ -162,8 +162,9 @@ pub struct ChatManager {
     pub(crate) enrichment_pipeline: Arc<super::enrichment::EnrichmentPipeline>,
     /// Trajectory collector for neural routing feedback loop.
     /// When Some, `close_session()` calls `end_session()` to finalize trajectories.
+    /// Behind a RwLock to allow hot-swap when collection is enabled at runtime via API.
     pub(crate) trajectory_collector:
-        Option<std::sync::Arc<neural_routing_runtime::TrajectoryCollector>>,
+        Arc<std::sync::RwLock<Option<std::sync::Arc<neural_routing_runtime::TrajectoryCollector>>>>,
     /// Optional reasoning tree engine for StatusInjectionStage.
     /// When Some, the status stage can build reasoning trees from the knowledge graph.
     pub(crate) reasoning_engine: Option<Arc<crate::reasoning::ReasoningTreeEngine>>,
@@ -373,7 +374,7 @@ impl ChatManager {
             config_yaml_path: None,
             env_config,
             enrichment_pipeline,
-            trajectory_collector: None,
+            trajectory_collector: Arc::new(std::sync::RwLock::new(None)),
             reasoning_engine: None,
         }
     }
@@ -423,7 +424,7 @@ impl ChatManager {
             config_yaml_path: None,
             env_config,
             enrichment_pipeline,
-            trajectory_collector: None,
+            trajectory_collector: Arc::new(std::sync::RwLock::new(None)),
             reasoning_engine: None,
         }
     }
@@ -459,12 +460,14 @@ impl ChatManager {
         engine: Arc<crate::reasoning::ReasoningTreeEngine>,
     ) -> Self {
         self.reasoning_engine = Some(engine.clone());
+        let tc_guard = self.trajectory_collector.read().unwrap();
         self.enrichment_pipeline = Self::build_enrichment_pipeline(
             &self.graph,
             &self.search,
             Some(&engine),
-            self.trajectory_collector.as_ref(),
+            tc_guard.as_ref(),
         );
+        drop(tc_guard);
         self
     }
 
@@ -473,18 +476,23 @@ impl ChatManager {
     /// Rebuilds the pipeline so that `SkillActivationStage` and
     /// `KnowledgeInjectionStage` fire decision records to the collector.
     pub fn with_trajectory_collector(
-        mut self,
+        self,
         collector: std::sync::Arc<neural_routing_runtime::TrajectoryCollector>,
     ) -> Self {
-        self.enrichment_pipeline = Self::build_enrichment_pipeline(
-            &self.graph,
-            &self.search,
-            self.reasoning_engine.as_ref(),
-            Some(&collector),
-        );
-        // Store collector for end_session() in close_session()
-        self.trajectory_collector = Some(collector);
+        self.set_trajectory_collector(collector);
         self
+    }
+
+    /// Hot-swap the trajectory collector at runtime.
+    ///
+    /// Called when collection is enabled via the API after the ChatManager
+    /// is already constructed. Rebuilds the enrichment pipeline and stores
+    /// the collector for `close_session()` finalization.
+    pub fn set_trajectory_collector(
+        &self,
+        collector: std::sync::Arc<neural_routing_runtime::TrajectoryCollector>,
+    ) {
+        *self.trajectory_collector.write().unwrap() = Some(collector);
     }
 
     /// Set a custom reward computer for session reward computation.
@@ -1520,7 +1528,8 @@ impl ChatManager {
             FsmPromptComposer::compose_with_record(&input, &HeuristicRouter);
 
         // Emit routing decision to trajectory collector (fire-and-forget)
-        if let (Some(ref collector), Some(sid)) = (&self.trajectory_collector, session_id) {
+        let tc_guard = self.trajectory_collector.read().unwrap();
+        if let (Some(ref collector), Some(sid)) = (&*tc_guard, session_id) {
             // Emit routing decision directly to trajectory collector
             let params = serde_json::to_value(&routing_record).unwrap_or_default();
             collector.record_decision(neural_routing_runtime::DecisionRecord {
@@ -5083,7 +5092,7 @@ impl ChatManager {
         //    Uses end_session_auto() so the collector computes the reward from
         //    actual buffered DecisionRecords (tool success rate, confidence, duration).
         //    SessionHints provides optional task metadata not available inside the loop.
-        if let Some(ref collector) = self.trajectory_collector {
+        if let Some(ref collector) = *self.trajectory_collector.read().unwrap() {
             let hints = neural_routing_runtime::SessionHints {
                 protocol_run_id,
                 protocol_state,
