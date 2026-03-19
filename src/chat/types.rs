@@ -1,6 +1,117 @@
 //! Chat types — request/response/event types for the chat system
 
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+// ---------------------------------------------------------------------------
+// SpawnedBy — typed origin for sessions spawned by the pipeline or runner
+// ---------------------------------------------------------------------------
+
+/// Describes how/why a session was created. Stored as JSON in Neo4j's
+/// `spawned_by` property. The enum is **backward-compatible**: the legacy
+/// `{"type":"runner", ...}` payloads are parsed via `from_json_str` with
+/// a serde fallback.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SpawnedBy {
+    /// Spawned by the classic PlanRunner (wave-based execution).
+    Runner {
+        run_id: Uuid,
+        task_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_session_id: Option<Uuid>,
+    },
+    /// Spawned by the pipeline orchestrator (WaveExecutor / PipelineEngine).
+    Pipeline {
+        run_id: Uuid,
+        task_id: Uuid,
+        wave: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_session_id: Option<Uuid>,
+    },
+    /// Spawned as a gate-retry (quality gate failed, re-running task).
+    Gate {
+        run_id: Uuid,
+        task_id: Uuid,
+        gate_name: String,
+        attempt: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_session_id: Option<Uuid>,
+    },
+    /// Spawned by an external trigger or schedule.
+    Trigger {
+        trigger_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_id: Option<Uuid>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task_id: Option<Uuid>,
+    },
+    /// Sub-conversation spawned by a user or another agent.
+    Conversation {
+        parent_session_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_use_id: Option<String>,
+    },
+}
+
+impl SpawnedBy {
+    /// Serialize to a JSON string suitable for Neo4j storage.
+    pub fn to_json_string(&self) -> String {
+        serde_json::to_string(self).unwrap_or_else(|_| "{}".to_string())
+    }
+
+    /// Parse from a JSON string. Returns `None` for empty/invalid input.
+    pub fn from_json_str(s: &str) -> Option<Self> {
+        if s.is_empty() {
+            return None;
+        }
+        serde_json::from_str(s).ok()
+    }
+
+    /// Extract the parent session ID if present.
+    pub fn parent_session_id(&self) -> Option<Uuid> {
+        match self {
+            Self::Runner { parent_session_id, .. } => *parent_session_id,
+            Self::Pipeline { parent_session_id, .. } => *parent_session_id,
+            Self::Gate { parent_session_id, .. } => *parent_session_id,
+            Self::Trigger { .. } => None,
+            Self::Conversation { parent_session_id, .. } => Some(*parent_session_id),
+        }
+    }
+
+    /// Return a short label for the spawn type (for display/logging).
+    pub fn spawn_type(&self) -> &'static str {
+        match self {
+            Self::Runner { .. } => "runner",
+            Self::Pipeline { .. } => "pipeline",
+            Self::Gate { .. } => "gate",
+            Self::Trigger { .. } => "trigger",
+            Self::Conversation { .. } => "conversation",
+        }
+    }
+
+    /// Extract run_id if present.
+    pub fn run_id(&self) -> Option<Uuid> {
+        match self {
+            Self::Runner { run_id, .. } => Some(*run_id),
+            Self::Pipeline { run_id, .. } => Some(*run_id),
+            Self::Gate { run_id, .. } => Some(*run_id),
+            Self::Trigger { run_id, .. } => *run_id,
+            Self::Conversation { .. } => None,
+        }
+    }
+
+    /// Extract task_id if present.
+    pub fn task_id(&self) -> Option<Uuid> {
+        match self {
+            Self::Runner { task_id, .. } => Some(*task_id),
+            Self::Pipeline { task_id, .. } => Some(*task_id),
+            Self::Gate { task_id, .. } => Some(*task_id),
+            Self::Trigger { task_id, .. } => *task_id,
+            Self::Conversation { .. } => None,
+        }
+    }
+}
 
 /// Request to send a chat message
 #[derive(Debug, Clone, Serialize, Deserialize)]

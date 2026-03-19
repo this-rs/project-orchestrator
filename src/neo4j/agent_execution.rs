@@ -32,6 +32,43 @@ pub struct AgentExecutionNode {
     pub vector_json: Option<String>,
     /// Structured execution report JSON (serialized TaskExecutionReport)
     pub report_json: Option<String>,
+    /// The type of execution (task agent, gate retry, verification).
+    #[serde(default)]
+    pub execution_type: ExecutionType,
+}
+
+/// Type of agent execution — distinguishes regular task runs from gate retries
+/// and verification passes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionType {
+    /// Normal task execution by an agent.
+    #[default]
+    TaskAgent,
+    /// Re-execution triggered by a quality gate failure.
+    GateRetry,
+    /// Verification pass (e.g., running tests after a fix).
+    Verification,
+}
+
+impl std::fmt::Display for ExecutionType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TaskAgent => write!(f, "task_agent"),
+            Self::GateRetry => write!(f, "gate_retry"),
+            Self::Verification => write!(f, "verification"),
+        }
+    }
+}
+
+impl ExecutionType {
+    pub fn from_str_lossy(s: &str) -> Self {
+        match s {
+            "gate_retry" => Self::GateRetry,
+            "verification" => Self::Verification,
+            _ => Self::TaskAgent,
+        }
+    }
 }
 
 /// Status of an agent execution.
@@ -93,7 +130,8 @@ impl Neo4jClient {
                 tools_used: $tools_used,
                 files_modified: $files_modified,
                 commits: $commits,
-                persona_profile: $persona
+                persona_profile: $persona,
+                execution_type: $execution_type
             })
             CREATE (ae)-[:PART_OF]->(r)
             CREATE (ae)-[:EXECUTES]->(t)
@@ -113,7 +151,8 @@ impl Neo4jClient {
         .param("tools_used", ae.tools_used.clone())
         .param("files_modified", ae.files_modified.clone())
         .param("commits", ae.commits.clone())
-        .param("persona", ae.persona_profile.clone());
+        .param("persona", ae.persona_profile.clone())
+        .param("execution_type", ae.execution_type.to_string());
 
         self.graph.run(q).await?;
         Ok(())
@@ -249,6 +288,10 @@ impl Neo4jClient {
             persona_profile: node.get("persona_profile").unwrap_or_default(),
             vector_json: node.get("vector_json").ok(),
             report_json: node.get("report_json").ok(),
+            execution_type: node
+                .get::<String>("execution_type")
+                .map(|s| ExecutionType::from_str_lossy(&s))
+                .unwrap_or_default(),
         })
     }
 }
@@ -278,6 +321,7 @@ mod tests {
             persona_profile: "test-profile".to_string(),
             vector_json,
             report_json,
+            execution_type: ExecutionType::TaskAgent,
         }
     }
 
