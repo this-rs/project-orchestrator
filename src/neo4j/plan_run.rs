@@ -172,6 +172,48 @@ impl Neo4jClient {
         Ok(runs)
     }
 
+    /// List all PlanRuns across all plans, ordered by started_at desc.
+    pub async fn list_all_plan_runs_impl(
+        &self,
+        limit: i64,
+        offset: i64,
+        status: Option<&str>,
+    ) -> Result<Vec<RunnerState>> {
+        let cypher = if status.is_some() {
+            r#"
+                MATCH (r:PlanRun)
+                WHERE r.status = $status
+                RETURN r
+                ORDER BY r.started_at DESC
+                SKIP $offset
+                LIMIT $limit
+                "#
+            .to_string()
+        } else {
+            r#"
+            MATCH (r:PlanRun)
+            RETURN r
+            ORDER BY r.started_at DESC
+            SKIP $offset
+            LIMIT $limit
+            "#
+            .to_string()
+        };
+
+        let mut q = query(&cypher).param("limit", limit).param("offset", offset);
+        if let Some(s) = status {
+            q = q.param("status", s.to_string());
+        }
+
+        let mut result = self.graph.execute(q).await?;
+        let mut runs = Vec::new();
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("r")?;
+            runs.push(self.node_to_plan_run(&node)?);
+        }
+        Ok(runs)
+    }
+
     /// List all PlanRuns for a given plan.
     pub async fn list_plan_runs_impl(&self, plan_id: Uuid, limit: i64) -> Result<Vec<RunnerState>> {
         let q = query(

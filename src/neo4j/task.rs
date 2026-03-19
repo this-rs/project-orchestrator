@@ -686,6 +686,27 @@ impl Neo4jClient {
         }
     }
 
+    /// Get the plan UUID that owns a given task.
+    pub async fn get_plan_id_for_task(&self, task_id: Uuid) -> Result<Option<Uuid>> {
+        let q = query(
+            r#"
+            MATCH (p:Plan)-[:HAS_TASK]->(t:Task {id: $task_id})
+            RETURN p.id AS plan_id
+            LIMIT 1
+            "#,
+        )
+        .param("task_id", task_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let plan_id_str: String = row.get("plan_id")?;
+            let plan_id = Uuid::parse_str(&plan_id_str)?;
+            Ok(Some(plan_id))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Link a task to files it modifies
     pub async fn link_task_to_files(&self, task_id: Uuid, file_paths: &[String]) -> Result<()> {
         for path in file_paths {

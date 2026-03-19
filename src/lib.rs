@@ -27,6 +27,7 @@ pub mod neurons;
 pub mod notes;
 pub mod orchestrator;
 pub mod parser;
+pub mod pipeline;
 pub mod plan;
 pub mod profile;
 pub mod protocol;
@@ -1393,6 +1394,9 @@ pub async fn start_server(mut config: Config) -> Result<()> {
         None
     };
 
+    // Subscribe to the event bus BEFORE creating ServerState (the bus lives independently)
+    let reactor_receiver = event_bus.subscribe();
+
     // Create server state
     let server_state = Arc::new(ServerState {
         orchestrator,
@@ -1426,7 +1430,24 @@ pub async fn start_server(mut config: Config) -> Result<()> {
                 }
             }
         },
+        reactor_counters: std::sync::OnceLock::new(),
     });
+
+    // ── EventReactor: build, register built-in reactions, and spawn ──
+    {
+        let builder = events::ReactorBuilder::new(
+            reactor_receiver,
+            server_state.clone() as Arc<dyn std::any::Any + Send + Sync>,
+        );
+        let builder = events::register_builtin_reactions(builder, server_state.clone());
+        let (reactor, counters) = builder.build();
+
+        // Store counters in ServerState (OnceLock — safe one-time init)
+        let _ = server_state.reactor_counters.set(counters);
+
+        tokio::spawn(reactor.run());
+        tracing::info!("EventReactor started with built-in reactions");
+    }
 
     // Create router
     let app = api::create_router(server_state);

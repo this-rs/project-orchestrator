@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use super::handlers::{AppError, OrchestratorState};
 use crate::analytics::distribution::{adaptive_threshold, analyze_distribution};
 use crate::analytics::hypothesis::test_community_homogeneity;
+use crate::events::EventEmitter;
 use crate::graph::algorithms::into_ranked;
 use crate::graph::models::{FusionWeights, MultiSignalImpact, MultiSignalScore, RankedList};
 use crate::neo4j::models::{ConnectedFileNode, DecisionNode};
@@ -1535,6 +1536,17 @@ pub async fn create_feature_graph(
         include_relations: None,
     };
     state.orchestrator.neo4j().create_feature_graph(&fg).await?;
+
+    state.event_bus.emit_created(
+        crate::events::EntityType::FeatureGraph,
+        &fg.id.to_string(),
+        serde_json::json!({
+            "name": fg.name,
+            "project_id": fg.project_id.to_string(),
+        }),
+        Some(fg.project_id.to_string()),
+    );
+
     Ok(Json(serde_json::json!({
         "id": fg.id.to_string(),
         "name": fg.name,
@@ -1626,6 +1638,15 @@ pub async fn delete_feature_graph(
     Path(id): Path<uuid::Uuid>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let deleted = state.orchestrator.neo4j().delete_feature_graph(id).await?;
+
+    if deleted {
+        state.event_bus.emit_deleted(
+            crate::events::EntityType::FeatureGraph,
+            &id.to_string(),
+            None,
+        );
+    }
+
     Ok(Json(serde_json::json!({ "deleted": deleted })))
 }
 
@@ -3042,6 +3063,18 @@ pub async fn create_topology_rule(
 
     neo4j.create_topology_rule(&rule).await?;
 
+    state.event_bus.emit_created(
+        crate::events::EntityType::TopologyRule,
+        &rule.id,
+        serde_json::json!({
+            "project_id": rule.project_id,
+            "rule_type": format!("{:?}", rule.rule_type),
+            "source_pattern": rule.source_pattern,
+            "target_pattern": rule.target_pattern,
+        }),
+        Some(rule.project_id.clone()),
+    );
+
     Ok(Json(rule))
 }
 
@@ -3052,6 +3085,11 @@ pub async fn delete_topology_rule(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let neo4j = state.orchestrator.neo4j();
     neo4j.delete_topology_rule(&rule_id).await?;
+
+    state
+        .event_bus
+        .emit_deleted(crate::events::EntityType::TopologyRule, &rule_id, None);
+
     Ok(Json(serde_json::json!({"deleted": true})))
 }
 
@@ -4263,6 +4301,7 @@ mod tests {
             trajectory_collector: None,
             trajectory_store: None,
             identity: None,
+            reactor_counters: std::sync::OnceLock::new(),
         });
         create_router(state)
     }
@@ -4328,6 +4367,7 @@ mod tests {
             trajectory_collector: None,
             trajectory_store: None,
             identity: None,
+            reactor_counters: std::sync::OnceLock::new(),
         });
         create_router(state)
     }
@@ -4607,6 +4647,7 @@ mod tests {
             trajectory_collector: None,
             trajectory_store: None,
             identity: None,
+            reactor_counters: std::sync::OnceLock::new(),
         });
         create_router(state)
     }
@@ -4790,6 +4831,7 @@ mod tests {
             trajectory_collector: None,
             trajectory_store: None,
             identity: None,
+            reactor_counters: std::sync::OnceLock::new(),
         });
         create_router(state)
     }
@@ -4999,6 +5041,7 @@ mod tests {
             trajectory_collector: None,
             trajectory_store: None,
             identity: None,
+            reactor_counters: std::sync::OnceLock::new(),
         });
         (create_router(state), project_id)
     }
@@ -5193,6 +5236,7 @@ mod tests {
             trajectory_collector: None,
             trajectory_store: None,
             identity: None,
+            reactor_counters: std::sync::OnceLock::new(),
         });
         let app = create_router(state);
 
@@ -5391,6 +5435,7 @@ mod tests {
             trajectory_collector: None,
             trajectory_store: None,
             identity: None,
+            reactor_counters: std::sync::OnceLock::new(),
         });
         create_router(state)
     }
@@ -5632,6 +5677,7 @@ mod tests {
             trajectory_collector: None,
             trajectory_store: None,
             identity: None,
+            reactor_counters: std::sync::OnceLock::new(),
         });
         create_router(state)
     }
@@ -5766,6 +5812,7 @@ mod tests {
             trajectory_collector: None,
             trajectory_store: None,
             identity: None,
+            reactor_counters: std::sync::OnceLock::new(),
         });
         let app = create_router(state);
 
@@ -5974,6 +6021,7 @@ mod tests {
             trajectory_collector: None,
             trajectory_store: None,
             identity: None,
+            reactor_counters: std::sync::OnceLock::new(),
         });
         let app = create_router(state);
 
@@ -6135,6 +6183,7 @@ mod tests {
             trajectory_collector: None,
             trajectory_store: None,
             identity: None,
+            reactor_counters: std::sync::OnceLock::new(),
         });
         let app = create_router(state);
 

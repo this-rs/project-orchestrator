@@ -21,8 +21,7 @@ static BACKEND_PORT: std::sync::atomic::AtomicU16 =
 /// Flag set by the splash screen's `proceed_to_main` Tauri command to signal
 /// that the splash has finished all its checks and is ready to transition.
 /// The backend thread polls this flag before calling `show_main_window()`.
-static SPLASH_READY: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static SPLASH_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Tauri command: get the server port for the frontend to connect to.
 /// Returns the real port from config.yaml (not necessarily 6600).
@@ -447,7 +446,8 @@ fn main() {
         // macOS: clicking the dock icon when the window is hidden should reshow it
         #[cfg(target_os = "macos")]
         if let tauri::RunEvent::Reopen {
-            has_visible_windows, ..
+            has_visible_windows,
+            ..
         } = &event
         {
             if !has_visible_windows {
@@ -462,11 +462,16 @@ fn main() {
             let infra_mode = std::fs::read_to_string(setup::config_path())
                 .ok()
                 .and_then(|c| serde_yaml::from_str::<serde_yaml::Value>(&c).ok())
-                .and_then(|v| v.get("infra_mode").and_then(|m| m.as_str().map(String::from)))
+                .and_then(|v| {
+                    v.get("infra_mode")
+                        .and_then(|m| m.as_str().map(String::from))
+                })
                 .unwrap_or_else(|| "docker".to_string());
 
             if infra_mode == "external" {
-                tracing::info!("Application exiting — infra_mode is external, skipping Docker stop");
+                tracing::info!(
+                    "Application exiting — infra_mode is external, skipping Docker stop"
+                );
             } else {
                 tracing::info!("Application exiting — stopping Docker services...");
                 let dm = docker_for_exit.clone();
@@ -522,7 +527,10 @@ fn show_main_window(handle: &tauri::AppHandle) {
         let port = BACKEND_PORT.load(std::sync::atomic::Ordering::Relaxed);
         let version = env!("CARGO_PKG_VERSION");
         let http_url = format!("http://localhost:{}/?v={}", port, version);
-        tracing::info!("Navigating main window to {} (same-origin for cookies)", http_url);
+        tracing::info!(
+            "Navigating main window to {} (same-origin for cookies)",
+            http_url
+        );
         if let Ok(url) = http_url.parse() {
             if let Err(e) = main_window.navigate(url) {
                 tracing::error!("Failed to navigate main window to {}: {}", http_url, e);
@@ -579,9 +587,7 @@ fn show_main_window(handle: &tauri::AppHandle) {
 
                     // 3. Transparent titlebar that blends with content
                     ns_window.setTitlebarAppearsTransparent_(cocoa::base::YES);
-                    ns_window.setTitleVisibility_(
-                        NSWindowTitleVisibility::NSWindowTitleHidden,
-                    );
+                    ns_window.setTitleVisibility_(NSWindowTitleVisibility::NSWindowTitleHidden);
                     ns_window.setHasShadow_(cocoa::base::YES);
 
                     // 4. Set dark underPageBackgroundColor on the WKWebView.
@@ -598,8 +604,7 @@ fn show_main_window(handle: &tauri::AppHandle) {
                     let layer: id = msg_send![content_view, layer];
                     if !layer.is_null() {
                         let _: () = msg_send![layer, setCornerRadius: 10.0_f64];
-                        let _: () =
-                            msg_send![layer, setMasksToBounds: cocoa::base::YES];
+                        let _: () = msg_send![layer, setMasksToBounds: cocoa::base::YES];
                     }
                 }
             });

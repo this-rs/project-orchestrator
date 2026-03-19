@@ -4,6 +4,7 @@
 //! `tokio::sync::RwLock<HashMap<K, V>>` collections.
 //! Conditionally compiled with `#[cfg(test)]`.
 
+use crate::events::trigger::EventTrigger;
 use crate::neo4j::models::*;
 use crate::neo4j::traits::GraphStore;
 use crate::notes::{
@@ -4029,6 +4030,14 @@ impl GraphStore for MockGraphStore {
         Ok(projects.get(&project_id).cloned())
     }
 
+    async fn get_plan_id_for_task(&self, task_id: Uuid) -> Result<Option<Uuid>> {
+        let plan_tasks = self.plan_tasks.read().await;
+        Ok(plan_tasks
+            .iter()
+            .find(|(_, tasks)| tasks.contains(&task_id))
+            .map(|(plan_id, _)| *plan_id))
+    }
+
     // ========================================================================
     // Step operations
     // ========================================================================
@@ -4183,6 +4192,11 @@ impl GraphStore for MockGraphStore {
 
     async fn get_decision(&self, decision_id: Uuid) -> Result<Option<DecisionNode>> {
         Ok(self.decisions.read().await.get(&decision_id).cloned())
+    }
+
+    async fn get_decision_project_id(&self, _decision_id: Uuid) -> Result<Option<String>> {
+        // Mock doesn't track Decision→Task→Plan→Project chain
+        Ok(None)
     }
 
     async fn update_decision(
@@ -10193,6 +10207,34 @@ impl GraphStore for MockGraphStore {
             .collect())
     }
 
+    async fn list_all_plan_runs(
+        &self,
+        limit: i64,
+        offset: i64,
+        status: Option<&str>,
+    ) -> anyhow::Result<Vec<crate::runner::RunnerState>> {
+        let runs = self.plan_runs.read().await;
+        let mut result: Vec<_> = runs
+            .values()
+            .filter(|s| {
+                if let Some(st) = status {
+                    format!("{:?}", s.status) == st
+                } else {
+                    true
+                }
+            })
+            .cloned()
+            .collect();
+        result.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+        let start = (offset as usize).min(result.len());
+        result = result
+            .into_iter()
+            .skip(start)
+            .take(limit as usize)
+            .collect();
+        Ok(result)
+    }
+
     async fn list_plan_runs(
         &self,
         plan_id: Uuid,
@@ -10548,6 +10590,40 @@ impl GraphStore for MockGraphStore {
         let total = all.len();
         let page = all.into_iter().skip(offset).take(limit).collect();
         Ok((page, total))
+    }
+
+    async fn list_event_triggers(
+        &self,
+        _project_scope: Option<Uuid>,
+        _enabled_only: bool,
+    ) -> Result<Vec<EventTrigger>> {
+        Ok(vec![])
+    }
+
+    async fn create_event_trigger(&self, _trigger: &EventTrigger) -> Result<Uuid> {
+        Ok(Uuid::new_v4())
+    }
+
+    async fn get_event_trigger(&self, _id: Uuid) -> Result<Option<EventTrigger>> {
+        Ok(None)
+    }
+
+    async fn update_event_trigger(
+        &self,
+        _id: Uuid,
+        _enabled: Option<bool>,
+        _name: Option<String>,
+        _entity_type_pattern: Option<Option<String>>,
+        _action_pattern: Option<Option<String>>,
+        _payload_conditions: Option<Option<serde_json::Value>>,
+        _cooldown_secs: Option<u32>,
+        _project_scope: Option<Option<Uuid>>,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
+    async fn delete_event_trigger(&self, _id: Uuid) -> Result<bool> {
+        Ok(false)
     }
 }
 

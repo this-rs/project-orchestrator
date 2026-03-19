@@ -1092,6 +1092,10 @@ impl GraphStore for Neo4jClient {
         self.get_project_for_task(task_id).await
     }
 
+    async fn get_plan_id_for_task(&self, task_id: Uuid) -> anyhow::Result<Option<Uuid>> {
+        self.get_plan_id_for_task(task_id).await
+    }
+
     // ========================================================================
     // Step operations
     // ========================================================================
@@ -1169,6 +1173,10 @@ impl GraphStore for Neo4jClient {
 
     async fn get_decision(&self, decision_id: Uuid) -> anyhow::Result<Option<DecisionNode>> {
         self.get_decision(decision_id).await
+    }
+
+    async fn get_decision_project_id(&self, decision_id: Uuid) -> anyhow::Result<Option<String>> {
+        self.get_decision_project_id(decision_id).await
     }
 
     async fn update_decision(
@@ -3526,6 +3534,15 @@ impl GraphStore for Neo4jClient {
         self.list_active_plan_runs_impl().await
     }
 
+    async fn list_all_plan_runs(
+        &self,
+        limit: i64,
+        offset: i64,
+        status: Option<&str>,
+    ) -> anyhow::Result<Vec<crate::runner::RunnerState>> {
+        self.list_all_plan_runs_impl(limit, offset, status).await
+    }
+
     async fn list_plan_runs(
         &self,
         plan_id: Uuid,
@@ -3770,5 +3787,59 @@ impl GraphStore for Neo4jClient {
         offset: usize,
     ) -> anyhow::Result<(Vec<AlertNode>, usize)> {
         self.list_alerts_impl(project_id, limit, offset).await
+    }
+
+    // ========================================================================
+    // EventTrigger operations
+    // ========================================================================
+
+    async fn list_event_triggers(
+        &self,
+        project_scope: Option<Uuid>,
+        enabled_only: bool,
+    ) -> anyhow::Result<Vec<crate::events::trigger::EventTrigger>> {
+        self.list_event_triggers(project_scope, enabled_only).await
+    }
+
+    async fn create_event_trigger(
+        &self,
+        trigger: &crate::events::trigger::EventTrigger,
+    ) -> anyhow::Result<Uuid> {
+        self.create_event_trigger(trigger).await
+    }
+
+    async fn get_event_trigger(
+        &self,
+        id: Uuid,
+    ) -> anyhow::Result<Option<crate::events::trigger::EventTrigger>> {
+        self.get_event_trigger(id).await
+    }
+
+    async fn update_event_trigger(
+        &self,
+        id: Uuid,
+        enabled: Option<bool>,
+        name: Option<String>,
+        entity_type_pattern: Option<Option<String>>,
+        action_pattern: Option<Option<String>>,
+        payload_conditions: Option<Option<serde_json::Value>>,
+        cooldown_secs: Option<u32>,
+        project_scope: Option<Option<Uuid>>,
+    ) -> anyhow::Result<bool> {
+        self.update_event_trigger(
+            id,
+            enabled,
+            name,
+            entity_type_pattern,
+            action_pattern,
+            payload_conditions,
+            cooldown_secs,
+            project_scope,
+        )
+        .await
+    }
+
+    async fn delete_event_trigger(&self, id: Uuid) -> anyhow::Result<bool> {
+        self.delete_event_trigger(id).await
     }
 }

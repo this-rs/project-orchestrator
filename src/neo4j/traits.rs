@@ -4,6 +4,7 @@
 //! This trait mirrors all public async methods of `Neo4jClient`,
 //! enabling testing with mock implementations and future backend swaps.
 
+use crate::events::trigger::EventTrigger;
 use crate::graph::models::{
     AnalysisProfile, FabricFileAnalyticsUpdate, FileAnalyticsUpdate, FunctionAnalyticsUpdate,
     TopologyRule, TopologyViolation,
@@ -863,6 +864,12 @@ pub trait GraphStore: Send + Sync {
     /// Returns `None` if the task doesn't exist or has no linked project.
     async fn get_project_for_task(&self, task_id: Uuid) -> Result<Option<ProjectNode>>;
 
+    /// Get the plan UUID that owns a given task.
+    ///
+    /// Traverses: `(Plan)-[:HAS_TASK]->(Task {id: task_id})`
+    /// Returns `None` if the task doesn't exist or has no parent plan.
+    async fn get_plan_id_for_task(&self, task_id: Uuid) -> Result<Option<Uuid>>;
+
     // ========================================================================
     // Step operations
     // ========================================================================
@@ -922,6 +929,9 @@ pub trait GraphStore: Send + Sync {
 
     /// Get a single decision by ID
     async fn get_decision(&self, decision_id: Uuid) -> Result<Option<DecisionNode>>;
+
+    /// Get the project ID for a decision (traverses Decision←Task←Plan←Project).
+    async fn get_decision_project_id(&self, decision_id: Uuid) -> Result<Option<String>>;
 
     /// Update a decision
     async fn update_decision(
@@ -2948,6 +2958,14 @@ pub trait GraphStore: Send + Sync {
     /// List all PlanRuns with status=Running (for crash recovery at boot).
     async fn list_active_plan_runs(&self) -> Result<Vec<crate::runner::RunnerState>>;
 
+    /// List all PlanRuns across all plans, ordered by started_at desc.
+    async fn list_all_plan_runs(
+        &self,
+        limit: i64,
+        offset: i64,
+        status: Option<&str>,
+    ) -> Result<Vec<crate::runner::RunnerState>>;
+
     /// List all PlanRuns for a given plan, ordered by started_at desc.
     async fn list_plan_runs(
         &self,
@@ -3166,4 +3184,40 @@ pub trait GraphStore: Send + Sync {
         limit: usize,
         offset: usize,
     ) -> Result<(Vec<AlertNode>, usize)>;
+
+    // ========================================================================
+    // EventTrigger operations
+    // ========================================================================
+
+    /// List EventTriggers, optionally filtered by project scope and/or enabled status.
+    async fn list_event_triggers(
+        &self,
+        project_scope: Option<Uuid>,
+        enabled_only: bool,
+    ) -> Result<Vec<EventTrigger>>;
+
+    /// Create an EventTrigger node. Returns the generated UUID.
+    async fn create_event_trigger(&self, trigger: &EventTrigger) -> Result<Uuid>;
+
+    /// Get an EventTrigger by its UUID.
+    async fn get_event_trigger(&self, id: Uuid) -> Result<Option<EventTrigger>>;
+
+    /// Update an EventTrigger's fields. Only provided fields are updated.
+    /// Returns `true` if the trigger was found and updated, `false` if not found.
+    #[allow(clippy::too_many_arguments)]
+    async fn update_event_trigger(
+        &self,
+        id: Uuid,
+        enabled: Option<bool>,
+        name: Option<String>,
+        entity_type_pattern: Option<Option<String>>,
+        action_pattern: Option<Option<String>>,
+        payload_conditions: Option<Option<serde_json::Value>>,
+        cooldown_secs: Option<u32>,
+        project_scope: Option<Option<Uuid>>,
+    ) -> Result<bool>;
+
+    /// Delete an EventTrigger by its UUID.
+    /// Returns `true` if a node was deleted, `false` if not found.
+    async fn delete_event_trigger(&self, id: Uuid) -> Result<bool>;
 }

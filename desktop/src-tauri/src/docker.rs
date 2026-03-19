@@ -99,31 +99,31 @@ impl DockerManager {
     /// on the version and architecture. We try multiple paths if the default fails.
     pub fn new() -> Self {
         // Try the default first (DOCKER_HOST env var, or /var/run/docker.sock)
-        let docker = Docker::connect_with_local_defaults()
-            .ok()
-            .or_else(|| {
-                // On macOS, Docker Desktop often uses ~/.docker/run/docker.sock
-                // instead of /var/run/docker.sock (especially on newer installs)
-                #[cfg(target_os = "macos")]
-                {
-                    let home = std::env::var("HOME").unwrap_or_default();
-                    let alt_sockets = [
-                        format!("{}/.docker/run/docker.sock", home),
-                        format!("{}/.docker/desktop/docker.sock", home),
-                        "/var/run/docker.sock.raw".to_string(),
-                    ];
-                    for socket in &alt_sockets {
-                        if std::path::Path::new(socket).exists() {
-                            tracing::info!("Trying Docker socket: {}", socket);
-                            let url = format!("unix://{}", socket);
-                            if let Ok(d) = Docker::connect_with_socket(&url, 5, bollard::API_DEFAULT_VERSION) {
-                                return Some(d);
-                            }
+        let docker = Docker::connect_with_local_defaults().ok().or_else(|| {
+            // On macOS, Docker Desktop often uses ~/.docker/run/docker.sock
+            // instead of /var/run/docker.sock (especially on newer installs)
+            #[cfg(target_os = "macos")]
+            {
+                let home = std::env::var("HOME").unwrap_or_default();
+                let alt_sockets = [
+                    format!("{}/.docker/run/docker.sock", home),
+                    format!("{}/.docker/desktop/docker.sock", home),
+                    "/var/run/docker.sock.raw".to_string(),
+                ];
+                for socket in &alt_sockets {
+                    if std::path::Path::new(socket).exists() {
+                        tracing::info!("Trying Docker socket: {}", socket);
+                        let url = format!("unix://{}", socket);
+                        if let Ok(d) =
+                            Docker::connect_with_socket(&url, 5, bollard::API_DEFAULT_VERSION)
+                        {
+                            return Some(d);
                         }
                     }
                 }
-                None
-            });
+            }
+            None
+        });
         Self { docker }
     }
 
@@ -191,7 +191,12 @@ impl DockerManager {
         {
             // Check for Docker Desktop in standard install locations
             let program_files = std::env::var("ProgramFiles").unwrap_or_default();
-            if std::path::Path::new(&format!("{}\\Docker\\Docker\\Docker Desktop.exe", program_files)).exists() {
+            if std::path::Path::new(&format!(
+                "{}\\Docker\\Docker\\Docker Desktop.exe",
+                program_files
+            ))
+            .exists()
+            {
                 return true;
             }
             // Also check PATH
@@ -276,10 +281,7 @@ impl DockerManager {
     async fn container_running(&self, name: &str) -> Result<bool, String> {
         let docker = self.docker()?;
         match docker.inspect_container(name, None).await {
-            Ok(info) => Ok(info
-                .state
-                .and_then(|s| s.running)
-                .unwrap_or(false)),
+            Ok(info) => Ok(info.state.and_then(|s| s.running).unwrap_or(false)),
             Err(_) => Ok(false),
         }
     }

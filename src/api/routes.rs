@@ -22,6 +22,7 @@ use super::rfc_handlers;
 use super::sharing_handlers;
 use super::skill_handlers;
 use super::trajectory_handlers;
+use super::trigger_handlers;
 use super::workspace_handlers;
 use super::ws_chat_handler;
 use super::ws_handlers;
@@ -410,6 +411,7 @@ fn protected_routes() -> Router<OrchestratorState> {
             post(handlers::create_auto_pr),
         )
         // Plan Runs
+        .route("/api/runs", get(handlers::list_all_plan_runs))
         .route("/api/plans/{plan_id}/runs", get(handlers::list_plan_runs))
         .route("/api/runs/{run_id}", get(handlers::get_plan_run))
         .route(
@@ -648,6 +650,8 @@ fn protected_routes() -> Router<OrchestratorState> {
                 .post(handlers::start_watch)
                 .delete(handlers::stop_watch),
         )
+        // EventReactor status
+        .route("/api/reactor/status", get(handlers::reactor_status))
         // ================================================================
         // Code Exploration (Graph + Search powered)
         // ================================================================
@@ -1411,6 +1415,32 @@ fn protected_routes() -> Router<OrchestratorState> {
         // NOTE: /api/admin/install-hooks removed — hooks are now managed
         // in-process via SkillActivationHook (zero config required)
         // ================================================================
+        // Event Triggers (persistent event-to-protocol triggers)
+        // ================================================================
+        .route(
+            "/api/event-triggers",
+            get(trigger_handlers::list_triggers).post(trigger_handlers::create_trigger),
+        )
+        // Static sub-paths MUST come before /{id} to avoid capture
+        .route(
+            "/api/event-triggers/stats",
+            get(trigger_handlers::trigger_stats),
+        )
+        .route(
+            "/api/event-triggers/{id}",
+            get(trigger_handlers::get_trigger)
+                .put(trigger_handlers::update_trigger)
+                .delete(trigger_handlers::delete_trigger),
+        )
+        .route(
+            "/api/event-triggers/{id}/enable",
+            post(trigger_handlers::enable_trigger),
+        )
+        .route(
+            "/api/event-triggers/{id}/disable",
+            post(trigger_handlers::disable_trigger),
+        )
+        // ================================================================
         // Alerts (HeartbeatEngine)
         // ================================================================
         .route("/api/alerts", get(handlers::list_alerts))
@@ -1633,6 +1663,7 @@ mod tests {
             trajectory_collector: None,
             trajectory_store: None,
             identity: None,
+            reactor_counters: std::sync::OnceLock::new(),
         });
         create_router(state)
     }
@@ -1663,6 +1694,7 @@ mod tests {
             trajectory_collector: None,
             trajectory_store: None,
             identity: None,
+            reactor_counters: std::sync::OnceLock::new(),
         });
         create_router(state)
     }

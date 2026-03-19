@@ -6,6 +6,7 @@
 pub mod formatter;
 pub mod handlers;
 pub mod http_client;
+pub mod pipeline_handler;
 pub mod protocol;
 pub mod server;
 pub mod tools;

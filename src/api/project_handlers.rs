@@ -1,6 +1,7 @@
 //! Project API handlers
 
 use crate::api::{PaginatedResponse, PaginationParams, SearchFilter};
+use crate::events::{EntityType, EventEmitter};
 use crate::neo4j::models::ProjectNode;
 use axum::{
     extract::{Path, Query, State},
@@ -288,13 +289,17 @@ pub async fn sync_project(
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Project '{}' not found", slug)))?;
 
+    let is_first_sync = project.last_synced.is_none();
     let force = query.force.unwrap_or(false);
     let expanded = expand_tilde(&project.root_path);
     let path = std::path::Path::new(&expanded);
+
+    let sync_start = std::time::Instant::now();
     let result = state
         .orchestrator
         .sync_directory_for_project_with_options(path, Some(project.id), Some(&project.slug), force)
         .await?;
+    let duration_ms = sync_start.elapsed().as_millis() as u64;
 
     // Update last_synced timestamp
     state
@@ -302,6 +307,22 @@ pub async fn sync_project(
         .neo4j()
         .update_project_synced(project.id)
         .await?;
+
+    // Emit CrudEvent(Project, Synced) after successful sync
+    let project_id_str = project.id.to_string();
+    state.event_bus.emit_synced(
+        EntityType::Project,
+        &project_id_str,
+        serde_json::json!({
+            "files_parsed": result.files_synced,
+            "duration_ms": duration_ms,
+            "is_first_sync": is_first_sync,
+            "files_skipped": result.files_skipped,
+            "files_deleted": result.files_deleted,
+            "errors": result.errors,
+        }),
+        Some(project_id_str.clone()),
+    );
 
     // Compute graph analytics (PageRank, communities, etc.) — best-effort, background
     state.orchestrator.spawn_analyze_project(project.id);
@@ -843,6 +864,7 @@ mod tests {
             trajectory_collector: None,
             trajectory_store: None,
             identity: None,
+            reactor_counters: std::sync::OnceLock::new(),
         })
     }
 
@@ -940,6 +962,7 @@ mod tests {
             trajectory_collector: None,
             trajectory_store: None,
             identity: None,
+            reactor_counters: std::sync::OnceLock::new(),
         });
         let app = create_router(state);
 
@@ -1006,6 +1029,7 @@ mod tests {
             trajectory_collector: None,
             trajectory_store: None,
             identity: None,
+            reactor_counters: std::sync::OnceLock::new(),
         });
         let app = create_router(state);
 
@@ -1174,6 +1198,7 @@ mod tests {
             trajectory_collector: None,
             trajectory_store: None,
             identity: None,
+            reactor_counters: std::sync::OnceLock::new(),
         })
     }
 

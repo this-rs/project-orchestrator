@@ -71,6 +71,9 @@ pub struct ServerState {
     pub trajectory_collector: Option<Arc<neural_routing_runtime::TrajectoryCollector>>,
     /// Trajectory store — Neo4j CRUD + vector search for stored trajectories.
     pub trajectory_store: Option<Arc<dyn neural_routing_runtime::TrajectoryStore>>,
+    /// EventReactor counters for the /api/reactor/status endpoint.
+    /// Initialized once after reactor is built via `OnceLock`.
+    pub reactor_counters: std::sync::OnceLock<Arc<crate::events::ReactorCounters>>,
 }
 
 /// Shared orchestrator state
@@ -387,6 +390,12 @@ pub async fn create_plan(
         .plan_manager()
         .create_plan(req, "orchestrator")
         .await?;
+    state.event_bus.emit_created(
+        crate::events::EntityType::Plan,
+        &plan.id.to_string(),
+        serde_json::json!({"title": &plan.title, "status": format!("{:?}", plan.status)}),
+        plan.project_id.map(|id| id.to_string()),
+    );
     Ok(Json(plan))
 }
 
@@ -458,11 +467,28 @@ pub async fn update_plan_status(
 ) -> Result<StatusCode, AppError> {
     // Handle status change if provided
     if let Some(status) = req.status {
+        // Get old status before mutation for StatusChanged event
+        let old_status = state
+            .orchestrator
+            .neo4j()
+            .get_plan(plan_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|p| format!("{:?}", p.status))
+            .unwrap_or_default();
         state
             .orchestrator
             .plan_manager()
-            .update_plan_status(plan_id, status)
+            .update_plan_status(plan_id, status.clone())
             .await?;
+        state.event_bus.emit_status_changed(
+            crate::events::EntityType::Plan,
+            &plan_id.to_string(),
+            &old_status,
+            &format!("{:?}", status),
+            None,
+        );
     }
 
     // Handle field updates (title, description, priority)
@@ -480,6 +506,12 @@ pub async fn update_plan_status(
             .plan_manager()
             .update_plan(plan_id, plan_update)
             .await?;
+        state.event_bus.emit_updated(
+            crate::events::EntityType::Plan,
+            &plan_id.to_string(),
+            serde_json::json!({}),
+            None,
+        );
     }
 
     Ok(StatusCode::NO_CONTENT)
@@ -495,6 +527,9 @@ pub async fn delete_plan(
         .plan_manager()
         .delete_plan(plan_id)
         .await?;
+    state
+        .event_bus
+        .emit_deleted(crate::events::EntityType::Plan, &plan_id.to_string(), None);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -513,6 +548,12 @@ pub async fn add_task(
         .plan_manager()
         .add_task(plan_id, req)
         .await?;
+    state.event_bus.emit_created(
+        crate::events::EntityType::Task,
+        &task.id.to_string(),
+        serde_json::json!({"title": &task.title, "plan_id": plan_id}),
+        None,
+    );
     Ok(Json(task))
 }
 
@@ -540,6 +581,9 @@ pub async fn delete_task(
         .plan_manager()
         .delete_task(task_id)
         .await?;
+    state
+        .event_bus
+        .emit_deleted(crate::events::EntityType::Task, &task_id.to_string(), None);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -549,11 +593,42 @@ pub async fn update_task(
     Path(task_id): Path<Uuid>,
     Json(req): Json<UpdateTaskRequest>,
 ) -> Result<StatusCode, AppError> {
+    let status_change = if let Some(ref new_status_val) = req.status {
+        let old_status = state
+            .orchestrator
+            .neo4j()
+            .get_task(task_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|t| format!("{:?}", t.status))
+            .unwrap_or_default();
+        let new_status = format!("{:?}", new_status_val);
+        Some((old_status, new_status))
+    } else {
+        None
+    };
     state
         .orchestrator
         .plan_manager()
         .update_task(task_id, req)
         .await?;
+    if let Some((old_status, new_status)) = status_change {
+        state.event_bus.emit_status_changed(
+            crate::events::EntityType::Task,
+            &task_id.to_string(),
+            &old_status,
+            &new_status,
+            None,
+        );
+    } else {
+        state.event_bus.emit_updated(
+            crate::events::EntityType::Task,
+            &task_id.to_string(),
+            serde_json::json!({}),
+            None,
+        );
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1175,6 +1250,13 @@ pub async fn add_decision(
         });
     }
 
+    state.event_bus.emit_created(
+        crate::events::EntityType::Decision,
+        &decision.id.to_string(),
+        serde_json::json!({"task_id": task_id, "description": &decision.description}),
+        None,
+    );
+
     Ok(Json(decision))
 }
 
@@ -1384,9 +1466,8 @@ pub async fn add_decision_affects(
     Path(decision_id): Path<Uuid>,
     Json(req): Json<AddAffectsRequest>,
 ) -> Result<StatusCode, AppError> {
-    state
-        .orchestrator
-        .neo4j()
+    let neo4j = state.orchestrator.neo4j();
+    neo4j
         .add_decision_affects(
             decision_id,
             &req.entity_type,
@@ -1394,6 +1475,19 @@ pub async fn add_decision_affects(
             req.impact_description.as_deref(),
         )
         .await?;
+
+    // Emit GraphEvent for the new AFFECTS edge (best-effort, don't fail the request)
+    if let Ok(Some(pid)) = neo4j.get_decision_project_id(decision_id).await {
+        state.event_bus.emit_graph(crate::events::GraphEvent::edge(
+            crate::events::graph::GraphEventType::EdgeCreated,
+            crate::events::graph::GraphLayer::Knowledge,
+            decision_id.to_string(),
+            &req.entity_id,
+            "AFFECTS",
+            pid,
+        ));
+    }
+
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1406,11 +1500,23 @@ pub async fn remove_decision_affects(
     State(state): State<OrchestratorState>,
     Path((decision_id, entity_type, entity_id)): Path<(Uuid, String, String)>,
 ) -> Result<StatusCode, AppError> {
-    state
-        .orchestrator
-        .neo4j()
+    let neo4j = state.orchestrator.neo4j();
+    neo4j
         .remove_decision_affects(decision_id, &entity_type, &entity_id)
         .await?;
+
+    // Emit GraphEvent for the removed AFFECTS edge (best-effort)
+    if let Ok(Some(pid)) = neo4j.get_decision_project_id(decision_id).await {
+        state.event_bus.emit_graph(crate::events::GraphEvent::edge(
+            crate::events::graph::GraphEventType::EdgeRemoved,
+            crate::events::graph::GraphLayer::Knowledge,
+            decision_id.to_string(),
+            &entity_id,
+            "AFFECTS",
+            pid,
+        ));
+    }
+
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1429,11 +1535,23 @@ pub async fn remove_decision_affects_query(
     Path(decision_id): Path<Uuid>,
     Query(query): Query<RemoveAffectsQuery>,
 ) -> Result<StatusCode, AppError> {
-    state
-        .orchestrator
-        .neo4j()
+    let neo4j = state.orchestrator.neo4j();
+    neo4j
         .remove_decision_affects(decision_id, &query.entity_type, &query.entity_id)
         .await?;
+
+    // Emit GraphEvent for the removed AFFECTS edge (best-effort)
+    if let Ok(Some(pid)) = neo4j.get_decision_project_id(decision_id).await {
+        state.event_bus.emit_graph(crate::events::GraphEvent::edge(
+            crate::events::graph::GraphEventType::EdgeRemoved,
+            crate::events::graph::GraphLayer::Knowledge,
+            decision_id.to_string(),
+            &query.entity_id,
+            "AFFECTS",
+            pid,
+        ));
+    }
+
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1759,6 +1877,28 @@ pub async fn watch_status(
     }))
 }
 
+/// GET /api/reactor/status — EventReactor health and statistics.
+///
+/// Returns the reactor's running state and event processing counters.
+pub async fn reactor_status(State(state): State<OrchestratorState>) -> Json<serde_json::Value> {
+    match state.reactor_counters.get() {
+        Some(counters) => {
+            let stats = counters.snapshot(0, 0);
+            Json(serde_json::json!({
+                "running": stats.running,
+                "events_received": stats.events_received,
+                "events_matched": stats.events_matched,
+                "handlers_invoked": stats.handlers_invoked,
+                "handler_errors": stats.handler_errors,
+            }))
+        }
+        None => Json(serde_json::json!({
+            "running": false,
+            "error": "reactor not initialized",
+        })),
+    }
+}
+
 // ============================================================================
 // Steps
 // ============================================================================
@@ -1812,6 +1952,9 @@ pub async fn delete_step(
     Path(step_id): Path<Uuid>,
 ) -> Result<StatusCode, AppError> {
     state.orchestrator.delete_step(step_id).await?;
+    state
+        .event_bus
+        .emit_deleted(crate::events::EntityType::Step, &step_id.to_string(), None);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1852,6 +1995,12 @@ pub async fn update_step(
             .update_step(step_id, &req)
             .await?;
     }
+    state.event_bus.emit_updated(
+        crate::events::EntityType::Step,
+        &step_id.to_string(),
+        serde_json::json!({}),
+        None,
+    );
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1903,6 +2052,13 @@ pub async fn add_constraint(
         .plan_manager()
         .add_constraint(plan_id, &constraint)
         .await?;
+
+    state.event_bus.emit_created(
+        crate::events::EntityType::Constraint,
+        &constraint.id.to_string(),
+        serde_json::json!({"plan_id": plan_id, "constraint_type": format!("{:?}", constraint.constraint_type)}),
+        None,
+    );
 
     Ok(Json(constraint))
 }
@@ -1957,6 +2113,14 @@ pub async fn update_constraint(
             req.enforced_by,
         )
         .await?;
+
+    state.event_bus.emit_updated(
+        crate::events::EntityType::Constraint,
+        &constraint_id.to_string(),
+        serde_json::json!({"constraint_id": constraint_id}),
+        None,
+    );
+
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1966,6 +2130,13 @@ pub async fn delete_constraint(
     Path(constraint_id): Path<Uuid>,
 ) -> Result<StatusCode, AppError> {
     state.orchestrator.delete_constraint(constraint_id).await?;
+
+    state.event_bus.emit_deleted(
+        crate::events::EntityType::Constraint,
+        &constraint_id.to_string(),
+        None,
+    );
+
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2273,6 +2444,13 @@ pub async fn create_commit(
         );
     }
 
+    state.event_bus.emit_created(
+        crate::events::EntityType::Commit,
+        &commit.hash,
+        serde_json::json!({"message": &commit.message, "author": &commit.author}),
+        project_id.map(|p| p.to_string()),
+    );
+
     Ok(Json(CreateCommitResponse {
         commit,
         sync_triggered,
@@ -2295,6 +2473,13 @@ pub async fn link_commit_to_task(
         .orchestrator
         .link_commit_to_task(&req.commit_hash, task_id)
         .await?;
+    state.event_bus.emit_linked(
+        crate::events::EntityType::Commit,
+        &req.commit_hash,
+        crate::events::EntityType::Task,
+        &task_id.to_string(),
+        None,
+    );
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2317,6 +2502,13 @@ pub async fn link_commit_to_plan(
         .orchestrator
         .link_commit_to_plan(&req.commit_hash, plan_id)
         .await?;
+    state.event_bus.emit_linked(
+        crate::events::EntityType::Commit,
+        &req.commit_hash,
+        crate::events::EntityType::Plan,
+        &plan_id.to_string(),
+        None,
+    );
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -3719,6 +3911,12 @@ pub async fn create_release(
     };
 
     state.orchestrator.create_release(&release).await?;
+    state.event_bus.emit_created(
+        crate::events::EntityType::Release,
+        &release.id.to_string(),
+        serde_json::json!({"version": &release.version, "title": &release.title}),
+        Some(project_id.to_string()),
+    );
     Ok(Json(release))
 }
 
@@ -3776,6 +3974,25 @@ pub async fn update_release(
     Path(release_id): Path<Uuid>,
     Json(req): Json<UpdateReleaseRequest>,
 ) -> Result<StatusCode, AppError> {
+    let status_change = if let Some(ref new_status_val) = req.status {
+        let old_status = state
+            .orchestrator
+            .neo4j()
+            .get_release(release_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|r| format!("{:?}", r.status))
+            .unwrap_or_default();
+        let new_status = format!("{:?}", new_status_val);
+        Some((old_status, new_status))
+    } else {
+        None
+    };
+    let payload = serde_json::json!({
+        "title": &req.title,
+        "description": &req.description,
+    });
     state
         .orchestrator
         .update_release(
@@ -3787,6 +4004,22 @@ pub async fn update_release(
             req.description,
         )
         .await?;
+    if let Some((old_status, new_status)) = status_change {
+        state.event_bus.emit_status_changed(
+            crate::events::EntityType::Release,
+            &release_id.to_string(),
+            &old_status,
+            &new_status,
+            None,
+        );
+    } else {
+        state.event_bus.emit_updated(
+            crate::events::EntityType::Release,
+            &release_id.to_string(),
+            payload,
+            None,
+        );
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -3796,6 +4029,11 @@ pub async fn delete_release(
     Path(release_id): Path<Uuid>,
 ) -> Result<StatusCode, AppError> {
     state.orchestrator.delete_release(release_id).await?;
+    state.event_bus.emit_deleted(
+        crate::events::EntityType::Release,
+        &release_id.to_string(),
+        None,
+    );
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -3815,6 +4053,13 @@ pub async fn add_task_to_release(
         .orchestrator
         .add_task_to_release(release_id, req.task_id)
         .await?;
+    state.event_bus.emit_linked(
+        crate::events::EntityType::Release,
+        &release_id.to_string(),
+        crate::events::EntityType::Task,
+        &req.task_id.to_string(),
+        None,
+    );
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -3906,6 +4151,12 @@ pub async fn create_milestone(
     };
 
     state.orchestrator.create_milestone(&milestone).await?;
+    state.event_bus.emit_created(
+        crate::events::EntityType::Milestone,
+        &milestone.id.to_string(),
+        serde_json::json!({"title": &milestone.title, "description": &milestone.description}),
+        Some(project_id.to_string()),
+    );
     Ok(Json(milestone))
 }
 
@@ -3963,6 +4214,25 @@ pub async fn update_milestone(
     Path(milestone_id): Path<Uuid>,
     Json(req): Json<UpdateMilestoneRequest>,
 ) -> Result<StatusCode, AppError> {
+    let status_change = if let Some(ref new_status_val) = req.status {
+        let old_status = state
+            .orchestrator
+            .neo4j()
+            .get_milestone(milestone_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|m| format!("{:?}", m.status))
+            .unwrap_or_default();
+        let new_status = format!("{:?}", new_status_val);
+        Some((old_status, new_status))
+    } else {
+        None
+    };
+    let payload = serde_json::json!({
+        "title": &req.title,
+        "description": &req.description,
+    });
     state
         .orchestrator
         .update_milestone(
@@ -3974,6 +4244,22 @@ pub async fn update_milestone(
             req.description,
         )
         .await?;
+    if let Some((old_status, new_status)) = status_change {
+        state.event_bus.emit_status_changed(
+            crate::events::EntityType::Milestone,
+            &milestone_id.to_string(),
+            &old_status,
+            &new_status,
+            None,
+        );
+    } else {
+        state.event_bus.emit_updated(
+            crate::events::EntityType::Milestone,
+            &milestone_id.to_string(),
+            payload,
+            None,
+        );
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -3983,6 +4269,11 @@ pub async fn delete_milestone(
     Path(milestone_id): Path<Uuid>,
 ) -> Result<StatusCode, AppError> {
     state.orchestrator.delete_milestone(milestone_id).await?;
+    state.event_bus.emit_deleted(
+        crate::events::EntityType::Milestone,
+        &milestone_id.to_string(),
+        None,
+    );
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -4002,6 +4293,13 @@ pub async fn add_task_to_milestone(
         .orchestrator
         .add_task_to_milestone(milestone_id, req.task_id)
         .await?;
+    state.event_bus.emit_linked(
+        crate::events::EntityType::Milestone,
+        &milestone_id.to_string(),
+        crate::events::EntityType::Task,
+        &req.task_id.to_string(),
+        None,
+    );
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -4021,6 +4319,13 @@ pub async fn link_plan_to_milestone(
         .orchestrator
         .link_plan_to_milestone(req.plan_id, milestone_id)
         .await?;
+    state.event_bus.emit_linked(
+        crate::events::EntityType::Milestone,
+        &milestone_id.to_string(),
+        crate::events::EntityType::Plan,
+        &req.plan_id.to_string(),
+        None,
+    );
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -4770,6 +5075,13 @@ pub async fn create_trigger(
         .await
         .map_err(AppError::Internal)?;
 
+    state.event_bus.emit_created(
+        crate::events::EntityType::Trigger,
+        &trigger.id.to_string(),
+        serde_json::json!({"plan_id": plan_id, "trigger_type": trigger_type_str}),
+        None,
+    );
+
     Ok(Json(serde_json::to_value(&created).unwrap_or_default()))
 }
 
@@ -4798,6 +5110,12 @@ pub async fn delete_trigger(
         .await
         .map_err(AppError::Internal)?;
 
+    state.event_bus.emit_deleted(
+        crate::events::EntityType::Trigger,
+        &trigger_id.to_string(),
+        None,
+    );
+
     Ok(Json(
         serde_json::json!({ "deleted": true, "trigger_id": trigger_id }),
     ))
@@ -4815,6 +5133,13 @@ pub async fn enable_trigger(
         .map_err(AppError::Internal)?
         .ok_or_else(|| AppError::NotFound(format!("Trigger {} not found", trigger_id)))?;
 
+    state.event_bus.emit_updated(
+        crate::events::EntityType::Trigger,
+        &trigger_id.to_string(),
+        serde_json::json!({"enabled": true}),
+        None,
+    );
+
     Ok(Json(serde_json::to_value(&trigger).unwrap_or_default()))
 }
 
@@ -4829,6 +5154,13 @@ pub async fn disable_trigger(
         .await
         .map_err(AppError::Internal)?
         .ok_or_else(|| AppError::NotFound(format!("Trigger {} not found", trigger_id)))?;
+
+    state.event_bus.emit_updated(
+        crate::events::EntityType::Trigger,
+        &trigger_id.to_string(),
+        serde_json::json!({"enabled": false}),
+        None,
+    );
 
     Ok(Json(serde_json::to_value(&trigger).unwrap_or_default()))
 }
@@ -4962,6 +5294,28 @@ pub async fn receive_webhook(
 // ============================================================================
 // Plan Runs — List, Get, Compare, Predict
 // ============================================================================
+
+/// GET /api/runs — List all plan runs across all plans.
+pub async fn list_all_plan_runs(
+    State(state): State<OrchestratorState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let limit = params
+        .get("limit")
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(50);
+    let offset = params
+        .get("offset")
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(0);
+    let status = params.get("status").map(|s| s.as_str());
+    let graph = state.orchestrator.neo4j_arc();
+    let runs = graph
+        .list_all_plan_runs(limit, offset, status)
+        .await
+        .map_err(AppError::Internal)?;
+    Ok(Json(serde_json::to_value(&runs).unwrap_or_default()))
+}
 
 /// GET /api/plans/:plan_id/runs — List historical plan runs.
 pub async fn list_plan_runs(
@@ -5488,6 +5842,7 @@ mod tests {
             trajectory_collector: None,
             trajectory_store: None,
             identity: None,
+            reactor_counters: std::sync::OnceLock::new(),
         });
         (create_router(state), milestone.id, task1.id, task2.id)
     }
@@ -5697,6 +6052,7 @@ mod tests {
             trajectory_collector: None,
             trajectory_store: None,
             identity: None,
+            reactor_counters: std::sync::OnceLock::new(),
         }
     }
 
@@ -5853,6 +6209,7 @@ mod tests {
             trajectory_collector: None,
             trajectory_store: None,
             identity: None,
+            reactor_counters: std::sync::OnceLock::new(),
         });
         create_router(state)
     }
@@ -6626,6 +6983,7 @@ mod tests {
             trajectory_collector: None,
             trajectory_store: None,
             identity: None,
+            reactor_counters: std::sync::OnceLock::new(),
         });
         (create_router(state), plan.id, task1.id, task2.id)
     }
@@ -6731,6 +7089,7 @@ mod tests {
             trajectory_collector: None,
             trajectory_store: None,
             identity: None,
+            reactor_counters: std::sync::OnceLock::new(),
         });
         let app = create_router(state);
 
@@ -6747,5 +7106,222 @@ mod tests {
         assert_eq!(json["edges"].as_array().unwrap().len(), 0);
         assert_eq!(json["conflicts"].as_array().unwrap().len(), 0);
         assert_eq!(json["feature_graphs"].as_array().unwrap().len(), 0);
+    }
+
+    // ================================================================
+    // GET /api/runs — list_all_plan_runs
+    // ================================================================
+
+    #[tokio::test]
+    async fn test_list_all_plan_runs_empty() {
+        let app = test_app().await;
+        let resp = app.oneshot(auth_get("/api/runs")).await.unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let json = body_json(resp).await;
+        assert!(json.is_array());
+        assert_eq!(json.as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_list_all_plan_runs_with_limit() {
+        let app = test_app().await;
+        let resp = app.oneshot(auth_get("/api/runs?limit=10")).await.unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let json = body_json(resp).await;
+        assert!(json.is_array());
+    }
+
+    #[tokio::test]
+    async fn test_list_all_plan_runs_with_offset() {
+        let app = test_app().await;
+        let resp = app.oneshot(auth_get("/api/runs?offset=5")).await.unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let json = body_json(resp).await;
+        assert!(json.is_array());
+    }
+
+    #[tokio::test]
+    async fn test_list_all_plan_runs_with_limit_and_offset() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_get("/api/runs?limit=10&offset=5"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let json = body_json(resp).await;
+        assert!(json.is_array());
+    }
+
+    #[tokio::test]
+    async fn test_list_all_plan_runs_with_status_filter() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_get("/api/runs?status=running"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let json = body_json(resp).await;
+        assert!(json.is_array());
+        assert_eq!(json.as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_list_all_plan_runs_with_all_params() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_get("/api/runs?limit=5&offset=0&status=completed"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let json = body_json(resp).await;
+        assert!(json.is_array());
+    }
+
+    #[tokio::test]
+    async fn test_list_all_plan_runs_invalid_limit_uses_default() {
+        let app = test_app().await;
+        // Non-numeric limit should be ignored, falling back to default (50)
+        let resp = app.oneshot(auth_get("/api/runs?limit=abc")).await.unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let json = body_json(resp).await;
+        assert!(json.is_array());
+    }
+
+    #[tokio::test]
+    async fn test_list_all_plan_runs_invalid_offset_uses_default() {
+        let app = test_app().await;
+        // Non-numeric offset should be ignored, falling back to default (0)
+        let resp = app.oneshot(auth_get("/api/runs?offset=xyz")).await.unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let json = body_json(resp).await;
+        assert!(json.is_array());
+    }
+
+    // ================================================================
+    // GET /api/reactor/status — reactor_status
+    // ================================================================
+
+    #[tokio::test]
+    async fn test_reactor_status_not_initialized() {
+        // test_app() creates a ServerState with an empty OnceLock (reactor not set)
+        let app = test_app().await;
+        let resp = app.oneshot(auth_get("/api/reactor/status")).await.unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["running"], false);
+        assert_eq!(json["error"], "reactor not initialized");
+    }
+
+    #[tokio::test]
+    async fn test_reactor_status_with_counters() {
+        // Build a state where reactor_counters is populated
+        let app_state = mock_app_state();
+        let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
+        let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
+            orchestrator.clone(),
+        )));
+        let reactor_counters = std::sync::OnceLock::new();
+        let counters = Arc::new(crate::events::ReactorCounters::default());
+        // Mark running
+        counters
+            .running
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        // Simulate some events
+        counters
+            .events_received
+            .store(42, std::sync::atomic::Ordering::Relaxed);
+        counters
+            .events_matched
+            .store(10, std::sync::atomic::Ordering::Relaxed);
+        counters
+            .handlers_invoked
+            .store(8, std::sync::atomic::Ordering::Relaxed);
+        counters
+            .handler_errors
+            .store(1, std::sync::atomic::Ordering::Relaxed);
+        let _ = reactor_counters.set(counters);
+
+        let state = Arc::new(ServerState {
+            orchestrator,
+            watcher,
+            chat_manager: None,
+            event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(
+                crate::events::EventBus::default(),
+            ))),
+            nats_emitter: None,
+            auth_config: Some(crate::test_helpers::test_auth_config()),
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+            setup_completed: true,
+            server_port: 6600,
+            public_url: None,
+            ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
+            registry_remote_url: None,
+            oidc_client: None,
+            neural_router: crate::test_helpers::mock_neural_router(),
+            trajectory_collector: None,
+            trajectory_store: None,
+            identity: None,
+            reactor_counters,
+        });
+        let app = create_router(state);
+
+        let resp = app.oneshot(auth_get("/api/reactor/status")).await.unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["running"], true);
+        assert_eq!(json["events_received"], 42);
+        assert_eq!(json["events_matched"], 10);
+        assert_eq!(json["handlers_invoked"], 8);
+        assert_eq!(json["handler_errors"], 1);
+    }
+
+    #[tokio::test]
+    async fn test_reactor_status_with_zero_counters() {
+        // Reactor initialized but no events processed yet
+        let app_state = mock_app_state();
+        let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
+        let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
+            orchestrator.clone(),
+        )));
+        let reactor_counters = std::sync::OnceLock::new();
+        let counters = Arc::new(crate::events::ReactorCounters::default());
+        let _ = reactor_counters.set(counters);
+
+        let state = Arc::new(ServerState {
+            orchestrator,
+            watcher,
+            chat_manager: None,
+            event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(
+                crate::events::EventBus::default(),
+            ))),
+            nats_emitter: None,
+            auth_config: Some(crate::test_helpers::test_auth_config()),
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+            setup_completed: true,
+            server_port: 6600,
+            public_url: None,
+            ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
+            registry_remote_url: None,
+            oidc_client: None,
+            neural_router: crate::test_helpers::mock_neural_router(),
+            trajectory_collector: None,
+            trajectory_store: None,
+            identity: None,
+            reactor_counters,
+        });
+        let app = create_router(state);
+
+        let resp = app.oneshot(auth_get("/api/reactor/status")).await.unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["running"], false);
+        assert_eq!(json["events_received"], 0);
+        assert_eq!(json["events_matched"], 0);
+        assert_eq!(json["handlers_invoked"], 0);
+        assert_eq!(json["handler_errors"], 0);
+        // Should NOT have the error field when reactor is initialized
+        assert!(json.get("error").is_none());
     }
 }

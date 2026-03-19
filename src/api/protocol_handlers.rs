@@ -572,6 +572,20 @@ pub async fn create_protocol(
         }
     }
 
+    // Emit event for protocol creation
+    state.event_bus.emit_created(
+        crate::events::EntityType::Protocol,
+        &protocol.id.to_string(),
+        serde_json::json!({
+            "name": protocol.name,
+            "project_id": protocol.project_id,
+            "category": protocol.protocol_category.to_string(),
+            "states_count": created_states.len(),
+            "transitions_count": created_transitions.len(),
+        }),
+        Some(protocol.project_id.to_string()),
+    );
+
     Ok((
         StatusCode::CREATED,
         Json(ProtocolDetail {
@@ -682,6 +696,17 @@ pub async fn update_protocol(
         .await
         .map_err(AppError::Internal)?;
 
+    // Emit event for protocol update
+    state.event_bus.emit_updated(
+        crate::events::EntityType::Protocol,
+        &protocol.id.to_string(),
+        serde_json::json!({
+            "name": protocol.name,
+            "project_id": protocol.project_id,
+        }),
+        Some(protocol.project_id.to_string()),
+    );
+
     Ok(Json(protocol))
 }
 
@@ -700,6 +725,11 @@ pub async fn delete_protocol(
         .map_err(AppError::Internal)?;
 
     if deleted {
+        state.event_bus.emit_deleted(
+            crate::events::EntityType::Protocol,
+            &protocol_id.to_string(),
+            None,
+        );
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(AppError::NotFound(format!(
@@ -792,6 +822,15 @@ pub async fn add_state(
         }
     }
 
+    // Emit event for state addition
+    state.event_bus.emit_linked(
+        crate::events::EntityType::Protocol,
+        &protocol_id.to_string(),
+        crate::events::EntityType::Protocol,
+        &ps.id.to_string(),
+        None,
+    );
+
     Ok((StatusCode::CREATED, Json(ps)))
 }
 
@@ -817,7 +856,7 @@ pub async fn list_states(
 /// DELETE /api/protocols/:protocol_id/states/:state_id
 pub async fn delete_state(
     State(state): State<OrchestratorState>,
-    Path((_protocol_id, state_id)): Path<(Uuid, Uuid)>,
+    Path((protocol_id, state_id)): Path<(Uuid, Uuid)>,
 ) -> Result<StatusCode, AppError> {
     let deleted = state
         .orchestrator
@@ -827,6 +866,14 @@ pub async fn delete_state(
         .map_err(AppError::Internal)?;
 
     if deleted {
+        // Emit event for state removal
+        state.event_bus.emit_unlinked(
+            crate::events::EntityType::Protocol,
+            &protocol_id.to_string(),
+            crate::events::EntityType::Protocol,
+            &state_id.to_string(),
+            None,
+        );
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(AppError::NotFound(format!(
@@ -909,6 +956,15 @@ pub async fn add_transition(
         .await
         .map_err(AppError::Internal)?;
 
+    // Emit event for transition addition
+    state.event_bus.emit_linked(
+        crate::events::EntityType::Protocol,
+        &protocol_id.to_string(),
+        crate::events::EntityType::Protocol,
+        &pt.id.to_string(),
+        None,
+    );
+
     Ok((StatusCode::CREATED, Json(pt)))
 }
 
@@ -934,7 +990,7 @@ pub async fn list_transitions(
 /// DELETE /api/protocols/:protocol_id/transitions/:transition_id
 pub async fn delete_transition(
     State(state): State<OrchestratorState>,
-    Path((_protocol_id, transition_id)): Path<(Uuid, Uuid)>,
+    Path((protocol_id, transition_id)): Path<(Uuid, Uuid)>,
 ) -> Result<StatusCode, AppError> {
     let deleted = state
         .orchestrator
@@ -944,6 +1000,14 @@ pub async fn delete_transition(
         .map_err(AppError::Internal)?;
 
     if deleted {
+        // Emit event for transition removal
+        state.event_bus.emit_unlinked(
+            crate::events::EntityType::Protocol,
+            &protocol_id.to_string(),
+            crate::events::EntityType::Protocol,
+            &transition_id.to_string(),
+            None,
+        );
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(AppError::NotFound(format!(
@@ -982,6 +1046,15 @@ pub async fn link_to_skill(
         .upsert_protocol(&protocol)
         .await
         .map_err(AppError::Internal)?;
+
+    // Emit event for skill linking
+    state.event_bus.emit_linked(
+        crate::events::EntityType::Protocol,
+        &protocol_id.to_string(),
+        crate::events::EntityType::Skill,
+        &body.skill_id.to_string(),
+        Some(protocol.project_id.to_string()),
+    );
 
     Ok(Json(protocol))
 }
@@ -1725,6 +1798,22 @@ pub async fn compose_protocol(
         }
     }
 
+    // Emit event for composed protocol creation
+    state.event_bus.emit_created(
+        crate::events::EntityType::Protocol,
+        &proto.id.to_string(),
+        serde_json::json!({
+            "name": proto.name,
+            "project_id": proto.project_id,
+            "skill_id": skill_id,
+            "states_created": created_states.len(),
+            "transitions_created": created_transitions.len(),
+            "notes_linked": notes_linked,
+            "composed": true,
+        }),
+        Some(proto.project_id.to_string()),
+    );
+
     Ok((
         StatusCode::CREATED,
         Json(ComposeResponse {
@@ -2034,6 +2123,7 @@ mod tests {
             ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
             registry_remote_url: None,
             identity: None,
+            reactor_counters: std::sync::OnceLock::new(),
             oidc_client: None,
             neural_router: crate::test_helpers::mock_neural_router(),
             trajectory_collector: None,
