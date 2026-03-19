@@ -1,54 +1,101 @@
-//! CRUD event types for WebSocket notifications
+//! CRUD event types for WebSocket notifications.
+//!
+//! Defines the core types used by the event system:
+//! - [`EntityType`] — all entity kinds that can emit events (26 variants)
+//! - [`CrudAction`] — the mutation action performed (8 variants)
+//! - [`CrudEvent`] — the event payload sent over WebSocket/NATS
+//! - [`EventEmitter`] — trait with convenience methods for emitting events
 
 use super::graph::GraphEvent;
 use serde::{Deserialize, Serialize};
 
-/// The type of entity that was mutated
+/// The type of entity that was mutated.
+///
+/// Each variant corresponds to a Neo4j node label. Serialized as `snake_case`
+/// for JSON (e.g., `FeatureGraph` → `"feature_graph"`).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EntityType {
+    /// Tracked codebase — emitters: handlers.rs, project_handlers.rs
     Project,
+    /// Development objective — emitters: handlers.rs (Created, Updated, Deleted, StatusChanged)
     Plan,
+    /// Unit of work within a plan — emitters: handlers.rs (Created, Updated, Deleted, StatusChanged)
     Task,
+    /// Atomic sub-step within a task — emitters: handlers.rs (Updated, Deleted)
     Step,
+    /// Architectural decision record — emitters: handlers.rs (Created, Linked via AFFECTS)
     Decision,
+    /// Plan constraint (performance, security, etc.) — emitters: handlers.rs
     Constraint,
+    /// Git commit record — emitters: handlers.rs (Created, Linked to Task/Plan)
     Commit,
+    /// Deliverable version — emitters: handlers.rs (Created, Updated, Deleted, StatusChanged, Linked)
     Release,
+    /// Progress marker — emitters: handlers.rs (Created, Updated, Deleted, StatusChanged, Linked)
     Milestone,
+    /// Multi-project container
     Workspace,
+    /// Cross-project milestone
     WorkspaceMilestone,
+    /// Shared API contract or schema
     Resource,
+    /// Service/library/database in workspace topology
     Component,
+    /// Knowledge note (guideline, gotcha, pattern, etc.) — emitters: note_handlers.rs
     Note,
+    /// Conversation session — emitters: chat_handlers.rs
     ChatSession,
+    /// FSM protocol execution instance — emitters: protocol_handlers.rs
     ProtocolRun,
+    /// Autonomous plan execution agent — emitters: runner.rs
     Runner,
+    /// System-generated alert
     Alert,
+    /// Adaptive knowledge agent — emitters: persona_handlers.rs (full CRUD + 7 link pairs + StatusChanged)
     Persona,
+    /// Emergent knowledge cluster — emitters: skill_handlers.rs (CRUD + member links + StatusChanged + split/merge)
     Skill,
+    /// FSM definition (states + transitions) — emitters: protocol_handlers.rs (CRUD + state/transition/skill links)
     Protocol,
+    /// Code feature subgraph — emitters: code_handlers.rs (Created, Deleted)
     FeatureGraph,
+    /// Cognitive snapshot from protocol run — emitters: episode_handlers.rs (Created)
     Episode,
+    /// Edge/fusion weight preset — emitters: profile_handlers.rs (Created, Deleted)
     AnalysisProfile,
+    /// Automated plan trigger (schedule/webhook/event) — emitters: handlers.rs (Created, Updated, Deleted)
     Trigger,
+    /// Graph topology constraint rule — emitters: code_handlers.rs (Created, Deleted)
     TopologyRule,
 }
 
-/// The CRUD action performed
+/// The CRUD action performed on an entity.
+///
+/// Serialized as `snake_case` for JSON. Each action has specific semantics
+/// for the frontend and the EventReactor system.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CrudAction {
+    /// Entity was created — frontend should add it to lists/caches
     Created,
+    /// Entity fields were updated (NOT status) — frontend should refresh the entity
     Updated,
+    /// Entity was deleted — frontend should remove it from lists/caches
     Deleted,
+    /// Entity was linked to another entity — payload contains `related` field
     Linked,
+    /// Entity was unlinked from another entity — payload contains `related` field
     Unlinked,
-    /// In-flight progress update for long-running operations (e.g., protocol state execution)
+    /// In-flight progress update for long-running operations (e.g., protocol state execution).
+    /// Payload contains `processed`, `total`, `elapsed_ms`.
     Progress,
-    /// Entity has been synchronized from an external source (e.g., project sync from filesystem)
+    /// Entity has been synchronized from an external source (e.g., project sync from filesystem).
+    /// Payload contains sync stats: `files_parsed`, `duration_ms`, `is_first_sync`.
     Synced,
-    /// Entity status has changed (distinct from a field update — carries old_status/new_status in payload)
+    /// Entity status has changed (distinct from a field update).
+    /// Payload contains `old_status` and `new_status` strings.
+    /// Used for lifecycle transitions (plan: draft→approved, task: pending→in_progress, etc.).
     StatusChanged,
 }
 
