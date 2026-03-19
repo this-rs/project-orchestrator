@@ -227,8 +227,7 @@ mod tests {
         let emitter = Arc::new(RecordingEmitter::new());
         let cancel = CancellationToken::new();
 
-        let (_project_id, protocol, states) =
-            setup_auto_maintenance_protocol(&store).await;
+        let (_project_id, protocol, states) = setup_auto_maintenance_protocol(&store).await;
 
         // Start a run
         let run = engine::start_run(
@@ -246,14 +245,9 @@ mod tests {
         assert_eq!(run.triggered_by, "event:post_sync");
 
         // Run the protocol to completion
-        let final_run = run_protocol_no_llm(
-            store.clone(),
-            run.id,
-            cancel.clone(),
-            emitter.clone(),
-        )
-        .await
-        .unwrap();
+        let final_run = run_protocol_no_llm(store.clone(), run.id, cancel.clone(), emitter.clone())
+            .await
+            .unwrap();
 
         // Verify final state
         assert_eq!(
@@ -266,10 +260,7 @@ mod tests {
             final_run.completed_at.is_some(),
             "completed_at should be set"
         );
-        assert!(
-            final_run.runner_managed,
-            "runner_managed should be true"
-        );
+        assert!(final_run.runner_managed, "runner_managed should be true");
 
         // Verify states_visited: should have 6 entries (all states including maintained)
         assert!(
@@ -342,23 +333,22 @@ mod tests {
             setup_simple_protocol(&store, ProtocolCategory::Business).await;
 
         // Start a run manually (no runner)
-        let run = engine::start_run(
-            &*store,
-            protocol.id,
-            None,
-            None,
-            Some("manual"),
-        )
-        .await
-        .unwrap();
+        let run = engine::start_run(&*store, protocol.id, None, None, Some("manual"))
+            .await
+            .unwrap();
 
         // Verify initial state
         assert_eq!(run.status, RunStatus::Running);
-        assert!(!run.runner_managed, "Manual run should not be runner_managed");
+        assert!(
+            !run.runner_managed,
+            "Manual run should not be runner_managed"
+        );
         assert_eq!(run.current_state, states[0].id); // start
 
         // Fire transition manually: start → processing
-        let result = engine::fire_transition(&*store, run.id, "done").await.unwrap();
+        let result = engine::fire_transition(&*store, run.id, "done")
+            .await
+            .unwrap();
         assert!(result.success, "Transition should succeed");
         assert_eq!(result.current_state_name, "processing");
         assert!(!result.run_completed, "Run should not be completed yet");
@@ -366,11 +356,16 @@ mod tests {
         // Verify run is still Running and still NOT runner_managed
         let mid_run = store.get_protocol_run(run.id).await.unwrap().unwrap();
         assert_eq!(mid_run.status, RunStatus::Running);
-        assert!(!mid_run.runner_managed, "Run should remain non-runner_managed");
+        assert!(
+            !mid_run.runner_managed,
+            "Run should remain non-runner_managed"
+        );
         assert_eq!(mid_run.current_state, states[1].id); // processing
 
         // Fire transition manually: processing → done (terminal)
-        let result = engine::fire_transition(&*store, run.id, "done").await.unwrap();
+        let result = engine::fire_transition(&*store, run.id, "done")
+            .await
+            .unwrap();
         assert!(result.success, "Transition should succeed");
         assert_eq!(result.current_state_name, "done");
         assert!(result.run_completed, "Run should be completed");
@@ -378,7 +373,10 @@ mod tests {
         // Verify final state
         let final_run = store.get_protocol_run(run.id).await.unwrap().unwrap();
         assert_eq!(final_run.status, RunStatus::Completed);
-        assert!(!final_run.runner_managed, "Run should remain non-runner_managed");
+        assert!(
+            !final_run.runner_managed,
+            "Run should remain non-runner_managed"
+        );
         assert!(final_run.completed_at.is_some());
 
         // Verify states_visited has entries
@@ -399,15 +397,9 @@ mod tests {
             setup_simple_protocol(&store, ProtocolCategory::System).await;
 
         // Start a run
-        let run = engine::start_run(
-            &*store,
-            protocol.id,
-            None,
-            None,
-            Some("event:post_sync"),
-        )
-        .await
-        .unwrap();
+        let run = engine::start_run(&*store, protocol.id, None, None, Some("event:post_sync"))
+            .await
+            .unwrap();
 
         // Manually mark as runner_managed (simulating what the runner does)
         let mut run_mut = store.get_protocol_run(run.id).await.unwrap().unwrap();
@@ -415,8 +407,13 @@ mod tests {
         store.update_protocol_run(&mut run_mut).await.unwrap();
 
         // External fire_transition should still work
-        let result = engine::fire_transition(&*store, run.id, "done").await.unwrap();
-        assert!(result.success, "External transition on runner_managed run should succeed");
+        let result = engine::fire_transition(&*store, run.id, "done")
+            .await
+            .unwrap();
+        assert!(
+            result.success,
+            "External transition on runner_managed run should succeed"
+        );
         assert_eq!(result.current_state_name, "processing");
     }
 
@@ -434,27 +431,24 @@ mod tests {
         let store = Arc::new(MockGraphStore::new());
         let emitter = Arc::new(RecordingEmitter::new());
 
-        let (_project_id, protocol, states) =
-            setup_auto_maintenance_protocol(&store).await;
+        let (_project_id, protocol, states) = setup_auto_maintenance_protocol(&store).await;
 
         // Start a run at health_check
-        let run = engine::start_run(
-            &*store,
-            protocol.id,
-            None,
-            None,
-            Some("event:post_sync"),
-        )
-        .await
-        .unwrap();
+        let run = engine::start_run(&*store, protocol.id, None, None, Some("event:post_sync"))
+            .await
+            .unwrap();
         assert_eq!(run.current_state, states[0].id); // health_check
 
         // Manually advance through health_check → analyze_delta → triage
-        let result = engine::fire_transition(&*store, run.id, "done").await.unwrap();
+        let result = engine::fire_transition(&*store, run.id, "done")
+            .await
+            .unwrap();
         assert!(result.success);
         assert_eq!(result.current_state_name, "analyze_delta");
 
-        let result = engine::fire_transition(&*store, run.id, "done").await.unwrap();
+        let result = engine::fire_transition(&*store, run.id, "done")
+            .await
+            .unwrap();
         assert!(result.success);
         assert_eq!(result.current_state_name, "triage");
 
@@ -471,14 +465,9 @@ mod tests {
 
         // *** "Resume" — create a new runner from the persisted state ***
         let cancel = CancellationToken::new();
-        let final_run = run_protocol_no_llm(
-            store.clone(),
-            run.id,
-            cancel,
-            emitter.clone(),
-        )
-        .await
-        .unwrap();
+        let final_run = run_protocol_no_llm(store.clone(), run.id, cancel, emitter.clone())
+            .await
+            .unwrap();
 
         // Verify the run completed successfully
         assert_eq!(
@@ -535,15 +524,9 @@ mod tests {
             setup_simple_protocol(&store, ProtocolCategory::System).await;
 
         // Start a run
-        let run = engine::start_run(
-            &*store,
-            protocol.id,
-            None,
-            None,
-            Some("event:post_sync"),
-        )
-        .await
-        .unwrap();
+        let run = engine::start_run(&*store, protocol.id, None, None, Some("event:post_sync"))
+            .await
+            .unwrap();
         assert_eq!(run.status, RunStatus::Running);
 
         // Cancel via the engine API (the way the MCP handler does it)
@@ -569,19 +552,12 @@ mod tests {
         let emitter = Arc::new(RecordingEmitter::new());
         let cancel = CancellationToken::new();
 
-        let (_project_id, protocol, _states) =
-            setup_auto_maintenance_protocol(&store).await;
+        let (_project_id, protocol, _states) = setup_auto_maintenance_protocol(&store).await;
 
         // Start a run
-        let run = engine::start_run(
-            &*store,
-            protocol.id,
-            None,
-            None,
-            Some("event:post_sync"),
-        )
-        .await
-        .unwrap();
+        let run = engine::start_run(&*store, protocol.id, None, None, Some("event:post_sync"))
+            .await
+            .unwrap();
 
         // Spawn a task that cancels after a very short delay
         let cancel_clone = cancel.clone();
@@ -592,14 +568,9 @@ mod tests {
         });
 
         // Run the protocol — should get cancelled mid-execution
-        let final_run = run_protocol_no_llm(
-            store.clone(),
-            run.id,
-            cancel,
-            emitter.clone(),
-        )
-        .await
-        .unwrap();
+        let final_run = run_protocol_no_llm(store.clone(), run.id, cancel, emitter.clone())
+            .await
+            .unwrap();
 
         // Should be either Cancelled (if cancel arrived during execution)
         // or Completed (if it finished before cancel arrived — race condition)
@@ -630,10 +601,7 @@ mod tests {
 
         // Try to start second run — should fail
         let result = engine::start_run(&*store, protocol.id, None, None, Some("manual")).await;
-        assert!(
-            result.is_err(),
-            "Second concurrent run should be rejected"
-        );
+        assert!(result.is_err(), "Second concurrent run should be rejected");
         let err_msg = result.unwrap_err().to_string();
         assert!(
             err_msg.contains("concurrent") || err_msg.contains("already"),
@@ -658,7 +626,9 @@ mod tests {
         // Runner_managed starts as false
         assert!(!run.runner_managed);
 
-        let final_run = run_protocol_no_llm(store.clone(), run.id, cancel, emitter).await.unwrap();
+        let final_run = run_protocol_no_llm(store.clone(), run.id, cancel, emitter)
+            .await
+            .unwrap();
 
         // After runner execution, it should be true
         assert!(final_run.runner_managed);
@@ -679,8 +649,12 @@ mod tests {
             .unwrap();
 
         // Complete the run via fire_transition
-        engine::fire_transition(&*store, run.id, "done").await.unwrap(); // start → processing
-        engine::fire_transition(&*store, run.id, "done").await.unwrap(); // processing → done
+        engine::fire_transition(&*store, run.id, "done")
+            .await
+            .unwrap(); // start → processing
+        engine::fire_transition(&*store, run.id, "done")
+            .await
+            .unwrap(); // processing → done
 
         let completed = store.get_protocol_run(run.id).await.unwrap().unwrap();
         assert_eq!(completed.status, RunStatus::Completed);
@@ -701,8 +675,7 @@ mod tests {
         let emitter = Arc::new(RecordingEmitter::new());
         let cancel = CancellationToken::new();
 
-        let (_project_id, protocol, _states) =
-            setup_auto_maintenance_protocol(&store).await;
+        let (_project_id, protocol, _states) = setup_auto_maintenance_protocol(&store).await;
 
         let run = engine::start_run(&*store, protocol.id, None, None, Some("event:post_sync"))
             .await

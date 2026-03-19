@@ -91,9 +91,7 @@ pub async fn run_protocol(
     // 3. Select executor based on protocol category
     let executor: Box<dyn Executor> = match protocol.protocol_category {
         ProtocolCategory::System => Box::new(SystemExecutor::new()),
-        ProtocolCategory::Business => {
-            Box::new(AgentExecutor::new(chat_manager, cancel.clone()))
-        }
+        ProtocolCategory::Business => Box::new(AgentExecutor::new(chat_manager, cancel.clone())),
     };
 
     info!(
@@ -213,7 +211,8 @@ pub async fn run_protocol(
                 Ok(exec_result) => {
                     if exec_result.should_retry && retries < MAX_RETRIES {
                         retries += 1;
-                        let backoff = Duration::from_millis(BASE_BACKOFF_MS * 2u64.pow(retries - 1));
+                        let backoff =
+                            Duration::from_millis(BASE_BACKOFF_MS * 2u64.pow(retries - 1));
                         warn!(
                             run_id = %run_id,
                             state_name = %current_state.name,
@@ -229,7 +228,8 @@ pub async fn run_protocol(
                 Err(e) => {
                     if retries < MAX_RETRIES {
                         retries += 1;
-                        let backoff = Duration::from_millis(BASE_BACKOFF_MS * 2u64.pow(retries - 1));
+                        let backoff =
+                            Duration::from_millis(BASE_BACKOFF_MS * 2u64.pow(retries - 1));
                         warn!(
                             run_id = %run_id,
                             state_name = %current_state.name,

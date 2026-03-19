@@ -5309,7 +5309,12 @@ async fn enrich_runs_with_plan_titles(
     use std::collections::HashMap;
 
     // Collect unique plan_ids
-    let plan_ids: Vec<uuid::Uuid> = runs.iter().map(|r| r.plan_id).collect::<std::collections::HashSet<_>>().into_iter().collect();
+    let plan_ids: Vec<uuid::Uuid> = runs
+        .iter()
+        .map(|r| r.plan_id)
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
 
     // Batch fetch plan titles
     let mut title_map: HashMap<uuid::Uuid, String> = HashMap::new();

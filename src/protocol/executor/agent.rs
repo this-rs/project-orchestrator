@@ -9,6 +9,7 @@
 //! Trigger extraction convention:
 //! - The agent outputs `TRIGGER: <trigger_name>` at the end of its response, OR
 //! - The agent calls `protocol(action: "transition", ...)` which is intercepted.
+//!
 //! If neither is found, falls back to outgoing transition heuristics.
 
 use super::system::SystemExecutor;
@@ -103,10 +104,7 @@ fn build_agent_prompt(
     }
 
     if !state.description.is_empty() {
-        prompt.push_str(&format!(
-            "**State purpose:** {}\n\n",
-            state.description
-        ));
+        prompt.push_str(&format!("**State purpose:** {}\n\n", state.description));
     }
 
     // Run context
@@ -198,9 +196,7 @@ fn build_agent_prompt(
     prompt.push_str(
         "When you are done, end your response with exactly:\n\n```\nTRIGGER: <trigger_name>\n```\n\n",
     );
-    prompt.push_str(
-        "where `<trigger_name>` is one of the triggers listed above.\n",
-    );
+    prompt.push_str("where `<trigger_name>` is one of the triggers listed above.\n");
 
     prompt
 }
@@ -235,7 +231,7 @@ fn extract_trigger_from_text(text: &str) -> Option<String> {
         // Look for trigger field
         if let Some(trig_pos) = after.find("\"trigger\"") {
             let after_trigger = &after[trig_pos + 9..]; // skip "trigger"
-            // Find the value: skip whitespace, colon, whitespace, quote
+                                                        // Find the value: skip whitespace, colon, whitespace, quote
             let value_start = after_trigger.find('"');
             if let Some(vs) = value_start {
                 let rest = &after_trigger[vs + 1..];
@@ -293,6 +289,7 @@ fn determine_trigger_from_transitions(
 
 /// Execute the slow path: spawn a Claude agent session, send the prompt, monitor events,
 /// and extract the trigger from the agent's response.
+#[allow(clippy::too_many_arguments)]
 async fn execute_via_agent(
     chat_manager: &ChatManager,
     prompt: String,
@@ -416,7 +413,11 @@ async fn execute_via_agent(
             ChatEvent::AssistantText { content, .. } => {
                 accumulated_text.push_str(&content);
             }
-            ChatEvent::ToolUse { ref tool, ref input, .. } => {
+            ChatEvent::ToolUse {
+                ref tool,
+                ref input,
+                ..
+            } => {
                 // Check if the agent is calling protocol(transition) — intercept
                 if let Some(trigger) = extract_trigger_from_tool_use(tool, input) {
                     info!(
@@ -612,28 +613,19 @@ mod tests {
     #[test]
     fn test_extract_trigger_from_text_with_backticks() {
         let text = "Done.\n\nTRIGGER: `success`";
-        assert_eq!(
-            extract_trigger_from_text(text),
-            Some("success".to_string())
-        );
+        assert_eq!(extract_trigger_from_text(text), Some("success".to_string()));
     }
 
     #[test]
     fn test_extract_trigger_from_text_lowercase() {
         let text = "trigger: done";
-        assert_eq!(
-            extract_trigger_from_text(text),
-            Some("done".to_string())
-        );
+        assert_eq!(extract_trigger_from_text(text), Some("done".to_string()));
     }
 
     #[test]
     fn test_extract_trigger_from_text_last_wins() {
         let text = "TRIGGER: first\nSome more text\nTRIGGER: second";
-        assert_eq!(
-            extract_trigger_from_text(text),
-            Some("second".to_string())
-        );
+        assert_eq!(extract_trigger_from_text(text), Some("second".to_string()));
     }
 
     #[test]
@@ -756,7 +748,8 @@ mod tests {
             ProtocolTransition::new(protocol_id, state_id, uuid::Uuid::new_v4(), "rejected"),
         ];
 
-        let prompt = build_agent_prompt(&state, &run, &protocol, &transitions, Some("/tmp/project"));
+        let prompt =
+            build_agent_prompt(&state, &run, &protocol, &transitions, Some("/tmp/project"));
 
         // Verify all sections are present
         assert!(prompt.contains("Test Protocol"));
