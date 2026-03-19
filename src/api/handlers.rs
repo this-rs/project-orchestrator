@@ -67,7 +67,8 @@ pub struct ServerState {
     /// Always present (build full), but only active when config.neural_routing.enabled = true.
     pub neural_router: Arc<tokio::sync::RwLock<neural_routing_runtime::DualTrackRouter>>,
     /// Trajectory collector — wrapped in RwLock for lazy runtime initialization.
-    pub trajectory_collector: std::sync::RwLock<Option<Arc<neural_routing_runtime::TrajectoryCollector>>>,
+    pub trajectory_collector:
+        std::sync::RwLock<Option<Arc<neural_routing_runtime::TrajectoryCollector>>>,
     /// Concrete Neo4j trajectory store — needed to create the collector at runtime.
     pub trajectory_store_neo4j: Option<Arc<neural_routing_runtime::Neo4jTrajectoryStore>>,
     /// Trajectory store — Neo4j CRUD + vector search for stored trajectories.

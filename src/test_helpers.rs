@@ -130,7 +130,8 @@ pub fn mock_app_state() -> AppState {
             config_yaml_path: None,
         }),
         neural_router: mock_neural_router(),
-        trajectory_collector: None,
+        trajectory_collector: Arc::new(std::sync::RwLock::new(None)),
+        trajectory_store_neo4j: None,
         trajectory_store: mock_trajectory_store(),
     }
 }
@@ -176,7 +177,8 @@ pub fn mock_app_state_with(graph: MockGraphStore, search: MockSearchStore) -> Ap
             config_yaml_path: None,
         }),
         neural_router: mock_neural_router(),
-        trajectory_collector: None,
+        trajectory_collector: Arc::new(std::sync::RwLock::new(None)),
+        trajectory_store_neo4j: None,
         trajectory_store: mock_trajectory_store(),
     }
 }
@@ -222,7 +224,8 @@ pub fn mock_app_state_with_graph(graph: Arc<MockGraphStore>) -> AppState {
             config_yaml_path: None,
         }),
         neural_router: mock_neural_router(),
-        trajectory_collector: None,
+        trajectory_collector: Arc::new(std::sync::RwLock::new(None)),
+        trajectory_store_neo4j: None,
         trajectory_store: mock_trajectory_store(),
     }
 }
@@ -273,7 +276,8 @@ pub fn mock_app_state_with_stores() -> (AppState, Arc<MockGraphStore>, Arc<MockS
             config_yaml_path: None,
         }),
         neural_router: mock_neural_router(),
-        trajectory_collector: None,
+        trajectory_collector: Arc::new(std::sync::RwLock::new(None)),
+        trajectory_store_neo4j: None,
         trajectory_store: mock_trajectory_store(),
     };
     (state, graph, meili)

@@ -766,9 +766,11 @@ pub struct AppState {
     /// Neural routing — DualTrack router (NN + policy net fallback).
     /// Always present (build full), but only active when config.neural_routing.enabled = true.
     pub neural_router: Arc<tokio::sync::RwLock<neural_routing_runtime::DualTrackRouter>>,
-    /// Trajectory collector — fire-and-forget decision capture for neural route learning.
-    /// Present when config.neural_routing.collection.enabled = true.
-    pub trajectory_collector: Option<Arc<neural_routing_runtime::TrajectoryCollector>>,
+    /// Trajectory collector — wrapped in Arc<RwLock> for lazy runtime initialization.
+    pub trajectory_collector:
+        Arc<std::sync::RwLock<Option<Arc<neural_routing_runtime::TrajectoryCollector>>>>,
+    /// Concrete Neo4j store — needed for lazy TrajectoryCollector creation.
+    pub trajectory_store_neo4j: Option<Arc<neural_routing_runtime::Neo4jTrajectoryStore>>,
     /// Trajectory store — Neo4j CRUD + vector search for stored trajectories.
     pub trajectory_store: Arc<dyn neural_routing_runtime::TrajectoryStore>,
 }
@@ -818,9 +820,9 @@ impl AppState {
         let neural_router = Arc::new(tokio::sync::RwLock::new(dual_router));
 
         // Initialize trajectory collector (fire-and-forget decision capture)
-        let trajectory_collector = if config.neural_routing.collection.enabled {
+        let trajectory_collector_inner = if config.neural_routing.collection.enabled {
             let (collector, _handle) = neural_routing_runtime::TrajectoryCollector::new(
-                nr_store,
+                nr_store.clone(),
                 &config.neural_routing.collection,
                 None, // use default DecisionVectorBuilder
             );
@@ -839,7 +841,8 @@ impl AppState {
             parser,
             config: Arc::new(config),
             neural_router,
-            trajectory_collector,
+            trajectory_collector: Arc::new(std::sync::RwLock::new(trajectory_collector_inner)),
+            trajectory_store_neo4j: Some(nr_store.clone()),
             trajectory_store: trajectory_store_api,
         })
     }
@@ -926,10 +929,11 @@ pub async fn start_server(mut config: Config) -> Result<()> {
     // source of truth — WS handlers only need to listen to the local bus.
     event_bus.start_nats_bridge();
 
-    // Extract neural_router, trajectory_collector, and trajectory_store before state is moved into Orchestrator
+    // Extract neural_router, trajectory_collector, trajectory_store, and trajectory_store_neo4j before state is moved into Orchestrator
     let neural_router = state.neural_router.clone();
     let trajectory_collector = state.trajectory_collector.clone();
     let trajectory_store = state.trajectory_store.clone();
+    let trajectory_store_neo4j = state.trajectory_store_neo4j.clone();
 
     // Create orchestrator with hybrid emitter
     let orchestrator =
@@ -1202,7 +1206,7 @@ pub async fn start_server(mut config: Config) -> Result<()> {
         if let Some(ref nats) = nats_emitter {
             cm = cm.with_nats(nats.clone());
         }
-        if let Some(ref tc) = trajectory_collector {
+        if let Some(ref tc) = *trajectory_collector.read().unwrap() {
             cm = cm.with_trajectory_collector(tc.clone());
         }
         if let Some(re) = orchestrator.reasoning_engine() {
@@ -1413,7 +1417,8 @@ pub async fn start_server(mut config: Config) -> Result<()> {
         ws_ticket_store,
         registry_remote_url: config.registry_remote_url.clone(),
         neural_router: neural_router.clone(),
-        trajectory_collector,
+        trajectory_collector: std::sync::RwLock::new(trajectory_collector.read().unwrap().clone()),
+        trajectory_store_neo4j,
         trajectory_store: Some(trajectory_store),
         oidc_client,
         identity: {

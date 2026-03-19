@@ -1156,7 +1156,7 @@ pub async fn fire_transition(
     }
 
     // ── Trajectory collection: record protocol transition decision ────────
-    if let Some(ref collector) = state.trajectory_collector {
+    if let Some(ref collector) = *state.trajectory_collector.read().unwrap() {
         collector.record_decision(neural_routing_runtime::DecisionRecord {
             session_id: format!("protocol-run:{}", run_id),
             context_embedding: vec![],
@@ -2126,7 +2126,8 @@ mod tests {
             reactor_counters: std::sync::OnceLock::new(),
             oidc_client: None,
             neural_router: crate::test_helpers::mock_neural_router(),
-            trajectory_collector: None,
+            trajectory_collector: std::sync::RwLock::new(None),
+            trajectory_store_neo4j: None,
             trajectory_store: None,
         })
     }

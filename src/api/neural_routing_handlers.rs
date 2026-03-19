@@ -8,6 +8,7 @@ use axum::{extract::State, Json};
 use neural_routing_runtime::config::{NeuralRoutingConfig, RoutingMode};
 use neural_routing_runtime::NNMetricsSnapshot;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 // ============================================================================
 // Request / Response types
@@ -126,7 +127,7 @@ pub async fn disable(
     router.update_config(config);
 
     // Also disable trajectory collection when routing is disabled
-    if let Some(ref collector) = state.trajectory_collector {
+    if let Some(ref collector) = *state.trajectory_collector.read().unwrap() {
         collector.set_enabled(false);
     }
 
@@ -220,18 +221,43 @@ pub async fn update_config(
         config.nn.max_route_age_days = max_age;
     }
 
-    // Propagate collection.enabled to the TrajectoryCollector
+    router.update_config(config.clone());
+
+    // Propagate collection.enabled to the TrajectoryCollector (lazy-init if needed)
     if let Some(collection_enabled) = req.collection_enabled {
-        if let Some(ref collector) = state.trajectory_collector {
+        let mut tc_guard = state.trajectory_collector.write().unwrap();
+        if let Some(ref collector) = *tc_guard {
+            // Collector already exists — just toggle
             collector.set_enabled(collection_enabled);
             tracing::info!(
                 enabled = collection_enabled,
                 "Trajectory collector toggled via config update"
             );
+        } else if collection_enabled {
+            // Collector doesn't exist yet — create it on demand
+            if let Some(ref store) = state.trajectory_store_neo4j {
+                let coll_config = neural_routing_runtime::config::CollectionConfig {
+                    enabled: true,
+                    buffer_size: config.collection.buffer_size,
+                    stale_session_timeout_secs: config.collection.stale_session_timeout_secs,
+                };
+                let (collector, _handle) = neural_routing_runtime::TrajectoryCollector::new(
+                    store.clone(),
+                    &coll_config,
+                    None,
+                );
+                *tc_guard = Some(Arc::new(collector));
+                tracing::info!(
+                    buffer_size = coll_config.buffer_size,
+                    "Trajectory collector created at runtime via config update"
+                );
+            } else {
+                tracing::warn!(
+                    "Cannot create trajectory collector: no Neo4j trajectory store available"
+                );
+            }
         }
     }
-
-    router.update_config(config);
 
     tracing::info!("Neural routing config updated via API");
 
@@ -275,7 +301,8 @@ mod tests {
             registry_remote_url: None,
             oidc_client: None,
             neural_router: mock_neural_router(),
-            trajectory_collector: None,
+            trajectory_collector: std::sync::RwLock::new(None),
+            trajectory_store_neo4j: None,
             trajectory_store: None,
             identity: None,
             reactor_counters: std::sync::OnceLock::new(),
