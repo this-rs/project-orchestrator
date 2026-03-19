@@ -124,7 +124,9 @@ struct AvailableUpdate(std::sync::Mutex<Option<tauri_plugin_updater::Update>>);
 /// Manually trigger an update check from the frontend.
 #[tauri::command]
 pub async fn check_update(app: AppHandle) -> Result<Option<UpdateAvailablePayload>, String> {
-    let updater = app.updater().map_err(|e| format!("Updater init failed: {}", e))?;
+    let updater = app
+        .updater()
+        .map_err(|e| format!("Updater init failed: {}", e))?;
 
     match updater.check().await {
         Ok(Some(update)) => {

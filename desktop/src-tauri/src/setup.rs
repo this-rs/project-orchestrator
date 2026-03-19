@@ -391,8 +391,7 @@ pub async fn check_dependencies(
     let docker_available = docker_status == crate::docker::DockerStatus::Running;
 
     // Claude Code CLI check
-    let claude_code_available =
-        project_orchestrator::setup_claude::detect_claude_cli().is_some();
+    let claude_code_available = project_orchestrator::setup_claude::detect_claude_cli().is_some();
 
     // Config file check + read config for infra_mode, credentials, etc.
     let config_path = config_path();
@@ -578,22 +577,24 @@ pub fn generate_config(config: SetupConfig) -> Result<String, String> {
         "oidc" => {
             // Use frontend-provided endpoints when available (resolved via Verify button).
             // Only fall back to resolve_oidc_endpoints() network fetch when endpoints are missing.
-            let (auth_ep, token_ep, userinfo_ep, resolved_provider_name) =
-                if !config.oidc_auth_endpoint.trim().is_empty()
-                    && !config.oidc_token_endpoint.trim().is_empty()
-                {
-                    tracing::info!("Using frontend-provided OIDC endpoints (skipping network fetch)");
-                    (
-                        config.oidc_auth_endpoint.trim().to_string(),
-                        config.oidc_token_endpoint.trim().to_string(),
-                        config.oidc_userinfo_endpoint.trim().to_string(),
-                        // Detect provider name from discovery URL for fallback
-                        detect_provider_name(&config.oidc_discovery_url),
-                    )
-                } else {
-                    tracing::info!("No frontend endpoints — resolving via discovery URL fetch");
-                    resolve_oidc_endpoints(&config.oidc_discovery_url)
-                };
+            let (auth_ep, token_ep, userinfo_ep, resolved_provider_name) = if !config
+                .oidc_auth_endpoint
+                .trim()
+                .is_empty()
+                && !config.oidc_token_endpoint.trim().is_empty()
+            {
+                tracing::info!("Using frontend-provided OIDC endpoints (skipping network fetch)");
+                (
+                    config.oidc_auth_endpoint.trim().to_string(),
+                    config.oidc_token_endpoint.trim().to_string(),
+                    config.oidc_userinfo_endpoint.trim().to_string(),
+                    // Detect provider name from discovery URL for fallback
+                    detect_provider_name(&config.oidc_discovery_url),
+                )
+            } else {
+                tracing::info!("No frontend endpoints — resolving via discovery URL fetch");
+                resolve_oidc_endpoints(&config.oidc_discovery_url)
+            };
 
             // Use frontend-provided provider_name/scopes, fallback to resolved values
             let provider_name = if config.oidc_provider_name.trim().is_empty() {
@@ -733,7 +734,9 @@ pub fn generate_config(config: SetupConfig) -> Result<String, String> {
             let provider = config.embedding_provider.trim().to_lowercase();
             Some(EmbeddingsSection {
                 provider: provider.clone(),
-                fastembed_model: if provider == "local" && !config.embedding_fastembed_model.trim().is_empty() {
+                fastembed_model: if provider == "local"
+                    && !config.embedding_fastembed_model.trim().is_empty()
+                {
                     Some(config.embedding_fastembed_model.trim().to_string())
                 } else {
                     None
@@ -815,7 +818,8 @@ pub async fn detect_shell_path() -> Result<Option<String>, String> {
 /// This is used by the setup wizard which runs BEFORE the backend is available.
 /// Calls `check_cli_status()` from the shared `cli_version` module.
 #[tauri::command]
-pub async fn check_cli_status() -> Result<project_orchestrator::chat::cli_version::CliVersionStatus, String> {
+pub async fn check_cli_status(
+) -> Result<project_orchestrator::chat::cli_version::CliVersionStatus, String> {
     Ok(project_orchestrator::chat::cli_version::check_cli_status().await)
 }
 
@@ -824,7 +828,9 @@ pub async fn check_cli_status() -> Result<project_orchestrator::chat::cli_versio
 /// Same rationale as `check_cli_status` — the setup wizard needs this before
 /// the API server is running.
 #[tauri::command]
-pub async fn install_cli(version: Option<String>) -> Result<project_orchestrator::chat::cli_version::CliInstallResult, String> {
+pub async fn install_cli(
+    version: Option<String>,
+) -> Result<project_orchestrator::chat::cli_version::CliInstallResult, String> {
     Ok(project_orchestrator::chat::cli_version::install_or_upgrade_cli(version.as_deref()).await)
 }
 
@@ -1035,22 +1041,26 @@ pub fn read_config() -> Result<ReadConfigResponse, String> {
 
                 // Use persisted provider_key when available (new configs),
                 // fallback to heuristic from discovery URL (old configs).
-                oidc_provider = o.provider_key.clone().filter(|k| !k.is_empty()).unwrap_or_else(|| {
-                    let disc = oidc_discovery_url.to_lowercase();
-                    if disc.contains("accounts.google.com") || disc.contains("googleapis") {
-                        "google".into()
-                    } else if disc.contains("login.microsoftonline.com") {
-                        "microsoft".into()
-                    } else if disc.contains(".okta.com") {
-                        "okta".into()
-                    } else if disc.contains(".auth0.com") {
-                        "auth0".into()
-                    } else if disc.contains("/realms/") {
-                        "keycloak".into()
-                    } else {
-                        "custom".into()
-                    }
-                });
+                oidc_provider = o
+                    .provider_key
+                    .clone()
+                    .filter(|k| !k.is_empty())
+                    .unwrap_or_else(|| {
+                        let disc = oidc_discovery_url.to_lowercase();
+                        if disc.contains("accounts.google.com") || disc.contains("googleapis") {
+                            "google".into()
+                        } else if disc.contains("login.microsoftonline.com") {
+                            "microsoft".into()
+                        } else if disc.contains(".okta.com") {
+                            "okta".into()
+                        } else if disc.contains(".auth0.com") {
+                            "auth0".into()
+                        } else if disc.contains("/realms/") {
+                            "keycloak".into()
+                        } else {
+                            "custom".into()
+                        }
+                    });
             }
         }
     }
@@ -1085,11 +1095,16 @@ pub fn read_config() -> Result<ReadConfigResponse, String> {
         nats_url,
         nats_enabled,
         chat_model: normalize_model_id(
-            &yaml.chat.default_model.unwrap_or_else(|| "claude-sonnet-4-6".into()),
+            &yaml
+                .chat
+                .default_model
+                .unwrap_or_else(|| "claude-sonnet-4-6".into()),
         ),
         chat_max_sessions: yaml.chat.max_sessions.unwrap_or(3) as u32,
         chat_max_turns: yaml.chat.max_turns.unwrap_or(50) as u32,
-        chat_permission_mode: yaml.chat.permissions
+        chat_permission_mode: yaml
+            .chat
+            .permissions
             .map(|p| p.mode)
             .unwrap_or_else(|| "default".into()),
         chat_process_path: yaml.chat.process_path.unwrap_or_default(),
@@ -1097,13 +1112,25 @@ pub fn read_config() -> Result<ReadConfigResponse, String> {
         chat_auto_update_cli: yaml.chat.auto_update_cli.unwrap_or(false),
         chat_auto_update_app: yaml.chat.auto_update_app.unwrap_or(true),
         // Embedding settings
-        embedding_provider: yaml.embeddings.provider.clone().unwrap_or_else(|| "local".into()),
-        embedding_fastembed_model: yaml.embeddings.fastembed_model.clone().unwrap_or_else(|| "multilingual-e5-base".into()),
+        embedding_provider: yaml
+            .embeddings
+            .provider
+            .clone()
+            .unwrap_or_else(|| "local".into()),
+        embedding_fastembed_model: yaml
+            .embeddings
+            .fastembed_model
+            .clone()
+            .unwrap_or_else(|| "multilingual-e5-base".into()),
         embedding_url: yaml.embeddings.url.clone().unwrap_or_default(),
         embedding_model: yaml.embeddings.model.clone().unwrap_or_default(),
         embedding_api_key: String::new(), // redacted
         embedding_dimensions: yaml.embeddings.dimensions.unwrap_or(768) as u32,
-        has_embedding_api_key: yaml.embeddings.api_key.as_ref().is_some_and(|k| !k.is_empty()),
+        has_embedding_api_key: yaml
+            .embeddings
+            .api_key
+            .as_ref()
+            .is_some_and(|k| !k.is_empty()),
         has_oidc_secret,
         has_neo4j_password,
         has_meilisearch_key,
@@ -1175,7 +1202,10 @@ pub struct ReadConfigResponse {
 /// Returns the path where the config was written.
 pub fn generate_default_config() -> Result<PathBuf, String> {
     let path = config_path();
-    tracing::info!("Generating default (unconfigured) config at: {}", path.display());
+    tracing::info!(
+        "Generating default (unconfigured) config at: {}",
+        path.display()
+    );
 
     let yaml = YamlOutput {
         setup_completed: false,
@@ -1265,7 +1295,11 @@ pub async fn verify_oidc_discovery(url: String) -> Result<OidcDiscoveryResponse,
         .map_err(|e| format!("Failed to fetch discovery document: {}", e))?;
 
     if !resp.status().is_success() {
-        return Err(format!("HTTP {}: {}", resp.status().as_u16(), resp.status().canonical_reason().unwrap_or("error")));
+        return Err(format!(
+            "HTTP {}: {}",
+            resp.status().as_u16(),
+            resp.status().canonical_reason().unwrap_or("error")
+        ));
     }
 
     let json: serde_json::Value = resp
@@ -1277,23 +1311,19 @@ pub async fn verify_oidc_discovery(url: String) -> Result<OidcDiscoveryResponse,
         .as_str()
         .unwrap_or("")
         .to_string();
-    let token = json["token_endpoint"]
-        .as_str()
-        .unwrap_or("")
-        .to_string();
+    let token = json["token_endpoint"].as_str().unwrap_or("").to_string();
 
     if auth.is_empty() || token.is_empty() {
-        return Err("Invalid discovery document: missing authorization_endpoint or token_endpoint".into());
+        return Err(
+            "Invalid discovery document: missing authorization_endpoint or token_endpoint".into(),
+        );
     }
 
     Ok(OidcDiscoveryResponse {
         issuer: json["issuer"].as_str().unwrap_or("").to_string(),
         authorization_endpoint: auth,
         token_endpoint: token,
-        userinfo_endpoint: json["userinfo_endpoint"]
-            .as_str()
-            .unwrap_or("")
-            .to_string(),
+        userinfo_endpoint: json["userinfo_endpoint"].as_str().unwrap_or("").to_string(),
     })
 }
 
@@ -1344,14 +1374,19 @@ fn resolve_oidc_endpoints(discovery_url: &str) -> (String, String, String, Strin
     if let Ok(resp) = reqwest::blocking::get(&well_known) {
         if resp.status().is_success() {
             if let Ok(json) = resp.json::<serde_json::Value>() {
-                let auth = json["authorization_endpoint"].as_str().unwrap_or("").to_string();
+                let auth = json["authorization_endpoint"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string();
                 let token = json["token_endpoint"].as_str().unwrap_or("").to_string();
                 let userinfo = json["userinfo_endpoint"].as_str().unwrap_or("").to_string();
 
                 if !auth.is_empty() && !token.is_empty() {
                     tracing::info!(
                         "Resolved OIDC endpoints from discovery: auth={}, token={}, userinfo={}",
-                        auth, token, userinfo
+                        auth,
+                        token,
+                        userinfo
                     );
                     return (auth, token, userinfo, provider_name);
                 }
@@ -1359,7 +1394,10 @@ fn resolve_oidc_endpoints(discovery_url: &str) -> (String, String, String, Strin
         }
     }
 
-    tracing::warn!("Could not fetch OIDC discovery document at {}, using known provider defaults", well_known);
+    tracing::warn!(
+        "Could not fetch OIDC discovery document at {}, using known provider defaults",
+        well_known
+    );
 
     // Fallback: well-known endpoints for common providers
     match provider_name.as_str() {
@@ -1371,7 +1409,9 @@ fn resolve_oidc_endpoints(discovery_url: &str) -> (String, String, String, Strin
         ),
         _ => {
             // Last resort — use the URL as-is (will likely fail but at least config is written)
-            tracing::error!("Unknown OIDC provider and discovery fetch failed — config may need manual editing");
+            tracing::error!(
+                "Unknown OIDC provider and discovery fetch failed — config may need manual editing"
+            );
             (
                 url.to_string(),
                 url.to_string(),
@@ -1438,9 +1478,10 @@ fn fastembed_cache_dir() -> PathBuf {
 /// ONNX model file exists. Returns availability status and estimated size.
 #[tauri::command]
 pub fn check_embedding_model(model_name: String) -> Result<EmbeddingModelStatus, String> {
-    use fastembed::{TextEmbedding, EmbeddingModel};
+    use fastembed::{EmbeddingModel, TextEmbedding};
 
-    let model_variant = project_orchestrator::embeddings::fastembed::parse_model_name_pub(&model_name);
+    let model_variant =
+        project_orchestrator::embeddings::fastembed::parse_model_name_pub(&model_name);
     let estimated_size_mb = estimated_model_size(&model_name);
 
     // Get model info to find the cache path
@@ -1493,7 +1534,11 @@ pub fn check_embedding_model(model_name: String) -> Result<EmbeddingModelStatus,
 
         Ok(EmbeddingModelStatus {
             available,
-            cache_path: if available { Some(model_dir.display().to_string()) } else { None },
+            cache_path: if available {
+                Some(model_dir.display().to_string())
+            } else {
+                None
+            },
             estimated_size_mb,
         })
     } else {
@@ -1557,11 +1602,18 @@ async fn fetch_model_total_size(model_code: &str, fallback_name: &str) -> u64 {
     /// Fetch file entries from one HF tree path (non-recursive).
     /// Returns (type, size, lfs_size, path) tuples. Uses lfs.size when available
     /// since the top-level `size` for LFS pointers reflects the pointer, not the blob.
-    async fn fetch_tree(client: &reqwest::Client, repo: &str, path: &str) -> Vec<(String, u64, String)> {
+    async fn fetch_tree(
+        client: &reqwest::Client,
+        repo: &str,
+        path: &str,
+    ) -> Vec<(String, u64, String)> {
         let url = if path.is_empty() {
             format!("https://huggingface.co/api/models/{}/tree/main", repo)
         } else {
-            format!("https://huggingface.co/api/models/{}/tree/main/{}", repo, path)
+            format!(
+                "https://huggingface.co/api/models/{}/tree/main/{}",
+                repo, path
+            )
         };
 
         let resp = match client.get(&url).send().await {
@@ -1579,7 +1631,8 @@ async fn fetch_model_total_size(model_code: &str, fallback_name: &str) -> u64 {
                 let entry_type = entry.get("type")?.as_str()?.to_string();
                 let entry_path = entry.get("path")?.as_str()?.to_string();
                 // Prefer lfs.size (real blob size) over top-level size (may be pointer size)
-                let size = entry.get("lfs")
+                let size = entry
+                    .get("lfs")
                     .and_then(|lfs| lfs.get("size"))
                     .and_then(|s| s.as_u64())
                     .or_else(|| entry.get("size").and_then(|s| s.as_u64()))
@@ -1591,8 +1644,12 @@ async fn fetch_model_total_size(model_code: &str, fallback_name: &str) -> u64 {
 
     /// Files that fastembed downloads from root and onnx/ directories.
     const TOKENIZER_CONFIG_FILES: &[&str] = &[
-        "config.json", "tokenizer.json", "tokenizer_config.json",
-        "special_tokens_map.json", "sentencepiece.bpe.model", "vocab.txt",
+        "config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "special_tokens_map.json",
+        "sentencepiece.bpe.model",
+        "vocab.txt",
     ];
 
     let client = match reqwest::Client::builder()
@@ -1620,7 +1677,8 @@ async fn fetch_model_total_size(model_code: &str, fallback_name: &str) -> u64 {
     for (entry_type, size, path) in fetch_tree(&client, model_code, "onnx").await {
         if entry_type == "file" {
             let basename = path.rsplit('/').next().unwrap_or(&path);
-            if basename == "model.onnx" || basename == "model.onnx_data"
+            if basename == "model.onnx"
+                || basename == "model.onnx_data"
                 || TOKENIZER_CONFIG_FILES.contains(&basename)
             {
                 total += size;
@@ -1633,7 +1691,11 @@ async fn fetch_model_total_size(model_code: &str, fallback_name: &str) -> u64 {
         tracing::warn!(model_code, "HF API returned 0 bytes — using estimated size");
         estimated_model_size(fallback_name) as u64 * 1_000_000
     } else {
-        tracing::info!(model_code, total_bytes = total, "Fetched real model size from HF API");
+        tracing::info!(
+            model_code,
+            total_bytes = total,
+            "Fetched real model size from HF API"
+        );
         total
     }
 }
@@ -1651,7 +1713,8 @@ pub async fn download_embedding_model(
     use fastembed::{TextEmbedding, TextInitOptions};
     use tauri::Emitter;
 
-    let model_variant = project_orchestrator::embeddings::fastembed::parse_model_name_pub(&model_name);
+    let model_variant =
+        project_orchestrator::embeddings::fastembed::parse_model_name_pub(&model_name);
     let cache_dir = fastembed_cache_dir();
 
     // Get model_code for HF API + cache directory monitoring
@@ -1759,7 +1822,11 @@ pub async fn download_embedding_model(
     let _ = app_handle.emit(
         "embedding-download-progress",
         EmbeddingDownloadProgress {
-            downloaded_bytes: if result.success { total_bytes } else { final_downloaded },
+            downloaded_bytes: if result.success {
+                total_bytes
+            } else {
+                final_downloaded
+            },
             total_bytes,
             percentage: if result.success {
                 100.0
@@ -1827,7 +1894,11 @@ pub async fn test_embedding_endpoint(
                     success: false,
                     dimensions: None,
                     latency_ms,
-                    error: Some(format!("HTTP {}: {}", status, body.chars().take(200).collect::<String>())),
+                    error: Some(format!(
+                        "HTTP {}: {}",
+                        status,
+                        body.chars().take(200).collect::<String>()
+                    )),
                 });
             }
 

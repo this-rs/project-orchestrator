@@ -91,7 +91,10 @@ fn handle_menu_event(app: &AppHandle, item_id: &str) {
                 let infra_mode = std::fs::read_to_string(crate::setup::config_path())
                     .ok()
                     .and_then(|c| serde_yaml::from_str::<serde_yaml::Value>(&c).ok())
-                    .and_then(|v| v.get("infra_mode").and_then(|m| m.as_str().map(String::from)))
+                    .and_then(|v| {
+                        v.get("infra_mode")
+                            .and_then(|m| m.as_str().map(String::from))
+                    })
                     .unwrap_or_else(|| "docker".to_string());
 
                 if infra_mode != "external" {
@@ -151,9 +154,7 @@ fn start_status_polling(
 
                 // Check API server
                 let api_text = match reqwest::get("http://127.0.0.1:8080/health").await {
-                    Ok(resp) if resp.status().is_success() => {
-                        "API Server: OK Healthy".to_string()
-                    }
+                    Ok(resp) if resp.status().is_success() => "API Server: OK Healthy".to_string(),
                     _ => "API Server: X Down".to_string(),
                 };
 
