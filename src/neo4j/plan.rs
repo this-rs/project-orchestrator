@@ -1122,20 +1122,20 @@ impl Neo4jClient {
             "MATCH (p:Plan)".to_string()
         };
 
-        // Count query
-        let count_cypher = format!("{} {} RETURN count(p) AS total", match_clause, where_clause);
+        // Count query (DISTINCT to avoid duplicates when a plan is linked to multiple projects in the same workspace)
+        let count_cypher = format!("{} {} RETURN count(DISTINCT p) AS total", match_clause, where_clause);
         let count_result = self.execute(&count_cypher).await?;
         let total: i64 = count_result
             .first()
             .and_then(|r| r.get("total").ok())
             .unwrap_or(0);
 
-        // Data query
+        // Data query (DISTINCT to avoid duplicates when a plan is linked to multiple projects in the same workspace)
         let cypher = format!(
             r#"
             {}
             {}
-            RETURN p
+            RETURN DISTINCT p
             ORDER BY {} {}
             SKIP {}
             LIMIT {}
