@@ -10,6 +10,7 @@
 //! Each run is driven by a spawned tokio task with a CancellationToken
 //! for graceful shutdown.
 
+use crate::chat::manager::ChatManager;
 use crate::events::{CrudAction, CrudEvent, EntityType, EventEmitter};
 use crate::neo4j::traits::GraphStore;
 use crate::protocol::engine;
@@ -23,6 +24,9 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
+
+/// Base backoff delay for retries (1 second).
+const BASE_BACKOFF_MS: u64 = 1000;
 
 /// Default timeout for system protocol states (5 minutes).
 const DEFAULT_SYSTEM_TIMEOUT_SECS: u64 = 300;
@@ -47,6 +51,8 @@ const MAX_RETRIES: u32 = 3;
 /// - `run_id` — the protocol run to drive
 /// - `cancel` — cancellation token for graceful shutdown
 /// - `emitter` — event emitter for CRUD notifications
+/// - `chat_manager` — optional ChatManager for LLM-driven business protocols.
+///   When None, business protocol states that require LLM will use stub behavior.
 ///
 /// # Returns
 /// The final state of the protocol run (completed, failed, or cancelled).
@@ -55,6 +61,7 @@ pub async fn run_protocol(
     run_id: Uuid,
     cancel: CancellationToken,
     emitter: Arc<dyn EventEmitter>,
+    chat_manager: Option<Arc<ChatManager>>,
 ) -> Result<ProtocolRun> {
     // 1. Load run + protocol
     let mut run = store
@@ -84,7 +91,9 @@ pub async fn run_protocol(
     // 3. Select executor based on protocol category
     let executor: Box<dyn Executor> = match protocol.protocol_category {
         ProtocolCategory::System => Box::new(SystemExecutor::new()),
-        ProtocolCategory::Business => Box::new(AgentExecutor::new()),
+        ProtocolCategory::Business => {
+            Box::new(AgentExecutor::new(chat_manager, cancel.clone()))
+        }
     };
 
     info!(
@@ -145,6 +154,17 @@ pub async fn run_protocol(
             break;
         }
 
+        // Emit progress event: starting state execution
+        emit_progress_event(
+            &emitter,
+            run_id,
+            &current_state.name,
+            "executing",
+            None,
+            None,
+            protocol.project_id,
+        );
+
         // Determine timeout
         let timeout_secs =
             current_state
@@ -193,7 +213,7 @@ pub async fn run_protocol(
                 Ok(exec_result) => {
                     if exec_result.should_retry && retries < MAX_RETRIES {
                         retries += 1;
-                        let backoff = Duration::from_millis(500 * 2u64.pow(retries - 1));
+                        let backoff = Duration::from_millis(BASE_BACKOFF_MS * 2u64.pow(retries - 1));
                         warn!(
                             run_id = %run_id,
                             state_name = %current_state.name,
@@ -209,7 +229,7 @@ pub async fn run_protocol(
                 Err(e) => {
                     if retries < MAX_RETRIES {
                         retries += 1;
-                        let backoff = Duration::from_millis(500 * 2u64.pow(retries - 1));
+                        let backoff = Duration::from_millis(BASE_BACKOFF_MS * 2u64.pow(retries - 1));
                         warn!(
                             run_id = %run_id,
                             state_name = %current_state.name,
@@ -307,6 +327,40 @@ async fn fail_run_with_error(store: &dyn GraphStore, run_id: Uuid, error: &str) 
         }
     }
     Ok(())
+}
+
+/// Emit a CrudEvent::Progress for in-flight state execution updates.
+///
+/// Used to notify the frontend (via WebSocket) that the runner is executing
+/// a state, including optional processed/total counters for long-running states.
+fn emit_progress_event(
+    emitter: &Arc<dyn EventEmitter>,
+    run_id: Uuid,
+    state_name: &str,
+    sub_action: &str,
+    processed: Option<u64>,
+    total: Option<u64>,
+    project_id: Uuid,
+) {
+    let mut payload = serde_json::json!({
+        "current_state": state_name,
+        "sub_action": sub_action,
+    });
+    if let Some(p) = processed {
+        payload["processed"] = serde_json::json!(p);
+    }
+    if let Some(t) = total {
+        payload["total"] = serde_json::json!(t);
+    }
+    emitter.emit(CrudEvent {
+        entity_type: EntityType::ProtocolRun,
+        action: CrudAction::Progress,
+        entity_id: run_id.to_string(),
+        related: None,
+        payload,
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        project_id: Some(project_id.to_string()),
+    });
 }
 
 /// Emit a CrudEvent after a protocol run state transition.
