@@ -76,6 +76,8 @@ mod notifier;
 pub mod reactor;
 pub mod reactions;
 pub mod trigger;
+pub mod trigger_routing;
+pub mod builtin_triggers;
 mod types;
 
 pub use bus::EventBus;
@@ -87,4 +89,5 @@ pub use notifier::EventNotifier;
 pub use reactor::{EventReactor, ReactorBuilder, ReactorCounters, ReactorStats};
 pub use reactions::register_builtin_reactions;
 pub use trigger::EventTrigger;
+pub use trigger_routing::{RoutingContext, RoutingDecision, TriggerRouter};
 pub use types::{CrudAction, CrudEvent, EntityType, EventEmitter, RelatedEntity};

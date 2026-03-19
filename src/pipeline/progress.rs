@@ -533,14 +533,20 @@ mod tests {
     fn test_trend_stagnant() {
         let mut oracle = ProgressOracle::with_defaults();
 
-        // Start with a good score, then regress/stagnate for 6+ checkpoints
-        // so that the last 5 deltas are all <= 0.
+        // Start with a good score, then alternate between regression and
+        // stagnation so the last 5 deltas are all <= 0 but NOT all zero
+        // and NOT all negative — triggering the Stagnant path.
         oracle.record_checkpoint(make_checkpoint(10, 8, 0, 80.0, 5, 10));
-
-        for _ in 0..6 {
-            // same or slightly worse
-            oracle.record_checkpoint(make_checkpoint(10, 7, 0, 70.0, 4, 10));
-        }
+        // Regress
+        oracle.record_checkpoint(make_checkpoint(10, 7, 0, 70.0, 4, 10));
+        // Stay flat
+        oracle.record_checkpoint(make_checkpoint(10, 7, 0, 70.0, 4, 10));
+        // Regress slightly
+        oracle.record_checkpoint(make_checkpoint(10, 6, 0, 65.0, 4, 10));
+        // Stay flat
+        oracle.record_checkpoint(make_checkpoint(10, 6, 0, 65.0, 4, 10));
+        // Regress slightly
+        oracle.record_checkpoint(make_checkpoint(10, 5, 0, 60.0, 4, 10));
 
         let summary = oracle.progress_summary();
         assert_eq!(summary.trend, ProgressTrend::Stagnant);
