@@ -16,6 +16,7 @@
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 use tracing::{debug, warn};
 use uuid::Uuid;
@@ -44,6 +45,9 @@ pub struct EnrichmentConfig {
     /// Enable the user profile stage (adaptive behavioral profile injection).
     #[serde(default)]
     pub user_profile: bool,
+    /// Enable the persona stage (auto-detect relevant persona for mentioned files).
+    #[serde(default)]
+    pub persona: bool,
     /// Enable the reasoning tree injection stage.
     pub reasoning_tree: bool,
     /// Enable debug mode (logs timing and content of each stage).
@@ -61,6 +65,7 @@ impl Default for EnrichmentConfig {
             biomimicry: false, // Disabled by default — opt-in via ENRICHMENT_BIOMIMICRY=true
             reflex: false,     // Disabled by default — opt-in via ENRICHMENT_REFLEX=true
             user_profile: false, // Disabled by default — opt-in via ENRICHMENT_USER_PROFILE=true
+            persona: true,     // Enabled by default — auto-skips when no personas match
             reasoning_tree: true,
             debug: false,
             max_pipeline_ms: 500,
@@ -98,6 +103,9 @@ impl EnrichmentConfig {
             user_profile: std::env::var("ENRICHMENT_USER_PROFILE")
                 .map(|v| v == "true" || v == "1")
                 .unwrap_or(false),
+            persona: std::env::var("ENRICHMENT_PERSONA")
+                .map(|v| v != "false" && v != "0")
+                .unwrap_or(true),
             reasoning_tree: std::env::var("ENRICHMENT_REASONING_TREE")
                 .map(|v| v != "false" && v != "0")
                 .unwrap_or(true),
@@ -133,16 +141,31 @@ pub struct EnrichmentInput {
     pub protocol_run_id: Option<Uuid>,
     /// Current protocol state name (e.g. "implement", "review").
     pub protocol_state: Option<String>,
+    /// Note IDs already included in the system prompt (from ProjectContext guidelines/gotchas).
+    /// Used by KnowledgeInjectionStage to avoid duplicating notes that are already present.
+    pub excluded_note_ids: HashSet<String>,
 }
 
 /// Mutable context that accumulates enrichment data across stages.
 ///
 /// Each stage can read what previous stages added and add its own data.
 /// The context is [`Serialize`] for debug logging.
+///
+/// **Hints**: stages can communicate inter-stage signals via `set_hint`/`get_hint`.
+/// For example, SkillActivationStage sets `intent=planning` which KnowledgeInjectionStage
+/// can read to filter notes by intent.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct EnrichmentContext {
     /// Sections of enriched content to prepend to the prompt.
     pub sections: Vec<EnrichmentSection>,
+    /// Inter-stage hints: key-value signals that subsequent stages can read.
+    ///
+    /// Common hints:
+    /// - `intent`: planning | code | debug | review | general
+    /// - `scaffolding_level`: 0-4 (from project maturity)
+    /// - `detected_files`: comma-separated file paths mentioned in the message
+    /// - `detected_functions`: comma-separated function names mentioned
+    pub hints: HashMap<String, String>,
     /// Timing information per stage (name, duration in ms).
     pub stage_timings: Vec<(String, u64)>,
     /// Total pipeline execution time in ms.
@@ -177,9 +200,84 @@ impl EnrichmentContext {
         });
     }
 
+    /// Set an inter-stage hint that subsequent stages can read.
+    ///
+    /// Common hints:
+    /// - `intent`: planning | code | debug | review | general
+    /// - `scaffolding_level`: 0-4
+    /// - `detected_files`: comma-separated file paths
+    pub fn set_hint(&mut self, key: impl Into<String>, value: impl Into<String>) {
+        self.hints.insert(key.into(), value.into());
+    }
+
+    /// Get an inter-stage hint set by a previous stage.
+    pub fn get_hint(&self, key: &str) -> Option<&str> {
+        self.hints.get(key).map(|s| s.as_str())
+    }
+
     /// Check if any enrichment content was produced.
     pub fn has_content(&self) -> bool {
         !self.sections.is_empty()
+    }
+
+    /// Convert enrichment sections to PromptSection variants.
+    ///
+    /// This bridges the EnrichmentPipeline → PromptBuilder unification:
+    /// stages continue producing EnrichmentSections internally, but the
+    /// output can be consumed as PromptSections by the FsmPromptComposer.
+    ///
+    /// Mapping:
+    /// - "Activated Skills" → PromptSection::SkillContext
+    /// - "Relevant Notes" / "Contextual Notes" → PromptSection::KnowledgeNotes
+    /// - "Propagated Notes" → PromptSection::PropagatedNotes
+    /// - "File Context" / "Symbols" → PromptSection::FileContext
+    /// - "Persona" → PromptSection::PersonaContext
+    /// - Other → PromptSection::Enrichment
+    pub fn to_prompt_sections(&self) -> Vec<crate::runner::prompt::PromptSection> {
+        use crate::runner::prompt::PromptSection;
+
+        self.sections
+            .iter()
+            .map(|section| {
+                let title_lower = section.title.to_lowercase();
+                if title_lower.contains("skill") {
+                    PromptSection::SkillContext(section.content.clone())
+                } else if title_lower.contains("propagated") {
+                    PromptSection::PropagatedNotes(section.content.clone())
+                } else if title_lower.contains("note")
+                    || title_lower.contains("guideline")
+                    || title_lower.contains("gotcha")
+                    || title_lower.contains("knowledge")
+                {
+                    PromptSection::KnowledgeNotes(section.content.clone())
+                } else if title_lower.contains("file")
+                    || title_lower.contains("symbol")
+                    || title_lower.contains("dependency")
+                {
+                    PromptSection::FileContext(section.content.clone())
+                } else if title_lower.contains("persona") {
+                    PromptSection::PersonaContext(section.content.clone())
+                } else {
+                    PromptSection::Enrichment(section.content.clone())
+                }
+            })
+            .collect()
+    }
+
+    /// Render enrichment as a single markdown string for system prompt injection.
+    ///
+    /// Unlike `render()` which wraps in XML tags for user message prepending,
+    /// this produces clean markdown sections for direct system prompt inclusion.
+    pub fn to_system_prompt_markdown(&self) -> String {
+        if self.sections.is_empty() {
+            return String::new();
+        }
+
+        let mut output = String::new();
+        for section in &self.sections {
+            output.push_str(&format!("## {}\n{}\n\n", section.title, section.content));
+        }
+        output.trim_end().to_string()
     }
 
     /// Render all sections into a single string for prompt injection.
@@ -413,6 +511,7 @@ mod tests {
             cwd: None,
             protocol_run_id: None,
             protocol_state: None,
+            excluded_note_ids: Default::default(),
         }
     }
 
@@ -691,6 +790,7 @@ mod tests {
             biomimicry: false,
             reflex: false,
             user_profile: false,
+            persona: false,
             reasoning_tree: true,
             debug: true,
             max_pipeline_ms: 1000,
@@ -701,5 +801,51 @@ mod tests {
         assert_eq!(deserialized.knowledge_injection, config.knowledge_injection);
         assert_eq!(deserialized.debug, config.debug);
         assert_eq!(deserialized.max_pipeline_ms, config.max_pipeline_ms);
+    }
+
+    // ── PromptSection bridge tests ──────────────────────────────────
+
+    #[tokio::test]
+    async fn test_to_prompt_sections_mapping() {
+        use crate::runner::prompt::PromptSection;
+
+        let mut ctx = EnrichmentContext::default();
+        ctx.add_section("Activated Skills", "skill content", "skill_stage");
+        ctx.add_section("Relevant Notes", "note content", "knowledge_stage");
+        ctx.add_section("Propagated Notes", "propagated content", "knowledge_stage");
+        ctx.add_section("File Context", "file content", "file_stage");
+        ctx.add_section("Persona Context", "persona content", "persona_stage");
+        ctx.add_section("Active Work", "task content", "status_stage");
+
+        let sections = ctx.to_prompt_sections();
+        assert_eq!(sections.len(), 6, "Should produce 6 PromptSections");
+
+        // Check correct mapping
+        assert!(matches!(&sections[0], PromptSection::SkillContext(_)));
+        assert!(matches!(&sections[1], PromptSection::KnowledgeNotes(_)));
+        assert!(matches!(&sections[2], PromptSection::PropagatedNotes(_)));
+        assert!(matches!(&sections[3], PromptSection::FileContext(_)));
+        assert!(matches!(&sections[4], PromptSection::PersonaContext(_)));
+        assert!(matches!(&sections[5], PromptSection::Enrichment(_)));
+    }
+
+    #[tokio::test]
+    async fn test_to_system_prompt_markdown() {
+        let mut ctx = EnrichmentContext::default();
+        ctx.add_section("Skills", "- Skill A", "test");
+        ctx.add_section("Notes", "- Note 1", "test");
+
+        let md = ctx.to_system_prompt_markdown();
+        assert!(md.contains("## Skills"));
+        assert!(md.contains("- Skill A"));
+        assert!(md.contains("## Notes"));
+        assert!(md.contains("- Note 1"));
+        assert!(!md.contains("<enrichment_context>"), "No XML wrapper");
+    }
+
+    #[tokio::test]
+    async fn test_to_system_prompt_markdown_empty() {
+        let ctx = EnrichmentContext::default();
+        assert_eq!(ctx.to_system_prompt_markdown(), "");
     }
 }

@@ -13,8 +13,8 @@ use crate::runner::enricher::TaskEnricher;
 use crate::runner::git;
 use crate::runner::guard::{AgentGuard, ChatManagerHintSender, GuardConfig, GuardVerdict};
 use crate::runner::models::{
-    ActiveAgent, ActiveAgentSnapshot, PlanRunStatus, RunnerConfig, RunnerEvent, TaskResult,
-    TriggerSource,
+    ActiveAgent, ActiveAgentSnapshot, PlanRunStatus, RunnerConfig, RunnerEvent,
+    TaskExecutionReport, TaskResult, TriggerSource,
 };
 use crate::runner::persona::{
     activate_skills_for_task, complexity_directive, profile_task, record_skill_feedback,
@@ -93,6 +93,88 @@ struct WaveResult {
     pub aborted: bool,
 }
 
+/// Summary of a completed task, used for inter-task continuity in a PlanRun.
+#[derive(Debug, Clone)]
+struct TaskSummary {
+    #[allow(dead_code)]
+    task_id: Uuid,
+    title: String,
+    wave_number: usize,
+    status: String, // "completed" or "failed"
+    commits: Vec<String>,
+    files_modified: Vec<String>,
+}
+
+/// Cumulative memory across waves in a PlanRun, providing continuity context
+/// to subsequent tasks so they know what was accomplished by previous tasks.
+#[derive(Debug, Clone, Default)]
+struct RunMemory {
+    summaries: Vec<TaskSummary>,
+}
+
+impl RunMemory {
+    /// Render the accumulated memory as a markdown section for prompt injection.
+    fn to_markdown(&self) -> String {
+        if self.summaries.is_empty() {
+            return String::new();
+        }
+        let mut md = String::from("\n## Previous Tasks (Continuity Context)\n\n");
+        md.push_str("The following tasks have already been completed in this plan run. ");
+        md.push_str("Build on their work — do NOT redo what is already done.\n\n");
+        for s in &self.summaries {
+            md.push_str(&format!(
+                "### Wave {} — {} ({})\n",
+                s.wave_number, s.title, s.status
+            ));
+            if !s.commits.is_empty() {
+                md.push_str("**Commits:**\n");
+                for c in &s.commits {
+                    md.push_str(&format!("- `{}`\n", c));
+                }
+            }
+            if !s.files_modified.is_empty() {
+                md.push_str("**Files modified:**\n");
+                for f in &s.files_modified {
+                    md.push_str(&format!("- `{}`\n", f));
+                }
+            }
+            md.push('\n');
+        }
+        md
+    }
+
+    /// Add a task summary from a completed task.
+    fn record_completed(
+        &mut self,
+        task_id: Uuid,
+        title: String,
+        wave_number: usize,
+        commits: Vec<String>,
+        files_modified: Vec<String>,
+    ) {
+        self.summaries.push(TaskSummary {
+            task_id,
+            title,
+            wave_number,
+            status: "completed".to_string(),
+            commits,
+            files_modified,
+        });
+    }
+
+    /// Add a summary for a failed task.
+    fn record_failed(&mut self, task_id: Uuid, title: String, wave_number: usize, reason: &str) {
+        self.summaries.push(TaskSummary {
+            task_id,
+            title,
+            wave_number,
+            status: format!("failed: {}", &reason[..reason.len().min(200)]),
+            commits: vec![],
+            files_modified: vec![],
+        });
+    }
+}
+
 /// Result of execute_task — wraps TaskResult with the session_id for enricher.
 #[derive(Debug)]
 struct TaskExecutionResult {
@@ -106,6 +188,8 @@ struct TaskExecutionResult {
     pub agent_execution_id: Uuid,
     /// Persona profile string used for this agent.
     pub persona_profile: String,
+    /// Structured execution report with tool usage metrics and confidence score.
+    pub report: Option<TaskExecutionReport>,
 }
 
 impl TaskExecutionResult {
@@ -582,6 +666,8 @@ impl PlanRunner {
             }
         }
 
+        let mut run_memory = RunMemory::default();
+
         for (wave_idx, wave) in waves.iter().enumerate() {
             let wave_number = wave_idx + 1;
 
@@ -611,6 +697,7 @@ impl PlanRunner {
             let wave_base_sha = git::head_sha(&cwd).await.unwrap_or_default();
 
             // Execute all tasks in this wave in parallel via JoinSet
+            let continuity_context = run_memory.to_markdown();
             let wave_result = self
                 .execute_wave(
                     run_id,
@@ -619,6 +706,7 @@ impl PlanRunner {
                     &cwd,
                     project_slug.as_deref(),
                     project_id,
+                    &continuity_context,
                 )
                 .await?;
 
@@ -739,6 +827,51 @@ impl PlanRunner {
                 tasks_completed: tc,
                 tasks_failed: tf,
             });
+
+            // Accumulate RunMemory from completed/failed tasks in this wave
+            for &task_id in &wave_result.tasks_completed {
+                let title = wave
+                    .tasks
+                    .iter()
+                    .find(|t| t.id == task_id)
+                    .and_then(|t| t.title.clone())
+                    .unwrap_or_else(|| format!("Task {}", task_id));
+                // Collect commits for this task from the graph (best effort)
+                let (commits, files) = match self.graph.get_task_commits(task_id).await {
+                    Ok(commit_nodes) => {
+                        let commit_msgs: Vec<String> = commit_nodes
+                            .iter()
+                            .map(|c| {
+                                format!(
+                                    "{}: {}",
+                                    &c.hash[..c.hash.len().min(8)],
+                                    c.message.lines().next().unwrap_or("")
+                                )
+                            })
+                            .collect();
+                        let mut all_files: Vec<String> = Vec::new();
+                        for c in &commit_nodes {
+                            if let Ok(files) = self.graph.get_commit_files(&c.hash).await {
+                                all_files.extend(files.into_iter().map(|f| f.path));
+                            }
+                        }
+                        all_files.sort();
+                        all_files.dedup();
+                        (commit_msgs, all_files)
+                    }
+                    Err(_) => (vec![], vec![]),
+                };
+                run_memory.record_completed(task_id, title, wave_number, commits, files);
+            }
+            for (task_id, reason) in &wave_result.tasks_failed {
+                let title = wave
+                    .tasks
+                    .iter()
+                    .find(|t| t.id == *task_id)
+                    .and_then(|t| t.title.clone())
+                    .unwrap_or_else(|| format!("Task {}", task_id));
+                run_memory.record_failed(*task_id, title, wave_number, reason);
+            }
         }
 
         // All waves completed successfully
@@ -752,6 +885,7 @@ impl PlanRunner {
     /// Each task is spawned as a separate tokio task. Results are collected as
     /// they complete. Budget and cancellation checks happen after each result,
     /// with `join_set.abort_all()` used to stop remaining tasks if needed.
+    #[allow(clippy::too_many_arguments)]
     async fn execute_wave(
         &self,
         run_id: Uuid,
@@ -760,6 +894,7 @@ impl PlanRunner {
         cwd: &str,
         project_slug: Option<&str>,
         project_id: Option<Uuid>,
+        continuity_context: &str,
     ) -> Result<WaveResult> {
         use tokio::task::JoinSet;
 
@@ -812,6 +947,7 @@ impl PlanRunner {
             let cwd = cwd.to_string();
             let project_slug = project_slug.map(|s| s.to_string());
             let title_clone = task_title.clone();
+            let continuity = continuity_context.to_string();
 
             join_set.spawn(async move {
                 let result = runner
@@ -822,6 +958,8 @@ impl PlanRunner {
                         &title_clone,
                         &cwd,
                         project_slug.as_deref(),
+                        None, // no retry context on first attempt
+                        &continuity,
                     )
                     .await;
                 (task_id, title_clone, result)
@@ -872,6 +1010,12 @@ impl PlanRunner {
                 .map(|r| r.persona_profile.clone())
                 .unwrap_or_default();
 
+            // Extract execution report before consuming the result
+            let task_report = task_result.as_ref().ok().and_then(|r| r.report.clone());
+            let task_report_json = task_report
+                .as_ref()
+                .and_then(|r| serde_json::to_string(r).ok());
+
             match task_result.map(|r| r.result) {
                 Ok(TaskResult::Success {
                     duration_secs,
@@ -914,9 +1058,21 @@ impl PlanRunner {
                     if let Some(ae_id) = task_agent_execution_id {
                         let graph = self.graph.clone();
                         let persona = task_persona.clone();
+                        let report_json = task_report_json.clone();
+                        let report_ref = task_report.clone();
                         tokio::spawn(async move {
                             use crate::neo4j::agent_execution::{
                                 AgentExecutionNode, AgentExecutionStatus,
+                            };
+                            let (tools_json, files, commits) = if let Some(ref r) = report_ref {
+                                (
+                                    serde_json::to_string(&r.tool_use_breakdown)
+                                        .unwrap_or_else(|_| "{}".to_string()),
+                                    r.files_modified.clone(),
+                                    r.commits.clone(),
+                                )
+                            } else {
+                                ("{}".to_string(), vec![], vec![])
                             };
                             let ae = AgentExecutionNode {
                                 id: ae_id,
@@ -928,11 +1084,12 @@ impl PlanRunner {
                                 cost_usd,
                                 duration_secs,
                                 status: AgentExecutionStatus::Completed,
-                                tools_used: "{}".to_string(),
-                                files_modified: vec![],
-                                commits: vec![],
+                                tools_used: tools_json,
+                                files_modified: files,
+                                commits,
                                 persona_profile: persona,
                                 vector_json: None,
+                                report_json,
                             };
                             if let Err(e) = graph.update_agent_execution(&ae).await {
                                 warn!("Failed to update AgentExecution {}: {}", ae_id, e);
@@ -1013,6 +1170,7 @@ impl PlanRunner {
                                 commits: vec![],
                                 persona_profile: persona,
                                 vector_json: None,
+                                report_json: None,
                             };
                             if let Err(e) = graph.update_agent_execution(&ae).await {
                                 warn!("Failed to update AgentExecution {}: {}", ae_id, e);
@@ -1106,6 +1264,7 @@ impl PlanRunner {
                                 commits: vec![],
                                 persona_profile: persona,
                                 vector_json: None,
+                                report_json: None,
                             };
                             if let Err(e) = graph.update_agent_execution(&ae).await {
                                 warn!("Failed to update AgentExecution {}: {}", ae_id, e);
@@ -1206,10 +1365,225 @@ impl PlanRunner {
             }
         }
 
+        // =====================================================================
+        // Retry loop — sequentially retry failed tasks with error context
+        // =====================================================================
+        if !wave_result.tasks_failed.is_empty()
+            && self.config.max_retries > 0
+            && !wave_result.aborted
+        {
+            // Build title lookup from wave tasks
+            let title_map: std::collections::HashMap<Uuid, String> = wave
+                .tasks
+                .iter()
+                .map(|t| {
+                    (
+                        t.id,
+                        t.title.clone().unwrap_or_else(|| "untitled".to_string()),
+                    )
+                })
+                .collect();
+
+            // Collect retryable tasks (those where on_task_failed returned true / status is Pending)
+            let retryable: Vec<(Uuid, String)> = {
+                let global = RUNNER_STATE.read().await;
+                wave_result
+                    .tasks_failed
+                    .iter()
+                    .filter(|(tid, _)| {
+                        // Eligible if retry_count <= max_retries (on_task_failed already incremented)
+                        global
+                            .as_ref()
+                            .map(|s| {
+                                let count = s.retry_counts.get(tid).copied().unwrap_or(0);
+                                count <= self.config.max_retries
+                            })
+                            .unwrap_or(false)
+                    })
+                    .cloned()
+                    .collect()
+            };
+
+            for (task_id, failure_reason) in &retryable {
+                // Check cancellation before each retry
+                if RUNNER_CANCEL.load(Ordering::SeqCst) {
+                    info!("Runner cancelled, skipping remaining retries");
+                    break;
+                }
+
+                // Check budget before retry
+                {
+                    let global = RUNNER_STATE.read().await;
+                    if let Some(ref s) = *global {
+                        if s.is_budget_exceeded(self.config.max_cost_usd) {
+                            info!("Budget exceeded, skipping remaining retries");
+                            break;
+                        }
+                    }
+                }
+
+                let task_title = title_map
+                    .get(task_id)
+                    .cloned()
+                    .unwrap_or_else(|| "untitled".to_string());
+
+                let retry_count = {
+                    let global = RUNNER_STATE.read().await;
+                    global
+                        .as_ref()
+                        .and_then(|s| s.retry_counts.get(task_id).copied())
+                        .unwrap_or(1)
+                };
+
+                info!(
+                    "Retrying task {} ({}) — attempt {}/{}",
+                    task_id, task_title, retry_count, self.config.max_retries
+                );
+
+                // Build retry context from failure reason
+                let retry_context = format!(
+                    "Attempt {attempt} failed with error:\n```\n{reason}\n```\n\
+                     Analyze the root cause carefully before retrying. \
+                     Do NOT repeat the same approach — adapt your strategy.",
+                    attempt = retry_count,
+                    reason = failure_reason,
+                );
+
+                // Execute the retry
+                let retry_result = self
+                    .execute_task(
+                        run_id,
+                        plan_id,
+                        *task_id,
+                        &task_title,
+                        cwd,
+                        project_slug,
+                        Some(retry_context),
+                        continuity_context,
+                    )
+                    .await;
+
+                match retry_result {
+                    Ok(exec_result) => match exec_result.result {
+                        TaskResult::Success {
+                            duration_secs,
+                            cost_usd,
+                        } => {
+                            info!(
+                                "Retry succeeded for task {} ({}) in {:.1}s",
+                                task_id, task_title, duration_secs
+                            );
+                            self.on_task_completed(run_id, *task_id, duration_secs, cost_usd)
+                                .await?;
+                            // Move from failed to completed
+                            wave_result.tasks_failed.retain(|(tid, _)| tid != task_id);
+                            wave_result.tasks_completed.push(*task_id);
+                            wave_result.wave_cost_usd += cost_usd;
+
+                            // Fire-and-forget enrichment for retry success
+                            let enricher = TaskEnricher::new(self.graph.clone());
+                            let enrich_plan_id = plan_id;
+                            let enrich_project_id = project_id;
+                            let enrich_session_id = exec_result.session_id();
+                            let enrich_cwd = cwd.to_string();
+                            let enrich_start = chrono::Utc::now();
+                            let retry_task_id = *task_id;
+                            tokio::spawn(async move {
+                                let result = enricher
+                                    .enrich(
+                                        retry_task_id,
+                                        enrich_plan_id,
+                                        enrich_project_id,
+                                        enrich_session_id,
+                                        enrich_start,
+                                        &enrich_cwd,
+                                    )
+                                    .await;
+                                info!(
+                                    "Enricher (retry) completed for task {}: {} commits, note={}, {} affects",
+                                    retry_task_id,
+                                    result.commits_linked,
+                                    result.note_created,
+                                    result.affects_added
+                                );
+                            });
+                        }
+                        TaskResult::Failed {
+                            reason,
+                            attempts: _,
+                            cost_usd,
+                        } => {
+                            warn!(
+                                "Retry failed again for task {} ({}): {}",
+                                task_id, task_title, reason
+                            );
+                            // Update the failure reason in wave_result
+                            if let Some(entry) = wave_result
+                                .tasks_failed
+                                .iter_mut()
+                                .find(|(tid, _)| tid == task_id)
+                            {
+                                entry.1 = format!("retry failed: {}", reason);
+                            }
+                            wave_result.wave_cost_usd += cost_usd;
+                            // Mark definitively failed
+                            self.update_task_status_with_event(*task_id, TaskStatus::Failed)
+                                .await?;
+                            {
+                                let mut global = RUNNER_STATE.write().await;
+                                if let Some(ref mut s) = *global {
+                                    s.mark_task_failed(*task_id);
+                                    self.graph.update_plan_run(s).await?;
+                                }
+                            }
+                            // Create gotcha note for future learning
+                            self.create_failure_gotcha(
+                                *task_id,
+                                &task_title,
+                                &reason,
+                                retry_count,
+                                project_id,
+                            )
+                            .await;
+                        }
+                        other => {
+                            warn!(
+                                "Retry for task {} returned unexpected result: {:?}",
+                                task_id, other
+                            );
+                        }
+                    },
+                    Err(e) => {
+                        error!("Retry execution error for task {}: {}", task_id, e);
+                        // Mark definitively failed
+                        self.update_task_status_with_event(*task_id, TaskStatus::Failed)
+                            .await?;
+                        {
+                            let mut global = RUNNER_STATE.write().await;
+                            if let Some(ref mut s) = *global {
+                                s.mark_task_failed(*task_id);
+                                self.graph.update_plan_run(s).await?;
+                            }
+                        }
+                        // Create gotcha note for future learning
+                        self.create_failure_gotcha(
+                            *task_id,
+                            &task_title,
+                            &e.to_string(),
+                            retry_count,
+                            project_id,
+                        )
+                        .await;
+                    }
+                }
+            }
+        }
+
         Ok(wave_result)
     }
 
     /// Execute a single task by spawning a Claude Code agent.
+    #[allow(clippy::too_many_arguments)]
     async fn execute_task(
         &self,
         run_id: Uuid,
@@ -1218,8 +1592,17 @@ impl PlanRunner {
         task_title: &str,
         cwd: &str,
         project_slug: Option<&str>,
+        retry_context: Option<String>,
+        continuity_context: &str,
     ) -> Result<TaskExecutionResult> {
-        info!("Executing task {}: {}", task_id, task_title);
+        if retry_context.is_some() {
+            info!(
+                "Retrying task {}: {} (with error context)",
+                task_id, task_title
+            );
+        } else {
+            info!("Executing task {}: {}", task_id, task_title);
+        }
 
         // Update global state — register active agent
         {
@@ -1286,17 +1669,13 @@ impl PlanRunner {
             "Task profiled"
         );
 
-        // --- Step 2: Activate skills ---
-        let project_id_for_skills = if let Some(slug) = &project_slug {
-            self.graph
-                .get_project_by_slug(slug)
-                .await
-                .ok()
-                .flatten()
-                .map(|p| p.id)
+        // --- Step 2: Resolve project once (reused for skills + scaffolding) ---
+        let project_node = if let Some(slug) = &project_slug {
+            self.graph.get_project_by_slug(slug).await.ok().flatten()
         } else {
             None
         };
+        let project_id_for_skills = project_node.as_ref().map(|p| p.id);
 
         let skill_activation =
             if let (Some(pid), Some(ref tn)) = (project_id_for_skills, &task_node) {
@@ -1361,6 +1740,17 @@ impl PlanRunner {
             .as_ref()
             .map(|t| t.frustration_score)
             .unwrap_or(0.0);
+        // Resolve scaffolding level from project (best effort, default L0)
+        let scaffolding_level = if let Some(ref project) = project_node {
+            self.graph
+                .compute_scaffolding_level(project.id, project.scaffolding_override)
+                .await
+                .map(|l| l.level)
+                .unwrap_or(0)
+        } else {
+            0
+        };
+
         let runner_ctx = RunnerPromptContext {
             git_branch,
             task_tags,
@@ -1370,8 +1760,29 @@ impl PlanRunner {
             frustration_level,
             wave_number,
             parallel_agents: 1, // default, overridden by execute_wave
+            scaffolding_level,
         };
         prompt.push_str(&build_runner_constraints(&runner_ctx));
+
+        // --- Step 2b.4: Inject continuity context from previous waves ---
+        if !continuity_context.is_empty() {
+            prompt.push_str(continuity_context);
+        }
+
+        // --- Step 2b.5: Inject retry context if this is a retry ---
+        if let Some(ref ctx) = retry_context {
+            prompt.push_str(&format!(
+                "\n## ⚠️ Previous Attempt Failed\n\
+                 This is a retry. The previous attempt failed with the following context:\n\n\
+                 {}\n\n\
+                 **Instructions for retry:**\n\
+                 - Analyze the error carefully before starting\n\
+                 - Try a DIFFERENT approach than the one that failed\n\
+                 - If the error was a compilation issue, check types and imports first\n\
+                 - If the error was a test failure, read the test expectations carefully\n",
+                ctx
+            ));
+        }
 
         // --- Step 2c: Inject persona context ---
         if let Some(ref pc) = persona_context {
@@ -1386,6 +1797,16 @@ impl PlanRunner {
         ));
 
         // Spawn agent: create_session → subscribe → send_message → listen
+        let task_context_str = task_node
+            .as_ref()
+            .map(|t| {
+                if t.description.is_empty() {
+                    t.title.clone().unwrap_or_default()
+                } else {
+                    t.description.clone()
+                }
+            })
+            .unwrap_or_default();
         let request = ChatRequest {
             message: String::new(), // message sent separately via send_message
             session_id: None,
@@ -1402,9 +1823,12 @@ impl PlanRunner {
                     "run_id": run_id.to_string(),
                     "plan_id": plan_id.to_string(),
                     "task_id": task_id.to_string(),
+                    "scaffolding_level": scaffolding_level,
                 })
                 .to_string(),
             ),
+            task_context: Some(task_context_str),
+            scaffolding_override: None,
         };
 
         let session = self.chat_manager.create_session(&request).await?;
@@ -1437,6 +1861,7 @@ impl PlanRunner {
                 commits: vec![],
                 persona_profile: persona_str.clone(),
                 vector_json: None,
+                report_json: None,
             };
             let graph = self.graph.clone();
             tokio::spawn(async move {
@@ -1458,6 +1883,7 @@ impl PlanRunner {
                 persona_ids: persona_ids_clone.clone(),
                 agent_execution_id,
                 persona_profile: persona_clone.clone(),
+                report: None,
             }
         };
 
@@ -1493,7 +1919,7 @@ impl PlanRunner {
         let guard_handle = tokio::spawn(async move { guard.monitor().await });
 
         // Listen for events until Result — in parallel with the guard
-        let event_result = self.listen_for_result(rx, run_id).await;
+        let (event_result, event_metrics) = self.listen_for_result(rx, run_id).await;
 
         // Wait for guard to finish (it should return quickly once the channel closes)
         let guard_verdict = match guard_handle.await {
@@ -1655,10 +2081,71 @@ impl PlanRunner {
         // NOTE: Verification (build check, steps, git sanity) is now performed
         // post-wave by execute_wave, not per-task. This avoids redundant build
         // checks when multiple tasks run in parallel within the same wave.
-        Ok(wrap(TaskResult::Success {
+
+        // Build TaskExecutionReport from event metrics + git data
+        let git_files = {
+            let output = tokio::process::Command::new("git")
+                .args(["diff", "--name-only", "HEAD~1..HEAD"])
+                .current_dir(cwd)
+                .output()
+                .await;
+            output
+                .map(|o| {
+                    String::from_utf8_lossy(&o.stdout)
+                        .lines()
+                        .filter(|l| !l.is_empty())
+                        .map(|l| l.to_string())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        };
+        let git_commits = {
+            let output = tokio::process::Command::new("git")
+                .args(["log", "--oneline", "--format=%H", "-5"])
+                .current_dir(cwd)
+                .output()
+                .await;
+            output
+                .map(|o| {
+                    String::from_utf8_lossy(&o.stdout)
+                        .lines()
+                        .filter(|l| !l.is_empty())
+                        .map(|l| l.to_string())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        };
+
+        let mut report = TaskExecutionReport {
+            tool_use_count: event_metrics.tool_use_count,
+            tool_use_breakdown: event_metrics.tool_use_breakdown,
+            error_count: event_metrics.error_count,
+            last_error: event_metrics.last_error,
+            files_modified: git_files,
+            commits: git_commits,
+            agent_success: !is_error,
+            cost_usd,
+            duration_secs,
+            confidence_score: 0.0,
+        };
+        report.compute_confidence();
+
+        info!(
+            "Task {} report: {} tool_uses, {} errors, {} files, {} commits, confidence={:.2}",
+            task_id,
+            report.tool_use_count,
+            report.error_count,
+            report.files_modified.len(),
+            report.commits.len(),
+            report.confidence_score,
+        );
+
+        let mut result = wrap(TaskResult::Success {
             duration_secs,
             cost_usd,
-        }))
+        });
+        result.report = Some(report);
+        Ok(result)
     }
 
     // ========================================================================
@@ -1709,6 +2196,8 @@ impl PlanRunner {
         Ok(())
     }
 
+    /// Handle a task failure. Returns `true` if a retry is eligible (retry count
+    /// has been incremented and task is marked Pending, not Failed).
     async fn on_task_failed(
         &self,
         run_id: Uuid,
@@ -1717,18 +2206,17 @@ impl PlanRunner {
         reason: &str,
         duration_secs: f64,
         cost_usd: f64,
-    ) -> Result<()> {
-        // Check retry count
-        let mut should_retry = false;
-        {
+    ) -> Result<bool> {
+        // Check retry eligibility
+        let (should_retry, retry_count) = {
             let global = RUNNER_STATE.read().await;
             if let Some(ref s) = *global {
-                let retry_count = s.retry_counts.get(&task_id).copied().unwrap_or(0);
-                if retry_count < self.config.max_retries {
-                    should_retry = true;
-                }
+                let count = s.retry_counts.get(&task_id).copied().unwrap_or(0);
+                (count < self.config.max_retries, count)
+            } else {
+                (false, 0)
             }
-        }
+        };
 
         if should_retry {
             // Increment retry count
@@ -1740,29 +2228,39 @@ impl PlanRunner {
             }
 
             warn!(
-                "Task {} failed ({}), retrying with error context...",
-                task_id, reason
+                "Task {} failed ({}), retry {}/{} eligible",
+                task_id,
+                reason,
+                retry_count + 1,
+                self.config.max_retries
             );
 
-            // Retry: re-execute with the error context injected
-            // For now, we just mark failed — retry logic will be enhanced in T3/T4
-            let retry_count = {
-                let global = RUNNER_STATE.read().await;
-                global
-                    .as_ref()
-                    .and_then(|s| s.retry_counts.get(&task_id).copied())
-                    .unwrap_or(0)
-            };
+            // Mark task back to Pending so retry can re-enter InProgress
+            self.update_task_status_with_event(task_id, TaskStatus::Pending)
+                .await?;
+
             self.emit_event(RunnerEvent::TaskFailed {
                 run_id,
                 task_id,
                 task_title: String::new(),
-                reason: format!("{} (will retry)", reason),
-                attempts: retry_count,
+                reason: format!(
+                    "{} (will retry {}/{})",
+                    reason,
+                    retry_count + 1,
+                    self.config.max_retries
+                ),
+                attempts: retry_count + 1,
             });
+
+            error!(
+                "Task {} failed (retryable): {} (duration: {:.1}s, cost: ${:.4})",
+                task_id, reason, duration_secs, cost_usd
+            );
+
+            return Ok(true);
         }
 
-        // Mark task as failed (with CrudEvent for WebSocket)
+        // No retries left — mark as definitively Failed
         self.update_task_status_with_event(task_id, TaskStatus::Failed)
             .await?;
 
@@ -1775,27 +2273,88 @@ impl PlanRunner {
             }
         }
 
-        let attempts = {
-            let global = RUNNER_STATE.read().await;
-            global
-                .as_ref()
-                .and_then(|s| s.retry_counts.get(&task_id).copied())
-                .unwrap_or(0)
-        };
         self.emit_event(RunnerEvent::TaskFailed {
             run_id,
             task_id,
             task_title: String::new(),
             reason: reason.to_string(),
-            attempts,
+            attempts: retry_count,
         });
 
         error!(
-            "Task {} failed: {} (duration: {:.1}s, cost: ${:.4})",
+            "Task {} failed (final): {} (duration: {:.1}s, cost: ${:.4})",
             task_id, reason, duration_secs, cost_usd
         );
 
-        Ok(())
+        Ok(false)
+    }
+
+    /// Create a gotcha note when a task fails definitively after all retries.
+    ///
+    /// This captures the failure context as a knowledge artifact so future runs
+    /// (and humans) can learn from the failure pattern.
+    async fn create_failure_gotcha(
+        &self,
+        task_id: Uuid,
+        task_title: &str,
+        reason: &str,
+        retry_count: u32,
+        project_id: Option<Uuid>,
+    ) {
+        use crate::notes::models::{Note, NoteImportance, NoteType};
+
+        let content = format!(
+            "## Task Failed After {retries} Retry(ies)\n\n\
+             **Task**: {title} (`{id}`)\n\n\
+             **Final error**:\n```\n{reason}\n```\n\n\
+             **Retries attempted**: {retries}/{max}\n\n\
+             This task could not be completed autonomously. \
+             Manual investigation is recommended.",
+            title = task_title,
+            id = task_id,
+            reason = reason,
+            retries = retry_count,
+            max = self.config.max_retries,
+        );
+
+        let mut note = Note::new(
+            project_id,
+            NoteType::Gotcha,
+            content,
+            "runner-retry".to_string(),
+        );
+        note.importance = NoteImportance::High;
+        note.tags = vec![
+            "auto-generated".to_string(),
+            "task-failure".to_string(),
+            "retry-exhausted".to_string(),
+            format!("task:{}", task_id),
+        ];
+
+        let note_id = note.id;
+        if let Err(e) = self.graph.create_note(&note).await {
+            warn!(
+                "Failed to create failure gotcha note for task {}: {}",
+                task_id, e
+            );
+            return;
+        }
+
+        // Link note to the task
+        use crate::notes::models::EntityType as NoteEntityType;
+        let task_id_str = task_id.to_string();
+        if let Err(e) = self
+            .graph
+            .link_note_to_entity(note_id, &NoteEntityType::Task, &task_id_str, None, None)
+            .await
+        {
+            warn!("Failed to link gotcha note to task {}: {}", task_id, e);
+        }
+
+        info!(
+            "Created failure gotcha note {} for task {} ({})",
+            note_id, task_id, task_title
+        );
     }
 
     /// Create a PR automatically via `gh pr create` after plan completion.
@@ -2033,55 +2592,90 @@ impl PlanRunner {
         &self,
         mut rx: broadcast::Receiver<ChatEvent>,
         _run_id: Uuid,
-    ) -> EventListenResult {
+    ) -> (EventListenResult, EventMetrics) {
         let start = std::time::Instant::now();
         // Use a generous timeout here — the guard handles the actual task_timeout
         // with soft hints before hard stop. This is just a safety net.
         let safety_timeout = std::time::Duration::from_secs(self.config.task_timeout_secs + 60);
         let mut cost_usd = 0.0_f64;
+        let mut metrics = EventMetrics::default();
 
         loop {
             let remaining = safety_timeout.saturating_sub(start.elapsed());
             if remaining.is_zero() {
-                return EventListenResult::Completed {
-                    cost_usd,
-                    is_error: true,
-                    error_text: "Safety timeout exceeded".to_string(),
-                    subtype: "timeout".to_string(),
-                };
+                return (
+                    EventListenResult::Completed {
+                        cost_usd,
+                        is_error: true,
+                        error_text: "Safety timeout exceeded".to_string(),
+                        subtype: "timeout".to_string(),
+                    },
+                    metrics,
+                );
             }
 
             // Check cancel flag
             if RUNNER_CANCEL.load(Ordering::SeqCst) {
-                return EventListenResult::Cancelled { cost_usd };
+                return (EventListenResult::Cancelled { cost_usd }, metrics);
             }
 
             match tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await {
                 Ok(Ok(event)) => {
-                    if let ChatEvent::Result {
-                        cost_usd: event_cost,
-                        subtype,
-                        is_error,
-                        result_text,
-                        ..
-                    } = event
-                    {
-                        if let Some(c) = event_cost {
-                            cost_usd = c;
+                    match &event {
+                        ChatEvent::ToolUse { tool, .. } => {
+                            metrics.tool_use_count += 1;
+                            *metrics.tool_use_breakdown.entry(tool.clone()).or_insert(0) += 1;
                         }
-                        return EventListenResult::Completed {
-                            cost_usd,
-                            is_error,
-                            error_text: result_text.unwrap_or_default(),
+                        ChatEvent::ToolResult {
+                            is_error, result, ..
+                        } if *is_error => {
+                            metrics.error_count += 1;
+                            // Extract error text from the result value
+                            let err_text = result
+                                .as_str()
+                                .map(|s| s.to_string())
+                                .or_else(|| {
+                                    result
+                                        .get("error")
+                                        .and_then(|e| e.as_str())
+                                        .map(|s| s.to_string())
+                                })
+                                .unwrap_or_else(|| result.to_string());
+                            // Keep last 500 chars to avoid bloat
+                            metrics.last_error = Some(if err_text.len() > 500 {
+                                err_text[err_text.len() - 500..].to_string()
+                            } else {
+                                err_text
+                            });
+                        }
+                        ChatEvent::Result {
+                            cost_usd: event_cost,
                             subtype,
-                        };
+                            is_error,
+                            result_text,
+                            ..
+                        } => {
+                            if let Some(c) = event_cost {
+                                cost_usd = *c;
+                            }
+                            return (
+                                EventListenResult::Completed {
+                                    cost_usd,
+                                    is_error: *is_error,
+                                    error_text: result_text.clone().unwrap_or_default(),
+                                    subtype: subtype.clone(),
+                                },
+                                metrics,
+                            );
+                        }
+                        _ => {}
                     }
                 }
                 Ok(Err(broadcast::error::RecvError::Lagged(n))) => {
                     warn!("Runner event receiver lagged by {} events", n);
                 }
                 Ok(Err(broadcast::error::RecvError::Closed)) => {
-                    return EventListenResult::ChannelClosed { cost_usd };
+                    return (EventListenResult::ChannelClosed { cost_usd }, metrics);
                 }
                 Err(_) => {
                     // 5s poll timeout — just loop again (check cancel flag)
@@ -2110,6 +2704,22 @@ enum EventListenResult {
     Cancelled { cost_usd: f64 },
 }
 
+/// Metrics collected from ChatEvents during task execution.
+///
+/// Populated by `listen_for_result` while waiting for the final Result event.
+/// Used to build [`TaskExecutionReport`] after task completion.
+#[derive(Debug, Default)]
+struct EventMetrics {
+    /// Total tool_use events
+    tool_use_count: u32,
+    /// Per-tool breakdown
+    tool_use_breakdown: std::collections::HashMap<String, u32>,
+    /// Number of tool_result events that indicate errors
+    error_count: u32,
+    /// Last error text from a tool_result
+    last_error: Option<String>,
+}
+
 // ============================================================================
 // Trait impls
 // ============================================================================
@@ -2136,13 +2746,24 @@ mod tests {
     use super::*;
     use crate::runner::models::TriggerSource;
 
-    #[tokio::test]
-    async fn test_status_when_no_run() {
-        // Clear global state
+    /// Mutex to serialize tests that touch global RUNNER_STATE / RUNNER_CANCEL.
+    /// tokio::sync::Mutex is used because these are async tests.
+    static TEST_MUTEX: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+    /// Reset global state to a clean baseline.
+    async fn reset_globals() {
         {
             let mut global = RUNNER_STATE.write().await;
             *global = None;
         }
+        RUNNER_CANCEL.store(false, Ordering::SeqCst);
+    }
+
+    #[tokio::test]
+    async fn test_status_when_no_run() {
+        let _lock = TEST_MUTEX.lock().await;
+        reset_globals().await;
         let status = PlanRunner::status().await;
         assert!(!status.running);
         assert!(status.run_id.is_none());
@@ -2151,6 +2772,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_status_when_running() {
+        let _lock = TEST_MUTEX.lock().await;
+        reset_globals().await;
         let run_id = Uuid::new_v4();
         let plan_id = Uuid::new_v4();
         let state = RunnerState::new(run_id, plan_id, 5, TriggerSource::Manual);
@@ -2164,20 +2787,13 @@ mod tests {
         assert_eq!(status.plan_id, Some(plan_id));
         assert_eq!(status.tasks_total, 5);
         assert_eq!(status.tasks_completed, 0);
-
-        // Cleanup
-        {
-            let mut global = RUNNER_STATE.write().await;
-            *global = None;
-        }
+        reset_globals().await;
     }
 
     #[tokio::test]
     async fn test_cancel_no_active_run() {
-        {
-            let mut global = RUNNER_STATE.write().await;
-            *global = None;
-        }
+        let _lock = TEST_MUTEX.lock().await;
+        reset_globals().await;
         let result = PlanRunner::cancel(Uuid::new_v4()).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("No active run"));
@@ -2185,6 +2801,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_cancel_sets_flag() {
+        let _lock = TEST_MUTEX.lock().await;
+        reset_globals().await;
         let run_id = Uuid::new_v4();
         let plan_id = Uuid::new_v4();
         let state = RunnerState::new(run_id, plan_id, 3, TriggerSource::Manual);
@@ -2192,22 +2810,17 @@ mod tests {
             let mut global = RUNNER_STATE.write().await;
             *global = Some(state);
         }
-        RUNNER_CANCEL.store(false, Ordering::SeqCst);
 
         let result = PlanRunner::cancel(run_id).await;
         assert!(result.is_ok());
         assert!(RUNNER_CANCEL.load(Ordering::SeqCst));
-
-        // Cleanup
-        {
-            let mut global = RUNNER_STATE.write().await;
-            *global = None;
-        }
-        RUNNER_CANCEL.store(false, Ordering::SeqCst);
+        reset_globals().await;
     }
 
     #[tokio::test]
     async fn test_cancel_wrong_run_id() {
+        let _lock = TEST_MUTEX.lock().await;
+        reset_globals().await;
         let run_id = Uuid::new_v4();
         let plan_id = Uuid::new_v4();
         let state = RunnerState::new(run_id, plan_id, 3, TriggerSource::Manual);
@@ -2219,12 +2832,7 @@ mod tests {
         let result = PlanRunner::cancel(Uuid::new_v4()).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("not running"));
-
-        // Cleanup
-        {
-            let mut global = RUNNER_STATE.write().await;
-            *global = None;
-        }
+        reset_globals().await;
     }
 
     #[test]
@@ -2237,6 +2845,118 @@ mod tests {
         assert!(constraints.contains("task(action: \"update\", status"));
         assert!(constraints.contains(".env"));
         assert!(constraints.contains("cargo check"));
+    }
+
+    // ---------------------------------------------------------------
+    // RunMemory / TaskSummary unit tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_run_memory_to_markdown_empty() {
+        let mem = RunMemory::default();
+        assert_eq!(mem.to_markdown(), "");
+    }
+
+    #[test]
+    fn test_run_memory_to_markdown_single_completed() {
+        let mut mem = RunMemory::default();
+        mem.record_completed(
+            Uuid::new_v4(),
+            "Setup CI".into(),
+            1,
+            vec!["abc1234".into()],
+            vec!["ci.yml".into()],
+        );
+        let md = mem.to_markdown();
+        assert!(md.contains("## Previous Tasks (Continuity Context)"));
+        assert!(md.contains("### Wave 1 — Setup CI (completed)"));
+        assert!(md.contains("**Commits:**"));
+        assert!(md.contains("- `abc1234`"));
+        assert!(md.contains("**Files modified:**"));
+        assert!(md.contains("- `ci.yml`"));
+    }
+
+    #[test]
+    fn test_run_memory_to_markdown_multiple_waves() {
+        let mut mem = RunMemory::default();
+        mem.record_completed(Uuid::new_v4(), "Task A".into(), 1, vec![], vec![]);
+        mem.record_completed(
+            Uuid::new_v4(),
+            "Task B".into(),
+            2,
+            vec!["def5678".into()],
+            vec!["src/main.rs".into(), "Cargo.toml".into()],
+        );
+        let md = mem.to_markdown();
+        assert!(md.contains("### Wave 1 — Task A (completed)"));
+        assert!(md.contains("### Wave 2 — Task B (completed)"));
+        // Task A has no commits/files — sections should be absent for it
+        // but present for Task B
+        assert!(md.contains("- `def5678`"));
+        assert!(md.contains("- `src/main.rs`"));
+        assert!(md.contains("- `Cargo.toml`"));
+    }
+
+    #[test]
+    fn test_run_memory_to_markdown_failed_task() {
+        let mut mem = RunMemory::default();
+        mem.record_failed(Uuid::new_v4(), "Broken task".into(), 1, "compilation error");
+        let md = mem.to_markdown();
+        assert!(md.contains("### Wave 1 — Broken task (failed: compilation error)"));
+        // Failed tasks should NOT have commits/files sections
+        assert!(!md.contains("**Commits:**"));
+        assert!(!md.contains("**Files modified:**"));
+    }
+
+    #[test]
+    fn test_run_memory_to_markdown_omits_empty_commits_and_files() {
+        let mut mem = RunMemory::default();
+        mem.record_completed(Uuid::new_v4(), "No artifacts".into(), 1, vec![], vec![]);
+        let md = mem.to_markdown();
+        assert!(md.contains("### Wave 1 — No artifacts (completed)"));
+        assert!(!md.contains("**Commits:**"));
+        assert!(!md.contains("**Files modified:**"));
+    }
+
+    #[test]
+    fn test_run_memory_record_completed_stores_fields() {
+        let task_id = Uuid::new_v4();
+        let mut mem = RunMemory::default();
+        mem.record_completed(
+            task_id,
+            "My task".into(),
+            3,
+            vec!["c1".into(), "c2".into()],
+            vec!["f1.rs".into()],
+        );
+        assert_eq!(mem.summaries.len(), 1);
+        let s = &mem.summaries[0];
+        assert_eq!(s.task_id, task_id);
+        assert_eq!(s.title, "My task");
+        assert_eq!(s.wave_number, 3);
+        assert_eq!(s.status, "completed");
+        assert_eq!(s.commits, vec!["c1", "c2"]);
+        assert_eq!(s.files_modified, vec!["f1.rs"]);
+    }
+
+    #[test]
+    fn test_run_memory_record_failed_truncates_reason() {
+        let mut mem = RunMemory::default();
+        let long_reason = "x".repeat(300);
+        mem.record_failed(Uuid::new_v4(), "Fail".into(), 1, &long_reason);
+        let s = &mem.summaries[0];
+        // status = "failed: " (8 chars) + truncated reason (200 chars) = 208 chars
+        assert_eq!(s.status.len(), 208);
+        assert!(s.status.starts_with("failed: "));
+        assert!(s.status.ends_with("xxxx"));
+    }
+
+    #[test]
+    fn test_run_memory_record_failed_short_reason_not_truncated() {
+        let mut mem = RunMemory::default();
+        mem.record_failed(Uuid::new_v4(), "Fail".into(), 1, "short reason");
+        let s = &mem.summaries[0];
+        assert_eq!(s.status, "failed: short reason");
     }
 
     #[test]
@@ -2259,5 +2979,564 @@ mod tests {
         let json = serde_json::to_string(&status).unwrap();
         assert!(json.contains("\"running\":false"));
         assert!(json.contains("\"active_agents\":[]"));
+    }
+
+    // ---------------------------------------------------------------
+    // Helper: build a PlanRunner with mock stores
+    // ---------------------------------------------------------------
+
+    fn test_plan_runner() -> PlanRunner {
+        use crate::chat::config::ChatConfig;
+        use crate::chat::manager::ChatManager;
+        use crate::meilisearch::mock::MockSearchStore;
+        use crate::meilisearch::traits::SearchStore;
+        use crate::neo4j::mock::MockGraphStore;
+        use crate::notes::manager::NoteManager;
+        use crate::orchestrator::context::ContextBuilder;
+        use crate::plan::manager::PlanManager;
+
+        let graph: Arc<dyn GraphStore> = Arc::new(MockGraphStore::new());
+        let search: Arc<dyn SearchStore> = Arc::new(MockSearchStore::new());
+        let chat_config = ChatConfig {
+            mcp_server_path: std::path::PathBuf::from("/dev/null"),
+            default_model: "test".into(),
+            max_sessions: 1,
+            session_timeout: std::time::Duration::from_secs(10),
+            neo4j_uri: "bolt://mock:7687".into(),
+            neo4j_user: "neo4j".into(),
+            neo4j_password: "test".into(),
+            meilisearch_url: "http://mock:7700".into(),
+            meilisearch_key: "test".into(),
+            nats_url: None,
+            max_turns: 5,
+            permission: Default::default(),
+            auto_continue: false,
+            retry: Default::default(),
+            process_path: None,
+            claude_cli_path: None,
+            auto_update_cli: false,
+            auto_update_app: false,
+            jwt_secret: None,
+            server_port: 0,
+            session_token_expiry_secs: 3600,
+        };
+        let chat_manager = Arc::new(ChatManager::new_without_memory(
+            graph.clone(),
+            search.clone(),
+            chat_config,
+        ));
+        let plan_manager = Arc::new(PlanManager::new(graph.clone(), search.clone()));
+        let note_manager = Arc::new(NoteManager::new(graph.clone(), search.clone()));
+        let context_builder = Arc::new(ContextBuilder::new(
+            graph.clone(),
+            search.clone(),
+            plan_manager,
+            note_manager,
+        ));
+        let (event_tx, _) = broadcast::channel(16);
+        PlanRunner::new(
+            chat_manager,
+            graph,
+            context_builder,
+            RunnerConfig::default(),
+            event_tx,
+        )
+    }
+
+    // ---------------------------------------------------------------
+    // EventMetrics tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_event_metrics_default() {
+        let m = EventMetrics::default();
+        assert_eq!(m.tool_use_count, 0);
+        assert!(m.tool_use_breakdown.is_empty());
+        assert_eq!(m.error_count, 0);
+        assert!(m.last_error.is_none());
+    }
+
+    #[test]
+    fn test_event_metrics_mutation() {
+        let mut breakdown = std::collections::HashMap::new();
+        breakdown.insert("Edit".to_string(), 3u32);
+        breakdown.insert("Bash".to_string(), 2u32);
+        let m = EventMetrics {
+            tool_use_count: 5,
+            tool_use_breakdown: breakdown,
+            error_count: 1,
+            last_error: Some("something broke".into()),
+        };
+
+        assert_eq!(m.tool_use_count, 5);
+        assert_eq!(m.tool_use_breakdown.len(), 2);
+        assert_eq!(m.tool_use_breakdown["Edit"], 3);
+        assert_eq!(m.tool_use_breakdown["Bash"], 2);
+        assert_eq!(m.error_count, 1);
+        assert_eq!(m.last_error.as_deref(), Some("something broke"));
+    }
+
+    // ---------------------------------------------------------------
+    // listen_for_result tests
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_listen_for_result_completed() {
+        let runner = test_plan_runner();
+        let (tx, rx) = broadcast::channel::<ChatEvent>(16);
+        let run_id = Uuid::new_v4();
+
+        // Send a ToolUse, then a Result
+        tx.send(ChatEvent::ToolUse {
+            id: "tu1".into(),
+            tool: "Edit".into(),
+            input: serde_json::json!({}),
+            parent_tool_use_id: None,
+        })
+        .unwrap();
+
+        tx.send(ChatEvent::ToolUse {
+            id: "tu2".into(),
+            tool: "Bash".into(),
+            input: serde_json::json!({}),
+            parent_tool_use_id: None,
+        })
+        .unwrap();
+
+        tx.send(ChatEvent::ToolUse {
+            id: "tu3".into(),
+            tool: "Edit".into(),
+            input: serde_json::json!({}),
+            parent_tool_use_id: None,
+        })
+        .unwrap();
+
+        tx.send(ChatEvent::Result {
+            session_id: "s1".into(),
+            duration_ms: 1000,
+            cost_usd: Some(0.05),
+            subtype: "success".into(),
+            is_error: false,
+            num_turns: Some(3),
+            result_text: None,
+        })
+        .unwrap();
+
+        RUNNER_CANCEL.store(false, Ordering::SeqCst);
+        let (result, metrics) = runner.listen_for_result(rx, run_id).await;
+
+        assert_eq!(metrics.tool_use_count, 3);
+        assert_eq!(metrics.tool_use_breakdown["Edit"], 2);
+        assert_eq!(metrics.tool_use_breakdown["Bash"], 1);
+        assert_eq!(metrics.error_count, 0);
+        assert!(metrics.last_error.is_none());
+
+        match result {
+            EventListenResult::Completed {
+                cost_usd,
+                is_error,
+                subtype,
+                ..
+            } => {
+                assert!((cost_usd - 0.05).abs() < f64::EPSILON);
+                assert!(!is_error);
+                assert_eq!(subtype, "success");
+            }
+            _ => panic!("Expected Completed variant"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_listen_for_result_tracks_errors() {
+        let runner = test_plan_runner();
+        let (tx, rx) = broadcast::channel::<ChatEvent>(16);
+        let run_id = Uuid::new_v4();
+
+        tx.send(ChatEvent::ToolResult {
+            id: "tr1".into(),
+            result: serde_json::json!("first error message"),
+            is_error: true,
+            parent_tool_use_id: None,
+        })
+        .unwrap();
+
+        tx.send(ChatEvent::ToolResult {
+            id: "tr2".into(),
+            result: serde_json::json!({"error": "second error"}),
+            is_error: true,
+            parent_tool_use_id: None,
+        })
+        .unwrap();
+
+        tx.send(ChatEvent::Result {
+            session_id: "s1".into(),
+            duration_ms: 500,
+            cost_usd: Some(0.01),
+            subtype: "success".into(),
+            is_error: false,
+            num_turns: None,
+            result_text: None,
+        })
+        .unwrap();
+
+        RUNNER_CANCEL.store(false, Ordering::SeqCst);
+        let (_result, metrics) = runner.listen_for_result(rx, run_id).await;
+
+        assert_eq!(metrics.error_count, 2);
+        // last_error should be from the second error event
+        assert_eq!(metrics.last_error.as_deref(), Some("second error"));
+    }
+
+    #[tokio::test]
+    async fn test_listen_for_result_error_truncation() {
+        let runner = test_plan_runner();
+        let (tx, rx) = broadcast::channel::<ChatEvent>(16);
+        let run_id = Uuid::new_v4();
+
+        let long_error = "x".repeat(1000);
+        tx.send(ChatEvent::ToolResult {
+            id: "tr1".into(),
+            result: serde_json::json!(long_error),
+            is_error: true,
+            parent_tool_use_id: None,
+        })
+        .unwrap();
+
+        tx.send(ChatEvent::Result {
+            session_id: "s1".into(),
+            duration_ms: 100,
+            cost_usd: None,
+            subtype: "success".into(),
+            is_error: false,
+            num_turns: None,
+            result_text: None,
+        })
+        .unwrap();
+
+        RUNNER_CANCEL.store(false, Ordering::SeqCst);
+        let (_result, metrics) = runner.listen_for_result(rx, run_id).await;
+
+        assert_eq!(metrics.error_count, 1);
+        // Error text should be truncated to 500 chars
+        assert_eq!(metrics.last_error.as_ref().unwrap().len(), 500);
+    }
+
+    #[tokio::test]
+    async fn test_listen_for_result_channel_closed() {
+        let runner = test_plan_runner();
+        let (tx, rx) = broadcast::channel::<ChatEvent>(16);
+        let run_id = Uuid::new_v4();
+
+        // Drop sender to close channel
+        drop(tx);
+
+        RUNNER_CANCEL.store(false, Ordering::SeqCst);
+        let (result, metrics) = runner.listen_for_result(rx, run_id).await;
+
+        assert_eq!(metrics.tool_use_count, 0);
+        match result {
+            EventListenResult::ChannelClosed { cost_usd } => {
+                assert!((cost_usd - 0.0).abs() < f64::EPSILON);
+            }
+            _ => panic!("Expected ChannelClosed variant"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_listen_for_result_cancelled() {
+        let _lock = TEST_MUTEX.lock().await;
+        reset_globals().await;
+        let runner = test_plan_runner();
+        let (_tx, rx) = broadcast::channel::<ChatEvent>(16);
+        let run_id = Uuid::new_v4();
+
+        // Set cancel flag BEFORE listening
+        RUNNER_CANCEL.store(true, Ordering::SeqCst);
+        let (result, _metrics) = runner.listen_for_result(rx, run_id).await;
+
+        match result {
+            EventListenResult::Cancelled { cost_usd } => {
+                assert!((cost_usd - 0.0).abs() < f64::EPSILON);
+            }
+            _ => panic!("Expected Cancelled variant"),
+        }
+        reset_globals().await;
+    }
+
+    // ---------------------------------------------------------------
+    // create_failure_gotcha tests
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_create_failure_gotcha_creates_note() {
+        let runner = test_plan_runner();
+        let task_id = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+
+        runner
+            .create_failure_gotcha(
+                task_id,
+                "Build CI pipeline",
+                "compilation failed",
+                2,
+                Some(project_id),
+            )
+            .await;
+
+        // The mock graph store should have received the create_note call.
+        // Use list_notes to retrieve notes from the mock store.
+        let (notes, count) = runner
+            .graph
+            .list_notes(
+                Some(project_id),
+                None,
+                &crate::notes::NoteFilters::default(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(count, 1);
+        assert_eq!(notes.len(), 1);
+        let note = &notes[0];
+        assert!(note.content.contains("Build CI pipeline"));
+        assert!(note.content.contains("compilation failed"));
+        assert!(note.content.contains("2 Retry(ies)"));
+        assert_eq!(note.note_type, crate::notes::NoteType::Gotcha);
+        assert_eq!(note.importance, crate::notes::NoteImportance::High);
+        assert!(note.tags.contains(&"auto-generated".to_string()));
+        assert!(note.tags.contains(&"task-failure".to_string()));
+        assert!(note.tags.contains(&"retry-exhausted".to_string()));
+        assert!(note.tags.contains(&format!("task:{}", task_id)));
+    }
+
+    #[tokio::test]
+    async fn test_create_failure_gotcha_without_project() {
+        let runner = test_plan_runner();
+        let task_id = Uuid::new_v4();
+
+        // Should not panic even with project_id = None
+        runner
+            .create_failure_gotcha(task_id, "Task title", "some error", 1, None)
+            .await;
+    }
+
+    // ---------------------------------------------------------------
+    // on_task_failed tests
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_on_task_failed_should_retry() {
+        let _lock = TEST_MUTEX.lock().await;
+        reset_globals().await;
+        let runner = test_plan_runner();
+        let run_id = Uuid::new_v4();
+        let plan_id = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
+
+        // Set up RUNNER_STATE with a state that has 0 retries for this task
+        {
+            let state = RunnerState::new(run_id, plan_id, 3, TriggerSource::Manual);
+            let mut global = RUNNER_STATE.write().await;
+            *global = Some(state);
+        }
+
+        // RunnerConfig default max_retries = 1, so retry_count 0 < 1 → should retry
+        let result = runner
+            .on_task_failed(run_id, plan_id, task_id, "test error", 5.0, 0.01)
+            .await
+            .unwrap();
+
+        assert!(result, "Should return true when retries are available");
+
+        // Verify retry count was incremented
+        {
+            let global = RUNNER_STATE.read().await;
+            let s = global.as_ref().unwrap();
+            assert_eq!(s.retry_counts.get(&task_id).copied(), Some(1));
+        }
+        reset_globals().await;
+    }
+
+    #[tokio::test]
+    async fn test_on_task_failed_no_retry_when_exhausted() {
+        let _lock = TEST_MUTEX.lock().await;
+        reset_globals().await;
+        let runner = test_plan_runner();
+        let run_id = Uuid::new_v4();
+        let plan_id = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
+
+        // Set up RUNNER_STATE with retry_count already at max_retries (1)
+        {
+            let mut state = RunnerState::new(run_id, plan_id, 3, TriggerSource::Manual);
+            state.retry_counts.insert(task_id, 1); // already at max
+            let mut global = RUNNER_STATE.write().await;
+            *global = Some(state);
+        }
+
+        // retry_count 1 >= max_retries 1 → should NOT retry
+        let result = runner
+            .on_task_failed(run_id, plan_id, task_id, "final failure", 10.0, 0.05)
+            .await
+            .unwrap();
+
+        assert!(!result, "Should return false when retries exhausted");
+        reset_globals().await;
+    }
+
+    #[tokio::test]
+    async fn test_on_task_failed_no_retry_without_state() {
+        let _lock = TEST_MUTEX.lock().await;
+        reset_globals().await;
+        let runner = test_plan_runner();
+        let result = runner
+            .on_task_failed(
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                "err",
+                1.0,
+                0.0,
+            )
+            .await
+            .unwrap();
+
+        assert!(!result, "Should return false when no runner state");
+        reset_globals().await;
+    }
+
+    // ---------------------------------------------------------------
+    // WaveResult tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_wave_result_empty() {
+        let wr = WaveResult {
+            tasks_completed: vec![],
+            tasks_failed: vec![],
+            wave_cost_usd: 0.0,
+            aborted: false,
+        };
+        assert!(wr.tasks_completed.is_empty());
+        assert!(wr.tasks_failed.is_empty());
+        assert!(!wr.aborted);
+        assert!((wr.wave_cost_usd - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_wave_result_with_completed_and_failed() {
+        let id1 = Uuid::new_v4();
+        let id2 = Uuid::new_v4();
+        let id3 = Uuid::new_v4();
+        let wr = WaveResult {
+            tasks_completed: vec![id1, id2],
+            tasks_failed: vec![(id3, "timeout".to_string())],
+            wave_cost_usd: 1.23,
+            aborted: false,
+        };
+        assert_eq!(wr.tasks_completed.len(), 2);
+        assert_eq!(wr.tasks_failed.len(), 1);
+        assert_eq!(wr.tasks_failed[0].0, id3);
+        assert_eq!(wr.tasks_failed[0].1, "timeout");
+        assert!((wr.wave_cost_usd - 1.23).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_wave_result_aborted() {
+        let wr = WaveResult {
+            tasks_completed: vec![Uuid::new_v4()],
+            tasks_failed: vec![],
+            wave_cost_usd: 5.0,
+            aborted: true,
+        };
+        assert!(wr.aborted);
+    }
+
+    // ---------------------------------------------------------------
+    // TaskExecutionResult tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_task_execution_result_session_id() {
+        use crate::runner::models::TaskResult;
+
+        let session = Uuid::new_v4();
+        let exec_id = Uuid::new_v4();
+        let ter = TaskExecutionResult {
+            result: TaskResult::Success {
+                cost_usd: 0.05,
+                duration_secs: 30.0,
+            },
+            session_id: Some(session),
+            activated_skill_ids: vec![],
+            persona_ids: vec![],
+            agent_execution_id: exec_id,
+            persona_profile: "test-persona".into(),
+            report: None,
+        };
+        assert_eq!(ter.session_id(), Some(session));
+    }
+
+    #[test]
+    fn test_task_execution_result_no_session() {
+        use crate::runner::models::TaskResult;
+
+        let ter = TaskExecutionResult {
+            result: TaskResult::Failed {
+                reason: "test failure".into(),
+                attempts: 2,
+                cost_usd: 0.1,
+            },
+            session_id: None,
+            activated_skill_ids: vec![Uuid::new_v4()],
+            persona_ids: vec![Uuid::new_v4()],
+            agent_execution_id: Uuid::new_v4(),
+            persona_profile: String::new(),
+            report: None,
+        };
+        assert_eq!(ter.session_id(), None);
+    }
+
+    #[test]
+    fn test_task_execution_result_with_report() {
+        use crate::runner::models::{TaskExecutionReport, TaskResult};
+
+        let report = TaskExecutionReport {
+            tool_use_count: 10,
+            tool_use_breakdown: {
+                let mut m = std::collections::HashMap::new();
+                m.insert("Edit".into(), 7);
+                m.insert("Bash".into(), 3);
+                m
+            },
+            error_count: 1,
+            last_error: Some("compile error".into()),
+            files_modified: vec!["src/main.rs".into()],
+            commits: vec!["abc1234".into()],
+            agent_success: true,
+            cost_usd: 0.05,
+            duration_secs: 45.0,
+            confidence_score: 0.85,
+        };
+
+        let ter = TaskExecutionResult {
+            result: TaskResult::Success {
+                cost_usd: 0.05,
+                duration_secs: 45.0,
+            },
+            session_id: Some(Uuid::new_v4()),
+            activated_skill_ids: vec![],
+            persona_ids: vec![],
+            agent_execution_id: Uuid::new_v4(),
+            persona_profile: "dev".into(),
+            report: Some(report),
+        };
+
+        assert!(ter.report.is_some());
+        let r = ter.report.as_ref().unwrap();
+        assert_eq!(r.tool_use_count, 10);
+        assert_eq!(r.error_count, 1);
+        assert!(r.agent_success);
+        assert!((r.confidence_score - 0.85).abs() < f64::EPSILON);
     }
 }

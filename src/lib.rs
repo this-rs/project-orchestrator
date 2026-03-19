@@ -193,7 +193,6 @@ pub struct ChatYamlConfig {
     pub max_sessions: Option<usize>,
     pub session_timeout_secs: Option<u64>,
     pub max_turns: Option<i32>,
-    pub prompt_builder_model: Option<String>,
     /// Permission configuration (mode + allowed/disallowed tool patterns).
     /// When absent, falls back to env vars or defaults (BypassPermissions).
     #[serde(default)]
@@ -1204,6 +1203,9 @@ pub async fn start_server(mut config: Config) -> Result<()> {
         }
         if let Some(ref tc) = trajectory_collector {
             cm = cm.with_trajectory_collector(tc.clone());
+        }
+        if let Some(re) = orchestrator.reasoning_engine() {
+            cm = cm.with_reasoning_engine(re.clone());
         }
         let cm = Arc::new(cm);
         cm.start_cleanup_task();

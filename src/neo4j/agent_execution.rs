@@ -30,6 +30,8 @@ pub struct AgentExecutionNode {
     pub persona_profile: String,
     /// Per-agent execution vector JSON (serialized AgentExecutionVector)
     pub vector_json: Option<String>,
+    /// Structured execution report JSON (serialized TaskExecutionReport)
+    pub report_json: Option<String>,
 }
 
 /// Status of an agent execution.
@@ -143,6 +145,10 @@ impl Neo4jClient {
             cypher.push_str(", ae.vector_json = $vector_json");
         }
 
+        if ae.report_json.is_some() {
+            cypher.push_str(", ae.report_json = $report_json");
+        }
+
         let mut q = query(&cypher)
             .param("id", ae.id.to_string())
             .param("cost_usd", ae.cost_usd)
@@ -154,6 +160,10 @@ impl Neo4jClient {
 
         if let Some(ref vector_json) = ae.vector_json {
             q = q.param("vector_json", vector_json.clone());
+        }
+
+        if let Some(ref report_json) = ae.report_json {
+            q = q.param("report_json", report_json.clone());
         }
 
         self.graph.run(q).await?;
@@ -238,6 +248,152 @@ impl Neo4jClient {
             commits,
             persona_profile: node.get("persona_profile").unwrap_or_default(),
             vector_json: node.get("vector_json").ok(),
+            report_json: node.get("report_json").ok(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+
+    fn make_agent_execution(
+        report_json: Option<String>,
+        vector_json: Option<String>,
+    ) -> AgentExecutionNode {
+        AgentExecutionNode {
+            id: Uuid::new_v4(),
+            run_id: Uuid::new_v4(),
+            task_id: Uuid::new_v4(),
+            session_id: Some(Uuid::new_v4()),
+            started_at: Utc::now(),
+            completed_at: Some(Utc::now()),
+            cost_usd: 0.05,
+            duration_secs: 12.5,
+            status: AgentExecutionStatus::Completed,
+            tools_used: "note,code".to_string(),
+            files_modified: vec!["src/main.rs".to_string()],
+            commits: vec!["abc123".to_string()],
+            persona_profile: "test-profile".to_string(),
+            vector_json,
+            report_json,
+        }
+    }
+
+    #[test]
+    fn test_agent_execution_node_serialize_with_report_json() {
+        let ae = make_agent_execution(
+            Some(r#"{"summary":"ok"}"#.to_string()),
+            Some(r#"{"vec":[1,2]}"#.to_string()),
+        );
+        let json = serde_json::to_string(&ae).unwrap();
+        assert!(json.contains("report_json"));
+        // report_json is a String field, so the inner JSON is escaped in the outer JSON
+        assert!(json.contains("summary"));
+        assert!(json.contains("vector_json"));
+        assert!(json.contains("vec"));
+    }
+
+    #[test]
+    fn test_agent_execution_node_serialize_without_report_json() {
+        let ae = make_agent_execution(None, None);
+        let json = serde_json::to_string(&ae).unwrap();
+        assert!(json.contains("\"report_json\":null"));
+        assert!(json.contains("\"vector_json\":null"));
+    }
+
+    #[test]
+    fn test_agent_execution_node_roundtrip() {
+        let ae = make_agent_execution(
+            Some(r#"{"tasks_completed":3}"#.to_string()),
+            Some(r#"{"energy":0.9}"#.to_string()),
+        );
+        let json = serde_json::to_string(&ae).unwrap();
+        let deserialized: AgentExecutionNode = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.report_json, ae.report_json);
+        assert_eq!(deserialized.vector_json, ae.vector_json);
+        assert_eq!(deserialized.id, ae.id);
+        assert_eq!(deserialized.cost_usd, ae.cost_usd);
+        assert_eq!(deserialized.status, ae.status);
+    }
+
+    #[test]
+    fn test_agent_execution_status_display() {
+        assert_eq!(AgentExecutionStatus::Running.to_string(), "running");
+        assert_eq!(AgentExecutionStatus::Completed.to_string(), "completed");
+        assert_eq!(AgentExecutionStatus::Failed.to_string(), "failed");
+        assert_eq!(AgentExecutionStatus::Timeout.to_string(), "timeout");
+    }
+
+    #[test]
+    fn test_agent_execution_status_from_str_lossy() {
+        assert_eq!(
+            AgentExecutionStatus::from_str_lossy("completed"),
+            AgentExecutionStatus::Completed
+        );
+        assert_eq!(
+            AgentExecutionStatus::from_str_lossy("failed"),
+            AgentExecutionStatus::Failed
+        );
+        assert_eq!(
+            AgentExecutionStatus::from_str_lossy("timeout"),
+            AgentExecutionStatus::Timeout
+        );
+        // Unknown strings default to Running
+        assert_eq!(
+            AgentExecutionStatus::from_str_lossy("running"),
+            AgentExecutionStatus::Running
+        );
+        assert_eq!(
+            AgentExecutionStatus::from_str_lossy("unknown"),
+            AgentExecutionStatus::Running
+        );
+        assert_eq!(
+            AgentExecutionStatus::from_str_lossy(""),
+            AgentExecutionStatus::Running
+        );
+    }
+
+    #[test]
+    fn test_agent_execution_node_without_session_id() {
+        let mut ae = make_agent_execution(None, None);
+        ae.session_id = None;
+        ae.completed_at = None;
+        let json = serde_json::to_string(&ae).unwrap();
+        let deserialized: AgentExecutionNode = serde_json::from_str(&json).unwrap();
+        assert!(deserialized.session_id.is_none());
+        assert!(deserialized.completed_at.is_none());
+    }
+
+    #[test]
+    fn test_agent_execution_status_serialize_roundtrip() {
+        for status in &[
+            AgentExecutionStatus::Running,
+            AgentExecutionStatus::Completed,
+            AgentExecutionStatus::Failed,
+            AgentExecutionStatus::Timeout,
+        ] {
+            let json = serde_json::to_string(status).unwrap();
+            let deserialized: AgentExecutionStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(*status, deserialized);
+        }
+    }
+
+    #[test]
+    fn test_agent_execution_node_debug() {
+        let ae = make_agent_execution(Some("report".to_string()), None);
+        let debug = format!("{:?}", ae);
+        assert!(debug.contains("AgentExecutionNode"));
+        assert!(debug.contains("report_json"));
+    }
+
+    #[test]
+    fn test_agent_execution_node_clone() {
+        let ae = make_agent_execution(Some("report".to_string()), Some("vector".to_string()));
+        let cloned = ae.clone();
+        assert_eq!(cloned.id, ae.id);
+        assert_eq!(cloned.report_json, ae.report_json);
+        assert_eq!(cloned.vector_json, ae.vector_json);
     }
 }

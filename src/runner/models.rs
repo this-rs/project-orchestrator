@@ -184,6 +184,76 @@ pub enum TaskResult {
 }
 
 // ============================================================================
+// TaskExecutionReport — structured post-execution feedback
+// ============================================================================
+
+/// Structured report generated after a sub-agent completes a task.
+///
+/// Captures tool usage metrics from ChatEvents and git-derived data
+/// (commits, files modified) to compute a confidence score. Persisted
+/// in `AgentExecution.report_json` for analysis and used by the retry
+/// logic to inject error context on re-attempt.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskExecutionReport {
+    /// Total number of tool_use events the agent emitted
+    pub tool_use_count: u32,
+    /// Breakdown of tool uses by tool name (e.g. {"Edit": 5, "Bash": 3})
+    pub tool_use_breakdown: std::collections::HashMap<String, u32>,
+    /// Number of tool_result events that contained errors
+    pub error_count: u32,
+    /// Last error message (if any) — useful for retry context
+    pub last_error: Option<String>,
+    /// Files modified (from git diff)
+    pub files_modified: Vec<String>,
+    /// Commit SHAs produced during this task
+    pub commits: Vec<String>,
+    /// Whether the task ended with agent-reported success
+    pub agent_success: bool,
+    /// Cost in USD
+    pub cost_usd: f64,
+    /// Duration in seconds
+    pub duration_secs: f64,
+    /// Computed confidence score (0.0 - 1.0)
+    ///
+    /// Formula: starts at 1.0, penalized by:
+    /// - error_ratio (errors / tool_uses): -0.3 * ratio
+    /// - zero commits: -0.3
+    /// - zero files modified: -0.2
+    /// - agent failure: -0.4
+    pub confidence_score: f64,
+}
+
+impl TaskExecutionReport {
+    /// Compute the confidence score based on the report's metrics.
+    pub fn compute_confidence(&mut self) {
+        let mut score = 1.0_f64;
+
+        // Penalize by error ratio
+        if self.tool_use_count > 0 {
+            let error_ratio = self.error_count as f64 / self.tool_use_count as f64;
+            score -= 0.3 * error_ratio;
+        }
+
+        // Penalize for no commits
+        if self.commits.is_empty() {
+            score -= 0.3;
+        }
+
+        // Penalize for no file modifications
+        if self.files_modified.is_empty() {
+            score -= 0.2;
+        }
+
+        // Penalize for agent failure
+        if !self.agent_success {
+            score -= 0.4;
+        }
+
+        self.confidence_score = score.clamp(0.0, 1.0);
+    }
+}
+
+// ============================================================================
 // RunStatus — overall plan run status
 // ============================================================================
 
@@ -611,5 +681,160 @@ mod tests {
     fn test_plan_run_status_display() {
         assert_eq!(PlanRunStatus::Running.to_string(), "running");
         assert_eq!(PlanRunStatus::BudgetExceeded.to_string(), "budget_exceeded");
+    }
+
+    // ========================================================================
+    // TaskExecutionReport tests
+    // ========================================================================
+
+    fn make_report() -> TaskExecutionReport {
+        TaskExecutionReport {
+            tool_use_count: 10,
+            tool_use_breakdown: std::collections::HashMap::from([
+                ("Edit".to_string(), 5),
+                ("Bash".to_string(), 5),
+            ]),
+            error_count: 0,
+            last_error: None,
+            files_modified: vec!["src/main.rs".to_string()],
+            commits: vec!["abc123".to_string()],
+            agent_success: true,
+            cost_usd: 0.5,
+            duration_secs: 60.0,
+            confidence_score: 0.0,
+        }
+    }
+
+    #[test]
+    fn test_report_perfect_confidence() {
+        let mut report = make_report();
+        report.compute_confidence();
+        assert!(
+            (report.confidence_score - 1.0).abs() < f64::EPSILON,
+            "Perfect report should have confidence 1.0, got {}",
+            report.confidence_score
+        );
+    }
+
+    #[test]
+    fn test_report_error_ratio_penalty() {
+        let mut report = make_report();
+        report.error_count = 5; // 50% error ratio → -0.15
+        report.compute_confidence();
+        let expected = 1.0 - 0.3 * 0.5;
+        assert!(
+            (report.confidence_score - expected).abs() < 1e-9,
+            "Expected {}, got {}",
+            expected,
+            report.confidence_score
+        );
+    }
+
+    #[test]
+    fn test_report_no_commits_penalty() {
+        let mut report = make_report();
+        report.commits = vec![];
+        report.compute_confidence();
+        let expected = 1.0 - 0.3;
+        assert!(
+            (report.confidence_score - expected).abs() < 1e-9,
+            "Expected {}, got {}",
+            expected,
+            report.confidence_score
+        );
+    }
+
+    #[test]
+    fn test_report_no_files_modified_penalty() {
+        let mut report = make_report();
+        report.files_modified = vec![];
+        report.compute_confidence();
+        let expected = 1.0 - 0.2;
+        assert!(
+            (report.confidence_score - expected).abs() < 1e-9,
+            "Expected {}, got {}",
+            expected,
+            report.confidence_score
+        );
+    }
+
+    #[test]
+    fn test_report_agent_failure_penalty() {
+        let mut report = make_report();
+        report.agent_success = false;
+        report.compute_confidence();
+        let expected = 1.0 - 0.4;
+        assert!(
+            (report.confidence_score - expected).abs() < 1e-9,
+            "Expected {}, got {}",
+            expected,
+            report.confidence_score
+        );
+    }
+
+    #[test]
+    fn test_report_all_penalties_clamped_to_zero() {
+        let mut report = TaskExecutionReport {
+            tool_use_count: 10,
+            tool_use_breakdown: std::collections::HashMap::new(),
+            error_count: 10, // 100% errors → -0.3
+            last_error: Some("boom".to_string()),
+            files_modified: vec![], // -0.2
+            commits: vec![],        // -0.3
+            agent_success: false,   // -0.4
+            cost_usd: 1.0,
+            duration_secs: 300.0,
+            confidence_score: 0.0,
+        };
+        // Total penalty = 0.3 + 0.3 + 0.2 + 0.4 = 1.2 → clamped to 0.0
+        report.compute_confidence();
+        assert!(
+            report.confidence_score.abs() < f64::EPSILON,
+            "Should be clamped to 0.0, got {}",
+            report.confidence_score
+        );
+    }
+
+    #[test]
+    fn test_report_zero_tool_uses_no_error_penalty() {
+        let mut report = make_report();
+        report.tool_use_count = 0;
+        report.error_count = 5; // should be ignored when tool_use_count == 0
+        report.compute_confidence();
+        assert!(
+            (report.confidence_score - 1.0).abs() < f64::EPSILON,
+            "Zero tool uses should skip error ratio penalty, got {}",
+            report.confidence_score
+        );
+    }
+
+    #[test]
+    fn test_report_serialization_roundtrip() {
+        let mut report = make_report();
+        report.compute_confidence();
+        let json = serde_json::to_string(&report).unwrap();
+        let deserialized: TaskExecutionReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.tool_use_count, 10);
+        assert_eq!(deserialized.error_count, 0);
+        assert!(deserialized.agent_success);
+        assert_eq!(deserialized.commits, vec!["abc123"]);
+        assert_eq!(deserialized.files_modified, vec!["src/main.rs"]);
+        assert!((deserialized.confidence_score - 1.0).abs() < f64::EPSILON,);
+    }
+
+    #[test]
+    fn test_report_combined_penalties() {
+        let mut report = make_report();
+        report.error_count = 2; // 20% error ratio → -0.06
+        report.commits = vec![]; // -0.3
+        report.agent_success = true;
+        report.compute_confidence();
+        let expected = 1.0 - (0.3 * 0.2) - 0.3;
+        assert!(
+            (report.confidence_score - expected).abs() < 1e-9,
+            "Expected {}, got {}",
+            expected,
+            report.confidence_score
+        );
     }
 }

@@ -118,6 +118,7 @@ mod tests {
             cwd: None,
             protocol_run_id: None,
             protocol_state: None,
+            excluded_note_ids: Default::default(),
         }
     }
 

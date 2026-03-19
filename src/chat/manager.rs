@@ -26,7 +26,7 @@ use nexus_claude::{
     build_hook_response_json, dispatch_hook_from_registry, is_hook_callback,
     memory::{ContextInjector, ConversationMemoryManager, MemoryConfig},
     ClaudeCodeOptions, ContentBlock, ContentValue, InteractiveClient, McpServerConfig, Message,
-    PermissionMode, StreamDelta, StreamEventData,
+    StreamDelta, StreamEventData,
 };
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
@@ -38,7 +38,6 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::expand_tilde;
-use nexus_claude::ToolsConfig;
 
 /// Broadcast channel buffer size for WebSocket subscribers
 const BROADCAST_BUFFER: usize = 256;
@@ -165,6 +164,9 @@ pub struct ChatManager {
     /// When Some, `close_session()` calls `end_session()` to finalize trajectories.
     pub(crate) trajectory_collector:
         Option<std::sync::Arc<neural_routing_runtime::TrajectoryCollector>>,
+    /// Optional reasoning tree engine for StatusInjectionStage.
+    /// When Some, the status stage can build reasoning trees from the knowledge graph.
+    pub(crate) reasoning_engine: Option<Arc<crate::reasoning::ReasoningTreeEngine>>,
 }
 
 // ============================================================================
@@ -248,6 +250,8 @@ pub struct SpawnedByContext {
     pub task_id: Option<Uuid>,
     pub protocol_run_id: Option<Uuid>,
     pub protocol_state: Option<String>,
+    /// Inherited scaffolding level from parent session (None = auto-detect).
+    pub scaffolding_level: Option<u8>,
 }
 
 /// Parse a `spawned_by` JSON string and extract parent session info + protocol FSM context.
@@ -282,6 +286,10 @@ pub fn parse_spawned_by(json_str: &str) -> Option<SpawnedByContext> {
         .get("protocol_state")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
+    let scaffolding_level = val
+        .get("scaffolding_level")
+        .and_then(|v| v.as_u64())
+        .map(|v| v.min(4) as u8);
     Some(SpawnedByContext {
         parent_session_id,
         spawn_type,
@@ -289,10 +297,55 @@ pub fn parse_spawned_by(json_str: &str) -> Option<SpawnedByContext> {
         task_id,
         protocol_run_id,
         protocol_state,
+        scaffolding_level,
     })
 }
 
 impl ChatManager {
+    /// Build the standard enrichment pipeline with optional reasoning engine and trajectory collector.
+    ///
+    /// Centralizes the 7-stage pipeline construction to avoid duplication across
+    /// `new()`, `with_reasoning_engine()`, and `with_trajectory_collector()`.
+    fn build_enrichment_pipeline(
+        graph: &Arc<dyn GraphStore>,
+        search: &Arc<dyn SearchStore>,
+        reasoning_engine: Option<&Arc<crate::reasoning::ReasoningTreeEngine>>,
+        trajectory_collector: Option<&std::sync::Arc<neural_routing_runtime::TrajectoryCollector>>,
+    ) -> Arc<super::enrichment::EnrichmentPipeline> {
+        let mut pipeline = super::enrichment::EnrichmentPipeline::new(
+            super::enrichment::EnrichmentConfig::from_env(),
+        );
+        let skill_stage = super::stages::SkillActivationStage::new(graph.clone());
+        let skill_stage = if let Some(tc) = trajectory_collector {
+            skill_stage.with_collector(tc.clone())
+        } else {
+            skill_stage
+        };
+        pipeline.add_stage(Box::new(skill_stage));
+        pipeline.add_stage(Box::new(super::stages::BiomimicryStage::new(graph.clone())));
+        pipeline.add_stage(Box::new(super::stages::UserProfileStage::new(
+            graph.clone(),
+        )));
+        pipeline.add_stage(Box::new(super::stages::PersonaStage::new(graph.clone())));
+        let ki_stage = super::stages::KnowledgeInjectionStage::new(graph.clone(), search.clone());
+        let ki_stage = if let Some(tc) = trajectory_collector {
+            ki_stage.with_collector(tc.clone())
+        } else {
+            ki_stage
+        };
+        pipeline.add_stage(Box::new(ki_stage));
+        pipeline.add_stage(Box::new(super::stages::StatusInjectionStage::with_config(
+            graph.clone(),
+            reasoning_engine.cloned(),
+            Arc::new(super::stages::GraphProtocolProvider::new(graph.clone())),
+            super::stages::StatusInjectionConfig::default(),
+        )));
+        pipeline.add_stage(Box::new(super::stages::FileContextStage::new(
+            graph.clone(),
+        )));
+        Arc::new(pipeline)
+    }
+
     /// Create a ChatManager without memory support (for tests or when Meilisearch is unavailable)
     pub fn new_without_memory(
         graph: Arc<dyn GraphStore>,
@@ -306,29 +359,7 @@ impl ChatManager {
             auto_update_cli: config.auto_update_cli,
             auto_update_app: config.auto_update_app,
         }));
-        let enrichment_pipeline = {
-            let mut pipeline = super::enrichment::EnrichmentPipeline::new(
-                super::enrichment::EnrichmentConfig::default(),
-            );
-            pipeline.add_stage(Box::new(super::stages::SkillActivationStage::new(
-                graph.clone(),
-            )));
-            pipeline.add_stage(Box::new(super::stages::BiomimicryStage::new(graph.clone())));
-            pipeline.add_stage(Box::new(super::stages::UserProfileStage::new(
-                graph.clone(),
-            )));
-            pipeline.add_stage(Box::new(super::stages::KnowledgeInjectionStage::new(
-                graph.clone(),
-                search.clone(),
-            )));
-            pipeline.add_stage(Box::new(super::stages::StatusInjectionStage::new(
-                graph.clone(),
-            )));
-            pipeline.add_stage(Box::new(super::stages::FileContextStage::new(
-                graph.clone(),
-            )));
-            Arc::new(pipeline)
-        };
+        let enrichment_pipeline = Self::build_enrichment_pipeline(&graph, &search, None, None);
         Self {
             graph,
             search,
@@ -343,6 +374,7 @@ impl ChatManager {
             env_config,
             enrichment_pipeline,
             trajectory_collector: None,
+            reasoning_engine: None,
         }
     }
 
@@ -377,29 +409,7 @@ impl ChatManager {
             auto_update_cli: config.auto_update_cli,
             auto_update_app: config.auto_update_app,
         }));
-        let enrichment_pipeline = {
-            let mut pipeline = super::enrichment::EnrichmentPipeline::new(
-                super::enrichment::EnrichmentConfig::default(),
-            );
-            pipeline.add_stage(Box::new(super::stages::SkillActivationStage::new(
-                graph.clone(),
-            )));
-            pipeline.add_stage(Box::new(super::stages::BiomimicryStage::new(graph.clone())));
-            pipeline.add_stage(Box::new(super::stages::UserProfileStage::new(
-                graph.clone(),
-            )));
-            pipeline.add_stage(Box::new(super::stages::KnowledgeInjectionStage::new(
-                graph.clone(),
-                search.clone(),
-            )));
-            pipeline.add_stage(Box::new(super::stages::StatusInjectionStage::new(
-                graph.clone(),
-            )));
-            pipeline.add_stage(Box::new(super::stages::FileContextStage::new(
-                graph.clone(),
-            )));
-            Arc::new(pipeline)
-        };
+        let enrichment_pipeline = Self::build_enrichment_pipeline(&graph, &search, None, None);
         Self {
             graph,
             search,
@@ -414,6 +424,7 @@ impl ChatManager {
             env_config,
             enrichment_pipeline,
             trajectory_collector: None,
+            reasoning_engine: None,
         }
     }
 
@@ -439,6 +450,24 @@ impl ChatManager {
         self
     }
 
+    /// Attach a reasoning tree engine for the StatusInjectionStage.
+    ///
+    /// Rebuilds the enrichment pipeline so that `StatusInjectionStage` receives
+    /// the engine and can build reasoning trees from the knowledge graph.
+    pub fn with_reasoning_engine(
+        mut self,
+        engine: Arc<crate::reasoning::ReasoningTreeEngine>,
+    ) -> Self {
+        self.reasoning_engine = Some(engine.clone());
+        self.enrichment_pipeline = Self::build_enrichment_pipeline(
+            &self.graph,
+            &self.search,
+            Some(&engine),
+            self.trajectory_collector.as_ref(),
+        );
+        self
+    }
+
     /// Attach a trajectory collector to the enrichment pipeline stages.
     ///
     /// Rebuilds the pipeline so that `SkillActivationStage` and
@@ -447,30 +476,12 @@ impl ChatManager {
         mut self,
         collector: std::sync::Arc<neural_routing_runtime::TrajectoryCollector>,
     ) -> Self {
-        let mut pipeline = super::enrichment::EnrichmentPipeline::new(
-            super::enrichment::EnrichmentConfig::from_env(),
+        self.enrichment_pipeline = Self::build_enrichment_pipeline(
+            &self.graph,
+            &self.search,
+            self.reasoning_engine.as_ref(),
+            Some(&collector),
         );
-        pipeline.add_stage(Box::new(
-            super::stages::SkillActivationStage::new(self.graph.clone())
-                .with_collector(collector.clone()),
-        ));
-        pipeline.add_stage(Box::new(super::stages::BiomimicryStage::new(
-            self.graph.clone(),
-        )));
-        pipeline.add_stage(Box::new(super::stages::UserProfileStage::new(
-            self.graph.clone(),
-        )));
-        pipeline.add_stage(Box::new(
-            super::stages::KnowledgeInjectionStage::new(self.graph.clone(), self.search.clone())
-                .with_collector(collector.clone()),
-        ));
-        pipeline.add_stage(Box::new(super::stages::StatusInjectionStage::new(
-            self.graph.clone(),
-        )));
-        pipeline.add_stage(Box::new(super::stages::FileContextStage::new(
-            self.graph.clone(),
-        )));
-        self.enrichment_pipeline = std::sync::Arc::new(pipeline);
         // Store collector for end_session() in close_session()
         self.trajectory_collector = Some(collector);
         self
@@ -1311,22 +1322,34 @@ impl ChatManager {
 
     /// Build the system prompt with project context.
     ///
-    /// Two-layer architecture:
-    /// 1. Hardcoded base (BASE_SYSTEM_PROMPT) — protocols, data model, git, statuses
-    /// 2. Dynamic context — oneshot Opus refines raw Neo4j data, fallback to markdown
+    /// Modular architecture via FsmPromptComposer:
+    /// 1. Base sections — selected by scaffolding level (0-4)
+    /// 2. FSM context — injected from active protocol runs
+    /// 3. Dynamic context — markdown rendering of project context + session continuity
+    /// 4. Tool reference — selectively rendered by intent + FSM + scaffolding
+    ///
+    /// Build the system prompt and return the set of note IDs included
+    /// (from guidelines/gotchas) for deduplication with the enrichment pipeline.
     pub async fn build_system_prompt(
         &self,
         project_slug: Option<&str>,
         user_message: &str,
-    ) -> String {
-        use super::prompt::{
-            assemble_prompt, context_to_json, context_to_markdown, fetch_project_context,
-            truncate_dynamic_context_default, BASE_SYSTEM_PROMPT, TOOL_REFERENCE,
-        };
+        model: Option<&str>,
+        session_id: Option<&str>,
+        scaffolding_override: Option<u8>,
+    ) -> (String, std::collections::HashSet<String>) {
+        use super::composer::{ComposerInput, FsmPromptComposer};
+        use super::prompt::{context_to_markdown, fetch_project_context};
+        use super::routing::HeuristicRouter;
+        use super::stages::status_injection::GraphProtocolProvider;
+        use super::stages::status_injection::ProtocolStatusProvider;
 
-        // No project → base prompt + tool reference only
+        let empty_ids = std::collections::HashSet::new();
+
+        // No project → compose with defaults (L0, no FSM, no dynamic context)
         let Some(slug) = project_slug else {
-            return format!("{}\n\n---\n\n{}", BASE_SYSTEM_PROMPT, TOOL_REFERENCE);
+            let input = ComposerInput::default();
+            return (FsmPromptComposer::compose(&input), empty_ids);
         };
 
         // Fetch raw context from Neo4j
@@ -1337,9 +1360,20 @@ impl ChatManager {
                     "Failed to fetch project context for '{}': {} — using base prompt only",
                     slug, e
                 );
-                return format!("{}\n\n---\n\n{}", BASE_SYSTEM_PROMPT, TOOL_REFERENCE);
+                let input = ComposerInput::default();
+                return (FsmPromptComposer::compose(&input), empty_ids);
             }
         };
+
+        // Collect note IDs from guidelines/gotchas for deduplication with enrichment
+        let included_note_ids: std::collections::HashSet<String> = ctx
+            .guidelines
+            .iter()
+            .chain(ctx.gotchas.iter())
+            .chain(ctx.global_guidelines.iter())
+            .chain(ctx.global_gotchas.iter())
+            .map(|n| n.id.to_string())
+            .collect();
 
         // Hook Niveau 3: auto-boost notes included in the system prompt context
         {
@@ -1377,30 +1411,70 @@ impl ChatManager {
             }
         }
 
-        // Try oneshot Opus refinement (with tool catalog for tool-aware prompting)
-        let dynamic_section = if self.config.enable_oneshot_refinement {
-            let context_json = context_to_json(&ctx);
-            let tools_catalog_json =
-                super::prompt::tools_catalog_to_json(super::prompt::TOOL_GROUPS);
-            match self
-                .refine_context_with_oneshot(user_message, &context_json, &tools_catalog_json)
-                .await
+        // ── Fetch scaffolding level (with 100ms timeout, fallback to L0) ──
+        let scaffolding_level = if let Some(ref project) = ctx.project {
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                self.graph
+                    .compute_scaffolding_level(project.id, project.scaffolding_override),
+            )
+            .await
             {
-                Ok(refined) => refined,
-                Err(e) => {
+                Ok(Ok(level)) => {
+                    debug!("[composer] Scaffolding L{} for '{}'", level.level, slug);
+                    level.level
+                }
+                Ok(Err(e)) => {
                     warn!(
-                        "Oneshot context refinement failed: {} — using markdown fallback",
+                        "[composer] Scaffolding computation failed: {} — defaulting to L0",
                         e
                     );
-                    context_to_markdown(&ctx, Some(user_message))
+                    0
+                }
+                Err(_) => {
+                    warn!("[composer] Scaffolding computation timed out — defaulting to L0");
+                    0
                 }
             }
         } else {
-            info!("Oneshot refinement disabled — using markdown fallback");
-            context_to_markdown(&ctx, Some(user_message))
+            0
         };
 
-        // Load session continuity context (previous session, active work)
+        // Override with inherited scaffolding level from parent session
+        let scaffolding_level = scaffolding_override.unwrap_or(scaffolding_level);
+
+        // ── Fetch active protocol runs ──────────────────────────────────
+        let protocol_runs = if let Some(ref project) = ctx.project {
+            let provider = GraphProtocolProvider::new(self.graph.clone());
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                provider.get_active_runs(project.id),
+            )
+            .await
+            {
+                Ok(Ok(runs)) => {
+                    if !runs.is_empty() {
+                        debug!("[composer] {} active protocol runs", runs.len());
+                    }
+                    runs
+                }
+                Ok(Err(e)) => {
+                    warn!("[composer] Failed to fetch protocol runs: {}", e);
+                    Vec::new()
+                }
+                Err(_) => {
+                    warn!("[composer] Protocol runs fetch timed out");
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
+
+        // ── Build dynamic context (markdown) ─────────────────────────────
+        let dynamic_section = context_to_markdown(&ctx, Some(user_message));
+
+        // ── Load session continuity context ─────────────────────────────
         let continuity_section = {
             let graph = self.graph.clone();
             let slug_owned = slug.to_string();
@@ -1420,79 +1494,64 @@ impl ChatManager {
             }
         };
 
-        let full_dynamic = if continuity_section.is_empty() {
-            dynamic_section
-        } else {
-            format!("{}\n\n{}", continuity_section, dynamic_section)
+        // ── Derive context flags from ProjectContext ────────────────────
+        let has_active_plan = !ctx.active_plans.is_empty();
+        let task_count = ctx.active_plans.len() * 3; // rough estimate
+        let is_multi_project = !ctx.sibling_projects.is_empty();
+
+        // ── Compose via FsmPromptComposer ───────────────────────────────
+        let input = ComposerInput {
+            scaffolding_level,
+            protocol_runs: &protocol_runs,
+            project_context_markdown: &dynamic_section,
+            continuity_markdown: &continuity_section,
+            enrichment_markdown: "", // enrichment injected later in stream_response
+            user_message,
+            routing_hints: None,
+            is_multi_project,
+            has_active_plan,
+            task_count,
+            model: model.unwrap_or(""),
+            message_embedding: None, // Future: pre-compute via EmbeddingProvider
         };
 
-        // Smart truncation: cap dynamic context to ~2500 tokens (~10k chars)
-        // to keep total system prompt under ~8000 tokens
-        let truncated_dynamic = truncate_dynamic_context_default(&full_dynamic);
+        // Use compose_with_record to get the routing decision for trajectory tracking
+        let (prompt, routing_record) =
+            FsmPromptComposer::compose_with_record(&input, &HeuristicRouter);
 
-        let prompt = assemble_prompt(BASE_SYSTEM_PROMPT, &truncated_dynamic);
-        // Append exhaustive tool reference as final section
-        format!("{}\n\n---\n\n{}", prompt, TOOL_REFERENCE)
-    }
-
-    /// Use a oneshot Opus call to refine raw project context into a concise,
-    /// relevant contextual section for the system prompt.
-    async fn refine_context_with_oneshot(
-        &self,
-        user_message: &str,
-        context_json: &str,
-        tools_catalog_json: &str,
-    ) -> Result<String> {
-        use super::prompt::build_refinement_prompt;
-
-        let refinement_prompt =
-            build_refinement_prompt(user_message, context_json, tools_catalog_json);
-
-        // Build options: no MCP server, max_turns=1, just text generation.
-        // NOTE: Intentionally hardcoded to BypassPermissions — this is an internal
-        // one-shot context refinement call with no user-facing tool interaction.
-        // It must NOT use the user-configured permission mode.
-        #[allow(deprecated)]
-        let options = ClaudeCodeOptions::builder()
-            .model(&self.config.prompt_builder_model)
-            .system_prompt("You are an assistant that builds concise context sections.")
-            .permission_mode(PermissionMode::Plan)
-            .tools(ToolsConfig::none())
-            .max_turns(1)
-            .build();
-
-        let mut client = InteractiveClient::new(options)
-            .map_err(|e| anyhow!("Failed to create oneshot client: {}", e))?;
-
-        client
-            .connect()
-            .await
-            .map_err(|e| anyhow!("Failed to connect oneshot client: {}", e))?;
-
-        let messages = client
-            .send_and_receive(refinement_prompt)
-            .await
-            .map_err(|e| anyhow!("Oneshot send_and_receive failed: {}", e))?;
-
-        // Extract text from assistant messages
-        let mut result = String::new();
-        for msg in &messages {
-            if let Message::Assistant { message, .. } = msg {
-                for block in &message.content {
-                    if let ContentBlock::Text(text) = block {
-                        result.push_str(&text.text);
-                    }
-                }
-            }
+        // Emit routing decision to trajectory collector (fire-and-forget)
+        if let (Some(ref collector), Some(sid)) = (&self.trajectory_collector, session_id) {
+            // Emit routing decision directly to trajectory collector
+            let params = serde_json::to_value(&routing_record).unwrap_or_default();
+            collector.record_decision(neural_routing_runtime::DecisionRecord {
+                session_id: sid.to_string(),
+                context_embedding: vec![],
+                action_type: "routing.select_sections".to_string(),
+                action_params: params,
+                alternatives_count: routing_record.selected_sections.len(),
+                chosen_index: 0,
+                confidence: if routing_record.section_weights.is_empty() {
+                    0.5
+                } else {
+                    let sum: f32 = routing_record.section_weights.iter().map(|(_, w)| w).sum();
+                    (sum / routing_record.section_weights.len() as f32) as f64
+                },
+                tool_usages: vec![],
+                touched_entities: vec![],
+                timestamp_ms: 0,
+                query_embedding: vec![],
+                node_features: vec![],
+                protocol_run_id: None,
+                protocol_state: None,
+            });
+            debug!(
+                "[routing] Emitted routing decision to trajectory: {} sections, {} tool groups",
+                routing_record.selected_sections.len(),
+                routing_record.selected_tool_groups.len()
+            );
         }
 
-        let _ = client.disconnect().await;
-
-        if result.is_empty() {
-            return Err(anyhow!("Oneshot returned empty response"));
-        }
-
-        Ok(result)
+        (prompt, included_note_ids)
     }
 
     /// Check if a session is currently active (subprocess alive)
@@ -1926,8 +1985,32 @@ impl ChatManager {
 
         let session_id = Uuid::new_v4();
         let model = self.resolve_model(request.model.as_deref());
-        let system_prompt = self
-            .build_system_prompt(request.project_slug.as_deref(), &request.message)
+
+        // Resolve scaffolding override: explicit field takes priority,
+        // fallback to spawned_by JSON if present (for MCP callers)
+        let scaffolding_override = request.scaffolding_override.or_else(|| {
+            request
+                .spawned_by
+                .as_deref()
+                .and_then(parse_spawned_by)
+                .and_then(|ctx| ctx.scaffolding_level)
+        });
+
+        // Use task_context (from delegate_task/PlanRunner) as routing signal when
+        // the message is empty — this gives the router intent awareness for sub-agents.
+        let routing_message = if request.message.is_empty() {
+            request.task_context.as_deref().unwrap_or("")
+        } else {
+            &request.message
+        };
+        let (system_prompt, _included_note_ids) = self
+            .build_system_prompt(
+                request.project_slug.as_deref(),
+                routing_message,
+                Some(&model),
+                Some(&session_id.to_string()),
+                scaffolding_override,
+            )
             .await;
 
         // Persist session in Neo4j
@@ -2433,6 +2516,7 @@ impl ChatManager {
                             cwd: Some(node.cwd),
                             protocol_run_id: proto_run_id,
                             protocol_state: proto_state,
+                            excluded_note_ids: Default::default(), // no dedup in send_message path
                         })
                     }
                     _ => None,
@@ -2445,11 +2529,19 @@ impl ChatManager {
                 let ctx = enrichment_pipeline.execute(&input).await;
                 if ctx.has_content() {
                     debug!(
-                        "[enrichment] Prompt enriched: {} sections, {}ms",
+                        "[enrichment] Prompt enriched: {} sections, {}ms (hints: {:?})",
                         ctx.sections.len(),
-                        ctx.total_time_ms
+                        ctx.total_time_ms,
+                        ctx.hints.keys().collect::<Vec<_>>()
                     );
-                    super::enrichment::enrich_prompt(&prompt, &ctx)
+                    // Integrate enrichment as clean markdown prepended to user message
+                    // (replaces old XML-wrapped <enrichment_context> format)
+                    let enrichment_md = ctx.to_system_prompt_markdown();
+                    if enrichment_md.is_empty() {
+                        prompt
+                    } else {
+                        format!("{}\n\n---\n\n{}", enrichment_md, prompt)
+                    }
                 } else {
                     prompt
                 }
@@ -4199,8 +4291,14 @@ impl ChatManager {
         }
 
         // Build options - with resume flag only if we have a cli_session_id
-        let system_prompt = self
-            .build_system_prompt(session_node.project_slug.as_deref(), message)
+        let (system_prompt, _included_note_ids) = self
+            .build_system_prompt(
+                session_node.project_slug.as_deref(),
+                message,
+                Some(&session_node.model),
+                Some(session_id),
+                None,
+            )
             .await;
 
         // Create broadcast channel early so CompactionNotifier can use the sender
@@ -5156,7 +5254,7 @@ mod tests {
     use crate::neo4j::models::ChatSessionNode;
     use crate::test_helpers::{mock_app_state, test_chat_session, test_project};
     use nexus_claude::{
-        AssistantMessage, ContentBlock, ContentValue, TextContent, ThinkingContent,
+        AssistantMessage, ContentBlock, ContentValue, PermissionMode, TextContent, ThinkingContent,
         ToolResultContent, ToolUseContent,
     };
     use std::path::PathBuf;
@@ -5175,9 +5273,7 @@ mod tests {
             meilisearch_key: "key".into(),
             nats_url: None,
             max_turns: 10,
-            prompt_builder_model: "claude-opus-4-6".into(),
             permission: crate::chat::config::PermissionConfig::default(),
-            enable_oneshot_refinement: false,
             auto_continue: false,
             retry: crate::chat::config::RetryConfig::default(),
             process_path: None,
@@ -5403,10 +5499,13 @@ mod tests {
         let state = mock_app_state();
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
 
-        let prompt = manager.build_system_prompt(None, "test").await;
+        let (prompt, note_ids) = manager
+            .build_system_prompt(None, "test", None, None, None)
+            .await;
         assert!(prompt.contains("Project Orchestrator"));
         assert!(prompt.contains("EXCLUSIVELY the Project Orchestrator MCP tools"));
         assert!(!prompt.contains("Active Project"));
+        assert!(note_ids.is_empty(), "No project → no included note IDs");
     }
 
     #[tokio::test]
@@ -5416,8 +5515,8 @@ mod tests {
         state.neo4j.create_project(&project).await.unwrap();
 
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
-        let prompt = manager
-            .build_system_prompt(Some(&project.slug), "help me plan")
+        let (prompt, _note_ids) = manager
+            .build_system_prompt(Some(&project.slug), "help me plan", None, None, None)
             .await;
 
         // Contains the base prompt
@@ -6205,8 +6304,8 @@ mod tests {
             .unwrap();
 
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
-        let prompt = manager
-            .build_system_prompt(Some(&project.slug), "check the plan")
+        let (prompt, _note_ids) = manager
+            .build_system_prompt(Some(&project.slug), "check the plan", None, None, None)
             .await;
 
         // Base prompt present
@@ -9170,6 +9269,76 @@ mod tests {
         assert_eq!(ctx.parent_session_id, None);
         assert_eq!(ctx.protocol_run_id, Some(proto_run_id));
         assert_eq!(ctx.protocol_state, Some("review".to_string()));
+    }
+
+    // ---------------------------------------------------------------
+    // parse_spawned_by — scaffolding_level tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_parse_spawned_by_scaffolding_level_zero() {
+        let json = r#"{"scaffolding_level": 0}"#;
+        let ctx = parse_spawned_by(json).unwrap();
+        assert_eq!(ctx.scaffolding_level, Some(0));
+    }
+
+    #[test]
+    fn test_parse_spawned_by_scaffolding_level_mid() {
+        let json = r#"{"scaffolding_level": 2}"#;
+        let ctx = parse_spawned_by(json).unwrap();
+        assert_eq!(ctx.scaffolding_level, Some(2));
+    }
+
+    #[test]
+    fn test_parse_spawned_by_scaffolding_level_max() {
+        let json = r#"{"scaffolding_level": 4}"#;
+        let ctx = parse_spawned_by(json).unwrap();
+        assert_eq!(ctx.scaffolding_level, Some(4));
+    }
+
+    #[test]
+    fn test_parse_spawned_by_scaffolding_level_capped_at_4() {
+        let json = r#"{"scaffolding_level": 5}"#;
+        let ctx = parse_spawned_by(json).unwrap();
+        assert_eq!(ctx.scaffolding_level, Some(4));
+    }
+
+    #[test]
+    fn test_parse_spawned_by_scaffolding_level_large_capped() {
+        let json = r#"{"scaffolding_level": 255}"#;
+        let ctx = parse_spawned_by(json).unwrap();
+        assert_eq!(ctx.scaffolding_level, Some(4));
+    }
+
+    #[test]
+    fn test_parse_spawned_by_scaffolding_level_null() {
+        let json = r#"{"scaffolding_level": null}"#;
+        let ctx = parse_spawned_by(json).unwrap();
+        assert_eq!(ctx.scaffolding_level, None);
+    }
+
+    #[test]
+    fn test_parse_spawned_by_no_scaffolding_level_backward_compat() {
+        let json = r#"{"type": "runner", "parent_session_id": "abc"}"#;
+        let ctx = parse_spawned_by(json).unwrap();
+        assert_eq!(ctx.scaffolding_level, None);
+        assert_eq!(ctx.parent_session_id, Some("abc".to_string()));
+        assert_eq!(ctx.spawn_type, "runner");
+    }
+
+    #[test]
+    fn test_parse_spawned_by_scaffolding_with_other_fields() {
+        let run_id = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
+        let json = format!(
+            r#"{{"type":"runner","run_id":"{}","task_id":"{}","scaffolding_level":3}}"#,
+            run_id, task_id
+        );
+        let ctx = parse_spawned_by(&json).unwrap();
+        assert_eq!(ctx.scaffolding_level, Some(3));
+        assert_eq!(ctx.run_id, Some(run_id));
+        assert_eq!(ctx.task_id, Some(task_id));
+        assert_eq!(ctx.spawn_type, "runner");
     }
 
     #[test]

@@ -1092,7 +1092,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
 
     /// Use a oneshot LLM call to propose feature graphs for a project.
     ///
-    /// Follows the same pattern as `ChatManager::refine_context_with_oneshot`:
+    /// Uses an InteractiveClient oneshot call:
     /// InteractiveClient + max_turns(1) + BypassPermissions.
     ///
     /// Returns an empty Vec on any failure (best-effort).

@@ -148,6 +148,12 @@ pub struct AddStateBody {
     pub description: Option<String>,
     pub state_type: Option<String>,
     pub action: Option<String>,
+    /// Contextual prompt fragment injected when the agent is in this state.
+    pub prompt_fragment: Option<String>,
+    /// Whitelist of MCP tools allowed in this state.
+    pub available_tools: Option<Vec<String>>,
+    /// Actions explicitly forbidden in this state.
+    pub forbidden_actions: Option<Vec<String>>,
 }
 
 /// Request body for adding a transition
@@ -483,6 +489,9 @@ pub async fn create_protocol(
                 completion_strategy: None,
                 on_failure_strategy: None,
                 generator_config: None,
+                prompt_fragment: None,
+                available_tools: None,
+                forbidden_actions: None,
             };
             created_states.push(ps);
         }
@@ -743,6 +752,9 @@ pub async fn add_state(
         completion_strategy: None,
         on_failure_strategy: None,
         generator_config: None,
+        prompt_fragment: body.prompt_fragment,
+        available_tools: body.available_tools,
+        forbidden_actions: body.forbidden_actions,
     };
 
     state
@@ -1437,6 +1449,12 @@ pub struct ComposeStateInline {
     pub action: Option<String>,
     /// Optional sub-protocol to spawn when entering this state
     pub sub_protocol_id: Option<Uuid>,
+    /// Contextual prompt fragment injected when the agent is in this state.
+    pub prompt_fragment: Option<String>,
+    /// Whitelist of MCP tools allowed in this state.
+    pub available_tools: Option<Vec<String>>,
+    /// Actions explicitly forbidden in this state.
+    pub forbidden_actions: Option<Vec<String>>,
 }
 
 /// Inline transition for composition (uses state names instead of UUIDs)
@@ -1623,6 +1641,9 @@ pub async fn compose_protocol(
             completion_strategy: None,
             on_failure_strategy: None,
             generator_config: None,
+            prompt_fragment: s.prompt_fragment.clone(),
+            available_tools: s.available_tools.clone(),
+            forbidden_actions: s.forbidden_actions.clone(),
         };
         name_to_id.insert(s.name.clone(), ps.id);
         created_states.push(ps);
@@ -1848,6 +1869,9 @@ mod tests {
             completion_strategy: None,
             on_failure_strategy: None,
             generator_config: None,
+            prompt_fragment: None,
+            available_tools: None,
+            forbidden_actions: None,
         }
     }
 
@@ -2056,6 +2080,9 @@ mod tests {
                 completion_strategy: None,
                 on_failure_strategy: None,
                 generator_config: None,
+                prompt_fragment: None,
+                available_tools: None,
+                forbidden_actions: None,
             };
             mock.protocol_states.write().await.insert(id, ps);
         }

@@ -879,7 +879,7 @@ impl EnrichmentStage for KnowledgeInjectionStage {
         );
 
         // Run all knowledge queries in parallel (using scaffolding-adjusted config)
-        let (notes, decisions, predictions) = self
+        let (mut notes, decisions, predictions) = self
             .query_knowledge_with_config(
                 &input.message,
                 Some(&project_slug),
@@ -890,9 +890,23 @@ impl EnrichmentStage for KnowledgeInjectionStage {
             )
             .await;
 
+        // ── Deduplicate: exclude notes already in the system prompt ──────
+        let pre_dedup_count = notes.len();
+        if !input.excluded_note_ids.is_empty() {
+            notes.retain(|n| !input.excluded_note_ids.contains(&n.id));
+            let removed = pre_dedup_count - notes.len();
+            if removed > 0 {
+                debug!(
+                    "[knowledge_injection] Dedup: removed {} notes already in system prompt",
+                    removed
+                );
+            }
+        }
+
         debug!(
-            "[knowledge_injection] Found {} notes, {} decisions, {} predictions",
+            "[knowledge_injection] Found {} notes ({} deduped), {} decisions, {} predictions",
             notes.len(),
+            pre_dedup_count - notes.len(),
             decisions.len(),
             predictions.len()
         );
@@ -1191,6 +1205,7 @@ mod tests {
             cwd: None,
             protocol_run_id: None,
             protocol_state: None,
+            excluded_note_ids: Default::default(),
         };
         let mut ctx = EnrichmentContext::default();
         stage.execute(&input, &mut ctx).await.unwrap();
@@ -1230,6 +1245,7 @@ mod tests {
             cwd: None,
             protocol_run_id: None,
             protocol_state: None,
+            excluded_note_ids: Default::default(),
         };
         let mut ctx = EnrichmentContext::default();
 
@@ -1250,6 +1266,7 @@ mod tests {
             cwd: None,
             protocol_run_id: Some(proto_run_id),
             protocol_state: Some("implement".to_string()),
+            excluded_note_ids: Default::default(),
         };
         let mut ctx = EnrichmentContext::default();
 

@@ -776,14 +776,15 @@ pub async fn delegate_task(
         .clone()
         .unwrap_or_else(|| "Untitled task".to_string());
 
-    // Step 1: Build enriched prompt via ContextBuilder
+    // Step 1: Build enriched prompt via ContextBuilder + EnrichmentPipeline
+    let pipeline = chat_manager.enrichment_pipeline.clone();
     let structured = state
         .orchestrator
         .context_builder()
         .build_enriched_context(
             task_id,
             plan_id,
-            None, // no pipeline in HTTP context (stages require DI)
+            Some(&pipeline),
             req.project_slug.as_deref(),
             None, // project_id resolved from slug if needed
             req.custom_sections,
@@ -801,12 +802,31 @@ pub async fn delegate_task(
         prompt[..end].to_string()
     };
 
-    // Step 2: Spawn sub-agent via ChatManager
+    // Step 2: Resolve scaffolding level from project for inheritance
+    let scaffolding_override = if let Some(ref slug) = req.project_slug {
+        match graph.get_project_by_slug(slug).await {
+            Ok(Some(project)) => {
+                match graph
+                    .compute_scaffolding_level(project.id, project.scaffolding_override)
+                    .await
+                {
+                    Ok(level) => Some(level.level),
+                    Err(_) => None,
+                }
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    // Step 3: Spawn sub-agent via ChatManager
     let spawned_by_json = serde_json::json!({
         "type": "delegation",
         "plan_id": plan_id.to_string(),
         "task_id": task_id.to_string(),
         "parent_session_id": req.parent_session_id,
+        "scaffolding_level": scaffolding_override,
     });
 
     let chat_request_cwd = req.cwd.clone();
@@ -821,6 +841,8 @@ pub async fn delegate_task(
         workspace_slug: None,
         user_claims: None,
         spawned_by: Some(spawned_by_json.to_string()),
+        task_context: Some(task_title.clone()),
+        scaffolding_override,
     };
 
     let session = chat_manager
@@ -848,6 +870,7 @@ pub async fn delegate_task(
             commits: vec![],
             persona_profile: "delegation".to_string(),
             vector_json: None,
+            report_json: None,
         };
         let graph_clone = graph.clone();
         tokio::spawn(async move {
@@ -3564,6 +3587,30 @@ pub async fn run_deep_maintenance(
         .await;
 
     Ok(Json(serde_json::to_value(&report).unwrap_or_default()))
+}
+
+/// Seed prompt fragments for the 5 critical protocols.
+///
+/// Populates `prompt_fragment`, `available_tools`, and `forbidden_actions`
+/// on existing protocol states. Idempotent — safe to run multiple times.
+pub async fn seed_prompt_fragments(
+    State(state): State<OrchestratorState>,
+    Path(project_id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    state
+        .orchestrator
+        .neo4j()
+        .get_project(project_id)
+        .await
+        .map_err(AppError::Internal)?
+        .ok_or_else(|| AppError::NotFound(format!("Project not found: {}", project_id)))?;
+
+    let result =
+        crate::protocol::seed::seed_prompt_fragments(state.orchestrator.neo4j(), project_id)
+            .await
+            .map_err(AppError::Internal)?;
+
+    Ok(Json(serde_json::to_value(&result).unwrap_or_default()))
 }
 
 // ============================================================================

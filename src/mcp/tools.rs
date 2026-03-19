@@ -986,7 +986,7 @@ fn admin_tool() -> ToolDefinition {
             properties: Some(json!({
                 "action": {
                     "type": "string",
-                    "enum": ["sync_directory", "start_watch", "stop_watch", "watch_status", "meilisearch_stats", "delete_meilisearch_orphans", "cleanup_cross_project_calls", "cleanup_builtin_calls", "migrate_calls_confidence", "cleanup_sync_data", "update_staleness_scores", "update_energy_scores", "search_neurons", "reinforce_neurons", "decay_synapses", "backfill_synapses", "reindex_decisions", "backfill_decision_embeddings", "backfill_touches", "backfill_discussed", "update_fabric_scores", "bootstrap_knowledge_fabric", "reinforce_isomorphic", "detect_skills", "detect_skill_fission", "detect_skill_fusion", "maintain_skills", "auto_anchor_notes", "reconstruct_knowledge", "heal_scars", "consolidate_memory", "detect_stagnation", "deep_maintenance", "install_hooks"],
+                    "enum": ["sync_directory", "start_watch", "stop_watch", "watch_status", "meilisearch_stats", "delete_meilisearch_orphans", "cleanup_cross_project_calls", "cleanup_builtin_calls", "migrate_calls_confidence", "cleanup_sync_data", "update_staleness_scores", "update_energy_scores", "search_neurons", "reinforce_neurons", "decay_synapses", "backfill_synapses", "reindex_decisions", "backfill_decision_embeddings", "backfill_touches", "backfill_discussed", "update_fabric_scores", "bootstrap_knowledge_fabric", "reinforce_isomorphic", "detect_skills", "detect_skill_fission", "detect_skill_fusion", "maintain_skills", "auto_anchor_notes", "reconstruct_knowledge", "heal_scars", "consolidate_memory", "detect_stagnation", "deep_maintenance", "seed_prompt_fragments", "install_hooks"],
                     "description": "Operation to perform"
                 },
                 "path": {"type": "string", "description": "Directory path (sync_directory/start_watch)"},
@@ -1072,6 +1072,9 @@ fn protocol_tool() -> ToolDefinition {
                 "state_id": {"type": "string", "description": "State UUID (delete_state)"},
                 "state_type": {"type": "string", "description": "State type (add_state): start, intermediate, terminal. Default: intermediate"},
                 "action_name": {"type": "string", "description": "Action to execute when entering state (add_state)"},
+                "prompt_fragment": {"type": "string", "description": "Contextual prompt fragment injected when agent is in this state (add_state/compose states[])"},
+                "available_tools": {"type": "array", "items": {"type": "string"}, "description": "Whitelist of MCP tools allowed in this state (add_state/compose states[])"},
+                "forbidden_actions": {"type": "array", "items": {"type": "string"}, "description": "Actions explicitly forbidden in this state (add_state/compose states[])"},
                 "transition_id": {"type": "string", "description": "Transition UUID (delete_transition)"},
                 "from_state": {"type": "string", "description": "Source state UUID (add_transition)"},
                 "to_state": {"type": "string", "description": "Target state UUID (add_transition)"},

@@ -674,6 +674,9 @@ async fn import_protocols(
                 completion_strategy: None,
                 on_failure_strategy: None,
                 generator_config: None,
+                prompt_fragment: None,
+                available_tools: None,
+                forbidden_actions: None,
             };
 
             if state_type == StateType::Start {
@@ -1413,6 +1416,9 @@ mod tests {
             completion_strategy: None,
             on_failure_strategy: None,
             generator_config: None,
+            prompt_fragment: None,
+            available_tools: None,
+            forbidden_actions: None,
         };
         let s2 = crate::protocol::ProtocolState {
             id: end_state_id,
@@ -1425,6 +1431,9 @@ mod tests {
             completion_strategy: None,
             on_failure_strategy: None,
             generator_config: None,
+            prompt_fragment: None,
+            available_tools: None,
+            forbidden_actions: None,
         };
         store.upsert_protocol_state(&s1).await.unwrap();
         store.upsert_protocol_state(&s2).await.unwrap();

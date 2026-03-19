@@ -5,6 +5,7 @@
 
 pub mod cli_auth;
 pub mod cli_version;
+pub mod composer;
 pub mod config;
 pub mod continuity;
 pub mod enrichment;
@@ -15,6 +16,8 @@ pub mod observation_detector;
 pub mod path_detect;
 pub(crate) mod post_tool_hook;
 pub mod prompt;
+pub mod prompt_sections;
+pub mod routing;
 pub(crate) mod skill_hook;
 pub mod stages;
 pub mod types;

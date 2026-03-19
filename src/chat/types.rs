@@ -38,6 +38,18 @@ pub struct ChatRequest {
     /// Not deserialized from HTTP requests (internal use only).
     #[serde(skip)]
     pub spawned_by: Option<String>,
+    /// Task context for sub-agent sessions — provides the task description
+    /// to `build_system_prompt` so the routing intent detection can produce
+    /// a task-aware system prompt instead of a generic one.
+    /// Set by `delegate_task` and `PlanRunner.execute_task`.
+    /// Not deserialized from HTTP requests (internal use only).
+    #[serde(skip)]
+    pub task_context: Option<String>,
+    /// Inherited scaffolding level from parent session.
+    /// When set, overrides the auto-computed scaffolding level in `build_system_prompt`.
+    /// This ensures sub-agents inherit the same prompt complexity as their parent.
+    #[serde(skip)]
+    pub scaffolding_override: Option<u8>,
 }
 
 /// Events emitted by the chat system (sent via WebSocket / broadcast)

@@ -74,7 +74,6 @@ impl Default for StatusInjectionConfig {
 /// When T3 is implemented, the stub provider will be replaced with a real one
 /// that queries active FSM runs.
 #[derive(Debug, Clone, serde::Serialize)]
-#[allow(dead_code)] // Fields will be used when Pattern Federation is implemented
 pub struct ProtocolRunStatus {
     /// Protocol/pattern name (e.g., "code_review", "deploy_pipeline")
     pub protocol_name: String,
@@ -84,6 +83,15 @@ pub struct ProtocolRunStatus {
     pub progress: u8,
     /// Human-readable status message
     pub status_message: String,
+    /// Contextual prompt fragment from the current state (injected into prompt)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_fragment: Option<String>,
+    /// Tools allowed in the current state (empty = all)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub available_tools: Option<Vec<String>>,
+    /// Actions forbidden in the current state
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forbidden_actions: Option<Vec<String>>,
 }
 
 /// Trait for providing active protocol run status.
@@ -97,13 +105,89 @@ pub trait ProtocolStatusProvider: Send + Sync {
     async fn get_active_runs(&self, project_id: Uuid) -> Result<Vec<ProtocolRunStatus>>;
 }
 
-/// No-op implementation that always returns empty (stub for T3).
+/// No-op implementation that always returns empty.
+#[deprecated(note = "Use GraphProtocolProvider instead")]
 pub struct NoOpProtocolProvider;
 
 #[async_trait::async_trait]
+#[allow(deprecated)]
 impl ProtocolStatusProvider for NoOpProtocolProvider {
     async fn get_active_runs(&self, _project_id: Uuid) -> Result<Vec<ProtocolRunStatus>> {
         Ok(Vec::new())
+    }
+}
+
+/// Real implementation backed by Neo4j graph.
+///
+/// Queries active (running) protocol runs for a project and enriches each
+/// with the current state's `prompt_fragment`, `available_tools`, and
+/// `forbidden_actions`.
+pub struct GraphProtocolProvider {
+    graph: Arc<dyn GraphStore>,
+}
+
+impl GraphProtocolProvider {
+    pub fn new(graph: Arc<dyn GraphStore>) -> Self {
+        Self { graph }
+    }
+}
+
+#[async_trait::async_trait]
+impl ProtocolStatusProvider for GraphProtocolProvider {
+    async fn get_active_runs(&self, project_id: Uuid) -> Result<Vec<ProtocolRunStatus>> {
+        // 1. Get all protocols for this project
+        let (protocols, _) = self.graph.list_protocols(project_id, None, 100, 0).await?;
+
+        if protocols.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut results = Vec::new();
+
+        // 2. For each protocol, check for running runs
+        for proto in &protocols {
+            let (runs, _) = self
+                .graph
+                .list_protocol_runs(proto.id, Some(crate::protocol::RunStatus::Running), 10, 0)
+                .await?;
+
+            for run in &runs {
+                // 3. Get the current state to extract prompt fields
+                let states = self.graph.get_protocol_states(proto.id).await?;
+                let current = states.iter().find(|s| s.id == run.current_state);
+
+                let (state_name, prompt_fragment, available_tools, forbidden_actions) =
+                    match current {
+                        Some(s) => (
+                            s.name.clone(),
+                            s.prompt_fragment.clone(),
+                            s.available_tools.clone(),
+                            s.forbidden_actions.clone(),
+                        ),
+                        None => (format!("unknown({})", run.current_state), None, None, None),
+                    };
+
+                // Calculate progress from states_visited
+                let total_states = states.len().max(1);
+                let visited = run.states_visited.len();
+                let progress = ((visited as f64 / total_states as f64) * 100.0).min(99.0) as u8;
+
+                results.push(ProtocolRunStatus {
+                    protocol_name: proto.name.clone(),
+                    current_state: state_name,
+                    progress,
+                    status_message: format!(
+                        "Running ({}/{} states visited)",
+                        visited, total_states
+                    ),
+                    prompt_fragment,
+                    available_tools,
+                    forbidden_actions,
+                });
+            }
+        }
+
+        Ok(results)
     }
 }
 
@@ -121,6 +205,7 @@ pub struct StatusInjectionStage {
 
 impl StatusInjectionStage {
     /// Create a new status injection stage (without ReasoningTree support).
+    #[allow(deprecated)]
     pub fn new(graph: Arc<dyn GraphStore>) -> Self {
         Self {
             graph,
@@ -131,6 +216,7 @@ impl StatusInjectionStage {
     }
 
     /// Create with a ReasoningTreeEngine for full functionality.
+    #[allow(deprecated)]
     pub fn with_reasoning(
         graph: Arc<dyn GraphStore>,
         reasoning_engine: Arc<ReasoningTreeEngine>,
@@ -370,31 +456,59 @@ impl EnrichmentStage for StatusInjectionStage {
             None
         };
 
-        // ── Query 2: Protocol status (stub) ─────────────────────────────
-        let protocol_content = if let Some(pid) = project_id {
+        // ── Query 2: Protocol status ─────────────────────────────────────
+        let (protocol_content, protocol_context) = if let Some(pid) = project_id {
             match timeout(query_timeout, self.protocol_provider.get_active_runs(pid)).await {
                 Ok(Ok(runs)) if !runs.is_empty() => {
-                    let mut content = String::new();
+                    let mut status_content = String::new();
+                    let mut context_content = String::new();
+
                     for run in &runs {
-                        content.push_str(&format!(
+                        status_content.push_str(&format!(
                             "- **{}**: {} ({}%) — {}\n",
                             run.protocol_name, run.current_state, run.progress, run.status_message,
                         ));
+
+                        // Render prompt_fragment as protocol context
+                        if let Some(ref fragment) = run.prompt_fragment {
+                            context_content.push_str(&format!(
+                                "<protocol_context state=\"{}\" protocol=\"{}\">\n{}\n</protocol_context>\n",
+                                run.current_state, run.protocol_name, fragment,
+                            ));
+                        }
+                        // Render forbidden_actions as warnings
+                        if let Some(ref actions) = run.forbidden_actions {
+                            if !actions.is_empty() {
+                                context_content.push_str(&format!(
+                                    "\n⚠️ **Forbidden in state '{}'**: {}\n",
+                                    run.current_state,
+                                    actions.join(", "),
+                                ));
+                            }
+                        }
                     }
-                    Some(content)
+
+                    (
+                        Some(status_content),
+                        if context_content.is_empty() {
+                            None
+                        } else {
+                            Some(context_content)
+                        },
+                    )
                 }
-                Ok(Ok(_)) => None, // Empty runs
+                Ok(Ok(_)) => (None, None),
                 Ok(Err(e)) => {
                     debug!("[status_injection] Protocol status query failed: {}", e);
-                    None
+                    (None, None)
                 }
                 Err(_) => {
                     debug!("[status_injection] Protocol status query timed out");
-                    None
+                    (None, None)
                 }
             }
         } else {
-            None
+            (None, None)
         };
 
         // ── Query 3: ReasoningTree (optional) ───────────────────────────
@@ -423,6 +537,10 @@ impl EnrichmentStage for StatusInjectionStage {
 
         if let Some(content) = protocol_content {
             ctx.add_section("Active Protocols", content, self.name());
+        }
+
+        if let Some(content) = protocol_context {
+            ctx.add_section("Active Protocol Context", content, self.name());
         }
 
         if let Some(content) = reasoning_content {
@@ -465,10 +583,174 @@ mod tests {
     // ── NoOp protocol provider tests ────────────────────────────────────
 
     #[tokio::test]
+    #[allow(deprecated)]
     async fn test_noop_protocol_provider() {
         let provider = NoOpProtocolProvider;
         let runs = provider.get_active_runs(Uuid::new_v4()).await.unwrap();
         assert!(runs.is_empty(), "NoOp provider should return empty runs");
+    }
+
+    // ── GraphProtocolProvider tests ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_graph_provider_no_protocols() {
+        let mock = crate::neo4j::mock::MockGraphStore::new();
+        let provider = GraphProtocolProvider::new(Arc::new(mock));
+        let runs = provider.get_active_runs(Uuid::new_v4()).await.unwrap();
+        assert!(runs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_graph_provider_with_running_run() {
+        let mock = crate::neo4j::mock::MockGraphStore::new();
+        let project_id = Uuid::new_v4();
+
+        // Create project
+        let project = crate::neo4j::models::ProjectNode {
+            id: project_id,
+            name: "test-project".to_string(),
+            slug: "test-project".to_string(),
+            root_path: "/tmp/test".to_string(),
+            description: None,
+            created_at: chrono::Utc::now(),
+            last_synced: None,
+            analytics_computed_at: None,
+            last_co_change_computed_at: None,
+            default_note_energy: None,
+            scaffolding_override: None,
+            sharing_policy: None,
+        };
+        mock.create_project(&project).await.unwrap();
+
+        // Create protocol
+        let start_id = Uuid::new_v4();
+        let mut proto = crate::protocol::Protocol::new(project_id, "code-review", start_id);
+
+        // Create states with prompt_fragment
+        let state_analyze = crate::protocol::ProtocolState {
+            id: start_id,
+            protocol_id: proto.id,
+            name: "analyze".to_string(),
+            description: "Analyze code".to_string(),
+            action: None,
+            state_type: crate::protocol::StateType::Start,
+            sub_protocol_id: None,
+            completion_strategy: None,
+            on_failure_strategy: None,
+            generator_config: None,
+            prompt_fragment: Some(
+                "Focus on analyzing code changes. Use code(search) and code(analyze_impact)."
+                    .to_string(),
+            ),
+            available_tools: Some(vec!["code".to_string(), "note".to_string()]),
+            forbidden_actions: Some(vec![
+                "Do not create commits".to_string(),
+                "Do not modify files".to_string(),
+            ]),
+        };
+
+        let done_id = Uuid::new_v4();
+        let state_done = crate::protocol::ProtocolState {
+            id: done_id,
+            protocol_id: proto.id,
+            name: "done".to_string(),
+            description: "Complete".to_string(),
+            action: None,
+            state_type: crate::protocol::StateType::Terminal,
+            sub_protocol_id: None,
+            completion_strategy: None,
+            on_failure_strategy: None,
+            generator_config: None,
+            prompt_fragment: None,
+            available_tools: None,
+            forbidden_actions: None,
+        };
+
+        proto.terminal_states = vec![done_id];
+        mock.upsert_protocol(&proto).await.unwrap();
+        mock.upsert_protocol_state(&state_analyze).await.unwrap();
+        mock.upsert_protocol_state(&state_done).await.unwrap();
+
+        // Create a running run in the "analyze" state
+        let run = crate::protocol::ProtocolRun {
+            id: Uuid::new_v4(),
+            protocol_id: proto.id,
+            plan_id: None,
+            task_id: None,
+            parent_run_id: None,
+            current_state: start_id,
+            states_visited: vec![crate::protocol::StateVisit {
+                state_id: start_id,
+                state_name: "analyze".to_string(),
+                entered_at: chrono::Utc::now(),
+                exited_at: None,
+                duration_ms: None,
+                trigger: None,
+                progress_snapshot: None,
+            }],
+            status: crate::protocol::RunStatus::Running,
+            started_at: chrono::Utc::now(),
+            completed_at: None,
+            error: None,
+            triggered_by: "manual".to_string(),
+            depth: 0,
+            version: 1,
+        };
+        mock.create_protocol_run(&run).await.unwrap();
+
+        // Query
+        let provider = GraphProtocolProvider::new(Arc::new(mock));
+        let runs = provider.get_active_runs(project_id).await.unwrap();
+
+        assert_eq!(runs.len(), 1);
+        let r = &runs[0];
+        assert_eq!(r.protocol_name, "code-review");
+        assert_eq!(r.current_state, "analyze");
+        assert!(r.prompt_fragment.is_some());
+        assert!(r
+            .prompt_fragment
+            .as_ref()
+            .unwrap()
+            .contains("analyzing code"));
+        assert_eq!(
+            r.available_tools,
+            Some(vec!["code".to_string(), "note".to_string()])
+        );
+        assert_eq!(r.forbidden_actions.as_ref().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_graph_provider_no_running_runs() {
+        let mock = crate::neo4j::mock::MockGraphStore::new();
+        let project_id = Uuid::new_v4();
+
+        let project = crate::neo4j::models::ProjectNode {
+            id: project_id,
+            name: "test-project".to_string(),
+            slug: "test-project".to_string(),
+            root_path: "/tmp/test".to_string(),
+            description: None,
+            created_at: chrono::Utc::now(),
+            last_synced: None,
+            analytics_computed_at: None,
+            last_co_change_computed_at: None,
+            default_note_energy: None,
+            scaffolding_override: None,
+            sharing_policy: None,
+        };
+        mock.create_project(&project).await.unwrap();
+
+        let start_id = Uuid::new_v4();
+        let proto = crate::protocol::Protocol::new(project_id, "code-review", start_id);
+        mock.upsert_protocol(&proto).await.unwrap();
+
+        let state = crate::protocol::ProtocolState::new(proto.id, "analyze");
+        mock.upsert_protocol_state(&state).await.unwrap();
+
+        // No runs created → empty result
+        let provider = GraphProtocolProvider::new(Arc::new(mock));
+        let runs = provider.get_active_runs(project_id).await.unwrap();
+        assert!(runs.is_empty());
     }
 
     // ── truncate tests ──────────────────────────────────────────────────
@@ -524,6 +806,7 @@ mod tests {
             cwd: None,
             protocol_run_id: None,
             protocol_state: None,
+            excluded_note_ids: Default::default(),
         };
         let mut ctx = EnrichmentContext::default();
         stage.execute(&input, &mut ctx).await.unwrap();
@@ -541,6 +824,7 @@ mod tests {
             cwd: None,
             protocol_run_id: None,
             protocol_state: None,
+            excluded_note_ids: Default::default(),
         };
         let mut ctx = EnrichmentContext::default();
 
@@ -606,6 +890,9 @@ mod tests {
             current_state: "awaiting_approval".to_string(),
             progress: 75,
             status_message: "Waiting for reviewer".to_string(),
+            prompt_fragment: None,
+            available_tools: None,
+            forbidden_actions: None,
         };
         let json = serde_json::to_string(&status).unwrap();
         assert!(json.contains("code_review"));
