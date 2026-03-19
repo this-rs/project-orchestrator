@@ -10227,7 +10227,11 @@ impl GraphStore for MockGraphStore {
             .collect();
         result.sort_by(|a, b| b.started_at.cmp(&a.started_at));
         let start = (offset as usize).min(result.len());
-        result = result.into_iter().skip(start).take(limit as usize).collect();
+        result = result
+            .into_iter()
+            .skip(start)
+            .take(limit as usize)
+            .collect();
         Ok(result)
     }
 
