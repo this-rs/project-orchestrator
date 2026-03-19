@@ -3791,4 +3791,46 @@ impl GraphStore for Neo4jClient {
     ) -> anyhow::Result<Vec<crate::events::trigger::EventTrigger>> {
         self.list_event_triggers(project_scope, enabled_only).await
     }
+
+    async fn create_event_trigger(
+        &self,
+        trigger: &crate::events::trigger::EventTrigger,
+    ) -> anyhow::Result<Uuid> {
+        self.create_event_trigger(trigger).await
+    }
+
+    async fn get_event_trigger(
+        &self,
+        id: Uuid,
+    ) -> anyhow::Result<Option<crate::events::trigger::EventTrigger>> {
+        self.get_event_trigger(id).await
+    }
+
+    async fn update_event_trigger(
+        &self,
+        id: Uuid,
+        enabled: Option<bool>,
+        name: Option<String>,
+        entity_type_pattern: Option<Option<String>>,
+        action_pattern: Option<Option<String>>,
+        payload_conditions: Option<Option<serde_json::Value>>,
+        cooldown_secs: Option<u32>,
+        project_scope: Option<Option<Uuid>>,
+    ) -> anyhow::Result<bool> {
+        self.update_event_trigger(
+            id,
+            enabled,
+            name,
+            entity_type_pattern,
+            action_pattern,
+            payload_conditions,
+            cooldown_secs,
+            project_scope,
+        )
+        .await
+    }
+
+    async fn delete_event_trigger(&self, id: Uuid) -> anyhow::Result<bool> {
+        self.delete_event_trigger(id).await
+    }
 }

@@ -102,6 +102,58 @@ pub fn skill_emerged_trigger(protocol_id: Uuid) -> EventTrigger {
 }
 
 // ────────────────────────────────────────────────────────────────────
+// Install builtin triggers (idempotent)
+// ────────────────────────────────────────────────────────────────────
+
+use crate::neo4j::GraphStore;
+
+/// Install all 6 builtin triggers into Neo4j for a given project, idempotently.
+///
+/// Each trigger is identified by its `name` — if a trigger with the same name
+/// already exists (for this project scope), it is skipped.
+///
+/// `protocol_id` is the protocol UUID that each trigger will fire. Pass a
+/// placeholder UUID if no protocol is configured yet; it can be updated later.
+///
+/// Returns the number of triggers actually created (0..=6).
+pub async fn install_builtin_triggers(
+    store: &dyn GraphStore,
+    project_id: Uuid,
+    protocol_id: Uuid,
+) -> anyhow::Result<usize> {
+    // Build all 6 builtin trigger templates, scoped to this project
+    let mut templates = vec![
+        project_first_sync_trigger(protocol_id),
+        rfc_created_trigger(protocol_id),
+        protocol_run_completed_trigger(protocol_id),
+        plan_completed_trigger(protocol_id),
+        commit_topology_check_trigger(protocol_id),
+        skill_emerged_trigger(protocol_id),
+    ];
+    for t in &mut templates {
+        t.project_scope = Some(project_id);
+    }
+
+    // Fetch existing triggers for this project to avoid duplicates
+    let existing = store
+        .list_event_triggers(Some(project_id), false)
+        .await?;
+    let existing_names: std::collections::HashSet<&str> =
+        existing.iter().map(|t| t.name.as_str()).collect();
+
+    let mut created = 0usize;
+    for trigger in &templates {
+        if existing_names.contains(trigger.name.as_str()) {
+            continue;
+        }
+        store.create_event_trigger(trigger).await?;
+        created += 1;
+    }
+
+    Ok(created)
+}
+
+// ────────────────────────────────────────────────────────────────────
 // Tests
 // ────────────────────────────────────────────────────────────────────
 

@@ -22,6 +22,7 @@ use super::rfc_handlers;
 use super::sharing_handlers;
 use super::skill_handlers;
 use super::trajectory_handlers;
+use super::trigger_handlers;
 use super::workspace_handlers;
 use super::ws_chat_handler;
 use super::ws_handlers;
@@ -1412,6 +1413,32 @@ fn protected_routes() -> Router<OrchestratorState> {
         )
         // NOTE: /api/admin/install-hooks removed — hooks are now managed
         // in-process via SkillActivationHook (zero config required)
+        // ================================================================
+        // Event Triggers
+        // ================================================================
+        .route(
+            "/api/triggers",
+            get(trigger_handlers::list_triggers).post(trigger_handlers::create_trigger),
+        )
+        // Static sub-paths MUST come before /{id} to avoid capture
+        .route(
+            "/api/triggers/stats",
+            get(trigger_handlers::trigger_stats),
+        )
+        .route(
+            "/api/triggers/{id}",
+            get(trigger_handlers::get_trigger)
+                .put(trigger_handlers::update_trigger)
+                .delete(trigger_handlers::delete_trigger),
+        )
+        .route(
+            "/api/triggers/{id}/enable",
+            post(trigger_handlers::enable_trigger),
+        )
+        .route(
+            "/api/triggers/{id}/disable",
+            post(trigger_handlers::disable_trigger),
+        )
         // ================================================================
         // Alerts (HeartbeatEngine)
         // ================================================================

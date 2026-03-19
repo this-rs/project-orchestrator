@@ -3187,4 +3187,28 @@ pub trait GraphStore: Send + Sync {
         project_scope: Option<Uuid>,
         enabled_only: bool,
     ) -> Result<Vec<EventTrigger>>;
+
+    /// Create an EventTrigger node. Returns the generated UUID.
+    async fn create_event_trigger(&self, trigger: &EventTrigger) -> Result<Uuid>;
+
+    /// Get an EventTrigger by its UUID.
+    async fn get_event_trigger(&self, id: Uuid) -> Result<Option<EventTrigger>>;
+
+    /// Update an EventTrigger's fields. Only provided fields are updated.
+    /// Returns `true` if the trigger was found and updated, `false` if not found.
+    async fn update_event_trigger(
+        &self,
+        id: Uuid,
+        enabled: Option<bool>,
+        name: Option<String>,
+        entity_type_pattern: Option<Option<String>>,
+        action_pattern: Option<Option<String>>,
+        payload_conditions: Option<Option<serde_json::Value>>,
+        cooldown_secs: Option<u32>,
+        project_scope: Option<Option<Uuid>>,
+    ) -> Result<bool>;
+
+    /// Delete an EventTrigger by its UUID.
+    /// Returns `true` if a node was deleted, `false` if not found.
+    async fn delete_event_trigger(&self, id: Uuid) -> Result<bool>;
 }
