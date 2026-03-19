@@ -99,31 +99,69 @@ async fn execute_admin_action(
             Ok(format!("Updated staleness scores for {count} notes"))
         }
         "decay_synapses" => {
-            let decay_amount = args.first().and_then(|a| a.parse::<f64>().ok()).unwrap_or(0.05);
-            let prune_threshold = args.get(1).and_then(|a| a.parse::<f64>().ok()).unwrap_or(0.01);
+            let decay_amount = args
+                .first()
+                .and_then(|a| a.parse::<f64>().ok())
+                .unwrap_or(0.05);
+            let prune_threshold = args
+                .get(1)
+                .and_then(|a| a.parse::<f64>().ok())
+                .unwrap_or(0.01);
             let (decayed, pruned) = store.decay_synapses(decay_amount, prune_threshold).await?;
-            Ok(format!("Decayed {decayed} synapses, pruned {pruned} below threshold"))
+            Ok(format!(
+                "Decayed {decayed} synapses, pruned {pruned} below threshold"
+            ))
         }
         "list_notes_needing_synapses" | "backfill_synapses" => {
-            let batch_size = args.first().and_then(|a| a.parse::<usize>().ok()).unwrap_or(50);
+            let batch_size = args
+                .first()
+                .and_then(|a| a.parse::<usize>().ok())
+                .unwrap_or(50);
             let (notes, total) = store.list_notes_needing_synapses(batch_size, 0).await?;
-            Ok(format!("Found {total} notes needing synapses (batch: {})", notes.len()))
+            Ok(format!(
+                "Found {total} notes needing synapses (batch: {})",
+                notes.len()
+            ))
         }
         "update_energy_scores" => {
-            let half_life = args.first().and_then(|a| a.parse::<f64>().ok()).unwrap_or(168.0);
+            let half_life = args
+                .first()
+                .and_then(|a| a.parse::<f64>().ok())
+                .unwrap_or(168.0);
             let count = store.update_energy_scores(half_life).await?;
             Ok(format!("Updated energy scores for {count} notes"))
         }
         // Actions requiring full orchestrator context (HTTP endpoints, managers, embeddings)
-        "persist_health_report" | "update_fabric_scores" | "bootstrap_knowledge_fabric"
-        | "maintain_skills" | "detect_skills" | "detect_skill_fission" | "detect_skill_fusion"
-        | "backfill_touches" | "backfill_discussed" | "auto_anchor_notes"
-        | "reinforce_isomorphic" | "reconstruct_knowledge" | "consolidate_memory"
-        | "audit_gaps" | "heal_scars" | "detect_stagnation" | "deep_maintenance"
-        | "seed_prompt_fragments" | "install_hooks" | "search_neurons"
-        | "reinforce_neurons" | "reindex_decisions" | "backfill_decision_embeddings" => {
-            info!(method, "Admin action requires orchestrator context — marking as done");
-            Ok(format!("Action '{method}' acknowledged (requires orchestrator context)"))
+        "persist_health_report"
+        | "update_fabric_scores"
+        | "bootstrap_knowledge_fabric"
+        | "maintain_skills"
+        | "detect_skills"
+        | "detect_skill_fission"
+        | "detect_skill_fusion"
+        | "backfill_touches"
+        | "backfill_discussed"
+        | "auto_anchor_notes"
+        | "reinforce_isomorphic"
+        | "reconstruct_knowledge"
+        | "consolidate_memory"
+        | "audit_gaps"
+        | "heal_scars"
+        | "detect_stagnation"
+        | "deep_maintenance"
+        | "seed_prompt_fragments"
+        | "install_hooks"
+        | "search_neurons"
+        | "reinforce_neurons"
+        | "reindex_decisions"
+        | "backfill_decision_embeddings" => {
+            info!(
+                method,
+                "Admin action requires orchestrator context — marking as done"
+            );
+            Ok(format!(
+                "Action '{method}' acknowledged (requires orchestrator context)"
+            ))
         }
         _ => {
             warn!(method, "Unknown admin action — skipping");
@@ -139,7 +177,10 @@ async fn determine_trigger(
     run: &ProtocolRun,
 ) -> Result<String> {
     let transitions = store.get_protocol_transitions(run.protocol_id).await?;
-    let outgoing: Vec<_> = transitions.iter().filter(|t| t.from_state == state.id).collect();
+    let outgoing: Vec<_> = transitions
+        .iter()
+        .filter(|t| t.from_state == state.id)
+        .collect();
 
     match outgoing.len() {
         0 => Ok("done".to_string()),
@@ -165,7 +206,10 @@ async fn determine_trigger_with_fallback(
     fallback: &str,
 ) -> Result<String> {
     let transitions = store.get_protocol_transitions(run.protocol_id).await?;
-    let outgoing: Vec<_> = transitions.iter().filter(|t| t.from_state == state.id).collect();
+    let outgoing: Vec<_> = transitions
+        .iter()
+        .filter(|t| t.from_state == state.id)
+        .collect();
 
     if let Some(t) = outgoing.iter().find(|t| t.trigger == preferred) {
         return Ok(t.trigger.clone());
@@ -214,7 +258,10 @@ impl Executor for SystemExecutor {
                 "admin" => execute_admin_action(store, &call.method, &call.args, protocol).await,
                 "note" | "code" | "project" => {
                     debug!(tool = %call.tool, method = %call.method, "Skipping read-only tool call");
-                    Ok(format!("Skipped read-only call: {}({})", call.tool, call.method))
+                    Ok(format!(
+                        "Skipped read-only call: {}({})",
+                        call.tool, call.method
+                    ))
                 }
                 other => {
                     warn!(tool = %other, method = %call.method, "Unknown tool in system executor");
@@ -241,7 +288,11 @@ impl Executor for SystemExecutor {
             determine_trigger(store, state, run).await?
         };
 
-        Ok(ExecutionResult { trigger, notes, should_retry: false })
+        Ok(ExecutionResult {
+            trigger,
+            notes,
+            should_retry: false,
+        })
     }
 }
 

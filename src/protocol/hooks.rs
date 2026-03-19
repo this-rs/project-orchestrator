@@ -35,8 +35,7 @@ use uuid::Uuid;
 /// Maps run_id -> CancellationToken. Used by `cancel_run()` to signal
 /// graceful shutdown of the runner loop, and by `spawn_protocol_runner()`
 /// to register new runners.
-static ACTIVE_RUNNERS: LazyLock<DashMap<Uuid, CancellationToken>> =
-    LazyLock::new(DashMap::new);
+static ACTIVE_RUNNERS: LazyLock<DashMap<Uuid, CancellationToken>> = LazyLock::new(DashMap::new);
 
 /// Cancel an active runner by run_id (if one is registered).
 ///
@@ -259,19 +258,13 @@ pub async fn recover_orphaned_runs(
                                 age_secs,
                                 "Re-spawning runner for orphaned runner-managed run"
                             );
-                            spawn_protocol_runner(
-                                store.clone(),
-                                run.id,
-                                emitter.clone(),
-                            );
+                            spawn_protocol_runner(store.clone(), run.id, emitter.clone());
                             total_recovered += 1;
                         } else {
                             let mut recovered_run = run.clone();
                             recovered_run
                                 .fail("Recovered: server restarted (no emitter for re-spawn)");
-                            if let Err(e) =
-                                store.update_protocol_run(&mut recovered_run).await
-                            {
+                            if let Err(e) = store.update_protocol_run(&mut recovered_run).await {
                                 tracing::warn!(
                                     run_id = %run.id,
                                     "Failed to recover orphaned run: {}", e
@@ -283,11 +276,8 @@ pub async fn recover_orphaned_runs(
                     } else {
                         // Not runner-managed — mark as failed
                         let mut recovered_run = run.clone();
-                        recovered_run
-                            .fail("Recovered: server restarted during execution");
-                        if let Err(e) =
-                            store.update_protocol_run(&mut recovered_run).await
-                        {
+                        recovered_run.fail("Recovered: server restarted during execution");
+                        if let Err(e) = store.update_protocol_run(&mut recovered_run).await {
                             tracing::warn!(
                                 run_id = %run.id,
                                 protocol_id = %protocol.id,
@@ -470,9 +460,7 @@ pub fn spawn_protocol_scheduler(
             }
 
             // 3. Evaluate scheduled protocols and start new runs
-            if let Err(e) =
-                run_scheduled_protocols(store.clone(), emitter.clone()).await
-            {
+            if let Err(e) = run_scheduled_protocols(store.clone(), emitter.clone()).await {
                 tracing::warn!("Protocol scheduler: scheduled trigger failed: {}", e);
             }
         }
@@ -940,7 +928,9 @@ mod tests {
         run.started_at = chrono::Utc::now() - chrono::Duration::hours(2);
         store.create_protocol_run(&run).await.unwrap();
 
-        let count = recover_orphaned_runs(store.clone() as Arc<dyn GraphStore>, None).await.unwrap();
+        let count = recover_orphaned_runs(store.clone() as Arc<dyn GraphStore>, None)
+            .await
+            .unwrap();
         assert_eq!(count, 1);
 
         // Verify run is now Failed
@@ -968,7 +958,9 @@ mod tests {
         run.started_at = chrono::Utc::now() - chrono::Duration::minutes(5);
         store.create_protocol_run(&run).await.unwrap();
 
-        let count = recover_orphaned_runs(store.clone() as Arc<dyn GraphStore>, None).await.unwrap();
+        let count = recover_orphaned_runs(store.clone() as Arc<dyn GraphStore>, None)
+            .await
+            .unwrap();
         assert_eq!(count, 0);
 
         // Run should still be Running
@@ -992,7 +984,9 @@ mod tests {
         run.complete();
         store.create_protocol_run(&run).await.unwrap();
 
-        let count = recover_orphaned_runs(store.clone() as Arc<dyn GraphStore>, None).await.unwrap();
+        let count = recover_orphaned_runs(store.clone() as Arc<dyn GraphStore>, None)
+            .await
+            .unwrap();
         assert_eq!(count, 0);
     }
 

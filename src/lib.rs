@@ -1291,10 +1291,7 @@ pub async fn start_server(mut config: Config) -> Result<()> {
     }
 
     // Spawn the protocol scheduler (hourly evaluation of scheduled protocols)
-    crate::protocol::hooks::spawn_protocol_scheduler(
-        orchestrator.neo4j_arc(),
-        protocol_emitter,
-    );
+    crate::protocol::hooks::spawn_protocol_scheduler(orchestrator.neo4j_arc(), protocol_emitter);
 
     // Recover interrupted plan runner runs from previous server instance
     if let Some(ref cm) = chat_manager {

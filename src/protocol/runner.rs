@@ -146,19 +146,19 @@ pub async fn run_protocol(
         }
 
         // Determine timeout
-        let timeout_secs = current_state.state_timeout_secs.unwrap_or(
-            match protocol.protocol_category {
-                ProtocolCategory::System => DEFAULT_SYSTEM_TIMEOUT_SECS,
-                ProtocolCategory::Business => DEFAULT_BUSINESS_TIMEOUT_SECS,
-            },
-        );
+        let timeout_secs =
+            current_state
+                .state_timeout_secs
+                .unwrap_or(match protocol.protocol_category {
+                    ProtocolCategory::System => DEFAULT_SYSTEM_TIMEOUT_SECS,
+                    ProtocolCategory::Business => DEFAULT_BUSINESS_TIMEOUT_SECS,
+                });
         let timeout = Duration::from_secs(timeout_secs);
 
         // Execute with retry loop
         let mut retries = 0u32;
         let execution_result = loop {
-            let exec_future =
-                executor.execute_state(&current_state, &run, &protocol, &*store);
+            let exec_future = executor.execute_state(&current_state, &run, &protocol, &*store);
 
             // Execute with timeout and cancellation
             let result = tokio::select! {
@@ -276,10 +276,7 @@ pub async fn run_protocol(
                 fail_run_with_error(
                     &*store,
                     run_id,
-                    &format!(
-                        "Execution failed in state '{}': {}",
-                        current_state.name, e
-                    ),
+                    &format!("Execution failed in state '{}': {}", current_state.name, e),
                 )
                 .await?;
                 let final_run = store.get_protocol_run(run_id).await?.unwrap_or(run);
@@ -289,10 +286,7 @@ pub async fn run_protocol(
     }
 
     // 5. Return final run state
-    let final_run = store
-        .get_protocol_run(run_id)
-        .await?
-        .unwrap_or(run);
+    let final_run = store.get_protocol_run(run_id).await?.unwrap_or(run);
 
     info!(
         run_id = %run_id,

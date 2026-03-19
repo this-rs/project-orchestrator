@@ -121,10 +121,7 @@ impl Neo4jClient {
                 .ok()
                 .filter(|s| !s.is_empty())
                 .and_then(|s| serde_json::from_str(&s).ok()),
-            state_timeout_secs: node
-                .get::<i64>("state_timeout_secs")
-                .ok()
-                .map(|v| v as u64),
+            state_timeout_secs: node.get::<i64>("state_timeout_secs").ok().map(|v| v as u64),
         })
     }
 
