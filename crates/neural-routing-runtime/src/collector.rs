@@ -430,8 +430,10 @@ async fn run_collector_loop(
                     }
                 }
 
-                // Flush if we have pending trajectories from stale sessions
-                if pending_flush.len() >= buffer_size {
+                // Flush all pending trajectories — don't wait for buffer_size here.
+                // The stale timer is the last chance to persist trajectories from
+                // sessions that ended without reaching the batch threshold.
+                if !pending_flush.is_empty() {
                     let to_flush = std::mem::take(&mut pending_flush);
                     flush_batch(&store, to_flush, &trainer).await;
                 }
