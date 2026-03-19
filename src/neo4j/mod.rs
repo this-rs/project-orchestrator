@@ -31,6 +31,7 @@ mod task;
 mod topology;
 pub mod traits;
 mod trigger;
+mod event_trigger;
 mod user;
 mod workspace;
 
