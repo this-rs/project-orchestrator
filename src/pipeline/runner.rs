@@ -758,4 +758,575 @@ mod tests {
         );
         assert_eq!(gate_type_to_error_category("unknown"), ErrorCategory::Other);
     }
+
+    // -- PipelineRunner::new() construction ----------------------------------
+
+    #[test]
+    fn runner_new_with_default_config() {
+        let config = PipelineConfig::default();
+        let _runner = PipelineRunner::new(config);
+        // Construction should not panic with defaults.
+    }
+
+    #[test]
+    fn runner_new_with_custom_config() {
+        let config = PipelineConfig {
+            cwd: "/home/user/project".to_string(),
+            project_slug: Some("my-project".to_string()),
+            max_retries_per_gate: 5,
+            timeout_secs: 120,
+            fail_fast: false,
+        };
+        let _runner = PipelineRunner::new(config);
+    }
+
+    #[test]
+    fn runner_new_with_zero_timeout() {
+        let config = PipelineConfig {
+            timeout_secs: 0,
+            ..PipelineConfig::default()
+        };
+        let _runner = PipelineRunner::new(config);
+    }
+
+    #[test]
+    fn runner_new_with_zero_retries() {
+        let config = PipelineConfig {
+            max_retries_per_gate: 0,
+            ..PipelineConfig::default()
+        };
+        let _runner = PipelineRunner::new(config);
+    }
+
+    #[test]
+    fn runner_new_with_large_timeout() {
+        let config = PipelineConfig {
+            timeout_secs: u64::MAX,
+            ..PipelineConfig::default()
+        };
+        let _runner = PipelineRunner::new(config);
+    }
+
+    // -- PipelineConfig with non-default values ------------------------------
+
+    #[test]
+    fn config_custom_values() {
+        let config = PipelineConfig {
+            cwd: "/opt/builds/workspace".to_string(),
+            project_slug: Some("backend-api".to_string()),
+            max_retries_per_gate: 10,
+            timeout_secs: 30,
+            fail_fast: false,
+        };
+        assert_eq!(config.cwd, "/opt/builds/workspace");
+        assert_eq!(config.project_slug.as_deref(), Some("backend-api"));
+        assert_eq!(config.max_retries_per_gate, 10);
+        assert_eq!(config.timeout_secs, 30);
+        assert!(!config.fail_fast);
+    }
+
+    #[test]
+    fn config_clone_is_independent() {
+        let config = PipelineConfig {
+            cwd: "/tmp".to_string(),
+            project_slug: Some("test".to_string()),
+            max_retries_per_gate: 1,
+            timeout_secs: 60,
+            fail_fast: true,
+        };
+        let mut cloned = config.clone();
+        cloned.cwd = "/other".to_string();
+        cloned.fail_fast = false;
+        // Original is not affected.
+        assert_eq!(config.cwd, "/tmp");
+        assert!(config.fail_fast);
+        assert_eq!(cloned.cwd, "/other");
+        assert!(!cloned.fail_fast);
+    }
+
+    #[test]
+    fn config_debug_format() {
+        let config = PipelineConfig::default();
+        let debug = format!("{:?}", config);
+        assert!(debug.contains("PipelineConfig"));
+        assert!(debug.contains("cwd"));
+        assert!(debug.contains("fail_fast"));
+    }
+
+    #[test]
+    fn config_deserialize_from_partial_json() {
+        // Deserialize with all fields present but non-default values.
+        let json = r#"{
+            "cwd": "/workspace",
+            "project_slug": null,
+            "max_retries_per_gate": 0,
+            "timeout_secs": 1,
+            "fail_fast": false
+        }"#;
+        let config: PipelineConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.cwd, "/workspace");
+        assert!(config.project_slug.is_none());
+        assert_eq!(config.max_retries_per_gate, 0);
+        assert_eq!(config.timeout_secs, 1);
+        assert!(!config.fail_fast);
+    }
+
+    // -- gate_type_to_error_category edge cases ------------------------------
+
+    #[test]
+    fn error_category_empty_string() {
+        assert_eq!(gate_type_to_error_category(""), ErrorCategory::Other);
+    }
+
+    #[test]
+    fn error_category_case_sensitive() {
+        // Gate type matching is case-sensitive; uppercase should fall through.
+        assert_eq!(
+            gate_type_to_error_category("Cargo-Check"),
+            ErrorCategory::Other
+        );
+        assert_eq!(
+            gate_type_to_error_category("CARGO-TEST"),
+            ErrorCategory::Other
+        );
+        assert_eq!(
+            gate_type_to_error_category("Coverage"),
+            ErrorCategory::Other
+        );
+    }
+
+    #[test]
+    fn error_category_similar_but_wrong() {
+        assert_eq!(
+            gate_type_to_error_category("cargo-check "),
+            ErrorCategory::Other
+        );
+        assert_eq!(
+            gate_type_to_error_category("cargo_test"),
+            ErrorCategory::Other
+        );
+        assert_eq!(
+            gate_type_to_error_category("npm-type-check"),
+            ErrorCategory::Other
+        );
+    }
+
+    // -- create_gate edge cases ----------------------------------------------
+
+    #[test]
+    fn create_gate_empty_string_falls_back() {
+        let gate = create_gate("", &HashMap::new());
+        assert_eq!(gate.name(), "cargo-check");
+    }
+
+    #[test]
+    fn create_gate_coverage_non_numeric_threshold_uses_default() {
+        let mut params = HashMap::new();
+        params.insert("threshold".into(), serde_json::json!("not-a-number"));
+        let gate = create_gate("coverage", &params);
+        // Should still create a coverage gate (using default threshold 60.0).
+        assert_eq!(gate.name(), "coverage");
+    }
+
+    #[test]
+    fn create_gate_coverage_negative_threshold() {
+        let mut params = HashMap::new();
+        params.insert("threshold".into(), serde_json::json!(-10.0));
+        let gate = create_gate("coverage", &params);
+        assert_eq!(gate.name(), "coverage");
+    }
+
+    #[test]
+    fn create_gate_coverage_zero_threshold() {
+        let mut params = HashMap::new();
+        params.insert("threshold".into(), serde_json::json!(0.0));
+        let gate = create_gate("coverage", &params);
+        assert_eq!(gate.name(), "coverage");
+    }
+
+    #[test]
+    fn create_gate_ignores_extra_params() {
+        let mut params = HashMap::new();
+        params.insert("irrelevant".into(), serde_json::json!(42));
+        params.insert("another".into(), serde_json::json!("value"));
+        let gate = create_gate("cargo-check", &params);
+        assert_eq!(gate.name(), "cargo-check");
+    }
+
+    // -- PipelineRunResult with different stop_reason variants ---------------
+
+    #[test]
+    fn pipeline_run_result_with_loop_stop_reason() {
+        let now = Utc::now();
+        let sig = ErrorSignature::from_message("error[E0308]: mismatched types", None, None, ErrorCategory::Compile);
+        let result = PipelineRunResult {
+            plan_id: Uuid::new_v4(),
+            status: PipelineRunStatus::Stopped,
+            started_at: now,
+            completed_at: now,
+            duration_ms: 200,
+            waves_completed: 0,
+            waves_total: 2,
+            gate_results: vec![],
+            final_score: 0.0,
+            stop_reason: Some(StopReason::Loop {
+                error: sig,
+                seen_count: 3,
+            }),
+            events: vec![],
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let back: PipelineRunResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.status, PipelineRunStatus::Stopped);
+        match &back.stop_reason {
+            Some(StopReason::Loop { seen_count, .. }) => assert_eq!(*seen_count, 3),
+            other => panic!("Expected StopReason::Loop, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn pipeline_run_result_with_regression_stop_reason() {
+        let now = Utc::now();
+        let result = PipelineRunResult {
+            plan_id: Uuid::new_v4(),
+            status: PipelineRunStatus::Stopped,
+            started_at: now,
+            completed_at: now,
+            duration_ms: 300,
+            waves_completed: 1,
+            waves_total: 4,
+            gate_results: vec![],
+            final_score: 0.5,
+            stop_reason: Some(StopReason::Regression {
+                test_name: "test_login_flow".to_string(),
+            }),
+            events: vec![],
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let back: PipelineRunResult = serde_json::from_str(&json).unwrap();
+        match &back.stop_reason {
+            Some(StopReason::Regression { test_name }) => {
+                assert_eq!(test_name, "test_login_flow");
+            }
+            other => panic!("Expected StopReason::Regression, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn pipeline_run_result_with_continue_stop_reason() {
+        let now = Utc::now();
+        let result = PipelineRunResult {
+            plan_id: Uuid::new_v4(),
+            status: PipelineRunStatus::Completed,
+            started_at: now,
+            completed_at: now,
+            duration_ms: 1000,
+            waves_completed: 3,
+            waves_total: 3,
+            gate_results: vec![],
+            final_score: 1.0,
+            stop_reason: Some(StopReason::Continue),
+            events: vec![],
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let back: PipelineRunResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.stop_reason, Some(StopReason::Continue));
+    }
+
+    // -- PipelineRunStatus equality and variants -----------------------------
+
+    #[test]
+    fn pipeline_run_status_equality() {
+        assert_eq!(PipelineRunStatus::Running, PipelineRunStatus::Running);
+        assert_eq!(PipelineRunStatus::Completed, PipelineRunStatus::Completed);
+        assert_eq!(PipelineRunStatus::Failed, PipelineRunStatus::Failed);
+        assert_eq!(PipelineRunStatus::Stopped, PipelineRunStatus::Stopped);
+        assert_eq!(PipelineRunStatus::Cancelled, PipelineRunStatus::Cancelled);
+    }
+
+    #[test]
+    fn pipeline_run_status_inequality() {
+        assert_ne!(PipelineRunStatus::Running, PipelineRunStatus::Completed);
+        assert_ne!(PipelineRunStatus::Failed, PipelineRunStatus::Stopped);
+        assert_ne!(PipelineRunStatus::Cancelled, PipelineRunStatus::Running);
+        assert_ne!(PipelineRunStatus::Completed, PipelineRunStatus::Failed);
+    }
+
+    #[test]
+    fn pipeline_run_status_debug_format() {
+        assert_eq!(format!("{:?}", PipelineRunStatus::Running), "Running");
+        assert_eq!(format!("{:?}", PipelineRunStatus::Completed), "Completed");
+        assert_eq!(format!("{:?}", PipelineRunStatus::Failed), "Failed");
+        assert_eq!(format!("{:?}", PipelineRunStatus::Stopped), "Stopped");
+        assert_eq!(format!("{:?}", PipelineRunStatus::Cancelled), "Cancelled");
+    }
+
+    #[test]
+    fn pipeline_run_status_clone() {
+        let status = PipelineRunStatus::Failed;
+        let cloned = status.clone();
+        assert_eq!(status, cloned);
+    }
+
+    // -- PipelineEventType ---------------------------------------------------
+
+    #[test]
+    fn pipeline_event_type_equality() {
+        assert_eq!(PipelineEventType::GatePassed, PipelineEventType::GatePassed);
+        assert_ne!(PipelineEventType::GatePassed, PipelineEventType::GateFailed);
+    }
+
+    #[test]
+    fn pipeline_event_type_debug_format() {
+        assert_eq!(
+            format!("{:?}", PipelineEventType::RegressionDetected),
+            "RegressionDetected"
+        );
+        assert_eq!(
+            format!("{:?}", PipelineEventType::StagnationDetected),
+            "StagnationDetected"
+        );
+    }
+
+    // -- PipelineEvent with metadata -----------------------------------------
+
+    #[test]
+    fn pipeline_event_with_rich_metadata() {
+        let mut metadata = HashMap::new();
+        metadata.insert("wave_number".into(), serde_json::json!(3));
+        metadata.insert("gate_type".into(), serde_json::json!("cargo-test"));
+        metadata.insert("details".into(), serde_json::json!({"errors": 2, "warnings": 5}));
+
+        let event = PipelineEvent {
+            timestamp: Utc::now(),
+            event_type: PipelineEventType::GateFailed,
+            message: "Gate failed with 2 errors".to_string(),
+            metadata,
+        };
+
+        let json = serde_json::to_string(&event).unwrap();
+        let back: PipelineEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.metadata["wave_number"], serde_json::json!(3));
+        assert_eq!(back.metadata["gate_type"], serde_json::json!("cargo-test"));
+        assert_eq!(back.metadata["details"]["errors"], serde_json::json!(2));
+    }
+
+    #[test]
+    fn pipeline_event_empty_metadata() {
+        let event = PipelineEvent {
+            timestamp: Utc::now(),
+            event_type: PipelineEventType::PipelineCompleted,
+            message: "Done".to_string(),
+            metadata: HashMap::new(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let back: PipelineEvent = serde_json::from_str(&json).unwrap();
+        assert!(back.metadata.is_empty());
+    }
+
+    #[test]
+    fn pipeline_event_clone() {
+        let event = PipelineEvent {
+            timestamp: Utc::now(),
+            event_type: PipelineEventType::WaveStarted,
+            message: "Starting wave".to_string(),
+            metadata: HashMap::new(),
+        };
+        let cloned = event.clone();
+        assert_eq!(cloned.event_type, event.event_type);
+        assert_eq!(cloned.message, event.message);
+    }
+
+    // -- PipelineRunResult with gate_results and events ----------------------
+
+    #[test]
+    fn pipeline_run_result_with_gate_results() {
+        let now = Utc::now();
+        let gate_result = GateResult {
+            gate_name: "cargo-check".to_string(),
+            status: GateStatus::Pass,
+            metrics: {
+                let mut m = HashMap::new();
+                m.insert("error_count".to_string(), 0.0);
+                m.insert("warning_count".to_string(), 2.0);
+                m
+            },
+            message: "Compilation successful with 2 warnings".to_string(),
+            duration_ms: 5000,
+        };
+
+        let result = PipelineRunResult {
+            plan_id: Uuid::new_v4(),
+            status: PipelineRunStatus::Completed,
+            started_at: now,
+            completed_at: now,
+            duration_ms: 8000,
+            waves_completed: 1,
+            waves_total: 1,
+            gate_results: vec![gate_result],
+            final_score: 0.9,
+            stop_reason: None,
+            events: vec![],
+        };
+
+        let json = serde_json::to_string(&result).unwrap();
+        let back: PipelineRunResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.gate_results.len(), 1);
+        assert_eq!(back.gate_results[0].gate_name, "cargo-check");
+        assert_eq!(back.gate_results[0].status, GateStatus::Pass);
+        assert!((back.gate_results[0].metrics["warning_count"] - 2.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn pipeline_run_result_failed_status() {
+        let now = Utc::now();
+        let result = PipelineRunResult {
+            plan_id: Uuid::new_v4(),
+            status: PipelineRunStatus::Failed,
+            started_at: now,
+            completed_at: now,
+            duration_ms: 100,
+            waves_completed: 0,
+            waves_total: 5,
+            gate_results: vec![],
+            final_score: 0.0,
+            stop_reason: None,
+            events: vec![],
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let back: PipelineRunResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.status, PipelineRunStatus::Failed);
+        assert_eq!(back.waves_completed, 0);
+        assert_eq!(back.waves_total, 5);
+    }
+
+    #[test]
+    fn pipeline_run_result_cancelled_status() {
+        let now = Utc::now();
+        let result = PipelineRunResult {
+            plan_id: Uuid::new_v4(),
+            status: PipelineRunStatus::Cancelled,
+            started_at: now,
+            completed_at: now,
+            duration_ms: 50,
+            waves_completed: 2,
+            waves_total: 4,
+            gate_results: vec![],
+            final_score: 0.4,
+            stop_reason: None,
+            events: vec![],
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let back: PipelineRunResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.status, PipelineRunStatus::Cancelled);
+    }
+
+    #[test]
+    fn pipeline_run_result_with_events() {
+        let now = Utc::now();
+        let events = vec![
+            PipelineEvent {
+                timestamp: now,
+                event_type: PipelineEventType::PipelineStarted,
+                message: "Started".to_string(),
+                metadata: HashMap::new(),
+            },
+            PipelineEvent {
+                timestamp: now,
+                event_type: PipelineEventType::PipelineCompleted,
+                message: "Completed".to_string(),
+                metadata: HashMap::new(),
+            },
+        ];
+
+        let result = PipelineRunResult {
+            plan_id: Uuid::new_v4(),
+            status: PipelineRunStatus::Completed,
+            started_at: now,
+            completed_at: now,
+            duration_ms: 2000,
+            waves_completed: 1,
+            waves_total: 1,
+            gate_results: vec![],
+            final_score: 1.0,
+            stop_reason: None,
+            events,
+        };
+
+        let json = serde_json::to_string(&result).unwrap();
+        let back: PipelineRunResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.events.len(), 2);
+        assert_eq!(back.events[0].event_type, PipelineEventType::PipelineStarted);
+        assert_eq!(back.events[1].event_type, PipelineEventType::PipelineCompleted);
+    }
+
+    // -- GateSpec construction -----------------------------------------------
+
+    #[test]
+    fn gate_spec_serialization_roundtrip() {
+        let spec = GateSpec {
+            gate_type: "coverage".to_string(),
+            params: {
+                let mut m = HashMap::new();
+                m.insert("threshold".into(), serde_json::json!(75.0));
+                m
+            },
+        };
+        let json = serde_json::to_string(&spec).unwrap();
+        let back: GateSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.gate_type, "coverage");
+        assert_eq!(back.params["threshold"], serde_json::json!(75.0));
+    }
+
+    #[test]
+    fn gate_spec_empty_params() {
+        let spec = GateSpec {
+            gate_type: "cargo-check".to_string(),
+            params: HashMap::new(),
+        };
+        let json = serde_json::to_string(&spec).unwrap();
+        let back: GateSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.gate_type, "cargo-check");
+        assert!(back.params.is_empty());
+    }
+
+    // -- GateResult construction and serialization ---------------------------
+
+    #[test]
+    fn gate_result_all_statuses_serialize() {
+        for status in [GateStatus::Pass, GateStatus::Fail, GateStatus::Skip, GateStatus::Error] {
+            let result = GateResult {
+                gate_name: "test-gate".to_string(),
+                status: status.clone(),
+                metrics: HashMap::new(),
+                message: format!("Status: {:?}", status),
+                duration_ms: 100,
+            };
+            let json = serde_json::to_string(&result).unwrap();
+            let back: GateResult = serde_json::from_str(&json).unwrap();
+            assert_eq!(back.status, status);
+        }
+    }
+
+    #[test]
+    fn gate_result_with_metrics() {
+        let mut metrics = HashMap::new();
+        metrics.insert("error_count".to_string(), 3.0);
+        metrics.insert("tests_passed".to_string(), 42.0);
+        metrics.insert("tests_failed".to_string(), 1.0);
+        metrics.insert("coverage_pct".to_string(), 87.5);
+
+        let result = GateResult {
+            gate_name: "cargo-test".to_string(),
+            status: GateStatus::Fail,
+            metrics,
+            message: "1 test failed".to_string(),
+            duration_ms: 12000,
+        };
+
+        let json = serde_json::to_string(&result).unwrap();
+        let back: GateResult = serde_json::from_str(&json).unwrap();
+        assert!((back.metrics["coverage_pct"] - 87.5).abs() < f64::EPSILON);
+        assert!((back.metrics["tests_passed"] - 42.0).abs() < f64::EPSILON);
+    }
 }

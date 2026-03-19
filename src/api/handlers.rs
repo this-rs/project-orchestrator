@@ -7107,4 +7107,242 @@ mod tests {
         assert_eq!(json["conflicts"].as_array().unwrap().len(), 0);
         assert_eq!(json["feature_graphs"].as_array().unwrap().len(), 0);
     }
+
+    // ================================================================
+    // GET /api/runs — list_all_plan_runs
+    // ================================================================
+
+    #[tokio::test]
+    async fn test_list_all_plan_runs_empty() {
+        let app = test_app().await;
+        let resp = app.oneshot(auth_get("/api/runs")).await.unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let json = body_json(resp).await;
+        assert!(json.is_array());
+        assert_eq!(json.as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_list_all_plan_runs_with_limit() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_get("/api/runs?limit=10"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let json = body_json(resp).await;
+        assert!(json.is_array());
+    }
+
+    #[tokio::test]
+    async fn test_list_all_plan_runs_with_offset() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_get("/api/runs?offset=5"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let json = body_json(resp).await;
+        assert!(json.is_array());
+    }
+
+    #[tokio::test]
+    async fn test_list_all_plan_runs_with_limit_and_offset() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_get("/api/runs?limit=10&offset=5"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let json = body_json(resp).await;
+        assert!(json.is_array());
+    }
+
+    #[tokio::test]
+    async fn test_list_all_plan_runs_with_status_filter() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_get("/api/runs?status=running"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let json = body_json(resp).await;
+        assert!(json.is_array());
+        assert_eq!(json.as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_list_all_plan_runs_with_all_params() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_get("/api/runs?limit=5&offset=0&status=completed"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let json = body_json(resp).await;
+        assert!(json.is_array());
+    }
+
+    #[tokio::test]
+    async fn test_list_all_plan_runs_invalid_limit_uses_default() {
+        let app = test_app().await;
+        // Non-numeric limit should be ignored, falling back to default (50)
+        let resp = app
+            .oneshot(auth_get("/api/runs?limit=abc"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let json = body_json(resp).await;
+        assert!(json.is_array());
+    }
+
+    #[tokio::test]
+    async fn test_list_all_plan_runs_invalid_offset_uses_default() {
+        let app = test_app().await;
+        // Non-numeric offset should be ignored, falling back to default (0)
+        let resp = app
+            .oneshot(auth_get("/api/runs?offset=xyz"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let json = body_json(resp).await;
+        assert!(json.is_array());
+    }
+
+    // ================================================================
+    // GET /api/reactor/status — reactor_status
+    // ================================================================
+
+    #[tokio::test]
+    async fn test_reactor_status_not_initialized() {
+        // test_app() creates a ServerState with an empty OnceLock (reactor not set)
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_get("/api/reactor/status"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["running"], false);
+        assert_eq!(json["error"], "reactor not initialized");
+    }
+
+    #[tokio::test]
+    async fn test_reactor_status_with_counters() {
+        // Build a state where reactor_counters is populated
+        let app_state = mock_app_state();
+        let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
+        let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
+            orchestrator.clone(),
+        )));
+        let reactor_counters = std::sync::OnceLock::new();
+        let counters = Arc::new(crate::events::ReactorCounters::default());
+        // Mark running
+        counters
+            .running
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        // Simulate some events
+        counters
+            .events_received
+            .store(42, std::sync::atomic::Ordering::Relaxed);
+        counters
+            .events_matched
+            .store(10, std::sync::atomic::Ordering::Relaxed);
+        counters
+            .handlers_invoked
+            .store(8, std::sync::atomic::Ordering::Relaxed);
+        counters
+            .handler_errors
+            .store(1, std::sync::atomic::Ordering::Relaxed);
+        let _ = reactor_counters.set(counters);
+
+        let state = Arc::new(ServerState {
+            orchestrator,
+            watcher,
+            chat_manager: None,
+            event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(
+                crate::events::EventBus::default(),
+            ))),
+            nats_emitter: None,
+            auth_config: Some(crate::test_helpers::test_auth_config()),
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+            setup_completed: true,
+            server_port: 6600,
+            public_url: None,
+            ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
+            registry_remote_url: None,
+            oidc_client: None,
+            neural_router: crate::test_helpers::mock_neural_router(),
+            trajectory_collector: None,
+            trajectory_store: None,
+            identity: None,
+            reactor_counters,
+        });
+        let app = create_router(state);
+
+        let resp = app
+            .oneshot(auth_get("/api/reactor/status"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["running"], true);
+        assert_eq!(json["events_received"], 42);
+        assert_eq!(json["events_matched"], 10);
+        assert_eq!(json["handlers_invoked"], 8);
+        assert_eq!(json["handler_errors"], 1);
+    }
+
+    #[tokio::test]
+    async fn test_reactor_status_with_zero_counters() {
+        // Reactor initialized but no events processed yet
+        let app_state = mock_app_state();
+        let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
+        let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
+            orchestrator.clone(),
+        )));
+        let reactor_counters = std::sync::OnceLock::new();
+        let counters = Arc::new(crate::events::ReactorCounters::default());
+        let _ = reactor_counters.set(counters);
+
+        let state = Arc::new(ServerState {
+            orchestrator,
+            watcher,
+            chat_manager: None,
+            event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(
+                crate::events::EventBus::default(),
+            ))),
+            nats_emitter: None,
+            auth_config: Some(crate::test_helpers::test_auth_config()),
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+            setup_completed: true,
+            server_port: 6600,
+            public_url: None,
+            ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
+            registry_remote_url: None,
+            oidc_client: None,
+            neural_router: crate::test_helpers::mock_neural_router(),
+            trajectory_collector: None,
+            trajectory_store: None,
+            identity: None,
+            reactor_counters,
+        });
+        let app = create_router(state);
+
+        let resp = app
+            .oneshot(auth_get("/api/reactor/status"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["running"], false);
+        assert_eq!(json["events_received"], 0);
+        assert_eq!(json["events_matched"], 0);
+        assert_eq!(json["handlers_invoked"], 0);
+        assert_eq!(json["handler_errors"], 0);
+        // Should NOT have the error field when reactor is initialized
+        assert!(json.get("error").is_none());
+    }
 }

@@ -627,4 +627,426 @@ mod tests {
         let skills = parse_skills(&json!({"skills": []}));
         assert!(skills.is_empty());
     }
+
+    // -- extract_plan_id ----------------------------------------------------
+
+    #[test]
+    fn extract_plan_id_valid() {
+        let id = Uuid::new_v4();
+        let args = json!({"plan_id": id.to_string()});
+        let result = extract_plan_id(&args).unwrap();
+        assert_eq!(result, id);
+    }
+
+    #[test]
+    fn extract_plan_id_missing_field() {
+        let args = json!({"other_field": "value"});
+        let err = extract_plan_id(&args).unwrap_err();
+        assert!(
+            err.to_string().contains("missing required parameter"),
+            "expected 'missing required parameter' but got: {err}"
+        );
+    }
+
+    #[test]
+    fn extract_plan_id_null_value() {
+        let args = json!({"plan_id": null});
+        let err = extract_plan_id(&args).unwrap_err();
+        assert!(err.to_string().contains("missing required parameter"));
+    }
+
+    #[test]
+    fn extract_plan_id_invalid_uuid() {
+        let args = json!({"plan_id": "not-a-uuid"});
+        let err = extract_plan_id(&args).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid plan_id UUID"),
+            "expected 'invalid plan_id UUID' but got: {err}"
+        );
+    }
+
+    #[test]
+    fn extract_plan_id_numeric_value() {
+        // plan_id is a number, not a string — should fail
+        let args = json!({"plan_id": 12345});
+        let err = extract_plan_id(&args).unwrap_err();
+        assert!(err.to_string().contains("missing required parameter"));
+    }
+
+    #[test]
+    fn extract_plan_id_empty_string() {
+        let args = json!({"plan_id": ""});
+        let err = extract_plan_id(&args).unwrap_err();
+        assert!(err.to_string().contains("invalid plan_id UUID"));
+    }
+
+    #[test]
+    fn extract_plan_id_from_empty_object() {
+        let args = json!({});
+        let err = extract_plan_id(&args).unwrap_err();
+        assert!(err.to_string().contains("missing required parameter"));
+    }
+
+    // -- serialization/deserialization round-trips ---------------------------
+
+    #[test]
+    fn pipeline_config_serde_roundtrip() {
+        let config = PipelineConfig {
+            cwd: "/tmp/test".to_string(),
+            project_slug: Some("my-project".to_string()),
+            max_retries_per_gate: 3,
+            timeout_secs: 1800,
+            fail_fast: false,
+        };
+        let serialized = serde_json::to_value(&config).unwrap();
+        assert_eq!(serialized["cwd"], "/tmp/test");
+        assert_eq!(serialized["project_slug"], "my-project");
+        assert_eq!(serialized["max_retries_per_gate"], 3);
+        assert_eq!(serialized["timeout_secs"], 1800);
+        assert_eq!(serialized["fail_fast"], false);
+
+        let deserialized: PipelineConfig = serde_json::from_value(serialized).unwrap();
+        assert_eq!(deserialized.cwd, config.cwd);
+        assert_eq!(deserialized.project_slug, config.project_slug);
+        assert_eq!(deserialized.max_retries_per_gate, config.max_retries_per_gate);
+        assert_eq!(deserialized.timeout_secs, config.timeout_secs);
+        assert_eq!(deserialized.fail_fast, config.fail_fast);
+    }
+
+    #[test]
+    fn pipeline_config_serde_with_none_slug() {
+        let config = PipelineConfig {
+            cwd: ".".to_string(),
+            project_slug: None,
+            max_retries_per_gate: 2,
+            timeout_secs: 3600,
+            fail_fast: true,
+        };
+        let serialized = serde_json::to_value(&config).unwrap();
+        assert!(serialized["project_slug"].is_null());
+
+        let deserialized: PipelineConfig = serde_json::from_value(serialized).unwrap();
+        assert_eq!(deserialized.project_slug, None);
+    }
+
+    #[test]
+    fn skill_context_serde_roundtrip() {
+        let id = Uuid::new_v4();
+        let ctx_json = json!({
+            "skill_id": id.to_string(),
+            "name": "test-skill",
+            "tags": ["rust", "testing"],
+            "trigger_patterns": ["*.rs"],
+            "context_template": "run tests",
+            "notes": []
+        });
+        let ctx: SkillContext = serde_json::from_value(ctx_json).unwrap();
+        assert_eq!(ctx.skill_id, id);
+        assert_eq!(ctx.name, "test-skill");
+        assert_eq!(ctx.tags, vec!["rust", "testing"]);
+        assert_eq!(ctx.trigger_patterns, vec!["*.rs"]);
+        assert_eq!(ctx.context_template, Some("run tests".to_string()));
+        assert!(ctx.notes.is_empty());
+
+        // Round-trip back to JSON
+        let reserialized = serde_json::to_value(&ctx).unwrap();
+        assert_eq!(reserialized["name"], "test-skill");
+    }
+
+    #[test]
+    fn skill_context_deserialize_without_optional_fields() {
+        let id = Uuid::new_v4();
+        let ctx_json = json!({
+            "skill_id": id.to_string(),
+            "name": "minimal-skill",
+            "tags": [],
+            "trigger_patterns": [],
+            "context_template": null,
+            "notes": []
+        });
+        let ctx: SkillContext = serde_json::from_value(ctx_json).unwrap();
+        assert_eq!(ctx.name, "minimal-skill");
+        assert_eq!(ctx.context_template, None);
+    }
+
+    // -- parse_waves edge cases ---------------------------------------------
+
+    #[test]
+    fn parse_waves_skips_entries_missing_wave_number() {
+        let id1 = Uuid::new_v4();
+        let json = json!([
+            {
+                "task_ids": [id1.to_string()],
+                "affected_files": ["src/lib.rs"]
+            }
+        ]);
+        let waves = parse_waves(&json);
+        assert!(waves.is_empty(), "entries without wave_number should be skipped");
+    }
+
+    #[test]
+    fn parse_waves_handles_invalid_task_uuids() {
+        let json = json!([
+            {
+                "wave_number": 1,
+                "task_ids": ["not-a-uuid", "also-bad"],
+                "affected_files": ["a.rs"]
+            }
+        ]);
+        let waves = parse_waves(&json);
+        assert_eq!(waves.len(), 1);
+        assert!(waves[0].task_ids.is_empty(), "invalid UUIDs should be filtered out");
+        assert_eq!(waves[0].affected_files, vec!["a.rs".to_string()]);
+    }
+
+    #[test]
+    fn parse_waves_missing_task_ids_and_files() {
+        let json = json!([
+            {
+                "wave_number": 3
+            }
+        ]);
+        let waves = parse_waves(&json);
+        assert_eq!(waves.len(), 1);
+        assert_eq!(waves[0].wave_number, 3);
+        assert!(waves[0].task_ids.is_empty());
+        assert!(waves[0].affected_files.is_empty());
+    }
+
+    #[test]
+    fn parse_waves_multiple_waves_ordering() {
+        let json = json!([
+            {"wave_number": 2, "task_ids": [], "affected_files": []},
+            {"wave_number": 1, "task_ids": [], "affected_files": []},
+            {"wave_number": 3, "task_ids": [], "affected_files": []}
+        ]);
+        let waves = parse_waves(&json);
+        assert_eq!(waves.len(), 3);
+        // Order should match input order, not sorted
+        assert_eq!(waves[0].wave_number, 2);
+        assert_eq!(waves[1].wave_number, 1);
+        assert_eq!(waves[2].wave_number, 3);
+    }
+
+    #[test]
+    fn parse_waves_string_value_not_array() {
+        let json = json!("this is a string");
+        let waves = parse_waves(&json);
+        assert!(waves.is_empty());
+    }
+
+    #[test]
+    fn parse_waves_mixed_valid_and_invalid_uuids() {
+        let valid_id = Uuid::new_v4();
+        let json = json!([
+            {
+                "wave_number": 1,
+                "task_ids": [valid_id.to_string(), "bad-id", valid_id.to_string()],
+                "affected_files": []
+            }
+        ]);
+        let waves = parse_waves(&json);
+        assert_eq!(waves[0].task_ids.len(), 2);
+        assert_eq!(waves[0].task_ids[0], valid_id);
+        assert_eq!(waves[0].task_ids[1], valid_id);
+    }
+
+    #[test]
+    fn parse_waves_empty_array() {
+        let json = json!([]);
+        let waves = parse_waves(&json);
+        assert!(waves.is_empty());
+    }
+
+    #[test]
+    fn parse_waves_wrapped_empty_array() {
+        let json = json!({"waves": []});
+        let waves = parse_waves(&json);
+        assert!(waves.is_empty());
+    }
+
+    // -- parse_constraints edge cases ---------------------------------------
+
+    #[test]
+    fn parse_constraints_skips_entries_missing_type() {
+        let json = json!([
+            {
+                "description": "some constraint",
+                "severity": "must"
+            }
+        ]);
+        let constraints = parse_constraints(&json);
+        assert!(constraints.is_empty(), "entries without constraint_type should be skipped");
+    }
+
+    #[test]
+    fn parse_constraints_from_wrapped_object() {
+        let json = json!({
+            "constraints": [
+                {
+                    "constraint_type": "performance",
+                    "description": "Must be fast",
+                    "severity": "must"
+                }
+            ]
+        });
+        let constraints = parse_constraints(&json);
+        assert_eq!(constraints.len(), 1);
+        assert_eq!(constraints[0].constraint_type, "performance");
+    }
+
+    #[test]
+    fn parse_constraints_multiple_entries() {
+        let json = json!([
+            {"constraint_type": "performance", "description": "Fast", "severity": "must"},
+            {"constraint_type": "security", "description": "Secure", "severity": "should"},
+            {"constraint_type": "style"}
+        ]);
+        let constraints = parse_constraints(&json);
+        assert_eq!(constraints.len(), 3);
+        assert_eq!(constraints[0].constraint_type, "performance");
+        assert_eq!(constraints[1].constraint_type, "security");
+        assert_eq!(constraints[2].constraint_type, "style");
+        assert_eq!(constraints[2].description, "");
+        assert_eq!(constraints[2].severity, "should");
+    }
+
+    #[test]
+    fn parse_constraints_string_value() {
+        let json = json!("not an array or object");
+        let constraints = parse_constraints(&json);
+        assert!(constraints.is_empty());
+    }
+
+    #[test]
+    fn parse_constraints_empty_array() {
+        let json = json!([]);
+        let constraints = parse_constraints(&json);
+        assert!(constraints.is_empty());
+    }
+
+    // -- collect_affected_files edge cases -----------------------------------
+
+    #[test]
+    fn collect_affected_files_sorts_output() {
+        let waves = vec![PlanWave {
+            wave_number: 1,
+            task_ids: vec![],
+            affected_files: vec!["z.rs".into(), "a.rs".into(), "m.rs".into()],
+        }];
+        let files = collect_affected_files(&waves);
+        assert_eq!(files, vec!["a.rs", "m.rs", "z.rs"]);
+    }
+
+    #[test]
+    fn collect_affected_files_single_wave_with_duplicates() {
+        let waves = vec![PlanWave {
+            wave_number: 1,
+            task_ids: vec![],
+            affected_files: vec!["a.rs".into(), "a.rs".into(), "b.rs".into()],
+        }];
+        let files = collect_affected_files(&waves);
+        assert_eq!(files, vec!["a.rs", "b.rs"]);
+    }
+
+    #[test]
+    fn collect_affected_files_waves_with_no_files() {
+        let waves = vec![
+            PlanWave {
+                wave_number: 1,
+                task_ids: vec![Uuid::new_v4()],
+                affected_files: vec![],
+            },
+            PlanWave {
+                wave_number: 2,
+                task_ids: vec![],
+                affected_files: vec![],
+            },
+        ];
+        let files = collect_affected_files(&waves);
+        assert!(files.is_empty());
+    }
+
+    // -- parse_skills edge cases --------------------------------------------
+
+    #[test]
+    fn parse_skills_with_valid_entry() {
+        let id = Uuid::new_v4();
+        let json = json!([
+            {
+                "skill_id": id.to_string(),
+                "name": "test-skill",
+                "tags": ["rust"],
+                "trigger_patterns": ["*.rs"],
+                "context_template": null,
+                "notes": []
+            }
+        ]);
+        let skills = parse_skills(&json);
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].skill_id, id);
+        assert_eq!(skills[0].name, "test-skill");
+    }
+
+    #[test]
+    fn parse_skills_skips_invalid_entries() {
+        let json = json!([
+            {"not_a_skill": true},
+            {"name": "missing-other-fields"}
+        ]);
+        let skills = parse_skills(&json);
+        assert!(skills.is_empty(), "malformed entries should be skipped");
+    }
+
+    #[test]
+    fn parse_skills_mixed_valid_and_invalid() {
+        let id = Uuid::new_v4();
+        let json = json!([
+            {"garbage": true},
+            {
+                "skill_id": id.to_string(),
+                "name": "good-skill",
+                "tags": [],
+                "trigger_patterns": [],
+                "context_template": null,
+                "notes": []
+            },
+            {"also_garbage": 42}
+        ]);
+        let skills = parse_skills(&json);
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "good-skill");
+    }
+
+    #[test]
+    fn parse_skills_string_input() {
+        let skills = parse_skills(&json!("not an array"));
+        assert!(skills.is_empty());
+    }
+
+    #[test]
+    fn parse_skills_number_input() {
+        let skills = parse_skills(&json!(42));
+        assert!(skills.is_empty());
+    }
+
+    #[test]
+    fn parse_skills_wrapped_with_valid_entries() {
+        let id = Uuid::new_v4();
+        let json = json!({
+            "skills": [
+                {
+                    "skill_id": id.to_string(),
+                    "name": "wrapped-skill",
+                    "tags": ["test"],
+                    "trigger_patterns": [],
+                    "context_template": null,
+                    "notes": []
+                }
+            ]
+        });
+        let skills = parse_skills(&json);
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "wrapped-skill");
+    }
 }

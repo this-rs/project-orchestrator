@@ -46,6 +46,8 @@ ignore:
   - "src/neo4j/user.rs"
   - "src/neo4j/workspace.rs"
   - "src/neo4j/persona.rs"
+  - "src/neo4j/event_trigger.rs"
+  - "src/neo4j/plan_run.rs"
   # Route registration — pure infrastructure (just .route() wiring).
   # No business logic to unit-test; covered by integration/API tests.
   - "src/api/routes.rs"

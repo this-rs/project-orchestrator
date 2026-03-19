@@ -355,6 +355,10 @@ async fn on_plan_status_changed(event: CrudEvent, state: Arc<ServerState>) {
 }
 
 // ─────────────────────────────────────────────────────────────
+// Helpers (visible to tests)
+// ─────────────────────────────────────────────────────────────
+
+// ─────────────────────────────────────────────────────────────
 // Registration
 // ─────────────────────────────────────────────────────────────
 
@@ -418,4 +422,520 @@ pub fn register_builtin_reactions(
                 })
             }),
         )
+}
+
+// ─────────────────────────────────────────────────────────────
+// Tests
+// ─────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::handlers::ServerState;
+    use crate::events::{EventBus, HybridEmitter};
+    use crate::neo4j::models::{PlanStatus, TaskStatus};
+    use crate::orchestrator::{watcher::FileWatcher, Orchestrator};
+    use crate::test_helpers::{mock_app_state, test_plan, test_project, test_task};
+    use serde_json::json;
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+    use uuid::Uuid;
+
+    // ── helpers ──────────────────────────────────────────────────
+
+    /// Build a [`CrudEvent`] with the given fields.
+    fn make_event(
+        entity_type: EntityType,
+        action: CrudAction,
+        entity_id: &str,
+        payload: serde_json::Value,
+    ) -> CrudEvent {
+        CrudEvent::new(entity_type, action, entity_id).with_payload(payload)
+    }
+
+    /// Build a minimal mock [`ServerState`] for reaction tests.
+    async fn mock_server_state() -> Arc<ServerState> {
+        let app_state = mock_app_state();
+        let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
+        let watcher = Arc::new(RwLock::new(FileWatcher::new(orchestrator.clone())));
+        let event_bus = Arc::new(HybridEmitter::new(Arc::new(EventBus::default())));
+        Arc::new(ServerState {
+            orchestrator,
+            watcher,
+            chat_manager: None,
+            event_bus,
+            nats_emitter: None,
+            auth_config: None,
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+            setup_completed: true,
+            server_port: 6600,
+            public_url: None,
+            ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
+            registry_remote_url: None,
+            oidc_client: None,
+            neural_router: crate::test_helpers::mock_neural_router(),
+            trajectory_collector: None,
+            trajectory_store: None,
+            identity: None,
+            reactor_counters: std::sync::OnceLock::new(),
+        })
+    }
+
+    // ── extract_state ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn extract_state_succeeds_with_server_state() {
+        let state = mock_server_state().await;
+        let any: Arc<dyn std::any::Any + Send + Sync> = state.clone();
+        // Should not panic
+        let recovered = extract_state(any);
+        assert_eq!(recovered.server_port, state.server_port);
+    }
+
+    #[test]
+    #[should_panic(expected = "reactor context must be Arc<ServerState>")]
+    fn extract_state_panics_on_wrong_type() {
+        let wrong: Arc<dyn std::any::Any + Send + Sync> = Arc::new(42u32);
+        let _ = extract_state(wrong);
+    }
+
+    // ── get_plan_id_for_task ────────────────────────────────────
+
+    #[tokio::test]
+    async fn get_plan_id_for_task_returns_none_when_no_relationship() {
+        let state = mock_server_state().await;
+        let task_id = Uuid::new_v4();
+        let result = get_plan_id_for_task(&state, task_id).await;
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_plan_id_for_task_returns_plan_when_linked() {
+        let state = mock_server_state().await;
+        let mut plan = test_plan();
+        plan.status = PlanStatus::InProgress;
+        let plan_id = plan.id;
+        state.orchestrator.neo4j().create_plan(&plan).await.unwrap();
+
+        let mut task = test_task();
+        task.status = TaskStatus::Completed;
+        let task_id = task.id;
+        state
+            .orchestrator
+            .neo4j()
+            .create_task(plan_id, &task)
+            .await
+            .unwrap();
+
+        let result = get_plan_id_for_task(&state, task_id).await;
+        assert_eq!(result, Some(plan_id));
+    }
+
+    // ── on_project_synced ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn on_project_synced_returns_on_invalid_uuid() {
+        let state = mock_server_state().await;
+        let event = make_event(
+            EntityType::Project,
+            CrudAction::Synced,
+            "not-a-uuid",
+            json!({"is_first_sync": true}),
+        );
+        // Should return early without panicking
+        on_project_synced(event, state).await;
+    }
+
+    #[tokio::test]
+    async fn on_project_synced_returns_when_project_not_found() {
+        let state = mock_server_state().await;
+        let id = Uuid::new_v4();
+        let event = make_event(
+            EntityType::Project,
+            CrudAction::Synced,
+            &id.to_string(),
+            json!({"is_first_sync": true}),
+        );
+        // Project doesn't exist in the mock store — should return early
+        on_project_synced(event, state).await;
+    }
+
+    #[tokio::test]
+    async fn on_project_synced_incremental_does_not_panic() {
+        let state = mock_server_state().await;
+        let project = test_project();
+        state
+            .orchestrator
+            .neo4j()
+            .create_project(&project)
+            .await
+            .unwrap();
+        let event = make_event(
+            EntityType::Project,
+            CrudAction::Synced,
+            &project.id.to_string(),
+            json!({"is_first_sync": false}),
+        );
+        // Incremental sync path — triggers debouncer, should not panic
+        on_project_synced(event, state).await;
+    }
+
+    #[tokio::test]
+    async fn on_project_synced_missing_payload_defaults_to_incremental() {
+        let state = mock_server_state().await;
+        let project = test_project();
+        state
+            .orchestrator
+            .neo4j()
+            .create_project(&project)
+            .await
+            .unwrap();
+        // No is_first_sync in payload — should default to false
+        let event = make_event(
+            EntityType::Project,
+            CrudAction::Synced,
+            &project.id.to_string(),
+            json!({}),
+        );
+        on_project_synced(event, state).await;
+    }
+
+    // ── on_task_status_changed ──────────────────────────────────
+
+    #[tokio::test]
+    async fn on_task_status_changed_ignores_non_completed() {
+        let state = mock_server_state().await;
+        let event = make_event(
+            EntityType::Task,
+            CrudAction::StatusChanged,
+            &Uuid::new_v4().to_string(),
+            json!({"new_status": "InProgress", "old_status": "Pending"}),
+        );
+        // Should return early (not "Completed")
+        on_task_status_changed(event, state).await;
+    }
+
+    #[tokio::test]
+    async fn on_task_status_changed_ignores_missing_status() {
+        let state = mock_server_state().await;
+        let event = make_event(
+            EntityType::Task,
+            CrudAction::StatusChanged,
+            &Uuid::new_v4().to_string(),
+            json!({}),
+        );
+        // Empty payload → new_status defaults to "" → not "Completed"
+        on_task_status_changed(event, state).await;
+    }
+
+    #[tokio::test]
+    async fn on_task_status_changed_returns_on_invalid_uuid() {
+        let state = mock_server_state().await;
+        let event = make_event(
+            EntityType::Task,
+            CrudAction::StatusChanged,
+            "bad-uuid",
+            json!({"new_status": "Completed"}),
+        );
+        on_task_status_changed(event, state).await;
+    }
+
+    #[tokio::test]
+    async fn on_task_status_changed_returns_when_no_parent_plan() {
+        let state = mock_server_state().await;
+        let event = make_event(
+            EntityType::Task,
+            CrudAction::StatusChanged,
+            &Uuid::new_v4().to_string(),
+            json!({"new_status": "Completed"}),
+        );
+        // Task not linked to any plan → early return
+        on_task_status_changed(event, state).await;
+    }
+
+    #[tokio::test]
+    async fn on_task_status_changed_auto_completes_plan_when_all_done() {
+        let state = mock_server_state().await;
+        let neo4j = state.orchestrator.neo4j();
+
+        // Create a plan in InProgress state
+        let mut plan = test_plan();
+        plan.status = PlanStatus::InProgress;
+        let plan_id = plan.id;
+        neo4j.create_plan(&plan).await.unwrap();
+
+        // Create a single task, already completed
+        let mut task = test_task();
+        task.status = TaskStatus::Completed;
+        let task_id = task.id;
+        neo4j.create_task(plan_id, &task).await.unwrap();
+
+        // Fire the event
+        let event = make_event(
+            EntityType::Task,
+            CrudAction::StatusChanged,
+            &task_id.to_string(),
+            json!({"new_status": "Completed", "old_status": "InProgress"}),
+        );
+        on_task_status_changed(event, state.clone()).await;
+
+        // Verify plan was auto-completed
+        let updated_plan = neo4j.get_plan(plan_id).await.unwrap().unwrap();
+        assert_eq!(updated_plan.status, PlanStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn on_task_status_changed_does_not_complete_plan_with_pending_tasks() {
+        let state = mock_server_state().await;
+        let neo4j = state.orchestrator.neo4j();
+
+        let mut plan = test_plan();
+        plan.status = PlanStatus::InProgress;
+        let plan_id = plan.id;
+        neo4j.create_plan(&plan).await.unwrap();
+
+        // Task 1: completed
+        let mut t1 = test_task();
+        t1.status = TaskStatus::Completed;
+        let t1_id = t1.id;
+        neo4j.create_task(plan_id, &t1).await.unwrap();
+
+        // Task 2: still pending
+        let mut t2 = test_task();
+        t2.status = TaskStatus::Pending;
+        neo4j.create_task(plan_id, &t2).await.unwrap();
+
+        let event = make_event(
+            EntityType::Task,
+            CrudAction::StatusChanged,
+            &t1_id.to_string(),
+            json!({"new_status": "Completed"}),
+        );
+        on_task_status_changed(event, state.clone()).await;
+
+        // Plan should still be InProgress
+        let updated_plan = neo4j.get_plan(plan_id).await.unwrap().unwrap();
+        assert_eq!(updated_plan.status, PlanStatus::InProgress);
+    }
+
+    #[tokio::test]
+    async fn on_task_status_changed_completes_plan_with_failed_and_completed() {
+        let state = mock_server_state().await;
+        let neo4j = state.orchestrator.neo4j();
+
+        let mut plan = test_plan();
+        plan.status = PlanStatus::InProgress;
+        let plan_id = plan.id;
+        neo4j.create_plan(&plan).await.unwrap();
+
+        // One completed, one failed
+        let mut t1 = test_task();
+        t1.status = TaskStatus::Completed;
+        let t1_id = t1.id;
+        neo4j.create_task(plan_id, &t1).await.unwrap();
+
+        let mut t2 = test_task();
+        t2.status = TaskStatus::Failed;
+        neo4j.create_task(plan_id, &t2).await.unwrap();
+
+        let event = make_event(
+            EntityType::Task,
+            CrudAction::StatusChanged,
+            &t1_id.to_string(),
+            json!({"new_status": "Completed"}),
+        );
+        on_task_status_changed(event, state.clone()).await;
+
+        // Failed tasks don't block completion
+        let updated_plan = neo4j.get_plan(plan_id).await.unwrap().unwrap();
+        assert_eq!(updated_plan.status, PlanStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn on_task_status_changed_skips_if_plan_not_in_progress() {
+        let state = mock_server_state().await;
+        let neo4j = state.orchestrator.neo4j();
+
+        // Plan in Draft status — auto-complete should be skipped
+        let mut plan = test_plan();
+        plan.status = PlanStatus::Draft;
+        let plan_id = plan.id;
+        neo4j.create_plan(&plan).await.unwrap();
+
+        let mut task = test_task();
+        task.status = TaskStatus::Completed;
+        let task_id = task.id;
+        neo4j.create_task(plan_id, &task).await.unwrap();
+
+        let event = make_event(
+            EntityType::Task,
+            CrudAction::StatusChanged,
+            &task_id.to_string(),
+            json!({"new_status": "Completed"}),
+        );
+        on_task_status_changed(event, state.clone()).await;
+
+        // Plan should remain Draft
+        let updated_plan = neo4j.get_plan(plan_id).await.unwrap().unwrap();
+        assert_eq!(updated_plan.status, PlanStatus::Draft);
+    }
+
+    // ── on_plan_status_changed ──────────────────────────────────
+
+    #[tokio::test]
+    async fn on_plan_status_changed_ignores_non_completed() {
+        let state = mock_server_state().await;
+        let event = make_event(
+            EntityType::Plan,
+            CrudAction::StatusChanged,
+            &Uuid::new_v4().to_string(),
+            json!({"new_status": "InProgress", "old_status": "Draft"}),
+        );
+        on_plan_status_changed(event, state).await;
+    }
+
+    #[tokio::test]
+    async fn on_plan_status_changed_ignores_missing_status() {
+        let state = mock_server_state().await;
+        let event = make_event(
+            EntityType::Plan,
+            CrudAction::StatusChanged,
+            &Uuid::new_v4().to_string(),
+            json!({}),
+        );
+        on_plan_status_changed(event, state).await;
+    }
+
+    #[tokio::test]
+    async fn on_plan_status_changed_returns_on_invalid_uuid() {
+        let state = mock_server_state().await;
+        let event = make_event(
+            EntityType::Plan,
+            CrudAction::StatusChanged,
+            "not-a-uuid",
+            json!({"new_status": "Completed"}),
+        );
+        on_plan_status_changed(event, state).await;
+    }
+
+    #[tokio::test]
+    async fn on_plan_status_changed_logs_completed() {
+        let state = mock_server_state().await;
+        let plan_id = Uuid::new_v4();
+        let event = make_event(
+            EntityType::Plan,
+            CrudAction::StatusChanged,
+            &plan_id.to_string(),
+            json!({"new_status": "Completed", "old_status": "InProgress"}),
+        );
+        // Should log and return without panicking
+        on_plan_status_changed(event, state).await;
+    }
+
+    // ── register_builtin_reactions ──────────────────────────────
+
+    #[tokio::test]
+    async fn register_builtin_reactions_builds_without_panic() {
+        let state = mock_server_state().await;
+        let bus = Arc::new(EventBus::default());
+        let rx = bus.subscribe();
+        let builder = ReactorBuilder::new(rx, state.clone() as Arc<dyn std::any::Any + Send + Sync>);
+        // Should register 3 reactions without panicking
+        let _builder = register_builtin_reactions(builder, state);
+    }
+
+    // ── CrudEvent payload parsing (pure logic) ─────────────────
+
+    #[test]
+    fn make_event_sets_payload_correctly() {
+        let event = make_event(
+            EntityType::Task,
+            CrudAction::StatusChanged,
+            "abc",
+            json!({"new_status": "Completed", "old_status": "Pending"}),
+        );
+        assert_eq!(event.entity_type, EntityType::Task);
+        assert_eq!(event.action, CrudAction::StatusChanged);
+        assert_eq!(event.entity_id, "abc");
+        assert_eq!(event.payload["new_status"], "Completed");
+        assert_eq!(event.payload["old_status"], "Pending");
+    }
+
+    #[test]
+    fn payload_get_new_status_extracts_string() {
+        let event = make_event(
+            EntityType::Task,
+            CrudAction::StatusChanged,
+            &Uuid::new_v4().to_string(),
+            json!({"new_status": "Completed"}),
+        );
+        let status = event
+            .payload
+            .get("new_status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert_eq!(status, "Completed");
+    }
+
+    #[test]
+    fn payload_missing_new_status_defaults_to_empty() {
+        let event = make_event(
+            EntityType::Task,
+            CrudAction::StatusChanged,
+            &Uuid::new_v4().to_string(),
+            json!({}),
+        );
+        let status = event
+            .payload
+            .get("new_status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert_eq!(status, "");
+    }
+
+    #[test]
+    fn payload_is_first_sync_parsing() {
+        let event = make_event(
+            EntityType::Project,
+            CrudAction::Synced,
+            &Uuid::new_v4().to_string(),
+            json!({"is_first_sync": true}),
+        );
+        let is_first = event
+            .payload
+            .get("is_first_sync")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        assert!(is_first);
+    }
+
+    #[test]
+    fn payload_is_first_sync_missing_defaults_false() {
+        let event = make_event(
+            EntityType::Project,
+            CrudAction::Synced,
+            &Uuid::new_v4().to_string(),
+            json!({}),
+        );
+        let is_first = event
+            .payload
+            .get("is_first_sync")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        assert!(!is_first);
+    }
+
+    #[test]
+    fn uuid_parse_valid() {
+        let id = Uuid::new_v4();
+        assert!(Uuid::parse_str(&id.to_string()).is_ok());
+    }
+
+    #[test]
+    fn uuid_parse_invalid() {
+        assert!(Uuid::parse_str("not-a-uuid").is_err());
+        assert!(Uuid::parse_str("").is_err());
+        assert!(Uuid::parse_str("12345").is_err());
+    }
 }
