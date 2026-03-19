@@ -917,7 +917,7 @@ mod tests {
     async fn test_recover_orphaned_run() {
         let store = Arc::new(MockGraphStore::new());
         let (_, protocol) = setup_event_triggered_protocol(
-            &*store,
+            &store,
             TriggerMode::Event,
             vec!["post_sync".to_string()],
         )
@@ -947,7 +947,7 @@ mod tests {
     async fn test_recover_skips_recent_runs() {
         let store = Arc::new(MockGraphStore::new());
         let (_, protocol) = setup_event_triggered_protocol(
-            &*store,
+            &store,
             TriggerMode::Event,
             vec!["post_sync".to_string()],
         )
@@ -972,7 +972,7 @@ mod tests {
     async fn test_recover_skips_completed_runs() {
         let store = Arc::new(MockGraphStore::new());
         let (_, protocol) = setup_event_triggered_protocol(
-            &*store,
+            &store,
             TriggerMode::Event,
             vec!["post_sync".to_string()],
         )

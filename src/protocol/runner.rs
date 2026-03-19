@@ -136,7 +136,7 @@ pub async fn run_protocol(
         }
 
         // Check if state has no action → break (wait for external trigger)
-        if current_state.action.as_ref().map_or(true, |a| a.is_empty()) {
+        if current_state.action.as_ref().is_none_or(|a| a.is_empty()) {
             debug!(
                 run_id = %run_id,
                 state_name = %current_state.name,
