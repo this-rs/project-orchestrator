@@ -644,7 +644,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_event_trigger_starts_run() {
-        let store = MockGraphStore::new();
+        let store = Arc::new(MockGraphStore::new());
         let (project_id, protocol) = setup_event_triggered_protocol(
             &store,
             TriggerMode::Event,
@@ -652,7 +652,7 @@ mod tests {
         )
         .await;
 
-        trigger_protocols_for_event(Arc::new(store.clone()), project_id, "post_sync", None)
+        trigger_protocols_for_event(store.clone(), project_id, "post_sync", None)
             .await
             .unwrap();
 
@@ -667,7 +667,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_event_trigger_auto_mode() {
-        let store = MockGraphStore::new();
+        let store = Arc::new(MockGraphStore::new());
         let (project_id, protocol) = setup_event_triggered_protocol(
             &store,
             TriggerMode::Auto,
@@ -676,7 +676,7 @@ mod tests {
         .await;
 
         // post_sync should trigger
-        trigger_protocols_for_event(Arc::new(store.clone()), project_id, "post_sync", None)
+        trigger_protocols_for_event(store.clone(), project_id, "post_sync", None)
             .await
             .unwrap();
 
@@ -690,7 +690,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_event_trigger_ignores_manual_mode() {
-        let store = MockGraphStore::new();
+        let store = Arc::new(MockGraphStore::new());
         let (project_id, protocol) = setup_event_triggered_protocol(
             &store,
             TriggerMode::Manual,
@@ -698,7 +698,7 @@ mod tests {
         )
         .await;
 
-        trigger_protocols_for_event(Arc::new(store.clone()), project_id, "post_sync", None)
+        trigger_protocols_for_event(store.clone(), project_id, "post_sync", None)
             .await
             .unwrap();
 
@@ -713,7 +713,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_event_trigger_ignores_scheduled_only() {
-        let store = MockGraphStore::new();
+        let store = Arc::new(MockGraphStore::new());
         let (project_id, protocol) = setup_event_triggered_protocol(
             &store,
             TriggerMode::Scheduled,
@@ -721,7 +721,7 @@ mod tests {
         )
         .await;
 
-        trigger_protocols_for_event(Arc::new(store.clone()), project_id, "post_sync", None)
+        trigger_protocols_for_event(store.clone(), project_id, "post_sync", None)
             .await
             .unwrap();
 
@@ -734,7 +734,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_event_trigger_wrong_event_ignored() {
-        let store = MockGraphStore::new();
+        let store = Arc::new(MockGraphStore::new());
         let (project_id, protocol) = setup_event_triggered_protocol(
             &store,
             TriggerMode::Event,
@@ -743,7 +743,7 @@ mod tests {
         .await;
 
         // post_sync should NOT trigger a protocol listening only to post_import
-        trigger_protocols_for_event(Arc::new(store.clone()), project_id, "post_sync", None)
+        trigger_protocols_for_event(store.clone(), project_id, "post_sync", None)
             .await
             .unwrap();
 
@@ -756,7 +756,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_event_trigger_debounce() {
-        let store = MockGraphStore::new();
+        let store = Arc::new(MockGraphStore::new());
         let (project_id, mut protocol) = setup_event_triggered_protocol(
             &store,
             TriggerMode::Event,
@@ -768,7 +768,7 @@ mod tests {
         protocol.last_triggered_at = Some(chrono::Utc::now() - chrono::Duration::seconds(60));
         store.upsert_protocol(&protocol).await.unwrap();
 
-        trigger_protocols_for_event(Arc::new(store.clone()), project_id, "post_sync", None)
+        trigger_protocols_for_event(store.clone(), project_id, "post_sync", None)
             .await
             .unwrap();
 
@@ -782,7 +782,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_event_trigger_after_debounce_window() {
-        let store = MockGraphStore::new();
+        let store = Arc::new(MockGraphStore::new());
         let (project_id, mut protocol) = setup_event_triggered_protocol(
             &store,
             TriggerMode::Event,
@@ -794,7 +794,7 @@ mod tests {
         protocol.last_triggered_at = Some(chrono::Utc::now() - chrono::Duration::seconds(600));
         store.upsert_protocol(&protocol).await.unwrap();
 
-        trigger_protocols_for_event(Arc::new(store.clone()), project_id, "post_sync", None)
+        trigger_protocols_for_event(store.clone(), project_id, "post_sync", None)
             .await
             .unwrap();
 
@@ -809,7 +809,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_event_trigger_no_protocols() {
-        let store = MockGraphStore::new();
+        let store = Arc::new(MockGraphStore::new());
         let project_id = Uuid::new_v4();
 
         // Create only the project (no protocols)
@@ -830,14 +830,14 @@ mod tests {
         store.create_project(&project).await.unwrap();
 
         // Should succeed silently (no protocols to trigger)
-        trigger_protocols_for_event(Arc::new(store.clone()), project_id, "post_sync", None)
+        trigger_protocols_for_event(store.clone(), project_id, "post_sync", None)
             .await
             .unwrap();
     }
 
     #[tokio::test]
     async fn test_event_trigger_updates_last_triggered_at() {
-        let store = MockGraphStore::new();
+        let store = Arc::new(MockGraphStore::new());
         let (project_id, protocol) = setup_event_triggered_protocol(
             &store,
             TriggerMode::Event,
@@ -847,7 +847,7 @@ mod tests {
 
         assert!(protocol.last_triggered_at.is_none());
 
-        trigger_protocols_for_event(Arc::new(store.clone()), project_id, "post_sync", None)
+        trigger_protocols_for_event(store.clone(), project_id, "post_sync", None)
             .await
             .unwrap();
 
@@ -1009,7 +1009,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_scheduled_trigger_daily_due() {
-        let store = MockGraphStore::new();
+        let store = Arc::new(MockGraphStore::new());
         let (_, mut protocol) =
             setup_scheduled_protocol(&store, TriggerMode::Scheduled, Some("daily")).await;
 
@@ -1017,7 +1017,7 @@ mod tests {
         protocol.last_triggered_at = Some(chrono::Utc::now() - chrono::Duration::hours(25));
         store.upsert_protocol(&protocol).await.unwrap();
 
-        run_scheduled_protocols(Arc::new(store.clone()), None).await.unwrap();
+        run_scheduled_protocols(store.clone(), None).await.unwrap();
 
         let (runs, total) = store
             .list_protocol_runs(protocol.id, None, 10, 0)
@@ -1029,14 +1029,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_scheduled_trigger_never_triggered() {
-        let store = MockGraphStore::new();
+        let store = Arc::new(MockGraphStore::new());
         let (_, protocol) =
             setup_scheduled_protocol(&store, TriggerMode::Scheduled, Some("hourly")).await;
 
         // last_triggered_at is None — should trigger (never triggered = always due)
         assert!(protocol.last_triggered_at.is_none());
 
-        run_scheduled_protocols(Arc::new(store.clone()), None).await.unwrap();
+        run_scheduled_protocols(store.clone(), None).await.unwrap();
 
         let (runs, total) = store
             .list_protocol_runs(protocol.id, None, 10, 0)
@@ -1048,7 +1048,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_scheduled_not_due_yet() {
-        let store = MockGraphStore::new();
+        let store = Arc::new(MockGraphStore::new());
         let (_, mut protocol) =
             setup_scheduled_protocol(&store, TriggerMode::Scheduled, Some("daily")).await;
 
@@ -1056,7 +1056,7 @@ mod tests {
         protocol.last_triggered_at = Some(chrono::Utc::now() - chrono::Duration::hours(1));
         store.upsert_protocol(&protocol).await.unwrap();
 
-        run_scheduled_protocols(Arc::new(store.clone()), None).await.unwrap();
+        run_scheduled_protocols(store.clone(), None).await.unwrap();
 
         let (_, total) = store
             .list_protocol_runs(protocol.id, None, 10, 0)
@@ -1067,11 +1067,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_scheduled_ignores_event_only() {
-        let store = MockGraphStore::new();
+        let store = Arc::new(MockGraphStore::new());
         let (_, protocol) =
             setup_scheduled_protocol(&store, TriggerMode::Event, Some("daily")).await;
 
-        run_scheduled_protocols(Arc::new(store.clone()), None).await.unwrap();
+        run_scheduled_protocols(store.clone(), None).await.unwrap();
 
         // Event-only protocols should not be triggered by scheduler
         let (_, total) = store
@@ -1083,11 +1083,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_scheduled_ignores_manual() {
-        let store = MockGraphStore::new();
+        let store = Arc::new(MockGraphStore::new());
         let (_, protocol) =
             setup_scheduled_protocol(&store, TriggerMode::Manual, Some("daily")).await;
 
-        run_scheduled_protocols(Arc::new(store.clone()), None).await.unwrap();
+        run_scheduled_protocols(store.clone(), None).await.unwrap();
 
         let (_, total) = store
             .list_protocol_runs(protocol.id, None, 10, 0)
@@ -1098,13 +1098,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_scheduled_auto_mode() {
-        let store = MockGraphStore::new();
+        let store = Arc::new(MockGraphStore::new());
         let (_, protocol) =
             setup_scheduled_protocol(&store, TriggerMode::Auto, Some("weekly")).await;
 
         // Auto = Event + Scheduled, should be picked up by scheduler
         // last_triggered_at is None → always due
-        run_scheduled_protocols(Arc::new(store.clone()), None).await.unwrap();
+        run_scheduled_protocols(store.clone(), None).await.unwrap();
 
         let (runs, total) = store
             .list_protocol_runs(protocol.id, None, 10, 0)
@@ -1116,13 +1116,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_scheduled_updates_last_triggered_at() {
-        let store = MockGraphStore::new();
+        let store = Arc::new(MockGraphStore::new());
         let (_, protocol) =
             setup_scheduled_protocol(&store, TriggerMode::Scheduled, Some("hourly")).await;
 
         assert!(protocol.last_triggered_at.is_none());
 
-        run_scheduled_protocols(Arc::new(store.clone()), None).await.unwrap();
+        run_scheduled_protocols(store.clone(), None).await.unwrap();
 
         let updated = store.get_protocol(protocol.id).await.unwrap().unwrap();
         assert!(updated.last_triggered_at.is_some());
@@ -1130,10 +1130,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_scheduled_no_schedule_config() {
-        let store = MockGraphStore::new();
+        let store = Arc::new(MockGraphStore::new());
         let (_, protocol) = setup_scheduled_protocol(&store, TriggerMode::Scheduled, None).await;
 
-        run_scheduled_protocols(Arc::new(store.clone()), None).await.unwrap();
+        run_scheduled_protocols(store.clone(), None).await.unwrap();
 
         // No schedule in config → not triggered
         let (_, total) = store
@@ -1204,11 +1204,11 @@ mod tests {
     /// Integration test 1: sync → auto-triggered event run
     #[tokio::test]
     async fn test_integration_sync_triggers_inference() {
-        let store = MockGraphStore::new();
+        let store = Arc::new(MockGraphStore::new());
         let (project_id, protocol) = setup_inference_protocol(&store).await;
 
         // Simulate a post_sync event (like after admin(sync_directory))
-        trigger_protocols_for_event(Arc::new(store.clone()), project_id, "post_sync", None)
+        trigger_protocols_for_event(store.clone(), project_id, "post_sync", None)
             .await
             .unwrap();
 
@@ -1220,10 +1220,10 @@ mod tests {
         assert_eq!(runs[0].triggered_by, "event:post_sync");
 
         // Complete the first run so the next event can start (concurrency guard)
-        engine::fire_transition(&store, runs[0].id, "process")
+        engine::fire_transition(&*store, runs[0].id, "process")
             .await
             .unwrap();
-        engine::fire_transition(&store, runs[0].id, "complete")
+        engine::fire_transition(&*store, runs[0].id, "complete")
             .await
             .unwrap();
 
@@ -1233,7 +1233,7 @@ mod tests {
         p.last_triggered_at = Some(chrono::Utc::now() - chrono::Duration::seconds(600));
         store.upsert_protocol(&p).await.unwrap();
 
-        trigger_protocols_for_event(Arc::new(store.clone()), project_id, "post_import", None)
+        trigger_protocols_for_event(store.clone(), project_id, "post_import", None)
             .await
             .unwrap();
 
@@ -1253,11 +1253,11 @@ mod tests {
     /// Integration test 2: schedule → auto-triggered scheduled run
     #[tokio::test]
     async fn test_integration_schedule_triggers_inference() {
-        let store = MockGraphStore::new();
+        let store = Arc::new(MockGraphStore::new());
         let (_, protocol) = setup_inference_protocol(&store).await;
 
         // Protocol has never been triggered → scheduler should trigger it
-        run_scheduled_protocols(Arc::new(store.clone()), None).await.unwrap();
+        run_scheduled_protocols(store.clone(), None).await.unwrap();
 
         let (runs, total) = store
             .list_protocol_runs(protocol.id, None, 10, 0)
@@ -1271,25 +1271,25 @@ mod tests {
     /// Each must complete before the next can start (concurrency guard).
     #[tokio::test]
     async fn test_integration_manual_then_event_then_schedule() {
-        let store = MockGraphStore::new();
+        let store = Arc::new(MockGraphStore::new());
         let (project_id, protocol) = setup_inference_protocol(&store).await;
 
         // 1. Manual start (via MCP/REST — triggered_by defaults to "manual")
-        let manual_run = engine::start_run(&store, protocol.id, None, None, None)
+        let manual_run = engine::start_run(&*store, protocol.id, None, None, None)
             .await
             .unwrap();
         assert_eq!(manual_run.triggered_by, "manual");
 
         // Complete the manual run so event-triggered can start
-        engine::fire_transition(&store, manual_run.id, "process")
+        engine::fire_transition(&*store, manual_run.id, "process")
             .await
             .unwrap();
-        engine::fire_transition(&store, manual_run.id, "complete")
+        engine::fire_transition(&*store, manual_run.id, "complete")
             .await
             .unwrap();
 
         // 2. Event-triggered start (simulating post_sync)
-        trigger_protocols_for_event(Arc::new(store.clone()), project_id, "post_sync", None)
+        trigger_protocols_for_event(store.clone(), project_id, "post_sync", None)
             .await
             .unwrap();
 
@@ -1299,10 +1299,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(event_runs.len(), 1);
-        engine::fire_transition(&store, event_runs[0].id, "process")
+        engine::fire_transition(&*store, event_runs[0].id, "process")
             .await
             .unwrap();
-        engine::fire_transition(&store, event_runs[0].id, "complete")
+        engine::fire_transition(&*store, event_runs[0].id, "complete")
             .await
             .unwrap();
 
@@ -1311,7 +1311,7 @@ mod tests {
         p.last_triggered_at = Some(chrono::Utc::now() - chrono::Duration::hours(25));
         store.upsert_protocol(&p).await.unwrap();
 
-        run_scheduled_protocols(Arc::new(store.clone()), None).await.unwrap();
+        run_scheduled_protocols(store.clone(), None).await.unwrap();
 
         // All 3 runs should exist with different triggered_by values
         let (runs, total) = store
@@ -1335,17 +1335,17 @@ mod tests {
     /// Integration test: concurrent run guard rejects event trigger when run is active
     #[tokio::test]
     async fn test_integration_concurrent_guard_rejects_event() {
-        let store = MockGraphStore::new();
+        let store = Arc::new(MockGraphStore::new());
         let (project_id, protocol) = setup_inference_protocol(&store).await;
 
         // Start a manual run (still Running)
-        let _manual_run = engine::start_run(&store, protocol.id, None, None, None)
+        let _manual_run = engine::start_run(&*store, protocol.id, None, None, None)
             .await
             .unwrap();
 
         // Event trigger should be silently rejected (concurrent run guard)
         // trigger_protocols_for_event catches the error and logs it, so it returns Ok(())
-        trigger_protocols_for_event(Arc::new(store.clone()), project_id, "post_sync", None)
+        trigger_protocols_for_event(store.clone(), project_id, "post_sync", None)
             .await
             .unwrap();
 
@@ -1363,11 +1363,11 @@ mod tests {
     /// Integration test: event debounce prevents double-trigger on rapid syncs
     #[tokio::test]
     async fn test_integration_debounce_prevents_rapid_triggers() {
-        let store = MockGraphStore::new();
+        let store = Arc::new(MockGraphStore::new());
         let (project_id, protocol) = setup_inference_protocol(&store).await;
 
         // First sync triggers
-        trigger_protocols_for_event(Arc::new(store.clone()), project_id, "post_sync", None)
+        trigger_protocols_for_event(store.clone(), project_id, "post_sync", None)
             .await
             .unwrap();
 
@@ -1376,21 +1376,21 @@ mod tests {
             .list_protocol_runs(protocol.id, Some(crate::protocol::RunStatus::Running), 1, 0)
             .await
             .unwrap();
-        engine::fire_transition(&store, runs[0].id, "process")
+        engine::fire_transition(&*store, runs[0].id, "process")
             .await
             .unwrap();
-        engine::fire_transition(&store, runs[0].id, "complete")
+        engine::fire_transition(&*store, runs[0].id, "complete")
             .await
             .unwrap();
 
         // Second sync should be debounced (last_triggered_at was just set)
-        trigger_protocols_for_event(Arc::new(store.clone()), project_id, "post_sync", None)
+        trigger_protocols_for_event(store.clone(), project_id, "post_sync", None)
             .await
             .unwrap();
 
         // Third sync with different event should also be debounced
         // (debounce is per-protocol, not per-event)
-        trigger_protocols_for_event(Arc::new(store.clone()), project_id, "post_import", None)
+        trigger_protocols_for_event(store.clone(), project_id, "post_import", None)
             .await
             .unwrap();
 
@@ -1457,7 +1457,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_timeout_stale_auto_triggered_run() {
-        let store = MockGraphStore::new();
+        let store = Arc::new(MockGraphStore::new());
         let (_, protocol) = setup_event_triggered_protocol(
             &store,
             TriggerMode::Event,
@@ -1475,7 +1475,7 @@ mod tests {
         }
         store.create_protocol_run(&run).await.unwrap();
 
-        let count = timeout_stale_runs(&store).await.unwrap();
+        let count = timeout_stale_runs(&*store).await.unwrap();
         assert_eq!(count, 1);
 
         let updated = store.get_protocol_run(run.id).await.unwrap().unwrap();
@@ -1487,7 +1487,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_timeout_skips_recent_auto_run() {
-        let store = MockGraphStore::new();
+        let store = Arc::new(MockGraphStore::new());
         let (_, protocol) = setup_event_triggered_protocol(
             &store,
             TriggerMode::Event,
@@ -1504,7 +1504,7 @@ mod tests {
         }
         store.create_protocol_run(&run).await.unwrap();
 
-        let count = timeout_stale_runs(&store).await.unwrap();
+        let count = timeout_stale_runs(&*store).await.unwrap();
         assert_eq!(count, 0);
 
         let updated = store.get_protocol_run(run.id).await.unwrap().unwrap();
@@ -1513,7 +1513,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_timeout_skips_manual_runs() {
-        let store = MockGraphStore::new();
+        let store = Arc::new(MockGraphStore::new());
         let (_, protocol) =
             setup_event_triggered_protocol(&store, TriggerMode::Manual, vec![]).await;
 
@@ -1526,7 +1526,7 @@ mod tests {
         }
         store.create_protocol_run(&run).await.unwrap();
 
-        let count = timeout_stale_runs(&store).await.unwrap();
+        let count = timeout_stale_runs(&*store).await.unwrap();
         assert_eq!(count, 0);
 
         let updated = store.get_protocol_run(run.id).await.unwrap().unwrap();
@@ -1535,7 +1535,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_timeout_scheduled_run() {
-        let store = MockGraphStore::new();
+        let store = Arc::new(MockGraphStore::new());
         let (_, protocol) =
             setup_scheduled_protocol(&store, TriggerMode::Scheduled, Some("daily")).await;
 
@@ -1548,7 +1548,7 @@ mod tests {
         }
         store.create_protocol_run(&run).await.unwrap();
 
-        let count = timeout_stale_runs(&store).await.unwrap();
+        let count = timeout_stale_runs(&*store).await.unwrap();
         assert_eq!(count, 1);
 
         let updated = store.get_protocol_run(run.id).await.unwrap().unwrap();
