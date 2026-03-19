@@ -28,6 +28,8 @@ pub mod hooks;
 pub mod models;
 pub mod routing;
 pub mod runner;
+#[cfg(test)]
+mod runner_tests;
 pub mod seed;
 
 pub use models::*;
