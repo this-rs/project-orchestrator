@@ -121,6 +121,51 @@ impl SpawnedBy {
     }
 }
 
+/// Runner-specific context passed through `ChatRequest` so that `create_session`
+/// can build a runner-specific system prompt instead of the generic PO prompt.
+///
+/// When this is `Some`, the session is an autonomous code execution agent — the
+/// system prompt will instruct Claude to write code, test, and commit without
+/// conversation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunnerContext {
+    /// Git branch the agent must commit on.
+    pub git_branch: String,
+    /// Files the agent is expected to modify.
+    pub affected_files: Vec<String>,
+    /// Files the agent must NOT modify (managed by parallel agents).
+    pub forbidden_files: Vec<String>,
+    /// Activated skill context text (pre-rendered).
+    pub skill_context: Option<String>,
+    /// Current wave number (for parallel execution awareness).
+    pub wave_number: usize,
+    /// Number of parallel agents in this wave.
+    pub parallel_agents: usize,
+    /// Scaffolding level (0-4) for adaptive prompt verbosity.
+    pub scaffolding_level: u8,
+    /// Frustration score (0.0-1.0) — high = previous attempts failed.
+    pub frustration_level: f64,
+    /// Task tags (test, refactor, security, etc.) for conditional constraints.
+    pub task_tags: Vec<String>,
+}
+
+impl RunnerContext {
+    /// Convert to the `RunnerPromptContext` used by `build_runner_system_prompt`.
+    pub fn to_prompt_context(&self) -> crate::runner::prompt::RunnerPromptContext {
+        crate::runner::prompt::RunnerPromptContext {
+            git_branch: self.git_branch.clone(),
+            task_tags: self.task_tags.clone(),
+            affected_files: self.affected_files.clone(),
+            forbidden_files: self.forbidden_files.clone(),
+            skill_context: self.skill_context.clone(),
+            frustration_level: self.frustration_level,
+            wave_number: self.wave_number,
+            parallel_agents: self.parallel_agents,
+            scaffolding_level: self.scaffolding_level,
+        }
+    }
+}
+
 /// Request to send a chat message
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatRequest {
@@ -169,6 +214,11 @@ pub struct ChatRequest {
     /// This ensures sub-agents inherit the same prompt complexity as their parent.
     #[serde(skip)]
     pub scaffolding_override: Option<u8>,
+    /// Runner-specific context — when set, `create_session` uses a runner system
+    /// prompt (autonomous code execution) instead of the generic PO assistant prompt.
+    /// Set by `PlanRunner.execute_task()` and `delegate_task()`.
+    #[serde(skip)]
+    pub runner_context: Option<RunnerContext>,
 }
 
 /// Events emitted by the chat system (sent via WebSocket / broadcast)

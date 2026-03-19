@@ -19,6 +19,7 @@ use crate::runner::models::{
 use crate::runner::persona::{
     activate_skills_for_task, complexity_directive, profile_task, record_skill_feedback,
 };
+#[cfg(test)]
 use crate::runner::prompt::{build_runner_constraints, RunnerPromptContext};
 use crate::runner::state::RunnerState;
 use crate::runner::vector::VectorCollector;
@@ -1754,7 +1755,10 @@ impl PlanRunner {
             0
         };
 
-        let runner_ctx = RunnerPromptContext {
+        // Build RunnerContext — behavioral constraints now go into the SYSTEM PROMPT
+        // (via create_session), not the user message. This prevents the generic PO
+        // system prompt from conflicting with runner execution instructions.
+        let runner_context = crate::chat::types::RunnerContext {
             git_branch,
             task_tags,
             affected_files: affected_files_for_ctx,
@@ -1765,14 +1769,27 @@ impl PlanRunner {
             parallel_agents: 1, // default, overridden by execute_wave
             scaffolding_level,
         };
-        prompt.push_str(&build_runner_constraints(&runner_ctx));
 
         // --- Step 2b.4: Inject continuity context from previous waves ---
+        // (still in user message — this is task-specific, not behavioral)
         if !continuity_context.is_empty() {
             prompt.push_str(continuity_context);
         }
 
-        // --- Step 2b.5: Inject retry context if this is a retry ---
+        // --- Step 2b.5: Pre-read affected files so the agent has immediate context ---
+        let file_contents = crate::orchestrator::context::pre_read_affected_files(
+            cwd,
+            &runner_context.affected_files,
+            5,
+            200,
+        )
+        .await;
+        if !file_contents.is_empty() {
+            prompt.push('\n');
+            prompt.push_str(&file_contents);
+        }
+
+        // --- Step 2b.6: Inject retry context if this is a retry ---
         if let Some(ref ctx) = retry_context {
             prompt.push_str(&format!(
                 "\n## ⚠️ Previous Attempt Failed\n\
@@ -1832,6 +1849,7 @@ impl PlanRunner {
             ),
             task_context: Some(task_context_str),
             scaffolding_override: None,
+            runner_context: Some(runner_context),
         };
 
         let session = self.chat_manager.create_session(&request).await?;

@@ -102,8 +102,9 @@ impl Default for InferenceConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CollectionConfig {
     /// Enable trajectory collection.
-    /// Default: false (opt-in). Set to true or NEURAL_ROUTING_COLLECT=true to enable.
-    #[serde(default)]
+    /// Default: true — collection runs automatically so the NN router can learn.
+    /// Set to false or NEURAL_ROUTING_COLLECT=false to disable.
+    #[serde(default = "default_true")]
     pub enabled: bool,
     /// Flush batch size — trajectories are buffered and flushed in batches.
     #[serde(default = "default_buffer_size")]
@@ -118,7 +119,7 @@ pub struct CollectionConfig {
 impl Default for CollectionConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             buffer_size: 50,
             stale_session_timeout_secs: 60,
         }
@@ -261,7 +262,7 @@ mod tests {
         assert!(config.enabled);
         assert_eq!(config.mode, RoutingMode::NN);
         assert_eq!(config.inference.timeout_ms, 15);
-        assert!(!config.collection.enabled); // default: false (opt-in)
+        assert!(config.collection.enabled); // default: true (auto-learn)
         assert_eq!(config.nn.top_k, 5);
     }
 

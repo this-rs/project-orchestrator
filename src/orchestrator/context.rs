@@ -878,6 +878,121 @@ pub struct PlanEnrichmentResult {
     pub errors: Vec<String>,
 }
 
+// ============================================================================
+// Standalone utilities
+// ============================================================================
+
+/// Pre-read affected files and format them as markdown code blocks.
+///
+/// Gives runner-spawned agents immediate file context so they can start coding
+/// without spending turns on file discovery. Limits:
+/// - Max `max_files` files (default 5)
+/// - Max `max_lines` lines per file (default 200)
+/// - Skips files > 500 lines (too large for prompt injection)
+/// - Resolves relative paths against `cwd`
+pub async fn pre_read_affected_files(
+    cwd: &str,
+    files: &[String],
+    max_files: usize,
+    max_lines: usize,
+) -> String {
+    use std::path::PathBuf;
+    use tokio::fs;
+
+    if files.is_empty() {
+        return String::new();
+    }
+
+    let mut output = String::from("## Current File Contents\n\n");
+    let mut files_read = 0;
+
+    for file_path in files {
+        if files_read >= max_files {
+            output.push_str(&format!(
+                "_({} more files not shown)_\n",
+                files.len() - files_read
+            ));
+            break;
+        }
+
+        // Resolve path: if relative, prepend cwd
+        let full_path = if file_path.starts_with('/') {
+            PathBuf::from(file_path)
+        } else {
+            PathBuf::from(cwd).join(file_path)
+        };
+
+        match fs::read_to_string(&full_path).await {
+            Ok(content) => {
+                let lines: Vec<&str> = content.lines().collect();
+
+                // Skip files that are too large
+                if lines.len() > 500 {
+                    output.push_str(&format!(
+                        "### `{}`\n_({} lines — too large, read it yourself)_\n\n",
+                        file_path,
+                        lines.len()
+                    ));
+                    files_read += 1;
+                    continue;
+                }
+
+                // Detect language from extension
+                let lang = full_path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(|ext| match ext {
+                        "rs" => "rust",
+                        "ts" | "tsx" => "typescript",
+                        "js" | "jsx" => "javascript",
+                        "py" => "python",
+                        "go" => "go",
+                        "java" => "java",
+                        "toml" => "toml",
+                        "yaml" | "yml" => "yaml",
+                        "json" => "json",
+                        "md" => "markdown",
+                        other => other,
+                    })
+                    .unwrap_or("");
+
+                let truncated = lines.len() > max_lines;
+                let display_lines = if truncated {
+                    &lines[..max_lines]
+                } else {
+                    &lines[..]
+                };
+
+                output.push_str(&format!("### `{}`\n```{}\n", file_path, lang));
+                for line in display_lines {
+                    output.push_str(line);
+                    output.push('\n');
+                }
+                output.push_str("```\n");
+                if truncated {
+                    output.push_str(&format!(
+                        "_(truncated at {} lines, {} total)_\n",
+                        max_lines,
+                        lines.len()
+                    ));
+                }
+                output.push('\n');
+                files_read += 1;
+            }
+            Err(_) => {
+                // File doesn't exist or can't be read — skip silently
+                output.push_str(&format!(
+                    "### `{}`\n_(file not found or unreadable)_\n\n",
+                    file_path
+                ));
+                files_read += 1;
+            }
+        }
+    }
+
+    output
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
