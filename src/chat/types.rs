@@ -38,6 +38,13 @@ pub struct ChatRequest {
     /// Not deserialized from HTTP requests (internal use only).
     #[serde(skip)]
     pub spawned_by: Option<String>,
+    /// Task context for sub-agent sessions — provides the task description
+    /// to `build_system_prompt` so the routing intent detection can produce
+    /// a task-aware system prompt instead of a generic one.
+    /// Set by `delegate_task` and `PlanRunner.execute_task`.
+    /// Not deserialized from HTTP requests (internal use only).
+    #[serde(skip)]
+    pub task_context: Option<String>,
 }
 
 /// Events emitted by the chat system (sent via WebSocket / broadcast)

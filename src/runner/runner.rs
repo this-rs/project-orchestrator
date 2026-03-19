@@ -1386,6 +1386,16 @@ impl PlanRunner {
         ));
 
         // Spawn agent: create_session → subscribe → send_message → listen
+        let task_context_str = task_node
+            .as_ref()
+            .map(|t| {
+                if t.description.is_empty() {
+                    t.title.clone().unwrap_or_default()
+                } else {
+                    t.description.clone()
+                }
+            })
+            .unwrap_or_default();
         let request = ChatRequest {
             message: String::new(), // message sent separately via send_message
             session_id: None,
@@ -1405,6 +1415,7 @@ impl PlanRunner {
                 })
                 .to_string(),
             ),
+            task_context: Some(task_context_str),
         };
 
         let session = self.chat_manager.create_session(&request).await?;

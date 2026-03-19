@@ -776,14 +776,15 @@ pub async fn delegate_task(
         .clone()
         .unwrap_or_else(|| "Untitled task".to_string());
 
-    // Step 1: Build enriched prompt via ContextBuilder
+    // Step 1: Build enriched prompt via ContextBuilder + EnrichmentPipeline
+    let pipeline = chat_manager.enrichment_pipeline.clone();
     let structured = state
         .orchestrator
         .context_builder()
         .build_enriched_context(
             task_id,
             plan_id,
-            None, // no pipeline in HTTP context (stages require DI)
+            Some(&pipeline),
             req.project_slug.as_deref(),
             None, // project_id resolved from slug if needed
             req.custom_sections,
@@ -821,6 +822,7 @@ pub async fn delegate_task(
         workspace_slug: None,
         user_claims: None,
         spawned_by: Some(spawned_by_json.to_string()),
+        task_context: Some(task_title.clone()),
     };
 
     let session = chat_manager

@@ -2042,10 +2042,20 @@ impl ChatManager {
 
         let session_id = Uuid::new_v4();
         let model = self.resolve_model(request.model.as_deref());
+        // Use task_context (from delegate_task/PlanRunner) as routing signal when
+        // the message is empty — this gives the router intent awareness for sub-agents.
+        let routing_message = if request.message.is_empty() {
+            request
+                .task_context
+                .as_deref()
+                .unwrap_or("")
+        } else {
+            &request.message
+        };
         let (system_prompt, _included_note_ids) = self
             .build_system_prompt(
                 request.project_slug.as_deref(),
-                &request.message,
+                routing_message,
                 Some(&model),
                 Some(&session_id.to_string()),
             )
