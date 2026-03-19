@@ -30,6 +30,8 @@ pub struct AgentExecutionNode {
     pub persona_profile: String,
     /// Per-agent execution vector JSON (serialized AgentExecutionVector)
     pub vector_json: Option<String>,
+    /// Structured execution report JSON (serialized TaskExecutionReport)
+    pub report_json: Option<String>,
 }
 
 /// Status of an agent execution.
@@ -143,6 +145,10 @@ impl Neo4jClient {
             cypher.push_str(", ae.vector_json = $vector_json");
         }
 
+        if ae.report_json.is_some() {
+            cypher.push_str(", ae.report_json = $report_json");
+        }
+
         let mut q = query(&cypher)
             .param("id", ae.id.to_string())
             .param("cost_usd", ae.cost_usd)
@@ -154,6 +160,10 @@ impl Neo4jClient {
 
         if let Some(ref vector_json) = ae.vector_json {
             q = q.param("vector_json", vector_json.clone());
+        }
+
+        if let Some(ref report_json) = ae.report_json {
+            q = q.param("report_json", report_json.clone());
         }
 
         self.graph.run(q).await?;
@@ -238,6 +248,7 @@ impl Neo4jClient {
             commits,
             persona_profile: node.get("persona_profile").unwrap_or_default(),
             vector_json: node.get("vector_json").ok(),
+            report_json: node.get("report_json").ok(),
         })
     }
 }

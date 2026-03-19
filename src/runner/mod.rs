@@ -36,8 +36,8 @@ pub use git::{WorktreeCollector, WorktreeInfo, WorktreeResolution};
 pub use guard::{AgentGuard, ChatManagerHintSender, GuardConfig, GuardVerdict, HintSender};
 pub use models::{
     ActiveAgent, ActiveAgentSnapshot, PlanRunStatus, RunSnapshot, RunnerConfig, RunnerEvent,
-    TaskResult, TaskRunStatus, TaskStateMachine, Trigger, TriggerFiring, TriggerSource,
-    TriggerType,
+    TaskExecutionReport, TaskResult, TaskRunStatus, TaskStateMachine, Trigger, TriggerFiring,
+    TriggerSource, TriggerType,
 };
 pub use persona::{
     activate_skills_for_task, complexity_directive, load_persona_stack, profile_task,

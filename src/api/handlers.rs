@@ -850,6 +850,7 @@ pub async fn delegate_task(
             commits: vec![],
             persona_profile: "delegation".to_string(),
             vector_json: None,
+            report_json: None,
         };
         let graph_clone = graph.clone();
         tokio::spawn(async move {

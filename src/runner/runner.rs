@@ -106,6 +106,8 @@ struct TaskExecutionResult {
     pub agent_execution_id: Uuid,
     /// Persona profile string used for this agent.
     pub persona_profile: String,
+    /// Structured execution report with tool usage metrics and confidence score.
+    pub report: Option<TaskExecutionReport>,
 }
 
 impl TaskExecutionResult {
@@ -872,6 +874,15 @@ impl PlanRunner {
                 .map(|r| r.persona_profile.clone())
                 .unwrap_or_default();
 
+            // Extract execution report before consuming the result
+            let task_report = task_result
+                .as_ref()
+                .ok()
+                .and_then(|r| r.report.clone());
+            let task_report_json = task_report
+                .as_ref()
+                .and_then(|r| serde_json::to_string(r).ok());
+
             match task_result.map(|r| r.result) {
                 Ok(TaskResult::Success {
                     duration_secs,
@@ -914,9 +925,21 @@ impl PlanRunner {
                     if let Some(ae_id) = task_agent_execution_id {
                         let graph = self.graph.clone();
                         let persona = task_persona.clone();
+                        let report_json = task_report_json.clone();
+                        let report_ref = task_report.clone();
                         tokio::spawn(async move {
                             use crate::neo4j::agent_execution::{
                                 AgentExecutionNode, AgentExecutionStatus,
+                            };
+                            let (tools_json, files, commits) = if let Some(ref r) = report_ref {
+                                (
+                                    serde_json::to_string(&r.tool_use_breakdown)
+                                        .unwrap_or_else(|_| "{}".to_string()),
+                                    r.files_modified.clone(),
+                                    r.commits.clone(),
+                                )
+                            } else {
+                                ("{}".to_string(), vec![], vec![])
                             };
                             let ae = AgentExecutionNode {
                                 id: ae_id,
@@ -928,11 +951,12 @@ impl PlanRunner {
                                 cost_usd,
                                 duration_secs,
                                 status: AgentExecutionStatus::Completed,
-                                tools_used: "{}".to_string(),
-                                files_modified: vec![],
-                                commits: vec![],
+                                tools_used: tools_json,
+                                files_modified: files,
+                                commits,
                                 persona_profile: persona,
                                 vector_json: None,
+                                report_json,
                             };
                             if let Err(e) = graph.update_agent_execution(&ae).await {
                                 warn!("Failed to update AgentExecution {}: {}", ae_id, e);
@@ -1013,6 +1037,7 @@ impl PlanRunner {
                                 commits: vec![],
                                 persona_profile: persona,
                                 vector_json: None,
+                report_json: None,
                             };
                             if let Err(e) = graph.update_agent_execution(&ae).await {
                                 warn!("Failed to update AgentExecution {}: {}", ae_id, e);
@@ -1106,6 +1131,7 @@ impl PlanRunner {
                                 commits: vec![],
                                 persona_profile: persona,
                                 vector_json: None,
+                report_json: None,
                             };
                             if let Err(e) = graph.update_agent_execution(&ae).await {
                                 warn!("Failed to update AgentExecution {}: {}", ae_id, e);
@@ -1448,6 +1474,7 @@ impl PlanRunner {
                 commits: vec![],
                 persona_profile: persona_str.clone(),
                 vector_json: None,
+                report_json: None,
             };
             let graph = self.graph.clone();
             tokio::spawn(async move {
@@ -1469,6 +1496,7 @@ impl PlanRunner {
                 persona_ids: persona_ids_clone.clone(),
                 agent_execution_id,
                 persona_profile: persona_clone.clone(),
+                report: None,
             }
         };
 
@@ -1504,7 +1532,7 @@ impl PlanRunner {
         let guard_handle = tokio::spawn(async move { guard.monitor().await });
 
         // Listen for events until Result — in parallel with the guard
-        let event_result = self.listen_for_result(rx, run_id).await;
+        let (event_result, event_metrics) = self.listen_for_result(rx, run_id).await;
 
         // Wait for guard to finish (it should return quickly once the channel closes)
         let guard_verdict = match guard_handle.await {
@@ -1666,10 +1694,71 @@ impl PlanRunner {
         // NOTE: Verification (build check, steps, git sanity) is now performed
         // post-wave by execute_wave, not per-task. This avoids redundant build
         // checks when multiple tasks run in parallel within the same wave.
-        Ok(wrap(TaskResult::Success {
+
+        // Build TaskExecutionReport from event metrics + git data
+        let git_files = {
+            let output = tokio::process::Command::new("git")
+                .args(["diff", "--name-only", "HEAD~1..HEAD"])
+                .current_dir(cwd)
+                .output()
+                .await;
+            output
+                .map(|o| {
+                    String::from_utf8_lossy(&o.stdout)
+                        .lines()
+                        .filter(|l| !l.is_empty())
+                        .map(|l| l.to_string())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        };
+        let git_commits = {
+            let output = tokio::process::Command::new("git")
+                .args(["log", "--oneline", "--format=%H", "-5"])
+                .current_dir(cwd)
+                .output()
+                .await;
+            output
+                .map(|o| {
+                    String::from_utf8_lossy(&o.stdout)
+                        .lines()
+                        .filter(|l| !l.is_empty())
+                        .map(|l| l.to_string())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        };
+
+        let mut report = TaskExecutionReport {
+            tool_use_count: event_metrics.tool_use_count,
+            tool_use_breakdown: event_metrics.tool_use_breakdown,
+            error_count: event_metrics.error_count,
+            last_error: event_metrics.last_error,
+            files_modified: git_files,
+            commits: git_commits,
+            agent_success: !is_error,
+            cost_usd,
+            duration_secs,
+            confidence_score: 0.0,
+        };
+        report.compute_confidence();
+
+        info!(
+            "Task {} report: {} tool_uses, {} errors, {} files, {} commits, confidence={:.2}",
+            task_id,
+            report.tool_use_count,
+            report.error_count,
+            report.files_modified.len(),
+            report.commits.len(),
+            report.confidence_score,
+        );
+
+        let mut result = wrap(TaskResult::Success {
             duration_secs,
             cost_usd,
-        }))
+        });
+        result.report = Some(report);
+        Ok(result)
     }
 
     // ========================================================================
@@ -2044,55 +2133,82 @@ impl PlanRunner {
         &self,
         mut rx: broadcast::Receiver<ChatEvent>,
         _run_id: Uuid,
-    ) -> EventListenResult {
+    ) -> (EventListenResult, EventMetrics) {
         let start = std::time::Instant::now();
         // Use a generous timeout here — the guard handles the actual task_timeout
         // with soft hints before hard stop. This is just a safety net.
         let safety_timeout = std::time::Duration::from_secs(self.config.task_timeout_secs + 60);
         let mut cost_usd = 0.0_f64;
+        let mut metrics = EventMetrics::default();
 
         loop {
             let remaining = safety_timeout.saturating_sub(start.elapsed());
             if remaining.is_zero() {
-                return EventListenResult::Completed {
-                    cost_usd,
-                    is_error: true,
-                    error_text: "Safety timeout exceeded".to_string(),
-                    subtype: "timeout".to_string(),
-                };
+                return (
+                    EventListenResult::Completed {
+                        cost_usd,
+                        is_error: true,
+                        error_text: "Safety timeout exceeded".to_string(),
+                        subtype: "timeout".to_string(),
+                    },
+                    metrics,
+                );
             }
 
             // Check cancel flag
             if RUNNER_CANCEL.load(Ordering::SeqCst) {
-                return EventListenResult::Cancelled { cost_usd };
+                return (EventListenResult::Cancelled { cost_usd }, metrics);
             }
 
             match tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await {
                 Ok(Ok(event)) => {
-                    if let ChatEvent::Result {
-                        cost_usd: event_cost,
-                        subtype,
-                        is_error,
-                        result_text,
-                        ..
-                    } = event
-                    {
-                        if let Some(c) = event_cost {
-                            cost_usd = c;
+                    match &event {
+                        ChatEvent::ToolUse { tool, .. } => {
+                            metrics.tool_use_count += 1;
+                            *metrics.tool_use_breakdown.entry(tool.clone()).or_insert(0) += 1;
                         }
-                        return EventListenResult::Completed {
-                            cost_usd,
-                            is_error,
-                            error_text: result_text.unwrap_or_default(),
+                        ChatEvent::ToolResult { is_error, result, .. } if *is_error => {
+                            metrics.error_count += 1;
+                            // Extract error text from the result value
+                            let err_text = result.as_str()
+                                .map(|s| s.to_string())
+                                .or_else(|| result.get("error").and_then(|e| e.as_str()).map(|s| s.to_string()))
+                                .unwrap_or_else(|| result.to_string());
+                            // Keep last 500 chars to avoid bloat
+                            metrics.last_error = Some(if err_text.len() > 500 {
+                                err_text[err_text.len() - 500..].to_string()
+                            } else {
+                                err_text
+                            });
+                        }
+                        ChatEvent::Result {
+                            cost_usd: event_cost,
                             subtype,
-                        };
+                            is_error,
+                            result_text,
+                            ..
+                        } => {
+                            if let Some(c) = event_cost {
+                                cost_usd = *c;
+                            }
+                            return (
+                                EventListenResult::Completed {
+                                    cost_usd,
+                                    is_error: *is_error,
+                                    error_text: result_text.clone().unwrap_or_default(),
+                                    subtype: subtype.clone(),
+                                },
+                                metrics,
+                            );
+                        }
+                        _ => {}
                     }
                 }
                 Ok(Err(broadcast::error::RecvError::Lagged(n))) => {
                     warn!("Runner event receiver lagged by {} events", n);
                 }
                 Ok(Err(broadcast::error::RecvError::Closed)) => {
-                    return EventListenResult::ChannelClosed { cost_usd };
+                    return (EventListenResult::ChannelClosed { cost_usd }, metrics);
                 }
                 Err(_) => {
                     // 5s poll timeout — just loop again (check cancel flag)
@@ -2119,6 +2235,22 @@ enum EventListenResult {
     ChannelClosed { cost_usd: f64 },
     /// The run was cancelled by the user.
     Cancelled { cost_usd: f64 },
+}
+
+/// Metrics collected from ChatEvents during task execution.
+///
+/// Populated by `listen_for_result` while waiting for the final Result event.
+/// Used to build [`TaskExecutionReport`] after task completion.
+#[derive(Debug, Default)]
+struct EventMetrics {
+    /// Total tool_use events
+    tool_use_count: u32,
+    /// Per-tool breakdown
+    tool_use_breakdown: std::collections::HashMap<String, u32>,
+    /// Number of tool_result events that indicate errors
+    error_count: u32,
+    /// Last error text from a tool_result
+    last_error: Option<String>,
 }
 
 // ============================================================================

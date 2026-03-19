@@ -184,6 +184,76 @@ pub enum TaskResult {
 }
 
 // ============================================================================
+// TaskExecutionReport — structured post-execution feedback
+// ============================================================================
+
+/// Structured report generated after a sub-agent completes a task.
+///
+/// Captures tool usage metrics from ChatEvents and git-derived data
+/// (commits, files modified) to compute a confidence score. Persisted
+/// in `AgentExecution.report_json` for analysis and used by the retry
+/// logic to inject error context on re-attempt.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskExecutionReport {
+    /// Total number of tool_use events the agent emitted
+    pub tool_use_count: u32,
+    /// Breakdown of tool uses by tool name (e.g. {"Edit": 5, "Bash": 3})
+    pub tool_use_breakdown: std::collections::HashMap<String, u32>,
+    /// Number of tool_result events that contained errors
+    pub error_count: u32,
+    /// Last error message (if any) — useful for retry context
+    pub last_error: Option<String>,
+    /// Files modified (from git diff)
+    pub files_modified: Vec<String>,
+    /// Commit SHAs produced during this task
+    pub commits: Vec<String>,
+    /// Whether the task ended with agent-reported success
+    pub agent_success: bool,
+    /// Cost in USD
+    pub cost_usd: f64,
+    /// Duration in seconds
+    pub duration_secs: f64,
+    /// Computed confidence score (0.0 - 1.0)
+    ///
+    /// Formula: starts at 1.0, penalized by:
+    /// - error_ratio (errors / tool_uses): -0.3 * ratio
+    /// - zero commits: -0.3
+    /// - zero files modified: -0.2
+    /// - agent failure: -0.4
+    pub confidence_score: f64,
+}
+
+impl TaskExecutionReport {
+    /// Compute the confidence score based on the report's metrics.
+    pub fn compute_confidence(&mut self) {
+        let mut score = 1.0_f64;
+
+        // Penalize by error ratio
+        if self.tool_use_count > 0 {
+            let error_ratio = self.error_count as f64 / self.tool_use_count as f64;
+            score -= 0.3 * error_ratio;
+        }
+
+        // Penalize for no commits
+        if self.commits.is_empty() {
+            score -= 0.3;
+        }
+
+        // Penalize for no file modifications
+        if self.files_modified.is_empty() {
+            score -= 0.2;
+        }
+
+        // Penalize for agent failure
+        if !self.agent_success {
+            score -= 0.4;
+        }
+
+        self.confidence_score = score.clamp(0.0, 1.0);
+    }
+}
+
+// ============================================================================
 // RunStatus — overall plan run status
 // ============================================================================
 
