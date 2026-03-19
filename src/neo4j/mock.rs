@@ -4029,6 +4029,14 @@ impl GraphStore for MockGraphStore {
         Ok(projects.get(&project_id).cloned())
     }
 
+    async fn get_plan_id_for_task(&self, task_id: Uuid) -> Result<Option<Uuid>> {
+        let plan_tasks = self.plan_tasks.read().await;
+        Ok(plan_tasks
+            .iter()
+            .find(|(_, tasks)| tasks.contains(&task_id))
+            .map(|(plan_id, _)| *plan_id))
+    }
+
     // ========================================================================
     // Step operations
     // ========================================================================

@@ -243,6 +243,7 @@ mod tests {
             trajectory_collector: None,
             trajectory_store: None,
             identity: None,
+            reactor_counters: std::sync::OnceLock::new(),
         })
     }
 
@@ -274,6 +275,7 @@ mod tests {
             trajectory_collector: None,
             trajectory_store: Some(mock_trajectory_store()),
             identity: None,
+            reactor_counters: std::sync::OnceLock::new(),
         })
     }
 

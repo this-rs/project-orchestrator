@@ -2002,6 +2002,7 @@ mod tests {
             trajectory_collector: None,
             trajectory_store: None,
             identity: None,
+            reactor_counters: std::sync::OnceLock::new(),
         });
         create_router(state)
     }
@@ -2036,6 +2037,7 @@ mod tests {
             trajectory_collector: None,
             trajectory_store: None,
             identity: None,
+            reactor_counters: std::sync::OnceLock::new(),
         });
         (create_router(state), project_id)
     }
@@ -2099,6 +2101,7 @@ mod tests {
             trajectory_collector: None,
             trajectory_store: None,
             identity: None,
+            reactor_counters: std::sync::OnceLock::new(),
         });
         (create_router(state), project_id, persona_id)
     }
@@ -3182,6 +3185,7 @@ mod tests {
             trajectory_collector: None,
             trajectory_store: None,
             identity: None,
+            reactor_counters: std::sync::OnceLock::new(),
         });
         (create_router(state), project_id, persona_id)
     }

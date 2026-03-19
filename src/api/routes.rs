@@ -648,6 +648,8 @@ fn protected_routes() -> Router<OrchestratorState> {
                 .post(handlers::start_watch)
                 .delete(handlers::stop_watch),
         )
+        // EventReactor status
+        .route("/api/reactor/status", get(handlers::reactor_status))
         // ================================================================
         // Code Exploration (Graph + Search powered)
         // ================================================================
@@ -1633,6 +1635,7 @@ mod tests {
             trajectory_collector: None,
             trajectory_store: None,
             identity: None,
+            reactor_counters: std::sync::OnceLock::new(),
         });
         create_router(state)
     }
@@ -1663,6 +1666,7 @@ mod tests {
             trajectory_collector: None,
             trajectory_store: None,
             identity: None,
+            reactor_counters: std::sync::OnceLock::new(),
         });
         create_router(state)
     }

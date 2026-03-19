@@ -71,6 +71,9 @@ pub struct ServerState {
     pub trajectory_collector: Option<Arc<neural_routing_runtime::TrajectoryCollector>>,
     /// Trajectory store — Neo4j CRUD + vector search for stored trajectories.
     pub trajectory_store: Option<Arc<dyn neural_routing_runtime::TrajectoryStore>>,
+    /// EventReactor counters for the /api/reactor/status endpoint.
+    /// Initialized once after reactor is built via `OnceLock`.
+    pub reactor_counters: std::sync::OnceLock<Arc<crate::events::ReactorCounters>>,
 }
 
 /// Shared orchestrator state
@@ -1882,6 +1885,30 @@ pub async fn watch_status(
             .map(|p| p.to_string_lossy().to_string())
             .collect(),
     }))
+}
+
+/// GET /api/reactor/status — EventReactor health and statistics.
+///
+/// Returns the reactor's running state and event processing counters.
+pub async fn reactor_status(
+    State(state): State<OrchestratorState>,
+) -> Json<serde_json::Value> {
+    match state.reactor_counters.get() {
+        Some(counters) => {
+            let stats = counters.snapshot(0);
+            Json(serde_json::json!({
+                "running": stats.running,
+                "events_received": stats.events_received,
+                "events_matched": stats.events_matched,
+                "handlers_invoked": stats.handlers_invoked,
+                "handler_errors": stats.handler_errors,
+            }))
+        }
+        None => Json(serde_json::json!({
+            "running": false,
+            "error": "reactor not initialized",
+        })),
+    }
 }
 
 // ============================================================================
@@ -5798,6 +5825,7 @@ mod tests {
             trajectory_collector: None,
             trajectory_store: None,
             identity: None,
+            reactor_counters: std::sync::OnceLock::new(),
         });
         (create_router(state), milestone.id, task1.id, task2.id)
     }
@@ -6007,6 +6035,7 @@ mod tests {
             trajectory_collector: None,
             trajectory_store: None,
             identity: None,
+            reactor_counters: std::sync::OnceLock::new(),
         }
     }
 
@@ -6163,6 +6192,7 @@ mod tests {
             trajectory_collector: None,
             trajectory_store: None,
             identity: None,
+            reactor_counters: std::sync::OnceLock::new(),
         });
         create_router(state)
     }
@@ -6936,6 +6966,7 @@ mod tests {
             trajectory_collector: None,
             trajectory_store: None,
             identity: None,
+            reactor_counters: std::sync::OnceLock::new(),
         });
         (create_router(state), plan.id, task1.id, task2.id)
     }
@@ -7041,6 +7072,7 @@ mod tests {
             trajectory_collector: None,
             trajectory_store: None,
             identity: None,
+            reactor_counters: std::sync::OnceLock::new(),
         });
         let app = create_router(state);
 

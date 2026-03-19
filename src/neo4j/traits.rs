@@ -863,6 +863,12 @@ pub trait GraphStore: Send + Sync {
     /// Returns `None` if the task doesn't exist or has no linked project.
     async fn get_project_for_task(&self, task_id: Uuid) -> Result<Option<ProjectNode>>;
 
+    /// Get the plan UUID that owns a given task.
+    ///
+    /// Traverses: `(Plan)-[:HAS_TASK]->(Task {id: task_id})`
+    /// Returns `None` if the task doesn't exist or has no parent plan.
+    async fn get_plan_id_for_task(&self, task_id: Uuid) -> Result<Option<Uuid>>;
+
     // ========================================================================
     // Step operations
     // ========================================================================

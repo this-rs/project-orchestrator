@@ -2123,6 +2123,7 @@ mod tests {
             ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
             registry_remote_url: None,
             identity: None,
+            reactor_counters: std::sync::OnceLock::new(),
             oidc_client: None,
             neural_router: crate::test_helpers::mock_neural_router(),
             trajectory_collector: None,

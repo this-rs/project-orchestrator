@@ -1092,6 +1092,10 @@ impl GraphStore for Neo4jClient {
         self.get_project_for_task(task_id).await
     }
 
+    async fn get_plan_id_for_task(&self, task_id: Uuid) -> anyhow::Result<Option<Uuid>> {
+        self.get_plan_id_for_task(task_id).await
+    }
+
     // ========================================================================
     // Step operations
     // ========================================================================
