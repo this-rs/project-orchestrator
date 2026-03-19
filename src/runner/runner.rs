@@ -1824,7 +1824,8 @@ impl PlanRunner {
             let prompt_ctx = runner_context.to_prompt_context();
             let runner_instructions =
                 crate::runner::prompt::build_runner_system_prompt(&prompt_ctx);
-            let mut full_prompt = String::with_capacity(runner_instructions.len() + prompt.len() + 2);
+            let mut full_prompt =
+                String::with_capacity(runner_instructions.len() + prompt.len() + 2);
             full_prompt.push_str(&runner_instructions);
             full_prompt.push_str("\n---\n\n");
             full_prompt.push_str(&prompt);
