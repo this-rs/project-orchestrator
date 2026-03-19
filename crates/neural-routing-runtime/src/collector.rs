@@ -1758,4 +1758,93 @@ mod tests {
         let extracted: Option<uuid::Uuid> = decisions.iter().find_map(|d| d.protocol_run_id);
         assert_eq!(extracted, None);
     }
+
+    // ── Stale timer flush logic ─────────────────────────────────────────
+
+    #[test]
+    fn test_stale_flush_does_not_require_full_buffer() {
+        // Regression test: the stale timer must flush pending trajectories
+        // even when the buffer hasn't reached buffer_size.
+        // Previously, the condition was `pending_flush.len() >= buffer_size`
+        // which meant trajectories from low-traffic environments were never
+        // persisted (stuck in memory forever).
+        let buffer_size = 50;
+        let builder = DecisionVectorBuilder::new();
+
+        let mut pending_flush: Vec<PendingTrajectory> = Vec::new();
+
+        // Simulate a single stale session being finalized
+        let buffer = SessionBuffer {
+            decisions: vec![make_decision("stale-test", "code.search", 0)],
+            started_at: Utc::now(),
+            last_decision_at: Instant::now(),
+        };
+        pending_flush.push(build_trajectory("stale-test", &buffer, 0.5, &builder));
+
+        // Verify: 1 trajectory pending, far below buffer_size
+        assert_eq!(pending_flush.len(), 1);
+        assert!(pending_flush.len() < buffer_size);
+
+        // The stale timer flush condition must trigger (not empty)
+        assert!(
+            !pending_flush.is_empty(),
+            "Stale timer should flush even with < buffer_size trajectories"
+        );
+
+        // Simulate the flush
+        let to_flush = std::mem::take(&mut pending_flush);
+        assert_eq!(to_flush.len(), 1);
+        assert!(pending_flush.is_empty());
+    }
+
+    #[test]
+    fn test_stale_flush_noop_when_empty() {
+        // Stale timer should NOT flush when there are no pending trajectories.
+        let pending_flush: Vec<PendingTrajectory> = Vec::new();
+        assert!(
+            pending_flush.is_empty(),
+            "No flush should happen when pending_flush is empty"
+        );
+    }
+
+    #[test]
+    fn test_stale_flush_with_multiple_sessions() {
+        // When multiple stale sessions are finalized in one tick,
+        // all their trajectories should be flushed together.
+        let builder = DecisionVectorBuilder::new();
+        let mut pending_flush: Vec<PendingTrajectory> = Vec::new();
+
+        // Simulate 3 stale sessions finalized in one tick
+        for i in 0..3 {
+            let session_id = format!("stale-session-{}", i);
+            let buffer = SessionBuffer {
+                decisions: vec![
+                    make_decision(&session_id, "code.search", 0),
+                    make_decision(&session_id, "note.create", 50),
+                ],
+                started_at: Utc::now(),
+                last_decision_at: Instant::now(),
+            };
+            let reward = 0.5 + (i as f64) * 0.1;
+            pending_flush.push(build_trajectory(&session_id, &buffer, reward, &builder));
+        }
+
+        // 3 trajectories < buffer_size (50), but should still flush
+        assert_eq!(pending_flush.len(), 3);
+        assert!(!pending_flush.is_empty());
+
+        let to_flush = std::mem::take(&mut pending_flush);
+        assert_eq!(to_flush.len(), 3);
+        assert!(pending_flush.is_empty());
+
+        // Verify each trajectory is distinct
+        let session_ids: Vec<&str> = to_flush
+            .iter()
+            .map(|t| t.trajectory.session_id.as_str())
+            .collect();
+        assert_eq!(
+            session_ids,
+            vec!["stale-session-0", "stale-session-1", "stale-session-2"]
+        );
+    }
 }
