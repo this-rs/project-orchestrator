@@ -73,6 +73,7 @@ pub mod graph;
 mod hybrid;
 pub mod nats;
 mod notifier;
+pub mod reactor;
 mod types;
 
 pub use bus::EventBus;
@@ -81,4 +82,5 @@ pub use hybrid::HybridEmitter;
 pub use nats::{connect_nats, ChatRpcRequest, ChatRpcResponse, NatsEmitter, StreamingSnapshot};
 #[allow(deprecated)]
 pub use notifier::EventNotifier;
+pub use reactor::{EventReactor, ReactorBuilder, ReactorCounters, ReactorStats};
 pub use types::{CrudAction, CrudEvent, EntityType, EventEmitter, RelatedEntity};
