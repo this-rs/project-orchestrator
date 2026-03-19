@@ -198,9 +198,7 @@ impl Neo4jClient {
             cypher.push_str("WHERE r.status = $status\n");
         }
 
-        cypher.push_str(
-            "RETURN r\nORDER BY r.started_at DESC\nSKIP $offset\nLIMIT $limit",
-        );
+        cypher.push_str("RETURN r\nORDER BY r.started_at DESC\nSKIP $offset\nLIMIT $limit");
 
         let mut q = query(&cypher).param("limit", limit).param("offset", offset);
         if let Some(s) = status {

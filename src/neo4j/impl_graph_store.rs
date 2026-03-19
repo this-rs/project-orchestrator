@@ -3541,7 +3541,8 @@ impl GraphStore for Neo4jClient {
         status: Option<&str>,
         workspace_slug: Option<&str>,
     ) -> anyhow::Result<Vec<crate::runner::RunnerState>> {
-        self.list_all_plan_runs_impl(limit, offset, status, workspace_slug).await
+        self.list_all_plan_runs_impl(limit, offset, status, workspace_slug)
+            .await
     }
 
     async fn list_plan_runs(
