@@ -19,6 +19,7 @@ use crate::runner::models::{
 use crate::runner::persona::{
     activate_skills_for_task, complexity_directive, profile_task, record_skill_feedback,
 };
+#[cfg(test)]
 use crate::runner::prompt::{build_runner_constraints, RunnerPromptContext};
 use crate::runner::state::RunnerState;
 use crate::runner::vector::VectorCollector;
@@ -1784,7 +1785,7 @@ impl PlanRunner {
         )
         .await;
         if !file_contents.is_empty() {
-            prompt.push_str("\n");
+            prompt.push('\n');
             prompt.push_str(&file_contents);
         }
 
