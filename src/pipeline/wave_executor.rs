@@ -100,6 +100,7 @@ impl TaskDelegate for PlaceholderDelegate {
 
 /// The Wave Executor
 pub struct WaveExecutor {
+    #[allow(dead_code)] // Will be used when async task timeout is implemented
     timeout_secs: u64,
     delegate: std::sync::Arc<dyn TaskDelegate>,
 }

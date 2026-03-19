@@ -423,10 +423,7 @@ fn protected_routes() -> Router<OrchestratorState> {
             post(handlers::predict_plan_run),
         )
         // Pipeline — Gate Results & Progress
-        .route(
-            "/api/runs/{run_id}/gates",
-            get(handlers::get_run_gates),
-        )
+        .route("/api/runs/{run_id}/gates", get(handlers::get_run_gates))
         .route(
             "/api/runs/{run_id}/progress",
             get(handlers::get_run_progress),

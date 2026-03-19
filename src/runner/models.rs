@@ -420,14 +420,9 @@ pub enum TriggerSource {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SpawnedBy {
     /// Spawned by the PlanRunner for a specific task
-    Runner {
-        run_id: Uuid,
-        plan_id: Uuid,
-    },
+    Runner { run_id: Uuid, plan_id: Uuid },
     /// Spawned as a sub-conversation from another session
-    Conversation {
-        session_id: Uuid,
-    },
+    Conversation { session_id: Uuid },
     /// Spawned by the pipeline executor (wave-based execution)
     Pipeline {
         run_id: Uuid,

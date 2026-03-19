@@ -71,11 +71,19 @@ impl SpawnedBy {
     /// Extract the parent session ID if present.
     pub fn parent_session_id(&self) -> Option<Uuid> {
         match self {
-            Self::Runner { parent_session_id, .. } => *parent_session_id,
-            Self::Pipeline { parent_session_id, .. } => *parent_session_id,
-            Self::Gate { parent_session_id, .. } => *parent_session_id,
+            Self::Runner {
+                parent_session_id, ..
+            } => *parent_session_id,
+            Self::Pipeline {
+                parent_session_id, ..
+            } => *parent_session_id,
+            Self::Gate {
+                parent_session_id, ..
+            } => *parent_session_id,
             Self::Trigger { .. } => None,
-            Self::Conversation { parent_session_id, .. } => Some(*parent_session_id),
+            Self::Conversation {
+                parent_session_id, ..
+            } => Some(*parent_session_id),
         }
     }
 
