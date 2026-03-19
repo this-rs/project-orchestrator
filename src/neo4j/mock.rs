@@ -10571,6 +10571,32 @@ impl GraphStore for MockGraphStore {
     ) -> Result<Vec<EventTrigger>> {
         Ok(vec![])
     }
+
+    async fn create_event_trigger(&self, _trigger: &EventTrigger) -> Result<Uuid> {
+        Ok(Uuid::new_v4())
+    }
+
+    async fn get_event_trigger(&self, _id: Uuid) -> Result<Option<EventTrigger>> {
+        Ok(None)
+    }
+
+    async fn update_event_trigger(
+        &self,
+        _id: Uuid,
+        _enabled: Option<bool>,
+        _name: Option<String>,
+        _entity_type_pattern: Option<Option<String>>,
+        _action_pattern: Option<Option<String>>,
+        _payload_conditions: Option<Option<serde_json::Value>>,
+        _cooldown_secs: Option<u32>,
+        _project_scope: Option<Option<Uuid>>,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
+    async fn delete_event_trigger(&self, _id: Uuid) -> Result<bool> {
+        Ok(false)
+    }
 }
 
 #[cfg(test)]
