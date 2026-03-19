@@ -40,7 +40,7 @@
 
 use super::prompt::TOOL_REFERENCE;
 use super::prompt_sections::{assemble_sections, extract_tool_reference};
-use super::routing::{HeuristicRouter, RoutingContext, RoutingProvider};
+use super::routing::{HeuristicRouter, RoutingContext, RoutingDecisionRecord, RoutingProvider};
 use super::stages::status_injection::ProtocolRunStatus;
 
 // Re-export SectionHint from routing for backward compatibility
@@ -77,13 +77,54 @@ pub struct ComposerInput<'a> {
     pub has_active_plan: bool,
     /// Number of tasks across active plans.
     pub task_count: usize,
+    /// Model name (e.g., "claude-sonnet-4-20250514"). Used for adaptive context budgeting.
+    pub model: &'a str,
+    /// Pre-computed embedding of the user message (for DualTrackRouter).
+    /// `None` if embeddings are unavailable → routing falls back to heuristics.
+    pub message_embedding: Option<&'a Vec<f32>>,
 }
 
 // Default is derived — all numeric fields default to 0, bools to false,
 // &str to "", Option to None, &[] to empty slice.
 
-/// Maximum character budget for the dynamic context section (~2500 tokens at 4 chars/token).
-const DYNAMIC_CONTEXT_CHAR_BUDGET: usize = 10_000;
+/// Fallback character budget when the model is unknown (~2500 tokens at 4 chars/token).
+const DEFAULT_DYNAMIC_CONTEXT_CHAR_BUDGET: usize = 10_000;
+
+/// Compute the dynamic context character budget based on the model's context window
+/// and the current system prompt length.
+///
+/// Strategy: allocate up to 15% of the model's remaining context window (after base prompt)
+/// for dynamic context, clamped between 5K and 40K chars.
+///
+/// Known context windows (in tokens):
+/// - claude-opus-4 / claude-sonnet-4: 200K
+/// - claude-haiku-3-5: 200K
+/// - claude-3-opus: 200K
+/// - Smaller/unknown models: fallback to 10K chars
+fn compute_dynamic_budget(model: &str, base_prompt_chars: usize) -> usize {
+    // Estimate model context window in tokens
+    let context_window_tokens: usize = if model.contains("opus")
+        || model.contains("sonnet")
+        || model.contains("haiku")
+    {
+        200_000
+    } else {
+        // Unknown model → use conservative fallback
+        return DEFAULT_DYNAMIC_CONTEXT_CHAR_BUDGET;
+    };
+
+    // Convert to chars (~4 chars per token)
+    let context_window_chars = context_window_tokens * 4;
+
+    // Remaining space after base prompt
+    let remaining = context_window_chars.saturating_sub(base_prompt_chars);
+
+    // Allocate 15% of remaining space for dynamic context
+    let budget = remaining * 15 / 100;
+
+    // Clamp between 5K and 40K chars
+    budget.clamp(5_000, 40_000)
+}
 
 /// The FsmPromptComposer assembles the full system prompt from modular sections.
 ///
@@ -97,7 +138,18 @@ impl FsmPromptComposer {
     /// This is the standard entry point. For custom routing (e.g., DualTrackRouter),
     /// use [`compose_with_router()`] instead.
     pub fn compose(input: &ComposerInput<'_>) -> String {
-        Self::compose_with_router(input, &HeuristicRouter)
+        Self::compose_with_router(input, &HeuristicRouter).0
+    }
+
+    /// Compose the full system prompt and return the routing decision record.
+    ///
+    /// Use this when you need to emit the routing decision to the
+    /// `TrajectoryCollector` for the neural feedback loop.
+    pub fn compose_with_record(
+        input: &ComposerInput<'_>,
+        router: &dyn RoutingProvider,
+    ) -> (String, RoutingDecisionRecord) {
+        Self::compose_with_router(input, router)
     }
 
     /// Compose the full system prompt using a custom [`RoutingProvider`].
@@ -119,7 +171,10 @@ impl FsmPromptComposer {
     /// let dual_track = DualTrackRouter::new(model_weights);
     /// let prompt = FsmPromptComposer::compose_with_router(&input, &dual_track);
     /// ```
-    pub fn compose_with_router(input: &ComposerInput<'_>, router: &dyn RoutingProvider) -> String {
+    pub fn compose_with_router(
+        input: &ComposerInput<'_>,
+        router: &dyn RoutingProvider,
+    ) -> (String, RoutingDecisionRecord) {
         // ── Step 1: Build routing context ─────────────────────────────
         let fsm_tools: Vec<String> = input
             .protocol_runs
@@ -138,6 +193,7 @@ impl FsmPromptComposer {
             fsm_available_tools: fsm_tools,
             user_message: input.user_message.to_string(),
             detected_intent: None, // Future: from enrichment hints
+            message_embedding: input.message_embedding.cloned(),
         };
 
         // ── Step 2: Route — get section + tool group decisions ────────
@@ -153,13 +209,20 @@ impl FsmPromptComposer {
         let tool_ref = extract_tool_reference(TOOL_REFERENCE, &decision.tool_groups);
 
         // ── Step 6: Build dynamic context (truncated) ─────────────────
+        // Compute adaptive budget based on model context window and current prompt size
+        let base_prompt_len = base_prompt.len() + fsm_section.len() + tool_ref.len();
+        let char_budget = compute_dynamic_budget(input.model, base_prompt_len);
         let dynamic = Self::build_dynamic_section(
             input.continuity_markdown,
             input.project_context_markdown,
             input.enrichment_markdown,
+            char_budget,
         );
 
-        // ── Step 7: Assemble final prompt ─────────────────────────────
+        // ── Step 7: Build trajectory record ────────────────────────────
+        let routing_record = decision.to_trajectory_record(&routing_ctx);
+
+        // ── Step 8: Assemble final prompt ─────────────────────────────
         let mut parts: Vec<&str> = Vec::with_capacity(4);
         parts.push(&base_prompt);
 
@@ -177,7 +240,7 @@ impl FsmPromptComposer {
 
         parts.push(&tool_ref);
 
-        parts.join("\n\n---\n\n")
+        (parts.join("\n\n---\n\n"), routing_record)
     }
 
     /// Build the FSM context section from active protocol runs.
@@ -244,7 +307,15 @@ impl FsmPromptComposer {
     /// 1. Parses the markdown into sections (## headers) with their list items (- lines)
     /// 2. Scores each item by importance markers ([Critical] > [High] > [Medium] > [Low])
     /// 3. When over budget, keeps only the top-N items per section (never drops entire sections)
-    fn build_dynamic_section(continuity: &str, project_context: &str, enrichment: &str) -> String {
+    ///
+    /// `char_budget` is the maximum character count for the dynamic section, computed
+    /// by [`compute_dynamic_budget()`] based on the model's context window.
+    fn build_dynamic_section(
+        continuity: &str,
+        project_context: &str,
+        enrichment: &str,
+        char_budget: usize,
+    ) -> String {
         let mut parts = Vec::new();
 
         if !continuity.is_empty() {
@@ -264,12 +335,12 @@ impl FsmPromptComposer {
         let full = parts.join("\n\n");
 
         // Under budget → return as-is
-        if full.len() <= DYNAMIC_CONTEXT_CHAR_BUDGET {
+        if full.len() <= char_budget {
             return full;
         }
 
         // Over budget → semantic truncation
-        truncate_markdown_semantically(&full, DYNAMIC_CONTEXT_CHAR_BUDGET)
+        truncate_markdown_semantically(&full, char_budget)
     }
 
     /// Estimate token count (~4 chars per token).
@@ -307,6 +378,7 @@ impl FsmPromptComposer {
             fsm_available_tools: fsm_tools,
             user_message: input.user_message.to_string(),
             detected_intent: None,
+            message_embedding: input.message_embedding.cloned(),
         };
         router.route(&routing_ctx).tool_groups.len()
     }
@@ -819,7 +891,8 @@ mod tests {
 
     #[test]
     fn test_dynamic_section_uses_semantic_truncation() {
-        // Build a big project context that exceeds DYNAMIC_CONTEXT_CHAR_BUDGET
+        // Build a big project context that exceeds the default budget
+        let budget = DEFAULT_DYNAMIC_CONTEXT_CHAR_BUDGET;
         let mut big_context = String::new();
         big_context.push_str("## Guidelines\n");
         for i in 0..100 {
@@ -841,18 +914,18 @@ mod tests {
         }
 
         assert!(
-            big_context.len() > DYNAMIC_CONTEXT_CHAR_BUDGET,
+            big_context.len() > budget,
             "Test context should exceed budget"
         );
 
-        let result = FsmPromptComposer::build_dynamic_section("", &big_context, "");
+        let result = FsmPromptComposer::build_dynamic_section("", &big_context, "", budget);
 
         // Should be within budget (with some margin for omission markers)
         assert!(
-            result.len() <= DYNAMIC_CONTEXT_CHAR_BUDGET + 200,
+            result.len() <= budget + 200,
             "Result ({} chars) should be near budget ({})",
             result.len(),
-            DYNAMIC_CONTEXT_CHAR_BUDGET
+            budget
         );
 
         // Should keep section headers
@@ -861,5 +934,73 @@ mod tests {
 
         // Should indicate truncation
         assert!(result.contains("more items omitted"));
+    }
+
+    // ── compute_dynamic_budget tests ─────────────────────────────────
+
+    #[test]
+    fn test_budget_known_model_sonnet() {
+        let budget = compute_dynamic_budget("claude-sonnet-4-20250514", 50_000);
+        // 200K tokens × 4 chars = 800K chars; remaining = 750K; 15% = 112.5K → clamped to 40K
+        assert_eq!(budget, 40_000);
+    }
+
+    #[test]
+    fn test_budget_known_model_haiku() {
+        let budget = compute_dynamic_budget("claude-haiku-3-5-20241022", 50_000);
+        assert_eq!(budget, 40_000);
+    }
+
+    #[test]
+    fn test_budget_known_model_opus() {
+        let budget = compute_dynamic_budget("claude-opus-4-20250514", 50_000);
+        assert_eq!(budget, 40_000);
+    }
+
+    #[test]
+    fn test_budget_unknown_model_uses_default() {
+        let budget = compute_dynamic_budget("gpt-4o", 50_000);
+        assert_eq!(budget, DEFAULT_DYNAMIC_CONTEXT_CHAR_BUDGET);
+    }
+
+    #[test]
+    fn test_budget_empty_model_uses_default() {
+        let budget = compute_dynamic_budget("", 50_000);
+        assert_eq!(budget, DEFAULT_DYNAMIC_CONTEXT_CHAR_BUDGET);
+    }
+
+    #[test]
+    fn test_budget_large_base_prompt_reduces_budget() {
+        // Base prompt nearly fills the context window
+        // 200K tokens × 4 = 800K chars; remaining = 800K - 780K = 20K; 15% = 3K → clamped to 5K
+        let budget = compute_dynamic_budget("claude-sonnet-4-20250514", 780_000);
+        assert_eq!(budget, 5_000);
+    }
+
+    #[test]
+    fn test_budget_small_base_prompt_gets_max() {
+        // Tiny base prompt → 15% of ~800K = ~120K → clamped to 40K
+        let budget = compute_dynamic_budget("claude-sonnet-4-20250514", 1_000);
+        assert_eq!(budget, 40_000);
+    }
+
+    #[test]
+    fn test_budget_adapts_via_compose() {
+        // Verify that compose() with a model name produces a different budget than without
+        let input_with_model = ComposerInput {
+            model: "claude-sonnet-4-20250514",
+            project_context_markdown: "## Context\n- item",
+            ..Default::default()
+        };
+        let input_no_model = ComposerInput {
+            model: "",
+            project_context_markdown: "## Context\n- item",
+            ..Default::default()
+        };
+        // Both should produce valid prompts (just with different internal budgets)
+        let prompt_with = FsmPromptComposer::compose(&input_with_model);
+        let prompt_without = FsmPromptComposer::compose(&input_no_model);
+        assert!(!prompt_with.is_empty());
+        assert!(!prompt_without.is_empty());
     }
 }

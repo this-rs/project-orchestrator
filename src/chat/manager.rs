@@ -1395,9 +1395,12 @@ impl ChatManager {
         &self,
         project_slug: Option<&str>,
         user_message: &str,
+        model: Option<&str>,
+        session_id: Option<&str>,
     ) -> (String, std::collections::HashSet<String>) {
         use super::composer::{ComposerInput, FsmPromptComposer};
         use super::prompt::{context_to_markdown, fetch_project_context};
+        use super::routing::HeuristicRouter;
         use super::stages::status_injection::GraphProtocolProvider;
         use super::stages::status_injection::ProtocolStatusProvider;
 
@@ -1565,9 +1568,47 @@ impl ChatManager {
             is_multi_project,
             has_active_plan,
             task_count,
+            model: model.unwrap_or(""),
+            message_embedding: None, // Future: pre-compute via EmbeddingProvider
         };
 
-        (FsmPromptComposer::compose(&input), included_note_ids)
+        // Use compose_with_record to get the routing decision for trajectory tracking
+        let (prompt, routing_record) =
+            FsmPromptComposer::compose_with_record(&input, &HeuristicRouter);
+
+        // Emit routing decision to trajectory collector (fire-and-forget)
+        if let (Some(ref collector), Some(sid)) = (&self.trajectory_collector, session_id) {
+            // Emit routing decision directly to trajectory collector
+            let params = serde_json::to_value(&routing_record).unwrap_or_default();
+            collector.record_decision(neural_routing_runtime::DecisionRecord {
+                session_id: sid.to_string(),
+                context_embedding: vec![],
+                action_type: "routing.select_sections".to_string(),
+                action_params: params,
+                alternatives_count: routing_record.selected_sections.len(),
+                chosen_index: 0,
+                confidence: if routing_record.section_weights.is_empty() {
+                    0.5
+                } else {
+                    let sum: f32 = routing_record.section_weights.iter().map(|(_, w)| w).sum();
+                    (sum / routing_record.section_weights.len() as f32) as f64
+                },
+                tool_usages: vec![],
+                touched_entities: vec![],
+                timestamp_ms: 0,
+                query_embedding: vec![],
+                node_features: vec![],
+                protocol_run_id: None,
+                protocol_state: None,
+            });
+            debug!(
+                "[routing] Emitted routing decision to trajectory: {} sections, {} tool groups",
+                routing_record.selected_sections.len(),
+                routing_record.selected_tool_groups.len()
+            );
+        }
+
+        (prompt, included_note_ids)
     }
 
     /// Check if a session is currently active (subprocess alive)
@@ -2002,7 +2043,12 @@ impl ChatManager {
         let session_id = Uuid::new_v4();
         let model = self.resolve_model(request.model.as_deref());
         let (system_prompt, _included_note_ids) = self
-            .build_system_prompt(request.project_slug.as_deref(), &request.message)
+            .build_system_prompt(
+                request.project_slug.as_deref(),
+                &request.message,
+                Some(&model),
+                Some(&session_id.to_string()),
+            )
             .await;
 
         // Persist session in Neo4j
@@ -4284,7 +4330,12 @@ impl ChatManager {
 
         // Build options - with resume flag only if we have a cli_session_id
         let (system_prompt, _included_note_ids) = self
-            .build_system_prompt(session_node.project_slug.as_deref(), message)
+            .build_system_prompt(
+                session_node.project_slug.as_deref(),
+                message,
+                Some(&session_node.model),
+                Some(session_id),
+            )
             .await;
 
         // Create broadcast channel early so CompactionNotifier can use the sender
@@ -5485,7 +5536,7 @@ mod tests {
         let state = mock_app_state();
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
 
-        let (prompt, note_ids) = manager.build_system_prompt(None, "test").await;
+        let (prompt, note_ids) = manager.build_system_prompt(None, "test", None, None).await;
         assert!(prompt.contains("Project Orchestrator"));
         assert!(prompt.contains("EXCLUSIVELY the Project Orchestrator MCP tools"));
         assert!(!prompt.contains("Active Project"));
@@ -5500,7 +5551,7 @@ mod tests {
 
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
         let (prompt, _note_ids) = manager
-            .build_system_prompt(Some(&project.slug), "help me plan")
+            .build_system_prompt(Some(&project.slug), "help me plan", None, None)
             .await;
 
         // Contains the base prompt
@@ -6289,7 +6340,7 @@ mod tests {
 
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
         let (prompt, _note_ids) = manager
-            .build_system_prompt(Some(&project.slug), "check the plan")
+            .build_system_prompt(Some(&project.slug), "check the plan", None, None)
             .await;
 
         // Base prompt present

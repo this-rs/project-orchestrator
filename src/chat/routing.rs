@@ -26,6 +26,8 @@
 //!  intent rules)      learned preferences)
 //! ```
 
+use serde::Serialize;
+
 use super::prompt_sections::{
     select_sections, select_tool_groups, BasePromptSection, ComposerContext, PromptSectionId,
     ToolGroupSelectionContext, ToolRefGroupId,
@@ -65,10 +67,11 @@ pub struct RoutingContext {
     /// Detected intent from the enrichment pipeline (e.g., "planning", "code", "debug").
     /// `None` if no intent was detected.
     pub detected_intent: Option<String>,
-    // ── Future: neural signals ─────────────────────────────────────
-    // pub conversation_embedding: Option<Vec<f32>>,
-    // pub session_history_summary: Option<String>,
-    // pub user_preference_vector: Option<Vec<f32>>,
+    // ── Neural signals (for DualTrackRouter) ───────────────────────
+    /// Pre-computed embedding of the user's message (from EmbeddingProvider).
+    /// Computed async by the caller, passed here for sync routing.
+    /// `None` if embeddings are unavailable → DualTrackRouter falls back to heuristics.
+    pub message_embedding: Option<Vec<f32>>,
 }
 
 // Default is derived — all fields have natural defaults (0, false, empty, None).
@@ -216,6 +219,278 @@ impl RoutingProvider for HeuristicRouter {
 }
 
 // ============================================================================
+// RoutingDecisionRecord — trajectory tracking for neural feedback
+// ============================================================================
+
+/// A serializable record of a routing decision, suitable for the
+/// `TrajectoryCollector` neural feedback loop.
+///
+/// Captures which sections and tool groups were selected, with what confidence,
+/// so that future sessions can learn from past routing decisions.
+#[derive(Debug, Clone, Serialize)]
+pub struct RoutingDecisionRecord {
+    /// Which sections were included (by ID).
+    pub selected_sections: Vec<String>,
+    /// Which tool groups were included (by ID).
+    pub selected_tool_groups: Vec<String>,
+    /// Per-section weights from the router (empty for HeuristicRouter).
+    pub section_weights: Vec<(String, f32)>,
+    /// Scaffolding level at decision time.
+    pub scaffolding_level: u8,
+    /// Whether embeddings were used for this decision.
+    pub used_embeddings: bool,
+    /// Detected intent (if any).
+    pub detected_intent: Option<String>,
+}
+
+impl RoutingDecision {
+    /// Convert this routing decision into a trajectory-compatible record.
+    ///
+    /// The `ctx` provides the scaffolding level and intent metadata that
+    /// contextualizes the decision for the neural feedback loop.
+    pub fn to_trajectory_record(&self, ctx: &RoutingContext) -> RoutingDecisionRecord {
+        RoutingDecisionRecord {
+            selected_sections: self
+                .sections
+                .iter()
+                .map(|s| s.id.to_string())
+                .collect(),
+            selected_tool_groups: self
+                .tool_groups
+                .iter()
+                .map(|g| format!("{:?}", g))
+                .collect(),
+            section_weights: self
+                .section_hints
+                .iter()
+                .map(|h| (h.section_id.to_string(), h.weight))
+                .collect(),
+            scaffolding_level: ctx.scaffolding_level,
+            used_embeddings: ctx.message_embedding.is_some(),
+            detected_intent: ctx.detected_intent.clone(),
+        }
+    }
+
+    /// Emit this routing decision to the TrajectoryCollector as a `DecisionRecord`.
+    ///
+    /// Fire-and-forget: never blocks, drops silently if channel is full.
+    pub fn emit_to_trajectory(
+        &self,
+        ctx: &RoutingContext,
+        session_id: &str,
+        collector: &neural_routing_runtime::TrajectoryCollector,
+    ) {
+        let record = self.to_trajectory_record(ctx);
+        let params = serde_json::to_value(&record).unwrap_or_default();
+
+        collector.record_decision(neural_routing_runtime::DecisionRecord {
+            session_id: session_id.to_string(),
+            context_embedding: vec![], // Will be computed by VectorBuilder
+            action_type: "routing.select_sections".to_string(),
+            action_params: params,
+            alternatives_count: PromptSectionId::ALL.len(),
+            chosen_index: 0,
+            confidence: if self.section_hints.is_empty() {
+                0.5 // Heuristic-only → moderate confidence
+            } else {
+                // Average of section weights as confidence proxy
+                let sum: f32 = self.section_hints.iter().map(|h| h.weight).sum();
+                (sum / self.section_hints.len() as f32) as f64
+            },
+            tool_usages: vec![],
+            touched_entities: vec![],
+            timestamp_ms: 0, // Collector fills this
+            query_embedding: ctx.message_embedding.clone().unwrap_or_default(),
+            node_features: vec![],
+            protocol_run_id: None,
+            protocol_state: None,
+        });
+    }
+}
+
+// ============================================================================
+// DualTrackRouter — embedding-enhanced routing
+// ============================================================================
+
+/// Section centroid: a semantic description embedded as a vector, associated
+/// with a `PromptSectionId`.
+#[derive(Debug, Clone)]
+struct SectionCentroid {
+    section_id: PromptSectionId,
+    embedding: Vec<f32>,
+}
+
+/// Semantic descriptions for each prompt section, used to compute centroids.
+/// These are short, keyword-rich descriptions optimized for embedding similarity.
+fn section_semantic_descriptions() -> Vec<(PromptSectionId, &'static str)> {
+    vec![
+        (PromptSectionId::IdentityRole, "agent identity role MCP tools project orchestrator"),
+        (PromptSectionId::MegatoolsSyntax, "mega-tools API syntax action parameters calling convention"),
+        (PromptSectionId::DataModel, "data model entities hierarchy project plan task step decision constraint note"),
+        (PromptSectionId::TreeSitterSync, "tree-sitter code sync parse source files functions structs imports"),
+        (PromptSectionId::GitWorkflow, "git workflow branch commit push merge atomic changes version control"),
+        (PromptSectionId::TaskExecutionProtocol, "task execution protocol warm-up preparation implementation closure verification"),
+        (PromptSectionId::PlanningProtocol, "planning protocol analyze create plan decompose tasks steps constraints milestones"),
+        (PromptSectionId::StatusManagement, "status management transitions pending in_progress completed blocked failed"),
+        (PromptSectionId::BestPracticesImpact, "impact analysis dependencies file references call graph architecture GDS communities"),
+        (PromptSectionId::BestPracticesSearch, "search strategy MCP-first code exploration find references semantic search"),
+        (PromptSectionId::BestPracticesKnowledge, "knowledge capture notes gotcha pattern guideline RFC decisions documentation"),
+        (PromptSectionId::BestPracticesAdvanced, "advanced protocols knowledge fabric workspace inheritance process detection wave dispatch"),
+        (PromptSectionId::BestPracticesPersonas, "personas episodes structural analysis memory horizons intent search scaffolding"),
+        (PromptSectionId::DeepMaintenance, "deep maintenance synapses energy staleness skills anchoring consolidation stagnation"),
+        (PromptSectionId::PlanExecutionAutomation, "plan execution automation autonomous run triggers delegation waves"),
+        (PromptSectionId::ToolReference, "tool reference mega-tools full API documentation parameters actions"),
+    ]
+}
+
+/// DualTrackRouter combines heuristic section selection with embedding-based
+/// cosine similarity scoring.
+///
+/// Architecture:
+/// 1. Heuristic pass: `HeuristicRouter` selects candidate sections (same as before)
+/// 2. Embedding pass: cosine similarity between user message embedding and
+///    pre-computed section centroids produces a relevance score per section
+/// 3. Fusion: scores are combined with configurable weights to produce
+///    `SectionHint`s that modulate the heuristic baseline
+///
+/// Falls back to pure heuristic routing when `message_embedding` is `None`.
+pub struct DualTrackRouter {
+    /// Pre-computed embeddings for each section's semantic description.
+    centroids: Vec<SectionCentroid>,
+    /// Weight for the heuristic score (0.0–1.0). Default: 0.6.
+    heuristic_weight: f32,
+    /// Weight for the embedding score (0.0–1.0). Default: 0.4.
+    embedding_weight: f32,
+    /// Minimum fused score to keep a section (below → weight 0.0). Default: 0.15.
+    min_score_threshold: f32,
+}
+
+impl DualTrackRouter {
+    /// Create a new DualTrackRouter with pre-computed centroids.
+    ///
+    /// Call [`DualTrackRouter::build()`] for async construction with an
+    /// `EmbeddingProvider`.
+    pub fn new(
+        centroids: Vec<(PromptSectionId, Vec<f32>)>,
+        heuristic_weight: f32,
+        embedding_weight: f32,
+    ) -> Self {
+        Self {
+            centroids: centroids
+                .into_iter()
+                .map(|(id, emb)| SectionCentroid {
+                    section_id: id,
+                    embedding: emb,
+                })
+                .collect(),
+            heuristic_weight,
+            embedding_weight,
+            min_score_threshold: 0.15,
+        }
+    }
+
+    /// Build a DualTrackRouter by embedding section descriptions via the
+    /// provided `EmbeddingProvider`.
+    ///
+    /// This is async because it calls `embed_batch()`. Should be called once
+    /// at startup or when the embedding model changes.
+    pub async fn build(
+        provider: &dyn crate::embeddings::EmbeddingProvider,
+        heuristic_weight: f32,
+        embedding_weight: f32,
+    ) -> Result<Self, anyhow::Error> {
+        let descriptions = section_semantic_descriptions();
+        let texts: Vec<String> = descriptions.iter().map(|(_, desc)| desc.to_string()).collect();
+
+        let embeddings = provider.embed_batch(&texts).await?;
+
+        let centroids: Vec<SectionCentroid> = descriptions
+            .iter()
+            .zip(embeddings.into_iter())
+            .map(|((id, _), emb)| SectionCentroid {
+                section_id: *id,
+                embedding: emb,
+            })
+            .collect();
+
+        Ok(Self {
+            centroids,
+            heuristic_weight,
+            embedding_weight,
+            min_score_threshold: 0.15,
+        })
+    }
+
+    /// Compute cosine similarity between two vectors.
+    fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+        if a.len() != b.len() || a.is_empty() {
+            return 0.0;
+        }
+        let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+        let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm_a == 0.0 || norm_b == 0.0 {
+            return 0.0;
+        }
+        dot / (norm_a * norm_b)
+    }
+
+    /// Get the embedding score for a given section ID.
+    fn embedding_score(&self, section_id: PromptSectionId, message_embedding: &[f32]) -> f32 {
+        self.centroids
+            .iter()
+            .find(|c| c.section_id == section_id)
+            .map(|c| Self::cosine_similarity(&c.embedding, message_embedding))
+            .unwrap_or(0.0)
+            // Normalize from [-1, 1] to [0, 1]
+            .mul_add(0.5, 0.5)
+    }
+}
+
+impl RoutingProvider for DualTrackRouter {
+    fn route(&self, ctx: &RoutingContext) -> RoutingDecision {
+        // ── Step 1: Get heuristic baseline ────────────────────────────
+        let heuristic = HeuristicRouter;
+        let baseline = heuristic.route(ctx);
+
+        // No embedding available → fall back to pure heuristic
+        let message_emb = match &ctx.message_embedding {
+            Some(emb) if !emb.is_empty() => emb,
+            _ => return baseline,
+        };
+
+        // ── Step 2: Score each heuristic-selected section ─────────────
+        let mut section_hints = Vec::new();
+        let mut sections = Vec::new();
+
+        for section in &baseline.sections {
+            // Heuristic says "include" → base score 1.0
+            let h_score: f32 = 1.0;
+            let e_score = self.embedding_score(section.id, message_emb);
+
+            // Fused score: weighted combination
+            let fused = self.heuristic_weight * h_score + self.embedding_weight * e_score;
+
+            if fused >= self.min_score_threshold {
+                sections.push(section.clone());
+                section_hints.push(SectionHint {
+                    section_id: section.id,
+                    weight: fused.min(1.0),
+                    token_budget: None,
+                });
+            }
+            // If fused < threshold → section dropped (weight effectively 0)
+        }
+
+        RoutingDecision {
+            sections,
+            tool_groups: baseline.tool_groups,
+            section_hints,
+        }
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -352,6 +627,227 @@ mod tests {
         assert!(ctx.fsm_available_tools.is_empty());
         assert!(ctx.user_message.is_empty());
         assert!(ctx.detected_intent.is_none());
+    }
+
+    // ── DualTrackRouter tests ─────────────────────────────────────
+
+    #[test]
+    fn test_cosine_similarity_identical() {
+        let a = vec![1.0, 0.0, 0.0];
+        let b = vec![1.0, 0.0, 0.0];
+        let sim = DualTrackRouter::cosine_similarity(&a, &b);
+        assert!((sim - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_cosine_similarity_orthogonal() {
+        let a = vec![1.0, 0.0, 0.0];
+        let b = vec![0.0, 1.0, 0.0];
+        let sim = DualTrackRouter::cosine_similarity(&a, &b);
+        assert!(sim.abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_cosine_similarity_opposite() {
+        let a = vec![1.0, 0.0];
+        let b = vec![-1.0, 0.0];
+        let sim = DualTrackRouter::cosine_similarity(&a, &b);
+        assert!((sim + 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_cosine_similarity_empty() {
+        let sim = DualTrackRouter::cosine_similarity(&[], &[]);
+        assert_eq!(sim, 0.0);
+    }
+
+    #[test]
+    fn test_cosine_similarity_length_mismatch() {
+        let a = vec![1.0, 0.0];
+        let b = vec![1.0, 0.0, 0.0];
+        let sim = DualTrackRouter::cosine_similarity(&a, &b);
+        assert_eq!(sim, 0.0);
+    }
+
+    #[test]
+    fn test_dual_track_no_embedding_falls_back_to_heuristic() {
+        let centroids = vec![
+            (PromptSectionId::IdentityRole, vec![1.0, 0.0, 0.0]),
+            (PromptSectionId::DataModel, vec![0.0, 1.0, 0.0]),
+        ];
+        let router = DualTrackRouter::new(centroids, 0.6, 0.4);
+
+        let ctx = RoutingContext {
+            scaffolding_level: 0,
+            has_active_plan: true,
+            task_count: 5,
+            message_embedding: None, // No embedding → fallback
+            ..Default::default()
+        };
+
+        let decision = router.route(&ctx);
+        let heuristic_decision = HeuristicRouter.route(&ctx);
+
+        // Should produce identical results to heuristic
+        assert_eq!(decision.sections.len(), heuristic_decision.sections.len());
+        assert!(decision.section_hints.is_empty());
+    }
+
+    #[test]
+    fn test_dual_track_with_embedding_produces_hints() {
+        let centroids = vec![
+            (PromptSectionId::IdentityRole, vec![1.0, 0.0, 0.0]),
+            (PromptSectionId::DataModel, vec![0.0, 1.0, 0.0]),
+            (PromptSectionId::GitWorkflow, vec![0.0, 0.0, 1.0]),
+        ];
+        let router = DualTrackRouter::new(centroids, 0.6, 0.4);
+
+        // Message embedding close to DataModel centroid
+        let ctx = RoutingContext {
+            scaffolding_level: 0,
+            has_active_plan: true,
+            task_count: 5,
+            message_embedding: Some(vec![0.1, 0.95, 0.05]),
+            ..Default::default()
+        };
+
+        let decision = router.route(&ctx);
+
+        // Should produce section_hints (non-empty)
+        assert!(!decision.section_hints.is_empty());
+
+        // DataModel should have the highest weight among hints that have centroids
+        let data_model_hint = decision
+            .section_hints
+            .iter()
+            .find(|h| h.section_id == PromptSectionId::DataModel);
+        let git_hint = decision
+            .section_hints
+            .iter()
+            .find(|h| h.section_id == PromptSectionId::GitWorkflow);
+
+        if let (Some(dm), Some(gw)) = (data_model_hint, git_hint) {
+            assert!(
+                dm.weight > gw.weight,
+                "DataModel ({:.3}) should score higher than GitWorkflow ({:.3})",
+                dm.weight,
+                gw.weight
+            );
+        }
+    }
+
+    #[test]
+    fn test_dual_track_empty_embedding_falls_back() {
+        let centroids = vec![(PromptSectionId::IdentityRole, vec![1.0, 0.0])];
+        let router = DualTrackRouter::new(centroids, 0.6, 0.4);
+
+        let ctx = RoutingContext {
+            message_embedding: Some(vec![]), // Empty vec → fallback
+            ..Default::default()
+        };
+
+        let decision = router.route(&ctx);
+        // Should fall back, no hints
+        assert!(decision.section_hints.is_empty());
+    }
+
+    #[test]
+    fn test_dual_track_all_sections_above_threshold() {
+        // With heuristic_weight=0.6, even a zero embedding score gives 0.6*1.0 + 0.4*0.5 = 0.8
+        // (0.5 because cosine=0 → normalized to 0.5)
+        // So with default threshold 0.15, no sections should be dropped
+        let centroids = vec![
+            (PromptSectionId::IdentityRole, vec![1.0, 0.0]),
+        ];
+        let router = DualTrackRouter::new(centroids, 0.6, 0.4);
+
+        let ctx = RoutingContext {
+            scaffolding_level: 0,
+            has_active_plan: true,
+            task_count: 5,
+            message_embedding: Some(vec![0.5, 0.5]),
+            ..Default::default()
+        };
+
+        let decision = router.route(&ctx);
+        let heuristic_count = HeuristicRouter.route(&ctx).sections.len();
+        // Should not drop any sections (all above threshold)
+        assert_eq!(decision.sections.len(), heuristic_count);
+    }
+
+    #[test]
+    fn test_section_semantic_descriptions_covers_all() {
+        let descriptions = section_semantic_descriptions();
+        let described_ids: Vec<_> = descriptions.iter().map(|(id, _)| *id).collect();
+        for id in PromptSectionId::ALL {
+            assert!(
+                described_ids.contains(id),
+                "Missing semantic description for {:?}",
+                id
+            );
+        }
+    }
+
+    // ── RoutingDecisionRecord tests ────────────────────────────────
+
+    #[test]
+    fn test_to_trajectory_record_heuristic() {
+        let router = HeuristicRouter;
+        let ctx = RoutingContext {
+            scaffolding_level: 2,
+            has_active_plan: true,
+            task_count: 5,
+            message_embedding: None,
+            ..Default::default()
+        };
+        let decision = router.route(&ctx);
+        let record = decision.to_trajectory_record(&ctx);
+
+        assert_eq!(record.scaffolding_level, 2);
+        assert!(!record.used_embeddings);
+        assert!(!record.selected_sections.is_empty());
+        assert!(!record.selected_tool_groups.is_empty());
+        assert!(record.section_weights.is_empty()); // HeuristicRouter produces no hints
+        assert!(record.detected_intent.is_none());
+    }
+
+    #[test]
+    fn test_to_trajectory_record_with_embeddings() {
+        let centroids = vec![
+            (PromptSectionId::IdentityRole, vec![1.0, 0.0]),
+            (PromptSectionId::DataModel, vec![0.0, 1.0]),
+        ];
+        let router = DualTrackRouter::new(centroids, 0.6, 0.4);
+        let ctx = RoutingContext {
+            scaffolding_level: 0,
+            has_active_plan: true,
+            task_count: 5,
+            message_embedding: Some(vec![0.5, 0.5]),
+            detected_intent: Some("planning".to_string()),
+            ..Default::default()
+        };
+        let decision = router.route(&ctx);
+        let record = decision.to_trajectory_record(&ctx);
+
+        assert!(record.used_embeddings);
+        assert!(!record.section_weights.is_empty());
+        assert_eq!(record.detected_intent, Some("planning".to_string()));
+    }
+
+    #[test]
+    fn test_trajectory_record_serializes() {
+        let record = RoutingDecisionRecord {
+            selected_sections: vec!["identity_role".into(), "data_model".into()],
+            selected_tool_groups: vec!["Core".into()],
+            section_weights: vec![("identity_role".into(), 0.9)],
+            scaffolding_level: 3,
+            used_embeddings: true,
+            detected_intent: Some("code".into()),
+        };
+        let json = serde_json::to_value(&record).unwrap();
+        assert_eq!(json["scaffolding_level"], 3);
+        assert_eq!(json["used_embeddings"], true);
+        assert_eq!(json["selected_sections"].as_array().unwrap().len(), 2);
     }
 
     #[test]

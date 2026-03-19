@@ -65,7 +65,7 @@ impl Default for EnrichmentConfig {
             biomimicry: false, // Disabled by default — opt-in via ENRICHMENT_BIOMIMICRY=true
             reflex: false,     // Disabled by default — opt-in via ENRICHMENT_REFLEX=true
             user_profile: false, // Disabled by default — opt-in via ENRICHMENT_USER_PROFILE=true
-            persona: false,    // Disabled by default — opt-in via ENRICHMENT_PERSONA=true
+            persona: true,     // Enabled by default — auto-skips when no personas match
             reasoning_tree: true,
             debug: false,
             max_pipeline_ms: 500,
@@ -104,8 +104,8 @@ impl EnrichmentConfig {
                 .map(|v| v == "true" || v == "1")
                 .unwrap_or(false),
             persona: std::env::var("ENRICHMENT_PERSONA")
-                .map(|v| v == "true" || v == "1")
-                .unwrap_or(false),
+                .map(|v| v != "false" && v != "0")
+                .unwrap_or(true),
             reasoning_tree: std::env::var("ENRICHMENT_REASONING_TREE")
                 .map(|v| v != "false" && v != "0")
                 .unwrap_or(true),
