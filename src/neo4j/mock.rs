@@ -5,6 +5,7 @@
 //! Conditionally compiled with `#[cfg(test)]`.
 
 use crate::events::trigger::EventTrigger;
+use crate::lifecycle::{LifecycleHook, LifecycleScope, UpdateLifecycleHookRequest};
 use crate::neo4j::models::*;
 use crate::neo4j::traits::GraphStore;
 use crate::notes::{
@@ -186,6 +187,9 @@ pub struct MockGraphStore {
     /// alert_id -> AlertNode
     pub alerts: RwLock<HashMap<Uuid, AlertNode>>,
 
+    // LifecycleHook stores
+    pub lifecycle_hooks: RwLock<HashMap<Uuid, LifecycleHook>>,
+
     // Test flags
     /// Controls what `has_context_cards()` returns (default: false)
     pub mock_has_context_cards: std::sync::atomic::AtomicBool,
@@ -288,6 +292,7 @@ impl MockGraphStore {
             user_profiles: RwLock::new(HashMap::new()),
             works_on: RwLock::new(HashMap::new()),
             alerts: RwLock::new(HashMap::new()),
+            lifecycle_hooks: RwLock::new(HashMap::new()),
             mock_has_context_cards: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -4109,6 +4114,25 @@ impl GraphStore for MockGraphStore {
             step_ids.retain(|id| *id != step_id);
         }
         Ok(())
+    }
+
+    async fn complete_pending_steps_for_task(&self, task_id: Uuid) -> Result<u32> {
+        let ts = self.task_steps.read().await;
+        let step_ids = ts.get(&task_id).cloned().unwrap_or_default();
+        drop(ts);
+        let mut steps = self.steps.write().await;
+        let mut count = 0u32;
+        for sid in &step_ids {
+            if let Some(s) = steps.get_mut(sid) {
+                if s.status == StepStatus::Pending || s.status == StepStatus::InProgress {
+                    s.status = StepStatus::Completed;
+                    s.completed_at = Some(Utc::now());
+                    s.updated_at = Some(Utc::now());
+                    count += 1;
+                }
+            }
+        }
+        Ok(count)
     }
 
     // ========================================================================
@@ -10625,6 +10649,101 @@ impl GraphStore for MockGraphStore {
 
     async fn delete_event_trigger(&self, _id: Uuid) -> Result<bool> {
         Ok(false)
+    }
+
+    // ========================================================================
+    // LifecycleHook operations
+    // ========================================================================
+
+    async fn create_lifecycle_hook(&self, hook: &LifecycleHook) -> Result<()> {
+        self.lifecycle_hooks
+            .write()
+            .await
+            .insert(hook.id, hook.clone());
+        Ok(())
+    }
+
+    async fn get_lifecycle_hook(&self, id: Uuid) -> Result<Option<LifecycleHook>> {
+        Ok(self.lifecycle_hooks.read().await.get(&id).cloned())
+    }
+
+    async fn list_lifecycle_hooks(&self, project_id: Option<Uuid>) -> Result<Vec<LifecycleHook>> {
+        let hooks = self.lifecycle_hooks.read().await;
+        let mut result: Vec<LifecycleHook> = hooks
+            .values()
+            .filter(|h| match project_id {
+                Some(pid) => h.project_id == Some(pid) || h.project_id.is_none(),
+                None => true,
+            })
+            .cloned()
+            .collect();
+        result.sort_by_key(|h| h.priority);
+        Ok(result)
+    }
+
+    async fn update_lifecycle_hook(
+        &self,
+        id: Uuid,
+        updates: &UpdateLifecycleHookRequest,
+    ) -> Result<()> {
+        if let Some(h) = self.lifecycle_hooks.write().await.get_mut(&id) {
+            if let Some(name) = &updates.name {
+                h.name = name.clone();
+            }
+            if let Some(description) = &updates.description {
+                h.description = description.clone();
+            }
+            if let Some(on_status) = &updates.on_status {
+                h.on_status = on_status.clone();
+            }
+            if let Some(action_config) = &updates.action_config {
+                h.action_config = action_config.clone();
+            }
+            if let Some(priority) = &updates.priority {
+                h.priority = *priority;
+            }
+            if let Some(enabled) = &updates.enabled {
+                h.enabled = *enabled;
+            }
+            h.updated_at = Some(Utc::now());
+        }
+        Ok(())
+    }
+
+    async fn delete_lifecycle_hook(&self, id: Uuid) -> Result<()> {
+        let hooks = self.lifecycle_hooks.read().await;
+        if let Some(h) = hooks.get(&id) {
+            if h.builtin {
+                anyhow::bail!("Cannot delete builtin lifecycle hook");
+            }
+        }
+        drop(hooks);
+        self.lifecycle_hooks.write().await.remove(&id);
+        Ok(())
+    }
+
+    async fn list_hooks_for_scope(
+        &self,
+        scope: &LifecycleScope,
+        on_status: &str,
+        project_id: Option<Uuid>,
+    ) -> Result<Vec<LifecycleHook>> {
+        let hooks = self.lifecycle_hooks.read().await;
+        let mut result: Vec<LifecycleHook> = hooks
+            .values()
+            .filter(|h| {
+                h.scope == *scope
+                    && h.on_status == on_status
+                    && h.enabled
+                    && match project_id {
+                        Some(pid) => h.project_id == Some(pid) || h.project_id.is_none(),
+                        None => h.project_id.is_none(),
+                    }
+            })
+            .cloned()
+            .collect();
+        result.sort_by_key(|h| h.priority);
+        Ok(result)
     }
 }
 

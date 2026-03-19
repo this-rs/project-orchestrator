@@ -482,6 +482,10 @@ pub struct ProtocolState {
     /// Actions explicitly forbidden in this state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forbidden_actions: Option<Vec<String>>,
+    /// Timeout in seconds for runner-managed execution of this state.
+    /// Defaults: 300 (5min) for system protocols, 1800 (30min) for business protocols.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_timeout_secs: Option<u64>,
 }
 
 impl ProtocolState {
@@ -501,6 +505,7 @@ impl ProtocolState {
             prompt_fragment: None,
             available_tools: None,
             forbidden_actions: None,
+            state_timeout_secs: None,
         }
     }
 
@@ -722,6 +727,11 @@ pub struct ProtocolRun {
     /// concurrent transitions from silently overwriting each other.
     #[serde(default)]
     pub version: u64,
+    /// Whether this run is driven by the autonomous ProtocolRunner.
+    /// When true, the runner loop will drive state transitions automatically.
+    /// When false (default), transitions require external triggers (manual or agent).
+    #[serde(default)]
+    pub runner_managed: bool,
 }
 
 fn default_triggered_by() -> String {
@@ -759,6 +769,7 @@ impl ProtocolRun {
             parent_run_id: None,
             depth: 0,
             version: 0,
+            runner_managed: false,
         }
     }
 

@@ -415,12 +415,22 @@ fn protected_routes() -> Router<OrchestratorState> {
         .route("/api/plans/{plan_id}/runs", get(handlers::list_plan_runs))
         .route("/api/runs/{run_id}", get(handlers::get_plan_run))
         .route(
+            "/api/runs/{run_id}/agent-executions",
+            get(handlers::get_run_agent_executions),
+        )
+        .route(
             "/api/plans/{plan_id}/runs/compare",
             post(handlers::compare_plan_runs),
         )
         .route(
             "/api/plans/{plan_id}/runs/predict",
             post(handlers::predict_plan_run),
+        )
+        // Pipeline — Gate Results & Progress
+        .route("/api/runs/{run_id}/gates", get(handlers::get_run_gates))
+        .route(
+            "/api/runs/{run_id}/progress",
+            get(handlers::get_run_progress),
         )
         // Triggers
         .route(
@@ -458,6 +468,17 @@ fn protected_routes() -> Router<OrchestratorState> {
             get(handlers::get_constraint)
                 .patch(handlers::update_constraint)
                 .delete(handlers::delete_constraint),
+        )
+        // Lifecycle Hooks
+        .route(
+            "/api/lifecycle-hooks",
+            get(handlers::list_lifecycle_hooks).post(handlers::create_lifecycle_hook),
+        )
+        .route(
+            "/api/lifecycle-hooks/{hook_id}",
+            get(handlers::get_lifecycle_hook)
+                .patch(handlers::update_lifecycle_hook)
+                .delete(handlers::delete_lifecycle_hook),
         )
         // Tasks (global listing)
         .route("/api/tasks", get(handlers::list_all_tasks))

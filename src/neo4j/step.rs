@@ -226,6 +226,35 @@ impl Neo4jClient {
         }
     }
 
+    /// Complete all pending/in_progress steps for a task in a single batch.
+    ///
+    /// When a task is marked as completed, any steps that were not individually
+    /// completed should be auto-completed to keep the graph consistent.
+    /// Returns the number of steps that were updated.
+    pub async fn complete_pending_steps_for_task(&self, task_id: Uuid) -> Result<u32> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let q = query(
+            r#"
+            MATCH (t:Task {id: $task_id})-[:HAS_STEP]->(s:Step)
+            WHERE s.status IN ['Pending', 'InProgress']
+            SET s.status = 'Completed',
+                s.completed_at = datetime($now),
+                s.updated_at = datetime($now)
+            RETURN count(s) AS updated
+            "#,
+        )
+        .param("task_id", task_id.to_string())
+        .param("now", now);
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let updated: i64 = row.get("updated")?;
+            Ok(updated as u32)
+        } else {
+            Ok(0)
+        }
+    }
+
     /// Delete a step
     pub async fn delete_step(&self, step_id: Uuid) -> Result<()> {
         let q = query(

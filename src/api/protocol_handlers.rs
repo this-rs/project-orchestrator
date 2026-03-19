@@ -492,6 +492,7 @@ pub async fn create_protocol(
                 prompt_fragment: None,
                 available_tools: None,
                 forbidden_actions: None,
+                state_timeout_secs: None,
             };
             created_states.push(ps);
         }
@@ -785,6 +786,7 @@ pub async fn add_state(
         prompt_fragment: body.prompt_fragment,
         available_tools: body.available_tools,
         forbidden_actions: body.forbidden_actions,
+        state_timeout_secs: None,
     };
 
     state
@@ -1717,6 +1719,7 @@ pub async fn compose_protocol(
             prompt_fragment: s.prompt_fragment.clone(),
             available_tools: s.available_tools.clone(),
             forbidden_actions: s.forbidden_actions.clone(),
+            state_timeout_secs: None,
         };
         name_to_id.insert(s.name.clone(), ps.id);
         created_states.push(ps);
@@ -1961,6 +1964,7 @@ mod tests {
             prompt_fragment: None,
             available_tools: None,
             forbidden_actions: None,
+            state_timeout_secs: None,
         }
     }
 
@@ -2174,6 +2178,7 @@ mod tests {
                 prompt_fragment: None,
                 available_tools: None,
                 forbidden_actions: None,
+                state_timeout_secs: None,
             };
             mock.protocol_states.write().await.insert(id, ps);
         }

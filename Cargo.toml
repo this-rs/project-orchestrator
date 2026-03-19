@@ -163,6 +163,7 @@ notify = { version = "8.2.0", features = ["macos_fsevent"] }
 rust-embed = { version = "8", optional = true }
 mime_guess = { version = "2", optional = true }
 rand = "0.10.0"
+dashmap = "6"
 
 # Neural routing — always compiled (build full), runtime-controlled via settings
 neural-routing-runtime = { path = "crates/neural-routing-runtime" }

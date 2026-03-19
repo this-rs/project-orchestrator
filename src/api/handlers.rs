@@ -948,6 +948,7 @@ pub async fn delegate_task(
             persona_profile: "delegation".to_string(),
             vector_json: None,
             report_json: None,
+            execution_type: Default::default(),
         };
         let graph_clone = graph.clone();
         tokio::spawn(async move {
@@ -1725,6 +1726,7 @@ pub async fn sync_directory(
             state.orchestrator.neo4j_arc(),
             pid,
             "post_sync",
+            Some(state.event_bus.clone() as std::sync::Arc<dyn crate::events::EventEmitter>),
         );
     }
 
@@ -2143,6 +2145,129 @@ pub async fn delete_constraint(
 }
 
 // ============================================================================
+// Lifecycle Hooks
+// ============================================================================
+
+/// GET /api/lifecycle-hooks — List lifecycle hooks, optionally filtered by project_id
+pub async fn list_lifecycle_hooks(
+    State(state): State<OrchestratorState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<Vec<crate::lifecycle::LifecycleHook>>, AppError> {
+    let project_id = params
+        .get("project_id")
+        .and_then(|s| Uuid::parse_str(s).ok());
+    let hooks = state
+        .orchestrator
+        .neo4j()
+        .list_lifecycle_hooks(project_id)
+        .await
+        .map_err(AppError::Internal)?;
+    Ok(Json(hooks))
+}
+
+/// POST /api/lifecycle-hooks — Create a lifecycle hook
+pub async fn create_lifecycle_hook(
+    State(state): State<OrchestratorState>,
+    Json(req): Json<crate::lifecycle::CreateLifecycleHookRequest>,
+) -> Result<Json<crate::lifecycle::LifecycleHook>, AppError> {
+    let mut hook = crate::lifecycle::LifecycleHook::new(
+        req.name,
+        req.scope,
+        req.on_status,
+        req.action_type,
+        req.action_config.unwrap_or(serde_json::json!({})),
+    );
+    hook.description = req.description;
+    if let Some(p) = req.priority {
+        hook.priority = p;
+    }
+    if let Some(pid_str) = &req.project_id {
+        hook.project_id = Uuid::parse_str(pid_str).ok();
+    }
+
+    state
+        .orchestrator
+        .neo4j()
+        .create_lifecycle_hook(&hook)
+        .await
+        .map_err(AppError::Internal)?;
+
+    state.event_bus.emit_created(
+        crate::events::EntityType::LifecycleHook,
+        &hook.id.to_string(),
+        serde_json::json!({"name": hook.name, "scope": format!("{:?}", hook.scope)}),
+        hook.project_id.map(|id| id.to_string()),
+    );
+
+    Ok(Json(hook))
+}
+
+/// GET /api/lifecycle-hooks/:id — Get a lifecycle hook by ID
+pub async fn get_lifecycle_hook(
+    State(state): State<OrchestratorState>,
+    Path(hook_id): Path<Uuid>,
+) -> Result<Json<crate::lifecycle::LifecycleHook>, AppError> {
+    let hook = state
+        .orchestrator
+        .neo4j()
+        .get_lifecycle_hook(hook_id)
+        .await
+        .map_err(AppError::Internal)?
+        .ok_or_else(|| AppError::NotFound("Lifecycle hook not found".into()))?;
+    Ok(Json(hook))
+}
+
+/// PATCH /api/lifecycle-hooks/:id — Update a lifecycle hook
+pub async fn update_lifecycle_hook(
+    State(state): State<OrchestratorState>,
+    Path(hook_id): Path<Uuid>,
+    Json(req): Json<crate::lifecycle::UpdateLifecycleHookRequest>,
+) -> Result<StatusCode, AppError> {
+    state
+        .orchestrator
+        .neo4j()
+        .update_lifecycle_hook(hook_id, &req)
+        .await
+        .map_err(AppError::Internal)?;
+
+    state.event_bus.emit_updated(
+        crate::events::EntityType::LifecycleHook,
+        &hook_id.to_string(),
+        serde_json::json!({"hook_id": hook_id}),
+        None,
+    );
+
+    Ok(StatusCode::OK)
+}
+
+/// DELETE /api/lifecycle-hooks/:id — Delete a lifecycle hook (builtin hooks cannot be deleted)
+pub async fn delete_lifecycle_hook(
+    State(state): State<OrchestratorState>,
+    Path(hook_id): Path<Uuid>,
+) -> Result<StatusCode, AppError> {
+    state
+        .orchestrator
+        .neo4j()
+        .delete_lifecycle_hook(hook_id)
+        .await
+        .map_err(|e| {
+            if e.to_string().contains("builtin") {
+                AppError::Conflict(e.to_string())
+            } else {
+                AppError::Internal(e)
+            }
+        })?;
+
+    state.event_bus.emit_deleted(
+        crate::events::EntityType::LifecycleHook,
+        &hook_id.to_string(),
+        None,
+    );
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ============================================================================
 // Meilisearch maintenance
 // ============================================================================
 
@@ -2443,6 +2568,7 @@ pub async fn create_commit(
             orchestrator.neo4j_arc(),
             pid,
             "post_sync",
+            None,
         );
     }
 
@@ -5297,8 +5423,49 @@ pub async fn receive_webhook(
 // Plan Runs — List, Get, Compare, Predict
 // ============================================================================
 
+/// Enrich a list of RunnerState with `plan_title` from the associated Plan nodes.
+/// Does a single batch query to Neo4j to resolve all unique plan_ids → titles.
+async fn enrich_runs_with_plan_titles(
+    graph: &std::sync::Arc<dyn crate::neo4j::traits::GraphStore>,
+    runs: Vec<crate::runner::state::RunnerState>,
+) -> serde_json::Value {
+    use std::collections::HashMap;
+
+    // Collect unique plan_ids
+    let plan_ids: Vec<uuid::Uuid> = runs
+        .iter()
+        .map(|r| r.plan_id)
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+
+    // Batch fetch plan titles
+    let mut title_map: HashMap<uuid::Uuid, String> = HashMap::new();
+    for pid in &plan_ids {
+        if let Ok(Some(plan)) = graph.get_plan(*pid).await {
+            title_map.insert(*pid, plan.title);
+        }
+    }
+
+    // Serialize runs and inject plan_title
+    let mut result = Vec::with_capacity(runs.len());
+    for run in &runs {
+        let mut val = serde_json::to_value(run).unwrap_or_default();
+        if let Some(obj) = val.as_object_mut() {
+            let title = title_map.get(&run.plan_id).cloned().unwrap_or_default();
+            obj.insert("plan_title".to_string(), serde_json::Value::String(title));
+        }
+        result.push(val);
+    }
+
+    serde_json::Value::Array(result)
+}
+
 /// GET /api/runs — List all plan runs across all plans.
 /// Supports optional `workspace_slug` query param to scope runs to a workspace.
+///
+/// Each run in the response is enriched with a `plan_title` field
+/// fetched from the associated Plan node, avoiding N+1 queries on the frontend.
 pub async fn list_all_plan_runs(
     State(state): State<OrchestratorState>,
     Query(params): Query<std::collections::HashMap<String, String>>,
@@ -5318,7 +5485,10 @@ pub async fn list_all_plan_runs(
         .list_all_plan_runs(limit, offset, status, workspace_slug)
         .await
         .map_err(AppError::Internal)?;
-    Ok(Json(serde_json::to_value(&runs).unwrap_or_default()))
+
+    // Enrich runs with plan titles (batch fetch to avoid N+1)
+    let enriched = enrich_runs_with_plan_titles(&graph, runs).await;
+    Ok(Json(enriched))
 }
 
 /// GET /api/plans/:plan_id/runs — List historical plan runs.
@@ -5337,6 +5507,19 @@ pub async fn list_plan_runs(
         .await
         .map_err(AppError::Internal)?;
     Ok(Json(serde_json::to_value(&runs).unwrap_or_default()))
+}
+
+/// GET /api/runs/:run_id/agent-executions — Get agent execution records for a plan run.
+pub async fn get_run_agent_executions(
+    State(state): State<OrchestratorState>,
+    Path(run_id): Path<Uuid>,
+) -> Result<Json<Vec<crate::neo4j::agent_execution::AgentExecutionNode>>, AppError> {
+    let graph = state.orchestrator.neo4j_arc();
+    let executions = graph
+        .get_agent_executions_for_run(run_id)
+        .await
+        .map_err(AppError::Internal)?;
+    Ok(Json(executions))
 }
 
 /// GET /api/runs/:run_id — Get a specific plan run.
@@ -5575,6 +5758,55 @@ pub async fn get_project_roadmap(
         progress,
         dependency_graph,
     }))
+}
+
+// ============================================================================
+// Pipeline — Gate Results & Progress Score
+// ============================================================================
+
+/// GET /api/runs/:run_id/gates — Return gate results for a pipeline run.
+///
+/// Returns an array of `GateResult` records. Currently returns the empty array
+/// when no gates have been persisted yet (pipeline V1 placeholder).
+pub async fn get_run_gates(
+    State(_state): State<OrchestratorState>,
+    Path(run_id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    // V1: return empty gate results. The pipeline runner will persist these
+    // in a future iteration and we'll query them from Neo4j here.
+    let response = serde_json::json!({
+        "run_id": run_id.to_string(),
+        "gates": [],
+    });
+    Ok(Json(response))
+}
+
+/// GET /api/runs/:run_id/progress — Return progress score for a pipeline run.
+///
+/// Returns a `ProgressScore` with default values when the pipeline has not
+/// recorded any checkpoints yet (V1 placeholder).
+pub async fn get_run_progress(
+    State(_state): State<OrchestratorState>,
+    Path(run_id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    // V1: return a default progress summary. Real data will come from
+    // ProgressOracle checkpoints once the pipeline runner persists them.
+    let response = serde_json::json!({
+        "run_id": run_id.to_string(),
+        "score": 0.0,
+        "delta": null,
+        "dimensions": {
+            "build": 0.0,
+            "tests": 0.0,
+            "coverage": 0.0,
+            "steps": 0.0,
+        },
+        "trend": "unknown",
+        "total_checkpoints": 0,
+        "best_score": 0.0,
+        "worst_score": 0.0,
+    });
+    Ok(Json(response))
 }
 
 // ============================================================================

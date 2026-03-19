@@ -335,6 +335,7 @@ pub async fn sync_project(
         state.orchestrator.neo4j_arc(),
         project.id,
         "post_sync",
+        Some(state.event_bus.clone() as std::sync::Arc<dyn crate::events::EventEmitter>),
     );
 
     Ok(Json(SyncProjectResponse {

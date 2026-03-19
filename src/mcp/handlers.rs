@@ -627,6 +627,13 @@ impl ToolHandler {
             ("admin", "install_hooks") => "install_hooks",
             ("admin", "get_learning_stats") => "get_learning_stats",
 
+            // Lifecycle Hooks
+            ("lifecycle_hook", "list") => "list_lifecycle_hooks",
+            ("lifecycle_hook", "create") => "create_lifecycle_hook",
+            ("lifecycle_hook", "get") => "get_lifecycle_hook",
+            ("lifecycle_hook", "update") => "update_lifecycle_hook",
+            ("lifecycle_hook", "delete") => "delete_lifecycle_hook",
+
             _ => {
                 return Err(anyhow!(
                     "Unknown action '{}' for mega-tool '{}'",
@@ -5544,6 +5551,74 @@ impl ToolHandler {
             "get_trajectory_stats" => {
                 let result = http.get("/api/trajectories/stats").await?;
                 Ok(Some(result))
+            }
+
+            // ── Lifecycle Hooks ──────────────────────────────────────────
+            "list_lifecycle_hooks" => {
+                let project_id = args
+                    .get("project_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let query = if project_id.is_empty() {
+                    String::new()
+                } else {
+                    format!("?project_id={}", project_id)
+                };
+                let result = http.get(&format!("/api/lifecycle-hooks{}", query)).await?;
+                Ok(Some(result))
+            }
+
+            "create_lifecycle_hook" => {
+                let result = http.post("/api/lifecycle-hooks", args).await?;
+                Ok(Some(result))
+            }
+
+            "get_lifecycle_hook" => {
+                let hook_id = extract_id(args, "hook_id")?;
+                let result = http
+                    .get(&format!("/api/lifecycle-hooks/{}", hook_id))
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "update_lifecycle_hook" => {
+                let hook_id = extract_id(args, "hook_id")?;
+                let mut body = serde_json::Map::new();
+                for key in [
+                    "name",
+                    "description",
+                    "on_status",
+                    "action_config",
+                    "priority",
+                    "enabled",
+                ] {
+                    if let Some(v) = args.get(key) {
+                        body.insert(key.to_string(), v.clone());
+                    }
+                }
+                let result = http
+                    .patch(
+                        &format!("/api/lifecycle-hooks/{}", hook_id),
+                        &Value::Object(body),
+                    )
+                    .await?;
+                Ok(Some(if result.is_null() {
+                    json!({"updated": true})
+                } else {
+                    result
+                }))
+            }
+
+            "delete_lifecycle_hook" => {
+                let hook_id = extract_id(args, "hook_id")?;
+                let result = http
+                    .delete(&format!("/api/lifecycle-hooks/{}", hook_id))
+                    .await?;
+                Ok(Some(if result.is_null() {
+                    json!({"deleted": true})
+                } else {
+                    result
+                }))
             }
 
             // ── All tools migrated ──────────────────────────────────────

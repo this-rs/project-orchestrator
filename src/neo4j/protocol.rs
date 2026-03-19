@@ -121,6 +121,7 @@ impl Neo4jClient {
                 .ok()
                 .filter(|s| !s.is_empty())
                 .and_then(|s| serde_json::from_str(&s).ok()),
+            state_timeout_secs: node.get::<i64>("state_timeout_secs").ok().map(|v| v as u64),
         })
     }
 
@@ -408,7 +409,8 @@ impl Neo4jClient {
                 s.generator_config_json = $generator_config_json,
                 s.prompt_fragment = $prompt_fragment,
                 s.available_tools_json = $available_tools_json,
-                s.forbidden_actions_json = $forbidden_actions_json
+                s.forbidden_actions_json = $forbidden_actions_json,
+                s.state_timeout_secs = $state_timeout_secs
             MERGE (proto)-[:HAS_STATE]->(s)
             "#,
         )
@@ -466,6 +468,10 @@ impl Neo4jClient {
                 .as_ref()
                 .map(|v| serde_json::to_string(v).unwrap_or_default())
                 .unwrap_or_default(),
+        )
+        .param(
+            "state_timeout_secs",
+            state.state_timeout_secs.map(|v| v as i64).unwrap_or(-1),
         );
 
         self.graph
@@ -672,6 +678,7 @@ impl Neo4jClient {
                 .unwrap_or_else(|_| "manual".to_string()),
             depth: node.get::<i64>("depth").unwrap_or(0) as u32,
             version: node.get::<i64>("version").unwrap_or(0) as u64,
+            runner_managed: node.get::<bool>("runner_managed").unwrap_or(false),
         })
     }
 
@@ -707,7 +714,8 @@ impl Neo4jClient {
                 error: $error,
                 triggered_by: $triggered_by,
                 depth: $depth,
-                version: $version
+                version: $version,
+                runner_managed: $runner_managed
             })
             CREATE (r)-[:INSTANCE_OF]->(proto)
             RETURN r.id AS created_id
@@ -741,7 +749,8 @@ impl Neo4jClient {
         .param("triggered_by", run.triggered_by.clone())
         .param("depth", run.depth as i64)
         .param("version", run.version as i64)
-        .param("is_child", run.parent_run_id.is_some());
+        .param("is_child", run.parent_run_id.is_some())
+        .param("runner_managed", run.runner_managed);
 
         let mut result = self
             .graph
@@ -845,7 +854,8 @@ impl Neo4jClient {
                 r.status = $status,
                 r.completed_at = $completed_at,
                 r.error = $error,
-                r.version = $new_version
+                r.version = $new_version,
+                r.runner_managed = $runner_managed
             RETURN r.id AS updated_id
             "#,
         )
@@ -861,7 +871,8 @@ impl Neo4jClient {
                 .map(|dt| dt.to_rfc3339())
                 .unwrap_or_default(),
         )
-        .param("error", run.error.clone().unwrap_or_default());
+        .param("error", run.error.clone().unwrap_or_default())
+        .param("runner_managed", run.runner_managed);
 
         let mut result = self
             .graph
