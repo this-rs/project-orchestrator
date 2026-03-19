@@ -532,8 +532,11 @@ impl ChatManager {
     pub fn with_nn_router(
         mut self,
         router: Arc<tokio::sync::RwLock<neural_routing_runtime::DualTrackRouter>>,
+        enabled: bool,
     ) -> Self {
         self.nn_router = Some(router);
+        self.neural_routing_enabled
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
         self
     }
 
