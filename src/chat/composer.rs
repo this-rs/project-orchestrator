@@ -103,15 +103,13 @@ const DEFAULT_DYNAMIC_CONTEXT_CHAR_BUDGET: usize = 10_000;
 /// - Smaller/unknown models: fallback to 10K chars
 fn compute_dynamic_budget(model: &str, base_prompt_chars: usize) -> usize {
     // Estimate model context window in tokens
-    let context_window_tokens: usize = if model.contains("opus")
-        || model.contains("sonnet")
-        || model.contains("haiku")
-    {
-        200_000
-    } else {
-        // Unknown model → use conservative fallback
-        return DEFAULT_DYNAMIC_CONTEXT_CHAR_BUDGET;
-    };
+    let context_window_tokens: usize =
+        if model.contains("opus") || model.contains("sonnet") || model.contains("haiku") {
+            200_000
+        } else {
+            // Unknown model → use conservative fallback
+            return DEFAULT_DYNAMIC_CONTEXT_CHAR_BUDGET;
+        };
 
     // Convert to chars (~4 chars per token)
     let context_window_chars = context_window_tokens * 4;

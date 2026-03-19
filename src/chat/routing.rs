@@ -250,11 +250,7 @@ impl RoutingDecision {
     /// contextualizes the decision for the neural feedback loop.
     pub fn to_trajectory_record(&self, ctx: &RoutingContext) -> RoutingDecisionRecord {
         RoutingDecisionRecord {
-            selected_sections: self
-                .sections
-                .iter()
-                .map(|s| s.id.to_string())
-                .collect(),
+            selected_sections: self.sections.iter().map(|s| s.id.to_string()).collect(),
             selected_tool_groups: self
                 .tool_groups
                 .iter()
@@ -400,7 +396,10 @@ impl DualTrackRouter {
         embedding_weight: f32,
     ) -> Result<Self, anyhow::Error> {
         let descriptions = section_semantic_descriptions();
-        let texts: Vec<String> = descriptions.iter().map(|(_, desc)| desc.to_string()).collect();
+        let texts: Vec<String> = descriptions
+            .iter()
+            .map(|(_, desc)| desc.to_string())
+            .collect();
 
         let embeddings = provider.embed_batch(&texts).await?;
 
@@ -756,9 +755,7 @@ mod tests {
         // With heuristic_weight=0.6, even a zero embedding score gives 0.6*1.0 + 0.4*0.5 = 0.8
         // (0.5 because cosine=0 → normalized to 0.5)
         // So with default threshold 0.15, no sections should be dropped
-        let centroids = vec![
-            (PromptSectionId::IdentityRole, vec![1.0, 0.0]),
-        ];
+        let centroids = vec![(PromptSectionId::IdentityRole, vec![1.0, 0.0])];
         let router = DualTrackRouter::new(centroids, 0.6, 0.4);
 
         let ctx = RoutingContext {
