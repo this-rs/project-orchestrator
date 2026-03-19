@@ -1742,6 +1742,21 @@ impl PlanRunner {
             .as_ref()
             .map(|t| t.frustration_score)
             .unwrap_or(0.0);
+        // Resolve scaffolding level from project (best effort, default L0)
+        let scaffolding_level = if let Some(slug) = project_slug {
+            match self.graph.get_project_by_slug(slug).await {
+                Ok(Some(project)) => self
+                    .graph
+                    .compute_scaffolding_level(project.id, project.scaffolding_override)
+                    .await
+                    .map(|l| l.level)
+                    .unwrap_or(0),
+                _ => 0,
+            }
+        } else {
+            0
+        };
+
         let runner_ctx = RunnerPromptContext {
             git_branch,
             task_tags,
@@ -1751,6 +1766,7 @@ impl PlanRunner {
             frustration_level,
             wave_number,
             parallel_agents: 1, // default, overridden by execute_wave
+            scaffolding_level,
         };
         prompt.push_str(&build_runner_constraints(&runner_ctx));
 

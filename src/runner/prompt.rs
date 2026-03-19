@@ -240,6 +240,8 @@ pub struct RunnerPromptContext {
     pub frustration_level: f64,
     pub wave_number: usize,
     pub parallel_agents: usize,
+    /// Scaffolding level (0-4) for adaptive constraint verbosity.
+    pub scaffolding_level: u8,
 }
 
 impl RunnerPromptContext {
@@ -254,11 +256,12 @@ impl RunnerPromptContext {
             frustration_level: 0.0,
             wave_number: 1,
             parallel_agents: 1,
+            scaffolding_level: 0,
         }
     }
 }
 
-/// Base constraints text — identical to the old `RUNNER_CONSTRAINTS` const.
+/// Base constraints text — full version for L0-L1 (verbose guidance).
 const BASE_CONSTRAINTS: &str = r#"
 ## Runner Execution Mode
 
@@ -285,17 +288,38 @@ Your ONLY job is to **write code, test it, and commit it**. You are NOT in a con
 5. You are DONE when all steps are implemented and the code compiles
 "#;
 
+/// Concise constraints for L2-L3 (reduced guidance — conventions assumed known).
+const CONCISE_CONSTRAINTS: &str = r#"
+## Runner Execution Mode
+
+Autonomous agent. Write code, test, commit. No discussion, no MCP status updates.
+Commits: `<type>(<scope>): <desc>`. Never commit secrets. Verify with `cargo check`.
+"#;
+
+/// Minimal constraints for L4 (expert mode — only critical warnings).
+const MINIMAL_CONSTRAINTS: &str = r#"
+## Runner Mode
+Autonomous. Code → test → commit. No MCP status calls. No secrets in commits.
+"#;
+
 /// Build the full runner constraints prompt from the given context.
 ///
-/// When called with `RunnerPromptContext::single_agent(...)`, the output is
-/// identical to the old static `RUNNER_CONSTRAINTS` const.
+/// Adapts verbosity based on `scaffolding_level`:
+/// - L0-L1: Full verbose guidance (BASE_CONSTRAINTS)
+/// - L2-L3: Concise (CONCISE_CONSTRAINTS)
+/// - L4: Minimal (MINIMAL_CONSTRAINTS)
 pub fn build_runner_constraints(ctx: &RunnerPromptContext) -> String {
-    let mut out = String::from(BASE_CONSTRAINTS);
+    let base = match ctx.scaffolding_level {
+        0..=1 => BASE_CONSTRAINTS,
+        2..=3 => CONCISE_CONSTRAINTS,
+        _ => MINIMAL_CONSTRAINTS,
+    };
+    let mut out = String::from(base);
 
     // Branch constraint
     if !ctx.git_branch.is_empty() {
         out.push_str(&format!(
-            "\nTous tes commits doivent être sur la branche `{}`.\n",
+            "\nAll commits must be on branch `{}`.\n",
             ctx.git_branch
         ));
     }
@@ -303,7 +327,7 @@ pub fn build_runner_constraints(ctx: &RunnerPromptContext) -> String {
     // Forbidden files (parallel agent safety)
     if !ctx.forbidden_files.is_empty() {
         out.push_str(&format!(
-            "\nNE MODIFIE PAS ces fichiers, ils sont gérés par d'autres agents : {}\n",
+            "\nDO NOT modify these files (managed by other agents): {}\n",
             ctx.forbidden_files.join(", ")
         ));
     }
@@ -315,18 +339,70 @@ pub fn build_runner_constraints(ctx: &RunnerPromptContext) -> String {
 
     // High frustration warning
     if ctx.frustration_level > 0.7 {
-        out.push_str("\n⚠️ Frustration élevée — utilise le deep reasoning avant d'agir.\n");
+        out.push_str("\n⚠️ High frustration — use deep reasoning before acting.\n");
     }
 
     // Parallel agent awareness
     if ctx.parallel_agents > 1 {
         out.push_str(&format!(
-            "\nTu es l'agent {} parmi {} agents parallèles dans cette wave.\n",
+            "\nYou are agent {} of {} parallel agents in this wave.\n",
             ctx.wave_number, ctx.parallel_agents
         ));
     }
 
+    // Tag-conditional constraints
+    build_tag_constraints(&ctx.task_tags, &mut out);
+
     out
+}
+
+/// Append tag-specific constraints based on task tags.
+fn build_tag_constraints(tags: &[String], out: &mut String) {
+    let tag_set: std::collections::HashSet<&str> = tags.iter().map(|s| s.as_str()).collect();
+
+    if tag_set.contains("test") || tag_set.contains("testing") {
+        out.push_str(
+            "\n### Test Constraints\n\
+             - Run the FULL test suite after changes (`cargo test` or equivalent)\n\
+             - Ensure all existing tests still pass — do not delete or skip tests\n\
+             - Add tests for new functionality\n",
+        );
+    }
+
+    if tag_set.contains("refactor") || tag_set.contains("refactoring") {
+        out.push_str(
+            "\n### Refactor Constraints\n\
+             - DO NOT change any public API signatures (function names, parameters, return types)\n\
+             - Preserve backward compatibility — all callers must work unchanged\n\
+             - Run tests before AND after refactoring to confirm no regressions\n",
+        );
+    }
+
+    if tag_set.contains("docs") || tag_set.contains("documentation") {
+        out.push_str(
+            "\n### Documentation Constraints\n\
+             - Update doc comments on modified functions/structs\n\
+             - Ensure examples in docs compile (if any)\n\
+             - Keep README/CHANGELOG up to date if relevant\n",
+        );
+    }
+
+    if tag_set.contains("security") {
+        out.push_str(
+            "\n### Security Constraints\n\
+             - Review for injection, XSS, CSRF vulnerabilities\n\
+             - Validate and sanitize all user inputs\n\
+             - Never log sensitive data (passwords, tokens, PII)\n",
+        );
+    }
+
+    if tag_set.contains("fix") || tag_set.contains("bugfix") {
+        out.push_str(
+            "\n### Bug Fix Constraints\n\
+             - Write a regression test that reproduces the bug BEFORE fixing it\n\
+             - Verify the test fails without the fix and passes with it\n",
+        );
+    }
 }
 
 #[cfg(test)]
@@ -438,6 +514,7 @@ mod tests {
     fn test_single_agent_matches_base() {
         let ctx = RunnerPromptContext::single_agent(String::new());
         let result = build_runner_constraints(&ctx);
+        // L0 default → full BASE_CONSTRAINTS
         assert_eq!(result, BASE_CONSTRAINTS);
     }
 
@@ -455,7 +532,7 @@ mod tests {
     fn test_branch_injected() {
         let ctx = RunnerPromptContext::single_agent("feat/my-branch".to_string());
         let result = build_runner_constraints(&ctx);
-        assert!(result.contains("branche `feat/my-branch`"));
+        assert!(result.contains("branch `feat/my-branch`"));
     }
 
     #[test]
@@ -463,7 +540,7 @@ mod tests {
         let mut ctx = RunnerPromptContext::single_agent(String::new());
         ctx.forbidden_files = vec!["src/main.rs".to_string(), "Cargo.toml".to_string()];
         let result = build_runner_constraints(&ctx);
-        assert!(result.contains("NE MODIFIE PAS"));
+        assert!(result.contains("DO NOT modify these files"));
         assert!(result.contains("src/main.rs, Cargo.toml"));
     }
 
@@ -481,7 +558,7 @@ mod tests {
         let mut ctx = RunnerPromptContext::single_agent(String::new());
         ctx.frustration_level = 0.8;
         let result = build_runner_constraints(&ctx);
-        assert!(result.contains("Frustration élevée"));
+        assert!(result.contains("High frustration"));
     }
 
     #[test]
@@ -489,7 +566,7 @@ mod tests {
         let mut ctx = RunnerPromptContext::single_agent(String::new());
         ctx.frustration_level = 0.5;
         let result = build_runner_constraints(&ctx);
-        assert!(!result.contains("Frustration"));
+        assert!(!result.contains("frustration"));
     }
 
     #[test]
@@ -498,7 +575,127 @@ mod tests {
         ctx.parallel_agents = 3;
         ctx.wave_number = 2;
         let result = build_runner_constraints(&ctx);
-        assert!(result.contains("l'agent 2 parmi 3 agents parallèles"));
+        assert!(result.contains("agent 2 of 3 parallel agents"));
+    }
+
+    // ========================================================================
+    // Scaffolding level tests
+    // ========================================================================
+
+    #[test]
+    fn test_scaffolding_l0_verbose() {
+        let mut ctx = RunnerPromptContext::single_agent(String::new());
+        ctx.scaffolding_level = 0;
+        let result = build_runner_constraints(&ctx);
+        assert!(result.contains("autonomous code execution agent"));
+        assert!(result.contains("### Behavior Rules"));
+        assert!(result.contains("### Execution Flow"));
+    }
+
+    #[test]
+    fn test_scaffolding_l2_concise() {
+        let mut ctx = RunnerPromptContext::single_agent(String::new());
+        ctx.scaffolding_level = 2;
+        let result = build_runner_constraints(&ctx);
+        assert!(result.contains("## Runner Execution Mode"));
+        assert!(result.contains("Autonomous agent"));
+        assert!(!result.contains("### Behavior Rules"));
+    }
+
+    #[test]
+    fn test_scaffolding_l4_minimal() {
+        let mut ctx = RunnerPromptContext::single_agent(String::new());
+        ctx.scaffolding_level = 4;
+        let result = build_runner_constraints(&ctx);
+        assert!(result.contains("## Runner Mode"));
+        assert!(!result.contains("### Behavior Rules"));
+        assert!(!result.contains("Autonomous agent. Write"));
+    }
+
+    #[test]
+    fn test_scaffolding_levels_decrease_size() {
+        let l0 = {
+            let mut ctx = RunnerPromptContext::single_agent(String::new());
+            ctx.scaffolding_level = 0;
+            build_runner_constraints(&ctx)
+        };
+        let l2 = {
+            let mut ctx = RunnerPromptContext::single_agent(String::new());
+            ctx.scaffolding_level = 2;
+            build_runner_constraints(&ctx)
+        };
+        let l4 = {
+            let mut ctx = RunnerPromptContext::single_agent(String::new());
+            ctx.scaffolding_level = 4;
+            build_runner_constraints(&ctx)
+        };
+        assert!(l0.len() > l2.len(), "L0 ({}) should be longer than L2 ({})", l0.len(), l2.len());
+        assert!(l2.len() > l4.len(), "L2 ({}) should be longer than L4 ({})", l2.len(), l4.len());
+    }
+
+    // ========================================================================
+    // Tag-conditional constraint tests
+    // ========================================================================
+
+    #[test]
+    fn test_tag_test_constraints() {
+        let mut ctx = RunnerPromptContext::single_agent(String::new());
+        ctx.task_tags = vec!["test".to_string()];
+        let result = build_runner_constraints(&ctx);
+        assert!(result.contains("### Test Constraints"));
+        assert!(result.contains("FULL test suite"));
+    }
+
+    #[test]
+    fn test_tag_refactor_constraints() {
+        let mut ctx = RunnerPromptContext::single_agent(String::new());
+        ctx.task_tags = vec!["refactor".to_string()];
+        let result = build_runner_constraints(&ctx);
+        assert!(result.contains("### Refactor Constraints"));
+        assert!(result.contains("public API signatures"));
+    }
+
+    #[test]
+    fn test_tag_docs_constraints() {
+        let mut ctx = RunnerPromptContext::single_agent(String::new());
+        ctx.task_tags = vec!["docs".to_string()];
+        let result = build_runner_constraints(&ctx);
+        assert!(result.contains("### Documentation Constraints"));
+    }
+
+    #[test]
+    fn test_tag_security_constraints() {
+        let mut ctx = RunnerPromptContext::single_agent(String::new());
+        ctx.task_tags = vec!["security".to_string()];
+        let result = build_runner_constraints(&ctx);
+        assert!(result.contains("### Security Constraints"));
+    }
+
+    #[test]
+    fn test_tag_bugfix_constraints() {
+        let mut ctx = RunnerPromptContext::single_agent(String::new());
+        ctx.task_tags = vec!["fix".to_string()];
+        let result = build_runner_constraints(&ctx);
+        assert!(result.contains("### Bug Fix Constraints"));
+        assert!(result.contains("regression test"));
+    }
+
+    #[test]
+    fn test_no_tag_no_extra_constraints() {
+        let ctx = RunnerPromptContext::single_agent(String::new());
+        let result = build_runner_constraints(&ctx);
+        assert!(!result.contains("### Test Constraints"));
+        assert!(!result.contains("### Refactor Constraints"));
+        assert!(!result.contains("### Documentation Constraints"));
+    }
+
+    #[test]
+    fn test_multiple_tags_combined() {
+        let mut ctx = RunnerPromptContext::single_agent(String::new());
+        ctx.task_tags = vec!["test".to_string(), "refactor".to_string()];
+        let result = build_runner_constraints(&ctx);
+        assert!(result.contains("### Test Constraints"));
+        assert!(result.contains("### Refactor Constraints"));
     }
 
     // ========================================================================
