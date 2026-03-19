@@ -2958,6 +2958,14 @@ pub trait GraphStore: Send + Sync {
     /// List all PlanRuns with status=Running (for crash recovery at boot).
     async fn list_active_plan_runs(&self) -> Result<Vec<crate::runner::RunnerState>>;
 
+    /// List all PlanRuns across all plans, ordered by started_at desc.
+    async fn list_all_plan_runs(
+        &self,
+        limit: i64,
+        offset: i64,
+        status: Option<&str>,
+    ) -> Result<Vec<crate::runner::RunnerState>>;
+
     /// List all PlanRuns for a given plan, ordered by started_at desc.
     async fn list_plan_runs(
         &self,

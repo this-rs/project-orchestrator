@@ -3534,6 +3534,15 @@ impl GraphStore for Neo4jClient {
         self.list_active_plan_runs_impl().await
     }
 
+    async fn list_all_plan_runs(
+        &self,
+        limit: i64,
+        offset: i64,
+        status: Option<&str>,
+    ) -> anyhow::Result<Vec<crate::runner::RunnerState>> {
+        self.list_all_plan_runs_impl(limit, offset, status).await
+    }
+
     async fn list_plan_runs(
         &self,
         plan_id: Uuid,

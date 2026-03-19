@@ -5295,6 +5295,28 @@ pub async fn receive_webhook(
 // Plan Runs — List, Get, Compare, Predict
 // ============================================================================
 
+/// GET /api/runs — List all plan runs across all plans.
+pub async fn list_all_plan_runs(
+    State(state): State<OrchestratorState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let limit = params
+        .get("limit")
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(50);
+    let offset = params
+        .get("offset")
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(0);
+    let status = params.get("status").map(|s| s.as_str());
+    let graph = state.orchestrator.neo4j_arc();
+    let runs = graph
+        .list_all_plan_runs(limit, offset, status)
+        .await
+        .map_err(AppError::Internal)?;
+    Ok(Json(serde_json::to_value(&runs).unwrap_or_default()))
+}
+
 /// GET /api/plans/:plan_id/runs — List historical plan runs.
 pub async fn list_plan_runs(
     State(state): State<OrchestratorState>,

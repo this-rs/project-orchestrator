@@ -10207,6 +10207,30 @@ impl GraphStore for MockGraphStore {
             .collect())
     }
 
+    async fn list_all_plan_runs(
+        &self,
+        limit: i64,
+        offset: i64,
+        status: Option<&str>,
+    ) -> anyhow::Result<Vec<crate::runner::RunnerState>> {
+        let runs = self.plan_runs.read().await;
+        let mut result: Vec<_> = runs
+            .values()
+            .filter(|s| {
+                if let Some(st) = status {
+                    format!("{:?}", s.status) == st
+                } else {
+                    true
+                }
+            })
+            .cloned()
+            .collect();
+        result.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+        let start = (offset as usize).min(result.len());
+        result = result.into_iter().skip(start).take(limit as usize).collect();
+        Ok(result)
+    }
+
     async fn list_plan_runs(
         &self,
         plan_id: Uuid,
