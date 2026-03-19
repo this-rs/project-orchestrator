@@ -1,6 +1,151 @@
 //! Chat types — request/response/event types for the chat system
 
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+// ============================================================================
+// SpawnedBy — typed origin for detached sessions
+// ============================================================================
+
+/// Typed origin for a detached session.
+///
+/// Serialized as `{"type": "pipeline", ...}` (serde tag-based).
+/// Legacy values (plain `{"type":"runner", ...}`) are handled via the
+/// `Runner` fallback variant for backward compatibility.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SpawnedBy {
+    /// Legacy runner-spawned session (backward compat)
+    Runner {
+        #[serde(default)]
+        run_id: Option<Uuid>,
+        #[serde(default)]
+        plan_id: Option<Uuid>,
+        #[serde(default)]
+        parent_session_id: Option<String>,
+        #[serde(default)]
+        task_id: Option<Uuid>,
+    },
+    /// Pipeline execution agent (wave-based execution)
+    Pipeline {
+        run_id: Uuid,
+        plan_id: Uuid,
+        wave: usize,
+        task_id: Uuid,
+    },
+    /// Gate retry / verification agent
+    Gate {
+        run_id: Uuid,
+        gate_type: String,
+        retry_count: u32,
+    },
+    /// Trigger-initiated session (webhook, schedule, event)
+    Trigger {
+        trigger_id: Uuid,
+        event_type: String,
+    },
+    /// Conversation-spawned sub-session
+    Conversation {
+        parent_session_id: String,
+    },
+}
+
+impl SpawnedBy {
+    /// Serialize to JSON string for storage in Neo4j.
+    pub fn to_json_string(&self) -> String {
+        serde_json::to_string(self).unwrap_or_default()
+    }
+
+    /// Parse from a JSON string with fallback for legacy formats.
+    ///
+    /// Legacy formats (plain `{"type":"runner",...}` or `{"parent_session_id":"..."}`)
+    /// are normalized to the appropriate variant.
+    pub fn from_json_str(s: &str) -> Option<Self> {
+        if s.is_empty() {
+            return None;
+        }
+        // Try direct deserialization first (typed enum)
+        if let Ok(v) = serde_json::from_str::<SpawnedBy>(s) {
+            return Some(v);
+        }
+        // Fallback: try to parse as legacy untyped JSON
+        let val: serde_json::Value = serde_json::from_str(s).ok()?;
+        let parent_session_id = val
+            .get("parent_session_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let run_id = val
+            .get("run_id")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<Uuid>().ok());
+        let plan_id = val
+            .get("plan_id")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<Uuid>().ok());
+        let task_id = val
+            .get("task_id")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<Uuid>().ok());
+
+        // If it has parent_session_id but no run_id, it's a conversation spawn
+        if parent_session_id.is_some() && run_id.is_none() {
+            return Some(SpawnedBy::Conversation {
+                parent_session_id: parent_session_id.unwrap(),
+            });
+        }
+
+        // Default: treat as legacy runner
+        Some(SpawnedBy::Runner {
+            run_id,
+            plan_id,
+            parent_session_id,
+            task_id,
+        })
+    }
+
+    /// Extract parent_session_id if present (for SPAWNED_BY relation).
+    pub fn parent_session_id(&self) -> Option<&str> {
+        match self {
+            SpawnedBy::Runner {
+                parent_session_id, ..
+            } => parent_session_id.as_deref(),
+            SpawnedBy::Conversation {
+                parent_session_id, ..
+            } => Some(parent_session_id.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Extract the spawn_type string for the SPAWNED_BY relation.
+    pub fn spawn_type(&self) -> &str {
+        match self {
+            SpawnedBy::Runner { .. } => "runner",
+            SpawnedBy::Pipeline { .. } => "pipeline",
+            SpawnedBy::Gate { .. } => "gate",
+            SpawnedBy::Trigger { .. } => "trigger",
+            SpawnedBy::Conversation { .. } => "conversation",
+        }
+    }
+
+    /// Extract run_id if present.
+    pub fn run_id(&self) -> Option<Uuid> {
+        match self {
+            SpawnedBy::Runner { run_id, .. } => *run_id,
+            SpawnedBy::Pipeline { run_id, .. } => Some(*run_id),
+            SpawnedBy::Gate { run_id, .. } => Some(*run_id),
+            _ => None,
+        }
+    }
+
+    /// Extract task_id if present.
+    pub fn task_id(&self) -> Option<Uuid> {
+        match self {
+            SpawnedBy::Runner { task_id, .. } => *task_id,
+            SpawnedBy::Pipeline { task_id, .. } => Some(*task_id),
+            _ => None,
+        }
+    }
+}
 
 /// Request to send a chat message
 #[derive(Debug, Clone, Serialize, Deserialize)]

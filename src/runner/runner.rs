@@ -1090,6 +1090,7 @@ impl PlanRunner {
                                 persona_profile: persona,
                                 vector_json: None,
                                 report_json,
+                                execution_type: Default::default(),
                             };
                             if let Err(e) = graph.update_agent_execution(&ae).await {
                                 warn!("Failed to update AgentExecution {}: {}", ae_id, e);
@@ -1171,6 +1172,7 @@ impl PlanRunner {
                                 persona_profile: persona,
                                 vector_json: None,
                                 report_json: None,
+                                execution_type: Default::default(),
                             };
                             if let Err(e) = graph.update_agent_execution(&ae).await {
                                 warn!("Failed to update AgentExecution {}: {}", ae_id, e);
@@ -1265,6 +1267,7 @@ impl PlanRunner {
                                 persona_profile: persona,
                                 vector_json: None,
                                 report_json: None,
+                                execution_type: Default::default(),
                             };
                             if let Err(e) = graph.update_agent_execution(&ae).await {
                                 warn!("Failed to update AgentExecution {}: {}", ae_id, e);
@@ -1862,6 +1865,7 @@ impl PlanRunner {
                 persona_profile: persona_str.clone(),
                 vector_json: None,
                 report_json: None,
+                execution_type: Default::default(),
             };
             let graph = self.graph.clone();
             tokio::spawn(async move {

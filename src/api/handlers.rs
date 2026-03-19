@@ -948,6 +948,7 @@ pub async fn delegate_task(
             persona_profile: "delegation".to_string(),
             vector_json: None,
             report_json: None,
+            execution_type: Default::default(),
         };
         let graph_clone = graph.clone();
         tokio::spawn(async move {
