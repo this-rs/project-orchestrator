@@ -71,15 +71,54 @@ pub enum WaveStatus {
     MergeConflict,
 }
 
+/// Trait for delegating task execution to an external system.
+///
+/// Implementations can wire into the ChatManager/PlanRunner to spawn real agents,
+/// or provide mock implementations for testing.
+#[async_trait::async_trait]
+pub trait TaskDelegate: Send + Sync {
+    /// Execute a task and return the result.
+    async fn execute(&self, task_id: Uuid, cwd: &str) -> TaskExecutionResult;
+}
+
+/// Default delegate that returns placeholder success results.
+/// Used when no real delegation infrastructure is available (V1).
+pub struct PlaceholderDelegate;
+
+#[async_trait::async_trait]
+impl TaskDelegate for PlaceholderDelegate {
+    async fn execute(&self, task_id: Uuid, _cwd: &str) -> TaskExecutionResult {
+        TaskExecutionResult {
+            task_id,
+            status: TaskExecStatus::Success,
+            message: "placeholder: task executed successfully".into(),
+            duration_ms: 0,
+            files_modified: Vec::new(),
+        }
+    }
+}
+
 /// The Wave Executor
 pub struct WaveExecutor {
     timeout_secs: u64,
+    delegate: std::sync::Arc<dyn TaskDelegate>,
 }
 
 impl WaveExecutor {
     /// Create a new wave executor with the given per-task timeout (default 600s / 10 minutes).
     pub fn new(timeout_secs: u64) -> Self {
-        Self { timeout_secs }
+        Self {
+            timeout_secs,
+            delegate: std::sync::Arc::new(PlaceholderDelegate),
+        }
+    }
+
+    /// Create a wave executor with a custom task delegate.
+    pub fn with_delegate(timeout_secs: u64, delegate: std::sync::Arc<dyn TaskDelegate>) -> Self {
+        Self {
+            timeout_secs,
+            delegate,
+        }
     }
 
     /// Execute all tasks in a wave, collect results, and optionally run a merge check.
@@ -90,10 +129,9 @@ impl WaveExecutor {
         let mut handles = Vec::new();
         for &task_id in &spec.task_ids {
             let cwd = spec.cwd.clone();
-            let timeout = self.timeout_secs;
+            let delegate = self.delegate.clone();
             handles.push(tokio::spawn(async move {
-                let executor = WaveExecutor::new(timeout);
-                executor.execute_task(task_id, &cwd).await
+                delegate.execute(task_id, &cwd).await
             }));
         }
 
@@ -143,20 +181,9 @@ impl WaveExecutor {
         }
     }
 
-    /// Execute a single task within a wave.
-    ///
-    /// This is currently a placeholder that returns Success with duration 0.
-    /// It will be replaced with actual `plan(delegate_task)` calls once the
-    /// delegation infrastructure is wired up.
-    pub async fn execute_task(&self, task_id: Uuid, _cwd: &str) -> TaskExecutionResult {
-        // TODO: Replace with actual delegation via plan(delegate_task)
-        TaskExecutionResult {
-            task_id,
-            status: TaskExecStatus::Success,
-            message: "placeholder: task executed successfully".into(),
-            duration_ms: 0,
-            files_modified: Vec::new(),
-        }
+    /// Execute a single task within a wave via the configured delegate.
+    pub async fn execute_task(&self, task_id: Uuid, cwd: &str) -> TaskExecutionResult {
+        self.delegate.execute(task_id, cwd).await
     }
 
     /// Run `cargo check` in the working directory to verify that all task outputs
@@ -209,7 +236,10 @@ impl WaveExecutor {
 
 impl Default for WaveExecutor {
     fn default() -> Self {
-        Self::new(600)
+        Self {
+            timeout_secs: 600,
+            delegate: std::sync::Arc::new(PlaceholderDelegate),
+        }
     }
 }
 

@@ -20,7 +20,7 @@ use super::gates::{
 };
 use super::progress::{Checkpoint, ProgressOracle};
 use super::regression::{ErrorCategory, ErrorSignature, RegressionDetector, StopReason};
-use super::wave_executor::{WaveExecutor, WaveSpec, WaveStatus};
+use super::wave_executor::{TaskDelegate, WaveExecutor, WaveSpec, WaveStatus};
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -135,6 +135,23 @@ impl PipelineRunner {
             oracle: ProgressOracle::with_defaults(),
             detector: RegressionDetector::default(),
             wave_executor: WaveExecutor::new(config.timeout_secs),
+            events: Vec::new(),
+            config,
+        }
+    }
+
+    /// Create a pipeline runner with a custom task delegate.
+    ///
+    /// This allows wiring real task execution (e.g. via ChatManager/PlanRunner)
+    /// into the pipeline without the WaveExecutor needing to know the details.
+    pub fn with_delegate(
+        config: PipelineConfig,
+        delegate: std::sync::Arc<dyn TaskDelegate>,
+    ) -> Self {
+        Self {
+            oracle: ProgressOracle::with_defaults(),
+            detector: RegressionDetector::default(),
+            wave_executor: WaveExecutor::with_delegate(config.timeout_secs, delegate),
             events: Vec::new(),
             config,
         }
