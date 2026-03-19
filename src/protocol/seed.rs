@@ -914,4 +914,371 @@ mod tests {
         assert!(state_names.contains(&"rejected"));
         assert!(state_names.contains(&"implemented"));
     }
+
+    #[test]
+    fn test_diagnostic_triage_has_full_flow() {
+        let protocols = build_protocol_seeds();
+        let diag = protocols
+            .iter()
+            .find(|p| p.protocol_name == "diagnostic-triage")
+            .unwrap();
+        let state_names: Vec<&str> = diag.states.iter().map(|s| s.state_name).collect();
+        assert!(state_names.contains(&"identify_symptom"));
+        assert!(state_names.contains(&"load_known_issues"));
+        assert!(state_names.contains(&"map_blast_radius"));
+        assert!(state_names.contains(&"check_recent_changes"));
+        assert!(state_names.contains(&"investigate"));
+        assert!(state_names.contains(&"capture_resolution"));
+    }
+
+    #[test]
+    fn test_auto_maintenance_has_full_flow() {
+        let protocols = build_protocol_seeds();
+        let maint = protocols
+            .iter()
+            .find(|p| p.protocol_name == "auto-maintenance")
+            .unwrap();
+        let state_names: Vec<&str> = maint.states.iter().map(|s| s.state_name).collect();
+        assert!(state_names.contains(&"health_check"));
+        assert!(state_names.contains(&"analyze_delta"));
+        assert!(state_names.contains(&"triage"));
+        assert!(state_names.contains(&"auto_fix"));
+        assert!(state_names.contains(&"plan_remediation"));
+        assert!(state_names.contains(&"maintained"));
+    }
+
+    #[test]
+    fn test_some_states_have_none_available_tools() {
+        // Verify that states with `available_tools: None` (meaning all tools allowed) exist
+        let protocols = build_protocol_seeds();
+        let mut found_none = false;
+        for proto in &protocols {
+            for state in &proto.states {
+                if state.available_tools.is_none() {
+                    found_none = true;
+                }
+            }
+        }
+        assert!(
+            found_none,
+            "Expected at least one state with available_tools = None"
+        );
+    }
+
+    #[test]
+    fn test_some_states_have_none_forbidden_actions() {
+        // Verify that states with `forbidden_actions: None` exist
+        let protocols = build_protocol_seeds();
+        let mut found_none = false;
+        for proto in &protocols {
+            for state in &proto.states {
+                if state.forbidden_actions.is_none() {
+                    found_none = true;
+                }
+            }
+        }
+        assert!(
+            found_none,
+            "Expected at least one state with forbidden_actions = None"
+        );
+    }
+
+    #[test]
+    fn test_available_tools_non_empty_when_present() {
+        let protocols = build_protocol_seeds();
+        for proto in &protocols {
+            for state in &proto.states {
+                if let Some(tools) = &state.available_tools {
+                    assert!(
+                        !tools.is_empty(),
+                        "available_tools should not be empty when Some for {}/{}",
+                        proto.protocol_name,
+                        state.state_name
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_forbidden_actions_non_empty_when_present() {
+        let protocols = build_protocol_seeds();
+        for proto in &protocols {
+            for state in &proto.states {
+                if let Some(actions) = &state.forbidden_actions {
+                    assert!(
+                        !actions.is_empty(),
+                        "forbidden_actions should not be empty when Some for {}/{}",
+                        proto.protocol_name,
+                        state.state_name
+                    );
+                }
+            }
+        }
+    }
+
+    // ========================================================================
+    // Async tests for seed_prompt_fragments using MockGraphStore
+    // ========================================================================
+
+    use crate::neo4j::mock::MockGraphStore;
+    use crate::protocol::{Protocol, ProtocolState};
+
+    /// Helper: insert a protocol and its states into the mock store.
+    async fn setup_protocol_in_mock(
+        mock: &MockGraphStore,
+        project_id: Uuid,
+        protocol_name: &str,
+        state_names: &[&str],
+    ) -> Uuid {
+        let entry_state = Uuid::new_v4();
+        let proto = Protocol::new(project_id, protocol_name, entry_state);
+        let protocol_id = proto.id;
+        mock.protocols.write().await.insert(protocol_id, proto);
+
+        for name in state_names {
+            let state = ProtocolState::new(protocol_id, *name);
+            mock.protocol_states.write().await.insert(state.id, state);
+        }
+        protocol_id
+    }
+
+    #[tokio::test]
+    async fn test_seed_all_protocols_found_and_all_states_matched() {
+        let mock = MockGraphStore::new();
+        let project_id = Uuid::new_v4();
+
+        // Insert all 5 protocols with their expected state names
+        let session_states = vec!["warm_up", "working", "checkpoint", "closing", "closed"];
+        setup_protocol_in_mock(&mock, project_id, "session-lifecycle", &session_states).await;
+
+        let rfc_states = vec![
+            "draft",
+            "proposed",
+            "under_review",
+            "accepted",
+            "planning",
+            "in_progress",
+            "implemented",
+            "rejected",
+            "superseded",
+        ];
+        setup_protocol_in_mock(&mock, project_id, "rfc-lifecycle", &rfc_states).await;
+
+        let wave_states = vec![
+            "compute_waves",
+            "prepare_wave",
+            "dispatch_parallel",
+            "await_wave",
+            "validate_wave",
+            "next_wave_or_done",
+            "plan_complete",
+        ];
+        setup_protocol_in_mock(&mock, project_id, "wave-dispatch", &wave_states).await;
+
+        let diag_states = vec![
+            "identify_symptom",
+            "load_known_issues",
+            "map_blast_radius",
+            "check_recent_changes",
+            "investigate",
+            "capture_resolution",
+        ];
+        setup_protocol_in_mock(&mock, project_id, "diagnostic-triage", &diag_states).await;
+
+        let maint_states = vec![
+            "health_check",
+            "analyze_delta",
+            "triage",
+            "auto_fix",
+            "plan_remediation",
+            "maintained",
+        ];
+        setup_protocol_in_mock(&mock, project_id, "auto-maintenance", &maint_states).await;
+
+        let result = seed_prompt_fragments(&mock, project_id).await.unwrap();
+
+        assert_eq!(result.protocols_found, 5);
+        assert!(result.protocols_missing.is_empty());
+        assert_eq!(result.skipped, 0);
+        // Total states across all 5 protocols: 5 + 9 + 7 + 6 + 6 = 33
+        assert_eq!(result.updated, 33);
+
+        // Verify that prompt_fragment was actually written to states
+        let states = mock.protocol_states.read().await;
+        for state in states.values() {
+            assert!(
+                state.prompt_fragment.is_some(),
+                "State '{}' should have prompt_fragment after seeding",
+                state.name
+            );
+            assert!(
+                !state.prompt_fragment.as_ref().unwrap().is_empty(),
+                "State '{}' prompt_fragment should not be empty",
+                state.name
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_seed_no_protocols_found() {
+        let mock = MockGraphStore::new();
+        let project_id = Uuid::new_v4();
+        // Don't insert any protocols
+
+        let result = seed_prompt_fragments(&mock, project_id).await.unwrap();
+
+        assert_eq!(result.protocols_found, 0);
+        assert_eq!(result.protocols_missing.len(), 5);
+        assert!(result
+            .protocols_missing
+            .contains(&"session-lifecycle".to_string()));
+        assert!(result
+            .protocols_missing
+            .contains(&"rfc-lifecycle".to_string()));
+        assert!(result
+            .protocols_missing
+            .contains(&"wave-dispatch".to_string()));
+        assert!(result
+            .protocols_missing
+            .contains(&"diagnostic-triage".to_string()));
+        assert!(result
+            .protocols_missing
+            .contains(&"auto-maintenance".to_string()));
+        // skipped = total number of seed states across all 5 protocols
+        assert_eq!(result.updated, 0);
+        assert_eq!(result.skipped, 33);
+    }
+
+    #[tokio::test]
+    async fn test_seed_partial_protocols_found() {
+        let mock = MockGraphStore::new();
+        let project_id = Uuid::new_v4();
+
+        // Only insert session-lifecycle
+        let session_states = vec!["warm_up", "working", "checkpoint", "closing", "closed"];
+        setup_protocol_in_mock(&mock, project_id, "session-lifecycle", &session_states).await;
+
+        let result = seed_prompt_fragments(&mock, project_id).await.unwrap();
+
+        assert_eq!(result.protocols_found, 1);
+        assert_eq!(result.protocols_missing.len(), 4);
+        assert!(!result
+            .protocols_missing
+            .contains(&"session-lifecycle".to_string()));
+        assert_eq!(result.updated, 5);
+        // skipped = states from the 4 missing protocols: 9 + 7 + 6 + 6 = 28
+        assert_eq!(result.skipped, 28);
+    }
+
+    #[tokio::test]
+    async fn test_seed_protocol_found_but_states_missing() {
+        let mock = MockGraphStore::new();
+        let project_id = Uuid::new_v4();
+
+        // Insert session-lifecycle protocol but with only 2 of 5 expected states
+        let partial_states = vec!["warm_up", "closed"];
+        setup_protocol_in_mock(&mock, project_id, "session-lifecycle", &partial_states).await;
+
+        let result = seed_prompt_fragments(&mock, project_id).await.unwrap();
+
+        assert_eq!(result.protocols_found, 1);
+        assert_eq!(result.protocols_missing.len(), 4);
+        // 2 states matched, 3 states from session-lifecycle skipped
+        assert_eq!(result.updated, 2);
+        // skipped = 3 missing session states + all states from 4 missing protocols (28) = 31
+        assert_eq!(result.skipped, 31);
+    }
+
+    #[tokio::test]
+    async fn test_seed_enriches_available_tools_and_forbidden_actions() {
+        let mock = MockGraphStore::new();
+        let project_id = Uuid::new_v4();
+
+        // Insert session-lifecycle with warm_up (has both available_tools and forbidden_actions)
+        // and closed (has neither)
+        let states = vec!["warm_up", "closed"];
+        let protocol_id =
+            setup_protocol_in_mock(&mock, project_id, "session-lifecycle", &states).await;
+
+        seed_prompt_fragments(&mock, project_id).await.unwrap();
+
+        let all_states = mock.protocol_states.read().await;
+        let protocol_states: Vec<_> = all_states
+            .values()
+            .filter(|s| s.protocol_id == protocol_id)
+            .collect();
+
+        let warm_up = protocol_states
+            .iter()
+            .find(|s| s.name == "warm_up")
+            .unwrap();
+        assert!(warm_up.available_tools.is_some());
+        assert!(warm_up.forbidden_actions.is_some());
+        let tools = warm_up.available_tools.as_ref().unwrap();
+        assert!(tools.contains(&"note".to_string()));
+        assert!(tools.contains(&"decision".to_string()));
+
+        let closed = protocol_states.iter().find(|s| s.name == "closed").unwrap();
+        assert!(closed.available_tools.is_none());
+        assert!(closed.forbidden_actions.is_none());
+        assert!(closed.prompt_fragment.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_seed_idempotent() {
+        let mock = MockGraphStore::new();
+        let project_id = Uuid::new_v4();
+
+        let states = vec!["warm_up", "working", "checkpoint", "closing", "closed"];
+        setup_protocol_in_mock(&mock, project_id, "session-lifecycle", &states).await;
+
+        // Run twice
+        let result1 = seed_prompt_fragments(&mock, project_id).await.unwrap();
+        let result2 = seed_prompt_fragments(&mock, project_id).await.unwrap();
+
+        // Both runs should produce the same counts (idempotent)
+        assert_eq!(result1.updated, result2.updated);
+        assert_eq!(result1.skipped, result2.skipped);
+        assert_eq!(result1.protocols_found, result2.protocols_found);
+    }
+
+    #[tokio::test]
+    async fn test_seed_different_project_id_finds_nothing() {
+        let mock = MockGraphStore::new();
+        let project_id = Uuid::new_v4();
+        let other_project_id = Uuid::new_v4();
+
+        let states = vec!["warm_up", "closed"];
+        setup_protocol_in_mock(&mock, project_id, "session-lifecycle", &states).await;
+
+        // Seed with a different project_id
+        let result = seed_prompt_fragments(&mock, other_project_id)
+            .await
+            .unwrap();
+
+        assert_eq!(result.protocols_found, 0);
+        assert_eq!(result.updated, 0);
+        assert_eq!(result.protocols_missing.len(), 5);
+    }
+
+    #[test]
+    fn test_seed_result_serialization_empty_missing() {
+        let result = SeedResult {
+            updated: 33,
+            skipped: 0,
+            protocols_found: 5,
+            protocols_missing: vec![],
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("\"updated\":33"));
+        assert!(json.contains("\"protocols_missing\":[]"));
+    }
+
+    #[test]
+    fn test_build_protocol_seeds_total_state_count() {
+        let protocols = build_protocol_seeds();
+        let total: usize = protocols.iter().map(|p| p.states.len()).sum();
+        assert_eq!(total, 33, "Expected 33 total states across all 5 protocols");
+    }
 }

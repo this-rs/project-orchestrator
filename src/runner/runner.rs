@@ -2746,13 +2746,24 @@ mod tests {
     use super::*;
     use crate::runner::models::TriggerSource;
 
-    #[tokio::test]
-    async fn test_status_when_no_run() {
-        // Clear global state
+    /// Mutex to serialize tests that touch global RUNNER_STATE / RUNNER_CANCEL.
+    /// tokio::sync::Mutex is used because these are async tests.
+    static TEST_MUTEX: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+    /// Reset global state to a clean baseline.
+    async fn reset_globals() {
         {
             let mut global = RUNNER_STATE.write().await;
             *global = None;
         }
+        RUNNER_CANCEL.store(false, Ordering::SeqCst);
+    }
+
+    #[tokio::test]
+    async fn test_status_when_no_run() {
+        let _lock = TEST_MUTEX.lock().await;
+        reset_globals().await;
         let status = PlanRunner::status().await;
         assert!(!status.running);
         assert!(status.run_id.is_none());
@@ -2761,6 +2772,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_status_when_running() {
+        let _lock = TEST_MUTEX.lock().await;
+        reset_globals().await;
         let run_id = Uuid::new_v4();
         let plan_id = Uuid::new_v4();
         let state = RunnerState::new(run_id, plan_id, 5, TriggerSource::Manual);
@@ -2774,20 +2787,13 @@ mod tests {
         assert_eq!(status.plan_id, Some(plan_id));
         assert_eq!(status.tasks_total, 5);
         assert_eq!(status.tasks_completed, 0);
-
-        // Cleanup
-        {
-            let mut global = RUNNER_STATE.write().await;
-            *global = None;
-        }
+        reset_globals().await;
     }
 
     #[tokio::test]
     async fn test_cancel_no_active_run() {
-        {
-            let mut global = RUNNER_STATE.write().await;
-            *global = None;
-        }
+        let _lock = TEST_MUTEX.lock().await;
+        reset_globals().await;
         let result = PlanRunner::cancel(Uuid::new_v4()).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("No active run"));
@@ -2795,6 +2801,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_cancel_sets_flag() {
+        let _lock = TEST_MUTEX.lock().await;
+        reset_globals().await;
         let run_id = Uuid::new_v4();
         let plan_id = Uuid::new_v4();
         let state = RunnerState::new(run_id, plan_id, 3, TriggerSource::Manual);
@@ -2802,22 +2810,17 @@ mod tests {
             let mut global = RUNNER_STATE.write().await;
             *global = Some(state);
         }
-        RUNNER_CANCEL.store(false, Ordering::SeqCst);
 
         let result = PlanRunner::cancel(run_id).await;
         assert!(result.is_ok());
         assert!(RUNNER_CANCEL.load(Ordering::SeqCst));
-
-        // Cleanup
-        {
-            let mut global = RUNNER_STATE.write().await;
-            *global = None;
-        }
-        RUNNER_CANCEL.store(false, Ordering::SeqCst);
+        reset_globals().await;
     }
 
     #[tokio::test]
     async fn test_cancel_wrong_run_id() {
+        let _lock = TEST_MUTEX.lock().await;
+        reset_globals().await;
         let run_id = Uuid::new_v4();
         let plan_id = Uuid::new_v4();
         let state = RunnerState::new(run_id, plan_id, 3, TriggerSource::Manual);
@@ -2829,12 +2832,7 @@ mod tests {
         let result = PlanRunner::cancel(Uuid::new_v4()).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("not running"));
-
-        // Cleanup
-        {
-            let mut global = RUNNER_STATE.write().await;
-            *global = None;
-        }
+        reset_globals().await;
     }
 
     #[test]
@@ -2981,5 +2979,564 @@ mod tests {
         let json = serde_json::to_string(&status).unwrap();
         assert!(json.contains("\"running\":false"));
         assert!(json.contains("\"active_agents\":[]"));
+    }
+
+    // ---------------------------------------------------------------
+    // Helper: build a PlanRunner with mock stores
+    // ---------------------------------------------------------------
+
+    fn test_plan_runner() -> PlanRunner {
+        use crate::chat::config::ChatConfig;
+        use crate::chat::manager::ChatManager;
+        use crate::meilisearch::mock::MockSearchStore;
+        use crate::meilisearch::traits::SearchStore;
+        use crate::neo4j::mock::MockGraphStore;
+        use crate::notes::manager::NoteManager;
+        use crate::orchestrator::context::ContextBuilder;
+        use crate::plan::manager::PlanManager;
+
+        let graph: Arc<dyn GraphStore> = Arc::new(MockGraphStore::new());
+        let search: Arc<dyn SearchStore> = Arc::new(MockSearchStore::new());
+        let chat_config = ChatConfig {
+            mcp_server_path: std::path::PathBuf::from("/dev/null"),
+            default_model: "test".into(),
+            max_sessions: 1,
+            session_timeout: std::time::Duration::from_secs(10),
+            neo4j_uri: "bolt://mock:7687".into(),
+            neo4j_user: "neo4j".into(),
+            neo4j_password: "test".into(),
+            meilisearch_url: "http://mock:7700".into(),
+            meilisearch_key: "test".into(),
+            nats_url: None,
+            max_turns: 5,
+            permission: Default::default(),
+            auto_continue: false,
+            retry: Default::default(),
+            process_path: None,
+            claude_cli_path: None,
+            auto_update_cli: false,
+            auto_update_app: false,
+            jwt_secret: None,
+            server_port: 0,
+            session_token_expiry_secs: 3600,
+        };
+        let chat_manager = Arc::new(ChatManager::new_without_memory(
+            graph.clone(),
+            search.clone(),
+            chat_config,
+        ));
+        let plan_manager = Arc::new(PlanManager::new(graph.clone(), search.clone()));
+        let note_manager = Arc::new(NoteManager::new(graph.clone(), search.clone()));
+        let context_builder = Arc::new(ContextBuilder::new(
+            graph.clone(),
+            search.clone(),
+            plan_manager,
+            note_manager,
+        ));
+        let (event_tx, _) = broadcast::channel(16);
+        PlanRunner::new(
+            chat_manager,
+            graph,
+            context_builder,
+            RunnerConfig::default(),
+            event_tx,
+        )
+    }
+
+    // ---------------------------------------------------------------
+    // EventMetrics tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_event_metrics_default() {
+        let m = EventMetrics::default();
+        assert_eq!(m.tool_use_count, 0);
+        assert!(m.tool_use_breakdown.is_empty());
+        assert_eq!(m.error_count, 0);
+        assert!(m.last_error.is_none());
+    }
+
+    #[test]
+    fn test_event_metrics_mutation() {
+        let mut breakdown = std::collections::HashMap::new();
+        breakdown.insert("Edit".to_string(), 3u32);
+        breakdown.insert("Bash".to_string(), 2u32);
+        let m = EventMetrics {
+            tool_use_count: 5,
+            tool_use_breakdown: breakdown,
+            error_count: 1,
+            last_error: Some("something broke".into()),
+        };
+
+        assert_eq!(m.tool_use_count, 5);
+        assert_eq!(m.tool_use_breakdown.len(), 2);
+        assert_eq!(m.tool_use_breakdown["Edit"], 3);
+        assert_eq!(m.tool_use_breakdown["Bash"], 2);
+        assert_eq!(m.error_count, 1);
+        assert_eq!(m.last_error.as_deref(), Some("something broke"));
+    }
+
+    // ---------------------------------------------------------------
+    // listen_for_result tests
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_listen_for_result_completed() {
+        let runner = test_plan_runner();
+        let (tx, rx) = broadcast::channel::<ChatEvent>(16);
+        let run_id = Uuid::new_v4();
+
+        // Send a ToolUse, then a Result
+        tx.send(ChatEvent::ToolUse {
+            id: "tu1".into(),
+            tool: "Edit".into(),
+            input: serde_json::json!({}),
+            parent_tool_use_id: None,
+        })
+        .unwrap();
+
+        tx.send(ChatEvent::ToolUse {
+            id: "tu2".into(),
+            tool: "Bash".into(),
+            input: serde_json::json!({}),
+            parent_tool_use_id: None,
+        })
+        .unwrap();
+
+        tx.send(ChatEvent::ToolUse {
+            id: "tu3".into(),
+            tool: "Edit".into(),
+            input: serde_json::json!({}),
+            parent_tool_use_id: None,
+        })
+        .unwrap();
+
+        tx.send(ChatEvent::Result {
+            session_id: "s1".into(),
+            duration_ms: 1000,
+            cost_usd: Some(0.05),
+            subtype: "success".into(),
+            is_error: false,
+            num_turns: Some(3),
+            result_text: None,
+        })
+        .unwrap();
+
+        RUNNER_CANCEL.store(false, Ordering::SeqCst);
+        let (result, metrics) = runner.listen_for_result(rx, run_id).await;
+
+        assert_eq!(metrics.tool_use_count, 3);
+        assert_eq!(metrics.tool_use_breakdown["Edit"], 2);
+        assert_eq!(metrics.tool_use_breakdown["Bash"], 1);
+        assert_eq!(metrics.error_count, 0);
+        assert!(metrics.last_error.is_none());
+
+        match result {
+            EventListenResult::Completed {
+                cost_usd,
+                is_error,
+                subtype,
+                ..
+            } => {
+                assert!((cost_usd - 0.05).abs() < f64::EPSILON);
+                assert!(!is_error);
+                assert_eq!(subtype, "success");
+            }
+            _ => panic!("Expected Completed variant"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_listen_for_result_tracks_errors() {
+        let runner = test_plan_runner();
+        let (tx, rx) = broadcast::channel::<ChatEvent>(16);
+        let run_id = Uuid::new_v4();
+
+        tx.send(ChatEvent::ToolResult {
+            id: "tr1".into(),
+            result: serde_json::json!("first error message"),
+            is_error: true,
+            parent_tool_use_id: None,
+        })
+        .unwrap();
+
+        tx.send(ChatEvent::ToolResult {
+            id: "tr2".into(),
+            result: serde_json::json!({"error": "second error"}),
+            is_error: true,
+            parent_tool_use_id: None,
+        })
+        .unwrap();
+
+        tx.send(ChatEvent::Result {
+            session_id: "s1".into(),
+            duration_ms: 500,
+            cost_usd: Some(0.01),
+            subtype: "success".into(),
+            is_error: false,
+            num_turns: None,
+            result_text: None,
+        })
+        .unwrap();
+
+        RUNNER_CANCEL.store(false, Ordering::SeqCst);
+        let (_result, metrics) = runner.listen_for_result(rx, run_id).await;
+
+        assert_eq!(metrics.error_count, 2);
+        // last_error should be from the second error event
+        assert_eq!(metrics.last_error.as_deref(), Some("second error"));
+    }
+
+    #[tokio::test]
+    async fn test_listen_for_result_error_truncation() {
+        let runner = test_plan_runner();
+        let (tx, rx) = broadcast::channel::<ChatEvent>(16);
+        let run_id = Uuid::new_v4();
+
+        let long_error = "x".repeat(1000);
+        tx.send(ChatEvent::ToolResult {
+            id: "tr1".into(),
+            result: serde_json::json!(long_error),
+            is_error: true,
+            parent_tool_use_id: None,
+        })
+        .unwrap();
+
+        tx.send(ChatEvent::Result {
+            session_id: "s1".into(),
+            duration_ms: 100,
+            cost_usd: None,
+            subtype: "success".into(),
+            is_error: false,
+            num_turns: None,
+            result_text: None,
+        })
+        .unwrap();
+
+        RUNNER_CANCEL.store(false, Ordering::SeqCst);
+        let (_result, metrics) = runner.listen_for_result(rx, run_id).await;
+
+        assert_eq!(metrics.error_count, 1);
+        // Error text should be truncated to 500 chars
+        assert_eq!(metrics.last_error.as_ref().unwrap().len(), 500);
+    }
+
+    #[tokio::test]
+    async fn test_listen_for_result_channel_closed() {
+        let runner = test_plan_runner();
+        let (tx, rx) = broadcast::channel::<ChatEvent>(16);
+        let run_id = Uuid::new_v4();
+
+        // Drop sender to close channel
+        drop(tx);
+
+        RUNNER_CANCEL.store(false, Ordering::SeqCst);
+        let (result, metrics) = runner.listen_for_result(rx, run_id).await;
+
+        assert_eq!(metrics.tool_use_count, 0);
+        match result {
+            EventListenResult::ChannelClosed { cost_usd } => {
+                assert!((cost_usd - 0.0).abs() < f64::EPSILON);
+            }
+            _ => panic!("Expected ChannelClosed variant"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_listen_for_result_cancelled() {
+        let _lock = TEST_MUTEX.lock().await;
+        reset_globals().await;
+        let runner = test_plan_runner();
+        let (_tx, rx) = broadcast::channel::<ChatEvent>(16);
+        let run_id = Uuid::new_v4();
+
+        // Set cancel flag BEFORE listening
+        RUNNER_CANCEL.store(true, Ordering::SeqCst);
+        let (result, _metrics) = runner.listen_for_result(rx, run_id).await;
+
+        match result {
+            EventListenResult::Cancelled { cost_usd } => {
+                assert!((cost_usd - 0.0).abs() < f64::EPSILON);
+            }
+            _ => panic!("Expected Cancelled variant"),
+        }
+        reset_globals().await;
+    }
+
+    // ---------------------------------------------------------------
+    // create_failure_gotcha tests
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_create_failure_gotcha_creates_note() {
+        let runner = test_plan_runner();
+        let task_id = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+
+        runner
+            .create_failure_gotcha(
+                task_id,
+                "Build CI pipeline",
+                "compilation failed",
+                2,
+                Some(project_id),
+            )
+            .await;
+
+        // The mock graph store should have received the create_note call.
+        // Use list_notes to retrieve notes from the mock store.
+        let (notes, count) = runner
+            .graph
+            .list_notes(
+                Some(project_id),
+                None,
+                &crate::notes::NoteFilters::default(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(count, 1);
+        assert_eq!(notes.len(), 1);
+        let note = &notes[0];
+        assert!(note.content.contains("Build CI pipeline"));
+        assert!(note.content.contains("compilation failed"));
+        assert!(note.content.contains("2 Retry(ies)"));
+        assert_eq!(note.note_type, crate::notes::NoteType::Gotcha);
+        assert_eq!(note.importance, crate::notes::NoteImportance::High);
+        assert!(note.tags.contains(&"auto-generated".to_string()));
+        assert!(note.tags.contains(&"task-failure".to_string()));
+        assert!(note.tags.contains(&"retry-exhausted".to_string()));
+        assert!(note.tags.contains(&format!("task:{}", task_id)));
+    }
+
+    #[tokio::test]
+    async fn test_create_failure_gotcha_without_project() {
+        let runner = test_plan_runner();
+        let task_id = Uuid::new_v4();
+
+        // Should not panic even with project_id = None
+        runner
+            .create_failure_gotcha(task_id, "Task title", "some error", 1, None)
+            .await;
+    }
+
+    // ---------------------------------------------------------------
+    // on_task_failed tests
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_on_task_failed_should_retry() {
+        let _lock = TEST_MUTEX.lock().await;
+        reset_globals().await;
+        let runner = test_plan_runner();
+        let run_id = Uuid::new_v4();
+        let plan_id = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
+
+        // Set up RUNNER_STATE with a state that has 0 retries for this task
+        {
+            let state = RunnerState::new(run_id, plan_id, 3, TriggerSource::Manual);
+            let mut global = RUNNER_STATE.write().await;
+            *global = Some(state);
+        }
+
+        // RunnerConfig default max_retries = 1, so retry_count 0 < 1 → should retry
+        let result = runner
+            .on_task_failed(run_id, plan_id, task_id, "test error", 5.0, 0.01)
+            .await
+            .unwrap();
+
+        assert!(result, "Should return true when retries are available");
+
+        // Verify retry count was incremented
+        {
+            let global = RUNNER_STATE.read().await;
+            let s = global.as_ref().unwrap();
+            assert_eq!(s.retry_counts.get(&task_id).copied(), Some(1));
+        }
+        reset_globals().await;
+    }
+
+    #[tokio::test]
+    async fn test_on_task_failed_no_retry_when_exhausted() {
+        let _lock = TEST_MUTEX.lock().await;
+        reset_globals().await;
+        let runner = test_plan_runner();
+        let run_id = Uuid::new_v4();
+        let plan_id = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
+
+        // Set up RUNNER_STATE with retry_count already at max_retries (1)
+        {
+            let mut state = RunnerState::new(run_id, plan_id, 3, TriggerSource::Manual);
+            state.retry_counts.insert(task_id, 1); // already at max
+            let mut global = RUNNER_STATE.write().await;
+            *global = Some(state);
+        }
+
+        // retry_count 1 >= max_retries 1 → should NOT retry
+        let result = runner
+            .on_task_failed(run_id, plan_id, task_id, "final failure", 10.0, 0.05)
+            .await
+            .unwrap();
+
+        assert!(!result, "Should return false when retries exhausted");
+        reset_globals().await;
+    }
+
+    #[tokio::test]
+    async fn test_on_task_failed_no_retry_without_state() {
+        let _lock = TEST_MUTEX.lock().await;
+        reset_globals().await;
+        let runner = test_plan_runner();
+        let result = runner
+            .on_task_failed(
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                "err",
+                1.0,
+                0.0,
+            )
+            .await
+            .unwrap();
+
+        assert!(!result, "Should return false when no runner state");
+        reset_globals().await;
+    }
+
+    // ---------------------------------------------------------------
+    // WaveResult tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_wave_result_empty() {
+        let wr = WaveResult {
+            tasks_completed: vec![],
+            tasks_failed: vec![],
+            wave_cost_usd: 0.0,
+            aborted: false,
+        };
+        assert!(wr.tasks_completed.is_empty());
+        assert!(wr.tasks_failed.is_empty());
+        assert!(!wr.aborted);
+        assert!((wr.wave_cost_usd - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_wave_result_with_completed_and_failed() {
+        let id1 = Uuid::new_v4();
+        let id2 = Uuid::new_v4();
+        let id3 = Uuid::new_v4();
+        let wr = WaveResult {
+            tasks_completed: vec![id1, id2],
+            tasks_failed: vec![(id3, "timeout".to_string())],
+            wave_cost_usd: 1.23,
+            aborted: false,
+        };
+        assert_eq!(wr.tasks_completed.len(), 2);
+        assert_eq!(wr.tasks_failed.len(), 1);
+        assert_eq!(wr.tasks_failed[0].0, id3);
+        assert_eq!(wr.tasks_failed[0].1, "timeout");
+        assert!((wr.wave_cost_usd - 1.23).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_wave_result_aborted() {
+        let wr = WaveResult {
+            tasks_completed: vec![Uuid::new_v4()],
+            tasks_failed: vec![],
+            wave_cost_usd: 5.0,
+            aborted: true,
+        };
+        assert!(wr.aborted);
+    }
+
+    // ---------------------------------------------------------------
+    // TaskExecutionResult tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_task_execution_result_session_id() {
+        use crate::runner::models::TaskResult;
+
+        let session = Uuid::new_v4();
+        let exec_id = Uuid::new_v4();
+        let ter = TaskExecutionResult {
+            result: TaskResult::Success {
+                cost_usd: 0.05,
+                duration_secs: 30.0,
+            },
+            session_id: Some(session),
+            activated_skill_ids: vec![],
+            persona_ids: vec![],
+            agent_execution_id: exec_id,
+            persona_profile: "test-persona".into(),
+            report: None,
+        };
+        assert_eq!(ter.session_id(), Some(session));
+    }
+
+    #[test]
+    fn test_task_execution_result_no_session() {
+        use crate::runner::models::TaskResult;
+
+        let ter = TaskExecutionResult {
+            result: TaskResult::Failed {
+                reason: "test failure".into(),
+                attempts: 2,
+                cost_usd: 0.1,
+            },
+            session_id: None,
+            activated_skill_ids: vec![Uuid::new_v4()],
+            persona_ids: vec![Uuid::new_v4()],
+            agent_execution_id: Uuid::new_v4(),
+            persona_profile: String::new(),
+            report: None,
+        };
+        assert_eq!(ter.session_id(), None);
+    }
+
+    #[test]
+    fn test_task_execution_result_with_report() {
+        use crate::runner::models::{TaskExecutionReport, TaskResult};
+
+        let report = TaskExecutionReport {
+            tool_use_count: 10,
+            tool_use_breakdown: {
+                let mut m = std::collections::HashMap::new();
+                m.insert("Edit".into(), 7);
+                m.insert("Bash".into(), 3);
+                m
+            },
+            error_count: 1,
+            last_error: Some("compile error".into()),
+            files_modified: vec!["src/main.rs".into()],
+            commits: vec!["abc1234".into()],
+            agent_success: true,
+            cost_usd: 0.05,
+            duration_secs: 45.0,
+            confidence_score: 0.85,
+        };
+
+        let ter = TaskExecutionResult {
+            result: TaskResult::Success {
+                cost_usd: 0.05,
+                duration_secs: 45.0,
+            },
+            session_id: Some(Uuid::new_v4()),
+            activated_skill_ids: vec![],
+            persona_ids: vec![],
+            agent_execution_id: Uuid::new_v4(),
+            persona_profile: "dev".into(),
+            report: Some(report),
+        };
+
+        assert!(ter.report.is_some());
+        let r = ter.report.as_ref().unwrap();
+        assert_eq!(r.tool_use_count, 10);
+        assert_eq!(r.error_count, 1);
+        assert!(r.agent_success);
+        assert!((r.confidence_score - 0.85).abs() < f64::EPSILON);
     }
 }
