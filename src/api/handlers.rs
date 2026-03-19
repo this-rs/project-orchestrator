@@ -7125,10 +7125,7 @@ mod tests {
     #[tokio::test]
     async fn test_list_all_plan_runs_with_limit() {
         let app = test_app().await;
-        let resp = app
-            .oneshot(auth_get("/api/runs?limit=10"))
-            .await
-            .unwrap();
+        let resp = app.oneshot(auth_get("/api/runs?limit=10")).await.unwrap();
         assert_eq!(resp.status(), HttpStatus::OK);
         let json = body_json(resp).await;
         assert!(json.is_array());
@@ -7137,10 +7134,7 @@ mod tests {
     #[tokio::test]
     async fn test_list_all_plan_runs_with_offset() {
         let app = test_app().await;
-        let resp = app
-            .oneshot(auth_get("/api/runs?offset=5"))
-            .await
-            .unwrap();
+        let resp = app.oneshot(auth_get("/api/runs?offset=5")).await.unwrap();
         assert_eq!(resp.status(), HttpStatus::OK);
         let json = body_json(resp).await;
         assert!(json.is_array());
@@ -7187,10 +7181,7 @@ mod tests {
     async fn test_list_all_plan_runs_invalid_limit_uses_default() {
         let app = test_app().await;
         // Non-numeric limit should be ignored, falling back to default (50)
-        let resp = app
-            .oneshot(auth_get("/api/runs?limit=abc"))
-            .await
-            .unwrap();
+        let resp = app.oneshot(auth_get("/api/runs?limit=abc")).await.unwrap();
         assert_eq!(resp.status(), HttpStatus::OK);
         let json = body_json(resp).await;
         assert!(json.is_array());
@@ -7200,10 +7191,7 @@ mod tests {
     async fn test_list_all_plan_runs_invalid_offset_uses_default() {
         let app = test_app().await;
         // Non-numeric offset should be ignored, falling back to default (0)
-        let resp = app
-            .oneshot(auth_get("/api/runs?offset=xyz"))
-            .await
-            .unwrap();
+        let resp = app.oneshot(auth_get("/api/runs?offset=xyz")).await.unwrap();
         assert_eq!(resp.status(), HttpStatus::OK);
         let json = body_json(resp).await;
         assert!(json.is_array());
@@ -7217,10 +7205,7 @@ mod tests {
     async fn test_reactor_status_not_initialized() {
         // test_app() creates a ServerState with an empty OnceLock (reactor not set)
         let app = test_app().await;
-        let resp = app
-            .oneshot(auth_get("/api/reactor/status"))
-            .await
-            .unwrap();
+        let resp = app.oneshot(auth_get("/api/reactor/status")).await.unwrap();
         assert_eq!(resp.status(), HttpStatus::OK);
         let json = body_json(resp).await;
         assert_eq!(json["running"], false);
@@ -7281,10 +7266,7 @@ mod tests {
         });
         let app = create_router(state);
 
-        let resp = app
-            .oneshot(auth_get("/api/reactor/status"))
-            .await
-            .unwrap();
+        let resp = app.oneshot(auth_get("/api/reactor/status")).await.unwrap();
         assert_eq!(resp.status(), HttpStatus::OK);
         let json = body_json(resp).await;
         assert_eq!(json["running"], true);
@@ -7331,10 +7313,7 @@ mod tests {
         });
         let app = create_router(state);
 
-        let resp = app
-            .oneshot(auth_get("/api/reactor/status"))
-            .await
-            .unwrap();
+        let resp = app.oneshot(auth_get("/api/reactor/status")).await.unwrap();
         assert_eq!(resp.status(), HttpStatus::OK);
         let json = body_json(resp).await;
         assert_eq!(json["running"], false);

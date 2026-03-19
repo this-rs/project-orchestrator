@@ -840,7 +840,8 @@ mod tests {
         let state = mock_server_state().await;
         let bus = Arc::new(EventBus::default());
         let rx = bus.subscribe();
-        let builder = ReactorBuilder::new(rx, state.clone() as Arc<dyn std::any::Any + Send + Sync>);
+        let builder =
+            ReactorBuilder::new(rx, state.clone() as Arc<dyn std::any::Any + Send + Sync>);
         // Should register 3 reactions without panicking
         let _builder = register_builtin_reactions(builder, state);
     }

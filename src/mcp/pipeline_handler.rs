@@ -708,7 +708,10 @@ mod tests {
         let deserialized: PipelineConfig = serde_json::from_value(serialized).unwrap();
         assert_eq!(deserialized.cwd, config.cwd);
         assert_eq!(deserialized.project_slug, config.project_slug);
-        assert_eq!(deserialized.max_retries_per_gate, config.max_retries_per_gate);
+        assert_eq!(
+            deserialized.max_retries_per_gate,
+            config.max_retries_per_gate
+        );
         assert_eq!(deserialized.timeout_secs, config.timeout_secs);
         assert_eq!(deserialized.fail_fast, config.fail_fast);
     }
@@ -781,7 +784,10 @@ mod tests {
             }
         ]);
         let waves = parse_waves(&json);
-        assert!(waves.is_empty(), "entries without wave_number should be skipped");
+        assert!(
+            waves.is_empty(),
+            "entries without wave_number should be skipped"
+        );
     }
 
     #[test]
@@ -795,7 +801,10 @@ mod tests {
         ]);
         let waves = parse_waves(&json);
         assert_eq!(waves.len(), 1);
-        assert!(waves[0].task_ids.is_empty(), "invalid UUIDs should be filtered out");
+        assert!(
+            waves[0].task_ids.is_empty(),
+            "invalid UUIDs should be filtered out"
+        );
         assert_eq!(waves[0].affected_files, vec!["a.rs".to_string()]);
     }
 
@@ -876,7 +885,10 @@ mod tests {
             }
         ]);
         let constraints = parse_constraints(&json);
-        assert!(constraints.is_empty(), "entries without constraint_type should be skipped");
+        assert!(
+            constraints.is_empty(),
+            "entries without constraint_type should be skipped"
+        );
     }
 
     #[test]

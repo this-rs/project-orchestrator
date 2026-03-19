@@ -958,7 +958,12 @@ mod tests {
     #[test]
     fn pipeline_run_result_with_loop_stop_reason() {
         let now = Utc::now();
-        let sig = ErrorSignature::from_message("error[E0308]: mismatched types", None, None, ErrorCategory::Compile);
+        let sig = ErrorSignature::from_message(
+            "error[E0308]: mismatched types",
+            None,
+            None,
+            ErrorCategory::Compile,
+        );
         let result = PipelineRunResult {
             plan_id: Uuid::new_v4(),
             status: PipelineRunStatus::Stopped,
@@ -1095,7 +1100,10 @@ mod tests {
         let mut metadata = HashMap::new();
         metadata.insert("wave_number".into(), serde_json::json!(3));
         metadata.insert("gate_type".into(), serde_json::json!("cargo-test"));
-        metadata.insert("details".into(), serde_json::json!({"errors": 2, "warnings": 5}));
+        metadata.insert(
+            "details".into(),
+            serde_json::json!({"errors": 2, "warnings": 5}),
+        );
 
         let event = PipelineEvent {
             timestamp: Utc::now(),
@@ -1256,8 +1264,14 @@ mod tests {
         let json = serde_json::to_string(&result).unwrap();
         let back: PipelineRunResult = serde_json::from_str(&json).unwrap();
         assert_eq!(back.events.len(), 2);
-        assert_eq!(back.events[0].event_type, PipelineEventType::PipelineStarted);
-        assert_eq!(back.events[1].event_type, PipelineEventType::PipelineCompleted);
+        assert_eq!(
+            back.events[0].event_type,
+            PipelineEventType::PipelineStarted
+        );
+        assert_eq!(
+            back.events[1].event_type,
+            PipelineEventType::PipelineCompleted
+        );
     }
 
     // -- GateSpec construction -----------------------------------------------
@@ -1294,7 +1308,12 @@ mod tests {
 
     #[test]
     fn gate_result_all_statuses_serialize() {
-        for status in [GateStatus::Pass, GateStatus::Fail, GateStatus::Skip, GateStatus::Error] {
+        for status in [
+            GateStatus::Pass,
+            GateStatus::Fail,
+            GateStatus::Skip,
+            GateStatus::Error,
+        ] {
             let result = GateResult {
                 gate_name: "test-gate".to_string(),
                 status: status.clone(),

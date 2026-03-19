@@ -403,14 +403,8 @@ mod tests {
         let req: UpdateTriggerRequest = serde_json::from_value(json).unwrap();
         assert_eq!(req.name.as_deref(), Some("renamed"));
         assert_eq!(req.enabled, Some(false));
-        assert_eq!(
-            req.entity_type_pattern,
-            Some(Some("project".to_string()))
-        );
-        assert_eq!(
-            req.action_pattern,
-            Some(Some("synced".to_string()))
-        );
+        assert_eq!(req.entity_type_pattern, Some(Some("project".to_string())));
+        assert_eq!(req.action_pattern, Some(Some("synced".to_string())));
         assert!(req.payload_conditions.is_some());
         assert_eq!(req.cooldown_secs, Some(120));
         assert_eq!(req.project_scope, Some(Some(scope_id)));
