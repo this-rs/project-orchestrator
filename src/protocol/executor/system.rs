@@ -299,6 +299,9 @@ impl Executor for SystemExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::mock::MockGraphStore;
+    use crate::protocol::ProtocolTransition;
+    use uuid::Uuid;
 
     #[test]
     fn test_parse_single_action() {
@@ -337,5 +340,306 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].tool, "admin");
         assert_eq!(calls[0].method, "update_staleness_scores");
+    }
+
+    // --- Helpers ---
+
+    fn make_protocol() -> (Protocol, ProtocolState, ProtocolRun) {
+        let project_id = Uuid::new_v4();
+        let state = ProtocolState::new(Uuid::new_v4(), "test_state");
+        let protocol = Protocol::new(project_id, "test_protocol", state.id);
+        let run = ProtocolRun::new(protocol.id, state.id, "test_state");
+        (protocol, state, run)
+    }
+
+    // ==================== execute_admin_action tests ====================
+
+    #[tokio::test]
+    async fn test_execute_admin_update_staleness_scores() {
+        let store = MockGraphStore::new();
+        let (protocol, _, _) = make_protocol();
+        let result = execute_admin_action(&store, "update_staleness_scores", &[], &protocol)
+            .await
+            .unwrap();
+        assert!(result.contains("Updated staleness scores"));
+    }
+
+    #[tokio::test]
+    async fn test_execute_admin_decay_synapses_default_args() {
+        let store = MockGraphStore::new();
+        let (protocol, _, _) = make_protocol();
+        let result = execute_admin_action(&store, "decay_synapses", &[], &protocol)
+            .await
+            .unwrap();
+        assert!(result.contains("Decayed"));
+        assert!(result.contains("pruned"));
+    }
+
+    #[tokio::test]
+    async fn test_execute_admin_decay_synapses_custom_args() {
+        let store = MockGraphStore::new();
+        let (protocol, _, _) = make_protocol();
+        let args = vec!["0.1".to_string(), "0.02".to_string()];
+        let result = execute_admin_action(&store, "decay_synapses", &args, &protocol)
+            .await
+            .unwrap();
+        assert!(result.contains("Decayed"));
+    }
+
+    #[tokio::test]
+    async fn test_execute_admin_backfill_synapses() {
+        let store = MockGraphStore::new();
+        let (protocol, _, _) = make_protocol();
+        let result = execute_admin_action(&store, "backfill_synapses", &[], &protocol)
+            .await
+            .unwrap();
+        assert!(result.contains("notes needing synapses"));
+    }
+
+    #[tokio::test]
+    async fn test_execute_admin_update_energy_scores() {
+        let store = MockGraphStore::new();
+        let (protocol, _, _) = make_protocol();
+        let result = execute_admin_action(&store, "update_energy_scores", &[], &protocol)
+            .await
+            .unwrap();
+        assert!(result.contains("Updated energy scores"));
+    }
+
+    #[tokio::test]
+    async fn test_execute_admin_orchestrator_context_actions() {
+        let store = MockGraphStore::new();
+        let (protocol, _, _) = make_protocol();
+        for method in &[
+            "persist_health_report",
+            "update_fabric_scores",
+            "bootstrap_knowledge_fabric",
+            "maintain_skills",
+            "detect_skills",
+        ] {
+            let result = execute_admin_action(&store, method, &[], &protocol)
+                .await
+                .unwrap();
+            assert!(
+                result.contains("requires orchestrator context"),
+                "Expected orchestrator context message for {method}, got: {result}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_execute_admin_unknown_action() {
+        let store = MockGraphStore::new();
+        let (protocol, _, _) = make_protocol();
+        let result = execute_admin_action(&store, "totally_fake_action", &[], &protocol)
+            .await
+            .unwrap();
+        assert!(result.contains("Skipped unknown admin action"));
+        assert!(result.contains("totally_fake_action"));
+    }
+
+    // ==================== determine_trigger tests ====================
+
+    #[tokio::test]
+    async fn test_determine_trigger_no_outgoing() {
+        let store = MockGraphStore::new();
+        let (_, state, run) = make_protocol();
+        let trigger = determine_trigger(&store, &state, &run).await.unwrap();
+        assert_eq!(trigger, "done");
+    }
+
+    #[tokio::test]
+    async fn test_determine_trigger_single_outgoing() {
+        let store = MockGraphStore::new();
+        let (protocol, state, run) = make_protocol();
+        let to_state = Uuid::new_v4();
+        let t = ProtocolTransition::new(protocol.id, state.id, to_state, "my_trigger");
+        store.upsert_protocol_transition(&t).await.unwrap();
+
+        let trigger = determine_trigger(&store, &state, &run).await.unwrap();
+        assert_eq!(trigger, "my_trigger");
+    }
+
+    #[tokio::test]
+    async fn test_determine_trigger_prefers_done() {
+        let store = MockGraphStore::new();
+        let (protocol, state, run) = make_protocol();
+        let to1 = Uuid::new_v4();
+        let to2 = Uuid::new_v4();
+        let t1 = ProtocolTransition::new(protocol.id, state.id, to1, "other");
+        let t2 = ProtocolTransition::new(protocol.id, state.id, to2, "done");
+        store.upsert_protocol_transition(&t1).await.unwrap();
+        store.upsert_protocol_transition(&t2).await.unwrap();
+
+        let trigger = determine_trigger(&store, &state, &run).await.unwrap();
+        assert_eq!(trigger, "done");
+    }
+
+    #[tokio::test]
+    async fn test_determine_trigger_prefers_success_over_first() {
+        let store = MockGraphStore::new();
+        let (protocol, state, run) = make_protocol();
+        let to1 = Uuid::new_v4();
+        let to2 = Uuid::new_v4();
+        let t1 = ProtocolTransition::new(protocol.id, state.id, to1, "fail");
+        let t2 = ProtocolTransition::new(protocol.id, state.id, to2, "success");
+        store.upsert_protocol_transition(&t1).await.unwrap();
+        store.upsert_protocol_transition(&t2).await.unwrap();
+
+        let trigger = determine_trigger(&store, &state, &run).await.unwrap();
+        assert_eq!(trigger, "success");
+    }
+
+    // ==================== determine_trigger_with_fallback tests ====================
+
+    #[tokio::test]
+    async fn test_determine_trigger_with_fallback_preferred() {
+        let store = MockGraphStore::new();
+        let (protocol, state, run) = make_protocol();
+        let to1 = Uuid::new_v4();
+        let to2 = Uuid::new_v4();
+        let t1 = ProtocolTransition::new(protocol.id, state.id, to1, "preferred");
+        let t2 = ProtocolTransition::new(protocol.id, state.id, to2, "fallback");
+        store.upsert_protocol_transition(&t1).await.unwrap();
+        store.upsert_protocol_transition(&t2).await.unwrap();
+
+        let trigger =
+            determine_trigger_with_fallback(&store, &state, &run, "preferred", "fallback")
+                .await
+                .unwrap();
+        assert_eq!(trigger, "preferred");
+    }
+
+    #[tokio::test]
+    async fn test_determine_trigger_with_fallback_uses_fallback() {
+        let store = MockGraphStore::new();
+        let (protocol, state, run) = make_protocol();
+        let to = Uuid::new_v4();
+        let t = ProtocolTransition::new(protocol.id, state.id, to, "fallback");
+        store.upsert_protocol_transition(&t).await.unwrap();
+
+        let trigger =
+            determine_trigger_with_fallback(&store, &state, &run, "preferred", "fallback")
+                .await
+                .unwrap();
+        assert_eq!(trigger, "fallback");
+    }
+
+    #[tokio::test]
+    async fn test_determine_trigger_with_fallback_no_match() {
+        let store = MockGraphStore::new();
+        let (_, state, run) = make_protocol();
+
+        let trigger =
+            determine_trigger_with_fallback(&store, &state, &run, "preferred", "fallback")
+                .await
+                .unwrap();
+        // No transitions at all — returns fallback string
+        assert_eq!(trigger, "fallback");
+    }
+
+    // ==================== SystemExecutor::execute_state tests ====================
+
+    #[tokio::test]
+    async fn test_execute_state_no_action_auto_advances() {
+        let store = MockGraphStore::new();
+        let (protocol, mut state, run) = make_protocol();
+        state.action = None;
+
+        let executor = SystemExecutor::new();
+        let result = executor
+            .execute_state(&state, &run, &protocol, &store)
+            .await
+            .unwrap();
+        assert_eq!(result.trigger, "done");
+        assert!(result.notes.iter().any(|n| n.contains("auto-advanced")));
+        assert!(!result.should_retry);
+    }
+
+    #[tokio::test]
+    async fn test_execute_state_empty_action_auto_advances() {
+        let store = MockGraphStore::new();
+        let (protocol, mut state, run) = make_protocol();
+        state.action = Some("".to_string());
+
+        let executor = SystemExecutor::new();
+        let result = executor
+            .execute_state(&state, &run, &protocol, &store)
+            .await
+            .unwrap();
+        assert_eq!(result.trigger, "done");
+        assert!(result.notes.iter().any(|n| n.contains("auto-advanced")));
+    }
+
+    #[tokio::test]
+    async fn test_execute_state_admin_action() {
+        let store = MockGraphStore::new();
+        let (protocol, mut state, run) = make_protocol();
+        state.action = Some("admin(update_staleness_scores)".to_string());
+
+        let to = Uuid::new_v4();
+        let t = ProtocolTransition::new(protocol.id, state.id, to, "next");
+        store.upsert_protocol_transition(&t).await.unwrap();
+
+        let executor = SystemExecutor::new();
+        let result = executor
+            .execute_state(&state, &run, &protocol, &store)
+            .await
+            .unwrap();
+        assert_eq!(result.trigger, "next");
+        assert!(result
+            .notes
+            .iter()
+            .any(|n| n.contains("Updated staleness scores")));
+    }
+
+    #[tokio::test]
+    async fn test_execute_state_chained_actions() {
+        let store = MockGraphStore::new();
+        let (protocol, mut state, run) = make_protocol();
+        state.action = Some("admin(update_staleness_scores) + admin(decay_synapses)".to_string());
+
+        let executor = SystemExecutor::new();
+        let result = executor
+            .execute_state(&state, &run, &protocol, &store)
+            .await
+            .unwrap();
+        assert_eq!(result.notes.len(), 2);
+        assert!(result.notes[0].contains("Updated staleness scores"));
+        assert!(result.notes[1].contains("Decayed"));
+    }
+
+    #[tokio::test]
+    async fn test_execute_state_read_only_tool_skipped() {
+        let store = MockGraphStore::new();
+        let (protocol, mut state, run) = make_protocol();
+        state.action = Some("note(list_notes)".to_string());
+
+        let executor = SystemExecutor::new();
+        let result = executor
+            .execute_state(&state, &run, &protocol, &store)
+            .await
+            .unwrap();
+        assert!(result
+            .notes
+            .iter()
+            .any(|n| n.contains("Skipped read-only call")));
+    }
+
+    #[tokio::test]
+    async fn test_execute_state_unknown_tool_skipped() {
+        let store = MockGraphStore::new();
+        let (protocol, mut state, run) = make_protocol();
+        state.action = Some("foobar(do_stuff)".to_string());
+
+        let executor = SystemExecutor::new();
+        let result = executor
+            .execute_state(&state, &run, &protocol, &store)
+            .await
+            .unwrap();
+        assert!(result
+            .notes
+            .iter()
+            .any(|n| n.contains("Skipped unknown tool: foobar")));
     }
 }

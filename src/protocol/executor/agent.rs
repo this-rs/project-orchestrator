@@ -765,4 +765,171 @@ mod tests {
         assert!(prompt.contains("TRIGGER:"));
         assert!(prompt.contains("/tmp/project"));
     }
+
+    #[test]
+    fn test_build_agent_prompt_no_action_no_description() {
+        let protocol_id = uuid::Uuid::new_v4();
+        let state_id = uuid::Uuid::new_v4();
+        let protocol = Protocol::new(uuid::Uuid::new_v4(), "Proto", state_id);
+        let mut state = ProtocolState::new(protocol_id, "idle");
+        state.id = state_id;
+        state.description = String::new();
+        state.action = None;
+        let run = ProtocolRun::new(protocol_id, state_id, "idle");
+        let prompt = build_agent_prompt(&state, &run, &protocol, &[], None);
+        // Should still contain the header and output convention
+        assert!(prompt.contains("Proto"));
+        assert!(prompt.contains("State: idle"));
+        assert!(prompt.contains("TRIGGER:"));
+        // No "State purpose" section
+        assert!(!prompt.contains("State purpose"));
+    }
+
+    #[test]
+    fn test_build_agent_prompt_with_states_visited() {
+        use crate::protocol::StateVisit;
+        let protocol_id = uuid::Uuid::new_v4();
+        let state_id = uuid::Uuid::new_v4();
+        let protocol = Protocol::new(uuid::Uuid::new_v4(), "P", state_id);
+        let mut state = ProtocolState::new(protocol_id, "s2");
+        state.id = state_id;
+        let mut run = ProtocolRun::new(protocol_id, state_id, "s2");
+        run.states_visited = vec![
+            StateVisit {
+                state_id: uuid::Uuid::new_v4(),
+                state_name: "s1".to_string(),
+                entered_at: chrono::Utc::now(),
+                exited_at: None,
+                duration_ms: None,
+                trigger: Some("start".to_string()),
+                progress_snapshot: None,
+            },
+            StateVisit {
+                state_id: uuid::Uuid::new_v4(),
+                state_name: "s2".to_string(),
+                entered_at: chrono::Utc::now(),
+                exited_at: None,
+                duration_ms: None,
+                trigger: None,
+                progress_snapshot: None,
+            },
+        ];
+        let prompt = build_agent_prompt(&state, &run, &protocol, &[], None);
+        assert!(prompt.contains("States visited so far"));
+        assert!(prompt.contains("s1"));
+        assert!(prompt.contains("(trigger: `start`)"));
+    }
+
+    #[test]
+    fn test_build_agent_prompt_no_transitions() {
+        let protocol_id = uuid::Uuid::new_v4();
+        let state_id = uuid::Uuid::new_v4();
+        let protocol = Protocol::new(uuid::Uuid::new_v4(), "P", state_id);
+        let mut state = ProtocolState::new(protocol_id, "final");
+        state.id = state_id;
+        let run = ProtocolRun::new(protocol_id, state_id, "final");
+        let prompt = build_agent_prompt(&state, &run, &protocol, &[], None);
+        assert!(!prompt.contains("Possible Triggers"));
+    }
+
+    #[test]
+    fn test_build_agent_prompt_with_guards() {
+        let protocol_id = uuid::Uuid::new_v4();
+        let state_id = uuid::Uuid::new_v4();
+        let protocol = Protocol::new(uuid::Uuid::new_v4(), "P", state_id);
+        let mut state = ProtocolState::new(protocol_id, "gate");
+        state.id = state_id;
+        let run = ProtocolRun::new(protocol_id, state_id, "gate");
+        let mut t = ProtocolTransition::new(protocol_id, state_id, uuid::Uuid::new_v4(), "pass");
+        t.guard = Some("all_tests_green".to_string());
+        let prompt = build_agent_prompt(&state, &run, &protocol, &[t], None);
+        assert!(prompt.contains("Possible Triggers"));
+        assert!(prompt.contains("`pass`"));
+        assert!(prompt.contains("guard: all_tests_green"));
+    }
+
+    #[test]
+    fn test_build_agent_prompt_no_project_root() {
+        let protocol_id = uuid::Uuid::new_v4();
+        let state_id = uuid::Uuid::new_v4();
+        let protocol = Protocol::new(uuid::Uuid::new_v4(), "P", state_id);
+        let mut state = ProtocolState::new(protocol_id, "s");
+        state.id = state_id;
+        let run = ProtocolRun::new(protocol_id, state_id, "s");
+        let prompt = build_agent_prompt(&state, &run, &protocol, &[], None);
+        assert!(!prompt.contains("Project root"));
+    }
+
+    #[test]
+    fn test_determine_trigger_prefers_success_over_first() {
+        let state_id = uuid::Uuid::new_v4();
+        let protocol_id = uuid::Uuid::new_v4();
+        let mut state = ProtocolState::new(protocol_id, "test");
+        state.id = state_id;
+        let transitions = vec![
+            ProtocolTransition::new(protocol_id, state_id, uuid::Uuid::new_v4(), "fail"),
+            ProtocolTransition::new(protocol_id, state_id, uuid::Uuid::new_v4(), "success"),
+            ProtocolTransition::new(protocol_id, state_id, uuid::Uuid::new_v4(), "retry"),
+        ];
+        let trigger = determine_trigger_from_transitions(&transitions, &state);
+        assert_eq!(trigger, "success");
+    }
+
+    #[test]
+    fn test_determine_trigger_uses_first_when_no_preferred() {
+        let state_id = uuid::Uuid::new_v4();
+        let protocol_id = uuid::Uuid::new_v4();
+        let mut state = ProtocolState::new(protocol_id, "test");
+        state.id = state_id;
+        let transitions = vec![
+            ProtocolTransition::new(protocol_id, state_id, uuid::Uuid::new_v4(), "alpha"),
+            ProtocolTransition::new(protocol_id, state_id, uuid::Uuid::new_v4(), "beta"),
+        ];
+        let trigger = determine_trigger_from_transitions(&transitions, &state);
+        assert_eq!(trigger, "alpha");
+    }
+
+    #[test]
+    fn test_extract_trigger_from_text_empty() {
+        assert_eq!(extract_trigger_from_text(""), None);
+    }
+
+    #[test]
+    fn test_extract_trigger_from_text_titlecase() {
+        let text = "All done.\nTrigger: completed";
+        assert_eq!(
+            extract_trigger_from_text(text),
+            Some("completed".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_trigger_from_text_empty_trigger_value() {
+        // "TRIGGER: " with nothing after → should return None
+        let text = "TRIGGER:   ";
+        assert_eq!(extract_trigger_from_text(text), None);
+    }
+
+    #[test]
+    fn test_agent_executor_stub_creation() {
+        let executor = AgentExecutor::new_stub();
+        assert!(executor.chat_manager.is_none());
+    }
+
+    #[test]
+    fn test_agent_executor_default() {
+        let executor = AgentExecutor::default();
+        assert!(executor.chat_manager.is_none());
+    }
+
+    #[test]
+    fn test_is_mcp_style_edge_cases() {
+        // Parentheses but no tool name pattern — still matches since we just check for ( and )
+        assert!(is_mcp_style("()"));
+        assert!(is_mcp_style("  (something)  "));
+        // Only opening paren
+        assert!(!is_mcp_style("foo("));
+        // Only closing paren
+        assert!(!is_mcp_style(")bar"));
+    }
 }

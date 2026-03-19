@@ -1555,4 +1555,38 @@ mod tests {
         let updated = store.get_protocol_run(run.id).await.unwrap().unwrap();
         assert_eq!(updated.status, crate::protocol::RunStatus::Failed);
     }
+
+    // ── cancel_active_runner tests ──
+
+    #[test]
+    fn test_cancel_active_runner_not_registered() {
+        let run_id = Uuid::new_v4();
+        // Calling cancel on a non-existent run_id should not panic
+        cancel_active_runner(run_id);
+    }
+
+    #[test]
+    fn test_cancel_active_runner_registered() {
+        let run_id = Uuid::new_v4();
+        let token = CancellationToken::new();
+        ACTIVE_RUNNERS.insert(run_id, token.clone());
+
+        assert!(!token.is_cancelled());
+        cancel_active_runner(run_id);
+        assert!(token.is_cancelled());
+        assert!(
+            ACTIVE_RUNNERS.get(&run_id).is_none(),
+            "Runner should be removed after cancel"
+        );
+    }
+
+    // ── MIN_TRIGGER_INTERVAL_SECS ──
+
+    #[test]
+    fn test_min_trigger_interval_is_reasonable() {
+        assert_eq!(
+            MIN_TRIGGER_INTERVAL_SECS, 300,
+            "Min trigger interval should be 5 minutes (300 seconds)"
+        );
+    }
 }

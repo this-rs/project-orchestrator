@@ -440,4 +440,52 @@ mod tests {
         assert_eq!(cloned.report_json, ae.report_json);
         assert_eq!(cloned.vector_json, ae.vector_json);
     }
+
+    #[test]
+    fn test_execution_type_display() {
+        assert_eq!(ExecutionType::TaskAgent.to_string(), "task_agent");
+        assert_eq!(ExecutionType::GateRetry.to_string(), "gate_retry");
+        assert_eq!(ExecutionType::Verification.to_string(), "verification");
+    }
+
+    #[test]
+    fn test_execution_type_from_str_lossy() {
+        assert_eq!(
+            ExecutionType::from_str_lossy("gate_retry"),
+            ExecutionType::GateRetry
+        );
+        assert_eq!(
+            ExecutionType::from_str_lossy("verification"),
+            ExecutionType::Verification
+        );
+        assert_eq!(
+            ExecutionType::from_str_lossy("task_agent"),
+            ExecutionType::TaskAgent
+        );
+        // Unknown defaults to TaskAgent
+        assert_eq!(
+            ExecutionType::from_str_lossy("unknown"),
+            ExecutionType::TaskAgent
+        );
+        assert_eq!(ExecutionType::from_str_lossy(""), ExecutionType::TaskAgent);
+    }
+
+    #[test]
+    fn test_execution_type_default() {
+        let default: ExecutionType = Default::default();
+        assert_eq!(default, ExecutionType::TaskAgent);
+    }
+
+    #[test]
+    fn test_execution_type_serde_roundtrip() {
+        for variant in &[
+            ExecutionType::TaskAgent,
+            ExecutionType::GateRetry,
+            ExecutionType::Verification,
+        ] {
+            let json = serde_json::to_string(variant).unwrap();
+            let deserialized: ExecutionType = serde_json::from_str(&json).unwrap();
+            assert_eq!(*variant, deserialized);
+        }
+    }
 }

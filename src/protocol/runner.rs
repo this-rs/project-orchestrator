@@ -391,3 +391,173 @@ fn emit_transition_event(
         project_id: Some(project_id.to_string()),
     });
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::events::{EventBus, EventEmitter};
+    use crate::neo4j::mock::MockGraphStore;
+    use crate::neo4j::models::ProjectNode;
+    use crate::neo4j::traits::GraphStore;
+    use crate::protocol::{Protocol, ProtocolCategory, ProtocolRun, ProtocolState, RunStatus};
+    use std::sync::Arc;
+    use uuid::Uuid;
+
+    // ── emit_progress_event tests ──
+
+    #[test]
+    fn test_emit_progress_event_basic() {
+        let bus = Arc::new(EventBus::default()) as Arc<dyn EventEmitter>;
+        let run_id = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+
+        // Should not panic with no processed/total
+        emit_progress_event(
+            &bus,
+            run_id,
+            "health_check",
+            "executing",
+            None,
+            None,
+            project_id,
+        );
+    }
+
+    #[test]
+    fn test_emit_progress_event_with_counters() {
+        let bus = Arc::new(EventBus::default()) as Arc<dyn EventEmitter>;
+        let run_id = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+
+        // Should not panic with processed and total counters
+        emit_progress_event(
+            &bus,
+            run_id,
+            "analyze_delta",
+            "processing",
+            Some(5),
+            Some(10),
+            project_id,
+        );
+    }
+
+    // ── emit_transition_event tests ──
+
+    #[test]
+    fn test_emit_transition_event_completed() {
+        let bus = Arc::new(EventBus::default()) as Arc<dyn EventEmitter>;
+        let run_id = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+
+        // Completed status should map to StatusChanged action
+        emit_transition_event(&bus, run_id, "done", RunStatus::Completed, project_id);
+    }
+
+    #[test]
+    fn test_emit_transition_event_running() {
+        let bus = Arc::new(EventBus::default()) as Arc<dyn EventEmitter>;
+        let run_id = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+
+        // Running status should map to Updated action
+        emit_transition_event(&bus, run_id, "processing", RunStatus::Running, project_id);
+    }
+
+    // ── fail_run_with_error tests ──
+
+    async fn setup_running_run(store: &MockGraphStore) -> (Protocol, ProtocolRun) {
+        let project_id = Uuid::new_v4();
+        let project = ProjectNode {
+            id: project_id,
+            name: "test".to_string(),
+            slug: "test".to_string(),
+            description: None,
+            root_path: "/tmp/test".to_string(),
+            created_at: chrono::Utc::now(),
+            last_synced: None,
+            analytics_computed_at: None,
+            last_co_change_computed_at: None,
+            default_note_energy: None,
+            scaffolding_override: None,
+            sharing_policy: None,
+        };
+        store.create_project(&project).await.unwrap();
+
+        let state_id = Uuid::new_v4();
+        let mut protocol = Protocol::new(project_id, "test-protocol", state_id);
+        protocol.protocol_category = ProtocolCategory::System;
+        store.upsert_protocol(&protocol).await.unwrap();
+
+        let mut state = ProtocolState::new(protocol.id, "start");
+        state.id = state_id;
+        state.state_type = crate::protocol::StateType::Start;
+        store.upsert_protocol_state(&state).await.unwrap();
+
+        let run = ProtocolRun::new(protocol.id, state_id, "start");
+        store.create_protocol_run(&run).await.unwrap();
+
+        (protocol, run)
+    }
+
+    #[tokio::test]
+    async fn test_fail_run_with_error_active_run() {
+        let store = MockGraphStore::new();
+        let (_protocol, run) = setup_running_run(&store).await;
+
+        assert!(run.is_active());
+
+        fail_run_with_error(&store, run.id, "something went wrong")
+            .await
+            .unwrap();
+
+        let updated = store.get_protocol_run(run.id).await.unwrap().unwrap();
+        assert_eq!(updated.status, RunStatus::Failed);
+        assert!(updated.completed_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_fail_run_with_error_already_completed() {
+        let store = MockGraphStore::new();
+        let (_protocol, run) = setup_running_run(&store).await;
+
+        // Complete the run first
+        let mut completed_run = store.get_protocol_run(run.id).await.unwrap().unwrap();
+        completed_run.status = RunStatus::Completed;
+        completed_run.completed_at = Some(chrono::Utc::now());
+        store.update_protocol_run(&mut completed_run).await.unwrap();
+
+        // Trying to fail an already-completed run should not change it
+        fail_run_with_error(&store, run.id, "late error")
+            .await
+            .unwrap();
+
+        let still_completed = store.get_protocol_run(run.id).await.unwrap().unwrap();
+        assert_eq!(still_completed.status, RunStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn test_fail_run_with_error_not_found() {
+        let store = MockGraphStore::new();
+        let non_existent_id = Uuid::new_v4();
+
+        // Should not panic when run doesn't exist
+        let result = fail_run_with_error(&store, non_existent_id, "no such run").await;
+        assert!(result.is_ok());
+    }
+
+    // ── Constants ──
+
+    #[test]
+    fn test_constants_are_reasonable() {
+        assert_eq!(BASE_BACKOFF_MS, 1000, "Base backoff should be 1 second");
+        assert_eq!(MAX_RETRIES, 3, "Max retries should be 3");
+        assert_eq!(
+            DEFAULT_SYSTEM_TIMEOUT_SECS, 300,
+            "System timeout should be 5 minutes"
+        );
+        assert_eq!(
+            DEFAULT_BUSINESS_TIMEOUT_SECS, 1800,
+            "Business timeout should be 30 minutes"
+        );
+    }
+}

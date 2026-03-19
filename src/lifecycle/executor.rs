@@ -763,4 +763,222 @@ mod tests {
             crate::neo4j::models::AlertSeverity::Critical
         );
     }
+
+    // ── CascadeChildren action tests ──
+
+    #[tokio::test]
+    async fn test_execute_cascade_children_steps() {
+        let (state, graph) = make_test_server_state().await;
+        let task_id = uuid::Uuid::new_v4();
+
+        // Create a step for the task that is pending
+        let step = crate::neo4j::models::StepNode {
+            id: uuid::Uuid::new_v4(),
+            order: 1,
+            description: "A pending step".to_string(),
+            status: crate::neo4j::models::StepStatus::Pending,
+            verification: None,
+            created_at: chrono::Utc::now(),
+            updated_at: None,
+            completed_at: None,
+            execution_context: None,
+            persona: None,
+        };
+        graph.create_step(task_id, &step).await.unwrap();
+
+        let hook = make_hook(
+            "cascade-steps",
+            LifecycleScope::Task,
+            "completed",
+            LifecycleActionType::CascadeChildren,
+            serde_json::json!({"target": "steps"}),
+        );
+        graph.create_lifecycle_hook(&hook).await.unwrap();
+
+        let event = make_status_changed_event(EntityType::Task, &task_id.to_string(), "completed");
+        execute_lifecycle_hooks(&event, &state).await;
+
+        // Verify step was completed
+        let steps = graph.steps.read().await;
+        let updated_step = steps.get(&step.id).unwrap();
+        assert_eq!(
+            updated_step.status,
+            crate::neo4j::models::StepStatus::Completed
+        );
+    }
+
+    #[tokio::test]
+    async fn test_execute_cascade_children_unknown_target() {
+        let (state, graph) = make_test_server_state().await;
+        let task_id = uuid::Uuid::new_v4();
+
+        let hook = make_hook(
+            "cascade-unknown",
+            LifecycleScope::Task,
+            "completed",
+            LifecycleActionType::CascadeChildren,
+            serde_json::json!({"target": "unknown_thing"}),
+        );
+        graph.create_lifecycle_hook(&hook).await.unwrap();
+
+        let event = make_status_changed_event(EntityType::Task, &task_id.to_string(), "completed");
+        // Should not panic, just ignore the unknown target
+        execute_lifecycle_hooks(&event, &state).await;
+    }
+
+    #[tokio::test]
+    async fn test_execute_cascade_children_default_target_is_steps() {
+        let (state, graph) = make_test_server_state().await;
+        let task_id = uuid::Uuid::new_v4();
+
+        // No "target" in config — should default to "steps"
+        let hook = make_hook(
+            "cascade-default",
+            LifecycleScope::Task,
+            "completed",
+            LifecycleActionType::CascadeChildren,
+            serde_json::json!({}),
+        );
+        graph.create_lifecycle_hook(&hook).await.unwrap();
+
+        let event = make_status_changed_event(EntityType::Task, &task_id.to_string(), "completed");
+        // Should not panic even with no steps
+        execute_lifecycle_hooks(&event, &state).await;
+    }
+
+    // ── StartProtocol with valid protocol_id ──
+
+    #[tokio::test]
+    async fn test_execute_start_protocol_with_valid_protocol() {
+        let (state, graph) = make_test_server_state().await;
+        let task_id = uuid::Uuid::new_v4();
+        let project_id = uuid::Uuid::new_v4();
+
+        // Create a protocol in the store
+        let state_id = uuid::Uuid::new_v4();
+        let mut protocol =
+            crate::protocol::Protocol::new(project_id, "test-auto-protocol", state_id);
+        protocol.protocol_category = crate::protocol::ProtocolCategory::System;
+        graph.upsert_protocol(&protocol).await.unwrap();
+
+        let mut proto_state = crate::protocol::ProtocolState::new(protocol.id, "start");
+        proto_state.id = state_id;
+        proto_state.state_type = crate::protocol::StateType::Start;
+        graph.upsert_protocol_state(&proto_state).await.unwrap();
+
+        let hook = make_hook(
+            "start-valid-proto",
+            LifecycleScope::Task,
+            "completed",
+            LifecycleActionType::StartProtocol,
+            serde_json::json!({"protocol_id": protocol.id.to_string()}),
+        );
+        graph.create_lifecycle_hook(&hook).await.unwrap();
+
+        let event = make_status_changed_event(EntityType::Task, &task_id.to_string(), "completed");
+        execute_lifecycle_hooks(&event, &state).await;
+
+        // Verify a protocol run was created
+        let (runs, _) = graph
+            .list_protocol_runs(protocol.id, None, 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(runs.len(), 1, "A protocol run should have been created");
+        assert_eq!(
+            runs[0].triggered_by, "lifecycle-hook:start-valid-proto",
+            "triggered_by should reference the hook name"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_execute_start_protocol_nonexistent_protocol() {
+        let (state, graph) = make_test_server_state().await;
+        let task_id = uuid::Uuid::new_v4();
+        let fake_protocol_id = uuid::Uuid::new_v4();
+
+        let hook = make_hook(
+            "start-missing-proto",
+            LifecycleScope::Task,
+            "completed",
+            LifecycleActionType::StartProtocol,
+            serde_json::json!({"protocol_id": fake_protocol_id.to_string()}),
+        );
+        graph.create_lifecycle_hook(&hook).await.unwrap();
+
+        let event = make_status_changed_event(EntityType::Task, &task_id.to_string(), "completed");
+        // Should not panic — error is logged
+        execute_lifecycle_hooks(&event, &state).await;
+    }
+
+    // ── CreateNote with default values ──
+
+    #[tokio::test]
+    async fn test_execute_create_note_with_defaults() {
+        let (state, graph) = make_test_server_state().await;
+        let task_id = uuid::Uuid::new_v4();
+
+        // Hook with empty config — all defaults
+        let hook = make_hook(
+            "note-defaults",
+            LifecycleScope::Task,
+            "completed",
+            LifecycleActionType::CreateNote,
+            serde_json::json!({}),
+        );
+        graph.create_lifecycle_hook(&hook).await.unwrap();
+
+        let event = make_status_changed_event(EntityType::Task, &task_id.to_string(), "completed");
+        execute_lifecycle_hooks(&event, &state).await;
+
+        let notes = graph.notes.read().await;
+        assert_eq!(notes.len(), 1);
+        let note = notes.values().next().unwrap();
+        // Default content_template is "Lifecycle hook triggered"
+        assert_eq!(note.content, "Lifecycle hook triggered");
+    }
+
+    // ── Scope mapping for Step and Milestone ──
+
+    #[tokio::test]
+    async fn test_execute_hooks_for_step_entity() {
+        let (state, graph) = make_test_server_state().await;
+        let step_id = uuid::Uuid::new_v4();
+
+        let hook = make_hook(
+            "step-alert",
+            LifecycleScope::Step,
+            "completed",
+            LifecycleActionType::EmitAlert,
+            serde_json::json!({"message_template": "Step done"}),
+        );
+        graph.create_lifecycle_hook(&hook).await.unwrap();
+
+        let event = make_status_changed_event(EntityType::Step, &step_id.to_string(), "completed");
+        execute_lifecycle_hooks(&event, &state).await;
+
+        let alerts = graph.alerts.read().await;
+        assert_eq!(alerts.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_execute_hooks_for_milestone_entity() {
+        let (state, graph) = make_test_server_state().await;
+        let milestone_id = uuid::Uuid::new_v4();
+
+        let hook = make_hook(
+            "milestone-alert",
+            LifecycleScope::Milestone,
+            "reached",
+            LifecycleActionType::EmitAlert,
+            serde_json::json!({"message_template": "Milestone reached"}),
+        );
+        graph.create_lifecycle_hook(&hook).await.unwrap();
+
+        let event =
+            make_status_changed_event(EntityType::Milestone, &milestone_id.to_string(), "reached");
+        execute_lifecycle_hooks(&event, &state).await;
+
+        let alerts = graph.alerts.read().await;
+        assert_eq!(alerts.len(), 1);
+    }
 }
