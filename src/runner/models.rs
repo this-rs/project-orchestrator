@@ -409,6 +409,46 @@ pub enum TriggerSource {
 }
 
 // ============================================================================
+// SpawnedBy — origin tracking for agent sessions
+// ============================================================================
+
+/// Describes what spawned an agent session.
+///
+/// Serialized as a tagged enum in JSON (e.g. `{"type":"pipeline", ...}`).
+/// Stored as a JSON string in Neo4j `ChatSession.spawned_by`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SpawnedBy {
+    /// Spawned by the PlanRunner for a specific task
+    Runner {
+        run_id: Uuid,
+        plan_id: Uuid,
+    },
+    /// Spawned as a sub-conversation from another session
+    Conversation {
+        session_id: Uuid,
+    },
+    /// Spawned by the pipeline executor (wave-based execution)
+    Pipeline {
+        run_id: Uuid,
+        plan_id: Uuid,
+        wave: usize,
+        task_id: Option<Uuid>,
+    },
+    /// Spawned by a quality gate retry
+    Gate {
+        run_id: Uuid,
+        gate_type: String,
+        retry_count: u32,
+    },
+    /// Spawned by an external trigger (webhook, cron, event)
+    Trigger {
+        trigger_id: Uuid,
+        event_type: String,
+    },
+}
+
+// ============================================================================
 // ActiveAgent — tracks a currently running agent for a task
 // ============================================================================
 
@@ -836,5 +876,73 @@ mod tests {
             expected,
             report.confidence_score
         );
+    }
+
+    // ========================================================================
+    // SpawnedBy tests
+    // ========================================================================
+
+    #[test]
+    fn test_spawned_by_runner_roundtrip() {
+        let spawned = SpawnedBy::Runner {
+            run_id: Uuid::nil(),
+            plan_id: Uuid::nil(),
+        };
+        let json = serde_json::to_string(&spawned).unwrap();
+        assert!(json.contains("\"type\":\"runner\""));
+        let back: SpawnedBy = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, spawned);
+    }
+
+    #[test]
+    fn test_spawned_by_pipeline_roundtrip() {
+        let spawned = SpawnedBy::Pipeline {
+            run_id: Uuid::nil(),
+            plan_id: Uuid::nil(),
+            wave: 3,
+            task_id: Some(Uuid::nil()),
+        };
+        let json = serde_json::to_string(&spawned).unwrap();
+        assert!(json.contains("\"type\":\"pipeline\""));
+        assert!(json.contains("\"wave\":3"));
+        let back: SpawnedBy = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, spawned);
+    }
+
+    #[test]
+    fn test_spawned_by_gate_roundtrip() {
+        let spawned = SpawnedBy::Gate {
+            run_id: Uuid::nil(),
+            gate_type: "cargo-check".into(),
+            retry_count: 2,
+        };
+        let json = serde_json::to_string(&spawned).unwrap();
+        assert!(json.contains("\"type\":\"gate\""));
+        assert!(json.contains("\"gate_type\":\"cargo-check\""));
+        let back: SpawnedBy = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, spawned);
+    }
+
+    #[test]
+    fn test_spawned_by_trigger_roundtrip() {
+        let spawned = SpawnedBy::Trigger {
+            trigger_id: Uuid::nil(),
+            event_type: "webhook".into(),
+        };
+        let json = serde_json::to_string(&spawned).unwrap();
+        assert!(json.contains("\"type\":\"trigger\""));
+        let back: SpawnedBy = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, spawned);
+    }
+
+    #[test]
+    fn test_spawned_by_conversation_roundtrip() {
+        let spawned = SpawnedBy::Conversation {
+            session_id: Uuid::nil(),
+        };
+        let json = serde_json::to_string(&spawned).unwrap();
+        assert!(json.contains("\"type\":\"conversation\""));
+        let back: SpawnedBy = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, spawned);
     }
 }
