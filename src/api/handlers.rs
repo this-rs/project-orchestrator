@@ -5578,6 +5578,55 @@ pub async fn get_project_roadmap(
 }
 
 // ============================================================================
+// Pipeline — Gate Results & Progress Score
+// ============================================================================
+
+/// GET /api/runs/:run_id/gates — Return gate results for a pipeline run.
+///
+/// Returns an array of `GateResult` records. Currently returns the empty array
+/// when no gates have been persisted yet (pipeline V1 placeholder).
+pub async fn get_run_gates(
+    State(_state): State<OrchestratorState>,
+    Path(run_id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    // V1: return empty gate results. The pipeline runner will persist these
+    // in a future iteration and we'll query them from Neo4j here.
+    let response = serde_json::json!({
+        "run_id": run_id.to_string(),
+        "gates": [],
+    });
+    Ok(Json(response))
+}
+
+/// GET /api/runs/:run_id/progress — Return progress score for a pipeline run.
+///
+/// Returns a `ProgressScore` with default values when the pipeline has not
+/// recorded any checkpoints yet (V1 placeholder).
+pub async fn get_run_progress(
+    State(_state): State<OrchestratorState>,
+    Path(run_id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    // V1: return a default progress summary. Real data will come from
+    // ProgressOracle checkpoints once the pipeline runner persists them.
+    let response = serde_json::json!({
+        "run_id": run_id.to_string(),
+        "score": 0.0,
+        "delta": null,
+        "dimensions": {
+            "build": 0.0,
+            "tests": 0.0,
+            "coverage": 0.0,
+            "steps": 0.0,
+        },
+        "trend": "unknown",
+        "total_checkpoints": 0,
+        "best_score": 0.0,
+        "worst_score": 0.0,
+    });
+    Ok(Json(response))
+}
+
+// ============================================================================
 // Error handling
 // ============================================================================
 
