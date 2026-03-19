@@ -9271,6 +9271,76 @@ mod tests {
         assert_eq!(ctx.protocol_state, Some("review".to_string()));
     }
 
+    // ---------------------------------------------------------------
+    // parse_spawned_by — scaffolding_level tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_parse_spawned_by_scaffolding_level_zero() {
+        let json = r#"{"scaffolding_level": 0}"#;
+        let ctx = parse_spawned_by(json).unwrap();
+        assert_eq!(ctx.scaffolding_level, Some(0));
+    }
+
+    #[test]
+    fn test_parse_spawned_by_scaffolding_level_mid() {
+        let json = r#"{"scaffolding_level": 2}"#;
+        let ctx = parse_spawned_by(json).unwrap();
+        assert_eq!(ctx.scaffolding_level, Some(2));
+    }
+
+    #[test]
+    fn test_parse_spawned_by_scaffolding_level_max() {
+        let json = r#"{"scaffolding_level": 4}"#;
+        let ctx = parse_spawned_by(json).unwrap();
+        assert_eq!(ctx.scaffolding_level, Some(4));
+    }
+
+    #[test]
+    fn test_parse_spawned_by_scaffolding_level_capped_at_4() {
+        let json = r#"{"scaffolding_level": 5}"#;
+        let ctx = parse_spawned_by(json).unwrap();
+        assert_eq!(ctx.scaffolding_level, Some(4));
+    }
+
+    #[test]
+    fn test_parse_spawned_by_scaffolding_level_large_capped() {
+        let json = r#"{"scaffolding_level": 255}"#;
+        let ctx = parse_spawned_by(json).unwrap();
+        assert_eq!(ctx.scaffolding_level, Some(4));
+    }
+
+    #[test]
+    fn test_parse_spawned_by_scaffolding_level_null() {
+        let json = r#"{"scaffolding_level": null}"#;
+        let ctx = parse_spawned_by(json).unwrap();
+        assert_eq!(ctx.scaffolding_level, None);
+    }
+
+    #[test]
+    fn test_parse_spawned_by_no_scaffolding_level_backward_compat() {
+        let json = r#"{"type": "runner", "parent_session_id": "abc"}"#;
+        let ctx = parse_spawned_by(json).unwrap();
+        assert_eq!(ctx.scaffolding_level, None);
+        assert_eq!(ctx.parent_session_id, Some("abc".to_string()));
+        assert_eq!(ctx.spawn_type, "runner");
+    }
+
+    #[test]
+    fn test_parse_spawned_by_scaffolding_with_other_fields() {
+        let run_id = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
+        let json = format!(
+            r#"{{"type":"runner","run_id":"{}","task_id":"{}","scaffolding_level":3}}"#,
+            run_id, task_id
+        );
+        let ctx = parse_spawned_by(&json).unwrap();
+        assert_eq!(ctx.scaffolding_level, Some(3));
+        assert_eq!(ctx.run_id, Some(run_id));
+        assert_eq!(ctx.task_id, Some(task_id));
+        assert_eq!(ctx.spawn_type, "runner");
+    }
+
     #[test]
     fn test_parse_spawned_by_empty_json() {
         let ctx = parse_spawned_by("{}").unwrap();

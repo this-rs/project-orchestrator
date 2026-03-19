@@ -2849,6 +2849,118 @@ mod tests {
         assert!(constraints.contains("cargo check"));
     }
 
+    // ---------------------------------------------------------------
+    // RunMemory / TaskSummary unit tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_run_memory_to_markdown_empty() {
+        let mem = RunMemory::default();
+        assert_eq!(mem.to_markdown(), "");
+    }
+
+    #[test]
+    fn test_run_memory_to_markdown_single_completed() {
+        let mut mem = RunMemory::default();
+        mem.record_completed(
+            Uuid::new_v4(),
+            "Setup CI".into(),
+            1,
+            vec!["abc1234".into()],
+            vec!["ci.yml".into()],
+        );
+        let md = mem.to_markdown();
+        assert!(md.contains("## Previous Tasks (Continuity Context)"));
+        assert!(md.contains("### Wave 1 — Setup CI (completed)"));
+        assert!(md.contains("**Commits:**"));
+        assert!(md.contains("- `abc1234`"));
+        assert!(md.contains("**Files modified:**"));
+        assert!(md.contains("- `ci.yml`"));
+    }
+
+    #[test]
+    fn test_run_memory_to_markdown_multiple_waves() {
+        let mut mem = RunMemory::default();
+        mem.record_completed(Uuid::new_v4(), "Task A".into(), 1, vec![], vec![]);
+        mem.record_completed(
+            Uuid::new_v4(),
+            "Task B".into(),
+            2,
+            vec!["def5678".into()],
+            vec!["src/main.rs".into(), "Cargo.toml".into()],
+        );
+        let md = mem.to_markdown();
+        assert!(md.contains("### Wave 1 — Task A (completed)"));
+        assert!(md.contains("### Wave 2 — Task B (completed)"));
+        // Task A has no commits/files — sections should be absent for it
+        // but present for Task B
+        assert!(md.contains("- `def5678`"));
+        assert!(md.contains("- `src/main.rs`"));
+        assert!(md.contains("- `Cargo.toml`"));
+    }
+
+    #[test]
+    fn test_run_memory_to_markdown_failed_task() {
+        let mut mem = RunMemory::default();
+        mem.record_failed(Uuid::new_v4(), "Broken task".into(), 1, "compilation error");
+        let md = mem.to_markdown();
+        assert!(md.contains("### Wave 1 — Broken task (failed: compilation error)"));
+        // Failed tasks should NOT have commits/files sections
+        assert!(!md.contains("**Commits:**"));
+        assert!(!md.contains("**Files modified:**"));
+    }
+
+    #[test]
+    fn test_run_memory_to_markdown_omits_empty_commits_and_files() {
+        let mut mem = RunMemory::default();
+        mem.record_completed(Uuid::new_v4(), "No artifacts".into(), 1, vec![], vec![]);
+        let md = mem.to_markdown();
+        assert!(md.contains("### Wave 1 — No artifacts (completed)"));
+        assert!(!md.contains("**Commits:**"));
+        assert!(!md.contains("**Files modified:**"));
+    }
+
+    #[test]
+    fn test_run_memory_record_completed_stores_fields() {
+        let task_id = Uuid::new_v4();
+        let mut mem = RunMemory::default();
+        mem.record_completed(
+            task_id,
+            "My task".into(),
+            3,
+            vec!["c1".into(), "c2".into()],
+            vec!["f1.rs".into()],
+        );
+        assert_eq!(mem.summaries.len(), 1);
+        let s = &mem.summaries[0];
+        assert_eq!(s.task_id, task_id);
+        assert_eq!(s.title, "My task");
+        assert_eq!(s.wave_number, 3);
+        assert_eq!(s.status, "completed");
+        assert_eq!(s.commits, vec!["c1", "c2"]);
+        assert_eq!(s.files_modified, vec!["f1.rs"]);
+    }
+
+    #[test]
+    fn test_run_memory_record_failed_truncates_reason() {
+        let mut mem = RunMemory::default();
+        let long_reason = "x".repeat(300);
+        mem.record_failed(Uuid::new_v4(), "Fail".into(), 1, &long_reason);
+        let s = &mem.summaries[0];
+        // status = "failed: " (8 chars) + truncated reason (200 chars) = 208 chars
+        assert_eq!(s.status.len(), 208);
+        assert!(s.status.starts_with("failed: "));
+        assert!(s.status.ends_with("xxxx"));
+    }
+
+    #[test]
+    fn test_run_memory_record_failed_short_reason_not_truncated() {
+        let mut mem = RunMemory::default();
+        mem.record_failed(Uuid::new_v4(), "Fail".into(), 1, "short reason");
+        let s = &mem.summaries[0];
+        assert_eq!(s.status, "failed: short reason");
+    }
+
     #[test]
     fn test_run_status_default() {
         let status = RunStatus {
