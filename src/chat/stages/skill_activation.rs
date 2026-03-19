@@ -351,7 +351,9 @@ fn detect_intent_from_skills(matches: &[(SkillNode, f64)], message: &str) -> &'s
         let tags_lower: Vec<String> = skill.tags.iter().map(|t| t.to_lowercase()).collect();
         let name_lower = skill.name.to_lowercase();
 
-        if tags_lower.iter().any(|t| t.contains("plan") || t.contains("roadmap"))
+        if tags_lower
+            .iter()
+            .any(|t| t.contains("plan") || t.contains("roadmap"))
             || name_lower.contains("plan")
         {
             return "planning";
@@ -480,9 +482,15 @@ mod tests {
 
     #[test]
     fn test_detect_intent_planning() {
-        assert_eq!(detect_intent_from_message("crée un plan pour X"), "planning");
+        assert_eq!(
+            detect_intent_from_message("crée un plan pour X"),
+            "planning"
+        );
         assert_eq!(detect_intent_from_message("check the roadmap"), "planning");
-        assert_eq!(detect_intent_from_message("update the milestone"), "planning");
+        assert_eq!(
+            detect_intent_from_message("update the milestone"),
+            "planning"
+        );
     }
 
     #[test]

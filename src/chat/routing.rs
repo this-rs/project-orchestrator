@@ -40,7 +40,7 @@ use super::prompt_sections::{
 ///
 /// This is a superset of `ComposerContext` and `ToolGroupSelectionContext`,
 /// combining structural, behavioral, and intent signals.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct RoutingContext {
     // ── Scaffolding & project state ────────────────────────────────
     /// Current scaffolding level (0–4). 0 = full guidance, 4 = expert.
@@ -65,27 +65,13 @@ pub struct RoutingContext {
     /// Detected intent from the enrichment pipeline (e.g., "planning", "code", "debug").
     /// `None` if no intent was detected.
     pub detected_intent: Option<String>,
-
     // ── Future: neural signals ─────────────────────────────────────
     // pub conversation_embedding: Option<Vec<f32>>,
     // pub session_history_summary: Option<String>,
     // pub user_preference_vector: Option<Vec<f32>>,
 }
 
-impl Default for RoutingContext {
-    fn default() -> Self {
-        Self {
-            scaffolding_level: 0,
-            has_active_plan: false,
-            has_active_protocol: false,
-            task_count: 0,
-            is_multi_project: false,
-            fsm_available_tools: vec![],
-            user_message: String::new(),
-            detected_intent: None,
-        }
-    }
-}
+// Default is derived — all fields have natural defaults (0, false, empty, None).
 
 // ============================================================================
 // RoutingDecision — the output of a RoutingProvider
@@ -298,7 +284,9 @@ mod tests {
         let decision = router.route(&ctx);
 
         // "function" and "file" and "import" are code keywords
-        assert!(decision.tool_groups.contains(&ToolRefGroupId::CodeExploration));
+        assert!(decision
+            .tool_groups
+            .contains(&ToolRefGroupId::CodeExploration));
     }
 
     #[test]
@@ -317,7 +305,9 @@ mod tests {
         assert!(decision.tool_groups.contains(&ToolRefGroupId::Core));
         assert!(decision.tool_groups.contains(&ToolRefGroupId::Knowledge));
         // Should NOT include CodeExploration (no "code" in whitelist)
-        assert!(!decision.tool_groups.contains(&ToolRefGroupId::CodeExploration));
+        assert!(!decision
+            .tool_groups
+            .contains(&ToolRefGroupId::CodeExploration));
     }
 
     #[test]

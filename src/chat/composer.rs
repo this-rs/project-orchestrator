@@ -54,6 +54,7 @@ pub use super::routing::SectionHint;
 ///
 /// All async data fetching happens outside the composer — it receives
 /// pre-rendered markdown strings for dynamic sections.
+#[derive(Debug, Clone, Default)]
 pub struct ComposerInput<'a> {
     /// Scaffolding level (0=full guidance, 4=expert).
     pub scaffolding_level: u8,
@@ -78,22 +79,8 @@ pub struct ComposerInput<'a> {
     pub task_count: usize,
 }
 
-impl<'a> Default for ComposerInput<'a> {
-    fn default() -> Self {
-        Self {
-            scaffolding_level: 0,
-            protocol_runs: &[],
-            project_context_markdown: "",
-            continuity_markdown: "",
-            enrichment_markdown: "",
-            user_message: "",
-            routing_hints: None,
-            is_multi_project: false,
-            has_active_plan: false,
-            task_count: 0,
-        }
-    }
-}
+// Default is derived — all numeric fields default to 0, bools to false,
+// &str to "", Option to None, &[] to empty slice.
 
 /// Maximum character budget for the dynamic context section (~2500 tokens at 4 chars/token).
 const DYNAMIC_CONTEXT_CHAR_BUDGET: usize = 10_000;
@@ -132,10 +119,7 @@ impl FsmPromptComposer {
     /// let dual_track = DualTrackRouter::new(model_weights);
     /// let prompt = FsmPromptComposer::compose_with_router(&input, &dual_track);
     /// ```
-    pub fn compose_with_router(
-        input: &ComposerInput<'_>,
-        router: &dyn RoutingProvider,
-    ) -> String {
+    pub fn compose_with_router(input: &ComposerInput<'_>, router: &dyn RoutingProvider) -> String {
         // ── Step 1: Build routing context ─────────────────────────────
         let fsm_tools: Vec<String> = input
             .protocol_runs
@@ -549,9 +533,18 @@ mod tests {
         let prompt = FsmPromptComposer::compose(&input);
 
         // Should contain the identity section
-        assert!(prompt.contains("# Development Agent"), "Should have identity");
-        assert!(prompt.contains("MCP Mega-Tools Reference"), "Should have tool reference");
-        assert!(!prompt.contains("Active Protocol Context"), "No FSM section");
+        assert!(
+            prompt.contains("# Development Agent"),
+            "Should have identity"
+        );
+        assert!(
+            prompt.contains("MCP Mega-Tools Reference"),
+            "Should have tool reference"
+        );
+        assert!(
+            !prompt.contains("Active Protocol Context"),
+            "No FSM section"
+        );
     }
 
     #[test]
@@ -563,9 +556,7 @@ mod tests {
             status_message: "Analyzing changes".to_string(),
             prompt_fragment: Some("Focus on test coverage and error handling.".to_string()),
             available_tools: Some(vec!["code".to_string(), "note".to_string()]),
-            forbidden_actions: Some(vec![
-                "Do NOT commit without review approval".to_string(),
-            ]),
+            forbidden_actions: Some(vec!["Do NOT commit without review approval".to_string()]),
         }];
         let input = ComposerInput {
             protocol_runs: &runs,
@@ -573,7 +564,10 @@ mod tests {
         };
         let prompt = FsmPromptComposer::compose(&input);
 
-        assert!(prompt.contains("Active Protocol Context"), "Should have FSM section");
+        assert!(
+            prompt.contains("Active Protocol Context"),
+            "Should have FSM section"
+        );
         assert!(prompt.contains("code-review"), "Should name the protocol");
         assert!(prompt.contains("analyzing"), "Should name the state");
         assert!(
@@ -599,8 +593,14 @@ mod tests {
         };
         let prompt = FsmPromptComposer::compose(&input);
 
-        assert!(prompt.contains("Previous Session"), "Should have continuity");
-        assert!(prompt.contains("Project: my-app"), "Should have project context");
+        assert!(
+            prompt.contains("Previous Session"),
+            "Should have continuity"
+        );
+        assert!(
+            prompt.contains("Project: my-app"),
+            "Should have project context"
+        );
     }
 
     #[test]
@@ -633,7 +633,10 @@ mod tests {
         // Build a large structured markdown context
         let mut big_context = String::from("## Items\n");
         for i in 0..500 {
-            big_context.push_str(&format!("- [Low] Item {} with padding text to make it much longer\n", i));
+            big_context.push_str(&format!(
+                "- [Low] Item {} with padding text to make it much longer\n",
+                i
+            ));
         }
         let input = ComposerInput {
             project_context_markdown: &big_context,
@@ -685,7 +688,10 @@ mod tests {
         let section = FsmPromptComposer::build_fsm_section(&runs);
         assert!(section.contains("deploy"), "Should contain first protocol");
         assert!(section.contains("review"), "Should contain second protocol");
-        assert!(section.contains("Check staging logs"), "Should contain fragment");
+        assert!(
+            section.contains("Check staging logs"),
+            "Should contain fragment"
+        );
     }
 
     #[test]
@@ -706,7 +712,7 @@ mod tests {
         let groups = FsmPromptComposer::count_tool_groups(&input);
         // Core + Knowledge always, + CodeExploration (has "code")
         assert!(
-            groups >= 2 && groups <= 4,
+            (2..=4).contains(&groups),
             "FSM whitelist should limit groups, got {}",
             groups
         );
@@ -729,7 +735,8 @@ mod tests {
 
     #[test]
     fn test_parse_markdown_sections() {
-        let md = "## Guidelines\n- [Critical] Rule 1\n- [Low] Rule 2\n\n## Gotchas\n- Watch out for X\n";
+        let md =
+            "## Guidelines\n- [Critical] Rule 1\n- [Low] Rule 2\n\n## Gotchas\n- Watch out for X\n";
         let sections = parse_markdown_sections(md);
         assert_eq!(sections.len(), 2, "Should parse 2 sections");
         assert_eq!(sections[0].items.len(), 2, "Guidelines should have 2 items");
@@ -781,7 +788,7 @@ mod tests {
 
         // Budget that fits headers + 1 item each but not all items
         let budget = md.len() * 2 / 3;
-        let result = truncate_markdown_semantically(&md, budget);
+        let result = truncate_markdown_semantically(md, budget);
 
         // All section headers must be preserved
         assert!(
@@ -830,10 +837,7 @@ mod tests {
         }
         big_context.push_str("\n## Gotchas\n");
         for i in 0..50 {
-            big_context.push_str(&format!(
-                "- [Medium] Gotcha number {} with extra text\n",
-                i
-            ));
+            big_context.push_str(&format!("- [Medium] Gotcha number {} with extra text\n", i));
         }
 
         assert!(
@@ -841,8 +845,7 @@ mod tests {
             "Test context should exceed budget"
         );
 
-        let result =
-            FsmPromptComposer::build_dynamic_section("", &big_context, "");
+        let result = FsmPromptComposer::build_dynamic_section("", &big_context, "");
 
         // Should be within budget (with some margin for omission markers)
         assert!(

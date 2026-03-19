@@ -1204,6 +1204,9 @@ pub async fn start_server(mut config: Config) -> Result<()> {
         if let Some(ref tc) = trajectory_collector {
             cm = cm.with_trajectory_collector(tc.clone());
         }
+        if let Some(re) = orchestrator.reasoning_engine() {
+            cm = cm.with_reasoning_engine(re.clone());
+        }
         let cm = Arc::new(cm);
         cm.start_cleanup_task();
         tracing::info!("Chat manager initialized");

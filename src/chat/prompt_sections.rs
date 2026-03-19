@@ -245,9 +245,9 @@ impl ComposerContext {
     pub fn level0_full() -> Self {
         Self {
             scaffolding_level: 0,
-            has_active_plan: true,   // Assume plan active to include plan-dependent sections
+            has_active_plan: true, // Assume plan active to include plan-dependent sections
             has_active_protocol: true, // Assume protocols to include protocol sections
-            task_count: 10,          // Assume enough tasks for wave dispatch
+            task_count: 10,        // Assume enough tasks for wave dispatch
         }
     }
 }
@@ -1122,7 +1122,15 @@ impl ToolRefGroupId {
     /// Tool names belonging to this group.
     pub fn tool_names(&self) -> &'static [&'static str] {
         match self {
-            Self::Core => &["project", "plan", "task", "step", "constraint", "release", "milestone"],
+            Self::Core => &[
+                "project",
+                "plan",
+                "task",
+                "step",
+                "constraint",
+                "release",
+                "milestone",
+            ],
             Self::Knowledge => &["note", "decision", "commit"],
             Self::CodeExploration => &["code", "analysis_profile"],
             Self::Structural => &["admin"],
@@ -1147,6 +1155,7 @@ impl ToolRefGroupId {
 }
 
 /// Context for tool group selection.
+#[derive(Default)]
 pub struct ToolGroupSelectionContext {
     pub scaffolding_level: u8,
     pub has_active_protocol: bool,
@@ -1158,39 +1167,69 @@ pub struct ToolGroupSelectionContext {
     pub user_intent_keywords: Vec<String>,
 }
 
-impl Default for ToolGroupSelectionContext {
-    fn default() -> Self {
-        Self {
-            scaffolding_level: 0,
-            has_active_protocol: false,
-            is_multi_project: false,
-            fsm_available_tools: vec![],
-            user_intent_keywords: vec![],
-        }
-    }
-}
+// Default is derived — all fields have natural defaults (0, false, empty vecs).
 
 /// Intent keywords that trigger specific tool groups.
 const CODE_KEYWORDS: &[&str] = &[
-    "code", "function", "file", "import", "search", "find", "reference",
-    "symbol", "architecture", "impact", "call graph", "dependency",
-    "trait", "struct", "class", "cherche", "fonction", "fichier",
+    "code",
+    "function",
+    "file",
+    "import",
+    "search",
+    "find",
+    "reference",
+    "symbol",
+    "architecture",
+    "impact",
+    "call graph",
+    "dependency",
+    "trait",
+    "struct",
+    "class",
+    "cherche",
+    "fonction",
+    "fichier",
 ];
 const STRUCTURAL_KEYWORDS: &[&str] = &[
-    "admin", "sync", "maintenance", "health", "fabric", "gds",
-    "neuron", "synapse", "energy", "staleness", "hotspot",
+    "admin",
+    "sync",
+    "maintenance",
+    "health",
+    "fabric",
+    "gds",
+    "neuron",
+    "synapse",
+    "energy",
+    "staleness",
+    "hotspot",
 ];
 const BEHAVIORAL_KEYWORDS: &[&str] = &[
-    "protocol", "skill", "persona", "episode", "fsm", "state machine",
-    "transition", "protocole", "compétence",
+    "protocol",
+    "skill",
+    "persona",
+    "episode",
+    "fsm",
+    "state machine",
+    "transition",
+    "protocole",
+    "compétence",
 ];
 const WORKSPACE_KEYWORDS: &[&str] = &[
-    "workspace", "component", "resource", "multi-project", "topology",
+    "workspace",
+    "component",
+    "resource",
+    "multi-project",
+    "topology",
     "cross-project",
 ];
 const COLLAB_KEYWORDS: &[&str] = &[
-    "chat", "session", "feature graph", "sharing", "reasoning",
-    "reason", "conversation",
+    "chat",
+    "session",
+    "feature graph",
+    "sharing",
+    "reasoning",
+    "reason",
+    "conversation",
 ];
 
 /// Select which tool reference groups to include in the prompt.
@@ -1214,7 +1253,9 @@ pub fn select_tool_groups(ctx: &ToolGroupSelectionContext) -> Vec<ToolRefGroupId
                 }
                 // Include group if any of its tools is in the whitelist
                 group.tool_names().iter().any(|tool| {
-                    ctx.fsm_available_tools.iter().any(|allowed| allowed == tool)
+                    ctx.fsm_available_tools
+                        .iter()
+                        .any(|allowed| allowed == tool)
                 })
             })
             .collect();
@@ -1262,10 +1303,7 @@ pub fn select_tool_groups(ctx: &ToolGroupSelectionContext) -> Vec<ToolRefGroupId
 ///
 /// Parses TOOL_REFERENCE by finding `## toolname` headers and extracting only
 /// the sections whose tool names match the selected groups.
-pub fn extract_tool_reference(
-    tool_reference: &str,
-    groups: &[ToolRefGroupId],
-) -> String {
+pub fn extract_tool_reference(tool_reference: &str, groups: &[ToolRefGroupId]) -> String {
     // Collect all tool names we want
     let wanted_tools: Vec<&str> = groups
         .iter()
@@ -1291,7 +1329,7 @@ pub fn extract_tool_reference(
             // Tool name is the word after "## " — e.g., "## project" → "project"
             // But some lines are "## project\n" and some are like "## workspace_milestone"
             current_tool = Some(tool_name);
-            include_current = wanted_tools.iter().any(|w| *w == tool_name);
+            include_current = wanted_tools.contains(&tool_name);
             current_section.clear();
             if include_current {
                 current_section.push_str(line);
@@ -1350,7 +1388,12 @@ mod tests {
     fn test_section_priorities_reasonable() {
         let sections = all_base_sections();
         for s in &sections {
-            assert!(s.priority <= 20, "Priority {} too high for {:?}", s.priority, s.id);
+            assert!(
+                s.priority <= 20,
+                "Priority {} too high for {:?}",
+                s.priority,
+                s.id
+            );
         }
     }
 
@@ -1359,7 +1402,8 @@ mod tests {
         let ctx = ComposerContext::level0_full();
         let selected = select_sections(&ctx);
         assert_eq!(
-            selected.len(), 16,
+            selected.len(),
+            16,
             "L0 with full context should activate all 16 sections, got {}",
             selected.len()
         );
@@ -1400,11 +1444,26 @@ mod tests {
         let selected = select_sections(&ctx);
         let ids: Vec<_> = selected.iter().map(|s| s.id).collect();
 
-        assert!(ids.contains(&PromptSectionId::IdentityRole), "Identity always included");
-        assert!(ids.contains(&PromptSectionId::MegatoolsSyntax), "Megatools always included");
-        assert!(ids.contains(&PromptSectionId::BestPracticesImpact), "BP Impact always included");
-        assert!(ids.contains(&PromptSectionId::BestPracticesKnowledge), "BP Knowledge always included");
-        assert!(ids.contains(&PromptSectionId::ToolReference), "ToolRef always included");
+        assert!(
+            ids.contains(&PromptSectionId::IdentityRole),
+            "Identity always included"
+        );
+        assert!(
+            ids.contains(&PromptSectionId::MegatoolsSyntax),
+            "Megatools always included"
+        );
+        assert!(
+            ids.contains(&PromptSectionId::BestPracticesImpact),
+            "BP Impact always included"
+        );
+        assert!(
+            ids.contains(&PromptSectionId::BestPracticesKnowledge),
+            "BP Knowledge always included"
+        );
+        assert!(
+            ids.contains(&PromptSectionId::ToolReference),
+            "ToolRef always included"
+        );
     }
 
     #[test]
@@ -1418,8 +1477,14 @@ mod tests {
         let selected = select_sections(&ctx);
         let ids: Vec<_> = selected.iter().map(|s| s.id).collect();
 
-        assert!(!ids.contains(&PromptSectionId::TaskExecutionProtocol), "TaskExec excluded without plan");
-        assert!(!ids.contains(&PromptSectionId::PlanExecutionAutomation), "PlanExec excluded without plan");
+        assert!(
+            !ids.contains(&PromptSectionId::TaskExecutionProtocol),
+            "TaskExec excluded without plan"
+        );
+        assert!(
+            !ids.contains(&PromptSectionId::PlanExecutionAutomation),
+            "PlanExec excluded without plan"
+        );
     }
 
     #[test]
@@ -1448,17 +1513,38 @@ mod tests {
         let sections = select_sections(&ctx);
         let assembled = assemble_sections(&sections);
 
-        assert!(assembled.contains("# Development Agent"), "Should start with title");
-        assert!(assembled.contains("## 1. Identity & Role"), "Should contain Identity section");
-        assert!(assembled.contains("## 2. Mega-tools"), "Should contain Megatools section");
-        assert!(assembled.contains("## 3. Data Model"), "Should contain Data Model section");
-        assert!(assembled.contains("## 4. Git Workflow"), "Should contain Git section");
+        assert!(
+            assembled.contains("# Development Agent"),
+            "Should start with title"
+        );
+        assert!(
+            assembled.contains("## 1. Identity & Role"),
+            "Should contain Identity section"
+        );
+        assert!(
+            assembled.contains("## 2. Mega-tools"),
+            "Should contain Megatools section"
+        );
+        assert!(
+            assembled.contains("## 3. Data Model"),
+            "Should contain Data Model section"
+        );
+        assert!(
+            assembled.contains("## 4. Git Workflow"),
+            "Should contain Git section"
+        );
     }
 
     #[test]
     fn test_display_section_id() {
-        assert_eq!(format!("{}", PromptSectionId::IdentityRole), "identity_role");
-        assert_eq!(format!("{}", PromptSectionId::ToolReference), "tool_reference");
+        assert_eq!(
+            format!("{}", PromptSectionId::IdentityRole),
+            "identity_role"
+        );
+        assert_eq!(
+            format!("{}", PromptSectionId::ToolReference),
+            "tool_reference"
+        );
     }
 
     #[test]
@@ -1480,7 +1566,10 @@ mod tests {
             assert!(
                 section_counts[i] <= section_counts[i - 1],
                 "L{} ({} sections) should have <= L{} ({} sections)",
-                i, section_counts[i], i - 1, section_counts[i - 1]
+                i,
+                section_counts[i],
+                i - 1,
+                section_counts[i - 1]
             );
         }
     }
@@ -1522,7 +1611,8 @@ mod tests {
         let ctx = ToolGroupSelectionContext::default(); // L0
         let groups = select_tool_groups(&ctx);
         assert_eq!(
-            groups.len(), 7,
+            groups.len(),
+            7,
             "L0 should include all 7 groups, got {}",
             groups.len()
         );
@@ -1536,7 +1626,12 @@ mod tests {
         };
         let groups = select_tool_groups(&ctx);
         // At L4 without intent: Core + Knowledge only
-        assert_eq!(groups.len(), 2, "L4 without intent should have 2 groups, got {}", groups.len());
+        assert_eq!(
+            groups.len(),
+            2,
+            "L4 without intent should have 2 groups, got {}",
+            groups.len()
+        );
         assert!(groups.contains(&ToolRefGroupId::Core));
         assert!(groups.contains(&ToolRefGroupId::Knowledge));
     }
@@ -1564,10 +1659,22 @@ mod tests {
         };
         let groups = select_tool_groups(&ctx);
         // Core + Knowledge always, plus CodeExploration (has "code") and Knowledge (has "note")
-        assert!(groups.contains(&ToolRefGroupId::Core), "Core always included");
-        assert!(groups.contains(&ToolRefGroupId::Knowledge), "Knowledge always included");
-        assert!(groups.contains(&ToolRefGroupId::CodeExploration), "CodeExploration has 'code'");
-        assert!(!groups.contains(&ToolRefGroupId::Workspace), "Workspace not in whitelist");
+        assert!(
+            groups.contains(&ToolRefGroupId::Core),
+            "Core always included"
+        );
+        assert!(
+            groups.contains(&ToolRefGroupId::Knowledge),
+            "Knowledge always included"
+        );
+        assert!(
+            groups.contains(&ToolRefGroupId::CodeExploration),
+            "CodeExploration has 'code'"
+        );
+        assert!(
+            !groups.contains(&ToolRefGroupId::Workspace),
+            "Workspace not in whitelist"
+        );
     }
 
     #[test]
@@ -1601,8 +1708,11 @@ mod tests {
     fn test_extract_tool_reference_smaller_than_full() {
         use crate::chat::prompt::TOOL_REFERENCE;
 
-        let core_only = extract_tool_reference(TOOL_REFERENCE, &[ToolRefGroupId::Core, ToolRefGroupId::Knowledge]);
-        let full = extract_tool_reference(TOOL_REFERENCE, &ToolRefGroupId::ALL.to_vec());
+        let core_only = extract_tool_reference(
+            TOOL_REFERENCE,
+            &[ToolRefGroupId::Core, ToolRefGroupId::Knowledge],
+        );
+        let full = extract_tool_reference(TOOL_REFERENCE, ToolRefGroupId::ALL);
 
         assert!(
             core_only.len() < full.len(),

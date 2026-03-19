@@ -42,10 +42,7 @@ pub struct SeedResult {
 /// enrich them with prompt fragments, and upsert back.
 ///
 /// Idempotent — safe to run multiple times.
-pub async fn seed_prompt_fragments(
-    graph: &dyn GraphStore,
-    project_id: Uuid,
-) -> Result<SeedResult> {
+pub async fn seed_prompt_fragments(graph: &dyn GraphStore, project_id: Uuid) -> Result<SeedResult> {
     let protocol_seeds = build_protocol_seeds();
     let mut updated = 0;
     let mut skipped = 0;
@@ -57,12 +54,8 @@ pub async fn seed_prompt_fragments(
         let protocol_id = match graph
             .get_protocol_by_name_and_project(proto_seed.protocol_name, project_id)
             .await
-            .with_context(|| {
-                format!(
-                    "Failed to look up protocol '{}'",
-                    proto_seed.protocol_name
-                )
-            })? {
+            .with_context(|| format!("Failed to look up protocol '{}'", proto_seed.protocol_name))?
+        {
             Some(id) => {
                 protocols_found += 1;
                 id
@@ -107,15 +100,12 @@ pub async fn seed_prompt_fragments(
                     .as_ref()
                     .map(|v| v.iter().map(|s| s.to_string()).collect());
 
-                graph
-                    .upsert_protocol_state(&state)
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "Failed to upsert state '{}/{}",
-                            proto_seed.protocol_name, fragment.state_name
-                        )
-                    })?;
+                graph.upsert_protocol_state(&state).await.with_context(|| {
+                    format!(
+                        "Failed to upsert state '{}/{}",
+                        proto_seed.protocol_name, fragment.state_name
+                    )
+                })?;
 
                 updated += 1;
                 info!(
@@ -176,9 +166,7 @@ before any work begins. Execute at least 3 of these 5 actions: \
 (4) note(get_propagated) for files likely to be touched, \
 (5) note(search) with exact keywords. \
 Summarize what you found before proceeding. Do NOT start modifying code yet.",
-                available_tools: Some(vec![
-                    "note", "decision", "code", "project", "task", "plan",
-                ]),
+                available_tools: Some(vec!["note", "decision", "code", "project", "task", "plan"]),
                 forbidden_actions: Some(vec![
                     "Do NOT edit or write any file during warm-up",
                     "Do NOT create commits",
@@ -208,9 +196,7 @@ discovery (bug root cause, pattern, convention, gotcha), create a note NOW. \
 Review open task/step statuses — are any stale? \
 If you've been working for a while, consider whether the current approach \
 is still optimal or if you should pivot.",
-                available_tools: Some(vec![
-                    "note", "decision", "task", "step", "commit",
-                ]),
+                available_tools: Some(vec!["note", "decision", "task", "step", "commit"]),
                 forbidden_actions: Some(vec![
                     "Do NOT continue coding without completing the reflection",
                     "Do NOT skip note creation if the ratio is above 5:1",
@@ -226,9 +212,7 @@ notes created, open questions. \
 (3) Verify every task/step status is current (no stale in_progress). \
 (4) If work is incomplete, document the exact resumption point. \
 This is your last chance to persist what you learned.",
-                available_tools: Some(vec![
-                    "note", "chat", "task", "step", "commit", "decision",
-                ]),
+                available_tools: Some(vec!["note", "chat", "task", "step", "commit", "decision"]),
                 forbidden_actions: Some(vec![
                     "Do NOT start new features during closing",
                     "Do NOT skip chat(add_discussed) — it feeds the Knowledge Fabric",
@@ -263,9 +247,7 @@ examples if relevant), **Alternatives** (other options considered and why reject
 **Impact** (affected files, components, breaking changes, migration path). \
 Use code(analyze_impact) and code(get_architecture) to ground the proposal in \
 actual codebase structure. Create the RFC as note(type: rfc, importance: high).",
-                available_tools: Some(vec![
-                    "note", "code", "decision", "project",
-                ]),
+                available_tools: Some(vec!["note", "code", "decision", "project"]),
                 forbidden_actions: Some(vec![
                     "Do NOT implement any code changes during draft phase",
                     "Do NOT skip the Alternatives section",
@@ -279,9 +261,7 @@ RFC is PROPOSED and awaiting review. Ensure the RFC note is linked to the projec
 and any relevant files via note(link_to_entity). Notify stakeholders by summarizing \
 the key trade-offs. Prepare a list of specific questions for reviewers to focus on. \
 Do not proceed to implementation until the RFC advances to accepted.",
-                available_tools: Some(vec![
-                    "note", "code", "decision",
-                ]),
+                available_tools: Some(vec!["note", "code", "decision"]),
                 forbidden_actions: Some(vec![
                     "Do NOT start implementation — the RFC is not yet accepted",
                     "Do NOT modify the RFC content without re-proposing",
@@ -294,9 +274,7 @@ RFC is UNDER REVIEW. Collect and address feedback systematically. For each piece
 feedback: (1) acknowledge it, (2) if it requires changes, update the RFC content, \
 (3) if you disagree, document your reasoning. Track all review comments. \
 When all feedback is addressed, the RFC can advance to accepted or be rejected.",
-                available_tools: Some(vec![
-                    "note", "decision", "code",
-                ]),
+                available_tools: Some(vec!["note", "decision", "code"]),
                 forbidden_actions: Some(vec![
                     "Do NOT ignore reviewer feedback",
                     "Do NOT start implementation while review is ongoing",
@@ -309,9 +287,7 @@ RFC is ACCEPTED. Record this as a formal architectural decision via \
 decision(add) with the rationale, alternatives considered, and chosen option. \
 Link the decision to all affected files using decision(add_affects). \
 The RFC is now ready for planning — advance to the planning state.",
-                available_tools: Some(vec![
-                    "note", "decision", "plan", "code",
-                ]),
+                available_tools: Some(vec!["note", "decision", "plan", "code"]),
                 forbidden_actions: Some(vec![
                     "Do NOT skip recording the formal decision",
                     "Do NOT start coding without creating a plan first",
@@ -328,7 +304,13 @@ Create an implementation PLAN for the accepted RFC. Use the Planning Protocol: \
 (5) Link the RFC note to the plan via note(link_to_entity, plan). \
 Use plan(get_waves) to verify parallelizability.",
                 available_tools: Some(vec![
-                    "plan", "task", "step", "constraint", "note", "milestone", "code",
+                    "plan",
+                    "task",
+                    "step",
+                    "constraint",
+                    "note",
+                    "milestone",
+                    "code",
                 ]),
                 forbidden_actions: Some(vec![
                     "Do NOT create tasks without steps",
@@ -357,9 +339,7 @@ RFC is IMPLEMENTED. All tasks are complete and acceptance criteria are met. \
 Create a final summary note documenting: what was built, key decisions made \
 during implementation, any deviations from the original proposal, and lessons learned. \
 Link the final commit to the plan. The RFC lifecycle is complete.",
-                available_tools: Some(vec![
-                    "note", "commit", "plan", "decision",
-                ]),
+                available_tools: Some(vec!["note", "commit", "plan", "decision"]),
                 forbidden_actions: None,
             },
             StateFragment {
@@ -369,12 +349,8 @@ RFC has been REJECTED. Document the rejection rationale as a decision note. \
 Record what was learned from the proposal process — even rejected RFCs \
 generate valuable knowledge about constraints, trade-offs, and requirements. \
 Link the rejection decision to the RFC note.",
-                available_tools: Some(vec![
-                    "note", "decision",
-                ]),
-                forbidden_actions: Some(vec![
-                    "Do NOT implement any part of a rejected RFC",
-                ]),
+                available_tools: Some(vec!["note", "decision"]),
+                forbidden_actions: Some(vec!["Do NOT implement any part of a rejected RFC"]),
             },
             StateFragment {
                 state_name: "superseded",
@@ -382,9 +358,7 @@ Link the rejection decision to the RFC note.",
 RFC has been SUPERSEDED by a newer proposal. Use note(supersede) to link \
 the old RFC to its successor. Ensure the successor RFC references the \
 original's rationale and explains what changed. Preserve the knowledge chain.",
-                available_tools: Some(vec![
-                    "note", "decision",
-                ]),
+                available_tools: Some(vec!["note", "decision"]),
                 forbidden_actions: Some(vec![
                     "Do NOT delete the superseded RFC — it's part of the decision history",
                 ]),
@@ -409,9 +383,7 @@ Verify that ALL tasks have affected_files populated — empty affected_files mea
 the wave splitter cannot detect conflicts. If any task lacks affected_files, \
 call task(enrich) or manually add them before proceeding. \
 Review the wave structure: tasks in the same wave must not share affected_files.",
-                available_tools: Some(vec![
-                    "plan", "task", "step", "code", "constraint",
-                ]),
+                available_tools: Some(vec!["plan", "task", "step", "code", "constraint"]),
                 forbidden_actions: Some(vec![
                     "Do NOT dispatch agents before waves are computed and validated",
                     "Do NOT proceed if tasks have empty affected_files",
@@ -426,9 +398,7 @@ PREPARE the current wave. For each task in this wave: \
 (3) note(get_context) for each affected file to inject relevant knowledge. \
 Determine the wave type: single-task waves get foreground agents (can compile), \
 multi-task waves get background agents (code-only, no build).",
-                available_tools: Some(vec![
-                    "task", "step", "constraint", "note", "plan", "code",
-                ]),
+                available_tools: Some(vec!["task", "step", "constraint", "note", "plan", "code"]),
                 forbidden_actions: Some(vec![
                     "Do NOT launch agents without loading task context first",
                     "Do NOT allow multi-task wave agents to run builds — file conflicts risk",
@@ -457,9 +427,7 @@ AWAIT wave completion. Use TaskOutput(block: true) on ALL agent IDs from this wa
 Monitor progress via step(get_progress) for each task. If an agent fails, \
 check its output for error details. Do NOT proceed to validation until \
 ALL agents in the wave have completed (success or failure).",
-                available_tools: Some(vec![
-                    "step", "task", "note",
-                ]),
+                available_tools: Some(vec!["step", "task", "note"]),
                 forbidden_actions: Some(vec![
                     "Do NOT proceed to validate_wave before all agents complete",
                     "Do NOT launch next wave agents while current wave is running",
@@ -473,9 +441,7 @@ to verify all agents' changes compile together. (2) Read notes created by \
 sub-agents — they may contain cross-wave knowledge needed for later waves. \
 (3) Update task statuses: completed for success, failed for errors. \
 (4) If build fails, identify which agent's changes broke it and fix before continuing.",
-                available_tools: Some(vec![
-                    "task", "step", "note", "code", "commit",
-                ]),
+                available_tools: Some(vec!["task", "step", "note", "code", "commit"]),
                 forbidden_actions: Some(vec![
                     "Do NOT skip the build validation step",
                     "Do NOT mark tasks completed if the build is broken",
@@ -488,9 +454,7 @@ CHECK remaining waves. If more waves exist, commit the current wave's changes, \
 then loop back to prepare_wave for the next wave. If all waves are done, \
 run a final build + test suite, update plan status to completed, \
 and create a summary commit linking to the plan.",
-                available_tools: Some(vec![
-                    "plan", "task", "commit", "note",
-                ]),
+                available_tools: Some(vec!["plan", "task", "commit", "note"]),
                 forbidden_actions: Some(vec![
                     "Do NOT skip the final build+test when all waves complete",
                 ]),
@@ -501,9 +465,7 @@ and create a summary commit linking to the plan.",
 Plan execution is COMPLETE. All waves executed, all tasks done, build passes. \
 Create a summary note documenting: total waves, tasks completed, time taken, \
 any issues encountered. Link the final commit to the plan.",
-                available_tools: Some(vec![
-                    "plan", "commit", "note", "milestone", "release",
-                ]),
+                available_tools: Some(vec!["plan", "commit", "note", "milestone", "release"]),
                 forbidden_actions: None,
             },
         ],
@@ -633,9 +595,7 @@ Run COMPREHENSIVE health assessment. Call admin(persist_health_report, project_i
 to capture current state: hotspots, knowledge gaps, risk assessment, neural metrics, \
 and audit gaps. This persists a timestamped health note for delta comparison. \
 The report is the foundation for all subsequent triage and remediation.",
-                available_tools: Some(vec![
-                    "admin", "code", "project",
-                ]),
+                available_tools: Some(vec!["admin", "code", "project"]),
                 forbidden_actions: Some(vec![
                     "Do NOT skip the health report — all downstream decisions depend on it",
                     "Do NOT start fixing issues before the report is complete",
@@ -649,9 +609,7 @@ via note(search, 'health-check auto-generated'). Identify degradation trends: \
 new hotspots appearing, growing knowledge gaps, dying neurons (energy approaching 0), \
 stale notes accumulating. Highlight any metric that changed by more than 20% since last check. \
 If no previous report exists, skip delta and proceed to triage with absolute values.",
-                available_tools: Some(vec![
-                    "note", "code", "admin",
-                ]),
+                available_tools: Some(vec!["note", "code", "admin"]),
                 forbidden_actions: Some(vec![
                     "Do NOT ignore degradation trends — they compound over time",
                 ]),
@@ -664,9 +622,7 @@ CLASSIFY issues by severity and actionability. Three categories: \
 (2) AGENT-FIXABLE — knowledge gaps, undocumented hotspots, orphan decisions: create tasks, \
 (3) HUMAN-REQUIRED — architecture changes, major refactoring: flag for human review. \
 Build a prioritized remediation list. Critical items first.",
-                available_tools: Some(vec![
-                    "note", "code", "admin",
-                ]),
+                available_tools: Some(vec!["note", "code", "admin"]),
                 forbidden_actions: Some(vec![
                     "Do NOT attempt human-required fixes autonomously",
                     "Do NOT skip prioritization — fix high-impact issues first",
@@ -683,9 +639,7 @@ Execute AUTOMATIC remediations that require no human judgment: \
 (5) admin(update_fabric_scores) — recalculate multi-layer GDS scores, \
 (6) admin(maintain_skills, 'daily') — skill lifecycle maintenance. \
 These are safe, idempotent operations.",
-                available_tools: Some(vec![
-                    "admin",
-                ]),
+                available_tools: Some(vec!["admin"]),
                 forbidden_actions: Some(vec![
                     "Do NOT run deep_maintenance here — it's too heavy for daily runs",
                     "Do NOT modify code or notes during auto_fix — only graph maintenance",
@@ -700,9 +654,7 @@ Create a REMEDIATION PLAN for agent-fixable issues. Use plan(create) with: \
 (3) A task for each orphan decision needing AFFECTS links. \
 Set priority based on the risk_score from the health report. \
 Only create the plan if there are actionable issues — do not create empty plans.",
-                available_tools: Some(vec![
-                    "plan", "task", "step", "note", "decision", "code",
-                ]),
+                available_tools: Some(vec!["plan", "task", "step", "note", "decision", "code"]),
                 forbidden_actions: Some(vec![
                     "Do NOT create empty remediation plans",
                     "Do NOT create tasks for human-required issues",
@@ -807,11 +759,31 @@ mod tests {
     #[test]
     fn test_available_tools_are_valid() {
         let valid_tools = [
-            "project", "plan", "task", "step", "decision", "constraint",
-            "release", "milestone", "commit", "note", "workspace",
-            "workspace_milestone", "resource", "component", "chat",
-            "feature_graph", "code", "reasoning", "admin", "skill",
-            "analysis_profile", "protocol", "persona", "episode", "sharing",
+            "project",
+            "plan",
+            "task",
+            "step",
+            "decision",
+            "constraint",
+            "release",
+            "milestone",
+            "commit",
+            "note",
+            "workspace",
+            "workspace_milestone",
+            "resource",
+            "component",
+            "chat",
+            "feature_graph",
+            "code",
+            "reasoning",
+            "admin",
+            "skill",
+            "analysis_profile",
+            "protocol",
+            "persona",
+            "episode",
+            "sharing",
         ];
 
         let protocols = build_protocol_seeds();

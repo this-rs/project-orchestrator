@@ -3582,12 +3582,10 @@ pub async fn seed_prompt_fragments(
         .map_err(AppError::Internal)?
         .ok_or_else(|| AppError::NotFound(format!("Project not found: {}", project_id)))?;
 
-    let result = crate::protocol::seed::seed_prompt_fragments(
-        state.orchestrator.neo4j(),
-        project_id,
-    )
-    .await
-    .map_err(AppError::Internal)?;
+    let result =
+        crate::protocol::seed::seed_prompt_fragments(state.orchestrator.neo4j(), project_id)
+            .await
+            .map_err(AppError::Internal)?;
 
     Ok(Json(serde_json::to_value(&result).unwrap_or_default()))
 }

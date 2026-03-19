@@ -45,6 +45,9 @@ pub struct EnrichmentConfig {
     /// Enable the user profile stage (adaptive behavioral profile injection).
     #[serde(default)]
     pub user_profile: bool,
+    /// Enable the persona stage (auto-detect relevant persona for mentioned files).
+    #[serde(default)]
+    pub persona: bool,
     /// Enable the reasoning tree injection stage.
     pub reasoning_tree: bool,
     /// Enable debug mode (logs timing and content of each stage).
@@ -62,6 +65,7 @@ impl Default for EnrichmentConfig {
             biomimicry: false, // Disabled by default — opt-in via ENRICHMENT_BIOMIMICRY=true
             reflex: false,     // Disabled by default — opt-in via ENRICHMENT_REFLEX=true
             user_profile: false, // Disabled by default — opt-in via ENRICHMENT_USER_PROFILE=true
+            persona: false,    // Disabled by default — opt-in via ENRICHMENT_PERSONA=true
             reasoning_tree: true,
             debug: false,
             max_pipeline_ms: 500,
@@ -97,6 +101,9 @@ impl EnrichmentConfig {
                 .map(|v| v == "true" || v == "1")
                 .unwrap_or(false),
             user_profile: std::env::var("ENRICHMENT_USER_PROFILE")
+                .map(|v| v == "true" || v == "1")
+                .unwrap_or(false),
+            persona: std::env::var("ENRICHMENT_PERSONA")
                 .map(|v| v == "true" || v == "1")
                 .unwrap_or(false),
             reasoning_tree: std::env::var("ENRICHMENT_REASONING_TREE")
@@ -783,6 +790,7 @@ mod tests {
             biomimicry: false,
             reflex: false,
             user_profile: false,
+            persona: false,
             reasoning_tree: true,
             debug: true,
             max_pipeline_ms: 1000,

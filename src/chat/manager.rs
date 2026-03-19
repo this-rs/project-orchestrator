@@ -26,7 +26,7 @@ use nexus_claude::{
     build_hook_response_json, dispatch_hook_from_registry, is_hook_callback,
     memory::{ContextInjector, ConversationMemoryManager, MemoryConfig},
     ClaudeCodeOptions, ContentBlock, ContentValue, InteractiveClient, McpServerConfig, Message,
-    PermissionMode, StreamDelta, StreamEventData,
+    StreamDelta, StreamEventData,
 };
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
@@ -164,6 +164,9 @@ pub struct ChatManager {
     /// When Some, `close_session()` calls `end_session()` to finalize trajectories.
     pub(crate) trajectory_collector:
         Option<std::sync::Arc<neural_routing_runtime::TrajectoryCollector>>,
+    /// Optional reasoning tree engine for StatusInjectionStage.
+    /// When Some, the status stage can build reasoning trees from the knowledge graph.
+    pub(crate) reasoning_engine: Option<Arc<crate::reasoning::ReasoningTreeEngine>>,
 }
 
 // ============================================================================
@@ -316,6 +319,7 @@ impl ChatManager {
             pipeline.add_stage(Box::new(super::stages::UserProfileStage::new(
                 graph.clone(),
             )));
+            pipeline.add_stage(Box::new(super::stages::PersonaStage::new(graph.clone())));
             pipeline.add_stage(Box::new(super::stages::KnowledgeInjectionStage::new(
                 graph.clone(),
                 search.clone(),
@@ -345,6 +349,7 @@ impl ChatManager {
             env_config,
             enrichment_pipeline,
             trajectory_collector: None,
+            reasoning_engine: None,
         }
     }
 
@@ -390,6 +395,7 @@ impl ChatManager {
             pipeline.add_stage(Box::new(super::stages::UserProfileStage::new(
                 graph.clone(),
             )));
+            pipeline.add_stage(Box::new(super::stages::PersonaStage::new(graph.clone())));
             pipeline.add_stage(Box::new(super::stages::KnowledgeInjectionStage::new(
                 graph.clone(),
                 search.clone(),
@@ -419,6 +425,7 @@ impl ChatManager {
             env_config,
             enrichment_pipeline,
             trajectory_collector: None,
+            reasoning_engine: None,
         }
     }
 
@@ -444,6 +451,58 @@ impl ChatManager {
         self
     }
 
+    /// Attach a reasoning tree engine for the StatusInjectionStage.
+    ///
+    /// Rebuilds the enrichment pipeline so that `StatusInjectionStage` receives
+    /// the engine and can build reasoning trees from the knowledge graph.
+    pub fn with_reasoning_engine(
+        mut self,
+        engine: Arc<crate::reasoning::ReasoningTreeEngine>,
+    ) -> Self {
+        self.reasoning_engine = Some(engine.clone());
+        // Rebuild the pipeline with the reasoning engine wired in
+        let mut pipeline = super::enrichment::EnrichmentPipeline::new(
+            super::enrichment::EnrichmentConfig::from_env(),
+        );
+        let skill_stage = super::stages::SkillActivationStage::new(self.graph.clone());
+        let skill_stage = if let Some(ref tc) = self.trajectory_collector {
+            skill_stage.with_collector(tc.clone())
+        } else {
+            skill_stage
+        };
+        pipeline.add_stage(Box::new(skill_stage));
+        pipeline.add_stage(Box::new(super::stages::BiomimicryStage::new(
+            self.graph.clone(),
+        )));
+        pipeline.add_stage(Box::new(super::stages::UserProfileStage::new(
+            self.graph.clone(),
+        )));
+        pipeline.add_stage(Box::new(super::stages::PersonaStage::new(
+            self.graph.clone(),
+        )));
+        let ki_stage =
+            super::stages::KnowledgeInjectionStage::new(self.graph.clone(), self.search.clone());
+        let ki_stage = if let Some(ref tc) = self.trajectory_collector {
+            ki_stage.with_collector(tc.clone())
+        } else {
+            ki_stage
+        };
+        pipeline.add_stage(Box::new(ki_stage));
+        pipeline.add_stage(Box::new(super::stages::StatusInjectionStage::with_config(
+            self.graph.clone(),
+            Some(engine),
+            Arc::new(super::stages::GraphProtocolProvider::new(
+                self.graph.clone(),
+            )),
+            super::stages::StatusInjectionConfig::default(),
+        )));
+        pipeline.add_stage(Box::new(super::stages::FileContextStage::new(
+            self.graph.clone(),
+        )));
+        self.enrichment_pipeline = std::sync::Arc::new(pipeline);
+        self
+    }
+
     /// Attach a trajectory collector to the enrichment pipeline stages.
     ///
     /// Rebuilds the pipeline so that `SkillActivationStage` and
@@ -465,13 +524,16 @@ impl ChatManager {
         pipeline.add_stage(Box::new(super::stages::UserProfileStage::new(
             self.graph.clone(),
         )));
+        pipeline.add_stage(Box::new(super::stages::PersonaStage::new(
+            self.graph.clone(),
+        )));
         pipeline.add_stage(Box::new(
             super::stages::KnowledgeInjectionStage::new(self.graph.clone(), self.search.clone())
                 .with_collector(collector.clone()),
         ));
         pipeline.add_stage(Box::new(super::stages::StatusInjectionStage::with_config(
             self.graph.clone(),
-            None,
+            self.reasoning_engine.clone(),
             Arc::new(super::stages::GraphProtocolProvider::new(
                 self.graph.clone(),
             )),
@@ -1326,6 +1388,7 @@ impl ChatManager {
     /// 2. FSM context — injected from active protocol runs
     /// 3. Dynamic context — markdown rendering of project context + session continuity
     /// 4. Tool reference — selectively rendered by intent + FSM + scaffolding
+    ///
     /// Build the system prompt and return the set of note IDs included
     /// (from guidelines/gotchas) for deduplication with the enrichment pipeline.
     pub async fn build_system_prompt(
@@ -1415,14 +1478,14 @@ impl ChatManager {
             .await
             {
                 Ok(Ok(level)) => {
-                    debug!(
-                        "[composer] Scaffolding L{} for '{}'",
-                        level.level, slug
-                    );
+                    debug!("[composer] Scaffolding L{} for '{}'", level.level, slug);
                     level.level
                 }
                 Ok(Err(e)) => {
-                    warn!("[composer] Scaffolding computation failed: {} — defaulting to L0", e);
+                    warn!(
+                        "[composer] Scaffolding computation failed: {} — defaulting to L0",
+                        e
+                    );
                     0
                 }
                 Err(_) => {
@@ -5177,7 +5240,7 @@ mod tests {
     use crate::neo4j::models::ChatSessionNode;
     use crate::test_helpers::{mock_app_state, test_chat_session, test_project};
     use nexus_claude::{
-        AssistantMessage, ContentBlock, ContentValue, TextContent, ThinkingContent,
+        AssistantMessage, ContentBlock, ContentValue, PermissionMode, TextContent, ThinkingContent,
         ToolResultContent, ToolUseContent,
     };
     use std::path::PathBuf;
