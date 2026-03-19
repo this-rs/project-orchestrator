@@ -1123,7 +1123,10 @@ impl Neo4jClient {
         };
 
         // Count query (DISTINCT to avoid duplicates when a plan is linked to multiple projects in the same workspace)
-        let count_cypher = format!("{} {} RETURN count(DISTINCT p) AS total", match_clause, where_clause);
+        let count_cypher = format!(
+            "{} {} RETURN count(DISTINCT p) AS total",
+            match_clause, where_clause
+        );
         let count_result = self.execute(&count_cypher).await?;
         let total: i64 = count_result
             .first()
