@@ -1210,6 +1210,7 @@ pub async fn start_server(mut config: Config) -> Result<()> {
         if let Some(ref tc) = *trajectory_collector.read().unwrap() {
             cm = cm.with_trajectory_collector(tc.clone());
         }
+        cm = cm.with_nn_router(neural_router.clone());
         if let Some(re) = orchestrator.reasoning_engine() {
             cm = cm.with_reasoning_engine(re.clone());
         }
