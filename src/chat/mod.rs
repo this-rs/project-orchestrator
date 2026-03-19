@@ -30,4 +30,4 @@ pub use entity_extractor::{
     ValidatedEntity,
 };
 pub use manager::ChatManager;
-pub use types::{ChatEvent, ChatRequest, ChatSession, ClientMessage};
+pub use types::{ChatEvent, ChatRequest, ChatSession, ClientMessage, SpawnedBy};
