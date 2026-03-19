@@ -308,3 +308,247 @@ fn snake_case_from_debug(s: &str) -> String {
     }
     result
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lifecycle::{
+        LifecycleActionType, LifecycleHook, LifecycleScope, UpdateLifecycleHookRequest,
+    };
+    use crate::neo4j::mock::MockGraphStore;
+    use crate::neo4j::traits::GraphStore;
+
+    fn make_hook(name: &str, scope: LifecycleScope, on_status: &str) -> LifecycleHook {
+        LifecycleHook::new(
+            name.to_string(),
+            scope,
+            on_status.to_string(),
+            LifecycleActionType::EmitAlert,
+            serde_json::json!({"level": "info"}),
+        )
+    }
+
+    // ── snake_case_from_debug tests ──
+
+    #[test]
+    fn test_snake_case_from_debug_cascade_children() {
+        assert_eq!(snake_case_from_debug("CascadeChildren"), "cascade_children");
+    }
+
+    #[test]
+    fn test_snake_case_from_debug_mcp_call() {
+        assert_eq!(snake_case_from_debug("McpCall"), "mcp_call");
+    }
+
+    #[test]
+    fn test_snake_case_from_debug_single_word() {
+        assert_eq!(snake_case_from_debug("Task"), "task");
+    }
+
+    #[test]
+    fn test_snake_case_from_debug_already_lowercase() {
+        assert_eq!(snake_case_from_debug("task"), "task");
+    }
+
+    // ── CRUD operations via MockGraphStore ──
+
+    #[tokio::test]
+    async fn test_create_and_get_lifecycle_hook() {
+        let store = MockGraphStore::new();
+        let hook = make_hook("alert-on-complete", LifecycleScope::Task, "completed");
+        let hook_id = hook.id;
+
+        store.create_lifecycle_hook(&hook).await.unwrap();
+
+        let retrieved = store.get_lifecycle_hook(hook_id).await.unwrap();
+        assert!(retrieved.is_some());
+        let retrieved = retrieved.unwrap();
+        assert_eq!(retrieved.name, "alert-on-complete");
+        assert_eq!(retrieved.scope, LifecycleScope::Task);
+        assert_eq!(retrieved.on_status, "completed");
+    }
+
+    #[tokio::test]
+    async fn test_get_nonexistent_hook_returns_none() {
+        let store = MockGraphStore::new();
+        let result = store.get_lifecycle_hook(Uuid::new_v4()).await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_list_lifecycle_hooks_no_filter() {
+        let store = MockGraphStore::new();
+        let h1 = make_hook("hook-1", LifecycleScope::Task, "completed");
+        let h2 = make_hook("hook-2", LifecycleScope::Plan, "in_progress");
+        store.create_lifecycle_hook(&h1).await.unwrap();
+        store.create_lifecycle_hook(&h2).await.unwrap();
+
+        let hooks = store.list_lifecycle_hooks(None).await.unwrap();
+        assert_eq!(hooks.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_list_lifecycle_hooks_with_project_filter() {
+        let store = MockGraphStore::new();
+        let project_id = Uuid::new_v4();
+
+        let mut h1 = make_hook("project-hook", LifecycleScope::Task, "completed");
+        h1.project_id = Some(project_id);
+
+        let h2 = make_hook("global-hook", LifecycleScope::Task, "completed");
+
+        let mut h3 = make_hook("other-project-hook", LifecycleScope::Task, "completed");
+        h3.project_id = Some(Uuid::new_v4());
+
+        store.create_lifecycle_hook(&h1).await.unwrap();
+        store.create_lifecycle_hook(&h2).await.unwrap();
+        store.create_lifecycle_hook(&h3).await.unwrap();
+
+        let hooks = store.list_lifecycle_hooks(Some(project_id)).await.unwrap();
+        // Should include the project-specific hook and the global hook (no project_id)
+        assert_eq!(hooks.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_update_lifecycle_hook() {
+        let store = MockGraphStore::new();
+        let hook = make_hook("original", LifecycleScope::Task, "completed");
+        let hook_id = hook.id;
+        store.create_lifecycle_hook(&hook).await.unwrap();
+
+        let updates = UpdateLifecycleHookRequest {
+            name: Some("updated-name".to_string()),
+            description: Some(Some("new description".to_string())),
+            on_status: Some("in_progress".to_string()),
+            action_config: None,
+            priority: Some(50),
+            enabled: Some(false),
+        };
+        store
+            .update_lifecycle_hook(hook_id, &updates)
+            .await
+            .unwrap();
+
+        let updated = store.get_lifecycle_hook(hook_id).await.unwrap().unwrap();
+        assert_eq!(updated.name, "updated-name");
+        assert_eq!(updated.description.as_deref(), Some("new description"));
+        assert_eq!(updated.on_status, "in_progress");
+        assert_eq!(updated.priority, 50);
+        assert!(!updated.enabled);
+    }
+
+    #[tokio::test]
+    async fn test_delete_lifecycle_hook() {
+        let store = MockGraphStore::new();
+        let hook = make_hook("deletable", LifecycleScope::Task, "completed");
+        let hook_id = hook.id;
+        store.create_lifecycle_hook(&hook).await.unwrap();
+
+        store.delete_lifecycle_hook(hook_id).await.unwrap();
+
+        let result = store.get_lifecycle_hook(hook_id).await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_delete_builtin_hook_returns_error() {
+        let store = MockGraphStore::new();
+        let mut hook = make_hook("builtin-hook", LifecycleScope::Task, "completed");
+        hook.builtin = true;
+        let hook_id = hook.id;
+        store.create_lifecycle_hook(&hook).await.unwrap();
+
+        let result = store.delete_lifecycle_hook(hook_id).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("builtin"));
+
+        // Verify it still exists
+        let still_exists = store.get_lifecycle_hook(hook_id).await.unwrap();
+        assert!(still_exists.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_list_hooks_for_scope_filters_correctly() {
+        let store = MockGraphStore::new();
+
+        let h1 = make_hook("task-completed", LifecycleScope::Task, "completed");
+        let h2 = make_hook("task-in-progress", LifecycleScope::Task, "in_progress");
+        let h3 = make_hook("plan-completed", LifecycleScope::Plan, "completed");
+        let mut h4 = make_hook("disabled-hook", LifecycleScope::Task, "completed");
+        h4.enabled = false;
+
+        store.create_lifecycle_hook(&h1).await.unwrap();
+        store.create_lifecycle_hook(&h2).await.unwrap();
+        store.create_lifecycle_hook(&h3).await.unwrap();
+        store.create_lifecycle_hook(&h4).await.unwrap();
+
+        // Only enabled Task hooks with on_status "completed"
+        let result = store
+            .list_hooks_for_scope(&LifecycleScope::Task, "completed", None)
+            .await
+            .unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].name, "task-completed");
+    }
+
+    #[tokio::test]
+    async fn test_list_hooks_for_scope_includes_global_and_project_hooks() {
+        let store = MockGraphStore::new();
+        let project_id = Uuid::new_v4();
+
+        // Global hook (no project_id)
+        let h1 = make_hook("global", LifecycleScope::Task, "completed");
+
+        // Project-specific hook
+        let mut h2 = make_hook("project-specific", LifecycleScope::Task, "completed");
+        h2.project_id = Some(project_id);
+
+        // Hook for a different project
+        let mut h3 = make_hook("other-project", LifecycleScope::Task, "completed");
+        h3.project_id = Some(Uuid::new_v4());
+
+        store.create_lifecycle_hook(&h1).await.unwrap();
+        store.create_lifecycle_hook(&h2).await.unwrap();
+        store.create_lifecycle_hook(&h3).await.unwrap();
+
+        // With project_id: should get global + project-specific
+        let result = store
+            .list_hooks_for_scope(&LifecycleScope::Task, "completed", Some(project_id))
+            .await
+            .unwrap();
+        assert_eq!(result.len(), 2);
+
+        // Without project_id: should get only global
+        let result = store
+            .list_hooks_for_scope(&LifecycleScope::Task, "completed", None)
+            .await
+            .unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].name, "global");
+    }
+
+    #[tokio::test]
+    async fn test_list_hooks_for_scope_sorted_by_priority() {
+        let store = MockGraphStore::new();
+
+        let mut h1 = make_hook("low-priority", LifecycleScope::Task, "completed");
+        h1.priority = 200;
+        let mut h2 = make_hook("high-priority", LifecycleScope::Task, "completed");
+        h2.priority = 10;
+        let mut h3 = make_hook("mid-priority", LifecycleScope::Task, "completed");
+        h3.priority = 100;
+
+        store.create_lifecycle_hook(&h1).await.unwrap();
+        store.create_lifecycle_hook(&h2).await.unwrap();
+        store.create_lifecycle_hook(&h3).await.unwrap();
+
+        let result = store
+            .list_hooks_for_scope(&LifecycleScope::Task, "completed", None)
+            .await
+            .unwrap();
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].name, "high-priority");
+        assert_eq!(result[1].name, "mid-priority");
+        assert_eq!(result[2].name, "low-priority");
+    }
+}

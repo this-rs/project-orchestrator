@@ -353,17 +353,26 @@ mod tests {
 
     #[test]
     fn test_entity_type_to_scope_task() {
-        assert_eq!(entity_type_to_scope(&EntityType::Task), Some(LifecycleScope::Task));
+        assert_eq!(
+            entity_type_to_scope(&EntityType::Task),
+            Some(LifecycleScope::Task)
+        );
     }
 
     #[test]
     fn test_entity_type_to_scope_plan() {
-        assert_eq!(entity_type_to_scope(&EntityType::Plan), Some(LifecycleScope::Plan));
+        assert_eq!(
+            entity_type_to_scope(&EntityType::Plan),
+            Some(LifecycleScope::Plan)
+        );
     }
 
     #[test]
     fn test_entity_type_to_scope_step() {
-        assert_eq!(entity_type_to_scope(&EntityType::Step), Some(LifecycleScope::Step));
+        assert_eq!(
+            entity_type_to_scope(&EntityType::Step),
+            Some(LifecycleScope::Step)
+        );
     }
 
     #[test]
@@ -553,8 +562,7 @@ mod tests {
         );
         graph.create_lifecycle_hook(&hook).await.unwrap();
 
-        let event =
-            make_status_changed_event(EntityType::Task, &task_id.to_string(), "completed");
+        let event = make_status_changed_event(EntityType::Task, &task_id.to_string(), "completed");
         execute_lifecycle_hooks(&event, &state).await;
 
         let alerts = graph.alerts.read().await;
@@ -579,8 +587,7 @@ mod tests {
         );
         graph.create_lifecycle_hook(&hook).await.unwrap();
 
-        let event =
-            make_status_changed_event(EntityType::Task, &task_id.to_string(), "completed");
+        let event = make_status_changed_event(EntityType::Task, &task_id.to_string(), "completed");
         // Should not panic or error
         execute_lifecycle_hooks(&event, &state).await;
     }
@@ -600,8 +607,7 @@ mod tests {
         );
         graph.create_lifecycle_hook(&hook).await.unwrap();
 
-        let event =
-            make_status_changed_event(EntityType::Task, &task_id.to_string(), "completed");
+        let event = make_status_changed_event(EntityType::Task, &task_id.to_string(), "completed");
         // Error is logged but should not propagate
         execute_lifecycle_hooks(&event, &state).await;
     }
@@ -622,8 +628,7 @@ mod tests {
         );
         graph.create_lifecycle_hook(&hook).await.unwrap();
 
-        let event =
-            make_status_changed_event(EntityType::Task, &task_id.to_string(), "completed");
+        let event = make_status_changed_event(EntityType::Task, &task_id.to_string(), "completed");
         execute_lifecycle_hooks(&event, &state).await;
 
         let notes = graph.notes.read().await;
@@ -661,8 +666,7 @@ mod tests {
         graph.create_lifecycle_hook(&hook1).await.unwrap();
         graph.create_lifecycle_hook(&hook2).await.unwrap();
 
-        let event =
-            make_status_changed_event(EntityType::Task, &task_id.to_string(), "completed");
+        let event = make_status_changed_event(EntityType::Task, &task_id.to_string(), "completed");
         execute_lifecycle_hooks(&event, &state).await;
 
         let alerts = graph.alerts.read().await;
@@ -697,14 +701,18 @@ mod tests {
         graph.create_lifecycle_hook(&hook1).await.unwrap();
         graph.create_lifecycle_hook(&hook2).await.unwrap();
 
-        let event =
-            make_status_changed_event(EntityType::Task, &task_id.to_string(), "completed");
+        let event = make_status_changed_event(EntityType::Task, &task_id.to_string(), "completed");
         execute_lifecycle_hooks(&event, &state).await;
 
         // The alert from hook2 should still be created
         let alerts = graph.alerts.read().await;
         assert_eq!(alerts.len(), 1);
-        assert!(alerts.values().next().unwrap().message.contains("should-still-fire"));
+        assert!(alerts
+            .values()
+            .next()
+            .unwrap()
+            .message
+            .contains("should-still-fire"));
     }
 
     #[tokio::test]
