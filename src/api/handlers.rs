@@ -5300,8 +5300,44 @@ pub async fn receive_webhook(
 // Plan Runs — List, Get, Compare, Predict
 // ============================================================================
 
+/// Enrich a list of RunnerState with `plan_title` from the associated Plan nodes.
+/// Does a single batch query to Neo4j to resolve all unique plan_ids → titles.
+async fn enrich_runs_with_plan_titles(
+    graph: &std::sync::Arc<dyn crate::neo4j::traits::GraphStore>,
+    runs: Vec<crate::runner::state::RunnerState>,
+) -> serde_json::Value {
+    use std::collections::HashMap;
+
+    // Collect unique plan_ids
+    let plan_ids: Vec<uuid::Uuid> = runs.iter().map(|r| r.plan_id).collect::<std::collections::HashSet<_>>().into_iter().collect();
+
+    // Batch fetch plan titles
+    let mut title_map: HashMap<uuid::Uuid, String> = HashMap::new();
+    for pid in &plan_ids {
+        if let Ok(Some(plan)) = graph.get_plan(*pid).await {
+            title_map.insert(*pid, plan.title);
+        }
+    }
+
+    // Serialize runs and inject plan_title
+    let mut result = Vec::with_capacity(runs.len());
+    for run in &runs {
+        let mut val = serde_json::to_value(run).unwrap_or_default();
+        if let Some(obj) = val.as_object_mut() {
+            let title = title_map.get(&run.plan_id).cloned().unwrap_or_default();
+            obj.insert("plan_title".to_string(), serde_json::Value::String(title));
+        }
+        result.push(val);
+    }
+
+    serde_json::Value::Array(result)
+}
+
 /// GET /api/runs — List all plan runs across all plans.
 /// Supports optional `workspace_slug` query param to scope runs to a workspace.
+///
+/// Each run in the response is enriched with a `plan_title` field
+/// fetched from the associated Plan node, avoiding N+1 queries on the frontend.
 pub async fn list_all_plan_runs(
     State(state): State<OrchestratorState>,
     Query(params): Query<std::collections::HashMap<String, String>>,
@@ -5321,7 +5357,10 @@ pub async fn list_all_plan_runs(
         .list_all_plan_runs(limit, offset, status, workspace_slug)
         .await
         .map_err(AppError::Internal)?;
-    Ok(Json(serde_json::to_value(&runs).unwrap_or_default()))
+
+    // Enrich runs with plan titles (batch fetch to avoid N+1)
+    let enriched = enrich_runs_with_plan_titles(&graph, runs).await;
+    Ok(Json(enriched))
 }
 
 /// GET /api/plans/:plan_id/runs — List historical plan runs.

@@ -895,6 +895,9 @@ pub trait GraphStore: Send + Sync {
     /// Delete a step
     async fn delete_step(&self, step_id: Uuid) -> Result<()>;
 
+    /// Complete all pending/in_progress steps for a task (cascade on task completion)
+    async fn complete_pending_steps_for_task(&self, task_id: Uuid) -> Result<u32>;
+
     // ========================================================================
     // Constraint operations
     // ========================================================================

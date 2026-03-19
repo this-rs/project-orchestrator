@@ -1128,6 +1128,10 @@ impl GraphStore for Neo4jClient {
         self.delete_step(step_id).await
     }
 
+    async fn complete_pending_steps_for_task(&self, task_id: Uuid) -> anyhow::Result<u32> {
+        self.complete_pending_steps_for_task(task_id).await
+    }
+
     // ========================================================================
     // Constraint operations
     // ========================================================================

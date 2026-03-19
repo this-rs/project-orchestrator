@@ -4111,6 +4111,25 @@ impl GraphStore for MockGraphStore {
         Ok(())
     }
 
+    async fn complete_pending_steps_for_task(&self, task_id: Uuid) -> Result<u32> {
+        let ts = self.task_steps.read().await;
+        let step_ids = ts.get(&task_id).cloned().unwrap_or_default();
+        drop(ts);
+        let mut steps = self.steps.write().await;
+        let mut count = 0u32;
+        for sid in &step_ids {
+            if let Some(s) = steps.get_mut(sid) {
+                if s.status == StepStatus::Pending || s.status == StepStatus::InProgress {
+                    s.status = StepStatus::Completed;
+                    s.completed_at = Some(Utc::now());
+                    s.updated_at = Some(Utc::now());
+                    count += 1;
+                }
+            }
+        }
+        Ok(count)
+    }
+
     // ========================================================================
     // Constraint operations
     // ========================================================================

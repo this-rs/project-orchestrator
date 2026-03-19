@@ -8,6 +8,7 @@
 //! | Event                              | Reaction                                                   |
 //! |------------------------------------|------------------------------------------------------------|
 //! | `Project::Synced`                  | Bootstrap knowledge fabric (first sync) or update scores   |
+//! | `Task::StatusChanged → Completed`  | Cascade-complete all pending/in_progress steps for the task|
 //! | `Task::StatusChanged → Completed`  | Check if all plan tasks completed → auto-complete plan     |
 //! | `Plan::StatusChanged → Completed`  | Log completion (future: collect episode if protocol linked)|
 //!
@@ -159,6 +160,68 @@ async fn on_project_synced(event: CrudEvent, state: Arc<ServerState>) {
         // For incremental syncs, use the debouncer to avoid expensive recomputation
         // on every file change. The debouncer batches multiple syncs into one update.
         state.orchestrator.analytics_debouncer().trigger(project_id);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Reaction: Task::StatusChanged(Completed) → cascade-complete steps
+// ─────────────────────────────────────────────────────────────
+
+/// When a task is completed, automatically complete all its pending/in_progress steps.
+///
+/// This keeps the step graph consistent — if a task is marked complete (e.g. by the
+/// runner or an agent), any steps that weren't individually completed are auto-closed.
+async fn on_task_completed_cascade_steps(event: CrudEvent, state: Arc<ServerState>) {
+    let new_status = event
+        .payload
+        .get("new_status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    // Only react to Completed transitions
+    if new_status != "Completed" {
+        return;
+    }
+
+    let task_id = match Uuid::parse_str(&event.entity_id) {
+        Ok(id) => id,
+        Err(e) => {
+            warn!(
+                task_id = %event.entity_id,
+                error = %e,
+                "on_task_completed_cascade_steps: invalid task UUID"
+            );
+            return;
+        }
+    };
+
+    match state
+        .orchestrator
+        .neo4j()
+        .complete_pending_steps_for_task(task_id)
+        .await
+    {
+        Ok(count) => {
+            if count > 0 {
+                info!(
+                    task_id = %task_id,
+                    steps_completed = count,
+                    "on_task_completed_cascade_steps: auto-completed pending steps"
+                );
+            } else {
+                debug!(
+                    task_id = %task_id,
+                    "on_task_completed_cascade_steps: no pending steps to complete"
+                );
+            }
+        }
+        Err(e) => {
+            error!(
+                task_id = %task_id,
+                error = %e,
+                "on_task_completed_cascade_steps: failed to cascade-complete steps"
+            );
+        }
     }
 }
 
@@ -379,8 +442,9 @@ fn extract_state(ctx: Arc<dyn std::any::Any + Send + Sync>) -> Arc<ServerState> 
 /// # Reactions registered
 ///
 /// 1. **project-synced** — `Project::Synced` → bootstrap/update knowledge fabric
-/// 2. **task-completed** — `Task::StatusChanged` → check plan auto-completion
-/// 3. **plan-completed** — `Plan::StatusChanged` → log + future episode collection
+/// 2. **task-cascade-steps** — `Task::StatusChanged(Completed)` → auto-complete pending steps
+/// 3. **task-completed** — `Task::StatusChanged(Completed)` → check plan auto-completion
+/// 4. **plan-completed** — `Plan::StatusChanged` → log + future episode collection
 pub fn register_builtin_reactions(
     builder: ReactorBuilder,
     _state: Arc<ServerState>,
@@ -399,6 +463,16 @@ pub fn register_builtin_reactions(
             Arc::new(|event, ctx| -> Pin<Box<dyn Future<Output = ()> + Send>> {
                 Box::pin(async move {
                     on_project_synced(event, extract_state(ctx)).await;
+                })
+            }),
+        )
+        .on(
+            "task-cascade-steps",
+            Some(EntityType::Task),
+            Some(CrudAction::StatusChanged),
+            Arc::new(|event, ctx| -> Pin<Box<dyn Future<Output = ()> + Send>> {
+                Box::pin(async move {
+                    on_task_completed_cascade_steps(event, extract_state(ctx)).await;
                 })
             }),
         )
@@ -433,9 +507,9 @@ mod tests {
     use super::*;
     use crate::api::handlers::ServerState;
     use crate::events::{EventBus, HybridEmitter};
-    use crate::neo4j::models::{PlanStatus, TaskStatus};
+    use crate::neo4j::models::{PlanStatus, StepStatus, TaskStatus};
     use crate::orchestrator::{watcher::FileWatcher, Orchestrator};
-    use crate::test_helpers::{mock_app_state, test_plan, test_project, test_task};
+    use crate::test_helpers::{mock_app_state, test_plan, test_project, test_step, test_task};
     use serde_json::json;
     use std::sync::Arc;
     use tokio::sync::RwLock;
@@ -782,6 +856,117 @@ mod tests {
         assert_eq!(updated_plan.status, PlanStatus::Draft);
     }
 
+    // ── on_task_completed_cascade_steps ─────────────────────────
+
+    #[tokio::test]
+    async fn cascade_steps_ignores_non_completed() {
+        let state = mock_server_state().await;
+        let event = make_event(
+            EntityType::Task,
+            CrudAction::StatusChanged,
+            &Uuid::new_v4().to_string(),
+            json!({"new_status": "InProgress", "old_status": "Pending"}),
+        );
+        // Should return early — not "Completed"
+        on_task_completed_cascade_steps(event, state).await;
+    }
+
+    #[tokio::test]
+    async fn cascade_steps_returns_on_invalid_uuid() {
+        let state = mock_server_state().await;
+        let event = make_event(
+            EntityType::Task,
+            CrudAction::StatusChanged,
+            "bad-uuid",
+            json!({"new_status": "Completed"}),
+        );
+        on_task_completed_cascade_steps(event, state).await;
+    }
+
+    #[tokio::test]
+    async fn cascade_steps_completes_pending_steps() {
+        let state = mock_server_state().await;
+        let neo4j = state.orchestrator.neo4j();
+
+        // Create plan + task
+        let mut plan = test_plan();
+        plan.status = PlanStatus::InProgress;
+        let plan_id = plan.id;
+        neo4j.create_plan(&plan).await.unwrap();
+
+        let mut task = test_task();
+        task.status = TaskStatus::Completed;
+        let task_id = task.id;
+        neo4j.create_task(plan_id, &task).await.unwrap();
+
+        // Create 3 steps: one pending, one in_progress, one already completed
+        let s1 = test_step(1, "Step pending");
+        let s2 = {
+            let mut s = test_step(2, "Step in progress");
+            s.status = StepStatus::InProgress;
+            s
+        };
+        let s3 = {
+            let mut s = test_step(3, "Step already done");
+            s.status = StepStatus::Completed;
+            s.completed_at = Some(chrono::Utc::now());
+            s
+        };
+        let s1_id = s1.id;
+        let s2_id = s2.id;
+        let s3_id = s3.id;
+        neo4j.create_step(task_id, &s1).await.unwrap();
+        neo4j.create_step(task_id, &s2).await.unwrap();
+        neo4j.create_step(task_id, &s3).await.unwrap();
+
+        // Fire the event
+        let event = make_event(
+            EntityType::Task,
+            CrudAction::StatusChanged,
+            &task_id.to_string(),
+            json!({"new_status": "Completed", "old_status": "InProgress"}),
+        );
+        on_task_completed_cascade_steps(event, state.clone()).await;
+
+        // Verify: s1 and s2 should now be Completed, s3 unchanged
+        let step1 = neo4j.get_step(s1_id).await.unwrap().unwrap();
+        assert_eq!(step1.status, StepStatus::Completed);
+        assert!(step1.completed_at.is_some());
+
+        let step2 = neo4j.get_step(s2_id).await.unwrap().unwrap();
+        assert_eq!(step2.status, StepStatus::Completed);
+        assert!(step2.completed_at.is_some());
+
+        let step3 = neo4j.get_step(s3_id).await.unwrap().unwrap();
+        assert_eq!(step3.status, StepStatus::Completed); // was already completed
+    }
+
+    #[tokio::test]
+    async fn cascade_steps_no_steps_does_not_panic() {
+        let state = mock_server_state().await;
+        let neo4j = state.orchestrator.neo4j();
+
+        // Create plan + task with no steps
+        let mut plan = test_plan();
+        plan.status = PlanStatus::InProgress;
+        let plan_id = plan.id;
+        neo4j.create_plan(&plan).await.unwrap();
+
+        let mut task = test_task();
+        task.status = TaskStatus::Completed;
+        let task_id = task.id;
+        neo4j.create_task(plan_id, &task).await.unwrap();
+
+        let event = make_event(
+            EntityType::Task,
+            CrudAction::StatusChanged,
+            &task_id.to_string(),
+            json!({"new_status": "Completed"}),
+        );
+        // Should complete gracefully with 0 updates
+        on_task_completed_cascade_steps(event, state).await;
+    }
+
     // ── on_plan_status_changed ──────────────────────────────────
 
     #[tokio::test]
@@ -843,7 +1028,7 @@ mod tests {
         let rx = bus.subscribe();
         let builder =
             ReactorBuilder::new(rx, state.clone() as Arc<dyn std::any::Any + Send + Sync>);
-        // Should register 3 reactions without panicking
+        // Should register 4 reactions without panicking
         let _builder = register_builtin_reactions(builder, state);
     }
 
