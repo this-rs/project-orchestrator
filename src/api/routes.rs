@@ -1414,26 +1414,26 @@ fn protected_routes() -> Router<OrchestratorState> {
         // NOTE: /api/admin/install-hooks removed — hooks are now managed
         // in-process via SkillActivationHook (zero config required)
         // ================================================================
-        // Event Triggers
+        // Event Triggers (persistent event-to-protocol triggers)
         // ================================================================
         .route(
-            "/api/triggers",
+            "/api/event-triggers",
             get(trigger_handlers::list_triggers).post(trigger_handlers::create_trigger),
         )
         // Static sub-paths MUST come before /{id} to avoid capture
-        .route("/api/triggers/stats", get(trigger_handlers::trigger_stats))
+        .route("/api/event-triggers/stats", get(trigger_handlers::trigger_stats))
         .route(
-            "/api/triggers/{id}",
+            "/api/event-triggers/{id}",
             get(trigger_handlers::get_trigger)
                 .put(trigger_handlers::update_trigger)
                 .delete(trigger_handlers::delete_trigger),
         )
         .route(
-            "/api/triggers/{id}/enable",
+            "/api/event-triggers/{id}/enable",
             post(trigger_handlers::enable_trigger),
         )
         .route(
-            "/api/triggers/{id}/disable",
+            "/api/event-triggers/{id}/disable",
             post(trigger_handlers::disable_trigger),
         )
         // ================================================================
