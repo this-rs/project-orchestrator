@@ -54,6 +54,10 @@ pub enum GraphEventType {
     Activation,
     /// Community structure changed (Louvain recomputation)
     CommunityChanged,
+    /// Batch of graph mutations completed (used during project sync)
+    BatchCreated,
+    /// GDS scores (PageRank, betweenness, community) have been recalculated
+    ScoresUpdated,
 }
 
 /// A graph mutation event for real-time visualization updates.
@@ -223,6 +227,40 @@ impl GraphEvent {
         }
     }
 
+    /// Create a batch event summarizing multiple graph mutations.
+    pub fn batch(
+        layer: GraphLayer,
+        counts: serde_json::Value,
+        project_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind: "graph".into(),
+            event_type: GraphEventType::BatchCreated,
+            layer,
+            node_id: None,
+            target_id: None,
+            edge_type: None,
+            delta: counts,
+            project_id: project_id.into(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+        }
+    }
+
+    /// Create a scores-updated event after GDS recalculation.
+    pub fn scores_updated(project_id: impl Into<String>) -> Self {
+        Self {
+            kind: "graph".into(),
+            event_type: GraphEventType::ScoresUpdated,
+            layer: GraphLayer::Fabric,
+            node_id: None,
+            target_id: None,
+            edge_type: None,
+            delta: serde_json::Value::Null,
+            project_id: project_id.into(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+        }
+    }
+
     /// Set the delta payload.
     pub fn with_delta(mut self, delta: serde_json::Value) -> Self {
         self.delta = delta;
@@ -288,6 +326,7 @@ mod tests {
             GraphLayer::Fabric,
             GraphLayer::Neural,
             GraphLayer::Skills,
+            GraphLayer::Behavioral,
             GraphLayer::Pm,
         ];
 
@@ -315,8 +354,10 @@ mod tests {
             GraphEventType::Reinforcement,
             GraphEventType::Activation,
             GraphEventType::CommunityChanged,
+            GraphEventType::BatchCreated,
+            GraphEventType::ScoresUpdated,
         ];
-        assert_eq!(variants.len(), 7);
+        assert_eq!(variants.len(), 9);
 
         for variant in &variants {
             let json = serde_json::to_string(variant).unwrap();
@@ -556,6 +597,41 @@ mod tests {
         assert_eq!(parsed.id, "note-42");
         assert_eq!(parsed.via.as_deref(), Some("note-1"));
         assert!((parsed.score - 0.73).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_graph_event_batch_constructor() {
+        let counts = serde_json::json!({
+            "nodes_created": 5,
+            "edges_created": 12,
+        });
+        let event = GraphEvent::batch(GraphLayer::Code, counts, "proj-1");
+
+        assert_eq!(event.kind, "graph");
+        assert_eq!(event.event_type, GraphEventType::BatchCreated);
+        assert_eq!(event.layer, GraphLayer::Code);
+        assert!(event.node_id.is_none());
+        assert!(event.target_id.is_none());
+        assert!(event.edge_type.is_none());
+        assert_eq!(event.delta["nodes_created"], 5);
+        assert_eq!(event.delta["edges_created"], 12);
+        assert_eq!(event.project_id, "proj-1");
+        assert!(!event.timestamp.is_empty());
+    }
+
+    #[test]
+    fn test_graph_event_scores_updated_constructor() {
+        let event = GraphEvent::scores_updated("proj-1");
+
+        assert_eq!(event.kind, "graph");
+        assert_eq!(event.event_type, GraphEventType::ScoresUpdated);
+        assert_eq!(event.layer, GraphLayer::Fabric);
+        assert!(event.node_id.is_none());
+        assert!(event.target_id.is_none());
+        assert!(event.edge_type.is_none());
+        assert!(event.delta.is_null());
+        assert_eq!(event.project_id, "proj-1");
+        assert!(!event.timestamp.is_empty());
     }
 
     #[test]

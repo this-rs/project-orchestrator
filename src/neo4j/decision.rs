@@ -468,6 +468,29 @@ impl Neo4jClient {
     // AFFECTS relations (Decision → Entity)
     // ========================================================================
 
+    /// Get the project ID for a decision (traverses Decision←Task←Plan←Project).
+    ///
+    /// Returns `None` if the decision or project chain doesn't exist.
+    pub async fn get_decision_project_id(&self, decision_id: Uuid) -> Result<Option<String>> {
+        let q = query(
+            r#"
+            MATCH (proj:Project)-[:HAS_PLAN]->(plan:Plan)
+                  -[:HAS_TASK]->(task:Task)-[:INFORMED_BY]->(d:Decision {id: $id})
+            RETURN proj.id AS project_id
+            LIMIT 1
+            "#,
+        )
+        .param("id", decision_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let pid: String = row.get("project_id")?;
+            Ok(Some(pid))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Create an AFFECTS relation from a Decision to any entity in the graph.
     ///
     /// The entity is matched by a generic `{id: $entity_id}` or `{path: $entity_id}`

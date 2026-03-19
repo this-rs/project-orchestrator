@@ -1384,9 +1384,8 @@ pub async fn add_decision_affects(
     Path(decision_id): Path<Uuid>,
     Json(req): Json<AddAffectsRequest>,
 ) -> Result<StatusCode, AppError> {
-    state
-        .orchestrator
-        .neo4j()
+    let neo4j = state.orchestrator.neo4j();
+    neo4j
         .add_decision_affects(
             decision_id,
             &req.entity_type,
@@ -1394,6 +1393,21 @@ pub async fn add_decision_affects(
             req.impact_description.as_deref(),
         )
         .await?;
+
+    // Emit GraphEvent for the new AFFECTS edge (best-effort, don't fail the request)
+    if let Ok(Some(pid)) = neo4j.get_decision_project_id(decision_id).await {
+        state.event_bus.emit_graph(
+            crate::events::GraphEvent::edge(
+                crate::events::graph::GraphEventType::EdgeCreated,
+                crate::events::graph::GraphLayer::Knowledge,
+                decision_id.to_string(),
+                &req.entity_id,
+                "AFFECTS",
+                pid,
+            ),
+        );
+    }
+
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1406,11 +1420,25 @@ pub async fn remove_decision_affects(
     State(state): State<OrchestratorState>,
     Path((decision_id, entity_type, entity_id)): Path<(Uuid, String, String)>,
 ) -> Result<StatusCode, AppError> {
-    state
-        .orchestrator
-        .neo4j()
+    let neo4j = state.orchestrator.neo4j();
+    neo4j
         .remove_decision_affects(decision_id, &entity_type, &entity_id)
         .await?;
+
+    // Emit GraphEvent for the removed AFFECTS edge (best-effort)
+    if let Ok(Some(pid)) = neo4j.get_decision_project_id(decision_id).await {
+        state.event_bus.emit_graph(
+            crate::events::GraphEvent::edge(
+                crate::events::graph::GraphEventType::EdgeRemoved,
+                crate::events::graph::GraphLayer::Knowledge,
+                decision_id.to_string(),
+                &entity_id,
+                "AFFECTS",
+                pid,
+            ),
+        );
+    }
+
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1429,11 +1457,25 @@ pub async fn remove_decision_affects_query(
     Path(decision_id): Path<Uuid>,
     Query(query): Query<RemoveAffectsQuery>,
 ) -> Result<StatusCode, AppError> {
-    state
-        .orchestrator
-        .neo4j()
+    let neo4j = state.orchestrator.neo4j();
+    neo4j
         .remove_decision_affects(decision_id, &query.entity_type, &query.entity_id)
         .await?;
+
+    // Emit GraphEvent for the removed AFFECTS edge (best-effort)
+    if let Ok(Some(pid)) = neo4j.get_decision_project_id(decision_id).await {
+        state.event_bus.emit_graph(
+            crate::events::GraphEvent::edge(
+                crate::events::graph::GraphEventType::EdgeRemoved,
+                crate::events::graph::GraphLayer::Knowledge,
+                decision_id.to_string(),
+                &query.entity_id,
+                "AFFECTS",
+                pid,
+            ),
+        );
+    }
+
     Ok(StatusCode::NO_CONTENT)
 }
 

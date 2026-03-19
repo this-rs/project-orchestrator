@@ -7,6 +7,7 @@
 //! - `POST /api/episodes/export-artifact` — Export enriched artifact (structure + episodes)
 
 use crate::api::handlers::{AppError, OrchestratorState};
+use crate::events::EventEmitter;
 use crate::episodes::collector;
 use axum::{
     extract::{Query, State},
@@ -90,6 +91,18 @@ pub async fn collect_episode(
         collector::collect_episode(state.orchestrator.neo4j(), body.run_id, body.project_id)
             .await
             .map_err(AppError::Internal)?;
+
+    if episode.is_some() {
+        state.event_bus.emit_created(
+            crate::events::EntityType::Episode,
+            &body.run_id.to_string(),
+            serde_json::json!({
+                "run_id": body.run_id.to_string(),
+                "project_id": body.project_id.to_string(),
+            }),
+            Some(body.project_id.to_string()),
+        );
+    }
 
     Ok(Json(CollectEpisodeResponse { episode }))
 }

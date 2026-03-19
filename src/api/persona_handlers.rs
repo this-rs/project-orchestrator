@@ -2,6 +2,7 @@
 
 use super::handlers::{AppError, OrchestratorState};
 use super::{PaginatedResponse, PaginationParams};
+use crate::events::EventEmitter;
 use crate::neo4j::models::{
     DecisionNode, PersonaImportResult, PersonaNode, PersonaOrigin, PersonaPackage,
     PersonaPackageSource, PersonaStatus, PersonaSubgraph, PortablePersona, PortablePersonaDecision,
@@ -228,6 +229,17 @@ pub async fn create_persona(
         .await
         .map_err(AppError::Internal)?;
 
+    state.event_bus.emit_created(
+        crate::events::EntityType::Persona,
+        &persona.id.to_string(),
+        serde_json::json!({
+            "name": persona.name,
+            "project_id": persona.project_id,
+            "origin": format!("{:?}", persona.origin),
+        }),
+        persona.project_id.map(|pid| pid.to_string()),
+    );
+
     Ok((StatusCode::CREATED, Json(persona)))
 }
 
@@ -330,6 +342,18 @@ pub async fn update_persona(
         .await
         .map_err(AppError::Internal)?;
 
+    state.event_bus.emit_updated(
+        crate::events::EntityType::Persona,
+        &persona.id.to_string(),
+        serde_json::json!({
+            "name": persona.name,
+            "status": format!("{:?}", persona.status),
+            "energy": persona.energy,
+            "cohesion": persona.cohesion,
+        }),
+        persona.project_id.map(|pid| pid.to_string()),
+    );
+
     Ok(Json(persona))
 }
 
@@ -348,6 +372,11 @@ pub async fn delete_persona(
         .map_err(AppError::Internal)?;
 
     if deleted {
+        state.event_bus.emit_deleted(
+            crate::events::EntityType::Persona,
+            &persona_id.to_string(),
+            None,
+        );
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(AppError::NotFound(format!(
@@ -372,6 +401,15 @@ pub async fn add_skill(
         .add_persona_skill(persona_id, skill_id)
         .await
         .map_err(AppError::Internal)?;
+
+    state.event_bus.emit_linked(
+        crate::events::EntityType::Persona,
+        &persona_id.to_string(),
+        crate::events::EntityType::Skill,
+        &skill_id.to_string(),
+        None,
+    );
+
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -386,6 +424,15 @@ pub async fn remove_skill(
         .remove_persona_skill(persona_id, skill_id)
         .await
         .map_err(AppError::Internal)?;
+
+    state.event_bus.emit_unlinked(
+        crate::events::EntityType::Persona,
+        &persona_id.to_string(),
+        crate::events::EntityType::Skill,
+        &skill_id.to_string(),
+        None,
+    );
+
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -404,6 +451,15 @@ pub async fn add_protocol(
         .add_persona_protocol(persona_id, protocol_id)
         .await
         .map_err(AppError::Internal)?;
+
+    state.event_bus.emit_linked(
+        crate::events::EntityType::Persona,
+        &persona_id.to_string(),
+        crate::events::EntityType::Protocol,
+        &protocol_id.to_string(),
+        None,
+    );
+
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -418,6 +474,15 @@ pub async fn remove_protocol(
         .remove_persona_protocol(persona_id, protocol_id)
         .await
         .map_err(AppError::Internal)?;
+
+    state.event_bus.emit_unlinked(
+        crate::events::EntityType::Persona,
+        &persona_id.to_string(),
+        crate::events::EntityType::Protocol,
+        &protocol_id.to_string(),
+        None,
+    );
+
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -475,6 +540,15 @@ pub async fn add_file(
         .add_persona_file(persona_id, &body.file_path, weight)
         .await
         .map_err(AppError::Internal)?;
+
+    state.event_bus.emit_linked(
+        crate::events::EntityType::Persona,
+        &persona_id.to_string(),
+        crate::events::EntityType::Resource,
+        &body.file_path,
+        None,
+    );
+
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -490,6 +564,15 @@ pub async fn remove_file(
         .remove_persona_file(persona_id, &body.file_path)
         .await
         .map_err(AppError::Internal)?;
+
+    state.event_bus.emit_unlinked(
+        crate::events::EntityType::Persona,
+        &persona_id.to_string(),
+        crate::events::EntityType::Resource,
+        &body.file_path,
+        None,
+    );
+
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -515,6 +598,15 @@ pub async fn add_function(
         .add_persona_function(persona_id, &body.function_name, weight)
         .await
         .map_err(AppError::Internal)?;
+
+    state.event_bus.emit_linked(
+        crate::events::EntityType::Persona,
+        &persona_id.to_string(),
+        crate::events::EntityType::Resource,
+        &body.function_name,
+        None,
+    );
+
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -530,6 +622,15 @@ pub async fn remove_function(
         .remove_persona_function(persona_id, &body.function_name)
         .await
         .map_err(AppError::Internal)?;
+
+    state.event_bus.emit_unlinked(
+        crate::events::EntityType::Persona,
+        &persona_id.to_string(),
+        crate::events::EntityType::Resource,
+        &body.function_name,
+        None,
+    );
+
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -550,6 +651,15 @@ pub async fn add_note(
         .add_persona_note(persona_id, note_id, weight)
         .await
         .map_err(AppError::Internal)?;
+
+    state.event_bus.emit_linked(
+        crate::events::EntityType::Persona,
+        &persona_id.to_string(),
+        crate::events::EntityType::Note,
+        &note_id.to_string(),
+        None,
+    );
+
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -564,6 +674,15 @@ pub async fn remove_note(
         .remove_persona_note(persona_id, note_id)
         .await
         .map_err(AppError::Internal)?;
+
+    state.event_bus.emit_unlinked(
+        crate::events::EntityType::Persona,
+        &persona_id.to_string(),
+        crate::events::EntityType::Note,
+        &note_id.to_string(),
+        None,
+    );
+
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -584,6 +703,15 @@ pub async fn add_decision(
         .add_persona_decision(persona_id, decision_id, weight)
         .await
         .map_err(AppError::Internal)?;
+
+    state.event_bus.emit_linked(
+        crate::events::EntityType::Persona,
+        &persona_id.to_string(),
+        crate::events::EntityType::Decision,
+        &decision_id.to_string(),
+        None,
+    );
+
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -598,6 +726,15 @@ pub async fn remove_decision(
         .remove_persona_decision(persona_id, decision_id)
         .await
         .map_err(AppError::Internal)?;
+
+    state.event_bus.emit_unlinked(
+        crate::events::EntityType::Persona,
+        &persona_id.to_string(),
+        crate::events::EntityType::Decision,
+        &decision_id.to_string(),
+        None,
+    );
+
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -621,6 +758,15 @@ pub async fn add_extends(
         .add_persona_extends(persona_id, parent_persona_id)
         .await
         .map_err(AppError::Internal)?;
+
+    state.event_bus.emit_linked(
+        crate::events::EntityType::Persona,
+        &persona_id.to_string(),
+        crate::events::EntityType::Persona,
+        &parent_persona_id.to_string(),
+        None,
+    );
+
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -635,6 +781,15 @@ pub async fn remove_extends(
         .remove_persona_extends(persona_id, parent_persona_id)
         .await
         .map_err(AppError::Internal)?;
+
+    state.event_bus.emit_unlinked(
+        crate::events::EntityType::Persona,
+        &persona_id.to_string(),
+        crate::events::EntityType::Persona,
+        &parent_persona_id.to_string(),
+        None,
+    );
+
     Ok(StatusCode::NO_CONTENT)
 }
 

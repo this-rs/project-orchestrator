@@ -923,6 +923,9 @@ pub trait GraphStore: Send + Sync {
     /// Get a single decision by ID
     async fn get_decision(&self, decision_id: Uuid) -> Result<Option<DecisionNode>>;
 
+    /// Get the project ID for a decision (traverses Decision←Task←Plan←Project).
+    async fn get_decision_project_id(&self, decision_id: Uuid) -> Result<Option<String>>;
+
     /// Update a decision
     async fn update_decision(
         &self,

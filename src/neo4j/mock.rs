@@ -4185,6 +4185,11 @@ impl GraphStore for MockGraphStore {
         Ok(self.decisions.read().await.get(&decision_id).cloned())
     }
 
+    async fn get_decision_project_id(&self, _decision_id: Uuid) -> Result<Option<String>> {
+        // Mock doesn't track Decision→Task→Plan→Project chain
+        Ok(None)
+    }
+
     async fn update_decision(
         &self,
         decision_id: Uuid,

@@ -1171,6 +1171,10 @@ impl GraphStore for Neo4jClient {
         self.get_decision(decision_id).await
     }
 
+    async fn get_decision_project_id(&self, decision_id: Uuid) -> anyhow::Result<Option<String>> {
+        self.get_decision_project_id(decision_id).await
+    }
+
     async fn update_decision(
         &self,
         decision_id: Uuid,

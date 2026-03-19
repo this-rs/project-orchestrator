@@ -1315,6 +1315,17 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
             "CO_CHANGED computation finished"
         );
 
+        // Emit batch GraphEvent for CO_CHANGED relations (Fabric layer)
+        if count > 0 {
+            if let Some(ref bus) = self.event_bus {
+                bus.emit_graph(crate::events::GraphEvent::batch(
+                    crate::events::graph::GraphLayer::Fabric,
+                    serde_json::json!({"CO_CHANGED": count}),
+                    project_id.to_string(),
+                ));
+            }
+        }
+
         Ok(count)
     }
 

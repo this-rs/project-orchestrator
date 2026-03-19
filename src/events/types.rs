@@ -25,6 +25,14 @@ pub enum EntityType {
     ProtocolRun,
     Runner,
     Alert,
+    Persona,
+    Skill,
+    Protocol,
+    FeatureGraph,
+    Episode,
+    AnalysisProfile,
+    Trigger,
+    TopologyRule,
 }
 
 /// The CRUD action performed
@@ -38,6 +46,10 @@ pub enum CrudAction {
     Unlinked,
     /// In-flight progress update for long-running operations (e.g., protocol state execution)
     Progress,
+    /// Entity has been synchronized from an external source (e.g., project sync from filesystem)
+    Synced,
+    /// Entity status has changed (distinct from a field update — carries old_status/new_status in payload)
+    StatusChanged,
 }
 
 /// A related entity for Linked/Unlinked actions
@@ -162,6 +174,50 @@ pub trait EventEmitter: Send + Sync {
         self.emit(event);
     }
 
+    /// Emit a Synced event after a successful synchronization.
+    ///
+    /// Used after project sync from filesystem. Payload should include
+    /// stats like `files_parsed`, `duration_ms`, `is_first_sync`.
+    fn emit_synced(
+        &self,
+        entity_type: EntityType,
+        entity_id: &str,
+        payload: serde_json::Value,
+        project_id: Option<String>,
+    ) {
+        let mut event =
+            CrudEvent::new(entity_type, CrudAction::Synced, entity_id).with_payload(payload);
+        if let Some(pid) = project_id {
+            event = event.with_project_id(pid);
+        }
+        self.emit(event);
+    }
+
+    /// Emit a StatusChanged event for lifecycle transitions.
+    ///
+    /// Distinct from `emit_updated` — used when an entity's status changes
+    /// (e.g., plan: draft→approved, task: pending→in_progress).
+    /// Automatically builds a payload with `old_status` and `new_status`.
+    fn emit_status_changed(
+        &self,
+        entity_type: EntityType,
+        entity_id: &str,
+        old_status: &str,
+        new_status: &str,
+        project_id: Option<String>,
+    ) {
+        let payload = serde_json::json!({
+            "old_status": old_status,
+            "new_status": new_status,
+        });
+        let mut event =
+            CrudEvent::new(entity_type, CrudAction::StatusChanged, entity_id).with_payload(payload);
+        if let Some(pid) = project_id {
+            event = event.with_project_id(pid);
+        }
+        self.emit(event);
+    }
+
     /// Emit a Progress event for long-running operations.
     ///
     /// Used by protocol runs to report intermediate progress during
@@ -240,6 +296,17 @@ mod tests {
             EntityType::Component,
             EntityType::Note,
             EntityType::ChatSession,
+            EntityType::ProtocolRun,
+            EntityType::Runner,
+            EntityType::Alert,
+            EntityType::Persona,
+            EntityType::Skill,
+            EntityType::Protocol,
+            EntityType::FeatureGraph,
+            EntityType::Episode,
+            EntityType::AnalysisProfile,
+            EntityType::Trigger,
+            EntityType::TopologyRule,
         ];
 
         for variant in &variants {
@@ -257,6 +324,18 @@ mod tests {
             serde_json::to_string(&EntityType::ChatSession).unwrap(),
             "\"chat_session\""
         );
+        assert_eq!(
+            serde_json::to_string(&EntityType::FeatureGraph).unwrap(),
+            "\"feature_graph\""
+        );
+        assert_eq!(
+            serde_json::to_string(&EntityType::AnalysisProfile).unwrap(),
+            "\"analysis_profile\""
+        );
+        assert_eq!(
+            serde_json::to_string(&EntityType::TopologyRule).unwrap(),
+            "\"topology_rule\""
+        );
     }
 
     #[test]
@@ -268,6 +347,8 @@ mod tests {
             CrudAction::Linked,
             CrudAction::Unlinked,
             CrudAction::Progress,
+            CrudAction::Synced,
+            CrudAction::StatusChanged,
         ];
 
         for variant in &variants {
@@ -331,7 +412,7 @@ mod tests {
     }
 
     #[test]
-    fn test_entity_type_has_15_variants() {
+    fn test_entity_type_has_26_variants() {
         // Ensure we don't accidentally add/remove variants
         let all = vec![
             EntityType::Project,
@@ -349,8 +430,19 @@ mod tests {
             EntityType::Component,
             EntityType::Note,
             EntityType::ChatSession,
+            EntityType::ProtocolRun,
+            EntityType::Runner,
+            EntityType::Alert,
+            EntityType::Persona,
+            EntityType::Skill,
+            EntityType::Protocol,
+            EntityType::FeatureGraph,
+            EntityType::Episode,
+            EntityType::AnalysisProfile,
+            EntityType::Trigger,
+            EntityType::TopologyRule,
         ];
-        assert_eq!(all.len(), 15);
+        assert_eq!(all.len(), 26);
     }
 
     // ================================================================

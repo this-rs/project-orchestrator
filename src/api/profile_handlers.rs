@@ -3,6 +3,7 @@
 //! CRUD for analysis profiles that weight edge types for contextual analytics.
 
 use super::handlers::{AppError, OrchestratorState};
+use crate::events::EventEmitter;
 use crate::graph::models::AnalysisProfile;
 use axum::{
     extract::{Path, Query, State},
@@ -110,6 +111,16 @@ pub async fn create_analysis_profile(
         .await
         .map_err(AppError::Internal)?;
 
+    state.event_bus.emit_created(
+        crate::events::EntityType::AnalysisProfile,
+        &profile.id,
+        serde_json::json!({
+            "name": profile.name,
+            "project_id": profile.project_id,
+        }),
+        profile.project_id.clone(),
+    );
+
     Ok((StatusCode::CREATED, Json(profile)))
 }
 
@@ -154,6 +165,12 @@ pub async fn delete_analysis_profile(
                 AppError::Internal(e)
             }
         })?;
+
+    state.event_bus.emit_deleted(
+        crate::events::EntityType::AnalysisProfile,
+        &profile_id,
+        None,
+    );
 
     Ok(StatusCode::NO_CONTENT)
 }

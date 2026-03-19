@@ -1,6 +1,7 @@
 //! API handlers for Neural Skills
 
 use super::handlers::{AppError, OrchestratorState};
+use crate::events::EventEmitter;
 use super::hook_handlers::skill_cache;
 use super::{PaginatedResponse, PaginationParams};
 use crate::skills::{
@@ -303,6 +304,14 @@ pub async fn create_skill(
     // Invalidate hook activation cache for this project
     skill_cache().invalidate_project(&skill.project_id).await;
 
+    // Emit created event
+    state.event_bus.emit_created(
+        crate::events::EntityType::Skill,
+        &skill.id.to_string(),
+        serde_json::json!({"name": &skill.name, "project_id": skill.project_id}),
+        Some(skill.project_id.to_string()),
+    );
+
     Ok((StatusCode::CREATED, Json(skill)))
 }
 
@@ -403,6 +412,14 @@ pub async fn update_skill(
     // Invalidate hook activation cache for this project
     skill_cache().invalidate_project(&skill.project_id).await;
 
+    // Emit updated event
+    state.event_bus.emit_updated(
+        crate::events::EntityType::Skill,
+        &skill.id.to_string(),
+        serde_json::json!({"name": &skill.name, "project_id": skill.project_id}),
+        Some(skill.project_id.to_string()),
+    );
+
     Ok(Json(skill))
 }
 
@@ -430,9 +447,18 @@ pub async fn delete_skill(
 
     if deleted {
         // Invalidate hook activation cache for this project
-        if let Some(skill) = skill {
+        let project_id_str = skill.as_ref().map(|s| s.project_id.to_string());
+        if let Some(ref skill) = skill {
             skill_cache().invalidate_project(&skill.project_id).await;
         }
+
+        // Emit deleted event
+        state.event_bus.emit_deleted(
+            crate::events::EntityType::Skill,
+            &skill_id.to_string(),
+            project_id_str,
+        );
+
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(AppError::NotFound(format!("Skill {} not found", skill_id)))
@@ -493,6 +519,20 @@ pub async fn add_skill_member(
     // Invalidate cache — membership change may affect trigger evaluation
     skill_cache().invalidate_project(&skill.project_id).await;
 
+    // Emit linked event
+    let related_entity_type = match body.entity_type.as_str() {
+        "note" => crate::events::EntityType::Note,
+        "decision" => crate::events::EntityType::Decision,
+        _ => crate::events::EntityType::Note, // validated above
+    };
+    state.event_bus.emit_linked(
+        crate::events::EntityType::Skill,
+        &skill_id.to_string(),
+        related_entity_type,
+        &body.entity_id.to_string(),
+        Some(skill.project_id.to_string()),
+    );
+
     Ok(StatusCode::CREATED)
 }
 
@@ -526,9 +566,25 @@ pub async fn remove_skill_member(
 
     if removed {
         // Invalidate cache — membership change may affect trigger evaluation
-        if let Some(skill) = skill {
+        let project_id_str = skill.as_ref().map(|s| s.project_id.to_string());
+        if let Some(ref skill) = skill {
             skill_cache().invalidate_project(&skill.project_id).await;
         }
+
+        // Emit unlinked event
+        let related_entity_type = match entity_type.as_str() {
+            "note" => crate::events::EntityType::Note,
+            "decision" => crate::events::EntityType::Decision,
+            _ => crate::events::EntityType::Note, // validated above
+        };
+        state.event_bus.emit_unlinked(
+            crate::events::EntityType::Skill,
+            &skill_id.to_string(),
+            related_entity_type,
+            &entity_id.to_string(),
+            project_id_str,
+        );
+
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(AppError::NotFound(format!(
@@ -821,6 +877,20 @@ pub async fn split_skill(
         .flat_map(|e| e.new_skill_ids.clone())
         .collect();
 
+    // Emit updated event with split details
+    state.event_bus.emit_updated(
+        crate::events::EntityType::Skill,
+        &skill_id.to_string(),
+        serde_json::json!({
+            "action": "split",
+            "original_skill_id": skill_id,
+            "new_skill_ids": new_ids,
+            "sub_cluster_count": candidates.len(),
+            "project_id": skill.project_id,
+        }),
+        Some(skill.project_id.to_string()),
+    );
+
     Ok(Json(serde_json::json!({
         "original_skill_id": skill_id,
         "archived": true,
@@ -917,6 +987,22 @@ pub async fn merge_skills(
 
     let survivor_id = result.merged.first().map(|e| e.survivor_id);
     let absorbed_ids: Vec<Uuid> = result.merged.iter().map(|e| e.absorbed_id).collect();
+
+    // Emit updated event with merge details
+    if let Some(sid) = survivor_id {
+        state.event_bus.emit_updated(
+            crate::events::EntityType::Skill,
+            &sid.to_string(),
+            serde_json::json!({
+                "action": "merge",
+                "survivor_id": sid,
+                "absorbed_ids": absorbed_ids,
+                "total_merged": result.merged.len(),
+                "project_id": project_id,
+            }),
+            Some(project_id.to_string()),
+        );
+    }
 
     Ok(Json(serde_json::json!({
         "survivor_id": survivor_id,
