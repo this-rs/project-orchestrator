@@ -335,6 +335,7 @@ fn section_semantic_descriptions() -> Vec<(PromptSectionId, &'static str)> {
         (PromptSectionId::BestPracticesPersonas, "personas episodes structural analysis memory horizons intent search scaffolding"),
         (PromptSectionId::DeepMaintenance, "deep maintenance synapses energy staleness skills anchoring consolidation stagnation"),
         (PromptSectionId::PlanExecutionAutomation, "plan execution automation autonomous run triggers delegation waves"),
+        (PromptSectionId::DelegationAwareness, "delegation delegate sub-agent task parallel actionable autonomous spawn"),
         (PromptSectionId::ToolReference, "tool reference mega-tools full API documentation parameters actions"),
     ]
 }

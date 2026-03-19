@@ -56,7 +56,9 @@ pub enum PromptSectionId {
     DeepMaintenance,
     /// §15 — Plan execution & automation: autonomous execution, triggers, delegation (if plan active)
     PlanExecutionAutomation,
-    /// §16 — Tool reference — the exhaustive MCP mega-tools reference (selective by group)
+    /// §16 — Delegation awareness: when actionable tasks exist, guide the agent to delegate
+    DelegationAwareness,
+    /// §17 — Tool reference — the exhaustive MCP mega-tools reference (selective by group)
     ToolReference,
 }
 
@@ -78,6 +80,7 @@ impl PromptSectionId {
         Self::BestPracticesPersonas,
         Self::DeepMaintenance,
         Self::PlanExecutionAutomation,
+        Self::DelegationAwareness,
         Self::ToolReference,
     ];
 }
@@ -100,6 +103,7 @@ impl fmt::Display for PromptSectionId {
             Self::BestPracticesPersonas => write!(f, "bp_personas"),
             Self::DeepMaintenance => write!(f, "deep_maintenance"),
             Self::PlanExecutionAutomation => write!(f, "plan_execution"),
+            Self::DelegationAwareness => write!(f, "delegation_awareness"),
             Self::ToolReference => write!(f, "tool_reference"),
         }
     }
@@ -946,8 +950,31 @@ Plans can be executed autonomously and triggered automatically:
 - `plan(action: "delegate_task", plan_id, task_id)` — delegate task to sub-agent for autonomous execution
 - `plan(action: "enrich", plan_id)` — auto-enrich plan with affected files and dependencies"#;
 
+/// §16 — Delegation awareness: proactive delegation guidance
+pub const SECTION_DELEGATION_AWARENESS: &str = r#"## Delegation Awareness
+
+When an active plan has **actionable tasks** (pending with all dependencies satisfied), you should proactively consider delegation:
+
+**When to delegate:**
+- Multiple independent tasks are ready (check `plan(action: "get_waves", plan_id)`)
+- The current task is completed and the next task has no dependency on user input
+- The user is discussing implementation and tasks align with the conversation topic
+- At scaffolding level 2+, prefer autonomous delegation over asking permission
+
+**How to delegate:**
+1. Use `task(action: "get_next", plan_id)` to find the next actionable task
+2. Use `plan(action: "delegate_task", plan_id, task_id)` to spawn a sub-agent
+3. The sub-agent inherits the project context, persona, and routing from the parent session
+4. Monitor progress via `plan(action: "run_status", plan_id)` or task status updates
+
+**Delegation hints:**
+- Tasks with `affected_files` that don't overlap can run in parallel
+- Prefer delegation for well-defined tasks (clear acceptance criteria, specific affected files)
+- Keep complex/ambiguous tasks for interactive discussion with the user
+- If a previous delegation failed (check task `frustration_score`), discuss the approach before re-delegating"#;
+
 // ============================================================================
-// Section registry — all 16 base sections with their metadata
+// Section registry — all 17 base sections with their metadata
 // ============================================================================
 
 /// Returns all 16 base prompt sections with their activation conditions.
@@ -1047,7 +1074,20 @@ pub fn all_base_sections() -> Vec<BasePromptSection> {
             priority: 14,
             condition: ActivationCondition::when_plan_active(),
         },
-        // §16 — Tool Reference is handled separately (selective by group)
+        BasePromptSection {
+            id: PromptSectionId::DelegationAwareness,
+            content: SECTION_DELEGATION_AWARENESS,
+            priority: 15,
+            condition: ActivationCondition {
+                scaffolding_min: None,
+                scaffolding_max: None,
+                requires_active_plan: true,
+                requires_active_protocol: false,
+                min_task_count: Some(2), // Only show when there are multiple tasks
+                always: false,
+            },
+        },
+        // §17 — Tool Reference is handled separately (selective by group)
         // but included in the registry for completeness
         BasePromptSection {
             id: PromptSectionId::ToolReference,
@@ -1371,7 +1411,7 @@ mod tests {
     #[test]
     fn test_all_sections_count() {
         let sections = all_base_sections();
-        assert_eq!(sections.len(), 16, "Expected 16 base sections");
+        assert_eq!(sections.len(), 17, "Expected 17 base sections");
     }
 
     #[test]
@@ -1403,8 +1443,8 @@ mod tests {
         let selected = select_sections(&ctx);
         assert_eq!(
             selected.len(),
-            16,
-            "L0 with full context should activate all 16 sections, got {}",
+            17,
+            "L0 with full context should activate all 17 sections, got {}",
             selected.len()
         );
     }

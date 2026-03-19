@@ -802,12 +802,31 @@ pub async fn delegate_task(
         prompt[..end].to_string()
     };
 
-    // Step 2: Spawn sub-agent via ChatManager
+    // Step 2: Resolve scaffolding level from project for inheritance
+    let scaffolding_override = if let Some(ref slug) = req.project_slug {
+        match graph.get_project_by_slug(slug).await {
+            Ok(Some(project)) => {
+                match graph
+                    .compute_scaffolding_level(project.id, project.scaffolding_override)
+                    .await
+                {
+                    Ok(level) => Some(level.level),
+                    Err(_) => None,
+                }
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    // Step 3: Spawn sub-agent via ChatManager
     let spawned_by_json = serde_json::json!({
         "type": "delegation",
         "plan_id": plan_id.to_string(),
         "task_id": task_id.to_string(),
         "parent_session_id": req.parent_session_id,
+        "scaffolding_level": scaffolding_override,
     });
 
     let chat_request_cwd = req.cwd.clone();
@@ -823,6 +842,7 @@ pub async fn delegate_task(
         user_claims: None,
         spawned_by: Some(spawned_by_json.to_string()),
         task_context: Some(task_title.clone()),
+        scaffolding_override,
     };
 
     let session = chat_manager

@@ -1675,6 +1675,7 @@ impl PlanRunner {
                 .to_string(),
             ),
             task_context: Some(task_context_str),
+            scaffolding_override: None,
         };
 
         let session = self.chat_manager.create_session(&request).await?;

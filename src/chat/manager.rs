@@ -250,6 +250,8 @@ pub struct SpawnedByContext {
     pub task_id: Option<Uuid>,
     pub protocol_run_id: Option<Uuid>,
     pub protocol_state: Option<String>,
+    /// Inherited scaffolding level from parent session (None = auto-detect).
+    pub scaffolding_level: Option<u8>,
 }
 
 /// Parse a `spawned_by` JSON string and extract parent session info + protocol FSM context.
@@ -284,6 +286,10 @@ pub fn parse_spawned_by(json_str: &str) -> Option<SpawnedByContext> {
         .get("protocol_state")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
+    let scaffolding_level = val
+        .get("scaffolding_level")
+        .and_then(|v| v.as_u64())
+        .map(|v| v.min(4) as u8);
     Some(SpawnedByContext {
         parent_session_id,
         spawn_type,
@@ -291,6 +297,7 @@ pub fn parse_spawned_by(json_str: &str) -> Option<SpawnedByContext> {
         task_id,
         protocol_run_id,
         protocol_state,
+        scaffolding_level,
     })
 }
 
@@ -1397,6 +1404,7 @@ impl ChatManager {
         user_message: &str,
         model: Option<&str>,
         session_id: Option<&str>,
+        scaffolding_override: Option<u8>,
     ) -> (String, std::collections::HashSet<String>) {
         use super::composer::{ComposerInput, FsmPromptComposer};
         use super::prompt::{context_to_markdown, fetch_project_context};
@@ -1499,6 +1507,9 @@ impl ChatManager {
         } else {
             0
         };
+
+        // Override with inherited scaffolding level from parent session
+        let scaffolding_level = scaffolding_override.unwrap_or(scaffolding_level);
 
         // ── Fetch active protocol runs ──────────────────────────────────
         let protocol_runs = if let Some(ref project) = ctx.project {
@@ -2042,6 +2053,17 @@ impl ChatManager {
 
         let session_id = Uuid::new_v4();
         let model = self.resolve_model(request.model.as_deref());
+
+        // Resolve scaffolding override: explicit field takes priority,
+        // fallback to spawned_by JSON if present (for MCP callers)
+        let scaffolding_override = request.scaffolding_override.or_else(|| {
+            request
+                .spawned_by
+                .as_deref()
+                .and_then(parse_spawned_by)
+                .and_then(|ctx| ctx.scaffolding_level)
+        });
+
         // Use task_context (from delegate_task/PlanRunner) as routing signal when
         // the message is empty — this gives the router intent awareness for sub-agents.
         let routing_message = if request.message.is_empty() {
@@ -2058,6 +2080,7 @@ impl ChatManager {
                 routing_message,
                 Some(&model),
                 Some(&session_id.to_string()),
+                scaffolding_override,
             )
             .await;
 
@@ -4345,6 +4368,7 @@ impl ChatManager {
                 message,
                 Some(&session_node.model),
                 Some(session_id),
+                None,
             )
             .await;
 
@@ -5546,7 +5570,7 @@ mod tests {
         let state = mock_app_state();
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
 
-        let (prompt, note_ids) = manager.build_system_prompt(None, "test", None, None).await;
+        let (prompt, note_ids) = manager.build_system_prompt(None, "test", None, None, None).await;
         assert!(prompt.contains("Project Orchestrator"));
         assert!(prompt.contains("EXCLUSIVELY the Project Orchestrator MCP tools"));
         assert!(!prompt.contains("Active Project"));
@@ -5561,7 +5585,7 @@ mod tests {
 
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
         let (prompt, _note_ids) = manager
-            .build_system_prompt(Some(&project.slug), "help me plan", None, None)
+            .build_system_prompt(Some(&project.slug), "help me plan", None, None, None)
             .await;
 
         // Contains the base prompt
@@ -6350,7 +6374,7 @@ mod tests {
 
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
         let (prompt, _note_ids) = manager
-            .build_system_prompt(Some(&project.slug), "check the plan", None, None)
+            .build_system_prompt(Some(&project.slug), "check the plan", None, None, None)
             .await;
 
         // Base prompt present
