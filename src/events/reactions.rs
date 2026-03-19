@@ -384,6 +384,12 @@ pub fn register_builtin_reactions(
     builder: ReactorBuilder,
     _state: Arc<ServerState>,
 ) -> ReactorBuilder {
+    // Enable persistent EventTrigger support via Neo4j
+    let builder = builder.with_trigger_support(
+        _state.orchestrator.neo4j_arc(),
+        _state.event_bus.clone() as Arc<dyn super::types::EventEmitter>,
+    );
+
     builder
         .on(
             "project-synced",

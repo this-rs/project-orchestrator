@@ -4,6 +4,7 @@
 //! `tokio::sync::RwLock<HashMap<K, V>>` collections.
 //! Conditionally compiled with `#[cfg(test)]`.
 
+use crate::events::trigger::EventTrigger;
 use crate::neo4j::models::*;
 use crate::neo4j::traits::GraphStore;
 use crate::notes::{
@@ -10561,6 +10562,14 @@ impl GraphStore for MockGraphStore {
         let total = all.len();
         let page = all.into_iter().skip(offset).take(limit).collect();
         Ok((page, total))
+    }
+
+    async fn list_event_triggers(
+        &self,
+        _project_scope: Option<Uuid>,
+        _enabled_only: bool,
+    ) -> Result<Vec<EventTrigger>> {
+        Ok(vec![])
     }
 }
 

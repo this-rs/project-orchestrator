@@ -423,7 +423,7 @@ impl QualityGate for CiWatchGate {
             }
             Ok(Err(e)) => skip_result(self.name(), e, duration_ms),
             Err(_) => {
-                let mut metrics = HashMap::new();
+                let mut metrics: HashMap<String, f64> = HashMap::new();
                 metrics.insert("ci_status".into(), 0.0);
                 error_result(
                     self.name(),

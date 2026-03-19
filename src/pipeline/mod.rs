@@ -7,11 +7,14 @@
 //! ## Components
 //!
 //! - [`gates`] — Reusable quality gate library (cargo-check, cargo-test, coverage, etc.)
-//! - `composer` — Dynamic protocol composer that generates pipelines from plans (coming soon)
+//! - [`composer`] — Dynamic protocol composer that generates pipelines from plans
 //! - `runner` — Pipeline execution orchestrator (coming soon)
 //! - [`regression`] — Loop and regression detection
 //! - `progress` — Objective progress measurement (coming soon)
 
+pub mod composer;
+pub mod feedback;
 pub mod gates;
 pub mod progress;
 pub mod regression;
+pub mod wave_executor;

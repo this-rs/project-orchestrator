@@ -4,6 +4,7 @@
 //! This trait mirrors all public async methods of `Neo4jClient`,
 //! enabling testing with mock implementations and future backend swaps.
 
+use crate::events::trigger::EventTrigger;
 use crate::graph::models::{
     AnalysisProfile, FabricFileAnalyticsUpdate, FileAnalyticsUpdate, FunctionAnalyticsUpdate,
     TopologyRule, TopologyViolation,
@@ -3175,4 +3176,15 @@ pub trait GraphStore: Send + Sync {
         limit: usize,
         offset: usize,
     ) -> Result<(Vec<AlertNode>, usize)>;
+
+    // ========================================================================
+    // EventTrigger operations
+    // ========================================================================
+
+    /// List EventTriggers, optionally filtered by project scope and/or enabled status.
+    async fn list_event_triggers(
+        &self,
+        project_scope: Option<Uuid>,
+        enabled_only: bool,
+    ) -> Result<Vec<EventTrigger>>;
 }

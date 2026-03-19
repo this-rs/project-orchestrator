@@ -1895,7 +1895,7 @@ pub async fn reactor_status(
 ) -> Json<serde_json::Value> {
     match state.reactor_counters.get() {
         Some(counters) => {
-            let stats = counters.snapshot(0);
+            let stats = counters.snapshot(0, 0);
             Json(serde_json::json!({
                 "running": stats.running,
                 "events_received": stats.events_received,

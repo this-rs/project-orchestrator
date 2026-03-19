@@ -136,6 +136,7 @@ fn scalar_eq(a: &serde_json::Value, b: &serde_json::Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::types::{CrudAction, EntityType};
     use serde_json::json;
 
     fn make_trigger(

@@ -3779,4 +3779,16 @@ impl GraphStore for Neo4jClient {
     ) -> anyhow::Result<(Vec<AlertNode>, usize)> {
         self.list_alerts_impl(project_id, limit, offset).await
     }
+
+    // ========================================================================
+    // EventTrigger operations
+    // ========================================================================
+
+    async fn list_event_triggers(
+        &self,
+        project_scope: Option<Uuid>,
+        enabled_only: bool,
+    ) -> anyhow::Result<Vec<crate::events::trigger::EventTrigger>> {
+        self.list_event_triggers(project_scope, enabled_only).await
+    }
 }

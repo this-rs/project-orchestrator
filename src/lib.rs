@@ -27,6 +27,7 @@ pub mod neurons;
 pub mod notes;
 pub mod orchestrator;
 pub mod parser;
+pub mod pipeline;
 pub mod plan;
 pub mod profile;
 pub mod protocol;

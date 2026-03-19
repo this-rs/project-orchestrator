@@ -12,7 +12,8 @@
 //!                              ├─ Rule 1: Project::Synced  → bootstrap_knowledge_fabric
 //!                              ├─ Rule 2: Task::StatusChanged(completed) → check plan progress
 //!                              ├─ Rule 3: Plan::StatusChanged(completed) → collect episode
-//!                              └─ Rule N: custom rules...
+//!                              ├─ Rule N: custom rules...
+//!                              └─ Persistent EventTriggers (from Neo4j, refreshed periodically)
 //! ```
 //!
 //! ## Built-in Reactions
@@ -23,16 +24,21 @@
 //! | Task       | StatusChanged | Check if all plan tasks completed → auto-complete plan |
 //! | Plan       | StatusChanged | Collect episode if protocol run linked       |
 
+use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, RwLock};
 use tracing::{debug, error, info, warn};
+use uuid::Uuid;
 
-use super::types::{CrudAction, CrudEvent, EntityType};
+use super::trigger::EventTrigger;
+use super::types::{CrudAction, CrudEvent, EntityType, EventEmitter};
+use crate::neo4j::GraphStore;
 
 /// Type alias for async reaction handler functions.
 ///
@@ -100,6 +106,10 @@ pub struct ReactorStats {
     pub handlers_invoked: u64,
     /// Total handler errors (panics caught)
     pub handler_errors: u64,
+    /// Number of EventTriggers currently loaded from Neo4j
+    pub triggers_loaded: usize,
+    /// Total number of EventTrigger firings
+    pub triggers_fired: u64,
 }
 
 /// Shared counters for the reactor, thread-safe via atomics.
@@ -110,6 +120,7 @@ pub struct ReactorCounters {
     pub events_matched: AtomicU64,
     pub handlers_invoked: AtomicU64,
     pub handler_errors: AtomicU64,
+    pub triggers_fired: AtomicU64,
 }
 
 impl Default for ReactorCounters {
@@ -120,13 +131,14 @@ impl Default for ReactorCounters {
             events_matched: AtomicU64::new(0),
             handlers_invoked: AtomicU64::new(0),
             handler_errors: AtomicU64::new(0),
+            triggers_fired: AtomicU64::new(0),
         }
     }
 }
 
 impl ReactorCounters {
     /// Snapshot the current counters into a `ReactorStats`.
-    pub fn snapshot(&self, rules_count: usize) -> ReactorStats {
+    pub fn snapshot(&self, rules_count: usize, triggers_loaded: usize) -> ReactorStats {
         ReactorStats {
             running: self.running.load(Ordering::Relaxed),
             rules_count,
@@ -134,8 +146,19 @@ impl ReactorCounters {
             events_matched: self.events_matched.load(Ordering::Relaxed),
             handlers_invoked: self.handlers_invoked.load(Ordering::Relaxed),
             handler_errors: self.handler_errors.load(Ordering::Relaxed),
+            triggers_loaded,
+            triggers_fired: self.triggers_fired.load(Ordering::Relaxed),
         }
     }
+}
+
+/// Trigger support context — holds the Neo4j store and event bus needed
+/// to evaluate and fire persistent EventTriggers.
+struct TriggerSupport {
+    /// Neo4j graph store for loading triggers
+    neo4j: Arc<dyn GraphStore>,
+    /// Event bus for emitting trigger-fired events
+    event_bus: Arc<dyn EventEmitter>,
 }
 
 /// The EventReactor — subscribes to the event bus and dispatches to handlers.
@@ -144,6 +167,12 @@ pub struct EventReactor {
     receiver: broadcast::Receiver<CrudEvent>,
     context: Arc<dyn std::any::Any + Send + Sync>,
     counters: Arc<ReactorCounters>,
+    /// Cached EventTriggers from Neo4j (refreshed periodically)
+    triggers: Arc<RwLock<Vec<EventTrigger>>>,
+    /// Cooldown tracker: trigger_id → last fired timestamp
+    cooldowns: Arc<RwLock<HashMap<Uuid, Instant>>>,
+    /// Trigger support context (None if trigger support not enabled)
+    trigger_support: Option<Arc<TriggerSupport>>,
 }
 
 impl EventReactor {
@@ -157,12 +186,51 @@ impl EventReactor {
         self.rules.len()
     }
 
+    /// Get the shared triggers cache (for stats).
+    pub fn triggers(&self) -> Arc<RwLock<Vec<EventTrigger>>> {
+        Arc::clone(&self.triggers)
+    }
+
+    /// Reload triggers from Neo4j into the cache.
+    async fn refresh_triggers(
+        neo4j: &dyn GraphStore,
+        triggers: &RwLock<Vec<EventTrigger>>,
+    ) {
+        match neo4j.list_event_triggers(None, true).await {
+            Ok(new_triggers) => {
+                let count = new_triggers.len();
+                let mut cache = triggers.write().await;
+                *cache = new_triggers;
+                debug!(count, "EventReactor: refreshed triggers from Neo4j");
+            }
+            Err(e) => {
+                error!(error = %e, "EventReactor: failed to refresh triggers from Neo4j");
+            }
+        }
+    }
+
     /// Run the reactor loop. This consumes self and runs until the broadcast
     /// channel is closed (all senders dropped) or the task is cancelled.
     pub async fn run(mut self) {
         let rules_count = self.rules.len();
         info!(rules = rules_count, "EventReactor started");
         self.counters.running.store(true, Ordering::Relaxed);
+
+        // If trigger support is enabled, do initial refresh and spawn periodic refresh task
+        if let Some(ref support) = self.trigger_support {
+            Self::refresh_triggers(support.neo4j.as_ref(), &self.triggers).await;
+
+            let triggers_clone = Arc::clone(&self.triggers);
+            let neo4j_clone = Arc::clone(&support.neo4j);
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(30));
+                interval.tick().await; // skip the first immediate tick (already refreshed above)
+                loop {
+                    interval.tick().await;
+                    Self::refresh_triggers(neo4j_clone.as_ref(), &triggers_clone).await;
+                }
+            });
+        }
 
         loop {
             match self.receiver.recv().await {
@@ -202,6 +270,83 @@ impl EventReactor {
                                     }
                                 }
                             });
+                        }
+                    }
+
+                    // Check persistent EventTriggers (if enabled)
+                    // Anti-recursion guard: skip if the event was emitted by a trigger
+                    if self.trigger_support.is_some()
+                        && event.entity_type != EntityType::Trigger
+                    {
+                        let triggers = self.triggers.read().await;
+                        for trigger in triggers.iter() {
+                            if !trigger.enabled {
+                                continue;
+                            }
+                            if !trigger.matches(&event) {
+                                continue;
+                            }
+
+                            // Check cooldown
+                            let now = Instant::now();
+                            let should_fire = {
+                                let cooldowns = self.cooldowns.read().await;
+                                match cooldowns.get(&trigger.id) {
+                                    Some(last_fired) => {
+                                        now.duration_since(*last_fired)
+                                            >= Duration::from_secs(trigger.cooldown_secs as u64)
+                                    }
+                                    None => true,
+                                }
+                            };
+
+                            if !should_fire {
+                                debug!(
+                                    trigger_name = %trigger.name,
+                                    trigger_id = %trigger.id,
+                                    "EventTrigger matched but cooldown active, skipping"
+                                );
+                                continue;
+                            }
+
+                            // Update cooldown timestamp
+                            {
+                                let mut cooldowns = self.cooldowns.write().await;
+                                cooldowns.insert(trigger.id, now);
+                            }
+
+                            matched = true;
+                            self.counters
+                                .triggers_fired
+                                .fetch_add(1, Ordering::Relaxed);
+
+                            info!(
+                                trigger_name = %trigger.name,
+                                trigger_id = %trigger.id,
+                                protocol_id = %trigger.protocol_id,
+                                event_entity = ?event.entity_type,
+                                event_action = ?event.action,
+                                "EventTrigger fired"
+                            );
+
+                            // Emit a CrudEvent for the trigger firing
+                            if let Some(ref support) = self.trigger_support {
+                                let payload = serde_json::json!({
+                                    "trigger_name": trigger.name,
+                                    "protocol_id": trigger.protocol_id.to_string(),
+                                    "matched_event": {
+                                        "entity_type": format!("{:?}", event.entity_type),
+                                        "action": format!("{:?}", event.action),
+                                        "entity_id": event.entity_id,
+                                    }
+                                });
+                                support.event_bus.emit_created(
+                                    EntityType::Trigger,
+                                    &trigger.id.to_string(),
+                                    payload,
+                                    event.project_id.clone(),
+                                );
+                            }
                         }
                     }
 
@@ -251,6 +396,7 @@ pub struct ReactorBuilder {
     rules: Vec<ReactionRule>,
     receiver: broadcast::Receiver<CrudEvent>,
     context: Arc<dyn std::any::Any + Send + Sync>,
+    trigger_support: Option<Arc<TriggerSupport>>,
 }
 
 impl ReactorBuilder {
@@ -263,6 +409,7 @@ impl ReactorBuilder {
             rules: Vec::new(),
             receiver,
             context,
+            trigger_support: None,
         }
     }
 
@@ -288,6 +435,20 @@ impl ReactorBuilder {
         self
     }
 
+    /// Enable persistent EventTrigger support.
+    ///
+    /// When enabled, the reactor will periodically load EventTriggers from Neo4j
+    /// and evaluate them against incoming events, in addition to the in-memory
+    /// ReactionRules.
+    pub fn with_trigger_support(
+        mut self,
+        neo4j: Arc<dyn GraphStore>,
+        event_bus: Arc<dyn EventEmitter>,
+    ) -> Self {
+        self.trigger_support = Some(Arc::new(TriggerSupport { neo4j, event_bus }));
+        self
+    }
+
     /// Build the reactor. The counters are returned separately for the status endpoint.
     pub fn build(self) -> (EventReactor, Arc<ReactorCounters>) {
         let counters = Arc::new(ReactorCounters::default());
@@ -296,6 +457,9 @@ impl ReactorBuilder {
             receiver: self.receiver,
             context: self.context,
             counters: Arc::clone(&counters),
+            triggers: Arc::new(RwLock::new(Vec::new())),
+            cooldowns: Arc::new(RwLock::new(HashMap::new())),
+            trigger_support: self.trigger_support,
         };
         (reactor, counters)
     }
