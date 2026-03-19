@@ -302,6 +302,50 @@ pub fn parse_spawned_by(json_str: &str) -> Option<SpawnedByContext> {
 }
 
 impl ChatManager {
+    /// Build the standard enrichment pipeline with optional reasoning engine and trajectory collector.
+    ///
+    /// Centralizes the 7-stage pipeline construction to avoid duplication across
+    /// `new()`, `with_reasoning_engine()`, and `with_trajectory_collector()`.
+    fn build_enrichment_pipeline(
+        graph: &Arc<dyn GraphStore>,
+        search: &Arc<dyn SearchStore>,
+        reasoning_engine: Option<&Arc<crate::reasoning::ReasoningTreeEngine>>,
+        trajectory_collector: Option<&std::sync::Arc<neural_routing_runtime::TrajectoryCollector>>,
+    ) -> Arc<super::enrichment::EnrichmentPipeline> {
+        let mut pipeline = super::enrichment::EnrichmentPipeline::new(
+            super::enrichment::EnrichmentConfig::from_env(),
+        );
+        let skill_stage = super::stages::SkillActivationStage::new(graph.clone());
+        let skill_stage = if let Some(tc) = trajectory_collector {
+            skill_stage.with_collector(tc.clone())
+        } else {
+            skill_stage
+        };
+        pipeline.add_stage(Box::new(skill_stage));
+        pipeline.add_stage(Box::new(super::stages::BiomimicryStage::new(graph.clone())));
+        pipeline.add_stage(Box::new(super::stages::UserProfileStage::new(
+            graph.clone(),
+        )));
+        pipeline.add_stage(Box::new(super::stages::PersonaStage::new(graph.clone())));
+        let ki_stage = super::stages::KnowledgeInjectionStage::new(graph.clone(), search.clone());
+        let ki_stage = if let Some(tc) = trajectory_collector {
+            ki_stage.with_collector(tc.clone())
+        } else {
+            ki_stage
+        };
+        pipeline.add_stage(Box::new(ki_stage));
+        pipeline.add_stage(Box::new(super::stages::StatusInjectionStage::with_config(
+            graph.clone(),
+            reasoning_engine.cloned(),
+            Arc::new(super::stages::GraphProtocolProvider::new(graph.clone())),
+            super::stages::StatusInjectionConfig::default(),
+        )));
+        pipeline.add_stage(Box::new(super::stages::FileContextStage::new(
+            graph.clone(),
+        )));
+        Arc::new(pipeline)
+    }
+
     /// Create a ChatManager without memory support (for tests or when Meilisearch is unavailable)
     pub fn new_without_memory(
         graph: Arc<dyn GraphStore>,
@@ -315,33 +359,7 @@ impl ChatManager {
             auto_update_cli: config.auto_update_cli,
             auto_update_app: config.auto_update_app,
         }));
-        let enrichment_pipeline = {
-            let mut pipeline = super::enrichment::EnrichmentPipeline::new(
-                super::enrichment::EnrichmentConfig::default(),
-            );
-            pipeline.add_stage(Box::new(super::stages::SkillActivationStage::new(
-                graph.clone(),
-            )));
-            pipeline.add_stage(Box::new(super::stages::BiomimicryStage::new(graph.clone())));
-            pipeline.add_stage(Box::new(super::stages::UserProfileStage::new(
-                graph.clone(),
-            )));
-            pipeline.add_stage(Box::new(super::stages::PersonaStage::new(graph.clone())));
-            pipeline.add_stage(Box::new(super::stages::KnowledgeInjectionStage::new(
-                graph.clone(),
-                search.clone(),
-            )));
-            pipeline.add_stage(Box::new(super::stages::StatusInjectionStage::with_config(
-                graph.clone(),
-                None,
-                Arc::new(super::stages::GraphProtocolProvider::new(graph.clone())),
-                super::stages::StatusInjectionConfig::default(),
-            )));
-            pipeline.add_stage(Box::new(super::stages::FileContextStage::new(
-                graph.clone(),
-            )));
-            Arc::new(pipeline)
-        };
+        let enrichment_pipeline = Self::build_enrichment_pipeline(&graph, &search, None, None);
         Self {
             graph,
             search,
@@ -391,33 +409,7 @@ impl ChatManager {
             auto_update_cli: config.auto_update_cli,
             auto_update_app: config.auto_update_app,
         }));
-        let enrichment_pipeline = {
-            let mut pipeline = super::enrichment::EnrichmentPipeline::new(
-                super::enrichment::EnrichmentConfig::default(),
-            );
-            pipeline.add_stage(Box::new(super::stages::SkillActivationStage::new(
-                graph.clone(),
-            )));
-            pipeline.add_stage(Box::new(super::stages::BiomimicryStage::new(graph.clone())));
-            pipeline.add_stage(Box::new(super::stages::UserProfileStage::new(
-                graph.clone(),
-            )));
-            pipeline.add_stage(Box::new(super::stages::PersonaStage::new(graph.clone())));
-            pipeline.add_stage(Box::new(super::stages::KnowledgeInjectionStage::new(
-                graph.clone(),
-                search.clone(),
-            )));
-            pipeline.add_stage(Box::new(super::stages::StatusInjectionStage::with_config(
-                graph.clone(),
-                None,
-                Arc::new(super::stages::GraphProtocolProvider::new(graph.clone())),
-                super::stages::StatusInjectionConfig::default(),
-            )));
-            pipeline.add_stage(Box::new(super::stages::FileContextStage::new(
-                graph.clone(),
-            )));
-            Arc::new(pipeline)
-        };
+        let enrichment_pipeline = Self::build_enrichment_pipeline(&graph, &search, None, None);
         Self {
             graph,
             search,
@@ -467,46 +459,12 @@ impl ChatManager {
         engine: Arc<crate::reasoning::ReasoningTreeEngine>,
     ) -> Self {
         self.reasoning_engine = Some(engine.clone());
-        // Rebuild the pipeline with the reasoning engine wired in
-        let mut pipeline = super::enrichment::EnrichmentPipeline::new(
-            super::enrichment::EnrichmentConfig::from_env(),
+        self.enrichment_pipeline = Self::build_enrichment_pipeline(
+            &self.graph,
+            &self.search,
+            Some(&engine),
+            self.trajectory_collector.as_ref(),
         );
-        let skill_stage = super::stages::SkillActivationStage::new(self.graph.clone());
-        let skill_stage = if let Some(ref tc) = self.trajectory_collector {
-            skill_stage.with_collector(tc.clone())
-        } else {
-            skill_stage
-        };
-        pipeline.add_stage(Box::new(skill_stage));
-        pipeline.add_stage(Box::new(super::stages::BiomimicryStage::new(
-            self.graph.clone(),
-        )));
-        pipeline.add_stage(Box::new(super::stages::UserProfileStage::new(
-            self.graph.clone(),
-        )));
-        pipeline.add_stage(Box::new(super::stages::PersonaStage::new(
-            self.graph.clone(),
-        )));
-        let ki_stage =
-            super::stages::KnowledgeInjectionStage::new(self.graph.clone(), self.search.clone());
-        let ki_stage = if let Some(ref tc) = self.trajectory_collector {
-            ki_stage.with_collector(tc.clone())
-        } else {
-            ki_stage
-        };
-        pipeline.add_stage(Box::new(ki_stage));
-        pipeline.add_stage(Box::new(super::stages::StatusInjectionStage::with_config(
-            self.graph.clone(),
-            Some(engine),
-            Arc::new(super::stages::GraphProtocolProvider::new(
-                self.graph.clone(),
-            )),
-            super::stages::StatusInjectionConfig::default(),
-        )));
-        pipeline.add_stage(Box::new(super::stages::FileContextStage::new(
-            self.graph.clone(),
-        )));
-        self.enrichment_pipeline = std::sync::Arc::new(pipeline);
         self
     }
 
@@ -518,38 +476,12 @@ impl ChatManager {
         mut self,
         collector: std::sync::Arc<neural_routing_runtime::TrajectoryCollector>,
     ) -> Self {
-        let mut pipeline = super::enrichment::EnrichmentPipeline::new(
-            super::enrichment::EnrichmentConfig::from_env(),
+        self.enrichment_pipeline = Self::build_enrichment_pipeline(
+            &self.graph,
+            &self.search,
+            self.reasoning_engine.as_ref(),
+            Some(&collector),
         );
-        pipeline.add_stage(Box::new(
-            super::stages::SkillActivationStage::new(self.graph.clone())
-                .with_collector(collector.clone()),
-        ));
-        pipeline.add_stage(Box::new(super::stages::BiomimicryStage::new(
-            self.graph.clone(),
-        )));
-        pipeline.add_stage(Box::new(super::stages::UserProfileStage::new(
-            self.graph.clone(),
-        )));
-        pipeline.add_stage(Box::new(super::stages::PersonaStage::new(
-            self.graph.clone(),
-        )));
-        pipeline.add_stage(Box::new(
-            super::stages::KnowledgeInjectionStage::new(self.graph.clone(), self.search.clone())
-                .with_collector(collector.clone()),
-        ));
-        pipeline.add_stage(Box::new(super::stages::StatusInjectionStage::with_config(
-            self.graph.clone(),
-            self.reasoning_engine.clone(),
-            Arc::new(super::stages::GraphProtocolProvider::new(
-                self.graph.clone(),
-            )),
-            super::stages::StatusInjectionConfig::default(),
-        )));
-        pipeline.add_stage(Box::new(super::stages::FileContextStage::new(
-            self.graph.clone(),
-        )));
-        self.enrichment_pipeline = std::sync::Arc::new(pipeline);
         // Store collector for end_session() in close_session()
         self.trajectory_collector = Some(collector);
         self
@@ -2067,10 +1999,7 @@ impl ChatManager {
         // Use task_context (from delegate_task/PlanRunner) as routing signal when
         // the message is empty — this gives the router intent awareness for sub-agents.
         let routing_message = if request.message.is_empty() {
-            request
-                .task_context
-                .as_deref()
-                .unwrap_or("")
+            request.task_context.as_deref().unwrap_or("")
         } else {
             &request.message
         };
@@ -5570,7 +5499,9 @@ mod tests {
         let state = mock_app_state();
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
 
-        let (prompt, note_ids) = manager.build_system_prompt(None, "test", None, None, None).await;
+        let (prompt, note_ids) = manager
+            .build_system_prompt(None, "test", None, None, None)
+            .await;
         assert!(prompt.contains("Project Orchestrator"));
         assert!(prompt.contains("EXCLUSIVELY the Project Orchestrator MCP tools"));
         assert!(!prompt.contains("Active Project"));

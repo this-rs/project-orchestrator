@@ -95,21 +95,21 @@ struct WaveResult {
 
 /// Summary of a completed task, used for inter-task continuity in a PlanRun.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 struct TaskSummary {
-    pub task_id: Uuid,
-    pub title: String,
-    pub wave_number: usize,
-    pub status: String, // "completed" or "failed"
-    pub commits: Vec<String>,
-    pub files_modified: Vec<String>,
+    #[allow(dead_code)]
+    task_id: Uuid,
+    title: String,
+    wave_number: usize,
+    status: String, // "completed" or "failed"
+    commits: Vec<String>,
+    files_modified: Vec<String>,
 }
 
 /// Cumulative memory across waves in a PlanRun, providing continuity context
 /// to subsequent tasks so they know what was accomplished by previous tasks.
 #[derive(Debug, Clone, Default)]
 struct RunMemory {
-    pub summaries: Vec<TaskSummary>,
+    summaries: Vec<TaskSummary>,
 }
 
 impl RunMemory {
@@ -852,8 +852,7 @@ impl PlanRunner {
                         let mut all_files: Vec<String> = Vec::new();
                         for c in &commit_nodes {
                             if let Ok(files) = self.graph.get_commit_files(&c.hash).await {
-                                all_files
-                                    .extend(files.into_iter().map(|f| f.path));
+                                all_files.extend(files.into_iter().map(|f| f.path));
                             }
                         }
                         all_files.sort();
@@ -886,6 +885,7 @@ impl PlanRunner {
     /// Each task is spawned as a separate tokio task. Results are collected as
     /// they complete. Budget and cancellation checks happen after each result,
     /// with `join_set.abort_all()` used to stop remaining tasks if needed.
+    #[allow(clippy::too_many_arguments)]
     async fn execute_wave(
         &self,
         run_id: Uuid,
@@ -1011,10 +1011,7 @@ impl PlanRunner {
                 .unwrap_or_default();
 
             // Extract execution report before consuming the result
-            let task_report = task_result
-                .as_ref()
-                .ok()
-                .and_then(|r| r.report.clone());
+            let task_report = task_result.as_ref().ok().and_then(|r| r.report.clone());
             let task_report_json = task_report
                 .as_ref()
                 .and_then(|r| serde_json::to_string(r).ok());
@@ -1173,7 +1170,7 @@ impl PlanRunner {
                                 commits: vec![],
                                 persona_profile: persona,
                                 vector_json: None,
-                report_json: None,
+                                report_json: None,
                             };
                             if let Err(e) = graph.update_agent_execution(&ae).await {
                                 warn!("Failed to update AgentExecution {}: {}", ae_id, e);
@@ -1267,7 +1264,7 @@ impl PlanRunner {
                                 commits: vec![],
                                 persona_profile: persona,
                                 vector_json: None,
-                report_json: None,
+                                report_json: None,
                             };
                             if let Err(e) = graph.update_agent_execution(&ae).await {
                                 warn!("Failed to update AgentExecution {}: {}", ae_id, e);
@@ -1371,7 +1368,10 @@ impl PlanRunner {
         // =====================================================================
         // Retry loop — sequentially retry failed tasks with error context
         // =====================================================================
-        if !wave_result.tasks_failed.is_empty() && self.config.max_retries > 0 && !wave_result.aborted {
+        if !wave_result.tasks_failed.is_empty()
+            && self.config.max_retries > 0
+            && !wave_result.aborted
+        {
             // Build title lookup from wave tasks
             let title_map: std::collections::HashMap<Uuid, String> = wave
                 .tasks
@@ -1476,9 +1476,7 @@ impl PlanRunner {
                             self.on_task_completed(run_id, *task_id, duration_secs, cost_usd)
                                 .await?;
                             // Move from failed to completed
-                            wave_result
-                                .tasks_failed
-                                .retain(|(tid, _)| tid != task_id);
+                            wave_result.tasks_failed.retain(|(tid, _)| tid != task_id);
                             wave_result.tasks_completed.push(*task_id);
                             wave_result.wave_cost_usd += cost_usd;
 
@@ -1585,6 +1583,7 @@ impl PlanRunner {
     }
 
     /// Execute a single task by spawning a Claude Code agent.
+    #[allow(clippy::too_many_arguments)]
     async fn execute_task(
         &self,
         run_id: Uuid,
@@ -1597,7 +1596,10 @@ impl PlanRunner {
         continuity_context: &str,
     ) -> Result<TaskExecutionResult> {
         if retry_context.is_some() {
-            info!("Retrying task {}: {} (with error context)", task_id, task_title);
+            info!(
+                "Retrying task {}: {} (with error context)",
+                task_id, task_title
+            );
         } else {
             info!("Executing task {}: {}", task_id, task_title);
         }
@@ -1667,17 +1669,13 @@ impl PlanRunner {
             "Task profiled"
         );
 
-        // --- Step 2: Activate skills ---
-        let project_id_for_skills = if let Some(slug) = &project_slug {
-            self.graph
-                .get_project_by_slug(slug)
-                .await
-                .ok()
-                .flatten()
-                .map(|p| p.id)
+        // --- Step 2: Resolve project once (reused for skills + scaffolding) ---
+        let project_node = if let Some(slug) = &project_slug {
+            self.graph.get_project_by_slug(slug).await.ok().flatten()
         } else {
             None
         };
+        let project_id_for_skills = project_node.as_ref().map(|p| p.id);
 
         let skill_activation =
             if let (Some(pid), Some(ref tn)) = (project_id_for_skills, &task_node) {
@@ -1743,16 +1741,12 @@ impl PlanRunner {
             .map(|t| t.frustration_score)
             .unwrap_or(0.0);
         // Resolve scaffolding level from project (best effort, default L0)
-        let scaffolding_level = if let Some(slug) = project_slug {
-            match self.graph.get_project_by_slug(slug).await {
-                Ok(Some(project)) => self
-                    .graph
-                    .compute_scaffolding_level(project.id, project.scaffolding_override)
-                    .await
-                    .map(|l| l.level)
-                    .unwrap_or(0),
-                _ => 0,
-            }
+        let scaffolding_level = if let Some(ref project) = project_node {
+            self.graph
+                .compute_scaffolding_level(project.id, project.scaffolding_override)
+                .await
+                .map(|l| l.level)
+                .unwrap_or(0)
         } else {
             0
         };
@@ -1829,6 +1823,7 @@ impl PlanRunner {
                     "run_id": run_id.to_string(),
                     "plan_id": plan_id.to_string(),
                     "task_id": task_id.to_string(),
+                    "scaffolding_level": scaffolding_level,
                 })
                 .to_string(),
             ),
@@ -2234,7 +2229,10 @@ impl PlanRunner {
 
             warn!(
                 "Task {} failed ({}), retry {}/{} eligible",
-                task_id, reason, retry_count + 1, self.config.max_retries
+                task_id,
+                reason,
+                retry_count + 1,
+                self.config.max_retries
             );
 
             // Mark task back to Pending so retry can re-enter InProgress
@@ -2245,7 +2243,12 @@ impl PlanRunner {
                 run_id,
                 task_id,
                 task_title: String::new(),
-                reason: format!("{} (will retry {}/{})", reason, retry_count + 1, self.config.max_retries),
+                reason: format!(
+                    "{} (will retry {}/{})",
+                    reason,
+                    retry_count + 1,
+                    self.config.max_retries
+                ),
                 attempts: retry_count + 1,
             });
 
@@ -2330,7 +2333,10 @@ impl PlanRunner {
 
         let note_id = note.id;
         if let Err(e) = self.graph.create_note(&note).await {
-            warn!("Failed to create failure gotcha note for task {}: {}", task_id, e);
+            warn!(
+                "Failed to create failure gotcha note for task {}: {}",
+                task_id, e
+            );
             return;
         }
 
@@ -2620,12 +2626,20 @@ impl PlanRunner {
                             metrics.tool_use_count += 1;
                             *metrics.tool_use_breakdown.entry(tool.clone()).or_insert(0) += 1;
                         }
-                        ChatEvent::ToolResult { is_error, result, .. } if *is_error => {
+                        ChatEvent::ToolResult {
+                            is_error, result, ..
+                        } if *is_error => {
                             metrics.error_count += 1;
                             // Extract error text from the result value
-                            let err_text = result.as_str()
+                            let err_text = result
+                                .as_str()
                                 .map(|s| s.to_string())
-                                .or_else(|| result.get("error").and_then(|e| e.as_str()).map(|s| s.to_string()))
+                                .or_else(|| {
+                                    result
+                                        .get("error")
+                                        .and_then(|e| e.as_str())
+                                        .map(|s| s.to_string())
+                                })
                                 .unwrap_or_else(|| result.to_string());
                             // Keep last 500 chars to avoid bloat
                             metrics.last_error = Some(if err_text.len() > 500 {

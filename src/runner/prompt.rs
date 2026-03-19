@@ -629,8 +629,18 @@ mod tests {
             ctx.scaffolding_level = 4;
             build_runner_constraints(&ctx)
         };
-        assert!(l0.len() > l2.len(), "L0 ({}) should be longer than L2 ({})", l0.len(), l2.len());
-        assert!(l2.len() > l4.len(), "L2 ({}) should be longer than L4 ({})", l2.len(), l4.len());
+        assert!(
+            l0.len() > l2.len(),
+            "L0 ({}) should be longer than L2 ({})",
+            l0.len(),
+            l2.len()
+        );
+        assert!(
+            l2.len() > l4.len(),
+            "L2 ({}) should be longer than L4 ({})",
+            l2.len(),
+            l4.len()
+        );
     }
 
     // ========================================================================
