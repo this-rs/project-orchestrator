@@ -465,6 +465,17 @@ fn protected_routes() -> Router<OrchestratorState> {
                 .patch(handlers::update_constraint)
                 .delete(handlers::delete_constraint),
         )
+        // Lifecycle Hooks
+        .route(
+            "/api/lifecycle-hooks",
+            get(handlers::list_lifecycle_hooks).post(handlers::create_lifecycle_hook),
+        )
+        .route(
+            "/api/lifecycle-hooks/{hook_id}",
+            get(handlers::get_lifecycle_hook)
+                .patch(handlers::update_lifecycle_hook)
+                .delete(handlers::delete_lifecycle_hook),
+        )
         // Tasks (global listing)
         .route("/api/tasks", get(handlers::list_all_tasks))
         // Tasks (plan-scoped)

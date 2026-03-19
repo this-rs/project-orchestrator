@@ -20,6 +20,7 @@ pub mod graph;
 pub mod heartbeat;
 pub mod homeostasis;
 pub mod identity;
+pub mod lifecycle;
 pub mod mcp;
 pub mod meilisearch;
 pub mod neo4j;
@@ -1459,6 +1460,43 @@ pub async fn start_server(mut config: Config) -> Result<()> {
 
         tokio::spawn(reactor.run());
         tracing::info!("EventReactor started with built-in reactions");
+    }
+
+    // Seed builtin lifecycle hooks
+    {
+        let orch = server_state.orchestrator.clone();
+        tokio::spawn(async move {
+            match orch.neo4j().list_lifecycle_hooks(None).await {
+                Ok(hooks) => {
+                    let has_builtin = hooks.iter().any(|h| h.builtin);
+                    if !has_builtin {
+                        tracing::info!("Seeding builtin lifecycle hooks...");
+
+                        let mut hook = crate::lifecycle::LifecycleHook::new(
+                            "cascade-steps-on-task-complete".to_string(),
+                            crate::lifecycle::LifecycleScope::Task,
+                            "completed".to_string(),
+                            crate::lifecycle::LifecycleActionType::CascadeChildren,
+                            serde_json::json!({"target": "steps"}),
+                        );
+                        hook.builtin = true;
+                        hook.priority = 10;
+                        hook.description = Some(
+                            "Auto-complete pending steps when a task is completed".to_string(),
+                        );
+
+                        if let Err(e) = orch.neo4j().create_lifecycle_hook(&hook).await {
+                            tracing::warn!("Failed to seed builtin hook: {}", e);
+                        } else {
+                            tracing::info!("Seeded builtin lifecycle hook: {}", hook.name);
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to check lifecycle hooks at startup: {}", e);
+                }
+            }
+        });
     }
 
     // Create router

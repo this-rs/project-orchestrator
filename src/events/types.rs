@@ -1,7 +1,7 @@
 //! CRUD event types for WebSocket notifications.
 //!
 //! Defines the core types used by the event system:
-//! - [`EntityType`] — all entity kinds that can emit events (26 variants)
+//! - [`EntityType`] — all entity kinds that can emit events (27 variants)
 //! - [`CrudAction`] — the mutation action performed (8 variants)
 //! - [`CrudEvent`] — the event payload sent over WebSocket/NATS
 //! - [`EventEmitter`] — trait with convenience methods for emitting events
@@ -68,6 +68,8 @@ pub enum EntityType {
     Trigger,
     /// Graph topology constraint rule — emitters: code_handlers.rs (Created, Deleted)
     TopologyRule,
+    /// Lifecycle hook (automatic action on status change) — emitters: handlers.rs (Created, Updated, Deleted)
+    LifecycleHook,
 }
 
 /// The CRUD action performed on an entity.
@@ -354,6 +356,7 @@ mod tests {
             EntityType::AnalysisProfile,
             EntityType::Trigger,
             EntityType::TopologyRule,
+            EntityType::LifecycleHook,
         ];
 
         for variant in &variants {
@@ -488,8 +491,9 @@ mod tests {
             EntityType::AnalysisProfile,
             EntityType::Trigger,
             EntityType::TopologyRule,
+            EntityType::LifecycleHook,
         ];
-        assert_eq!(all.len(), 26);
+        assert_eq!(all.len(), 27);
     }
 
     // ================================================================

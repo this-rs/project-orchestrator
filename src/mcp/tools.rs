@@ -39,6 +39,7 @@ pub fn all_tools() -> Vec<ToolDefinition> {
         sharing_tool(),
         neural_routing_tool(),
         trajectory_tool(),
+        lifecycle_hook_tool(),
     ]
 }
 
@@ -1342,6 +1343,34 @@ fn trajectory_tool() -> ToolDefinition {
     }
 }
 
+fn lifecycle_hook_tool() -> ToolDefinition {
+    ToolDefinition {
+        name: "lifecycle_hook".to_string(),
+        description: "Manage lifecycle hooks (automatic actions on status changes). Actions: list, create, get, update, delete".to_string(),
+        input_schema: InputSchema {
+            schema_type: "object".to_string(),
+            properties: Some(json!({
+                "action": {
+                    "type": "string",
+                    "enum": ["list", "create", "get", "update", "delete"],
+                    "description": "Operation to perform"
+                },
+                "hook_id": {"type": "string", "description": "Hook UUID (get/update/delete)"},
+                "project_id": {"type": "string", "description": "Project UUID (list/create, optional)"},
+                "name": {"type": "string", "description": "Hook name (create)"},
+                "description": {"type": "string", "description": "Hook description (create/update)"},
+                "scope": {"type": "string", "description": "Entity scope (create): task, plan, step, milestone"},
+                "on_status": {"type": "string", "description": "Status to trigger on (create): completed, failed, in_progress, etc."},
+                "action_type": {"type": "string", "description": "Action type (create): cascade_children, mcp_call, create_note, emit_alert, start_protocol"},
+                "action_config": {"type": "object", "description": "Action configuration JSON (create/update)"},
+                "priority": {"type": "integer", "description": "Priority, lower = higher (create/update, default 100)"},
+                "enabled": {"type": "boolean", "description": "Whether the hook is enabled (update)"}
+            })),
+            required: Some(vec!["action".to_string()]),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1351,8 +1380,8 @@ mod tests {
         let tools = all_tools();
         assert_eq!(
             tools.len(),
-            27,
-            "Expected 27 mega-tools, got {}",
+            28,
+            "Expected 28 mega-tools, got {}",
             tools.len()
         );
     }

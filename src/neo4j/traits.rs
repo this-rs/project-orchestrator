@@ -9,6 +9,7 @@ use crate::graph::models::{
     AnalysisProfile, FabricFileAnalyticsUpdate, FileAnalyticsUpdate, FunctionAnalyticsUpdate,
     TopologyRule, TopologyViolation,
 };
+use crate::lifecycle::{LifecycleHook, LifecycleScope, UpdateLifecycleHookRequest};
 use crate::neo4j::models::*;
 use crate::notes::{
     EntityType, Note, NoteAnchor, NoteFilters, NoteImportance, NoteStatus, PropagatedNote,
@@ -3226,4 +3227,35 @@ pub trait GraphStore: Send + Sync {
     /// Delete an EventTrigger by its UUID.
     /// Returns `true` if a node was deleted, `false` if not found.
     async fn delete_event_trigger(&self, id: Uuid) -> Result<bool>;
+
+    // ========================================================================
+    // LifecycleHook operations
+    // ========================================================================
+
+    /// Create a lifecycle hook
+    async fn create_lifecycle_hook(&self, hook: &LifecycleHook) -> Result<()>;
+
+    /// Get a lifecycle hook by ID
+    async fn get_lifecycle_hook(&self, id: Uuid) -> Result<Option<LifecycleHook>>;
+
+    /// List lifecycle hooks, optionally filtered by project_id
+    async fn list_lifecycle_hooks(&self, project_id: Option<Uuid>) -> Result<Vec<LifecycleHook>>;
+
+    /// Update a lifecycle hook
+    async fn update_lifecycle_hook(
+        &self,
+        id: Uuid,
+        updates: &UpdateLifecycleHookRequest,
+    ) -> Result<()>;
+
+    /// Delete a lifecycle hook (builtin hooks cannot be deleted)
+    async fn delete_lifecycle_hook(&self, id: Uuid) -> Result<()>;
+
+    /// List hooks matching scope and on_status, including global hooks
+    async fn list_hooks_for_scope(
+        &self,
+        scope: &LifecycleScope,
+        on_status: &str,
+        project_id: Option<Uuid>,
+    ) -> Result<Vec<LifecycleHook>>;
 }

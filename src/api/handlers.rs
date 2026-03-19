@@ -2145,6 +2145,129 @@ pub async fn delete_constraint(
 }
 
 // ============================================================================
+// Lifecycle Hooks
+// ============================================================================
+
+/// GET /api/lifecycle-hooks — List lifecycle hooks, optionally filtered by project_id
+pub async fn list_lifecycle_hooks(
+    State(state): State<OrchestratorState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<Vec<crate::lifecycle::LifecycleHook>>, AppError> {
+    let project_id = params
+        .get("project_id")
+        .and_then(|s| Uuid::parse_str(s).ok());
+    let hooks = state
+        .orchestrator
+        .neo4j()
+        .list_lifecycle_hooks(project_id)
+        .await
+        .map_err(AppError::Internal)?;
+    Ok(Json(hooks))
+}
+
+/// POST /api/lifecycle-hooks — Create a lifecycle hook
+pub async fn create_lifecycle_hook(
+    State(state): State<OrchestratorState>,
+    Json(req): Json<crate::lifecycle::CreateLifecycleHookRequest>,
+) -> Result<Json<crate::lifecycle::LifecycleHook>, AppError> {
+    let mut hook = crate::lifecycle::LifecycleHook::new(
+        req.name,
+        req.scope,
+        req.on_status,
+        req.action_type,
+        req.action_config.unwrap_or(serde_json::json!({})),
+    );
+    hook.description = req.description;
+    if let Some(p) = req.priority {
+        hook.priority = p;
+    }
+    if let Some(pid_str) = &req.project_id {
+        hook.project_id = Uuid::parse_str(pid_str).ok();
+    }
+
+    state
+        .orchestrator
+        .neo4j()
+        .create_lifecycle_hook(&hook)
+        .await
+        .map_err(AppError::Internal)?;
+
+    state.event_bus.emit_created(
+        crate::events::EntityType::LifecycleHook,
+        &hook.id.to_string(),
+        serde_json::json!({"name": hook.name, "scope": format!("{:?}", hook.scope)}),
+        hook.project_id.map(|id| id.to_string()),
+    );
+
+    Ok(Json(hook))
+}
+
+/// GET /api/lifecycle-hooks/:id — Get a lifecycle hook by ID
+pub async fn get_lifecycle_hook(
+    State(state): State<OrchestratorState>,
+    Path(hook_id): Path<Uuid>,
+) -> Result<Json<crate::lifecycle::LifecycleHook>, AppError> {
+    let hook = state
+        .orchestrator
+        .neo4j()
+        .get_lifecycle_hook(hook_id)
+        .await
+        .map_err(AppError::Internal)?
+        .ok_or_else(|| AppError::NotFound("Lifecycle hook not found".into()))?;
+    Ok(Json(hook))
+}
+
+/// PATCH /api/lifecycle-hooks/:id — Update a lifecycle hook
+pub async fn update_lifecycle_hook(
+    State(state): State<OrchestratorState>,
+    Path(hook_id): Path<Uuid>,
+    Json(req): Json<crate::lifecycle::UpdateLifecycleHookRequest>,
+) -> Result<StatusCode, AppError> {
+    state
+        .orchestrator
+        .neo4j()
+        .update_lifecycle_hook(hook_id, &req)
+        .await
+        .map_err(AppError::Internal)?;
+
+    state.event_bus.emit_updated(
+        crate::events::EntityType::LifecycleHook,
+        &hook_id.to_string(),
+        serde_json::json!({"hook_id": hook_id}),
+        None,
+    );
+
+    Ok(StatusCode::OK)
+}
+
+/// DELETE /api/lifecycle-hooks/:id — Delete a lifecycle hook (builtin hooks cannot be deleted)
+pub async fn delete_lifecycle_hook(
+    State(state): State<OrchestratorState>,
+    Path(hook_id): Path<Uuid>,
+) -> Result<StatusCode, AppError> {
+    state
+        .orchestrator
+        .neo4j()
+        .delete_lifecycle_hook(hook_id)
+        .await
+        .map_err(|e| {
+            if e.to_string().contains("builtin") {
+                AppError::Conflict(e.to_string())
+            } else {
+                AppError::Internal(e)
+            }
+        })?;
+
+    state.event_bus.emit_deleted(
+        crate::events::EntityType::LifecycleHook,
+        &hook_id.to_string(),
+        None,
+    );
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ============================================================================
 // Meilisearch maintenance
 // ============================================================================
 

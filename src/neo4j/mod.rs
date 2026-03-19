@@ -13,6 +13,7 @@ mod decision;
 mod event_trigger;
 mod feature_graph;
 mod impl_graph_store;
+mod lifecycle_hook;
 mod milestone;
 pub mod models;
 mod note;

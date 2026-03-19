@@ -8,6 +8,7 @@ use uuid::Uuid;
 use super::client::Neo4jClient;
 use super::models::*;
 use super::traits::GraphStore;
+use crate::lifecycle::{LifecycleHook, LifecycleScope, UpdateLifecycleHookRequest};
 use crate::notes::{
     EntityType, Note, NoteAnchor, NoteFilters, NoteImportance, NoteStatus, PropagatedNote,
 };
@@ -3847,5 +3848,46 @@ impl GraphStore for Neo4jClient {
 
     async fn delete_event_trigger(&self, id: Uuid) -> anyhow::Result<bool> {
         self.delete_event_trigger(id).await
+    }
+
+    // ========================================================================
+    // LifecycleHook operations
+    // ========================================================================
+
+    async fn create_lifecycle_hook(&self, hook: &LifecycleHook) -> anyhow::Result<()> {
+        self.create_lifecycle_hook(hook).await
+    }
+
+    async fn get_lifecycle_hook(&self, id: Uuid) -> anyhow::Result<Option<LifecycleHook>> {
+        self.get_lifecycle_hook(id).await
+    }
+
+    async fn list_lifecycle_hooks(
+        &self,
+        project_id: Option<Uuid>,
+    ) -> anyhow::Result<Vec<LifecycleHook>> {
+        self.list_lifecycle_hooks(project_id).await
+    }
+
+    async fn update_lifecycle_hook(
+        &self,
+        id: Uuid,
+        updates: &UpdateLifecycleHookRequest,
+    ) -> anyhow::Result<()> {
+        self.update_lifecycle_hook(id, updates).await
+    }
+
+    async fn delete_lifecycle_hook(&self, id: Uuid) -> anyhow::Result<()> {
+        self.delete_lifecycle_hook(id).await
+    }
+
+    async fn list_hooks_for_scope(
+        &self,
+        scope: &LifecycleScope,
+        on_status: &str,
+        project_id: Option<Uuid>,
+    ) -> anyhow::Result<Vec<LifecycleHook>> {
+        self.list_hooks_for_scope(scope, on_status, project_id)
+            .await
     }
 }

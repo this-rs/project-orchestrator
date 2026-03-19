@@ -1331,6 +1331,7 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
             "critical path", "chemin critique", "blocked", "bloquer",
             "run", "execute", "exécuter", "trigger", "auto PR", "delegate", "déléguer",
             "predict", "compare", "enrich", "enrichir",
+            "lifecycle", "hook", "cascade", "on_status", "automation",
         ],
         tools: &[
             ToolRef {
@@ -1344,6 +1345,10 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
             ToolRef {
                 name: "step",
                 description: "Manage steps (list/create/update/get/delete/get_progress)",
+            },
+            ToolRef {
+                name: "lifecycle_hook",
+                description: "Manage lifecycle hooks (list/create/get/update/delete) — automatic actions triggered on entity status changes (cascade_children, create_note, emit_alert, start_protocol, mcp_call)",
             },
         ],
     },
@@ -2881,8 +2886,8 @@ mod tests {
     fn test_tool_groups_cover_all_23_mega_tools() {
         let count = tool_catalog_tool_count();
         assert_eq!(
-            count, 27,
-            "TOOL_GROUPS must cover exactly 27 unique mega-tools (got {}). \
+            count, 28,
+            "TOOL_GROUPS must cover exactly 28 unique mega-tools (got {}). \
              Update the catalog when adding/removing MCP tools.",
             count
         );

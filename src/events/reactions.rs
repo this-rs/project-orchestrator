@@ -418,6 +418,23 @@ async fn on_plan_status_changed(event: CrudEvent, state: Arc<ServerState>) {
 }
 
 // ─────────────────────────────────────────────────────────────
+// Reaction: *::StatusChanged → evaluate LifecycleHooks
+// ─────────────────────────────────────────────────────────────
+
+/// When any entity changes status, evaluate and execute matching LifecycleHooks.
+///
+/// This is the bridge between the EventReactor and the LifecycleHook system.
+/// It runs AFTER the built-in reactions (cascade-steps, plan-auto-complete)
+/// and handles user-defined hooks stored in Neo4j.
+async fn on_status_changed_lifecycle_hooks(event: CrudEvent, state: Arc<ServerState>) {
+    if event.action != CrudAction::StatusChanged {
+        return;
+    }
+
+    crate::lifecycle::executor::execute_lifecycle_hooks(&event, &state).await;
+}
+
+// ─────────────────────────────────────────────────────────────
 // Helpers (visible to tests)
 // ─────────────────────────────────────────────────────────────
 
@@ -493,6 +510,16 @@ pub fn register_builtin_reactions(
             Arc::new(|event, ctx| -> Pin<Box<dyn Future<Output = ()> + Send>> {
                 Box::pin(async move {
                     on_plan_status_changed(event, extract_state(ctx)).await;
+                })
+            }),
+        )
+        .on(
+            "lifecycle-hooks",
+            None,
+            Some(CrudAction::StatusChanged),
+            Arc::new(|event, ctx| -> Pin<Box<dyn Future<Output = ()> + Send>> {
+                Box::pin(async move {
+                    on_status_changed_lifecycle_hooks(event, extract_state(ctx)).await;
                 })
             }),
         )
