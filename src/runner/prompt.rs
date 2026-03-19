@@ -708,6 +708,38 @@ mod tests {
         assert!(result.contains("### Refactor Constraints"));
     }
 
+    #[test]
+    fn test_tag_synonym_testing() {
+        let mut ctx = RunnerPromptContext::single_agent(String::new());
+        ctx.task_tags = vec!["testing".to_string()];
+        let result = build_runner_constraints(&ctx);
+        assert!(result.contains("### Test Constraints"));
+    }
+
+    #[test]
+    fn test_tag_synonym_refactoring() {
+        let mut ctx = RunnerPromptContext::single_agent(String::new());
+        ctx.task_tags = vec!["refactoring".to_string()];
+        let result = build_runner_constraints(&ctx);
+        assert!(result.contains("### Refactor Constraints"));
+    }
+
+    #[test]
+    fn test_tag_synonym_documentation() {
+        let mut ctx = RunnerPromptContext::single_agent(String::new());
+        ctx.task_tags = vec!["documentation".to_string()];
+        let result = build_runner_constraints(&ctx);
+        assert!(result.contains("### Documentation Constraints"));
+    }
+
+    #[test]
+    fn test_tag_synonym_bugfix() {
+        let mut ctx = RunnerPromptContext::single_agent(String::new());
+        ctx.task_tags = vec!["bugfix".to_string()];
+        let result = build_runner_constraints(&ctx);
+        assert!(result.contains("### Bug Fix Constraints"));
+    }
+
     // ========================================================================
     // PersonaContext section tests
     // ========================================================================

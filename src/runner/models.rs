@@ -682,4 +682,159 @@ mod tests {
         assert_eq!(PlanRunStatus::Running.to_string(), "running");
         assert_eq!(PlanRunStatus::BudgetExceeded.to_string(), "budget_exceeded");
     }
+
+    // ========================================================================
+    // TaskExecutionReport tests
+    // ========================================================================
+
+    fn make_report() -> TaskExecutionReport {
+        TaskExecutionReport {
+            tool_use_count: 10,
+            tool_use_breakdown: std::collections::HashMap::from([
+                ("Edit".to_string(), 5),
+                ("Bash".to_string(), 5),
+            ]),
+            error_count: 0,
+            last_error: None,
+            files_modified: vec!["src/main.rs".to_string()],
+            commits: vec!["abc123".to_string()],
+            agent_success: true,
+            cost_usd: 0.5,
+            duration_secs: 60.0,
+            confidence_score: 0.0,
+        }
+    }
+
+    #[test]
+    fn test_report_perfect_confidence() {
+        let mut report = make_report();
+        report.compute_confidence();
+        assert!(
+            (report.confidence_score - 1.0).abs() < f64::EPSILON,
+            "Perfect report should have confidence 1.0, got {}",
+            report.confidence_score
+        );
+    }
+
+    #[test]
+    fn test_report_error_ratio_penalty() {
+        let mut report = make_report();
+        report.error_count = 5; // 50% error ratio → -0.15
+        report.compute_confidence();
+        let expected = 1.0 - 0.3 * 0.5;
+        assert!(
+            (report.confidence_score - expected).abs() < 1e-9,
+            "Expected {}, got {}",
+            expected,
+            report.confidence_score
+        );
+    }
+
+    #[test]
+    fn test_report_no_commits_penalty() {
+        let mut report = make_report();
+        report.commits = vec![];
+        report.compute_confidence();
+        let expected = 1.0 - 0.3;
+        assert!(
+            (report.confidence_score - expected).abs() < 1e-9,
+            "Expected {}, got {}",
+            expected,
+            report.confidence_score
+        );
+    }
+
+    #[test]
+    fn test_report_no_files_modified_penalty() {
+        let mut report = make_report();
+        report.files_modified = vec![];
+        report.compute_confidence();
+        let expected = 1.0 - 0.2;
+        assert!(
+            (report.confidence_score - expected).abs() < 1e-9,
+            "Expected {}, got {}",
+            expected,
+            report.confidence_score
+        );
+    }
+
+    #[test]
+    fn test_report_agent_failure_penalty() {
+        let mut report = make_report();
+        report.agent_success = false;
+        report.compute_confidence();
+        let expected = 1.0 - 0.4;
+        assert!(
+            (report.confidence_score - expected).abs() < 1e-9,
+            "Expected {}, got {}",
+            expected,
+            report.confidence_score
+        );
+    }
+
+    #[test]
+    fn test_report_all_penalties_clamped_to_zero() {
+        let mut report = TaskExecutionReport {
+            tool_use_count: 10,
+            tool_use_breakdown: std::collections::HashMap::new(),
+            error_count: 10, // 100% errors → -0.3
+            last_error: Some("boom".to_string()),
+            files_modified: vec![], // -0.2
+            commits: vec![],        // -0.3
+            agent_success: false,   // -0.4
+            cost_usd: 1.0,
+            duration_secs: 300.0,
+            confidence_score: 0.0,
+        };
+        // Total penalty = 0.3 + 0.3 + 0.2 + 0.4 = 1.2 → clamped to 0.0
+        report.compute_confidence();
+        assert!(
+            report.confidence_score.abs() < f64::EPSILON,
+            "Should be clamped to 0.0, got {}",
+            report.confidence_score
+        );
+    }
+
+    #[test]
+    fn test_report_zero_tool_uses_no_error_penalty() {
+        let mut report = make_report();
+        report.tool_use_count = 0;
+        report.error_count = 5; // should be ignored when tool_use_count == 0
+        report.compute_confidence();
+        assert!(
+            (report.confidence_score - 1.0).abs() < f64::EPSILON,
+            "Zero tool uses should skip error ratio penalty, got {}",
+            report.confidence_score
+        );
+    }
+
+    #[test]
+    fn test_report_serialization_roundtrip() {
+        let mut report = make_report();
+        report.compute_confidence();
+        let json = serde_json::to_string(&report).unwrap();
+        let deserialized: TaskExecutionReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.tool_use_count, 10);
+        assert_eq!(deserialized.error_count, 0);
+        assert!(deserialized.agent_success);
+        assert_eq!(deserialized.commits, vec!["abc123"]);
+        assert_eq!(deserialized.files_modified, vec!["src/main.rs"]);
+        assert!((deserialized.confidence_score - 1.0).abs() < f64::EPSILON,);
+    }
+
+    #[test]
+    fn test_report_combined_penalties() {
+        let mut report = make_report();
+        report.error_count = 2; // 20% error ratio → -0.06
+        report.commits = vec![]; // -0.3
+        report.agent_success = true;
+        report.compute_confidence();
+        let expected = 1.0 - (0.3 * 0.2) - 0.3;
+        assert!(
+            (report.confidence_score - expected).abs() < 1e-9,
+            "Expected {}, got {}",
+            expected,
+            report.confidence_score
+        );
+    }
 }

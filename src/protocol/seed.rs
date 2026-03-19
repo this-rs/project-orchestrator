@@ -803,4 +803,115 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn test_seed_result_serialization() {
+        let result = SeedResult {
+            updated: 10,
+            skipped: 2,
+            protocols_found: 4,
+            protocols_missing: vec!["auto-maintenance".to_string()],
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("\"updated\":10"));
+        assert!(json.contains("\"skipped\":2"));
+        assert!(json.contains("\"protocols_found\":4"));
+        assert!(json.contains("auto-maintenance"));
+    }
+
+    #[test]
+    fn test_seed_result_debug() {
+        let result = SeedResult {
+            updated: 0,
+            skipped: 0,
+            protocols_found: 0,
+            protocols_missing: vec![],
+        };
+        let debug = format!("{:?}", result);
+        assert!(debug.contains("SeedResult"));
+        assert!(debug.contains("updated: 0"));
+    }
+
+    #[test]
+    fn test_unique_state_names_per_protocol() {
+        let protocols = build_protocol_seeds();
+        for proto in &protocols {
+            let mut seen = std::collections::HashSet::new();
+            for state in &proto.states {
+                assert!(
+                    seen.insert(state.state_name),
+                    "Duplicate state name '{}' in protocol '{}'",
+                    state.state_name,
+                    proto.protocol_name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_unique_protocol_names() {
+        let protocols = build_protocol_seeds();
+        let mut seen = std::collections::HashSet::new();
+        for proto in &protocols {
+            assert!(
+                seen.insert(proto.protocol_name),
+                "Duplicate protocol name '{}'",
+                proto.protocol_name
+            );
+        }
+    }
+
+    #[test]
+    fn test_all_fragments_end_with_period_or_instruction() {
+        let protocols = build_protocol_seeds();
+        for proto in &protocols {
+            for state in &proto.states {
+                let trimmed = state.prompt_fragment.trim();
+                assert!(
+                    trimmed.ends_with('.') || trimmed.ends_with(':') || trimmed.ends_with(')'),
+                    "Fragment for {}/{} should end with punctuation, got: ...{}",
+                    proto.protocol_name,
+                    state.state_name,
+                    &trimmed[trimmed.len().saturating_sub(20)..],
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_session_lifecycle_has_warm_up_and_closing() {
+        let protocols = build_protocol_seeds();
+        let session = &protocols[0];
+        assert_eq!(session.protocol_name, "session-lifecycle");
+        let state_names: Vec<&str> = session.states.iter().map(|s| s.state_name).collect();
+        assert!(state_names.contains(&"warm_up"));
+        assert!(state_names.contains(&"closing"));
+        assert!(state_names.contains(&"closed"));
+    }
+
+    #[test]
+    fn test_wave_dispatch_has_compute_and_dispatch() {
+        let protocols = build_protocol_seeds();
+        let wave = protocols
+            .iter()
+            .find(|p| p.protocol_name == "wave-dispatch")
+            .unwrap();
+        let state_names: Vec<&str> = wave.states.iter().map(|s| s.state_name).collect();
+        assert!(state_names.contains(&"compute_waves"));
+        assert!(state_names.contains(&"dispatch_parallel"));
+    }
+
+    #[test]
+    fn test_rfc_lifecycle_has_full_flow() {
+        let protocols = build_protocol_seeds();
+        let rfc = protocols
+            .iter()
+            .find(|p| p.protocol_name == "rfc-lifecycle")
+            .unwrap();
+        let state_names: Vec<&str> = rfc.states.iter().map(|s| s.state_name).collect();
+        assert!(state_names.contains(&"draft"));
+        assert!(state_names.contains(&"accepted"));
+        assert!(state_names.contains(&"rejected"));
+        assert!(state_names.contains(&"implemented"));
+    }
 }
