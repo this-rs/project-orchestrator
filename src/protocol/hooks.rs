@@ -22,6 +22,7 @@
 //! Each protocol has a `last_triggered_at` timestamp. Auto-triggers are skipped
 //! if the protocol was triggered less than [`MIN_TRIGGER_INTERVAL_SECS`] seconds ago.
 
+use crate::chat::manager::ChatManager;
 use crate::events::EventEmitter;
 use crate::neo4j::traits::GraphStore;
 use crate::protocol::engine;
@@ -52,15 +53,21 @@ pub fn cancel_active_runner(run_id: Uuid) {
 ///
 /// Registers the run in `ACTIVE_RUNNERS` and spawns a tokio task
 /// that drives the FSM to completion via `runner::run_protocol()`.
+///
+/// When `chat_manager` is provided, business protocols can spawn Claude
+/// agent sessions for LLM-driven state execution. Without it, business
+/// states that require LLM will use stub/auto-advance behavior.
 pub fn spawn_protocol_runner(
     store: Arc<dyn GraphStore>,
     run_id: Uuid,
     emitter: Arc<dyn EventEmitter>,
+    chat_manager: Option<Arc<ChatManager>>,
 ) {
     let cancel = CancellationToken::new();
     ACTIVE_RUNNERS.insert(run_id, cancel.clone());
     tokio::spawn(async move {
-        let result = super::runner::run_protocol(store, run_id, cancel, emitter).await;
+        let result =
+            super::runner::run_protocol(store, run_id, cancel, emitter, chat_manager).await;
         ACTIVE_RUNNERS.remove(&run_id);
         match &result {
             Ok(run) => tracing::info!(run_id = %run_id, "Protocol run completed: {:?}", run.status),
@@ -175,7 +182,7 @@ async fn trigger_protocols_for_event(
 
                 // 6. Spawn the protocol runner to drive the FSM
                 if let Some(ref emitter) = emitter {
-                    spawn_protocol_runner(store.clone(), run.id, emitter.clone());
+                    spawn_protocol_runner(store.clone(), run.id, emitter.clone(), None);
                 }
 
                 triggered_count += 1;
@@ -258,7 +265,7 @@ pub async fn recover_orphaned_runs(
                                 age_secs,
                                 "Re-spawning runner for orphaned runner-managed run"
                             );
-                            spawn_protocol_runner(store.clone(), run.id, emitter.clone());
+                            spawn_protocol_runner(store.clone(), run.id, emitter.clone(), None);
                             total_recovered += 1;
                         } else {
                             let mut recovered_run = run.clone();
@@ -537,7 +544,7 @@ async fn run_scheduled_protocols(
 
                     // Spawn the protocol runner to drive the FSM
                     if let Some(ref emitter) = emitter {
-                        spawn_protocol_runner(store.clone(), run.id, emitter.clone());
+                        spawn_protocol_runner(store.clone(), run.id, emitter.clone(), None);
                     }
 
                     total_triggered += 1;

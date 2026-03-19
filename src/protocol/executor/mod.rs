@@ -2,8 +2,10 @@
 //!
 //! Provides the [`Executor`] trait for executing protocol state actions,
 //! and two concrete implementations:
-//! - [`SystemExecutor`]: Executes system protocol actions natively via GraphStore
-//! - [`AgentExecutor`]: Executes business protocol actions via Claude agent
+//! - [`SystemExecutor`]: Executes system protocol actions natively via GraphStore (no LLM)
+//! - [`AgentExecutor`]: Executes business protocol actions via Claude agent sessions.
+//!   Uses a fast-path (MCP-style actions → SystemExecutor) and a slow-path
+//!   (spawns a Claude session via ChatManager, streams response, extracts trigger).
 //!
 //! The runner loop ([`super::runner`]) selects the appropriate executor
 //! based on the protocol's `protocol_category`.
