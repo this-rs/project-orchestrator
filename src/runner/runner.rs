@@ -1816,6 +1816,22 @@ impl PlanRunner {
             complexity_directive(task_profile.complexity)
         ));
 
+        // --- Step 3b: Prepend runner behavioral instructions into the user message ---
+        // The --system-prompt CLI flag is ignored in interactive mode (--input-format stream-json).
+        // To ensure the agent receives the autonomous execution instructions, we prepend them
+        // directly into the user message. This is the ONLY reliable way to reach the agent.
+        {
+            let prompt_ctx = runner_context.to_prompt_context();
+            let runner_instructions =
+                crate::runner::prompt::build_runner_system_prompt(&prompt_ctx);
+            let mut full_prompt =
+                String::with_capacity(runner_instructions.len() + prompt.len() + 2);
+            full_prompt.push_str(&runner_instructions);
+            full_prompt.push_str("\n---\n\n");
+            full_prompt.push_str(&prompt);
+            prompt = full_prompt;
+        }
+
         // Spawn agent: create_session → subscribe → send_message → listen
         let task_context_str = task_node
             .as_ref()
