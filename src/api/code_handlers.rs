@@ -10,9 +10,9 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use super::handlers::{AppError, OrchestratorState};
-use crate::events::EventEmitter;
 use crate::analytics::distribution::{adaptive_threshold, analyze_distribution};
 use crate::analytics::hypothesis::test_community_homogeneity;
+use crate::events::EventEmitter;
 use crate::graph::algorithms::into_ranked;
 use crate::graph::models::{FusionWeights, MultiSignalImpact, MultiSignalScore, RankedList};
 use crate::neo4j::models::{ConnectedFileNode, DecisionNode};
@@ -3086,11 +3086,9 @@ pub async fn delete_topology_rule(
     let neo4j = state.orchestrator.neo4j();
     neo4j.delete_topology_rule(&rule_id).await?;
 
-    state.event_bus.emit_deleted(
-        crate::events::EntityType::TopologyRule,
-        &rule_id,
-        None,
-    );
+    state
+        .event_bus
+        .emit_deleted(crate::events::EntityType::TopologyRule, &rule_id, None);
 
     Ok(Json(serde_json::json!({"deleted": true})))
 }

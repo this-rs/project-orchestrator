@@ -100,12 +100,7 @@ async fn on_project_synced(event: CrudEvent, state: Arc<ServerState>) {
         }
 
         // Step 2: Reindex decisions
-        match state
-            .orchestrator
-            .plan_manager()
-            .reindex_decisions()
-            .await
-        {
+        match state.orchestrator.plan_manager().reindex_decisions().await {
             Ok((total, indexed)) => {
                 debug!(
                     project_id = %project_id,
@@ -163,10 +158,7 @@ async fn on_project_synced(event: CrudEvent, state: Arc<ServerState>) {
 
         // For incremental syncs, use the debouncer to avoid expensive recomputation
         // on every file change. The debouncer batches multiple syncs into one update.
-        state
-            .orchestrator
-            .analytics_debouncer()
-            .trigger(project_id);
+        state.orchestrator.analytics_debouncer().trigger(project_id);
     }
 }
 
@@ -314,7 +306,12 @@ async fn on_task_status_changed(event: CrudEvent, state: Arc<ServerState>) {
 /// Uses `GraphStore::get_plan_id_for_task` which traverses the
 /// `(Plan)-[:HAS_TASK]->(Task)` relationship in Neo4j.
 async fn get_plan_id_for_task(state: &ServerState, task_id: Uuid) -> Option<Uuid> {
-    match state.orchestrator.neo4j().get_plan_id_for_task(task_id).await {
+    match state
+        .orchestrator
+        .neo4j()
+        .get_plan_id_for_task(task_id)
+        .await
+    {
         Ok(plan_id) => plan_id,
         Err(e) => {
             error!(task_id = %task_id, error = %e, "get_plan_id_for_task: query failed");

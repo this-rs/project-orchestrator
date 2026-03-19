@@ -45,7 +45,10 @@ use crate::neo4j::GraphStore;
 /// Each handler receives the event and an opaque context (typically `Arc<ServerState>`).
 /// Handlers are `Send + Sync` and return a pinned future.
 pub type ReactionFn = Arc<
-    dyn Fn(CrudEvent, Arc<dyn std::any::Any + Send + Sync>) -> Pin<Box<dyn Future<Output = ()> + Send>>
+    dyn Fn(
+            CrudEvent,
+            Arc<dyn std::any::Any + Send + Sync>,
+        ) -> Pin<Box<dyn Future<Output = ()> + Send>>
         + Send
         + Sync,
 >;
@@ -73,10 +76,7 @@ impl ReactionRule {
             .entity_type
             .as_ref()
             .map_or(true, |t| t == &event.entity_type);
-        let action_match = self
-            .action
-            .as_ref()
-            .map_or(true, |a| a == &event.action);
+        let action_match = self.action.as_ref().map_or(true, |a| a == &event.action);
         type_match && action_match
     }
 }
@@ -192,10 +192,7 @@ impl EventReactor {
     }
 
     /// Reload triggers from Neo4j into the cache.
-    async fn refresh_triggers(
-        neo4j: &dyn GraphStore,
-        triggers: &RwLock<Vec<EventTrigger>>,
-    ) {
+    async fn refresh_triggers(neo4j: &dyn GraphStore, triggers: &RwLock<Vec<EventTrigger>>) {
         match neo4j.list_event_triggers(None, true).await {
             Ok(new_triggers) => {
                 let count = new_triggers.len();
@@ -275,9 +272,7 @@ impl EventReactor {
 
                     // Check persistent EventTriggers (if enabled)
                     // Anti-recursion guard: skip if the event was emitted by a trigger
-                    if self.trigger_support.is_some()
-                        && event.entity_type != EntityType::Trigger
-                    {
+                    if self.trigger_support.is_some() && event.entity_type != EntityType::Trigger {
                         let triggers = self.triggers.read().await;
                         for trigger in triggers.iter() {
                             if !trigger.enabled {
@@ -316,9 +311,7 @@ impl EventReactor {
                             }
 
                             matched = true;
-                            self.counters
-                                .triggers_fired
-                                .fetch_add(1, Ordering::Relaxed);
+                            self.counters.triggers_fired.fetch_add(1, Ordering::Relaxed);
 
                             info!(
                                 trigger_name = %trigger.name,
@@ -351,16 +344,11 @@ impl EventReactor {
                     }
 
                     if matched {
-                        self.counters
-                            .events_matched
-                            .fetch_add(1, Ordering::Relaxed);
+                        self.counters.events_matched.fetch_add(1, Ordering::Relaxed);
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
-                    warn!(
-                        skipped = n,
-                        "EventReactor lagged, skipped events"
-                    );
+                    warn!(skipped = n, "EventReactor lagged, skipped events");
                 }
                 Err(broadcast::error::RecvError::Closed) => {
                     info!("EventReactor channel closed, shutting down");

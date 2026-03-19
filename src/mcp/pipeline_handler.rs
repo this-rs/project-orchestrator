@@ -13,9 +13,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use super::http_client::McpHttpClient;
-use crate::pipeline::composer::{
-    compose_pipeline, PipelineSpec, PlanConstraint, PlanWave,
-};
+use crate::pipeline::composer::{compose_pipeline, PipelineSpec, PlanConstraint, PlanWave};
 use crate::pipeline::runner::PipelineConfig;
 use crate::pipeline::skill_injector::{SkillContext, SkillInjector};
 
@@ -58,10 +56,7 @@ fn parse_waves(waves_json: &Value) -> Vec<PlanWave> {
                 .and_then(|v| v.as_array())
                 .map(|arr| {
                     arr.iter()
-                        .filter_map(|id| {
-                            id.as_str()
-                                .and_then(|s| Uuid::parse_str(s).ok())
-                        })
+                        .filter_map(|id| id.as_str().and_then(|s| Uuid::parse_str(s).ok()))
                         .collect()
                 })
                 .unwrap_or_default();
@@ -144,12 +139,10 @@ fn collect_affected_files(waves: &[PlanWave]) -> Vec<String> {
 fn parse_skills(skills_json: &Value) -> Vec<SkillContext> {
     let arr = match skills_json.as_array() {
         Some(a) => a,
-        None => {
-            match skills_json.get("skills").and_then(|v| v.as_array()) {
-                Some(a) => a,
-                None => return Vec::new(),
-            }
-        }
+        None => match skills_json.get("skills").and_then(|v| v.as_array()) {
+            Some(a) => a,
+            None => return Vec::new(),
+        },
     };
 
     arr.iter()
@@ -163,7 +156,10 @@ fn parse_skills(skills_json: &Value) -> Vec<SkillContext> {
 async fn build_pipeline_spec(
     http: &McpHttpClient,
     plan_id: Uuid,
-) -> Result<(PipelineSpec, Option<crate::pipeline::skill_injector::InjectionResult>)> {
+) -> Result<(
+    PipelineSpec,
+    Option<crate::pipeline::skill_injector::InjectionResult>,
+)> {
     // 1. Fetch plan details
     let plan = http
         .get(&format!("/api/plans/{plan_id}"))
@@ -197,10 +193,7 @@ async fn build_pipeline_spec(
     let mut spec = compose_pipeline(plan_id, plan_name, &waves, &constraints, &affected_files);
 
     // 6. Apply skill injections if skills are available
-    let injection_result = match http
-        .get(&format!("/api/plans/{plan_id}/skills"))
-        .await
-    {
+    let injection_result = match http.get(&format!("/api/plans/{plan_id}/skills")).await {
         Ok(skills_json) => {
             let skills = parse_skills(&skills_json);
             if skills.is_empty() {
@@ -232,10 +225,7 @@ async fn build_pipeline_spec(
 ///
 /// Returns the composed `PipelineSpec` as JSON, including any skill injections
 /// that were applied.
-pub async fn handle_build_pipeline(
-    http: &McpHttpClient,
-    args: &Value,
-) -> Result<Value> {
+pub async fn handle_build_pipeline(http: &McpHttpClient, args: &Value) -> Result<Value> {
     let plan_id = extract_plan_id(args)?;
 
     let (spec, injection_result) = build_pipeline_spec(http, plan_id).await?;
@@ -247,13 +237,11 @@ pub async fn handle_build_pipeline(
     if let Value::Object(ref mut map) = result {
         map.insert(
             "protocol_states".to_string(),
-            serde_json::to_value(spec.to_protocol_states())
-                .unwrap_or(json!([])),
+            serde_json::to_value(spec.to_protocol_states()).unwrap_or(json!([])),
         );
         map.insert(
             "protocol_transitions".to_string(),
-            serde_json::to_value(spec.to_protocol_transitions())
-                .unwrap_or(json!([])),
+            serde_json::to_value(spec.to_protocol_transitions()).unwrap_or(json!([])),
         );
         if let Some(ref inj) = injection_result {
             map.insert(
@@ -272,10 +260,7 @@ pub async fn handle_build_pipeline(
 ///
 /// Returns the run configuration with the embedded pipeline spec.
 /// Actual execution is async and would be started by the runner service.
-pub async fn handle_run_pipeline(
-    http: &McpHttpClient,
-    args: &Value,
-) -> Result<Value> {
+pub async fn handle_run_pipeline(http: &McpHttpClient, args: &Value) -> Result<Value> {
     let plan_id = extract_plan_id(args)?;
     let cwd = args
         .get("cwd")
@@ -337,10 +322,7 @@ pub async fn handle_run_pipeline(
 ///
 /// Returns structured status from the plan's protocol runs: current wave,
 /// current gate, and progress score.
-pub async fn handle_pipeline_status(
-    http: &McpHttpClient,
-    args: &Value,
-) -> Result<Value> {
+pub async fn handle_pipeline_status(http: &McpHttpClient, args: &Value) -> Result<Value> {
     let plan_id = extract_plan_id(args)?;
 
     // Fetch the current run status
@@ -396,10 +378,7 @@ pub async fn handle_pipeline_status(
 ///
 /// Returns a list of protocol runs associated with the plan with metrics
 /// comparison across runs.
-pub async fn handle_pipeline_history(
-    http: &McpHttpClient,
-    args: &Value,
-) -> Result<Value> {
+pub async fn handle_pipeline_history(http: &McpHttpClient, args: &Value) -> Result<Value> {
     let plan_id = extract_plan_id(args)?;
 
     // Fetch all runs for the plan

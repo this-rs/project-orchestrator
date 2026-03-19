@@ -1421,10 +1421,7 @@ fn protected_routes() -> Router<OrchestratorState> {
             get(trigger_handlers::list_triggers).post(trigger_handlers::create_trigger),
         )
         // Static sub-paths MUST come before /{id} to avoid capture
-        .route(
-            "/api/triggers/stats",
-            get(trigger_handlers::trigger_stats),
-        )
+        .route("/api/triggers/stats", get(trigger_handlers::trigger_stats))
         .route(
             "/api/triggers/{id}",
             get(trigger_handlers::get_trigger)

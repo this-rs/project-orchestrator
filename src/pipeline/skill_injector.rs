@@ -203,9 +203,7 @@ impl SkillInjector {
 
             // --- context_template JSON directives -----------------------------
             if let Some(ref template) = skill.context_template {
-                if let Some(directive_injections) =
-                    Self::parse_context_template(skill, template)
-                {
+                if let Some(directive_injections) = Self::parse_context_template(skill, template) {
                     injections.extend(directive_injections);
                 }
             }
@@ -290,11 +288,7 @@ impl SkillInjector {
     // -----------------------------------------------------------------------
 
     /// Convenience: analyze skills then apply the resulting injections.
-    pub fn inject(
-        &self,
-        skills: &[SkillContext],
-        spec: &mut PipelineSpec,
-    ) -> InjectionResult {
+    pub fn inject(&self, skills: &[SkillContext], spec: &mut PipelineSpec) -> InjectionResult {
         let injections = self.analyze_skills(skills, spec);
         self.apply_injections(spec, &injections)
     }
@@ -345,10 +339,7 @@ impl SkillInjector {
                             "after_state".into(),
                             serde_json::Value::String(after_state.clone()),
                         );
-                        p.insert(
-                            "trigger".into(),
-                            serde_json::Value::String(trigger.clone()),
-                        );
+                        p.insert("trigger".into(), serde_json::Value::String(trigger.clone()));
                         p.insert(
                             "description".into(),
                             serde_json::Value::String(state.description.clone()),
@@ -415,10 +406,7 @@ impl SkillInjector {
                             "to_state".into(),
                             serde_json::Value::String(to_state.clone()),
                         );
-                        p.insert(
-                            "guard".into(),
-                            serde_json::Value::String(guard.clone()),
-                        );
+                        p.insert("guard".into(), serde_json::Value::String(guard.clone()));
                         p
                     },
                 });
@@ -455,10 +443,8 @@ impl SkillInjector {
                 let mut found = false;
                 for gate in &mut spec.final_gates {
                     if gate.gate_type == "coverage" {
-                        gate.params.insert(
-                            "threshold".into(),
-                            serde_json::json!(new_threshold),
-                        );
+                        gate.params
+                            .insert("threshold".into(), serde_json::json!(new_threshold));
                         found = true;
                     }
                 }
@@ -469,10 +455,8 @@ impl SkillInjector {
                         .chain(stage.post_gates.iter_mut())
                     {
                         if gate.gate_type == "coverage" {
-                            gate.params.insert(
-                                "threshold".into(),
-                                serde_json::json!(new_threshold),
-                            );
+                            gate.params
+                                .insert("threshold".into(), serde_json::json!(new_threshold));
                             found = true;
                         }
                     }
@@ -505,7 +489,10 @@ impl SkillInjector {
         // Simple pattern: find a number followed by optional '%'.
         let lower = text.to_lowercase();
         for word in lower.split_whitespace() {
-            let cleaned = word.trim_end_matches('%').trim_end_matches(',').trim_end_matches('.');
+            let cleaned = word
+                .trim_end_matches('%')
+                .trim_end_matches(',')
+                .trim_end_matches('.');
             if let Ok(val) = cleaned.parse::<f64>() {
                 // Only accept values that look like percentages (0–100).
                 if (0.0..=100.0).contains(&val) {
@@ -533,10 +520,7 @@ impl SkillInjector {
     ///   ]
     /// }
     /// ```
-    fn parse_context_template(
-        skill: &SkillContext,
-        template: &str,
-    ) -> Option<Vec<SkillInjection>> {
+    fn parse_context_template(skill: &SkillContext, template: &str) -> Option<Vec<SkillInjection>> {
         let parsed: serde_json::Value = serde_json::from_str(template).ok()?;
         let directives = parsed.get("injections")?.as_array()?;
 
@@ -555,10 +539,8 @@ impl SkillInjector {
 
             let modification = match injection_type {
                 "add_pre_gate" => {
-                    let wave_number =
-                        directive.get("wave_number")?.as_u64()? as usize;
-                    let gate_type =
-                        directive.get("gate_type")?.as_str()?.to_string();
+                    let wave_number = directive.get("wave_number")?.as_u64()? as usize;
+                    let gate_type = directive.get("gate_type")?.as_str()?.to_string();
                     let params: HashMap<String, serde_json::Value> = directive
                         .get("params")
                         .and_then(|p| serde_json::from_value(p.clone()).ok())
@@ -569,10 +551,8 @@ impl SkillInjector {
                     }
                 }
                 "add_post_gate" => {
-                    let wave_number =
-                        directive.get("wave_number")?.as_u64()? as usize;
-                    let gate_type =
-                        directive.get("gate_type")?.as_str()?.to_string();
+                    let wave_number = directive.get("wave_number")?.as_u64()? as usize;
+                    let gate_type = directive.get("gate_type")?.as_str()?.to_string();
                     let params: HashMap<String, serde_json::Value> = directive
                         .get("params")
                         .and_then(|p| serde_json::from_value(p.clone()).ok())
@@ -583,25 +563,20 @@ impl SkillInjector {
                     }
                 }
                 "modify_gate_params" => {
-                    let gate_type =
-                        directive.get("gate_type")?.as_str()?.to_string();
-                    let param_overrides: HashMap<String, serde_json::Value> =
-                        directive
-                            .get("params")
-                            .and_then(|p| serde_json::from_value(p.clone()).ok())
-                            .unwrap_or_default();
+                    let gate_type = directive.get("gate_type")?.as_str()?.to_string();
+                    let param_overrides: HashMap<String, serde_json::Value> = directive
+                        .get("params")
+                        .and_then(|p| serde_json::from_value(p.clone()).ok())
+                        .unwrap_or_default();
                     InjectionType::ModifyGateParams {
                         gate_type,
                         param_overrides,
                     }
                 }
                 "add_guard" => {
-                    let from_state =
-                        directive.get("from_state")?.as_str()?.to_string();
-                    let to_state =
-                        directive.get("to_state")?.as_str()?.to_string();
-                    let guard =
-                        directive.get("guard")?.as_str()?.to_string();
+                    let from_state = directive.get("from_state")?.as_str()?.to_string();
+                    let to_state = directive.get("to_state")?.as_str()?.to_string();
+                    let guard = directive.get("guard")?.as_str()?.to_string();
                     InjectionType::AddGuard {
                         from_state,
                         to_state,
@@ -609,8 +584,7 @@ impl SkillInjector {
                     }
                 }
                 "override_coverage_threshold" => {
-                    let new_threshold =
-                        directive.get("new_threshold")?.as_f64()?;
+                    let new_threshold = directive.get("new_threshold")?.as_f64()?;
                     InjectionType::OverrideCoverageThreshold { new_threshold }
                 }
                 _ => continue,
@@ -640,9 +614,7 @@ impl SkillInjector {
             InjectionType::AddGuard { .. } => "AddGuard".into(),
             InjectionType::AddPreGate { .. } => "AddPreGate".into(),
             InjectionType::AddPostGate { .. } => "AddPostGate".into(),
-            InjectionType::OverrideCoverageThreshold { .. } => {
-                "OverrideCoverageThreshold".into()
-            }
+            InjectionType::OverrideCoverageThreshold { .. } => "OverrideCoverageThreshold".into(),
         }
     }
 }
@@ -821,11 +793,7 @@ mod tests {
                 vec![("cfg", "threshold 95%")],
             ),
             make_skill("sec", vec!["security"], vec![]),
-            make_skill(
-                "tdd",
-                vec!["testing"],
-                vec![("note", "write tests first")],
-            ),
+            make_skill("tdd", vec!["testing"], vec![("note", "write tests first")]),
         ];
 
         let injections = injector.analyze_skills(&skills, &spec);
@@ -902,7 +870,10 @@ mod tests {
         let result = injector.apply_injections(&mut spec, &injections);
         assert_eq!(result.applied, 1);
         assert_eq!(spec.stages[0].pre_gates.len(), pre_count + 1);
-        assert_eq!(spec.stages[0].pre_gates.last().unwrap().gate_type, "cargo-test");
+        assert_eq!(
+            spec.stages[0].pre_gates.last().unwrap().gate_type,
+            "cargo-test"
+        );
     }
 
     #[test]
@@ -952,10 +923,7 @@ mod tests {
         assert_eq!(result.applied, 1);
         // Guard is stored as an injected-guard final gate.
         assert_eq!(spec.final_gates.len(), final_count + 1);
-        assert_eq!(
-            spec.final_gates.last().unwrap().gate_type,
-            "injected-guard"
-        );
+        assert_eq!(spec.final_gates.last().unwrap().gate_type, "injected-guard");
     }
 
     #[test]
@@ -1014,7 +982,11 @@ mod tests {
         assert_eq!(result.applied, 0);
         assert_eq!(result.skipped, 1);
         assert!(!result.trace[0].applied);
-        assert!(result.trace[0].reason.as_ref().unwrap().contains("confidence"));
+        assert!(result.trace[0]
+            .reason
+            .as_ref()
+            .unwrap()
+            .contains("confidence"));
     }
 
     #[test]
@@ -1114,7 +1086,11 @@ mod tests {
 
         // Second: skipped (low confidence)
         assert!(!result.trace[1].applied);
-        assert!(result.trace[1].reason.as_ref().unwrap().contains("confidence"));
+        assert!(result.trace[1]
+            .reason
+            .as_ref()
+            .unwrap()
+            .contains("confidence"));
 
         // Third: skipped (wave not found)
         assert!(!result.trace[2].applied);

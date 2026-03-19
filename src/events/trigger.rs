@@ -135,8 +135,8 @@ fn scalar_eq(a: &serde_json::Value, b: &serde_json::Value) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::types::{CrudAction, EntityType};
+    use super::*;
     use serde_json::json;
 
     fn make_trigger(
@@ -182,12 +182,7 @@ mod tests {
     #[test]
     fn test_wildcard_matches_everything() {
         let trigger = make_trigger(None, None, None, None);
-        let event = make_event(
-            EntityType::Project,
-            CrudAction::Created,
-            json!({}),
-            None,
-        );
+        let event = make_event(EntityType::Project, CrudAction::Created, json!({}), None);
         assert!(trigger.matches(&event));
     }
 
@@ -360,12 +355,7 @@ mod tests {
 
     #[test]
     fn test_payload_number_condition() {
-        let trigger = make_trigger(
-            None,
-            None,
-            Some(json!({"priority": 1})),
-            None,
-        );
+        let trigger = make_trigger(None, None, Some(json!({"priority": 1})), None);
 
         let event_ok = make_event(
             EntityType::Task,
@@ -420,12 +410,7 @@ mod tests {
 
     #[test]
     fn test_payload_missing_key_fails() {
-        let trigger = make_trigger(
-            None,
-            None,
-            Some(json!({"note_type": "rfc"})),
-            None,
-        );
+        let trigger = make_trigger(None, None, Some(json!({"note_type": "rfc"})), None);
 
         let event = make_event(
             EntityType::Note,
@@ -506,7 +491,10 @@ mod tests {
         assert_eq!(deserialized.id, trigger.id);
         assert_eq!(deserialized.name, trigger.name);
         assert_eq!(deserialized.protocol_id, trigger.protocol_id);
-        assert_eq!(deserialized.entity_type_pattern, trigger.entity_type_pattern);
+        assert_eq!(
+            deserialized.entity_type_pattern,
+            trigger.entity_type_pattern
+        );
         assert_eq!(deserialized.action_pattern, trigger.action_pattern);
         assert_eq!(deserialized.payload_conditions, trigger.payload_conditions);
         assert_eq!(deserialized.cooldown_secs, trigger.cooldown_secs);

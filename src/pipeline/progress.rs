@@ -220,11 +220,7 @@ impl ProgressOracle {
 
     /// Build a summary of the current progress state.
     pub fn progress_summary(&self) -> ProgressSummary {
-        let current_score = self
-            .scores
-            .back()
-            .map(|s| s.score)
-            .unwrap_or(0.0);
+        let current_score = self.scores.back().map(|s| s.score).unwrap_or(0.0);
 
         let best_score = self
             .scores
@@ -244,8 +240,16 @@ impl ProgressOracle {
             current_score,
             trend,
             total_checkpoints: self.checkpoints.len(),
-            best_score: if self.scores.is_empty() { 0.0 } else { best_score },
-            worst_score: if self.scores.is_empty() { 0.0 } else { worst_score },
+            best_score: if self.scores.is_empty() {
+                0.0
+            } else {
+                best_score
+            },
+            worst_score: if self.scores.is_empty() {
+                0.0
+            } else {
+                worst_score
+            },
         }
     }
 
@@ -307,9 +311,7 @@ impl ProgressOracle {
             .take(5)
             .collect();
 
-        if stagnation_deltas.len() >= 5
-            && stagnation_deltas.iter().all(|&d| d <= 0.0)
-        {
+        if stagnation_deltas.len() >= 5 && stagnation_deltas.iter().all(|&d| d <= 0.0) {
             return ProgressTrend::Stagnant;
         }
 

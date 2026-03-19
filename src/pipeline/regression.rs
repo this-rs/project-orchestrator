@@ -95,9 +95,7 @@ pub enum StopReason {
     /// A previously passing test is now failing.
     Regression { test_name: String },
     /// No progress over K consecutive checkpoints.
-    Stagnation {
-        iterations_without_progress: usize,
-    },
+    Stagnation { iterations_without_progress: usize },
 }
 
 // ─── Progress checkpoint ────────────────────────────────────────────────────
@@ -298,7 +296,12 @@ mod tests {
     use super::*;
     use chrono::Utc;
 
-    fn make_checkpoint(passing: usize, failing: usize, build_errors: usize, coverage: f64) -> ProgressCheckpoint {
+    fn make_checkpoint(
+        passing: usize,
+        failing: usize,
+        build_errors: usize,
+        coverage: f64,
+    ) -> ProgressCheckpoint {
         ProgressCheckpoint {
             tests_passing: passing,
             tests_failing: failing,
@@ -331,7 +334,12 @@ mod tests {
     #[test]
     fn loop_detection_triggers_after_threshold() {
         let mut det = RegressionDetector::new(1000, 100, 3, 5);
-        let sig = ErrorSignature::from_message("cannot find value `x`", Some("main.rs"), Some(10), ErrorCategory::Compile);
+        let sig = ErrorSignature::from_message(
+            "cannot find value `x`",
+            Some("main.rs"),
+            Some(10),
+            ErrorCategory::Compile,
+        );
 
         det.record_error(sig.clone());
         assert_eq!(det.should_stop(), StopReason::Continue);
@@ -365,9 +373,24 @@ mod tests {
     fn different_errors_do_not_trigger_loop() {
         let mut det = RegressionDetector::new(1000, 100, 3, 5);
 
-        det.record_error(ErrorSignature::from_message("error A", None, None, ErrorCategory::Compile));
-        det.record_error(ErrorSignature::from_message("error B", None, None, ErrorCategory::Compile));
-        det.record_error(ErrorSignature::from_message("error C", None, None, ErrorCategory::Compile));
+        det.record_error(ErrorSignature::from_message(
+            "error A",
+            None,
+            None,
+            ErrorCategory::Compile,
+        ));
+        det.record_error(ErrorSignature::from_message(
+            "error B",
+            None,
+            None,
+            ErrorCategory::Compile,
+        ));
+        det.record_error(ErrorSignature::from_message(
+            "error C",
+            None,
+            None,
+            ErrorCategory::Compile,
+        ));
 
         assert_eq!(det.should_stop(), StopReason::Continue);
     }
@@ -378,16 +401,9 @@ mod tests {
     fn regression_detected_when_passing_test_fails() {
         let mut det = RegressionDetector::default();
 
-        det.record_passing_tests(&[
-            "test_login".to_string(),
-            "test_signup".to_string(),
-        ]);
+        det.record_passing_tests(&["test_login".to_string(), "test_signup".to_string()]);
 
-        let cp = make_checkpoint_with_failures(
-            1,
-            1,
-            vec!["test_login".to_string()],
-        );
+        let cp = make_checkpoint_with_failures(1, 1, vec!["test_login".to_string()]);
         det.record_checkpoint(cp);
 
         match det.should_stop() {
@@ -401,11 +417,7 @@ mod tests {
         let mut det = RegressionDetector::default();
 
         // Never recorded "test_new" as passing
-        let cp = make_checkpoint_with_failures(
-            5,
-            1,
-            vec!["test_new".to_string()],
-        );
+        let cp = make_checkpoint_with_failures(5, 1, vec!["test_new".to_string()]);
         det.record_checkpoint(cp);
 
         assert_eq!(det.should_stop(), StopReason::Continue);
@@ -423,7 +435,9 @@ mod tests {
         }
 
         match det.should_stop() {
-            StopReason::Stagnation { iterations_without_progress } => {
+            StopReason::Stagnation {
+                iterations_without_progress,
+            } => {
                 assert_eq!(iterations_without_progress, 5);
             }
             other => panic!("expected Stagnation, got {:?}", other),
@@ -460,7 +474,12 @@ mod tests {
     fn continue_when_no_issues() {
         let mut det = RegressionDetector::default();
 
-        det.record_error(ErrorSignature::from_message("some warning", None, None, ErrorCategory::Lint));
+        det.record_error(ErrorSignature::from_message(
+            "some warning",
+            None,
+            None,
+            ErrorCategory::Lint,
+        ));
         det.record_checkpoint(make_checkpoint(10, 0, 0, 90.0));
 
         assert_eq!(det.should_stop(), StopReason::Continue);
@@ -538,8 +557,18 @@ mod tests {
     fn reset_clears_all_state() {
         let mut det = RegressionDetector::default();
 
-        det.record_error(ErrorSignature::from_message("err", None, None, ErrorCategory::Compile));
-        det.record_error(ErrorSignature::from_message("err", None, None, ErrorCategory::Compile));
+        det.record_error(ErrorSignature::from_message(
+            "err",
+            None,
+            None,
+            ErrorCategory::Compile,
+        ));
+        det.record_error(ErrorSignature::from_message(
+            "err",
+            None,
+            None,
+            ErrorCategory::Compile,
+        ));
         det.record_passing_tests(&["test_a".to_string()]);
         det.record_checkpoint(make_checkpoint(5, 5, 0, 50.0));
 
@@ -556,8 +585,14 @@ mod tests {
 
     #[test]
     fn from_message_normalizes_whitespace_and_case() {
-        let a = ErrorSignature::from_message("  Error FOO  ", Some("a.rs"), None, ErrorCategory::Compile);
-        let b = ErrorSignature::from_message("error foo", Some("a.rs"), None, ErrorCategory::Compile);
+        let a = ErrorSignature::from_message(
+            "  Error FOO  ",
+            Some("a.rs"),
+            None,
+            ErrorCategory::Compile,
+        );
+        let b =
+            ErrorSignature::from_message("error foo", Some("a.rs"), None, ErrorCategory::Compile);
         assert_eq!(a, b);
     }
 

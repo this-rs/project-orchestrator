@@ -157,7 +157,10 @@ impl PipelineRunner {
 
         self.emit_event(
             PipelineEventType::PipelineStarted,
-            &format!("Starting pipeline '{}' with {} stages", spec.name, waves_total),
+            &format!(
+                "Starting pipeline '{}' with {} stages",
+                spec.name, waves_total
+            ),
             HashMap::new(),
         );
 
@@ -201,7 +204,11 @@ impl PipelineRunner {
 
             self.emit_event(
                 PipelineEventType::WaveStarted,
-                &format!("Starting wave {} ({} tasks)", stage.wave_number, stage.task_ids.len()),
+                &format!(
+                    "Starting wave {} ({} tasks)",
+                    stage.wave_number,
+                    stage.task_ids.len()
+                ),
                 {
                     let mut m = HashMap::new();
                     m.insert("wave_number".into(), serde_json::json!(stage.wave_number));
@@ -278,11 +285,7 @@ impl PipelineRunner {
         }
 
         // Compute final score from oracle
-        let final_score = self
-            .oracle
-            .latest_score()
-            .map(|s| s.score)
-            .unwrap_or(0.0);
+        let final_score = self.oracle.latest_score().map(|s| s.score).unwrap_or(0.0);
 
         // Emit final event
         match &status {
@@ -309,10 +312,7 @@ impl PipelineRunner {
             PipelineRunStatus::Stopped => {
                 self.emit_event(
                     PipelineEventType::PipelineStopped,
-                    &format!(
-                        "Pipeline '{}' stopped by regression detector",
-                        spec.name
-                    ),
+                    &format!("Pipeline '{}' stopped by regression detector", spec.name),
                     HashMap::new(),
                 );
             }
@@ -736,11 +736,26 @@ mod tests {
 
     #[test]
     fn error_category_mapping() {
-        assert_eq!(gate_type_to_error_category("cargo-check"), ErrorCategory::Compile);
-        assert_eq!(gate_type_to_error_category("cargo-test"), ErrorCategory::Test);
-        assert_eq!(gate_type_to_error_category("coverage"), ErrorCategory::Coverage);
-        assert_eq!(gate_type_to_error_category("npm-typecheck"), ErrorCategory::Compile);
-        assert_eq!(gate_type_to_error_category("pr-checks"), ErrorCategory::Other);
+        assert_eq!(
+            gate_type_to_error_category("cargo-check"),
+            ErrorCategory::Compile
+        );
+        assert_eq!(
+            gate_type_to_error_category("cargo-test"),
+            ErrorCategory::Test
+        );
+        assert_eq!(
+            gate_type_to_error_category("coverage"),
+            ErrorCategory::Coverage
+        );
+        assert_eq!(
+            gate_type_to_error_category("npm-typecheck"),
+            ErrorCategory::Compile
+        );
+        assert_eq!(
+            gate_type_to_error_category("pr-checks"),
+            ErrorCategory::Other
+        );
         assert_eq!(gate_type_to_error_category("unknown"), ErrorCategory::Other);
     }
 }

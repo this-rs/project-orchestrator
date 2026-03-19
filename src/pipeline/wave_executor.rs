@@ -408,7 +408,15 @@ mod tests {
         let names: Vec<&str> = states.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(
             names,
-            vec!["init", "dispatch", "execute", "collect", "merge-check", "done", "failed"]
+            vec![
+                "init",
+                "dispatch",
+                "execute",
+                "collect",
+                "merge-check",
+                "done",
+                "failed"
+            ]
         );
 
         // Check start state

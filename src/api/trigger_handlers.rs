@@ -117,11 +117,15 @@ pub async fn create_trigger(
 
     // Emit CRUD event
     state.event_bus.emit(
-        CrudEvent::new(EntityType::Trigger, CrudAction::Created, &trigger.id.to_string())
-            .with_payload(serde_json::json!({
-                "name": trigger.name,
-                "protocol_id": trigger.protocol_id.to_string(),
-            })),
+        CrudEvent::new(
+            EntityType::Trigger,
+            CrudAction::Created,
+            &trigger.id.to_string(),
+        )
+        .with_payload(serde_json::json!({
+            "name": trigger.name,
+            "protocol_id": trigger.protocol_id.to_string(),
+        })),
     );
 
     Ok(Json(trigger))
@@ -167,9 +171,11 @@ pub async fn update_trigger(
     }
 
     // Emit CRUD event
-    state.event_bus.emit(
-        CrudEvent::new(EntityType::Trigger, CrudAction::Updated, &id.to_string()),
-    );
+    state.event_bus.emit(CrudEvent::new(
+        EntityType::Trigger,
+        CrudAction::Updated,
+        &id.to_string(),
+    ));
 
     Ok(Json(serde_json::json!({ "ok": true })))
 }
@@ -179,20 +185,18 @@ pub async fn delete_trigger(
     State(state): State<OrchestratorState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let deleted = state
-        .orchestrator
-        .neo4j()
-        .delete_event_trigger(id)
-        .await?;
+    let deleted = state.orchestrator.neo4j().delete_event_trigger(id).await?;
 
     if !deleted {
         return Err(AppError::NotFound(format!("Trigger {} not found", id)));
     }
 
     // Emit CRUD event
-    state.event_bus.emit(
-        CrudEvent::new(EntityType::Trigger, CrudAction::Deleted, &id.to_string()),
-    );
+    state.event_bus.emit(CrudEvent::new(
+        EntityType::Trigger,
+        CrudAction::Deleted,
+        &id.to_string(),
+    ));
 
     Ok(Json(serde_json::json!({ "ok": true })))
 }
@@ -258,7 +262,8 @@ pub async fn trigger_stats(
     let disabled = total - enabled;
 
     // Count by entity_type_pattern
-    let mut type_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut type_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
     for t in &triggers {
         let key = t
             .entity_type_pattern

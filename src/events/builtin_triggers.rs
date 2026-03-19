@@ -135,9 +135,7 @@ pub async fn install_builtin_triggers(
     }
 
     // Fetch existing triggers for this project to avoid duplicates
-    let existing = store
-        .list_event_triggers(Some(project_id), false)
-        .await?;
+    let existing = store.list_event_triggers(Some(project_id), false).await?;
     let existing_names: std::collections::HashSet<&str> =
         existing.iter().map(|t| t.name.as_str()).collect();
 
@@ -387,7 +385,11 @@ mod tests {
 
         for t in &triggers {
             assert!(t.enabled, "Trigger '{}' should be enabled", t.name);
-            assert!(t.project_scope.is_none(), "Trigger '{}' should have no project scope", t.name);
+            assert!(
+                t.project_scope.is_none(),
+                "Trigger '{}' should have no project scope",
+                t.name
+            );
             assert_eq!(t.protocol_id, pid);
         }
     }

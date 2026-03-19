@@ -7,8 +7,8 @@
 //! - `POST /api/episodes/export-artifact` — Export enriched artifact (structure + episodes)
 
 use crate::api::handlers::{AppError, OrchestratorState};
-use crate::events::EventEmitter;
 use crate::episodes::collector;
+use crate::events::EventEmitter;
 use axum::{
     extract::{Query, State},
     Json,

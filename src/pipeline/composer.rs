@@ -105,12 +105,24 @@ pub fn detect_tech_stack(affected_files: &[String]) -> Vec<TechStack> {
     for file in affected_files {
         let ext = file.rsplit('.').next().unwrap_or("");
         match ext {
-            "rs" => { stacks.insert(TechStack::Rust); }
-            "ts" | "tsx" => { stacks.insert(TechStack::TypeScript); }
-            "js" | "jsx" => { stacks.insert(TechStack::JavaScript); }
-            "py" => { stacks.insert(TechStack::Python); }
-            "go" => { stacks.insert(TechStack::Go); }
-            "java" => { stacks.insert(TechStack::Java); }
+            "rs" => {
+                stacks.insert(TechStack::Rust);
+            }
+            "ts" | "tsx" => {
+                stacks.insert(TechStack::TypeScript);
+            }
+            "js" | "jsx" => {
+                stacks.insert(TechStack::JavaScript);
+            }
+            "py" => {
+                stacks.insert(TechStack::Python);
+            }
+            "go" => {
+                stacks.insert(TechStack::Go);
+            }
+            "java" => {
+                stacks.insert(TechStack::Java);
+            }
             _ => {}
         }
     }
@@ -291,10 +303,7 @@ impl PipelineSpec {
                 states.push(ProtocolState {
                     name: gate_name,
                     state_type: "intermediate".into(),
-                    description: format!(
-                        "Run {} after wave {}",
-                        gate.gate_type, stage.wave_number
-                    ),
+                    description: format!("Run {} after wave {}", gate.gate_type, stage.wave_number),
                     action: Some(format!("run_gate:{}", gate.gate_type)),
                 });
             }
@@ -341,10 +350,8 @@ impl PipelineSpec {
         let mut transitions = Vec::new();
 
         // Collect only actionable states (skip "failed" terminal).
-        let flow_states: Vec<&ProtocolState> = states
-            .iter()
-            .filter(|s| s.name != "failed")
-            .collect();
+        let flow_states: Vec<&ProtocolState> =
+            states.iter().filter(|s| s.name != "failed").collect();
 
         for i in 0..flow_states.len().saturating_sub(1) {
             let from = &flow_states[i];
@@ -354,7 +361,11 @@ impl PipelineSpec {
                 "pipeline_started".into()
             } else if from.action.as_deref() == Some("execute_wave") {
                 "wave_complete".into()
-            } else if from.action.as_deref().is_some_and(|a| a.starts_with("run_gate:")) {
+            } else if from
+                .action
+                .as_deref()
+                .is_some_and(|a| a.starts_with("run_gate:"))
+            {
                 "gate_passed".into()
             } else {
                 "next".into()
@@ -369,7 +380,11 @@ impl PipelineSpec {
             });
 
             // Failure transition for gate states.
-            if from.action.as_deref().is_some_and(|a| a.starts_with("run_gate:")) {
+            if from
+                .action
+                .as_deref()
+                .is_some_and(|a| a.starts_with("run_gate:"))
+            {
                 transitions.push(ProtocolTransition {
                     from_state: from.name.clone(),
                     to_state: "failed".into(),
@@ -436,11 +451,7 @@ mod tests {
 
     #[test]
     fn detect_deduplicates() {
-        let files = vec![
-            "a.rs".into(),
-            "b.rs".into(),
-            "c.rs".into(),
-        ];
+        let files = vec!["a.rs".into(), "b.rs".into(), "c.rs".into()];
         let stacks = detect_tech_stack(&files);
         assert_eq!(stacks, vec![TechStack::Rust]);
     }
@@ -564,13 +575,21 @@ mod tests {
 
         // Each stage should have cargo-check + cargo-test as post-gates.
         for stage in &spec.stages {
-            let types: Vec<&str> = stage.post_gates.iter().map(|g| g.gate_type.as_str()).collect();
+            let types: Vec<&str> = stage
+                .post_gates
+                .iter()
+                .map(|g| g.gate_type.as_str())
+                .collect();
             assert!(types.contains(&"cargo-check"));
             assert!(types.contains(&"cargo-test"));
         }
 
         // Final gates should include pr-checks.
-        let final_types: Vec<&str> = spec.final_gates.iter().map(|g| g.gate_type.as_str()).collect();
+        let final_types: Vec<&str> = spec
+            .final_gates
+            .iter()
+            .map(|g| g.gate_type.as_str())
+            .collect();
         assert!(final_types.contains(&"pr-checks"));
     }
 
@@ -591,7 +610,11 @@ mod tests {
 
         let spec = compose_pipeline(plan_id, "cov-plan", &waves, &constraints, &affected_files);
 
-        let final_types: Vec<&str> = spec.final_gates.iter().map(|g| g.gate_type.as_str()).collect();
+        let final_types: Vec<&str> = spec
+            .final_gates
+            .iter()
+            .map(|g| g.gate_type.as_str())
+            .collect();
         assert!(final_types.contains(&"coverage"));
         assert!(final_types.contains(&"pr-checks"));
     }

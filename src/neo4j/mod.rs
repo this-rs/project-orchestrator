@@ -10,6 +10,7 @@ mod code;
 mod commit;
 mod constraint;
 mod decision;
+mod event_trigger;
 mod feature_graph;
 mod impl_graph_store;
 mod milestone;
@@ -31,7 +32,6 @@ mod task;
 mod topology;
 pub mod traits;
 mod trigger;
-mod event_trigger;
 mod user;
 mod workspace;
 

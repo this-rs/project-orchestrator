@@ -139,31 +139,41 @@ impl EpisodeAnalyzer {
         patterns.extend(
             Self::analyze_gate_failures(episodes)
                 .into_iter()
-                .filter(|p| p.frequency >= self.min_frequency && p.confidence >= self.min_confidence),
+                .filter(|p| {
+                    p.frequency >= self.min_frequency && p.confidence >= self.min_confidence
+                }),
         );
 
         patterns.extend(
             self.analyze_regression_prone(episodes)
                 .into_iter()
-                .filter(|p| p.frequency >= self.min_frequency && p.confidence >= self.min_confidence),
+                .filter(|p| {
+                    p.frequency >= self.min_frequency && p.confidence >= self.min_confidence
+                }),
         );
 
         patterns.extend(
             Self::analyze_retry_effectiveness(episodes)
                 .into_iter()
-                .filter(|p| p.frequency >= self.min_frequency && p.confidence >= self.min_confidence),
+                .filter(|p| {
+                    p.frequency >= self.min_frequency && p.confidence >= self.min_confidence
+                }),
         );
 
         patterns.extend(
             self.analyze_common_root_causes(episodes)
                 .into_iter()
-                .filter(|p| p.frequency >= self.min_frequency && p.confidence >= self.min_confidence),
+                .filter(|p| {
+                    p.frequency >= self.min_frequency && p.confidence >= self.min_confidence
+                }),
         );
 
         patterns.extend(
             self.analyze_success_patterns(episodes)
                 .into_iter()
-                .filter(|p| p.frequency >= self.min_frequency && p.confidence >= self.min_confidence),
+                .filter(|p| {
+                    p.frequency >= self.min_frequency && p.confidence >= self.min_confidence
+                }),
         );
 
         patterns
@@ -179,8 +189,15 @@ impl EpisodeAnalyzer {
             .map(|pattern| {
                 let (name, trigger) = match &pattern.pattern_type {
                     PatternType::FrequentGateFailure => (
-                        format!("handle-{}-failure", pattern.related_gates.first().map_or("gate", |s| s.as_str())),
-                        pattern.related_gates.iter().map(|g| format!("gate_failure:{g}")).collect(),
+                        format!(
+                            "handle-{}-failure",
+                            pattern.related_gates.first().map_or("gate", |s| s.as_str())
+                        ),
+                        pattern
+                            .related_gates
+                            .iter()
+                            .map(|g| format!("gate_failure:{g}"))
+                            .collect(),
                     ),
                     PatternType::RegressionProne => (
                         format!("regression-guard-{}", slug(&pattern.description)),
@@ -541,7 +558,9 @@ mod tests {
         let patterns = analyzer.analyze(&episodes);
 
         assert!(
-            patterns.iter().any(|p| p.pattern_type == PatternType::FrequentGateFailure),
+            patterns
+                .iter()
+                .any(|p| p.pattern_type == PatternType::FrequentGateFailure),
             "expected FrequentGateFailure pattern, got: {patterns:?}"
         );
 
@@ -550,7 +569,9 @@ mod tests {
             .find(|p| p.pattern_type == PatternType::FrequentGateFailure)
             .unwrap();
         assert_eq!(gate_pattern.frequency, 5);
-        assert!(gate_pattern.related_gates.contains(&"cargo-check".to_string()));
+        assert!(gate_pattern
+            .related_gates
+            .contains(&"cargo-check".to_string()));
     }
 
     #[test]
@@ -571,7 +592,9 @@ mod tests {
         let patterns = analyzer.analyze(&episodes);
 
         assert!(
-            patterns.iter().any(|p| p.pattern_type == PatternType::EffectiveRetry),
+            patterns
+                .iter()
+                .any(|p| p.pattern_type == PatternType::EffectiveRetry),
             "expected EffectiveRetry pattern, got: {patterns:?}"
         );
     }
@@ -594,7 +617,9 @@ mod tests {
         let patterns = analyzer.analyze(&episodes);
 
         assert!(
-            patterns.iter().any(|p| p.pattern_type == PatternType::RegressionProne),
+            patterns
+                .iter()
+                .any(|p| p.pattern_type == PatternType::RegressionProne),
             "expected RegressionProne pattern, got: {patterns:?}"
         );
     }
@@ -617,7 +642,9 @@ mod tests {
         let patterns = analyzer.analyze(&episodes);
 
         assert!(
-            patterns.iter().any(|p| p.pattern_type == PatternType::CommonRootCause),
+            patterns
+                .iter()
+                .any(|p| p.pattern_type == PatternType::CommonRootCause),
             "expected CommonRootCause pattern, got: {patterns:?}"
         );
     }
@@ -640,7 +667,9 @@ mod tests {
         let patterns = analyzer.analyze(&episodes);
 
         assert!(
-            patterns.iter().any(|p| p.pattern_type == PatternType::SuccessPattern),
+            patterns
+                .iter()
+                .any(|p| p.pattern_type == PatternType::SuccessPattern),
             "expected SuccessPattern pattern, got: {patterns:?}"
         );
     }
@@ -681,7 +710,10 @@ mod tests {
         assert_eq!(skills[0].name, "handle-cargo-test-failure");
         assert!(skills[0].tags.contains(&"rust".to_string()));
         assert!(!skills[0].notes.is_empty());
-        assert!(skills[0].trigger_patterns.iter().any(|t| t.contains("gate_failure")));
+        assert!(skills[0]
+            .trigger_patterns
+            .iter()
+            .any(|t| t.contains("gate_failure")));
 
         // Second skill — retry
         assert!(skills[1].name.starts_with("retry-strategy-"));
@@ -763,7 +795,9 @@ mod tests {
 
         // Gate failure count is 2, below threshold of 3
         assert!(
-            !patterns.iter().any(|p| p.pattern_type == PatternType::FrequentGateFailure),
+            !patterns
+                .iter()
+                .any(|p| p.pattern_type == PatternType::FrequentGateFailure),
             "should not detect gate failure below min_frequency"
         );
     }
@@ -796,7 +830,9 @@ mod tests {
         let patterns = analyzer.analyze(&episodes);
 
         assert!(
-            !patterns.iter().any(|p| p.pattern_type == PatternType::FrequentGateFailure),
+            !patterns
+                .iter()
+                .any(|p| p.pattern_type == PatternType::FrequentGateFailure),
             "should not detect gate failure below min_confidence"
         );
     }
@@ -806,23 +842,39 @@ mod tests {
     #[test]
     fn analyze_gate_failures_groups_by_gate_name() {
         let episodes = vec![
-            make_episode("a", &["rust"], EpisodeOutcome::Failure, vec![
-                gate("cargo-check", false, Some("err")),
-                gate("cargo-test", true, None),
-            ], 0),
-            make_episode("a", &["rust"], EpisodeOutcome::Failure, vec![
-                gate("cargo-check", false, Some("err")),
-                gate("cargo-test", false, Some("test failed")),
-            ], 0),
+            make_episode(
+                "a",
+                &["rust"],
+                EpisodeOutcome::Failure,
+                vec![
+                    gate("cargo-check", false, Some("err")),
+                    gate("cargo-test", true, None),
+                ],
+                0,
+            ),
+            make_episode(
+                "a",
+                &["rust"],
+                EpisodeOutcome::Failure,
+                vec![
+                    gate("cargo-check", false, Some("err")),
+                    gate("cargo-test", false, Some("test failed")),
+                ],
+                0,
+            ),
         ];
 
         let patterns = EpisodeAnalyzer::analyze_gate_failures(&episodes);
 
-        let check_pattern = patterns.iter().find(|p| p.related_gates.contains(&"cargo-check".to_string()));
+        let check_pattern = patterns
+            .iter()
+            .find(|p| p.related_gates.contains(&"cargo-check".to_string()));
         assert!(check_pattern.is_some());
         assert_eq!(check_pattern.unwrap().frequency, 2);
 
-        let test_pattern = patterns.iter().find(|p| p.related_gates.contains(&"cargo-test".to_string()));
+        let test_pattern = patterns
+            .iter()
+            .find(|p| p.related_gates.contains(&"cargo-test".to_string()));
         assert!(test_pattern.is_some());
         assert_eq!(test_pattern.unwrap().frequency, 1);
     }

@@ -100,11 +100,8 @@ impl TriggerRouter {
 
             // ProtocolRun::StatusChanged → check for completion (closure)
             (EntityType::ProtocolRun, CrudAction::StatusChanged) => {
-                let is_completed = event
-                    .payload
-                    .get("new_status")
-                    .and_then(|v| v.as_str())
-                    == Some("completed");
+                let is_completed =
+                    event.payload.get("new_status").and_then(|v| v.as_str()) == Some("completed");
                 if is_completed {
                     ctx.phase = 1.0;
                     ctx.lifecycle = 1.0;
@@ -116,11 +113,8 @@ impl TriggerRouter {
 
             // Plan::StatusChanged → review phase when completed
             (EntityType::Plan, CrudAction::StatusChanged) => {
-                let is_completed = event
-                    .payload
-                    .get("new_status")
-                    .and_then(|v| v.as_str())
-                    == Some("completed");
+                let is_completed =
+                    event.payload.get("new_status").and_then(|v| v.as_str()) == Some("completed");
                 if is_completed {
                     ctx.phase = 0.75;
                     ctx.lifecycle = 0.9;
@@ -175,7 +169,11 @@ impl TriggerRouter {
             .collect();
 
         // Sort descending by score (stable sort keeps insertion order for ties)
-        decisions.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        decisions.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         decisions
     }
 
@@ -462,10 +460,8 @@ mod tests {
         let event = make_event(EntityType::Project, CrudAction::Synced, json!({}));
         let ctx = TriggerRouter::build_context_from_event(&event);
 
-        let decisions = TriggerRouter::rank_triggers(
-            &[&trigger_commit, &trigger_plan, &trigger_project],
-            &ctx,
-        );
+        let decisions =
+            TriggerRouter::rank_triggers(&[&trigger_commit, &trigger_plan, &trigger_project], &ctx);
 
         assert_eq!(decisions.len(), 3);
         assert_eq!(decisions[0].trigger_id, trigger_project.id);
@@ -519,7 +515,11 @@ mod tests {
 
         // With a very high threshold, should not select
         let best = TriggerRouter::select_best(&decisions, 0.99);
-        assert!(best.is_none(), "Expected None but got score {}", decisions[0].score);
+        assert!(
+            best.is_none(),
+            "Expected None but got score {}",
+            decisions[0].score
+        );
     }
 
     #[test]

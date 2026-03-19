@@ -46,8 +46,7 @@ impl Neo4jClient {
             protocol_id: protocol_id.parse()?,
             entity_type_pattern,
             action_pattern,
-            payload_conditions: payload_conditions_str
-                .and_then(|s| serde_json::from_str(&s).ok()),
+            payload_conditions: payload_conditions_str.and_then(|s| serde_json::from_str(&s).ok()),
             cooldown_secs: cooldown_secs as u32,
             enabled,
             project_scope: project_scope.and_then(|s| s.parse().ok()),
@@ -145,9 +144,8 @@ impl Neo4jClient {
         let mut where_clauses = Vec::new();
         if project_scope.is_some() {
             // Match triggers scoped to this project OR global triggers (empty project_scope)
-            where_clauses.push(
-                "(t.project_scope = $project_scope OR t.project_scope = '')".to_string(),
-            );
+            where_clauses
+                .push("(t.project_scope = $project_scope OR t.project_scope = '')".to_string());
         }
         if enabled_only {
             where_clauses.push("t.enabled = true".to_string());

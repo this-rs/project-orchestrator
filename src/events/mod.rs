@@ -68,16 +68,16 @@
 //! | BatchCreated      | Code       | project sync completion (bulk IMPORTS/CALLS)          |
 //! | ScoresUpdated     | Fabric     | update_fabric_scores, bootstrap_knowledge_fabric     |
 
+pub mod builtin_triggers;
 mod bus;
 pub mod graph;
 mod hybrid;
 pub mod nats;
 mod notifier;
-pub mod reactor;
 pub mod reactions;
+pub mod reactor;
 pub mod trigger;
 pub mod trigger_routing;
-pub mod builtin_triggers;
 mod types;
 
 pub use bus::EventBus;
@@ -86,8 +86,8 @@ pub use hybrid::HybridEmitter;
 pub use nats::{connect_nats, ChatRpcRequest, ChatRpcResponse, NatsEmitter, StreamingSnapshot};
 #[allow(deprecated)]
 pub use notifier::EventNotifier;
-pub use reactor::{EventReactor, ReactorBuilder, ReactorCounters, ReactorStats};
 pub use reactions::register_builtin_reactions;
+pub use reactor::{EventReactor, ReactorBuilder, ReactorCounters, ReactorStats};
 pub use trigger::EventTrigger;
 pub use trigger_routing::{RoutingContext, RoutingDecision, TriggerRouter};
 pub use types::{CrudAction, CrudEvent, EntityType, EventEmitter, RelatedEntity};

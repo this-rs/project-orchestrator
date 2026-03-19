@@ -527,11 +527,9 @@ pub async fn delete_plan(
         .plan_manager()
         .delete_plan(plan_id)
         .await?;
-    state.event_bus.emit_deleted(
-        crate::events::EntityType::Plan,
-        &plan_id.to_string(),
-        None,
-    );
+    state
+        .event_bus
+        .emit_deleted(crate::events::EntityType::Plan, &plan_id.to_string(), None);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -583,11 +581,9 @@ pub async fn delete_task(
         .plan_manager()
         .delete_task(task_id)
         .await?;
-    state.event_bus.emit_deleted(
-        crate::events::EntityType::Task,
-        &task_id.to_string(),
-        None,
-    );
+    state
+        .event_bus
+        .emit_deleted(crate::events::EntityType::Task, &task_id.to_string(), None);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1482,16 +1478,14 @@ pub async fn add_decision_affects(
 
     // Emit GraphEvent for the new AFFECTS edge (best-effort, don't fail the request)
     if let Ok(Some(pid)) = neo4j.get_decision_project_id(decision_id).await {
-        state.event_bus.emit_graph(
-            crate::events::GraphEvent::edge(
-                crate::events::graph::GraphEventType::EdgeCreated,
-                crate::events::graph::GraphLayer::Knowledge,
-                decision_id.to_string(),
-                &req.entity_id,
-                "AFFECTS",
-                pid,
-            ),
-        );
+        state.event_bus.emit_graph(crate::events::GraphEvent::edge(
+            crate::events::graph::GraphEventType::EdgeCreated,
+            crate::events::graph::GraphLayer::Knowledge,
+            decision_id.to_string(),
+            &req.entity_id,
+            "AFFECTS",
+            pid,
+        ));
     }
 
     Ok(StatusCode::NO_CONTENT)
@@ -1513,16 +1507,14 @@ pub async fn remove_decision_affects(
 
     // Emit GraphEvent for the removed AFFECTS edge (best-effort)
     if let Ok(Some(pid)) = neo4j.get_decision_project_id(decision_id).await {
-        state.event_bus.emit_graph(
-            crate::events::GraphEvent::edge(
-                crate::events::graph::GraphEventType::EdgeRemoved,
-                crate::events::graph::GraphLayer::Knowledge,
-                decision_id.to_string(),
-                &entity_id,
-                "AFFECTS",
-                pid,
-            ),
-        );
+        state.event_bus.emit_graph(crate::events::GraphEvent::edge(
+            crate::events::graph::GraphEventType::EdgeRemoved,
+            crate::events::graph::GraphLayer::Knowledge,
+            decision_id.to_string(),
+            &entity_id,
+            "AFFECTS",
+            pid,
+        ));
     }
 
     Ok(StatusCode::NO_CONTENT)
@@ -1550,16 +1542,14 @@ pub async fn remove_decision_affects_query(
 
     // Emit GraphEvent for the removed AFFECTS edge (best-effort)
     if let Ok(Some(pid)) = neo4j.get_decision_project_id(decision_id).await {
-        state.event_bus.emit_graph(
-            crate::events::GraphEvent::edge(
-                crate::events::graph::GraphEventType::EdgeRemoved,
-                crate::events::graph::GraphLayer::Knowledge,
-                decision_id.to_string(),
-                &query.entity_id,
-                "AFFECTS",
-                pid,
-            ),
-        );
+        state.event_bus.emit_graph(crate::events::GraphEvent::edge(
+            crate::events::graph::GraphEventType::EdgeRemoved,
+            crate::events::graph::GraphLayer::Knowledge,
+            decision_id.to_string(),
+            &query.entity_id,
+            "AFFECTS",
+            pid,
+        ));
     }
 
     Ok(StatusCode::NO_CONTENT)
@@ -1890,9 +1880,7 @@ pub async fn watch_status(
 /// GET /api/reactor/status — EventReactor health and statistics.
 ///
 /// Returns the reactor's running state and event processing counters.
-pub async fn reactor_status(
-    State(state): State<OrchestratorState>,
-) -> Json<serde_json::Value> {
+pub async fn reactor_status(State(state): State<OrchestratorState>) -> Json<serde_json::Value> {
     match state.reactor_counters.get() {
         Some(counters) => {
             let stats = counters.snapshot(0, 0);
@@ -1964,7 +1952,9 @@ pub async fn delete_step(
     Path(step_id): Path<Uuid>,
 ) -> Result<StatusCode, AppError> {
     state.orchestrator.delete_step(step_id).await?;
-    state.event_bus.emit_deleted(crate::events::EntityType::Step, &step_id.to_string(), None);
+    state
+        .event_bus
+        .emit_deleted(crate::events::EntityType::Step, &step_id.to_string(), None);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2005,7 +1995,12 @@ pub async fn update_step(
             .update_step(step_id, &req)
             .await?;
     }
-    state.event_bus.emit_updated(crate::events::EntityType::Step, &step_id.to_string(), serde_json::json!({}), None);
+    state.event_bus.emit_updated(
+        crate::events::EntityType::Step,
+        &step_id.to_string(),
+        serde_json::json!({}),
+        None,
+    );
     Ok(StatusCode::NO_CONTENT)
 }
 

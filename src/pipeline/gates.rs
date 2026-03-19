@@ -120,15 +120,16 @@ impl QualityGate for CargoCheckGate {
 
     async fn check(&self, ctx: &GateContext) -> GateResult {
         let start = Instant::now();
-        let (stdout, stderr, code) = match run_command("cargo", &["check", "--message-format=short"], &ctx.cwd).await {
-            Ok(v) => v,
-            Err(e) => return skip_result(self.name(), e, start.elapsed().as_millis() as u64),
-        };
+        let (stdout, stderr, code) =
+            match run_command("cargo", &["check", "--message-format=short"], &ctx.cwd).await {
+                Ok(v) => v,
+                Err(e) => return skip_result(self.name(), e, start.elapsed().as_millis() as u64),
+            };
         let duration_ms = start.elapsed().as_millis() as u64;
 
         let combined = format!("{stdout}\n{stderr}");
-        let error_count = combined.matches("error[").count() as f64
-            + combined.matches("error:").count() as f64;
+        let error_count =
+            combined.matches("error[").count() as f64 + combined.matches("error:").count() as f64;
         let warning_count = combined.matches("warning:").count() as f64;
 
         let mut metrics = HashMap::new();
@@ -171,10 +172,11 @@ impl QualityGate for CargoTestGate {
 
     async fn check(&self, ctx: &GateContext) -> GateResult {
         let start = Instant::now();
-        let (stdout, stderr, code) = match run_command("cargo", &["test", "--", "--format=terse"], &ctx.cwd).await {
-            Ok(v) => v,
-            Err(e) => return skip_result(self.name(), e, start.elapsed().as_millis() as u64),
-        };
+        let (stdout, stderr, code) =
+            match run_command("cargo", &["test", "--", "--format=terse"], &ctx.cwd).await {
+                Ok(v) => v,
+                Err(e) => return skip_result(self.name(), e, start.elapsed().as_millis() as u64),
+            };
         let duration_ms = start.elapsed().as_millis() as u64;
 
         let combined = format!("{stdout}\n{stderr}");
@@ -256,11 +258,16 @@ impl QualityGate for CoverageGate {
 
     async fn check(&self, ctx: &GateContext) -> GateResult {
         let start = Instant::now();
-        let (stdout, _stderr, code) =
-            match run_command("cargo", &["tarpaulin", "--out", "json", "--output-dir", "/tmp"], &ctx.cwd).await {
-                Ok(v) => v,
-                Err(e) => return skip_result(self.name(), e, start.elapsed().as_millis() as u64),
-            };
+        let (stdout, _stderr, code) = match run_command(
+            "cargo",
+            &["tarpaulin", "--out", "json", "--output-dir", "/tmp"],
+            &ctx.cwd,
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => return skip_result(self.name(), e, start.elapsed().as_millis() as u64),
+        };
         let duration_ms = start.elapsed().as_millis() as u64;
 
         if code != 0 {
@@ -329,7 +336,8 @@ impl QualityGate for NpmTypeCheckGate {
 
     async fn check(&self, ctx: &GateContext) -> GateResult {
         let start = Instant::now();
-        let (stdout, stderr, code) = match run_command("npx", &["tsc", "--noEmit"], &ctx.cwd).await {
+        let (stdout, stderr, code) = match run_command("npx", &["tsc", "--noEmit"], &ctx.cwd).await
+        {
             Ok(v) => v,
             Err(e) => return skip_result(self.name(), e, start.elapsed().as_millis() as u64),
         };
@@ -389,9 +397,7 @@ impl QualityGate for CiWatchGate {
         let start = Instant::now();
 
         let timeout_str = self.timeout_secs.to_string();
-        let args: Vec<&str> = vec![
-            "run", "watch", "--exit-status",
-        ];
+        let args: Vec<&str> = vec!["run", "watch", "--exit-status"];
 
         // We use `timeout` on the tokio side rather than passing --interval
         // to gh so that we can enforce a hard ceiling.
@@ -411,7 +417,11 @@ impl QualityGate for CiWatchGate {
 
                 GateResult {
                     gate_name: self.name().to_string(),
-                    status: if ci_success { GateStatus::Pass } else { GateStatus::Fail },
+                    status: if ci_success {
+                        GateStatus::Pass
+                    } else {
+                        GateStatus::Fail
+                    },
                     metrics,
                     message: if ci_success {
                         "CI run succeeded".into()
@@ -515,15 +525,32 @@ mod tests {
 
     #[test]
     fn gate_status_serializes_to_expected_strings() {
-        assert_eq!(serde_json::to_string(&GateStatus::Pass).unwrap(), "\"Pass\"");
-        assert_eq!(serde_json::to_string(&GateStatus::Fail).unwrap(), "\"Fail\"");
-        assert_eq!(serde_json::to_string(&GateStatus::Skip).unwrap(), "\"Skip\"");
-        assert_eq!(serde_json::to_string(&GateStatus::Error).unwrap(), "\"Error\"");
+        assert_eq!(
+            serde_json::to_string(&GateStatus::Pass).unwrap(),
+            "\"Pass\""
+        );
+        assert_eq!(
+            serde_json::to_string(&GateStatus::Fail).unwrap(),
+            "\"Fail\""
+        );
+        assert_eq!(
+            serde_json::to_string(&GateStatus::Skip).unwrap(),
+            "\"Skip\""
+        );
+        assert_eq!(
+            serde_json::to_string(&GateStatus::Error).unwrap(),
+            "\"Error\""
+        );
     }
 
     #[test]
     fn gate_status_roundtrips() {
-        for status in [GateStatus::Pass, GateStatus::Fail, GateStatus::Skip, GateStatus::Error] {
+        for status in [
+            GateStatus::Pass,
+            GateStatus::Fail,
+            GateStatus::Skip,
+            GateStatus::Error,
+        ] {
             let json = serde_json::to_string(&status).unwrap();
             let back: GateStatus = serde_json::from_str(&json).unwrap();
             assert_eq!(back, status);
@@ -621,8 +648,14 @@ mod tests {
 
     #[test]
     fn extract_number_before_works() {
-        assert_eq!(extract_number_before("42 passed; 1 failed", "passed"), Some(42.0));
-        assert_eq!(extract_number_before("42 passed; 1 failed", "failed"), Some(1.0));
+        assert_eq!(
+            extract_number_before("42 passed; 1 failed", "passed"),
+            Some(42.0)
+        );
+        assert_eq!(
+            extract_number_before("42 passed; 1 failed", "failed"),
+            Some(1.0)
+        );
         assert_eq!(extract_number_before("no match here", "passed"), None);
     }
 
