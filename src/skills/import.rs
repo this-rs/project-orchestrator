@@ -677,6 +677,7 @@ async fn import_protocols(
                 prompt_fragment: None,
                 available_tools: None,
                 forbidden_actions: None,
+                state_timeout_secs: None,
             };
 
             if state_type == StateType::Start {
@@ -1419,6 +1420,7 @@ mod tests {
             prompt_fragment: None,
             available_tools: None,
             forbidden_actions: None,
+            state_timeout_secs: None,
         };
         let s2 = crate::protocol::ProtocolState {
             id: end_state_id,
@@ -1434,6 +1436,7 @@ mod tests {
             prompt_fragment: None,
             available_tools: None,
             forbidden_actions: None,
+            state_timeout_secs: None,
         };
         store.upsert_protocol_state(&s1).await.unwrap();
         store.upsert_protocol_state(&s2).await.unwrap();

@@ -647,6 +647,7 @@ mod tests {
                 "Do not create commits".to_string(),
                 "Do not modify files".to_string(),
             ]),
+            state_timeout_secs: None,
         };
 
         let done_id = Uuid::new_v4();
@@ -664,6 +665,7 @@ mod tests {
             prompt_fragment: None,
             available_tools: None,
             forbidden_actions: None,
+            state_timeout_secs: None,
         };
 
         proto.terminal_states = vec![done_id];
@@ -695,6 +697,7 @@ mod tests {
             triggered_by: "manual".to_string(),
             depth: 0,
             version: 1,
+            runner_managed: false,
         };
         mock.create_protocol_run(&run).await.unwrap();
 
