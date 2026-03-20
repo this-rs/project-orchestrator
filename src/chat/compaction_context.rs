@@ -218,19 +218,13 @@ impl CompactionContextBuilder {
     ///
     /// Fetches: project info, critical notes (guidelines, gotchas).
     /// Works even without a project (returns minimal context).
-    pub async fn build_for_session(
-        &self,
-        project_slug: Option<&str>,
-    ) -> Result<CompactionContext> {
+    pub async fn build_for_session(&self, project_slug: Option<&str>) -> Result<CompactionContext> {
         let mut ctx = CompactionContext::default();
 
         if let Some(slug) = project_slug {
             if let Ok(Some(project)) = self.graph.get_project_by_slug(slug).await {
                 ctx.project_name = Some(project.name.clone());
-                ctx.project_description = project
-                    .description
-                    .as_ref()
-                    .map(|d| truncate(d, 300));
+                ctx.project_description = project.description.as_ref().map(|d| truncate(d, 300));
 
                 // Fetch critical notes for this project
                 self.fetch_critical_notes(&mut ctx, Some(project.id)).await;
@@ -244,11 +238,7 @@ impl CompactionContextBuilder {
     }
 
     /// Fetch critical notes (guidelines + gotchas with importance >= High).
-    async fn fetch_critical_notes(
-        &self,
-        ctx: &mut CompactionContext,
-        project_id: Option<Uuid>,
-    ) {
+    async fn fetch_critical_notes(&self, ctx: &mut CompactionContext, project_id: Option<Uuid>) {
         let filters = NoteFilters {
             status: Some(vec![NoteStatus::Active]),
             note_type: Some(vec![NoteType::Guideline, NoteType::Gotcha]),
@@ -403,7 +393,11 @@ impl CompactionContext {
         if !self.notes.is_empty() && out.len() < MAX_MARKDOWN_CHARS - 200 {
             out.push_str("## Critical Notes\n");
             for n in &self.notes {
-                let _ = writeln!(out, "- **[{}|{}]** {}", n.note_type, n.importance, n.content);
+                let _ = writeln!(
+                    out,
+                    "- **[{}|{}]** {}",
+                    n.note_type, n.importance, n.content
+                );
                 if out.len() > MAX_MARKDOWN_CHARS - 50 {
                     break;
                 }
@@ -625,7 +619,10 @@ mod tests {
         let ctx = sample_context();
         let md = ctx.to_markdown();
 
-        assert!(md.contains("## Task Context"), "Missing Task Context section");
+        assert!(
+            md.contains("## Task Context"),
+            "Missing Task Context section"
+        );
         assert!(
             md.contains("## Steps Progress"),
             "Missing Steps Progress section"
@@ -634,14 +631,8 @@ mod tests {
             md.contains("## Active Constraints"),
             "Missing Constraints section"
         );
-        assert!(
-            md.contains("## Key Decisions"),
-            "Missing Decisions section"
-        );
-        assert!(
-            md.contains("## Critical Notes"),
-            "Missing Notes section"
-        );
+        assert!(md.contains("## Key Decisions"), "Missing Decisions section");
+        assert!(md.contains("## Critical Notes"), "Missing Notes section");
         assert!(md.contains("## Plan"), "Missing Plan section");
     }
 

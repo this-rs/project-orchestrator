@@ -96,9 +96,9 @@ mod tests {
     #[test]
     fn embedded_js_has_no_inline_autofill_grid() {
         let problematic_patterns = [
-            "auto-fill, minmax(280px",  // IntelLayerCards old pattern
-            "auto-fill, minmax(240px",  // IntelAttention old pattern
-            "auto-fill, minmax(200px",  // IntelQuickActions old pattern
+            "auto-fill, minmax(280px", // IntelLayerCards old pattern
+            "auto-fill, minmax(240px", // IntelAttention old pattern
+            "auto-fill, minmax(200px", // IntelQuickActions old pattern
         ];
 
         for file in FrontendAssets::iter() {

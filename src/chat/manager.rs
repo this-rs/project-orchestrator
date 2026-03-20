@@ -3553,9 +3553,7 @@ impl ChatManager {
             // Build context using CompactionContextBuilder (timed for metrics)
             let build_start = std::time::Instant::now();
             let builder = super::compaction_context::CompactionContextBuilder::new(graph.clone());
-            let build_result = builder
-                .build_for_session(project_slug.as_deref())
-                .await;
+            let build_result = builder.build_for_session(project_slug.as_deref()).await;
             let build_latency_ms = build_start.elapsed().as_millis() as u64;
 
             let (hint_len, recovery_success) = match build_result {
@@ -5225,10 +5223,7 @@ impl ChatManager {
     }
 
     /// Get the broadcast sender for a session (used by AgentGuard to emit events).
-    pub async fn get_events_tx(
-        &self,
-        session_id: &str,
-    ) -> Result<broadcast::Sender<ChatEvent>> {
+    pub async fn get_events_tx(&self, session_id: &str) -> Result<broadcast::Sender<ChatEvent>> {
         let sessions = self.active_sessions.read().await;
         let session = sessions
             .get(session_id)
@@ -9165,7 +9160,9 @@ mod tests {
         // 4. Verify: output should have custom_instructions (via reason field)
         if let nexus_claude::HookJSONOutput::Sync(sync) = result {
             assert_eq!(sync.continue_, Some(true), "Must always continue");
-            let reason = sync.reason.expect("reason (custom_instructions) should be set");
+            let reason = sync
+                .reason
+                .expect("reason (custom_instructions) should be set");
             assert!(
                 reason.contains("src/chat/manager.rs"),
                 "Should mention affected files, got: {reason}"

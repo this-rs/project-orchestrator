@@ -31,8 +31,8 @@ use uuid::Uuid;
 
 use super::viz::{
     ContentBlock, EmptyStateVizBuilder, KnowledgeCardVizBuilder, ProgressBarVizBuilder,
-    ProgressRingVizBuilder, ProgressSegment, ReasoningTreeVizBuilder, TabDef,
-    TabLayoutVizBuilder, TaskProgress, VizBlock, VizDataBuilder, VizType,
+    ProgressRingVizBuilder, ProgressSegment, ReasoningTreeVizBuilder, TabDef, TabLayoutVizBuilder,
+    TaskProgress, VizBlock, VizDataBuilder, VizType,
 };
 use crate::reasoning::models::ReasoningTree;
 
@@ -396,30 +396,42 @@ pub async fn build_progress_ring_viz(graph: &dyn GraphStore, plan_id: Uuid) -> R
     let tasks = graph.get_plan_tasks(plan_id).await?;
     let total = tasks.len();
 
-    let completed = tasks.iter().filter(|t| {
-        serde_json::to_value(&t.status)
-            .ok()
-            .and_then(|v| v.as_str().map(|s| s == "completed"))
-            .unwrap_or(false)
-    }).count();
-    let in_progress = tasks.iter().filter(|t| {
-        serde_json::to_value(&t.status)
-            .ok()
-            .and_then(|v| v.as_str().map(|s| s == "in_progress"))
-            .unwrap_or(false)
-    }).count();
-    let failed = tasks.iter().filter(|t| {
-        serde_json::to_value(&t.status)
-            .ok()
-            .and_then(|v| v.as_str().map(|s| s == "failed"))
-            .unwrap_or(false)
-    }).count();
-    let blocked = tasks.iter().filter(|t| {
-        serde_json::to_value(&t.status)
-            .ok()
-            .and_then(|v| v.as_str().map(|s| s == "blocked"))
-            .unwrap_or(false)
-    }).count();
+    let completed = tasks
+        .iter()
+        .filter(|t| {
+            serde_json::to_value(&t.status)
+                .ok()
+                .and_then(|v| v.as_str().map(|s| s == "completed"))
+                .unwrap_or(false)
+        })
+        .count();
+    let in_progress = tasks
+        .iter()
+        .filter(|t| {
+            serde_json::to_value(&t.status)
+                .ok()
+                .and_then(|v| v.as_str().map(|s| s == "in_progress"))
+                .unwrap_or(false)
+        })
+        .count();
+    let failed = tasks
+        .iter()
+        .filter(|t| {
+            serde_json::to_value(&t.status)
+                .ok()
+                .and_then(|v| v.as_str().map(|s| s == "failed"))
+                .unwrap_or(false)
+        })
+        .count();
+    let blocked = tasks
+        .iter()
+        .filter(|t| {
+            serde_json::to_value(&t.status)
+                .ok()
+                .and_then(|v| v.as_str().map(|s| s == "blocked"))
+                .unwrap_or(false)
+        })
+        .count();
     let pending = total.saturating_sub(completed + in_progress + failed + blocked);
 
     let percentage = if total > 0 {
@@ -429,11 +441,31 @@ pub async fn build_progress_ring_viz(graph: &dyn GraphStore, plan_id: Uuid) -> R
     };
 
     let segments = vec![
-        ProgressSegment { status: "completed".to_string(), count: completed, color: Some("#22c55e".to_string()) },
-        ProgressSegment { status: "in_progress".to_string(), count: in_progress, color: Some("#3b82f6".to_string()) },
-        ProgressSegment { status: "pending".to_string(), count: pending, color: Some("#6b7280".to_string()) },
-        ProgressSegment { status: "failed".to_string(), count: failed, color: Some("#ef4444".to_string()) },
-        ProgressSegment { status: "blocked".to_string(), count: blocked, color: Some("#f59e0b".to_string()) },
+        ProgressSegment {
+            status: "completed".to_string(),
+            count: completed,
+            color: Some("#22c55e".to_string()),
+        },
+        ProgressSegment {
+            status: "in_progress".to_string(),
+            count: in_progress,
+            color: Some("#3b82f6".to_string()),
+        },
+        ProgressSegment {
+            status: "pending".to_string(),
+            count: pending,
+            color: Some("#6b7280".to_string()),
+        },
+        ProgressSegment {
+            status: "failed".to_string(),
+            count: failed,
+            color: Some("#ef4444".to_string()),
+        },
+        ProgressSegment {
+            status: "blocked".to_string(),
+            count: blocked,
+            color: Some("#f59e0b".to_string()),
+        },
     ];
 
     let builder = ProgressRingVizBuilder {
@@ -590,8 +622,16 @@ impl VizBlockProcessor {
             }
 
             VizType::EmptyState => {
-                let icon = tag.attrs.get("icon").cloned().unwrap_or_else(|| "robot".to_string());
-                let title = tag.attrs.get("title").cloned().unwrap_or_else(|| "No data".to_string());
+                let icon = tag
+                    .attrs
+                    .get("icon")
+                    .cloned()
+                    .unwrap_or_else(|| "robot".to_string());
+                let title = tag
+                    .attrs
+                    .get("title")
+                    .cloned()
+                    .unwrap_or_else(|| "No data".to_string());
                 let description = tag.attrs.get("description").cloned().unwrap_or_default();
                 let cta_label = tag.attrs.get("cta_label").cloned();
                 let cta_action = tag.attrs.get("cta_action").cloned();
@@ -622,7 +662,10 @@ impl VizBlockProcessor {
                         }
                     })
                     .collect();
-                let builder = TabLayoutVizBuilder { tabs, active_tab: active };
+                let builder = TabLayoutVizBuilder {
+                    tabs,
+                    active_tab: active,
+                };
                 builder.build()
             }
 
@@ -632,7 +675,9 @@ impl VizBlockProcessor {
                     let plan_id = Uuid::parse_str(plan_id_str)?;
                     build_progress_ring_viz(self.graph.as_ref(), plan_id).await
                 } else {
-                    let pct: f64 = tag.attrs.get("percentage")
+                    let pct: f64 = tag
+                        .attrs
+                        .get("percentage")
                         .and_then(|s| s.parse().ok())
                         .unwrap_or(0.0);
                     let label = tag.attrs.get("label").cloned().unwrap_or_default();

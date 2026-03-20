@@ -328,7 +328,10 @@ impl AgentGuard {
                 }
             }
             Ok(Err(e)) => {
-                warn!("Guard: CompactionContextBuilder failed: {}, using fallback", e);
+                warn!(
+                    "Guard: CompactionContextBuilder failed: {}, using fallback",
+                    e
+                );
                 fallback
             }
             Err(_) => {

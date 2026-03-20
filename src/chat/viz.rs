@@ -833,11 +833,7 @@ impl VizDataBuilder for TabLayoutVizBuilder {
             .tabs
             .iter()
             .map(|t| {
-                let active = if t.id == self.active_tab {
-                    " [*]"
-                } else {
-                    ""
-                };
+                let active = if t.id == self.active_tab { " [*]" } else { "" };
                 let badge = t
                     .badge
                     .as_ref()
@@ -1748,9 +1744,24 @@ mod tests {
     fn test_tab_layout_builder() {
         let builder = TabLayoutVizBuilder {
             tabs: vec![
-                TabDef { id: "waves".to_string(), label: "Waves".to_string(), icon: Some("wave".to_string()), badge: Some("3".to_string()) },
-                TabDef { id: "conversation".to_string(), label: "Conversation".to_string(), icon: None, badge: None },
-                TabDef { id: "details".to_string(), label: "Execution Details".to_string(), icon: None, badge: None },
+                TabDef {
+                    id: "waves".to_string(),
+                    label: "Waves".to_string(),
+                    icon: Some("wave".to_string()),
+                    badge: Some("3".to_string()),
+                },
+                TabDef {
+                    id: "conversation".to_string(),
+                    label: "Conversation".to_string(),
+                    icon: None,
+                    badge: None,
+                },
+                TabDef {
+                    id: "details".to_string(),
+                    label: "Execution Details".to_string(),
+                    icon: None,
+                    badge: None,
+                },
             ],
             active_tab: "waves".to_string(),
         };
@@ -1788,9 +1799,21 @@ mod tests {
             percentage: 60.0,
             label: "3/5 tasks".to_string(),
             segments: vec![
-                ProgressSegment { status: "completed".to_string(), count: 3, color: Some("#22c55e".to_string()) },
-                ProgressSegment { status: "in_progress".to_string(), count: 1, color: Some("#3b82f6".to_string()) },
-                ProgressSegment { status: "pending".to_string(), count: 1, color: Some("#6b7280".to_string()) },
+                ProgressSegment {
+                    status: "completed".to_string(),
+                    count: 3,
+                    color: Some("#22c55e".to_string()),
+                },
+                ProgressSegment {
+                    status: "in_progress".to_string(),
+                    count: 1,
+                    color: Some("#3b82f6".to_string()),
+                },
+                ProgressSegment {
+                    status: "pending".to_string(),
+                    count: 1,
+                    color: Some("#6b7280".to_string()),
+                },
             ],
             animated: true,
             ring_title: Some("My Plan".to_string()),
@@ -1842,6 +1865,9 @@ mod tests {
     fn test_from_str_loose_new_types() {
         assert_eq!(VizType::from_str_loose("empty_state"), VizType::EmptyState);
         assert_eq!(VizType::from_str_loose("tab_layout"), VizType::TabLayout);
-        assert_eq!(VizType::from_str_loose("progress_ring"), VizType::ProgressRing);
+        assert_eq!(
+            VizType::from_str_loose("progress_ring"),
+            VizType::ProgressRing
+        );
     }
 }
