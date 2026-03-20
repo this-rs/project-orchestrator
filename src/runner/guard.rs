@@ -85,6 +85,8 @@ pub struct AgentGuard {
     graph: Option<Arc<dyn GraphStore>>,
     /// Plan ID for compaction context (None = session mode)
     plan_id: Option<Uuid>,
+    /// Broadcast sender for emitting ChatEvents (e.g. CompactionRecovery metrics)
+    events_tx: Option<broadcast::Sender<ChatEvent>>,
 }
 
 /// Trait for sending hints to the agent without interrupting.
@@ -135,7 +137,14 @@ impl AgentGuard {
             hint_tx,
             graph,
             plan_id,
+            events_tx: None,
         }
+    }
+
+    /// Attach a broadcast sender for emitting events (e.g. CompactionRecovery).
+    pub fn with_events_tx(mut self, tx: broadcast::Sender<ChatEvent>) -> Self {
+        self.events_tx = Some(tx);
+        self
     }
 
     /// Run the guard monitoring loop.
@@ -215,11 +224,23 @@ impl AgentGuard {
                             return GuardVerdict::Completed;
                         }
 
-                        // Compaction — re-inject rich task context
+                        // Compaction — re-inject rich task context + emit recovery metrics
                         ChatEvent::CompactionStarted { .. } => {
                             info!("Guard: compaction detected, will re-inject context");
+                            let build_start = Instant::now();
                             let hint = self.build_compaction_hint().await;
+                            let build_latency_ms = build_start.elapsed().as_millis() as u64;
+                            let hint_tokens = (hint.len() as u32) / 3; // rough chars→tokens estimate
                             self.inject_hint(&hint).await;
+                            // Emit CompactionRecovery metrics (v1: recovery_success = true if injection succeeded)
+                            let recovery_event = ChatEvent::CompactionRecovery {
+                                hint_tokens,
+                                build_latency_ms,
+                                recovery_success: true,
+                            };
+                            if let Some(ref tx) = self.events_tx {
+                                let _ = tx.send(recovery_event);
+                            }
                         }
 
                         // AskUserQuestion — auto-respond for autonomous mode

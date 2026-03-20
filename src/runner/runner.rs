@@ -2120,6 +2120,11 @@ impl PlanRunner {
             Some(self.graph.clone()),
             Some(plan_id),
         );
+        // Attach events_tx so the guard can emit CompactionRecovery metrics
+        let guard = match self.chat_manager.get_events_tx(&session_id).await {
+            Ok(tx) => guard.with_events_tx(tx),
+            Err(_) => guard, // best-effort: if session not found, skip
+        };
 
         let guard_handle = tokio::spawn(async move { guard.monitor().await });
 

@@ -359,6 +359,20 @@ pub enum ChatEvent {
         /// Compaction trigger: "auto" or "manual"
         trigger: String,
     },
+    /// Metrics emitted after a successful post-compaction context re-injection.
+    /// Tracks the quality of the recovery: hint size, build latency, and whether
+    /// the agent continued normally (no idle warning within 60s — v1: always true
+    /// if injection succeeded).
+    CompactionRecovery {
+        /// Number of tokens in the re-injected hint (estimated: chars / 3).
+        hint_tokens: u32,
+        /// Time taken to build the compaction context (ms), including Neo4j queries.
+        build_latency_ms: u64,
+        /// Whether the agent continued the task correctly after compaction.
+        /// V1 simplification: true if injection did not fail. A 60s idle timer
+        /// will be added in v2.
+        recovery_success: bool,
+    },
     /// Context window was compacted (automatic or manual)
     CompactBoundary {
         /// Compaction trigger: "auto" or "manual"
@@ -430,6 +444,7 @@ impl ChatEvent {
             ChatEvent::PermissionModeChanged { .. } => "permission_mode_changed",
             ChatEvent::ModelChanged { .. } => "model_changed",
             ChatEvent::CompactionStarted { .. } => "compaction_started",
+            ChatEvent::CompactionRecovery { .. } => "compaction_recovery",
             ChatEvent::CompactBoundary { .. } => "compact_boundary",
             ChatEvent::SystemInit { .. } => "system_init",
             ChatEvent::AutoContinue { .. } => "auto_continue",
@@ -494,6 +509,14 @@ impl ChatEvent {
             ChatEvent::CompactionStarted { trigger } => {
                 Some(format!("compaction_started:{}", trigger))
             }
+            ChatEvent::CompactionRecovery {
+                hint_tokens,
+                build_latency_ms,
+                recovery_success,
+            } => Some(format!(
+                "compaction_recovery:{}:{}:{}",
+                hint_tokens, build_latency_ms, recovery_success
+            )),
             ChatEvent::CompactBoundary { trigger, .. } => {
                 Some(format!("compact_boundary:{}", trigger))
             }
@@ -971,6 +994,16 @@ mod tests {
             ChatEvent::CompactionStarted {
                 trigger: "manual".into(),
             },
+            ChatEvent::CompactionRecovery {
+                hint_tokens: 450,
+                build_latency_ms: 120,
+                recovery_success: true,
+            },
+            ChatEvent::CompactionRecovery {
+                hint_tokens: 0,
+                build_latency_ms: 510,
+                recovery_success: false,
+            },
             ChatEvent::CompactBoundary {
                 trigger: "auto".into(),
                 pre_tokens: Some(150000),
@@ -1106,6 +1139,52 @@ mod tests {
         assert!(matches!(
             deserialized,
             ChatEvent::CompactionStarted { ref trigger } if trigger == "auto"
+        ));
+
+        // CompactionRecovery — success
+        let json = r#"{"type":"compaction_recovery","hint_tokens":450,"build_latency_ms":120,"recovery_success":true}"#;
+        let event: ChatEvent = serde_json::from_str(json).unwrap();
+        assert!(matches!(
+            event,
+            ChatEvent::CompactionRecovery {
+                hint_tokens: 450,
+                build_latency_ms: 120,
+                recovery_success: true
+            }
+        ));
+        assert_eq!(event.event_type(), "compaction_recovery");
+        assert_eq!(
+            event.fingerprint(),
+            Some("compaction_recovery:450:120:true".to_string())
+        );
+
+        // CompactionRecovery — failure
+        let json = r#"{"type":"compaction_recovery","hint_tokens":0,"build_latency_ms":510,"recovery_success":false}"#;
+        let event: ChatEvent = serde_json::from_str(json).unwrap();
+        assert!(matches!(
+            event,
+            ChatEvent::CompactionRecovery {
+                hint_tokens: 0,
+                build_latency_ms: 510,
+                recovery_success: false
+            }
+        ));
+
+        // CompactionRecovery round-trip
+        let original = ChatEvent::CompactionRecovery {
+            hint_tokens: 200,
+            build_latency_ms: 80,
+            recovery_success: true,
+        };
+        let serialized = serde_json::to_string(&original).unwrap();
+        let deserialized: ChatEvent = serde_json::from_str(&serialized).unwrap();
+        assert!(matches!(
+            deserialized,
+            ChatEvent::CompactionRecovery {
+                hint_tokens: 200,
+                build_latency_ms: 80,
+                recovery_success: true
+            }
         ));
 
         // CompactBoundary with pre_tokens

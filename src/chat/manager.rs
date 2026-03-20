@@ -3550,22 +3550,26 @@ impl ChatManager {
                 None
             };
 
-            // Build context using CompactionContextBuilder
+            // Build context using CompactionContextBuilder (timed for metrics)
+            let build_start = std::time::Instant::now();
             let builder = super::compaction_context::CompactionContextBuilder::new(graph.clone());
-            match builder
+            let build_result = builder
                 .build_for_session(project_slug.as_deref())
-                .await
-            {
+                .await;
+            let build_latency_ms = build_start.elapsed().as_millis() as u64;
+
+            let (hint_len, recovery_success) = match build_result {
                 Ok(ctx) => {
                     let hint = ctx.to_markdown();
+                    let len = hint.len();
                     if !hint.is_empty() {
                         info!(
                             "Injecting post-compaction context for session {} ({} chars)",
-                            session_id,
-                            hint.len()
+                            session_id, len
                         );
                         pending_messages.lock().await.push_back(hint);
                     }
+                    (len, true)
                 }
                 Err(e) => {
                     // Fallback: if build fails, inject a minimal reminder
@@ -3581,9 +3585,20 @@ impl ChatManager {
                     } else {
                         "<system-reminder>\n# Post-Compaction Context\nYou are in an interactive session. No project context available.\n</system-reminder>".to_string()
                     };
+                    let len = minimal.len();
                     pending_messages.lock().await.push_back(minimal);
+                    (len, false)
                 }
-            }
+            };
+
+            // Emit CompactionRecovery metrics
+            let hint_tokens = (hint_len as u32) / 3; // rough chars→tokens estimate
+            let recovery_event = ChatEvent::CompactionRecovery {
+                hint_tokens,
+                build_latency_ms,
+                recovery_success,
+            };
+            emit_chat(recovery_event, &events_tx, &nats, &session_id);
         } else if needs_post_compaction_injection {
             debug!(
                 "Skipping post-compaction injection for session {} (interrupted)",
@@ -5207,6 +5222,18 @@ impl ChatManager {
             .get(session_id)
             .ok_or_else(|| anyhow!("Session {} not found or inactive", session_id))?;
         Ok(session.events_tx.subscribe())
+    }
+
+    /// Get the broadcast sender for a session (used by AgentGuard to emit events).
+    pub async fn get_events_tx(
+        &self,
+        session_id: &str,
+    ) -> Result<broadcast::Sender<ChatEvent>> {
+        let sessions = self.active_sessions.read().await;
+        let session = sessions
+            .get(session_id)
+            .ok_or_else(|| anyhow!("Session {} not found or inactive", session_id))?;
+        Ok(session.events_tx.clone())
     }
 
     /// Get persisted events since a given sequence number (for WebSocket replay)

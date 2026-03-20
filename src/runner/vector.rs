@@ -78,6 +78,10 @@ pub struct DriftDim {
     pub compaction_count: u32,
     pub timeout_count: u32,
     pub budget_warnings: u32,
+    /// Ratio of successful compaction recoveries / total compactions (0.0–1.0).
+    /// Fed from `ChatEvent::CompactionRecovery` events.
+    #[serde(default)]
+    pub compaction_recovery_rate: f32,
 }
 
 /// Outcome of the run.
@@ -118,6 +122,9 @@ pub struct VectorCollector {
     // Token tracking
     pub input_tokens: u64,
     pub output_tokens: u64,
+    // Compaction recovery tracking
+    pub compaction_recoveries_success: u32,
+    pub compaction_recoveries_total: u32,
     // Outcome
     pub failure_reasons: Vec<String>,
     pub pr_url: Option<String>,
@@ -151,6 +158,14 @@ impl VectorCollector {
             DriftEvent::Compaction => self.compaction_count += 1,
             DriftEvent::Timeout => self.timeout_count += 1,
             DriftEvent::Budget => self.budget_warnings += 1,
+        }
+    }
+
+    /// Record a compaction recovery event from `ChatEvent::CompactionRecovery`.
+    pub fn record_compaction_recovery(&mut self, success: bool) {
+        self.compaction_recoveries_total += 1;
+        if success {
+            self.compaction_recoveries_success += 1;
         }
     }
 
@@ -202,6 +217,12 @@ impl VectorCollector {
                 compaction_count: self.compaction_count,
                 timeout_count: self.timeout_count,
                 budget_warnings: self.budget_warnings,
+                compaction_recovery_rate: if self.compaction_recoveries_total > 0 {
+                    self.compaction_recoveries_success as f32
+                        / self.compaction_recoveries_total as f32
+                } else {
+                    0.0
+                },
             },
             outcome: OutcomeDim {
                 status: state.status,
@@ -266,6 +287,9 @@ pub struct AgentVectorCollector {
     // Token tracking
     pub input_tokens: u64,
     pub output_tokens: u64,
+    // Compaction recovery tracking
+    pub compaction_recoveries_success: u32,
+    pub compaction_recoveries_total: u32,
 }
 
 impl AgentVectorCollector {
@@ -298,6 +322,14 @@ impl AgentVectorCollector {
         self.decisions_created += affects as u32;
     }
 
+    /// Record a compaction recovery event.
+    pub fn record_compaction_recovery(&mut self, success: bool) {
+        self.compaction_recoveries_total += 1;
+        if success {
+            self.compaction_recoveries_success += 1;
+        }
+    }
+
     /// Finalize this agent's metrics into an `AgentExecutionVector`.
     pub fn finalize(
         &self,
@@ -317,6 +349,12 @@ impl AgentVectorCollector {
                 compaction_count: self.compaction_count,
                 timeout_count: self.timeout_count,
                 budget_warnings: self.budget_warnings,
+                compaction_recovery_rate: if self.compaction_recoveries_total > 0 {
+                    self.compaction_recoveries_success as f32
+                        / self.compaction_recoveries_total as f32
+                } else {
+                    0.0
+                },
             },
             knowledge: KnowledgeDim {
                 notes_created: self.notes_created,
@@ -346,6 +384,8 @@ impl AgentVectorCollector {
         global.lines_deleted += self.lines_deleted;
         global.input_tokens += self.input_tokens;
         global.output_tokens += self.output_tokens;
+        global.compaction_recoveries_success += self.compaction_recoveries_success;
+        global.compaction_recoveries_total += self.compaction_recoveries_total;
     }
 }
 
@@ -479,6 +519,7 @@ impl ExecutionVector {
                 compaction_count: 0,
                 timeout_count: 0,
                 budget_warnings: 0,
+                compaction_recovery_rate: 0.0,
             },
             outcome: OutcomeDim {
                 status: state.status,
@@ -854,6 +895,28 @@ pub fn predict_run(vectors: &[ExecutionVector]) -> RunPrediction {
 mod tests {
     use super::*;
 
+    fn make_runner_state() -> crate::runner::RunnerState {
+        crate::runner::RunnerState {
+            run_id: Uuid::new_v4(),
+            plan_id: Uuid::new_v4(),
+            total_tasks: 0,
+            current_wave: 0,
+            current_task_id: None,
+            current_task_title: None,
+            active_agents: vec![],
+            completed_tasks: vec![],
+            failed_tasks: vec![],
+            retry_counts: std::collections::HashMap::new(),
+            git_branch: String::new(),
+            started_at: Utc::now(),
+            completed_at: Some(Utc::now()),
+            status: PlanRunStatus::Completed,
+            cost_usd: 0.0,
+            triggered_by: TriggerSource::Manual,
+            project_id: None,
+        }
+    }
+
     fn make_vector(
         duration: f64,
         cost: f64,
@@ -896,13 +959,7 @@ mod tests {
                 lines_added: 100,
                 lines_deleted: 20,
             },
-            drift: DriftDim {
-                idle_warnings: 0,
-                loop_warnings: 0,
-                compaction_count: 0,
-                timeout_count: 0,
-                budget_warnings: 0,
-            },
+            drift: DriftDim::default(),
             outcome: OutcomeDim {
                 status,
                 failure_reasons: vec![],
@@ -1054,6 +1111,61 @@ mod tests {
         assert_eq!(global.input_tokens, 600); // 100 + 500
         assert_eq!(global.output_tokens, 200);
         assert_eq!(global.commits_linked, 3);
+    }
+
+    #[test]
+    fn test_compaction_recovery_rate_calculation() {
+        let mut collector = VectorCollector::new();
+
+        // 2 compactions: 1 success + 1 failure → rate = 0.5
+        collector.record_compaction_recovery(true);
+        collector.record_compaction_recovery(false);
+
+        assert_eq!(collector.compaction_recoveries_total, 2);
+        assert_eq!(collector.compaction_recoveries_success, 1);
+
+        // Verify via a minimal RunnerState to test finalize
+        let state = make_runner_state();
+        let vector = collector.finalize(&state);
+        assert!((vector.drift.compaction_recovery_rate - 0.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_compaction_recovery_rate_zero_compactions() {
+        let collector = VectorCollector::new();
+        let state = make_runner_state();
+        let vector = collector.finalize(&state);
+        assert!((vector.drift.compaction_recovery_rate - 0.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_compaction_recovery_rate_all_success() {
+        let mut collector = VectorCollector::new();
+        collector.record_compaction_recovery(true);
+        collector.record_compaction_recovery(true);
+        collector.record_compaction_recovery(true);
+
+        assert_eq!(collector.compaction_recoveries_total, 3);
+        assert_eq!(collector.compaction_recoveries_success, 3);
+
+        let state = make_runner_state();
+        let vector = collector.finalize(&state);
+        assert!((vector.drift.compaction_recovery_rate - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_agent_compaction_recovery_merge() {
+        let mut agent = AgentVectorCollector::new(Uuid::new_v4(), "simple".to_string());
+        agent.record_compaction_recovery(true);
+        agent.record_compaction_recovery(false);
+
+        let mut global = VectorCollector::new();
+        global.record_compaction_recovery(true); // 1 success already
+
+        agent.merge_into(&mut global);
+
+        assert_eq!(global.compaction_recoveries_total, 3); // 1 + 2
+        assert_eq!(global.compaction_recoveries_success, 2); // 1 + 1
     }
 
     #[test]
