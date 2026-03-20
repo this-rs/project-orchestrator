@@ -362,6 +362,9 @@ impl PlanRunner {
                 RunnerEvent::WorktreeRecovery { run_id, .. } => {
                     (run_id.to_string(), CrudAction::Updated)
                 }
+                RunnerEvent::LifecycleTransition { run_id, .. } => {
+                    (run_id.to_string(), CrudAction::StatusChanged)
+                }
             };
 
             let payload = serde_json::to_value(&event).unwrap_or_default();
@@ -2066,7 +2069,9 @@ impl PlanRunner {
             permission_mode: Some("bypassPermissions".to_string()),
             add_dirs: None,
             workspace_slug: None,
-            user_claims: None,
+            user_claims: Some(crate::auth::jwt::Claims::service_account(
+                &format!("runner-agent:{}", run_id),
+            )),
             spawned_by: Some(
                 serde_json::json!({
                     "type": "runner",
