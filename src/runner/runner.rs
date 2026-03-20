@@ -1809,6 +1809,66 @@ impl PlanRunner {
             prompt.push_str(&format!("\n## Persona Context\n{}\n", pc));
         }
 
+        // --- Step 2d: Inject knowledge context (notes + decisions) for affected files ---
+        {
+            use crate::notes::EntityType as NoteEntityType;
+            let mut knowledge_parts: Vec<String> = Vec::new();
+            // Cap at 5 files to avoid prompt bloat
+            for file_path in runner_context.affected_files.iter().take(5) {
+                let mut file_notes = Vec::new();
+                // Fetch notes linked to this file
+                if let Ok(notes) = self
+                    .graph
+                    .get_notes_for_entity(&NoteEntityType::File, file_path)
+                    .await
+                {
+                    for note in notes.iter().take(3) {
+                        // Truncate content to ~200 chars
+                        let excerpt = if note.content.len() > 200 {
+                            format!("{}…", &note.content[..200])
+                        } else {
+                            note.content.clone()
+                        };
+                        file_notes.push(format!(
+                            "  - **[{:?}]** ({:?}): {}",
+                            note.note_type, note.importance, excerpt
+                        ));
+                    }
+                }
+                // Fetch decisions affecting this file
+                if let Ok(decisions) = self
+                    .graph
+                    .get_decisions_affecting("File", file_path, Some("accepted"))
+                    .await
+                {
+                    for dec in decisions.iter().take(2) {
+                        let rationale_excerpt = if dec.rationale.len() > 150 {
+                            format!("{}…", &dec.rationale[..150])
+                        } else {
+                            dec.rationale.clone()
+                        };
+                        file_notes.push(format!(
+                            "  - **[Decision]** {}: {}",
+                            dec.description, rationale_excerpt
+                        ));
+                    }
+                }
+                if !file_notes.is_empty() {
+                    knowledge_parts.push(format!(
+                        "### `{}`\n{}",
+                        file_path,
+                        file_notes.join("\n")
+                    ));
+                }
+            }
+            if !knowledge_parts.is_empty() {
+                prompt.push_str("\n## Knowledge Context\n");
+                prompt.push_str("The following notes and decisions are relevant to the files you will modify:\n\n");
+                prompt.push_str(&knowledge_parts.join("\n\n"));
+                prompt.push('\n');
+            }
+        }
+
         // --- Step 3: Inject complexity directive ---
         prompt.push_str(&format!(
             "\n## Cognitive Profile: {}\n{}\n",
@@ -2520,6 +2580,29 @@ impl PlanRunner {
                         )
                     })
                     .unwrap_or((Uuid::nil(), 0.0, 0.0, 0, 0));
+
+                // Post-run enricher sweep: catch commits missed by per-task enrichment
+                // (e.g., mega-commit at end instead of atomic per-task commits)
+                if let Some(cwd) = cwd {
+                    if let Some(ref state) = *global {
+                        let enricher = TaskEnricher::new(self.graph.clone());
+                        let sweep_linked = enricher
+                            .post_run_sweep(
+                                state.plan_id,
+                                &state.completed_tasks,
+                                state.started_at,
+                                state.project_id,
+                                cwd,
+                            )
+                            .await;
+                        if sweep_linked > 0 {
+                            info!(
+                                "Post-run sweep linked {} commit→task relations",
+                                sweep_linked
+                            );
+                        }
+                    }
+                }
 
                 // Auto-PR: generate and create PR if auto_pr is enabled
                 let pr_url = if self.config.auto_pr {

@@ -433,6 +433,97 @@ impl TaskEnricher {
     }
 
     // ========================================================================
+    // Post-run sweep — catch commits missed by per-task enrichment
+    // ========================================================================
+
+    /// Sweep all commits since `run_start` and link any that are orphaned.
+    ///
+    /// When agents produce a single mega-commit at the end of the plan (instead
+    /// of per-task atomic commits), the per-task enricher finds 0 commits for
+    /// T1..T(N-1). This sweep runs ONCE after the full plan completes and links
+    /// every unlinked commit to the plan + assigns to tasks by file overlap.
+    pub async fn post_run_sweep(
+        &self,
+        plan_id: Uuid,
+        completed_tasks: &[Uuid],
+        run_start: DateTime<Utc>,
+        _project_id: Option<Uuid>,
+        cwd: &str,
+    ) -> usize {
+        // 1. Get ALL commits since the run started
+        let commits = match self.get_commits_since(cwd, run_start).await {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("Post-run sweep: failed to get commits: {}", e);
+                return 0;
+            }
+        };
+
+        if commits.is_empty() {
+            info!("Post-run sweep: no commits found since run start");
+            return 0;
+        }
+
+        let mut linked = 0;
+
+        for commit in &commits {
+            // Create commit node (idempotent — skips if already exists)
+            let commit_node = CommitNode {
+                hash: commit.hash.clone(),
+                message: commit.message.clone(),
+                author: commit.author.clone(),
+                timestamp: commit.timestamp,
+            };
+            let _ = self.graph.create_commit(&commit_node).await;
+
+            // Create TOUCHES relations
+            if !commit.files.is_empty() {
+                let _ = self
+                    .graph
+                    .create_commit_touches(&commit.hash, &commit.files)
+                    .await;
+            }
+
+            // Link to plan (idempotent)
+            let _ = self.graph.link_commit_to_plan(&commit.hash, plan_id).await;
+
+            // Try to assign to a task by matching affected_files
+            // For each completed task, check if the commit touches any of its affected files
+            let commit_files: std::collections::HashSet<&str> =
+                commit.files.iter().map(|f| f.path.as_str()).collect();
+
+            for &task_id in completed_tasks {
+                // Check if this task already has this commit linked
+                let existing = self.graph.get_task_commits(task_id).await.unwrap_or_default();
+                if existing.iter().any(|c| c.hash == commit.hash) {
+                    continue; // Already linked
+                }
+
+                // Get task's affected_files to match against commit
+                if let Ok(Some(task_node)) = self.graph.get_task(task_id).await {
+                    let task_files: std::collections::HashSet<&str> =
+                        task_node.affected_files.iter().map(|f| f.as_str()).collect();
+
+                    let overlap = commit_files.intersection(&task_files).count();
+                    if overlap > 0 || task_node.affected_files.is_empty() {
+                        // Match found (or task has no affected_files → link anyway)
+                        let _ = self.graph.link_commit_to_task(&commit.hash, task_id).await;
+                        linked += 1;
+                    }
+                }
+            }
+        }
+
+        info!(
+            "Post-run sweep: {} commits processed, {} task links created",
+            commits.len(),
+            linked
+        );
+
+        linked
+    }
+
+    // ========================================================================
     // Git helpers
     // ========================================================================
 
