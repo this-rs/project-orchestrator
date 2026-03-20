@@ -311,7 +311,10 @@ async fn execute_via_agent(
         permission_mode: Some("bypassPermissions".to_string()),
         add_dirs: None,
         workspace_slug: None,
-        user_claims: None,
+        user_claims: Some(crate::auth::jwt::Claims::service_account(&format!(
+            "protocol-agent:{}",
+            run.id
+        ))),
         spawned_by: Some(
             serde_json::json!({
                 "type": "protocol_runner",

@@ -916,7 +916,10 @@ pub async fn delegate_task(
         permission_mode: Some("bypassPermissions".to_string()),
         add_dirs: None,
         workspace_slug: None,
-        user_claims: None,
+        user_claims: Some(crate::auth::jwt::Claims::service_account(&format!(
+            "delegate-agent:{}",
+            task_id
+        ))),
         spawned_by: Some(spawned_by_json.to_string()),
         task_context: Some(task_title.clone()),
         scaffolding_override,

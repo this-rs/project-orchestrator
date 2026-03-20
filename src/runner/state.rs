@@ -59,6 +59,11 @@ pub struct RunnerState {
     pub triggered_by: TriggerSource,
     /// Project ID (for scoping)
     pub project_id: Option<Uuid>,
+    /// Optional lifecycle ProtocolRun tracking this plan execution.
+    /// Set when a lifecycle protocol (plan-runner-*) is routed at startup.
+    /// None when no lifecycle protocol is available (fallback mode).
+    #[serde(default)]
+    pub lifecycle_run_id: Option<Uuid>,
 }
 
 impl RunnerState {
@@ -87,6 +92,7 @@ impl RunnerState {
             cost_usd: 0.0,
             triggered_by,
             project_id: None,
+            lifecycle_run_id: None,
         }
     }
 
@@ -157,6 +163,17 @@ impl RunnerState {
             .find(|a| &a.task_id == task_id)
         {
             agent.status = status;
+        }
+    }
+
+    /// Set the session_id on an active agent (after create_session completes).
+    pub fn set_agent_session(&mut self, task_id: &Uuid, session_id: Option<Uuid>) {
+        if let Some(agent) = self
+            .active_agents
+            .iter_mut()
+            .find(|a| &a.task_id == task_id)
+        {
+            agent.session_id = session_id;
         }
     }
 

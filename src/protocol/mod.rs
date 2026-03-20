@@ -31,5 +31,6 @@ pub mod runner;
 #[cfg(test)]
 mod runner_tests;
 pub mod seed;
+pub mod seed_runner;
 
 pub use models::*;

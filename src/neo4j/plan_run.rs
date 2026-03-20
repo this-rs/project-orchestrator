@@ -303,6 +303,10 @@ impl Neo4jClient {
                 .get::<String>("project_id")
                 .ok()
                 .and_then(|s| s.parse().ok()),
+            lifecycle_run_id: node
+                .get::<String>("lifecycle_run_id")
+                .ok()
+                .and_then(|s| s.parse().ok()),
         })
     }
 }

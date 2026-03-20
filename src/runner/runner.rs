@@ -6,15 +6,16 @@
 use crate::chat::manager::ChatManager;
 use crate::chat::types::{ChatEvent, ChatRequest};
 use crate::events::{CrudAction, CrudEvent, EntityType, EventEmitter};
-use crate::neo4j::models::TaskStatus;
+use crate::neo4j::models::{PlanStatus, TaskStatus};
 use crate::neo4j::traits::GraphStore;
 use crate::orchestrator::context::ContextBuilder;
 use crate::runner::enricher::TaskEnricher;
 use crate::runner::git;
 use crate::runner::guard::{AgentGuard, ChatManagerHintSender, GuardConfig, GuardVerdict};
+use crate::runner::lifecycle;
 use crate::runner::models::{
     ActiveAgent, ActiveAgentSnapshot, PlanRunStatus, RunnerConfig, RunnerEvent,
-    TaskExecutionReport, TaskResult, TriggerSource,
+    TaskExecutionReport, TaskResult, TaskRunStatus, TriggerSource,
 };
 use crate::runner::persona::{
     activate_skills_for_task, complexity_directive, profile_task, record_skill_feedback,
@@ -30,7 +31,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tokio::sync::{broadcast, RwLock};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 // ============================================================================
@@ -361,6 +362,9 @@ impl PlanRunner {
                 RunnerEvent::WorktreeRecovery { run_id, .. } => {
                     (run_id.to_string(), CrudAction::Updated)
                 }
+                RunnerEvent::LifecycleTransition { run_id, .. } => {
+                    (run_id.to_string(), CrudAction::StatusChanged)
+                }
             };
 
             let payload = serde_json::to_value(&event).unwrap_or_default();
@@ -413,6 +417,7 @@ impl PlanRunner {
                 let mut failed_state = saved_state.clone();
                 failed_state.finalize(PlanRunStatus::Failed);
                 self.graph.update_plan_run(&failed_state).await?;
+                // Plan no longer exists, no status to update
                 continue;
             }
 
@@ -430,6 +435,16 @@ impl PlanRunner {
                 let mut done_state = saved_state.clone();
                 done_state.finalize(PlanRunStatus::Completed);
                 self.graph.update_plan_run(&done_state).await?;
+                if let Err(e) = self
+                    .graph
+                    .update_plan_status(plan_id, PlanStatus::Completed)
+                    .await
+                {
+                    warn!(
+                        "Failed to set plan {} status to Completed on recovery: {}",
+                        plan_id, e
+                    );
+                }
                 continue;
             }
 
@@ -468,6 +483,13 @@ impl PlanRunner {
                     if let Some(ref mut s) = *global {
                         s.finalize(PlanRunStatus::Failed);
                         let _ = runner.graph.update_plan_run(s).await;
+                        if let Err(e) = runner
+                            .graph
+                            .update_plan_status(s.plan_id, PlanStatus::Cancelled)
+                            .await
+                        {
+                            warn!("Failed to set plan {} status to Cancelled after recovery failure: {}", s.plan_id, e);
+                        }
                     }
                 }
             });
@@ -530,6 +552,49 @@ impl PlanRunner {
         {
             let mut collector = VECTOR_COLLECTOR.write().await;
             *collector = VectorCollector::new();
+        }
+
+        // Transition plan status to InProgress (idempotent — warn if already in_progress)
+        if let Err(e) = self
+            .graph
+            .update_plan_status(plan_id, PlanStatus::InProgress)
+            .await
+        {
+            warn!(
+                "Failed to set plan {} status to in_progress (may already be in_progress): {}",
+                plan_id, e
+            );
+        } else {
+            info!("Plan {} status set to in_progress", plan_id);
+        }
+
+        // Route to lifecycle protocol (if available). Non-fatal — fallback on None.
+        match lifecycle::route_lifecycle_protocol(&self.graph, plan_id, total_tasks).await {
+            Ok(Some(route_result)) => {
+                info!(
+                    "Plan {} wrapped by lifecycle protocol {} (run: {}, affinity: {:.2})",
+                    plan_id,
+                    route_result.protocol_name,
+                    route_result.run_id,
+                    route_result.affinity_score
+                );
+                let mut global = RUNNER_STATE.write().await;
+                if let Some(ref mut s) = *global {
+                    s.lifecycle_run_id = Some(route_result.run_id);
+                }
+            }
+            Ok(None) => {
+                debug!(
+                    "No lifecycle protocol for plan {} — using default runner flow",
+                    plan_id
+                );
+            }
+            Err(e) => {
+                warn!(
+                    "Lifecycle protocol routing failed for plan {}: {}. Continuing without.",
+                    plan_id, e
+                );
+            }
         }
 
         let result = StartResult {
@@ -606,6 +671,17 @@ impl PlanRunner {
                 if let Some(ref mut s) = *global {
                     s.finalize(PlanRunStatus::Failed);
                     let _ = runner.graph.update_plan_run(s).await;
+                    // Also transition plan status to Cancelled (failed run)
+                    if let Err(e) = runner
+                        .graph
+                        .update_plan_status(s.plan_id, PlanStatus::Cancelled)
+                        .await
+                    {
+                        warn!(
+                            "Failed to set plan {} status to Cancelled after error: {}",
+                            s.plan_id, e
+                        );
+                    }
                 }
             }
         });
@@ -644,9 +720,20 @@ impl PlanRunner {
         let mut global = RUNNER_STATE.write().await;
         match &mut *global {
             Some(state) if state.run_id == run_id => {
+                let plan_id = state.plan_id;
                 state.finalize(PlanRunStatus::Cancelled);
                 if let Err(e) = graph.update_plan_run(state).await {
                     error!("Failed to persist force-cancelled run to Neo4j: {}", e);
+                }
+                // Transition plan status to Cancelled
+                if let Err(e) = graph
+                    .update_plan_status(plan_id, PlanStatus::Cancelled)
+                    .await
+                {
+                    warn!(
+                        "Failed to set plan {} status to Cancelled on force-cancel: {}",
+                        plan_id, e
+                    );
                 }
                 info!("Runner force-cancelled run {}", run_id);
                 // Clear the global state so a new run can start
@@ -1021,10 +1108,10 @@ impl PlanRunner {
             .tasks
             .iter()
             .filter(|t| {
-                if t.status == "completed" {
+                if t.status.eq_ignore_ascii_case("completed") {
                     return false;
                 }
-                if t.status == "blocked" {
+                if t.status.eq_ignore_ascii_case("blocked") {
                     warn!(
                         "Skipping blocked task {}: {}",
                         t.id,
@@ -2019,7 +2106,10 @@ impl PlanRunner {
             permission_mode: Some("bypassPermissions".to_string()),
             add_dirs: None,
             workspace_slug: None,
-            user_claims: None,
+            user_claims: Some(crate::auth::jwt::Claims::service_account(&format!(
+                "runner-agent:{}",
+                run_id
+            ))),
             spawned_by: Some(
                 serde_json::json!({
                     "type": "runner",
@@ -2038,6 +2128,15 @@ impl PlanRunner {
         let session = self.chat_manager.create_session(&request).await?;
         let session_id = session.session_id.clone();
         let session_uuid = session_id.parse::<Uuid>().ok();
+
+        // Transition agent status: Spawning → Running (session is now live)
+        {
+            let mut global = RUNNER_STATE.write().await;
+            if let Some(ref mut s) = *global {
+                s.update_agent_status(&task_id, TaskRunStatus::Running);
+                s.set_agent_session(&task_id, session_uuid);
+            }
+        }
 
         // Create an AgentExecution ID for this task
         let agent_execution_id = Uuid::new_v4();
@@ -2807,6 +2906,12 @@ impl PlanRunner {
         // Clear budget override
         RUNNER_BUDGET.store(0, std::sync::atomic::Ordering::Relaxed);
 
+        // Extract lifecycle_run_id before finalizing state
+        let lifecycle_run_id = {
+            let global = RUNNER_STATE.read().await;
+            global.as_ref().and_then(|s| s.lifecycle_run_id)
+        };
+
         let mut global = RUNNER_STATE.write().await;
         if let Some(ref mut s) = *global {
             s.finalize(status);
@@ -2828,20 +2933,52 @@ impl PlanRunner {
             // TODO: persist vector to PlanRun node in Neo4j when schema supports it
         }
 
+        // Transition plan status to match the run's terminal state
+        let plan_id = global.as_ref().map(|s| s.plan_id).unwrap_or(Uuid::nil());
+        {
+            if plan_id != Uuid::nil() {
+                let plan_status = match status {
+                    PlanRunStatus::Completed => Some(PlanStatus::Completed),
+                    PlanRunStatus::Failed | PlanRunStatus::BudgetExceeded => {
+                        Some(PlanStatus::Cancelled)
+                    }
+                    PlanRunStatus::Cancelled => Some(PlanStatus::Cancelled),
+                    _ => None,
+                };
+                if let Some(ps) = plan_status {
+                    if let Err(e) = self.graph.update_plan_status(plan_id, ps.clone()).await {
+                        warn!(
+                            "Failed to set plan {} status to {:?} (idempotent, continuing): {}",
+                            plan_id, ps, e
+                        );
+                    } else {
+                        info!("Plan {} status set to {:?}", plan_id, ps);
+                    }
+                }
+            }
+        }
+
         match status {
             PlanRunStatus::Completed => {
-                let (plan_id, total_cost, total_duration, tc, tf) = global
+                let (total_cost, total_duration, tc, tf) = global
                     .as_ref()
                     .map(|s| {
                         (
-                            s.plan_id,
                             s.cost_usd,
                             s.elapsed_secs(),
                             s.completed_tasks.len(),
                             s.failed_tasks.len(),
                         )
                     })
-                    .unwrap_or((Uuid::nil(), 0.0, 0.0, 0, 0));
+                    .unwrap_or((0.0, 0.0, 0, 0));
+
+                // ============================================================
+                // Lifecycle FSM: child_completed → post_run
+                // ============================================================
+                if let Some(lc_run_id) = lifecycle_run_id {
+                    self.fire_lifecycle_transition(run_id, lc_run_id, "child_completed")
+                        .await;
+                }
 
                 // Post-run enricher sweep: catch commits missed by per-task enrichment
                 // (e.g., mega-commit at end instead of atomic per-task commits)
@@ -2866,8 +3003,43 @@ impl PlanRunner {
                     }
                 }
 
-                // Auto-PR: generate and create PR if auto_pr is enabled
-                let pr_url = if self.config.auto_pr {
+                // ============================================================
+                // Lifecycle FSM: commits_linked → pr_decision
+                // ============================================================
+                if let Some(lc_run_id) = lifecycle_run_id {
+                    self.fire_lifecycle_transition(run_id, lc_run_id, "commits_linked")
+                        .await;
+                }
+
+                // ============================================================
+                // PR decision: evaluate guard and create PR or skip
+                // ============================================================
+                let pr_url = if let Some(lc_run_id) = lifecycle_run_id {
+                    // Evaluate guard: has_commits && is_implementation
+                    let should_pr = self.evaluate_pr_guard(plan_id).await;
+                    if should_pr {
+                        // Try to create PR, then fire pr_created
+                        let url = match self.create_auto_pr(plan_id).await {
+                            Ok(url) => {
+                                info!("Auto-PR created: {}", url);
+                                Some(url)
+                            }
+                            Err(e) => {
+                                warn!("Auto-PR failed (non-fatal): {}", e);
+                                None
+                            }
+                        };
+                        self.fire_lifecycle_transition(run_id, lc_run_id, "pr_created")
+                            .await;
+                        url
+                    } else {
+                        info!("PR guard not met — skipping PR creation");
+                        self.fire_lifecycle_transition(run_id, lc_run_id, "skip_pr")
+                            .await;
+                        None
+                    }
+                } else if self.config.auto_pr {
+                    // Fallback: no lifecycle protocol, use config flag
                     match self.create_auto_pr(plan_id).await {
                         Ok(url) => {
                             info!("Auto-PR created: {}", url);
@@ -2894,19 +3066,186 @@ impl PlanRunner {
                 });
                 info!("Plan run {} completed successfully", run_id);
             }
+            PlanRunStatus::Failed => {
+                error!("Plan run {} failed", run_id);
+
+                // Lifecycle FSM: fire execution_failed → failed terminal state
+                if let Some(lc_run_id) = lifecycle_run_id {
+                    self.fire_lifecycle_transition(run_id, lc_run_id, "execution_failed")
+                        .await;
+                }
+
+                // Create a gotcha note with error context for failed runs
+                if plan_id != Uuid::nil() {
+                    self.create_failure_note(plan_id, run_id).await;
+                }
+            }
             PlanRunStatus::Cancelled => {
                 info!("Plan run {} cancelled", run_id);
+
+                // Lifecycle FSM: fire execution_failed for cancelled runs too
+                if let Some(lc_run_id) = lifecycle_run_id {
+                    self.fire_lifecycle_transition(run_id, lc_run_id, "execution_failed")
+                        .await;
+                }
             }
             PlanRunStatus::BudgetExceeded => {
                 warn!("Plan run {} aborted: budget exceeded", run_id);
-            }
-            PlanRunStatus::Failed => {
-                error!("Plan run {} failed", run_id);
+
+                // Lifecycle FSM: fire execution_failed for budget exceeded
+                if let Some(lc_run_id) = lifecycle_run_id {
+                    self.fire_lifecycle_transition(run_id, lc_run_id, "execution_failed")
+                        .await;
+                }
             }
             _ => {}
         }
 
         Ok(())
+    }
+
+    /// Fire a lifecycle protocol transition and emit a WebSocket event.
+    ///
+    /// Non-fatal: logs warnings on failure but never propagates errors.
+    /// This ensures the runner completes even if the lifecycle protocol
+    /// has issues (graceful degradation).
+    async fn fire_lifecycle_transition(&self, run_id: Uuid, lifecycle_run_id: Uuid, trigger: &str) {
+        // Capture current state name before transition
+        let from_state = match self.graph.get_protocol_run(lifecycle_run_id).await {
+            Ok(Some(run)) => run
+                .states_visited
+                .last()
+                .map(|v| v.state_name.clone())
+                .unwrap_or_else(|| "unknown".to_string()),
+            _ => "unknown".to_string(),
+        };
+
+        match crate::protocol::engine::fire_transition(
+            self.graph.as_ref(),
+            lifecycle_run_id,
+            trigger,
+        )
+        .await
+        {
+            Ok(result) if result.success => {
+                info!(
+                    "Lifecycle transition: {} → {} (trigger: {})",
+                    from_state, result.current_state_name, trigger
+                );
+                self.emit_event(RunnerEvent::LifecycleTransition {
+                    run_id,
+                    lifecycle_run_id,
+                    from_state,
+                    to_state: result.current_state_name,
+                    trigger: trigger.to_string(),
+                });
+            }
+            Ok(result) => {
+                warn!(
+                    "Lifecycle transition failed (non-fatal): trigger='{}', error={:?}",
+                    trigger, result.error
+                );
+            }
+            Err(e) => {
+                warn!(
+                    "Lifecycle transition error (non-fatal): trigger='{}', error={}",
+                    trigger, e
+                );
+            }
+        }
+    }
+
+    /// Evaluate the PR guard for the lifecycle protocol's pr_decision state.
+    ///
+    /// Returns true if:
+    /// 1. The plan has commits linked (has_commits > 0)
+    /// 2. AND is an implementation plan:
+    ///    - Task tags contain feat/fix/refactor, OR
+    ///    - Tasks have non-empty affected_files
+    async fn evaluate_pr_guard(&self, plan_id: Uuid) -> bool {
+        // Check has_commits
+        let has_commits = match self.graph.get_plan_commits(plan_id).await {
+            Ok(commits) => !commits.is_empty(),
+            Err(e) => {
+                warn!("Failed to get plan commits for PR guard: {}", e);
+                false
+            }
+        };
+
+        if !has_commits {
+            return false;
+        }
+
+        // Check is_implementation: task tags contain feat/fix/refactor OR affected_files non-empty
+        let is_implementation = match self.graph.get_plan_tasks(plan_id).await {
+            Ok(tasks) => {
+                let implementation_tags = ["feat", "fix", "refactor"];
+                tasks.iter().any(|t| {
+                    // Check tags
+                    let has_impl_tag = t.tags.iter().any(|tag| {
+                        implementation_tags
+                            .iter()
+                            .any(|it| tag.to_lowercase().contains(it))
+                    });
+                    // Check affected_files
+                    let has_files = !t.affected_files.is_empty();
+                    has_impl_tag || has_files
+                })
+            }
+            Err(e) => {
+                warn!("Failed to get plan tasks for PR guard: {}", e);
+                false
+            }
+        };
+
+        is_implementation
+    }
+
+    /// Create a gotcha note when a plan run fails.
+    ///
+    /// Captures error context (failed tasks, run_id) for debugging.
+    async fn create_failure_note(&self, plan_id: Uuid, run_id: Uuid) {
+        let (failed_tasks, project_id) = {
+            let global = RUNNER_STATE.read().await;
+            global
+                .as_ref()
+                .map(|s| (s.failed_tasks.clone(), s.project_id))
+                .unwrap_or_default()
+        };
+
+        let failed_summary: Vec<String> = failed_tasks
+            .iter()
+            .map(|id| format!("- Task {}", id))
+            .collect();
+
+        let content = format!(
+            "## Plan run failed\n\n\
+             **Run ID**: {}\n\
+             **Plan ID**: {}\n\n\
+             ### Failed tasks\n{}\n",
+            run_id,
+            plan_id,
+            if failed_summary.is_empty() {
+                "No task-level failures recorded (runner-level error).".to_string()
+            } else {
+                failed_summary.join("\n")
+            }
+        );
+
+        let mut note = crate::notes::models::Note::new(
+            project_id,
+            crate::notes::models::NoteType::Gotcha,
+            content,
+            "runner".to_string(),
+        );
+        note.importance = crate::notes::models::NoteImportance::High;
+        note.tags = vec!["runner-failure".to_string(), "auto-generated".to_string()];
+
+        if let Err(e) = self.graph.create_note(&note).await {
+            warn!("Failed to create failure note (non-fatal): {}", e);
+        } else {
+            info!("Created gotcha note {} for failed run {}", note.id, run_id);
+        }
     }
 
     /// Create a dedicated git branch for this plan run.

@@ -626,6 +626,7 @@ impl ToolHandler {
             ("admin", "seed_prompt_fragments") => "seed_prompt_fragments",
             ("admin", "install_hooks") => "install_hooks",
             ("admin", "get_learning_stats") => "get_learning_stats",
+            ("admin", "analyze_runner_feedback") => "analyze_runner_feedback",
 
             // Lifecycle Hooks
             ("lifecycle_hook", "list") => "list_lifecycle_hooks",

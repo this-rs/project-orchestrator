@@ -914,6 +914,7 @@ mod tests {
             cost_usd: 0.0,
             triggered_by: TriggerSource::Manual,
             project_id: None,
+            lifecycle_run_id: None,
         }
     }
 

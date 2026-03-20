@@ -969,6 +969,19 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/notes/consolidate-memory",
             post(note_handlers::consolidate_memory),
         )
+        // Runner feedback analysis
+        .route(
+            "/api/admin/analyze-runner-feedback",
+            post(note_handlers::analyze_runner_feedback),
+        )
+        .route(
+            "/api/admin/generate-feedback-rfcs",
+            post(note_handlers::generate_feedback_rfcs),
+        )
+        .route(
+            "/api/admin/apply-feedback-rfc",
+            post(note_handlers::apply_feedback_rfc),
+        )
         // Notes needing review
         .route(
             "/api/notes/needs-review",

@@ -14,17 +14,17 @@ use uuid::Uuid;
 use crate::neo4j::GraphStore;
 
 /// A single state fragment definition.
-struct StateFragment {
-    state_name: &'static str,
-    prompt_fragment: &'static str,
-    available_tools: Option<Vec<&'static str>>,
-    forbidden_actions: Option<Vec<&'static str>>,
+pub(crate) struct StateFragment {
+    pub(crate) state_name: &'static str,
+    pub(crate) prompt_fragment: &'static str,
+    pub(crate) available_tools: Option<Vec<&'static str>>,
+    pub(crate) forbidden_actions: Option<Vec<&'static str>>,
 }
 
 /// A protocol with all its state fragments.
-struct ProtocolSeed {
-    protocol_name: &'static str,
-    states: Vec<StateFragment>,
+pub(crate) struct ProtocolSeed {
+    pub(crate) protocol_name: &'static str,
+    pub(crate) states: Vec<StateFragment>,
 }
 
 /// Result of the seed operation.
@@ -36,7 +36,7 @@ pub struct SeedResult {
     pub protocols_missing: Vec<String>,
 }
 
-/// Seed prompt fragments for the 5 critical protocols.
+/// Seed prompt fragments for the 8 protocols (5 system + 3 runner).
 ///
 /// Uses `GraphStore` trait methods to find protocols by name, fetch their states,
 /// enrich them with prompt fragments, and upsert back.
@@ -144,6 +144,9 @@ fn build_protocol_seeds() -> Vec<ProtocolSeed> {
         seed_wave_dispatch(),
         seed_diagnostic_triage(),
         seed_auto_maintenance(),
+        super::seed_runner::seed_plan_runner_full(),
+        super::seed_runner::seed_plan_runner_light(),
+        super::seed_runner::seed_plan_runner_reviewed(),
     ]
 }
 
@@ -681,7 +684,7 @@ mod tests {
     #[test]
     fn test_all_fragments_non_empty() {
         let protocols = build_protocol_seeds();
-        assert_eq!(protocols.len(), 5, "Expected 5 protocol seeds");
+        assert_eq!(protocols.len(), 8, "Expected 8 protocol seeds");
 
         for proto in &protocols {
             assert!(
@@ -734,6 +737,12 @@ mod tests {
         assert_eq!(counts[3], ("diagnostic-triage", 6));
         // auto-maintenance: 6 states
         assert_eq!(counts[4], ("auto-maintenance", 6));
+        // plan-runner-full: 6 states
+        assert_eq!(counts[5], ("plan-runner-full", 6));
+        // plan-runner-light: 5 states
+        assert_eq!(counts[6], ("plan-runner-light", 5));
+        // plan-runner-reviewed: 7 states
+        assert_eq!(counts[7], ("plan-runner-reviewed", 7));
     }
 
     #[test]
@@ -1096,13 +1105,44 @@ mod tests {
         ];
         setup_protocol_in_mock(&mock, project_id, "auto-maintenance", &maint_states).await;
 
+        // Runner protocols
+        let runner_full_states = vec![
+            "approved",
+            "executing",
+            "post_run",
+            "pr_decision",
+            "completed",
+            "failed",
+        ];
+        setup_protocol_in_mock(&mock, project_id, "plan-runner-full", &runner_full_states).await;
+
+        let runner_light_states = vec!["approved", "executing", "post_run", "completed", "failed"];
+        setup_protocol_in_mock(&mock, project_id, "plan-runner-light", &runner_light_states).await;
+
+        let runner_reviewed_states = vec![
+            "approved",
+            "executing",
+            "post_run",
+            "pr_decision",
+            "awaiting_review",
+            "completed",
+            "failed",
+        ];
+        setup_protocol_in_mock(
+            &mock,
+            project_id,
+            "plan-runner-reviewed",
+            &runner_reviewed_states,
+        )
+        .await;
+
         let result = seed_prompt_fragments(&mock, project_id).await.unwrap();
 
-        assert_eq!(result.protocols_found, 5);
+        assert_eq!(result.protocols_found, 8);
         assert!(result.protocols_missing.is_empty());
         assert_eq!(result.skipped, 0);
-        // Total states across all 5 protocols: 5 + 9 + 7 + 6 + 6 = 33
-        assert_eq!(result.updated, 33);
+        // Total states across all 8 protocols: 5 + 9 + 7 + 6 + 6 + 6 + 5 + 7 = 51
+        assert_eq!(result.updated, 51);
 
         // Verify that prompt_fragment was actually written to states
         let states = mock.protocol_states.read().await;
@@ -1129,7 +1169,7 @@ mod tests {
         let result = seed_prompt_fragments(&mock, project_id).await.unwrap();
 
         assert_eq!(result.protocols_found, 0);
-        assert_eq!(result.protocols_missing.len(), 5);
+        assert_eq!(result.protocols_missing.len(), 8);
         assert!(result
             .protocols_missing
             .contains(&"session-lifecycle".to_string()));
@@ -1145,9 +1185,18 @@ mod tests {
         assert!(result
             .protocols_missing
             .contains(&"auto-maintenance".to_string()));
-        // skipped = total number of seed states across all 5 protocols
+        assert!(result
+            .protocols_missing
+            .contains(&"plan-runner-full".to_string()));
+        assert!(result
+            .protocols_missing
+            .contains(&"plan-runner-light".to_string()));
+        assert!(result
+            .protocols_missing
+            .contains(&"plan-runner-reviewed".to_string()));
+        // skipped = total number of seed states across all 8 protocols
         assert_eq!(result.updated, 0);
-        assert_eq!(result.skipped, 33);
+        assert_eq!(result.skipped, 51);
     }
 
     #[tokio::test]
@@ -1162,13 +1211,13 @@ mod tests {
         let result = seed_prompt_fragments(&mock, project_id).await.unwrap();
 
         assert_eq!(result.protocols_found, 1);
-        assert_eq!(result.protocols_missing.len(), 4);
+        assert_eq!(result.protocols_missing.len(), 7);
         assert!(!result
             .protocols_missing
             .contains(&"session-lifecycle".to_string()));
         assert_eq!(result.updated, 5);
-        // skipped = states from the 4 missing protocols: 9 + 7 + 6 + 6 = 28
-        assert_eq!(result.skipped, 28);
+        // skipped = states from the 7 missing protocols: 9 + 7 + 6 + 6 + 6 + 5 + 7 = 46
+        assert_eq!(result.skipped, 46);
     }
 
     #[tokio::test]
@@ -1183,11 +1232,11 @@ mod tests {
         let result = seed_prompt_fragments(&mock, project_id).await.unwrap();
 
         assert_eq!(result.protocols_found, 1);
-        assert_eq!(result.protocols_missing.len(), 4);
+        assert_eq!(result.protocols_missing.len(), 7);
         // 2 states matched, 3 states from session-lifecycle skipped
         assert_eq!(result.updated, 2);
-        // skipped = 3 missing session states + all states from 4 missing protocols (28) = 31
-        assert_eq!(result.skipped, 31);
+        // skipped = 3 missing session states + all states from 7 missing protocols (46) = 49
+        assert_eq!(result.skipped, 49);
     }
 
     #[tokio::test]
@@ -1259,19 +1308,19 @@ mod tests {
 
         assert_eq!(result.protocols_found, 0);
         assert_eq!(result.updated, 0);
-        assert_eq!(result.protocols_missing.len(), 5);
+        assert_eq!(result.protocols_missing.len(), 8);
     }
 
     #[test]
     fn test_seed_result_serialization_empty_missing() {
         let result = SeedResult {
-            updated: 33,
+            updated: 51,
             skipped: 0,
-            protocols_found: 5,
+            protocols_found: 8,
             protocols_missing: vec![],
         };
         let json = serde_json::to_string(&result).unwrap();
-        assert!(json.contains("\"updated\":33"));
+        assert!(json.contains("\"updated\":51"));
         assert!(json.contains("\"protocols_missing\":[]"));
     }
 
@@ -1279,6 +1328,6 @@ mod tests {
     fn test_build_protocol_seeds_total_state_count() {
         let protocols = build_protocol_seeds();
         let total: usize = protocols.iter().map(|p| p.states.len()).sum();
-        assert_eq!(total, 33, "Expected 33 total states across all 5 protocols");
+        assert_eq!(total, 51, "Expected 51 total states across all 8 protocols");
     }
 }

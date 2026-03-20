@@ -43,6 +43,22 @@ impl Claims {
             exp: now + 86400 * 365 * 100, // effectively never expires
         }
     }
+
+    /// Create service-account claims for internally spawned agents.
+    ///
+    /// Used by the plan runner, task delegation, and protocol executor so that
+    /// spawned Claude sessions receive a valid JWT and can call protected MCP
+    /// tool routes.
+    pub fn service_account(identity: &str) -> Self {
+        let now = chrono::Utc::now().timestamp();
+        Self {
+            sub: identity.to_string(),
+            email: "runner@system.local".to_string(),
+            name: "Service Account".to_string(),
+            iat: now,
+            exp: now + 86400, // 24 h
+        }
+    }
 }
 
 /// Encode a JWT token for the given user.

@@ -17,8 +17,11 @@
 //! ```
 
 pub mod enricher;
+pub mod feedback;
+pub mod feedback_analyzer;
 pub mod git;
 pub mod guard;
+pub mod lifecycle;
 pub mod models;
 pub mod persona;
 pub mod prompt;
@@ -32,8 +35,17 @@ pub mod verifier;
 
 // Re-export key types for convenience
 pub use enricher::{EnrichResult, TaskEnricher};
+pub use feedback::{
+    contains_dissatisfaction, ManualCommitInfo, OverrideType, PostRunMessage,
+    RunnerFeedbackCollector, UserOverride,
+};
+pub use feedback_analyzer::{
+    AppliedProtocol, DetectedPattern, FeedbackAnalyzer, FeedbackPatternType, FeedbackReport,
+    PatternSuggestion, ProtocolTrust, TrustStatus,
+};
 pub use git::{WorktreeCollector, WorktreeInfo, WorktreeResolution};
 pub use guard::{AgentGuard, ChatManagerHintSender, GuardConfig, GuardVerdict, HintSender};
+pub use lifecycle::{route_lifecycle_protocol, LifecycleRouteResult};
 pub use models::{
     ActiveAgent, ActiveAgentSnapshot, PlanRunStatus, RunSnapshot, RunnerConfig, RunnerEvent,
     TaskExecutionReport, TaskResult, TaskRunStatus, TaskStateMachine, Trigger, TriggerFiring,
