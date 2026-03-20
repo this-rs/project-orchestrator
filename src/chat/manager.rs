@@ -2725,6 +2725,10 @@ impl ChatManager {
         // Track whether this stream ended with error_max_turns (for auto-continue)
         let mut hit_error_max_turns = false;
 
+        // Track whether a CompactBoundary was received during this stream turn.
+        // When true, we'll rebuild and re-inject project context after the stream ends.
+        let mut needs_post_compaction_injection = false;
+
         // Record user message in memory manager
         if let Some(ref mm) = memory_manager {
             let mut mm = mm.lock().await;
@@ -3413,6 +3417,15 @@ impl ChatManager {
                                         }
                                     }
 
+                                    // Detect CompactBoundary for post-compaction context re-injection
+                                    if matches!(event, ChatEvent::CompactBoundary { .. }) {
+                                        info!(
+                                            "CompactBoundary detected in session {}, will inject context after stream",
+                                            session_id
+                                        );
+                                        needs_post_compaction_injection = true;
+                                    }
+
                                     emit_chat(event, &events_tx, &nats, &session_id);
                                 }
                             }
@@ -3515,6 +3528,67 @@ impl ChatManager {
         // being silently lost after the first message in a session).
         if sdk_control_rx.is_some() {
             *shared_sdk_control_rx.lock().await = sdk_control_rx;
+        }
+
+        // Post-compaction context re-injection for interactive sessions.
+        // If a CompactBoundary was detected during this stream turn, rebuild project
+        // context via CompactionContextBuilder and queue it as a system-reminder hint
+        // so the LLM regains project awareness after compaction.
+        if needs_post_compaction_injection && !interrupt_flag.load(Ordering::SeqCst) {
+            info!(
+                "Post-compaction injection triggered for session {}",
+                session_id
+            );
+
+            // Resolve project_slug from the session's Neo4j node
+            let project_slug = if let Some(uuid) = session_uuid {
+                match graph.get_chat_session(uuid).await {
+                    Ok(Some(node)) => node.project_slug,
+                    _ => None,
+                }
+            } else {
+                None
+            };
+
+            // Build context using CompactionContextBuilder
+            let builder = super::compaction_context::CompactionContextBuilder::new(graph.clone());
+            match builder
+                .build_for_session(project_slug.as_deref())
+                .await
+            {
+                Ok(ctx) => {
+                    let hint = ctx.to_markdown();
+                    if !hint.is_empty() {
+                        info!(
+                            "Injecting post-compaction context for session {} ({} chars)",
+                            session_id,
+                            hint.len()
+                        );
+                        pending_messages.lock().await.push_back(hint);
+                    }
+                }
+                Err(e) => {
+                    // Fallback: if build fails, inject a minimal reminder
+                    warn!(
+                        "Failed to build post-compaction context for session {}: {}. Injecting minimal reminder.",
+                        session_id, e
+                    );
+                    let minimal = if project_slug.is_some() {
+                        format!(
+                            "<system-reminder>\n# Post-Compaction Context\nYou are working on project \"{}\". Context rebuild failed — continue based on conversation history.\n</system-reminder>",
+                            project_slug.as_deref().unwrap_or("unknown")
+                        )
+                    } else {
+                        "<system-reminder>\n# Post-Compaction Context\nYou are in an interactive session. No project context available.\n</system-reminder>".to_string()
+                    };
+                    pending_messages.lock().await.push_back(minimal);
+                }
+            }
+        } else if needs_post_compaction_injection {
+            debug!(
+                "Skipping post-compaction injection for session {} (interrupted)",
+                session_id
+            );
         }
 
         // Lock-free interrupt: send the CLI interrupt signal IMMEDIATELY via stdin_tx
