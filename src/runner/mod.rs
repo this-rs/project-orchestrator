@@ -17,6 +17,7 @@
 //! ```
 
 pub mod enricher;
+pub mod feedback;
 pub mod git;
 pub mod guard;
 pub mod lifecycle;
@@ -56,5 +57,9 @@ pub use trigger::TriggerEngine;
 pub use vector::{
     compare_vectors, predict_run, predict_run_per_agent, AgentExecutionVector,
     AgentVectorCollector, ComparisonResult, ExecutionVector, RunPrediction,
+};
+pub use feedback::{
+    contains_dissatisfaction, ManualCommitInfo, OverrideType, PostRunMessage,
+    RunnerFeedbackCollector, UserOverride,
 };
 pub use verifier::{TaskVerifier, VerifyResult};
