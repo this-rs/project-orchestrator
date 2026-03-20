@@ -793,7 +793,8 @@ impl TrajectoryStore for Neo4jTrajectoryStore {
                      WITH t, collect(tn) AS nodes
                      WHERE size(nodes) >= 2
                      UNWIND range(0, size(nodes) - 2) AS i
-                     CREATE (nodes[i])-[:NEXT_DECISION {delta_ms: nodes[i+1].delta_ms}]->(nodes[i+1])",
+                     WITH nodes[i] AS current, nodes[i+1] AS next
+                     CREATE (current)-[:NEXT_DECISION {delta_ms: next.delta_ms}]->(next)",
                 )
                 .param("traj_ids", chain_ids);
 
