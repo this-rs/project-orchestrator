@@ -27,6 +27,7 @@ pub mod workspace_handlers;
 pub mod ws_auth;
 pub mod ws_chat_handler;
 pub mod ws_handlers;
+pub mod ws_run_handler;
 
 #[cfg(feature = "embedded-frontend")]
 pub mod embedded_frontend;

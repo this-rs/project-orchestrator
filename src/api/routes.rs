@@ -26,6 +26,7 @@ use super::trigger_handlers;
 use super::workspace_handlers;
 use super::ws_chat_handler;
 use super::ws_handlers;
+use super::ws_run_handler;
 use crate::auth::middleware::require_auth;
 use axum::http::{header, Method};
 use axum::{
@@ -177,6 +178,7 @@ fn public_routes() -> Router<OrchestratorState> {
         // ================================================================
         .route("/ws/events", get(ws_handlers::ws_events))
         .route("/ws/chat/{session_id}", get(ws_chat_handler::ws_chat))
+        .route("/ws/run/{run_id}", get(ws_run_handler::ws_run))
         // ================================================================
         // Webhooks & Internal
         // ================================================================
