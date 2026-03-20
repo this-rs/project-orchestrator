@@ -14,7 +14,7 @@ use crate::runner::git;
 use crate::runner::guard::{AgentGuard, ChatManagerHintSender, GuardConfig, GuardVerdict};
 use crate::runner::models::{
     ActiveAgent, ActiveAgentSnapshot, PlanRunStatus, RunnerConfig, RunnerEvent,
-    TaskExecutionReport, TaskResult, TriggerSource,
+    TaskExecutionReport, TaskResult, TaskRunStatus, TriggerSource,
 };
 use crate::runner::persona::{
     activate_skills_for_task, complexity_directive, profile_task, record_skill_feedback,
@@ -2090,6 +2090,15 @@ impl PlanRunner {
         let session = self.chat_manager.create_session(&request).await?;
         let session_id = session.session_id.clone();
         let session_uuid = session_id.parse::<Uuid>().ok();
+
+        // Transition agent status: Spawning → Running (session is now live)
+        {
+            let mut global = RUNNER_STATE.write().await;
+            if let Some(ref mut s) = *global {
+                s.update_agent_status(&task_id, TaskRunStatus::Running);
+                s.set_agent_session(&task_id, session_uuid);
+            }
+        }
 
         // Create an AgentExecution ID for this task
         let agent_execution_id = Uuid::new_v4();

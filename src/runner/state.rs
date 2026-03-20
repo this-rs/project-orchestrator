@@ -166,6 +166,17 @@ impl RunnerState {
         }
     }
 
+    /// Set the session_id on an active agent (after create_session completes).
+    pub fn set_agent_session(&mut self, task_id: &Uuid, session_id: Option<Uuid>) {
+        if let Some(agent) = self
+            .active_agents
+            .iter_mut()
+            .find(|a| &a.task_id == task_id)
+        {
+            agent.session_id = session_id;
+        }
+    }
+
     /// Add cost to an active agent.
     pub fn add_agent_cost(&mut self, task_id: &Uuid, cost: f64) {
         if let Some(agent) = self
