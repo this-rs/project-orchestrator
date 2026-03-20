@@ -18,6 +18,7 @@
 
 pub mod enricher;
 pub mod feedback;
+pub mod feedback_analyzer;
 pub mod git;
 pub mod guard;
 pub mod lifecycle;
@@ -61,5 +62,9 @@ pub use vector::{
 pub use feedback::{
     contains_dissatisfaction, ManualCommitInfo, OverrideType, PostRunMessage,
     RunnerFeedbackCollector, UserOverride,
+};
+pub use feedback_analyzer::{
+    AppliedProtocol, DetectedPattern, FeedbackAnalyzer, FeedbackPatternType, FeedbackReport,
+    PatternSuggestion, ProtocolTrust, TrustStatus,
 };
 pub use verifier::{TaskVerifier, VerifyResult};

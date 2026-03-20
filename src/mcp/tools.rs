@@ -323,6 +323,7 @@ pub fn resolve_legacy_alias(name: &str) -> Option<(&'static str, &'static str)> 
         "delete_meilisearch_orphans" => Some(("admin", "delete_meilisearch_orphans")),
         "cleanup_cross_project_calls" => Some(("admin", "cleanup_cross_project_calls")),
         "cleanup_builtin_calls" => Some(("admin", "cleanup_builtin_calls")),
+        "analyze_runner_feedback" => Some(("admin", "analyze_runner_feedback")),
         "migrate_calls_confidence" => Some(("admin", "migrate_calls_confidence")),
         "cleanup_sync_data" => Some(("admin", "cleanup_sync_data")),
         "update_staleness_scores" => Some(("admin", "update_staleness_scores")),
@@ -981,13 +982,13 @@ fn analysis_profile_tool() -> ToolDefinition {
 fn admin_tool() -> ToolDefinition {
     ToolDefinition {
         name: "admin".to_string(),
-        description: "Admin operations. Actions: sync_directory, start_watch, stop_watch, watch_status, meilisearch_stats, delete_meilisearch_orphans, cleanup_cross_project_calls, cleanup_builtin_calls, migrate_calls_confidence, cleanup_sync_data, update_staleness_scores, update_energy_scores, search_neurons, reinforce_neurons, decay_synapses, backfill_synapses, reindex_decisions, backfill_decision_embeddings, backfill_touches, backfill_discussed, update_fabric_scores, bootstrap_knowledge_fabric, reinforce_isomorphic, detect_skills, detect_skill_fission, detect_skill_fusion, heal_scars, consolidate_memory, detect_stagnation, deep_maintenance, install_hooks".to_string(),
+        description: "Admin operations. Actions: sync_directory, start_watch, stop_watch, watch_status, meilisearch_stats, delete_meilisearch_orphans, cleanup_cross_project_calls, cleanup_builtin_calls, migrate_calls_confidence, cleanup_sync_data, update_staleness_scores, update_energy_scores, search_neurons, reinforce_neurons, decay_synapses, backfill_synapses, reindex_decisions, backfill_decision_embeddings, backfill_touches, backfill_discussed, update_fabric_scores, bootstrap_knowledge_fabric, reinforce_isomorphic, detect_skills, detect_skill_fission, detect_skill_fusion, heal_scars, consolidate_memory, detect_stagnation, deep_maintenance, analyze_runner_feedback, install_hooks".to_string(),
         input_schema: InputSchema {
             schema_type: "object".to_string(),
             properties: Some(json!({
                 "action": {
                     "type": "string",
-                    "enum": ["sync_directory", "start_watch", "stop_watch", "watch_status", "meilisearch_stats", "delete_meilisearch_orphans", "cleanup_cross_project_calls", "cleanup_builtin_calls", "migrate_calls_confidence", "cleanup_sync_data", "update_staleness_scores", "update_energy_scores", "search_neurons", "reinforce_neurons", "decay_synapses", "backfill_synapses", "reindex_decisions", "backfill_decision_embeddings", "backfill_touches", "backfill_discussed", "update_fabric_scores", "bootstrap_knowledge_fabric", "reinforce_isomorphic", "detect_skills", "detect_skill_fission", "detect_skill_fusion", "maintain_skills", "auto_anchor_notes", "reconstruct_knowledge", "heal_scars", "consolidate_memory", "detect_stagnation", "deep_maintenance", "seed_prompt_fragments", "install_hooks"],
+                    "enum": ["sync_directory", "start_watch", "stop_watch", "watch_status", "meilisearch_stats", "delete_meilisearch_orphans", "cleanup_cross_project_calls", "cleanup_builtin_calls", "migrate_calls_confidence", "cleanup_sync_data", "update_staleness_scores", "update_energy_scores", "search_neurons", "reinforce_neurons", "decay_synapses", "backfill_synapses", "reindex_decisions", "backfill_decision_embeddings", "backfill_touches", "backfill_discussed", "update_fabric_scores", "bootstrap_knowledge_fabric", "reinforce_isomorphic", "detect_skills", "detect_skill_fission", "detect_skill_fusion", "maintain_skills", "auto_anchor_notes", "reconstruct_knowledge", "heal_scars", "consolidate_memory", "detect_stagnation", "deep_maintenance", "seed_prompt_fragments", "analyze_runner_feedback", "install_hooks"],
                     "description": "Operation to perform"
                 },
                 "path": {"type": "string", "description": "Directory path (sync_directory/start_watch)"},

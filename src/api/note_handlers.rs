@@ -1530,6 +1530,91 @@ pub async fn consolidate_memory(
 }
 
 // ============================================================================
+// Runner Feedback Analysis
+// ============================================================================
+
+/// Query parameters for analyze_runner_feedback
+#[derive(Debug, Deserialize, Default)]
+pub struct AnalyzeRunnerFeedbackQuery {
+    pub project_id: Option<Uuid>,
+}
+
+/// POST /api/admin/analyze-runner-feedback — Analyze runner feedback patterns
+///
+/// Aggregates runner-feedback observation notes, detects recurring patterns,
+/// and returns a structured report with frequencies and examples.
+/// Part of the feedback→protocol loop.
+pub async fn analyze_runner_feedback(
+    State(state): State<OrchestratorState>,
+    Query(query): Query<AnalyzeRunnerFeedbackQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let analyzer = crate::runner::FeedbackAnalyzer::new(state.orchestrator.neo4j_arc());
+    let report = analyzer
+        .analyze_runner_feedback(query.project_id)
+        .await
+        .map_err(AppError::Internal)?;
+
+    Ok(Json(serde_json::to_value(&report).unwrap_or_default()))
+}
+
+/// POST /api/admin/generate-feedback-rfcs — Generate RFC proposals from actionable patterns
+///
+/// Runs feedback analysis, then for each actionable pattern generates an RFC note
+/// with the proposed protocol adjustment. Returns the RFC note IDs.
+pub async fn generate_feedback_rfcs(
+    State(state): State<OrchestratorState>,
+    Json(body): Json<GenerateFeedbackRfcsBody>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let analyzer = crate::runner::FeedbackAnalyzer::new(state.orchestrator.neo4j_arc());
+    let report = analyzer
+        .analyze_runner_feedback(Some(body.project_id))
+        .await
+        .map_err(AppError::Internal)?;
+
+    let rfc_ids = analyzer
+        .generate_rfc_proposals(body.project_id, &report)
+        .await
+        .map_err(AppError::Internal)?;
+
+    Ok(Json(serde_json::json!({
+        "actionable_patterns": report.actionable_count,
+        "rfcs_created": rfc_ids.len(),
+        "rfc_ids": rfc_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GenerateFeedbackRfcsBody {
+    pub project_id: Uuid,
+}
+
+/// POST /api/admin/apply-feedback-rfc — Apply an accepted feedback RFC
+///
+/// Extracts the protocol spec from the accepted RFC, computes trust score,
+/// and returns the AppliedProtocol ready for composition.
+pub async fn apply_feedback_rfc(
+    State(state): State<OrchestratorState>,
+    Json(body): Json<ApplyFeedbackRfcBody>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let analyzer = crate::runner::FeedbackAnalyzer::new(state.orchestrator.neo4j_arc());
+    let result = analyzer
+        .apply_accepted_rfc(body.rfc_note_id, body.project_id)
+        .await
+        .map_err(AppError::Internal)?;
+
+    match result {
+        Some(applied) => Ok(Json(serde_json::to_value(&applied).unwrap_or_default())),
+        None => Err(AppError::NotFound("RFC note not found or not a valid runner-feedback RFC".to_string())),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ApplyFeedbackRfcBody {
+    pub rfc_note_id: Uuid,
+    pub project_id: Uuid,
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
