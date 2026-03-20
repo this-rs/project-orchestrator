@@ -266,7 +266,11 @@ impl PlanRunner {
     /// Get the current effective budget (static, no &self needed).
     pub fn current_budget() -> f64 {
         let bits = RUNNER_BUDGET.load(std::sync::atomic::Ordering::Relaxed);
-        if bits == 0 { 0.0 } else { f64::from_bits(bits) }
+        if bits == 0 {
+            0.0
+        } else {
+            f64::from_bits(bits)
+        }
     }
 
     /// Create a new PlanRunner.

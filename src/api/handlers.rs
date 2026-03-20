@@ -5068,11 +5068,15 @@ pub async fn update_run_budget(
         .get("max_cost_usd")
         .and_then(|v| v.as_f64())
         .ok_or_else(|| {
-            AppError::BadRequest("Missing or invalid 'max_cost_usd' (must be a positive number)".to_string())
+            AppError::BadRequest(
+                "Missing or invalid 'max_cost_usd' (must be a positive number)".to_string(),
+            )
         })?;
 
     if max_cost_usd <= 0.0 {
-        return Err(AppError::BadRequest("max_cost_usd must be positive".to_string()));
+        return Err(AppError::BadRequest(
+            "max_cost_usd must be positive".to_string(),
+        ));
     }
 
     // Get the current run_id
