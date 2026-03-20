@@ -84,3 +84,41 @@ fn serve_file(path: &str, data: &[u8]) -> Response {
         .body(Body::from(data.to_vec()))
         .unwrap()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression test: intelligence dashboard grids must NOT use inline
+    /// `gridTemplateColumns: repeat(auto-fill, minmax(...))` which overflows
+    /// on mobile viewports < 320px. They should use Tailwind responsive classes
+    /// (grid-cols-1 sm:grid-cols-2) instead.
+    #[test]
+    fn embedded_js_has_no_inline_autofill_grid() {
+        let problematic_patterns = [
+            "auto-fill, minmax(280px",  // IntelLayerCards old pattern
+            "auto-fill, minmax(240px",  // IntelAttention old pattern
+            "auto-fill, minmax(200px",  // IntelQuickActions old pattern
+        ];
+
+        for file in FrontendAssets::iter() {
+            let filename = file.as_ref();
+            if !filename.ends_with(".js") {
+                continue;
+            }
+            if let Some(asset) = FrontendAssets::get(filename) {
+                let content = String::from_utf8_lossy(&asset.data);
+                for pattern in &problematic_patterns {
+                    assert!(
+                        !content.contains(pattern),
+                        "Embedded JS file '{}' still contains inline grid pattern '{}' — \
+                         intelligence dashboard cards will overflow on mobile. \
+                         Replace with Tailwind responsive grid classes.",
+                        filename,
+                        pattern,
+                    );
+                }
+            }
+        }
+    }
+}
