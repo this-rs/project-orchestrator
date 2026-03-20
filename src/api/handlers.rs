@@ -4944,6 +4944,9 @@ pub struct RunPlanRequest {
     /// Defaults to "manual" if not specified.
     #[serde(default)]
     pub triggered_by: Option<String>,
+    /// Optional budget limit in USD. Overrides the default ($10).
+    /// When omitted, falls back to RunnerConfig::default().max_cost_usd.
+    pub max_cost_usd: Option<f64>,
 }
 
 /// Response for a successfully started plan run.
@@ -4971,7 +4974,11 @@ pub async fn run_plan(
 
     let graph = state.orchestrator.neo4j_arc();
     let context_builder = state.orchestrator.context_builder().clone();
-    let config = state.orchestrator.runner_config();
+    let mut config = state.orchestrator.runner_config();
+    // Override budget if the caller specified one
+    if let Some(budget) = req.max_cost_usd {
+        config.max_cost_usd = budget;
+    }
 
     // Create a broadcast channel for RunnerEvents
     let (event_tx, _) = tokio::sync::broadcast::channel(256);
