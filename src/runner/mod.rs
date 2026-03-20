@@ -19,6 +19,7 @@
 pub mod enricher;
 pub mod git;
 pub mod guard;
+pub mod lifecycle;
 pub mod models;
 pub mod persona;
 pub mod prompt;
@@ -32,6 +33,7 @@ pub mod verifier;
 
 // Re-export key types for convenience
 pub use enricher::{EnrichResult, TaskEnricher};
+pub use lifecycle::{route_lifecycle_protocol, LifecycleRouteResult};
 pub use git::{WorktreeCollector, WorktreeInfo, WorktreeResolution};
 pub use guard::{AgentGuard, ChatManagerHintSender, GuardConfig, GuardVerdict, HintSender};
 pub use models::{

@@ -21,6 +21,7 @@ use crate::runner::persona::{
 };
 #[cfg(test)]
 use crate::runner::prompt::{build_runner_constraints, RunnerPromptContext};
+use crate::runner::lifecycle;
 use crate::runner::state::RunnerState;
 use crate::runner::vector::VectorCollector;
 use crate::runner::verifier::{TaskVerifier, VerifyResult};
@@ -30,7 +31,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tokio::sync::{broadcast, RwLock};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 // ============================================================================
@@ -547,6 +548,26 @@ impl PlanRunner {
             );
         } else {
             info!("Plan {} status set to in_progress", plan_id);
+        }
+
+        // Route to lifecycle protocol (if available). Non-fatal — fallback on None.
+        match lifecycle::route_lifecycle_protocol(&self.graph, plan_id, total_tasks).await {
+            Ok(Some(route_result)) => {
+                info!(
+                    "Plan {} wrapped by lifecycle protocol {} (run: {}, affinity: {:.2})",
+                    plan_id, route_result.protocol_name, route_result.run_id, route_result.affinity_score
+                );
+                let mut global = RUNNER_STATE.write().await;
+                if let Some(ref mut s) = *global {
+                    s.lifecycle_run_id = Some(route_result.run_id);
+                }
+            }
+            Ok(None) => {
+                debug!("No lifecycle protocol for plan {} — using default runner flow", plan_id);
+            }
+            Err(e) => {
+                warn!("Lifecycle protocol routing failed for plan {}: {}. Continuing without.", plan_id, e);
+            }
         }
 
         let result = StartResult {

@@ -59,6 +59,11 @@ pub struct RunnerState {
     pub triggered_by: TriggerSource,
     /// Project ID (for scoping)
     pub project_id: Option<Uuid>,
+    /// Optional lifecycle ProtocolRun tracking this plan execution.
+    /// Set when a lifecycle protocol (plan-runner-*) is routed at startup.
+    /// None when no lifecycle protocol is available (fallback mode).
+    #[serde(default)]
+    pub lifecycle_run_id: Option<Uuid>,
 }
 
 impl RunnerState {
@@ -87,6 +92,7 @@ impl RunnerState {
             cost_usd: 0.0,
             triggered_by,
             project_id: None,
+            lifecycle_run_id: None,
         }
     }
 
