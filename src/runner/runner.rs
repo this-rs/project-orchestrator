@@ -2128,15 +2128,79 @@ impl PlanRunner {
 
         let guard_handle = tokio::spawn(async move { guard.monitor().await });
 
-        // Listen for events until Result — in parallel with the guard
-        let (event_result, event_metrics) = self.listen_for_result(rx, run_id).await;
+        // Run listener and guard in parallel with tokio::select!
+        // Priority: Result event > Guard completion loop > Guard timeout
+        //
+        // Previously, listen_for_result was awaited sequentially then guard
+        // verdict was checked — causing a race where guard timeout would
+        // override a successful Result event.
+        let (event_result, event_metrics, guard_verdict) = {
+            let listen_fut = self.listen_for_result(rx, run_id);
+            tokio::pin!(listen_fut);
+            tokio::pin!(guard_handle);
 
-        // Wait for guard to finish (it should return quickly once the channel closes)
-        let guard_verdict = match guard_handle.await {
-            Ok(verdict) => verdict,
-            Err(e) => {
-                warn!("Guard task panicked: {}", e);
-                GuardVerdict::Completed
+            tokio::select! {
+                // Branch 1: listen_for_result completes (Result event received or channel closed)
+                (result, metrics) = &mut listen_fut => {
+                    // Got an event result — abort the guard (we don't need it anymore)
+                    guard_handle.abort();
+                    // Guard was aborted — we don't need its verdict since we have a Result event
+                    let verdict = GuardVerdict::Completed;
+                    (result, metrics, verdict)
+                }
+                // Branch 2: guard finishes first (timeout or completion loop detected)
+                verdict = &mut guard_handle => {
+                    let verdict = match verdict {
+                        Ok(v) => v,
+                        Err(e) => {
+                            warn!("Guard task panicked: {}", e);
+                            GuardVerdict::Completed
+                        }
+                    };
+                    match &verdict {
+                        GuardVerdict::Timeout { .. } | GuardVerdict::CompletionLoopDetected => {
+                            let is_loop = matches!(verdict, GuardVerdict::CompletionLoopDetected);
+                            if is_loop {
+                                info!("Guard detected completion loop, waiting 5s for Result event...");
+                            }
+                            // Give listener a grace period to get a pending Result
+                            match tokio::time::timeout(
+                                std::time::Duration::from_secs(5),
+                                &mut listen_fut,
+                            ).await {
+                                Ok((result, metrics)) => {
+                                    // Got a Result within grace period — use it
+                                    let effective_verdict = if is_loop {
+                                        GuardVerdict::Completed
+                                    } else {
+                                        verdict
+                                    };
+                                    (result, metrics, effective_verdict)
+                                }
+                                Err(_) => {
+                                    if is_loop {
+                                        // No Result but agent said it's done — treat as success
+                                        info!("No Result event but agent signaled completion — treating as success");
+                                        (EventListenResult::Completed {
+                                            cost_usd: 0.0,
+                                            is_error: false,
+                                            error_text: String::new(),
+                                            subtype: "completion_loop".to_string(),
+                                        }, EventMetrics::default(), GuardVerdict::Completed)
+                                    } else {
+                                        // True timeout — no Result within grace period
+                                        (EventListenResult::ChannelClosed { cost_usd: 0.0 }, EventMetrics::default(), verdict)
+                                    }
+                                }
+                            }
+                        }
+                        _ => {
+                            // Completed/Cancelled from guard — get listener result
+                            let (result, metrics) = listen_fut.await;
+                            (result, metrics, verdict.clone())
+                        }
+                    }
+                }
             }
         };
 
@@ -2149,34 +2213,44 @@ impl PlanRunner {
                 subtype,
             } => (cost_usd, is_error, error_text, subtype, false),
             EventListenResult::ChannelClosed { cost_usd } => {
-                // Check if the guard timed out (it would have interrupted the session)
-                if let GuardVerdict::Timeout { elapsed_secs } = guard_verdict {
-                    return Ok(wrap(TaskResult::Timeout {
+                // Channel closed without Result — check guard verdict
+                let result = if let GuardVerdict::Timeout { elapsed_secs } = guard_verdict {
+                    TaskResult::Timeout {
                         duration_secs: elapsed_secs,
                         cost_usd,
-                    }));
-                }
-                return Ok(wrap(TaskResult::Failed {
-                    reason: "Chat event channel closed unexpectedly".to_string(),
-                    attempts: 0,
-                    cost_usd,
-                }));
+                    }
+                } else {
+                    TaskResult::Failed {
+                        reason: "Chat event channel closed unexpectedly".to_string(),
+                        attempts: 0,
+                        cost_usd,
+                    }
+                };
+                self.finalize_steps(task_id, &result, cwd).await;
+                return Ok(wrap(result));
             }
             EventListenResult::Cancelled { cost_usd } => {
-                return Ok(wrap(TaskResult::Failed {
+                let result = TaskResult::Failed {
                     reason: "Cancelled by user".to_string(),
                     attempts: 0,
                     cost_usd,
-                }));
+                };
+                self.finalize_steps(task_id, &result, cwd).await;
+                return Ok(wrap(result));
             }
         };
 
-        // If the guard decided timeout, honor it even if we got a result
-        if let GuardVerdict::Timeout { elapsed_secs } = guard_verdict {
-            return Ok(wrap(TaskResult::Timeout {
-                duration_secs: elapsed_secs,
-                cost_usd,
-            }));
+        // Only honor guard timeout if we did NOT get a successful Result
+        // (the select! already gave priority to Results, but double-check)
+        if is_error {
+            if let GuardVerdict::Timeout { elapsed_secs } = guard_verdict {
+                let result = TaskResult::Timeout {
+                    duration_secs: elapsed_secs,
+                    cost_usd,
+                };
+                self.finalize_steps(task_id, &result, cwd).await;
+                return Ok(wrap(result));
+            }
         }
 
         let duration_secs = start.elapsed().as_secs_f64();
@@ -2187,10 +2261,12 @@ impl PlanRunner {
             if let Some(ref mut s) = *global {
                 s.add_cost(cost_usd);
                 if s.is_budget_exceeded(self.effective_budget()) {
-                    return Ok(wrap(TaskResult::BudgetExceeded {
+                    let result = TaskResult::BudgetExceeded {
                         cumulated_cost_usd: s.cost_usd,
                         limit_usd: self.effective_budget(),
-                    }));
+                    };
+                    self.finalize_steps(task_id, &result, cwd).await;
+                    return Ok(wrap(result));
                 }
             }
         }
@@ -2204,7 +2280,7 @@ impl PlanRunner {
                     task_id
                 );
             } else {
-                return Ok(wrap(TaskResult::Failed {
+                let result = TaskResult::Failed {
                     reason: if error_text.is_empty() {
                         format!("Agent returned error (subtype: {})", _subtype)
                     } else {
@@ -2212,14 +2288,14 @@ impl PlanRunner {
                     },
                     attempts: 0,
                     cost_usd,
-                }));
+                };
+                self.finalize_steps(task_id, &result, cwd).await;
+                return Ok(wrap(result));
             }
         }
 
         // Fallback: auto-complete any steps the agent didn't update during execution.
-        // The agent is now instructed to update step statuses in real-time via MCP,
-        // but some steps may be missed (agent error, simple tasks, etc.).
-        // We only complete remaining pending/in_progress steps as a safety net.
+        // This is the success path — finalize_steps marks remaining pending/in_progress as completed.
         {
             // Check for uncommitted changes — agent might have written code but forgot to commit
             let output = tokio::process::Command::new("git")
@@ -2240,34 +2316,11 @@ impl PlanRunner {
                 );
             }
 
-            if let Ok(steps) = self.graph.get_task_steps(task_id).await {
-                let remaining: Vec<_> = steps
-                    .iter()
-                    .filter(|s| {
-                        s.status == crate::neo4j::models::StepStatus::Pending
-                            || s.status == crate::neo4j::models::StepStatus::InProgress
-                    })
-                    .collect();
-                if !remaining.is_empty() {
-                    info!(
-                        "Task {} — auto-completing {} remaining steps (agent didn't update them)",
-                        task_id,
-                        remaining.len()
-                    );
-                    for step in remaining {
-                        if let Err(e) = self
-                            .graph
-                            .update_step_status(
-                                step.id,
-                                crate::neo4j::models::StepStatus::Completed,
-                            )
-                            .await
-                        {
-                            warn!("Failed to auto-complete step {}: {}", step.id, e);
-                        }
-                    }
-                }
-            }
+            let success_result = TaskResult::Success {
+                cost_usd,
+                duration_secs: start.elapsed().as_secs_f64(),
+            };
+            self.finalize_steps(task_id, &success_result, cwd).await;
         }
 
         // Post-execution: persist persona used on the task node (Step 5 — T9)
@@ -2631,6 +2684,95 @@ impl PlanRunner {
         }
 
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    /// Finalize steps for a task on ALL exit paths (success, timeout, error, cancelled).
+    ///
+    /// - `Success`: pending/in_progress → completed
+    /// - `Timeout` with commits: in_progress → completed, pending → skipped
+    /// - `Timeout` without commits: all → skipped
+    /// - `Error`/`Cancelled`/`BudgetExceeded`: all → skipped
+    async fn finalize_steps(&self, task_id: Uuid, outcome: &TaskResult, cwd: &str) {
+        // Check if agent made any commits (proof of work)
+        let has_commits = match outcome {
+            TaskResult::Timeout { .. } => {
+                let output = tokio::process::Command::new("git")
+                    .args(["log", "--oneline", "-1", "--since=1 hour ago"])
+                    .current_dir(cwd)
+                    .output()
+                    .await;
+                output
+                    .map(|o| {
+                        o.status.success()
+                            && !String::from_utf8_lossy(&o.stdout).trim().is_empty()
+                    })
+                    .unwrap_or(false)
+            }
+            _ => false,
+        };
+
+        let steps = match self.graph.get_task_steps(task_id).await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("finalize_steps: failed to get steps for task {}: {}", task_id, e);
+                return;
+            }
+        };
+
+        let remaining: Vec<_> = steps
+            .iter()
+            .filter(|s| {
+                s.status == crate::neo4j::models::StepStatus::Pending
+                    || s.status == crate::neo4j::models::StepStatus::InProgress
+            })
+            .collect();
+
+        if remaining.is_empty() {
+            return;
+        }
+
+        // Warn if agent didn't update ANY step (all still pending = agent ignored MCP step updates)
+        let all_pending = remaining
+            .iter()
+            .all(|s| s.status == crate::neo4j::models::StepStatus::Pending);
+        if all_pending && remaining.len() == steps.len() {
+            warn!(
+                "Task {} — agent updated 0/{} steps during execution (all still pending)",
+                task_id,
+                steps.len()
+            );
+        }
+
+        for step in &remaining {
+            let new_status = match outcome {
+                TaskResult::Success { .. } => crate::neo4j::models::StepStatus::Completed,
+                TaskResult::Timeout { .. } => {
+                    if has_commits && step.status == crate::neo4j::models::StepStatus::InProgress {
+                        crate::neo4j::models::StepStatus::Completed
+                    } else {
+                        crate::neo4j::models::StepStatus::Skipped
+                    }
+                }
+                _ => crate::neo4j::models::StepStatus::Skipped,
+            };
+
+            if let Err(e) = self.graph.update_step_status(step.id, new_status).await {
+                warn!("finalize_steps: failed to update step {}: {}", step.id, e);
+            }
+        }
+
+        info!(
+            "Task {} — finalized {} remaining steps (outcome: {})",
+            task_id,
+            remaining.len(),
+            match outcome {
+                TaskResult::Success { .. } => "success",
+                TaskResult::Timeout { .. } => if has_commits { "timeout+commits" } else { "timeout" },
+                TaskResult::Failed { .. } => "failed",
+                TaskResult::BudgetExceeded { .. } => "budget_exceeded",
+                TaskResult::Blocked { .. } => "blocked",
+            }
+        );
     }
 
     /// Finalize the run — update state, persist, emit event, cleanup worktrees.
@@ -3772,5 +3914,222 @@ mod tests {
         assert_eq!(r.error_count, 1);
         assert!(r.agent_success);
         assert!((r.confidence_score - 0.85).abs() < f64::EPSILON);
+    }
+
+    // ---------------------------------------------------------------
+    // finalize_steps tests
+    // ---------------------------------------------------------------
+
+    /// Helper: build a PlanRunner that shares a MockGraphStore we can seed
+    fn test_plan_runner_with_graph() -> (PlanRunner, Arc<crate::neo4j::mock::MockGraphStore>) {
+        use crate::chat::config::ChatConfig;
+        use crate::chat::manager::ChatManager;
+        use crate::meilisearch::mock::MockSearchStore;
+        use crate::meilisearch::traits::SearchStore;
+        use crate::neo4j::mock::MockGraphStore;
+        use crate::notes::manager::NoteManager;
+        use crate::orchestrator::context::ContextBuilder;
+        use crate::plan::manager::PlanManager;
+
+        let mock_graph = Arc::new(MockGraphStore::new());
+        let graph: Arc<dyn GraphStore> = mock_graph.clone();
+        let search: Arc<dyn SearchStore> = Arc::new(MockSearchStore::new());
+        let chat_config = ChatConfig {
+            mcp_server_path: std::path::PathBuf::from("/dev/null"),
+            default_model: "test".into(),
+            max_sessions: 1,
+            session_timeout: std::time::Duration::from_secs(10),
+            neo4j_uri: "bolt://mock:7687".into(),
+            neo4j_user: "neo4j".into(),
+            neo4j_password: "test".into(),
+            meilisearch_url: "http://mock:7700".into(),
+            meilisearch_key: "test".into(),
+            nats_url: None,
+            max_turns: 5,
+            permission: Default::default(),
+            auto_continue: false,
+            retry: Default::default(),
+            process_path: None,
+            claude_cli_path: None,
+            auto_update_cli: false,
+            auto_update_app: false,
+            jwt_secret: None,
+            server_port: 0,
+            session_token_expiry_secs: 3600,
+        };
+        let chat_manager = Arc::new(ChatManager::new_without_memory(
+            graph.clone(),
+            search.clone(),
+            chat_config,
+        ));
+        let plan_manager = Arc::new(PlanManager::new(graph.clone(), search.clone()));
+        let note_manager = Arc::new(NoteManager::new(graph.clone(), search.clone()));
+        let context_builder = Arc::new(ContextBuilder::new(
+            graph.clone(),
+            search.clone(),
+            plan_manager,
+            note_manager,
+        ));
+        let (event_tx, _) = broadcast::channel(16);
+        let runner = PlanRunner::new(
+            chat_manager,
+            graph,
+            context_builder,
+            RunnerConfig::default(),
+            event_tx,
+        );
+        (runner, mock_graph)
+    }
+
+    #[tokio::test]
+    async fn test_finalize_steps_on_success() {
+        use crate::neo4j::models::{StepStatus, TaskStatus};
+        use crate::test_helpers::{test_plan, test_step, test_task};
+
+        let (runner, graph) = test_plan_runner_with_graph();
+
+        let plan = test_plan();
+        let plan_id = plan.id;
+        graph.create_plan(&plan).await.unwrap();
+
+        let mut task = test_task();
+        task.status = TaskStatus::InProgress;
+        let task_id = task.id;
+        graph.create_task(plan_id, &task).await.unwrap();
+
+        // 2 pending steps + 1 already completed
+        let mut step1 = test_step(1, "Write code");
+        step1.status = StepStatus::Pending;
+        graph.create_step(task_id, &step1).await.unwrap();
+
+        let mut step2 = test_step(2, "Run tests");
+        step2.status = StepStatus::InProgress;
+        graph.create_step(task_id, &step2).await.unwrap();
+
+        let mut step3 = test_step(3, "Already done");
+        step3.status = StepStatus::Completed;
+        graph.create_step(task_id, &step3).await.unwrap();
+
+        // finalize_steps with Success outcome
+        let result = TaskResult::Success {
+            cost_usd: 0.1,
+            duration_secs: 30.0,
+        };
+        runner.finalize_steps(task_id, &result, "/tmp").await;
+
+        // Verify: pending and in_progress → completed, already completed stays
+        let steps = graph.get_task_steps(task_id).await.unwrap();
+        for step in &steps {
+            assert_eq!(
+                step.status,
+                StepStatus::Completed,
+                "Step '{}' should be Completed, got {:?}",
+                step.description,
+                step.status
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_finalize_steps_on_error_marks_skipped() {
+        use crate::neo4j::models::{StepStatus, TaskStatus};
+        use crate::test_helpers::{test_plan, test_step, test_task};
+
+        let (runner, graph) = test_plan_runner_with_graph();
+
+        let plan = test_plan();
+        let plan_id = plan.id;
+        graph.create_plan(&plan).await.unwrap();
+
+        let mut task = test_task();
+        task.status = TaskStatus::InProgress;
+        let task_id = task.id;
+        graph.create_task(plan_id, &task).await.unwrap();
+
+        let step1 = test_step(1, "Write code");
+        graph.create_step(task_id, &step1).await.unwrap();
+
+        let step2 = test_step(2, "Run tests");
+        graph.create_step(task_id, &step2).await.unwrap();
+
+        // finalize_steps with Failed outcome
+        let result = TaskResult::Failed {
+            reason: "Agent crashed".to_string(),
+            attempts: 1,
+            cost_usd: 0.05,
+        };
+        runner.finalize_steps(task_id, &result, "/tmp").await;
+
+        // Verify: all pending → skipped
+        let steps = graph.get_task_steps(task_id).await.unwrap();
+        for step in &steps {
+            assert_eq!(
+                step.status,
+                StepStatus::Skipped,
+                "Step '{}' should be Skipped on error, got {:?}",
+                step.description,
+                step.status
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_finalize_steps_on_budget_exceeded_marks_skipped() {
+        use crate::neo4j::models::{StepStatus, TaskStatus};
+        use crate::test_helpers::{test_plan, test_step, test_task};
+
+        let (runner, graph) = test_plan_runner_with_graph();
+
+        let plan = test_plan();
+        let plan_id = plan.id;
+        graph.create_plan(&plan).await.unwrap();
+
+        let mut task = test_task();
+        task.status = TaskStatus::InProgress;
+        let task_id = task.id;
+        graph.create_task(plan_id, &task).await.unwrap();
+
+        let step1 = test_step(1, "Pending step");
+        graph.create_step(task_id, &step1).await.unwrap();
+
+        let result = TaskResult::BudgetExceeded {
+            cumulated_cost_usd: 10.0,
+            limit_usd: 5.0,
+        };
+        runner.finalize_steps(task_id, &result, "/tmp").await;
+
+        let steps = graph.get_task_steps(task_id).await.unwrap();
+        assert_eq!(steps[0].status, StepStatus::Skipped);
+    }
+
+    #[tokio::test]
+    async fn test_finalize_steps_noop_when_all_completed() {
+        use crate::neo4j::models::{StepStatus, TaskStatus};
+        use crate::test_helpers::{test_plan, test_step, test_task};
+
+        let (runner, graph) = test_plan_runner_with_graph();
+
+        let plan = test_plan();
+        let plan_id = plan.id;
+        graph.create_plan(&plan).await.unwrap();
+
+        let mut task = test_task();
+        task.status = TaskStatus::InProgress;
+        let task_id = task.id;
+        graph.create_task(plan_id, &task).await.unwrap();
+
+        let mut step1 = test_step(1, "Already done");
+        step1.status = StepStatus::Completed;
+        graph.create_step(task_id, &step1).await.unwrap();
+
+        // finalize_steps should be a no-op (all already completed)
+        let result = TaskResult::Success {
+            cost_usd: 0.1,
+            duration_secs: 10.0,
+        };
+        runner.finalize_steps(task_id, &result, "/tmp").await;
+
+        let steps = graph.get_task_steps(task_id).await.unwrap();
+        assert_eq!(steps[0].status, StepStatus::Completed);
     }
 }
