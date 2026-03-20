@@ -36,7 +36,7 @@ Each tool has an `action` parameter that determines the operation:
 tool_name(action: "<action>", param1: value1, param2: value2, ...)
 ```
 
-The 25 mega-tools: `project`, `plan`, `task`, `step`, `decision`, `constraint`, `release`, `milestone`, `commit`, `note`, `workspace`, `workspace_milestone`, `resource`, `component`, `chat`, `feature_graph`, `code`, `reasoning`, `admin`, `skill`, `analysis_profile`, `protocol`, `persona`, `episode`, `sharing`
+The 28 mega-tools: `project`, `plan`, `task`, `step`, `decision`, `constraint`, `release`, `milestone`, `commit`, `note`, `workspace`, `workspace_milestone`, `resource`, `component`, `chat`, `feature_graph`, `code`, `reasoning`, `admin`, `skill`, `analysis_profile`, `protocol`, `persona`, `episode`, `sharing`, `neural_routing`, `trajectory`, `lifecycle_hook`
 
 ## 3. Data Model
 
@@ -910,20 +910,23 @@ Manage workspace components (services, modules). Actions: list, create, get, upd
 | map_to_project | `component_id` (req), `project_id` (req) | Map component to project |
 
 ## chat
-Manage chat sessions. Actions: list_sessions, get_session, delete_session, send_message, list_messages, add_discussed, get_session_entities
+Manage chat sessions. Actions: list_sessions, get_session, get_children, delete_session, send_message, list_messages, add_discussed, get_session_entities, get_session_tree, get_run_sessions
 
 | Action | Key Parameters | Description |
 |--------|---------------|-------------|
 | list_sessions | `project_slug`, `limit`, `offset` | List chat sessions |
 | get_session | `session_id` (req) | Get session details |
+| get_children | `session_id` (req) | Get child sessions |
 | delete_session | `session_id` (req) | Delete session |
 | send_message | `message` (req), `cwd`, `project_slug`, `model`, `permission_mode`, `workspace_slug`, `add_dirs` | Send message to orchestrator |
 | list_messages | `session_id` (req), `limit`, `offset` | List messages in session |
 | add_discussed | `session_id` (req), `entities` (req: [{entity_type, entity_id}]) | Mark entities as discussed |
 | get_session_entities | `session_id` (req), `project_id` | Get entities from session |
+| get_session_tree | `session_id` (req) | Get full session conversation tree (parent + all children recursively) |
+| get_run_sessions | `run_id` (req) | Get chat sessions associated with a ProtocolRun |
 
 ## feature_graph
-Manage feature graphs. Actions: create, get, list, add_entity, auto_build, delete
+Manage feature graphs. Actions: create, get, list, add_entity, auto_build, delete, get_statistics, compare, find_overlapping
 
 | Action | Key Parameters | Description |
 |--------|---------------|-------------|
@@ -933,6 +936,9 @@ Manage feature graphs. Actions: create, get, list, add_entity, auto_build, delet
 | add_entity | `feature_graph_id` (req), `entity_type` (req), `entity_id` (req), `role` | Add entity to graph |
 | auto_build | `project_id` (req), `name` (req), `description`, `entry_function`, `depth`, `include_relations`, `filter_community` | Auto-build graph from code |
 | delete | `id` (req) | Delete feature graph |
+| get_statistics | `id` (req) | Get feature graph statistics (node/edge counts, density) |
+| compare | `id1` (req), `id2` (req) | Compare two feature graphs (overlap, unique nodes) |
+| find_overlapping | `id` (req) | Find other feature graphs that overlap with this one |
 
 ## code
 Explore and analyze code. Actions: search, search_project, search_workspace, get_file_symbols, find_references, get_file_dependencies, get_call_graph, analyze_impact, get_architecture, find_similar, find_trait_implementations, find_type_traits, get_impl_blocks, get_communities, get_health, get_node_importance, plan_implementation, get_co_change_graph, get_file_co_changers, detect_processes, get_class_hierarchy, find_subclasses, find_interface_implementors, list_processes, get_process, get_entry_points, enrich_communities, get_hotspots, get_knowledge_gaps, get_risk_assessment, get_homeostasis, get_structural_drift, get_structural_profile, find_structural_twins, cluster_dna, find_cross_project_twins, predict_missing_links, check_link_plausibility, stress_test_node, stress_test_edge, stress_test_cascade, find_bridges, get_context_card, refresh_context_cards, get_fingerprint, find_isomorphic, suggest_structural_templates, get_bridge, check_topology, list_topology_rules, create_topology_rule, delete_topology_rule, check_file_topology
@@ -1258,6 +1264,39 @@ Manage sharing policies and consent for P2P knowledge federation. Actions: statu
 | get_policy | `project_slug` (req) | Get current sharing policy |
 | set_consent | `note_id` (req), `consent` (explicit_allow/explicit_deny/not_set) | Set sharing consent on a note |
 | history | `project_slug` (req), `limit`, `offset` | Get sharing audit trail |
+
+## neural_routing
+Runtime control for neural route learning (NN-based tool routing). Actions: status, get_config, enable, disable, set_mode, update_config
+
+| Action | Key Parameters | Description |
+|--------|---------------|-------------|
+| status | | Get neural routing status (enabled, mode, model loaded, trajectory count) |
+| get_config | | Get full neural routing configuration |
+| enable | | Enable neural routing |
+| disable | | Disable neural routing |
+| set_mode | `mode` (req: nn_only/nn_with_fallback/fallback_only) | Set routing mode |
+| update_config | `enabled`, `inference_timeout_ms`, `nn_fallback`, `collection_enabled`, `training_enabled`, `min_trajectories_for_training`, `retrain_interval_secs` | Update routing configuration |
+
+## trajectory
+Query decision trajectories (stored reasoning paths from tool routing). Actions: list, get, search_similar, stats
+
+| Action | Key Parameters | Description |
+|--------|---------------|-------------|
+| list | `session_id`, `min_reward`, `max_reward`, `limit`, `offset` | List trajectories (filterable by session/reward) |
+| get | `trajectory_id` (req) | Get trajectory by UUID |
+| search_similar | `embedding` (req, array of floats), `top_k` | Find similar trajectories by embedding vector |
+| stats | | Get trajectory statistics (count, reward distribution, collection rate) |
+
+## lifecycle_hook
+Manage lifecycle hooks — automatic actions triggered on entity status changes. Actions: list, create, get, update, delete
+
+| Action | Key Parameters | Description |
+|--------|---------------|-------------|
+| list | `project_id` | List hooks (optionally filtered by project) |
+| create | `project_id`, `name` (req), `description`, `scope` (req: task/plan/step/milestone), `on_status` (req), `action_type` (req: cascade_children/mcp_call/create_note/emit_alert/start_protocol), `action_config` (req, object), `priority` | Create a lifecycle hook |
+| get | `hook_id` (req) | Get hook by UUID |
+| update | `hook_id` (req), `name`, `description`, `action_config`, `priority`, `enabled` | Update hook fields |
+| delete | `hook_id` (req) | Delete a hook |
 "#;
 
 use anyhow::Result;
@@ -1599,7 +1638,7 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
 ];
 
 /// Total number of unique tools across all groups.
-/// Must match the MCP tools.rs count (currently 25 mega-tools).
+/// Must match the MCP tools.rs count (currently 28 mega-tools).
 pub fn tool_catalog_tool_count() -> usize {
     let mut names: Vec<&str> = TOOL_GROUPS
         .iter()
@@ -2502,7 +2541,7 @@ mod tests {
         assert!(BASE_SYSTEM_PROMPT.contains(r#"note(action: "create""#));
         assert!(BASE_SYSTEM_PROMPT.contains(r#"note(action: "link_to_entity""#));
         // Mega-tools section
-        assert!(BASE_SYSTEM_PROMPT.contains("25 mega-tools"));
+        assert!(BASE_SYSTEM_PROMPT.contains("28 mega-tools"));
         assert!(BASE_SYSTEM_PROMPT.contains("Mega-tools"));
     }
 
