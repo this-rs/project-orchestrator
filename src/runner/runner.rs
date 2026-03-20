@@ -1854,11 +1854,7 @@ impl PlanRunner {
                     }
                 }
                 if !file_notes.is_empty() {
-                    knowledge_parts.push(format!(
-                        "### `{}`\n{}",
-                        file_path,
-                        file_notes.join("\n")
-                    ));
+                    knowledge_parts.push(format!("### `{}`\n{}", file_path, file_notes.join("\n")));
                 }
             }
             if !knowledge_parts.is_empty() {

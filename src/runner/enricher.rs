@@ -494,15 +494,22 @@ impl TaskEnricher {
 
             for &task_id in completed_tasks {
                 // Check if this task already has this commit linked
-                let existing = self.graph.get_task_commits(task_id).await.unwrap_or_default();
+                let existing = self
+                    .graph
+                    .get_task_commits(task_id)
+                    .await
+                    .unwrap_or_default();
                 if existing.iter().any(|c| c.hash == commit.hash) {
                     continue; // Already linked
                 }
 
                 // Get task's affected_files to match against commit
                 if let Ok(Some(task_node)) = self.graph.get_task(task_id).await {
-                    let task_files: std::collections::HashSet<&str> =
-                        task_node.affected_files.iter().map(|f| f.as_str()).collect();
+                    let task_files: std::collections::HashSet<&str> = task_node
+                        .affected_files
+                        .iter()
+                        .map(|f| f.as_str())
+                        .collect();
 
                     let overlap = commit_files.intersection(&task_files).count();
                     if overlap > 0 || task_node.affected_files.is_empty() {
