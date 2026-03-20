@@ -6,7 +6,7 @@
 use crate::chat::manager::ChatManager;
 use crate::chat::types::{ChatEvent, ChatRequest};
 use crate::events::{CrudAction, CrudEvent, EntityType, EventEmitter};
-use crate::neo4j::models::TaskStatus;
+use crate::neo4j::models::{PlanStatus, TaskStatus};
 use crate::neo4j::traits::GraphStore;
 use crate::orchestrator::context::ContextBuilder;
 use crate::runner::enricher::TaskEnricher;
@@ -413,6 +413,7 @@ impl PlanRunner {
                 let mut failed_state = saved_state.clone();
                 failed_state.finalize(PlanRunStatus::Failed);
                 self.graph.update_plan_run(&failed_state).await?;
+                // Plan no longer exists, no status to update
                 continue;
             }
 
@@ -430,6 +431,9 @@ impl PlanRunner {
                 let mut done_state = saved_state.clone();
                 done_state.finalize(PlanRunStatus::Completed);
                 self.graph.update_plan_run(&done_state).await?;
+                if let Err(e) = self.graph.update_plan_status(plan_id, PlanStatus::Completed).await {
+                    warn!("Failed to set plan {} status to Completed on recovery: {}", plan_id, e);
+                }
                 continue;
             }
 
@@ -468,6 +472,9 @@ impl PlanRunner {
                     if let Some(ref mut s) = *global {
                         s.finalize(PlanRunStatus::Failed);
                         let _ = runner.graph.update_plan_run(s).await;
+                        if let Err(e) = runner.graph.update_plan_status(s.plan_id, PlanStatus::Cancelled).await {
+                            warn!("Failed to set plan {} status to Cancelled after recovery failure: {}", s.plan_id, e);
+                        }
                     }
                 }
             });
@@ -530,6 +537,16 @@ impl PlanRunner {
         {
             let mut collector = VECTOR_COLLECTOR.write().await;
             *collector = VectorCollector::new();
+        }
+
+        // Transition plan status to InProgress (idempotent — warn if already in_progress)
+        if let Err(e) = self.graph.update_plan_status(plan_id, PlanStatus::InProgress).await {
+            warn!(
+                "Failed to set plan {} status to in_progress (may already be in_progress): {}",
+                plan_id, e
+            );
+        } else {
+            info!("Plan {} status set to in_progress", plan_id);
         }
 
         let result = StartResult {
@@ -606,6 +623,10 @@ impl PlanRunner {
                 if let Some(ref mut s) = *global {
                     s.finalize(PlanRunStatus::Failed);
                     let _ = runner.graph.update_plan_run(s).await;
+                    // Also transition plan status to Cancelled (failed run)
+                    if let Err(e) = runner.graph.update_plan_status(s.plan_id, PlanStatus::Cancelled).await {
+                        warn!("Failed to set plan {} status to Cancelled after error: {}", s.plan_id, e);
+                    }
                 }
             }
         });
@@ -644,9 +665,14 @@ impl PlanRunner {
         let mut global = RUNNER_STATE.write().await;
         match &mut *global {
             Some(state) if state.run_id == run_id => {
+                let plan_id = state.plan_id;
                 state.finalize(PlanRunStatus::Cancelled);
                 if let Err(e) = graph.update_plan_run(state).await {
                     error!("Failed to persist force-cancelled run to Neo4j: {}", e);
+                }
+                // Transition plan status to Cancelled
+                if let Err(e) = graph.update_plan_status(plan_id, PlanStatus::Cancelled).await {
+                    warn!("Failed to set plan {} status to Cancelled on force-cancel: {}", plan_id, e);
                 }
                 info!("Runner force-cancelled run {}", run_id);
                 // Clear the global state so a new run can start
@@ -2826,6 +2852,29 @@ impl PlanRunner {
                 vector.stability()
             );
             // TODO: persist vector to PlanRun node in Neo4j when schema supports it
+        }
+
+        // Transition plan status to match the run's terminal state
+        {
+            let plan_id = global.as_ref().map(|s| s.plan_id).unwrap_or(Uuid::nil());
+            if plan_id != Uuid::nil() {
+                let plan_status = match status {
+                    PlanRunStatus::Completed => Some(PlanStatus::Completed),
+                    PlanRunStatus::Failed | PlanRunStatus::BudgetExceeded => Some(PlanStatus::Cancelled),
+                    PlanRunStatus::Cancelled => Some(PlanStatus::Cancelled),
+                    _ => None,
+                };
+                if let Some(ps) = plan_status {
+                    if let Err(e) = self.graph.update_plan_status(plan_id, ps.clone()).await {
+                        warn!(
+                            "Failed to set plan {} status to {:?} (idempotent, continuing): {}",
+                            plan_id, ps, e
+                        );
+                    } else {
+                        info!("Plan {} status set to {:?}", plan_id, ps);
+                    }
+                }
+            }
         }
 
         match status {

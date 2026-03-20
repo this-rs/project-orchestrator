@@ -8,10 +8,14 @@
 //! `POST /api/admin/seed-prompt-fragments`.
 
 use anyhow::{Context, Result};
+use std::collections::HashMap;
 use tracing::info;
 use uuid::Uuid;
 
 use crate::neo4j::GraphStore;
+use crate::protocol::models::{Protocol, ProtocolState, ProtocolTransition};
+use crate::protocol::routing::RelevanceVector;
+use crate::protocol::StateType;
 
 /// A single state fragment definition.
 struct StateFragment {
@@ -36,7 +40,7 @@ pub struct SeedResult {
     pub protocols_missing: Vec<String>,
 }
 
-/// Seed prompt fragments for the 5 critical protocols.
+/// Seed prompt fragments for the 8 protocols (5 system + 3 runner).
 ///
 /// Uses `GraphStore` trait methods to find protocols by name, fetch their states,
 /// enrich them with prompt fragments, and upsert back.
@@ -144,6 +148,9 @@ fn build_protocol_seeds() -> Vec<ProtocolSeed> {
         seed_wave_dispatch(),
         seed_diagnostic_triage(),
         seed_auto_maintenance(),
+        seed_plan_runner_full(),
+        seed_plan_runner_light(),
+        seed_plan_runner_reviewed(),
     ]
 }
 
@@ -674,6 +681,937 @@ No further action required until the next maintenance trigger.",
     }
 }
 
+// ============================================================================
+// Runner Protocol Compose — 3 plan-runner lifecycle FSMs
+// ============================================================================
+
+/// A composed protocol definition for seeding (states + transitions + metadata).
+struct RunnerProtocolDef {
+    name: &'static str,
+    description: &'static str,
+    relevance_vector: RelevanceVector,
+    states: Vec<RunnerStateDef>,
+    transitions: Vec<RunnerTransitionDef>,
+}
+
+struct RunnerStateDef {
+    name: &'static str,
+    state_type: StateType,
+    prompt_fragment: &'static str,
+    available_tools: Option<Vec<&'static str>>,
+    forbidden_actions: Option<Vec<&'static str>>,
+    action: Option<&'static str>,
+}
+
+struct RunnerTransitionDef {
+    from: &'static str,
+    to: &'static str,
+    trigger: &'static str,
+    guard: Option<&'static str>,
+}
+
+/// Result of the runner protocol seeding operation.
+#[derive(Debug, serde::Serialize)]
+pub struct RunnerSeedResult {
+    pub created: usize,
+    pub skipped: usize,
+    pub details: Vec<String>,
+}
+
+/// Seed the 3 plan-runner lifecycle protocols via the compose pattern.
+///
+/// Creates: Protocol + States + Transitions (no Skill needed — these are system protocols).
+/// Idempotent — skips protocols that already exist by name within the project.
+pub async fn seed_runner_protocols(
+    graph: &dyn GraphStore,
+    project_id: Uuid,
+) -> Result<RunnerSeedResult> {
+    let defs = vec![
+        build_plan_runner_full(),
+        build_plan_runner_light(),
+        build_plan_runner_reviewed(),
+    ];
+
+    let mut created = 0;
+    let mut skipped = 0;
+    let mut details = Vec::new();
+
+    for def in &defs {
+        // Idempotence: skip if protocol already exists
+        if let Some(existing_id) = graph
+            .get_protocol_by_name_and_project(def.name, project_id)
+            .await
+            .with_context(|| format!("Failed to check existence of protocol '{}'", def.name))?
+        {
+            info!(
+                protocol = def.name,
+                id = %existing_id,
+                "Runner protocol already exists — skipping"
+            );
+            details.push(format!("{}: already exists ({})", def.name, existing_id));
+            skipped += 1;
+            continue;
+        }
+
+        // Build name→UUID map for states
+        let mut name_to_id: HashMap<&str, Uuid> = HashMap::new();
+        let mut state_objects: Vec<ProtocolState> = Vec::new();
+
+        let placeholder_entry = Uuid::new_v4();
+        let mut proto = Protocol::new(project_id, def.name, placeholder_entry);
+        proto.description = def.description.to_string();
+        proto.protocol_category = crate::protocol::ProtocolCategory::Business;
+        proto.relevance_vector = Some(def.relevance_vector.clone());
+
+        // Create states
+        for s in &def.states {
+            let mut ps = ProtocolState::new(proto.id, s.name);
+            ps.state_type = s.state_type;
+            ps.prompt_fragment = Some(s.prompt_fragment.to_string());
+            ps.available_tools = s
+                .available_tools
+                .as_ref()
+                .map(|v| v.iter().map(|t| t.to_string()).collect());
+            ps.forbidden_actions = s
+                .forbidden_actions
+                .as_ref()
+                .map(|v| v.iter().map(|a| a.to_string()).collect());
+            ps.action = s.action.map(|a| a.to_string());
+            name_to_id.insert(s.name, ps.id);
+            state_objects.push(ps);
+        }
+
+        // Set entry_state to the Start state
+        if let Some(start) = state_objects
+            .iter()
+            .find(|s| s.state_type == StateType::Start)
+        {
+            proto.entry_state = start.id;
+        }
+
+        // Set terminal_states
+        proto.terminal_states = state_objects
+            .iter()
+            .filter(|s| s.state_type == StateType::Terminal)
+            .map(|s| s.id)
+            .collect();
+
+        // Upsert protocol
+        graph
+            .upsert_protocol(&proto)
+            .await
+            .with_context(|| format!("Failed to upsert protocol '{}'", def.name))?;
+
+        // Upsert states
+        for ps in &state_objects {
+            graph
+                .upsert_protocol_state(ps)
+                .await
+                .with_context(|| format!("Failed to upsert state '{}/{}'", def.name, ps.name))?;
+        }
+
+        // Create transitions
+        for t in &def.transitions {
+            let from_id = name_to_id.get(t.from).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Transition from_state '{}' not found in protocol '{}'",
+                    t.from,
+                    def.name
+                )
+            })?;
+            let to_id = name_to_id.get(t.to).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Transition to_state '{}' not found in protocol '{}'",
+                    t.to,
+                    def.name
+                )
+            })?;
+
+            let mut pt = ProtocolTransition::new(proto.id, *from_id, *to_id, t.trigger);
+            pt.guard = t.guard.map(|g| g.to_string());
+
+            graph.upsert_protocol_transition(&pt).await.with_context(|| {
+                format!(
+                    "Failed to upsert transition '{} -> {}' in '{}'",
+                    t.from, t.to, def.name
+                )
+            })?;
+        }
+
+        info!(
+            protocol = def.name,
+            states = state_objects.len(),
+            transitions = def.transitions.len(),
+            "Seeded runner protocol"
+        );
+        details.push(format!(
+            "{}: created ({} states, {} transitions)",
+            def.name,
+            state_objects.len(),
+            def.transitions.len()
+        ));
+        created += 1;
+    }
+
+    info!(created, skipped, "Runner protocol seeding complete");
+
+    Ok(RunnerSeedResult {
+        created,
+        skipped,
+        details,
+    })
+}
+
+// ============================================================================
+// 6. plan-runner-full (implementation lifecycle)
+// ============================================================================
+
+fn build_plan_runner_full() -> RunnerProtocolDef {
+    RunnerProtocolDef {
+        name: "plan-runner-full",
+        description: "Standard plan runner lifecycle for implementation tasks. \
+            Covers execution, post-run analysis, and optional PR creation.",
+        relevance_vector: RelevanceVector {
+            phase: 0.5,
+            structure: 0.7,
+            domain: 0.5,
+            resource: 0.5,
+            lifecycle: 0.5,
+        },
+        states: vec![
+            RunnerStateDef {
+                name: "approved",
+                state_type: StateType::Start,
+                action: Some("plan(action: \"get\")"),
+                prompt_fragment: "\
+Plan is APPROVED and ready for execution. Load the full plan context: \
+tasks, steps, constraints, and affected files. Verify all tasks have \
+affected_files populated and dependencies are satisfiable. \
+Call task(get_next) to identify the first executable task. \
+Do NOT start executing until the plan structure is validated.",
+                available_tools: Some(vec!["plan", "task", "step", "constraint", "code", "note"]),
+                forbidden_actions: Some(vec![
+                    "Do NOT start executing tasks before validating the plan structure",
+                    "Do NOT modify the plan during the approved phase",
+                ]),
+            },
+            RunnerStateDef {
+                name: "executing",
+                state_type: StateType::Intermediate,
+                action: Some("task(action: \"get_next\")"),
+                prompt_fragment: "\
+EXECUTING tasks. Follow the Task Execution Protocol for each task: \
+(1) task(get_next) to pick the next ready task, \
+(2) task(get_context) to load knowledge and affected files, \
+(3) update step statuses in real-time as you work, \
+(4) run cargo check / tests after each significant change, \
+(5) commit atomically with conventional format. \
+Track all files modified for the post_run phase.",
+                available_tools: None, // all tools needed during execution
+                forbidden_actions: Some(vec![
+                    "Do NOT skip step status updates — they enable real-time tracking",
+                    "Do NOT commit without running cargo check first",
+                    "Do NOT batch multiple tasks into a single commit",
+                ]),
+            },
+            RunnerStateDef {
+                name: "post_run",
+                state_type: StateType::Intermediate,
+                action: Some("commit(action: \"link_to_plan\")"),
+                prompt_fragment: "\
+POST-RUN analysis. All tasks are complete. Perform final validation: \
+(1) Run the full test suite (cargo test), \
+(2) Link all commits to the plan via commit(link_to_plan), \
+(3) Create summary notes for patterns, gotchas, and decisions discovered, \
+(4) Verify all task/step statuses are current (no stale in_progress). \
+Prepare commit list for the PR decision phase.",
+                available_tools: Some(vec!["commit", "note", "task", "step", "plan", "decision"]),
+                forbidden_actions: Some(vec![
+                    "Do NOT skip the test suite — broken builds must not reach PR",
+                    "Do NOT forget to link commits to the plan",
+                ]),
+            },
+            RunnerStateDef {
+                name: "pr_decision",
+                state_type: StateType::Intermediate,
+                action: Some("plan(action: \"get\")"),
+                prompt_fragment: "\
+PR DECISION. Evaluate whether a pull request should be created: \
+(1) Check the number of files changed and commits made, \
+(2) If changes are non-trivial (>1 file or >1 commit), create a PR, \
+(3) Use gh pr create with a summary of changes, test results, and plan link, \
+(4) If changes are trivial or the plan was exploratory, skip PR creation. \
+Record the decision via decision(add) for traceability.",
+                available_tools: Some(vec!["commit", "plan", "decision", "note"]),
+                forbidden_actions: Some(vec![
+                    "Do NOT create PRs for exploratory or trivial changes",
+                    "Do NOT skip the decision record — PR choices must be traceable",
+                ]),
+            },
+            RunnerStateDef {
+                name: "completed",
+                state_type: StateType::Terminal,
+                action: None,
+                prompt_fragment: "\
+Plan execution COMPLETED successfully. All tasks done, tests pass, \
+commits linked, and PR decision made. No further action required.",
+                available_tools: Some(vec!["note", "plan"]),
+                forbidden_actions: None,
+            },
+            RunnerStateDef {
+                name: "failed",
+                state_type: StateType::Terminal,
+                action: None,
+                prompt_fragment: "\
+Plan execution FAILED. Document the failure: (1) which task/step failed, \
+(2) the error message or root cause, (3) what was completed before failure, \
+(4) recommended next steps for retry or manual intervention. \
+Create a gotcha note if the failure reveals a systemic issue.",
+                available_tools: Some(vec!["note", "task", "step", "plan", "decision"]),
+                forbidden_actions: Some(vec![
+                    "Do NOT retry automatically without diagnosing the root cause",
+                ]),
+            },
+        ],
+        transitions: vec![
+            RunnerTransitionDef {
+                from: "approved",
+                to: "executing",
+                trigger: "run_started",
+                guard: None,
+            },
+            RunnerTransitionDef {
+                from: "approved",
+                to: "failed",
+                trigger: "execution_failed",
+                guard: Some("plan validation failed"),
+            },
+            RunnerTransitionDef {
+                from: "executing",
+                to: "post_run",
+                trigger: "child_completed",
+                guard: Some("all tasks completed"),
+            },
+            RunnerTransitionDef {
+                from: "executing",
+                to: "failed",
+                trigger: "execution_failed",
+                guard: None,
+            },
+            RunnerTransitionDef {
+                from: "post_run",
+                to: "pr_decision",
+                trigger: "commits_linked",
+                guard: None,
+            },
+            RunnerTransitionDef {
+                from: "post_run",
+                to: "failed",
+                trigger: "execution_failed",
+                guard: Some("test suite failed"),
+            },
+            RunnerTransitionDef {
+                from: "pr_decision",
+                to: "completed",
+                trigger: "pr_created",
+                guard: None,
+            },
+            RunnerTransitionDef {
+                from: "pr_decision",
+                to: "completed",
+                trigger: "skip_pr",
+                guard: None,
+            },
+        ],
+    }
+}
+
+// ============================================================================
+// 7. plan-runner-light (exploration lifecycle)
+// ============================================================================
+
+fn build_plan_runner_light() -> RunnerProtocolDef {
+    RunnerProtocolDef {
+        name: "plan-runner-light",
+        description: "Lightweight plan runner for exploration and research tasks. \
+            No PR decision phase — execution flows directly to completion.",
+        relevance_vector: RelevanceVector {
+            phase: 0.25,
+            structure: 0.3,
+            domain: 0.5,
+            resource: 0.5,
+            lifecycle: 0.3,
+        },
+        states: vec![
+            RunnerStateDef {
+                name: "approved",
+                state_type: StateType::Start,
+                action: Some("plan(action: \"get\")"),
+                prompt_fragment: "\
+Plan is APPROVED for lightweight execution. This is an exploration or research \
+task — focus on learning and knowledge capture rather than production code. \
+Load the plan context and verify task structure. \
+Exploration plans may have fewer constraints and looser affected_files.",
+                available_tools: Some(vec!["plan", "task", "step", "constraint", "code", "note"]),
+                forbidden_actions: Some(vec![
+                    "Do NOT enforce strict affected_files validation for exploration plans",
+                    "Do NOT block execution for missing constraints",
+                ]),
+            },
+            RunnerStateDef {
+                name: "executing",
+                state_type: StateType::Intermediate,
+                action: Some("task(action: \"get_next\")"),
+                prompt_fragment: "\
+EXECUTING exploration tasks. For each task: \
+(1) Focus on understanding and documenting findings, \
+(2) Create notes liberally — exploration generates more knowledge than code, \
+(3) Update step statuses as you progress, \
+(4) Code changes are optional — the primary output is knowledge. \
+Commit any code changes with conventional format.",
+                available_tools: None, // all tools needed
+                forbidden_actions: Some(vec![
+                    "Do NOT skip note creation — exploration without documentation is wasted effort",
+                    "Do NOT over-engineer exploratory code",
+                ]),
+            },
+            RunnerStateDef {
+                name: "post_run",
+                state_type: StateType::Intermediate,
+                action: Some("note(action: \"create\")"),
+                prompt_fragment: "\
+POST-RUN wrap-up. Exploration complete. Synthesize findings: \
+(1) Create a summary observation note with key discoveries, \
+(2) Link any code changes to the plan via commit(link_to_plan), \
+(3) If exploration revealed actionable work, document it as a follow-up task, \
+(4) Verify all step statuses are finalized.",
+                available_tools: Some(vec!["note", "commit", "task", "step", "plan", "decision"]),
+                forbidden_actions: Some(vec![
+                    "Do NOT skip the summary note — it captures the exploration's value",
+                ]),
+            },
+            RunnerStateDef {
+                name: "completed",
+                state_type: StateType::Terminal,
+                action: None,
+                prompt_fragment: "\
+Exploration COMPLETED. Findings documented, knowledge captured, \
+and follow-up work identified if applicable. No PR needed.",
+                available_tools: Some(vec!["note", "plan"]),
+                forbidden_actions: None,
+            },
+            RunnerStateDef {
+                name: "failed",
+                state_type: StateType::Terminal,
+                action: None,
+                prompt_fragment: "\
+Exploration FAILED. Document what was attempted, what blocked progress, \
+and any partial findings that may be useful for future attempts. \
+Create a gotcha note if the failure reveals environmental or tooling issues.",
+                available_tools: Some(vec!["note", "task", "step", "plan"]),
+                forbidden_actions: Some(vec![
+                    "Do NOT discard partial findings — even failed explorations generate knowledge",
+                ]),
+            },
+        ],
+        transitions: vec![
+            RunnerTransitionDef {
+                from: "approved",
+                to: "executing",
+                trigger: "run_started",
+                guard: None,
+            },
+            RunnerTransitionDef {
+                from: "approved",
+                to: "failed",
+                trigger: "execution_failed",
+                guard: Some("plan validation failed"),
+            },
+            RunnerTransitionDef {
+                from: "executing",
+                to: "post_run",
+                trigger: "child_completed",
+                guard: Some("all tasks completed"),
+            },
+            RunnerTransitionDef {
+                from: "executing",
+                to: "failed",
+                trigger: "execution_failed",
+                guard: None,
+            },
+            RunnerTransitionDef {
+                from: "post_run",
+                to: "completed",
+                trigger: "commits_linked",
+                guard: None,
+            },
+            RunnerTransitionDef {
+                from: "post_run",
+                to: "failed",
+                trigger: "execution_failed",
+                guard: None,
+            },
+        ],
+    }
+}
+
+// ============================================================================
+// 8. plan-runner-reviewed (critical lifecycle with review gate)
+// ============================================================================
+
+fn build_plan_runner_reviewed() -> RunnerProtocolDef {
+    RunnerProtocolDef {
+        name: "plan-runner-reviewed",
+        description: "Critical plan runner lifecycle with mandatory review gate. \
+            Like plan-runner-full but adds an awaiting_review state between \
+            PR creation and completion for human approval.",
+        relevance_vector: RelevanceVector {
+            phase: 0.5,
+            structure: 0.9,
+            domain: 0.5,
+            resource: 0.5,
+            lifecycle: 0.7,
+        },
+        states: vec![
+            RunnerStateDef {
+                name: "approved",
+                state_type: StateType::Start,
+                action: Some("plan(action: \"get\")"),
+                prompt_fragment: "\
+Plan is APPROVED for critical execution with mandatory review. \
+This plan requires human review before completion. Load full context: \
+tasks, steps, constraints, affected files. Validate thoroughly — \
+critical plans have stricter quality gates. \
+Verify all constraints are satisfiable before starting.",
+                available_tools: Some(vec!["plan", "task", "step", "constraint", "code", "note"]),
+                forbidden_actions: Some(vec![
+                    "Do NOT start executing without validating ALL constraints",
+                    "Do NOT relax quality gates for critical plans",
+                ]),
+            },
+            RunnerStateDef {
+                name: "executing",
+                state_type: StateType::Intermediate,
+                action: Some("task(action: \"get_next\")"),
+                prompt_fragment: "\
+EXECUTING critical tasks. Apply heightened rigor: \
+(1) Run tests after EVERY change, not just significant ones, \
+(2) Document every decision with decision(add) — reviewers need context, \
+(3) Create detailed commit messages explaining the 'why', \
+(4) Track all files modified for comprehensive review preparation. \
+Quality over speed — this code will be reviewed.",
+                available_tools: None, // all tools needed
+                forbidden_actions: Some(vec![
+                    "Do NOT skip tests between changes — critical code needs continuous validation",
+                    "Do NOT make undocumented decisions — reviewers need full context",
+                    "Do NOT combine unrelated changes in a single commit",
+                ]),
+            },
+            RunnerStateDef {
+                name: "post_run",
+                state_type: StateType::Intermediate,
+                action: Some("commit(action: \"link_to_plan\")"),
+                prompt_fragment: "\
+POST-RUN validation for critical changes. Perform thorough checks: \
+(1) Run the full test suite AND any integration tests, \
+(2) Link ALL commits to the plan, \
+(3) Create comprehensive notes documenting every change rationale, \
+(4) Prepare a detailed PR description with test evidence, \
+(5) List any risks or caveats for the reviewer.",
+                available_tools: Some(vec!["commit", "note", "task", "step", "plan", "decision"]),
+                forbidden_actions: Some(vec![
+                    "Do NOT skip integration tests for critical changes",
+                    "Do NOT create the PR without comprehensive documentation",
+                ]),
+            },
+            RunnerStateDef {
+                name: "pr_decision",
+                state_type: StateType::Intermediate,
+                action: Some("plan(action: \"get\")"),
+                prompt_fragment: "\
+PR CREATION for reviewed changes. A PR is MANDATORY for critical plans. \
+Create the PR with: (1) detailed summary of all changes, \
+(2) test results and evidence, (3) risk assessment, \
+(4) link to the plan and related decisions. \
+The PR must be ready for review — no draft PRs for critical changes.",
+                available_tools: Some(vec!["commit", "plan", "decision", "note"]),
+                forbidden_actions: Some(vec![
+                    "Do NOT skip PR creation — it is mandatory for critical plans",
+                    "Do NOT create draft PRs — critical changes need immediate review readiness",
+                ]),
+            },
+            RunnerStateDef {
+                name: "awaiting_review",
+                state_type: StateType::Intermediate,
+                action: None,
+                prompt_fragment: "\
+AWAITING REVIEW. The PR has been created and is pending human approval. \
+While waiting: (1) Monitor for review comments via note(search), \
+(2) Respond to reviewer questions with additional context, \
+(3) If changes are requested, address them and update the PR. \
+Do NOT merge or mark as complete until review_approved is received.",
+                available_tools: Some(vec!["note", "chat", "decision", "commit"]),
+                forbidden_actions: Some(vec![
+                    "Do NOT mark the plan as completed before review approval",
+                    "Do NOT ignore reviewer feedback — address every comment",
+                    "Do NOT force-merge without explicit approval",
+                ]),
+            },
+            RunnerStateDef {
+                name: "completed",
+                state_type: StateType::Terminal,
+                action: None,
+                prompt_fragment: "\
+Plan execution COMPLETED with review approval. All tasks done, tests pass, \
+PR approved and merged. Record the approval as a decision for traceability.",
+                available_tools: Some(vec!["note", "plan", "decision"]),
+                forbidden_actions: None,
+            },
+            RunnerStateDef {
+                name: "failed",
+                state_type: StateType::Terminal,
+                action: None,
+                prompt_fragment: "\
+Plan execution FAILED. Document comprehensively: (1) failure point and root cause, \
+(2) review feedback if rejection-related, (3) all completed work, \
+(4) specific remediation steps. Critical failures may need escalation — \
+flag for human attention via a high-importance gotcha note.",
+                available_tools: Some(vec!["note", "task", "step", "plan", "decision"]),
+                forbidden_actions: Some(vec![
+                    "Do NOT retry critical failures without human acknowledgment",
+                ]),
+            },
+        ],
+        transitions: vec![
+            RunnerTransitionDef {
+                from: "approved",
+                to: "executing",
+                trigger: "run_started",
+                guard: None,
+            },
+            RunnerTransitionDef {
+                from: "approved",
+                to: "failed",
+                trigger: "execution_failed",
+                guard: Some("plan validation failed"),
+            },
+            RunnerTransitionDef {
+                from: "executing",
+                to: "post_run",
+                trigger: "child_completed",
+                guard: Some("all tasks completed"),
+            },
+            RunnerTransitionDef {
+                from: "executing",
+                to: "failed",
+                trigger: "execution_failed",
+                guard: None,
+            },
+            RunnerTransitionDef {
+                from: "post_run",
+                to: "pr_decision",
+                trigger: "commits_linked",
+                guard: None,
+            },
+            RunnerTransitionDef {
+                from: "post_run",
+                to: "failed",
+                trigger: "execution_failed",
+                guard: Some("test suite failed"),
+            },
+            RunnerTransitionDef {
+                from: "pr_decision",
+                to: "awaiting_review",
+                trigger: "pr_created",
+                guard: None,
+            },
+            RunnerTransitionDef {
+                from: "awaiting_review",
+                to: "completed",
+                trigger: "review_approved",
+                guard: None,
+            },
+            RunnerTransitionDef {
+                from: "awaiting_review",
+                to: "failed",
+                trigger: "review_rejected",
+                guard: None,
+            },
+        ],
+    }
+}
+
+/// Build the list of runner protocol definitions (for testing).
+fn build_runner_protocol_defs() -> Vec<RunnerProtocolDef> {
+    vec![
+        build_plan_runner_full(),
+        build_plan_runner_light(),
+        build_plan_runner_reviewed(),
+    ]
+}
+
+// Also add the 3 runner protocols to the fragment-seed system so
+// seed_prompt_fragments can enrich them if they already exist.
+
+fn seed_plan_runner_full() -> ProtocolSeed {
+    ProtocolSeed {
+        protocol_name: "plan-runner-full",
+        states: vec![
+            StateFragment {
+                state_name: "approved",
+                prompt_fragment: "\
+Plan is APPROVED and ready for execution. Load the full plan context: \
+tasks, steps, constraints, and affected files. Verify all tasks have \
+affected_files populated and dependencies are satisfiable. \
+Call task(get_next) to identify the first executable task. \
+Do NOT start executing until the plan structure is validated.",
+                available_tools: Some(vec!["plan", "task", "step", "constraint", "code", "note"]),
+                forbidden_actions: Some(vec![
+                    "Do NOT start executing tasks before validating the plan structure",
+                    "Do NOT modify the plan during the approved phase",
+                ]),
+            },
+            StateFragment {
+                state_name: "executing",
+                prompt_fragment: "\
+EXECUTING tasks. Follow the Task Execution Protocol for each task: \
+(1) task(get_next) to pick the next ready task, \
+(2) task(get_context) to load knowledge and affected files, \
+(3) update step statuses in real-time as you work, \
+(4) run cargo check / tests after each significant change, \
+(5) commit atomically with conventional format. \
+Track all files modified for the post_run phase.",
+                available_tools: None,
+                forbidden_actions: Some(vec![
+                    "Do NOT skip step status updates — they enable real-time tracking",
+                    "Do NOT commit without running cargo check first",
+                    "Do NOT batch multiple tasks into a single commit",
+                ]),
+            },
+            StateFragment {
+                state_name: "post_run",
+                prompt_fragment: "\
+POST-RUN analysis. All tasks are complete. Perform final validation: \
+(1) Run the full test suite (cargo test), \
+(2) Link all commits to the plan via commit(link_to_plan), \
+(3) Create summary notes for patterns, gotchas, and decisions discovered, \
+(4) Verify all task/step statuses are current (no stale in_progress). \
+Prepare commit list for the PR decision phase.",
+                available_tools: Some(vec!["commit", "note", "task", "step", "plan", "decision"]),
+                forbidden_actions: Some(vec![
+                    "Do NOT skip the test suite — broken builds must not reach PR",
+                    "Do NOT forget to link commits to the plan",
+                ]),
+            },
+            StateFragment {
+                state_name: "pr_decision",
+                prompt_fragment: "\
+PR DECISION. Evaluate whether a pull request should be created: \
+(1) Check the number of files changed and commits made, \
+(2) If changes are non-trivial (>1 file or >1 commit), create a PR, \
+(3) Use gh pr create with a summary of changes, test results, and plan link, \
+(4) If changes are trivial or the plan was exploratory, skip PR creation. \
+Record the decision via decision(add) for traceability.",
+                available_tools: Some(vec!["commit", "plan", "decision", "note"]),
+                forbidden_actions: Some(vec![
+                    "Do NOT create PRs for exploratory or trivial changes",
+                    "Do NOT skip the decision record — PR choices must be traceable",
+                ]),
+            },
+            StateFragment {
+                state_name: "completed",
+                prompt_fragment: "\
+Plan execution COMPLETED successfully. All tasks done, tests pass, \
+commits linked, and PR decision made. No further action required.",
+                available_tools: Some(vec!["note", "plan"]),
+                forbidden_actions: None,
+            },
+            StateFragment {
+                state_name: "failed",
+                prompt_fragment: "\
+Plan execution FAILED. Document the failure: (1) which task/step failed, \
+(2) the error message or root cause, (3) what was completed before failure, \
+(4) recommended next steps for retry or manual intervention. \
+Create a gotcha note if the failure reveals a systemic issue.",
+                available_tools: Some(vec!["note", "task", "step", "plan", "decision"]),
+                forbidden_actions: Some(vec![
+                    "Do NOT retry automatically without diagnosing the root cause",
+                ]),
+            },
+        ],
+    }
+}
+
+fn seed_plan_runner_light() -> ProtocolSeed {
+    ProtocolSeed {
+        protocol_name: "plan-runner-light",
+        states: vec![
+            StateFragment {
+                state_name: "approved",
+                prompt_fragment: "\
+Plan is APPROVED for lightweight execution. This is an exploration or research \
+task — focus on learning and knowledge capture rather than production code. \
+Load the plan context and verify task structure. \
+Exploration plans may have fewer constraints and looser affected_files.",
+                available_tools: Some(vec!["plan", "task", "step", "constraint", "code", "note"]),
+                forbidden_actions: Some(vec![
+                    "Do NOT enforce strict affected_files validation for exploration plans",
+                    "Do NOT block execution for missing constraints",
+                ]),
+            },
+            StateFragment {
+                state_name: "executing",
+                prompt_fragment: "\
+EXECUTING exploration tasks. For each task: \
+(1) Focus on understanding and documenting findings, \
+(2) Create notes liberally — exploration generates more knowledge than code, \
+(3) Update step statuses as you progress, \
+(4) Code changes are optional — the primary output is knowledge. \
+Commit any code changes with conventional format.",
+                available_tools: None,
+                forbidden_actions: Some(vec![
+                    "Do NOT skip note creation — exploration without documentation is wasted effort",
+                    "Do NOT over-engineer exploratory code",
+                ]),
+            },
+            StateFragment {
+                state_name: "post_run",
+                prompt_fragment: "\
+POST-RUN wrap-up. Exploration complete. Synthesize findings: \
+(1) Create a summary observation note with key discoveries, \
+(2) Link any code changes to the plan via commit(link_to_plan), \
+(3) If exploration revealed actionable work, document it as a follow-up task, \
+(4) Verify all step statuses are finalized.",
+                available_tools: Some(vec!["note", "commit", "task", "step", "plan", "decision"]),
+                forbidden_actions: Some(vec![
+                    "Do NOT skip the summary note — it captures the exploration's value",
+                ]),
+            },
+            StateFragment {
+                state_name: "completed",
+                prompt_fragment: "\
+Exploration COMPLETED. Findings documented, knowledge captured, \
+and follow-up work identified if applicable. No PR needed.",
+                available_tools: Some(vec!["note", "plan"]),
+                forbidden_actions: None,
+            },
+            StateFragment {
+                state_name: "failed",
+                prompt_fragment: "\
+Exploration FAILED. Document what was attempted, what blocked progress, \
+and any partial findings that may be useful for future attempts. \
+Create a gotcha note if the failure reveals environmental or tooling issues.",
+                available_tools: Some(vec!["note", "task", "step", "plan"]),
+                forbidden_actions: Some(vec![
+                    "Do NOT discard partial findings — even failed explorations generate knowledge",
+                ]),
+            },
+        ],
+    }
+}
+
+fn seed_plan_runner_reviewed() -> ProtocolSeed {
+    ProtocolSeed {
+        protocol_name: "plan-runner-reviewed",
+        states: vec![
+            StateFragment {
+                state_name: "approved",
+                prompt_fragment: "\
+Plan is APPROVED for critical execution with mandatory review. \
+This plan requires human review before completion. Load full context: \
+tasks, steps, constraints, affected files. Validate thoroughly — \
+critical plans have stricter quality gates. \
+Verify all constraints are satisfiable before starting.",
+                available_tools: Some(vec!["plan", "task", "step", "constraint", "code", "note"]),
+                forbidden_actions: Some(vec![
+                    "Do NOT start executing without validating ALL constraints",
+                    "Do NOT relax quality gates for critical plans",
+                ]),
+            },
+            StateFragment {
+                state_name: "executing",
+                prompt_fragment: "\
+EXECUTING critical tasks. Apply heightened rigor: \
+(1) Run tests after EVERY change, not just significant ones, \
+(2) Document every decision with decision(add) — reviewers need context, \
+(3) Create detailed commit messages explaining the 'why', \
+(4) Track all files modified for comprehensive review preparation. \
+Quality over speed — this code will be reviewed.",
+                available_tools: None,
+                forbidden_actions: Some(vec![
+                    "Do NOT skip tests between changes — critical code needs continuous validation",
+                    "Do NOT make undocumented decisions — reviewers need full context",
+                    "Do NOT combine unrelated changes in a single commit",
+                ]),
+            },
+            StateFragment {
+                state_name: "post_run",
+                prompt_fragment: "\
+POST-RUN validation for critical changes. Perform thorough checks: \
+(1) Run the full test suite AND any integration tests, \
+(2) Link ALL commits to the plan, \
+(3) Create comprehensive notes documenting every change rationale, \
+(4) Prepare a detailed PR description with test evidence, \
+(5) List any risks or caveats for the reviewer.",
+                available_tools: Some(vec!["commit", "note", "task", "step", "plan", "decision"]),
+                forbidden_actions: Some(vec![
+                    "Do NOT skip integration tests for critical changes",
+                    "Do NOT create the PR without comprehensive documentation",
+                ]),
+            },
+            StateFragment {
+                state_name: "pr_decision",
+                prompt_fragment: "\
+PR CREATION for reviewed changes. A PR is MANDATORY for critical plans. \
+Create the PR with: (1) detailed summary of all changes, \
+(2) test results and evidence, (3) risk assessment, \
+(4) link to the plan and related decisions. \
+The PR must be ready for review — no draft PRs for critical changes.",
+                available_tools: Some(vec!["commit", "plan", "decision", "note"]),
+                forbidden_actions: Some(vec![
+                    "Do NOT skip PR creation — it is mandatory for critical plans",
+                    "Do NOT create draft PRs — critical changes need immediate review readiness",
+                ]),
+            },
+            StateFragment {
+                state_name: "awaiting_review",
+                prompt_fragment: "\
+AWAITING REVIEW. The PR has been created and is pending human approval. \
+While waiting: (1) Monitor for review comments via note(search), \
+(2) Respond to reviewer questions with additional context, \
+(3) If changes are requested, address them and update the PR. \
+Do NOT merge or mark as complete until review_approved is received.",
+                available_tools: Some(vec!["note", "chat", "decision", "commit"]),
+                forbidden_actions: Some(vec![
+                    "Do NOT mark the plan as completed before review approval",
+                    "Do NOT ignore reviewer feedback — address every comment",
+                    "Do NOT force-merge without explicit approval",
+                ]),
+            },
+            StateFragment {
+                state_name: "completed",
+                prompt_fragment: "\
+Plan execution COMPLETED with review approval. All tasks done, tests pass, \
+PR approved and merged. Record the approval as a decision for traceability.",
+                available_tools: Some(vec!["note", "plan", "decision"]),
+                forbidden_actions: None,
+            },
+            StateFragment {
+                state_name: "failed",
+                prompt_fragment: "\
+Plan execution FAILED. Document comprehensively: (1) failure point and root cause, \
+(2) review feedback if rejection-related, (3) all completed work, \
+(4) specific remediation steps. Critical failures may need escalation — \
+flag for human attention via a high-importance gotcha note.",
+                available_tools: Some(vec!["note", "task", "step", "plan", "decision"]),
+                forbidden_actions: Some(vec![
+                    "Do NOT retry critical failures without human acknowledgment",
+                ]),
+            },
+        ],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -681,7 +1619,7 @@ mod tests {
     #[test]
     fn test_all_fragments_non_empty() {
         let protocols = build_protocol_seeds();
-        assert_eq!(protocols.len(), 5, "Expected 5 protocol seeds");
+        assert_eq!(protocols.len(), 8, "Expected 8 protocol seeds");
 
         for proto in &protocols {
             assert!(
@@ -734,6 +1672,12 @@ mod tests {
         assert_eq!(counts[3], ("diagnostic-triage", 6));
         // auto-maintenance: 6 states
         assert_eq!(counts[4], ("auto-maintenance", 6));
+        // plan-runner-full: 6 states
+        assert_eq!(counts[5], ("plan-runner-full", 6));
+        // plan-runner-light: 5 states
+        assert_eq!(counts[6], ("plan-runner-light", 5));
+        // plan-runner-reviewed: 7 states
+        assert_eq!(counts[7], ("plan-runner-reviewed", 7));
     }
 
     #[test]
@@ -1096,13 +2040,39 @@ mod tests {
         ];
         setup_protocol_in_mock(&mock, project_id, "auto-maintenance", &maint_states).await;
 
+        // Runner protocols
+        let runner_full_states = vec![
+            "approved",
+            "executing",
+            "post_run",
+            "pr_decision",
+            "completed",
+            "failed",
+        ];
+        setup_protocol_in_mock(&mock, project_id, "plan-runner-full", &runner_full_states).await;
+
+        let runner_light_states = vec!["approved", "executing", "post_run", "completed", "failed"];
+        setup_protocol_in_mock(&mock, project_id, "plan-runner-light", &runner_light_states).await;
+
+        let runner_reviewed_states = vec![
+            "approved",
+            "executing",
+            "post_run",
+            "pr_decision",
+            "awaiting_review",
+            "completed",
+            "failed",
+        ];
+        setup_protocol_in_mock(&mock, project_id, "plan-runner-reviewed", &runner_reviewed_states)
+            .await;
+
         let result = seed_prompt_fragments(&mock, project_id).await.unwrap();
 
-        assert_eq!(result.protocols_found, 5);
+        assert_eq!(result.protocols_found, 8);
         assert!(result.protocols_missing.is_empty());
         assert_eq!(result.skipped, 0);
-        // Total states across all 5 protocols: 5 + 9 + 7 + 6 + 6 = 33
-        assert_eq!(result.updated, 33);
+        // Total states across all 8 protocols: 5 + 9 + 7 + 6 + 6 + 6 + 5 + 7 = 51
+        assert_eq!(result.updated, 51);
 
         // Verify that prompt_fragment was actually written to states
         let states = mock.protocol_states.read().await;
@@ -1129,7 +2099,7 @@ mod tests {
         let result = seed_prompt_fragments(&mock, project_id).await.unwrap();
 
         assert_eq!(result.protocols_found, 0);
-        assert_eq!(result.protocols_missing.len(), 5);
+        assert_eq!(result.protocols_missing.len(), 8);
         assert!(result
             .protocols_missing
             .contains(&"session-lifecycle".to_string()));
@@ -1145,9 +2115,18 @@ mod tests {
         assert!(result
             .protocols_missing
             .contains(&"auto-maintenance".to_string()));
-        // skipped = total number of seed states across all 5 protocols
+        assert!(result
+            .protocols_missing
+            .contains(&"plan-runner-full".to_string()));
+        assert!(result
+            .protocols_missing
+            .contains(&"plan-runner-light".to_string()));
+        assert!(result
+            .protocols_missing
+            .contains(&"plan-runner-reviewed".to_string()));
+        // skipped = total number of seed states across all 8 protocols
         assert_eq!(result.updated, 0);
-        assert_eq!(result.skipped, 33);
+        assert_eq!(result.skipped, 51);
     }
 
     #[tokio::test]
@@ -1162,13 +2141,13 @@ mod tests {
         let result = seed_prompt_fragments(&mock, project_id).await.unwrap();
 
         assert_eq!(result.protocols_found, 1);
-        assert_eq!(result.protocols_missing.len(), 4);
+        assert_eq!(result.protocols_missing.len(), 7);
         assert!(!result
             .protocols_missing
             .contains(&"session-lifecycle".to_string()));
         assert_eq!(result.updated, 5);
-        // skipped = states from the 4 missing protocols: 9 + 7 + 6 + 6 = 28
-        assert_eq!(result.skipped, 28);
+        // skipped = states from the 7 missing protocols: 9 + 7 + 6 + 6 + 6 + 5 + 7 = 46
+        assert_eq!(result.skipped, 46);
     }
 
     #[tokio::test]
@@ -1183,11 +2162,11 @@ mod tests {
         let result = seed_prompt_fragments(&mock, project_id).await.unwrap();
 
         assert_eq!(result.protocols_found, 1);
-        assert_eq!(result.protocols_missing.len(), 4);
+        assert_eq!(result.protocols_missing.len(), 7);
         // 2 states matched, 3 states from session-lifecycle skipped
         assert_eq!(result.updated, 2);
-        // skipped = 3 missing session states + all states from 4 missing protocols (28) = 31
-        assert_eq!(result.skipped, 31);
+        // skipped = 3 missing session states + all states from 7 missing protocols (46) = 49
+        assert_eq!(result.skipped, 49);
     }
 
     #[tokio::test]
@@ -1259,15 +2238,15 @@ mod tests {
 
         assert_eq!(result.protocols_found, 0);
         assert_eq!(result.updated, 0);
-        assert_eq!(result.protocols_missing.len(), 5);
+        assert_eq!(result.protocols_missing.len(), 8);
     }
 
     #[test]
     fn test_seed_result_serialization_empty_missing() {
         let result = SeedResult {
-            updated: 33,
+            updated: 51,
             skipped: 0,
-            protocols_found: 5,
+            protocols_found: 8,
             protocols_missing: vec![],
         };
         let json = serde_json::to_string(&result).unwrap();
