@@ -12,7 +12,7 @@ use super::handlers::OrchestratorState;
 use super::ws_auth::CookieAuthResult;
 use crate::auth::jwt::Claims;
 use crate::chat::types::ChatEvent;
-use crate::runner::{RUNNER_STATE, RunnerEvent};
+use crate::runner::{RunnerEvent, RUNNER_STATE};
 use axum::{
     extract::{
         ws::{Message, WebSocket},
@@ -73,9 +73,7 @@ pub async fn ws_run(
 #[serde(tag = "type", rename_all = "snake_case")]
 enum RunWsEvent<'a> {
     /// A RunnerEvent (TaskStarted, TaskCompleted, WaveStarted, etc.)
-    RunnerEvent {
-        event: &'a RunnerEvent,
-    },
+    RunnerEvent { event: &'a RunnerEvent },
     /// A ChatEvent from one of the run's child sessions
     ChatEvent {
         task_id: Uuid,
@@ -106,12 +104,7 @@ struct TrackedSession {
 }
 
 /// Main WebSocket loop for a plan run
-async fn handle_run_ws(
-    socket: WebSocket,
-    state: OrchestratorState,
-    run_id: Uuid,
-    claims: Claims,
-) {
+async fn handle_run_ws(socket: WebSocket, state: OrchestratorState, run_id: Uuid, claims: Claims) {
     // Wait for client "ready" signal (must be done before split)
     let mut socket = socket;
     super::ws_auth::wait_ready_then_auth_ok(&mut socket, &claims).await;
@@ -125,7 +118,13 @@ async fn handle_run_ws(
     let mut known_session_ids: HashSet<String> = HashSet::new();
 
     // Discover and subscribe to existing sessions
-    discover_sessions(&state, run_id, &mut tracked_sessions, &mut known_session_ids).await;
+    discover_sessions(
+        &state,
+        run_id,
+        &mut tracked_sessions,
+        &mut known_session_ids,
+    )
+    .await;
 
     // Send initial status
     send_run_status(&mut ws_sender, run_id, &tracked_sessions).await;
@@ -451,7 +450,10 @@ mod tests {
         let crud = make_crud_runner_event(&event);
 
         let result = extract_runner_event(&crud, other_run_id);
-        assert!(result.is_none(), "Should reject event with different run_id");
+        assert!(
+            result.is_none(),
+            "Should reject event with different run_id"
+        );
     }
 
     #[test]
@@ -501,10 +503,7 @@ mod tests {
         };
 
         let result = extract_runner_event(&crud, Uuid::new_v4());
-        assert!(
-            result.is_none(),
-            "Should handle invalid payload gracefully"
-        );
+        assert!(result.is_none(), "Should handle invalid payload gracefully");
     }
 
     #[tokio::test]
@@ -512,11 +511,9 @@ mod tests {
         let mut tracked: HashMap<String, TrackedSession> = HashMap::new();
 
         // poll_chat_sessions with empty map should pend forever — use timeout
-        let result = tokio::time::timeout(
-            Duration::from_millis(100),
-            poll_chat_sessions(&mut tracked),
-        )
-        .await;
+        let result =
+            tokio::time::timeout(Duration::from_millis(100), poll_chat_sessions(&mut tracked))
+                .await;
 
         assert!(result.is_err(), "Should pend (not return) when no sessions");
     }
@@ -544,11 +541,9 @@ mod tests {
         };
         tx.send(chat_event).unwrap();
 
-        let result = tokio::time::timeout(
-            Duration::from_millis(200),
-            poll_chat_sessions(&mut tracked),
-        )
-        .await;
+        let result =
+            tokio::time::timeout(Duration::from_millis(200), poll_chat_sessions(&mut tracked))
+                .await;
 
         assert!(result.is_ok(), "Should return within timeout");
         let result = result.unwrap();
@@ -573,14 +568,15 @@ mod tests {
         );
 
         // No event sent — should sleep 50ms then return None
-        let result = tokio::time::timeout(
-            Duration::from_millis(200),
-            poll_chat_sessions(&mut tracked),
-        )
-        .await;
+        let result =
+            tokio::time::timeout(Duration::from_millis(200), poll_chat_sessions(&mut tracked))
+                .await;
 
         assert!(result.is_ok(), "Should return within timeout");
-        assert!(result.unwrap().is_none(), "Should return None when no events");
+        assert!(
+            result.unwrap().is_none(),
+            "Should return None when no events"
+        );
     }
 
     #[test]

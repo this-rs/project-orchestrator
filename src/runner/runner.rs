@@ -2703,8 +2703,7 @@ impl PlanRunner {
                     .await;
                 output
                     .map(|o| {
-                        o.status.success()
-                            && !String::from_utf8_lossy(&o.stdout).trim().is_empty()
+                        o.status.success() && !String::from_utf8_lossy(&o.stdout).trim().is_empty()
                     })
                     .unwrap_or(false)
             }
@@ -2714,7 +2713,10 @@ impl PlanRunner {
         let steps = match self.graph.get_task_steps(task_id).await {
             Ok(s) => s,
             Err(e) => {
-                warn!("finalize_steps: failed to get steps for task {}: {}", task_id, e);
+                warn!(
+                    "finalize_steps: failed to get steps for task {}: {}",
+                    task_id, e
+                );
                 return;
             }
         };
@@ -2767,7 +2769,12 @@ impl PlanRunner {
             remaining.len(),
             match outcome {
                 TaskResult::Success { .. } => "success",
-                TaskResult::Timeout { .. } => if has_commits { "timeout+commits" } else { "timeout" },
+                TaskResult::Timeout { .. } =>
+                    if has_commits {
+                        "timeout+commits"
+                    } else {
+                        "timeout"
+                    },
                 TaskResult::Failed { .. } => "failed",
                 TaskResult::BudgetExceeded { .. } => "budget_exceeded",
                 TaskResult::Blocked { .. } => "blocked",

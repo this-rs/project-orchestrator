@@ -1000,7 +1000,9 @@ mod tests {
         assert!(is_completion_message("Task is done, nothing more to do."));
         assert!(is_completion_message("All work is done."));
         assert!(is_completion_message("All steps are done."));
-        assert!(is_completion_message("All changes are committed and pushed."));
+        assert!(is_completion_message(
+            "All changes are committed and pushed."
+        ));
         assert!(is_completion_message("Work is done!"));
         assert!(is_completion_message("ALL DONE"));
 
