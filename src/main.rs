@@ -24,9 +24,9 @@ struct Cli {
 enum Commands {
     /// Start the orchestrator server
     Serve {
-        /// Port to listen on
-        #[arg(short, long, default_value = "8080")]
-        port: u16,
+        /// Port to listen on (overrides config.yaml server.port, default: 8080 if no config)
+        #[arg(short, long)]
+        port: Option<u16>,
 
         /// Disable serving the frontend static files (API-only mode)
         #[arg(long)]
@@ -84,7 +84,12 @@ async fn main() -> Result<()> {
             no_frontend,
             frontend_path,
         } => {
-            config.server_port = port;
+            // --port flag overrides config.yaml; if neither is set, default to 8080
+            if let Some(p) = port {
+                config.server_port = p;
+            } else if config.server_port == 0 {
+                config.server_port = 8080;
+            }
             if no_frontend {
                 config.serve_frontend = false;
             }
