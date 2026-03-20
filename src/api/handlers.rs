@@ -5058,6 +5058,30 @@ pub async fn cancel_run(
     })))
 }
 
+/// POST /api/plans/{plan_id}/run/force-cancel — Force-cancel a stuck run.
+/// Unlike regular cancel (which sets a flag and waits for the execution loop to
+/// check it), force-cancel immediately clears the global runner state and persists
+/// the run as cancelled. Use when agents are stuck in "spawning" and never respond
+/// to the graceful cancel flag.
+pub async fn force_cancel_run(
+    State(state): State<OrchestratorState>,
+    Path(_plan_id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let status = crate::runner::PlanRunner::status().await;
+    let run_id = status
+        .run_id
+        .ok_or_else(|| AppError::NotFound("No active run".to_string()))?;
+
+    crate::runner::PlanRunner::force_cancel(run_id, state.orchestrator.neo4j_arc())
+        .await
+        .map_err(AppError::Internal)?;
+
+    Ok(Json(serde_json::json!({
+        "force_cancelled": true,
+        "run_id": run_id,
+    })))
+}
+
 /// PATCH /api/plans/{plan_id}/run/budget — Update the budget of a running execution.
 pub async fn update_run_budget(
     State(_state): State<OrchestratorState>,

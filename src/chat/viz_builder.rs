@@ -30,8 +30,9 @@ use std::sync::{Arc, LazyLock};
 use uuid::Uuid;
 
 use super::viz::{
-    ContentBlock, KnowledgeCardVizBuilder, ProgressBarVizBuilder, ReasoningTreeVizBuilder,
-    TaskProgress, VizBlock, VizDataBuilder, VizType,
+    ContentBlock, EmptyStateVizBuilder, KnowledgeCardVizBuilder, ProgressBarVizBuilder,
+    ProgressRingVizBuilder, ProgressSegment, ReasoningTreeVizBuilder, TabDef,
+    TabLayoutVizBuilder, TaskProgress, VizBlock, VizDataBuilder, VizType,
 };
 use crate::reasoning::models::ReasoningTree;
 
@@ -351,6 +352,100 @@ pub async fn build_dependency_tree_viz(
     )))
 }
 
+/// Build an empty state VizBlock for the runner dashboard (no agents spawned).
+///
+/// Pure construction — no graph queries needed.
+pub fn build_empty_state_viz(
+    icon: &str,
+    title: &str,
+    description: &str,
+    cta_label: Option<&str>,
+    cta_action: Option<&str>,
+) -> Result<VizBlock> {
+    let builder = EmptyStateVizBuilder {
+        icon: icon.to_string(),
+        title: title.to_string(),
+        description: description.to_string(),
+        cta_label: cta_label.map(|s| s.to_string()),
+        cta_action: cta_action.map(|s| s.to_string()),
+    };
+    builder.build()
+}
+
+/// Build a tab layout VizBlock for runner dashboard navigation.
+///
+/// Pure construction — no graph queries needed.
+pub fn build_tab_layout_viz(tabs: Vec<TabDef>, active_tab: &str) -> Result<VizBlock> {
+    let builder = TabLayoutVizBuilder {
+        tabs,
+        active_tab: active_tab.to_string(),
+    };
+    builder.build()
+}
+
+/// Build a progress ring VizBlock from a plan ID.
+///
+/// Queries the graph for the plan and its tasks, then builds a
+/// circular gauge visualization with status segments.
+pub async fn build_progress_ring_viz(graph: &dyn GraphStore, plan_id: Uuid) -> Result<VizBlock> {
+    let plan = graph
+        .get_plan(plan_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Plan {plan_id} not found"))?;
+
+    let tasks = graph.get_plan_tasks(plan_id).await?;
+    let total = tasks.len();
+
+    let completed = tasks.iter().filter(|t| {
+        serde_json::to_value(&t.status)
+            .ok()
+            .and_then(|v| v.as_str().map(|s| s == "completed"))
+            .unwrap_or(false)
+    }).count();
+    let in_progress = tasks.iter().filter(|t| {
+        serde_json::to_value(&t.status)
+            .ok()
+            .and_then(|v| v.as_str().map(|s| s == "in_progress"))
+            .unwrap_or(false)
+    }).count();
+    let failed = tasks.iter().filter(|t| {
+        serde_json::to_value(&t.status)
+            .ok()
+            .and_then(|v| v.as_str().map(|s| s == "failed"))
+            .unwrap_or(false)
+    }).count();
+    let blocked = tasks.iter().filter(|t| {
+        serde_json::to_value(&t.status)
+            .ok()
+            .and_then(|v| v.as_str().map(|s| s == "blocked"))
+            .unwrap_or(false)
+    }).count();
+    let pending = total.saturating_sub(completed + in_progress + failed + blocked);
+
+    let percentage = if total > 0 {
+        (completed as f64 / total as f64 * 100.0).round()
+    } else {
+        0.0
+    };
+
+    let segments = vec![
+        ProgressSegment { status: "completed".to_string(), count: completed, color: Some("#22c55e".to_string()) },
+        ProgressSegment { status: "in_progress".to_string(), count: in_progress, color: Some("#3b82f6".to_string()) },
+        ProgressSegment { status: "pending".to_string(), count: pending, color: Some("#6b7280".to_string()) },
+        ProgressSegment { status: "failed".to_string(), count: failed, color: Some("#ef4444".to_string()) },
+        ProgressSegment { status: "blocked".to_string(), count: blocked, color: Some("#f59e0b".to_string()) },
+    ];
+
+    let builder = ProgressRingVizBuilder {
+        percentage,
+        label: format!("{completed}/{total} tasks"),
+        segments,
+        animated: true,
+        ring_title: Some(plan.title.clone()),
+    };
+    builder.build()
+}
+
 // ============================================================================
 // VizBlockProcessor — orchestrates tag parsing and block generation
 // ============================================================================
@@ -492,6 +587,64 @@ impl VizBlockProcessor {
                     anyhow::anyhow!("dependency_tree requires 'target' attribute")
                 })?;
                 build_dependency_tree_viz(self.graph.as_ref(), target, self.project_id).await
+            }
+
+            VizType::EmptyState => {
+                let icon = tag.attrs.get("icon").cloned().unwrap_or_else(|| "robot".to_string());
+                let title = tag.attrs.get("title").cloned().unwrap_or_else(|| "No data".to_string());
+                let description = tag.attrs.get("description").cloned().unwrap_or_default();
+                let cta_label = tag.attrs.get("cta_label").cloned();
+                let cta_action = tag.attrs.get("cta_action").cloned();
+                let builder = EmptyStateVizBuilder {
+                    icon,
+                    title,
+                    description,
+                    cta_label,
+                    cta_action,
+                };
+                builder.build()
+            }
+
+            VizType::TabLayout => {
+                // Parse tabs from comma-separated list or JSON
+                let tabs_str = tag.attrs.get("tabs").cloned().unwrap_or_default();
+                let active = tag.attrs.get("active").cloned().unwrap_or_default();
+                let tabs: Vec<TabDef> = tabs_str
+                    .split(',')
+                    .filter(|s| !s.trim().is_empty())
+                    .map(|s| {
+                        let s = s.trim();
+                        TabDef {
+                            id: s.to_lowercase().replace(' ', "_"),
+                            label: s.to_string(),
+                            icon: None,
+                            badge: None,
+                        }
+                    })
+                    .collect();
+                let builder = TabLayoutVizBuilder { tabs, active_tab: active };
+                builder.build()
+            }
+
+            VizType::ProgressRing => {
+                // Can be built from a plan_id (like progress_bar) or from direct params
+                if let Some(plan_id_str) = tag.attrs.get("plan_id") {
+                    let plan_id = Uuid::parse_str(plan_id_str)?;
+                    build_progress_ring_viz(self.graph.as_ref(), plan_id).await
+                } else {
+                    let pct: f64 = tag.attrs.get("percentage")
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(0.0);
+                    let label = tag.attrs.get("label").cloned().unwrap_or_default();
+                    let builder = ProgressRingVizBuilder {
+                        percentage: pct,
+                        label,
+                        segments: vec![],
+                        animated: true,
+                        ring_title: tag.attrs.get("title").cloned(),
+                    };
+                    builder.build()
+                }
             }
 
             // Pattern Federation reserved types → stub

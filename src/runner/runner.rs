@@ -631,6 +631,37 @@ impl PlanRunner {
         }
     }
 
+    /// Force-cancel: immediately clears the global runner state and persists
+    /// the run as cancelled in Neo4j. Use when graceful cancel is stuck
+    /// (e.g. agents blocked in spawning state that never respond to the
+    /// cancel flag).
+    pub async fn force_cancel(run_id: Uuid, graph: Arc<dyn GraphStore>) -> Result<()> {
+        // Set cancel flag so any in-flight code that checks it will stop
+        RUNNER_CANCEL.store(true, Ordering::SeqCst);
+        // Clear budget override
+        RUNNER_BUDGET.store(0, std::sync::atomic::Ordering::Relaxed);
+
+        let mut global = RUNNER_STATE.write().await;
+        match &mut *global {
+            Some(state) if state.run_id == run_id => {
+                state.finalize(PlanRunStatus::Cancelled);
+                if let Err(e) = graph.update_plan_run(state).await {
+                    error!("Failed to persist force-cancelled run to Neo4j: {}", e);
+                }
+                info!("Runner force-cancelled run {}", run_id);
+                // Clear the global state so a new run can start
+                *global = None;
+                Ok(())
+            }
+            Some(state) => Err(anyhow!(
+                "Run {} does not match active run {}",
+                run_id,
+                state.run_id
+            )),
+            None => Err(anyhow!("No active run to force-cancel")),
+        }
+    }
+
     /// Get the current run status snapshot.
     pub async fn status() -> RunStatus {
         let global = RUNNER_STATE.read().await;

@@ -77,6 +77,19 @@ pub enum VizType {
     /// Wave computation progress — multi-step protocol wave status.
     WaveProgress,
 
+    // === Design system types (Runner Dashboard) ===
+    /// Empty state — placeholder shown when no data is available (e.g., no agents spawned).
+    /// Data schema: `{ icon, title, description, cta_label?, cta_action? }`
+    EmptyState,
+
+    /// Tab layout — structured tabbed navigation for multi-panel views.
+    /// Data schema: `{ tabs: [{id, label, icon?, badge?}], active_tab, content? }`
+    TabLayout,
+
+    /// Progress ring — circular gauge for completion percentage (replaces linear ProgressBar).
+    /// Data schema: `{ percentage, label, segments?: [{status, count}], animated? }`
+    ProgressRing,
+
     // === Extension point ===
     /// Custom visualization type for third-party extensions.
     /// The string identifies the custom type (e.g., "my_plugin.heatmap").
@@ -96,6 +109,9 @@ impl fmt::Display for VizType {
             Self::FsmState => write!(f, "fsm_state"),
             Self::ContextRouting => write!(f, "context_routing"),
             Self::WaveProgress => write!(f, "wave_progress"),
+            Self::EmptyState => write!(f, "empty_state"),
+            Self::TabLayout => write!(f, "tab_layout"),
+            Self::ProgressRing => write!(f, "progress_ring"),
             Self::Custom(name) => write!(f, "custom:{name}"),
         }
     }
@@ -115,6 +131,9 @@ impl VizType {
             "fsm_state" => Self::FsmState,
             "context_routing" => Self::ContextRouting,
             "wave_progress" => Self::WaveProgress,
+            "empty_state" => Self::EmptyState,
+            "tab_layout" => Self::TabLayout,
+            "progress_ring" => Self::ProgressRing,
             other => Self::Custom(other.to_string()),
         }
     }
@@ -715,6 +734,220 @@ impl VizDataBuilder for KnowledgeCardVizBuilder {
     }
 }
 
+// --- EmptyStateVizBuilder ---
+
+/// Builds a VizBlock for empty state placeholders (e.g., no agents spawned).
+///
+/// Renders as a centered icon + title + description + optional CTA button.
+pub struct EmptyStateVizBuilder {
+    /// Icon identifier (e.g., "robot", "inbox", "search").
+    pub icon: String,
+    /// Main title text.
+    pub title: String,
+    /// Descriptive subtitle.
+    pub description: String,
+    /// Optional call-to-action button label.
+    pub cta_label: Option<String>,
+    /// Optional action identifier triggered by the CTA.
+    pub cta_action: Option<String>,
+}
+
+impl VizDataBuilder for EmptyStateVizBuilder {
+    fn viz_type(&self) -> VizType {
+        VizType::EmptyState
+    }
+
+    fn build_data(&self) -> Result<serde_json::Value> {
+        Ok(serde_json::json!({
+            "icon": self.icon,
+            "title": self.title,
+            "description": self.description,
+            "cta_label": self.cta_label,
+            "cta_action": self.cta_action,
+        }))
+    }
+
+    fn build_fallback(&self) -> String {
+        let icon_emoji = match self.icon.as_str() {
+            "robot" => "🤖",
+            "inbox" => "📥",
+            "search" => "🔍",
+            "rocket" => "🚀",
+            _ => "📭",
+        };
+        let mut text = format!("{icon_emoji} {}\n{}", self.title, self.description);
+        if let Some(ref cta) = self.cta_label {
+            text.push_str(&format!("\n→ {cta}"));
+        }
+        text
+    }
+
+    fn title(&self) -> Option<String> {
+        Some(self.title.clone())
+    }
+}
+
+// --- TabLayoutVizBuilder ---
+
+/// Builds a VizBlock for tabbed navigation layouts.
+///
+/// Renders as a horizontal tab bar with active tab indicator.
+/// Used for Waves / Conversation / Execution Details navigation.
+pub struct TabLayoutVizBuilder {
+    /// Tab definitions.
+    pub tabs: Vec<TabDef>,
+    /// ID of the currently active tab.
+    pub active_tab: String,
+}
+
+/// A single tab definition in a TabLayout.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TabDef {
+    /// Unique tab identifier.
+    pub id: String,
+    /// Display label.
+    pub label: String,
+    /// Optional icon identifier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+    /// Optional badge text (e.g., count).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub badge: Option<String>,
+}
+
+impl VizDataBuilder for TabLayoutVizBuilder {
+    fn viz_type(&self) -> VizType {
+        VizType::TabLayout
+    }
+
+    fn build_data(&self) -> Result<serde_json::Value> {
+        Ok(serde_json::json!({
+            "tabs": self.tabs,
+            "active_tab": self.active_tab,
+            "tab_count": self.tabs.len(),
+        }))
+    }
+
+    fn build_fallback(&self) -> String {
+        let tabs_str: Vec<String> = self
+            .tabs
+            .iter()
+            .map(|t| {
+                let active = if t.id == self.active_tab {
+                    " [*]"
+                } else {
+                    ""
+                };
+                let badge = t
+                    .badge
+                    .as_ref()
+                    .map(|b| format!(" ({b})"))
+                    .unwrap_or_default();
+                format!("{}{badge}{active}", t.label)
+            })
+            .collect();
+        format!("Tabs: {}", tabs_str.join(" | "))
+    }
+
+    fn is_interactive(&self) -> bool {
+        true
+    }
+
+    fn title(&self) -> Option<String> {
+        None // Tab layouts don't need a separate title
+    }
+}
+
+// --- ProgressRingVizBuilder ---
+
+/// Builds a VizBlock showing circular progress gauge for run completion.
+///
+/// Replaces the linear ProgressBar with a ring/gauge visualization.
+/// Supports segmented status breakdown and animation hints.
+pub struct ProgressRingVizBuilder {
+    /// Completion percentage (0.0 - 100.0).
+    pub percentage: f64,
+    /// Center label (e.g., "3/5 tasks").
+    pub label: String,
+    /// Optional status segments for the ring.
+    pub segments: Vec<ProgressSegment>,
+    /// Whether the ring should animate.
+    pub animated: bool,
+    /// Optional title (e.g., plan name).
+    pub ring_title: Option<String>,
+}
+
+/// A segment in a progress ring showing status breakdown.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProgressSegment {
+    /// Status name (completed, in_progress, pending, failed, blocked).
+    pub status: String,
+    /// Count of items in this status.
+    pub count: usize,
+    /// Color hint for the frontend (e.g., "#22c55e" for completed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+}
+
+impl VizDataBuilder for ProgressRingVizBuilder {
+    fn viz_type(&self) -> VizType {
+        VizType::ProgressRing
+    }
+
+    fn build_data(&self) -> Result<serde_json::Value> {
+        let total: usize = self.segments.iter().map(|s| s.count).sum();
+        Ok(serde_json::json!({
+            "percentage": self.percentage,
+            "label": self.label,
+            "segments": self.segments,
+            "animated": self.animated,
+            "total": total,
+            "title": self.ring_title,
+        }))
+    }
+
+    fn build_fallback(&self) -> String {
+        // Circular ASCII gauge
+        let pct = self.percentage.round() as usize;
+        let filled = pct / 5; // 20 segments
+        let empty = 20_usize.saturating_sub(filled);
+        let ring = "●".repeat(filled) + &"○".repeat(empty);
+
+        let mut lines = Vec::new();
+        if let Some(ref title) = self.ring_title {
+            lines.push(title.clone());
+        }
+        lines.push(format!("[{ring}] {:.0}%", self.percentage));
+        lines.push(self.label.clone());
+
+        if !self.segments.is_empty() {
+            let seg_str: Vec<String> = self
+                .segments
+                .iter()
+                .filter(|s| s.count > 0)
+                .map(|s| {
+                    let icon = match s.status.as_str() {
+                        "completed" => "✅",
+                        "in_progress" => "🔄",
+                        "pending" => "⬜",
+                        "failed" => "❌",
+                        "blocked" => "🚫",
+                        _ => "•",
+                    };
+                    format!("{icon} {} {}", s.count, s.status)
+                })
+                .collect();
+            lines.push(seg_str.join("  "));
+        }
+
+        lines.join("\n")
+    }
+
+    fn title(&self) -> Option<String> {
+        self.ring_title.clone()
+    }
+}
+
 // --- Pattern Federation Stub Builder ---
 
 /// Stub builder for Pattern Federation reserved types.
@@ -868,6 +1101,101 @@ impl VizBuilderFactory for KnowledgeCardVizFactory {
     }
 }
 
+/// Factory for EmptyStateVizBuilder.
+pub struct EmptyStateVizFactory;
+
+impl VizBuilderFactory for EmptyStateVizFactory {
+    fn create(&self, params: &serde_json::Value) -> Result<Box<dyn VizDataBuilder>> {
+        let icon = params
+            .get("icon")
+            .and_then(|v| v.as_str())
+            .unwrap_or("robot")
+            .to_string();
+        let title = params
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("No data")
+            .to_string();
+        let description = params
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let cta_label = params
+            .get("cta_label")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let cta_action = params
+            .get("cta_action")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        Ok(Box::new(EmptyStateVizBuilder {
+            icon,
+            title,
+            description,
+            cta_label,
+            cta_action,
+        }))
+    }
+}
+
+/// Factory for TabLayoutVizBuilder.
+pub struct TabLayoutVizFactory;
+
+impl VizBuilderFactory for TabLayoutVizFactory {
+    fn create(&self, params: &serde_json::Value) -> Result<Box<dyn VizDataBuilder>> {
+        let tabs: Vec<TabDef> = params
+            .get("tabs")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+        let active_tab = params
+            .get("active_tab")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        Ok(Box::new(TabLayoutVizBuilder { tabs, active_tab }))
+    }
+}
+
+/// Factory for ProgressRingVizBuilder.
+pub struct ProgressRingVizFactory;
+
+impl VizBuilderFactory for ProgressRingVizFactory {
+    fn create(&self, params: &serde_json::Value) -> Result<Box<dyn VizDataBuilder>> {
+        let percentage = params
+            .get("percentage")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        let label = params
+            .get("label")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let segments: Vec<ProgressSegment> = params
+            .get("segments")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+        let animated = params
+            .get("animated")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        let ring_title = params
+            .get("title")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        Ok(Box::new(ProgressRingVizBuilder {
+            percentage,
+            label,
+            segments,
+            animated,
+            ring_title,
+        }))
+    }
+}
+
 /// Factory for Pattern Federation stub types.
 pub struct PatternFederationStubFactory {
     viz_type: VizType,
@@ -900,6 +1228,11 @@ impl VizRegistry {
         registry.register(VizType::ReasoningTree, Box::new(ReasoningTreeVizFactory));
         registry.register(VizType::ProgressBar, Box::new(ProgressBarVizFactory));
         registry.register(VizType::KnowledgeCard, Box::new(KnowledgeCardVizFactory));
+
+        // Design system types (Runner Dashboard)
+        registry.register(VizType::EmptyState, Box::new(EmptyStateVizFactory));
+        registry.register(VizType::TabLayout, Box::new(TabLayoutVizFactory));
+        registry.register(VizType::ProgressRing, Box::new(ProgressRingVizFactory));
 
         // Pattern Federation stubs
         registry.register(
@@ -945,6 +1278,9 @@ mod tests {
         assert_eq!(VizType::FsmState.to_string(), "fsm_state");
         assert_eq!(VizType::ContextRouting.to_string(), "context_routing");
         assert_eq!(VizType::WaveProgress.to_string(), "wave_progress");
+        assert_eq!(VizType::EmptyState.to_string(), "empty_state");
+        assert_eq!(VizType::TabLayout.to_string(), "tab_layout");
+        assert_eq!(VizType::ProgressRing.to_string(), "progress_ring");
         assert_eq!(
             VizType::Custom("my_viz".into()).to_string(),
             "custom:my_viz"
@@ -1367,6 +1703,145 @@ mod tests {
             "Must have at least 7 viz types, found {}",
             types.len()
         );
-        // Plus Custom(String) makes it 11+
+        // Plus Custom(String) makes it 14+
+    }
+
+    // --- EmptyState builder tests ---
+
+    #[test]
+    fn test_empty_state_builder() {
+        let builder = EmptyStateVizBuilder {
+            icon: "robot".to_string(),
+            title: "No agents spawned".to_string(),
+            description: "Start a run to spawn agents".to_string(),
+            cta_label: Some("Start a run".to_string()),
+            cta_action: Some("start_run".to_string()),
+        };
+        let block = builder.build().unwrap();
+        assert_eq!(block.viz_type, VizType::EmptyState);
+        assert!(block.fallback_text.contains("🤖"));
+        assert!(block.fallback_text.contains("No agents spawned"));
+        assert!(block.fallback_text.contains("Start a run"));
+        assert_eq!(block.data["icon"], "robot");
+        assert_eq!(block.data["cta_label"], "Start a run");
+        assert_eq!(block.data["cta_action"], "start_run");
+    }
+
+    #[test]
+    fn test_empty_state_factory() {
+        let factory = EmptyStateVizFactory;
+        let params = serde_json::json!({
+            "icon": "inbox",
+            "title": "No data",
+            "description": "Nothing here yet",
+        });
+        let builder = factory.create(&params).unwrap();
+        let block = builder.build().unwrap();
+        assert_eq!(block.viz_type, VizType::EmptyState);
+        assert!(block.fallback_text.contains("📥"));
+        assert!(block.fallback_text.contains("No data"));
+    }
+
+    // --- TabLayout builder tests ---
+
+    #[test]
+    fn test_tab_layout_builder() {
+        let builder = TabLayoutVizBuilder {
+            tabs: vec![
+                TabDef { id: "waves".to_string(), label: "Waves".to_string(), icon: Some("wave".to_string()), badge: Some("3".to_string()) },
+                TabDef { id: "conversation".to_string(), label: "Conversation".to_string(), icon: None, badge: None },
+                TabDef { id: "details".to_string(), label: "Execution Details".to_string(), icon: None, badge: None },
+            ],
+            active_tab: "waves".to_string(),
+        };
+        let block = builder.build().unwrap();
+        assert_eq!(block.viz_type, VizType::TabLayout);
+        assert!(block.interactive);
+        assert!(block.fallback_text.contains("Waves"));
+        assert!(block.fallback_text.contains("[*]"));
+        assert!(block.fallback_text.contains("(3)"));
+        assert_eq!(block.data["tab_count"], 3);
+        assert_eq!(block.data["active_tab"], "waves");
+    }
+
+    #[test]
+    fn test_tab_layout_factory() {
+        let factory = TabLayoutVizFactory;
+        let params = serde_json::json!({
+            "tabs": [
+                {"id": "waves", "label": "Waves"},
+                {"id": "conv", "label": "Conversation"},
+            ],
+            "active_tab": "conv",
+        });
+        let builder = factory.create(&params).unwrap();
+        let block = builder.build().unwrap();
+        assert_eq!(block.data["active_tab"], "conv");
+        assert_eq!(block.data["tab_count"], 2);
+    }
+
+    // --- ProgressRing builder tests ---
+
+    #[test]
+    fn test_progress_ring_builder() {
+        let builder = ProgressRingVizBuilder {
+            percentage: 60.0,
+            label: "3/5 tasks".to_string(),
+            segments: vec![
+                ProgressSegment { status: "completed".to_string(), count: 3, color: Some("#22c55e".to_string()) },
+                ProgressSegment { status: "in_progress".to_string(), count: 1, color: Some("#3b82f6".to_string()) },
+                ProgressSegment { status: "pending".to_string(), count: 1, color: Some("#6b7280".to_string()) },
+            ],
+            animated: true,
+            ring_title: Some("My Plan".to_string()),
+        };
+        let block = builder.build().unwrap();
+        assert_eq!(block.viz_type, VizType::ProgressRing);
+        assert!(block.fallback_text.contains("60%"));
+        assert!(block.fallback_text.contains("3/5 tasks"));
+        assert!(block.fallback_text.contains("✅"));
+        assert_eq!(block.data["percentage"], 60.0);
+        assert_eq!(block.data["total"], 5);
+        assert_eq!(block.data["animated"], true);
+    }
+
+    #[test]
+    fn test_progress_ring_factory() {
+        let factory = ProgressRingVizFactory;
+        let params = serde_json::json!({
+            "percentage": 75.0,
+            "label": "6/8 done",
+            "segments": [
+                {"status": "completed", "count": 6},
+                {"status": "pending", "count": 2},
+            ],
+            "animated": false,
+            "title": "Build Plan",
+        });
+        let builder = factory.create(&params).unwrap();
+        let block = builder.build().unwrap();
+        assert_eq!(block.viz_type, VizType::ProgressRing);
+        assert_eq!(block.data["percentage"], 75.0);
+        assert_eq!(block.data["animated"], false);
+        assert_eq!(block.data["title"], "Build Plan");
+    }
+
+    // --- Registry includes new types ---
+
+    #[test]
+    fn test_registry_has_design_system_types() {
+        let registry = VizRegistry::with_builtins();
+        assert!(registry.has(&VizType::EmptyState));
+        assert!(registry.has(&VizType::TabLayout));
+        assert!(registry.has(&VizType::ProgressRing));
+    }
+
+    // --- from_str_loose for new types ---
+
+    #[test]
+    fn test_from_str_loose_new_types() {
+        assert_eq!(VizType::from_str_loose("empty_state"), VizType::EmptyState);
+        assert_eq!(VizType::from_str_loose("tab_layout"), VizType::TabLayout);
+        assert_eq!(VizType::from_str_loose("progress_ring"), VizType::ProgressRing);
     }
 }
