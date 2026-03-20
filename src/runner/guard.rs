@@ -118,6 +118,7 @@ impl HintSender for ChatManagerHintSender {
 
 impl AgentGuard {
     /// Create a new AgentGuard.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         session_id: String,
         task_title: String,
