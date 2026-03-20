@@ -760,6 +760,28 @@ impl PlanRunner {
         for (wave_idx, wave) in waves.iter().enumerate() {
             let wave_number = wave_idx + 1;
 
+            // Skip waves where all tasks are already completed (resume optimization)
+            let has_pending_tasks = wave.tasks.iter().any(|t| t.status != "completed");
+            if !has_pending_tasks {
+                info!(
+                    "Skipping wave {} — all {} tasks already completed",
+                    wave_number, wave.task_count
+                );
+                // Still track completed tasks in runner state
+                {
+                    let mut global = RUNNER_STATE.write().await;
+                    if let Some(ref mut s) = *global {
+                        for t in &wave.tasks {
+                            if !s.completed_tasks.contains(&t.id) {
+                                s.completed_tasks.push(t.id);
+                            }
+                        }
+                        s.current_wave = wave_number;
+                    }
+                }
+                continue;
+            }
+
             // Check cancel flag
             if RUNNER_CANCEL.load(Ordering::SeqCst) {
                 info!("Runner cancelled at wave {}", wave_number);
@@ -2095,6 +2117,8 @@ impl PlanRunner {
             guard_config,
             guard_rx,
             Some(hint_sender),
+            Some(self.graph.clone()),
+            Some(plan_id),
         );
 
         let guard_handle = tokio::spawn(async move { guard.monitor().await });

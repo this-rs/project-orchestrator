@@ -7,8 +7,10 @@
 //! - Compaction (re-inject task context after compaction)
 //! - AskUserQuestion (auto-respond for autonomous mode)
 
+use crate::chat::compaction_context::CompactionContextBuilder;
 use crate::chat::manager::ChatManager;
 use crate::chat::types::ChatEvent;
+use crate::neo4j::traits::GraphStore;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -79,6 +81,10 @@ pub struct AgentGuard {
     event_rx: broadcast::Receiver<ChatEvent>,
     /// Channel to send hints to the agent (via ChatManager::send_message)
     hint_tx: Option<Arc<dyn HintSender>>,
+    /// Graph store for building rich compaction context
+    graph: Option<Arc<dyn GraphStore>>,
+    /// Plan ID for compaction context (None = session mode)
+    plan_id: Option<Uuid>,
 }
 
 /// Trait for sending hints to the agent without interrupting.
@@ -117,6 +123,8 @@ impl AgentGuard {
         config: GuardConfig,
         event_rx: broadcast::Receiver<ChatEvent>,
         hint_tx: Option<Arc<dyn HintSender>>,
+        graph: Option<Arc<dyn GraphStore>>,
+        plan_id: Option<Uuid>,
     ) -> Self {
         Self {
             session_id,
@@ -125,6 +133,8 @@ impl AgentGuard {
             config,
             event_rx,
             hint_tx,
+            graph,
+            plan_id,
         }
     }
 
@@ -205,17 +215,11 @@ impl AgentGuard {
                             return GuardVerdict::Completed;
                         }
 
-                        // Compaction — re-inject task context
+                        // Compaction — re-inject rich task context
                         ChatEvent::CompactionStarted { .. } => {
                             info!("Guard: compaction detected, will re-inject context");
-                            self.inject_hint(&format!(
-                                "📋 Context reminder after compaction:\n\
-                                 You are working on task: {}\n\
-                                 Task ID: {}\n\
-                                 Continue where you left off.",
-                                self.task_title, self.task_id
-                            ))
-                            .await;
+                            let hint = self.build_compaction_hint().await;
+                            self.inject_hint(&hint).await;
                         }
 
                         // AskUserQuestion — auto-respond for autonomous mode
@@ -258,6 +262,57 @@ impl AgentGuard {
                         .await;
                     }
                 }
+            }
+        }
+    }
+
+    /// Build a rich compaction hint using `CompactionContextBuilder`.
+    ///
+    /// Falls back to a minimal 3-line hint if the builder fails (Neo4j down,
+    /// timeout, missing graph store, etc.).
+    async fn build_compaction_hint(&self) -> String {
+        // Fallback hint — always works, even without graph/plan
+        let fallback = format!(
+            "<system-reminder>\n\
+             # Post-Compaction Context (auto-restored)\n\n\
+             ## Task Context\n\
+             **Task:** {}\n\
+             **Task ID:** {}\n\
+             Continue where you left off.\n\
+             </system-reminder>",
+            self.task_title, self.task_id
+        );
+
+        let (graph, plan_id) = match (&self.graph, self.plan_id) {
+            (Some(g), Some(pid)) => (g.clone(), pid),
+            _ => return fallback,
+        };
+
+        let builder = CompactionContextBuilder::new(graph);
+
+        // Timeout at 500ms to stay within performance budget
+        match tokio::time::timeout(
+            Duration::from_millis(500),
+            builder.build_for_task(plan_id, self.task_id),
+        )
+        .await
+        {
+            Ok(Ok(ctx)) => {
+                let md = ctx.to_markdown();
+                if md.is_empty() || md.len() < 50 {
+                    warn!("Guard: compaction context too small, using fallback");
+                    fallback
+                } else {
+                    md
+                }
+            }
+            Ok(Err(e)) => {
+                warn!("Guard: CompactionContextBuilder failed: {}, using fallback", e);
+                fallback
+            }
+            Err(_) => {
+                warn!("Guard: CompactionContextBuilder timed out (>500ms), using fallback");
+                fallback
             }
         }
     }
@@ -340,6 +395,8 @@ mod tests {
             config,
             rx,
             None,
+            None,
+            None,
         );
 
         let verdict = guard.monitor().await;
@@ -367,6 +424,8 @@ mod tests {
             Uuid::new_v4(),
             config,
             rx,
+            None,
+            None,
             None,
         );
 
@@ -404,6 +463,8 @@ mod tests {
             Uuid::new_v4(),
             config,
             rx,
+            None,
+            None,
             None,
         );
 
@@ -453,6 +514,8 @@ mod tests {
             Some(Arc::new(MockHintSender {
                 count: hint_count_clone,
             })),
+            None,
+            None,
         );
 
         // Send 3 identical tool_use events then a Result
@@ -529,6 +592,8 @@ mod tests {
                 count: hint_count_clone,
                 last_message: last_message_clone,
             })),
+            None,
+            None,
         );
 
         // Send a Result after enough time for idle detection to fire
@@ -559,6 +624,139 @@ mod tests {
 
     #[tokio::test]
     async fn test_guard_compaction_reinjects_context() {
+        use crate::neo4j::mock::MockGraphStore;
+        use crate::neo4j::models::*;
+        use crate::neo4j::traits::GraphStore;
+        use crate::test_helpers::{test_plan, test_step, test_task_titled};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let hint_count = Arc::new(AtomicUsize::new(0));
+        let hint_count_clone = hint_count.clone();
+        let last_message = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let last_message_clone = last_message.clone();
+
+        struct MockHintSender {
+            count: Arc<AtomicUsize>,
+            last_message: Arc<tokio::sync::Mutex<String>>,
+        }
+
+        #[async_trait::async_trait]
+        impl HintSender for MockHintSender {
+            async fn send_hint(&self, _session_id: &str, message: &str) -> anyhow::Result<()> {
+                self.count.fetch_add(1, Ordering::SeqCst);
+                *self.last_message.lock().await = message.to_string();
+                Ok(())
+            }
+        }
+
+        // Seed MockGraphStore with a plan, task, and steps
+        let mock_graph = Arc::new(MockGraphStore::new());
+        let plan = test_plan();
+        let plan_id = plan.id;
+        mock_graph.create_plan(&plan).await.unwrap();
+
+        let mut task = test_task_titled("My Important Task");
+        task.status = TaskStatus::InProgress;
+        task.acceptance_criteria = vec!["Code compiles".to_string(), "Tests pass".to_string()];
+        let task_id = task.id;
+        mock_graph.create_task(plan_id, &task).await.unwrap();
+
+        let mut step1 = test_step(1, "Create CompactionContextBuilder struct");
+        step1.status = StepStatus::Completed;
+        mock_graph.create_step(task_id, &step1).await.unwrap();
+
+        let step2 = test_step(2, "Implement to_markdown formatting");
+        mock_graph.create_step(task_id, &step2).await.unwrap();
+
+        let (tx, rx) = broadcast::channel::<ChatEvent>(16);
+        let config = GuardConfig {
+            idle_timeout: Duration::from_secs(100),
+            task_timeout: Duration::from_secs(5),
+            loop_threshold: 3,
+            ..Default::default()
+        };
+
+        let guard = AgentGuard::new(
+            "test-session".to_string(),
+            "My Important Task".to_string(),
+            task_id,
+            config,
+            rx,
+            Some(Arc::new(MockHintSender {
+                count: hint_count_clone,
+                last_message: last_message_clone,
+            })),
+            Some(mock_graph),
+            Some(plan_id),
+        );
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let _ = tx.send(ChatEvent::CompactionStarted {
+                trigger: "auto".to_string(),
+            });
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let _ = tx.send(ChatEvent::Result {
+                session_id: "test".to_string(),
+                duration_ms: 100,
+                cost_usd: Some(0.01),
+                subtype: "success".to_string(),
+                is_error: false,
+                num_turns: Some(1),
+                result_text: None,
+            });
+        });
+
+        let verdict = guard.monitor().await;
+        assert!(matches!(verdict, GuardVerdict::Completed));
+        assert_eq!(
+            hint_count.load(Ordering::SeqCst),
+            1,
+            "Expected compaction hint"
+        );
+        let msg = last_message.lock().await;
+
+        // Verify structured sections from CompactionContextBuilder
+        assert!(
+            msg.contains("<system-reminder>"),
+            "Hint should be wrapped in system-reminder tags: {}",
+            msg
+        );
+        assert!(
+            msg.contains("</system-reminder>"),
+            "Hint should have closing system-reminder tag: {}",
+            msg
+        );
+        assert!(
+            msg.contains("## Task Context"),
+            "Hint should contain Task Context section: {}",
+            msg
+        );
+        assert!(
+            msg.contains("My Important Task"),
+            "Hint should contain task title: {}",
+            msg
+        );
+        assert!(
+            msg.contains("## Steps Progress"),
+            "Hint should contain Steps Progress section: {}",
+            msg
+        );
+        assert!(
+            msg.contains("✅"),
+            "Hint should show completed step icon: {}",
+            msg
+        );
+        assert!(
+            msg.contains("## Plan"),
+            "Hint should contain Plan section: {}",
+            msg
+        );
+    }
+
+    /// Test that compaction falls back to minimal hint when no graph is provided.
+    #[tokio::test]
+    async fn test_guard_compaction_fallback_without_graph() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let hint_count = Arc::new(AtomicUsize::new(0));
@@ -590,7 +788,7 @@ mod tests {
 
         let guard = AgentGuard::new(
             "test-session".to_string(),
-            "My Important Task".to_string(),
+            "Fallback Task".to_string(),
             Uuid::new_v4(),
             config,
             rx,
@@ -598,6 +796,8 @@ mod tests {
                 count: hint_count_clone,
                 last_message: last_message_clone,
             })),
+            None, // No graph
+            None, // No plan_id
         );
 
         tokio::spawn(async move {
@@ -619,15 +819,24 @@ mod tests {
 
         let verdict = guard.monitor().await;
         assert!(matches!(verdict, GuardVerdict::Completed));
-        assert_eq!(
-            hint_count.load(Ordering::SeqCst),
-            1,
-            "Expected compaction hint"
-        );
+        assert_eq!(hint_count.load(Ordering::SeqCst), 1);
         let msg = last_message.lock().await;
+
+        // Fallback should still wrap in system-reminder and contain task title
         assert!(
-            msg.contains("My Important Task"),
-            "Compaction hint should contain task title: {}",
+            msg.contains("<system-reminder>"),
+            "Fallback should use system-reminder tags: {}",
+            msg
+        );
+        assert!(
+            msg.contains("Fallback Task"),
+            "Fallback should contain task title: {}",
+            msg
+        );
+        // But should NOT have structured sections (no graph data)
+        assert!(
+            !msg.contains("## Steps Progress"),
+            "Fallback should NOT have Steps Progress: {}",
             msg
         );
     }
@@ -668,6 +877,8 @@ mod tests {
             Some(Arc::new(MockHintSender {
                 count: hint_count_clone,
             })),
+            None,
+            None,
         );
 
         tokio::spawn(async move {
