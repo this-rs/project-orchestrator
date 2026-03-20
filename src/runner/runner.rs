@@ -47,6 +47,12 @@ pub static RUNNER_STATE: LazyLock<Arc<RwLock<Option<RunnerState>>>> =
 pub static RUNNER_CANCEL: LazyLock<Arc<AtomicBool>> =
     LazyLock::new(|| Arc::new(AtomicBool::new(false)));
 
+/// Budget override — allows updating max_cost_usd during a running execution.
+/// Stores f64 bits in an AtomicU64 (0 = no override, use config default).
+/// Set via PATCH /api/plans/{plan_id}/run/budget.
+pub static RUNNER_BUDGET: LazyLock<Arc<std::sync::atomic::AtomicU64>> =
+    LazyLock::new(|| Arc::new(std::sync::atomic::AtomicU64::new(0)));
+
 /// Vector collector — accumulates drift/knowledge metrics during execution.
 /// Reset at the start of each run, finalized at the end.
 static VECTOR_COLLECTOR: LazyLock<Arc<RwLock<VectorCollector>>> =
@@ -219,9 +225,50 @@ pub struct RunStatus {
     pub tasks_total: usize,
     pub elapsed_secs: f64,
     pub cost_usd: f64,
+    /// Current effective budget limit (from override or config).
+    pub max_cost_usd: f64,
 }
 
 impl PlanRunner {
+    /// Get the effective max_cost_usd, checking for a runtime override.
+    pub fn effective_budget(&self) -> f64 {
+        let bits = RUNNER_BUDGET.load(std::sync::atomic::Ordering::Relaxed);
+        if bits == 0 {
+            self.config.max_cost_usd
+        } else {
+            f64::from_bits(bits)
+        }
+    }
+
+    /// Update the budget override for the currently running execution.
+    /// The new value takes effect on the next budget check in the execution loop.
+    pub async fn update_budget(run_id: Uuid, new_budget: f64) -> Result<()> {
+        if new_budget <= 0.0 {
+            return Err(anyhow!("Budget must be positive"));
+        }
+        let global = RUNNER_STATE.read().await;
+        match &*global {
+            Some(state) if state.run_id == run_id && state.status == PlanRunStatus::Running => {
+                let bits = new_budget.to_bits();
+                RUNNER_BUDGET.store(bits, std::sync::atomic::Ordering::Relaxed);
+                info!("Budget updated to ${:.2} for run {}", new_budget, run_id);
+                Ok(())
+            }
+            Some(state) => Err(anyhow!(
+                "Run {} is not running (status: {})",
+                run_id,
+                state.status
+            )),
+            None => Err(anyhow!("No active run")),
+        }
+    }
+
+    /// Get the current effective budget (static, no &self needed).
+    pub fn current_budget() -> f64 {
+        let bits = RUNNER_BUDGET.load(std::sync::atomic::Ordering::Relaxed);
+        if bits == 0 { 0.0 } else { f64::from_bits(bits) }
+    }
+
     /// Create a new PlanRunner.
     pub fn new(
         chat_manager: Arc<ChatManager>,
@@ -470,8 +517,12 @@ impl PlanRunner {
             *global = Some(state.clone());
         }
 
-        // Reset cancel flag and vector collector
+        // Reset cancel flag, budget override, and vector collector
         RUNNER_CANCEL.store(false, Ordering::SeqCst);
+        RUNNER_BUDGET.store(
+            self.config.max_cost_usd.to_bits(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         {
             let mut collector = VECTOR_COLLECTOR.write().await;
             *collector = VectorCollector::new();
@@ -597,6 +648,7 @@ impl PlanRunner {
                     tasks_total: state.total_tasks,
                     elapsed_secs: state.elapsed_secs(),
                     cost_usd: state.cost_usd,
+                    max_cost_usd: Self::current_budget(),
                 }
             }
             None => RunStatus {
@@ -613,6 +665,7 @@ impl PlanRunner {
                 tasks_total: 0,
                 elapsed_secs: 0.0,
                 cost_usd: 0.0,
+                max_cost_usd: 0.0,
             },
         }
     }
@@ -723,7 +776,7 @@ impl PlanRunner {
                         let global = RUNNER_STATE.read().await;
                         global
                             .as_ref()
-                            .map(|s| (s.cost_usd, self.config.max_cost_usd))
+                            .map(|s| (s.cost_usd, self.effective_budget()))
                             .unwrap_or((0.0, 0.0))
                     };
                     self.emit_event(RunnerEvent::BudgetExceeded {
@@ -1349,7 +1402,7 @@ impl PlanRunner {
             {
                 let global = RUNNER_STATE.read().await;
                 if let Some(ref s) = *global {
-                    if s.is_budget_exceeded(self.config.max_cost_usd) {
+                    if s.is_budget_exceeded(self.effective_budget()) {
                         wave_result.aborted = true;
                         drop(global);
                         join_set.abort_all();
@@ -1419,7 +1472,7 @@ impl PlanRunner {
                 {
                     let global = RUNNER_STATE.read().await;
                     if let Some(ref s) = *global {
-                        if s.is_budget_exceeded(self.config.max_cost_usd) {
+                        if s.is_budget_exceeded(self.effective_budget()) {
                             info!("Budget exceeded, skipping remaining retries");
                             break;
                         }
@@ -2069,10 +2122,10 @@ impl PlanRunner {
             let mut global = RUNNER_STATE.write().await;
             if let Some(ref mut s) = *global {
                 s.add_cost(cost_usd);
-                if s.is_budget_exceeded(self.config.max_cost_usd) {
+                if s.is_budget_exceeded(self.effective_budget()) {
                     return Ok(wrap(TaskResult::BudgetExceeded {
                         cumulated_cost_usd: s.cost_usd,
-                        limit_usd: self.config.max_cost_usd,
+                        limit_usd: self.effective_budget(),
                     }));
                 }
             }
@@ -2537,6 +2590,9 @@ impl PlanRunner {
                 _ => {}
             }
         }
+
+        // Clear budget override
+        RUNNER_BUDGET.store(0, std::sync::atomic::Ordering::Relaxed);
 
         let mut global = RUNNER_STATE.write().await;
         if let Some(ref mut s) = *global {

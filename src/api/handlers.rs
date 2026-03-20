@@ -5058,6 +5058,40 @@ pub async fn cancel_run(
     })))
 }
 
+/// PATCH /api/plans/{plan_id}/run/budget — Update the budget of a running execution.
+pub async fn update_run_budget(
+    State(_state): State<OrchestratorState>,
+    Path(_plan_id): Path<Uuid>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let max_cost_usd = body
+        .get("max_cost_usd")
+        .and_then(|v| v.as_f64())
+        .ok_or_else(|| {
+            AppError::BadRequest("Missing or invalid 'max_cost_usd' (must be a positive number)".to_string())
+        })?;
+
+    if max_cost_usd <= 0.0 {
+        return Err(AppError::BadRequest("max_cost_usd must be positive".to_string()));
+    }
+
+    // Get the current run_id
+    let status = crate::runner::PlanRunner::status().await;
+    let run_id = status
+        .run_id
+        .ok_or_else(|| AppError::NotFound("No active run".to_string()))?;
+
+    crate::runner::PlanRunner::update_budget(run_id, max_cost_usd)
+        .await
+        .map_err(AppError::Internal)?;
+
+    Ok(Json(serde_json::json!({
+        "updated": true,
+        "run_id": run_id,
+        "max_cost_usd": max_cost_usd,
+    })))
+}
+
 /// POST /api/plans/:id/run/auto-pr — Create a PR from a completed plan.
 ///
 /// Verifies the plan is completed, collects commits, generates a PR body,

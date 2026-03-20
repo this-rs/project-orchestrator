@@ -407,6 +407,10 @@ fn protected_routes() -> Router<OrchestratorState> {
             post(handlers::cancel_run),
         )
         .route(
+            "/api/plans/{plan_id}/run/budget",
+            axum::routing::patch(handlers::update_run_budget),
+        )
+        .route(
             "/api/plans/{plan_id}/run/auto-pr",
             post(handlers::create_auto_pr),
         )
