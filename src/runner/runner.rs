@@ -3148,6 +3148,7 @@ mod tests {
             tasks_total: 0,
             elapsed_secs: 0.0,
             cost_usd: 0.0,
+            max_cost_usd: 0.0,
         };
         let json = serde_json::to_string(&status).unwrap();
         assert!(json.contains("\"running\":false"));
