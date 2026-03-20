@@ -1071,10 +1071,10 @@ impl PlanRunner {
             .tasks
             .iter()
             .filter(|t| {
-                if t.status == "completed" {
+                if t.status.eq_ignore_ascii_case("completed") {
                     return false;
                 }
-                if t.status == "blocked" {
+                if t.status.eq_ignore_ascii_case("blocked") {
                     warn!(
                         "Skipping blocked task {}: {}",
                         t.id,
