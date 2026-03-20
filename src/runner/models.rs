@@ -379,6 +379,14 @@ pub enum RunnerEvent {
         conflicts: usize,
         worktrees_cleaned: usize,
     },
+    /// Lifecycle protocol FSM transition fired (for FSM Viewer)
+    LifecycleTransition {
+        run_id: Uuid,
+        lifecycle_run_id: Uuid,
+        from_state: String,
+        to_state: String,
+        trigger: String,
+    },
 }
 
 // ============================================================================
