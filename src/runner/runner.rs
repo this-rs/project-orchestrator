@@ -1,7 +1,7 @@
 //! PlanRunner — Main execution loop for autonomous plan execution.
 //!
 //! Orchestrates: get_next_task → spawn agent → monitor → verify → update_status → next.
-//! The Runner owns all task/step status transitions — the spawned agent must NOT update them.
+//! The Runner owns task status transitions — agents update step statuses in real-time via MCP.
 
 use crate::chat::manager::ChatManager;
 use crate::chat::types::{ChatEvent, ChatRequest};
@@ -2099,12 +2099,11 @@ impl PlanRunner {
             }
         }
 
-        // Auto-complete pending steps ONLY if the agent produced commits.
-        // The agent is instructed NOT to update step statuses via MCP
-        // (the Runner manages all status transitions). But we must verify that
-        // actual code work was done before blindly marking steps as completed —
-        // otherwise agents that produce no code get "ghost completions".
-        let agent_has_activity = {
+        // Fallback: auto-complete any steps the agent didn't update during execution.
+        // The agent is now instructed to update step statuses in real-time via MCP,
+        // but some steps may be missed (agent error, simple tasks, etc.).
+        // We only complete remaining pending/in_progress steps as a safety net.
+        {
             // Check for uncommitted changes — agent might have written code but forgot to commit
             let output = tokio::process::Command::new("git")
                 .args(["status", "--porcelain"])
@@ -2124,18 +2123,21 @@ impl PlanRunner {
                 );
             }
 
-            // For auto-complete, we're lenient: always auto-complete steps.
-            // The wave-level verify_has_commits will catch ghost completions
-            // and fail the task if no commits were produced for the entire wave.
-            true
-        };
-
-        if agent_has_activity {
             if let Ok(steps) = self.graph.get_task_steps(task_id).await {
-                for step in &steps {
-                    if step.status == crate::neo4j::models::StepStatus::Pending
-                        || step.status == crate::neo4j::models::StepStatus::InProgress
-                    {
+                let remaining: Vec<_> = steps
+                    .iter()
+                    .filter(|s| {
+                        s.status == crate::neo4j::models::StepStatus::Pending
+                            || s.status == crate::neo4j::models::StepStatus::InProgress
+                    })
+                    .collect();
+                if !remaining.is_empty() {
+                    info!(
+                        "Task {} — auto-completing {} remaining steps (agent didn't update them)",
+                        task_id,
+                        remaining.len()
+                    );
+                    for step in remaining {
                         if let Err(e) = self
                             .graph
                             .update_step_status(
@@ -2149,11 +2151,6 @@ impl PlanRunner {
                     }
                 }
             }
-        } else {
-            warn!(
-                "Task {} — skipping step auto-complete: agent produced no git activity",
-                task_id
-            );
         }
 
         // Post-execution: persist persona used on the task node (Step 5 — T9)

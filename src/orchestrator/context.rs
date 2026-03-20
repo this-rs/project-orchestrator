@@ -372,10 +372,11 @@ impl ContextBuilder {
                     _ => "[ ]",
                 };
                 s.push_str(&format!(
-                    "{} {}. {}\n",
+                    "{} {}. {} `[step_id: {}]`\n",
                     status,
                     step.order + 1,
-                    step.description
+                    step.description,
+                    step.id
                 ));
                 if let Some(ref verification) = step.verification {
                     s.push_str(&format!("   Verification: {}\n", verification));
@@ -584,10 +585,11 @@ impl ContextBuilder {
                     _ => "[ ]",
                 };
                 prompt.push_str(&format!(
-                    "{} {}. {}\n",
+                    "{} {}. {} `[step_id: {}]`\n",
                     status,
                     step.order + 1,
-                    step.description
+                    step.description,
+                    step.id
                 ));
                 if let Some(ref verification) = step.verification {
                     prompt.push_str(&format!("   Verification: {}\n", verification));
