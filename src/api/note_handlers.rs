@@ -1604,7 +1604,9 @@ pub async fn apply_feedback_rfc(
 
     match result {
         Some(applied) => Ok(Json(serde_json::to_value(&applied).unwrap_or_default())),
-        None => Err(AppError::NotFound("RFC note not found or not a valid runner-feedback RFC".to_string())),
+        None => Err(AppError::NotFound(
+            "RFC note not found or not a valid runner-feedback RFC".to_string(),
+        )),
     }
 }
 

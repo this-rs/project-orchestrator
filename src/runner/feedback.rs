@@ -83,8 +83,8 @@ impl RunnerFeedbackCollector {
         run_id: Uuid,
         project_id: Uuid,
     ) -> Result<Option<Uuid>> {
-        let episode = episode_collector::collect_episode(self.graph.as_ref(), run_id, project_id)
-            .await?;
+        let episode =
+            episode_collector::collect_episode(self.graph.as_ref(), run_id, project_id).await?;
 
         match episode {
             Some(ep) => {
@@ -346,7 +346,10 @@ impl RunnerFeedbackCollector {
                     skipped_state,
                     from_state,
                     to_state,
-                    override_info.reason.as_deref().unwrap_or("(no reason given)"),
+                    override_info
+                        .reason
+                        .as_deref()
+                        .unwrap_or("(no reason given)"),
                     skipped_state,
                 )
             }
@@ -372,7 +375,10 @@ impl RunnerFeedbackCollector {
                     trigger,
                     from_state,
                     to_state,
-                    override_info.reason.as_deref().unwrap_or("(no reason given)"),
+                    override_info
+                        .reason
+                        .as_deref()
+                        .unwrap_or("(no reason given)"),
                     trigger,
                 )
             }
@@ -395,7 +401,10 @@ impl RunnerFeedbackCollector {
                     override_info.timestamp,
                     step_description,
                     inserted_after_state,
-                    override_info.reason.as_deref().unwrap_or("(no reason given)"),
+                    override_info
+                        .reason
+                        .as_deref()
+                        .unwrap_or("(no reason given)"),
                 )
             }
         };
@@ -407,7 +416,13 @@ impl RunnerFeedbackCollector {
         };
 
         let note_id = self
-            .create_feedback_note(project_id, Some(run_id), tag, &content, NoteImportance::High)
+            .create_feedback_note(
+                project_id,
+                Some(run_id),
+                tag,
+                &content,
+                NoteImportance::High,
+            )
             .await?;
 
         info!(
@@ -646,7 +661,11 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(note_ids.len(), 1, "Should create one note per manual commit");
+        assert_eq!(
+            note_ids.len(),
+            1,
+            "Should create one note per manual commit"
+        );
 
         let notes = mock.notes.read().await;
         let note = notes.get(&note_ids[0]).unwrap();
@@ -787,9 +806,7 @@ mod tests {
         let note = notes.get(&note_id).unwrap();
         assert!(note.content.contains("State Skip"));
         assert!(note.content.contains("review"));
-        assert!(note
-            .tags
-            .contains(&"runner-override-skip".to_string()));
+        assert!(note.tags.contains(&"runner-override-skip".to_string()));
         assert!(note.tags.contains(&"runner-feedback".to_string()));
     }
 

@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 use crate::neo4j::traits::GraphStore;
 use crate::protocol::engine;
-use crate::protocol::routing::{ContextVector, DimensionWeights, rank_protocols};
+use crate::protocol::routing::{rank_protocols, ContextVector, DimensionWeights};
 
 /// Result of lifecycle protocol routing.
 #[derive(Debug, Clone)]
@@ -68,7 +68,10 @@ pub async fn route_lifecycle_protocol(
     let project_id = match plan.project_id {
         Some(pid) => pid,
         None => {
-            debug!("Plan {} has no project_id, skipping lifecycle routing", plan_id);
+            debug!(
+                "Plan {} has no project_id, skipping lifecycle routing",
+                plan_id
+            );
             return Ok(None);
         }
     };
@@ -95,9 +98,9 @@ pub async fn route_lifecycle_protocol(
     let context = ContextVector::from_plan_context(
         "execution", // We're at execution phase — the runner is starting
         total_tasks,
-        0,           // dependency count not cheaply available here
-        0,           // affected files count not cheaply available here
-        0.0,         // Just starting — 0% completion
+        0,   // dependency count not cheaply available here
+        0,   // affected files count not cheaply available here
+        0.0, // Just starting — 0% completion
     );
 
     // 4. Rank protocols by affinity
@@ -209,7 +212,10 @@ mod tests {
 
         let graph: Arc<dyn GraphStore> = mock;
         let result = route_lifecycle_protocol(&graph, plan_id, 5).await.unwrap();
-        assert!(result.is_none(), "Should return None when plan has no project_id");
+        assert!(
+            result.is_none(),
+            "Should return None when plan has no project_id"
+        );
     }
 
     #[tokio::test]
@@ -220,14 +226,19 @@ mod tests {
         // No protocols seeded — should return None
         let graph: Arc<dyn GraphStore> = mock;
         let result = route_lifecycle_protocol(&graph, plan_id, 5).await.unwrap();
-        assert!(result.is_none(), "Should return None when no lifecycle protocols exist");
+        assert!(
+            result.is_none(),
+            "Should return None when no lifecycle protocols exist"
+        );
     }
 
     #[tokio::test]
     async fn test_route_plan_not_found() {
         let mock = Arc::new(MockGraphStore::new());
         let graph: Arc<dyn GraphStore> = mock;
-        let result = route_lifecycle_protocol(&graph, Uuid::new_v4(), 5).await.unwrap();
+        let result = route_lifecycle_protocol(&graph, Uuid::new_v4(), 5)
+            .await
+            .unwrap();
         assert!(result.is_none(), "Should return None when plan not found");
     }
 }

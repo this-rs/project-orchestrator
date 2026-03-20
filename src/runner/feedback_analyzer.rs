@@ -257,10 +257,7 @@ impl FeedbackAnalyzer {
             ..Default::default()
         };
 
-        let (notes, _total) = self
-            .graph
-            .list_notes(project_id, None, &filters)
-            .await?;
+        let (notes, _total) = self.graph.list_notes(project_id, None, &filters).await?;
 
         info!(
             project_id = ?project_id,
@@ -319,7 +316,10 @@ impl FeedbackAnalyzer {
             return (key, state);
         }
 
-        if note.tags.contains(&"runner-override-transition".to_string()) {
+        if note
+            .tags
+            .contains(&"runner-override-transition".to_string())
+        {
             let trigger = self.extract_field(&note.content, "Custom trigger");
             let key = format!(
                 "custom_transition:{}",
@@ -956,10 +956,16 @@ mod tests {
         .await;
 
         let analyzer = FeedbackAnalyzer::new(mock as Arc<dyn GraphStore>);
-        let report = analyzer.analyze_runner_feedback(Some(project_id)).await.unwrap();
+        let report = analyzer
+            .analyze_runner_feedback(Some(project_id))
+            .await
+            .unwrap();
 
         assert_eq!(report.total_notes_analyzed, 5);
-        assert!(report.patterns.len() >= 2, "Should have at least 2 pattern groups");
+        assert!(
+            report.patterns.len() >= 2,
+            "Should have at least 2 pattern groups"
+        );
     }
 
     // ========================================================================
@@ -982,11 +988,17 @@ mod tests {
         .await;
 
         let analyzer = FeedbackAnalyzer::new(mock as Arc<dyn GraphStore>);
-        let report = analyzer.analyze_runner_feedback(Some(project_id)).await.unwrap();
+        let report = analyzer
+            .analyze_runner_feedback(Some(project_id))
+            .await
+            .unwrap();
 
         assert_eq!(report.actionable_count, 1);
         let pattern = report.patterns.first().unwrap();
-        assert_eq!(pattern.pattern_type, FeedbackPatternType::ManualCommitPostRun);
+        assert_eq!(
+            pattern.pattern_type,
+            FeedbackPatternType::ManualCommitPostRun
+        );
         assert!(pattern.is_actionable);
         assert!(
             matches!(pattern.suggestion, PatternSuggestion::UpgradeToFull),
@@ -1021,7 +1033,10 @@ mod tests {
         }
 
         let analyzer = FeedbackAnalyzer::new(mock as Arc<dyn GraphStore>);
-        let report = analyzer.analyze_runner_feedback(Some(project_id)).await.unwrap();
+        let report = analyzer
+            .analyze_runner_feedback(Some(project_id))
+            .await
+            .unwrap();
 
         let override_pattern = report
             .patterns
@@ -1052,7 +1067,10 @@ mod tests {
         .await;
 
         let analyzer = FeedbackAnalyzer::new(mock as Arc<dyn GraphStore>);
-        let report = analyzer.analyze_runner_feedback(Some(project_id)).await.unwrap();
+        let report = analyzer
+            .analyze_runner_feedback(Some(project_id))
+            .await
+            .unwrap();
 
         assert_eq!(report.actionable_count, 0);
         assert!(!report.patterns[0].is_actionable);
@@ -1081,13 +1099,20 @@ mod tests {
         .await;
 
         let analyzer = FeedbackAnalyzer::new(mock.clone() as Arc<dyn GraphStore>);
-        let report = analyzer.analyze_runner_feedback(Some(project_id)).await.unwrap();
+        let report = analyzer
+            .analyze_runner_feedback(Some(project_id))
+            .await
+            .unwrap();
         let rfc_ids = analyzer
             .generate_rfc_proposals(project_id, &report)
             .await
             .unwrap();
 
-        assert_eq!(rfc_ids.len(), 1, "Should generate one RFC for the actionable pattern");
+        assert_eq!(
+            rfc_ids.len(),
+            1,
+            "Should generate one RFC for the actionable pattern"
+        );
 
         // Verify the RFC note
         let notes = mock.notes.read().await;
@@ -1115,10 +1140,7 @@ mod tests {
             "## RFC\n```json\n{\"name\": \"test-protocol\", \"description\": \"test\", \"evidence_count\": 5}\n```\n".to_string(),
             "RFC: upgrade".to_string(),
         );
-        rfc.tags = vec![
-            "runner-feedback-rfc".to_string(),
-            "proposed".to_string(),
-        ];
+        rfc.tags = vec!["runner-feedback-rfc".to_string(), "proposed".to_string()];
         let rfc_id = rfc.id;
         mock.notes.write().await.insert(rfc_id, rfc);
 
@@ -1233,10 +1255,7 @@ mod tests {
         let analyzer = FeedbackAnalyzer::new(Arc::new(MockGraphStore::new()));
         let run_id = Uuid::new_v4();
         let content = format!("## Run\n**Run ID**: {}\n**Other**: stuff\n", run_id);
-        assert_eq!(
-            analyzer.extract_run_id_from_content(&content),
-            Some(run_id)
-        );
+        assert_eq!(analyzer.extract_run_id_from_content(&content), Some(run_id));
     }
 
     #[test]

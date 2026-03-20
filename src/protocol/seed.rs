@@ -1128,8 +1128,13 @@ mod tests {
             "completed",
             "failed",
         ];
-        setup_protocol_in_mock(&mock, project_id, "plan-runner-reviewed", &runner_reviewed_states)
-            .await;
+        setup_protocol_in_mock(
+            &mock,
+            project_id,
+            "plan-runner-reviewed",
+            &runner_reviewed_states,
+        )
+        .await;
 
         let result = seed_prompt_fragments(&mock, project_id).await.unwrap();
 

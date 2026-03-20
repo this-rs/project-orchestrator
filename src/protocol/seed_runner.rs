@@ -172,12 +172,15 @@ pub async fn seed_runner_protocols(
             let mut pt = ProtocolTransition::new(proto.id, *from_id, *to_id, t.trigger);
             pt.guard = t.guard.map(|g| g.to_string());
 
-            graph.upsert_protocol_transition(&pt).await.with_context(|| {
-                format!(
-                    "Failed to upsert transition '{} -> {}' in '{}'",
-                    t.from, t.to, def.name
-                )
-            })?;
+            graph
+                .upsert_protocol_transition(&pt)
+                .await
+                .with_context(|| {
+                    format!(
+                        "Failed to upsert transition '{} -> {}' in '{}'",
+                        t.from, t.to, def.name
+                    )
+                })?;
         }
 
         info!(
@@ -1008,7 +1011,10 @@ mod tests {
         let def = build_plan_runner_light();
         assert_eq!(def.name, "plan-runner-light");
         let names: Vec<&str> = def.states.iter().map(|s| s.name).collect();
-        assert!(!names.contains(&"pr_decision"), "Light runner should not have pr_decision");
+        assert!(
+            !names.contains(&"pr_decision"),
+            "Light runner should not have pr_decision"
+        );
         assert_eq!(names.len(), 5);
         assert_eq!(def.transitions.len(), 6);
     }
@@ -1102,10 +1108,31 @@ mod tests {
     #[test]
     fn test_runner_available_tools_are_valid() {
         let valid_tools = [
-            "project", "plan", "task", "step", "decision", "constraint", "release", "milestone",
-            "commit", "note", "workspace", "workspace_milestone", "resource", "component", "chat",
-            "feature_graph", "code", "reasoning", "admin", "skill", "analysis_profile", "protocol",
-            "persona", "episode", "sharing",
+            "project",
+            "plan",
+            "task",
+            "step",
+            "decision",
+            "constraint",
+            "release",
+            "milestone",
+            "commit",
+            "note",
+            "workspace",
+            "workspace_milestone",
+            "resource",
+            "component",
+            "chat",
+            "feature_graph",
+            "code",
+            "reasoning",
+            "admin",
+            "skill",
+            "analysis_profile",
+            "protocol",
+            "persona",
+            "episode",
+            "sharing",
         ];
 
         let defs = build_runner_protocol_defs();

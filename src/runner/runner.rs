@@ -12,6 +12,7 @@ use crate::orchestrator::context::ContextBuilder;
 use crate::runner::enricher::TaskEnricher;
 use crate::runner::git;
 use crate::runner::guard::{AgentGuard, ChatManagerHintSender, GuardConfig, GuardVerdict};
+use crate::runner::lifecycle;
 use crate::runner::models::{
     ActiveAgent, ActiveAgentSnapshot, PlanRunStatus, RunnerConfig, RunnerEvent,
     TaskExecutionReport, TaskResult, TaskRunStatus, TriggerSource,
@@ -21,7 +22,6 @@ use crate::runner::persona::{
 };
 #[cfg(test)]
 use crate::runner::prompt::{build_runner_constraints, RunnerPromptContext};
-use crate::runner::lifecycle;
 use crate::runner::state::RunnerState;
 use crate::runner::vector::VectorCollector;
 use crate::runner::verifier::{TaskVerifier, VerifyResult};
@@ -435,8 +435,15 @@ impl PlanRunner {
                 let mut done_state = saved_state.clone();
                 done_state.finalize(PlanRunStatus::Completed);
                 self.graph.update_plan_run(&done_state).await?;
-                if let Err(e) = self.graph.update_plan_status(plan_id, PlanStatus::Completed).await {
-                    warn!("Failed to set plan {} status to Completed on recovery: {}", plan_id, e);
+                if let Err(e) = self
+                    .graph
+                    .update_plan_status(plan_id, PlanStatus::Completed)
+                    .await
+                {
+                    warn!(
+                        "Failed to set plan {} status to Completed on recovery: {}",
+                        plan_id, e
+                    );
                 }
                 continue;
             }
@@ -476,7 +483,11 @@ impl PlanRunner {
                     if let Some(ref mut s) = *global {
                         s.finalize(PlanRunStatus::Failed);
                         let _ = runner.graph.update_plan_run(s).await;
-                        if let Err(e) = runner.graph.update_plan_status(s.plan_id, PlanStatus::Cancelled).await {
+                        if let Err(e) = runner
+                            .graph
+                            .update_plan_status(s.plan_id, PlanStatus::Cancelled)
+                            .await
+                        {
                             warn!("Failed to set plan {} status to Cancelled after recovery failure: {}", s.plan_id, e);
                         }
                     }
@@ -544,7 +555,11 @@ impl PlanRunner {
         }
 
         // Transition plan status to InProgress (idempotent — warn if already in_progress)
-        if let Err(e) = self.graph.update_plan_status(plan_id, PlanStatus::InProgress).await {
+        if let Err(e) = self
+            .graph
+            .update_plan_status(plan_id, PlanStatus::InProgress)
+            .await
+        {
             warn!(
                 "Failed to set plan {} status to in_progress (may already be in_progress): {}",
                 plan_id, e
@@ -558,7 +573,10 @@ impl PlanRunner {
             Ok(Some(route_result)) => {
                 info!(
                     "Plan {} wrapped by lifecycle protocol {} (run: {}, affinity: {:.2})",
-                    plan_id, route_result.protocol_name, route_result.run_id, route_result.affinity_score
+                    plan_id,
+                    route_result.protocol_name,
+                    route_result.run_id,
+                    route_result.affinity_score
                 );
                 let mut global = RUNNER_STATE.write().await;
                 if let Some(ref mut s) = *global {
@@ -566,10 +584,16 @@ impl PlanRunner {
                 }
             }
             Ok(None) => {
-                debug!("No lifecycle protocol for plan {} — using default runner flow", plan_id);
+                debug!(
+                    "No lifecycle protocol for plan {} — using default runner flow",
+                    plan_id
+                );
             }
             Err(e) => {
-                warn!("Lifecycle protocol routing failed for plan {}: {}. Continuing without.", plan_id, e);
+                warn!(
+                    "Lifecycle protocol routing failed for plan {}: {}. Continuing without.",
+                    plan_id, e
+                );
             }
         }
 
@@ -648,8 +672,15 @@ impl PlanRunner {
                     s.finalize(PlanRunStatus::Failed);
                     let _ = runner.graph.update_plan_run(s).await;
                     // Also transition plan status to Cancelled (failed run)
-                    if let Err(e) = runner.graph.update_plan_status(s.plan_id, PlanStatus::Cancelled).await {
-                        warn!("Failed to set plan {} status to Cancelled after error: {}", s.plan_id, e);
+                    if let Err(e) = runner
+                        .graph
+                        .update_plan_status(s.plan_id, PlanStatus::Cancelled)
+                        .await
+                    {
+                        warn!(
+                            "Failed to set plan {} status to Cancelled after error: {}",
+                            s.plan_id, e
+                        );
                     }
                 }
             }
@@ -695,8 +726,14 @@ impl PlanRunner {
                     error!("Failed to persist force-cancelled run to Neo4j: {}", e);
                 }
                 // Transition plan status to Cancelled
-                if let Err(e) = graph.update_plan_status(plan_id, PlanStatus::Cancelled).await {
-                    warn!("Failed to set plan {} status to Cancelled on force-cancel: {}", plan_id, e);
+                if let Err(e) = graph
+                    .update_plan_status(plan_id, PlanStatus::Cancelled)
+                    .await
+                {
+                    warn!(
+                        "Failed to set plan {} status to Cancelled on force-cancel: {}",
+                        plan_id, e
+                    );
                 }
                 info!("Runner force-cancelled run {}", run_id);
                 // Clear the global state so a new run can start
@@ -2069,9 +2106,10 @@ impl PlanRunner {
             permission_mode: Some("bypassPermissions".to_string()),
             add_dirs: None,
             workspace_slug: None,
-            user_claims: Some(crate::auth::jwt::Claims::service_account(
-                &format!("runner-agent:{}", run_id),
-            )),
+            user_claims: Some(crate::auth::jwt::Claims::service_account(&format!(
+                "runner-agent:{}",
+                run_id
+            ))),
             spawned_by: Some(
                 serde_json::json!({
                     "type": "runner",
@@ -2901,7 +2939,9 @@ impl PlanRunner {
             if plan_id != Uuid::nil() {
                 let plan_status = match status {
                     PlanRunStatus::Completed => Some(PlanStatus::Completed),
-                    PlanRunStatus::Failed | PlanRunStatus::BudgetExceeded => Some(PlanStatus::Cancelled),
+                    PlanRunStatus::Failed | PlanRunStatus::BudgetExceeded => {
+                        Some(PlanStatus::Cancelled)
+                    }
                     PlanRunStatus::Cancelled => Some(PlanStatus::Cancelled),
                     _ => None,
                 };
@@ -3069,12 +3109,7 @@ impl PlanRunner {
     /// Non-fatal: logs warnings on failure but never propagates errors.
     /// This ensures the runner completes even if the lifecycle protocol
     /// has issues (graceful degradation).
-    async fn fire_lifecycle_transition(
-        &self,
-        run_id: Uuid,
-        lifecycle_run_id: Uuid,
-        trigger: &str,
-    ) {
+    async fn fire_lifecycle_transition(&self, run_id: Uuid, lifecycle_run_id: Uuid, trigger: &str) {
         // Capture current state name before transition
         let from_state = match self.graph.get_protocol_run(lifecycle_run_id).await {
             Ok(Some(run)) => run
@@ -3148,7 +3183,9 @@ impl PlanRunner {
                 tasks.iter().any(|t| {
                     // Check tags
                     let has_impl_tag = t.tags.iter().any(|tag| {
-                        implementation_tags.iter().any(|it| tag.to_lowercase().contains(it))
+                        implementation_tags
+                            .iter()
+                            .any(|it| tag.to_lowercase().contains(it))
                     });
                     // Check affected_files
                     let has_files = !t.affected_files.is_empty();

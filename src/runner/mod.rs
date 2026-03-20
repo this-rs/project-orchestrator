@@ -35,9 +35,17 @@ pub mod verifier;
 
 // Re-export key types for convenience
 pub use enricher::{EnrichResult, TaskEnricher};
-pub use lifecycle::{route_lifecycle_protocol, LifecycleRouteResult};
+pub use feedback::{
+    contains_dissatisfaction, ManualCommitInfo, OverrideType, PostRunMessage,
+    RunnerFeedbackCollector, UserOverride,
+};
+pub use feedback_analyzer::{
+    AppliedProtocol, DetectedPattern, FeedbackAnalyzer, FeedbackPatternType, FeedbackReport,
+    PatternSuggestion, ProtocolTrust, TrustStatus,
+};
 pub use git::{WorktreeCollector, WorktreeInfo, WorktreeResolution};
 pub use guard::{AgentGuard, ChatManagerHintSender, GuardConfig, GuardVerdict, HintSender};
+pub use lifecycle::{route_lifecycle_protocol, LifecycleRouteResult};
 pub use models::{
     ActiveAgent, ActiveAgentSnapshot, PlanRunStatus, RunSnapshot, RunnerConfig, RunnerEvent,
     TaskExecutionReport, TaskResult, TaskRunStatus, TaskStateMachine, Trigger, TriggerFiring,
@@ -58,13 +66,5 @@ pub use trigger::TriggerEngine;
 pub use vector::{
     compare_vectors, predict_run, predict_run_per_agent, AgentExecutionVector,
     AgentVectorCollector, ComparisonResult, ExecutionVector, RunPrediction,
-};
-pub use feedback::{
-    contains_dissatisfaction, ManualCommitInfo, OverrideType, PostRunMessage,
-    RunnerFeedbackCollector, UserOverride,
-};
-pub use feedback_analyzer::{
-    AppliedProtocol, DetectedPattern, FeedbackAnalyzer, FeedbackPatternType, FeedbackReport,
-    PatternSuggestion, ProtocolTrust, TrustStatus,
 };
 pub use verifier::{TaskVerifier, VerifyResult};
