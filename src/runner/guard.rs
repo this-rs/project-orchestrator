@@ -46,6 +46,9 @@ pub struct GuardConfig {
     pub idle_timeout: Duration,
     /// Task timeout — force stop if exceeded
     pub task_timeout: Duration,
+    /// Spawning timeout — max time to wait for create_session() before aborting.
+    /// Prevents indefinite hangs when ChatManager/Neo4j is unresponsive. Default: 120s.
+    pub spawning_timeout: Duration,
     /// Max consecutive identical tool_use before loop warning
     pub loop_threshold: usize,
     /// Interval between idle/timeout checks (default 5s)
@@ -57,6 +60,7 @@ impl Default for GuardConfig {
         Self {
             idle_timeout: Duration::from_secs(180),
             task_timeout: Duration::from_secs(10800),
+            spawning_timeout: Duration::from_secs(120),
             loop_threshold: 3,
             check_interval: Duration::from_secs(5),
         }
@@ -661,6 +665,7 @@ mod tests {
             task_timeout: Duration::from_secs(5),
             loop_threshold: 3,
             check_interval: Duration::from_millis(20), // Fast checks for test
+            ..Default::default()
         };
 
         let guard = AgentGuard::new(
@@ -1029,6 +1034,7 @@ mod tests {
             task_timeout: Duration::from_secs(5),
             loop_threshold: 3,
             check_interval: Duration::from_millis(20),
+            ..Default::default()
         };
 
         let guard = AgentGuard::new(
@@ -1072,6 +1078,7 @@ mod tests {
             task_timeout: Duration::from_secs(5),
             loop_threshold: 3,
             check_interval: Duration::from_millis(20),
+            ..Default::default()
         };
 
         let guard = AgentGuard::new(

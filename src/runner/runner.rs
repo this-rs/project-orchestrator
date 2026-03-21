@@ -362,6 +362,9 @@ impl PlanRunner {
                 RunnerEvent::WorktreeRecovery { run_id, .. } => {
                     (run_id.to_string(), CrudAction::Updated)
                 }
+                RunnerEvent::TaskSpawningTimeout { run_id, .. } => {
+                    (run_id.to_string(), CrudAction::Updated)
+                }
                 RunnerEvent::LifecycleTransition { run_id, .. } => {
                     (run_id.to_string(), CrudAction::StatusChanged)
                 }
@@ -2220,7 +2223,57 @@ impl PlanRunner {
             runner_context: Some(runner_context),
         };
 
-        let session = self.chat_manager.create_session(&request).await?;
+        let spawning_timeout = Duration::from_secs(self.config.spawning_timeout_secs);
+        let session = match tokio::time::timeout(
+            spawning_timeout,
+            self.chat_manager.create_session(&request),
+        )
+        .await
+        {
+            Ok(Ok(session)) => session,
+            Ok(Err(e)) => {
+                // create_session returned an error (not a timeout)
+                return Err(e);
+            }
+            Err(_elapsed) => {
+                // Spawning timed out — create_session() hung
+                warn!(
+                    "Task {} — create_session() timed out after {}s",
+                    task_id, self.config.spawning_timeout_secs
+                );
+                self.emit_event(RunnerEvent::TaskSpawningTimeout {
+                    run_id,
+                    task_id,
+                    task_title: task_title.to_string(),
+                    timeout_secs: self.config.spawning_timeout_secs,
+                });
+                // Transition agent status: Spawning → Timeout
+                {
+                    let mut global = RUNNER_STATE.write().await;
+                    if let Some(ref mut s) = *global {
+                        s.update_agent_status(&task_id, TaskRunStatus::Timeout);
+                    }
+                }
+                let result = TaskResult::Failed {
+                    reason: format!(
+                        "Agent spawning timed out after {}s — create_session() did not respond",
+                        self.config.spawning_timeout_secs
+                    ),
+                    attempts: 0,
+                    cost_usd: 0.0,
+                };
+                self.finalize_steps(task_id, &result, cwd).await;
+                return Ok(TaskExecutionResult {
+                    result,
+                    session_id: None,
+                    activated_skill_ids: activated_skill_ids.clone(),
+                    persona_ids: persona_ids_for_feedback.clone(),
+                    agent_execution_id: Uuid::new_v4(),
+                    persona_profile: String::new(),
+                    report: None,
+                });
+            }
+        };
         let session_id = session.session_id.clone();
         let session_uuid = session_id.parse::<Uuid>().ok();
 
@@ -2298,6 +2351,7 @@ impl PlanRunner {
         let guard_config = GuardConfig {
             idle_timeout: Duration::from_secs(self.config.idle_timeout_secs),
             task_timeout: Duration::from_secs(task_profile.timeout_secs),
+            spawning_timeout: Duration::from_secs(self.config.spawning_timeout_secs),
             loop_threshold: 3,
             ..Default::default()
         };

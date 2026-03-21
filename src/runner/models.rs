@@ -35,6 +35,9 @@ pub struct RunnerConfig {
     pub test_runner: bool,
     /// Maximum total cost (USD) for the entire plan run. Abort if exceeded. Default: 10.0.
     pub max_cost_usd: f64,
+    /// Spawning timeout (seconds) — max time to wait for create_session() before aborting.
+    /// Prevents indefinite hangs when ChatManager/Neo4j is unresponsive. Default: 120 (2 min).
+    pub spawning_timeout_secs: u64,
 }
 
 impl Default for RunnerConfig {
@@ -47,6 +50,7 @@ impl Default for RunnerConfig {
             build_check: true,
             test_runner: false,
             max_cost_usd: 10.0,
+            spawning_timeout_secs: 120,
         }
     }
 }
@@ -118,6 +122,7 @@ impl TaskStateMachine {
                 | (Verifying, Completed)
                 // Failure paths
                 | (Spawning, Failed)
+                | (Spawning, Timeout)
                 | (Running, Failed)
                 | (Running, Timeout)
                 | (Verifying, Failed)
@@ -361,6 +366,13 @@ pub enum RunnerEvent {
         tasks_failed: usize,
         /// PR URL if auto-PR was created
         pr_url: Option<String>,
+    },
+    /// Agent spawning timed out — create_session() took too long
+    TaskSpawningTimeout {
+        run_id: Uuid,
+        task_id: Uuid,
+        task_title: String,
+        timeout_secs: u64,
     },
     /// A runner error occurred (non-fatal)
     RunnerError { run_id: Uuid, message: String },
@@ -626,6 +638,7 @@ mod tests {
         assert!(config.build_check);
         assert!(!config.test_runner);
         assert!((config.max_cost_usd - 10.0).abs() < f64::EPSILON);
+        assert_eq!(config.spawning_timeout_secs, 120);
     }
 
     #[test]
@@ -654,6 +667,7 @@ mod tests {
 
         // Failure paths
         assert!(TaskStateMachine::transition(Spawning, Failed).is_ok());
+        assert!(TaskStateMachine::transition(Spawning, Timeout).is_ok());
         assert!(TaskStateMachine::transition(Running, Failed).is_ok());
         assert!(TaskStateMachine::transition(Running, Timeout).is_ok());
         assert!(TaskStateMachine::transition(Verifying, Failed).is_ok());
@@ -947,5 +961,53 @@ mod tests {
         assert!(json.contains("\"type\":\"conversation\""));
         let back: SpawnedBy = serde_json::from_str(&json).unwrap();
         assert_eq!(back, spawned);
+    }
+
+    // ========================================================================
+    // Spawning timeout tests
+    // ========================================================================
+
+    #[test]
+    fn test_spawning_timeout_event_serialization() {
+        let event = RunnerEvent::TaskSpawningTimeout {
+            run_id: Uuid::nil(),
+            task_id: Uuid::nil(),
+            task_title: "Test task".into(),
+            timeout_secs: 120,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"event\":\"task_spawning_timeout\""));
+        assert!(json.contains("\"timeout_secs\":120"));
+    }
+
+    #[test]
+    fn test_spawning_timeout_secs_in_config() {
+        // Default
+        let config = RunnerConfig::default();
+        assert_eq!(config.spawning_timeout_secs, 120);
+
+        // Custom via YAML
+        let yaml = r#"
+            spawning_timeout_secs: 30
+        "#;
+        let config: RunnerConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.spawning_timeout_secs, 30);
+        // Other defaults still applied
+        assert_eq!(config.task_timeout_secs, 10800);
+    }
+
+    #[test]
+    fn test_guard_config_spawning_timeout_default() {
+        let config = crate::runner::guard::GuardConfig::default();
+        assert_eq!(config.spawning_timeout, std::time::Duration::from_secs(120));
+    }
+
+    #[test]
+    fn test_spawning_to_timeout_transition() {
+        use TaskRunStatus::*;
+        assert!(
+            TaskStateMachine::transition(Spawning, Timeout).is_ok(),
+            "Spawning → Timeout should be a valid transition for spawning timeout"
+        );
     }
 }
