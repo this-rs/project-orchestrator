@@ -513,23 +513,21 @@ impl MetricNoise {
 
     /// Generate a Gaussian random value using the Box-Muller transform.
     fn gaussian_noise(&self, original: f64) -> f64 {
-        use rand::Rng;
+        use rand::{RngExt, SeedableRng};
 
         let std_dev = self.sigma * original.abs().max(1.0);
 
-        let mut rng = if let Some(seed) = self.seed {
+        let mut rng: rand::rngs::StdRng = if let Some(seed) = self.seed {
             // Deterministic RNG for testing
-            use rand::SeedableRng;
             rand::rngs::StdRng::seed_from_u64(seed)
         } else {
-            use rand::SeedableRng;
-            rand::rngs::StdRng::from_os_rng()
+            rand::rngs::StdRng::from_rng(&mut rand::rng())
         };
 
         // Box-Muller transform
         let u1: f64 = rng.random_range(f64::EPSILON..1.0);
         let u2: f64 = rng.random_range(0.0..std::f64::consts::TAU);
-        let z = (-2.0 * u1.ln()).sqrt() * u2.cos();
+        let z: f64 = (-2.0_f64 * u1.ln()).sqrt() * u2.cos();
 
         z * std_dev
     }
