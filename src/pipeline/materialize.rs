@@ -19,7 +19,9 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::neo4j::GraphStore;
-use crate::notes::models::{MemoryHorizon, Note, NoteFilters, NoteImportance, NoteScope, NoteStatus, NoteType};
+use crate::notes::models::{
+    MemoryHorizon, Note, NoteFilters, NoteImportance, NoteScope, NoteStatus, NoteType,
+};
 use crate::pipeline::feedback::{DetectedPattern, PatternType, SkillRecommendation};
 use crate::skills::models::{SkillNode, SkillTrigger, TriggerType};
 
@@ -106,9 +108,7 @@ pub async fn materialize_patterns(
     // 2. Create skills from high-confidence recommendations
     for rec in recommendations {
         // Find the source pattern by matching description
-        let source_pattern = patterns
-            .iter()
-            .find(|p| rec.description == p.description);
+        let source_pattern = patterns.iter().find(|p| rec.description == p.description);
 
         let confidence = source_pattern.map(|p| p.confidence).unwrap_or(0.0);
         if confidence < 0.75 {
@@ -198,7 +198,12 @@ async fn create_note_from_pattern(
     );
 
     // Create the note
-    let mut note = Note::new(Some(project_id), note_type, content, "learning-loop".to_string());
+    let mut note = Note::new(
+        Some(project_id),
+        note_type,
+        content,
+        "learning-loop".to_string(),
+    );
     note.importance = importance;
     note.memory_horizon = MemoryHorizon::Ephemeral;
     note.scar_intensity = scar;

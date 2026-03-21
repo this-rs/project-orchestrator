@@ -490,7 +490,10 @@ mod tests {
         // Verify ordering: SCAR (priority 3) appears before CO-CHANGE (priority 1)
         let scar_pos = prompt.find("SCAR").unwrap();
         let co_change_pos = prompt.find("CO-CHANGE").unwrap();
-        assert!(scar_pos < co_change_pos, "ScarWarning should appear before CoChangeReminder");
+        assert!(
+            scar_pos < co_change_pos,
+            "ScarWarning should appear before CoChangeReminder"
+        );
     }
 
     #[test]

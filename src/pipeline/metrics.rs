@@ -85,8 +85,9 @@ impl LearningMetrics {
             limit: Some(500),
             ..Default::default()
         };
-        let (auto_learned_notes, _) =
-            graph.list_notes(Some(project_id), None, &auto_learned_filters).await?;
+        let (auto_learned_notes, _) = graph
+            .list_notes(Some(project_id), None, &auto_learned_filters)
+            .await?;
 
         let total_auto_learned = auto_learned_notes.len();
         let activated_auto_learned = auto_learned_notes
@@ -104,7 +105,9 @@ impl LearningMetrics {
             limit: Some(500),
             ..Default::default()
         };
-        let (all_notes, _) = graph.list_notes(Some(project_id), None, &all_filters).await?;
+        let (all_notes, _) = graph
+            .list_notes(Some(project_id), None, &all_filters)
+            .await?;
         let scarred_notes: Vec<_> = all_notes
             .iter()
             .filter(|n| n.scar_intensity > 0.0)
@@ -143,8 +146,9 @@ impl LearningMetrics {
             limit: Some(500),
             ..Default::default()
         };
-        let (archived_notes, _) =
-            graph.list_notes(Some(project_id), None, &archived_filters).await?;
+        let (archived_notes, _) = graph
+            .list_notes(Some(project_id), None, &archived_filters)
+            .await?;
         let notes_archived_by_decay = archived_notes.len();
 
         let promoted_filters = NoteFilters {
@@ -152,8 +156,9 @@ impl LearningMetrics {
             limit: Some(500),
             ..Default::default()
         };
-        let (promoted_notes, _) =
-            graph.list_notes(Some(project_id), None, &promoted_filters).await?;
+        let (promoted_notes, _) = graph
+            .list_notes(Some(project_id), None, &promoted_filters)
+            .await?;
         let notes_promoted = promoted_notes.len();
 
         Ok(Self {
@@ -235,14 +240,7 @@ pub async fn decay_ineffective_notes(
             "Archiving ineffective auto-learned note"
         );
         graph
-            .update_note(
-                note.id,
-                None,
-                None,
-                Some(NoteStatus::Archived),
-                None,
-                None,
-            )
+            .update_note(note.id, None, None, Some(NoteStatus::Archived), None, None)
             .await?;
         archived_count += 1;
     }
@@ -340,14 +338,7 @@ pub async fn promote_battle_tested_notes(
 
         // Update tags via update_note
         graph
-            .update_note(
-                note.id,
-                None,
-                None,
-                None,
-                Some(new_tags),
-                None,
-            )
+            .update_note(note.id, None, None, None, Some(new_tags), None)
             .await?;
 
         // Note: memory_horizon promotion to Consolidated is handled by

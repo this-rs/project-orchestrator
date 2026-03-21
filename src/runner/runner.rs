@@ -694,10 +694,7 @@ impl PlanRunner {
     /// When a `ChatManager` is provided, all active agent sessions are
     /// forcefully closed (interrupt + SIGKILL) so that Claude Code
     /// subprocesses don't keep running after the cancel is requested.
-    pub async fn cancel(
-        run_id: Uuid,
-        chat_manager: Option<Arc<ChatManager>>,
-    ) -> Result<()> {
+    pub async fn cancel(run_id: Uuid, chat_manager: Option<Arc<ChatManager>>) -> Result<()> {
         let global = RUNNER_STATE.read().await;
         match &*global {
             Some(state) if state.run_id == run_id && state.status == PlanRunStatus::Running => {
@@ -709,7 +706,9 @@ impl PlanRunner {
                     let session_ids: Vec<Uuid> = state
                         .active_agents
                         .iter()
-                        .filter(|a| matches!(a.status, TaskRunStatus::Running | TaskRunStatus::Spawning))
+                        .filter(|a| {
+                            matches!(a.status, TaskRunStatus::Running | TaskRunStatus::Spawning)
+                        })
                         .filter_map(|a| a.session_id)
                         .collect();
                     drop(global); // release lock before async close calls
@@ -1629,7 +1628,9 @@ impl PlanRunner {
                         let session_ids: Vec<Uuid> = s
                             .active_agents
                             .iter()
-                            .filter(|a| matches!(a.status, TaskRunStatus::Running | TaskRunStatus::Spawning))
+                            .filter(|a| {
+                                matches!(a.status, TaskRunStatus::Running | TaskRunStatus::Spawning)
+                            })
                             .filter_map(|a| a.session_id)
                             .collect();
                         drop(global);

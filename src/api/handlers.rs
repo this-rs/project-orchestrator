@@ -3929,12 +3929,10 @@ pub async fn get_learning_metrics(
         .map_err(AppError::Internal)?
         .ok_or_else(|| AppError::NotFound(format!("Project not found: {}", project_id)))?;
 
-    let metrics = crate::pipeline::metrics::LearningMetrics::compute(
-        state.orchestrator.neo4j(),
-        project_id,
-    )
-    .await
-    .map_err(AppError::Internal)?;
+    let metrics =
+        crate::pipeline::metrics::LearningMetrics::compute(state.orchestrator.neo4j(), project_id)
+            .await
+            .map_err(AppError::Internal)?;
 
     Ok(Json(serde_json::to_value(&metrics).unwrap_or_default()))
 }
@@ -5101,9 +5099,13 @@ pub async fn force_cancel_run(
         .run_id
         .ok_or_else(|| AppError::NotFound("No active run".to_string()))?;
 
-    crate::runner::PlanRunner::force_cancel(run_id, state.orchestrator.neo4j_arc(), state.chat_manager.clone())
-        .await
-        .map_err(AppError::Internal)?;
+    crate::runner::PlanRunner::force_cancel(
+        run_id,
+        state.orchestrator.neo4j_arc(),
+        state.chat_manager.clone(),
+    )
+    .await
+    .map_err(AppError::Internal)?;
 
     Ok(Json(serde_json::json!({
         "force_cancelled": true,

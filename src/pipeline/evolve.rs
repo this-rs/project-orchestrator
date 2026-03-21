@@ -118,7 +118,10 @@ pub fn pattern_to_mutations(pattern: &DetectedPattern) -> Vec<MutationRule> {
                 });
             }
 
-            if gates_lower.iter().any(|g| g.contains("clippy") || g.contains("lint")) {
+            if gates_lower
+                .iter()
+                .any(|g| g.contains("clippy") || g.contains("lint"))
+            {
                 rules.push(MutationRule {
                     state_name: "lint_check".to_string(),
                     state_description: "Auto-added: run linter after implementation (learned from frequent lint failures)".to_string(),
@@ -134,7 +137,10 @@ pub fn pattern_to_mutations(pattern: &DetectedPattern) -> Vec<MutationRule> {
                 });
             }
 
-            if gates_lower.iter().any(|g| g.contains("check") || g.contains("compile")) {
+            if gates_lower
+                .iter()
+                .any(|g| g.contains("check") || g.contains("compile"))
+            {
                 rules.push(MutationRule {
                     state_name: "cargo_check".to_string(),
                     state_description: "Auto-added: compilation check after implementation (learned from frequent build failures)".to_string(),
@@ -355,28 +361,18 @@ impl ProtocolEvolver {
         self.graph.upsert_protocol_state(&new_state).await?;
 
         // 2. Find insertion point
-        let (predecessor_id, successor_id) = self.find_insertion_point(
-            existing_states,
-            rule.insert_after.as_deref(),
-        )?;
+        let (predecessor_id, successor_id) =
+            self.find_insertion_point(existing_states, rule.insert_after.as_deref())?;
 
         // 3. Create transitions
         // Predecessor → new state
-        let t_in = ProtocolTransition::new(
-            protocol_id,
-            predecessor_id,
-            new_state.id,
-            &rule.trigger_in,
-        );
+        let t_in =
+            ProtocolTransition::new(protocol_id, predecessor_id, new_state.id, &rule.trigger_in);
         self.graph.upsert_protocol_transition(&t_in).await?;
 
         // New state → successor
-        let t_out = ProtocolTransition::new(
-            protocol_id,
-            new_state.id,
-            successor_id,
-            &rule.trigger_out,
-        );
+        let t_out =
+            ProtocolTransition::new(protocol_id, new_state.id, successor_id, &rule.trigger_out);
         self.graph.upsert_protocol_transition(&t_out).await?;
 
         // 4. Create Decision for traceability (if we have a task_id)
@@ -425,10 +421,7 @@ impl ProtocolEvolver {
                 .iter()
                 .find(|s| s.name == after_name)
                 .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "Cannot find state '{}' to insert after",
-                        after_name
-                    )
+                    anyhow::anyhow!("Cannot find state '{}' to insert after", after_name)
                 })?;
 
             // Successor = first terminal state, or the state that typically follows
@@ -546,10 +539,7 @@ impl ProtocolEvolver {
         // Find and remove auto-evolved states
         let states = self.graph.get_protocol_states(protocol_id).await?;
         for state in &states {
-            if state
-                .description
-                .starts_with("Auto-added:")
-            {
+            if state.description.starts_with("Auto-added:") {
                 // Remove transitions pointing to/from this state
                 let transitions = self.graph.get_protocol_transitions(protocol_id).await?;
                 for t in &transitions {
@@ -584,10 +574,7 @@ impl ProtocolEvolver {
                     "learning-loop".to_string(),
                 );
                 note.importance = crate::notes::models::NoteImportance::High;
-                note.tags = vec![
-                    "auto-learned".to_string(),
-                    "auto-revert".to_string(),
-                ];
+                note.tags = vec!["auto-learned".to_string(), "auto-revert".to_string()];
                 note.memory_horizon = crate::notes::models::MemoryHorizon::Ephemeral;
                 note.scar_intensity = 0.8;
 

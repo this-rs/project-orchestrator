@@ -465,7 +465,13 @@ async fn on_plan_status_changed(event: CrudEvent, state: Arc<ServerState>) {
     let event_bus = state.event_bus.clone();
     let neo4j_arc = state.orchestrator.neo4j_arc();
     tokio::spawn(async move {
-        match crate::episodes::collector::collect_episode(neo4j_arc.as_ref(), lifecycle_run_id, project_id).await {
+        match crate::episodes::collector::collect_episode(
+            neo4j_arc.as_ref(),
+            lifecycle_run_id,
+            project_id,
+        )
+        .await
+        {
             Ok(Some(episode)) => {
                 let episode_id = episode.id;
                 info!(
@@ -482,11 +488,15 @@ async fn on_plan_status_changed(event: CrudEvent, state: Arc<ServerState>) {
                     "project_id": project_id.to_string(),
                     "source": "plan_completed",
                 });
-                event_bus.emit(CrudEvent::new(
-                    EntityType::Episode,
-                    CrudAction::Collected,
-                    &episode_id.to_string(),
-                ).with_payload(payload).with_project_id(project_id.to_string()));
+                event_bus.emit(
+                    CrudEvent::new(
+                        EntityType::Episode,
+                        CrudAction::Collected,
+                        &episode_id.to_string(),
+                    )
+                    .with_payload(payload)
+                    .with_project_id(project_id.to_string()),
+                );
             }
             Ok(None) => {
                 debug!(
@@ -582,7 +592,9 @@ async fn on_protocol_run_completed_collect_episode(event: CrudEvent, state: Arc<
     let event_bus = state.event_bus.clone();
     let neo4j_arc = state.orchestrator.neo4j_arc();
     tokio::spawn(async move {
-        match crate::episodes::collector::collect_episode(neo4j_arc.as_ref(), run_id, project_id).await {
+        match crate::episodes::collector::collect_episode(neo4j_arc.as_ref(), run_id, project_id)
+            .await
+        {
             Ok(Some(episode)) => {
                 let episode_id = episode.id;
                 info!(
@@ -598,11 +610,15 @@ async fn on_protocol_run_completed_collect_episode(event: CrudEvent, state: Arc<
                     "project_id": project_id.to_string(),
                     "source": "protocol_run_completed",
                 });
-                event_bus.emit(CrudEvent::new(
-                    EntityType::Episode,
-                    CrudAction::Collected,
-                    &episode_id.to_string(),
-                ).with_payload(payload).with_project_id(project_id.to_string()));
+                event_bus.emit(
+                    CrudEvent::new(
+                        EntityType::Episode,
+                        CrudAction::Collected,
+                        &episode_id.to_string(),
+                    )
+                    .with_payload(payload)
+                    .with_project_id(project_id.to_string()),
+                );
             }
             Ok(None) => {
                 debug!(run_id = %run_id, "on_protocol_run_completed: run not found for collection");
@@ -642,13 +658,23 @@ async fn on_episode_collected_analyze_patterns(event: CrudEvent, state: Arc<Serv
     }
 
     let episode_id_str = event.entity_id.clone();
-    let project_id_str = event
-        .project_id
-        .clone()
-        .or_else(|| event.payload.get("project_id").and_then(|v| v.as_str()).map(String::from));
-    let run_id_str = event.payload.get("run_id").and_then(|v| v.as_str()).map(String::from);
+    let project_id_str = event.project_id.clone().or_else(|| {
+        event
+            .payload
+            .get("project_id")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+    });
+    let run_id_str = event
+        .payload
+        .get("run_id")
+        .and_then(|v| v.as_str())
+        .map(String::from);
 
-    let project_id = match project_id_str.as_deref().and_then(|s| s.parse::<uuid::Uuid>().ok()) {
+    let project_id = match project_id_str
+        .as_deref()
+        .and_then(|s| s.parse::<uuid::Uuid>().ok())
+    {
         Some(id) => id,
         None => {
             debug!(
@@ -670,7 +696,9 @@ async fn on_episode_collected_analyze_patterns(event: CrudEvent, state: Arc<Serv
         }
     };
 
-    let run_id = run_id_str.as_deref().and_then(|s| s.parse::<uuid::Uuid>().ok());
+    let run_id = run_id_str
+        .as_deref()
+        .and_then(|s| s.parse::<uuid::Uuid>().ok());
 
     info!(
         episode_id = %episode_id,
@@ -686,23 +714,20 @@ async fn on_episode_collected_analyze_patterns(event: CrudEvent, state: Arc<Serv
         // 1. Load recent episodes for this project (batch analysis, last 50)
         //    Batch analysis detects recurring patterns across multiple runs,
         //    which is far more robust than single-episode analysis.
-        let episodes = match crate::episodes::collector::list_episodes(
-            neo4j_arc.as_ref(),
-            project_id,
-            50,
-        )
-        .await
-        {
-            Ok(eps) => eps,
-            Err(e) => {
-                error!(
-                    project_id = %project_id,
-                    error = %e,
-                    "on_episode_collected: failed to list episodes for analysis"
-                );
-                return;
-            }
-        };
+        let episodes =
+            match crate::episodes::collector::list_episodes(neo4j_arc.as_ref(), project_id, 50)
+                .await
+            {
+                Ok(eps) => eps,
+                Err(e) => {
+                    error!(
+                        project_id = %project_id,
+                        error = %e,
+                        "on_episode_collected: failed to list episodes for analysis"
+                    );
+                    return;
+                }
+            };
 
         if episodes.len() < 3 {
             debug!(
@@ -714,11 +739,9 @@ async fn on_episode_collected_analyze_patterns(event: CrudEvent, state: Arc<Serv
         }
 
         // 2. Resolve protocol names for all episodes
-        let protocol_names = crate::pipeline::episode_adapter::resolve_protocol_names(
-            neo4j_arc.as_ref(),
-            &episodes,
-        )
-        .await;
+        let protocol_names =
+            crate::pipeline::episode_adapter::resolve_protocol_names(neo4j_arc.as_ref(), &episodes)
+                .await;
 
         // 3. Convert Episodes → EpisodeData via adapter (batch)
         let episode_pairs: Vec<_> = episodes.into_iter().zip(protocol_names).collect();
@@ -965,10 +988,7 @@ async fn on_patterns_detected_evolve(event: CrudEvent, state: Arc<ServerState>) 
 
     tokio::spawn(async move {
         // Find all protocols for this project
-        let protocols = match neo4j_arc
-            .list_protocols(project_id, None, 50, 0)
-            .await
-        {
+        let protocols = match neo4j_arc.list_protocols(project_id, None, 50, 0).await {
             Ok((protos, _)) => protos,
             Err(e) => {
                 warn!(
@@ -1729,7 +1749,10 @@ mod tests {
         plan.project_id = Some(project_id);
         let plan_id = plan.id;
         neo4j.create_plan(&plan).await.unwrap();
-        neo4j.link_plan_to_project(plan_id, project_id).await.unwrap();
+        neo4j
+            .link_plan_to_project(plan_id, project_id)
+            .await
+            .unwrap();
 
         // Create a protocol run (the lifecycle run)
         let mut run = ProtocolRun::new(Uuid::new_v4(), Uuid::new_v4(), "Start");

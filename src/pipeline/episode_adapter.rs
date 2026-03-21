@@ -264,10 +264,7 @@ mod tests {
             map_outcome(&FeedbackType::ExplicitNegative),
             EpisodeOutcome::Failure
         );
-        assert_eq!(
-            map_outcome(&FeedbackType::None),
-            EpisodeOutcome::Partial
-        );
+        assert_eq!(map_outcome(&FeedbackType::None), EpisodeOutcome::Partial);
     }
 
     #[test]
@@ -329,10 +326,7 @@ mod tests {
     #[test]
     fn counts_retries_correctly() {
         // No retries
-        assert_eq!(
-            count_retries(&["a".into(), "b".into(), "c".into()]),
-            0
-        );
+        assert_eq!(count_retries(&["a".into(), "b".into(), "c".into()]), 0);
 
         // One state retried once
         assert_eq!(
@@ -386,10 +380,7 @@ mod tests {
         let ep1 = sample_episode();
         let ep2 = sample_episode();
 
-        let pairs = vec![
-            (ep1, "proto-a".to_string()),
-            (ep2, "proto-b".to_string()),
-        ];
+        let pairs = vec![(ep1, "proto-a".to_string()), (ep2, "proto-b".to_string())];
 
         let data = episodes_to_data(&pairs);
         assert_eq!(data.len(), 2);
