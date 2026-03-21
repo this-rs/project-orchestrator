@@ -626,6 +626,7 @@ impl ToolHandler {
             ("admin", "seed_prompt_fragments") => "seed_prompt_fragments",
             ("admin", "install_hooks") => "install_hooks",
             ("admin", "get_learning_stats") => "get_learning_stats",
+            ("admin", "learning_metrics") => "learning_metrics",
             ("admin", "analyze_runner_feedback") => "analyze_runner_feedback",
 
             // Lifecycle Hooks
@@ -2696,6 +2697,17 @@ impl ToolHandler {
                         &format!("/api/admin/deep-maintenance/{}", pid),
                         &Value::Object(serde_json::Map::new()),
                     )
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "learning_metrics" => {
+                let pid = args
+                    .get("project_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("project_id is required"))?;
+                let result = http
+                    .get(&format!("/api/admin/learning-metrics/{}", pid))
                     .await?;
                 Ok(Some(result))
             }

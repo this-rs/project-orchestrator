@@ -29,6 +29,10 @@ pub struct DetectedPattern {
     pub related_gates: Vec<String>,
     /// Suggested action/recommendation.
     pub recommendation: String,
+    /// Files affected by this pattern (extracted from source episodes).
+    /// Used by T3 MATERIALIZE to link auto-created notes to code entities.
+    #[serde(default)]
+    pub affected_files: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

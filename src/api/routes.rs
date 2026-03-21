@@ -1453,6 +1453,10 @@ fn protected_routes() -> Router<OrchestratorState> {
             post(handlers::run_deep_maintenance),
         )
         .route(
+            "/api/admin/learning-metrics/{project_id}",
+            get(handlers::get_learning_metrics),
+        )
+        .route(
             "/api/admin/seed-prompt-fragments/{project_id}",
             post(handlers::seed_prompt_fragments),
         )

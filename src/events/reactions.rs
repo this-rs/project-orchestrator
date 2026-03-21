@@ -622,14 +622,19 @@ async fn on_protocol_run_completed_collect_episode(event: CrudEvent, state: Arc<
 // Reaction: Episode::Collected → analyze patterns (T2)
 // ─────────────────────────────────────────────────────────────
 
-/// When an episode is collected, analyze it for patterns using the
-/// `EpisodeAnalyzer` and emit `Learning::PatternsDetected` if any
-/// significant patterns are found.
+/// When an episode is collected, load all recent episodes for the project,
+/// run batch pattern analysis via [`EpisodeAnalyzer`], and emit
+/// `Learning::PatternsDetected` if significant recurring patterns are found.
 ///
-/// This is the T2 step of the autonomous learning loop:
-/// Episode::Collected → EpisodeAdapter → EpisodeAnalyzer → Learning::PatternsDetected
+/// This is the T2 (ANALYZE) step of the autonomous learning loop:
+/// `Episode::Collected → batch episodes → EpisodeAdapter → EpisodeAnalyzer → Learning::PatternsDetected`
 ///
-/// Fire-and-forget via tokio::spawn to avoid blocking the event reactor.
+/// **Design**: Uses batch analysis (last 50 episodes) with `min_frequency=3`,
+/// `min_confidence=0.5` to avoid false positives. Requires ≥3 episodes before
+/// activating. The full payload includes detected patterns AND skill
+/// recommendations for T3 (MATERIALIZE) to consume.
+///
+/// Fire-and-forget via `tokio::spawn` to avoid blocking the event reactor.
 async fn on_episode_collected_analyze_patterns(event: CrudEvent, state: Arc<ServerState>) {
     // Only react to Episode::Collected
     if event.entity_type != EntityType::Episode || event.action != CrudAction::Collected {
@@ -802,6 +807,225 @@ async fn on_episode_collected_analyze_patterns(event: CrudEvent, state: Arc<Serv
 }
 
 // ─────────────────────────────────────────────────────────────
+// Reaction: Learning::PatternsDetected → materialize (T3)
+// ─────────────────────────────────────────────────────────────
+
+/// When patterns are detected (from T2), materialize them into concrete
+/// knowledge graph entities: notes, skills, and neural scars.
+///
+/// This is the T3 (MATERIALIZE) step of the autonomous learning loop:
+/// `Learning::PatternsDetected → deserialize patterns → materialize_patterns()`
+///
+/// Fire-and-forget via `tokio::spawn` to avoid blocking the event reactor.
+async fn on_patterns_detected_materialize(event: CrudEvent, state: Arc<ServerState>) {
+    let project_id_str = match event.payload.get("project_id").and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => {
+            debug!("on_patterns_detected: no project_id in payload, skipping");
+            return;
+        }
+    };
+
+    let project_id = match Uuid::parse_str(&project_id_str) {
+        Ok(id) => id,
+        Err(_) => {
+            warn!(
+                project_id = %project_id_str,
+                "on_patterns_detected: invalid project_id UUID"
+            );
+            return;
+        }
+    };
+
+    let patterns_count = event
+        .payload
+        .get("patterns_count")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+
+    if patterns_count == 0 {
+        debug!(project_id = %project_id, "on_patterns_detected: zero patterns, skipping");
+        return;
+    }
+
+    info!(
+        project_id = %project_id,
+        patterns_count = patterns_count,
+        "on_patterns_detected: starting materialization (T3)"
+    );
+
+    // Deserialize patterns and recommendations from the event payload
+    let patterns: Vec<crate::pipeline::feedback::DetectedPattern> = event
+        .payload
+        .get("patterns")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+
+    let recommendations: Vec<crate::pipeline::feedback::SkillRecommendation> = event
+        .payload
+        .get("recommendations")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+
+    if patterns.is_empty() {
+        debug!(project_id = %project_id, "on_patterns_detected: failed to deserialize patterns");
+        return;
+    }
+
+    let neo4j_arc = state.orchestrator.neo4j_arc();
+
+    tokio::spawn(async move {
+        match crate::pipeline::materialize::materialize_patterns(
+            neo4j_arc.as_ref(),
+            project_id,
+            &patterns,
+            &recommendations,
+        )
+        .await
+        {
+            Ok(result) => {
+                info!(
+                    project_id = %project_id,
+                    notes_created = result.notes_created,
+                    notes_skipped = result.notes_skipped,
+                    skills_created = result.skills_created,
+                    "on_patterns_detected: materialization complete (T3)"
+                );
+            }
+            Err(e) => {
+                error!(
+                    project_id = %project_id,
+                    error = %e,
+                    "on_patterns_detected: materialization failed"
+                );
+            }
+        }
+    });
+}
+
+// ─────────────────────────────────────────────────────────────
+// Reaction: Learning::PatternsDetected → evolve protocols (T6)
+// ─────────────────────────────────────────────────────────────
+
+/// When patterns are detected (from T2), evolve project protocols by applying
+/// learned mutations (add states like `run_tests`, `lint_check`, `review`).
+///
+/// Chain: `Learning::PatternsDetected → filter high-confidence → ProtocolEvolver::evolve()`
+///
+/// Fire-and-forget via `tokio::spawn` to avoid blocking the event reactor.
+async fn on_patterns_detected_evolve(event: CrudEvent, state: Arc<ServerState>) {
+    let project_id_str = match event.payload.get("project_id").and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => {
+            debug!("on_patterns_detected_evolve: no project_id in payload, skipping");
+            return;
+        }
+    };
+
+    let project_id = match Uuid::parse_str(&project_id_str) {
+        Ok(id) => id,
+        Err(_) => {
+            warn!(
+                project_id = %project_id_str,
+                "on_patterns_detected_evolve: invalid project_id UUID"
+            );
+            return;
+        }
+    };
+
+    // Deserialize patterns from the event payload
+    let patterns: Vec<crate::pipeline::feedback::DetectedPattern> = event
+        .payload
+        .get("patterns")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+
+    if patterns.is_empty() {
+        debug!(project_id = %project_id, "on_patterns_detected_evolve: no patterns, skipping");
+        return;
+    }
+
+    // Only evolve if there are high-confidence patterns (≥0.8)
+    let high_confidence_count = patterns.iter().filter(|p| p.confidence >= 0.8).count();
+    if high_confidence_count == 0 {
+        debug!(
+            project_id = %project_id,
+            "on_patterns_detected_evolve: no high-confidence patterns (≥0.8), skipping"
+        );
+        return;
+    }
+
+    info!(
+        project_id = %project_id,
+        high_confidence_count = high_confidence_count,
+        "on_patterns_detected_evolve: starting protocol evolution (T6)"
+    );
+
+    let neo4j_arc = state.orchestrator.neo4j_arc();
+
+    tokio::spawn(async move {
+        // Find all protocols for this project
+        let protocols = match neo4j_arc
+            .list_protocols(project_id, None, 50, 0)
+            .await
+        {
+            Ok((protos, _)) => protos,
+            Err(e) => {
+                warn!(
+                    project_id = %project_id,
+                    error = %e,
+                    "on_patterns_detected_evolve: failed to list protocols"
+                );
+                return;
+            }
+        };
+
+        if protocols.is_empty() {
+            debug!(
+                project_id = %project_id,
+                "on_patterns_detected_evolve: no protocols found for project, skipping"
+            );
+            return;
+        }
+
+        let evolver = crate::pipeline::evolve::ProtocolEvolver::new(neo4j_arc.clone());
+
+        // Apply mutations to each protocol
+        for protocol in &protocols {
+            match evolver.evolve(protocol.id, &patterns, None).await {
+                Ok(result) => {
+                    if result.applied_count > 0 {
+                        info!(
+                            project_id = %project_id,
+                            protocol_id = %protocol.id,
+                            protocol_name = %protocol.name,
+                            applied = result.applied_count,
+                            skipped = result.skipped_count,
+                            "on_patterns_detected_evolve: protocol evolved (T6)"
+                        );
+                    } else {
+                        debug!(
+                            project_id = %project_id,
+                            protocol_id = %protocol.id,
+                            skipped = result.skipped_count,
+                            "on_patterns_detected_evolve: no mutations applied (all skipped)"
+                        );
+                    }
+                }
+                Err(e) => {
+                    error!(
+                        project_id = %project_id,
+                        protocol_id = %protocol.id,
+                        error = %e,
+                        "on_patterns_detected_evolve: evolution failed"
+                    );
+                }
+            }
+        }
+    });
+}
+
+// ─────────────────────────────────────────────────────────────
 // Reaction: *::StatusChanged → evaluate LifecycleHooks
 // ─────────────────────────────────────────────────────────────
 
@@ -848,7 +1072,9 @@ fn extract_state(ctx: Arc<dyn std::any::Any + Send + Sync>) -> Arc<ServerState> 
 /// 4. **plan-completed** — `Plan::StatusChanged(Completed|Failed)` → collect episode + emit Episode::Collected
 /// 5. **protocol-run-episode-collect** — `ProtocolRun::StatusChanged(Completed|Failed)` → collect episode + emit Episode::Collected
 /// 6. **episode-analyze-patterns** — `Episode::Collected` → analyze patterns via EpisodeAnalyzer + emit Learning::PatternsDetected
-/// 7. **lifecycle-hooks** — `*::StatusChanged` → evaluate and execute LifecycleHooks
+/// 7. **patterns-materialize** — `Learning::PatternsDetected` → materialize patterns into notes/skills/scars
+/// 8. **patterns-evolve** — `Learning::PatternsDetected` → evolve protocols via adaptive mutations
+/// 9. **lifecycle-hooks** — `*::StatusChanged` → evaluate and execute LifecycleHooks
 pub fn register_builtin_reactions(
     builder: ReactorBuilder,
     _state: Arc<ServerState>,
@@ -917,6 +1143,26 @@ pub fn register_builtin_reactions(
             Arc::new(|event, ctx| -> Pin<Box<dyn Future<Output = ()> + Send>> {
                 Box::pin(async move {
                     on_episode_collected_analyze_patterns(event, extract_state(ctx)).await;
+                })
+            }),
+        )
+        .on(
+            "patterns-materialize",
+            Some(EntityType::Learning),
+            Some(CrudAction::PatternsDetected),
+            Arc::new(|event, ctx| -> Pin<Box<dyn Future<Output = ()> + Send>> {
+                Box::pin(async move {
+                    on_patterns_detected_materialize(event, extract_state(ctx)).await;
+                })
+            }),
+        )
+        .on(
+            "patterns-evolve",
+            Some(EntityType::Learning),
+            Some(CrudAction::PatternsDetected),
+            Arc::new(|event, ctx| -> Pin<Box<dyn Future<Output = ()> + Send>> {
+                Box::pin(async move {
+                    on_patterns_detected_evolve(event, extract_state(ctx)).await;
                 })
             }),
         )
