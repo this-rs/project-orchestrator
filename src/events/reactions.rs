@@ -775,37 +775,16 @@ async fn on_episode_collected_analyze_patterns(event: CrudEvent, state: Arc<Serv
         );
 
         // 6. Emit Learning::PatternsDetected with full payload for T3 (MATERIALIZE)
+        // Use serde_json::to_value() instead of manual serialization to ensure
+        // field names match the Deserialize impl (e.g., PatternType variants).
         let patterns_payload: Vec<serde_json::Value> = patterns
             .iter()
-            .map(|p| {
-                serde_json::json!({
-                    "id": p.id,
-                    "pattern_type": format!("{:?}", p.pattern_type),
-                    "description": p.description,
-                    "frequency": p.frequency,
-                    "confidence": p.confidence,
-                    "recommendation": p.recommendation,
-                    "tech_stacks": p.tech_stacks,
-                    "related_gates": p.related_gates,
-                })
-            })
+            .filter_map(|p| serde_json::to_value(p).ok())
             .collect();
 
         let recommendations_payload: Vec<serde_json::Value> = recommendations
             .iter()
-            .map(|r| {
-                serde_json::json!({
-                    "name": r.name,
-                    "description": r.description,
-                    "tags": r.tags,
-                    "trigger_patterns": r.trigger_patterns,
-                    "notes": r.notes.iter().map(|n| serde_json::json!({
-                        "note_type": n.note_type,
-                        "content": n.content,
-                        "importance": n.importance,
-                    })).collect::<Vec<_>>(),
-                })
-            })
+            .filter_map(|r| serde_json::to_value(r).ok())
             .collect();
 
         let payload = serde_json::json!({
