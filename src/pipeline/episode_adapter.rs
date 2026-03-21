@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::episodes::models::{Episode, FeedbackType};
-use crate::pipeline::feedback::{EpisodeData, EpisodeOutcome, GateOutcome};
+use crate::pipeline::feedback::{DetectedPattern, EpisodeData, EpisodeOutcome, GateOutcome, PatternType};
 
 /// Convert an [`Episode`] into an [`EpisodeData`] suitable for analysis.
 ///
@@ -58,6 +58,7 @@ pub fn episode_to_data(episode: &Episode, protocol_name: &str) -> EpisodeData {
         gate_results,
         duration_ms,
         retry_count,
+        synthetic: false,
     }
 }
 
@@ -160,6 +161,216 @@ async fn resolve_single_protocol_name(
     let run = neo4j.get_protocol_run(run_id).await.ok()??;
     let protocol = neo4j.get_protocol(run.protocol_id).await.ok()??;
     Some(protocol.name)
+}
+
+// ─── Synthetic Episode Generation (T3 — Replay Génératif) ──────────────────
+
+use crate::notes::models::{Note, NoteType};
+
+/// Generate synthetic episodes from detected patterns and knowledge notes.
+///
+/// Synthetic episodes are "memory replay" traces that reinforce learning from
+/// detected patterns (gate failures, regressions, etc.) and from gotcha/pattern
+/// notes without requiring additional real protocol runs.
+///
+/// All generated episodes have `synthetic = true` and are weighted at 0.5×
+/// during analysis (see [`EpisodeAnalyzer::analyze`]).
+///
+/// # References
+///
+/// "A Neural Network Account of Memory Replay and Knowledge Consolidation"
+/// (Kumaran, Hassabis & McClelland, 2022) — synthetic replay strengthens
+/// pattern consolidation without requiring additional real-world experience.
+pub fn generate_synthetic_episodes(
+    patterns: &[DetectedPattern],
+    notes: &[Note],
+) -> Vec<EpisodeData> {
+    let mut episodes = Vec::new();
+
+    // Generate from detected patterns
+    for pattern in patterns {
+        episodes.push(generate_from_pattern(pattern));
+    }
+
+    // Generate from gotcha/pattern notes
+    episodes.extend(generate_from_notes(notes));
+
+    episodes
+}
+
+/// Generate a synthetic episode from a single [`DetectedPattern`].
+///
+/// Maps pattern fields to episode fields:
+/// - `stimulus` (protocol_name) = pattern type description
+/// - `process` (gate_results) = one gate per affected file
+/// - `outcome` = Failure + recommendation as failure message
+/// - `synthetic` = true
+fn generate_from_pattern(pattern: &DetectedPattern) -> EpisodeData {
+    let protocol_name = match &pattern.pattern_type {
+        PatternType::FrequentGateFailure => {
+            format!(
+                "synthetic:gate-failure:{}",
+                pattern
+                    .related_gates
+                    .first()
+                    .map_or("unknown", |s| s.as_str())
+            )
+        }
+        PatternType::RegressionProne => {
+            format!("synthetic:regression:{}", slug_desc(&pattern.description))
+        }
+        PatternType::EffectiveRetry => {
+            format!("synthetic:retry:{}", slug_desc(&pattern.description))
+        }
+        PatternType::CommonRootCause => {
+            format!("synthetic:root-cause:{}", slug_desc(&pattern.description))
+        }
+        PatternType::SuccessPattern => {
+            format!("synthetic:success:{}", slug_desc(&pattern.description))
+        }
+    };
+
+    // Create gate outcomes from affected files — each file is treated as a
+    // gate that failed (for failure patterns) or passed (for success patterns).
+    let is_success = matches!(
+        pattern.pattern_type,
+        PatternType::SuccessPattern | PatternType::EffectiveRetry
+    );
+
+    let gate_results: Vec<GateOutcome> = if pattern.affected_files.is_empty() {
+        // Fall back to related_gates if no affected files
+        pattern
+            .related_gates
+            .iter()
+            .map(|gate| GateOutcome {
+                gate_name: gate.clone(),
+                passed: is_success,
+                failure_message: if is_success {
+                    None
+                } else {
+                    Some(pattern.recommendation.clone())
+                },
+            })
+            .collect()
+    } else {
+        pattern
+            .affected_files
+            .iter()
+            .map(|file| GateOutcome {
+                gate_name: file.clone(),
+                passed: is_success,
+                failure_message: if is_success {
+                    None
+                } else {
+                    Some(pattern.recommendation.clone())
+                },
+            })
+            .collect()
+    };
+
+    let outcome = if is_success {
+        EpisodeOutcome::Success
+    } else {
+        EpisodeOutcome::Failure
+    };
+
+    EpisodeData {
+        episode_id: Uuid::new_v4(),
+        protocol_name,
+        tech_stack: pattern.tech_stacks.clone(),
+        outcome,
+        gate_results,
+        duration_ms: 0,
+        retry_count: 0,
+        synthetic: true,
+    }
+}
+
+/// Generate synthetic episodes from knowledge notes of type `Gotcha` or `Pattern`.
+///
+/// Each qualifying note produces one synthetic episode that encodes the
+/// problem (gotcha) or best-practice (pattern) as a simulated protocol run,
+/// enabling the analyzer to detect and reinforce these insights.
+///
+/// # References
+///
+/// "A Neural Network Account of Memory Replay and Knowledge Consolidation"
+/// (Kumaran, Hassabis & McClelland, 2022) — declarative knowledge (notes)
+/// is replayed as procedural experience (episodes) for consolidation.
+pub fn generate_from_notes(notes: &[Note]) -> Vec<EpisodeData> {
+    notes
+        .iter()
+        .filter(|n| matches!(n.note_type, NoteType::Gotcha | NoteType::Pattern))
+        .map(|note| {
+            let (outcome, passed) = match note.note_type {
+                NoteType::Gotcha => (EpisodeOutcome::Failure, false),
+                NoteType::Pattern => (EpisodeOutcome::Success, true),
+                _ => unreachable!(),
+            };
+
+            let protocol_name = format!(
+                "synthetic:note:{}:{}",
+                note.note_type,
+                note.id
+            );
+
+            // Use note content truncated as the gate failure/success message
+            let message = if note.content.len() > 200 {
+                format!("{}...", &note.content[..197])
+            } else {
+                note.content.clone()
+            };
+
+            // Build gate results from note anchors (code entities) if available,
+            // otherwise use a single gate named after the note type.
+            let gate_results = if note.anchors.is_empty() {
+                vec![GateOutcome {
+                    gate_name: format!("note-{}", note.note_type),
+                    passed,
+                    failure_message: if passed { None } else { Some(message.clone()) },
+                }]
+            } else {
+                note.anchors
+                    .iter()
+                    .map(|anchor| GateOutcome {
+                        gate_name: anchor.entity_id.clone(),
+                        passed,
+                        failure_message: if passed { None } else { Some(message.clone()) },
+                    })
+                    .collect()
+            };
+
+            EpisodeData {
+                episode_id: Uuid::new_v4(),
+                protocol_name,
+                tech_stack: note.tags.clone(),
+                outcome,
+                gate_results,
+                duration_ms: 0,
+                retry_count: 0,
+                synthetic: true,
+            }
+        })
+        .collect()
+}
+
+/// Create a short slug from a description for use in protocol names.
+fn slug_desc(s: &str) -> String {
+    let slug: String = s
+        .chars()
+        .take(40)
+        .map(|c| {
+            if c.is_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    slug.split('-')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────

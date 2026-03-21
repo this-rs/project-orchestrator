@@ -52,6 +52,17 @@ pub enum PatternType {
 // ─── Episode data ───────────────────────────────────────────────────────────
 
 /// Simplified episode data for analysis.
+///
+/// Episodes can be **organic** (collected from real protocol runs) or
+/// **synthetic** (generated via memory replay from detected patterns and
+/// knowledge notes). Synthetic episodes are weighted at 0.5× during
+/// frequency/confidence calculations to avoid over-fitting on inferred data.
+///
+/// # References
+///
+/// "A Neural Network Account of Memory Replay and Knowledge Consolidation"
+/// (Kumaran, Hassabis & McClelland, 2022) — synthetic replay strengthens
+/// pattern consolidation without requiring additional real-world experience.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EpisodeData {
     pub episode_id: Uuid,
@@ -61,6 +72,11 @@ pub struct EpisodeData {
     pub gate_results: Vec<GateOutcome>,
     pub duration_ms: u64,
     pub retry_count: usize,
+    /// Whether this episode was synthetically generated via memory replay
+    /// (T3 — Replay Génératif). Synthetic episodes are weighted at 0.5×
+    /// in pattern analysis to prevent over-fitting.
+    #[serde(default)]
+    pub synthetic: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -97,6 +113,31 @@ pub struct NoteContent {
     pub content: String,
     /// Importance level: "critical", "high", "medium", "low".
     pub importance: String,
+}
+
+// ─── Constants ──────────────────────────────────────────────────────────────
+
+/// Weight multiplier for synthetic (memory-replayed) episodes.
+///
+/// Synthetic episodes generated from detected patterns and knowledge notes
+/// are weighted at 0.5× in frequency and confidence calculations to prevent
+/// over-fitting on inferred data.
+///
+/// # References
+///
+/// "A Neural Network Account of Memory Replay and Knowledge Consolidation"
+/// (Kumaran, Hassabis & McClelland, 2022) — replay-generated traces should
+/// complement, not dominate, organic experience.
+const SYNTHETIC_WEIGHT: f64 = 0.5;
+
+/// Returns the effective weight for an episode: 1.0 for organic, [`SYNTHETIC_WEIGHT`] for synthetic.
+#[inline]
+fn episode_weight(ep: &EpisodeData) -> f64 {
+    if ep.synthetic {
+        SYNTHETIC_WEIGHT
+    } else {
+        1.0
+    }
 }
 
 // ─── Episode Analyzer ───────────────────────────────────────────────────────
@@ -268,19 +309,21 @@ impl EpisodeAnalyzer {
     /// Analyze gate failures across episodes.
     ///
     /// Counts how often each gate fails and produces `FrequentGateFailure`
-    /// patterns for gates that fail frequently.
+    /// patterns for gates that fail frequently. Synthetic episodes are
+    /// weighted at [`SYNTHETIC_WEIGHT`] (0.5×).
     pub fn analyze_gate_failures(episodes: &[EpisodeData]) -> Vec<DetectedPattern> {
-        // gate_name -> (fail_count, total_count, tech_stacks)
-        let mut gate_stats: HashMap<String, (usize, usize, Vec<String>)> = HashMap::new();
+        // gate_name -> (weighted_fail_count, weighted_total_count, tech_stacks)
+        let mut gate_stats: HashMap<String, (f64, f64, Vec<String>)> = HashMap::new();
 
         for ep in episodes {
+            let w = episode_weight(ep);
             for gate in &ep.gate_results {
                 let entry = gate_stats
                     .entry(gate.gate_name.clone())
-                    .or_insert_with(|| (0, 0, Vec::new()));
-                entry.1 += 1;
+                    .or_insert_with(|| (0.0, 0.0, Vec::new()));
+                entry.1 += w;
                 if !gate.passed {
-                    entry.0 += 1;
+                    entry.0 += w;
                 }
                 for ts in &ep.tech_stack {
                     if !entry.2.contains(ts) {
@@ -292,14 +335,15 @@ impl EpisodeAnalyzer {
 
         gate_stats
             .into_iter()
-            .filter(|(_, (fail_count, _, _))| *fail_count > 0)
+            .filter(|(_, (fail_count, _, _))| *fail_count > 0.0)
             .map(|(gate_name, (fail_count, total_count, tech_stacks))| {
-                let confidence = fail_count as f64 / total_count as f64;
+                let confidence = fail_count / total_count;
+                let frequency = fail_count.ceil() as usize;
                 DetectedPattern {
                     id: format!("gate-failure-{gate_name}"),
                     pattern_type: PatternType::FrequentGateFailure,
-                    description: format!("Gate '{gate_name}' fails frequently ({fail_count}/{total_count})"),
-                    frequency: fail_count,
+                    description: format!("Gate '{gate_name}' fails frequently ({frequency}/{total_count:.0})"),
+                    frequency,
                     confidence,
                     tech_stacks,
                     related_gates: vec![gate_name.clone()],
@@ -316,21 +360,22 @@ impl EpisodeAnalyzer {
     /// Analyze retry effectiveness across episodes.
     ///
     /// Identifies patterns where retries eventually lead to success, producing
-    /// `EffectiveRetry` patterns.
+    /// `EffectiveRetry` patterns. Synthetic episodes are weighted at 0.5×.
     pub fn analyze_retry_effectiveness(episodes: &[EpisodeData]) -> Vec<DetectedPattern> {
-        // protocol_name -> (retries_that_succeeded, total_retried, tech_stacks)
-        let mut retry_stats: HashMap<String, (usize, usize, Vec<String>)> = HashMap::new();
+        // protocol_name -> (weighted_successes, weighted_total, tech_stacks)
+        let mut retry_stats: HashMap<String, (f64, f64, Vec<String>)> = HashMap::new();
 
         for ep in episodes {
             if ep.retry_count == 0 {
                 continue;
             }
+            let w = episode_weight(ep);
             let entry = retry_stats
                 .entry(ep.protocol_name.clone())
-                .or_insert_with(|| (0, 0, Vec::new()));
-            entry.1 += 1;
+                .or_insert_with(|| (0.0, 0.0, Vec::new()));
+            entry.1 += w;
             if ep.outcome == EpisodeOutcome::Success {
-                entry.0 += 1;
+                entry.0 += w;
             }
             for ts in &ep.tech_stack {
                 if !entry.2.contains(ts) {
@@ -341,14 +386,15 @@ impl EpisodeAnalyzer {
 
         retry_stats
             .into_iter()
-            .filter(|(_, (successes, _, _))| *successes > 0)
+            .filter(|(_, (successes, _, _))| *successes > 0.0)
             .map(|(protocol, (successes, total, tech_stacks))| {
-                let confidence = successes as f64 / total as f64;
+                let confidence = successes / total;
+                let frequency = successes.ceil() as usize;
                 DetectedPattern {
                     id: format!("effective-retry-{protocol}"),
                     pattern_type: PatternType::EffectiveRetry,
-                    description: format!("Retries in '{protocol}' often succeed ({successes}/{total})"),
-                    frequency: successes,
+                    description: format!("Retries in '{protocol}' often succeed ({frequency}/{total:.0})"),
+                    frequency,
                     confidence,
                     tech_stacks,
                     related_gates: Vec::new(),
@@ -363,17 +409,19 @@ impl EpisodeAnalyzer {
     }
 
     /// Find protocols that frequently fail (regression-prone).
+    /// Synthetic episodes are weighted at 0.5×.
     fn analyze_regression_prone(&self, episodes: &[EpisodeData]) -> Vec<DetectedPattern> {
-        // protocol_name -> (fail_count, total_count, tech_stacks)
-        let mut proto_stats: HashMap<String, (usize, usize, Vec<String>)> = HashMap::new();
+        // protocol_name -> (weighted_fail_count, weighted_total_count, tech_stacks)
+        let mut proto_stats: HashMap<String, (f64, f64, Vec<String>)> = HashMap::new();
 
         for ep in episodes {
+            let w = episode_weight(ep);
             let entry = proto_stats
                 .entry(ep.protocol_name.clone())
-                .or_insert_with(|| (0, 0, Vec::new()));
-            entry.1 += 1;
+                .or_insert_with(|| (0.0, 0.0, Vec::new()));
+            entry.1 += w;
             if ep.outcome == EpisodeOutcome::Failure {
-                entry.0 += 1;
+                entry.0 += w;
             }
             for ts in &ep.tech_stack {
                 if !entry.2.contains(ts) {
@@ -384,14 +432,15 @@ impl EpisodeAnalyzer {
 
         proto_stats
             .into_iter()
-            .filter(|(_, (fail_count, _, _))| *fail_count > 0)
+            .filter(|(_, (fail_count, _, _))| *fail_count > 0.0)
             .map(|(protocol, (fail_count, total_count, tech_stacks))| {
-                let confidence = fail_count as f64 / total_count as f64;
+                let confidence = fail_count / total_count;
+                let frequency = fail_count.ceil() as usize;
                 DetectedPattern {
                     id: format!("regression-prone-{protocol}"),
                     pattern_type: PatternType::RegressionProne,
-                    description: format!("Protocol '{protocol}' is regression-prone ({fail_count}/{total_count} failures)"),
-                    frequency: fail_count,
+                    description: format!("Protocol '{protocol}' is regression-prone ({frequency}/{total_count:.0} failures)"),
+                    frequency,
                     confidence,
                     tech_stacks,
                     related_gates: Vec::new(),
@@ -406,18 +455,20 @@ impl EpisodeAnalyzer {
     }
 
     /// Extract common failure messages (root causes).
+    /// Synthetic episodes are weighted at 0.5×.
     fn analyze_common_root_causes(&self, episodes: &[EpisodeData]) -> Vec<DetectedPattern> {
-        // failure_message -> (count, gate_names, tech_stacks)
-        let mut cause_stats: HashMap<String, (usize, Vec<String>, Vec<String>)> = HashMap::new();
+        // failure_message -> (weighted_count, gate_names, tech_stacks)
+        let mut cause_stats: HashMap<String, (f64, Vec<String>, Vec<String>)> = HashMap::new();
 
         for ep in episodes {
+            let w = episode_weight(ep);
             for gate in &ep.gate_results {
                 if let Some(ref msg) = gate.failure_message {
                     let normalized = msg.trim().to_lowercase();
                     let entry = cause_stats
                         .entry(normalized)
-                        .or_insert_with(|| (0, Vec::new(), Vec::new()));
-                    entry.0 += 1;
+                        .or_insert_with(|| (0.0, Vec::new(), Vec::new()));
+                    entry.0 += w;
                     if !entry.1.contains(&gate.gate_name) {
                         entry.1.push(gate.gate_name.clone());
                     }
@@ -430,26 +481,27 @@ impl EpisodeAnalyzer {
             }
         }
 
-        let total_failures: usize = cause_stats.values().map(|(c, _, _)| c).sum();
+        let total_failures: f64 = cause_stats.values().map(|(c, _, _)| c).sum();
 
         cause_stats
             .into_iter()
             .map(|(message, (count, gates, tech_stacks))| {
-                let confidence = if total_failures > 0 {
-                    count as f64 / total_failures as f64
+                let confidence = if total_failures > 0.0 {
+                    count / total_failures
                 } else {
                     0.0
                 };
+                let frequency = count.ceil() as usize;
                 DetectedPattern {
                     id: format!("root-cause-{}", slug(&message)),
                     pattern_type: PatternType::CommonRootCause,
                     description: message.clone(),
-                    frequency: count,
+                    frequency,
                     confidence,
                     tech_stacks,
                     related_gates: gates,
                     recommendation: format!(
-                        "Common failure: \"{message}\". Seen {count} times. Create a targeted fix or workaround."
+                        "Common failure: \"{message}\". Seen {frequency} times. Create a targeted fix or workaround."
                     ),
                     affected_files: vec![],
                 }
@@ -458,32 +510,35 @@ impl EpisodeAnalyzer {
     }
 
     /// Detect success patterns (protocols + tech stacks that consistently succeed).
+    /// Synthetic episodes are weighted at 0.5×.
     fn analyze_success_patterns(&self, episodes: &[EpisodeData]) -> Vec<DetectedPattern> {
-        // (protocol, tech_stack_key) -> (success_count, total_count, tech_stacks)
-        let mut success_stats: HashMap<String, (usize, usize, Vec<String>)> = HashMap::new();
+        // (protocol, tech_stack_key) -> (weighted_successes, weighted_total, tech_stacks)
+        let mut success_stats: HashMap<String, (f64, f64, Vec<String>)> = HashMap::new();
 
         for ep in episodes {
+            let w = episode_weight(ep);
             let key = format!("{}:{}", ep.protocol_name, ep.tech_stack.join(","));
             let entry = success_stats
                 .entry(key)
-                .or_insert_with(|| (0, 0, ep.tech_stack.clone()));
-            entry.1 += 1;
+                .or_insert_with(|| (0.0, 0.0, ep.tech_stack.clone()));
+            entry.1 += w;
             if ep.outcome == EpisodeOutcome::Success {
-                entry.0 += 1;
+                entry.0 += w;
             }
         }
 
         success_stats
             .into_iter()
-            .filter(|(_, (successes, _, _))| *successes > 0)
+            .filter(|(_, (successes, _, _))| *successes > 0.0)
             .map(|(key, (successes, total, tech_stacks))| {
-                let confidence = successes as f64 / total as f64;
+                let confidence = successes / total;
+                let frequency = successes.ceil() as usize;
                 let protocol = key.split(':').next().unwrap_or(&key);
                 DetectedPattern {
                     id: format!("success-{}", slug(&key)),
                     pattern_type: PatternType::SuccessPattern,
-                    description: format!("Protocol '{protocol}' succeeds consistently ({successes}/{total})"),
-                    frequency: successes,
+                    description: format!("Protocol '{protocol}' succeeds consistently ({frequency}/{total:.0})"),
+                    frequency,
                     confidence,
                     tech_stacks,
                     related_gates: Vec::new(),
@@ -536,6 +591,7 @@ mod tests {
             gate_results: gates,
             duration_ms: 1000,
             retry_count,
+            synthetic: false,
         }
     }
 
