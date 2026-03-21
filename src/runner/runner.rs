@@ -14,7 +14,7 @@ use crate::runner::git;
 use crate::runner::guard::{AgentGuard, ChatManagerHintSender, GuardConfig, GuardVerdict};
 use crate::runner::lifecycle;
 use crate::runner::models::{
-    ActiveAgent, ActiveAgentSnapshot, PlanRunStatus, RunnerConfig, RunnerEvent,
+    ActiveAgent, ActiveAgentSnapshot, CwdValidation, PlanRunStatus, RunnerConfig, RunnerEvent,
     TaskExecutionReport, TaskResult, TaskRunStatus, TriggerSource,
 };
 use crate::runner::persona::{
@@ -360,6 +360,9 @@ impl PlanRunner {
                     (run_id.to_string(), CrudAction::Updated)
                 }
                 RunnerEvent::WorktreeRecovery { run_id, .. } => {
+                    (run_id.to_string(), CrudAction::Updated)
+                }
+                RunnerEvent::CwdMismatch { run_id, .. } => {
                     (run_id.to_string(), CrudAction::Updated)
                 }
                 RunnerEvent::TaskSpawningTimeout { run_id, .. } => {
@@ -868,24 +871,76 @@ impl PlanRunner {
             waves.len()
         );
 
-        // Resolve project_id from slug (for enricher)
-        let project_id = if let Some(ref slug) = project_slug {
+        // Resolve project_id and root_path from slug (for enricher + cwd validation)
+        let (project_id, project_root_path) = if let Some(ref slug) = project_slug {
             match self.graph.get_project_by_slug(slug).await {
-                Ok(Some(project)) => Some(project.id),
+                Ok(Some(project)) => {
+                    let rp = if project.root_path.is_empty() { None } else { Some(project.root_path.clone()) };
+                    (Some(project.id), rp)
+                }
                 Ok(None) => {
                     warn!(
                         "Project slug '{}' not found, enricher will run without project_id",
                         slug
                     );
-                    None
+                    (None, None)
                 }
                 Err(e) => {
                     warn!("Failed to resolve project slug '{}': {}, enricher will run without project_id", slug, e);
-                    None
+                    (None, None)
                 }
             }
         } else {
-            None
+            (None, None)
+        };
+
+        // CWD validation: fallback to root_path if cwd is ".", validate mismatch
+        let cwd = if let Some(ref root_path) = project_root_path {
+            let root_path_expanded = if root_path.starts_with('~') {
+                root_path.replacen('~', &std::env::var("HOME").unwrap_or_default(), 1)
+            } else {
+                root_path.clone()
+            };
+
+            if cwd == "." || cwd.is_empty() {
+                info!(
+                    "CWD not specified — using project root_path: {}",
+                    root_path_expanded
+                );
+                root_path_expanded
+            } else {
+                // Compare canonicalized paths to detect mismatch
+                let cwd_canon = std::fs::canonicalize(&cwd)
+                    .unwrap_or_else(|_| std::path::PathBuf::from(&cwd));
+                let root_canon = std::fs::canonicalize(&root_path_expanded)
+                    .unwrap_or_else(|_| std::path::PathBuf::from(&root_path_expanded));
+
+                if cwd_canon != root_canon {
+                    match self.config.cwd_validation {
+                        CwdValidation::Strict => {
+                            return Err(anyhow!(
+                                "CWD mismatch (strict mode): cwd='{}' != root_path='{}'. \
+                                 Aborting to prevent execution in wrong directory.",
+                                cwd, root_path_expanded
+                            ));
+                        }
+                        CwdValidation::Warn => {
+                            warn!(
+                                "CWD mismatch: cwd='{}' != root_path='{}'. Continuing with provided cwd.",
+                                cwd, root_path_expanded
+                            );
+                            self.emit_event(RunnerEvent::CwdMismatch {
+                                run_id,
+                                cwd: cwd.clone(),
+                                root_path: root_path_expanded,
+                            });
+                        }
+                    }
+                }
+                cwd
+            }
+        } else {
+            cwd
         };
 
         // Create a dedicated git branch for this run

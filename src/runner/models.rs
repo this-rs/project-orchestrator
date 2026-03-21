@@ -38,6 +38,21 @@ pub struct RunnerConfig {
     /// Spawning timeout (seconds) — max time to wait for create_session() before aborting.
     /// Prevents indefinite hangs when ChatManager/Neo4j is unresponsive. Default: 120 (2 min).
     pub spawning_timeout_secs: u64,
+    /// CWD validation mode — controls behavior when cwd doesn't match project.root_path.
+    /// - "warn" (default): log a warning and emit CwdMismatch event, but continue
+    /// - "strict": return an error if cwd doesn't match root_path
+    pub cwd_validation: CwdValidation,
+}
+
+/// CWD validation mode for the runner.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CwdValidation {
+    /// Log a warning on mismatch but continue execution
+    #[default]
+    Warn,
+    /// Return an error on mismatch — blocks execution
+    Strict,
 }
 
 impl Default for RunnerConfig {
@@ -51,6 +66,7 @@ impl Default for RunnerConfig {
             test_runner: false,
             max_cost_usd: 10.0,
             spawning_timeout_secs: 120,
+            cwd_validation: CwdValidation::default(),
         }
     }
 }
@@ -366,6 +382,12 @@ pub enum RunnerEvent {
         tasks_failed: usize,
         /// PR URL if auto-PR was created
         pr_url: Option<String>,
+    },
+    /// CWD doesn't match the project's root_path
+    CwdMismatch {
+        run_id: Uuid,
+        cwd: String,
+        root_path: String,
     },
     /// Agent spawning timed out — create_session() took too long
     TaskSpawningTimeout {
@@ -1009,5 +1031,37 @@ mod tests {
             TaskStateMachine::transition(Spawning, Timeout).is_ok(),
             "Spawning → Timeout should be a valid transition for spawning timeout"
         );
+    }
+
+    // ========================================================================
+    // CWD validation tests
+    // ========================================================================
+
+    #[test]
+    fn test_cwd_validation_default_is_warn() {
+        let config = RunnerConfig::default();
+        assert_eq!(config.cwd_validation, CwdValidation::Warn);
+    }
+
+    #[test]
+    fn test_cwd_validation_strict_deserialize() {
+        let yaml = r#"
+            cwd_validation: strict
+        "#;
+        let config: RunnerConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.cwd_validation, CwdValidation::Strict);
+    }
+
+    #[test]
+    fn test_cwd_mismatch_event_serialization() {
+        let event = RunnerEvent::CwdMismatch {
+            run_id: Uuid::nil(),
+            cwd: "/wrong/path".into(),
+            root_path: "/correct/path".into(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"event\":\"cwd_mismatch\""));
+        assert!(json.contains("/wrong/path"));
+        assert!(json.contains("/correct/path"));
     }
 }
