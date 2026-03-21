@@ -878,7 +878,11 @@ impl PlanRunner {
         let (project_id, project_root_path) = if let Some(ref slug) = project_slug {
             match self.graph.get_project_by_slug(slug).await {
                 Ok(Some(project)) => {
-                    let rp = if project.root_path.is_empty() { None } else { Some(project.root_path.clone()) };
+                    let rp = if project.root_path.is_empty() {
+                        None
+                    } else {
+                        Some(project.root_path.clone())
+                    };
                     (Some(project.id), rp)
                 }
                 Ok(None) => {
@@ -913,8 +917,8 @@ impl PlanRunner {
                 root_path_expanded
             } else {
                 // Compare canonicalized paths to detect mismatch
-                let cwd_canon = std::fs::canonicalize(&cwd)
-                    .unwrap_or_else(|_| std::path::PathBuf::from(&cwd));
+                let cwd_canon =
+                    std::fs::canonicalize(&cwd).unwrap_or_else(|_| std::path::PathBuf::from(&cwd));
                 let root_canon = std::fs::canonicalize(&root_path_expanded)
                     .unwrap_or_else(|_| std::path::PathBuf::from(&root_path_expanded));
 
@@ -924,7 +928,8 @@ impl PlanRunner {
                             return Err(anyhow!(
                                 "CWD mismatch (strict mode): cwd='{}' != root_path='{}'. \
                                  Aborting to prevent execution in wrong directory.",
-                                cwd, root_path_expanded
+                                cwd,
+                                root_path_expanded
                             ));
                         }
                         CwdValidation::Warn => {
@@ -3024,7 +3029,12 @@ impl PlanRunner {
     /// - `Timeout` with commits: in_progress → completed, pending → skipped
     /// - `Timeout` without commits: all → skipped
     /// - `Error`/`Cancelled`/`BudgetExceeded`: all → skipped
-    async fn finalize_steps(&self, task_id: Uuid, outcome: &TaskResult, cwd: &str) -> StepBreakdown {
+    async fn finalize_steps(
+        &self,
+        task_id: Uuid,
+        outcome: &TaskResult,
+        cwd: &str,
+    ) -> StepBreakdown {
         // Check if agent made any commits (proof of work)
         let has_commits = match outcome {
             TaskResult::Timeout { .. } => {
@@ -3055,12 +3065,21 @@ impl PlanRunner {
 
         // Count step statuses BEFORE finalization (reflects what the agent actually did)
         let mut breakdown = StepBreakdown {
-            completed: steps.iter().filter(|s| s.status == crate::neo4j::models::StepStatus::Completed).count(),
-            skipped: steps.iter().filter(|s| s.status == crate::neo4j::models::StepStatus::Skipped).count(),
-            pending: steps.iter().filter(|s| {
-                s.status == crate::neo4j::models::StepStatus::Pending
-                    || s.status == crate::neo4j::models::StepStatus::InProgress
-            }).count(),
+            completed: steps
+                .iter()
+                .filter(|s| s.status == crate::neo4j::models::StepStatus::Completed)
+                .count(),
+            skipped: steps
+                .iter()
+                .filter(|s| s.status == crate::neo4j::models::StepStatus::Skipped)
+                .count(),
+            pending: steps
+                .iter()
+                .filter(|s| {
+                    s.status == crate::neo4j::models::StepStatus::Pending
+                        || s.status == crate::neo4j::models::StepStatus::InProgress
+                })
+                .count(),
             total: steps.len(),
         };
 
@@ -4790,7 +4809,10 @@ mod tests {
 
         // Guard should NOT trigger: 1 completed before + 1 finalized = 2 completed
         assert_eq!(breakdown.total, 3);
-        assert!(breakdown.completed >= 1, "At least 1 step should be completed");
+        assert!(
+            breakdown.completed >= 1,
+            "At least 1 step should be completed"
+        );
         // This means the guard (total > 0 && completed == 0) would be false → task stays Success
     }
 
