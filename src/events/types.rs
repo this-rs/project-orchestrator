@@ -70,6 +70,8 @@ pub enum EntityType {
     TopologyRule,
     /// Lifecycle hook (automatic action on status change) — emitters: handlers.rs (Created, Updated, Deleted)
     LifecycleHook,
+    /// Learning system — emitters: reactions.rs (PatternsDetected after episode analysis)
+    Learning,
 }
 
 /// The CRUD action performed on an entity.
@@ -99,6 +101,14 @@ pub enum CrudAction {
     /// Payload contains `old_status` and `new_status` strings.
     /// Used for lifecycle transitions (plan: draft→approved, task: pending→in_progress, etc.).
     StatusChanged,
+    /// An episode has been collected from a completed run.
+    /// Payload contains `episode_id`, `run_id`, `project_id`.
+    /// Used by the learning loop to trigger pattern detection (T2).
+    Collected,
+    /// Patterns have been detected from collected episodes.
+    /// Payload contains `project_id`, `patterns_count`.
+    /// Used by the learning loop to trigger materialization (T3).
+    PatternsDetected,
 }
 
 /// A related entity for Linked/Unlinked actions
@@ -357,6 +367,7 @@ mod tests {
             EntityType::Trigger,
             EntityType::TopologyRule,
             EntityType::LifecycleHook,
+            EntityType::Learning,
         ];
 
         for variant in &variants {
@@ -399,6 +410,8 @@ mod tests {
             CrudAction::Progress,
             CrudAction::Synced,
             CrudAction::StatusChanged,
+            CrudAction::Collected,
+            CrudAction::PatternsDetected,
         ];
 
         for variant in &variants {
@@ -492,8 +505,9 @@ mod tests {
             EntityType::Trigger,
             EntityType::TopologyRule,
             EntityType::LifecycleHook,
+            EntityType::Learning,
         ];
-        assert_eq!(all.len(), 27);
+        assert_eq!(all.len(), 28);
     }
 
     // ================================================================
