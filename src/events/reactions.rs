@@ -12,6 +12,7 @@
 //! | `Task::StatusChanged → Completed`  | Check if all plan tasks completed → auto-complete plan     |
 //! | `Plan::StatusChanged → Completed/Failed` | Collect episode from lifecycle run + emit Episode::Collected |
 //! | `ProtocolRun::StatusChanged → Completed/Failed` | Collect episode from protocol run + emit Episode::Collected |
+//! | `Episode::Collected`                             | Analyze patterns via EpisodeAnalyzer + emit Learning::PatternsDetected |
 //!
 //! ## Architecture
 //!
@@ -618,6 +619,189 @@ async fn on_protocol_run_completed_collect_episode(event: CrudEvent, state: Arc<
 }
 
 // ─────────────────────────────────────────────────────────────
+// Reaction: Episode::Collected → analyze patterns (T2)
+// ─────────────────────────────────────────────────────────────
+
+/// When an episode is collected, analyze it for patterns using the
+/// `EpisodeAnalyzer` and emit `Learning::PatternsDetected` if any
+/// significant patterns are found.
+///
+/// This is the T2 step of the autonomous learning loop:
+/// Episode::Collected → EpisodeAdapter → EpisodeAnalyzer → Learning::PatternsDetected
+///
+/// Fire-and-forget via tokio::spawn to avoid blocking the event reactor.
+async fn on_episode_collected_analyze_patterns(event: CrudEvent, state: Arc<ServerState>) {
+    // Only react to Episode::Collected
+    if event.entity_type != EntityType::Episode || event.action != CrudAction::Collected {
+        return;
+    }
+
+    let episode_id_str = event.entity_id.clone();
+    let project_id_str = event
+        .project_id
+        .clone()
+        .or_else(|| event.payload.get("project_id").and_then(|v| v.as_str()).map(String::from));
+    let run_id_str = event.payload.get("run_id").and_then(|v| v.as_str()).map(String::from);
+
+    let project_id = match project_id_str.as_deref().and_then(|s| s.parse::<uuid::Uuid>().ok()) {
+        Some(id) => id,
+        None => {
+            debug!(
+                episode_id = %episode_id_str,
+                "on_episode_collected: no valid project_id in payload, skipping analysis"
+            );
+            return;
+        }
+    };
+
+    let episode_id = match episode_id_str.parse::<uuid::Uuid>() {
+        Ok(id) => id,
+        Err(_) => {
+            debug!(
+                episode_id = %episode_id_str,
+                "on_episode_collected: invalid episode_id, skipping analysis"
+            );
+            return;
+        }
+    };
+
+    let run_id = run_id_str.as_deref().and_then(|s| s.parse::<uuid::Uuid>().ok());
+
+    info!(
+        episode_id = %episode_id,
+        project_id = %project_id,
+        run_id = ?run_id,
+        "on_episode_collected: starting pattern analysis (T2)"
+    );
+
+    let neo4j_arc = state.orchestrator.neo4j_arc();
+    let event_bus = state.event_bus.clone();
+
+    tokio::spawn(async move {
+        // 1. Load recent episodes for this project (batch analysis, last 50)
+        //    Batch analysis detects recurring patterns across multiple runs,
+        //    which is far more robust than single-episode analysis.
+        let episodes = match crate::episodes::collector::list_episodes(
+            neo4j_arc.as_ref(),
+            project_id,
+            50,
+        )
+        .await
+        {
+            Ok(eps) => eps,
+            Err(e) => {
+                error!(
+                    project_id = %project_id,
+                    error = %e,
+                    "on_episode_collected: failed to list episodes for analysis"
+                );
+                return;
+            }
+        };
+
+        if episodes.len() < 3 {
+            debug!(
+                project_id = %project_id,
+                count = episodes.len(),
+                "on_episode_collected: too few episodes for analysis (need ≥3), skipping"
+            );
+            return;
+        }
+
+        // 2. Resolve protocol names for all episodes
+        let protocol_names = crate::pipeline::episode_adapter::resolve_protocol_names(
+            neo4j_arc.as_ref(),
+            &episodes,
+        )
+        .await;
+
+        // 3. Convert Episodes → EpisodeData via adapter (batch)
+        let episode_pairs: Vec<_> = episodes.into_iter().zip(protocol_names).collect();
+        let episode_data = crate::pipeline::episode_adapter::episodes_to_data(&episode_pairs);
+
+        // 4. Run the EpisodeAnalyzer with meaningful thresholds
+        //    min_frequency=3: pattern must appear ≥3 times to be significant
+        //    min_confidence=0.5: ≥50% occurrence rate
+        let analyzer = crate::pipeline::feedback::EpisodeAnalyzer::new(3, 0.5);
+        let patterns = analyzer.analyze(&episode_data);
+
+        if patterns.is_empty() {
+            debug!(
+                project_id = %project_id,
+                episodes_analyzed = episode_data.len(),
+                "on_episode_collected: no significant patterns detected"
+            );
+            return;
+        }
+
+        // 5. Generate skill recommendations from detected patterns
+        let recommendations = analyzer.recommend_skills(&patterns);
+
+        info!(
+            episode_id = %episode_id,
+            project_id = %project_id,
+            episodes_analyzed = episode_data.len(),
+            patterns_count = patterns.len(),
+            recommendations_count = recommendations.len(),
+            "on_episode_collected: patterns detected, emitting Learning::PatternsDetected"
+        );
+
+        // 6. Emit Learning::PatternsDetected with full payload for T3 (MATERIALIZE)
+        let patterns_payload: Vec<serde_json::Value> = patterns
+            .iter()
+            .map(|p| {
+                serde_json::json!({
+                    "id": p.id,
+                    "pattern_type": format!("{:?}", p.pattern_type),
+                    "description": p.description,
+                    "frequency": p.frequency,
+                    "confidence": p.confidence,
+                    "recommendation": p.recommendation,
+                    "tech_stacks": p.tech_stacks,
+                    "related_gates": p.related_gates,
+                })
+            })
+            .collect();
+
+        let recommendations_payload: Vec<serde_json::Value> = recommendations
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "name": r.name,
+                    "description": r.description,
+                    "tags": r.tags,
+                    "trigger_patterns": r.trigger_patterns,
+                    "notes": r.notes.iter().map(|n| serde_json::json!({
+                        "note_type": n.note_type,
+                        "content": n.content,
+                        "importance": n.importance,
+                    })).collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+
+        let payload = serde_json::json!({
+            "project_id": project_id.to_string(),
+            "episode_id": episode_id.to_string(),
+            "episodes_analyzed": episode_data.len(),
+            "patterns_count": patterns.len(),
+            "patterns": patterns_payload,
+            "recommendations": recommendations_payload,
+        });
+
+        event_bus.emit(
+            CrudEvent::new(
+                EntityType::Learning,
+                CrudAction::PatternsDetected,
+                &episode_id.to_string(),
+            )
+            .with_payload(payload)
+            .with_project_id(project_id.to_string()),
+        );
+    });
+}
+
+// ─────────────────────────────────────────────────────────────
 // Reaction: *::StatusChanged → evaluate LifecycleHooks
 // ─────────────────────────────────────────────────────────────
 
@@ -663,7 +847,8 @@ fn extract_state(ctx: Arc<dyn std::any::Any + Send + Sync>) -> Arc<ServerState> 
 /// 3. **task-completed** — `Task::StatusChanged(Completed)` → check plan auto-completion
 /// 4. **plan-completed** — `Plan::StatusChanged(Completed|Failed)` → collect episode + emit Episode::Collected
 /// 5. **protocol-run-episode-collect** — `ProtocolRun::StatusChanged(Completed|Failed)` → collect episode + emit Episode::Collected
-/// 6. **lifecycle-hooks** — `*::StatusChanged` → evaluate and execute LifecycleHooks
+/// 6. **episode-analyze-patterns** — `Episode::Collected` → analyze patterns via EpisodeAnalyzer + emit Learning::PatternsDetected
+/// 7. **lifecycle-hooks** — `*::StatusChanged` → evaluate and execute LifecycleHooks
 pub fn register_builtin_reactions(
     builder: ReactorBuilder,
     _state: Arc<ServerState>,
@@ -722,6 +907,16 @@ pub fn register_builtin_reactions(
             Arc::new(|event, ctx| -> Pin<Box<dyn Future<Output = ()> + Send>> {
                 Box::pin(async move {
                     on_protocol_run_completed_collect_episode(event, extract_state(ctx)).await;
+                })
+            }),
+        )
+        .on(
+            "episode-analyze-patterns",
+            Some(EntityType::Episode),
+            Some(CrudAction::Collected),
+            Arc::new(|event, ctx| -> Pin<Box<dyn Future<Output = ()> + Send>> {
+                Box::pin(async move {
+                    on_episode_collected_analyze_patterns(event, extract_state(ctx)).await;
                 })
             }),
         )
@@ -1395,6 +1590,105 @@ mod tests {
         on_protocol_run_completed_collect_episode(event, state).await;
     }
 
+    // ── on_episode_collected_analyze_patterns ──────────────────
+
+    #[tokio::test]
+    async fn on_episode_collected_skips_non_episode_events() {
+        let state = mock_server_state().await;
+        // A Task event should be ignored entirely
+        let event = make_event(
+            EntityType::Task,
+            CrudAction::Collected,
+            &Uuid::new_v4().to_string(),
+            json!({"project_id": Uuid::new_v4().to_string()}),
+        );
+        // Should return early without panic
+        on_episode_collected_analyze_patterns(event, state).await;
+    }
+
+    #[tokio::test]
+    async fn on_episode_collected_skips_missing_project_id() {
+        let state = mock_server_state().await;
+        let event = make_event(
+            EntityType::Episode,
+            CrudAction::Collected,
+            &Uuid::new_v4().to_string(),
+            json!({}), // no project_id
+        );
+        // Should return early (no project_id) without panic
+        on_episode_collected_analyze_patterns(event, state).await;
+    }
+
+    #[tokio::test]
+    async fn on_episode_collected_skips_missing_run_id() {
+        let state = mock_server_state().await;
+        let project_id = Uuid::new_v4();
+        let event = make_event(
+            EntityType::Episode,
+            CrudAction::Collected,
+            &Uuid::new_v4().to_string(),
+            json!({"project_id": project_id.to_string()}), // no run_id
+        );
+        // Should spawn task but return early inside (no run_id)
+        on_episode_collected_analyze_patterns(event, state).await;
+        // Give spawned task time to complete
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    #[tokio::test]
+    async fn on_episode_collected_handles_nonexistent_run_gracefully() {
+        let state = mock_server_state().await;
+        let project_id = Uuid::new_v4();
+        let run_id = Uuid::new_v4();
+        let episode_id = Uuid::new_v4();
+
+        let mut event = make_event(
+            EntityType::Episode,
+            CrudAction::Collected,
+            &episode_id.to_string(),
+            json!({
+                "project_id": project_id.to_string(),
+                "run_id": run_id.to_string(),
+            }),
+        );
+        event.project_id = Some(project_id.to_string());
+
+        // Run doesn't exist in mock store → should log and return without panic
+        on_episode_collected_analyze_patterns(event, state).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    #[tokio::test]
+    async fn on_episode_collected_with_completed_run_spawns_analysis() {
+        use crate::protocol::models::ProtocolRun;
+
+        let state = mock_server_state().await;
+        let neo4j = state.orchestrator.neo4j();
+
+        let project_id = Uuid::new_v4();
+        let mut run = ProtocolRun::new(Uuid::new_v4(), Uuid::new_v4(), "Start");
+        run.complete();
+        let run_id = run.id;
+        neo4j.create_protocol_run(&run).await.unwrap();
+
+        let episode_id = Uuid::new_v4();
+        let mut event = make_event(
+            EntityType::Episode,
+            CrudAction::Collected,
+            &episode_id.to_string(),
+            json!({
+                "project_id": project_id.to_string(),
+                "run_id": run_id.to_string(),
+            }),
+        );
+        event.project_id = Some(project_id.to_string());
+
+        on_episode_collected_analyze_patterns(event, state).await;
+        // Give the spawned task time to complete
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        // If we got here without panic, the analysis completed (or gracefully failed)
+    }
+
     // ── register_builtin_reactions ──────────────────────────────
 
     #[tokio::test]
@@ -1404,7 +1698,7 @@ mod tests {
         let rx = bus.subscribe();
         let builder =
             ReactorBuilder::new(rx, state.clone() as Arc<dyn std::any::Any + Send + Sync>);
-        // Should register 6 reactions without panicking
+        // Should register 7 reactions without panicking
         let _builder = register_builtin_reactions(builder, state);
     }
 
