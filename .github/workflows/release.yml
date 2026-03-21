@@ -621,7 +621,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: "tauri-${{ matrix.target }}"
-          workspaces: "desktop/src-tauri -> target"
+          workspaces: ". -> target"
 
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
@@ -779,7 +779,7 @@ jobs:
         shell: bash
         run: |
           echo "Cleaning stale bundle output..."
-          rm -rf desktop/src-tauri/target/*/release/bundle
+          rm -rf target/*/release/bundle
           echo "✅ Bundle cache cleaned"
 
       # IMPORTANT: TAURI_SIGNING_PRIVATE_KEY must be set in GitHub Secrets for
@@ -816,7 +816,7 @@ jobs:
       - name: Free disk space (remove build intermediates)
         shell: bash
         run: |
-          TARGET_DIR="desktop/src-tauri/target/${{ matrix.tauri_target }}/release"
+          TARGET_DIR="target/${{ matrix.tauri_target }}/release"
           if [ -d "$TARGET_DIR" ]; then
             echo "=== Disk usage before cleanup ==="
             df -h . | tail -1
@@ -838,7 +838,7 @@ jobs:
       - name: Bundle ONNX Runtime in Tauri app (macOS x86_64)
         if: matrix.target == 'x86_64-apple-darwin'
         run: |
-          BUNDLE_DIR="desktop/src-tauri/target/${{ matrix.target }}/release/bundle"
+          BUNDLE_DIR="target/${{ matrix.target }}/release/bundle"
           APP_PATH=$(find "$BUNDLE_DIR/macos" -name "*.app" -maxdepth 1 | head -1)
           if [ -z "$APP_PATH" ]; then
             echo "::warning::No .app bundle found — skipping ONNX Runtime bundling"
@@ -883,7 +883,7 @@ jobs:
         shell: bash
         run: |
           echo "=== Bundle frontend verification (post-build) ==="
-          BUNDLE_DIR="desktop/src-tauri/target/${{ matrix.target }}/release/bundle"
+          BUNDLE_DIR="target/${{ matrix.target }}/release/bundle"
 
           # macOS: check inside .app/Contents/Resources/dist/
           if [ -d "$BUNDLE_DIR/macos" ]; then
@@ -925,7 +925,7 @@ jobs:
         env:
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
         run: |
-          BUNDLE_DIR="desktop/src-tauri/target/${{ matrix.target }}/release/bundle"
+          BUNDLE_DIR="target/${{ matrix.target }}/release/bundle"
           APP_PATH=$(find "$BUNDLE_DIR/macos" -name "*.app" -maxdepth 1 | head -1)
           ENTITLEMENTS="desktop/src-tauri/entitlements.plist"
 
@@ -992,7 +992,7 @@ jobs:
         env:
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
         run: |
-          BUNDLE_DIR="desktop/src-tauri/target/${{ matrix.target }}/release/bundle"
+          BUNDLE_DIR="target/${{ matrix.target }}/release/bundle"
           APP_PATH=$(find "$BUNDLE_DIR/macos" -name "*.app" -maxdepth 1 | head -1)
           DMG_PATH=$(find "$BUNDLE_DIR/dmg" -name "*.dmg" | head -1)
 
@@ -1082,7 +1082,7 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
-          BUNDLE_DIR="desktop/src-tauri/target/${{ matrix.target }}/release/bundle"
+          BUNDLE_DIR="target/${{ matrix.target }}/release/bundle"
           APP_PATH=$(find "$BUNDLE_DIR/macos" -name "*.app" -maxdepth 1 | head -1)
           APP_NAME=$(basename "$APP_PATH")
 
@@ -1112,7 +1112,7 @@ jobs:
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
-          DMG_PATH=$(find desktop/src-tauri/target/${{ matrix.target }}/release/bundle/dmg -name "*.dmg" | head -1)
+          DMG_PATH=$(find target/${{ matrix.target }}/release/bundle/dmg -name "*.dmg" | head -1)
           if [ -n "$DMG_PATH" ]; then
             echo "Notarizing $DMG_PATH..."
             SUBMIT_OUTPUT=$(xcrun notarytool submit "$DMG_PATH" \
@@ -1147,7 +1147,7 @@ jobs:
         if: runner.os == 'macOS'
         shell: bash
         run: |
-          BUNDLE_DIR="desktop/src-tauri/target/${{ matrix.target }}/release/bundle/macos"
+          BUNDLE_DIR="target/${{ matrix.target }}/release/bundle/macos"
           ARCH="${{ matrix.artifact_arch }}"
 
           for f in "$BUNDLE_DIR"/*.app.tar.gz; do
@@ -1172,9 +1172,9 @@ jobs:
         with:
           name: tauri-${{ matrix.target }}
           path: |
-            desktop/src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg
-            desktop/src-tauri/target/${{ matrix.target }}/release/bundle/macos/*.app.tar.gz
-            desktop/src-tauri/target/${{ matrix.target }}/release/bundle/macos/*.app.tar.gz.sig
+            target/${{ matrix.target }}/release/bundle/dmg/*.dmg
+            target/${{ matrix.target }}/release/bundle/macos/*.app.tar.gz
+            target/${{ matrix.target }}/release/bundle/macos/*.app.tar.gz.sig
           retention-days: 1
 
       - name: Upload Tauri artifacts (Linux)
@@ -1183,10 +1183,10 @@ jobs:
         with:
           name: tauri-${{ matrix.target }}
           path: |
-            desktop/src-tauri/target/${{ matrix.target }}/release/bundle/deb/*.deb
-            desktop/src-tauri/target/${{ matrix.target }}/release/bundle/appimage/*.AppImage
-            desktop/src-tauri/target/${{ matrix.target }}/release/bundle/appimage/*.AppImage.tar.gz
-            desktop/src-tauri/target/${{ matrix.target }}/release/bundle/appimage/*.AppImage.tar.gz.sig
+            target/${{ matrix.target }}/release/bundle/deb/*.deb
+            target/${{ matrix.target }}/release/bundle/appimage/*.AppImage
+            target/${{ matrix.target }}/release/bundle/appimage/*.AppImage.tar.gz
+            target/${{ matrix.target }}/release/bundle/appimage/*.AppImage.tar.gz.sig
           retention-days: 1
 
       - name: Upload Tauri artifacts (Windows)
@@ -1195,12 +1195,12 @@ jobs:
         with:
           name: tauri-${{ matrix.target }}
           path: |
-            desktop/src-tauri/target/${{ matrix.target }}/release/bundle/nsis/*.exe
-            desktop/src-tauri/target/${{ matrix.target }}/release/bundle/nsis/*.nsis.zip
-            desktop/src-tauri/target/${{ matrix.target }}/release/bundle/nsis/*.nsis.zip.sig
-            desktop/src-tauri/target/${{ matrix.target }}/release/bundle/msi/*.msi
-            desktop/src-tauri/target/${{ matrix.target }}/release/bundle/msi/*.msi.zip
-            desktop/src-tauri/target/${{ matrix.target }}/release/bundle/msi/*.msi.zip.sig
+            target/${{ matrix.target }}/release/bundle/nsis/*.exe
+            target/${{ matrix.target }}/release/bundle/nsis/*.nsis.zip
+            target/${{ matrix.target }}/release/bundle/nsis/*.nsis.zip.sig
+            target/${{ matrix.target }}/release/bundle/msi/*.msi
+            target/${{ matrix.target }}/release/bundle/msi/*.msi.zip
+            target/${{ matrix.target }}/release/bundle/msi/*.msi.zip.sig
           retention-days: 1
 
       # --- macOS Cleanup: remove temp keychain ---

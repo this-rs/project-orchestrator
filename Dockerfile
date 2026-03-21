@@ -56,6 +56,11 @@ RUN apt-get update && apt-get install -y \
 # Copy manifests for dependency caching (Cargo.lock required for reproducible builds)
 COPY Cargo.toml Cargo.lock ./
 
+# Remove desktop/src-tauri from workspace members — it's not needed for the
+# backend Docker build and would require copying the full Tauri manifest tree.
+# This keeps the Docker build identical to the pre-workspace behavior.
+RUN sed -i 's/, "desktop\/src-tauri"//' Cargo.toml
+
 # Copy local crates (path dependencies referenced in Cargo.toml)
 COPY crates ./crates/
 
