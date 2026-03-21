@@ -35,6 +35,92 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 // ============================================================================
+// Pure helper functions (testable without PlanRunner)
+// ============================================================================
+
+/// Result of CWD validation — either the resolved cwd or an error.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CwdResolution {
+    /// CWD was empty/dot, replaced by root_path
+    FallbackToRoot { resolved_cwd: String },
+    /// CWD matches root_path (or no root_path to compare)
+    Match { resolved_cwd: String },
+    /// CWD differs from root_path — warn mode allows it
+    Mismatch {
+        resolved_cwd: String,
+        root_path: String,
+    },
+    /// CWD differs from root_path — strict mode rejects it
+    StrictMismatch { cwd: String, root_path: String },
+    /// No root_path configured — use cwd as-is
+    NoRootPath { resolved_cwd: String },
+}
+
+/// Validate and resolve the working directory against the project root_path.
+///
+/// Pure function — no side effects, fully testable.
+/// The caller is responsible for emitting events/logs based on the result.
+pub fn validate_cwd(
+    cwd: &str,
+    root_path: Option<&str>,
+    validation: &CwdValidation,
+) -> CwdResolution {
+    let root_path = match root_path {
+        Some(rp) if !rp.is_empty() => rp,
+        _ => {
+            return CwdResolution::NoRootPath {
+                resolved_cwd: cwd.to_string(),
+            }
+        }
+    };
+
+    // Expand ~ in root_path
+    let root_path_expanded = if root_path.starts_with('~') {
+        root_path.replacen('~', &std::env::var("HOME").unwrap_or_default(), 1)
+    } else {
+        root_path.to_string()
+    };
+
+    // Fallback: empty/dot cwd → use root_path
+    if cwd == "." || cwd.is_empty() {
+        return CwdResolution::FallbackToRoot {
+            resolved_cwd: root_path_expanded,
+        };
+    }
+
+    // Compare canonicalized paths
+    let cwd_canon = std::fs::canonicalize(cwd).unwrap_or_else(|_| std::path::PathBuf::from(cwd));
+    let root_canon = std::fs::canonicalize(&root_path_expanded)
+        .unwrap_or_else(|_| std::path::PathBuf::from(&root_path_expanded));
+
+    if cwd_canon == root_canon {
+        return CwdResolution::Match {
+            resolved_cwd: cwd.to_string(),
+        };
+    }
+
+    // Mismatch detected
+    match validation {
+        CwdValidation::Strict => CwdResolution::StrictMismatch {
+            cwd: cwd.to_string(),
+            root_path: root_path_expanded,
+        },
+        CwdValidation::Warn => CwdResolution::Mismatch {
+            resolved_cwd: cwd.to_string(),
+            root_path: root_path_expanded,
+        },
+    }
+}
+
+/// Check whether the step completion guard should trigger.
+///
+/// Returns `true` if the task has steps but none were completed (all skipped/pending),
+/// meaning the agent likely didn't do real work.
+pub fn should_step_guard_trigger(breakdown: &StepBreakdown) -> bool {
+    breakdown.total > 0 && breakdown.completed == 0
+}
+
+// ============================================================================
 // Global state — LazyLock pattern (no fields on OrchestratorState)
 // ============================================================================
 
@@ -902,53 +988,46 @@ impl PlanRunner {
         };
 
         // CWD validation: fallback to root_path if cwd is ".", validate mismatch
-        let cwd = if let Some(ref root_path) = project_root_path {
-            let root_path_expanded = if root_path.starts_with('~') {
-                root_path.replacen('~', &std::env::var("HOME").unwrap_or_default(), 1)
-            } else {
-                root_path.clone()
-            };
-
-            if cwd == "." || cwd.is_empty() {
-                info!(
-                    "CWD not specified — using project root_path: {}",
-                    root_path_expanded
-                );
-                root_path_expanded
-            } else {
-                // Compare canonicalized paths to detect mismatch
-                let cwd_canon =
-                    std::fs::canonicalize(&cwd).unwrap_or_else(|_| std::path::PathBuf::from(&cwd));
-                let root_canon = std::fs::canonicalize(&root_path_expanded)
-                    .unwrap_or_else(|_| std::path::PathBuf::from(&root_path_expanded));
-
-                if cwd_canon != root_canon {
-                    match self.config.cwd_validation {
-                        CwdValidation::Strict => {
-                            return Err(anyhow!(
-                                "CWD mismatch (strict mode): cwd='{}' != root_path='{}'. \
-                                 Aborting to prevent execution in wrong directory.",
-                                cwd,
-                                root_path_expanded
-                            ));
-                        }
-                        CwdValidation::Warn => {
-                            warn!(
-                                "CWD mismatch: cwd='{}' != root_path='{}'. Continuing with provided cwd.",
-                                cwd, root_path_expanded
-                            );
-                            self.emit_event(RunnerEvent::CwdMismatch {
-                                run_id,
-                                cwd: cwd.clone(),
-                                root_path: root_path_expanded,
-                            });
-                        }
-                    }
+        let cwd = {
+            let resolution = validate_cwd(
+                &cwd,
+                project_root_path.as_deref(),
+                &self.config.cwd_validation,
+            );
+            match resolution {
+                CwdResolution::FallbackToRoot { resolved_cwd } => {
+                    info!(
+                        "CWD not specified — using project root_path: {}",
+                        resolved_cwd
+                    );
+                    resolved_cwd
                 }
-                cwd
+                CwdResolution::Match { resolved_cwd }
+                | CwdResolution::NoRootPath { resolved_cwd } => resolved_cwd,
+                CwdResolution::Mismatch {
+                    resolved_cwd,
+                    root_path,
+                } => {
+                    warn!(
+                        "CWD mismatch: cwd='{}' != root_path='{}'. Continuing with provided cwd.",
+                        resolved_cwd, root_path
+                    );
+                    self.emit_event(RunnerEvent::CwdMismatch {
+                        run_id,
+                        cwd: resolved_cwd.clone(),
+                        root_path,
+                    });
+                    resolved_cwd
+                }
+                CwdResolution::StrictMismatch { cwd, root_path } => {
+                    return Err(anyhow!(
+                        "CWD mismatch (strict mode): cwd='{}' != root_path='{}'. \
+                         Aborting to prevent execution in wrong directory.",
+                        cwd,
+                        root_path
+                    ));
+                }
             }
-        } else {
-            cwd
         };
 
         // Create a dedicated git branch for this run
@@ -2635,7 +2714,7 @@ impl PlanRunner {
 
             // Step completion guard: if the task has steps but NONE were completed,
             // the agent likely skipped all work — override to Failed.
-            if breakdown.total > 0 && breakdown.completed == 0 {
+            if should_step_guard_trigger(&breakdown) {
                 warn!(
                     "Task {} — step completion guard triggered: 0/{} steps completed ({} skipped) — overriding to Failed",
                     task_id, breakdown.total, breakdown.skipped
@@ -4881,5 +4960,269 @@ mod tests {
         assert_eq!(breakdown.total, 0);
         assert_eq!(breakdown.completed, 0);
         // No steps = task with no defined steps → Success is valid
+    }
+
+    // === Pure function tests: validate_cwd ===
+
+    #[test]
+    fn test_validate_cwd_no_root_path() {
+        let result = validate_cwd("/some/path", None, &CwdValidation::Warn);
+        assert_eq!(
+            result,
+            CwdResolution::NoRootPath {
+                resolved_cwd: "/some/path".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn test_validate_cwd_empty_root_path() {
+        let result = validate_cwd("/some/path", Some(""), &CwdValidation::Warn);
+        assert_eq!(
+            result,
+            CwdResolution::NoRootPath {
+                resolved_cwd: "/some/path".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn test_validate_cwd_dot_fallback_to_root() {
+        let result = validate_cwd(".", Some("/tmp"), &CwdValidation::Warn);
+        assert!(matches!(result, CwdResolution::FallbackToRoot { .. }));
+        if let CwdResolution::FallbackToRoot { resolved_cwd } = result {
+            assert_eq!(resolved_cwd, "/tmp");
+        }
+    }
+
+    #[test]
+    fn test_validate_cwd_empty_fallback_to_root() {
+        let result = validate_cwd("", Some("/tmp"), &CwdValidation::Warn);
+        assert!(matches!(result, CwdResolution::FallbackToRoot { .. }));
+    }
+
+    #[test]
+    fn test_validate_cwd_matching_paths() {
+        // Use /tmp which exists and canonicalizes to itself
+        let result = validate_cwd("/tmp", Some("/tmp"), &CwdValidation::Warn);
+        assert!(
+            matches!(result, CwdResolution::Match { .. }),
+            "Expected Match, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_validate_cwd_mismatch_warn_mode() {
+        let result = validate_cwd("/tmp", Some("/var"), &CwdValidation::Warn);
+        assert!(
+            matches!(result, CwdResolution::Mismatch { .. }),
+            "Expected Mismatch, got {:?}",
+            result
+        );
+        if let CwdResolution::Mismatch {
+            resolved_cwd,
+            root_path,
+        } = result
+        {
+            assert_eq!(resolved_cwd, "/tmp");
+            // root_path is the expanded/original value
+            assert!(!root_path.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_validate_cwd_mismatch_strict_mode() {
+        let result = validate_cwd("/tmp", Some("/var"), &CwdValidation::Strict);
+        assert!(
+            matches!(result, CwdResolution::StrictMismatch { .. }),
+            "Expected StrictMismatch, got {:?}",
+            result
+        );
+        if let CwdResolution::StrictMismatch { cwd, root_path } = result {
+            assert_eq!(cwd, "/tmp");
+            assert!(!root_path.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_validate_cwd_tilde_expansion() {
+        // The ~ should be expanded using $HOME
+        let home = std::env::var("HOME").unwrap_or_default();
+        if !home.is_empty() {
+            let result = validate_cwd(".", Some("~/nonexistent"), &CwdValidation::Warn);
+            if let CwdResolution::FallbackToRoot { resolved_cwd } = result {
+                assert!(
+                    resolved_cwd.starts_with(&home),
+                    "Expected path to start with HOME={}, got {}",
+                    home,
+                    resolved_cwd
+                );
+                assert!(!resolved_cwd.contains('~'));
+            }
+        }
+    }
+
+    #[test]
+    fn test_validate_cwd_nonexistent_paths_still_compare() {
+        // Even if paths don't exist, canonicalize falls back to raw comparison
+        let result = validate_cwd(
+            "/nonexistent/path/a",
+            Some("/nonexistent/path/b"),
+            &CwdValidation::Warn,
+        );
+        assert!(
+            matches!(result, CwdResolution::Mismatch { .. }),
+            "Expected Mismatch for non-existent different paths, got {:?}",
+            result
+        );
+    }
+
+    // === Pure function tests: should_step_guard_trigger ===
+
+    #[test]
+    fn test_step_guard_trigger_all_skipped() {
+        let breakdown = StepBreakdown {
+            completed: 0,
+            skipped: 3,
+            pending: 0,
+            total: 3,
+        };
+        assert!(should_step_guard_trigger(&breakdown));
+    }
+
+    #[test]
+    fn test_step_guard_trigger_some_completed() {
+        let breakdown = StepBreakdown {
+            completed: 1,
+            skipped: 2,
+            pending: 0,
+            total: 3,
+        };
+        assert!(!should_step_guard_trigger(&breakdown));
+    }
+
+    #[test]
+    fn test_step_guard_trigger_no_steps() {
+        let breakdown = StepBreakdown {
+            completed: 0,
+            skipped: 0,
+            pending: 0,
+            total: 0,
+        };
+        assert!(!should_step_guard_trigger(&breakdown));
+    }
+
+    #[test]
+    fn test_step_guard_trigger_all_pending() {
+        let breakdown = StepBreakdown {
+            completed: 0,
+            skipped: 0,
+            pending: 5,
+            total: 5,
+        };
+        assert!(should_step_guard_trigger(&breakdown));
+    }
+
+    #[test]
+    fn test_step_guard_trigger_default_breakdown() {
+        let breakdown = StepBreakdown::default();
+        assert!(!should_step_guard_trigger(&breakdown));
+    }
+
+    // === emit_event tests for new variants ===
+
+    #[test]
+    fn test_emit_event_new_variants_broadcast() {
+        let (event_tx, mut rx) = broadcast::channel(16);
+        // We just test that new event variants can be sent through the channel
+        let run_id = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
+
+        let events = vec![
+            RunnerEvent::TaskSpawningTimeout {
+                run_id,
+                task_id,
+                task_title: "test task".to_string(),
+                timeout_secs: 120,
+            },
+            RunnerEvent::CwdMismatch {
+                run_id,
+                cwd: "/wrong/path".to_string(),
+                root_path: "/correct/path".to_string(),
+            },
+            RunnerEvent::TaskCompletedWithoutSteps {
+                run_id,
+                task_id,
+                task_title: "test task".to_string(),
+                steps_skipped: 3,
+                steps_total: 3,
+            },
+        ];
+
+        for event in &events {
+            event_tx.send(event.clone()).unwrap();
+        }
+
+        // Verify all 3 events received
+        for _ in 0..3 {
+            let received = rx.try_recv();
+            assert!(received.is_ok(), "Expected event, got {:?}", received);
+        }
+    }
+
+    #[test]
+    fn test_event_serialization_new_variants() {
+        // RunnerEvent uses #[serde(tag = "event", rename_all = "snake_case")]
+        let run_id = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
+
+        // TaskSpawningTimeout → "event": "task_spawning_timeout"
+        let event = RunnerEvent::TaskSpawningTimeout {
+            run_id,
+            task_id,
+            task_title: "my task".to_string(),
+            timeout_secs: 120,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(
+            json.contains("task_spawning_timeout"),
+            "Expected 'task_spawning_timeout' in: {}",
+            json
+        );
+        assert!(json.contains("120"));
+        // Roundtrip
+        let _: RunnerEvent = serde_json::from_str(&json).unwrap();
+
+        // CwdMismatch → "event": "cwd_mismatch"
+        let event = RunnerEvent::CwdMismatch {
+            run_id,
+            cwd: "/a".to_string(),
+            root_path: "/b".to_string(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(
+            json.contains("cwd_mismatch"),
+            "Expected 'cwd_mismatch' in: {}",
+            json
+        );
+        let _: RunnerEvent = serde_json::from_str(&json).unwrap();
+
+        // TaskCompletedWithoutSteps → "event": "task_completed_without_steps"
+        let event = RunnerEvent::TaskCompletedWithoutSteps {
+            run_id,
+            task_id,
+            task_title: "task".to_string(),
+            steps_skipped: 5,
+            steps_total: 5,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(
+            json.contains("task_completed_without_steps"),
+            "Expected 'task_completed_without_steps' in: {}",
+            json
+        );
+        assert!(json.contains("steps_skipped"));
+        let _: RunnerEvent = serde_json::from_str(&json).unwrap();
     }
 }
