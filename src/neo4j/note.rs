@@ -1177,6 +1177,7 @@ impl Neo4jClient {
         "IMPLEMENTS_TRAIT",
         "IMPLEMENTS_FOR",
         "CO_CHANGED",
+        "CO_CHANGED_TRANSITIVE",
         "TOUCHES",
         "MODIFIES",
         "AFFECTS",
@@ -1330,6 +1331,7 @@ impl Neo4jClient {
                               WHEN 'MODIFIES' THEN 0.7
                               WHEN 'TOUCHES' THEN 0.6
                               WHEN 'CO_CHANGED' THEN 0.6
+                              WHEN 'CO_CHANGED_TRANSITIVE' THEN 0.4
                               WHEN 'DISCUSSED' THEN 0.5
                               WHEN 'SYNAPSE' THEN coalesce(r.weight, 0.5)
                               ELSE 0.5

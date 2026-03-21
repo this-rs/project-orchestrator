@@ -1315,12 +1315,35 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
             "CO_CHANGED computation finished"
         );
 
+        // After computing direct CO_CHANGED, compute transitive co-change relations
+        // using BFS on the CO_CHANGED graph (Rolfsnes et al. 2018).
+        let transitive_config = crate::neo4j::models::TransitiveCoChangeConfig::default();
+        let transitive_count = self
+            .neo4j()
+            .compute_co_changed_transitive(
+                project_id,
+                transitive_config.max_transitive_depth,
+                transitive_config.min_transitive_score,
+            )
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(
+                    project_id = %project_id,
+                    error = %e,
+                    "CO_CHANGED_TRANSITIVE computation failed (non-fatal)"
+                );
+                0
+            });
+
         // Emit batch GraphEvent for CO_CHANGED relations (Fabric layer)
-        if count > 0 {
+        if count > 0 || transitive_count > 0 {
             if let Some(ref bus) = self.event_bus {
                 bus.emit_graph(crate::events::GraphEvent::batch(
                     crate::events::graph::GraphLayer::Fabric,
-                    serde_json::json!({"CO_CHANGED": count}),
+                    serde_json::json!({
+                        "CO_CHANGED": count,
+                        "CO_CHANGED_TRANSITIVE": transitive_count
+                    }),
                     project_id.to_string(),
                 ));
             }

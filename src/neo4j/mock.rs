@@ -4692,6 +4692,24 @@ impl GraphStore for MockGraphStore {
         Ok(vec![])
     }
 
+    async fn compute_co_changed_transitive(
+        &self,
+        _project_id: Uuid,
+        _max_depth: i64,
+        _min_score: f64,
+    ) -> Result<i64> {
+        Ok(0)
+    }
+
+    async fn get_file_transitive_co_changers(
+        &self,
+        _file_path: &str,
+        _min_score: f64,
+        _limit: i64,
+    ) -> Result<Vec<TransitiveCoChanger>> {
+        Ok(vec![])
+    }
+
     // ========================================================================
     // Release operations
     // ========================================================================

@@ -573,6 +573,13 @@ pub struct ImpactAnalysis {
     /// Each card contains PageRank, betweenness, DNA, WL hash, co-changers, etc.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub context_cards: Vec<crate::graph::models::ContextCard>,
+    /// Files with transitive co-change coupling (A~C via B where A↔B and B↔C co-change).
+    /// Detected via BFS on the CO_CHANGED graph with exponential decay scoring.
+    ///
+    /// # References
+    /// - Rolfsnes et al. (2018) — "Detecting Evolutionary Coupling Using Transitive Association Rules"
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub transitive_co_changers: Vec<crate::neo4j::models::TransitiveCoChanger>,
 }
 
 /// Analyze impact of changing a file or function
@@ -852,6 +859,20 @@ pub async fn analyze_impact(
         Vec::new()
     };
 
+    // Fetch transitive co-changers (Rolfsnes et al. 2018):
+    // Files that co-change transitively via intermediate files in the CO_CHANGED graph.
+    let transitive_config = crate::neo4j::models::TransitiveCoChangeConfig::default();
+    let transitive_co_changers = state
+        .orchestrator
+        .neo4j()
+        .get_file_transitive_co_changers(
+            &target,
+            transitive_config.min_transitive_score,
+            20,
+        )
+        .await
+        .unwrap_or_default();
+
     // Build ranked view: direct files score 1.0, transitive-only score 0.33
     let ranked_affected = {
         let mut scored: Vec<(AffectedFile, f64)> = Vec::new();
@@ -885,6 +906,7 @@ pub async fn analyze_impact(
         affecting_decisions,
         ranked_affected,
         context_cards,
+        transitive_co_changers,
     }))
 }
 

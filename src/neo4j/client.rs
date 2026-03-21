@@ -326,6 +326,9 @@ impl Neo4jClient {
             // Knowledge Fabric — CO_CHANGED relationship indexes (File↔File)
             "CREATE INDEX co_changed_count IF NOT EXISTS FOR ()-[r:CO_CHANGED]-() ON (r.count)",
             "CREATE INDEX co_changed_project IF NOT EXISTS FOR ()-[r:CO_CHANGED]-() ON (r.project_id)",
+            // Knowledge Fabric — CO_CHANGED_TRANSITIVE relationship indexes (Rolfsnes et al. 2018)
+            "CREATE INDEX co_changed_transitive_score IF NOT EXISTS FOR ()-[r:CO_CHANGED_TRANSITIVE]-() ON (r.score)",
+            "CREATE INDEX co_changed_transitive_project IF NOT EXISTS FOR ()-[r:CO_CHANGED_TRANSITIVE]-() ON (r.project_id)",
             // Decision AFFECTS relationship index
             "CREATE INDEX affects_rel_idx IF NOT EXISTS FOR ()-[r:AFFECTS]->() ON (r.created_at)",
             // Decision SUPERSEDES relationship index

@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 /// Relationship types that belong to the code structure layer.
 /// These are recreated during sync and can be safely deleted during cleanup.
-/// Knowledge relationships (LINKED_TO, AFFECTS, DISCUSSED, TOUCHES, CO_CHANGED)
+/// Knowledge relationships (LINKED_TO, AFFECTS, DISCUSSED, TOUCHES, CO_CHANGED, CO_CHANGED_TRANSITIVE)
 /// are NOT in this list and will survive cleanup.
 const CODE_REL_TYPES: &[&str] = &[
     "CONTAINS",
@@ -111,9 +111,9 @@ impl Neo4jClient {
             WHERE NOT f.path IN $valid_paths
             OPTIONAL MATCH (f)-[:CONTAINS]->(symbol)
             OPTIONAL MATCH ()-[kr]->(f)
-              WHERE type(kr) IN ['LINKED_TO', 'AFFECTS', 'DISCUSSED', 'TOUCHES', 'CO_CHANGED']
+              WHERE type(kr) IN ['LINKED_TO', 'AFFECTS', 'DISCUSSED', 'TOUCHES', 'CO_CHANGED', 'CO_CHANGED_TRANSITIVE']
             OPTIONAL MATCH ()-[kr2]->(symbol)
-              WHERE type(kr2) IN ['LINKED_TO', 'AFFECTS', 'DISCUSSED', 'TOUCHES', 'CO_CHANGED']
+              WHERE type(kr2) IN ['LINKED_TO', 'AFFECTS', 'DISCUSSED', 'TOUCHES', 'CO_CHANGED', 'CO_CHANGED_TRANSITIVE']
             RETURN count(DISTINCT kr) + count(DISTINCT kr2) AS knowledge_rels_count
             "#,
         )
@@ -4173,7 +4173,7 @@ impl Neo4jClient {
         use std::collections::HashSet;
 
         // Build relationship pattern from whitelisted types
-        let allowed = ["IMPORTS", "CALLS", "CO_CHANGED", "EXTENDS", "IMPLEMENTS"];
+        let allowed = ["IMPORTS", "CALLS", "CO_CHANGED", "CO_CHANGED_TRANSITIVE", "EXTENDS", "IMPLEMENTS"];
         let rel_pattern = if relation_types.is_empty() {
             "IMPORTS".to_string()
         } else {

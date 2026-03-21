@@ -1146,6 +1146,28 @@ pub trait GraphStore: Send + Sync {
         limit: i64,
     ) -> Result<Vec<CoChanger>>;
 
+    /// Compute CO_CHANGED_TRANSITIVE relations via BFS on the CO_CHANGED graph.
+    ///
+    /// # References
+    /// - Rolfsnes et al. (2018) — "Detecting Evolutionary Coupling Using Transitive Association Rules"
+    async fn compute_co_changed_transitive(
+        &self,
+        project_id: Uuid,
+        max_depth: i64,
+        min_score: f64,
+    ) -> Result<i64>;
+
+    /// Get files that are transitively co-changed with a given file.
+    ///
+    /// # References
+    /// - Rolfsnes et al. (2018) — "Detecting Evolutionary Coupling Using Transitive Association Rules"
+    async fn get_file_transitive_co_changers(
+        &self,
+        file_path: &str,
+        min_score: f64,
+        limit: i64,
+    ) -> Result<Vec<TransitiveCoChanger>>;
+
     // ========================================================================
     // Release operations
     // ========================================================================

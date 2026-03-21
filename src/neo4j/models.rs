@@ -699,6 +699,48 @@ pub struct CoChanger {
     pub last_at: Option<String>,
 }
 
+/// A file that co-changes *transitively* with a given file.
+///
+/// Detected via BFS over the CO_CHANGED graph: if A↔B and B↔C co-change
+/// frequently, then A~C has a transitive coupling even without direct co-change.
+///
+/// # References
+/// - Rolfsnes et al. (2018) — "Detecting Evolutionary Coupling Using Transitive Association Rules"
+/// - Oliva & Gerosa (2015) — transitive co-change correlates with software defects
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransitiveCoChanger {
+    /// The transitively co-changed file path
+    pub path: String,
+    /// Product of CO_CHANGED counts along the shortest path (exponential decay)
+    pub score: f64,
+    /// Number of hops in the CO_CHANGED graph (2 = A→B→C)
+    pub depth: i64,
+    /// The intermediate file(s) forming the transitive chain
+    pub via: Vec<String>,
+}
+
+/// Configuration for transitive co-change computation.
+///
+/// # References
+/// - Rolfsnes et al. (2018) — "Detecting Evolutionary Coupling Using Transitive Association Rules"
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransitiveCoChangeConfig {
+    /// Maximum BFS depth for transitive co-change detection (default: 2)
+    pub max_transitive_depth: i64,
+    /// Minimum transitive score to keep a relation (default: 0.1)
+    /// Score = product of normalized edge weights along the path
+    pub min_transitive_score: f64,
+}
+
+impl Default for TransitiveCoChangeConfig {
+    fn default() -> Self {
+        Self {
+            max_transitive_depth: 2,
+            min_transitive_score: 0.1,
+        }
+    }
+}
+
 /// Deserializes a list of file changes that can be either strings or objects.
 /// This allows backward-compatible API: `["a.rs", "b.rs"]` or `[{"path": "a.rs", "additions": 10}]`
 pub fn deserialize_files_changed<'de, D>(

@@ -74,6 +74,11 @@ pub enum CodeEdgeType {
     ImplementsFor,
     /// Temporal coupling — files changed together in commits (Knowledge Fabric P1)
     CoChanged,
+    /// Transitive temporal coupling — files co-change via intermediate files
+    ///
+    /// # References
+    /// - Rolfsnes et al. (2018) — "Detecting Evolutionary Coupling Using Transitive Association Rules"
+    CoChangedTransitive,
     /// Commit touches — file was modified by a commit (Knowledge Fabric P1)
     Touches,
     /// Chat discussed — entity was discussed in a chat session (Knowledge Fabric P4)
@@ -97,6 +102,7 @@ impl std::fmt::Display for CodeEdgeType {
             Self::ImplementsTrait => write!(f, "IMPLEMENTS_TRAIT"),
             Self::ImplementsFor => write!(f, "IMPLEMENTS_FOR"),
             Self::CoChanged => write!(f, "CO_CHANGED"),
+            Self::CoChangedTransitive => write!(f, "CO_CHANGED_TRANSITIVE"),
             Self::Touches => write!(f, "TOUCHES"),
             Self::Discussed => write!(f, "DISCUSSED"),
             Self::Affects => write!(f, "AFFECTS"),
@@ -935,6 +941,11 @@ pub struct FabricWeights {
     pub calls: f64,
     /// Weight for CO_CHANGED edges (temporal coupling, default: 0.4)
     pub co_changed: f64,
+    /// Weight for CO_CHANGED_TRANSITIVE edges (transitive temporal coupling, default: 0.2)
+    ///
+    /// # References
+    /// - Rolfsnes et al. (2018) — "Detecting Evolutionary Coupling Using Transitive Association Rules"
+    pub co_changed_transitive: f64,
     /// Weight for AFFECTS edges (decision impact, default: 0.7)
     pub affects: f64,
     /// Weight for TOUCHES edges (commit coupling, default: 0.5)
@@ -959,6 +970,7 @@ impl Default for FabricWeights {
             imports: 0.8,
             calls: 0.9,
             co_changed: 0.4,
+            co_changed_transitive: 0.2,
             affects: 0.7,
             touches: 0.5,
             discussed: 0.3,

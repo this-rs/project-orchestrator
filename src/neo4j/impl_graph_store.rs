@@ -1434,6 +1434,26 @@ impl GraphStore for Neo4jClient {
         self.get_file_co_changers(file_path, min_count, limit).await
     }
 
+    async fn compute_co_changed_transitive(
+        &self,
+        project_id: Uuid,
+        max_depth: i64,
+        min_score: f64,
+    ) -> anyhow::Result<i64> {
+        self.compute_co_changed_transitive(project_id, max_depth, min_score)
+            .await
+    }
+
+    async fn get_file_transitive_co_changers(
+        &self,
+        file_path: &str,
+        min_score: f64,
+        limit: i64,
+    ) -> anyhow::Result<Vec<TransitiveCoChanger>> {
+        self.get_file_transitive_co_changers(file_path, min_score, limit)
+            .await
+    }
+
     // ========================================================================
     // Release operations
     // ========================================================================
