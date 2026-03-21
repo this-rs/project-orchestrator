@@ -208,6 +208,19 @@ pub enum TaskResult {
 // TaskExecutionReport — structured post-execution feedback
 // ============================================================================
 
+/// Breakdown of step statuses for a task — used by the step completion guard.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct StepBreakdown {
+    /// Number of steps completed successfully
+    pub completed: usize,
+    /// Number of steps skipped
+    pub skipped: usize,
+    /// Number of steps still pending
+    pub pending: usize,
+    /// Total number of steps defined for this task
+    pub total: usize,
+}
+
 /// Structured report generated after a sub-agent completes a task.
 ///
 /// Captures tool usage metrics from ChatEvents and git-derived data
@@ -382,6 +395,14 @@ pub enum RunnerEvent {
         tasks_failed: usize,
         /// PR URL if auto-PR was created
         pr_url: Option<String>,
+    },
+    /// Task marked completed but no steps were actually completed (all skipped)
+    TaskCompletedWithoutSteps {
+        run_id: Uuid,
+        task_id: Uuid,
+        task_title: String,
+        steps_skipped: usize,
+        steps_total: usize,
     },
     /// CWD doesn't match the project's root_path
     CwdMismatch {

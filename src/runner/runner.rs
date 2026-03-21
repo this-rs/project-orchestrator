@@ -15,7 +15,7 @@ use crate::runner::guard::{AgentGuard, ChatManagerHintSender, GuardConfig, Guard
 use crate::runner::lifecycle;
 use crate::runner::models::{
     ActiveAgent, ActiveAgentSnapshot, CwdValidation, PlanRunStatus, RunnerConfig, RunnerEvent,
-    TaskExecutionReport, TaskResult, TaskRunStatus, TriggerSource,
+    StepBreakdown, TaskExecutionReport, TaskResult, TaskRunStatus, TriggerSource,
 };
 use crate::runner::persona::{
     activate_skills_for_task, complexity_directive, profile_task, record_skill_feedback,
@@ -360,6 +360,9 @@ impl PlanRunner {
                     (run_id.to_string(), CrudAction::Updated)
                 }
                 RunnerEvent::WorktreeRecovery { run_id, .. } => {
+                    (run_id.to_string(), CrudAction::Updated)
+                }
+                RunnerEvent::TaskCompletedWithoutSteps { run_id, .. } => {
                     (run_id.to_string(), CrudAction::Updated)
                 }
                 RunnerEvent::CwdMismatch { run_id, .. } => {
@@ -2623,7 +2626,33 @@ impl PlanRunner {
                 cost_usd,
                 duration_secs: start.elapsed().as_secs_f64(),
             };
-            self.finalize_steps(task_id, &success_result, cwd).await;
+            let breakdown = self.finalize_steps(task_id, &success_result, cwd).await;
+
+            // Step completion guard: if the task has steps but NONE were completed,
+            // the agent likely skipped all work — override to Failed.
+            if breakdown.total > 0 && breakdown.completed == 0 {
+                warn!(
+                    "Task {} — step completion guard triggered: 0/{} steps completed ({} skipped) — overriding to Failed",
+                    task_id, breakdown.total, breakdown.skipped
+                );
+                self.emit_event(RunnerEvent::TaskCompletedWithoutSteps {
+                    run_id,
+                    task_id,
+                    task_title: task_title.to_string(),
+                    steps_skipped: breakdown.skipped,
+                    steps_total: breakdown.total,
+                });
+                // Override: return Failed instead of Success
+                let failed_result = TaskResult::Failed {
+                    reason: format!(
+                        "Step completion guard: 0/{} steps completed ({} skipped, {} pending)",
+                        breakdown.total, breakdown.skipped, breakdown.pending
+                    ),
+                    attempts: 0,
+                    cost_usd,
+                };
+                return Ok(wrap(failed_result));
+            }
         }
 
         // Post-execution: persist persona used on the task node (Step 5 — T9)
@@ -2995,7 +3024,7 @@ impl PlanRunner {
     /// - `Timeout` with commits: in_progress → completed, pending → skipped
     /// - `Timeout` without commits: all → skipped
     /// - `Error`/`Cancelled`/`BudgetExceeded`: all → skipped
-    async fn finalize_steps(&self, task_id: Uuid, outcome: &TaskResult, cwd: &str) {
+    async fn finalize_steps(&self, task_id: Uuid, outcome: &TaskResult, cwd: &str) -> StepBreakdown {
         // Check if agent made any commits (proof of work)
         let has_commits = match outcome {
             TaskResult::Timeout { .. } => {
@@ -3020,8 +3049,19 @@ impl PlanRunner {
                     "finalize_steps: failed to get steps for task {}: {}",
                     task_id, e
                 );
-                return;
+                return StepBreakdown::default();
             }
+        };
+
+        // Count step statuses BEFORE finalization (reflects what the agent actually did)
+        let mut breakdown = StepBreakdown {
+            completed: steps.iter().filter(|s| s.status == crate::neo4j::models::StepStatus::Completed).count(),
+            skipped: steps.iter().filter(|s| s.status == crate::neo4j::models::StepStatus::Skipped).count(),
+            pending: steps.iter().filter(|s| {
+                s.status == crate::neo4j::models::StepStatus::Pending
+                    || s.status == crate::neo4j::models::StepStatus::InProgress
+            }).count(),
+            total: steps.len(),
         };
 
         let remaining: Vec<_> = steps
@@ -3033,7 +3073,7 @@ impl PlanRunner {
             .collect();
 
         if remaining.is_empty() {
-            return;
+            return breakdown;
         }
 
         // Warn if agent didn't update ANY step (all still pending = agent ignored MCP step updates)
@@ -3061,13 +3101,26 @@ impl PlanRunner {
                 _ => crate::neo4j::models::StepStatus::Skipped,
             };
 
+            // Update breakdown to reflect finalized statuses
+            match new_status {
+                crate::neo4j::models::StepStatus::Completed => {
+                    breakdown.completed += 1;
+                    breakdown.pending -= 1;
+                }
+                crate::neo4j::models::StepStatus::Skipped => {
+                    breakdown.skipped += 1;
+                    breakdown.pending -= 1;
+                }
+                _ => {}
+            }
+
             if let Err(e) = self.graph.update_step_status(step.id, new_status).await {
                 warn!("finalize_steps: failed to update step {}: {}", step.id, e);
             }
         }
 
         info!(
-            "Task {} — finalized {} remaining steps (outcome: {})",
+            "Task {} — finalized {} remaining steps (outcome: {}, breakdown: {}/{}/{} completed/skipped/pending)",
             task_id,
             remaining.len(),
             match outcome {
@@ -3081,8 +3134,13 @@ impl PlanRunner {
                 TaskResult::Failed { .. } => "failed",
                 TaskResult::BudgetExceeded { .. } => "budget_exceeded",
                 TaskResult::Blocked { .. } => "blocked",
-            }
+            },
+            breakdown.completed,
+            breakdown.skipped,
+            breakdown.pending,
         );
+
+        breakdown
     }
 
     /// Finalize the run — update state, persist, emit event, cleanup worktrees.
@@ -4565,7 +4623,13 @@ mod tests {
             cost_usd: 0.1,
             duration_secs: 30.0,
         };
-        runner.finalize_steps(task_id, &result, "/tmp").await;
+        let breakdown = runner.finalize_steps(task_id, &result, "/tmp").await;
+
+        // Verify breakdown
+        assert_eq!(breakdown.total, 3);
+        assert_eq!(breakdown.completed, 3); // 1 already + 2 finalized
+        assert_eq!(breakdown.skipped, 0);
+        assert_eq!(breakdown.pending, 0);
 
         // Verify: pending and in_progress → completed, already completed stays
         let steps = graph.get_task_steps(task_id).await.unwrap();
@@ -4677,9 +4741,123 @@ mod tests {
             cost_usd: 0.1,
             duration_secs: 10.0,
         };
-        runner.finalize_steps(task_id, &result, "/tmp").await;
+        let breakdown = runner.finalize_steps(task_id, &result, "/tmp").await;
+
+        assert_eq!(breakdown.total, 1);
+        assert_eq!(breakdown.completed, 1);
+        assert_eq!(breakdown.skipped, 0);
+        assert_eq!(breakdown.pending, 0);
 
         let steps = graph.get_task_steps(task_id).await.unwrap();
         assert_eq!(steps[0].status, StepStatus::Completed);
+    }
+
+    // === Step Completion Guard Tests ===
+
+    #[tokio::test]
+    async fn test_step_guard_some_completed_returns_ok() {
+        use crate::neo4j::models::{StepStatus, TaskStatus};
+        use crate::test_helpers::{test_plan, test_step, test_task};
+
+        let (runner, graph) = test_plan_runner_with_graph();
+
+        let plan = test_plan();
+        let plan_id = plan.id;
+        graph.create_plan(&plan).await.unwrap();
+
+        let mut task = test_task();
+        task.status = TaskStatus::InProgress;
+        let task_id = task.id;
+        graph.create_task(plan_id, &task).await.unwrap();
+
+        // 1 completed + 1 skipped + 1 pending
+        let mut step1 = test_step(1, "Completed step");
+        step1.status = StepStatus::Completed;
+        graph.create_step(task_id, &step1).await.unwrap();
+
+        let mut step2 = test_step(2, "Skipped step");
+        step2.status = StepStatus::Skipped;
+        graph.create_step(task_id, &step2).await.unwrap();
+
+        let step3 = test_step(3, "Pending step");
+        graph.create_step(task_id, &step3).await.unwrap();
+
+        let result = TaskResult::Success {
+            cost_usd: 0.1,
+            duration_secs: 30.0,
+        };
+        let breakdown = runner.finalize_steps(task_id, &result, "/tmp").await;
+
+        // Guard should NOT trigger: 1 completed before + 1 finalized = 2 completed
+        assert_eq!(breakdown.total, 3);
+        assert!(breakdown.completed >= 1, "At least 1 step should be completed");
+        // This means the guard (total > 0 && completed == 0) would be false → task stays Success
+    }
+
+    #[tokio::test]
+    async fn test_step_guard_all_skipped_triggers() {
+        use crate::neo4j::models::{StepStatus, TaskStatus};
+        use crate::test_helpers::{test_plan, test_step, test_task};
+
+        let (runner, graph) = test_plan_runner_with_graph();
+
+        let plan = test_plan();
+        let plan_id = plan.id;
+        graph.create_plan(&plan).await.unwrap();
+
+        let mut task = test_task();
+        task.status = TaskStatus::InProgress;
+        let task_id = task.id;
+        graph.create_task(plan_id, &task).await.unwrap();
+
+        // All steps already skipped (agent skipped them all)
+        let mut step1 = test_step(1, "Skipped step 1");
+        step1.status = StepStatus::Skipped;
+        graph.create_step(task_id, &step1).await.unwrap();
+
+        let mut step2 = test_step(2, "Skipped step 2");
+        step2.status = StepStatus::Skipped;
+        graph.create_step(task_id, &step2).await.unwrap();
+
+        let result = TaskResult::Success {
+            cost_usd: 0.1,
+            duration_secs: 30.0,
+        };
+        let breakdown = runner.finalize_steps(task_id, &result, "/tmp").await;
+
+        // Guard SHOULD trigger: total=2, completed=0, skipped=2
+        assert_eq!(breakdown.total, 2);
+        assert_eq!(breakdown.completed, 0);
+        assert_eq!(breakdown.skipped, 2);
+        // In execute_task, this would override Success → Failed
+    }
+
+    #[tokio::test]
+    async fn test_step_guard_no_steps_returns_ok() {
+        use crate::neo4j::models::TaskStatus;
+        use crate::test_helpers::{test_plan, test_task};
+
+        let (runner, graph) = test_plan_runner_with_graph();
+
+        let plan = test_plan();
+        let plan_id = plan.id;
+        graph.create_plan(&plan).await.unwrap();
+
+        let mut task = test_task();
+        task.status = TaskStatus::InProgress;
+        let task_id = task.id;
+        graph.create_task(plan_id, &task).await.unwrap();
+
+        // No steps at all
+        let result = TaskResult::Success {
+            cost_usd: 0.1,
+            duration_secs: 30.0,
+        };
+        let breakdown = runner.finalize_steps(task_id, &result, "/tmp").await;
+
+        // Guard should NOT trigger: total=0, so condition (total > 0 && completed == 0) is false
+        assert_eq!(breakdown.total, 0);
+        assert_eq!(breakdown.completed, 0);
+        // No steps = task with no defined steps → Success is valid
     }
 }
