@@ -2128,6 +2128,7 @@ mod tests {
             registry_remote_url: None,
             identity: None,
             reactor_counters: std::sync::OnceLock::new(),
+            confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
             oidc_client: None,
             neural_router: crate::test_helpers::mock_neural_router(),
             trajectory_collector: std::sync::RwLock::new(None),

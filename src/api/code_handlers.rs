@@ -580,6 +580,13 @@ pub struct ImpactAnalysis {
     /// - Rolfsnes et al. (2018) — "Detecting Evolutionary Coupling Using Transitive Association Rules"
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub transitive_co_changers: Vec<crate::neo4j::models::TransitiveCoChanger>,
+    /// System-level prediction confidence for this impact analysis.
+    /// Based on local graph density in the k=2 neighborhood of the target.
+    ///
+    /// # References
+    /// - ELL (2025) — "Experience-driven Lifelong Learning" — 4th pillar: self-evaluation
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<crate::graph::confidence::ConfidenceScore>,
 }
 
 /// Analyze impact of changing a file or function
@@ -891,6 +898,28 @@ pub async fn analyze_impact(
         into_ranked(scored, total)
     };
 
+    // Compute system-level prediction confidence from local graph density.
+    // Edge count ≈ direct + transitive relationships; node count ≈ unique affected files + target.
+    // References: ELL (2025) — 4th pillar: self-evaluation
+    let confidence = {
+        let edge_count = directly_affected.len() + transitively_affected.len();
+        let mut unique_nodes = std::collections::HashSet::new();
+        unique_nodes.insert(target.clone());
+        for p in &directly_affected {
+            unique_nodes.insert(p.clone());
+        }
+        for p in &transitively_affected {
+            unique_nodes.insert(p.clone());
+        }
+        let cs = crate::graph::confidence::confidence_from_graph_density(
+            edge_count,
+            unique_nodes.len(),
+        );
+        // Record in the tracker for aggregated system confidence
+        state.confidence_tracker.record(cs.clone());
+        Some(cs)
+    };
+
     Ok(Json(ImpactAnalysis {
         target,
         directly_affected,
@@ -907,6 +936,7 @@ pub async fn analyze_impact(
         ranked_affected,
         context_cards,
         transitive_co_changers,
+        confidence,
     }))
 }
 
@@ -3662,11 +3692,40 @@ pub async fn predict_missing_links(
 
     let predictions = suggest_missing_links(&graph, &co_change, dna_ref, top_n, min_plausibility);
 
+    // Compute confidence from signal convergence across predictions.
+    // Each prediction carries independent signals (co-change, Jaccard, Adamic-Adar,
+    // proximity, DNA similarity). Higher convergence = higher confidence.
+    //
+    // # References
+    // - ELL (2025) — "Experience-driven Lifelong Learning" — 4th pillar: self-evaluation
+    let confidence = if predictions.is_empty() {
+        crate::graph::confidence::ConfidenceScore::new(
+            0.0,
+            crate::graph::confidence::ConfidenceBasis::SignalConvergence,
+            0,
+        )
+    } else {
+        let mut total_score = 0.0;
+        let mut count = 0usize;
+        for pred in &predictions {
+            let cs = crate::graph::confidence::confidence_from_signal_convergence(&pred.signals);
+            total_score += cs.score;
+            count += 1;
+        }
+        crate::graph::confidence::ConfidenceScore::new(
+            if count > 0 { total_score / count as f64 } else { 0.0 },
+            crate::graph::confidence::ConfidenceBasis::SignalConvergence,
+            count,
+        )
+    };
+    state.confidence_tracker.record(confidence.clone());
+
     Ok(Json(serde_json::json!({
         "predictions": predictions,
         "total": predictions.len(),
         "top_n": top_n,
         "min_plausibility": min_plausibility,
+        "confidence": confidence,
     })))
 }
 
@@ -4325,6 +4384,7 @@ mod tests {
             trajectory_store: None,
             identity: None,
             reactor_counters: std::sync::OnceLock::new(),
+            confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
         });
         create_router(state)
     }
@@ -4392,6 +4452,7 @@ mod tests {
             trajectory_store: None,
             identity: None,
             reactor_counters: std::sync::OnceLock::new(),
+            confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
         });
         create_router(state)
     }
@@ -4673,6 +4734,7 @@ mod tests {
             trajectory_store: None,
             identity: None,
             reactor_counters: std::sync::OnceLock::new(),
+            confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
         });
         create_router(state)
     }
@@ -4858,6 +4920,7 @@ mod tests {
             trajectory_store: None,
             identity: None,
             reactor_counters: std::sync::OnceLock::new(),
+            confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
         });
         create_router(state)
     }
@@ -5069,6 +5132,7 @@ mod tests {
             trajectory_store: None,
             identity: None,
             reactor_counters: std::sync::OnceLock::new(),
+            confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
         });
         (create_router(state), project_id)
     }
@@ -5265,6 +5329,7 @@ mod tests {
             trajectory_store: None,
             identity: None,
             reactor_counters: std::sync::OnceLock::new(),
+            confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
         });
         let app = create_router(state);
 
@@ -5465,6 +5530,7 @@ mod tests {
             trajectory_store: None,
             identity: None,
             reactor_counters: std::sync::OnceLock::new(),
+            confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
         });
         create_router(state)
     }
@@ -5708,6 +5774,7 @@ mod tests {
             trajectory_store: None,
             identity: None,
             reactor_counters: std::sync::OnceLock::new(),
+            confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
         });
         create_router(state)
     }
@@ -5844,6 +5911,7 @@ mod tests {
             trajectory_store: None,
             identity: None,
             reactor_counters: std::sync::OnceLock::new(),
+            confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
         });
         let app = create_router(state);
 
@@ -6054,6 +6122,7 @@ mod tests {
             trajectory_store: None,
             identity: None,
             reactor_counters: std::sync::OnceLock::new(),
+            confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
         });
         let app = create_router(state);
 
@@ -6217,6 +6286,7 @@ mod tests {
             trajectory_store: None,
             identity: None,
             reactor_counters: std::sync::OnceLock::new(),
+            confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
         });
         let app = create_router(state);
 

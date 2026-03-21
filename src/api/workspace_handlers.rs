@@ -2003,6 +2003,7 @@ mod tests {
             trajectory_store: None,
             identity: None,
             reactor_counters: std::sync::OnceLock::new(),
+            confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
         });
         create_router(state)
     }
@@ -2085,6 +2086,7 @@ mod tests {
             trajectory_store: None,
             identity: None,
             reactor_counters: std::sync::OnceLock::new(),
+            confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
         });
         (create_router(state), milestone_id, task1.id, task2.id)
     }
@@ -2479,6 +2481,7 @@ mod tests {
             trajectory_store: None,
             identity: None,
             reactor_counters: std::sync::OnceLock::new(),
+            confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
         });
         let app = create_router(state);
 
@@ -2534,6 +2537,7 @@ mod tests {
             trajectory_store: None,
             identity: None,
             reactor_counters: std::sync::OnceLock::new(),
+            confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
         });
         let app = create_router(state);
 
@@ -2577,6 +2581,7 @@ mod tests {
             trajectory_store: None,
             identity: None,
             reactor_counters: std::sync::OnceLock::new(),
+            confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
         });
         let app = create_router(state);
 
@@ -2620,6 +2625,7 @@ mod tests {
             trajectory_store: None,
             identity: None,
             reactor_counters: std::sync::OnceLock::new(),
+            confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
         });
         let app = create_router(state);
 
@@ -2665,6 +2671,7 @@ mod tests {
             trajectory_store: None,
             identity: None,
             reactor_counters: std::sync::OnceLock::new(),
+            confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
         });
         let app = create_router(state);
 
@@ -2710,6 +2717,7 @@ mod tests {
             trajectory_store: None,
             identity: None,
             reactor_counters: std::sync::OnceLock::new(),
+            confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
         });
         let app = create_router(state);
 
@@ -2753,6 +2761,7 @@ mod tests {
             trajectory_store: None,
             identity: None,
             reactor_counters: std::sync::OnceLock::new(),
+            confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
         });
         let app = create_router(state);
 
@@ -2841,6 +2850,7 @@ mod tests {
             trajectory_store: None,
             identity: None,
             reactor_counters: std::sync::OnceLock::new(),
+            confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
         });
         let app = create_router(state);
 
@@ -2891,6 +2901,7 @@ mod tests {
             trajectory_store: None,
             identity: None,
             reactor_counters: std::sync::OnceLock::new(),
+            confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
         });
         let app = create_router(state);
 
@@ -2939,6 +2950,7 @@ mod tests {
             trajectory_store: None,
             identity: None,
             reactor_counters: std::sync::OnceLock::new(),
+            confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
         });
         let app = create_router(state);
 
@@ -2987,6 +2999,7 @@ mod tests {
             trajectory_store: None,
             identity: None,
             reactor_counters: std::sync::OnceLock::new(),
+            confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
         });
         let app = create_router(state);
 
@@ -3042,6 +3055,7 @@ mod tests {
             trajectory_store: None,
             identity: None,
             reactor_counters: std::sync::OnceLock::new(),
+            confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
         });
         let app = create_router(state);
 
@@ -3090,6 +3104,7 @@ mod tests {
             trajectory_store: None,
             identity: None,
             reactor_counters: std::sync::OnceLock::new(),
+            confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
         });
         let app = create_router(state);
 

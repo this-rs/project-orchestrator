@@ -76,6 +76,11 @@ pub struct ServerState {
     /// EventReactor counters for the /api/reactor/status endpoint.
     /// Initialized once after reactor is built via `OnceLock`.
     pub reactor_counters: std::sync::OnceLock<Arc<crate::events::ReactorCounters>>,
+    /// System-level prediction confidence tracker (rolling window).
+    ///
+    /// # References
+    /// - ELL (2025) — "Experience-driven Lifelong Learning" — 4th pillar: self-evaluation
+    pub confidence_tracker: Arc<crate::graph::confidence::ConfidenceTracker>,
 }
 
 /// Shared orchestrator state
@@ -6194,6 +6199,7 @@ mod tests {
             trajectory_store: None,
             identity: None,
             reactor_counters: std::sync::OnceLock::new(),
+            confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
         });
         (create_router(state), milestone.id, task1.id, task2.id)
     }
@@ -6563,6 +6569,7 @@ mod tests {
             trajectory_store: None,
             identity: None,
             reactor_counters: std::sync::OnceLock::new(),
+            confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
         });
         create_router(state)
     }
@@ -7338,6 +7345,7 @@ mod tests {
             trajectory_store: None,
             identity: None,
             reactor_counters: std::sync::OnceLock::new(),
+            confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
         });
         (create_router(state), plan.id, task1.id, task2.id)
     }
@@ -7445,6 +7453,7 @@ mod tests {
             trajectory_store: None,
             identity: None,
             reactor_counters: std::sync::OnceLock::new(),
+            confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
         });
         let app = create_router(state);
 

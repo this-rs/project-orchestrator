@@ -30,6 +30,7 @@
 //! - [`mock`] — `MockAnalyticsEngine` for testing (cfg(test) only)
 
 pub mod algorithms;
+pub mod confidence;
 pub mod debouncer;
 pub mod engine;
 pub mod enrichment;
@@ -42,6 +43,10 @@ pub mod writer;
 pub mod mock;
 
 // Re-export primary types for convenience
+pub use confidence::{
+    confidence_from_graph_density, confidence_from_signal_convergence, ConfidenceBasis,
+    ConfidenceFeedback, ConfidenceScore, ConfidenceTracker, PredictionOutcome, SystemConfidence,
+};
 pub use debouncer::{
     AnalyticsDebouncer, CoChangeDebouncer, NeuralReinforcementDebouncer, ReinforcementPayload,
 };

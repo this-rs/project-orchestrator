@@ -1445,6 +1445,7 @@ pub async fn start_server(mut config: Config) -> Result<()> {
             }
         },
         reactor_counters: std::sync::OnceLock::new(),
+        confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
     });
 
     // ── EventReactor: build, register built-in reactions, and spawn ──
