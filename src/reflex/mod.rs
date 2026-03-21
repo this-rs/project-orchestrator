@@ -447,6 +447,55 @@ mod tests {
         assert!((suggestion_score(&suggestions[1]) - 0.6).abs() < f64::EPSILON);
     }
 
+    /// Simulates the runner's reflex injection flow (Step 2e in execute_task):
+    /// builds a RefContext, gets suggestions, formats markdown, and injects
+    /// into the prompt as a `## Learned Reflexes` section.
+    #[test]
+    fn test_runner_reflex_injection_format() {
+        // Simulate scar suggestions as the engine would return them
+        let suggestions = vec![
+            Suggestion::ScarWarning {
+                note_id: Uuid::new_v4(),
+                content: "Don't use unwrap() in error handlers".to_string(),
+                scar_intensity: 0.85,
+                file_path: "src/api/handlers.rs".to_string(),
+            },
+            Suggestion::CoChangeReminder {
+                file_path: "src/api/routes.rs".to_string(),
+                source_file: "src/api/handlers.rs".to_string(),
+                coupling: 0.78,
+            },
+        ];
+
+        let reflex_block = ReflexEngine::format_markdown(&suggestions);
+        assert!(!reflex_block.is_empty());
+
+        // Simulate the runner's prompt injection (same code as execute_task Step 2e)
+        let mut prompt = String::from("## Task Context\nDo something.\n");
+        if !reflex_block.is_empty() {
+            prompt.push_str("\n## Learned Reflexes\n");
+            prompt.push_str(&reflex_block);
+            prompt.push('\n');
+        }
+
+        // Verify the prompt contains the expected sections
+        assert!(prompt.contains("## Learned Reflexes"));
+        assert!(prompt.contains("SCAR"));
+        assert!(prompt.contains("src/api/handlers.rs"));
+        assert!(prompt.contains("85%")); // scar_intensity * 100
+        assert!(prompt.contains("CO-CHANGE"));
+        assert!(prompt.contains("src/api/routes.rs"));
+        assert!(prompt.contains("78%")); // coupling * 100
+
+        // Verify ordering: SCAR (priority 3) appears before CO-CHANGE (priority 1)
+        let scar_pos = prompt.find("SCAR").unwrap();
+        let co_change_pos = prompt.find("CO-CHANGE").unwrap();
+        assert!(
+            scar_pos < co_change_pos,
+            "ScarWarning should appear before CoChangeReminder"
+        );
+    }
+
     #[test]
     fn test_ref_context_defaults() {
         let ctx = RefContext {

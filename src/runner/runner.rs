@@ -690,12 +690,31 @@ impl PlanRunner {
     }
 
     /// Cancel the currently running plan execution.
-    pub async fn cancel(run_id: Uuid) -> Result<()> {
+    ///
+    /// When a `ChatManager` is provided, all active agent sessions are
+    /// forcefully closed (interrupt + SIGKILL) so that Claude Code
+    /// subprocesses don't keep running after the cancel is requested.
+    pub async fn cancel(run_id: Uuid, chat_manager: Option<Arc<ChatManager>>) -> Result<()> {
         let global = RUNNER_STATE.read().await;
         match &*global {
             Some(state) if state.run_id == run_id && state.status == PlanRunStatus::Running => {
                 RUNNER_CANCEL.store(true, Ordering::SeqCst);
                 info!("Runner cancel requested for run {}", run_id);
+
+                // Kill all active agent sessions so subprocesses stop immediately
+                if let Some(cm) = chat_manager {
+                    let session_ids: Vec<Uuid> = state
+                        .active_agents
+                        .iter()
+                        .filter(|a| {
+                            matches!(a.status, TaskRunStatus::Running | TaskRunStatus::Spawning)
+                        })
+                        .filter_map(|a| a.session_id)
+                        .collect();
+                    drop(global); // release lock before async close calls
+                    Self::close_agent_sessions(&cm, &session_ids).await;
+                }
+
                 Ok(())
             }
             Some(state) => Err(anyhow!(
@@ -711,7 +730,14 @@ impl PlanRunner {
     /// the run as cancelled in Neo4j. Use when graceful cancel is stuck
     /// (e.g. agents blocked in spawning state that never respond to the
     /// cancel flag).
-    pub async fn force_cancel(run_id: Uuid, graph: Arc<dyn GraphStore>) -> Result<()> {
+    ///
+    /// When a `ChatManager` is provided, all active agent sessions are
+    /// forcefully closed so that Claude Code subprocesses stop immediately.
+    pub async fn force_cancel(
+        run_id: Uuid,
+        graph: Arc<dyn GraphStore>,
+        chat_manager: Option<Arc<ChatManager>>,
+    ) -> Result<()> {
         // Set cancel flag so any in-flight code that checks it will stop
         RUNNER_CANCEL.store(true, Ordering::SeqCst);
         // Clear budget override
@@ -721,6 +747,14 @@ impl PlanRunner {
         match &mut *global {
             Some(state) if state.run_id == run_id => {
                 let plan_id = state.plan_id;
+
+                // Collect active session IDs before finalizing
+                let session_ids: Vec<Uuid> = state
+                    .active_agents
+                    .iter()
+                    .filter_map(|a| a.session_id)
+                    .collect();
+
                 state.finalize(PlanRunStatus::Cancelled);
                 if let Err(e) = graph.update_plan_run(state).await {
                     error!("Failed to persist force-cancelled run to Neo4j: {}", e);
@@ -738,6 +772,13 @@ impl PlanRunner {
                 info!("Runner force-cancelled run {}", run_id);
                 // Clear the global state so a new run can start
                 *global = None;
+                drop(global); // release lock before async close calls
+
+                // Kill all active agent sessions
+                if let Some(cm) = chat_manager {
+                    Self::close_agent_sessions(&cm, &session_ids).await;
+                }
+
                 Ok(())
             }
             Some(state) => Err(anyhow!(
@@ -746,6 +787,18 @@ impl PlanRunner {
                 state.run_id
             )),
             None => Err(anyhow!("No active run to force-cancel")),
+        }
+    }
+
+    /// Close all active agent sessions, killing their Claude Code subprocesses.
+    /// Errors are logged but not propagated (best-effort cleanup).
+    async fn close_agent_sessions(chat_manager: &ChatManager, session_ids: &[Uuid]) {
+        for sid in session_ids {
+            let sid_str = sid.to_string();
+            info!("Closing agent session {} on cancel", sid_str);
+            if let Err(e) = chat_manager.close_session(&sid_str).await {
+                warn!("Failed to close agent session {} on cancel: {}", sid_str, e);
+            }
         }
     }
 
@@ -1124,6 +1177,13 @@ impl PlanRunner {
             .collect();
 
         if eligible_tasks.is_empty() {
+            return Ok(wave_result);
+        }
+
+        // Check cancel flag before spawning any agents in this wave
+        if RUNNER_CANCEL.load(Ordering::SeqCst) {
+            info!("Cancel detected at wave start — skipping wave");
+            wave_result.aborted = true;
             return Ok(wave_result);
         }
 
@@ -1561,6 +1621,22 @@ impl PlanRunner {
                 info!("Runner cancelled during wave execution");
                 wave_result.aborted = true;
                 join_set.abort_all();
+                // Also close any active agent sessions so Claude Code subprocesses stop
+                {
+                    let global = RUNNER_STATE.read().await;
+                    if let Some(ref s) = *global {
+                        let session_ids: Vec<Uuid> = s
+                            .active_agents
+                            .iter()
+                            .filter(|a| {
+                                matches!(a.status, TaskRunStatus::Running | TaskRunStatus::Spawning)
+                            })
+                            .filter_map(|a| a.session_id)
+                            .collect();
+                        drop(global);
+                        Self::close_agent_sessions(&self.chat_manager, &session_ids).await;
+                    }
+                }
                 while join_set.join_next().await.is_some() {}
                 return Ok(wave_result);
             }
@@ -2058,6 +2134,25 @@ impl PlanRunner {
                 prompt.push_str("\n## Knowledge Context\n");
                 prompt.push_str("The following notes and decisions are relevant to the files you will modify:\n\n");
                 prompt.push_str(&knowledge_parts.join("\n\n"));
+                prompt.push('\n');
+            }
+        }
+
+        // --- Step 2e: Inject learned reflexes (scars, co-change, episode recall) ---
+        if let Some(pid) = project_id_for_skills {
+            let ref_ctx = crate::reflex::RefContext {
+                affected_files: runner_context.affected_files.clone(),
+                task_title: Some(task_title.to_string()),
+                step_description: None,
+                embedding: None,
+                project_id: pid,
+            };
+            let engine = crate::reflex::ReflexEngine::new(self.graph.clone());
+            let suggestions = engine.suggest(&ref_ctx).await;
+            let reflex_block = crate::reflex::ReflexEngine::format_markdown(&suggestions);
+            if !reflex_block.is_empty() {
+                prompt.push_str("\n## Learned Reflexes\n");
+                prompt.push_str(&reflex_block);
                 prompt.push('\n');
             }
         }
@@ -3515,7 +3610,7 @@ mod tests {
     async fn test_cancel_no_active_run() {
         let _lock = TEST_MUTEX.lock().await;
         reset_globals().await;
-        let result = PlanRunner::cancel(Uuid::new_v4()).await;
+        let result = PlanRunner::cancel(Uuid::new_v4(), None).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("No active run"));
     }
@@ -3532,7 +3627,7 @@ mod tests {
             *global = Some(state);
         }
 
-        let result = PlanRunner::cancel(run_id).await;
+        let result = PlanRunner::cancel(run_id, None).await;
         assert!(result.is_ok());
         assert!(RUNNER_CANCEL.load(Ordering::SeqCst));
         reset_globals().await;
@@ -3550,7 +3645,7 @@ mod tests {
             *global = Some(state);
         }
 
-        let result = PlanRunner::cancel(Uuid::new_v4()).await;
+        let result = PlanRunner::cancel(Uuid::new_v4(), None).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("not running"));
         reset_globals().await;

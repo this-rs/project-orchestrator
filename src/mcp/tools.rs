@@ -340,6 +340,7 @@ pub fn resolve_legacy_alias(name: &str) -> Option<(&'static str, &'static str)> 
         "maintain_skills" => Some(("admin", "maintain_skills")),
         "heal_scars" => Some(("admin", "heal_scars")),
         "consolidate_memory" => Some(("admin", "consolidate_memory")),
+        "learning_metrics" => Some(("admin", "learning_metrics")),
 
         _ => None,
     }

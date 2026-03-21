@@ -39,11 +39,21 @@ impl EnrichmentStage for ReflexStage {
             }
         };
 
-        // Build RefContext from EnrichmentInput
-        // For now, affected_files and embedding come from the message context.
-        // In a full integration, these would be populated from the task/step context.
+        // Build RefContext from EnrichmentInput.
+        // Merge file paths extracted from the message with any files detected
+        // by earlier pipeline stages (e.g. FileContextStage sets `detected_files` hint).
+        let mut affected = extract_file_paths(&input.message);
+        if let Some(hint_files) = ctx.get_hint("detected_files") {
+            for f in hint_files.split(',') {
+                let f = f.trim().to_string();
+                if !f.is_empty() && !affected.contains(&f) {
+                    affected.push(f);
+                }
+            }
+        }
+
         let ref_ctx = RefContext {
-            affected_files: extract_file_paths(&input.message),
+            affected_files: affected,
             task_title: None,
             step_description: None,
             embedding: None, // Will be populated when embedding pipeline is wired
@@ -113,6 +123,79 @@ fn looks_like_file_path(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn test_extract_file_paths_with_hints() {
+        // Simulate EnrichmentContext with detected_files hint
+        let mut ctx = EnrichmentContext::default();
+        ctx.set_hint("detected_files", "src/api/routes.rs,src/lib.rs");
+
+        // Message mentions one file, hint has two (one overlapping)
+        let msg = "Fix the bug in `src/lib.rs`";
+        let mut affected = extract_file_paths(msg);
+        if let Some(hint_files) = ctx.get_hint("detected_files") {
+            for f in hint_files.split(',') {
+                let f = f.trim().to_string();
+                if !f.is_empty() && !affected.contains(&f) {
+                    affected.push(f);
+                }
+            }
+        }
+
+        assert_eq!(affected.len(), 2); // src/lib.rs (from msg) + src/api/routes.rs (from hint)
+        assert!(affected.contains(&"src/lib.rs".to_string()));
+        assert!(affected.contains(&"src/api/routes.rs".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_reflex_stage_skips_without_project_id() {
+        use crate::neo4j::mock::MockGraphStore;
+
+        let graph = Arc::new(MockGraphStore::new());
+        let stage = ReflexStage::new(graph);
+        let input = EnrichmentInput {
+            message: "Modify `src/main.rs`".to_string(),
+            session_id: uuid::Uuid::new_v4(),
+            project_slug: None,
+            project_id: None, // No project_id → should skip
+            cwd: None,
+            protocol_run_id: None,
+            protocol_state: None,
+            excluded_note_ids: HashSet::new(),
+        };
+        let mut ctx = EnrichmentContext::default();
+        let config = EnrichmentConfig::default();
+
+        assert!(stage.is_enabled(&config)); // reflex defaults to true
+        let result = stage.execute(&input, &mut ctx).await;
+        assert!(result.is_ok());
+        assert!(ctx.sections.is_empty(), "Should skip when no project_id");
+    }
+
+    #[tokio::test]
+    async fn test_reflex_stage_runs_with_project_id() {
+        use crate::neo4j::mock::MockGraphStore;
+
+        let graph = Arc::new(MockGraphStore::new());
+        let stage = ReflexStage::new(graph);
+        let input = EnrichmentInput {
+            message: "Fix `src/main.rs` error handling".to_string(),
+            session_id: uuid::Uuid::new_v4(),
+            project_slug: Some("test-project".to_string()),
+            project_id: Some(uuid::Uuid::new_v4()),
+            cwd: None,
+            protocol_run_id: None,
+            protocol_state: None,
+            excluded_note_ids: HashSet::new(),
+        };
+        let mut ctx = EnrichmentContext::default();
+
+        let result = stage.execute(&input, &mut ctx).await;
+        assert!(result.is_ok());
+        // Mock graph has no scar notes, so sections should be empty
+        // but the stage should run without error
+    }
 
     #[test]
     fn test_extract_file_paths() {

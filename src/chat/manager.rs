@@ -435,6 +435,12 @@ impl ChatManager {
         pipeline.add_stage(Box::new(super::stages::FileContextStage::new(
             graph.clone(),
         )));
+        // Reflex stage: injects scar warnings, episode recall, co-change reminders
+        // from the autonomous learning loop (T1→T2→T3 materialized knowledge).
+        // Controlled by ENRICHMENT_REFLEX env var (default: true).
+        pipeline.add_stage(Box::new(crate::reflex::stage::ReflexStage::new(
+            graph.clone(),
+        )));
         Arc::new(pipeline)
     }
 
