@@ -18,8 +18,13 @@
 //!
 //! - Max 3 mutations per cycle
 //! - Confidence threshold: 0.8
+//! - **Critic gate** (EvoFSM-inspired): each candidate is scored before application
 //! - Each mutation is idempotent (skipped if state already exists)
 //! - Each mutation creates a Decision for traceability
+//! - Rejected mutations are logged as Decision(status: Deprecated) with rationale
+//!
+//! # References
+//! - EvoFSM (2026): "Controllable Self-Evolution for Deep Research with FSMs"
 
 use std::sync::Arc;
 
@@ -28,16 +33,11 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::neo4j::traits::GraphStore;
+use crate::pipeline::critic::{
+    CriticMode, CriticScore, GraphBasedCritic, LearningConfig, MutationCandidate, MutationCritic,
+};
 use crate::pipeline::feedback::{DetectedPattern, PatternType};
 use crate::protocol::models::{ProtocolState, ProtocolTransition};
-
-// ─── Constants ──────────────────────────────────────────────────────────────
-
-/// Maximum mutations applied per learning cycle.
-const MAX_MUTATIONS_PER_CYCLE: usize = 3;
-
-/// Minimum confidence to trigger a protocol mutation.
-const MIN_CONFIDENCE: f64 = 0.8;
 
 // ─── Mutation Rules ─────────────────────────────────────────────────────────
 
@@ -68,8 +68,10 @@ pub struct MutationResult {
     pub applied: bool,
     /// Reason for skipping (if not applied).
     pub skip_reason: Option<String>,
-    /// Decision ID created for traceability (if applied).
+    /// Decision ID created for traceability (if applied or rejected by critic).
     pub decision_id: Option<Uuid>,
+    /// Critic score (if the critic was consulted).
+    pub critic_score: Option<CriticScore>,
 }
 
 /// Result of a full evolution cycle.
@@ -204,21 +206,53 @@ pub fn pattern_to_mutations(pattern: &DetectedPattern) -> Vec<MutationRule> {
 // ─── Protocol Evolver ───────────────────────────────────────────────────────
 
 /// Applies learned mutations to a protocol FSM.
+///
+/// # References
+/// - EvoFSM (2026): "Controllable Self-Evolution for Deep Research with FSMs"
+///   — Critic-gated mutation prevents destabilizing FSM changes
 pub struct ProtocolEvolver {
     graph: Arc<dyn GraphStore>,
+    critic: Arc<dyn MutationCritic>,
+    config: LearningConfig,
 }
 
 impl ProtocolEvolver {
+    /// Create with default config and a [`GraphBasedCritic`].
     pub fn new(graph: Arc<dyn GraphStore>) -> Self {
-        Self { graph }
+        let critic = Arc::new(GraphBasedCritic::new(graph.clone()));
+        Self {
+            graph,
+            critic,
+            config: LearningConfig::default(),
+        }
+    }
+
+    /// Create with custom config and critic.
+    pub fn with_config(
+        graph: Arc<dyn GraphStore>,
+        critic: Arc<dyn MutationCritic>,
+        config: LearningConfig,
+    ) -> Self {
+        Self {
+            graph,
+            critic,
+            config,
+        }
     }
 
     /// Evolve a protocol based on detected patterns.
     ///
-    /// Applies up to `MAX_MUTATIONS_PER_CYCLE` mutations, skipping patterns
-    /// below `MIN_CONFIDENCE` and states that already exist (idempotent).
+    /// For each candidate mutation:
+    /// 1. Filter by confidence threshold
+    /// 2. **Critic gate**: score via [`MutationCritic`] — reject if below `critic_threshold`
+    /// 3. Apply if in `CriticMode::Apply`, or just log if `SuggestOnly`
+    ///
+    /// Rejected mutations are logged as `Decision(status: Deprecated)` with the critic rationale.
     ///
     /// `task_id` is used for creating Decision records (traceability).
+    ///
+    /// # References
+    /// - EvoFSM (2026): "Controllable Self-Evolution for Deep Research with FSMs"
     pub async fn evolve(
         &self,
         protocol_id: Uuid,
@@ -228,11 +262,13 @@ impl ProtocolEvolver {
         info!(
             protocol_id = %protocol_id,
             pattern_count = patterns.len(),
+            critic_mode = ?self.config.critic_mode,
             "Starting protocol evolution cycle"
         );
 
-        // Load current protocol states
+        // Load current protocol states and transitions
         let existing_states = self.graph.get_protocol_states(protocol_id).await?;
+        let existing_transitions = self.graph.get_protocol_transitions(protocol_id).await?;
         let existing_state_names: Vec<String> =
             existing_states.iter().map(|s| s.name.clone()).collect();
 
@@ -247,11 +283,12 @@ impl ProtocolEvolver {
         let mut candidate_rules: Vec<(MutationRule, &DetectedPattern)> = Vec::new();
         for pattern in patterns {
             // Filter by confidence
-            if pattern.confidence < MIN_CONFIDENCE {
+            if pattern.confidence < self.config.min_confidence {
                 debug!(
                     pattern_id = %pattern.id,
                     confidence = pattern.confidence,
-                    "Skipping pattern below confidence threshold ({MIN_CONFIDENCE})"
+                    threshold = self.config.min_confidence,
+                    "Skipping pattern below confidence threshold"
                 );
                 continue;
             }
@@ -263,15 +300,17 @@ impl ProtocolEvolver {
         }
 
         // Apply mutations (up to limit)
-        for (rule, _pattern) in candidate_rules {
-            if result.applied_count >= MAX_MUTATIONS_PER_CYCLE {
+        for (rule, pattern) in candidate_rules {
+            if result.applied_count >= self.config.max_mutations_per_cycle {
                 result.mutations.push(MutationResult {
                     rule: rule.clone(),
                     applied: false,
                     skip_reason: Some(format!(
-                        "Max mutations per cycle reached ({MAX_MUTATIONS_PER_CYCLE})"
+                        "Max mutations per cycle reached ({})",
+                        self.config.max_mutations_per_cycle
                     )),
                     decision_id: None,
+                    critic_score: None,
                 });
                 result.skipped_count += 1;
                 continue;
@@ -291,12 +330,96 @@ impl ProtocolEvolver {
                         rule.state_name
                     )),
                     decision_id: None,
+                    critic_score: None,
                 });
                 result.skipped_count += 1;
                 continue;
             }
 
-            // Apply the mutation
+            // ── Critic gate (EvoFSM) ──────────────────────────────────
+            let candidate = MutationCandidate::from_rule(
+                &rule,
+                pattern,
+                &existing_states,
+                &existing_transitions,
+            );
+            let critic_result = self.critic.score_mutation(&candidate).await?;
+            let score = critic_result.score;
+
+            if score < self.config.critic_threshold {
+                info!(
+                    state = %rule.state_name,
+                    score = format!("{:.3}", score),
+                    threshold = self.config.critic_threshold,
+                    "Critic rejected mutation — below threshold"
+                );
+
+                // Log rejected mutation as Decision for traceability
+                let decision_id = if let Some(tid) = task_id {
+                    let decision = crate::neo4j::models::DecisionNode {
+                        id: Uuid::new_v4(),
+                        description: format!(
+                            "Critic rejected: '{}' state for protocol {} (score={:.3} < threshold={:.2})",
+                            rule.state_name, protocol_id, score, self.config.critic_threshold,
+                        ),
+                        rationale: format!(
+                            "Mutation rejected by EvoFSM critic. {}",
+                            critic_result.rationale
+                        ),
+                        alternatives: vec![
+                            "Apply mutation anyway (override critic)".to_string(),
+                            "Lower critic threshold".to_string(),
+                        ],
+                        chosen_option: Some("rejected by critic".to_string()),
+                        status: crate::neo4j::models::DecisionStatus::Deprecated,
+                        decided_by: "learning-loop-critic".to_string(),
+                        decided_at: chrono::Utc::now(),
+                        embedding: None,
+                        embedding_model: None,
+                        scar_intensity: 0.0,
+                    };
+                    self.graph.create_decision(tid, &decision).await?;
+                    Some(decision.id)
+                } else {
+                    None
+                };
+
+                result.mutations.push(MutationResult {
+                    rule,
+                    applied: false,
+                    skip_reason: Some(format!(
+                        "Critic score {:.3} below threshold {:.2}: {}",
+                        score, self.config.critic_threshold, critic_result.rationale
+                    )),
+                    decision_id,
+                    critic_score: Some(critic_result),
+                });
+                result.skipped_count += 1;
+                continue;
+            }
+
+            // ── SuggestOnly mode: log but don't apply ─────────────────
+            if self.config.critic_mode == CriticMode::SuggestOnly {
+                info!(
+                    state = %rule.state_name,
+                    score = format!("{:.3}", score),
+                    "Critic approved mutation (suggest-only mode — not applying)"
+                );
+                result.mutations.push(MutationResult {
+                    rule,
+                    applied: false,
+                    skip_reason: Some(format!(
+                        "SuggestOnly mode: critic approved (score={:.3}) but not applying",
+                        score
+                    )),
+                    decision_id: None,
+                    critic_score: Some(critic_result),
+                });
+                result.skipped_count += 1;
+                continue;
+            }
+
+            // ── Apply the mutation ────────────────────────────────────
             match self
                 .apply_mutation(protocol_id, &rule, &existing_states, task_id)
                 .await
@@ -305,13 +428,15 @@ impl ProtocolEvolver {
                     info!(
                         state = %rule.state_name,
                         protocol_id = %protocol_id,
-                        "Protocol mutation applied successfully"
+                        critic_score = format!("{:.3}", score),
+                        "Protocol mutation applied successfully (critic approved)"
                     );
                     result.mutations.push(MutationResult {
                         rule,
                         applied: true,
                         skip_reason: None,
                         decision_id,
+                        critic_score: Some(critic_result),
                     });
                     result.applied_count += 1;
                 }
@@ -326,6 +451,7 @@ impl ProtocolEvolver {
                         applied: false,
                         skip_reason: Some(format!("Error: {e}")),
                         decision_id: None,
+                        critic_score: Some(critic_result),
                     });
                     result.skipped_count += 1;
                 }
@@ -881,6 +1007,121 @@ mod tests {
             .as_ref()
             .unwrap()
             .contains("Max mutations per cycle"));
+    }
+
+    // ── Critic integration tests ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn evolve_rejects_mutation_below_critic_threshold() {
+        let (store, protocol_id, _, _, _) = setup_protocol().await;
+
+        // Use a very high critic threshold so the mutation gets rejected
+        let config = crate::pipeline::critic::LearningConfig {
+            min_confidence: 0.8,
+            max_mutations_per_cycle: 3,
+            critic_threshold: 0.99, // almost impossible to pass
+            critic_mode: CriticMode::Apply,
+        };
+        let critic = Arc::new(crate::pipeline::critic::GraphBasedCritic::new(store.clone()));
+        let evolver = ProtocolEvolver::with_config(store.clone(), critic, config);
+
+        let patterns = vec![make_pattern(
+            PatternType::FrequentGateFailure,
+            0.85, // above min_confidence but critic will score below 0.99
+            vec!["test"],
+            "Tests fail frequently",
+        )];
+
+        let task_id = Uuid::new_v4();
+        let result = evolver
+            .evolve(protocol_id, &patterns, Some(task_id))
+            .await
+            .unwrap();
+
+        assert_eq!(result.applied_count, 0);
+        assert_eq!(result.skipped_count, 1);
+        assert!(!result.mutations[0].applied);
+
+        // Verify critic score is present
+        let critic_score = result.mutations[0].critic_score.as_ref().unwrap();
+        assert!(critic_score.score < 0.99);
+
+        // Verify skip reason mentions critic
+        assert!(result.mutations[0]
+            .skip_reason
+            .as_ref()
+            .unwrap()
+            .contains("Critic score"));
+
+        // Verify a Decision was created for the rejection
+        assert!(result.mutations[0].decision_id.is_some());
+
+        // Verify no state was created in the store
+        let states = store.get_protocol_states(protocol_id).await.unwrap();
+        let names: Vec<&str> = states.iter().map(|s| s.name.as_str()).collect();
+        assert!(!names.contains(&"run_tests"));
+    }
+
+    #[tokio::test]
+    async fn evolve_suggest_only_mode_does_not_apply() {
+        let (store, protocol_id, _, _, _) = setup_protocol().await;
+
+        let config = crate::pipeline::critic::LearningConfig {
+            min_confidence: 0.8,
+            max_mutations_per_cycle: 3,
+            critic_threshold: 0.3, // low threshold so critic approves
+            critic_mode: CriticMode::SuggestOnly,
+        };
+        let critic = Arc::new(crate::pipeline::critic::GraphBasedCritic::new(store.clone()));
+        let evolver = ProtocolEvolver::with_config(store.clone(), critic, config);
+
+        let patterns = vec![make_pattern(
+            PatternType::FrequentGateFailure,
+            0.95,
+            vec!["test"],
+            "Tests fail frequently",
+        )];
+
+        let result = evolver.evolve(protocol_id, &patterns, None).await.unwrap();
+
+        assert_eq!(result.applied_count, 0, "SuggestOnly should not apply mutations");
+        assert_eq!(result.skipped_count, 1);
+        assert!(result.mutations[0]
+            .skip_reason
+            .as_ref()
+            .unwrap()
+            .contains("SuggestOnly"));
+
+        // Critic score should still be present
+        assert!(result.mutations[0].critic_score.is_some());
+
+        // State should NOT have been created
+        let states = store.get_protocol_states(protocol_id).await.unwrap();
+        let names: Vec<&str> = states.iter().map(|s| s.name.as_str()).collect();
+        assert!(!names.contains(&"run_tests"));
+    }
+
+    #[tokio::test]
+    async fn evolve_applies_when_critic_approves() {
+        let (store, protocol_id, _, _, _) = setup_protocol().await;
+
+        // Default config has critic_threshold=0.7
+        let evolver = ProtocolEvolver::new(store.clone());
+
+        let patterns = vec![make_pattern(
+            PatternType::FrequentGateFailure,
+            0.95, // high confidence
+            vec!["test"],
+            "Tests fail frequently",
+        )];
+
+        let result = evolver.evolve(protocol_id, &patterns, None).await.unwrap();
+
+        assert_eq!(result.applied_count, 1);
+        assert!(result.mutations[0].applied);
+        // Critic score should be attached
+        let score = result.mutations[0].critic_score.as_ref().unwrap();
+        assert!(score.score >= 0.7);
     }
 
     #[tokio::test]

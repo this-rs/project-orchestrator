@@ -13,6 +13,7 @@
 //! - [`progress`] — Objective progress measurement
 
 pub mod composer;
+pub mod critic;
 pub mod episode_adapter;
 pub mod evolve;
 pub mod feedback;
