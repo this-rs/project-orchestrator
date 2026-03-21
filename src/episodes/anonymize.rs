@@ -23,8 +23,8 @@ use std::sync::LazyLock;
 
 use super::distill_models::AnonymizationReport;
 use crate::episodes::distill_models::SharingPolicy;
-use crate::sharing::consent_gate;
 use crate::notes::models::Note;
+use crate::sharing::consent_gate;
 
 // ============================================================================
 // Error types
@@ -148,8 +148,7 @@ static RE_H13_GIT_SHA: LazyLock<Regex> =
 
 /// H14: CamelCase struct/class names (e.g. `MyStruct`, `HttpClient`).
 static RE_H14_STRUCT_NAME: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\b(?:struct|class|enum|trait|interface|type)\s+([A-Z][a-zA-Z0-9_]{2,})\b")
-        .unwrap()
+    Regex::new(r"\b(?:struct|class|enum|trait|interface|type)\s+([A-Z][a-zA-Z0-9_]{2,})\b").unwrap()
 });
 
 /// H14: Function/method names in `fn name(` or `def name(` style.
@@ -312,7 +311,9 @@ impl AnonymizationStage for ConfidentialReplacer {
         let mut sha_map: HashMap<String, usize> = HashMap::new();
 
         // H8: Absolute paths
-        result = RE_H8_ABS_PATH.replace_all(&result, "<PROJECT_ROOT>/").into_owned();
+        result = RE_H8_ABS_PATH
+            .replace_all(&result, "<PROJECT_ROOT>/")
+            .into_owned();
 
         // H9: Private IPs
         result = replace_deterministic(&RE_H9_PRIVATE_IP, &result, "ip", &mut ip_map);
@@ -858,8 +859,10 @@ fn replace_deterministic_counted(
 /// Count placeholder occurrences in anonymized text (for pipeline reporting).
 fn count_placeholder_occurrences(text: &str) -> u32 {
     static RE_PLACEHOLDER: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"<(?:PROJECT_ROOT|ip|author|corp-domain|uuid|commit|Struct_|Function_|File_)[^>]*>")
-            .unwrap()
+        Regex::new(
+            r"<(?:PROJECT_ROOT|ip|author|corp-domain|uuid|commit|Struct_|Function_|File_)[^>]*>",
+        )
+        .unwrap()
     });
     RE_PLACEHOLDER.find_iter(text).count() as u32
 }
@@ -1181,7 +1184,7 @@ mod tests {
         let value = 1000.0;
         let perturbed = noise.perturb(value);
         assert!(
-            perturbed >= 800.0 && perturbed <= 1200.0,
+            (800.0..=1200.0).contains(&perturbed),
             "Perturbed value {} out of +-20% range for {}",
             perturbed,
             value

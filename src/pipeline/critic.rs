@@ -93,19 +93,14 @@ pub struct CriticComponents {
 ///
 /// # References
 /// - EvoFSM (2026): "Controllable Self-Evolution for Deep Research with FSMs"
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CriticMode {
     /// Score mutations and apply those above threshold.
+    #[default]
     Apply,
     /// Score mutations but never apply — suggest only (for review).
     SuggestOnly,
-}
-
-impl Default for CriticMode {
-    fn default() -> Self {
-        Self::Apply
-    }
 }
 
 // ─── Trait ───────────────────────────────────────────────────────────────────
@@ -179,10 +174,8 @@ impl MutationCritic for GraphBasedCritic {
     async fn score_mutation(&self, candidate: &MutationCandidate) -> anyhow::Result<CriticScore> {
         let history_score = Self::compute_history_score(&candidate.pattern);
         let structural_score = Self::compute_structural_score(candidate.protocol_transition_count);
-        let coherence_score = Self::compute_coherence_score(
-            &candidate.proposed_state,
-            &candidate.protocol_context,
-        );
+        let coherence_score =
+            Self::compute_coherence_score(&candidate.proposed_state, &candidate.protocol_context);
 
         let overall = (history_score * 0.4) + (structural_score * 0.3) + (coherence_score * 0.3);
 
@@ -302,7 +295,8 @@ mod tests {
         let critic = GraphBasedCritic::new(store);
 
         // High confidence (0.95), high frequency (10), few transitions (2), no duplicate
-        let candidate = make_candidate(0.95, 10, 2, "run_tests", vec!["start", "implement", "done"]);
+        let candidate =
+            make_candidate(0.95, 10, 2, "run_tests", vec!["start", "implement", "done"]);
         let result = critic.score_mutation(&candidate).await.unwrap();
 
         assert!(

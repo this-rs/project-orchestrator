@@ -872,11 +872,7 @@ pub async fn analyze_impact(
     let transitive_co_changers = state
         .orchestrator
         .neo4j()
-        .get_file_transitive_co_changers(
-            &target,
-            transitive_config.min_transitive_score,
-            20,
-        )
+        .get_file_transitive_co_changers(&target, transitive_config.min_transitive_score, 20)
         .await
         .unwrap_or_default();
 
@@ -911,10 +907,8 @@ pub async fn analyze_impact(
         for p in &transitively_affected {
             unique_nodes.insert(p.clone());
         }
-        let cs = crate::graph::confidence::confidence_from_graph_density(
-            edge_count,
-            unique_nodes.len(),
-        );
+        let cs =
+            crate::graph::confidence::confidence_from_graph_density(edge_count, unique_nodes.len());
         // Record in the tracker for aggregated system confidence
         state.confidence_tracker.record(cs.clone());
         Some(cs)
@@ -3713,7 +3707,11 @@ pub async fn predict_missing_links(
             count += 1;
         }
         crate::graph::confidence::ConfidenceScore::new(
-            if count > 0 { total_score / count as f64 } else { 0.0 },
+            if count > 0 {
+                total_score / count as f64
+            } else {
+                0.0
+            },
             crate::graph::confidence::ConfidenceBasis::SignalConvergence,
             count,
         )

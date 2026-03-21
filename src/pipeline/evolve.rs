@@ -1022,7 +1022,9 @@ mod tests {
             critic_threshold: 0.99, // almost impossible to pass
             critic_mode: CriticMode::Apply,
         };
-        let critic = Arc::new(crate::pipeline::critic::GraphBasedCritic::new(store.clone()));
+        let critic = Arc::new(crate::pipeline::critic::GraphBasedCritic::new(
+            store.clone(),
+        ));
         let evolver = ProtocolEvolver::with_config(store.clone(), critic, config);
 
         let patterns = vec![make_pattern(
@@ -1072,7 +1074,9 @@ mod tests {
             critic_threshold: 0.3, // low threshold so critic approves
             critic_mode: CriticMode::SuggestOnly,
         };
-        let critic = Arc::new(crate::pipeline::critic::GraphBasedCritic::new(store.clone()));
+        let critic = Arc::new(crate::pipeline::critic::GraphBasedCritic::new(
+            store.clone(),
+        ));
         let evolver = ProtocolEvolver::with_config(store.clone(), critic, config);
 
         let patterns = vec![make_pattern(
@@ -1084,7 +1088,10 @@ mod tests {
 
         let result = evolver.evolve(protocol_id, &patterns, None).await.unwrap();
 
-        assert_eq!(result.applied_count, 0, "SuggestOnly should not apply mutations");
+        assert_eq!(
+            result.applied_count, 0,
+            "SuggestOnly should not apply mutations"
+        );
         assert_eq!(result.skipped_count, 1);
         assert!(result.mutations[0]
             .skip_reason

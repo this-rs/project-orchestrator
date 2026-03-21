@@ -859,6 +859,7 @@ mod tests {
         body::Body,
         http::{Request, StatusCode as AxumStatus},
     };
+    use std::sync::Arc;
     use tower::ServiceExt;
 
     // ----------------------------------------------------------------

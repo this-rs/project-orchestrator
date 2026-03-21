@@ -22,7 +22,9 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::episodes::models::{Episode, FeedbackType};
-use crate::pipeline::feedback::{DetectedPattern, EpisodeData, EpisodeOutcome, GateOutcome, PatternType};
+use crate::pipeline::feedback::{
+    DetectedPattern, EpisodeData, EpisodeOutcome, GateOutcome, PatternType,
+};
 
 /// Convert an [`Episode`] into an [`EpisodeData`] suitable for analysis.
 ///
@@ -308,11 +310,7 @@ pub fn generate_from_notes(notes: &[Note]) -> Vec<EpisodeData> {
                 _ => unreachable!(),
             };
 
-            let protocol_name = format!(
-                "synthetic:note:{}:{}",
-                note.note_type,
-                note.id
-            );
+            let protocol_name = format!("synthetic:note:{}:{}", note.note_type, note.id);
 
             // Use note content truncated as the gate failure/success message
             let message = if note.content.len() > 200 {

@@ -343,14 +343,22 @@ mod tests {
     #[test]
     fn test_confidence_from_graph_density_sparse() {
         let c = confidence_from_graph_density(2, 3);
-        assert!(c.score < 0.4, "sparse graph should have confidence < 0.4, got {}", c.score);
+        assert!(
+            c.score < 0.4,
+            "sparse graph should have confidence < 0.4, got {}",
+            c.score
+        );
         assert_eq!(c.basis, ConfidenceBasis::GraphDensity);
     }
 
     #[test]
     fn test_confidence_from_graph_density_dense() {
         let c = confidence_from_graph_density(15, 5);
-        assert!(c.score > 0.8, "dense graph should have confidence > 0.8, got {}", c.score);
+        assert!(
+            c.score > 0.8,
+            "dense graph should have confidence > 0.8, got {}",
+            c.score
+        );
     }
 
     #[test]
@@ -367,7 +375,11 @@ mod tests {
             ("structural".to_string(), 0.6),
         ];
         let c = confidence_from_signal_convergence(&signals);
-        assert!(c.score > 0.5, "convergent signals should yield decent confidence, got {}", c.score);
+        assert!(
+            c.score > 0.5,
+            "convergent signals should yield decent confidence, got {}",
+            c.score
+        );
         assert_eq!(c.basis, ConfidenceBasis::SignalConvergence);
     }
 
@@ -389,7 +401,11 @@ mod tests {
     fn test_tracker_record_and_aggregate() {
         let tracker = ConfidenceTracker::new(10);
         tracker.record(ConfidenceScore::new(0.8, ConfidenceBasis::GraphDensity, 5));
-        tracker.record(ConfidenceScore::new(0.6, ConfidenceBasis::SignalConvergence, 3));
+        tracker.record(ConfidenceScore::new(
+            0.6,
+            ConfidenceBasis::SignalConvergence,
+            3,
+        ));
 
         let agg = tracker.aggregate();
         assert_eq!(agg.prediction_count, 2);
@@ -415,7 +431,11 @@ mod tests {
     fn test_tracker_window_eviction() {
         let tracker = ConfidenceTracker::new(3);
         for i in 0..5 {
-            tracker.record(ConfidenceScore::new(i as f64 * 0.2, ConfidenceBasis::GraphDensity, 1));
+            tracker.record(ConfidenceScore::new(
+                i as f64 * 0.2,
+                ConfidenceBasis::GraphDensity,
+                1,
+            ));
         }
         let agg = tracker.aggregate();
         assert_eq!(agg.prediction_count, 3, "should evict oldest entries");

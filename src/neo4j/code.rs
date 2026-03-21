@@ -4173,7 +4173,14 @@ impl Neo4jClient {
         use std::collections::HashSet;
 
         // Build relationship pattern from whitelisted types
-        let allowed = ["IMPORTS", "CALLS", "CO_CHANGED", "CO_CHANGED_TRANSITIVE", "EXTENDS", "IMPLEMENTS"];
+        let allowed = [
+            "IMPORTS",
+            "CALLS",
+            "CO_CHANGED",
+            "CO_CHANGED_TRANSITIVE",
+            "EXTENDS",
+            "IMPLEMENTS",
+        ];
         let rel_pattern = if relation_types.is_empty() {
             "IMPORTS".to_string()
         } else {
