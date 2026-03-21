@@ -10111,4 +10111,95 @@ mod tests {
         unstringify_json_values(&mut v);
         assert_eq!(v, json!("just a string"));
     }
+
+    /// Regression test: the MCP schema previously declared `depends_on_task_id` for the
+    /// remove_dependency action, but the handler expected `dependency_id`. Clients using
+    /// the schema-declared name would always get "dependency_id is required".
+    ///
+    /// This test verifies that `dependency_id` (the correct param) works through the
+    /// mega-tool dispatch path (task action=remove_dependency).
+    #[tokio::test]
+    async fn test_remove_dependency_uses_dependency_id_not_depends_on_task_id() {
+        let (handler, _) = make_http_handler().await;
+
+        // The correct parameter name `dependency_id` must work
+        let result = handler
+            .handle(
+                "task",
+                Some(json!({
+                    "action": "remove_dependency",
+                    "task_id": UUID1,
+                    "dependency_id": UUID2
+                })),
+            )
+            .await;
+        assert!(
+            result.is_ok(),
+            "remove_dependency with dependency_id should succeed, got: {:?}",
+            result.err()
+        );
+        let val = result.unwrap();
+        assert_eq!(val["method"], "DELETE");
+        assert!(val["path"].as_str().unwrap().contains("/dependencies/"));
+    }
+
+    /// Integration-style test: add_dependencies then remove_dependency roundtrip
+    /// through the mega-tool dispatch, verifying correct HTTP calls are generated.
+    #[tokio::test]
+    async fn test_task_dependency_roundtrip_add_remove() {
+        let (handler, _) = make_http_handler().await;
+
+        // Step 1: add dependency B depends on A
+        let add_result = handler
+            .handle(
+                "task",
+                Some(json!({
+                    "action": "add_dependencies",
+                    "task_id": UUID1,
+                    "dependency_ids": [UUID2]
+                })),
+            )
+            .await
+            .expect("add_dependencies should succeed");
+        assert_eq!(add_result["method"], "POST");
+        assert!(add_result["path"]
+            .as_str()
+            .unwrap()
+            .ends_with("/dependencies"));
+
+        // Step 2: remove that dependency
+        let remove_result = handler
+            .handle(
+                "task",
+                Some(json!({
+                    "action": "remove_dependency",
+                    "task_id": UUID1,
+                    "dependency_id": UUID2
+                })),
+            )
+            .await
+            .expect("remove_dependency should succeed");
+        assert_eq!(remove_result["method"], "DELETE");
+        assert!(remove_result["path"]
+            .as_str()
+            .unwrap()
+            .contains("/dependencies/"));
+
+        // Step 3: get_blockers (verify HTTP call is correct)
+        let blockers_result = handler
+            .handle(
+                "task",
+                Some(json!({
+                    "action": "get_blockers",
+                    "task_id": UUID1
+                })),
+            )
+            .await
+            .expect("get_blockers should succeed");
+        assert_eq!(blockers_result["method"], "GET");
+        assert!(blockers_result["path"]
+            .as_str()
+            .unwrap()
+            .ends_with("/blockers"));
+    }
 }

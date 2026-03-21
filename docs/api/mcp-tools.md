@@ -99,7 +99,7 @@ Manage tasks within plans.
 | `delete` | Delete task | `task_id` |
 | `get_next` | Next unblocked task (highest priority) | `plan_id` |
 | `add_dependencies` | Add task dependencies | `task_id`, `dependency_ids` |
-| `remove_dependency` | Remove a dependency | `task_id`, `depends_on_task_id` |
+| `remove_dependency` | Remove a dependency | `task_id`, `dependency_id` |
 | `get_blockers` | Tasks blocking this one | `task_id` |
 | `get_blocked_by` | Tasks blocked by this one | `task_id` |
 | `get_context` | Full context for agent work | `plan_id`, `task_id` |

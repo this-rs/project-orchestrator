@@ -445,7 +445,7 @@ fn task_tool() -> ToolDefinition {
                 "acceptance_criteria": {"type": "array", "items": {"type": "string"}, "description": "Criteria (create)"},
                 "affected_files": {"type": "array", "items": {"type": "string"}, "description": "Files (create)"},
                 "dependency_ids": {"type": "array", "items": {"type": "string"}, "description": "Task UUIDs to depend on (add_dependencies)"},
-                "depends_on_task_id": {"type": "string", "description": "Dependency to remove (remove_dependency)"},
+                "dependency_id": {"type": "string", "description": "Dependency task UUID to remove (remove_dependency)"},
                 "search": {"type": "string", "description": "Search filter (list)"},
                 "limit": {"type": "integer", "description": "Max items (list)"},
                 "offset": {"type": "integer", "description": "Skip items (list)"},

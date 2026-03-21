@@ -732,7 +732,7 @@ Manage tasks. Actions: list, create, get, update, delete, get_next, add_dependen
 | delete | `task_id` (req) | Delete a task |
 | get_next | `plan_id` (req) | Get next actionable task |
 | add_dependencies | `task_id` (req), `dependency_ids` (req, array) | Add task dependencies |
-| remove_dependency | `task_id` (req), `depends_on_task_id` (req) | Remove one dependency |
+| remove_dependency | `task_id` (req), `dependency_id` (req) | Remove one dependency |
 | get_blockers | `task_id` (req) | Get tasks blocking this task |
 | get_blocked_by | `task_id` (req) | Get tasks blocked by this task |
 | get_context | `plan_id` (req), `task_id` (req) | Get full task context |
