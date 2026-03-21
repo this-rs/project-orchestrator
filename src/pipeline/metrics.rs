@@ -425,4 +425,204 @@ mod tests {
         let json = serde_json::to_string(&r).unwrap();
         assert!(json.contains("promoted_count"));
     }
+
+    // ── Async tests with MockGraphStore ─────────────────────────────────
+
+    use crate::neo4j::mock::MockGraphStore;
+    use crate::notes::models::{MemoryHorizon, Note, NoteStatus, NoteType};
+    use chrono::Duration;
+
+    /// Helper: create an auto-learned note with configurable fields.
+    fn make_auto_learned_note(
+        project_id: Uuid,
+        energy: f64,
+        activation_count: i64,
+        memory_horizon: MemoryHorizon,
+        age_days: i64,
+    ) -> Note {
+        let mut note = Note::new(
+            Some(project_id),
+            NoteType::Observation,
+            "auto-learned test note".to_string(),
+            "pipeline".to_string(),
+        );
+        note.tags = vec!["auto-learned".to_string()];
+        note.energy = energy;
+        note.activation_count = activation_count;
+        note.memory_horizon = memory_horizon;
+        note.status = NoteStatus::Active;
+        note.created_at = Utc::now() - Duration::days(age_days);
+        note
+    }
+
+    #[tokio::test]
+    async fn compute_metrics_with_mixed_notes() {
+        let store = MockGraphStore::new();
+        let project_id = Uuid::new_v4();
+
+        // 3 auto-learned notes: 2 activated, 1 not
+        let mut activated1 =
+            make_auto_learned_note(project_id, 0.8, 5, MemoryHorizon::Operational, 10);
+        activated1.activation_count = 5;
+
+        let mut activated2 =
+            make_auto_learned_note(project_id, 0.6, 2, MemoryHorizon::Operational, 5);
+        activated2.activation_count = 2;
+
+        let not_activated = make_auto_learned_note(project_id, 0.3, 0, MemoryHorizon::Ephemeral, 3);
+
+        // 1 scarred note (not auto-learned)
+        let mut scarred = Note::new(
+            Some(project_id),
+            NoteType::Gotcha,
+            "scarred note".to_string(),
+            "pipeline".to_string(),
+        );
+        scarred.scar_intensity = 0.7;
+
+        // 1 already-archived auto-learned note (for archived_by_decay count)
+        let mut archived =
+            make_auto_learned_note(project_id, 0.01, 0, MemoryHorizon::Ephemeral, 20);
+        archived.status = NoteStatus::Archived;
+
+        // 1 battle-tested note (for promoted count)
+        let mut promoted = Note::new(
+            Some(project_id),
+            NoteType::Pattern,
+            "battle-tested note".to_string(),
+            "pipeline".to_string(),
+        );
+        promoted.tags = vec!["battle-tested".to_string()];
+
+        // Insert all notes
+        for note in [
+            &activated1,
+            &activated2,
+            &not_activated,
+            &scarred,
+            &archived,
+            &promoted,
+        ] {
+            store.create_note(note).await.unwrap();
+        }
+
+        let metrics = LearningMetrics::compute(&store, project_id).await.unwrap();
+
+        // 3 active auto-learned + 1 archived auto-learned = 4 total auto-learned
+        // (list_notes with tags=["auto-learned"] and no status filter returns all statuses)
+        assert_eq!(metrics.total_auto_learned, 4);
+        // 2 of 4 auto-learned notes have activation_count > 0
+        assert_eq!(metrics.activated_auto_learned, 2);
+        assert!((metrics.learning_hit_rate - 0.5).abs() < f64::EPSILON);
+
+        // Scarred notes: only the one with scar_intensity > 0
+        assert_eq!(metrics.total_scarred, 1);
+
+        // Archived auto-learned count
+        assert_eq!(metrics.notes_archived_by_decay, 1);
+
+        // Battle-tested count
+        assert_eq!(metrics.notes_promoted, 1);
+
+        // No episodes or skills in the mock => ratio = 0
+        assert_eq!(metrics.episode_to_skill_ratio, 0.0);
+    }
+
+    #[tokio::test]
+    async fn decay_archives_old_low_energy_ephemeral_notes() {
+        let store = MockGraphStore::new();
+        let project_id = Uuid::new_v4();
+
+        // Should be archived: old, low energy, ephemeral, active
+        let decay_candidate =
+            make_auto_learned_note(project_id, 0.05, 0, MemoryHorizon::Ephemeral, 10);
+        let decay_id = decay_candidate.id;
+
+        // Should NOT be archived: too fresh (only 2 days old)
+        let fresh_note = make_auto_learned_note(project_id, 0.02, 0, MemoryHorizon::Ephemeral, 2);
+        let fresh_id = fresh_note.id;
+
+        // Should NOT be archived: high energy
+        let high_energy = make_auto_learned_note(project_id, 0.9, 0, MemoryHorizon::Ephemeral, 15);
+        let high_energy_id = high_energy.id;
+
+        // Should NOT be archived: not ephemeral (Operational)
+        let operational =
+            make_auto_learned_note(project_id, 0.05, 0, MemoryHorizon::Operational, 10);
+        let operational_id = operational.id;
+
+        for note in [&decay_candidate, &fresh_note, &high_energy, &operational] {
+            store.create_note(note).await.unwrap();
+        }
+
+        let result = decay_ineffective_notes(&store, project_id).await.unwrap();
+
+        assert_eq!(result.checked_count, 4);
+        assert_eq!(result.archived_count, 1);
+
+        // Verify the correct note was archived
+        let archived = store.get_note(decay_id).await.unwrap().unwrap();
+        assert_eq!(archived.status, NoteStatus::Archived);
+
+        // Verify preserved notes are still active
+        let fresh = store.get_note(fresh_id).await.unwrap().unwrap();
+        assert_eq!(fresh.status, NoteStatus::Active);
+
+        let he = store.get_note(high_energy_id).await.unwrap().unwrap();
+        assert_eq!(he.status, NoteStatus::Active);
+
+        let op = store.get_note(operational_id).await.unwrap().unwrap();
+        assert_eq!(op.status, NoteStatus::Active);
+    }
+
+    #[tokio::test]
+    async fn promote_tags_old_high_energy_high_activation_notes() {
+        let store = MockGraphStore::new();
+        let project_id = Uuid::new_v4();
+
+        // Should be promoted: old enough, high energy, enough activations
+        let promote_candidate =
+            make_auto_learned_note(project_id, 0.8, 5, MemoryHorizon::Operational, 45);
+        let promote_id = promote_candidate.id;
+
+        // Should NOT be promoted: too young
+        let young = make_auto_learned_note(project_id, 0.9, 10, MemoryHorizon::Operational, 10);
+        let young_id = young.id;
+
+        // Should NOT be promoted: low energy
+        let low_energy = make_auto_learned_note(project_id, 0.2, 5, MemoryHorizon::Operational, 60);
+        let low_energy_id = low_energy.id;
+
+        // Should NOT be promoted: too few activations
+        let low_activations =
+            make_auto_learned_note(project_id, 0.8, 2, MemoryHorizon::Operational, 45);
+        let low_act_id = low_activations.id;
+
+        for note in [&promote_candidate, &young, &low_energy, &low_activations] {
+            store.create_note(note).await.unwrap();
+        }
+
+        let result = promote_battle_tested_notes(&store, project_id)
+            .await
+            .unwrap();
+
+        assert_eq!(result.checked_count, 4);
+        assert_eq!(result.promoted_count, 1);
+
+        // Verify promoted note has battle-tested tag and no auto-learned tag
+        let promoted = store.get_note(promote_id).await.unwrap().unwrap();
+        assert!(promoted.tags.contains(&"battle-tested".to_string()));
+        assert!(!promoted.tags.contains(&"auto-learned".to_string()));
+
+        // Verify non-promoted notes still have auto-learned tag
+        let y = store.get_note(young_id).await.unwrap().unwrap();
+        assert!(y.tags.contains(&"auto-learned".to_string()));
+        assert!(!y.tags.contains(&"battle-tested".to_string()));
+
+        let le = store.get_note(low_energy_id).await.unwrap().unwrap();
+        assert!(le.tags.contains(&"auto-learned".to_string()));
+
+        let la = store.get_note(low_act_id).await.unwrap().unwrap();
+        assert!(la.tags.contains(&"auto-learned".to_string()));
+    }
 }

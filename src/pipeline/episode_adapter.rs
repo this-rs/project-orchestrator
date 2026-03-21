@@ -387,4 +387,53 @@ mod tests {
         assert_eq!(data[0].protocol_name, "proto-a");
         assert_eq!(data[1].protocol_name, "proto-b");
     }
+
+    // ── Async tests with MockGraphStore ──────────────────────────────────
+
+    #[tokio::test]
+    async fn resolve_protocol_names_from_run() {
+        use crate::neo4j::mock::MockGraphStore;
+        use crate::neo4j::traits::GraphStore;
+        use crate::protocol::models::{Protocol, ProtocolRun, ProtocolState};
+
+        let store = MockGraphStore::new();
+
+        // Create a protocol with a start state
+        let project_id = Uuid::new_v4();
+        let start_state = ProtocolState::start(Uuid::nil(), "start");
+        let protocol = Protocol::new(project_id, "my-cool-protocol", start_state.id);
+        store.upsert_protocol(&protocol).await.unwrap();
+
+        // Create a run for that protocol
+        let run = ProtocolRun::new(protocol.id, start_state.id, "start");
+        let run_id = run.id;
+        store.create_protocol_run(&run).await.unwrap();
+
+        // Create an episode whose source_run_id points to this run
+        let mut ep = sample_episode();
+        ep.source_run_id = Some(run_id);
+        ep.stimulus.request = "fallback-name".to_string();
+
+        let names = resolve_protocol_names(&store, &[ep]).await;
+
+        assert_eq!(names.len(), 1);
+        assert_eq!(names[0], "my-cool-protocol");
+    }
+
+    #[tokio::test]
+    async fn resolve_protocol_names_falls_back_to_request() {
+        use crate::neo4j::mock::MockGraphStore;
+
+        let store = MockGraphStore::new();
+
+        // Episode with no source_run_id — should fall back to stimulus.request
+        let mut ep = sample_episode();
+        ep.source_run_id = None;
+        ep.stimulus.request = "fallback-trigger".to_string();
+
+        let names = resolve_protocol_names(&store, &[ep]).await;
+
+        assert_eq!(names.len(), 1);
+        assert_eq!(names[0], "fallback-trigger");
+    }
 }

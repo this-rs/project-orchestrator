@@ -729,4 +729,197 @@ mod tests {
         let rules = pattern_to_mutations(&pattern);
         assert!(rules.is_empty()); // no "test_first" keyword
     }
+
+    // ── Async tests with MockGraphStore ──────────────────────────────────
+
+    use crate::neo4j::mock::MockGraphStore;
+    use crate::neo4j::traits::GraphStore;
+    use crate::protocol::models::{Protocol, ProtocolState};
+
+    /// Helper: set up a mock store with a protocol and start/implement/done states.
+    /// Returns (store, protocol_id, start_state, implement_state, done_state).
+    async fn setup_protocol() -> (
+        Arc<MockGraphStore>,
+        Uuid,
+        ProtocolState,
+        ProtocolState,
+        ProtocolState,
+    ) {
+        let store = MockGraphStore::new();
+        let project_id = Uuid::new_v4();
+
+        // Use a temporary id to build the protocol, then fix protocol_id on states
+        let tmp_start = ProtocolState::start(Uuid::nil(), "start");
+        let protocol = Protocol::new(project_id, "test-proto", tmp_start.id);
+        let protocol_id = protocol.id;
+
+        let start_state = ProtocolState::start(protocol_id, "start");
+        let implement_state = ProtocolState::new(protocol_id, "implement");
+        let done_state = ProtocolState::terminal(protocol_id, "done");
+
+        store.upsert_protocol(&protocol).await.unwrap();
+        store.upsert_protocol_state(&start_state).await.unwrap();
+        store.upsert_protocol_state(&implement_state).await.unwrap();
+        store.upsert_protocol_state(&done_state).await.unwrap();
+
+        (
+            Arc::new(store),
+            protocol_id,
+            start_state,
+            implement_state,
+            done_state,
+        )
+    }
+
+    #[tokio::test]
+    async fn evolve_creates_state_for_high_confidence_test_gate() {
+        let (store, protocol_id, _, _, _) = setup_protocol().await;
+        let evolver = ProtocolEvolver::new(store.clone());
+
+        let patterns = vec![make_pattern(
+            PatternType::FrequentGateFailure,
+            0.9,
+            vec!["test"],
+            "Tests fail frequently",
+        )];
+
+        let result = evolver.evolve(protocol_id, &patterns, None).await.unwrap();
+
+        assert_eq!(result.applied_count, 1);
+        assert_eq!(result.skipped_count, 0);
+        assert_eq!(result.mutations.len(), 1);
+        assert!(result.mutations[0].applied);
+        assert_eq!(result.mutations[0].rule.state_name, "run_tests");
+
+        // Verify the state was actually created in the store
+        let states = store.get_protocol_states(protocol_id).await.unwrap();
+        let names: Vec<&str> = states.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"run_tests"));
+    }
+
+    #[tokio::test]
+    async fn evolve_skips_patterns_below_min_confidence() {
+        let (store, protocol_id, _, _, _) = setup_protocol().await;
+        let evolver = ProtocolEvolver::new(store.clone());
+
+        let patterns = vec![make_pattern(
+            PatternType::FrequentGateFailure,
+            0.5, // below MIN_CONFIDENCE (0.8)
+            vec!["test"],
+            "Low confidence pattern",
+        )];
+
+        let result = evolver.evolve(protocol_id, &patterns, None).await.unwrap();
+
+        assert_eq!(result.applied_count, 0);
+        assert_eq!(result.mutations.len(), 0); // filtered out before mutation stage
+
+        // Verify no new state was created
+        let states = store.get_protocol_states(protocol_id).await.unwrap();
+        let names: Vec<&str> = states.iter().map(|s| s.name.as_str()).collect();
+        assert!(!names.contains(&"run_tests"));
+    }
+
+    #[tokio::test]
+    async fn evolve_is_idempotent_skips_existing_states() {
+        let (store, protocol_id, _, _, _) = setup_protocol().await;
+        let evolver = ProtocolEvolver::new(store.clone());
+
+        let patterns = vec![make_pattern(
+            PatternType::FrequentGateFailure,
+            0.9,
+            vec!["test"],
+            "Tests fail frequently",
+        )];
+
+        // First evolution — should apply
+        let result1 = evolver.evolve(protocol_id, &patterns, None).await.unwrap();
+        assert_eq!(result1.applied_count, 1);
+
+        // Second evolution — should skip (state already exists)
+        let result2 = evolver.evolve(protocol_id, &patterns, None).await.unwrap();
+        assert_eq!(result2.applied_count, 0);
+        assert_eq!(result2.skipped_count, 1);
+        assert!(result2.mutations[0]
+            .skip_reason
+            .as_ref()
+            .unwrap()
+            .contains("already exists"));
+    }
+
+    #[tokio::test]
+    async fn evolve_respects_max_mutations_per_cycle() {
+        let (store, protocol_id, _, _, _) = setup_protocol().await;
+        let evolver = ProtocolEvolver::new(store.clone());
+
+        // Create 4 patterns that each produce a distinct mutation rule.
+        // FrequentGateFailure with "test", "clippy", "check" = 3 rules from one pattern,
+        // plus a RegressionProne = 1 more rule. Total = 4, but max is 3.
+        let patterns = vec![
+            make_pattern(
+                PatternType::FrequentGateFailure,
+                0.95,
+                vec!["test", "clippy", "check"],
+                "Multiple gate failures",
+            ),
+            make_pattern(
+                PatternType::RegressionProne,
+                0.9,
+                vec![],
+                "Regression prone tasks",
+            ),
+        ];
+
+        let result = evolver.evolve(protocol_id, &patterns, None).await.unwrap();
+
+        assert_eq!(result.applied_count, 3); // MAX_MUTATIONS_PER_CYCLE
+        assert!(result.skipped_count >= 1); // at least one skipped
+                                            // The skipped one should mention the limit
+        let skipped = result.mutations.iter().find(|m| !m.applied).unwrap();
+        assert!(skipped
+            .skip_reason
+            .as_ref()
+            .unwrap()
+            .contains("Max mutations per cycle"));
+    }
+
+    #[tokio::test]
+    async fn check_and_revert_returns_empty_when_not_enough_runs() {
+        let (store, protocol_id, _, _, _) = setup_protocol().await;
+        let evolver = ProtocolEvolver::new(store.clone());
+        let project_id = Uuid::new_v4();
+
+        // No runs at all — should return empty
+        let result = evolver
+            .check_and_revert(protocol_id, project_id)
+            .await
+            .unwrap();
+
+        assert!(result.reverted_states.is_empty());
+        assert!(result.gotcha_note_ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn check_and_revert_no_revert_when_failure_rate_stable() {
+        use crate::protocol::models::{ProtocolRun, RunStatus};
+
+        let (store, protocol_id, start_state, _, _) = setup_protocol().await;
+        let evolver = ProtocolEvolver::new(store.clone());
+        let project_id = Uuid::new_v4();
+
+        // Create 6 runs (>= MIN_RUNS_FOR_COMPARISON * 2 = 6), all completed (0% failure)
+        for _ in 0..6 {
+            let mut run = ProtocolRun::new(protocol_id, start_state.id, "start");
+            run.status = RunStatus::Completed;
+            store.create_protocol_run(&run).await.unwrap();
+        }
+
+        let result = evolver
+            .check_and_revert(protocol_id, project_id)
+            .await
+            .unwrap();
+
+        assert!(result.reverted_states.is_empty());
+        assert!(result.gotcha_note_ids.is_empty());
+    }
 }
