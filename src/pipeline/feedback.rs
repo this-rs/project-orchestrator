@@ -307,6 +307,7 @@ impl EpisodeAnalyzer {
                         "Investigate why '{gate_name}' fails {:.0}% of the time. Consider adding pre-checks or adjusting thresholds.",
                         confidence * 100.0
                     ),
+                    affected_files: vec![],
                 }
             })
             .collect()
@@ -355,6 +356,7 @@ impl EpisodeAnalyzer {
                         "Retrying '{protocol}' works {:.0}% of the time. Consider automating retry logic.",
                         confidence * 100.0
                     ),
+                    affected_files: vec![],
                 }
             })
             .collect()
@@ -397,6 +399,7 @@ impl EpisodeAnalyzer {
                         "Protocol '{protocol}' fails {:.0}% of the time. Add stricter pre-conditions or break into smaller steps.",
                         confidence * 100.0
                     ),
+                    affected_files: vec![],
                 }
             })
             .collect()
@@ -448,6 +451,7 @@ impl EpisodeAnalyzer {
                     recommendation: format!(
                         "Common failure: \"{message}\". Seen {count} times. Create a targeted fix or workaround."
                     ),
+                    affected_files: vec![],
                 }
             })
             .collect()
@@ -487,6 +491,7 @@ impl EpisodeAnalyzer {
                         "Protocol '{protocol}' has a {:.0}% success rate. Replicate this pattern for similar tasks.",
                         confidence * 100.0
                     ),
+                    affected_files: vec![],
                 }
             })
             .collect()
@@ -692,6 +697,7 @@ mod tests {
                 tech_stacks: vec!["rust".to_string()],
                 related_gates: vec!["cargo-test".to_string()],
                 recommendation: "Investigate test failures.".to_string(),
+                affected_files: vec![],
             },
             DetectedPattern {
                 id: "effective-retry-deploy".to_string(),
@@ -702,6 +708,7 @@ mod tests {
                 tech_stacks: vec!["docker".to_string()],
                 related_gates: Vec::new(),
                 recommendation: "Automate retry logic.".to_string(),
+                affected_files: vec![],
             },
         ];
 
@@ -736,6 +743,7 @@ mod tests {
             tech_stacks: vec![],
             related_gates: vec![],
             recommendation: "Keep doing this.".to_string(),
+            affected_files: vec![],
         };
 
         let low_confidence = DetectedPattern {
@@ -747,6 +755,7 @@ mod tests {
             tech_stacks: vec![],
             related_gates: vec![],
             recommendation: "Maybe try this.".to_string(),
+            affected_files: vec![],
         };
 
         let analyzer = EpisodeAnalyzer::new(1, 0.0);

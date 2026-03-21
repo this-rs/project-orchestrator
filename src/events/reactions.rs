@@ -492,7 +492,7 @@ async fn on_plan_status_changed(event: CrudEvent, state: Arc<ServerState>) {
                     CrudEvent::new(
                         EntityType::Episode,
                         CrudAction::Collected,
-                        &episode_id.to_string(),
+                        episode_id.to_string(),
                     )
                     .with_payload(payload)
                     .with_project_id(project_id.to_string()),
@@ -614,7 +614,7 @@ async fn on_protocol_run_completed_collect_episode(event: CrudEvent, state: Arc<
                     CrudEvent::new(
                         EntityType::Episode,
                         CrudAction::Collected,
-                        &episode_id.to_string(),
+                        episode_id.to_string(),
                     )
                     .with_payload(payload)
                     .with_project_id(project_id.to_string()),
@@ -821,7 +821,7 @@ async fn on_episode_collected_analyze_patterns(event: CrudEvent, state: Arc<Serv
             CrudEvent::new(
                 EntityType::Learning,
                 CrudAction::PatternsDetected,
-                &episode_id.to_string(),
+                episode_id.to_string(),
             )
             .with_payload(payload)
             .with_project_id(project_id.to_string()),

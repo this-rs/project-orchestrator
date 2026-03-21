@@ -19,8 +19,6 @@
 //! - `decay_ineffective_notes()` — archives auto-learned notes with low energy after 7 days
 //! - `promote_battle_tested_notes()` — promotes high-energy old notes to consolidated
 
-use std::sync::Arc;
-
 use anyhow::Result;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};

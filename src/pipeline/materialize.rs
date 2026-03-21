@@ -223,7 +223,13 @@ async fn create_note_from_pattern(
     // Link note to affected files (T3 Step 3)
     for file_path in &pattern.affected_files {
         if let Err(e) = graph
-            .link_note_to_entity(note_id, &crate::notes::models::EntityType::File, file_path)
+            .link_note_to_entity(
+                note_id,
+                &crate::notes::models::EntityType::File,
+                file_path,
+                None,
+                None,
+            )
             .await
         {
             debug!(
@@ -357,6 +363,7 @@ mod tests {
                 tech_stacks: vec!["rust".to_string()],
                 related_gates: vec!["cargo-test".to_string()],
                 recommendation: "Investigate test failures.".to_string(),
+                affected_files: vec![],
             },
             DetectedPattern {
                 id: "success-lint".to_string(),
@@ -367,6 +374,7 @@ mod tests {
                 tech_stacks: vec!["typescript".to_string()],
                 related_gates: vec![],
                 recommendation: "Keep doing this.".to_string(),
+                affected_files: vec![],
             },
         ];
 
@@ -407,6 +415,7 @@ mod tests {
                 tech_stacks: vec![],
                 related_gates: vec![],
                 recommendation: format!("Rec {i}"),
+                affected_files: vec![],
             })
             .collect();
 
@@ -434,6 +443,7 @@ mod tests {
             tech_stacks: vec!["rust".to_string()],
             related_gates: vec!["test".to_string()],
             recommendation: "Fix tests.".to_string(),
+            affected_files: vec![],
         }];
 
         let recommendations = vec![SkillRecommendation {
@@ -469,6 +479,7 @@ mod tests {
             tech_stacks: vec![],
             related_gates: vec![],
             recommendation: "Maybe.".to_string(),
+            affected_files: vec![],
         }];
 
         let recommendations = vec![SkillRecommendation {
@@ -503,6 +514,7 @@ mod tests {
             tech_stacks: vec![],
             related_gates: vec![],
             recommendation: "Fix it.".to_string(),
+            affected_files: vec![],
         }];
 
         let result = materialize_patterns(&store, project_id, &patterns, &[])

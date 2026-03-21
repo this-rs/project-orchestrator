@@ -442,8 +442,8 @@ impl ProtocolEvolver {
             // Predecessor = last non-terminal state
             let predecessor = states
                 .iter()
-                .filter(|s| s.state_type != StateType::Terminal)
-                .last()
+                .rev()
+                .find(|s| s.state_type != StateType::Terminal)
                 .ok_or_else(|| {
                     anyhow::anyhow!("Protocol has no non-terminal states to insert before")
                 })?;
@@ -484,8 +484,6 @@ impl ProtocolEvolver {
         protocol_id: Uuid,
         project_id: Uuid,
     ) -> Result<RevertResult> {
-        use crate::protocol::models::RunStatus;
-
         let mut result = RevertResult {
             protocol_id,
             reverted_states: Vec::new(),
@@ -623,6 +621,7 @@ mod tests {
             tech_stacks: vec!["rust".to_string()],
             related_gates: related_gates.into_iter().map(String::from).collect(),
             recommendation: "test recommendation".to_string(),
+            affected_files: vec![],
         }
     }
 
