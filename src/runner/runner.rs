@@ -5784,7 +5784,9 @@ mod tests {
         // Verify agent is present before
         {
             let global = RUNNER_STATE.read().await;
-            let state = global.as_ref().expect("RUNNER_STATE should be set by this test");
+            let state = global
+                .as_ref()
+                .expect("RUNNER_STATE should be set by this test");
             assert!(
                 state.get_agent(&task_id).is_some(),
                 "Agent should be present before on_task_completed"
