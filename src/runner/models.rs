@@ -70,7 +70,7 @@ impl Default for RunnerConfig {
             build_check: true,
             test_runner: false,
             max_cost_usd: 10.0,
-            spawning_timeout_secs: 120,
+            spawning_timeout_secs: 480,
             cwd_validation: CwdValidation::default(),
             completion_loop_threshold: 5,
             completion_max_chars: 200,
@@ -688,7 +688,7 @@ mod tests {
         assert!(config.build_check);
         assert!(!config.test_runner);
         assert!((config.max_cost_usd - 10.0).abs() < f64::EPSILON);
-        assert_eq!(config.spawning_timeout_secs, 120);
+        assert_eq!(config.spawning_timeout_secs, 480);
     }
 
     #[test]
@@ -1034,7 +1034,7 @@ mod tests {
     fn test_spawning_timeout_secs_in_config() {
         // Default
         let config = RunnerConfig::default();
-        assert_eq!(config.spawning_timeout_secs, 120);
+        assert_eq!(config.spawning_timeout_secs, 480);
 
         // Custom via YAML
         let yaml = r#"
@@ -1049,7 +1049,7 @@ mod tests {
     #[test]
     fn test_guard_config_spawning_timeout_default() {
         let config = crate::runner::guard::GuardConfig::default();
-        assert_eq!(config.spawning_timeout, std::time::Duration::from_secs(120));
+        assert_eq!(config.spawning_timeout, std::time::Duration::from_secs(480));
     }
 
     #[test]

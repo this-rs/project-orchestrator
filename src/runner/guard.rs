@@ -64,7 +64,7 @@ impl Default for GuardConfig {
         Self {
             idle_timeout: Duration::from_secs(180),
             task_timeout: Duration::from_secs(10800),
-            spawning_timeout: Duration::from_secs(120),
+            spawning_timeout: Duration::from_secs(480),
             loop_threshold: 3,
             check_interval: Duration::from_secs(5),
             completion_loop_threshold: 5,
@@ -354,9 +354,9 @@ impl AgentGuard {
 
         let builder = CompactionContextBuilder::new(graph);
 
-        // Timeout at 500ms to stay within performance budget
+        // Timeout at 2s to allow rich context building, with fallback on failure
         match tokio::time::timeout(
-            Duration::from_millis(500),
+            Duration::from_secs(2),
             builder.build_for_task(plan_id, self.task_id),
         )
         .await
@@ -367,7 +367,15 @@ impl AgentGuard {
                     warn!("Guard: compaction context too small, using fallback");
                     fallback
                 } else {
-                    md
+                    // Append MCP step-update reminder to the rich context
+                    format!(
+                        "{}\n\n<system-reminder>\n\
+                         ## Agent Instructions\n\
+                         Continue working on the current task. \
+                         Update step statuses via MCP step(action: \"update\") as you progress.\n\
+                         </system-reminder>",
+                        md
+                    )
                 }
             }
             Ok(Err(e)) => {
@@ -378,7 +386,7 @@ impl AgentGuard {
                 fallback
             }
             Err(_) => {
-                warn!("Guard: CompactionContextBuilder timed out (>500ms), using fallback");
+                warn!("Guard: CompactionContextBuilder timed out (>2s), using fallback");
                 fallback
             }
         }
@@ -851,6 +859,17 @@ mod tests {
         assert!(
             msg.contains("## Plan"),
             "Hint should contain Plan section: {}",
+            msg
+        );
+        // Verify MCP step-update instruction is appended
+        assert!(
+            msg.contains("## Agent Instructions"),
+            "Hint should contain Agent Instructions section: {}",
+            msg
+        );
+        assert!(
+            msg.contains("Update step statuses via MCP"),
+            "Hint should remind about MCP step updates: {}",
             msg
         );
     }
