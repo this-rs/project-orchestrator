@@ -30,7 +30,7 @@ use nexus_claude::{
     StreamDelta, StreamEventData,
 };
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{broadcast, Mutex, RwLock};
@@ -116,6 +116,13 @@ pub struct ActiveSession {
     /// When `true`, the backend automatically sends "Continue" after error_max_turns.
     /// Toggled via WebSocket `set_auto_continue` message.
     pub auto_continue: Arc<AtomicBool>,
+    /// Number of auto-continue cycles consumed so far. Incremented each time
+    /// `stream_response` auto-continues after error_max_turns. When this reaches
+    /// `max_auto_continues`, auto_continue is disabled to prevent infinite loops.
+    pub auto_continue_count: Arc<AtomicU32>,
+    /// Maximum number of auto-continue cycles allowed. 0 = unlimited.
+    /// Set to `RunnerConfig.max_auto_continues` for runner sessions, 0 for interactive.
+    pub max_auto_continues: u32,
     /// RFC accumulator for detecting sustained architectural discussions.
     /// Persists across messages in a session — when 2+ consecutive responses
     /// contain RFC-qualifying patterns, auto-creates an RFC draft note.
@@ -2467,7 +2474,15 @@ impl ChatManager {
         // Register active session — cancel old NATS listeners if session key already exists
         let nats_cancel = CancellationToken::new();
         let interrupt_token = CancellationToken::new();
-        let auto_continue = Arc::new(AtomicBool::new(self.config.auto_continue));
+        // Runner sessions always get auto_continue=true; interactive sessions use config default.
+        let is_runner_session = request.runner_context.is_some();
+        let auto_continue = Arc::new(AtomicBool::new(
+            if is_runner_session { true } else { self.config.auto_continue }
+        ));
+        let auto_continue_count = Arc::new(AtomicU32::new(0));
+        // Runner sessions: limit to 5 auto-continues to prevent infinite loops.
+        // Interactive sessions: unlimited (0) — user can always interrupt manually.
+        let max_auto_continues: u32 = if is_runner_session { 5 } else { 0 };
         let interrupt_flag = {
             let mut sessions = self.active_sessions.write().await;
             // Cancel stale NATS listeners from a previous session with the same ID
@@ -2504,6 +2519,8 @@ impl ChatManager {
                         std::collections::HashMap::new(),
                     )),
                     auto_continue: auto_continue.clone(),
+                    auto_continue_count: auto_continue_count.clone(),
+                    max_auto_continues,
                     rfc_accumulator: Arc::new(Mutex::new(
                         super::observation_detector::RfcAccumulator::new(),
                     )),
@@ -3673,10 +3690,41 @@ impl ChatManager {
         // Auto-continue: if error_max_turns was hit and auto_continue is enabled,
         // emit an AutoContinue event, wait 500ms (interruptible), then enqueue "Continue"
         // into pending_messages for the drain below.
-        if hit_error_max_turns
+        //
+        // Safety valve: if max_auto_continues > 0 (runner sessions), check the counter
+        // and disable auto_continue when the limit is reached to prevent infinite loops.
+        let auto_continue_allowed = if hit_error_max_turns
             && auto_continue.load(Ordering::Relaxed)
             && !interrupt_flag.load(Ordering::SeqCst)
         {
+            // Check counter via active_sessions
+            let sessions = active_sessions.read().await;
+            if let Some(session) = sessions.get(&session_id) {
+                let count = session.auto_continue_count.fetch_add(1, Ordering::Relaxed) + 1;
+                let max = session.max_auto_continues;
+                if max > 0 && count > max {
+                    warn!(
+                        "Auto-continue limit reached for session {} ({}/{}), disabling",
+                        session_id, count, max
+                    );
+                    auto_continue.store(false, Ordering::Relaxed);
+                    false
+                } else {
+                    if max > 0 {
+                        info!(
+                            "Auto-continue {}/{} for session {}",
+                            count, max, session_id
+                        );
+                    }
+                    true
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if auto_continue_allowed {
             let delay_ms = 500u64;
             info!(
                 "Auto-continue triggered for session {} (delay={}ms)",
@@ -4879,6 +4927,8 @@ impl ChatManager {
                         std::collections::HashMap::new(),
                     )),
                     auto_continue: auto_continue.clone(),
+                    auto_continue_count: Arc::new(AtomicU32::new(0)),
+                    max_auto_continues: 0, // resumed sessions = interactive, unlimited
                     rfc_accumulator: Arc::new(Mutex::new(
                         super::observation_detector::RfcAccumulator::new(),
                     )),
@@ -7447,6 +7497,8 @@ mod tests {
                 std::collections::HashMap::new(),
             )),
             auto_continue: Arc::new(AtomicBool::new(false)),
+            auto_continue_count: Arc::new(AtomicU32::new(0)),
+            max_auto_continues: 0,
             rfc_accumulator: Arc::new(Mutex::new(
                 crate::chat::observation_detector::RfcAccumulator::new(),
             )),
@@ -8337,6 +8389,8 @@ mod tests {
                 std::collections::HashMap::new(),
             )),
             auto_continue: Arc::new(AtomicBool::new(false)),
+            auto_continue_count: Arc::new(AtomicU32::new(0)),
+            max_auto_continues: 0,
             rfc_accumulator: Arc::new(Mutex::new(
                 crate::chat::observation_detector::RfcAccumulator::new(),
             )),

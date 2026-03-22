@@ -47,6 +47,9 @@ pub struct RunnerConfig {
     /// Maximum message length (chars) to consider as a completion signal. Default: 200.
     /// Messages longer than this are treated as real explanations, not completion loops.
     pub completion_max_chars: usize,
+    /// Maximum number of auto-continue cycles before giving up. Default: 5.
+    /// Prevents infinite loops when the agent keeps hitting error_max_turns.
+    pub max_auto_continues: u32,
 }
 
 /// CWD validation mode for the runner.
@@ -74,6 +77,7 @@ impl Default for RunnerConfig {
             cwd_validation: CwdValidation::default(),
             completion_loop_threshold: 5,
             completion_max_chars: 200,
+            max_auto_continues: 5,
         }
     }
 }
