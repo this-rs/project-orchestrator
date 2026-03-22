@@ -1775,9 +1775,36 @@ impl PlanRunner {
                 }
                 Ok(TaskResult::Blocked { blocked_by }) => {
                     warn!("Task {} blocked by {:?}", task_id, blocked_by);
+
+                    // Extract session_id and remove agent from active_agents
+                    let agent_session_id = {
+                        let mut global = RUNNER_STATE.write().await;
+                        let sid = global
+                            .as_ref()
+                            .and_then(|s| s.get_agent(&task_id))
+                            .and_then(|a| a.session_id);
+                        if let Some(ref mut s) = *global {
+                            s.remove_agent(&task_id);
+                        }
+                        sid
+                    };
+
                     let _ = self
                         .update_task_status_with_event(task_id, TaskStatus::Blocked)
                         .await;
+
+                    // Close the agent's chat session (fire-and-forget)
+                    if let Some(sid) = agent_session_id {
+                        let chat_manager = self.chat_manager.clone();
+                        tokio::spawn(async move {
+                            let sid_str = sid.to_string();
+                            if let Err(e) = chat_manager.close_session(&sid_str).await {
+                                warn!("Failed to close agent session {} after task blocked: {}", sid_str, e);
+                            } else {
+                                debug!("Closed agent session {} after task {} blocked", sid_str, task_id);
+                            }
+                        });
+                    }
                 }
                 Err(e) => {
                     error!("Task {} execution error: {}", task_id, e);
@@ -2913,6 +2940,15 @@ impl PlanRunner {
         duration_secs: f64,
         cost_usd: f64,
     ) -> Result<()> {
+        // Extract session_id BEFORE mark_task_completed removes the agent
+        let agent_session_id = {
+            let global = RUNNER_STATE.read().await;
+            global
+                .as_ref()
+                .and_then(|s| s.get_agent(&task_id))
+                .and_then(|a| a.session_id)
+        };
+
         // Update task status (with CrudEvent for WebSocket)
         self.update_task_status_with_event(task_id, TaskStatus::Completed)
             .await?;
@@ -2925,6 +2961,19 @@ impl PlanRunner {
                 // Persist to Neo4j
                 self.graph.update_plan_run(s).await?;
             }
+        }
+
+        // Close the agent's chat session (fire-and-forget)
+        if let Some(sid) = agent_session_id {
+            let chat_manager = self.chat_manager.clone();
+            tokio::spawn(async move {
+                let sid_str = sid.to_string();
+                if let Err(e) = chat_manager.close_session(&sid_str).await {
+                    warn!("Failed to close agent session {} after task completion: {}", sid_str, e);
+                } else {
+                    debug!("Closed agent session {} after task {} completed", sid_str, task_id);
+                }
+            });
         }
 
         // Record in vector collector
@@ -3015,6 +3064,16 @@ impl PlanRunner {
         }
 
         // No retries left — mark as definitively Failed
+
+        // Extract session_id BEFORE mark_task_failed removes the agent
+        let agent_session_id = {
+            let global = RUNNER_STATE.read().await;
+            global
+                .as_ref()
+                .and_then(|s| s.get_agent(&task_id))
+                .and_then(|a| a.session_id)
+        };
+
         self.update_task_status_with_event(task_id, TaskStatus::Failed)
             .await?;
 
@@ -3025,6 +3084,19 @@ impl PlanRunner {
                 s.mark_task_failed(task_id);
                 self.graph.update_plan_run(s).await?;
             }
+        }
+
+        // Close the agent's chat session (fire-and-forget, definitive failure only)
+        if let Some(sid) = agent_session_id {
+            let chat_manager = self.chat_manager.clone();
+            tokio::spawn(async move {
+                let sid_str = sid.to_string();
+                if let Err(e) = chat_manager.close_session(&sid_str).await {
+                    warn!("Failed to close agent session {} after task failure: {}", sid_str, e);
+                } else {
+                    debug!("Closed agent session {} after task {} failed (final)", sid_str, task_id);
+                }
+            });
         }
 
         self.emit_event(RunnerEvent::TaskFailed {
