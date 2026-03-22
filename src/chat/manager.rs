@@ -2352,25 +2352,31 @@ impl ChatManager {
                 }],
             );
 
-            // PreToolUse → SkillActivationHook injects skill context as additionalContext
-            let skill_hook = skill_hook::SkillActivationHook::new(self.graph.clone());
-            hooks.insert(
-                "PreToolUse".to_string(),
-                vec![nexus_claude::HookMatcher {
-                    matcher: None, // Match all tools — filtering is done inside the hook
-                    hooks: vec![std::sync::Arc::new(skill_hook)],
-                }],
-            );
+            // Skip PreToolUse/PostToolUse hooks for runner sessions — they inject
+            // ~1000 chars of context per tool call (persona, notes, redirect suggestions),
+            // which accelerates compaction and wastes tokens. Runner agents already have
+            // full task context via the prompt.
+            if request.runner_context.is_none() {
+                // PreToolUse → SkillActivationHook injects skill context as additionalContext
+                let skill_hook = skill_hook::SkillActivationHook::new(self.graph.clone());
+                hooks.insert(
+                    "PreToolUse".to_string(),
+                    vec![nexus_claude::HookMatcher {
+                        matcher: None, // Match all tools — filtering is done inside the hook
+                        hooks: vec![std::sync::Arc::new(skill_hook)],
+                    }],
+                );
 
-            // PostToolUse → PostToolUseRedirectHook suggests MCP alternatives after noisy Grep
-            let post_hook = post_tool_hook::PostToolUseRedirectHook::new(self.graph.clone());
-            hooks.insert(
-                "PostToolUse".to_string(),
-                vec![nexus_claude::HookMatcher {
-                    matcher: None,
-                    hooks: vec![std::sync::Arc::new(post_hook)],
-                }],
-            );
+                // PostToolUse → PostToolUseRedirectHook suggests MCP alternatives after noisy Grep
+                let post_hook = post_tool_hook::PostToolUseRedirectHook::new(self.graph.clone());
+                hooks.insert(
+                    "PostToolUse".to_string(),
+                    vec![nexus_claude::HookMatcher {
+                        matcher: None,
+                        hooks: vec![std::sync::Arc::new(post_hook)],
+                    }],
+                );
+            }
 
             hooks
         };
