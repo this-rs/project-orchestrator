@@ -1560,6 +1560,18 @@ impl PlanRunner {
                     attempts: _,
                     cost_usd,
                 }) => {
+                    // Step coherence check: if all steps are completed despite
+                    // a Failed result, auto-complete the task instead of failing it.
+                    if let Some(true) = self.check_step_coherence(task_id).await {
+                        warn!(
+                            "Task {} failed ({}) but all steps are completed — auto-completing",
+                            task_id, reason
+                        );
+                        self.on_task_completed(run_id, task_id, 0.0, cost_usd)
+                            .await?;
+                        wave_result.tasks_completed.push(task_id);
+                        wave_result.wave_cost_usd += cost_usd;
+                    } else {
                     self.on_task_failed(run_id, plan_id, task_id, &reason, 0.0, cost_usd)
                         .await?;
                     wave_result.tasks_failed.push((task_id, reason));
@@ -1635,11 +1647,24 @@ impl PlanRunner {
                                 .await;
                         });
                     }
+                    } // end else (step coherence check)
                 }
                 Ok(TaskResult::Timeout {
                     duration_secs,
                     cost_usd,
                 }) => {
+                    // Step coherence check: if all steps completed despite timeout,
+                    // auto-complete the task (the agent finished its work but hit the timeout).
+                    if let Some(true) = self.check_step_coherence(task_id).await {
+                        warn!(
+                            "Task {} timed out but all steps are completed — auto-completing",
+                            task_id
+                        );
+                        self.on_task_completed(run_id, task_id, duration_secs, cost_usd)
+                            .await?;
+                        wave_result.tasks_completed.push(task_id);
+                        wave_result.wave_cost_usd += cost_usd;
+                    } else {
                     self.emit_event(RunnerEvent::TaskTimeout {
                         run_id,
                         task_id,
@@ -1730,6 +1755,7 @@ impl PlanRunner {
                                 .await;
                         });
                     }
+                    } // end else (step coherence check for timeout)
                 }
                 Ok(TaskResult::BudgetExceeded {
                     cumulated_cost_usd,
@@ -2837,6 +2863,43 @@ impl PlanRunner {
         });
         result.report = Some(report);
         Ok(result)
+    }
+
+    // ========================================================================
+    // Step coherence check
+    // ========================================================================
+
+    /// Check if all steps of a task are completed, indicating the task should
+    /// be auto-completed even if the guard didn't detect it (e.g. timeout).
+    ///
+    /// Returns `Some(true)` if all steps are completed (task should be completed).
+    /// Returns `Some(false)` if task is marked completed but no steps were updated (suspicious).
+    /// Returns `None` if the check is inconclusive (mixed states or no steps).
+    async fn check_step_coherence(&self, task_id: Uuid) -> Option<bool> {
+        let steps = self.graph.get_task_steps(task_id).await.ok()?;
+        if steps.is_empty() {
+            return None;
+        }
+
+        let all_completed = steps.iter().all(|s| {
+            s.status == crate::neo4j::models::StepStatus::Completed
+        });
+
+        if all_completed {
+            return Some(true);
+        }
+
+        // Check suspicious case: no steps updated at all
+        let all_pending_or_skipped = steps.iter().all(|s| {
+            s.status == crate::neo4j::models::StepStatus::Pending
+                || s.status == crate::neo4j::models::StepStatus::Skipped
+        });
+
+        if all_pending_or_skipped {
+            return Some(false);
+        }
+
+        None
     }
 
     // ========================================================================
@@ -4976,6 +5039,116 @@ mod tests {
         assert_eq!(breakdown.total, 0);
         assert_eq!(breakdown.completed, 0);
         // No steps = task with no defined steps → Success is valid
+    }
+
+    // === Step coherence tests ===
+
+    #[tokio::test]
+    async fn test_check_step_coherence_all_completed_returns_true() {
+        use crate::neo4j::models::{StepStatus, TaskStatus};
+        use crate::test_helpers::{test_plan, test_step, test_task};
+
+        let (runner, graph) = test_plan_runner_with_graph();
+
+        let plan = test_plan();
+        let plan_id = plan.id;
+        graph.create_plan(&plan).await.unwrap();
+
+        let mut task = test_task();
+        task.status = TaskStatus::InProgress;
+        let task_id = task.id;
+        graph.create_task(plan_id, &task).await.unwrap();
+
+        // All steps completed
+        let mut step1 = test_step(1, "Write code");
+        step1.status = StepStatus::Completed;
+        graph.create_step(task_id, &step1).await.unwrap();
+
+        let mut step2 = test_step(2, "Run tests");
+        step2.status = StepStatus::Completed;
+        graph.create_step(task_id, &step2).await.unwrap();
+
+        // All steps completed → should return Some(true)
+        let result = runner.check_step_coherence(task_id).await;
+        assert_eq!(result, Some(true));
+    }
+
+    #[tokio::test]
+    async fn test_check_step_coherence_all_pending_returns_false() {
+        use crate::neo4j::models::{StepStatus, TaskStatus};
+        use crate::test_helpers::{test_plan, test_step, test_task};
+
+        let (runner, graph) = test_plan_runner_with_graph();
+
+        let plan = test_plan();
+        let plan_id = plan.id;
+        graph.create_plan(&plan).await.unwrap();
+
+        let mut task = test_task();
+        task.status = TaskStatus::InProgress;
+        let task_id = task.id;
+        graph.create_task(plan_id, &task).await.unwrap();
+
+        // All steps still pending (agent did nothing)
+        let step1 = test_step(1, "Write code");
+        graph.create_step(task_id, &step1).await.unwrap();
+
+        let step2 = test_step(2, "Run tests");
+        graph.create_step(task_id, &step2).await.unwrap();
+
+        // All pending → should return Some(false) (suspicious)
+        let result = runner.check_step_coherence(task_id).await;
+        assert_eq!(result, Some(false));
+    }
+
+    #[tokio::test]
+    async fn test_check_step_coherence_mixed_returns_none() {
+        use crate::neo4j::models::{StepStatus, TaskStatus};
+        use crate::test_helpers::{test_plan, test_step, test_task};
+
+        let (runner, graph) = test_plan_runner_with_graph();
+
+        let plan = test_plan();
+        let plan_id = plan.id;
+        graph.create_plan(&plan).await.unwrap();
+
+        let mut task = test_task();
+        task.status = TaskStatus::InProgress;
+        let task_id = task.id;
+        graph.create_task(plan_id, &task).await.unwrap();
+
+        // Mixed: 1 completed, 1 pending
+        let mut step1 = test_step(1, "Write code");
+        step1.status = StepStatus::Completed;
+        graph.create_step(task_id, &step1).await.unwrap();
+
+        let step2 = test_step(2, "Run tests");
+        graph.create_step(task_id, &step2).await.unwrap();
+
+        // Mixed → should return None (inconclusive)
+        let result = runner.check_step_coherence(task_id).await;
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn test_check_step_coherence_no_steps_returns_none() {
+        use crate::neo4j::models::TaskStatus;
+        use crate::test_helpers::{test_plan, test_task};
+
+        let (runner, graph) = test_plan_runner_with_graph();
+
+        let plan = test_plan();
+        let plan_id = plan.id;
+        graph.create_plan(&plan).await.unwrap();
+
+        let mut task = test_task();
+        task.status = TaskStatus::InProgress;
+        let task_id = task.id;
+        graph.create_task(plan_id, &task).await.unwrap();
+
+        // No steps → should return None
+        let result = runner.check_step_coherence(task_id).await;
+        assert_eq!(result, None);
     }
 
     // === Pure function tests: validate_cwd ===
