@@ -3581,6 +3581,43 @@ impl ChatManager {
             *shared_sdk_control_rx.lock().await = sdk_control_rx;
         }
 
+        // ===== POST-STREAM CONTEXT (single Neo4j lookup) =====
+        // Single get_chat_session + get_project_by_slug call shared by:
+        // post-compaction injection, auto-continue, objective tracker, and feedback/RFC.
+        struct PostStreamContext {
+            project_slug: Option<String>,
+            project_id: Option<Uuid>,
+        }
+        let post_ctx = if let Some(uuid) = session_uuid {
+            match graph.get_chat_session(uuid).await {
+                Ok(Some(node)) => {
+                    let pid = if let Some(ref slug) = node.project_slug {
+                        graph
+                            .get_project_by_slug(slug)
+                            .await
+                            .ok()
+                            .flatten()
+                            .map(|p| p.id)
+                    } else {
+                        None
+                    };
+                    PostStreamContext {
+                        project_slug: node.project_slug,
+                        project_id: pid,
+                    }
+                }
+                _ => PostStreamContext {
+                    project_slug: None,
+                    project_id: None,
+                },
+            }
+        } else {
+            PostStreamContext {
+                project_slug: None,
+                project_id: None,
+            }
+        };
+
         // Post-compaction context re-injection for interactive sessions.
         // If a CompactBoundary was detected during this stream turn, rebuild project
         // context via CompactionContextBuilder and queue it as a system-reminder hint
@@ -3591,20 +3628,10 @@ impl ChatManager {
                 session_id
             );
 
-            // Resolve project_slug from the session's Neo4j node
-            let project_slug = if let Some(uuid) = session_uuid {
-                match graph.get_chat_session(uuid).await {
-                    Ok(Some(node)) => node.project_slug,
-                    _ => None,
-                }
-            } else {
-                None
-            };
-
             // Build context using CompactionContextBuilder (timed for metrics)
             let build_start = std::time::Instant::now();
             let builder = super::compaction_context::CompactionContextBuilder::new(graph.clone());
-            let build_result = builder.build_for_session(project_slug.as_deref()).await;
+            let build_result = builder.build_for_session(post_ctx.project_slug.as_deref()).await;
             let build_latency_ms = build_start.elapsed().as_millis() as u64;
 
             let (hint_len, recovery_success) = match build_result {
@@ -3629,10 +3656,10 @@ impl ChatManager {
                         "Failed to build post-compaction context for session {}: {}. Injecting minimal reminder.",
                         session_id, e
                     );
-                    let minimal = if project_slug.is_some() {
+                    let minimal = if post_ctx.project_slug.is_some() {
                         format!(
                             "<system-reminder>\n# Post-Compaction Context\nYou are working on project \"{}\". Context rebuild failed — continue based on conversation history.\n</system-reminder>",
-                            project_slug.as_deref().unwrap_or("unknown")
+                            post_ctx.project_slug.as_deref().unwrap_or("unknown")
                         )
                     } else {
                         "<system-reminder>\n# Post-Compaction Context\nYou are in an interactive session. No project context available.\n</system-reminder>".to_string()
@@ -3792,16 +3819,7 @@ impl ChatManager {
                 // Build enriched auto-continue message with remaining objectives.
                 // Best-effort: if context build fails or times out, fall back to plain "Continue".
                 let continue_msg = 'build_msg: {
-                    let slug = if let Some(uuid) = session_uuid {
-                        match graph.get_chat_session(uuid).await {
-                            Ok(Some(node)) => node.project_slug,
-                            _ => None,
-                        }
-                    } else {
-                        None
-                    };
-
-                    if let Some(ref slug) = slug {
+                    if let Some(ref slug) = post_ctx.project_slug {
                         let builder =
                             super::compaction_context::CompactionContextBuilder::new(graph.clone());
                         // Timeout at 2s to avoid blocking the stream too long
@@ -3865,17 +3883,7 @@ impl ChatManager {
             };
 
             if should_check {
-                // Look up the project slug for this session
-                let slug = if let Some(uuid) = session_uuid {
-                    match graph.get_chat_session(uuid).await {
-                        Ok(Some(node)) => node.project_slug,
-                        _ => None,
-                    }
-                } else {
-                    None
-                };
-
-                if let Some(ref slug) = slug {
+                if let Some(ref slug) = post_ctx.project_slug {
                     let builder =
                         super::compaction_context::CompactionContextBuilder::new(graph.clone());
                     if let Ok(Ok(ctx)) = tokio::time::timeout(
@@ -3974,24 +3982,7 @@ impl ChatManager {
 
                 // Auto add_discussed: extract entities from response and mark as DISCUSSED (async)
                 if let Some(uuid) = session_uuid {
-                    let project_id = {
-                        // Resolve project_id from session's project_slug
-                        match graph.get_chat_session(uuid).await {
-                            Ok(Some(node)) => {
-                                if let Some(ref slug) = node.project_slug {
-                                    graph
-                                        .get_project_by_slug(slug)
-                                        .await
-                                        .ok()
-                                        .flatten()
-                                        .map(|p| p.id)
-                                } else {
-                                    None
-                                }
-                            }
-                            _ => None,
-                        }
-                    };
+                    let project_id = post_ctx.project_id;
                     super::feedback::spawn_feedback(
                         graph.clone(),
                         uuid,
