@@ -1320,8 +1320,31 @@ impl PlanRunner {
             }
         }
 
-        // All waves completed successfully
-        self.finalize_run(run_id, PlanRunStatus::Completed, Some(&cwd))
+        // Compute final run status based on task outcomes
+        let final_status = {
+            let tasks = self.graph.get_plan_tasks(plan_id).await.unwrap_or_default();
+            let has_failed = tasks
+                .iter()
+                .any(|t| t.status == TaskStatus::Failed);
+            let has_blocked = tasks
+                .iter()
+                .any(|t| t.status == TaskStatus::Blocked);
+            let has_pending = tasks
+                .iter()
+                .any(|t| t.status == TaskStatus::Pending);
+
+            if has_failed || has_blocked || has_pending {
+                info!(
+                    "Run {} finishing with errors: failed={}, blocked={}, pending={}",
+                    run_id, has_failed, has_blocked, has_pending
+                );
+                PlanRunStatus::CompletedWithErrors
+            } else {
+                PlanRunStatus::Completed
+            }
+        };
+
+        self.finalize_run(run_id, final_status, Some(&cwd))
             .await?;
         Ok(())
     }
@@ -3564,6 +3587,7 @@ impl PlanRunner {
             if plan_id != Uuid::nil() {
                 let plan_status = match status {
                     PlanRunStatus::Completed => Some(PlanStatus::Completed),
+                    PlanRunStatus::CompletedWithErrors => Some(PlanStatus::InProgress),
                     PlanRunStatus::Failed | PlanRunStatus::BudgetExceeded => {
                         Some(PlanStatus::Cancelled)
                     }
@@ -3690,6 +3714,68 @@ impl PlanRunner {
                     pr_url,
                 });
                 info!("Plan run {} completed successfully", run_id);
+            }
+            PlanRunStatus::CompletedWithErrors => {
+                let (total_cost, total_duration, tc, tf) = global
+                    .as_ref()
+                    .map(|s| {
+                        (
+                            s.cost_usd,
+                            s.elapsed_secs(),
+                            s.completed_tasks.len(),
+                            s.failed_tasks.len(),
+                        )
+                    })
+                    .unwrap_or((0.0, 0.0, 0, 0));
+
+                // Lifecycle FSM: child_completed (partial success is still completion)
+                if let Some(lc_run_id) = lifecycle_run_id {
+                    self.fire_lifecycle_transition(run_id, lc_run_id, "child_completed")
+                        .await;
+                }
+
+                // Post-run enricher sweep (same as Completed — partial work still has commits)
+                if let Some(cwd) = cwd {
+                    if let Some(ref state) = *global {
+                        let enricher = TaskEnricher::new(self.graph.clone());
+                        let sweep_linked = enricher
+                            .post_run_sweep(
+                                state.plan_id,
+                                &state.completed_tasks,
+                                state.started_at,
+                                state.project_id,
+                                cwd,
+                            )
+                            .await;
+                        if sweep_linked > 0 {
+                            info!(
+                                "Post-run sweep linked {} commit→task relations",
+                                sweep_linked
+                            );
+                        }
+                    }
+                }
+
+                self.emit_event(RunnerEvent::PlanCompleted {
+                    run_id,
+                    plan_id,
+                    status: PlanRunStatus::CompletedWithErrors,
+                    total_cost_usd: total_cost,
+                    total_duration_secs: total_duration,
+                    tasks_completed: tc,
+                    tasks_failed: tf,
+                    pr_url: None, // No auto-PR for partial runs
+                });
+
+                warn!(
+                    "Plan run {} completed with errors ({} completed, {} failed)",
+                    run_id, tc, tf
+                );
+
+                // Create a gotcha note with error context
+                if plan_id != Uuid::nil() {
+                    self.create_failure_note(plan_id, run_id).await;
+                }
             }
             PlanRunStatus::Failed => {
                 error!("Plan run {} failed", run_id);
