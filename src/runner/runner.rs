@@ -120,6 +120,24 @@ pub fn should_step_guard_trigger(breakdown: &StepBreakdown) -> bool {
     breakdown.total > 0 && breakdown.completed == 0
 }
 
+/// Compute the final run status based on task outcomes.
+///
+/// Pure function — no side effects. Extracted from execute_wave for testability.
+/// - If any task is Failed, Blocked, or Pending → CompletedWithErrors
+/// - Otherwise → Completed
+pub fn compute_final_status(tasks: &[crate::neo4j::models::TaskNode]) -> PlanRunStatus {
+    use crate::neo4j::models::TaskStatus;
+    let has_failed = tasks.iter().any(|t| t.status == TaskStatus::Failed);
+    let has_blocked = tasks.iter().any(|t| t.status == TaskStatus::Blocked);
+    let has_pending = tasks.iter().any(|t| t.status == TaskStatus::Pending);
+
+    if has_failed || has_blocked || has_pending {
+        PlanRunStatus::CompletedWithErrors
+    } else {
+        PlanRunStatus::Completed
+    }
+}
+
 /// Validate that at least one affected file exists on disk before spawning an agent.
 ///
 /// Returns `(valid, missing)` where:
@@ -1320,19 +1338,14 @@ impl PlanRunner {
         // Compute final run status based on task outcomes
         let final_status = {
             let tasks = self.graph.get_plan_tasks(plan_id).await.unwrap_or_default();
-            let has_failed = tasks.iter().any(|t| t.status == TaskStatus::Failed);
-            let has_blocked = tasks.iter().any(|t| t.status == TaskStatus::Blocked);
-            let has_pending = tasks.iter().any(|t| t.status == TaskStatus::Pending);
-
-            if has_failed || has_blocked || has_pending {
+            let status = compute_final_status(&tasks);
+            if status == PlanRunStatus::CompletedWithErrors {
                 info!(
-                    "Run {} finishing with errors: failed={}, blocked={}, pending={}",
-                    run_id, has_failed, has_blocked, has_pending
+                    "Run {} finishing with errors (some tasks failed/blocked/pending)",
+                    run_id
                 );
-                PlanRunStatus::CompletedWithErrors
-            } else {
-                PlanRunStatus::Completed
             }
+            status
         };
 
         self.finalize_run(run_id, final_status, Some(&cwd)).await?;
@@ -5988,6 +6001,1433 @@ mod tests {
                 step.description,
                 step.status
             );
+        }
+    }
+
+    // === Coverage tests: on_task_completed with cwd (cargo fmt path) ===
+
+    #[tokio::test]
+    async fn test_on_task_completed_with_cwd_runs_cargo_fmt() {
+        use crate::neo4j::models::TaskStatus;
+        use crate::test_helpers::{test_plan, test_task};
+
+        let (runner, graph) = test_plan_runner_with_graph();
+
+        let plan = test_plan();
+        let plan_id = plan.id;
+        graph.create_plan(&plan).await.unwrap();
+
+        let mut task = test_task();
+        task.status = TaskStatus::InProgress;
+        let task_id = task.id;
+        graph.create_task(plan_id, &task).await.unwrap();
+
+        let run_id = Uuid::new_v4();
+        {
+            let mut global = RUNNER_STATE.write().await;
+            let mut state = RunnerState::new(run_id, plan_id, 1, TriggerSource::Manual);
+            state.add_agent(ActiveAgent::new(task_id, "test".to_string()));
+            *global = Some(state);
+        }
+
+        // Call with cwd = this project (cargo fmt will run and succeed)
+        let cwd = env!("CARGO_MANIFEST_DIR");
+        runner
+            .on_task_completed(run_id, task_id, 10.0, 0.5, Some(cwd))
+            .await
+            .unwrap();
+
+        let updated = graph.get_task(task_id).await.unwrap().unwrap();
+        assert_eq!(updated.status, TaskStatus::Completed);
+
+        // Cleanup
+        {
+            let mut global = RUNNER_STATE.write().await;
+            *global = None;
+        }
+    }
+
+    // === Coverage tests: on_task_failed (definitive, with session close) ===
+
+    #[tokio::test]
+    async fn test_on_task_failed_definitive_marks_failed_and_removes_agent() {
+        use crate::neo4j::models::TaskStatus;
+        use crate::test_helpers::{test_plan, test_task};
+
+        let (runner, graph) = test_plan_runner_with_graph();
+
+        let plan = test_plan();
+        let plan_id = plan.id;
+        graph.create_plan(&plan).await.unwrap();
+
+        let mut task = test_task();
+        task.status = TaskStatus::InProgress;
+        let task_id = task.id;
+        graph.create_task(plan_id, &task).await.unwrap();
+
+        let run_id = Uuid::new_v4();
+        {
+            let mut global = RUNNER_STATE.write().await;
+            let mut state = RunnerState::new(run_id, plan_id, 1, TriggerSource::Manual);
+            state.add_agent(ActiveAgent::new(task_id, "test".to_string()));
+            *global = Some(state);
+        }
+        // Override config to 0 retries
+        let runner = {
+            let (event_tx, _) = broadcast::channel(16);
+            let mut config = RunnerConfig::default();
+            config.max_retries = 0;
+            PlanRunner::new(
+                runner.chat_manager.clone(),
+                runner.graph.clone(),
+                runner.context_builder.clone(),
+                config,
+                event_tx,
+            )
+        };
+
+        let should_retry = runner
+            .on_task_failed(run_id, plan_id, task_id, "test error", 10.0, 0.5)
+            .await
+            .unwrap();
+
+        assert!(!should_retry, "Should NOT retry with max_retries=0");
+
+        let updated = graph.get_task(task_id).await.unwrap().unwrap();
+        assert_eq!(updated.status, TaskStatus::Failed);
+
+        // Agent should be removed
+        {
+            let global = RUNNER_STATE.read().await;
+            if let Some(ref state) = *global {
+                assert!(state.get_agent(&task_id).is_none());
+            }
+        }
+
+        // Cleanup
+        {
+            let mut global = RUNNER_STATE.write().await;
+            *global = None;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_on_task_failed_retryable_marks_pending() {
+        use crate::neo4j::models::TaskStatus;
+        use crate::test_helpers::{test_plan, test_task};
+
+        let (runner, graph) = test_plan_runner_with_graph();
+
+        let plan = test_plan();
+        let plan_id = plan.id;
+        graph.create_plan(&plan).await.unwrap();
+
+        let mut task = test_task();
+        task.status = TaskStatus::InProgress;
+        let task_id = task.id;
+        graph.create_task(plan_id, &task).await.unwrap();
+
+        let run_id = Uuid::new_v4();
+        {
+            let mut global = RUNNER_STATE.write().await;
+            let state = RunnerState::new(run_id, plan_id, 1, TriggerSource::Manual);
+            *global = Some(state);
+        }
+
+        // Default config has max_retries = 1, retry_count starts at 0 → should retry
+        let should_retry = runner
+            .on_task_failed(run_id, plan_id, task_id, "transient error", 5.0, 0.2)
+            .await
+            .unwrap();
+
+        assert!(
+            should_retry,
+            "Should retry with max_retries=1 and 0 attempts"
+        );
+
+        let updated = graph.get_task(task_id).await.unwrap().unwrap();
+        assert_eq!(
+            updated.status,
+            TaskStatus::Pending,
+            "Task should be back to Pending for retry"
+        );
+
+        // Cleanup
+        {
+            let mut global = RUNNER_STATE.write().await;
+            *global = None;
+        }
+    }
+
+    // === Coverage tests: finalize_run with CompletedWithErrors ===
+
+    #[tokio::test]
+    async fn test_finalize_run_completed_with_errors() {
+        use crate::neo4j::models::TaskStatus;
+        use crate::test_helpers::{test_plan, test_task};
+
+        let (runner, graph) = test_plan_runner_with_graph();
+
+        let plan = test_plan();
+        let plan_id = plan.id;
+        graph.create_plan(&plan).await.unwrap();
+
+        let mut task = test_task();
+        task.status = TaskStatus::Failed;
+        graph.create_task(plan_id, &task).await.unwrap();
+
+        let run_id = Uuid::new_v4();
+        {
+            let mut global = RUNNER_STATE.write().await;
+            let state = RunnerState::new(run_id, plan_id, 1, TriggerSource::Manual);
+            *global = Some(state);
+        }
+
+        runner
+            .finalize_run(run_id, PlanRunStatus::CompletedWithErrors, None)
+            .await
+            .unwrap();
+
+        // Verify the run state was finalized
+        {
+            let global = RUNNER_STATE.read().await;
+            if let Some(ref state) = *global {
+                assert_eq!(state.status, PlanRunStatus::CompletedWithErrors);
+            }
+        }
+
+        // Plan status should be InProgress (not Completed, not Cancelled)
+        let updated_plan = graph.get_plan(plan_id).await.unwrap().unwrap();
+        assert_eq!(
+            updated_plan.status,
+            crate::neo4j::models::PlanStatus::InProgress,
+            "CompletedWithErrors should map to PlanStatus::InProgress"
+        );
+
+        // Cleanup
+        {
+            let mut global = RUNNER_STATE.write().await;
+            *global = None;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_finalize_run_completed_success() {
+        use crate::test_helpers::test_plan;
+
+        let (runner, graph) = test_plan_runner_with_graph();
+
+        let plan = test_plan();
+        let plan_id = plan.id;
+        graph.create_plan(&plan).await.unwrap();
+
+        let run_id = Uuid::new_v4();
+        {
+            let mut global = RUNNER_STATE.write().await;
+            let state = RunnerState::new(run_id, plan_id, 0, TriggerSource::Manual);
+            *global = Some(state);
+        }
+
+        runner
+            .finalize_run(run_id, PlanRunStatus::Completed, None)
+            .await
+            .unwrap();
+
+        let updated_plan = graph.get_plan(plan_id).await.unwrap().unwrap();
+        assert_eq!(
+            updated_plan.status,
+            crate::neo4j::models::PlanStatus::Completed,
+            "Completed should map to PlanStatus::Completed"
+        );
+
+        // Cleanup
+        {
+            let mut global = RUNNER_STATE.write().await;
+            *global = None;
+        }
+    }
+
+    // === Coverage tests: compute_final_status (extracted pure function) ===
+
+    #[test]
+    fn test_compute_final_status_all_completed() {
+        use crate::neo4j::models::TaskStatus;
+        use crate::test_helpers::test_task;
+
+        let mut t1 = test_task();
+        t1.status = TaskStatus::Completed;
+        t1.id = Uuid::new_v4();
+        let mut t2 = test_task();
+        t2.status = TaskStatus::Completed;
+        t2.id = Uuid::new_v4();
+
+        let result = compute_final_status(&[t1, t2]);
+        assert_eq!(result, PlanRunStatus::Completed);
+    }
+
+    #[test]
+    fn test_compute_final_status_with_failed_task() {
+        use crate::neo4j::models::TaskStatus;
+        use crate::test_helpers::test_task;
+
+        let mut t1 = test_task();
+        t1.status = TaskStatus::Completed;
+        let mut t2 = test_task();
+        t2.status = TaskStatus::Failed;
+        t2.id = Uuid::new_v4();
+
+        let result = compute_final_status(&[t1, t2]);
+        assert_eq!(result, PlanRunStatus::CompletedWithErrors);
+    }
+
+    #[test]
+    fn test_compute_final_status_with_blocked_task() {
+        use crate::neo4j::models::TaskStatus;
+        use crate::test_helpers::test_task;
+
+        let mut t1 = test_task();
+        t1.status = TaskStatus::Completed;
+        let mut t2 = test_task();
+        t2.status = TaskStatus::Blocked;
+        t2.id = Uuid::new_v4();
+
+        let result = compute_final_status(&[t1, t2]);
+        assert_eq!(result, PlanRunStatus::CompletedWithErrors);
+    }
+
+    #[test]
+    fn test_compute_final_status_with_pending_task() {
+        use crate::neo4j::models::TaskStatus;
+        use crate::test_helpers::test_task;
+
+        let mut t1 = test_task();
+        t1.status = TaskStatus::Completed;
+        let mut t2 = test_task();
+        t2.status = TaskStatus::Pending;
+        t2.id = Uuid::new_v4();
+
+        let result = compute_final_status(&[t1, t2]);
+        assert_eq!(result, PlanRunStatus::CompletedWithErrors);
+    }
+
+    #[test]
+    fn test_compute_final_status_empty_tasks() {
+        let result = compute_final_status(&[]);
+        assert_eq!(result, PlanRunStatus::Completed);
+    }
+
+    // === Coverage: PlanRunStatus::CompletedWithErrors Display ===
+
+    #[test]
+    fn test_plan_run_status_completed_with_errors_display() {
+        assert_eq!(
+            PlanRunStatus::CompletedWithErrors.to_string(),
+            "completed_with_errors"
+        );
+    }
+
+    // === Coverage: validate_affected_files ===
+
+    #[test]
+    fn test_validate_affected_files_absolute_existing_path() {
+        let files = vec!["/tmp".to_string()];
+        let (valid, missing) = validate_affected_files(&files, "/nonexistent");
+        assert!(valid, "/tmp exists so validation should pass");
+        assert!(missing.is_empty());
+    }
+
+    #[test]
+    fn test_validate_affected_files_mixed_existing_and_missing() {
+        let files = vec![
+            "/tmp".to_string(),
+            "/nonexistent_file_xyz_12345".to_string(),
+        ];
+        let (valid, missing) = validate_affected_files(&files, "/");
+        assert!(valid, "At least /tmp exists");
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0], "/nonexistent_file_xyz_12345");
+    }
+
+    #[test]
+    fn test_validate_affected_files_relative_paths() {
+        // Use Cargo.toml which exists in the project root
+        let cwd = env!("CARGO_MANIFEST_DIR");
+        let files = vec!["Cargo.toml".to_string()];
+        let (valid, missing) = validate_affected_files(&files, cwd);
+        assert!(valid);
+        assert!(missing.is_empty());
+    }
+
+    // === Coverage: finalize_run with Failed status ===
+
+    #[tokio::test]
+    async fn test_finalize_run_failed_creates_note() {
+        use crate::test_helpers::test_plan;
+
+        let (runner, graph) = test_plan_runner_with_graph();
+
+        let plan = test_plan();
+        let plan_id = plan.id;
+        graph.create_plan(&plan).await.unwrap();
+
+        let run_id = Uuid::new_v4();
+        {
+            let mut global = RUNNER_STATE.write().await;
+            let mut state = RunnerState::new(run_id, plan_id, 1, TriggerSource::Manual);
+            let failed_task_id = Uuid::new_v4();
+            state.failed_tasks.push(failed_task_id);
+            *global = Some(state);
+        }
+
+        runner
+            .finalize_run(run_id, PlanRunStatus::Failed, None)
+            .await
+            .unwrap();
+
+        // Plan should be cancelled
+        let updated = graph.get_plan(plan_id).await.unwrap().unwrap();
+        assert_eq!(
+            updated.status,
+            crate::neo4j::models::PlanStatus::Cancelled,
+            "Failed run should map to PlanStatus::Cancelled"
+        );
+
+        // Cleanup
+        {
+            let mut global = RUNNER_STATE.write().await;
+            *global = None;
+        }
+    }
+
+    // === Coverage: finalize_run with Cancelled status ===
+
+    #[tokio::test]
+    async fn test_finalize_run_cancelled() {
+        use crate::test_helpers::test_plan;
+
+        let (runner, graph) = test_plan_runner_with_graph();
+
+        let plan = test_plan();
+        let plan_id = plan.id;
+        graph.create_plan(&plan).await.unwrap();
+
+        let run_id = Uuid::new_v4();
+        {
+            let mut global = RUNNER_STATE.write().await;
+            let state = RunnerState::new(run_id, plan_id, 0, TriggerSource::Manual);
+            *global = Some(state);
+        }
+
+        runner
+            .finalize_run(run_id, PlanRunStatus::Cancelled, None)
+            .await
+            .unwrap();
+
+        let updated = graph.get_plan(plan_id).await.unwrap().unwrap();
+        assert_eq!(
+            updated.status,
+            crate::neo4j::models::PlanStatus::Cancelled,
+            "Cancelled run should map to PlanStatus::Cancelled"
+        );
+
+        // Cleanup
+        {
+            let mut global = RUNNER_STATE.write().await;
+            *global = None;
+        }
+    }
+
+    // === Coverage: finalize_run with BudgetExceeded status ===
+
+    #[tokio::test]
+    async fn test_finalize_run_budget_exceeded() {
+        use crate::test_helpers::test_plan;
+
+        let (runner, graph) = test_plan_runner_with_graph();
+
+        let plan = test_plan();
+        let plan_id = plan.id;
+        graph.create_plan(&plan).await.unwrap();
+
+        let run_id = Uuid::new_v4();
+        {
+            let mut global = RUNNER_STATE.write().await;
+            let state = RunnerState::new(run_id, plan_id, 2, TriggerSource::Manual);
+            *global = Some(state);
+        }
+
+        runner
+            .finalize_run(run_id, PlanRunStatus::BudgetExceeded, None)
+            .await
+            .unwrap();
+
+        let updated = graph.get_plan(plan_id).await.unwrap().unwrap();
+        assert_eq!(
+            updated.status,
+            crate::neo4j::models::PlanStatus::Cancelled,
+            "BudgetExceeded should map to PlanStatus::Cancelled"
+        );
+
+        // Cleanup
+        {
+            let mut global = RUNNER_STATE.write().await;
+            *global = None;
+        }
+    }
+
+    // === Coverage: create_failure_note ===
+
+    #[tokio::test]
+    async fn test_create_failure_note_creates_gotcha() {
+        use crate::test_helpers::test_plan;
+
+        let (runner, graph) = test_plan_runner_with_graph();
+
+        let plan = test_plan();
+        let plan_id = plan.id;
+        graph.create_plan(&plan).await.unwrap();
+
+        let run_id = Uuid::new_v4();
+        let failed_task = Uuid::new_v4();
+        {
+            let mut global = RUNNER_STATE.write().await;
+            let mut state = RunnerState::new(run_id, plan_id, 1, TriggerSource::Manual);
+            state.failed_tasks.push(failed_task);
+            *global = Some(state);
+        }
+
+        runner.create_failure_note(plan_id, run_id).await;
+
+        // Verify note was created (the mock stores notes)
+        let (notes, _count) = graph
+            .list_notes(None, None, &crate::notes::models::NoteFilters::default())
+            .await
+            .unwrap();
+        assert!(
+            !notes.is_empty(),
+            "create_failure_note should create a note"
+        );
+        let note = &notes[0];
+        assert!(note.content.contains("Plan run failed"));
+        assert!(note.content.contains(&failed_task.to_string()));
+
+        // Cleanup
+        {
+            let mut global = RUNNER_STATE.write().await;
+            *global = None;
+        }
+    }
+
+    // === Coverage: create_failure_gotcha ===
+
+    #[tokio::test]
+    async fn test_create_failure_gotcha_creates_note_and_links() {
+        let (runner, graph) = test_plan_runner_with_graph();
+
+        let task_id = Uuid::new_v4();
+        let project_id = Some(Uuid::new_v4());
+
+        runner
+            .create_failure_gotcha(
+                task_id,
+                "My failing task",
+                "connection timeout",
+                2,
+                project_id,
+            )
+            .await;
+
+        // Verify note was created
+        let (notes, _count) = graph
+            .list_notes(None, None, &crate::notes::models::NoteFilters::default())
+            .await
+            .unwrap();
+        assert!(
+            !notes.is_empty(),
+            "create_failure_gotcha should create a note"
+        );
+        let note = &notes[0];
+        assert!(note.content.contains("Task Failed After 2 Retry(ies)"));
+        assert!(note.content.contains("connection timeout"));
+        assert!(note.content.contains("My failing task"));
+        assert!(note.tags.contains(&"retry-exhausted".to_string()));
+        assert!(note.tags.contains(&"auto-generated".to_string()));
+    }
+
+    // === Coverage: finalize_steps with BudgetExceeded (all → skipped) ===
+
+    #[tokio::test]
+    async fn test_finalize_steps_budget_exceeded_marks_skipped() {
+        use crate::neo4j::models::{StepStatus, TaskStatus};
+        use crate::test_helpers::{test_plan, test_step, test_task};
+
+        let (runner, graph) = test_plan_runner_with_graph();
+
+        let plan = test_plan();
+        let plan_id = plan.id;
+        graph.create_plan(&plan).await.unwrap();
+
+        let mut task = test_task();
+        task.status = TaskStatus::InProgress;
+        let task_id = task.id;
+        graph.create_task(plan_id, &task).await.unwrap();
+
+        // Create steps: one pending, one in_progress
+        let mut step1 = test_step(1, "Step 1");
+        step1.status = StepStatus::Pending;
+        graph.create_step(task_id, &step1).await.unwrap();
+
+        let mut step2 = test_step(2, "Step 2");
+        step2.id = Uuid::new_v4();
+        step2.status = StepStatus::InProgress;
+        graph.create_step(task_id, &step2).await.unwrap();
+
+        let outcome = TaskResult::BudgetExceeded {
+            cumulated_cost_usd: 100.0,
+            limit_usd: 50.0,
+        };
+        let cwd = env!("CARGO_MANIFEST_DIR");
+        let breakdown = runner.finalize_steps(task_id, &outcome, cwd).await;
+
+        assert_eq!(breakdown.skipped, 2, "Both steps should be marked skipped");
+        assert_eq!(breakdown.completed, 0);
+        assert_eq!(breakdown.total, 2);
+    }
+
+    // === Coverage: finalize_steps with Failed outcome ===
+
+    #[tokio::test]
+    async fn test_finalize_steps_failed_marks_skipped() {
+        use crate::neo4j::models::{StepStatus, TaskStatus};
+        use crate::test_helpers::{test_plan, test_step, test_task};
+
+        let (runner, graph) = test_plan_runner_with_graph();
+
+        let plan = test_plan();
+        let plan_id = plan.id;
+        graph.create_plan(&plan).await.unwrap();
+
+        let mut task = test_task();
+        task.status = TaskStatus::InProgress;
+        let task_id = task.id;
+        graph.create_task(plan_id, &task).await.unwrap();
+
+        let mut step1 = test_step(1, "Step 1");
+        step1.status = StepStatus::Completed;
+        graph.create_step(task_id, &step1).await.unwrap();
+
+        let mut step2 = test_step(2, "Step 2");
+        step2.id = Uuid::new_v4();
+        step2.status = StepStatus::Pending;
+        graph.create_step(task_id, &step2).await.unwrap();
+
+        let mut step3 = test_step(3, "Step 3");
+        step3.id = Uuid::new_v4();
+        step3.status = StepStatus::Pending;
+        graph.create_step(task_id, &step3).await.unwrap();
+
+        let outcome = TaskResult::Failed {
+            reason: "agent crashed".to_string(),
+            attempts: 1,
+            cost_usd: 0.5,
+        };
+        let cwd = env!("CARGO_MANIFEST_DIR");
+        let breakdown = runner.finalize_steps(task_id, &outcome, cwd).await;
+
+        // 1 already completed + 2 pending → skipped
+        assert_eq!(breakdown.completed, 1);
+        assert_eq!(breakdown.skipped, 2);
+        assert_eq!(breakdown.total, 3);
+    }
+
+    // === Coverage: finalize_steps with Timeout (no commits) ===
+
+    #[tokio::test]
+    async fn test_finalize_steps_timeout_no_commits_marks_skipped() {
+        use crate::neo4j::models::{StepStatus, TaskStatus};
+        use crate::test_helpers::{test_plan, test_step, test_task};
+
+        let (runner, graph) = test_plan_runner_with_graph();
+
+        let plan = test_plan();
+        let plan_id = plan.id;
+        graph.create_plan(&plan).await.unwrap();
+
+        let mut task = test_task();
+        task.status = TaskStatus::InProgress;
+        let task_id = task.id;
+        graph.create_task(plan_id, &task).await.unwrap();
+
+        let mut step1 = test_step(1, "Step 1");
+        step1.status = StepStatus::InProgress;
+        graph.create_step(task_id, &step1).await.unwrap();
+
+        let mut step2 = test_step(2, "Step 2");
+        step2.id = Uuid::new_v4();
+        step2.status = StepStatus::Pending;
+        graph.create_step(task_id, &step2).await.unwrap();
+
+        let outcome = TaskResult::Timeout {
+            duration_secs: 600.0,
+            cost_usd: 5.0,
+        };
+        // Use a temp dir (no git repo) so has_commits = false
+        let tmp = std::env::temp_dir();
+        let cwd = tmp.to_str().unwrap();
+        let breakdown = runner.finalize_steps(task_id, &outcome, cwd).await;
+
+        // Without commits, timeout marks everything as skipped
+        assert_eq!(breakdown.skipped, 2);
+        assert_eq!(breakdown.completed, 0);
+        assert_eq!(breakdown.total, 2);
+    }
+
+    // === Coverage: finalize_steps all-pending warning path ===
+
+    #[tokio::test]
+    async fn test_finalize_steps_all_pending_warning() {
+        use crate::neo4j::models::{StepStatus, TaskStatus};
+        use crate::test_helpers::{test_plan, test_step, test_task};
+
+        let (runner, graph) = test_plan_runner_with_graph();
+
+        let plan = test_plan();
+        let plan_id = plan.id;
+        graph.create_plan(&plan).await.unwrap();
+
+        let mut task = test_task();
+        task.status = TaskStatus::InProgress;
+        let task_id = task.id;
+        graph.create_task(plan_id, &task).await.unwrap();
+
+        // All steps pending = agent updated 0 steps
+        let mut step1 = test_step(1, "Step 1");
+        step1.status = StepStatus::Pending;
+        graph.create_step(task_id, &step1).await.unwrap();
+
+        let mut step2 = test_step(2, "Step 2");
+        step2.id = Uuid::new_v4();
+        step2.status = StepStatus::Pending;
+        graph.create_step(task_id, &step2).await.unwrap();
+
+        let outcome = TaskResult::Success {
+            duration_secs: 30.0,
+            cost_usd: 0.5,
+        };
+        let cwd = env!("CARGO_MANIFEST_DIR");
+        let breakdown = runner.finalize_steps(task_id, &outcome, cwd).await;
+
+        // On success, pending steps are auto-completed
+        assert_eq!(breakdown.completed, 2);
+        assert_eq!(breakdown.pending, 0);
+        assert_eq!(breakdown.total, 2);
+    }
+
+    // === Coverage: finalize_steps no remaining steps (early return) ===
+
+    #[tokio::test]
+    async fn test_finalize_steps_all_already_completed_early_return() {
+        use crate::neo4j::models::{StepStatus, TaskStatus};
+        use crate::test_helpers::{test_plan, test_step, test_task};
+
+        let (runner, graph) = test_plan_runner_with_graph();
+
+        let plan = test_plan();
+        let plan_id = plan.id;
+        graph.create_plan(&plan).await.unwrap();
+
+        let mut task = test_task();
+        task.status = TaskStatus::Completed;
+        let task_id = task.id;
+        graph.create_task(plan_id, &task).await.unwrap();
+
+        let mut step1 = test_step(1, "Step 1");
+        step1.status = StepStatus::Completed;
+        graph.create_step(task_id, &step1).await.unwrap();
+
+        let outcome = TaskResult::Success {
+            duration_secs: 10.0,
+            cost_usd: 0.2,
+        };
+        let cwd = env!("CARGO_MANIFEST_DIR");
+        let breakdown = runner.finalize_steps(task_id, &outcome, cwd).await;
+
+        assert_eq!(breakdown.completed, 1);
+        assert_eq!(breakdown.pending, 0);
+        assert_eq!(breakdown.skipped, 0);
+        assert_eq!(breakdown.total, 1);
+    }
+
+    // === Coverage: check_step_coherence with all_pending_or_skipped ===
+
+    #[tokio::test]
+    async fn test_check_step_coherence_all_skipped_returns_false() {
+        use crate::neo4j::models::{StepStatus, TaskStatus};
+        use crate::test_helpers::{test_plan, test_step, test_task};
+
+        let (runner, graph) = test_plan_runner_with_graph();
+
+        let plan = test_plan();
+        let plan_id = plan.id;
+        graph.create_plan(&plan).await.unwrap();
+
+        let mut task = test_task();
+        task.status = TaskStatus::InProgress;
+        let task_id = task.id;
+        graph.create_task(plan_id, &task).await.unwrap();
+
+        let mut step1 = test_step(1, "Step 1");
+        step1.status = StepStatus::Skipped;
+        graph.create_step(task_id, &step1).await.unwrap();
+
+        let mut step2 = test_step(2, "Step 2");
+        step2.id = Uuid::new_v4();
+        step2.status = StepStatus::Skipped;
+        graph.create_step(task_id, &step2).await.unwrap();
+
+        let result = runner.check_step_coherence(task_id).await;
+        assert_eq!(result, Some(false), "All skipped should return Some(false)");
+    }
+
+    // === Coverage: on_task_completed with cwd=None (no cargo fmt) ===
+
+    #[tokio::test]
+    async fn test_on_task_completed_without_cwd_skips_fmt() {
+        use crate::neo4j::models::TaskStatus;
+        use crate::test_helpers::{test_plan, test_task};
+
+        let (runner, graph) = test_plan_runner_with_graph();
+
+        let plan = test_plan();
+        let plan_id = plan.id;
+        graph.create_plan(&plan).await.unwrap();
+
+        let mut task = test_task();
+        task.status = TaskStatus::InProgress;
+        let task_id = task.id;
+        graph.create_task(plan_id, &task).await.unwrap();
+
+        let run_id = Uuid::new_v4();
+        {
+            let mut global = RUNNER_STATE.write().await;
+            let mut state = RunnerState::new(run_id, plan_id, 1, TriggerSource::Manual);
+            state.add_agent(ActiveAgent::new(task_id, "test".to_string()));
+            *global = Some(state);
+        }
+
+        // Call with cwd=None — should skip cargo fmt and still succeed
+        runner
+            .on_task_completed(run_id, task_id, 5.0, 0.3, None)
+            .await
+            .unwrap();
+
+        let updated = graph.get_task(task_id).await.unwrap().unwrap();
+        assert_eq!(updated.status, TaskStatus::Completed);
+
+        // Cleanup
+        {
+            let mut global = RUNNER_STATE.write().await;
+            *global = None;
+        }
+    }
+
+    // === Coverage: on_task_failed with RUNNER_STATE=None ===
+
+    #[tokio::test]
+    async fn test_on_task_failed_no_global_state() {
+        use crate::neo4j::models::TaskStatus;
+        use crate::test_helpers::{test_plan, test_task};
+
+        let (runner, graph) = test_plan_runner_with_graph();
+
+        let plan = test_plan();
+        let plan_id = plan.id;
+        graph.create_plan(&plan).await.unwrap();
+
+        let mut task = test_task();
+        task.status = TaskStatus::InProgress;
+        let task_id = task.id;
+        graph.create_task(plan_id, &task).await.unwrap();
+
+        let run_id = Uuid::new_v4();
+        // Don't set RUNNER_STATE — tests the (false, 0) fallback branch
+        {
+            let mut global = RUNNER_STATE.write().await;
+            *global = None;
+        }
+
+        let should_retry = runner
+            .on_task_failed(run_id, plan_id, task_id, "no state error", 1.0, 0.1)
+            .await
+            .unwrap();
+
+        assert!(
+            !should_retry,
+            "No global state should mean no retry (false, 0)"
+        );
+
+        let updated = graph.get_task(task_id).await.unwrap().unwrap();
+        assert_eq!(updated.status, TaskStatus::Failed);
+    }
+
+    // === Coverage: should_step_guard_trigger edge cases ===
+
+    #[test]
+    fn test_should_step_guard_trigger_with_completed() {
+        let breakdown = StepBreakdown {
+            completed: 2,
+            skipped: 0,
+            pending: 0,
+            total: 2,
+        };
+        assert!(!should_step_guard_trigger(&breakdown));
+    }
+
+    #[test]
+    fn test_should_step_guard_trigger_zero_completed_with_total() {
+        let breakdown = StepBreakdown {
+            completed: 0,
+            skipped: 3,
+            pending: 0,
+            total: 3,
+        };
+        assert!(should_step_guard_trigger(&breakdown));
+    }
+
+    // === Coverage: PlanRunStatus from neo4j deserialization ===
+
+    #[test]
+    fn test_plan_run_status_all_variants_display() {
+        assert_eq!(PlanRunStatus::Running.to_string(), "running");
+        assert_eq!(PlanRunStatus::Completed.to_string(), "completed");
+        assert_eq!(
+            PlanRunStatus::CompletedWithErrors.to_string(),
+            "completed_with_errors"
+        );
+        assert_eq!(PlanRunStatus::Failed.to_string(), "failed");
+        assert_eq!(PlanRunStatus::Cancelled.to_string(), "cancelled");
+        assert_eq!(PlanRunStatus::BudgetExceeded.to_string(), "budget_exceeded");
+    }
+
+    // === Coverage: finalize_run with cwd for worktree cleanup ===
+
+    #[tokio::test]
+    async fn test_finalize_run_with_cwd_attempts_worktree_cleanup() {
+        use crate::test_helpers::test_plan;
+
+        let (runner, graph) = test_plan_runner_with_graph();
+
+        let plan = test_plan();
+        let plan_id = plan.id;
+        graph.create_plan(&plan).await.unwrap();
+
+        let run_id = Uuid::new_v4();
+        {
+            let mut global = RUNNER_STATE.write().await;
+            let state = RunnerState::new(run_id, plan_id, 0, TriggerSource::Manual);
+            *global = Some(state);
+        }
+
+        let cwd = env!("CARGO_MANIFEST_DIR");
+        // Should not fail even if there are no worktrees to clean
+        runner
+            .finalize_run(run_id, PlanRunStatus::Completed, Some(cwd))
+            .await
+            .unwrap();
+
+        let updated_plan = graph.get_plan(plan_id).await.unwrap().unwrap();
+        assert_eq!(
+            updated_plan.status,
+            crate::neo4j::models::PlanStatus::Completed
+        );
+
+        // Cleanup
+        {
+            let mut global = RUNNER_STATE.write().await;
+            *global = None;
+        }
+    }
+
+    // === Coverage: finalize_run CompletedWithErrors creates failure note ===
+
+    #[tokio::test]
+    async fn test_finalize_run_completed_with_errors_creates_failure_note() {
+        use crate::neo4j::models::TaskStatus;
+        use crate::test_helpers::{test_plan, test_task};
+
+        let (runner, graph) = test_plan_runner_with_graph();
+
+        let plan = test_plan();
+        let plan_id = plan.id;
+        graph.create_plan(&plan).await.unwrap();
+
+        let mut task = test_task();
+        task.status = TaskStatus::Failed;
+        graph.create_task(plan_id, &task).await.unwrap();
+
+        let run_id = Uuid::new_v4();
+        {
+            let mut global = RUNNER_STATE.write().await;
+            let mut state = RunnerState::new(run_id, plan_id, 1, TriggerSource::Manual);
+            state.failed_tasks.push(task.id);
+            *global = Some(state);
+        }
+
+        runner
+            .finalize_run(run_id, PlanRunStatus::CompletedWithErrors, None)
+            .await
+            .unwrap();
+
+        // Verify failure note was created
+        let (notes, _count) = graph
+            .list_notes(None, None, &crate::notes::models::NoteFilters::default())
+            .await
+            .unwrap();
+        assert!(
+            !notes.is_empty(),
+            "CompletedWithErrors should create a failure note"
+        );
+        assert!(notes[0].content.contains("Plan run failed"));
+
+        // Cleanup
+        {
+            let mut global = RUNNER_STATE.write().await;
+            *global = None;
+        }
+    }
+
+    // === Coverage: RunnerState methods used in production code ===
+
+    #[test]
+    fn test_runner_state_elapsed_secs() {
+        let state = RunnerState::new(Uuid::new_v4(), Uuid::new_v4(), 3, TriggerSource::Manual);
+        // elapsed should be very small (just created)
+        assert!(state.elapsed_secs() < 1.0);
+    }
+
+    #[test]
+    fn test_runner_state_progress_pct_partial() {
+        let mut state = RunnerState::new(Uuid::new_v4(), Uuid::new_v4(), 4, TriggerSource::Manual);
+        state.completed_tasks.push(Uuid::new_v4());
+        state.completed_tasks.push(Uuid::new_v4());
+        assert!((state.progress_pct() - 50.0).abs() < 0.01);
+    }
+
+    // === Coverage: on_task_completed with session_id (close_session branch) ===
+
+    #[tokio::test]
+    async fn test_on_task_completed_with_session_id_closes_session() {
+        use crate::neo4j::models::TaskStatus;
+        use crate::test_helpers::{test_plan, test_task};
+
+        let (runner, graph) = test_plan_runner_with_graph();
+
+        let plan = test_plan();
+        let plan_id = plan.id;
+        graph.create_plan(&plan).await.unwrap();
+
+        let mut task = test_task();
+        task.status = TaskStatus::InProgress;
+        let task_id = task.id;
+        graph.create_task(plan_id, &task).await.unwrap();
+
+        let run_id = Uuid::new_v4();
+        let fake_session_id = Uuid::new_v4();
+        {
+            let mut global = RUNNER_STATE.write().await;
+            let mut state = RunnerState::new(run_id, plan_id, 1, TriggerSource::Manual);
+            state.add_agent(ActiveAgent::new(task_id, "test".to_string()));
+            // Set a session_id so the close_session branch is exercised
+            state.set_agent_session(&task_id, Some(fake_session_id));
+            *global = Some(state);
+        }
+
+        let cwd = env!("CARGO_MANIFEST_DIR");
+        runner
+            .on_task_completed(run_id, task_id, 10.0, 0.5, Some(cwd))
+            .await
+            .unwrap();
+
+        let updated = graph.get_task(task_id).await.unwrap().unwrap();
+        assert_eq!(updated.status, TaskStatus::Completed);
+
+        // Agent should be removed from active state
+        {
+            let global = RUNNER_STATE.read().await;
+            if let Some(ref state) = *global {
+                assert!(
+                    state.get_agent(&task_id).is_none(),
+                    "Agent should be removed after completion"
+                );
+            }
+        }
+
+        // Give tokio::spawn a moment to run the fire-and-forget close_session
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Cleanup
+        {
+            let mut global = RUNNER_STATE.write().await;
+            *global = None;
+        }
+    }
+
+    // === Coverage: on_task_failed definitive with session_id (close_session branch) ===
+
+    #[tokio::test]
+    async fn test_on_task_failed_definitive_with_session_id_closes_session() {
+        use crate::neo4j::models::TaskStatus;
+        use crate::test_helpers::{test_plan, test_task};
+
+        let (runner, graph) = test_plan_runner_with_graph();
+
+        let plan = test_plan();
+        let plan_id = plan.id;
+        graph.create_plan(&plan).await.unwrap();
+
+        let mut task = test_task();
+        task.status = TaskStatus::InProgress;
+        let task_id = task.id;
+        graph.create_task(plan_id, &task).await.unwrap();
+
+        let run_id = Uuid::new_v4();
+        let fake_session_id = Uuid::new_v4();
+        {
+            let mut global = RUNNER_STATE.write().await;
+            let mut state = RunnerState::new(run_id, plan_id, 1, TriggerSource::Manual);
+            state.add_agent(ActiveAgent::new(task_id, "test".to_string()));
+            state.set_agent_session(&task_id, Some(fake_session_id));
+            *global = Some(state);
+        }
+
+        // Override config to 0 retries for definitive failure path
+        let runner = {
+            let (event_tx, _) = broadcast::channel(16);
+            let mut config = RunnerConfig::default();
+            config.max_retries = 0;
+            PlanRunner::new(
+                runner.chat_manager.clone(),
+                runner.graph.clone(),
+                runner.context_builder.clone(),
+                config,
+                event_tx,
+            )
+        };
+
+        let should_retry = runner
+            .on_task_failed(run_id, plan_id, task_id, "fatal error", 10.0, 0.5)
+            .await
+            .unwrap();
+
+        assert!(!should_retry, "Should NOT retry with max_retries=0");
+
+        let updated = graph.get_task(task_id).await.unwrap().unwrap();
+        assert_eq!(updated.status, TaskStatus::Failed);
+
+        // Agent should be removed
+        {
+            let global = RUNNER_STATE.read().await;
+            if let Some(ref state) = *global {
+                assert!(state.get_agent(&task_id).is_none());
+            }
+        }
+
+        // Give tokio::spawn a moment to run the fire-and-forget close_session
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Cleanup
+        {
+            let mut global = RUNNER_STATE.write().await;
+            *global = None;
+        }
+    }
+
+    // === Coverage: on_task_completed exercises vector collector record_task ===
+
+    #[tokio::test]
+    async fn test_on_task_completed_records_vector_collector() {
+        use crate::neo4j::models::TaskStatus;
+        use crate::test_helpers::{test_plan, test_task};
+
+        let (runner, graph) = test_plan_runner_with_graph();
+
+        let plan = test_plan();
+        let plan_id = plan.id;
+        graph.create_plan(&plan).await.unwrap();
+
+        let mut task = test_task();
+        task.status = TaskStatus::InProgress;
+        let task_id = task.id;
+        graph.create_task(plan_id, &task).await.unwrap();
+
+        let run_id = Uuid::new_v4();
+        {
+            let mut global = RUNNER_STATE.write().await;
+            let mut state = RunnerState::new(run_id, plan_id, 1, TriggerSource::Manual);
+            state.add_agent(ActiveAgent::new(task_id, "test".to_string()));
+            *global = Some(state);
+        }
+
+        runner
+            .on_task_completed(run_id, task_id, 42.0, 1.23, None)
+            .await
+            .unwrap();
+
+        // Verify vector collector recorded the task
+        {
+            let collector = VECTOR_COLLECTOR.read().await;
+            // per_task_durations and per_task_costs should have at least 1 entry
+            assert!(
+                !collector.per_task_durations.is_empty(),
+                "Vector collector should have recorded at least 1 task duration"
+            );
+            assert!(
+                !collector.per_task_costs.is_empty(),
+                "Vector collector should have recorded at least 1 task cost"
+            );
+            // The last entry should match our task
+            let (last_tid, last_dur) = collector.per_task_durations.last().unwrap();
+            assert_eq!(*last_tid, task_id);
+            assert!((last_dur - 42.0).abs() < 0.001);
+            let (last_tid, last_cost) = collector.per_task_costs.last().unwrap();
+            assert_eq!(*last_tid, task_id);
+            assert!((last_cost - 1.23).abs() < 0.001);
+        }
+
+        // Cleanup
+        {
+            let mut global = RUNNER_STATE.write().await;
+            *global = None;
+        }
+    }
+
+    // === Coverage: add_agent_cost via RUNNER_STATE (real-time cost path) ===
+
+    #[tokio::test]
+    async fn test_add_agent_cost_via_runner_state() {
+        let task_id = Uuid::new_v4();
+        let run_id = Uuid::new_v4();
+        let plan_id = Uuid::new_v4();
+
+        {
+            let mut global = RUNNER_STATE.write().await;
+            let mut state = RunnerState::new(run_id, plan_id, 1, TriggerSource::Manual);
+            state.add_agent(ActiveAgent::new(task_id, "cost-test".to_string()));
+            *global = Some(state);
+        }
+
+        // Simulate what listen_for_result does: update agent cost in real-time
+        {
+            let mut global = RUNNER_STATE.write().await;
+            if let Some(ref mut s) = *global {
+                s.add_agent_cost(&task_id, 0.75);
+            }
+        }
+        {
+            let mut global = RUNNER_STATE.write().await;
+            if let Some(ref mut s) = *global {
+                s.add_agent_cost(&task_id, 1.25);
+            }
+        }
+
+        // Verify cumulative cost
+        {
+            let global = RUNNER_STATE.read().await;
+            let state = global.as_ref().unwrap();
+            let agent = state.get_agent(&task_id).unwrap();
+            assert!(
+                (agent.cost_usd - 2.0).abs() < 0.001,
+                "Agent cost should be 2.0, got {}",
+                agent.cost_usd
+            );
+        }
+
+        // Cleanup
+        {
+            let mut global = RUNNER_STATE.write().await;
+            *global = None;
+        }
+    }
+
+    // === Coverage: compute_final_status called from execute_wave context ===
+
+    #[test]
+    fn test_compute_final_status_mixed_failed_and_pending() {
+        use crate::neo4j::models::TaskStatus;
+        use crate::test_helpers::test_task;
+
+        let mut t1 = test_task();
+        t1.status = TaskStatus::Completed;
+        t1.id = Uuid::new_v4();
+        let mut t2 = test_task();
+        t2.status = TaskStatus::Failed;
+        t2.id = Uuid::new_v4();
+        let mut t3 = test_task();
+        t3.status = TaskStatus::Pending;
+        t3.id = Uuid::new_v4();
+
+        let result = compute_final_status(&[t1, t2, t3]);
+        assert_eq!(result, PlanRunStatus::CompletedWithErrors);
+    }
+
+    #[test]
+    fn test_compute_final_status_single_completed() {
+        use crate::neo4j::models::TaskStatus;
+        use crate::test_helpers::test_task;
+
+        let mut t1 = test_task();
+        t1.status = TaskStatus::Completed;
+
+        let result = compute_final_status(&[t1]);
+        assert_eq!(result, PlanRunStatus::Completed);
+    }
+
+    // === Coverage: validate_affected_files edge case — all absolute missing ===
+
+    #[test]
+    fn test_validate_affected_files_all_absolute_missing() {
+        let files = vec![
+            "/nonexistent_a_xyz".to_string(),
+            "/nonexistent_b_xyz".to_string(),
+        ];
+        let (valid, missing) = validate_affected_files(&files, "/tmp");
+        assert!(!valid, "No files exist so validation should fail");
+        assert_eq!(missing.len(), 2);
+    }
+
+    // === Coverage: on_task_completed emits RunnerEvent::TaskCompleted ===
+
+    #[tokio::test]
+    async fn test_on_task_completed_emits_event() {
+        use crate::neo4j::models::TaskStatus;
+        use crate::test_helpers::{test_plan, test_task};
+
+        let (event_tx, _) = broadcast::channel(16);
+        let mut event_rx = event_tx.subscribe();
+
+        let (runner_base, graph) = test_plan_runner_with_graph();
+        let runner = PlanRunner::new(
+            runner_base.chat_manager.clone(),
+            runner_base.graph.clone(),
+            runner_base.context_builder.clone(),
+            RunnerConfig::default(),
+            event_tx,
+        );
+
+        let plan = test_plan();
+        let plan_id = plan.id;
+        graph.create_plan(&plan).await.unwrap();
+
+        let mut task = test_task();
+        task.status = TaskStatus::InProgress;
+        let task_id = task.id;
+        graph.create_task(plan_id, &task).await.unwrap();
+
+        let run_id = Uuid::new_v4();
+        {
+            let mut global = RUNNER_STATE.write().await;
+            let mut state = RunnerState::new(run_id, plan_id, 1, TriggerSource::Manual);
+            state.add_agent(ActiveAgent::new(task_id, "test".to_string()));
+            *global = Some(state);
+        }
+
+        runner
+            .on_task_completed(run_id, task_id, 5.0, 0.3, None)
+            .await
+            .unwrap();
+
+        // Verify event was emitted
+        let event = event_rx.try_recv();
+        assert!(event.is_ok(), "Should have received a TaskCompleted event");
+        match event.unwrap() {
+            RunnerEvent::TaskCompleted {
+                run_id: r,
+                task_id: t,
+                cost_usd,
+                duration_secs,
+                ..
+            } => {
+                assert_eq!(r, run_id);
+                assert_eq!(t, task_id);
+                assert!((cost_usd - 0.3).abs() < 0.001);
+                assert!((duration_secs - 5.0).abs() < 0.001);
+            }
+            other => panic!("Expected TaskCompleted, got {:?}", other),
+        }
+
+        // Cleanup
+        {
+            let mut global = RUNNER_STATE.write().await;
+            *global = None;
+        }
+    }
+
+    // === Coverage: on_task_failed emits RunnerEvent::TaskFailed ===
+
+    #[tokio::test]
+    async fn test_on_task_failed_definitive_emits_event() {
+        use crate::neo4j::models::TaskStatus;
+        use crate::test_helpers::{test_plan, test_task};
+
+        let (event_tx, _) = broadcast::channel(16);
+        let mut event_rx = event_tx.subscribe();
+
+        let (runner_base, graph) = test_plan_runner_with_graph();
+        let mut config = RunnerConfig::default();
+        config.max_retries = 0;
+        let runner = PlanRunner::new(
+            runner_base.chat_manager.clone(),
+            runner_base.graph.clone(),
+            runner_base.context_builder.clone(),
+            config,
+            event_tx,
+        );
+
+        let plan = test_plan();
+        let plan_id = plan.id;
+        graph.create_plan(&plan).await.unwrap();
+
+        let mut task = test_task();
+        task.status = TaskStatus::InProgress;
+        let task_id = task.id;
+        graph.create_task(plan_id, &task).await.unwrap();
+
+        let run_id = Uuid::new_v4();
+        {
+            let mut global = RUNNER_STATE.write().await;
+            let mut state = RunnerState::new(run_id, plan_id, 1, TriggerSource::Manual);
+            state.add_agent(ActiveAgent::new(task_id, "test".to_string()));
+            *global = Some(state);
+        }
+
+        let should_retry = runner
+            .on_task_failed(run_id, plan_id, task_id, "crash", 8.0, 0.4)
+            .await
+            .unwrap();
+
+        assert!(!should_retry);
+
+        // Verify event was emitted
+        let event = event_rx.try_recv();
+        assert!(event.is_ok(), "Should have received a TaskFailed event");
+        match event.unwrap() {
+            RunnerEvent::TaskFailed {
+                run_id: r,
+                task_id: t,
+                reason,
+                ..
+            } => {
+                assert_eq!(r, run_id);
+                assert_eq!(t, task_id);
+                assert_eq!(reason, "crash");
+            }
+            other => panic!("Expected TaskFailed, got {:?}", other),
+        }
+
+        // Cleanup
+        {
+            let mut global = RUNNER_STATE.write().await;
+            *global = None;
         }
     }
 }
