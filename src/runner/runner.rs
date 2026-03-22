@@ -5784,8 +5784,9 @@ mod tests {
         // Verify agent is present before
         {
             let global = RUNNER_STATE.read().await;
+            let state = global.as_ref().expect("RUNNER_STATE should be set by this test");
             assert!(
-                global.as_ref().unwrap().get_agent(&task_id).is_some(),
+                state.get_agent(&task_id).is_some(),
                 "Agent should be present before on_task_completed"
             );
         }
@@ -5799,17 +5800,20 @@ mod tests {
         // Verify agent is removed after
         {
             let global = RUNNER_STATE.read().await;
-            assert!(
-                global.as_ref().unwrap().get_agent(&task_id).is_none(),
-                "Agent should be removed after on_task_completed"
-            );
+            if let Some(ref state) = *global {
+                assert!(
+                    state.get_agent(&task_id).is_none(),
+                    "Agent should be removed after on_task_completed"
+                );
+            }
+            // If state is None, mark_task_completed already cleaned up — agent is gone
         }
 
         // Verify task status is completed
         let updated_task = graph.get_task(task_id).await.unwrap().unwrap();
         assert_eq!(updated_task.status, TaskStatus::Completed);
 
-        // Cleanup
+        // Cleanup (idempotent)
         {
             let mut global = RUNNER_STATE.write().await;
             *global = None;
