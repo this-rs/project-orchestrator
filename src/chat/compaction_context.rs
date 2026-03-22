@@ -38,6 +38,9 @@ const MAX_NOTE_SNIPPET: usize = 200;
 /// Maximum length for custom instructions output.
 const MAX_CUSTOM_INSTRUCTIONS_CHARS: usize = 500;
 
+/// Maximum number of pending/in-progress tasks to include in session context.
+const MAX_PENDING_TASKS: usize = 8;
+
 // ============================================================================
 // CompactionContext — the assembled context data
 // ============================================================================
@@ -68,6 +71,31 @@ pub struct CompactionContext {
     // Session context (interactive mode)
     pub project_name: Option<String>,
     pub project_description: Option<String>,
+
+    // Active plans for interactive session (plans with status in_progress)
+    pub active_plans: Vec<PlanSummary>,
+
+    // Pending/in-progress tasks across active plans
+    pub pending_tasks: Vec<TaskSummary>,
+}
+
+/// Summary of an active plan for post-compaction context.
+#[derive(Debug, Clone)]
+pub struct PlanSummary {
+    pub title: String,
+    pub total_tasks: u32,
+    pub completed_tasks: u32,
+    pub in_progress_tasks: u32,
+    pub pending_tasks: u32,
+}
+
+/// Summary of a pending/in-progress task for post-compaction context.
+#[derive(Debug, Clone)]
+pub struct TaskSummary {
+    pub title: String,
+    pub status: String,
+    pub affected_files: Vec<String>,
+    pub steps: Vec<StepSummary>,
 }
 
 /// Step with status for progress display.
@@ -216,7 +244,8 @@ impl CompactionContextBuilder {
 
     /// Build context for an interactive session.
     ///
-    /// Fetches: project info, critical notes (guidelines, gotchas).
+    /// Fetches: project info, active plans with pending/in-progress tasks,
+    /// critical notes (guidelines, gotchas).
     /// Works even without a project (returns minimal context).
     pub async fn build_for_session(&self, project_slug: Option<&str>) -> Result<CompactionContext> {
         let mut ctx = CompactionContext::default();
@@ -225,6 +254,10 @@ impl CompactionContextBuilder {
             if let Ok(Some(project)) = self.graph.get_project_by_slug(slug).await {
                 ctx.project_name = Some(project.name.clone());
                 ctx.project_description = project.description.as_ref().map(|d| truncate(d, 300));
+
+                // Fetch active plans (status = in_progress) for this project
+                self.fetch_active_plans_and_tasks(&mut ctx, project.id)
+                    .await;
 
                 // Fetch critical notes for this project
                 self.fetch_critical_notes(&mut ctx, Some(project.id)).await;
@@ -235,6 +268,87 @@ impl CompactionContextBuilder {
         }
 
         Ok(ctx)
+    }
+
+    /// Fetch active plans (in_progress) and their pending/in-progress tasks with steps.
+    async fn fetch_active_plans_and_tasks(&self, ctx: &mut CompactionContext, project_id: Uuid) {
+        // Get plans filtered by in_progress status
+        let plans = match self
+            .graph
+            .list_plans_for_project(
+                project_id,
+                Some(vec!["in_progress".to_string()]),
+                5, // max 5 active plans
+                0,
+            )
+            .await
+        {
+            Ok((plans, _)) => plans,
+            Err(_) => return,
+        };
+
+        for plan in &plans {
+            // Get all tasks for this plan
+            let tasks = match self.graph.get_plan_tasks(plan.id).await {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+
+            let total = tasks.len() as u32;
+            let completed = tasks
+                .iter()
+                .filter(|t| t.status == TaskStatus::Completed)
+                .count() as u32;
+            let in_progress = tasks
+                .iter()
+                .filter(|t| t.status == TaskStatus::InProgress)
+                .count() as u32;
+            let pending = tasks
+                .iter()
+                .filter(|t| t.status == TaskStatus::Pending)
+                .count() as u32;
+
+            ctx.active_plans.push(PlanSummary {
+                title: plan.title.clone(),
+                total_tasks: total,
+                completed_tasks: completed,
+                in_progress_tasks: in_progress,
+                pending_tasks: pending,
+            });
+
+            // Collect pending/in-progress tasks with their steps
+            let active_tasks: Vec<&TaskNode> = tasks
+                .iter()
+                .filter(|t| t.status == TaskStatus::Pending || t.status == TaskStatus::InProgress)
+                .collect();
+
+            for task in active_tasks.iter().take(MAX_PENDING_TASKS) {
+                let task_title = task
+                    .title
+                    .clone()
+                    .unwrap_or_else(|| truncate(&task.description, 80));
+
+                // Fetch steps for this task
+                let steps = match self.graph.get_task_steps(task.id).await {
+                    Ok(s) => s
+                        .iter()
+                        .map(|s| StepSummary {
+                            order: s.order,
+                            description: truncate(&s.description, 100),
+                            status: format!("{:?}", s.status).to_lowercase(),
+                        })
+                        .collect(),
+                    Err(_) => vec![],
+                };
+
+                ctx.pending_tasks.push(TaskSummary {
+                    title: task_title,
+                    status: format!("{:?}", task.status).to_lowercase(),
+                    affected_files: task.affected_files.clone(),
+                    steps,
+                });
+            }
+        }
     }
 
     /// Fetch critical notes (guidelines + gotchas with importance >= High).
@@ -315,7 +429,78 @@ impl CompactionContext {
             out.push('\n');
         }
 
-        // § Plan Progress
+        // § Active Plans (interactive session — plans with in_progress status)
+        if !self.active_plans.is_empty() && out.len() < MAX_MARKDOWN_CHARS - 1500 {
+            out.push_str("## Active Plans\n");
+            for plan in &self.active_plans {
+                let _ = writeln!(
+                    out,
+                    "- **{}** — {}/{} done, {} in progress, {} pending",
+                    plan.title,
+                    plan.completed_tasks,
+                    plan.total_tasks,
+                    plan.in_progress_tasks,
+                    plan.pending_tasks
+                );
+                if out.len() > MAX_MARKDOWN_CHARS - 1200 {
+                    break;
+                }
+            }
+            out.push('\n');
+        }
+
+        // § Pending Objectives (interactive session — tasks pending/in_progress)
+        if !self.pending_tasks.is_empty() && out.len() < MAX_MARKDOWN_CHARS - 1000 {
+            out.push_str("## Pending Objectives\n");
+            for task in &self.pending_tasks {
+                let icon = match task.status.as_str() {
+                    "inprogress" | "in_progress" => "🔄",
+                    _ => "⬜",
+                };
+                let _ = writeln!(
+                    out,
+                    "{icon} {} — {}",
+                    task.status.to_uppercase(),
+                    task.title
+                );
+
+                // Show steps if budget allows
+                if !task.steps.is_empty() && out.len() < MAX_MARKDOWN_CHARS - 800 {
+                    for step in &task.steps {
+                        let step_icon = match step.status.as_str() {
+                            "completed" => "✅",
+                            "in_progress" | "inprogress" => "🔄",
+                            "skipped" => "⏭️",
+                            _ => "⬜",
+                        };
+                        let _ = writeln!(out, "  {step_icon} {}. {}", step.order, step.description);
+                        if out.len() > MAX_MARKDOWN_CHARS - 600 {
+                            out.push_str("  _(truncated)_\n");
+                            break;
+                        }
+                    }
+                }
+
+                // Show affected files if budget allows
+                if !task.affected_files.is_empty() && out.len() < MAX_MARKDOWN_CHARS - 600 {
+                    let files: Vec<&str> = task
+                        .affected_files
+                        .iter()
+                        .take(3)
+                        .map(|f| f.as_str())
+                        .collect();
+                    let _ = writeln!(out, "  Files: {}", files.join(", "));
+                }
+
+                if out.len() > MAX_MARKDOWN_CHARS - 500 {
+                    out.push_str("_(truncated)_\n");
+                    break;
+                }
+            }
+            out.push('\n');
+        }
+
+        // § Plan Progress (runner mode — single plan context)
         if let Some(plan_title) = &self.plan_title {
             out.push_str("## Plan\n");
             let _ = write!(out, "**{plan_title}**");
@@ -466,6 +651,28 @@ impl CompactionContext {
             let _ = write!(out, "Step progress: {done}/{total} completed. ");
         }
 
+        // Pending objectives summary (interactive session)
+        if !self.pending_tasks.is_empty() {
+            let titles: Vec<&str> = self
+                .pending_tasks
+                .iter()
+                .take(3)
+                .map(|t| t.title.as_str())
+                .collect();
+            let _ = write!(out, "Pending objectives: {}. ", titles.join("; "));
+        }
+
+        // Active plans summary (interactive session)
+        if !self.active_plans.is_empty() {
+            let plan_names: Vec<&str> = self
+                .active_plans
+                .iter()
+                .take(2)
+                .map(|p| p.title.as_str())
+                .collect();
+            let _ = write!(out, "Active plans: {}. ", plan_names.join("; "));
+        }
+
         // Truncate to budget
         if out.len() > MAX_CUSTOM_INSTRUCTIONS_CHARS {
             out.truncate(MAX_CUSTOM_INSTRUCTIONS_CHARS - 3);
@@ -473,6 +680,29 @@ impl CompactionContext {
         }
 
         out
+    }
+}
+
+impl CompactionContext {
+    /// Build a short summary of remaining objectives for auto-continue messages.
+    ///
+    /// Returns something like: "Remaining: T5 — Ajuster CompletionLoopDetected; T7 — Enrichir le compaction"
+    /// or empty string if no pending tasks.
+    pub fn pending_objectives_oneliner(&self) -> String {
+        if self.pending_tasks.is_empty() {
+            return String::new();
+        }
+        let tasks: Vec<String> = self
+            .pending_tasks
+            .iter()
+            .filter(|t| t.status == "inprogress" || t.status == "pending")
+            .take(4)
+            .map(|t| truncate(&t.title, 60))
+            .collect();
+        if tasks.is_empty() {
+            return String::new();
+        }
+        format!(" Remaining objectives: {}", tasks.join("; "))
     }
 }
 
@@ -596,6 +826,53 @@ mod tests {
             ],
             project_name: None,
             project_description: None,
+            active_plans: vec![],
+            pending_tasks: vec![],
+        }
+    }
+
+    fn sample_session_context() -> CompactionContext {
+        CompactionContext {
+            project_name: Some("my-project".to_string()),
+            project_description: Some("A cool project".to_string()),
+            active_plans: vec![PlanSummary {
+                title: "Fix UX issues".to_string(),
+                total_tasks: 8,
+                completed_tasks: 3,
+                in_progress_tasks: 2,
+                pending_tasks: 3,
+            }],
+            pending_tasks: vec![
+                TaskSummary {
+                    title: "Enrich compaction context".to_string(),
+                    status: "inprogress".to_string(),
+                    affected_files: vec!["src/chat/compaction_context.rs".to_string()],
+                    steps: vec![
+                        StepSummary {
+                            order: 1,
+                            description: "Add fields".to_string(),
+                            status: "completed".to_string(),
+                        },
+                        StepSummary {
+                            order: 2,
+                            description: "Fetch plans".to_string(),
+                            status: "in_progress".to_string(),
+                        },
+                    ],
+                },
+                TaskSummary {
+                    title: "Fix auto-continue message".to_string(),
+                    status: "pending".to_string(),
+                    affected_files: vec!["src/chat/manager.rs".to_string()],
+                    steps: vec![],
+                },
+            ],
+            notes: vec![NoteSummary {
+                note_type: "guideline".to_string(),
+                importance: "critical".to_string(),
+                content: "Always use traits".to_string(),
+            }],
+            ..Default::default()
         }
     }
 
@@ -803,6 +1080,140 @@ mod tests {
         assert!(
             md.len() <= MAX_MARKDOWN_CHARS,
             "Large context {} chars exceeds budget {}",
+            md.len(),
+            MAX_MARKDOWN_CHARS
+        );
+        assert!(md.ends_with("</system-reminder>"));
+    }
+
+    #[test]
+    fn test_session_context_with_active_plans() {
+        let ctx = sample_session_context();
+        let md = ctx.to_markdown();
+
+        assert!(
+            md.contains("## Active Plans"),
+            "Missing Active Plans section"
+        );
+        assert!(md.contains("Fix UX issues"), "Missing plan title");
+        assert!(md.contains("3/8 done"), "Missing plan progress");
+    }
+
+    #[test]
+    fn test_session_context_with_pending_objectives() {
+        let ctx = sample_session_context();
+        let md = ctx.to_markdown();
+
+        assert!(
+            md.contains("## Pending Objectives"),
+            "Missing Pending Objectives section: {}",
+            md
+        );
+        assert!(
+            md.contains("Enrich compaction context"),
+            "Missing task title"
+        );
+        assert!(
+            md.contains("Fix auto-continue message"),
+            "Missing pending task"
+        );
+        // Check step icons within objectives
+        assert!(md.contains("✅"), "Missing completed step icon");
+        assert!(md.contains("🔄"), "Missing in_progress icon");
+    }
+
+    #[test]
+    fn test_session_context_under_budget() {
+        let ctx = sample_session_context();
+        let md = ctx.to_markdown();
+
+        assert!(
+            md.len() <= MAX_MARKDOWN_CHARS,
+            "Session context {} chars exceeds budget {}",
+            md.len(),
+            MAX_MARKDOWN_CHARS
+        );
+    }
+
+    #[test]
+    fn test_pending_objectives_oneliner() {
+        let ctx = sample_session_context();
+        let oneliner = ctx.pending_objectives_oneliner();
+
+        assert!(
+            oneliner.contains("Enrich compaction context"),
+            "Missing task in oneliner: {}",
+            oneliner
+        );
+        assert!(
+            oneliner.contains("Fix auto-continue message"),
+            "Missing pending task in oneliner: {}",
+            oneliner
+        );
+        assert!(
+            oneliner.starts_with(" Remaining objectives:"),
+            "Wrong prefix: {}",
+            oneliner
+        );
+    }
+
+    #[test]
+    fn test_pending_objectives_oneliner_empty() {
+        let ctx = CompactionContext::default();
+        assert!(ctx.pending_objectives_oneliner().is_empty());
+    }
+
+    #[test]
+    fn test_custom_instructions_includes_pending_tasks() {
+        let ctx = sample_session_context();
+        let ci = ctx.to_custom_instructions();
+
+        assert!(
+            ci.contains("Pending objectives:"),
+            "Missing pending objectives in custom instructions: {}",
+            ci
+        );
+        assert!(
+            ci.contains("Active plans:"),
+            "Missing active plans in custom instructions: {}",
+            ci
+        );
+    }
+
+    #[test]
+    fn test_large_session_context_stays_under_budget() {
+        let mut ctx = sample_session_context();
+        // Add many pending tasks
+        ctx.pending_tasks = (0..20)
+            .map(|i| TaskSummary {
+                title: format!(
+                    "Task {i}: Very long task title that tests truncation behavior in the session context"
+                ),
+                status: if i % 2 == 0 { "inprogress" } else { "pending" }.to_string(),
+                affected_files: vec![format!("src/module_{i}/handler.rs")],
+                steps: (1..=5)
+                    .map(|j| StepSummary {
+                        order: j,
+                        description: format!("Step {j} of task {i}: do something important"),
+                        status: if j <= 2 { "completed" } else { "pending" }.to_string(),
+                    })
+                    .collect(),
+            })
+            .collect();
+        ctx.active_plans = (0..5)
+            .map(|i| PlanSummary {
+                title: format!("Plan {i}: A very important plan with a long title"),
+                total_tasks: 10,
+                completed_tasks: 3,
+                in_progress_tasks: 2,
+                pending_tasks: 5,
+            })
+            .collect();
+
+        let md = ctx.to_markdown();
+        assert!(
+            md.len() <= MAX_MARKDOWN_CHARS,
+            "Large session context {} chars exceeds budget {}",
             md.len(),
             MAX_MARKDOWN_CHARS
         );

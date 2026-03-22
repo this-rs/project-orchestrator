@@ -163,6 +163,11 @@ pub struct PlanRunner {
     /// for WebSocket delivery. When set, every RunnerEvent is also emitted as a
     /// CrudEvent with entity_type=Runner so WS clients can filter on it.
     event_emitter: Option<Arc<dyn EventEmitter>>,
+    /// User claims inherited from the caller who started the plan run.
+    /// When set, runner agent sessions authenticate as this user instead of
+    /// a synthetic service account — avoids 403 when email domain checks are
+    /// configured in the auth middleware.
+    user_claims: Option<crate::auth::jwt::Claims>,
 }
 
 /// Result of starting a plan run.
@@ -375,7 +380,16 @@ impl PlanRunner {
             config,
             event_tx,
             event_emitter: None,
+            user_claims: None,
         }
+    }
+
+    /// Set user claims inherited from the caller who started the run.
+    /// Runner agent sessions will authenticate as this user instead of
+    /// using a synthetic service account.
+    pub fn with_user_claims(mut self, claims: crate::auth::jwt::Claims) -> Self {
+        self.user_claims = Some(claims);
+        self
     }
 
     /// Set the event emitter for WebSocket bridging.
@@ -2346,10 +2360,9 @@ impl PlanRunner {
             permission_mode: Some("bypassPermissions".to_string()),
             add_dirs: None,
             workspace_slug: None,
-            user_claims: Some(crate::auth::jwt::Claims::service_account(&format!(
-                "runner-agent:{}",
-                run_id
-            ))),
+            user_claims: Some(self.user_claims.clone().unwrap_or_else(|| {
+                crate::auth::jwt::Claims::service_account(&format!("runner-agent:{}", run_id))
+            })),
             spawned_by: Some(
                 serde_json::json!({
                     "type": "runner",
@@ -2495,6 +2508,8 @@ impl PlanRunner {
             task_timeout: Duration::from_secs(task_profile.timeout_secs),
             spawning_timeout: Duration::from_secs(self.config.spawning_timeout_secs),
             loop_threshold: 3,
+            completion_loop_threshold: self.config.completion_loop_threshold,
+            completion_max_chars: self.config.completion_max_chars,
             ..Default::default()
         };
         let hint_sender = Arc::new(ChatManagerHintSender {
@@ -3814,6 +3829,7 @@ impl Clone for PlanRunner {
             config: self.config.clone(),
             event_tx: self.event_tx.clone(),
             event_emitter: self.event_emitter.clone(),
+            user_claims: self.user_claims.clone(),
         }
     }
 }

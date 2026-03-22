@@ -14,7 +14,8 @@ use super::post_tool_hook;
 use super::skill_hook;
 use super::types::{
     classify_api_error, truncate_snippet, ChatEvent, ChatEventPage, ChatRequest,
-    CreateSessionResponse, MessageSearchHit, MessageSearchResult,
+    CreateSessionResponse, MessageSearchHit, MessageSearchResult, PendingMessage,
+    PendingMessageKind,
 };
 use crate::meilisearch::SearchStore;
 use crate::neo4j::models::ChatEventRecord;
@@ -29,7 +30,7 @@ use nexus_claude::{
     StreamDelta, StreamEventData,
 };
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{broadcast, Mutex, RwLock};
@@ -59,7 +60,7 @@ pub struct ActiveSession {
     /// Monotonically increasing sequence number for persisted events
     pub next_seq: Arc<AtomicI64>,
     /// Queue of messages waiting to be sent (received while streaming)
-    pub pending_messages: Arc<Mutex<VecDeque<String>>>,
+    pub pending_messages: Arc<Mutex<VecDeque<PendingMessage>>>,
     /// Whether a stream is currently in progress
     pub is_streaming: Arc<AtomicBool>,
     /// Accumulated text from stream_delta during the current stream (for mid-stream join)
@@ -115,10 +116,26 @@ pub struct ActiveSession {
     /// When `true`, the backend automatically sends "Continue" after error_max_turns.
     /// Toggled via WebSocket `set_auto_continue` message.
     pub auto_continue: Arc<AtomicBool>,
+    /// Number of auto-continue cycles consumed so far. Incremented each time
+    /// `stream_response` auto-continues after error_max_turns. When this reaches
+    /// `max_auto_continues`, auto_continue is disabled to prevent infinite loops.
+    pub auto_continue_count: Arc<AtomicU32>,
+    /// Maximum number of auto-continue cycles allowed. 0 = unlimited.
+    /// Set to `RunnerConfig.max_auto_continues` for runner sessions, 0 for interactive.
+    pub max_auto_continues: u32,
     /// RFC accumulator for detecting sustained architectural discussions.
     /// Persists across messages in a session — when 2+ consecutive responses
     /// contain RFC-qualifying patterns, auto-creates an RFC draft note.
     pub rfc_accumulator: Arc<Mutex<super::observation_detector::RfcAccumulator>>,
+    /// Whether objective tracking is enabled for this session.
+    /// When `true`, the backend checks for pending plan tasks after each stream turn
+    /// where the agent did NOT use any tools (= conclusion/summary mode).
+    /// If pending tasks exist, a reminder is injected as SystemHint.
+    pub objective_tracking: bool,
+    /// Cooldown counter for objective reminders. Counts stream turns since the last
+    /// reminder was injected. Must reach `OBJECTIVE_REMINDER_COOLDOWN` before another
+    /// reminder is sent, to avoid spamming the agent.
+    pub objective_reminder_turns_since: Arc<AtomicU32>,
 }
 
 /// Runtime-mutable environment config for Claude CLI subprocess.
@@ -1337,7 +1354,7 @@ impl ChatManager {
                                 session_id
                             );
                             let mut queue = pending_messages.lock().await;
-                            queue.push_back(message.clone());
+                            queue.push_back(PendingMessage::user(message.clone()));
 
                             // Interrupt the stream so the message is processed sooner
                             interrupt_flag.store(true, Ordering::SeqCst);
@@ -2344,25 +2361,31 @@ impl ChatManager {
                 }],
             );
 
-            // PreToolUse → SkillActivationHook injects skill context as additionalContext
-            let skill_hook = skill_hook::SkillActivationHook::new(self.graph.clone());
-            hooks.insert(
-                "PreToolUse".to_string(),
-                vec![nexus_claude::HookMatcher {
-                    matcher: None, // Match all tools — filtering is done inside the hook
-                    hooks: vec![std::sync::Arc::new(skill_hook)],
-                }],
-            );
+            // Skip PreToolUse/PostToolUse hooks for runner sessions — they inject
+            // ~1000 chars of context per tool call (persona, notes, redirect suggestions),
+            // which accelerates compaction and wastes tokens. Runner agents already have
+            // full task context via the prompt.
+            if request.runner_context.is_none() {
+                // PreToolUse → SkillActivationHook injects skill context as additionalContext
+                let skill_hook = skill_hook::SkillActivationHook::new(self.graph.clone());
+                hooks.insert(
+                    "PreToolUse".to_string(),
+                    vec![nexus_claude::HookMatcher {
+                        matcher: None, // Match all tools — filtering is done inside the hook
+                        hooks: vec![std::sync::Arc::new(skill_hook)],
+                    }],
+                );
 
-            // PostToolUse → PostToolUseRedirectHook suggests MCP alternatives after noisy Grep
-            let post_hook = post_tool_hook::PostToolUseRedirectHook::new(self.graph.clone());
-            hooks.insert(
-                "PostToolUse".to_string(),
-                vec![nexus_claude::HookMatcher {
-                    matcher: None,
-                    hooks: vec![std::sync::Arc::new(post_hook)],
-                }],
-            );
+                // PostToolUse → PostToolUseRedirectHook suggests MCP alternatives after noisy Grep
+                let post_hook = post_tool_hook::PostToolUseRedirectHook::new(self.graph.clone());
+                hooks.insert(
+                    "PostToolUse".to_string(),
+                    vec![nexus_claude::HookMatcher {
+                        matcher: None,
+                        hooks: vec![std::sync::Arc::new(post_hook)],
+                    }],
+                );
+            }
 
             hooks
         };
@@ -2458,7 +2481,7 @@ impl ChatManager {
 
         // Initialize next_seq (new session = start at 1)
         let next_seq = Arc::new(AtomicI64::new(1));
-        let pending_messages = Arc::new(Mutex::new(VecDeque::new()));
+        let pending_messages = Arc::new(Mutex::new(VecDeque::<PendingMessage>::new()));
         let is_streaming = Arc::new(AtomicBool::new(false));
         let streaming_text = Arc::new(Mutex::new(String::new()));
         let streaming_events = Arc::new(Mutex::new(Vec::new()));
@@ -2466,7 +2489,17 @@ impl ChatManager {
         // Register active session — cancel old NATS listeners if session key already exists
         let nats_cancel = CancellationToken::new();
         let interrupt_token = CancellationToken::new();
-        let auto_continue = Arc::new(AtomicBool::new(self.config.auto_continue));
+        // Runner sessions always get auto_continue=true; interactive sessions use config default.
+        let is_runner_session = request.runner_context.is_some();
+        let auto_continue = Arc::new(AtomicBool::new(if is_runner_session {
+            true
+        } else {
+            self.config.auto_continue
+        }));
+        let auto_continue_count = Arc::new(AtomicU32::new(0));
+        // Runner sessions: limit to 5 auto-continues to prevent infinite loops.
+        // Interactive sessions: unlimited (0) — user can always interrupt manually.
+        let max_auto_continues: u32 = if is_runner_session { 5 } else { 0 };
         let interrupt_flag = {
             let mut sessions = self.active_sessions.write().await;
             // Cancel stale NATS listeners from a previous session with the same ID
@@ -2503,11 +2536,15 @@ impl ChatManager {
                         std::collections::HashMap::new(),
                     )),
                     auto_continue: auto_continue.clone(),
+                    auto_continue_count: auto_continue_count.clone(),
+                    max_auto_continues,
                     rfc_accumulator: Arc::new(Mutex::new(
                         super::observation_detector::RfcAccumulator::new(),
                     )),
                     protocol_run_id: spawned_protocol_run_id,
                     protocol_state: spawned_protocol_state.clone(),
+                    objective_tracking: true,
+                    objective_reminder_turns_since: Arc::new(AtomicU32::new(0)),
                 },
             );
             interrupt_flag
@@ -2663,7 +2700,7 @@ impl ChatManager {
         memory_manager: Option<Arc<Mutex<ConversationMemoryManager>>>,
         context_injector: Option<Arc<ContextInjector>>,
         next_seq: Arc<AtomicI64>,
-        pending_messages: Arc<Mutex<VecDeque<String>>>,
+        pending_messages: Arc<Mutex<VecDeque<PendingMessage>>>,
         is_streaming: Arc<AtomicBool>,
         streaming_text: Arc<Mutex<String>>,
         streaming_events: Arc<Mutex<Vec<ChatEvent>>>,
@@ -2730,6 +2767,9 @@ impl ChatManager {
 
         // Track whether this stream ended with error_max_turns (for auto-continue)
         let mut hit_error_max_turns = false;
+
+        // Track whether any tool_use occurred in this stream turn (for objective tracking)
+        let mut had_tool_use = false;
 
         // Track whether a CompactBoundary was received during this stream turn.
         // When true, we'll rebuild and re-inject project context after the stream ends.
@@ -3416,6 +3456,11 @@ impl ChatManager {
                                         streaming_events.lock().await.push(event.clone());
                                     }
 
+                                    // Track tool_use for objective tracking
+                                    if matches!(event, ChatEvent::ToolUse { .. }) {
+                                        had_tool_use = true;
+                                    }
+
                                     // Detect error_max_turns for auto-continue
                                     if let ChatEvent::Result { ref subtype, .. } = event {
                                         if subtype == "error_max_turns" {
@@ -3571,7 +3616,10 @@ impl ChatManager {
                             "Injecting post-compaction context for session {} ({} chars)",
                             session_id, len
                         );
-                        pending_messages.lock().await.push_back(hint);
+                        pending_messages
+                            .lock()
+                            .await
+                            .push_back(PendingMessage::system_hint(hint));
                     }
                     (len, true)
                 }
@@ -3590,7 +3638,10 @@ impl ChatManager {
                         "<system-reminder>\n# Post-Compaction Context\nYou are in an interactive session. No project context available.\n</system-reminder>".to_string()
                     };
                     let len = minimal.len();
-                    pending_messages.lock().await.push_back(minimal);
+                    pending_messages
+                        .lock()
+                        .await
+                        .push_back(PendingMessage::system_hint(minimal));
                     (len, false)
                 }
             };
@@ -3672,10 +3723,38 @@ impl ChatManager {
         // Auto-continue: if error_max_turns was hit and auto_continue is enabled,
         // emit an AutoContinue event, wait 500ms (interruptible), then enqueue "Continue"
         // into pending_messages for the drain below.
-        if hit_error_max_turns
+        //
+        // Safety valve: if max_auto_continues > 0 (runner sessions), check the counter
+        // and disable auto_continue when the limit is reached to prevent infinite loops.
+        let auto_continue_allowed = if hit_error_max_turns
             && auto_continue.load(Ordering::Relaxed)
             && !interrupt_flag.load(Ordering::SeqCst)
         {
+            // Check counter via active_sessions
+            let sessions = active_sessions.read().await;
+            if let Some(session) = sessions.get(&session_id) {
+                let count = session.auto_continue_count.fetch_add(1, Ordering::Relaxed) + 1;
+                let max = session.max_auto_continues;
+                if max > 0 && count > max {
+                    warn!(
+                        "Auto-continue limit reached for session {} ({}/{}), disabling",
+                        session_id, count, max
+                    );
+                    auto_continue.store(false, Ordering::Relaxed);
+                    false
+                } else {
+                    if max > 0 {
+                        info!("Auto-continue {}/{} for session {}", count, max, session_id);
+                    }
+                    true
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if auto_continue_allowed {
             let delay_ms = 500u64;
             info!(
                 "Auto-continue triggered for session {} (delay={}ms)",
@@ -3710,13 +3789,44 @@ impl ChatManager {
             };
 
             if !sleep_cancelled && !interrupt_flag.load(Ordering::SeqCst) {
-                // Enqueue "Continue" — the drain below will pick it up and recurse
+                // Build enriched auto-continue message with remaining objectives.
+                // Best-effort: if context build fails or times out, fall back to plain "Continue".
+                let continue_msg = 'build_msg: {
+                    let slug = if let Some(uuid) = session_uuid {
+                        match graph.get_chat_session(uuid).await {
+                            Ok(Some(node)) => node.project_slug,
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+
+                    if let Some(ref slug) = slug {
+                        let builder =
+                            super::compaction_context::CompactionContextBuilder::new(graph.clone());
+                        // Timeout at 2s to avoid blocking the stream too long
+                        if let Ok(Ok(ctx)) = tokio::time::timeout(
+                            std::time::Duration::from_secs(2),
+                            builder.build_for_session(Some(slug.as_str())),
+                        )
+                        .await
+                        {
+                            let objectives = ctx.pending_objectives_oneliner();
+                            if !objectives.is_empty() {
+                                break 'build_msg format!("Continue.{objectives}");
+                            }
+                        }
+                    }
+                    "Continue".to_string()
+                };
+
+                // Enqueue enriched continue message — the drain below will pick it up and recurse
                 pending_messages
                     .lock()
                     .await
-                    .push_back("Continue".to_string());
+                    .push_back(PendingMessage::system_hint(continue_msg));
                 debug!(
-                    "Auto-continue: enqueued 'Continue' for session {}",
+                    "Auto-continue: enqueued enriched 'Continue' for session {}",
                     session_id
                 );
             } else {
@@ -3724,6 +3834,90 @@ impl ChatManager {
                     "Auto-continue cancelled by interrupt for session {}",
                     session_id
                 );
+            }
+        }
+
+        // ===== OBJECTIVE TRACKING =====
+        // If the agent concluded WITHOUT using any tools (= summary/conclusion mode),
+        // and auto-continue didn't fire, check for pending plan tasks.
+        // If found, inject a reminder as SystemHint to nudge the agent to continue.
+        const OBJECTIVE_REMINDER_COOLDOWN: u32 = 3;
+        if !had_tool_use
+            && !auto_continue_allowed
+            && !hit_error_max_turns
+            && !interrupt_flag.load(Ordering::SeqCst)
+        {
+            // Check if objective_tracking is enabled for this session + cooldown
+            let should_check = {
+                let sessions = active_sessions.read().await;
+                if let Some(session) = sessions.get(&session_id) {
+                    if session.objective_tracking {
+                        let turns = session
+                            .objective_reminder_turns_since
+                            .fetch_add(1, Ordering::Relaxed);
+                        turns >= OBJECTIVE_REMINDER_COOLDOWN || turns == 0
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            };
+
+            if should_check {
+                // Look up the project slug for this session
+                let slug = if let Some(uuid) = session_uuid {
+                    match graph.get_chat_session(uuid).await {
+                        Ok(Some(node)) => node.project_slug,
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+
+                if let Some(ref slug) = slug {
+                    let builder =
+                        super::compaction_context::CompactionContextBuilder::new(graph.clone());
+                    if let Ok(Ok(ctx)) = tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        builder.build_for_session(Some(slug.as_str())),
+                    )
+                    .await
+                    {
+                        let objectives = ctx.pending_objectives_oneliner();
+                        if !objectives.is_empty() {
+                            let reminder = format!(
+                                "You stopped without using any tools. \
+                                 Check if you have completed all objectives before concluding.{}",
+                                objectives
+                            );
+                            info!(
+                                "Objective tracker: injecting reminder for session {}",
+                                session_id
+                            );
+                            pending_messages
+                                .lock()
+                                .await
+                                .push_back(PendingMessage::system_hint(reminder));
+
+                            // Reset cooldown counter
+                            let sessions = active_sessions.read().await;
+                            if let Some(session) = sessions.get(&session_id) {
+                                session
+                                    .objective_reminder_turns_since
+                                    .store(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                }
+            }
+        } else if had_tool_use {
+            // Agent used tools = still working, reset cooldown
+            let sessions = active_sessions.read().await;
+            if let Some(session) = sessions.get(&session_id) {
+                session
+                    .objective_reminder_turns_since
+                    .store(0, Ordering::Relaxed);
             }
         }
 
@@ -3849,51 +4043,78 @@ impl ChatManager {
         };
 
         if let Some(next_msg) = next_message {
+            let is_system_hint = next_msg.kind == PendingMessageKind::SystemHint;
+            let msg_content = next_msg.content;
+
             info!(
-                "Processing queued message for session {} (queue was non-empty after stream)",
+                "Processing queued {} for session {} (queue was non-empty after stream)",
+                if is_system_hint {
+                    "system_hint"
+                } else {
+                    "user_message"
+                },
                 session_id
             );
 
-            // Persist the queued user_message event and update message count
+            // Persist the event and update message count (only for user messages)
             if let Some(uuid) = session_uuid {
-                // Update message count
-                if let Ok(Some(node)) = graph.get_chat_session(uuid).await {
-                    let _ = graph
-                        .update_chat_session(
-                            uuid,
-                            None,
-                            None,
-                            Some(node.message_count + 1),
-                            None,
-                            None,
-                            None,
-                        )
-                        .await;
+                // Only increment message_count for real user messages
+                if !is_system_hint {
+                    if let Ok(Some(node)) = graph.get_chat_session(uuid).await {
+                        let _ = graph
+                            .update_chat_session(
+                                uuid,
+                                None,
+                                None,
+                                Some(node.message_count + 1),
+                                None,
+                                None,
+                                None,
+                            )
+                            .await;
+                    }
                 }
 
-                let user_event = ChatEventRecord {
+                let (event_type, event_data) = if is_system_hint {
+                    (
+                        "system_hint".to_string(),
+                        serde_json::to_string(&ChatEvent::SystemHint {
+                            content: msg_content.clone(),
+                        })
+                        .unwrap_or_default(),
+                    )
+                } else {
+                    (
+                        "user_message".to_string(),
+                        serde_json::to_string(&ChatEvent::UserMessage {
+                            content: msg_content.clone(),
+                        })
+                        .unwrap_or_default(),
+                    )
+                };
+
+                let event_record = ChatEventRecord {
                     id: Uuid::new_v4(),
                     session_id: uuid,
                     seq: next_seq.fetch_add(1, Ordering::SeqCst),
-                    event_type: "user_message".to_string(),
-                    data: serde_json::to_string(&ChatEvent::UserMessage {
-                        content: next_msg.clone(),
-                    })
-                    .unwrap_or_default(),
+                    event_type,
+                    data: event_data,
                     created_at: chrono::Utc::now(),
                 };
-                let _ = graph.store_chat_events(uuid, vec![user_event]).await;
+                let _ = graph.store_chat_events(uuid, vec![event_record]).await;
             }
 
-            // Emit user_message on broadcast + NATS
-            emit_chat(
+            // Emit the appropriate event on broadcast + NATS
+            let chat_event = if is_system_hint {
+                ChatEvent::SystemHint {
+                    content: msg_content.clone(),
+                }
+            } else {
                 ChatEvent::UserMessage {
-                    content: next_msg.clone(),
-                },
-                &events_tx,
-                &nats,
-                &session_id,
-            );
+                    content: msg_content.clone(),
+                }
+            };
+            emit_chat(chat_event, &events_tx, &nats, &session_id);
 
             // Recursive call to process the queued message
             // Use Box::pin to handle recursive async
@@ -3901,7 +4122,7 @@ impl ChatManager {
             Box::pin(Self::stream_response(
                 client,
                 events_tx,
-                next_msg,
+                msg_content,
                 session_id,
                 graph,
                 active_sessions,
@@ -4024,9 +4245,9 @@ impl ChatManager {
                     "Stream in progress for session {}, queuing message and interrupting",
                     session_id
                 );
-                // Queue the message
+                // Queue the message (real user message)
                 let mut queue = session.pending_messages.lock().await;
-                queue.push_back(message.to_string());
+                queue.push_back(PendingMessage::user(message.to_string()));
 
                 // Interrupt the stream so the message is processed sooner
                 session.interrupt_flag.store(true, Ordering::SeqCst);
@@ -4193,7 +4414,7 @@ impl ChatManager {
             // after the current stream turn ends naturally.
             info!("Injecting hint into session {} (no interrupt)", session_id);
             let mut queue = session.pending_messages.lock().await;
-            queue.push_back(message.to_string());
+            queue.push_back(PendingMessage::system_hint(message.to_string()));
             Ok(())
         } else {
             // Not streaming — just send normally (will start a new stream)
@@ -4765,7 +4986,7 @@ impl ChatManager {
             .await
             .unwrap_or(0);
         let next_seq = Arc::new(AtomicI64::new(latest_seq + 1));
-        let pending_messages = Arc::new(Mutex::new(VecDeque::new()));
+        let pending_messages = Arc::new(Mutex::new(VecDeque::<PendingMessage>::new()));
         let is_streaming = Arc::new(AtomicBool::new(false));
         let streaming_text = Arc::new(Mutex::new(String::new()));
         let streaming_events = Arc::new(Mutex::new(Vec::new()));
@@ -4820,11 +5041,15 @@ impl ChatManager {
                         std::collections::HashMap::new(),
                     )),
                     auto_continue: auto_continue.clone(),
+                    auto_continue_count: Arc::new(AtomicU32::new(0)),
+                    max_auto_continues: 0, // resumed sessions = interactive, unlimited
                     rfc_accumulator: Arc::new(Mutex::new(
                         super::observation_detector::RfcAccumulator::new(),
                     )),
                     protocol_run_id: None,
                     protocol_state: None,
+                    objective_tracking: true,
+                    objective_reminder_turns_since: Arc::new(AtomicU32::new(0)),
                 },
             );
             interrupt_flag
@@ -7360,10 +7585,10 @@ mod tests {
         is_streaming: bool,
         streaming_text: &str,
         streaming_events_data: Vec<ChatEvent>,
-    ) -> Option<(ActiveSession, Arc<Mutex<VecDeque<String>>>)> {
+    ) -> Option<(ActiveSession, Arc<Mutex<VecDeque<PendingMessage>>>)> {
         let client = try_create_dummy_client()?;
         let (tx, _rx) = broadcast::channel(16);
-        let pending_messages = Arc::new(Mutex::new(VecDeque::new()));
+        let pending_messages = Arc::new(Mutex::new(VecDeque::<PendingMessage>::new()));
 
         let session = ActiveSession {
             events_tx: tx,
@@ -7388,11 +7613,15 @@ mod tests {
                 std::collections::HashMap::new(),
             )),
             auto_continue: Arc::new(AtomicBool::new(false)),
+            auto_continue_count: Arc::new(AtomicU32::new(0)),
+            max_auto_continues: 0,
             rfc_accumulator: Arc::new(Mutex::new(
                 crate::chat::observation_detector::RfcAccumulator::new(),
             )),
             protocol_run_id: None,
             protocol_state: None,
+            objective_tracking: false,
+            objective_reminder_turns_since: Arc::new(AtomicU32::new(0)),
         };
 
         Some((session, pending_messages))
@@ -8263,7 +8492,7 @@ mod tests {
             interrupt_flag: Arc::new(AtomicBool::new(false)),
             memory_manager: None,
             next_seq: Arc::new(AtomicI64::new(1)),
-            pending_messages: Arc::new(Mutex::new(VecDeque::new())),
+            pending_messages: Arc::new(Mutex::new(VecDeque::<PendingMessage>::new())),
             is_streaming: Arc::new(AtomicBool::new(is_streaming)),
             streaming_text: Arc::new(Mutex::new(String::new())),
             streaming_events: Arc::new(Mutex::new(Vec::new())),
@@ -8278,11 +8507,15 @@ mod tests {
                 std::collections::HashMap::new(),
             )),
             auto_continue: Arc::new(AtomicBool::new(false)),
+            auto_continue_count: Arc::new(AtomicU32::new(0)),
+            max_auto_continues: 0,
             rfc_accumulator: Arc::new(Mutex::new(
                 crate::chat::observation_detector::RfcAccumulator::new(),
             )),
             protocol_run_id: None,
             protocol_state: None,
+            objective_tracking: false,
+            objective_reminder_turns_since: Arc::new(AtomicU32::new(0)),
         };
 
         (session, handle)

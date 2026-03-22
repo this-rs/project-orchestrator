@@ -42,6 +42,14 @@ pub struct RunnerConfig {
     /// - "warn" (default): log a warning and emit CwdMismatch event, but continue
     /// - "strict": return an error if cwd doesn't match root_path
     pub cwd_validation: CwdValidation,
+    /// Number of consecutive "I'm done" signals before treating the agent as stuck. Default: 5.
+    pub completion_loop_threshold: usize,
+    /// Maximum message length (chars) to consider as a completion signal. Default: 200.
+    /// Messages longer than this are treated as real explanations, not completion loops.
+    pub completion_max_chars: usize,
+    /// Maximum number of auto-continue cycles before giving up. Default: 5.
+    /// Prevents infinite loops when the agent keeps hitting error_max_turns.
+    pub max_auto_continues: u32,
 }
 
 /// CWD validation mode for the runner.
@@ -65,8 +73,11 @@ impl Default for RunnerConfig {
             build_check: true,
             test_runner: false,
             max_cost_usd: 10.0,
-            spawning_timeout_secs: 120,
+            spawning_timeout_secs: 480,
             cwd_validation: CwdValidation::default(),
+            completion_loop_threshold: 5,
+            completion_max_chars: 200,
+            max_auto_continues: 5,
         }
     }
 }
@@ -681,7 +692,7 @@ mod tests {
         assert!(config.build_check);
         assert!(!config.test_runner);
         assert!((config.max_cost_usd - 10.0).abs() < f64::EPSILON);
-        assert_eq!(config.spawning_timeout_secs, 120);
+        assert_eq!(config.spawning_timeout_secs, 480);
     }
 
     #[test]
@@ -1027,7 +1038,7 @@ mod tests {
     fn test_spawning_timeout_secs_in_config() {
         // Default
         let config = RunnerConfig::default();
-        assert_eq!(config.spawning_timeout_secs, 120);
+        assert_eq!(config.spawning_timeout_secs, 480);
 
         // Custom via YAML
         let yaml = r#"
@@ -1042,7 +1053,7 @@ mod tests {
     #[test]
     fn test_guard_config_spawning_timeout_default() {
         let config = crate::runner::guard::GuardConfig::default();
-        assert_eq!(config.spawning_timeout, std::time::Duration::from_secs(120));
+        assert_eq!(config.spawning_timeout, std::time::Duration::from_secs(480));
     }
 
     #[test]

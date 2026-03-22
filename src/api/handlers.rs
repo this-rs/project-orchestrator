@@ -5010,6 +5010,7 @@ pub struct RunPlanResponse {
 pub async fn run_plan(
     State(state): State<OrchestratorState>,
     Path(plan_id): Path<Uuid>,
+    axum::Extension(caller_claims): axum::Extension<crate::auth::jwt::Claims>,
     Json(req): Json<RunPlanRequest>,
 ) -> Result<(StatusCode, Json<RunPlanResponse>), AppError> {
     let chat_manager = state
@@ -5035,6 +5036,9 @@ pub async fn run_plan(
         config,
         event_tx,
     );
+
+    // Inherit caller's auth claims so runner agents authenticate as the user
+    runner = runner.with_user_claims(caller_claims);
 
     // Bridge RunnerEvents to CrudEvent for WebSocket delivery
     runner =
