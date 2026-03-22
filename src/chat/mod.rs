@@ -9,12 +9,15 @@ pub mod compaction_context;
 pub mod composer;
 pub mod config;
 pub mod continuity;
+pub(crate) mod drain;
+
 pub mod enrichment;
 pub mod entity_extractor;
 pub mod feedback;
 pub mod manager;
 pub mod observation_detector;
 pub mod path_detect;
+pub(crate) mod post_stream;
 pub(crate) mod post_tool_hook;
 pub mod prompt;
 pub mod prompt_sections;
