@@ -2613,7 +2613,7 @@ impl PlanRunner {
         // verdict was checked — causing a race where guard timeout would
         // override a successful Result event.
         let (event_result, event_metrics, guard_verdict) = {
-            let listen_fut = self.listen_for_result(rx, run_id);
+            let listen_fut = self.listen_for_result(rx, run_id, Some(task_id));
             tokio::pin!(listen_fut);
             tokio::pin!(guard_handle);
 
@@ -2734,6 +2734,7 @@ impl PlanRunner {
         let duration_secs = start.elapsed().as_secs_f64();
 
         // Check budget AFTER this task's cost
+        // Note: agent cost is already updated in listen_for_result for real-time tracking
         {
             let mut global = RUNNER_STATE.write().await;
             if let Some(ref mut s) = *global {
@@ -3878,6 +3879,7 @@ impl PlanRunner {
         &self,
         mut rx: broadcast::Receiver<ChatEvent>,
         _run_id: Uuid,
+        task_id: Option<Uuid>,
     ) -> (EventListenResult, EventMetrics) {
         let start = std::time::Instant::now();
         // Use a generous timeout here — the guard handles the actual task_timeout
@@ -3943,6 +3945,13 @@ impl PlanRunner {
                         } => {
                             if let Some(c) = event_cost {
                                 cost_usd = *c;
+                                // Update agent cost in real-time for run_status
+                                if let Some(tid) = task_id {
+                                    let mut global = RUNNER_STATE.write().await;
+                                    if let Some(ref mut s) = *global {
+                                        s.add_agent_cost(&tid, *c);
+                                    }
+                                }
                             }
                             return (
                                 EventListenResult::Completed {
@@ -4411,7 +4420,7 @@ mod tests {
         .unwrap();
 
         RUNNER_CANCEL.store(false, Ordering::SeqCst);
-        let (result, metrics) = runner.listen_for_result(rx, run_id).await;
+        let (result, metrics) = runner.listen_for_result(rx, run_id, None).await;
 
         assert_eq!(metrics.tool_use_count, 3);
         assert_eq!(metrics.tool_use_breakdown["Edit"], 2);
@@ -4468,7 +4477,7 @@ mod tests {
         .unwrap();
 
         RUNNER_CANCEL.store(false, Ordering::SeqCst);
-        let (_result, metrics) = runner.listen_for_result(rx, run_id).await;
+        let (_result, metrics) = runner.listen_for_result(rx, run_id, None).await;
 
         assert_eq!(metrics.error_count, 2);
         // last_error should be from the second error event
@@ -4502,7 +4511,7 @@ mod tests {
         .unwrap();
 
         RUNNER_CANCEL.store(false, Ordering::SeqCst);
-        let (_result, metrics) = runner.listen_for_result(rx, run_id).await;
+        let (_result, metrics) = runner.listen_for_result(rx, run_id, None).await;
 
         assert_eq!(metrics.error_count, 1);
         // Error text should be truncated to 500 chars
@@ -4519,7 +4528,7 @@ mod tests {
         drop(tx);
 
         RUNNER_CANCEL.store(false, Ordering::SeqCst);
-        let (result, metrics) = runner.listen_for_result(rx, run_id).await;
+        let (result, metrics) = runner.listen_for_result(rx, run_id, None).await;
 
         assert_eq!(metrics.tool_use_count, 0);
         match result {
@@ -4540,7 +4549,7 @@ mod tests {
 
         // Set cancel flag BEFORE listening
         RUNNER_CANCEL.store(true, Ordering::SeqCst);
-        let (result, _metrics) = runner.listen_for_result(rx, run_id).await;
+        let (result, _metrics) = runner.listen_for_result(rx, run_id, None).await;
 
         match result {
             EventListenResult::Cancelled { cost_usd } => {
