@@ -127,6 +127,15 @@ pub struct ActiveSession {
     /// Persists across messages in a session — when 2+ consecutive responses
     /// contain RFC-qualifying patterns, auto-creates an RFC draft note.
     pub rfc_accumulator: Arc<Mutex<super::observation_detector::RfcAccumulator>>,
+    /// Whether objective tracking is enabled for this session.
+    /// When `true`, the backend checks for pending plan tasks after each stream turn
+    /// where the agent did NOT use any tools (= conclusion/summary mode).
+    /// If pending tasks exist, a reminder is injected as SystemHint.
+    pub objective_tracking: bool,
+    /// Cooldown counter for objective reminders. Counts stream turns since the last
+    /// reminder was injected. Must reach `OBJECTIVE_REMINDER_COOLDOWN` before another
+    /// reminder is sent, to avoid spamming the agent.
+    pub objective_reminder_turns_since: Arc<AtomicU32>,
 }
 
 /// Runtime-mutable environment config for Claude CLI subprocess.
@@ -2534,6 +2543,8 @@ impl ChatManager {
                     )),
                     protocol_run_id: spawned_protocol_run_id,
                     protocol_state: spawned_protocol_state.clone(),
+                    objective_tracking: true,
+                    objective_reminder_turns_since: Arc::new(AtomicU32::new(0)),
                 },
             );
             interrupt_flag
@@ -2756,6 +2767,9 @@ impl ChatManager {
 
         // Track whether this stream ended with error_max_turns (for auto-continue)
         let mut hit_error_max_turns = false;
+
+        // Track whether any tool_use occurred in this stream turn (for objective tracking)
+        let mut had_tool_use = false;
 
         // Track whether a CompactBoundary was received during this stream turn.
         // When true, we'll rebuild and re-inject project context after the stream ends.
@@ -3442,6 +3456,11 @@ impl ChatManager {
                                         streaming_events.lock().await.push(event.clone());
                                     }
 
+                                    // Track tool_use for objective tracking
+                                    if matches!(event, ChatEvent::ToolUse { .. }) {
+                                        had_tool_use = true;
+                                    }
+
                                     // Detect error_max_turns for auto-continue
                                     if let ChatEvent::Result { ref subtype, .. } = event {
                                         if subtype == "error_max_turns" {
@@ -3815,6 +3834,90 @@ impl ChatManager {
                     "Auto-continue cancelled by interrupt for session {}",
                     session_id
                 );
+            }
+        }
+
+        // ===== OBJECTIVE TRACKING =====
+        // If the agent concluded WITHOUT using any tools (= summary/conclusion mode),
+        // and auto-continue didn't fire, check for pending plan tasks.
+        // If found, inject a reminder as SystemHint to nudge the agent to continue.
+        const OBJECTIVE_REMINDER_COOLDOWN: u32 = 3;
+        if !had_tool_use
+            && !auto_continue_allowed
+            && !hit_error_max_turns
+            && !interrupt_flag.load(Ordering::SeqCst)
+        {
+            // Check if objective_tracking is enabled for this session + cooldown
+            let should_check = {
+                let sessions = active_sessions.read().await;
+                if let Some(session) = sessions.get(&session_id) {
+                    if session.objective_tracking {
+                        let turns = session
+                            .objective_reminder_turns_since
+                            .fetch_add(1, Ordering::Relaxed);
+                        turns >= OBJECTIVE_REMINDER_COOLDOWN || turns == 0
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            };
+
+            if should_check {
+                // Look up the project slug for this session
+                let slug = if let Some(uuid) = session_uuid {
+                    match graph.get_chat_session(uuid).await {
+                        Ok(Some(node)) => node.project_slug,
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+
+                if let Some(ref slug) = slug {
+                    let builder =
+                        super::compaction_context::CompactionContextBuilder::new(graph.clone());
+                    if let Ok(Ok(ctx)) = tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        builder.build_for_session(Some(slug.as_str())),
+                    )
+                    .await
+                    {
+                        let objectives = ctx.pending_objectives_oneliner();
+                        if !objectives.is_empty() {
+                            let reminder = format!(
+                                "You stopped without using any tools. \
+                                 Check if you have completed all objectives before concluding.{}",
+                                objectives
+                            );
+                            info!(
+                                "Objective tracker: injecting reminder for session {}",
+                                session_id
+                            );
+                            pending_messages
+                                .lock()
+                                .await
+                                .push_back(PendingMessage::system_hint(reminder));
+
+                            // Reset cooldown counter
+                            let sessions = active_sessions.read().await;
+                            if let Some(session) = sessions.get(&session_id) {
+                                session
+                                    .objective_reminder_turns_since
+                                    .store(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                }
+            }
+        } else if had_tool_use {
+            // Agent used tools = still working, reset cooldown
+            let sessions = active_sessions.read().await;
+            if let Some(session) = sessions.get(&session_id) {
+                session
+                    .objective_reminder_turns_since
+                    .store(0, Ordering::Relaxed);
             }
         }
 
@@ -4945,6 +5048,8 @@ impl ChatManager {
                     )),
                     protocol_run_id: None,
                     protocol_state: None,
+                    objective_tracking: true,
+                    objective_reminder_turns_since: Arc::new(AtomicU32::new(0)),
                 },
             );
             interrupt_flag
@@ -7515,6 +7620,8 @@ mod tests {
             )),
             protocol_run_id: None,
             protocol_state: None,
+            objective_tracking: false,
+            objective_reminder_turns_since: Arc::new(AtomicU32::new(0)),
         };
 
         Some((session, pending_messages))
@@ -8407,6 +8514,8 @@ mod tests {
             )),
             protocol_run_id: None,
             protocol_state: None,
+            objective_tracking: false,
+            objective_reminder_turns_since: Arc::new(AtomicU32::new(0)),
         };
 
         (session, handle)
