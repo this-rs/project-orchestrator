@@ -2482,9 +2482,11 @@ impl ChatManager {
         let interrupt_token = CancellationToken::new();
         // Runner sessions always get auto_continue=true; interactive sessions use config default.
         let is_runner_session = request.runner_context.is_some();
-        let auto_continue = Arc::new(AtomicBool::new(
-            if is_runner_session { true } else { self.config.auto_continue }
-        ));
+        let auto_continue = Arc::new(AtomicBool::new(if is_runner_session {
+            true
+        } else {
+            self.config.auto_continue
+        }));
         let auto_continue_count = Arc::new(AtomicU32::new(0));
         // Runner sessions: limit to 5 auto-continues to prevent infinite loops.
         // Interactive sessions: unlimited (0) — user can always interrupt manually.
@@ -3595,7 +3597,10 @@ impl ChatManager {
                             "Injecting post-compaction context for session {} ({} chars)",
                             session_id, len
                         );
-                        pending_messages.lock().await.push_back(PendingMessage::system_hint(hint));
+                        pending_messages
+                            .lock()
+                            .await
+                            .push_back(PendingMessage::system_hint(hint));
                     }
                     (len, true)
                 }
@@ -3614,7 +3619,10 @@ impl ChatManager {
                         "<system-reminder>\n# Post-Compaction Context\nYou are in an interactive session. No project context available.\n</system-reminder>".to_string()
                     };
                     let len = minimal.len();
-                    pending_messages.lock().await.push_back(PendingMessage::system_hint(minimal));
+                    pending_messages
+                        .lock()
+                        .await
+                        .push_back(PendingMessage::system_hint(minimal));
                     (len, false)
                 }
             };
@@ -3717,10 +3725,7 @@ impl ChatManager {
                     false
                 } else {
                     if max > 0 {
-                        info!(
-                            "Auto-continue {}/{} for session {}",
-                            count, max, session_id
-                        );
+                        info!("Auto-continue {}/{} for session {}", count, max, session_id);
                     }
                     true
                 }
@@ -3778,9 +3783,8 @@ impl ChatManager {
                     };
 
                     if let Some(ref slug) = slug {
-                        let builder = super::compaction_context::CompactionContextBuilder::new(
-                            graph.clone(),
-                        );
+                        let builder =
+                            super::compaction_context::CompactionContextBuilder::new(graph.clone());
                         // Timeout at 2s to avoid blocking the stream too long
                         match tokio::time::timeout(
                             std::time::Duration::from_secs(2),
@@ -3944,7 +3948,11 @@ impl ChatManager {
 
             info!(
                 "Processing queued {} for session {} (queue was non-empty after stream)",
-                if is_system_hint { "system_hint" } else { "user_message" },
+                if is_system_hint {
+                    "system_hint"
+                } else {
+                    "user_message"
+                },
                 session_id
             );
 

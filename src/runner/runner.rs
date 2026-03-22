@@ -2361,10 +2361,7 @@ impl PlanRunner {
             add_dirs: None,
             workspace_slug: None,
             user_claims: Some(self.user_claims.clone().unwrap_or_else(|| {
-                crate::auth::jwt::Claims::service_account(&format!(
-                    "runner-agent:{}",
-                    run_id
-                ))
+                crate::auth::jwt::Claims::service_account(&format!("runner-agent:{}", run_id))
             })),
             spawned_by: Some(
                 serde_json::json!({

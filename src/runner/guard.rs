@@ -1037,7 +1037,10 @@ mod tests {
         let max = 200;
         // English patterns
         assert!(is_completion_message("The task is complete.", max));
-        assert!(is_completion_message("Task is done, nothing more to do.", max));
+        assert!(is_completion_message(
+            "Task is done, nothing more to do.",
+            max
+        ));
         assert!(is_completion_message("All work is done.", max));
         assert!(is_completion_message("All steps are done.", max));
         assert!(is_completion_message(
@@ -1054,10 +1057,16 @@ mod tests {
 
         // Should NOT match normal messages
         assert!(!is_completion_message("I'm reading the file now...", max));
-        assert!(!is_completion_message("Let me check the implementation.", max));
+        assert!(!is_completion_message(
+            "Let me check the implementation.",
+            max
+        ));
         assert!(!is_completion_message("Running cargo check...", max));
         // Should NOT match messages longer than max_chars (agent reasoning)
-        assert!(!is_completion_message(&format!("All done. {}", "x".repeat(250)), max));
+        assert!(!is_completion_message(
+            &format!("All done. {}", "x".repeat(250)),
+            max
+        ));
     }
 
     #[tokio::test]

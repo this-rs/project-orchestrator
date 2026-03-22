@@ -271,11 +271,7 @@ impl CompactionContextBuilder {
     }
 
     /// Fetch active plans (in_progress) and their pending/in-progress tasks with steps.
-    async fn fetch_active_plans_and_tasks(
-        &self,
-        ctx: &mut CompactionContext,
-        project_id: Uuid,
-    ) {
+    async fn fetch_active_plans_and_tasks(&self, ctx: &mut CompactionContext, project_id: Uuid) {
         // Get plans filtered by in_progress status
         let plans = match self
             .graph
@@ -323,9 +319,7 @@ impl CompactionContextBuilder {
             // Collect pending/in-progress tasks with their steps
             let active_tasks: Vec<&TaskNode> = tasks
                 .iter()
-                .filter(|t| {
-                    t.status == TaskStatus::Pending || t.status == TaskStatus::InProgress
-                })
+                .filter(|t| t.status == TaskStatus::Pending || t.status == TaskStatus::InProgress)
                 .collect();
 
             for task in active_tasks.iter().take(MAX_PENDING_TASKS) {
@@ -463,7 +457,12 @@ impl CompactionContext {
                     "inprogress" | "in_progress" => "🔄",
                     _ => "⬜",
                 };
-                let _ = writeln!(out, "{icon} {} — {}", task.status.to_uppercase(), task.title);
+                let _ = writeln!(
+                    out,
+                    "{icon} {} — {}",
+                    task.status.to_uppercase(),
+                    task.title
+                );
 
                 // Show steps if budget allows
                 if !task.steps.is_empty() && out.len() < MAX_MARKDOWN_CHARS - 800 {
@@ -474,11 +473,7 @@ impl CompactionContext {
                             "skipped" => "⏭️",
                             _ => "⬜",
                         };
-                        let _ = writeln!(
-                            out,
-                            "  {step_icon} {}. {}",
-                            step.order, step.description
-                        );
+                        let _ = writeln!(out, "  {step_icon} {}. {}", step.order, step.description);
                         if out.len() > MAX_MARKDOWN_CHARS - 600 {
                             out.push_str("  _(truncated)_\n");
                             break;
@@ -1096,7 +1091,10 @@ mod tests {
         let ctx = sample_session_context();
         let md = ctx.to_markdown();
 
-        assert!(md.contains("## Active Plans"), "Missing Active Plans section");
+        assert!(
+            md.contains("## Active Plans"),
+            "Missing Active Plans section"
+        );
         assert!(md.contains("Fix UX issues"), "Missing plan title");
         assert!(md.contains("3/8 done"), "Missing plan progress");
     }
