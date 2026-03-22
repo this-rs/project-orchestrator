@@ -6075,8 +6075,7 @@ mod tests {
         // Override config to 0 retries
         let runner = {
             let (event_tx, _) = broadcast::channel(16);
-            let mut config = RunnerConfig::default();
-            config.max_retries = 0;
+            let config = RunnerConfig { max_retries: 0, ..Default::default() };
             PlanRunner::new(
                 runner.chat_manager.clone(),
                 runner.graph.clone(),
@@ -7103,8 +7102,7 @@ mod tests {
         // Override config to 0 retries for definitive failure path
         let runner = {
             let (event_tx, _) = broadcast::channel(16);
-            let mut config = RunnerConfig::default();
-            config.max_retries = 0;
+            let config = RunnerConfig { max_retries: 0, ..Default::default() };
             PlanRunner::new(
                 runner.chat_manager.clone(),
                 runner.graph.clone(),
@@ -7373,8 +7371,7 @@ mod tests {
         let mut event_rx = event_tx.subscribe();
 
         let (runner_base, graph) = test_plan_runner_with_graph();
-        let mut config = RunnerConfig::default();
-        config.max_retries = 0;
+        let config = RunnerConfig { max_retries: 0, ..Default::default() };
         let runner = PlanRunner::new(
             runner_base.chat_manager.clone(),
             runner_base.graph.clone(),
