@@ -120,6 +120,42 @@ pub fn should_step_guard_trigger(breakdown: &StepBreakdown) -> bool {
     breakdown.total > 0 && breakdown.completed == 0
 }
 
+/// Validate that at least one affected file exists on disk before spawning an agent.
+///
+/// Returns `(valid, missing)` where:
+/// - `valid` = true if at least one file exists (or if affected_files is empty — no constraint)
+/// - `missing` = list of files that don't exist on disk
+///
+/// Pure function — no side effects.
+pub fn validate_affected_files(
+    affected_files: &[String],
+    cwd: &str,
+) -> (bool, Vec<String>) {
+    if affected_files.is_empty() {
+        return (true, vec![]);
+    }
+
+    let cwd_path = std::path::Path::new(cwd);
+    let mut missing = Vec::new();
+    let mut at_least_one_exists = false;
+
+    for file in affected_files {
+        let full_path = if std::path::Path::new(file).is_absolute() {
+            std::path::PathBuf::from(file)
+        } else {
+            cwd_path.join(file)
+        };
+
+        if full_path.exists() {
+            at_least_one_exists = true;
+        } else {
+            missing.push(file.clone());
+        }
+    }
+
+    (at_least_one_exists, missing)
+}
+
 // ============================================================================
 // Global state — LazyLock pattern (no fields on OrchestratorState)
 // ============================================================================
@@ -1377,6 +1413,29 @@ impl PlanRunner {
                     } else {
                         debug!("Marked step {} as in_progress at task {} launch", first_step.id, task_id);
                     }
+                }
+            }
+
+            // Pre-validate affected_files before spawning agent (T4)
+            if !wave_task.affected_files.is_empty() {
+                let (valid, missing) = validate_affected_files(&wave_task.affected_files, cwd);
+                if !valid {
+                    warn!(
+                        "Task {} ({}) blocked: none of the affected files exist on disk: {:?}",
+                        task_id, task_title, missing
+                    );
+                    self.update_task_status_with_event(task_id, TaskStatus::Blocked)
+                        .await?;
+                    wave_result
+                        .tasks_failed
+                        .push((task_id, task_title.clone()));
+                    continue;
+                }
+                if !missing.is_empty() {
+                    warn!(
+                        "Task {} ({}): some affected files missing (non-fatal): {:?}",
+                        task_id, task_title, missing
+                    );
                 }
             }
 
@@ -5401,6 +5460,47 @@ mod tests {
             "Expected Mismatch for non-existent different paths, got {:?}",
             result
         );
+    }
+
+    // === Pure function tests: validate_affected_files ===
+
+    #[test]
+    fn test_validate_affected_files_empty_list_is_valid() {
+        let (valid, missing) = validate_affected_files(&[], "/tmp");
+        assert!(valid);
+        assert!(missing.is_empty());
+    }
+
+    #[test]
+    fn test_validate_affected_files_all_missing() {
+        let files = vec![
+            "nonexistent/foo.rs".to_string(),
+            "nonexistent/bar.rs".to_string(),
+        ];
+        let (valid, missing) = validate_affected_files(&files, "/tmp");
+        assert!(!valid);
+        assert_eq!(missing.len(), 2);
+    }
+
+    #[test]
+    fn test_validate_affected_files_at_least_one_exists() {
+        // Use a file that always exists on any system
+        let files = vec![
+            "nonexistent/foo.rs".to_string(),
+        ];
+        // /tmp should exist, but none of the relative files do
+        let (valid, _) = validate_affected_files(&files, "/tmp");
+        assert!(!valid);
+
+        // Now test with an absolute path that exists
+        let files_with_existing = vec![
+            "/tmp".to_string(), // exists (it's a dir, but Path::exists returns true)
+            "nonexistent/bar.rs".to_string(),
+        ];
+        let (valid2, missing2) = validate_affected_files(&files_with_existing, "/");
+        assert!(valid2);
+        assert_eq!(missing2.len(), 1);
+        assert_eq!(missing2[0], "nonexistent/bar.rs");
     }
 
     // === Pure function tests: should_step_guard_trigger ===
