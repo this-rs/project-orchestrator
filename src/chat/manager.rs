@@ -3786,19 +3786,16 @@ impl ChatManager {
                         let builder =
                             super::compaction_context::CompactionContextBuilder::new(graph.clone());
                         // Timeout at 2s to avoid blocking the stream too long
-                        match tokio::time::timeout(
+                        if let Ok(Ok(ctx)) = tokio::time::timeout(
                             std::time::Duration::from_secs(2),
                             builder.build_for_session(Some(slug.as_str())),
                         )
                         .await
                         {
-                            Ok(Ok(ctx)) => {
-                                let objectives = ctx.pending_objectives_oneliner();
-                                if !objectives.is_empty() {
-                                    break 'build_msg format!("Continue.{objectives}");
-                                }
+                            let objectives = ctx.pending_objectives_oneliner();
+                            if !objectives.is_empty() {
+                                break 'build_msg format!("Continue.{objectives}");
                             }
-                            _ => {}
                         }
                     }
                     "Continue".to_string()
