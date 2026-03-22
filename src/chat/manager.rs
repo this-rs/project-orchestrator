@@ -15,7 +15,6 @@ use super::skill_hook;
 use super::types::{
     classify_api_error, truncate_snippet, ChatEvent, ChatEventPage, ChatRequest,
     CreateSessionResponse, MessageSearchHit, MessageSearchResult, PendingMessage,
-    PendingMessageKind,
 };
 use crate::meilisearch::SearchStore;
 use crate::neo4j::models::ChatEventRecord;
@@ -2689,7 +2688,7 @@ impl ChatManager {
 
     /// Internal: send a message to the client and stream the response to broadcast
     #[allow(clippy::too_many_arguments)]
-    async fn stream_response(
+    pub(crate) async fn stream_response(
         client: Arc<Mutex<InteractiveClient>>,
         events_tx: broadcast::Sender<ChatEvent>,
         prompt: String,
@@ -3581,595 +3580,84 @@ impl ChatManager {
             *shared_sdk_control_rx.lock().await = sdk_control_rx;
         }
 
-        // Post-compaction context re-injection for interactive sessions.
-        // If a CompactBoundary was detected during this stream turn, rebuild project
-        // context via CompactionContextBuilder and queue it as a system-reminder hint
-        // so the LLM regains project awareness after compaction.
-        if needs_post_compaction_injection && !interrupt_flag.load(Ordering::SeqCst) {
-            info!(
-                "Post-compaction injection triggered for session {}",
-                session_id
-            );
-
-            // Resolve project_slug from the session's Neo4j node
-            let project_slug = if let Some(uuid) = session_uuid {
-                match graph.get_chat_session(uuid).await {
-                    Ok(Some(node)) => node.project_slug,
-                    _ => None,
-                }
-            } else {
-                None
-            };
-
-            // Build context using CompactionContextBuilder (timed for metrics)
-            let build_start = std::time::Instant::now();
-            let builder = super::compaction_context::CompactionContextBuilder::new(graph.clone());
-            let build_result = builder.build_for_session(project_slug.as_deref()).await;
-            let build_latency_ms = build_start.elapsed().as_millis() as u64;
-
-            let (hint_len, recovery_success) = match build_result {
-                Ok(ctx) => {
-                    let hint = ctx.to_markdown();
-                    let len = hint.len();
-                    if !hint.is_empty() {
-                        info!(
-                            "Injecting post-compaction context for session {} ({} chars)",
-                            session_id, len
-                        );
-                        pending_messages
-                            .lock()
-                            .await
-                            .push_back(PendingMessage::system_hint(hint));
-                    }
-                    (len, true)
-                }
-                Err(e) => {
-                    // Fallback: if build fails, inject a minimal reminder
-                    warn!(
-                        "Failed to build post-compaction context for session {}: {}. Injecting minimal reminder.",
-                        session_id, e
-                    );
-                    let minimal = if project_slug.is_some() {
-                        format!(
-                            "<system-reminder>\n# Post-Compaction Context\nYou are working on project \"{}\". Context rebuild failed — continue based on conversation history.\n</system-reminder>",
-                            project_slug.as_deref().unwrap_or("unknown")
-                        )
-                    } else {
-                        "<system-reminder>\n# Post-Compaction Context\nYou are in an interactive session. No project context available.\n</system-reminder>".to_string()
-                    };
-                    let len = minimal.len();
-                    pending_messages
-                        .lock()
-                        .await
-                        .push_back(PendingMessage::system_hint(minimal));
-                    (len, false)
-                }
-            };
-
-            // Emit CompactionRecovery metrics
-            let hint_tokens = (hint_len as u32) / 3; // rough chars→tokens estimate
-            let recovery_event = ChatEvent::CompactionRecovery {
-                hint_tokens,
-                build_latency_ms,
-                recovery_success,
-            };
-            emit_chat(recovery_event, &events_tx, &nats, &session_id);
-        } else if needs_post_compaction_injection {
-            debug!(
-                "Skipping post-compaction injection for session {} (interrupted)",
-                session_id
-            );
-        }
-
-        // Lock-free interrupt: send the CLI interrupt signal IMMEDIATELY via stdin_tx
-        // BEFORE the Neo4j persistence and memory manager ops (T2 fix for Gaps 3, 6).
-        // This avoids taking the client Mutex lock which could be contended.
-        if interrupt_flag.load(Ordering::SeqCst) {
-            if let Some(ref tx) = stdin_tx_for_auto_allow {
-                let json = InteractiveClient::build_interrupt_json();
-                if let Err(e) = tx.try_send(json) {
-                    warn!("Failed to send lock-free interrupt to CLI: {}", e);
-                } else {
-                    debug!("Lock-free interrupt sent to CLI for session {}", session_id);
-                }
-            }
-        }
-
-        // If interrupted, emit ToolCancelled for any tools that were still running
-        // (ToolUse without ToolResult). The actual CLI interrupt was already sent
-        // lock-free via stdin_tx above.
-        if interrupt_flag.load(Ordering::SeqCst) {
-            // Emit ToolCancelled for each pending tool (ToolUse without ToolResult)
-            if !pending_tool_calls.is_empty() {
-                info!(
-                    "Emitting ToolCancelled for {} pending tool(s) in session {}",
-                    pending_tool_calls.len(),
-                    session_id
-                );
-                let mut cancel_events = Vec::new();
-                for (tool_id, parent) in &pending_tool_calls {
-                    let event = ChatEvent::ToolCancelled {
-                        id: tool_id.clone(),
-                        parent_tool_use_id: parent.clone(),
-                    };
-                    cancel_events.push(event.clone());
-                    emit_chat(event, &events_tx, &nats, &session_id);
-                }
-
-                // Persist ToolCancelled events in Neo4j
-                if let Some(uuid) = session_uuid {
-                    let mut cancel_records = Vec::new();
-                    for event in &cancel_events {
-                        let seq = next_seq.fetch_add(1, Ordering::SeqCst);
-                        cancel_records.push(ChatEventRecord {
-                            id: Uuid::new_v4(),
-                            session_id: uuid,
-                            seq,
-                            event_type: event.event_type().to_string(),
-                            data: serde_json::to_string(event).unwrap_or_default(),
-                            created_at: chrono::Utc::now(),
-                        });
-                    }
-                    if let Err(e) = graph.store_chat_events(uuid, cancel_records).await {
-                        warn!(
-                            "Failed to persist ToolCancelled events for session {}: {}",
-                            session_id, e
-                        );
-                    }
-                }
-            }
-        }
-
-        // Auto-continue: if error_max_turns was hit and auto_continue is enabled,
-        // emit an AutoContinue event, wait 500ms (interruptible), then enqueue "Continue"
-        // into pending_messages for the drain below.
-        //
-        // Safety valve: if max_auto_continues > 0 (runner sessions), check the counter
-        // and disable auto_continue when the limit is reached to prevent infinite loops.
-        let auto_continue_allowed = if hit_error_max_turns
-            && auto_continue.load(Ordering::Relaxed)
-            && !interrupt_flag.load(Ordering::SeqCst)
-        {
-            // Check counter via active_sessions
-            let sessions = active_sessions.read().await;
-            if let Some(session) = sessions.get(&session_id) {
-                let count = session.auto_continue_count.fetch_add(1, Ordering::Relaxed) + 1;
-                let max = session.max_auto_continues;
-                if max > 0 && count > max {
-                    warn!(
-                        "Auto-continue limit reached for session {} ({}/{}), disabling",
-                        session_id, count, max
-                    );
-                    auto_continue.store(false, Ordering::Relaxed);
-                    false
-                } else {
-                    if max > 0 {
-                        info!("Auto-continue {}/{} for session {}", count, max, session_id);
-                    }
-                    true
-                }
-            } else {
-                false
-            }
-        } else {
-            false
-        };
-        if auto_continue_allowed {
-            let delay_ms = 500u64;
-            info!(
-                "Auto-continue triggered for session {} (delay={}ms)",
-                session_id, delay_ms
-            );
-
-            // Emit AutoContinue event so frontends can show "Auto-continuing..."
-            let ac_event = ChatEvent::AutoContinue {
-                session_id: session_id.clone(),
-                delay_ms,
-            };
-            emit_chat(ac_event.clone(), &events_tx, &nats, &session_id);
-
-            // Persist the AutoContinue event
-            if let Some(uuid) = session_uuid {
-                let seq = next_seq.fetch_add(1, Ordering::SeqCst);
-                let record = ChatEventRecord {
-                    id: Uuid::new_v4(),
-                    session_id: uuid,
-                    seq,
-                    event_type: ac_event.event_type().to_string(),
-                    data: serde_json::to_string(&ac_event).unwrap_or_default(),
-                    created_at: chrono::Utc::now(),
-                };
-                let _ = graph.store_chat_events(uuid, vec![record]).await;
-            }
-
-            // Interruptible delay — if the user interrupts during the wait, skip the enqueue
-            let sleep_cancelled = tokio::select! {
-                _ = tokio::time::sleep(std::time::Duration::from_millis(delay_ms)) => false,
-                _ = interrupt_token.cancelled() => true,
-            };
-
-            if !sleep_cancelled && !interrupt_flag.load(Ordering::SeqCst) {
-                // Build enriched auto-continue message with remaining objectives.
-                // Best-effort: if context build fails or times out, fall back to plain "Continue".
-                let continue_msg = 'build_msg: {
-                    let slug = if let Some(uuid) = session_uuid {
-                        match graph.get_chat_session(uuid).await {
-                            Ok(Some(node)) => node.project_slug,
-                            _ => None,
-                        }
-                    } else {
-                        None
-                    };
-
-                    if let Some(ref slug) = slug {
-                        let builder =
-                            super::compaction_context::CompactionContextBuilder::new(graph.clone());
-                        // Timeout at 2s to avoid blocking the stream too long
-                        if let Ok(Ok(ctx)) = tokio::time::timeout(
-                            std::time::Duration::from_secs(2),
-                            builder.build_for_session(Some(slug.as_str())),
-                        )
-                        .await
-                        {
-                            let objectives = ctx.pending_objectives_oneliner();
-                            if !objectives.is_empty() {
-                                break 'build_msg format!("Continue.{objectives}");
-                            }
-                        }
-                    }
-                    "Continue".to_string()
-                };
-
-                // Enqueue enriched continue message — the drain below will pick it up and recurse
-                pending_messages
-                    .lock()
-                    .await
-                    .push_back(PendingMessage::system_hint(continue_msg));
-                debug!(
-                    "Auto-continue: enqueued enriched 'Continue' for session {}",
-                    session_id
-                );
-            } else {
-                info!(
-                    "Auto-continue cancelled by interrupt for session {}",
-                    session_id
-                );
-            }
-        }
-
-        // ===== OBJECTIVE TRACKING =====
-        // If the agent concluded WITHOUT using any tools (= summary/conclusion mode),
-        // and auto-continue didn't fire, check for pending plan tasks.
-        // If found, inject a reminder as SystemHint to nudge the agent to continue.
-        const OBJECTIVE_REMINDER_COOLDOWN: u32 = 3;
-        if !had_tool_use
-            && !auto_continue_allowed
-            && !hit_error_max_turns
-            && !interrupt_flag.load(Ordering::SeqCst)
-        {
-            // Check if objective_tracking is enabled for this session + cooldown
-            let should_check = {
-                let sessions = active_sessions.read().await;
-                if let Some(session) = sessions.get(&session_id) {
-                    if session.objective_tracking {
-                        let turns = session
-                            .objective_reminder_turns_since
-                            .fetch_add(1, Ordering::Relaxed);
-                        turns >= OBJECTIVE_REMINDER_COOLDOWN || turns == 0
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                }
-            };
-
-            if should_check {
-                // Look up the project slug for this session
-                let slug = if let Some(uuid) = session_uuid {
-                    match graph.get_chat_session(uuid).await {
-                        Ok(Some(node)) => node.project_slug,
-                        _ => None,
-                    }
-                } else {
-                    None
-                };
-
-                if let Some(ref slug) = slug {
-                    let builder =
-                        super::compaction_context::CompactionContextBuilder::new(graph.clone());
-                    if let Ok(Ok(ctx)) = tokio::time::timeout(
-                        std::time::Duration::from_secs(2),
-                        builder.build_for_session(Some(slug.as_str())),
-                    )
-                    .await
-                    {
-                        let objectives = ctx.pending_objectives_oneliner();
-                        if !objectives.is_empty() {
-                            let reminder = format!(
-                                "You stopped without using any tools. \
-                                 Check if you have completed all objectives before concluding.{}",
-                                objectives
-                            );
-                            info!(
-                                "Objective tracker: injecting reminder for session {}",
-                                session_id
-                            );
-                            pending_messages
-                                .lock()
-                                .await
-                                .push_back(PendingMessage::system_hint(reminder));
-
-                            // Reset cooldown counter
-                            let sessions = active_sessions.read().await;
-                            if let Some(session) = sessions.get(&session_id) {
-                                session
-                                    .objective_reminder_turns_since
-                                    .store(1, Ordering::Relaxed);
-                            }
-                        }
-                    }
-                }
-            }
-        } else if had_tool_use {
-            // Agent used tools = still working, reset cooldown
-            let sessions = active_sessions.read().await;
-            if let Some(session) = sessions.get(&session_id) {
-                session
-                    .objective_reminder_turns_since
-                    .store(0, Ordering::Relaxed);
-            }
-        }
-
-        // T5 race protection (Gap 11): check pending_messages BEFORE setting
-        // is_streaming=false. If there are pending messages, keep is_streaming=true
-        // so concurrent send_message() calls still queue instead of racing.
-        let has_pending = !pending_messages.lock().await.is_empty();
-
-        if !has_pending {
-            is_streaming.store(false, Ordering::SeqCst);
-            // Broadcast streaming_status=false to all connected clients (multi-tab support)
-            emit_chat(
-                ChatEvent::StreamingStatus {
-                    is_streaming: false,
-                },
-                &events_tx,
-                &nats,
-                &session_id,
-            );
-            // Emit CRUD event for session list live refresh
-            if let Some(ref emitter) = event_emitter {
-                emitter.emit_updated(
-                    crate::events::EntityType::ChatSession,
-                    &session_id,
-                    serde_json::json!({ "is_streaming": false }),
-                    None,
-                );
-            }
-            streaming_text.lock().await.clear();
-            streaming_events.lock().await.clear();
-            debug!("Stream completed for session {}", session_id);
-        }
-
-        // Batch-persist all collected events to Neo4j.
-        // This runs AFTER is_streaming=false so the frontend gets the signal immediately
-        // even if Neo4j is slow (GC pause, disk I/O, etc.).
-        if let Some(uuid) = session_uuid {
-            if !events_to_persist.is_empty() {
-                if let Err(e) = graph.store_chat_events(uuid, events_to_persist).await {
-                    warn!(
-                        "Failed to persist chat events for session {}: {}",
-                        session_id, e
-                    );
-                }
-            }
-        }
-
-        // Record assistant message and persist to memory store
-        if let Some(ref mm) = memory_manager {
-            let assistant_text = assistant_text_parts.join("");
-            if !assistant_text.is_empty() {
-                let mut mm = mm.lock().await;
-                mm.record_assistant_message(&assistant_text);
-
-                // Auto add_discussed: extract entities from response and mark as DISCUSSED (async)
-                if let Some(uuid) = session_uuid {
-                    let project_id = {
-                        // Resolve project_id from session's project_slug
-                        match graph.get_chat_session(uuid).await {
-                            Ok(Some(node)) => {
-                                if let Some(ref slug) = node.project_slug {
-                                    graph
-                                        .get_project_by_slug(slug)
-                                        .await
-                                        .ok()
-                                        .flatten()
-                                        .map(|p| p.id)
-                                } else {
-                                    None
-                                }
-                            }
-                            _ => None,
-                        }
-                    };
-                    super::feedback::spawn_feedback(
-                        graph.clone(),
-                        uuid,
-                        project_id,
-                        assistant_text.clone(),
-                        super::feedback::SessionDiscussedCache::new(),
-                    );
-
-                    // RFC auto-detection: feed observation to session accumulator
-                    let rfc_acc = {
-                        let sessions = active_sessions.read().await;
-                        sessions.get(&session_id).map(|s| s.rfc_accumulator.clone())
-                    };
-                    if let Some(rfc_acc) = rfc_acc {
-                        super::feedback::spawn_rfc_processing(
-                            graph.clone(),
-                            search.clone(),
-                            project_id,
-                            assistant_text.clone(),
-                            rfc_acc,
-                            Some(uuid),
-                            event_emitter.clone(),
-                        );
-                    }
-                }
-
-                // Store pending messages via ContextInjector
-                if let Some(ref injector) = context_injector {
-                    let pending = mm.take_pending_messages();
-                    if !pending.is_empty() {
-                        if let Err(e) = injector.store_messages(&pending).await {
-                            warn!("Failed to store messages for session {}: {}", session_id, e);
-                        } else {
-                            debug!(
-                                "Stored {} messages for session {}",
-                                pending.len(),
-                                session_id
-                            );
-                        }
-                    }
-                }
-            }
-        }
-
-        // Check pending_messages queue — if there are queued messages, process the next one
-        let next_message = {
-            let mut queue = pending_messages.lock().await;
-            queue.pop_front()
+        // ===== POST-STREAM PROCESSING =====
+        // All post-stream logic delegated to PostStreamHandler (see post_stream.rs)
+        let post_ctx = super::post_stream::PostStreamContext::build(&graph, session_uuid).await;
+        let post_handler = super::post_stream::PostStreamHandler {
+            graph: graph.clone(),
+            pending_messages: pending_messages.clone(),
+            session_id: session_id.clone(),
+            session_uuid,
+            active_sessions: active_sessions.clone(),
+            events_tx: events_tx.clone(),
+            nats: nats.clone(),
+            next_seq: next_seq.clone(),
+            interrupt_flag: interrupt_flag.clone(),
+            interrupt_token: interrupt_token.clone(),
+            ctx: post_ctx,
+            is_streaming: is_streaming.clone(),
+            streaming_text: streaming_text.clone(),
+            streaming_events: streaming_events.clone(),
+            event_emitter: event_emitter.clone(),
+            search: search.clone(),
+            auto_continue: auto_continue.clone(),
         };
 
-        if let Some(next_msg) = next_message {
-            let is_system_hint = next_msg.kind == PendingMessageKind::SystemHint;
-            let msg_content = next_msg.content;
-
-            info!(
-                "Processing queued {} for session {} (queue was non-empty after stream)",
-                if is_system_hint {
-                    "system_hint"
-                } else {
-                    "user_message"
-                },
-                session_id
-            );
-
-            // Persist the event and update message count (only for user messages)
-            if let Some(uuid) = session_uuid {
-                // Only increment message_count for real user messages
-                if !is_system_hint {
-                    if let Ok(Some(node)) = graph.get_chat_session(uuid).await {
-                        let _ = graph
-                            .update_chat_session(
-                                uuid,
-                                None,
-                                None,
-                                Some(node.message_count + 1),
-                                None,
-                                None,
-                                None,
-                            )
-                            .await;
-                    }
-                }
-
-                let (event_type, event_data) = if is_system_hint {
-                    (
-                        "system_hint".to_string(),
-                        serde_json::to_string(&ChatEvent::SystemHint {
-                            content: msg_content.clone(),
-                        })
-                        .unwrap_or_default(),
-                    )
-                } else {
-                    (
-                        "user_message".to_string(),
-                        serde_json::to_string(&ChatEvent::UserMessage {
-                            content: msg_content.clone(),
-                        })
-                        .unwrap_or_default(),
-                    )
-                };
-
-                let event_record = ChatEventRecord {
-                    id: Uuid::new_v4(),
-                    session_id: uuid,
-                    seq: next_seq.fetch_add(1, Ordering::SeqCst),
-                    event_type,
-                    data: event_data,
-                    created_at: chrono::Utc::now(),
-                };
-                let _ = graph.store_chat_events(uuid, vec![event_record]).await;
-            }
-
-            // Emit the appropriate event on broadcast + NATS
-            let chat_event = if is_system_hint {
-                ChatEvent::SystemHint {
-                    content: msg_content.clone(),
-                }
-            } else {
-                ChatEvent::UserMessage {
-                    content: msg_content.clone(),
-                }
-            };
-            emit_chat(chat_event, &events_tx, &nats, &session_id);
-
-            // Recursive call to process the queued message
-            // Use Box::pin to handle recursive async
-            // stream_response will create its own fresh interrupt_token internally
-            Box::pin(Self::stream_response(
-                client,
-                events_tx,
-                msg_content,
-                session_id,
-                graph,
-                active_sessions,
-                interrupt_flag,
-                memory_manager,
-                context_injector,
-                next_seq,
-                pending_messages,
-                is_streaming,
-                streaming_text,
-                streaming_events,
-                event_emitter,
-                nats,
-                shared_sdk_control_rx,
-                auto_continue,
-                retry_config,
-                enrichment_pipeline,
-                search,
-            ))
+        // 1. Post-compaction context re-injection
+        post_handler
+            .handle_post_compaction(needs_post_compaction_injection)
             .await;
-        } else if has_pending {
-            // Race: has_pending was true but pop_front returned None.
-            // Set is_streaming=false now since there's nothing to process.
-            is_streaming.store(false, Ordering::SeqCst);
-            emit_chat(
-                ChatEvent::StreamingStatus {
-                    is_streaming: false,
-                },
-                &events_tx,
-                &nats,
-                &session_id,
-            );
-            if let Some(ref emitter) = event_emitter {
-                emitter.emit_updated(
-                    crate::events::EntityType::ChatSession,
-                    &session_id,
-                    serde_json::json!({ "is_streaming": false }),
-                    None,
-                );
-            }
-            streaming_text.lock().await.clear();
-            streaming_events.lock().await.clear();
-            debug!(
-                "Stream completed for session {} (pending race resolved)",
-                session_id
-            );
-        }
+
+        // 2. Lock-free interrupt + ToolCancelled
+        post_handler
+            .handle_interrupt_cleanup(&stdin_tx_for_auto_allow, &pending_tool_calls)
+            .await;
+
+        // 3. Auto-continue
+        let auto_continue_allowed = post_handler.handle_auto_continue(hit_error_max_turns).await;
+
+        // 4. Objective tracking
+        post_handler
+            .handle_objective_tracking(had_tool_use, auto_continue_allowed, hit_error_max_turns)
+            .await;
+
+        // 5. Streaming status update
+        let has_pending = post_handler.finalize_streaming_status().await;
+
+        // 6. Batch-persist events to Neo4j
+        post_handler.persist_events(events_to_persist).await;
+
+        // 7. Memory / feedback / RFC
+        post_handler
+            .handle_feedback(&assistant_text_parts, &memory_manager, &context_injector)
+            .await;
+
+        // 8. Drain pending messages queue
+        super::drain::drain_pending_messages(
+            has_pending,
+            client,
+            events_tx,
+            session_id,
+            session_uuid,
+            graph,
+            active_sessions,
+            interrupt_flag,
+            memory_manager,
+            context_injector,
+            next_seq,
+            pending_messages,
+            is_streaming,
+            streaming_text,
+            streaming_events,
+            event_emitter,
+            nats,
+            shared_sdk_control_rx,
+            auto_continue,
+            retry_config,
+            enrichment_pipeline,
+            search,
+        )
+        .await;
     }
 
     /// Try to send a message to a session via NATS RPC (cross-instance proxy).
