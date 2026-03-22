@@ -1438,7 +1438,7 @@ impl PlanRunner {
                     duration_secs,
                     cost_usd,
                 }) => {
-                    self.on_task_completed(run_id, task_id, duration_secs, cost_usd)
+                    self.on_task_completed(run_id, task_id, duration_secs, cost_usd, Some(cwd))
                         .await?;
                     wave_result.tasks_completed.push(task_id);
                     wave_result.wave_cost_usd += cost_usd;
@@ -1567,7 +1567,7 @@ impl PlanRunner {
                             "Task {} failed ({}) but all steps are completed — auto-completing",
                             task_id, reason
                         );
-                        self.on_task_completed(run_id, task_id, 0.0, cost_usd)
+                        self.on_task_completed(run_id, task_id, 0.0, cost_usd, Some(cwd))
                             .await?;
                         wave_result.tasks_completed.push(task_id);
                         wave_result.wave_cost_usd += cost_usd;
@@ -1660,7 +1660,7 @@ impl PlanRunner {
                             "Task {} timed out but all steps are completed — auto-completing",
                             task_id
                         );
-                        self.on_task_completed(run_id, task_id, duration_secs, cost_usd)
+                        self.on_task_completed(run_id, task_id, duration_secs, cost_usd, Some(cwd))
                             .await?;
                         wave_result.tasks_completed.push(task_id);
                         wave_result.wave_cost_usd += cost_usd;
@@ -1962,7 +1962,7 @@ impl PlanRunner {
                                 "Retry succeeded for task {} ({}) in {:.1}s",
                                 task_id, task_title, duration_secs
                             );
-                            self.on_task_completed(run_id, *task_id, duration_secs, cost_usd)
+                            self.on_task_completed(run_id, *task_id, duration_secs, cost_usd, Some(cwd))
                                 .await?;
                             // Move from failed to completed
                             wave_result.tasks_failed.retain(|(tid, _)| tid != task_id);
@@ -2930,6 +2930,33 @@ impl PlanRunner {
     }
 
     // ========================================================================
+    // Auto-formatting
+    // ========================================================================
+
+    /// Run `cargo fmt --all` in the given working directory.
+    /// Returns Ok(()) if formatting succeeds, Err if it fails.
+    /// This is non-fatal: callers should log a warning on failure.
+    async fn run_cargo_fmt(cwd: &str) -> Result<()> {
+        let output = tokio::process::Command::new("cargo")
+            .args(["fmt", "--all"])
+            .current_dir(cwd)
+            .output()
+            .await?;
+
+        if output.status.success() {
+            info!("cargo fmt --all completed successfully in {}", cwd);
+            Ok(())
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            Err(anyhow!(
+                "cargo fmt --all failed (exit {}): {}",
+                output.status,
+                stderr.trim()
+            ))
+        }
+    }
+
+    // ========================================================================
     // Task lifecycle callbacks
     // ========================================================================
 
@@ -2939,6 +2966,7 @@ impl PlanRunner {
         task_id: Uuid,
         duration_secs: f64,
         cost_usd: f64,
+        cwd: Option<&str>,
     ) -> Result<()> {
         // Extract session_id BEFORE mark_task_completed removes the agent
         let agent_session_id = {
@@ -2948,6 +2976,13 @@ impl PlanRunner {
                 .and_then(|s| s.get_agent(&task_id))
                 .and_then(|a| a.session_id)
         };
+
+        // Run cargo fmt before marking task as completed (non-fatal)
+        if let Some(cwd) = cwd {
+            if let Err(e) = Self::run_cargo_fmt(cwd).await {
+                warn!("cargo fmt failed for task {} (non-fatal): {}", task_id, e);
+            }
+        }
 
         // Update task status (with CrudEvent for WebSocket)
         self.update_task_status_with_event(task_id, TaskStatus::Completed)
