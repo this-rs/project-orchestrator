@@ -711,6 +711,66 @@ mod integration_tests {
     use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
 
+    /// A no-op transport for tests — the InteractiveClient is stored in
+    /// ActiveSession but never actually used by `handle_objective_tracking`.
+    struct NoopTransport;
+
+    #[async_trait::async_trait]
+    impl nexus_claude::transport::Transport for NoopTransport {
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+        async fn connect(&mut self) -> nexus_claude::Result<()> {
+            Ok(())
+        }
+        async fn send_message(
+            &mut self,
+            _message: nexus_claude::transport::InputMessage,
+        ) -> nexus_claude::Result<()> {
+            Ok(())
+        }
+        fn receive_messages(
+            &mut self,
+        ) -> std::pin::Pin<
+            Box<
+                dyn futures::Stream<Item = nexus_claude::Result<nexus_claude::Message>>
+                    + Send
+                    + 'static,
+            >,
+        > {
+            Box::pin(futures::stream::empty())
+        }
+        async fn send_control_request(
+            &mut self,
+            _request: nexus_claude::ControlRequest,
+        ) -> nexus_claude::Result<()> {
+            Ok(())
+        }
+        async fn receive_control_response(
+            &mut self,
+        ) -> nexus_claude::Result<Option<nexus_claude::ControlResponse>> {
+            Ok(None)
+        }
+        async fn send_sdk_control_request(
+            &mut self,
+            _request: serde_json::Value,
+        ) -> nexus_claude::Result<()> {
+            Ok(())
+        }
+        async fn send_sdk_control_response(
+            &mut self,
+            _response: serde_json::Value,
+        ) -> nexus_claude::Result<()> {
+            Ok(())
+        }
+        fn is_connected(&self) -> bool {
+            false
+        }
+        async fn disconnect(&mut self) -> nexus_claude::Result<()> {
+            Ok(())
+        }
+    }
+
     /// Helper to build a PostStreamHandler with mock backends.
     async fn build_handler(
         graph: Arc<MockGraphStore>,
@@ -724,16 +784,10 @@ mod integration_tests {
             Arc::new(RwLock::new(HashMap::new()));
 
         // Insert a minimal ActiveSession with objective_tracking.
-        // We use nexus_claude::InteractiveClient::new with auto_download_cli — the client
-        // won't be used by handle_objective_tracking, but we need a valid instance
-        // to satisfy the ActiveSession struct. auto_download_cli ensures the CLI
-        // is available even in CI environments (downloaded and cached on first run).
+        // We use a NoopTransport so we don't need the real Claude CLI binary —
+        // the client is never actually used by handle_objective_tracking.
         {
-            let options = nexus_claude::ClaudeCodeOptions::builder()
-                .auto_download_cli(true)
-                .build();
-            let client = nexus_claude::InteractiveClient::new(options)
-                .expect("InteractiveClient with auto_download_cli");
+            let client = nexus_claude::InteractiveClient::from_transport(Box::new(NoopTransport));
 
             let session = ActiveSession {
                 events_tx: events_tx.clone(),
