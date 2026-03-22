@@ -11,8 +11,8 @@
 
 use super::manager::ActiveSession;
 use super::types::{ChatEvent, PendingMessage};
-use crate::neo4j::models::ChatEventRecord;
 use crate::meilisearch::SearchStore;
+use crate::neo4j::models::ChatEventRecord;
 use crate::neo4j::GraphStore;
 use nexus_claude::{
     memory::{ContextInjector, ConversationMemoryManager},
@@ -254,10 +254,7 @@ impl PostStreamHandler {
         {
             let sessions = self.active_sessions.read().await;
             if let Some(session) = sessions.get(&self.session_id) {
-                let count = session
-                    .auto_continue_count
-                    .fetch_add(1, Ordering::Relaxed)
-                    + 1;
+                let count = session.auto_continue_count.fetch_add(1, Ordering::Relaxed) + 1;
                 let max = session.max_auto_continues;
                 if max > 0 && count > max {
                     warn!(
@@ -319,10 +316,9 @@ impl PostStreamHandler {
             if !sleep_cancelled && !self.interrupt_flag.load(Ordering::SeqCst) {
                 let continue_msg = 'build_msg: {
                     if let Some(ref slug) = self.ctx.project_slug {
-                        let builder =
-                            super::compaction_context::CompactionContextBuilder::new(
-                                self.graph.clone(),
-                            );
+                        let builder = super::compaction_context::CompactionContextBuilder::new(
+                            self.graph.clone(),
+                        );
                         if let Ok(Ok(ctx)) = tokio::time::timeout(
                             std::time::Duration::from_secs(2),
                             builder.build_for_session(Some(slug.as_str())),
@@ -397,9 +393,7 @@ impl PostStreamHandler {
         {
             if let Some(ref slug) = self.ctx.project_slug {
                 let builder =
-                    super::compaction_context::CompactionContextBuilder::new(
-                        self.graph.clone(),
-                    );
+                    super::compaction_context::CompactionContextBuilder::new(self.graph.clone());
                 if let Ok(Ok(ctx)) = tokio::time::timeout(
                     std::time::Duration::from_secs(2),
                     builder.build_for_session(Some(slug.as_str())),
@@ -734,8 +728,8 @@ mod integration_tests {
         // won't be used by handle_objective_tracking.
         {
             let options = nexus_claude::ClaudeCodeOptions::default();
-            let client = nexus_claude::InteractiveClient::new(options)
-                .expect("dummy InteractiveClient");
+            let client =
+                nexus_claude::InteractiveClient::new(options).expect("dummy InteractiveClient");
 
             let session = ActiveSession {
                 events_tx: events_tx.clone(),
@@ -846,9 +840,7 @@ mod integration_tests {
         .await;
 
         // Call with had_tool_use=false → should inject reminder
-        handler
-            .handle_objective_tracking(false, false, false)
-            .await;
+        handler.handle_objective_tracking(false, false, false).await;
 
         let pending = handler.pending_messages.lock().await;
         assert_eq!(pending.len(), 1, "Expected 1 pending SystemHint message");
@@ -874,9 +866,7 @@ mod integration_tests {
         let handler = build_handler(graph, Some(slug), "test-session-2", true).await;
 
         // Call with had_tool_use=true → no reminder
-        handler
-            .handle_objective_tracking(true, false, false)
-            .await;
+        handler.handle_objective_tracking(true, false, false).await;
 
         let pending = handler.pending_messages.lock().await;
         assert!(
@@ -898,9 +888,7 @@ mod integration_tests {
         )
         .await;
 
-        handler
-            .handle_objective_tracking(false, false, false)
-            .await;
+        handler.handle_objective_tracking(false, false, false).await;
 
         let pending = handler.pending_messages.lock().await;
         assert!(
@@ -920,9 +908,7 @@ mod integration_tests {
 
         let handler = build_handler(graph, Some(slug), "test-session-4", true).await;
 
-        handler
-            .handle_objective_tracking(false, false, false)
-            .await;
+        handler.handle_objective_tracking(false, false, false).await;
 
         let pending = handler.pending_messages.lock().await;
         assert!(
@@ -939,9 +925,7 @@ mod integration_tests {
         let handler = build_handler(graph, Some(slug), "test-session-5", true).await;
 
         // First call (turn 0) → should fire
-        handler
-            .handle_objective_tracking(false, false, false)
-            .await;
+        handler.handle_objective_tracking(false, false, false).await;
         assert_eq!(
             handler.pending_messages.lock().await.len(),
             1,
@@ -952,27 +936,21 @@ mod integration_tests {
         handler.pending_messages.lock().await.clear();
 
         // Second call (turn 1, within cooldown) → should NOT fire
-        handler
-            .handle_objective_tracking(false, false, false)
-            .await;
+        handler.handle_objective_tracking(false, false, false).await;
         assert!(
             handler.pending_messages.lock().await.is_empty(),
             "Second call should be blocked by cooldown"
         );
 
         // Third call (turn 2, still within cooldown) → should NOT fire
-        handler
-            .handle_objective_tracking(false, false, false)
-            .await;
+        handler.handle_objective_tracking(false, false, false).await;
         assert!(
             handler.pending_messages.lock().await.is_empty(),
             "Third call should still be blocked by cooldown"
         );
 
         // Fourth call (turn 3, cooldown met) → should fire
-        handler
-            .handle_objective_tracking(false, false, false)
-            .await;
+        handler.handle_objective_tracking(false, false, false).await;
         assert_eq!(
             handler.pending_messages.lock().await.len(),
             1,

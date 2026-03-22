@@ -3582,8 +3582,7 @@ impl ChatManager {
 
         // ===== POST-STREAM PROCESSING =====
         // All post-stream logic delegated to PostStreamHandler (see post_stream.rs)
-        let post_ctx =
-            super::post_stream::PostStreamContext::build(&graph, session_uuid).await;
+        let post_ctx = super::post_stream::PostStreamContext::build(&graph, session_uuid).await;
         let post_handler = super::post_stream::PostStreamHandler {
             graph: graph.clone(),
             pending_messages: pending_messages.clone(),
@@ -3615,9 +3614,7 @@ impl ChatManager {
             .await;
 
         // 3. Auto-continue
-        let auto_continue_allowed = post_handler
-            .handle_auto_continue(hit_error_max_turns)
-            .await;
+        let auto_continue_allowed = post_handler.handle_auto_continue(hit_error_max_turns).await;
 
         // 4. Objective tracking
         post_handler

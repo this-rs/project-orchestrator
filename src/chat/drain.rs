@@ -7,8 +7,8 @@
 
 use super::manager::{ActiveSession, ChatManager};
 use super::types::{ChatEvent, PendingMessage, PendingMessageKind};
-use crate::neo4j::models::ChatEventRecord;
 use crate::meilisearch::SearchStore;
+use crate::neo4j::models::ChatEventRecord;
 use crate::neo4j::GraphStore;
 use nexus_claude::{
     memory::{ContextInjector, ConversationMemoryManager},
