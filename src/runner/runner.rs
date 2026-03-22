@@ -5375,7 +5375,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_check_step_coherence_all_pending_returns_false() {
-        use crate::neo4j::models::{StepStatus, TaskStatus};
+        use crate::neo4j::models::TaskStatus;
         use crate::test_helpers::{test_plan, test_step, test_task};
 
         let (runner, graph) = test_plan_runner_with_graph();
