@@ -3710,13 +3710,48 @@ impl ChatManager {
             };
 
             if !sleep_cancelled && !interrupt_flag.load(Ordering::SeqCst) {
-                // Enqueue "Continue" — the drain below will pick it up and recurse
+                // Build enriched auto-continue message with remaining objectives.
+                // Best-effort: if context build fails or times out, fall back to plain "Continue".
+                let continue_msg = 'build_msg: {
+                    let slug = if let Some(uuid) = session_uuid {
+                        match graph.get_chat_session(uuid).await {
+                            Ok(Some(node)) => node.project_slug,
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+
+                    if let Some(ref slug) = slug {
+                        let builder = super::compaction_context::CompactionContextBuilder::new(
+                            graph.clone(),
+                        );
+                        // Timeout at 2s to avoid blocking the stream too long
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(2),
+                            builder.build_for_session(Some(slug.as_str())),
+                        )
+                        .await
+                        {
+                            Ok(Ok(ctx)) => {
+                                let objectives = ctx.pending_objectives_oneliner();
+                                if !objectives.is_empty() {
+                                    break 'build_msg format!("Continue.{objectives}");
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    "Continue".to_string()
+                };
+
+                // Enqueue enriched continue message — the drain below will pick it up and recurse
                 pending_messages
                     .lock()
                     .await
-                    .push_back("Continue".to_string());
+                    .push_back(continue_msg);
                 debug!(
-                    "Auto-continue: enqueued 'Continue' for session {}",
+                    "Auto-continue: enqueued enriched 'Continue' for session {}",
                     session_id
                 );
             } else {
