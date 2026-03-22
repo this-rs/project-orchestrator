@@ -1360,6 +1360,26 @@ impl PlanRunner {
                 .unwrap_or_else(|| "untitled".to_string());
             task_start_times.insert(task_id, chrono::Utc::now());
 
+            // Mark the first step of this task as in_progress for live feedback
+            if let Ok(steps) = self.graph.get_task_steps(task_id).await {
+                if let Some(first_step) = steps.iter().find(|s| {
+                    s.status == crate::neo4j::models::StepStatus::Pending
+                }) {
+                    if let Err(e) = self
+                        .graph
+                        .update_step_status(
+                            first_step.id,
+                            crate::neo4j::models::StepStatus::InProgress,
+                        )
+                        .await
+                    {
+                        warn!("Failed to mark first step in_progress for task {}: {}", task_id, e);
+                    } else {
+                        debug!("Marked step {} as in_progress at task {} launch", first_step.id, task_id);
+                    }
+                }
+            }
+
             let runner = self.clone();
             let cwd = cwd.to_string();
             let project_slug = project_slug.map(|s| s.to_string());
