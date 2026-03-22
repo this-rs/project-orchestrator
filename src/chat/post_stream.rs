@@ -732,8 +732,8 @@ mod integration_tests {
             let options = nexus_claude::ClaudeCodeOptions::builder()
                 .auto_download_cli(true)
                 .build();
-            let client =
-                nexus_claude::InteractiveClient::new(options).expect("InteractiveClient with auto_download_cli");
+            let client = nexus_claude::InteractiveClient::new(options)
+                .expect("InteractiveClient with auto_download_cli");
 
             let session = ActiveSession {
                 events_tx: events_tx.clone(),
