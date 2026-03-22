@@ -2495,6 +2495,8 @@ impl PlanRunner {
             task_timeout: Duration::from_secs(task_profile.timeout_secs),
             spawning_timeout: Duration::from_secs(self.config.spawning_timeout_secs),
             loop_threshold: 3,
+            completion_loop_threshold: self.config.completion_loop_threshold,
+            completion_max_chars: self.config.completion_max_chars,
             ..Default::default()
         };
         let hint_sender = Arc::new(ChatManagerHintSender {

@@ -53,6 +53,10 @@ pub struct GuardConfig {
     pub loop_threshold: usize,
     /// Interval between idle/timeout checks (default 5s)
     pub check_interval: Duration,
+    /// Number of consecutive "I'm done" signals before CompletionLoopDetected. Default: 5.
+    pub completion_loop_threshold: usize,
+    /// Maximum message length (chars) to consider as a completion signal. Default: 200.
+    pub completion_max_chars: usize,
 }
 
 impl Default for GuardConfig {
@@ -63,6 +67,8 @@ impl Default for GuardConfig {
             spawning_timeout: Duration::from_secs(120),
             loop_threshold: 3,
             check_interval: Duration::from_secs(5),
+            completion_loop_threshold: 5,
+            completion_max_chars: 200,
         }
     }
 }
@@ -174,7 +180,7 @@ impl AgentGuard {
         // If the agent says "done/complete/terminé" N times in a row without
         // any tool_use in between, it's stuck in a completion loop.
         let mut completion_signals: usize = 0;
-        const COMPLETION_LOOP_THRESHOLD: usize = 3;
+        let mut recent_completion_messages: VecDeque<String> = VecDeque::with_capacity(4);
 
         loop {
             let remaining_timeout = self.config.task_timeout.saturating_sub(start.elapsed());
@@ -231,12 +237,19 @@ impl AgentGuard {
                             last_activity = Instant::now();
                             idle_warned = false;
 
-                            if is_completion_message(content) {
+                            if is_completion_message(content, self.config.completion_max_chars) {
                                 completion_signals += 1;
-                                if completion_signals >= COMPLETION_LOOP_THRESHOLD {
-                                    info!(
-                                        "Guard: completion loop detected — agent said 'done' {}x, treating as completed",
-                                        completion_signals
+                                // Track recent completion messages for warn log
+                                recent_completion_messages.push_back(content.clone());
+                                if recent_completion_messages.len() > 3 {
+                                    recent_completion_messages.pop_front();
+                                }
+                                if completion_signals >= self.config.completion_loop_threshold {
+                                    warn!(
+                                        "Guard: CompletionLoopDetected — agent said 'done' {}x in a row. Last {} messages: {:?}",
+                                        completion_signals,
+                                        recent_completion_messages.len(),
+                                        recent_completion_messages.iter().collect::<Vec<_>>()
                                     );
                                     return GuardVerdict::CompletionLoopDetected;
                                 }
@@ -387,11 +400,11 @@ impl AgentGuard {
 /// "all work is done", "task is complete", "nothing more to do", etc.
 /// Used to detect post-completion loops where the agent keeps repeating
 /// that it's finished without actually producing any work.
-fn is_completion_message(text: &str) -> bool {
+fn is_completion_message(text: &str, max_chars: usize) -> bool {
     let lower = text.to_lowercase();
-    // Only match if the message is relatively short (< 500 chars)
+    // Only match if the message is relatively short (< max_chars)
     // Long messages are likely real explanations, not completion signals
-    if lower.len() > 500 {
+    if lower.len() > max_chars {
         return false;
     }
     let patterns = [
@@ -438,6 +451,8 @@ mod tests {
         assert_eq!(config.task_timeout.as_secs(), 10800);
         assert_eq!(config.loop_threshold, 3);
         assert_eq!(config.check_interval.as_secs(), 5);
+        assert_eq!(config.completion_loop_threshold, 5);
+        assert_eq!(config.completion_max_chars, 200);
     }
 
     #[test]
@@ -1000,33 +1015,35 @@ mod tests {
 
     #[test]
     fn test_is_completion_message_detects_done_patterns() {
+        let max = 200;
         // English patterns
-        assert!(is_completion_message("The task is complete."));
-        assert!(is_completion_message("Task is done, nothing more to do."));
-        assert!(is_completion_message("All work is done."));
-        assert!(is_completion_message("All steps are done."));
+        assert!(is_completion_message("The task is complete.", max));
+        assert!(is_completion_message("Task is done, nothing more to do.", max));
+        assert!(is_completion_message("All work is done.", max));
+        assert!(is_completion_message("All steps are done.", max));
         assert!(is_completion_message(
-            "All changes are committed and pushed."
+            "All changes are committed and pushed.",
+            max
         ));
-        assert!(is_completion_message("Work is done!"));
-        assert!(is_completion_message("ALL DONE"));
+        assert!(is_completion_message("Work is done!", max));
+        assert!(is_completion_message("ALL DONE", max));
 
         // French patterns
-        assert!(is_completion_message("La tâche terminée avec succès."));
-        assert!(is_completion_message("Tout est fait."));
-        assert!(is_completion_message("Le travail terminé."));
+        assert!(is_completion_message("La tâche terminée avec succès.", max));
+        assert!(is_completion_message("Tout est fait.", max));
+        assert!(is_completion_message("Le travail terminé.", max));
 
         // Should NOT match normal messages
-        assert!(!is_completion_message("I'm reading the file now..."));
-        assert!(!is_completion_message("Let me check the implementation."));
-        assert!(!is_completion_message("Running cargo check..."));
-        // Should NOT match very long messages (agent reasoning)
-        assert!(!is_completion_message(&"x".repeat(600)));
+        assert!(!is_completion_message("I'm reading the file now...", max));
+        assert!(!is_completion_message("Let me check the implementation.", max));
+        assert!(!is_completion_message("Running cargo check...", max));
+        // Should NOT match messages longer than max_chars (agent reasoning)
+        assert!(!is_completion_message(&format!("All done. {}", "x".repeat(250)), max));
     }
 
     #[tokio::test]
     async fn test_guard_completion_loop_detected() {
-        // When the agent sends 3+ consecutive "I'm done" messages without any
+        // When the agent sends N consecutive "I'm done" messages without any
         // tool_use in between, the guard should return CompletionLoopDetected.
         let (tx, rx) = broadcast::channel::<ChatEvent>(16);
         let config = GuardConfig {
@@ -1034,6 +1051,7 @@ mod tests {
             task_timeout: Duration::from_secs(5),
             loop_threshold: 3,
             check_interval: Duration::from_millis(20),
+            completion_loop_threshold: 3, // Use 3 for this test
             ..Default::default()
         };
 
@@ -1140,5 +1158,225 @@ mod tests {
             "Expected Completed (reset by ToolUse), got {:?}",
             verdict
         );
+    }
+
+    // ========================================================================
+    // Completion loop — configurable threshold and max_chars tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_completion_loop_threshold_5_requires_5_signals() {
+        // With default threshold=5, 4 completion messages should NOT trigger detection.
+        // Only the 5th should.
+        let (tx, rx) = broadcast::channel::<ChatEvent>(32);
+        let config = GuardConfig {
+            idle_timeout: Duration::from_secs(100),
+            task_timeout: Duration::from_secs(5),
+            loop_threshold: 3,
+            check_interval: Duration::from_millis(20),
+            completion_loop_threshold: 5, // default
+            completion_max_chars: 200,
+            ..Default::default()
+        };
+
+        let guard = AgentGuard::new(
+            "test-session".to_string(),
+            "Test Task".to_string(),
+            Uuid::new_v4(),
+            config,
+            rx,
+            None,
+            None,
+            None,
+        );
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let msgs = [
+                "Task is complete.",
+                "All done.",
+                "Nothing more to do.",
+                "Work is done!",
+                "Tout est fait.",
+            ];
+            for msg in &msgs {
+                let _ = tx.send(ChatEvent::AssistantText {
+                    content: msg.to_string(),
+                    parent_tool_use_id: None,
+                });
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+
+        let verdict = guard.monitor().await;
+        assert!(
+            matches!(verdict, GuardVerdict::CompletionLoopDetected),
+            "Expected CompletionLoopDetected after 5 signals, got {:?}",
+            verdict
+        );
+    }
+
+    #[tokio::test]
+    async fn test_completion_loop_long_messages_not_counted() {
+        // Messages longer than completion_max_chars should NOT count as completion signals.
+        // Even with threshold=3, 3 long "done" messages should not trigger.
+        let (tx, rx) = broadcast::channel::<ChatEvent>(32);
+        let config = GuardConfig {
+            idle_timeout: Duration::from_secs(100),
+            task_timeout: Duration::from_secs(2),
+            loop_threshold: 3,
+            check_interval: Duration::from_millis(20),
+            completion_loop_threshold: 3,
+            completion_max_chars: 200,
+            ..Default::default()
+        };
+
+        let guard = AgentGuard::new(
+            "test-session".to_string(),
+            "Test Task".to_string(),
+            Uuid::new_v4(),
+            config,
+            rx,
+            None,
+            None,
+            None,
+        );
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            // Send 3 long messages containing completion patterns — should NOT trigger
+            for _ in 0..3 {
+                let long_msg = format!(
+                    "All done. Here is a detailed explanation of everything I did: {}",
+                    "x".repeat(250)
+                );
+                let _ = tx.send(ChatEvent::AssistantText {
+                    content: long_msg,
+                    parent_tool_use_id: None,
+                });
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            // End with Result so guard finishes
+            let _ = tx.send(ChatEvent::Result {
+                session_id: "test".to_string(),
+                duration_ms: 100,
+                cost_usd: Some(0.01),
+                subtype: "success".to_string(),
+                is_error: false,
+                num_turns: Some(3),
+                result_text: None,
+            });
+        });
+
+        let verdict = guard.monitor().await;
+        assert!(
+            matches!(verdict, GuardVerdict::Completed),
+            "Expected Completed (long messages not counted), got {:?}",
+            verdict
+        );
+    }
+
+    #[tokio::test]
+    async fn test_completion_loop_reset_by_tool_result() {
+        // ToolResult events should also reset the completion counter
+        let (tx, rx) = broadcast::channel::<ChatEvent>(32);
+        let config = GuardConfig {
+            idle_timeout: Duration::from_secs(100),
+            task_timeout: Duration::from_secs(5),
+            loop_threshold: 3,
+            check_interval: Duration::from_millis(20),
+            completion_loop_threshold: 3,
+            completion_max_chars: 200,
+            ..Default::default()
+        };
+
+        let guard = AgentGuard::new(
+            "test-session".to_string(),
+            "Test Task".to_string(),
+            Uuid::new_v4(),
+            config,
+            rx,
+            None,
+            None,
+            None,
+        );
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            // 2 completion messages
+            let _ = tx.send(ChatEvent::AssistantText {
+                content: "All done.".to_string(),
+                parent_tool_use_id: None,
+            });
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let _ = tx.send(ChatEvent::AssistantText {
+                content: "Task is complete.".to_string(),
+                parent_tool_use_id: None,
+            });
+            tokio::time::sleep(Duration::from_millis(10)).await;
+
+            // ToolResult resets the counter
+            let _ = tx.send(ChatEvent::ToolResult {
+                id: "tu_1".to_string(),
+                result: serde_json::json!("ok"),
+                is_error: false,
+                parent_tool_use_id: None,
+            });
+            tokio::time::sleep(Duration::from_millis(10)).await;
+
+            // 2 more completion messages (counter = 2, below threshold of 3)
+            let _ = tx.send(ChatEvent::AssistantText {
+                content: "All done.".to_string(),
+                parent_tool_use_id: None,
+            });
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let _ = tx.send(ChatEvent::AssistantText {
+                content: "Work is done!".to_string(),
+                parent_tool_use_id: None,
+            });
+            tokio::time::sleep(Duration::from_millis(10)).await;
+
+            // End with Result
+            let _ = tx.send(ChatEvent::Result {
+                session_id: "test".to_string(),
+                duration_ms: 100,
+                cost_usd: Some(0.01),
+                subtype: "success".to_string(),
+                is_error: false,
+                num_turns: Some(3),
+                result_text: None,
+            });
+        });
+
+        let verdict = guard.monitor().await;
+        assert!(
+            matches!(verdict, GuardVerdict::Completed),
+            "Expected Completed (reset by ToolResult), got {:?}",
+            verdict
+        );
+    }
+
+    #[test]
+    fn test_is_completion_message_respects_max_chars() {
+        // Short message with pattern → true
+        assert!(is_completion_message("All done.", 200));
+        // Same pattern but message > max_chars → false
+        assert!(!is_completion_message(
+            &format!("All done. {}", "x".repeat(250)),
+            200
+        ));
+        // Custom max_chars: 50
+        assert!(is_completion_message("All done.", 50));
+        assert!(!is_completion_message(
+            "Task is complete. Let me also mention a few things about the implementation.",
+            50
+        ));
+    }
+
+    #[test]
+    fn test_runner_config_completion_defaults() {
+        let config = crate::runner::models::RunnerConfig::default();
+        assert_eq!(config.completion_loop_threshold, 5);
+        assert_eq!(config.completion_max_chars, 200);
     }
 }

@@ -42,6 +42,11 @@ pub struct RunnerConfig {
     /// - "warn" (default): log a warning and emit CwdMismatch event, but continue
     /// - "strict": return an error if cwd doesn't match root_path
     pub cwd_validation: CwdValidation,
+    /// Number of consecutive "I'm done" signals before treating the agent as stuck. Default: 5.
+    pub completion_loop_threshold: usize,
+    /// Maximum message length (chars) to consider as a completion signal. Default: 200.
+    /// Messages longer than this are treated as real explanations, not completion loops.
+    pub completion_max_chars: usize,
 }
 
 /// CWD validation mode for the runner.
@@ -67,6 +72,8 @@ impl Default for RunnerConfig {
             max_cost_usd: 10.0,
             spawning_timeout_secs: 120,
             cwd_validation: CwdValidation::default(),
+            completion_loop_threshold: 5,
+            completion_max_chars: 200,
         }
     }
 }
