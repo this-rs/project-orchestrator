@@ -127,10 +127,7 @@ pub fn should_step_guard_trigger(breakdown: &StepBreakdown) -> bool {
 /// - `missing` = list of files that don't exist on disk
 ///
 /// Pure function — no side effects.
-pub fn validate_affected_files(
-    affected_files: &[String],
-    cwd: &str,
-) -> (bool, Vec<String>) {
+pub fn validate_affected_files(affected_files: &[String], cwd: &str) -> (bool, Vec<String>) {
     if affected_files.is_empty() {
         return (true, vec![]);
     }
@@ -1323,15 +1320,9 @@ impl PlanRunner {
         // Compute final run status based on task outcomes
         let final_status = {
             let tasks = self.graph.get_plan_tasks(plan_id).await.unwrap_or_default();
-            let has_failed = tasks
-                .iter()
-                .any(|t| t.status == TaskStatus::Failed);
-            let has_blocked = tasks
-                .iter()
-                .any(|t| t.status == TaskStatus::Blocked);
-            let has_pending = tasks
-                .iter()
-                .any(|t| t.status == TaskStatus::Pending);
+            let has_failed = tasks.iter().any(|t| t.status == TaskStatus::Failed);
+            let has_blocked = tasks.iter().any(|t| t.status == TaskStatus::Blocked);
+            let has_pending = tasks.iter().any(|t| t.status == TaskStatus::Pending);
 
             if has_failed || has_blocked || has_pending {
                 info!(
@@ -1344,8 +1335,7 @@ impl PlanRunner {
             }
         };
 
-        self.finalize_run(run_id, final_status, Some(&cwd))
-            .await?;
+        self.finalize_run(run_id, final_status, Some(&cwd)).await?;
         Ok(())
     }
 
@@ -1421,9 +1411,10 @@ impl PlanRunner {
 
             // Mark the first step of this task as in_progress for live feedback
             if let Ok(steps) = self.graph.get_task_steps(task_id).await {
-                if let Some(first_step) = steps.iter().find(|s| {
-                    s.status == crate::neo4j::models::StepStatus::Pending
-                }) {
+                if let Some(first_step) = steps
+                    .iter()
+                    .find(|s| s.status == crate::neo4j::models::StepStatus::Pending)
+                {
                     if let Err(e) = self
                         .graph
                         .update_step_status(
@@ -1432,9 +1423,15 @@ impl PlanRunner {
                         )
                         .await
                     {
-                        warn!("Failed to mark first step in_progress for task {}: {}", task_id, e);
+                        warn!(
+                            "Failed to mark first step in_progress for task {}: {}",
+                            task_id, e
+                        );
                     } else {
-                        debug!("Marked step {} as in_progress at task {} launch", first_step.id, task_id);
+                        debug!(
+                            "Marked step {} as in_progress at task {} launch",
+                            first_step.id, task_id
+                        );
                     }
                 }
             }
@@ -1449,9 +1446,7 @@ impl PlanRunner {
                     );
                     self.update_task_status_with_event(task_id, TaskStatus::Blocked)
                         .await?;
-                    wave_result
-                        .tasks_failed
-                        .push((task_id, task_title.clone()));
+                    wave_result.tasks_failed.push((task_id, task_title.clone()));
                     continue;
                 }
                 if !missing.is_empty() {
@@ -1674,81 +1669,81 @@ impl PlanRunner {
                         wave_result.tasks_completed.push(task_id);
                         wave_result.wave_cost_usd += cost_usd;
                     } else {
-                    self.on_task_failed(run_id, plan_id, task_id, &reason, 0.0, cost_usd)
-                        .await?;
-                    wave_result.tasks_failed.push((task_id, reason));
-                    wave_result.wave_cost_usd += cost_usd;
+                        self.on_task_failed(run_id, plan_id, task_id, &reason, 0.0, cost_usd)
+                            .await?;
+                        wave_result.tasks_failed.push((task_id, reason));
+                        wave_result.wave_cost_usd += cost_usd;
 
-                    // Fire-and-forget: finalize AgentExecution node (failure)
-                    if let Some(ae_id) = task_agent_execution_id {
-                        let graph = self.graph.clone();
-                        let persona = task_persona.clone();
-                        tokio::spawn(async move {
-                            use crate::neo4j::agent_execution::{
-                                AgentExecutionNode, AgentExecutionStatus,
-                            };
-                            let ae = AgentExecutionNode {
-                                id: ae_id,
-                                run_id,
-                                task_id,
-                                session_id: task_session_id,
-                                started_at: task_start_time,
-                                completed_at: Some(chrono::Utc::now()),
-                                cost_usd,
-                                duration_secs: 0.0,
-                                status: AgentExecutionStatus::Failed,
-                                tools_used: "{}".to_string(),
-                                files_modified: vec![],
-                                commits: vec![],
-                                persona_profile: persona,
-                                vector_json: None,
-                                report_json: None,
-                                execution_type: Default::default(),
-                            };
-                            if let Err(e) = graph.update_agent_execution(&ae).await {
-                                warn!("Failed to update AgentExecution {}: {}", ae_id, e);
-                            }
-                        });
-                    }
+                        // Fire-and-forget: finalize AgentExecution node (failure)
+                        if let Some(ae_id) = task_agent_execution_id {
+                            let graph = self.graph.clone();
+                            let persona = task_persona.clone();
+                            tokio::spawn(async move {
+                                use crate::neo4j::agent_execution::{
+                                    AgentExecutionNode, AgentExecutionStatus,
+                                };
+                                let ae = AgentExecutionNode {
+                                    id: ae_id,
+                                    run_id,
+                                    task_id,
+                                    session_id: task_session_id,
+                                    started_at: task_start_time,
+                                    completed_at: Some(chrono::Utc::now()),
+                                    cost_usd,
+                                    duration_secs: 0.0,
+                                    status: AgentExecutionStatus::Failed,
+                                    tools_used: "{}".to_string(),
+                                    files_modified: vec![],
+                                    commits: vec![],
+                                    persona_profile: persona,
+                                    vector_json: None,
+                                    report_json: None,
+                                    execution_type: Default::default(),
+                                };
+                                if let Err(e) = graph.update_agent_execution(&ae).await {
+                                    warn!("Failed to update AgentExecution {}: {}", ae_id, e);
+                                }
+                            });
+                        }
 
-                    // Fire-and-forget skill feedback + USED_SKILL (failure)
-                    if !task_activated_skills.is_empty() {
-                        let graph = self.graph.clone();
-                        let skills = task_activated_skills;
-                        let ae_id = task_agent_execution_id;
-                        tokio::spawn(async move {
-                            record_skill_feedback(
-                                graph.clone(),
-                                task_id,
-                                run_id,
-                                skills.clone(),
-                                false,
-                                cost_usd,
-                                0.0,
-                            )
-                            .await;
-                            if let Some(ae_id) = ae_id {
-                                for skill_id in &skills {
-                                    if let Err(e) = graph
-                                        .create_used_skill_relation(ae_id, *skill_id, "failure")
-                                        .await
-                                    {
-                                        warn!("Failed to create USED_SKILL relation: {}", e);
+                        // Fire-and-forget skill feedback + USED_SKILL (failure)
+                        if !task_activated_skills.is_empty() {
+                            let graph = self.graph.clone();
+                            let skills = task_activated_skills;
+                            let ae_id = task_agent_execution_id;
+                            tokio::spawn(async move {
+                                record_skill_feedback(
+                                    graph.clone(),
+                                    task_id,
+                                    run_id,
+                                    skills.clone(),
+                                    false,
+                                    cost_usd,
+                                    0.0,
+                                )
+                                .await;
+                                if let Some(ae_id) = ae_id {
+                                    for skill_id in &skills {
+                                        if let Err(e) = graph
+                                            .create_used_skill_relation(ae_id, *skill_id, "failure")
+                                            .await
+                                        {
+                                            warn!("Failed to create USED_SKILL relation: {}", e);
+                                        }
                                     }
                                 }
-                            }
-                        });
-                    }
+                            });
+                        }
 
-                    // Fire-and-forget persona feedback (failure)
-                    if !task_persona_ids.is_empty() {
-                        let graph = self.graph.clone();
-                        let pids = task_persona_ids;
-                        tokio::spawn(async move {
-                            crate::runner::persona::record_persona_feedback(graph, pids, false)
-                                .await;
-                        });
-                    }
+                        // Fire-and-forget persona feedback (failure)
+                        if !task_persona_ids.is_empty() {
+                            let graph = self.graph.clone();
+                            let pids = task_persona_ids;
+                            tokio::spawn(async move {
+                                crate::runner::persona::record_persona_feedback(graph, pids, false)
+                                    .await;
+                            });
+                        }
                     } // end else (step coherence check)
                 }
                 Ok(TaskResult::Timeout {
@@ -1767,96 +1762,96 @@ impl PlanRunner {
                         wave_result.tasks_completed.push(task_id);
                         wave_result.wave_cost_usd += cost_usd;
                     } else {
-                    self.emit_event(RunnerEvent::TaskTimeout {
-                        run_id,
-                        task_id,
-                        task_title: task_title.clone(),
-                        duration_secs,
-                    });
-                    self.on_task_failed(
-                        run_id,
-                        plan_id,
-                        task_id,
-                        "Task timeout",
-                        duration_secs,
-                        cost_usd,
-                    )
-                    .await?;
-                    wave_result
-                        .tasks_failed
-                        .push((task_id, "Task timeout".to_string()));
-                    wave_result.wave_cost_usd += cost_usd;
-
-                    // Fire-and-forget: finalize AgentExecution (timeout)
-                    if let Some(ae_id) = task_agent_execution_id {
-                        let graph = self.graph.clone();
-                        let persona = task_persona.clone();
-                        tokio::spawn(async move {
-                            use crate::neo4j::agent_execution::{
-                                AgentExecutionNode, AgentExecutionStatus,
-                            };
-                            let ae = AgentExecutionNode {
-                                id: ae_id,
-                                run_id,
-                                task_id,
-                                session_id: task_session_id,
-                                started_at: task_start_time,
-                                completed_at: Some(chrono::Utc::now()),
-                                cost_usd,
-                                duration_secs,
-                                status: AgentExecutionStatus::Timeout,
-                                tools_used: "{}".to_string(),
-                                files_modified: vec![],
-                                commits: vec![],
-                                persona_profile: persona,
-                                vector_json: None,
-                                report_json: None,
-                                execution_type: Default::default(),
-                            };
-                            if let Err(e) = graph.update_agent_execution(&ae).await {
-                                warn!("Failed to update AgentExecution {}: {}", ae_id, e);
-                            }
+                        self.emit_event(RunnerEvent::TaskTimeout {
+                            run_id,
+                            task_id,
+                            task_title: task_title.clone(),
+                            duration_secs,
                         });
-                    }
+                        self.on_task_failed(
+                            run_id,
+                            plan_id,
+                            task_id,
+                            "Task timeout",
+                            duration_secs,
+                            cost_usd,
+                        )
+                        .await?;
+                        wave_result
+                            .tasks_failed
+                            .push((task_id, "Task timeout".to_string()));
+                        wave_result.wave_cost_usd += cost_usd;
 
-                    // Fire-and-forget skill feedback + USED_SKILL (timeout = failure)
-                    if !task_activated_skills.is_empty() {
-                        let graph = self.graph.clone();
-                        let skills = task_activated_skills;
-                        let ae_id = task_agent_execution_id;
-                        tokio::spawn(async move {
-                            record_skill_feedback(
-                                graph.clone(),
-                                task_id,
-                                run_id,
-                                skills.clone(),
-                                false,
-                                cost_usd,
-                                duration_secs,
-                            )
-                            .await;
-                            if let Some(ae_id) = ae_id {
-                                for skill_id in &skills {
-                                    if let Err(e) = graph
-                                        .create_used_skill_relation(ae_id, *skill_id, "failure")
-                                        .await
-                                    {
-                                        warn!("Failed to create USED_SKILL relation: {}", e);
+                        // Fire-and-forget: finalize AgentExecution (timeout)
+                        if let Some(ae_id) = task_agent_execution_id {
+                            let graph = self.graph.clone();
+                            let persona = task_persona.clone();
+                            tokio::spawn(async move {
+                                use crate::neo4j::agent_execution::{
+                                    AgentExecutionNode, AgentExecutionStatus,
+                                };
+                                let ae = AgentExecutionNode {
+                                    id: ae_id,
+                                    run_id,
+                                    task_id,
+                                    session_id: task_session_id,
+                                    started_at: task_start_time,
+                                    completed_at: Some(chrono::Utc::now()),
+                                    cost_usd,
+                                    duration_secs,
+                                    status: AgentExecutionStatus::Timeout,
+                                    tools_used: "{}".to_string(),
+                                    files_modified: vec![],
+                                    commits: vec![],
+                                    persona_profile: persona,
+                                    vector_json: None,
+                                    report_json: None,
+                                    execution_type: Default::default(),
+                                };
+                                if let Err(e) = graph.update_agent_execution(&ae).await {
+                                    warn!("Failed to update AgentExecution {}: {}", ae_id, e);
+                                }
+                            });
+                        }
+
+                        // Fire-and-forget skill feedback + USED_SKILL (timeout = failure)
+                        if !task_activated_skills.is_empty() {
+                            let graph = self.graph.clone();
+                            let skills = task_activated_skills;
+                            let ae_id = task_agent_execution_id;
+                            tokio::spawn(async move {
+                                record_skill_feedback(
+                                    graph.clone(),
+                                    task_id,
+                                    run_id,
+                                    skills.clone(),
+                                    false,
+                                    cost_usd,
+                                    duration_secs,
+                                )
+                                .await;
+                                if let Some(ae_id) = ae_id {
+                                    for skill_id in &skills {
+                                        if let Err(e) = graph
+                                            .create_used_skill_relation(ae_id, *skill_id, "failure")
+                                            .await
+                                        {
+                                            warn!("Failed to create USED_SKILL relation: {}", e);
+                                        }
                                     }
                                 }
-                            }
-                        });
-                    }
+                            });
+                        }
 
-                    // Fire-and-forget persona feedback (timeout = failure)
-                    if !task_persona_ids.is_empty() {
-                        let graph = self.graph.clone();
-                        let pids = task_persona_ids;
-                        tokio::spawn(async move {
-                            crate::runner::persona::record_persona_feedback(graph, pids, false)
-                                .await;
-                        });
-                    }
+                        // Fire-and-forget persona feedback (timeout = failure)
+                        if !task_persona_ids.is_empty() {
+                            let graph = self.graph.clone();
+                            let pids = task_persona_ids;
+                            tokio::spawn(async move {
+                                crate::runner::persona::record_persona_feedback(graph, pids, false)
+                                    .await;
+                            });
+                        }
                     } // end else (step coherence check for timeout)
                 }
                 Ok(TaskResult::BudgetExceeded {
@@ -1901,9 +1896,15 @@ impl PlanRunner {
                         tokio::spawn(async move {
                             let sid_str = sid.to_string();
                             if let Err(e) = chat_manager.close_session(&sid_str).await {
-                                warn!("Failed to close agent session {} after task blocked: {}", sid_str, e);
+                                warn!(
+                                    "Failed to close agent session {} after task blocked: {}",
+                                    sid_str, e
+                                );
                             } else {
-                                debug!("Closed agent session {} after task {} blocked", sid_str, task_id);
+                                debug!(
+                                    "Closed agent session {} after task {} blocked",
+                                    sid_str, task_id
+                                );
                             }
                         });
                     }
@@ -2064,8 +2065,14 @@ impl PlanRunner {
                                 "Retry succeeded for task {} ({}) in {:.1}s",
                                 task_id, task_title, duration_secs
                             );
-                            self.on_task_completed(run_id, *task_id, duration_secs, cost_usd, Some(cwd))
-                                .await?;
+                            self.on_task_completed(
+                                run_id,
+                                *task_id,
+                                duration_secs,
+                                cost_usd,
+                                Some(cwd),
+                            )
+                            .await?;
                             // Move from failed to completed
                             wave_result.tasks_failed.retain(|(tid, _)| tid != task_id);
                             wave_result.tasks_completed.push(*task_id);
@@ -3011,9 +3018,9 @@ impl PlanRunner {
             return None;
         }
 
-        let all_completed = steps.iter().all(|s| {
-            s.status == crate::neo4j::models::StepStatus::Completed
-        });
+        let all_completed = steps
+            .iter()
+            .all(|s| s.status == crate::neo4j::models::StepStatus::Completed);
 
         if all_completed {
             return Some(true);
@@ -3107,9 +3114,15 @@ impl PlanRunner {
             tokio::spawn(async move {
                 let sid_str = sid.to_string();
                 if let Err(e) = chat_manager.close_session(&sid_str).await {
-                    warn!("Failed to close agent session {} after task completion: {}", sid_str, e);
+                    warn!(
+                        "Failed to close agent session {} after task completion: {}",
+                        sid_str, e
+                    );
                 } else {
-                    debug!("Closed agent session {} after task {} completed", sid_str, task_id);
+                    debug!(
+                        "Closed agent session {} after task {} completed",
+                        sid_str, task_id
+                    );
                 }
             });
         }
@@ -3230,9 +3243,15 @@ impl PlanRunner {
             tokio::spawn(async move {
                 let sid_str = sid.to_string();
                 if let Err(e) = chat_manager.close_session(&sid_str).await {
-                    warn!("Failed to close agent session {} after task failure: {}", sid_str, e);
+                    warn!(
+                        "Failed to close agent session {} after task failure: {}",
+                        sid_str, e
+                    );
                 } else {
-                    debug!("Closed agent session {} after task {} failed (final)", sid_str, task_id);
+                    debug!(
+                        "Closed agent session {} after task {} failed (final)",
+                        sid_str, task_id
+                    );
                 }
             });
         }
@@ -5571,9 +5590,7 @@ mod tests {
     #[test]
     fn test_validate_affected_files_at_least_one_exists() {
         // Use a file that always exists on any system
-        let files = vec![
-            "nonexistent/foo.rs".to_string(),
-        ];
+        let files = vec!["nonexistent/foo.rs".to_string()];
         // /tmp should exist, but none of the relative files do
         let (valid, _) = validate_affected_files(&files, "/tmp");
         assert!(!valid);
@@ -5735,5 +5752,236 @@ mod tests {
         );
         assert!(json.contains("steps_skipped"));
         let _: RunnerEvent = serde_json::from_str(&json).unwrap();
+    }
+
+    // === T7 skipped step: test session cleanup after on_task_completed ===
+
+    #[tokio::test]
+    async fn test_on_task_completed_removes_agent_from_active_agents() {
+        use crate::neo4j::models::TaskStatus;
+        use crate::test_helpers::{test_plan, test_task};
+
+        let (runner, graph) = test_plan_runner_with_graph();
+
+        let plan = test_plan();
+        let plan_id = plan.id;
+        graph.create_plan(&plan).await.unwrap();
+
+        let mut task = test_task();
+        task.status = TaskStatus::InProgress;
+        let task_id = task.id;
+        graph.create_task(plan_id, &task).await.unwrap();
+
+        // Set up RUNNER_STATE with an active agent for this task
+        let run_id = Uuid::new_v4();
+        {
+            let mut global = RUNNER_STATE.write().await;
+            let mut state = RunnerState::new(run_id, plan_id, 1, TriggerSource::Manual);
+            state.add_agent(ActiveAgent::new(task_id, "test task".to_string()));
+            *global = Some(state);
+        }
+
+        // Verify agent is present before
+        {
+            let global = RUNNER_STATE.read().await;
+            assert!(
+                global.as_ref().unwrap().get_agent(&task_id).is_some(),
+                "Agent should be present before on_task_completed"
+            );
+        }
+
+        // Call on_task_completed
+        runner
+            .on_task_completed(run_id, task_id, 10.0, 0.5, None)
+            .await
+            .unwrap();
+
+        // Verify agent is removed after
+        {
+            let global = RUNNER_STATE.read().await;
+            assert!(
+                global.as_ref().unwrap().get_agent(&task_id).is_none(),
+                "Agent should be removed after on_task_completed"
+            );
+        }
+
+        // Verify task status is completed
+        let updated_task = graph.get_task(task_id).await.unwrap().unwrap();
+        assert_eq!(updated_task.status, TaskStatus::Completed);
+
+        // Cleanup
+        {
+            let mut global = RUNNER_STATE.write().await;
+            *global = None;
+        }
+    }
+
+    // === T3 skipped step: test run_cargo_fmt ===
+
+    #[tokio::test]
+    async fn test_run_cargo_fmt_success_in_valid_project() {
+        // Use the project-orchestrator itself as a valid Cargo project
+        let cwd = env!("CARGO_MANIFEST_DIR");
+        let result = PlanRunner::run_cargo_fmt(cwd).await;
+        assert!(
+            result.is_ok(),
+            "cargo fmt should succeed on this project: {:?}",
+            result.err()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_cargo_fmt_fails_in_non_cargo_dir() {
+        let result = PlanRunner::run_cargo_fmt("/tmp").await;
+        assert!(
+            result.is_err(),
+            "cargo fmt should fail in a non-Cargo directory"
+        );
+    }
+
+    // === T5 skipped step: test step lifecycle (in_progress → completed on success, → failed on failure) ===
+
+    #[tokio::test]
+    async fn test_finalize_steps_on_failure_marks_remaining_as_skipped() {
+        use crate::neo4j::models::{StepStatus, TaskStatus};
+        use crate::test_helpers::{test_plan, test_step, test_task};
+
+        let (runner, graph) = test_plan_runner_with_graph();
+
+        let plan = test_plan();
+        let plan_id = plan.id;
+        graph.create_plan(&plan).await.unwrap();
+
+        let mut task = test_task();
+        task.status = TaskStatus::InProgress;
+        let task_id = task.id;
+        graph.create_task(plan_id, &task).await.unwrap();
+
+        // Step 1: in_progress (simulates step started by runner at launch)
+        let mut step1 = test_step(1, "Write code");
+        step1.status = StepStatus::InProgress;
+        graph.create_step(task_id, &step1).await.unwrap();
+
+        // Step 2: pending (not started yet)
+        let mut step2 = test_step(2, "Run tests");
+        step2.status = StepStatus::Pending;
+        graph.create_step(task_id, &step2).await.unwrap();
+
+        // Step 3: completed (already done before failure)
+        let mut step3 = test_step(3, "Setup");
+        step3.status = StepStatus::Completed;
+        graph.create_step(task_id, &step3).await.unwrap();
+
+        // finalize_steps with Failed outcome — remaining steps become Skipped
+        let result = TaskResult::Failed {
+            reason: "compilation error".to_string(),
+            attempts: 1,
+            cost_usd: 0.3,
+        };
+        let breakdown = runner.finalize_steps(task_id, &result, "/tmp").await;
+
+        // Verify breakdown
+        assert_eq!(breakdown.total, 3);
+        assert_eq!(breakdown.completed, 1); // step3 was already completed
+        assert_eq!(breakdown.skipped, 2); // step1 (in_progress) + step2 (pending) → skipped
+
+        // Verify step statuses:
+        let steps = graph.get_task_steps(task_id).await.unwrap();
+        let step1_updated = steps
+            .iter()
+            .find(|s| s.description == "Write code")
+            .unwrap();
+        let step2_updated = steps.iter().find(|s| s.description == "Run tests").unwrap();
+        let step3_updated = steps.iter().find(|s| s.description == "Setup").unwrap();
+
+        // in_progress → skipped (on failure, remaining steps are skipped)
+        assert_eq!(
+            step1_updated.status,
+            StepStatus::Skipped,
+            "in_progress step should become skipped on task failure"
+        );
+        // pending → skipped
+        assert_eq!(
+            step2_updated.status,
+            StepStatus::Skipped,
+            "pending step should become skipped on task failure"
+        );
+        // completed stays completed
+        assert_eq!(
+            step3_updated.status,
+            StepStatus::Completed,
+            "already completed step should stay completed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_step_marked_in_progress_at_task_launch_then_completed() {
+        use crate::neo4j::models::{StepStatus, TaskStatus};
+        use crate::test_helpers::{test_plan, test_step, test_task};
+
+        let (runner, graph) = test_plan_runner_with_graph();
+
+        let plan = test_plan();
+        let plan_id = plan.id;
+        graph.create_plan(&plan).await.unwrap();
+
+        let mut task = test_task();
+        task.status = TaskStatus::Pending;
+        let task_id = task.id;
+        graph.create_task(plan_id, &task).await.unwrap();
+
+        // Create 3 pending steps
+        let mut step1 = test_step(1, "First step");
+        step1.status = StepStatus::Pending;
+        graph.create_step(task_id, &step1).await.unwrap();
+
+        let mut step2 = test_step(2, "Second step");
+        step2.status = StepStatus::Pending;
+        graph.create_step(task_id, &step2).await.unwrap();
+
+        let mut step3 = test_step(3, "Third step");
+        step3.status = StepStatus::Pending;
+        graph.create_step(task_id, &step3).await.unwrap();
+
+        // Simulate what execute_wave does: mark first pending step as in_progress
+        let steps = graph.get_task_steps(task_id).await.unwrap();
+        let first_pending = steps
+            .iter()
+            .find(|s| s.status == StepStatus::Pending)
+            .unwrap();
+        graph
+            .update_step_status(first_pending.id, StepStatus::InProgress)
+            .await
+            .unwrap();
+
+        // Verify first step is now in_progress
+        let steps_after = graph.get_task_steps(task_id).await.unwrap();
+        let first = steps_after
+            .iter()
+            .find(|s| s.description == "First step")
+            .unwrap();
+        assert_eq!(first.status, StepStatus::InProgress);
+
+        // Now simulate task success: finalize_steps should mark all as completed
+        let result = TaskResult::Success {
+            cost_usd: 0.1,
+            duration_secs: 30.0,
+        };
+        let breakdown = runner.finalize_steps(task_id, &result, "/tmp").await;
+
+        assert_eq!(breakdown.total, 3);
+        assert_eq!(breakdown.completed, 3);
+
+        // All steps should be completed
+        let final_steps = graph.get_task_steps(task_id).await.unwrap();
+        for step in &final_steps {
+            assert_eq!(
+                step.status,
+                StepStatus::Completed,
+                "Step '{}' should be completed after task success, got {:?}",
+                step.description,
+                step.status
+            );
+        }
     }
 }
