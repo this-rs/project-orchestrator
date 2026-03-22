@@ -14,7 +14,8 @@ use super::post_tool_hook;
 use super::skill_hook;
 use super::types::{
     classify_api_error, truncate_snippet, ChatEvent, ChatEventPage, ChatRequest,
-    CreateSessionResponse, MessageSearchHit, MessageSearchResult,
+    CreateSessionResponse, MessageSearchHit, MessageSearchResult, PendingMessage,
+    PendingMessageKind,
 };
 use crate::meilisearch::SearchStore;
 use crate::neo4j::models::ChatEventRecord;
@@ -59,7 +60,7 @@ pub struct ActiveSession {
     /// Monotonically increasing sequence number for persisted events
     pub next_seq: Arc<AtomicI64>,
     /// Queue of messages waiting to be sent (received while streaming)
-    pub pending_messages: Arc<Mutex<VecDeque<String>>>,
+    pub pending_messages: Arc<Mutex<VecDeque<PendingMessage>>>,
     /// Whether a stream is currently in progress
     pub is_streaming: Arc<AtomicBool>,
     /// Accumulated text from stream_delta during the current stream (for mid-stream join)
@@ -1337,7 +1338,7 @@ impl ChatManager {
                                 session_id
                             );
                             let mut queue = pending_messages.lock().await;
-                            queue.push_back(message.clone());
+                            queue.push_back(PendingMessage::user(message.clone()));
 
                             // Interrupt the stream so the message is processed sooner
                             interrupt_flag.store(true, Ordering::SeqCst);
@@ -2458,7 +2459,7 @@ impl ChatManager {
 
         // Initialize next_seq (new session = start at 1)
         let next_seq = Arc::new(AtomicI64::new(1));
-        let pending_messages = Arc::new(Mutex::new(VecDeque::new()));
+        let pending_messages = Arc::new(Mutex::new(VecDeque::<PendingMessage>::new()));
         let is_streaming = Arc::new(AtomicBool::new(false));
         let streaming_text = Arc::new(Mutex::new(String::new()));
         let streaming_events = Arc::new(Mutex::new(Vec::new()));
@@ -2663,7 +2664,7 @@ impl ChatManager {
         memory_manager: Option<Arc<Mutex<ConversationMemoryManager>>>,
         context_injector: Option<Arc<ContextInjector>>,
         next_seq: Arc<AtomicI64>,
-        pending_messages: Arc<Mutex<VecDeque<String>>>,
+        pending_messages: Arc<Mutex<VecDeque<PendingMessage>>>,
         is_streaming: Arc<AtomicBool>,
         streaming_text: Arc<Mutex<String>>,
         streaming_events: Arc<Mutex<Vec<ChatEvent>>>,
@@ -3571,7 +3572,7 @@ impl ChatManager {
                             "Injecting post-compaction context for session {} ({} chars)",
                             session_id, len
                         );
-                        pending_messages.lock().await.push_back(hint);
+                        pending_messages.lock().await.push_back(PendingMessage::system_hint(hint));
                     }
                     (len, true)
                 }
@@ -3590,7 +3591,7 @@ impl ChatManager {
                         "<system-reminder>\n# Post-Compaction Context\nYou are in an interactive session. No project context available.\n</system-reminder>".to_string()
                     };
                     let len = minimal.len();
-                    pending_messages.lock().await.push_back(minimal);
+                    pending_messages.lock().await.push_back(PendingMessage::system_hint(minimal));
                     (len, false)
                 }
             };
@@ -3749,7 +3750,7 @@ impl ChatManager {
                 pending_messages
                     .lock()
                     .await
-                    .push_back(continue_msg);
+                    .push_back(PendingMessage::system_hint(continue_msg));
                 debug!(
                     "Auto-continue: enqueued enriched 'Continue' for session {}",
                     session_id
@@ -3884,51 +3885,74 @@ impl ChatManager {
         };
 
         if let Some(next_msg) = next_message {
+            let is_system_hint = next_msg.kind == PendingMessageKind::SystemHint;
+            let msg_content = next_msg.content;
+
             info!(
-                "Processing queued message for session {} (queue was non-empty after stream)",
+                "Processing queued {} for session {} (queue was non-empty after stream)",
+                if is_system_hint { "system_hint" } else { "user_message" },
                 session_id
             );
 
-            // Persist the queued user_message event and update message count
+            // Persist the event and update message count (only for user messages)
             if let Some(uuid) = session_uuid {
-                // Update message count
-                if let Ok(Some(node)) = graph.get_chat_session(uuid).await {
-                    let _ = graph
-                        .update_chat_session(
-                            uuid,
-                            None,
-                            None,
-                            Some(node.message_count + 1),
-                            None,
-                            None,
-                            None,
-                        )
-                        .await;
+                // Only increment message_count for real user messages
+                if !is_system_hint {
+                    if let Ok(Some(node)) = graph.get_chat_session(uuid).await {
+                        let _ = graph
+                            .update_chat_session(
+                                uuid,
+                                None,
+                                None,
+                                Some(node.message_count + 1),
+                                None,
+                                None,
+                                None,
+                            )
+                            .await;
+                    }
                 }
 
-                let user_event = ChatEventRecord {
+                let (event_type, event_data) = if is_system_hint {
+                    (
+                        "system_hint".to_string(),
+                        serde_json::to_string(&ChatEvent::SystemHint {
+                            content: msg_content.clone(),
+                        })
+                        .unwrap_or_default(),
+                    )
+                } else {
+                    (
+                        "user_message".to_string(),
+                        serde_json::to_string(&ChatEvent::UserMessage {
+                            content: msg_content.clone(),
+                        })
+                        .unwrap_or_default(),
+                    )
+                };
+
+                let event_record = ChatEventRecord {
                     id: Uuid::new_v4(),
                     session_id: uuid,
                     seq: next_seq.fetch_add(1, Ordering::SeqCst),
-                    event_type: "user_message".to_string(),
-                    data: serde_json::to_string(&ChatEvent::UserMessage {
-                        content: next_msg.clone(),
-                    })
-                    .unwrap_or_default(),
+                    event_type,
+                    data: event_data,
                     created_at: chrono::Utc::now(),
                 };
-                let _ = graph.store_chat_events(uuid, vec![user_event]).await;
+                let _ = graph.store_chat_events(uuid, vec![event_record]).await;
             }
 
-            // Emit user_message on broadcast + NATS
-            emit_chat(
+            // Emit the appropriate event on broadcast + NATS
+            let chat_event = if is_system_hint {
+                ChatEvent::SystemHint {
+                    content: msg_content.clone(),
+                }
+            } else {
                 ChatEvent::UserMessage {
-                    content: next_msg.clone(),
-                },
-                &events_tx,
-                &nats,
-                &session_id,
-            );
+                    content: msg_content.clone(),
+                }
+            };
+            emit_chat(chat_event, &events_tx, &nats, &session_id);
 
             // Recursive call to process the queued message
             // Use Box::pin to handle recursive async
@@ -3936,7 +3960,7 @@ impl ChatManager {
             Box::pin(Self::stream_response(
                 client,
                 events_tx,
-                next_msg,
+                msg_content,
                 session_id,
                 graph,
                 active_sessions,
@@ -4059,9 +4083,9 @@ impl ChatManager {
                     "Stream in progress for session {}, queuing message and interrupting",
                     session_id
                 );
-                // Queue the message
+                // Queue the message (real user message)
                 let mut queue = session.pending_messages.lock().await;
-                queue.push_back(message.to_string());
+                queue.push_back(PendingMessage::user(message.to_string()));
 
                 // Interrupt the stream so the message is processed sooner
                 session.interrupt_flag.store(true, Ordering::SeqCst);
@@ -4228,7 +4252,7 @@ impl ChatManager {
             // after the current stream turn ends naturally.
             info!("Injecting hint into session {} (no interrupt)", session_id);
             let mut queue = session.pending_messages.lock().await;
-            queue.push_back(message.to_string());
+            queue.push_back(PendingMessage::system_hint(message.to_string()));
             Ok(())
         } else {
             // Not streaming — just send normally (will start a new stream)
@@ -4800,7 +4824,7 @@ impl ChatManager {
             .await
             .unwrap_or(0);
         let next_seq = Arc::new(AtomicI64::new(latest_seq + 1));
-        let pending_messages = Arc::new(Mutex::new(VecDeque::new()));
+        let pending_messages = Arc::new(Mutex::new(VecDeque::<PendingMessage>::new()));
         let is_streaming = Arc::new(AtomicBool::new(false));
         let streaming_text = Arc::new(Mutex::new(String::new()));
         let streaming_events = Arc::new(Mutex::new(Vec::new()));
@@ -7395,10 +7419,10 @@ mod tests {
         is_streaming: bool,
         streaming_text: &str,
         streaming_events_data: Vec<ChatEvent>,
-    ) -> Option<(ActiveSession, Arc<Mutex<VecDeque<String>>>)> {
+    ) -> Option<(ActiveSession, Arc<Mutex<VecDeque<PendingMessage>>>)> {
         let client = try_create_dummy_client()?;
         let (tx, _rx) = broadcast::channel(16);
-        let pending_messages = Arc::new(Mutex::new(VecDeque::new()));
+        let pending_messages = Arc::new(Mutex::new(VecDeque::<PendingMessage>::new()));
 
         let session = ActiveSession {
             events_tx: tx,
@@ -8298,7 +8322,7 @@ mod tests {
             interrupt_flag: Arc::new(AtomicBool::new(false)),
             memory_manager: None,
             next_seq: Arc::new(AtomicI64::new(1)),
-            pending_messages: Arc::new(Mutex::new(VecDeque::new())),
+            pending_messages: Arc::new(Mutex::new(VecDeque::<PendingMessage>::new())),
             is_streaming: Arc::new(AtomicBool::new(is_streaming)),
             streaming_text: Arc::new(Mutex::new(String::new())),
             streaming_events: Arc::new(Mutex::new(Vec::new())),

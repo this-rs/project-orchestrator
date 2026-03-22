@@ -227,6 +227,10 @@ pub struct ChatRequest {
 pub enum ChatEvent {
     /// A user message (emitted so multi-tab clients see it)
     UserMessage { content: String },
+    /// A system-generated hint (post-compaction context, guard hints, auto-continue).
+    /// NOT a user message — frontends should render this differently (or hide it).
+    /// Does NOT increment the session's message_count.
+    SystemHint { content: String },
     /// Text content from the assistant
     AssistantText {
         content: String,
@@ -427,6 +431,7 @@ impl ChatEvent {
     pub fn event_type(&self) -> &'static str {
         match self {
             ChatEvent::UserMessage { .. } => "user_message",
+            ChatEvent::SystemHint { .. } => "system_hint",
             ChatEvent::AssistantText { .. } => "assistant_text",
             ChatEvent::Thinking { .. } => "thinking",
             ChatEvent::ToolUse { .. } => "tool_use",
@@ -493,6 +498,12 @@ impl ChatEvent {
                 let mut hasher = std::collections::hash_map::DefaultHasher::new();
                 content.hash(&mut hasher);
                 Some(format!("user_message:{}", hasher.finish()))
+            }
+            ChatEvent::SystemHint { content } => {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                content.hash(&mut hasher);
+                Some(format!("system_hint:{}", hasher.finish()))
             }
             ChatEvent::Error { message, .. } => {
                 use std::hash::{Hash, Hasher};
@@ -768,6 +779,54 @@ pub fn classify_api_error(error_message: &str) -> ApiErrorKind {
     }
 
     ApiErrorKind::NonRetryable("unknown".to_string())
+}
+
+// ============================================================================
+// PendingMessage — typed queue entry for pending_messages
+// ============================================================================
+
+/// Distinguishes user-originated messages from system-generated hints
+/// in the `pending_messages` queue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingMessageKind {
+    /// Real user message — persisted as `user_message`, increments message_count
+    User,
+    /// System-generated hint (post-compaction context, guard hint, auto-continue)
+    /// — persisted as `system_hint`, does NOT increment message_count
+    SystemHint,
+}
+
+/// A typed entry in the pending_messages queue.
+///
+/// Before this, `pending_messages` was `VecDeque<String>` — all messages
+/// were treated as user messages, causing system hints (post-compaction
+/// context, guard compaction hints) to appear as if the user sent them.
+#[derive(Debug, Clone)]
+pub struct PendingMessage {
+    pub kind: PendingMessageKind,
+    pub content: String,
+}
+
+impl PartialEq<&str> for PendingMessage {
+    fn eq(&self, other: &&str) -> bool {
+        self.content == *other
+    }
+}
+
+impl PendingMessage {
+    pub fn user(content: String) -> Self {
+        Self {
+            kind: PendingMessageKind::User,
+            content,
+        }
+    }
+
+    pub fn system_hint(content: String) -> Self {
+        Self {
+            kind: PendingMessageKind::SystemHint,
+            content,
+        }
+    }
 }
 
 #[cfg(test)]
