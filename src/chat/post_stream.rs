@@ -359,9 +359,6 @@ impl PostStreamHandler {
 
     // ── Objective tracking ────────────────────────────────────────────────
 
-    /// Cooldown: require N stream turns between reminders.
-    const OBJECTIVE_REMINDER_COOLDOWN: u32 = 3;
-
     /// If the agent concluded without using tools and auto-continue didn't fire,
     /// check for pending objectives and inject a SystemHint reminder.
     pub async fn handle_objective_tracking(
@@ -370,73 +367,83 @@ impl PostStreamHandler {
         auto_continue_allowed: bool,
         hit_error_max_turns: bool,
     ) {
-        if !had_tool_use
+        // Gather session-level state for the pure decision function
+        let (tracking_enabled, cooldown_turns) = {
+            let sessions = self.active_sessions.read().await;
+            if let Some(session) = sessions.get(&self.session_id) {
+                if had_tool_use {
+                    // Agent used tools = still working, reset cooldown
+                    session
+                        .objective_reminder_turns_since
+                        .store(0, Ordering::Relaxed);
+                }
+                let enabled = session.objective_tracking;
+                let turns = session
+                    .objective_reminder_turns_since
+                    .fetch_add(1, Ordering::Relaxed);
+                (enabled, turns)
+            } else {
+                return;
+            }
+        };
+
+        // Fetch pending objectives from graph (only if we might need them)
+        let objectives = if !had_tool_use
             && !auto_continue_allowed
             && !hit_error_max_turns
             && !self.interrupt_flag.load(Ordering::SeqCst)
+            && tracking_enabled
+            && (cooldown_turns == 0 || cooldown_turns >= OBJECTIVE_REMINDER_COOLDOWN)
         {
-            let should_check = {
-                let sessions = self.active_sessions.read().await;
-                if let Some(session) = sessions.get(&self.session_id) {
-                    if session.objective_tracking {
-                        let turns = session
-                            .objective_reminder_turns_since
-                            .fetch_add(1, Ordering::Relaxed);
-                        turns >= Self::OBJECTIVE_REMINDER_COOLDOWN || turns == 0
-                    } else {
-                        false
-                    }
+            if let Some(ref slug) = self.ctx.project_slug {
+                let builder =
+                    super::compaction_context::CompactionContextBuilder::new(
+                        self.graph.clone(),
+                    );
+                if let Ok(Ok(ctx)) = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    builder.build_for_session(Some(slug.as_str())),
+                )
+                .await
+                {
+                    ctx.pending_objectives_oneliner()
                 } else {
-                    false
+                    String::new()
                 }
-            };
-
-            if should_check {
-                if let Some(ref slug) = self.ctx.project_slug {
-                    let builder =
-                        super::compaction_context::CompactionContextBuilder::new(
-                            self.graph.clone(),
-                        );
-                    if let Ok(Ok(ctx)) = tokio::time::timeout(
-                        std::time::Duration::from_secs(2),
-                        builder.build_for_session(Some(slug.as_str())),
-                    )
-                    .await
-                    {
-                        let objectives = ctx.pending_objectives_oneliner();
-                        if !objectives.is_empty() {
-                            let reminder = format!(
-                                "You stopped without using any tools. \
-                                 Check if you have completed all objectives before concluding.{}",
-                                objectives
-                            );
-                            info!(
-                                "Objective tracker: injecting reminder for session {}",
-                                self.session_id
-                            );
-                            self.pending_messages
-                                .lock()
-                                .await
-                                .push_back(PendingMessage::system_hint(reminder));
-
-                            // Reset cooldown counter
-                            let sessions = self.active_sessions.read().await;
-                            if let Some(session) = sessions.get(&self.session_id) {
-                                session
-                                    .objective_reminder_turns_since
-                                    .store(1, Ordering::Relaxed);
-                            }
-                        }
-                    }
-                }
+            } else {
+                String::new()
             }
-        } else if had_tool_use {
-            // Agent used tools = still working, reset cooldown
+        } else {
+            String::new()
+        };
+
+        // Pure decision
+        let input = ObjectiveCheckInput {
+            had_tool_use,
+            auto_continue_allowed,
+            hit_error_max_turns,
+            interrupted: self.interrupt_flag.load(Ordering::SeqCst),
+            tracking_enabled,
+            cooldown_turns,
+            objectives,
+        };
+
+        if let Some(reminder) = check_objective_reminder(&input) {
+            info!(
+                "Objective tracker: injecting reminder for session {}",
+                self.session_id
+            );
+            self.pending_messages
+                .lock()
+                .await
+                .push_back(PendingMessage::system_hint(reminder));
+
+            // Reset cooldown counter
             let sessions = self.active_sessions.read().await;
             if let Some(session) = sessions.get(&self.session_id) {
                 session
                     .objective_reminder_turns_since
-                    .store(0, Ordering::Relaxed);
+                    .store(1, Ordering::Relaxed);
             }
         }
     }
@@ -691,5 +698,285 @@ mod tests {
         let mut input = base_input();
         input.interrupted = true;
         assert!(check_objective_reminder(&input).is_none());
+    }
+}
+
+#[cfg(test)]
+mod integration_tests {
+    use super::*;
+    use crate::chat::types::PendingMessageKind;
+    use crate::meilisearch::mock::MockSearchStore;
+    use crate::neo4j::mock::MockGraphStore;
+    use crate::neo4j::GraphStore;
+    use crate::test_helpers::{test_project_named, test_task_titled};
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32};
+    use std::sync::Arc;
+    use std::time::Instant;
+    use tokio::sync::{broadcast, Mutex, RwLock};
+    use tokio_util::sync::CancellationToken;
+    use uuid::Uuid;
+
+    /// Helper to build a PostStreamHandler with mock backends.
+    async fn build_handler(
+        graph: Arc<MockGraphStore>,
+        project_slug: Option<String>,
+        session_id: &str,
+        objective_tracking: bool,
+    ) -> PostStreamHandler {
+        let (events_tx, _rx) = broadcast::channel(16);
+        let pending_messages = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+        let active_sessions: Arc<RwLock<HashMap<String, ActiveSession>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+
+        // Insert a minimal ActiveSession with objective_tracking.
+        // We use nexus_claude::InteractiveClient::new with dummy options — the client
+        // won't be used by handle_objective_tracking.
+        {
+            let options = nexus_claude::ClaudeCodeOptions::default();
+            let client = nexus_claude::InteractiveClient::new(options)
+                .expect("dummy InteractiveClient");
+
+            let session = ActiveSession {
+                events_tx: events_tx.clone(),
+                last_activity: Instant::now(),
+                cli_session_id: None,
+                client: Arc::new(Mutex::new(client)),
+                interrupt_flag: Arc::new(AtomicBool::new(false)),
+                memory_manager: None,
+                next_seq: Arc::new(AtomicI64::new(0)),
+                pending_messages: pending_messages.clone(),
+                is_streaming: Arc::new(AtomicBool::new(false)),
+                streaming_text: Arc::new(Mutex::new(String::new())),
+                streaming_events: Arc::new(Mutex::new(Vec::new())),
+                permission_mode: None,
+                model: None,
+                protocol_run_id: None,
+                protocol_state: None,
+                sdk_control_rx: Arc::new(Mutex::new(None)),
+                stdin_tx: None,
+                child_pid: None,
+                nats_cancel: CancellationToken::new(),
+                interrupt_token: CancellationToken::new(),
+                pending_permission_inputs: Arc::new(Mutex::new(HashMap::new())),
+                auto_continue: Arc::new(AtomicBool::new(false)),
+                auto_continue_count: Arc::new(AtomicU32::new(0)),
+                max_auto_continues: 0,
+                rfc_accumulator: Arc::new(Mutex::new(
+                    super::super::observation_detector::RfcAccumulator::new(),
+                )),
+                objective_tracking,
+                objective_reminder_turns_since: Arc::new(AtomicU32::new(0)),
+            };
+            active_sessions
+                .write()
+                .await
+                .insert(session_id.to_string(), session);
+        }
+
+        PostStreamHandler {
+            graph: graph.clone(),
+            pending_messages,
+            session_id: session_id.to_string(),
+            session_uuid: Some(Uuid::new_v4()),
+            active_sessions,
+            events_tx,
+            nats: None,
+            next_seq: Arc::new(AtomicI64::new(0)),
+            interrupt_flag: Arc::new(AtomicBool::new(false)),
+            interrupt_token: CancellationToken::new(),
+            ctx: PostStreamContext {
+                project_slug,
+                project_id: None,
+            },
+            is_streaming: Arc::new(AtomicBool::new(false)),
+            streaming_text: Arc::new(Mutex::new(String::new())),
+            streaming_events: Arc::new(Mutex::new(Vec::new())),
+            event_emitter: None,
+            search: Arc::new(MockSearchStore::new()),
+            auto_continue: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Populate mock graph with a project, an in_progress plan, and pending tasks.
+    async fn seed_graph_with_pending_tasks(graph: &MockGraphStore) -> String {
+        use crate::neo4j::models::{PlanNode, PlanStatus, TaskStatus};
+
+        let project = test_project_named("test-project");
+        let slug = project.slug.clone();
+        graph.create_project(&project).await.unwrap();
+
+        let mut plan = PlanNode::new_for_project(
+            "Active Plan".to_string(),
+            "Plan with pending tasks".to_string(),
+            "test".to_string(),
+            50,
+            project.id,
+        );
+        plan.status = PlanStatus::InProgress;
+        graph.create_plan(&plan).await.unwrap();
+        // Also update via trait method so the mock stores it with InProgress status
+        graph
+            .update_plan_status(plan.id, PlanStatus::InProgress)
+            .await
+            .unwrap();
+
+        let mut task1 = test_task_titled("Fix the bug");
+        task1.status = TaskStatus::Pending;
+        graph.create_task(plan.id, &task1).await.unwrap();
+
+        let mut task2 = test_task_titled("Write tests");
+        task2.status = TaskStatus::Pending;
+        graph.create_task(plan.id, &task2).await.unwrap();
+
+        slug
+    }
+
+    #[tokio::test]
+    async fn test_integration_objective_reminder_injected_with_pending_tasks() {
+        let graph = Arc::new(MockGraphStore::new());
+        let slug = seed_graph_with_pending_tasks(&graph).await;
+
+        let handler = build_handler(
+            graph,
+            Some(slug),
+            "test-session-1",
+            true, // objective_tracking enabled
+        )
+        .await;
+
+        // Call with had_tool_use=false → should inject reminder
+        handler
+            .handle_objective_tracking(false, false, false)
+            .await;
+
+        let pending = handler.pending_messages.lock().await;
+        assert_eq!(pending.len(), 1, "Expected 1 pending SystemHint message");
+        let msg = &pending[0];
+        assert_eq!(msg.kind, PendingMessageKind::SystemHint);
+        assert!(
+            msg.content.contains("You stopped without using any tools"),
+            "Reminder text missing: {}",
+            msg.content
+        );
+        assert!(
+            msg.content.contains("Fix the bug") || msg.content.contains("Write tests"),
+            "Should contain task titles: {}",
+            msg.content
+        );
+    }
+
+    #[tokio::test]
+    async fn test_integration_no_reminder_when_tools_used() {
+        let graph = Arc::new(MockGraphStore::new());
+        let slug = seed_graph_with_pending_tasks(&graph).await;
+
+        let handler = build_handler(graph, Some(slug), "test-session-2", true).await;
+
+        // Call with had_tool_use=true → no reminder
+        handler
+            .handle_objective_tracking(true, false, false)
+            .await;
+
+        let pending = handler.pending_messages.lock().await;
+        assert!(
+            pending.is_empty(),
+            "No reminder should be injected when tools were used"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_integration_no_reminder_when_tracking_disabled() {
+        let graph = Arc::new(MockGraphStore::new());
+        let slug = seed_graph_with_pending_tasks(&graph).await;
+
+        let handler = build_handler(
+            graph,
+            Some(slug),
+            "test-session-3",
+            false, // tracking disabled
+        )
+        .await;
+
+        handler
+            .handle_objective_tracking(false, false, false)
+            .await;
+
+        let pending = handler.pending_messages.lock().await;
+        assert!(
+            pending.is_empty(),
+            "No reminder when objective_tracking is disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_integration_no_reminder_without_plans() {
+        let graph = Arc::new(MockGraphStore::new());
+
+        // Create project but NO plans
+        let project = test_project_named("empty-project");
+        let slug = project.slug.clone();
+        graph.create_project(&project).await.unwrap();
+
+        let handler = build_handler(graph, Some(slug), "test-session-4", true).await;
+
+        handler
+            .handle_objective_tracking(false, false, false)
+            .await;
+
+        let pending = handler.pending_messages.lock().await;
+        assert!(
+            pending.is_empty(),
+            "No reminder when there are no in_progress plans"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_integration_cooldown_prevents_consecutive_reminders() {
+        let graph = Arc::new(MockGraphStore::new());
+        let slug = seed_graph_with_pending_tasks(&graph).await;
+
+        let handler = build_handler(graph, Some(slug), "test-session-5", true).await;
+
+        // First call (turn 0) → should fire
+        handler
+            .handle_objective_tracking(false, false, false)
+            .await;
+        assert_eq!(
+            handler.pending_messages.lock().await.len(),
+            1,
+            "First call should inject reminder"
+        );
+
+        // Clear pending for next check
+        handler.pending_messages.lock().await.clear();
+
+        // Second call (turn 1, within cooldown) → should NOT fire
+        handler
+            .handle_objective_tracking(false, false, false)
+            .await;
+        assert!(
+            handler.pending_messages.lock().await.is_empty(),
+            "Second call should be blocked by cooldown"
+        );
+
+        // Third call (turn 2, still within cooldown) → should NOT fire
+        handler
+            .handle_objective_tracking(false, false, false)
+            .await;
+        assert!(
+            handler.pending_messages.lock().await.is_empty(),
+            "Third call should still be blocked by cooldown"
+        );
+
+        // Fourth call (turn 3, cooldown met) → should fire
+        handler
+            .handle_objective_tracking(false, false, false)
+            .await;
+        assert_eq!(
+            handler.pending_messages.lock().await.len(),
+            1,
+            "Fourth call should inject reminder (cooldown met)"
+        );
     }
 }
