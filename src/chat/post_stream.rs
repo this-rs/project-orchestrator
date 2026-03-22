@@ -552,3 +552,144 @@ impl PostStreamHandler {
         }
     }
 }
+
+// ── Pure logic for objective tracking (testable without Graph) ─────────
+
+/// Cooldown threshold for objective reminders (same as PostStreamHandler).
+pub(crate) const OBJECTIVE_REMINDER_COOLDOWN: u32 = 3;
+
+/// Inputs to the objective tracking decision (decoupled from async/Arc state).
+pub(crate) struct ObjectiveCheckInput {
+    pub had_tool_use: bool,
+    pub auto_continue_allowed: bool,
+    pub hit_error_max_turns: bool,
+    pub interrupted: bool,
+    pub tracking_enabled: bool,
+    pub cooldown_turns: u32,
+    pub objectives: String,
+}
+
+/// Pure decision function: given the objective check inputs, return the
+/// reminder text to inject as SystemHint, or None if no reminder should fire.
+///
+/// This function has NO side effects and is fully testable without mocks.
+pub(crate) fn check_objective_reminder(input: &ObjectiveCheckInput) -> Option<String> {
+    // Guard 1: only fire when agent concluded without tools
+    if input.had_tool_use
+        || input.auto_continue_allowed
+        || input.hit_error_max_turns
+        || input.interrupted
+    {
+        return None;
+    }
+
+    // Guard 2: tracking must be enabled for this session
+    if !input.tracking_enabled {
+        return None;
+    }
+
+    // Guard 3: cooldown — only fire on first turn (0) or after COOLDOWN turns
+    if input.cooldown_turns != 0 && input.cooldown_turns < OBJECTIVE_REMINDER_COOLDOWN {
+        return None;
+    }
+
+    // Guard 4: must have pending objectives
+    if input.objectives.is_empty() {
+        return None;
+    }
+
+    Some(format!(
+        "You stopped without using any tools. \
+         Check if you have completed all objectives before concluding.{}",
+        input.objectives
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_input() -> ObjectiveCheckInput {
+        ObjectiveCheckInput {
+            had_tool_use: false,
+            auto_continue_allowed: false,
+            hit_error_max_turns: false,
+            interrupted: false,
+            tracking_enabled: true,
+            cooldown_turns: 0, // first turn → should fire
+            objectives: " Remaining objectives: T1, T2".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_reminder_injected_when_no_tools_and_pending_objectives() {
+        let input = base_input();
+        let result = check_objective_reminder(&input);
+        assert!(result.is_some());
+        let msg = result.unwrap();
+        assert!(msg.contains("You stopped without using any tools"));
+        assert!(msg.contains("T1, T2"));
+    }
+
+    #[test]
+    fn test_no_reminder_when_tools_were_used() {
+        let mut input = base_input();
+        input.had_tool_use = true;
+        assert!(check_objective_reminder(&input).is_none());
+    }
+
+    #[test]
+    fn test_cooldown_respected() {
+        // turns=1 is within cooldown (COOLDOWN=3), should NOT fire
+        let mut input = base_input();
+        input.cooldown_turns = 1;
+        assert!(check_objective_reminder(&input).is_none());
+
+        // turns=2 is still within cooldown
+        input.cooldown_turns = 2;
+        assert!(check_objective_reminder(&input).is_none());
+
+        // turns=3 meets cooldown threshold → should fire
+        input.cooldown_turns = 3;
+        assert!(check_objective_reminder(&input).is_some());
+
+        // turns=0 is first turn → should fire
+        input.cooldown_turns = 0;
+        assert!(check_objective_reminder(&input).is_some());
+    }
+
+    #[test]
+    fn test_no_reminder_when_tracking_disabled() {
+        let mut input = base_input();
+        input.tracking_enabled = false;
+        assert!(check_objective_reminder(&input).is_none());
+    }
+
+    #[test]
+    fn test_no_reminder_without_pending_objectives() {
+        let mut input = base_input();
+        input.objectives = String::new();
+        assert!(check_objective_reminder(&input).is_none());
+    }
+
+    #[test]
+    fn test_no_reminder_when_auto_continue_allowed() {
+        let mut input = base_input();
+        input.auto_continue_allowed = true;
+        assert!(check_objective_reminder(&input).is_none());
+    }
+
+    #[test]
+    fn test_no_reminder_when_hit_error_max_turns() {
+        let mut input = base_input();
+        input.hit_error_max_turns = true;
+        assert!(check_objective_reminder(&input).is_none());
+    }
+
+    #[test]
+    fn test_no_reminder_when_interrupted() {
+        let mut input = base_input();
+        input.interrupted = true;
+        assert!(check_objective_reminder(&input).is_none());
+    }
+}
