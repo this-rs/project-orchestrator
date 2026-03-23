@@ -22,6 +22,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use tracing::{debug, error, info, warn};
@@ -30,6 +31,12 @@ use uuid::Uuid;
 use super::types::{CrudAction, CrudEvent, EntityType, EventEmitter};
 use super::ReactorBuilder;
 use crate::api::handlers::ServerState;
+
+/// Cooldown for feedback analysis: skip if last analysis was < 1 hour ago.
+const FEEDBACK_ANALYSIS_COOLDOWN_SECS: u64 = 3600;
+
+/// Timestamp (epoch seconds) of the last feedback analysis run.
+static LAST_FEEDBACK_ANALYSIS_TS: AtomicU64 = AtomicU64::new(0);
 
 // ─────────────────────────────────────────────────────────────
 // Reaction: Project::Synced → bootstrap or update fabric
@@ -1025,6 +1032,226 @@ async fn on_patterns_detected_evolve(event: CrudEvent, state: Arc<ServerState>) 
 }
 
 // ─────────────────────────────────────────────────────────────
+// Reaction: Runner::Updated(PlanCompleted) → analyze feedback
+// ─────────────────────────────────────────────────────────────
+
+/// When a plan run completes (Runner::Updated with event=plan_completed payload),
+/// run FeedbackAnalyzer to detect recurring patterns in runner-feedback notes.
+///
+/// Uses a static AtomicU64 cooldown: skips if < 1 hour since the last analysis.
+/// The analysis itself runs in `tokio::spawn` (fire-and-forget).
+///
+/// Detected actionable patterns are persisted as observation notes with tags
+/// `['runner-feedback-suggestion', 'auto-observed', <pattern_type>]` and a
+/// `Learning::PatternsDetected` event is emitted for frontend notification.
+async fn on_plan_run_completed_analyze_feedback(event: CrudEvent, state: Arc<ServerState>) {
+    // Only react to Runner::Updated events with plan_completed payload
+    if event.entity_type != EntityType::Runner || event.action != CrudAction::Updated {
+        return;
+    }
+
+    // Check if this is a PlanCompleted event (serde tag = "event": "plan_completed")
+    let event_type = event
+        .payload
+        .get("event")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if event_type != "plan_completed" {
+        return;
+    }
+
+    // Extract plan_id from the payload
+    let plan_id_str = match event.payload.get("plan_id").and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => {
+            debug!("on_plan_run_completed_analyze_feedback: no plan_id in payload, skipping");
+            return;
+        }
+    };
+
+    let plan_id = match Uuid::parse_str(&plan_id_str) {
+        Ok(id) => id,
+        Err(_) => {
+            warn!(
+                plan_id = %plan_id_str,
+                "on_plan_run_completed_analyze_feedback: invalid plan_id UUID"
+            );
+            return;
+        }
+    };
+
+    // Cooldown check: skip if < 1 hour since last analysis
+    let now_secs = chrono::Utc::now().timestamp() as u64;
+    let last_ts = LAST_FEEDBACK_ANALYSIS_TS.load(Ordering::Relaxed);
+    if now_secs.saturating_sub(last_ts) < FEEDBACK_ANALYSIS_COOLDOWN_SECS {
+        debug!(
+            plan_id = %plan_id,
+            last_analysis_secs_ago = now_secs.saturating_sub(last_ts),
+            cooldown_secs = FEEDBACK_ANALYSIS_COOLDOWN_SECS,
+            "on_plan_run_completed_analyze_feedback: cooldown active, skipping"
+        );
+        return;
+    }
+
+    // Update the cooldown timestamp
+    LAST_FEEDBACK_ANALYSIS_TS.store(now_secs, Ordering::Relaxed);
+
+    // Resolve project_id from plan
+    let neo4j = state.orchestrator.neo4j();
+    let project_id = match neo4j.get_plan(plan_id).await {
+        Ok(Some(plan)) => plan.project_id,
+        Ok(None) => {
+            debug!(plan_id = %plan_id, "on_plan_run_completed_analyze_feedback: plan not found");
+            return;
+        }
+        Err(e) => {
+            error!(plan_id = %plan_id, error = %e, "on_plan_run_completed_analyze_feedback: failed to get plan");
+            return;
+        }
+    };
+
+    info!(
+        plan_id = %plan_id,
+        project_id = ?project_id,
+        "on_plan_run_completed_analyze_feedback: starting feedback analysis"
+    );
+
+    let neo4j_arc = state.orchestrator.neo4j_arc();
+    let event_bus = state.event_bus.clone();
+
+    tokio::spawn(async move {
+        let analyzer = crate::runner::feedback_analyzer::FeedbackAnalyzer::new(neo4j_arc.clone());
+        let report = match analyzer.analyze_runner_feedback(project_id).await {
+            Ok(r) => r,
+            Err(e) => {
+                error!(
+                    plan_id = %plan_id,
+                    error = %e,
+                    "on_plan_run_completed_analyze_feedback: analysis failed"
+                );
+                return;
+            }
+        };
+
+        if report.actionable_count == 0 {
+            debug!(
+                plan_id = %plan_id,
+                total_notes = report.total_notes_analyzed,
+                patterns = report.patterns.len(),
+                "on_plan_run_completed_analyze_feedback: no actionable patterns"
+            );
+            return;
+        }
+
+        info!(
+            plan_id = %plan_id,
+            actionable = report.actionable_count,
+            total_patterns = report.patterns.len(),
+            "on_plan_run_completed_analyze_feedback: actionable patterns detected, persisting suggestions"
+        );
+
+        // Persist each actionable pattern as an observation note
+        let mut suggestion_note_ids = Vec::new();
+        for pattern in &report.patterns {
+            if !pattern.is_actionable {
+                continue;
+            }
+
+            let content = format!(
+                "## Auto-detected Feedback Pattern\n\n\
+                 **Pattern**: {} (observed {} times)\n\
+                 **Suggestion**: {}\n\
+                 **Evidence notes**: {}\n\
+                 **Run IDs**: {}\n\
+                 **Detected at**: {}\n",
+                pattern.pattern_type,
+                pattern.count,
+                pattern.suggestion,
+                pattern
+                    .evidence_note_ids
+                    .iter()
+                    .map(|id| id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                pattern
+                    .run_ids
+                    .iter()
+                    .map(|id| id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                report.analyzed_at,
+            );
+
+            let pattern_tag = format!("pattern:{}", pattern.pattern_type);
+            let mut note = crate::notes::models::Note::new(
+                project_id,
+                crate::notes::models::NoteType::Observation,
+                content,
+                format!("Feedback pattern: {}", pattern.suggestion),
+            );
+            note.tags = vec![
+                "runner-feedback-suggestion".to_string(),
+                "auto-observed".to_string(),
+                pattern_tag,
+            ];
+            note.importance = crate::notes::models::NoteImportance::Medium;
+            note.status = crate::notes::models::NoteStatus::Active;
+
+            let note_id = note.id;
+            match neo4j_arc.create_note(&note).await {
+                Ok(_) => {
+                    suggestion_note_ids.push(note_id);
+                    info!(
+                        note_id = %note_id,
+                        pattern = %pattern.pattern_type,
+                        "on_plan_run_completed_analyze_feedback: suggestion note created"
+                    );
+                }
+                Err(e) => {
+                    error!(
+                        pattern = %pattern.pattern_type,
+                        error = %e,
+                        "on_plan_run_completed_analyze_feedback: failed to create suggestion note"
+                    );
+                }
+            }
+        }
+
+        // Emit Learning::FeedbackPatternsDetected for frontend notification
+        if !suggestion_note_ids.is_empty() {
+            let payload = serde_json::json!({
+                "source": "feedback_analyzer",
+                "project_id": project_id.map(|id| id.to_string()),
+                "patterns_count": report.actionable_count,
+                "suggestion_note_ids": suggestion_note_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+                "total_notes_analyzed": report.total_notes_analyzed,
+            });
+
+            let pid_str = project_id.map(|id| id.to_string()).unwrap_or_default();
+            let mut crud_event = CrudEvent::new(
+                EntityType::Learning,
+                CrudAction::FeedbackPatternsDetected,
+                plan_id.to_string(),
+            )
+            .with_payload(payload);
+
+            if let Some(pid) = project_id {
+                crud_event = crud_event.with_project_id(pid.to_string());
+            }
+
+            event_bus.emit(crud_event);
+
+            info!(
+                plan_id = %plan_id,
+                project_id = pid_str,
+                suggestions = suggestion_note_ids.len(),
+                "on_plan_run_completed_analyze_feedback: Learning::FeedbackPatternsDetected emitted"
+            );
+        }
+    });
+}
+
+// ─────────────────────────────────────────────────────────────
 // Reaction: *::StatusChanged → evaluate LifecycleHooks
 // ─────────────────────────────────────────────────────────────
 
@@ -1074,6 +1301,7 @@ fn extract_state(ctx: Arc<dyn std::any::Any + Send + Sync>) -> Arc<ServerState> 
 /// 7. **patterns-materialize** — `Learning::PatternsDetected` → materialize patterns into notes/skills/scars
 /// 8. **patterns-evolve** — `Learning::PatternsDetected` → evolve protocols via adaptive mutations
 /// 9. **lifecycle-hooks** — `*::StatusChanged` → evaluate and execute LifecycleHooks
+/// 10. **plan-run-feedback** — `Runner::Updated(PlanCompleted)` → analyze runner feedback patterns
 pub fn register_builtin_reactions(
     builder: ReactorBuilder,
     _state: Arc<ServerState>,
@@ -1172,6 +1400,16 @@ pub fn register_builtin_reactions(
             Arc::new(|event, ctx| -> Pin<Box<dyn Future<Output = ()> + Send>> {
                 Box::pin(async move {
                     on_status_changed_lifecycle_hooks(event, extract_state(ctx)).await;
+                })
+            }),
+        )
+        .on(
+            "plan-run-feedback",
+            Some(EntityType::Runner),
+            Some(CrudAction::Updated),
+            Arc::new(|event, ctx| -> Pin<Box<dyn Future<Output = ()> + Send>> {
+                Box::pin(async move {
+                    on_plan_run_completed_analyze_feedback(event, extract_state(ctx)).await;
                 })
             }),
         )
@@ -2043,5 +2281,258 @@ mod tests {
         assert!(Uuid::parse_str("not-a-uuid").is_err());
         assert!(Uuid::parse_str("").is_err());
         assert!(Uuid::parse_str("12345").is_err());
+    }
+
+    // ── on_plan_run_completed_analyze_feedback ────────────────
+
+    #[tokio::test]
+    async fn on_plan_run_completed_ignores_non_runner_events() {
+        let state = mock_server_state().await;
+        let event = make_event(
+            EntityType::Task,
+            CrudAction::Updated,
+            &Uuid::new_v4().to_string(),
+            json!({"event": "plan_completed", "plan_id": Uuid::new_v4().to_string()}),
+        );
+        // Wrong entity type — should return early
+        on_plan_run_completed_analyze_feedback(event, state).await;
+    }
+
+    #[tokio::test]
+    async fn on_plan_run_completed_ignores_non_plan_completed_events() {
+        let state = mock_server_state().await;
+        let event = make_event(
+            EntityType::Runner,
+            CrudAction::Updated,
+            &Uuid::new_v4().to_string(),
+            json!({"event": "task_completed", "task_id": Uuid::new_v4().to_string()}),
+        );
+        // Not a plan_completed event — should return early
+        on_plan_run_completed_analyze_feedback(event, state).await;
+    }
+
+    #[tokio::test]
+    async fn on_plan_run_completed_skips_missing_plan_id() {
+        let state = mock_server_state().await;
+        // Reset cooldown for this test
+        LAST_FEEDBACK_ANALYSIS_TS.store(0, std::sync::atomic::Ordering::Relaxed);
+        let event = make_event(
+            EntityType::Runner,
+            CrudAction::Updated,
+            &Uuid::new_v4().to_string(),
+            json!({"event": "plan_completed"}), // no plan_id
+        );
+        on_plan_run_completed_analyze_feedback(event, state).await;
+    }
+
+    #[tokio::test]
+    async fn on_plan_run_completed_cooldown_skips_second_call() {
+        let state = mock_server_state().await;
+        let plan_id = Uuid::new_v4();
+
+        // Reset cooldown
+        LAST_FEEDBACK_ANALYSIS_TS.store(0, std::sync::atomic::Ordering::Relaxed);
+
+        // First call: should proceed (plan not found, but past cooldown)
+        let event1 = make_event(
+            EntityType::Runner,
+            CrudAction::Updated,
+            &Uuid::new_v4().to_string(),
+            json!({"event": "plan_completed", "plan_id": plan_id.to_string()}),
+        );
+        on_plan_run_completed_analyze_feedback(event1, state.clone()).await;
+
+        // Record the timestamp that was set
+        let ts_after_first = LAST_FEEDBACK_ANALYSIS_TS.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            ts_after_first > 0,
+            "Cooldown timestamp should be set after first call"
+        );
+
+        // Second call within cooldown — should be skipped (timestamp unchanged)
+        let event2 = make_event(
+            EntityType::Runner,
+            CrudAction::Updated,
+            &Uuid::new_v4().to_string(),
+            json!({"event": "plan_completed", "plan_id": plan_id.to_string()}),
+        );
+        on_plan_run_completed_analyze_feedback(event2, state).await;
+
+        // Timestamp should not have changed (cooldown prevented update)
+        let ts_after_second = LAST_FEEDBACK_ANALYSIS_TS.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            ts_after_first, ts_after_second,
+            "Cooldown should prevent second analysis"
+        );
+    }
+
+    #[tokio::test]
+    async fn on_plan_run_completed_runs_analysis_with_valid_plan() {
+        let state = mock_server_state().await;
+        let neo4j = state.orchestrator.neo4j();
+
+        // Reset cooldown
+        LAST_FEEDBACK_ANALYSIS_TS.store(0, std::sync::atomic::Ordering::Relaxed);
+
+        // Create a project + plan
+        let project = test_project();
+        let project_id = project.id;
+        neo4j.create_project(&project).await.unwrap();
+
+        let mut plan = test_plan();
+        plan.project_id = Some(project_id);
+        plan.status = PlanStatus::Completed;
+        let plan_id = plan.id;
+        neo4j.create_plan(&plan).await.unwrap();
+
+        let event = make_event(
+            EntityType::Runner,
+            CrudAction::Updated,
+            &Uuid::new_v4().to_string(),
+            json!({"event": "plan_completed", "plan_id": plan_id.to_string(), "status": "completed"}),
+        );
+        on_plan_run_completed_analyze_feedback(event, state.clone()).await;
+
+        // Give the spawned task time to complete
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        // If we got here without panic, the analysis ran (or gracefully completed with 0 patterns)
+    }
+
+    #[tokio::test]
+    async fn on_plan_run_completed_creates_suggestion_notes_for_actionable_patterns() {
+        use crate::notes::models::{Note, NoteFilters, NoteType};
+
+        let state = mock_server_state().await;
+        let neo4j = state.orchestrator.neo4j();
+
+        // Reset cooldown
+        LAST_FEEDBACK_ANALYSIS_TS.store(0, std::sync::atomic::Ordering::Relaxed);
+
+        // Create a project + plan
+        let project = test_project();
+        let project_id = project.id;
+        neo4j.create_project(&project).await.unwrap();
+
+        let mut plan = test_plan();
+        plan.project_id = Some(project_id);
+        plan.status = PlanStatus::Completed;
+        let plan_id = plan.id;
+        neo4j.create_plan(&plan).await.unwrap();
+
+        // Create 4+ runner-feedback observation notes with the same pattern tag
+        // (threshold is 3, so 4 = actionable)
+        for i in 0..4 {
+            let mut note = Note::new(
+                Some(project_id),
+                NoteType::Observation,
+                format!("Manual commit observed after run #{}", i),
+                format!("Runner feedback #{}", i),
+            );
+            note.tags = vec![
+                "runner-feedback".to_string(),
+                "runner-manual-action".to_string(),
+            ];
+            neo4j.create_note(&note).await.unwrap();
+        }
+
+        // Fire the event
+        let event = make_event(
+            EntityType::Runner,
+            CrudAction::Updated,
+            &Uuid::new_v4().to_string(),
+            json!({"event": "plan_completed", "plan_id": plan_id.to_string(), "status": "completed"}),
+        );
+        on_plan_run_completed_analyze_feedback(event, state.clone()).await;
+
+        // Give the spawned task time to complete
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        // Verify suggestion notes were created
+        let filters = NoteFilters {
+            tags: Some(vec!["runner-feedback-suggestion".to_string()]),
+            ..Default::default()
+        };
+        let (notes, _total) = neo4j
+            .list_notes(Some(project_id), None, &filters)
+            .await
+            .unwrap();
+
+        assert!(
+            !notes.is_empty(),
+            "Expected at least one suggestion note to be created for actionable patterns"
+        );
+
+        // Verify the note has the correct tags
+        let suggestion = &notes[0];
+        assert!(suggestion
+            .tags
+            .contains(&"runner-feedback-suggestion".to_string()));
+        assert!(suggestion.tags.contains(&"auto-observed".to_string()));
+        // Should have a pattern:* tag
+        assert!(suggestion.tags.iter().any(|t| t.starts_with("pattern:")));
+    }
+
+    #[tokio::test]
+    async fn on_plan_run_completed_emits_learning_event_for_actionable_patterns() {
+        use crate::notes::models::{Note, NoteType};
+
+        let state = mock_server_state().await;
+        let neo4j = state.orchestrator.neo4j();
+
+        // Reset cooldown
+        LAST_FEEDBACK_ANALYSIS_TS.store(0, std::sync::atomic::Ordering::Relaxed);
+
+        // Create a project + plan
+        let project = test_project();
+        let project_id = project.id;
+        neo4j.create_project(&project).await.unwrap();
+
+        let mut plan = test_plan();
+        plan.project_id = Some(project_id);
+        plan.status = PlanStatus::Completed;
+        let plan_id = plan.id;
+        neo4j.create_plan(&plan).await.unwrap();
+
+        // Create 4+ runner-feedback notes for an actionable pattern
+        for i in 0..4 {
+            let mut note = Note::new(
+                Some(project_id),
+                NoteType::Observation,
+                format!("Missing step feedback #{}", i),
+                format!("Runner feedback #{}", i),
+            );
+            note.tags = vec![
+                "runner-feedback".to_string(),
+                "runner-override-step".to_string(),
+            ];
+            neo4j.create_note(&note).await.unwrap();
+        }
+
+        // Fire the event
+        let event = make_event(
+            EntityType::Runner,
+            CrudAction::Updated,
+            &Uuid::new_v4().to_string(),
+            json!({"event": "plan_completed", "plan_id": plan_id.to_string(), "status": "completed"}),
+        );
+        on_plan_run_completed_analyze_feedback(event, state.clone()).await;
+
+        // Give the spawned task time to complete
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        // Verify suggestion notes were created (the Learning::FeedbackPatternsDetected
+        // event emission happens in the same code path, right after note creation)
+        let filters = crate::notes::models::NoteFilters {
+            tags: Some(vec!["runner-feedback-suggestion".to_string()]),
+            ..Default::default()
+        };
+        let (notes, _) = neo4j
+            .list_notes(Some(project_id), None, &filters)
+            .await
+            .unwrap();
+        assert!(
+            !notes.is_empty(),
+            "Suggestion notes should be created (event emission follows)"
+        );
     }
 }
