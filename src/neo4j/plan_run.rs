@@ -276,6 +276,7 @@ impl Neo4jClient {
         let plan_run_status = match status.as_str() {
             "running" => PlanRunStatus::Running,
             "completed" => PlanRunStatus::Completed,
+            "completed_with_errors" => PlanRunStatus::CompletedWithErrors,
             "failed" => PlanRunStatus::Failed,
             "cancelled" => PlanRunStatus::Cancelled,
             "budget_exceeded" => PlanRunStatus::BudgetExceeded,

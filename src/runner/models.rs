@@ -72,7 +72,7 @@ impl Default for RunnerConfig {
             auto_pr: false,
             build_check: true,
             test_runner: false,
-            max_cost_usd: 10.0,
+            max_cost_usd: 50.0,
             spawning_timeout_secs: 480,
             cwd_validation: CwdValidation::default(),
             completion_loop_threshold: 5,
@@ -310,6 +310,8 @@ pub enum PlanRunStatus {
     Running,
     /// All tasks completed successfully
     Completed,
+    /// Run finished but some tasks failed, were blocked, or remain pending
+    CompletedWithErrors,
     /// One or more tasks failed and the run was aborted
     Failed,
     /// Run was cancelled by the user
@@ -323,6 +325,7 @@ impl fmt::Display for PlanRunStatus {
         match self {
             Self::Running => write!(f, "running"),
             Self::Completed => write!(f, "completed"),
+            Self::CompletedWithErrors => write!(f, "completed_with_errors"),
             Self::Failed => write!(f, "failed"),
             Self::Cancelled => write!(f, "cancelled"),
             Self::BudgetExceeded => write!(f, "budget_exceeded"),
@@ -691,7 +694,7 @@ mod tests {
         assert!(!config.auto_pr);
         assert!(config.build_check);
         assert!(!config.test_runner);
-        assert!((config.max_cost_usd - 10.0).abs() < f64::EPSILON);
+        assert!((config.max_cost_usd - 50.0).abs() < f64::EPSILON);
         assert_eq!(config.spawning_timeout_secs, 480);
     }
 
