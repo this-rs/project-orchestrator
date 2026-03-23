@@ -15,6 +15,7 @@ use super::skill_hook;
 use super::types::{
     classify_api_error, truncate_snippet, ChatEvent, ChatEventPage, ChatRequest,
     CreateSessionResponse, MessageSearchHit, MessageSearchResult, PendingMessage,
+    SessionWorkLog,
 };
 use crate::meilisearch::SearchStore;
 use crate::neo4j::models::ChatEventRecord;
@@ -138,6 +139,10 @@ pub struct ActiveSession {
     /// reminder was injected. Must reach `OBJECTIVE_REMINDER_COOLDOWN` before another
     /// reminder is sent, to avoid spamming the agent.
     pub objective_reminder_turns_since: Arc<AtomicU32>,
+    /// Accumulates work performed during the session: files modified, files read,
+    /// steps completed, last tool used. Source of truth for resumption after
+    /// compaction or max_turns.
+    pub work_log: Arc<Mutex<SessionWorkLog>>,
 }
 
 /// Runtime-mutable environment config for Claude CLI subprocess.
@@ -2548,6 +2553,7 @@ impl ChatManager {
                     reasoning_path_tracker: super::feedback::ReasoningPathTracker::new(),
                     objective_tracking: true,
                     objective_reminder_turns_since: Arc::new(AtomicU32::new(0)),
+                    work_log: Arc::new(Mutex::new(SessionWorkLog::default())),
                 },
             );
             interrupt_flag
@@ -2874,13 +2880,18 @@ impl ChatManager {
         //
         // Also clone the stdin_tx sender for auto-allowing AskUserQuestion control
         // requests inline (without going through send_permission_response).
-        let (pending_perm_inputs, stdin_tx_for_auto_allow) = {
+        let (pending_perm_inputs, stdin_tx_for_auto_allow, work_log) = {
             let guard = active_sessions.read().await;
             match guard.get(&session_id) {
-                Some(s) => (s.pending_permission_inputs.clone(), s.stdin_tx.clone()),
+                Some(s) => (
+                    s.pending_permission_inputs.clone(),
+                    s.stdin_tx.clone(),
+                    s.work_log.clone(),
+                ),
                 None => (
                     Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
                     None,
+                    Arc::new(Mutex::new(SessionWorkLog::default())),
                 ),
             }
         };
@@ -3466,9 +3477,15 @@ impl ChatManager {
                                         streaming_events.lock().await.push(event.clone());
                                     }
 
-                                    // Track tool_use for objective tracking
-                                    if matches!(event, ChatEvent::ToolUse { .. }) {
+                                    // Track tool_use for objective tracking + work_log
+                                    if let ChatEvent::ToolUse {
+                                        ref tool,
+                                        ref input,
+                                        ..
+                                    } = event
+                                    {
                                         had_tool_use = true;
+                                        work_log.lock().await.record_tool_use(tool, input);
                                     }
 
                                     // Detect error_max_turns for auto-continue
@@ -4550,6 +4567,7 @@ impl ChatManager {
                     reasoning_path_tracker: super::feedback::ReasoningPathTracker::new(),
                     objective_tracking: true,
                     objective_reminder_turns_since: Arc::new(AtomicU32::new(0)),
+                    work_log: Arc::new(Mutex::new(SessionWorkLog::default())),
                 },
             );
             interrupt_flag
@@ -7123,6 +7141,7 @@ mod tests {
             reasoning_path_tracker: crate::chat::feedback::ReasoningPathTracker::new(),
             objective_tracking: false,
             objective_reminder_turns_since: Arc::new(AtomicU32::new(0)),
+            work_log: Arc::new(Mutex::new(SessionWorkLog::default())),
         };
 
         Some((session, pending_messages))
@@ -8018,6 +8037,7 @@ mod tests {
             reasoning_path_tracker: crate::chat::feedback::ReasoningPathTracker::new(),
             objective_tracking: false,
             objective_reminder_turns_since: Arc::new(AtomicU32::new(0)),
+            work_log: Arc::new(Mutex::new(SessionWorkLog::default())),
         };
 
         (session, handle)

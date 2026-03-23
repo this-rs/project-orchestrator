@@ -1,6 +1,7 @@
 //! Chat types — request/response/event types for the chat system
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -826,6 +827,207 @@ impl PendingMessage {
             kind: PendingMessageKind::SystemHint,
             content,
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SessionWorkLog — tracks work performed during a stream for continuity
+// ---------------------------------------------------------------------------
+
+/// Tracks the work performed during an active stream session.
+///
+/// Updated in real-time by parsing `ChatEvent::ToolUse` / `ChatEvent::ToolResult`
+/// events during `stream_response`. Serves as the source of truth for resumption
+/// after compaction or max_turns.
+#[derive(Debug, Clone, Default)]
+pub struct SessionWorkLog {
+    /// Files that were modified (Write/Edit tool_use)
+    pub files_modified: HashSet<String>,
+    /// Files that were read (Read/Glob tool_use)
+    pub files_read: HashSet<String>,
+    /// Steps completed (step(update) with status=completed)
+    pub steps_completed: Vec<Uuid>,
+    /// Step currently in progress (step(update) with status=in_progress)
+    pub step_in_progress: Option<Uuid>,
+    /// Short summaries of key decisions/actions
+    pub decisions_summary: Vec<String>,
+    /// Name of the last tool used
+    pub last_tool_name: Option<String>,
+    /// Total number of tool_use events processed
+    pub tool_use_count: u32,
+}
+
+/// Serializable snapshot of `SessionWorkLog` for transmission / persistence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionWorkLogSnapshot {
+    pub files_modified: Vec<String>,
+    pub files_read: Vec<String>,
+    pub steps_completed: Vec<Uuid>,
+    pub step_in_progress: Option<Uuid>,
+    pub decisions_summary: Vec<String>,
+    pub last_tool_name: Option<String>,
+    pub tool_use_count: u32,
+}
+
+impl SessionWorkLog {
+    /// Create a serializable snapshot (sorted for deterministic output).
+    pub fn snapshot(&self) -> SessionWorkLogSnapshot {
+        let mut files_modified: Vec<String> = self.files_modified.iter().cloned().collect();
+        files_modified.sort();
+        let mut files_read: Vec<String> = self.files_read.iter().cloned().collect();
+        files_read.sort();
+        SessionWorkLogSnapshot {
+            files_modified,
+            files_read,
+            steps_completed: self.steps_completed.clone(),
+            step_in_progress: self.step_in_progress,
+            decisions_summary: self.decisions_summary.clone(),
+            last_tool_name: self.last_tool_name.clone(),
+            tool_use_count: self.tool_use_count,
+        }
+    }
+
+    /// Produce a compact markdown summary for injection into continuity prompts.
+    pub fn to_summary_markdown(&self) -> String {
+        let mut parts = Vec::new();
+
+        if !self.files_modified.is_empty() {
+            let mut files: Vec<&String> = self.files_modified.iter().collect();
+            files.sort();
+            parts.push(format!(
+                "**Files modified ({}):** {}",
+                files.len(),
+                files.iter().map(|f| format!("`{}`", f)).collect::<Vec<_>>().join(", ")
+            ));
+        }
+
+        if !self.files_read.is_empty() {
+            let mut files: Vec<&String> = self.files_read.iter().collect();
+            files.sort();
+            parts.push(format!(
+                "**Files read ({}):** {}",
+                files.len(),
+                files.iter().map(|f| format!("`{}`", f)).collect::<Vec<_>>().join(", ")
+            ));
+        }
+
+        if !self.steps_completed.is_empty() {
+            parts.push(format!(
+                "**Steps completed ({}):** {}",
+                self.steps_completed.len(),
+                self.steps_completed
+                    .iter()
+                    .map(|id| format!("`{}`", id))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+
+        if let Some(ref step) = self.step_in_progress {
+            parts.push(format!("**Step in progress:** `{}`", step));
+        }
+
+        if !self.decisions_summary.is_empty() {
+            parts.push(format!(
+                "**Decisions:** {}",
+                self.decisions_summary.join("; ")
+            ));
+        }
+
+        if let Some(ref tool) = self.last_tool_name {
+            parts.push(format!("**Last tool:** {} (total: {})", tool, self.tool_use_count));
+        }
+
+        if parts.is_empty() {
+            return String::new();
+        }
+
+        format!("## Session Work Log\n{}", parts.join("\n"))
+    }
+
+    /// Record a tool_use event, extracting file paths from known tool inputs.
+    pub fn record_tool_use(&mut self, tool_name: &str, input: &serde_json::Value) {
+        self.tool_use_count += 1;
+        self.last_tool_name = Some(tool_name.to_string());
+
+        match tool_name {
+            "Write" | "Edit" | "NotebookEdit" => {
+                if let Some(path) = input.get("file_path").and_then(|v| v.as_str()) {
+                    self.files_modified.insert(path.to_string());
+                }
+            }
+            "Read" => {
+                if let Some(path) = input.get("file_path").and_then(|v| v.as_str()) {
+                    self.files_read.insert(path.to_string());
+                }
+            }
+            "Glob" => {
+                if let Some(path) = input.get("path").and_then(|v| v.as_str()) {
+                    self.files_read.insert(path.to_string());
+                }
+            }
+            "Grep" => {
+                if let Some(path) = input.get("path").and_then(|v| v.as_str()) {
+                    self.files_read.insert(path.to_string());
+                }
+            }
+            "Bash" => {
+                // Track bash commands as decisions for context
+                if let Some(cmd) = input.get("command").and_then(|v| v.as_str()) {
+                    let short = if cmd.len() > 80 { &cmd[..80] } else { cmd };
+                    self.decisions_summary.push(format!("bash: {}", short));
+                    // Cap decisions to avoid unbounded growth
+                    if self.decisions_summary.len() > 20 {
+                        self.decisions_summary.remove(0);
+                    }
+                }
+            }
+            // MCP step tool — track step completions
+            _ if tool_name.contains("step") => {
+                self.record_step_update(input);
+            }
+            _ => {}
+        }
+    }
+
+    /// Parse step(update) inputs to track step_in_progress / steps_completed.
+    fn record_step_update(&mut self, input: &serde_json::Value) {
+        let action = input.get("action").and_then(|v| v.as_str());
+        let status = input.get("status").and_then(|v| v.as_str());
+        let step_id = input
+            .get("step_id")
+            .and_then(|v| v.as_str())
+            .and_then(|s| Uuid::parse_str(s).ok());
+
+        if action != Some("update") {
+            return;
+        }
+
+        if let Some(id) = step_id {
+            match status {
+                Some("completed") => {
+                    if !self.steps_completed.contains(&id) {
+                        self.steps_completed.push(id);
+                    }
+                    if self.step_in_progress == Some(id) {
+                        self.step_in_progress = None;
+                    }
+                }
+                Some("in_progress") => {
+                    self.step_in_progress = Some(id);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Reset the log for a new stream turn (keeps accumulated data across
+    /// streams within the same session — only clears per-stream transients).
+    pub fn reset_for_new_stream(&mut self) {
+        // Intentionally does NOT clear files_modified, files_read, steps_completed, etc.
+        // Those accumulate across the session lifetime.
+        // Only the last_tool_name is reset since it's per-stream.
+        self.last_tool_name = None;
     }
 }
 
@@ -1883,5 +2085,186 @@ mod tests {
     fn test_classify_api_error_empty_message() {
         let kind = classify_api_error("");
         assert_eq!(kind, ApiErrorKind::NonRetryable("unknown".into()));
+    }
+
+    // ====================================================================
+    // SessionWorkLog
+    // ====================================================================
+
+    #[test]
+    fn test_session_work_log_record_write_edit_read() {
+        let mut log = SessionWorkLog::default();
+
+        // Write tool
+        log.record_tool_use(
+            "Write",
+            &serde_json::json!({"file_path": "/src/main.rs", "content": "fn main() {}"}),
+        );
+        assert!(log.files_modified.contains("/src/main.rs"));
+        assert_eq!(log.tool_use_count, 1);
+        assert_eq!(log.last_tool_name.as_deref(), Some("Write"));
+
+        // Edit tool
+        log.record_tool_use(
+            "Edit",
+            &serde_json::json!({"file_path": "/src/lib.rs", "old_string": "a", "new_string": "b"}),
+        );
+        assert!(log.files_modified.contains("/src/lib.rs"));
+        assert_eq!(log.tool_use_count, 2);
+
+        // Read tool
+        log.record_tool_use(
+            "Read",
+            &serde_json::json!({"file_path": "/src/types.rs"}),
+        );
+        assert!(log.files_read.contains("/src/types.rs"));
+        assert_eq!(log.tool_use_count, 3);
+    }
+
+    #[test]
+    fn test_session_work_log_dedup_files() {
+        let mut log = SessionWorkLog::default();
+
+        // Same file written twice → only one entry
+        log.record_tool_use(
+            "Write",
+            &serde_json::json!({"file_path": "/src/main.rs", "content": "v1"}),
+        );
+        log.record_tool_use(
+            "Write",
+            &serde_json::json!({"file_path": "/src/main.rs", "content": "v2"}),
+        );
+        assert_eq!(log.files_modified.len(), 1);
+        assert_eq!(log.tool_use_count, 2);
+    }
+
+    #[test]
+    fn test_session_work_log_step_tracking() {
+        let mut log = SessionWorkLog::default();
+        let step1 = Uuid::new_v4();
+        let step2 = Uuid::new_v4();
+
+        // Step in_progress
+        log.record_tool_use(
+            "mcp__project-orchestrator__step",
+            &serde_json::json!({"action": "update", "step_id": step1.to_string(), "status": "in_progress"}),
+        );
+        assert_eq!(log.step_in_progress, Some(step1));
+        assert!(log.steps_completed.is_empty());
+
+        // Step completed
+        log.record_tool_use(
+            "mcp__project-orchestrator__step",
+            &serde_json::json!({"action": "update", "step_id": step1.to_string(), "status": "completed"}),
+        );
+        assert_eq!(log.step_in_progress, None);
+        assert_eq!(log.steps_completed, vec![step1]);
+
+        // Second step in_progress
+        log.record_tool_use(
+            "mcp__project-orchestrator__step",
+            &serde_json::json!({"action": "update", "step_id": step2.to_string(), "status": "in_progress"}),
+        );
+        assert_eq!(log.step_in_progress, Some(step2));
+
+        // Complete step2
+        log.record_tool_use(
+            "mcp__project-orchestrator__step",
+            &serde_json::json!({"action": "update", "step_id": step2.to_string(), "status": "completed"}),
+        );
+        assert_eq!(log.steps_completed, vec![step1, step2]);
+    }
+
+    #[test]
+    fn test_session_work_log_to_summary_markdown() {
+        let mut log = SessionWorkLog::default();
+        let step1 = Uuid::new_v4();
+        let step2 = Uuid::new_v4();
+
+        // Add 3 files modified
+        log.record_tool_use("Write", &serde_json::json!({"file_path": "/a.rs"}));
+        log.record_tool_use("Edit", &serde_json::json!({"file_path": "/b.rs"}));
+        log.record_tool_use("Write", &serde_json::json!({"file_path": "/c.rs"}));
+
+        // Add 2 steps completed
+        log.steps_completed.push(step1);
+        log.steps_completed.push(step2);
+
+        let md = log.to_summary_markdown();
+        assert!(md.contains("## Session Work Log"));
+        assert!(md.contains("`/a.rs`"));
+        assert!(md.contains("`/b.rs`"));
+        assert!(md.contains("`/c.rs`"));
+        assert!(md.contains("Files modified (3)"));
+        assert!(md.contains(&step1.to_string()));
+        assert!(md.contains(&step2.to_string()));
+        assert!(md.contains("Steps completed (2)"));
+        assert!(md.contains("Last tool:"));
+    }
+
+    #[test]
+    fn test_session_work_log_empty_summary() {
+        let log = SessionWorkLog::default();
+        assert!(log.to_summary_markdown().is_empty());
+    }
+
+    #[test]
+    fn test_session_work_log_snapshot() {
+        let mut log = SessionWorkLog::default();
+        log.record_tool_use("Write", &serde_json::json!({"file_path": "/z.rs"}));
+        log.record_tool_use("Write", &serde_json::json!({"file_path": "/a.rs"}));
+        log.record_tool_use("Read", &serde_json::json!({"file_path": "/m.rs"}));
+
+        let snap = log.snapshot();
+        // Snapshot files are sorted
+        assert_eq!(snap.files_modified, vec!["/a.rs", "/z.rs"]);
+        assert_eq!(snap.files_read, vec!["/m.rs"]);
+        assert_eq!(snap.tool_use_count, 3);
+
+        // Snapshot is serializable
+        let json = serde_json::to_string(&snap).unwrap();
+        let deserialized: SessionWorkLogSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.files_modified, snap.files_modified);
+    }
+
+    #[test]
+    fn test_session_work_log_reset_for_new_stream() {
+        let mut log = SessionWorkLog::default();
+        log.record_tool_use("Write", &serde_json::json!({"file_path": "/a.rs"}));
+        log.record_tool_use("Read", &serde_json::json!({"file_path": "/b.rs"}));
+        assert_eq!(log.last_tool_name.as_deref(), Some("Read"));
+
+        log.reset_for_new_stream();
+
+        // Accumulated data persists
+        assert!(log.files_modified.contains("/a.rs"));
+        assert!(log.files_read.contains("/b.rs"));
+        assert_eq!(log.tool_use_count, 2);
+        // Per-stream transient is cleared
+        assert!(log.last_tool_name.is_none());
+    }
+
+    #[test]
+    fn test_session_work_log_bash_decisions_capped() {
+        let mut log = SessionWorkLog::default();
+        for i in 0..25 {
+            log.record_tool_use(
+                "Bash",
+                &serde_json::json!({"command": format!("echo {}", i)}),
+            );
+        }
+        // Decisions capped at 20
+        assert_eq!(log.decisions_summary.len(), 20);
+        // Most recent should be the last ones
+        assert!(log.decisions_summary.last().unwrap().contains("echo 24"));
+    }
+
+    #[test]
+    fn test_session_work_log_glob_grep_tracking() {
+        let mut log = SessionWorkLog::default();
+        log.record_tool_use("Glob", &serde_json::json!({"path": "/src", "pattern": "*.rs"}));
+        log.record_tool_use("Grep", &serde_json::json!({"path": "/src/lib.rs", "pattern": "fn main"}));
+        assert!(log.files_read.contains("/src"));
+        assert!(log.files_read.contains("/src/lib.rs"));
     }
 }
