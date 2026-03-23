@@ -1501,7 +1501,10 @@ mod tests {
             files_read: vec![],
             steps_completed: vec![],
             step_in_progress: None,
-            decisions_summary: vec!["bash: cargo test".to_string(), "bash: cargo check".to_string()],
+            decisions_summary: vec![
+                "bash: cargo test".to_string(),
+                "bash: cargo check".to_string(),
+            ],
             last_tool_name: None,
             tool_use_count: 0,
         };
@@ -1523,23 +1526,19 @@ mod tests {
     fn test_custom_instructions_active_plans_included() {
         let ctx = CompactionContext {
             project_name: Some("test-project".to_string()),
-            active_plans: vec![
-                PlanSummary {
-                    title: "Plan A".to_string(),
-                    total_tasks: 5,
-                    completed_tasks: 2,
-                    in_progress_tasks: 1,
-                    pending_tasks: 2,
-                },
-            ],
-            pending_tasks: vec![
-                TaskSummary {
-                    title: "Do something".to_string(),
-                    status: "inprogress".to_string(),
-                    affected_files: vec![],
-                    steps: vec![],
-                },
-            ],
+            active_plans: vec![PlanSummary {
+                title: "Plan A".to_string(),
+                total_tasks: 5,
+                completed_tasks: 2,
+                in_progress_tasks: 1,
+                pending_tasks: 2,
+            }],
+            pending_tasks: vec![TaskSummary {
+                title: "Do something".to_string(),
+                status: "inprogress".to_string(),
+                affected_files: vec![],
+                steps: vec![],
+            }],
             ..Default::default()
         };
         let ci = ctx.to_custom_instructions(None);
@@ -1564,7 +1563,10 @@ mod tests {
             steps: (0..50)
                 .map(|i| StepSummary {
                     order: i,
-                    description: format!("Step {} with a fairly long description to fill up chars", i),
+                    description: format!(
+                        "Step {} with a fairly long description to fill up chars",
+                        i
+                    ),
                     status: "pending".to_string(),
                 })
                 .collect(),
@@ -1610,11 +1612,7 @@ mod tests {
             "Missing Work Already Done section: {}",
             md
         );
-        assert!(
-            md.contains("`src/a.rs`"),
-            "Missing work_log file: {}",
-            md
-        );
+        assert!(md.contains("`src/a.rs`"), "Missing work_log file: {}", md);
     }
 
     #[test]

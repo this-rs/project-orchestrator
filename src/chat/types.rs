@@ -2338,7 +2338,8 @@ mod tests {
         let mut log = SessionWorkLog::default();
         let step = Uuid::new_v4();
         log.step_in_progress = Some(step);
-        log.decisions_summary.push("Use trait-based approach".to_string());
+        log.decisions_summary
+            .push("Use trait-based approach".to_string());
         log.last_tool_name = Some("Edit".to_string());
         log.tool_use_count = 5;
 
@@ -2372,10 +2373,7 @@ mod tests {
     #[test]
     fn test_session_work_log_unknown_tool_ignored() {
         let mut log = SessionWorkLog::default();
-        log.record_tool_use(
-            "SomeRandomTool",
-            &serde_json::json!({"whatever": "value"}),
-        );
+        log.record_tool_use("SomeRandomTool", &serde_json::json!({"whatever": "value"}));
         assert!(log.files_modified.is_empty());
         assert!(log.files_read.is_empty());
         assert!(log.decisions_summary.is_empty());
