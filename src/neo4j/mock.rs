@@ -10929,6 +10929,16 @@ impl GraphStore for MockGraphStore {
         );
         Ok(())
     }
+
+    async fn backfill_co_activated_with(&self) -> Result<usize> {
+        // Mock: no chat event records to scan, return 0
+        Ok(0)
+    }
+
+    async fn backfill_often_follows(&self) -> Result<usize> {
+        // Mock: no chat event records to scan, return 0
+        Ok(0)
+    }
 }
 
 #[cfg(test)]

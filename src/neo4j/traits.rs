@@ -3333,4 +3333,10 @@ pub trait GraphStore: Send + Sync {
         count: i64,
         avg_delta_ms: f64,
     ) -> Result<()>;
+
+    /// Backfill CO_ACTIVATED_WITH relations from chat event history
+    async fn backfill_co_activated_with(&self) -> Result<usize>;
+
+    /// Backfill OFTEN_FOLLOWS relations from consecutive tool use events
+    async fn backfill_often_follows(&self) -> Result<usize>;
 }

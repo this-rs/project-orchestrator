@@ -3980,4 +3980,12 @@ impl GraphStore for Neo4jClient {
         self.create_mcp_often_follows(tool_fqn_a, tool_fqn_b, count, avg_delta_ms)
             .await
     }
+
+    async fn backfill_co_activated_with(&self) -> anyhow::Result<usize> {
+        self.backfill_co_activated_with().await
+    }
+
+    async fn backfill_often_follows(&self) -> anyhow::Result<usize> {
+        self.backfill_often_follows().await
+    }
 }

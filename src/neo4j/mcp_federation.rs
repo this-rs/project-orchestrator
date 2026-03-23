@@ -349,6 +349,94 @@ impl Neo4jClient {
         })
     }
 
+    // ========================================================================
+    // Backfill relations from usage data
+    // ========================================================================
+
+    /// Backfill CO_ACTIVATED_WITH relations by scanning ChatEventRecord nodes.
+    ///
+    /// Finds pairs of McpTool FQNs that appear in `tool_use` events within the
+    /// same session and creates/updates CO_ACTIVATED_WITH edges with a count.
+    ///
+    /// Returns the number of relations created/updated.
+    pub async fn backfill_co_activated_with(&self) -> Result<usize> {
+        // This query:
+        // 1. Finds all tool_use events that contain "::" (external FQN pattern)
+        // 2. Groups by session
+        // 3. For each pair of distinct FQNs in the same session, creates CO_ACTIVATED_WITH
+        let q = query(
+            r#"
+            MATCH (e:ChatEventRecord)
+            WHERE e.event_type = 'tool_use' AND e.data CONTAINS '::'
+            WITH e.session_id AS sid, e.data AS data
+            WITH sid, data
+            ORDER BY sid
+            WITH sid, collect(DISTINCT data) AS tool_datas
+            WHERE size(tool_datas) >= 2
+            UNWIND tool_datas AS d1
+            UNWIND tool_datas AS d2
+            WITH sid, d1, d2
+            WHERE d1 < d2
+            WITH d1, d2, count(DISTINCT sid) AS co_count
+            MATCH (a:McpTool) WHERE d1 CONTAINS a.fqn
+            MATCH (b:McpTool) WHERE d2 CONTAINS b.fqn
+            MERGE (a)-[r:CO_ACTIVATED_WITH]->(b)
+            SET r.count = co_count, r.updated_at = datetime()
+            RETURN count(r) AS total
+            "#,
+        );
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let total: i64 = row.get("total").unwrap_or(0);
+            Ok(total as usize)
+        } else {
+            Ok(0)
+        }
+    }
+
+    /// Backfill OFTEN_FOLLOWS relations by scanning sequential tool_use events.
+    ///
+    /// Finds consecutive pairs of external tool calls (tool A followed by tool B)
+    /// within the same session and creates OFTEN_FOLLOWS edges with count and
+    /// average time delta.
+    ///
+    /// Returns the number of relations created/updated.
+    pub async fn backfill_often_follows(&self) -> Result<usize> {
+        // This query:
+        // 1. Finds consecutive tool_use events with "::" in the same session
+        // 2. Orders by seq within each session
+        // 3. Pairs consecutive events (seq, seq+1)
+        // 4. Creates OFTEN_FOLLOWS with count and avg_delta_ms
+        let q = query(
+            r#"
+            MATCH (e1:ChatEventRecord), (e2:ChatEventRecord)
+            WHERE e1.session_id = e2.session_id
+              AND e1.event_type = 'tool_use' AND e1.data CONTAINS '::'
+              AND e2.event_type = 'tool_use' AND e2.data CONTAINS '::'
+              AND e2.seq = e1.seq + 1
+            WITH e1.data AS data1, e2.data AS data2,
+                 duration.inMilliseconds(
+                     duration.between(e1.created_at, e2.created_at)
+                 ).milliseconds AS delta_ms
+            MATCH (a:McpTool) WHERE data1 CONTAINS a.fqn
+            MATCH (b:McpTool) WHERE data2 CONTAINS b.fqn
+            WITH a, b, count(*) AS follow_count, avg(delta_ms) AS avg_delta
+            MERGE (a)-[r:OFTEN_FOLLOWS]->(b)
+            SET r.count = follow_count, r.avg_delta_ms = avg_delta, r.updated_at = datetime()
+            RETURN count(r) AS total
+            "#,
+        );
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let total: i64 = row.get("total").unwrap_or(0);
+            Ok(total as usize)
+        } else {
+            Ok(0)
+        }
+    }
+
     fn parse_mcp_tool_node(&self, node: &neo4rs::Node) -> Result<McpToolNode> {
         use chrono::{DateTime, Utc};
 
