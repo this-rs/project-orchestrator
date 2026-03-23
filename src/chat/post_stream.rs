@@ -378,11 +378,15 @@ impl PostStreamHandler {
 
     // ── Objective tracking ────────────────────────────────────────────────
 
-    /// If the agent concluded without using tools and auto-continue didn't fire,
-    /// check for pending objectives and inject a SystemHint reminder.
+    /// If the agent concluded without using *productive* tools and auto-continue
+    /// didn't fire, check for pending objectives and inject a SystemHint reminder.
+    ///
+    /// "Productive" excludes conclusive tools (git commit/push/status) — the agent
+    /// may be wrapping up prematurely after a commit without finishing remaining tasks.
     pub async fn handle_objective_tracking(
         &self,
-        had_tool_use: bool,
+        had_productive_tool_use: bool,
+        had_conclusive_tool_use: bool,
         auto_continue_allowed: bool,
         hit_error_max_turns: bool,
     ) {
@@ -390,12 +394,14 @@ impl PostStreamHandler {
         let (tracking_enabled, cooldown_turns) = {
             let sessions = self.active_sessions.read().await;
             if let Some(session) = sessions.get(&self.session_id) {
-                if had_tool_use {
-                    // Agent used tools = still working, reset cooldown
+                if had_productive_tool_use && !had_conclusive_tool_use {
+                    // Agent used ONLY productive tools (no commit/push) = actively working, reset cooldown
                     session
                         .objective_reminder_turns_since
                         .store(0, Ordering::Relaxed);
                 }
+                // When both productive AND conclusive → agent did work AND committed.
+                // Don't reset cooldown — let the reminder check fire.
                 let enabled = session.objective_tracking;
                 let turns = session
                     .objective_reminder_turns_since
@@ -406,8 +412,12 @@ impl PostStreamHandler {
             }
         };
 
+        // Should we check for pending objectives?
+        // Yes when: (a) no productive tools, OR (b) productive + conclusive (agent wrapping up)
+        let should_check = !had_productive_tool_use || had_conclusive_tool_use;
+
         // Fetch pending objectives from graph (only if we might need them)
-        let (pending_tasks, work_log_summary) = if !had_tool_use
+        let (pending_tasks, work_log_summary) = if should_check
             && !auto_continue_allowed
             && !hit_error_max_turns
             && !self.interrupt_flag.load(Ordering::SeqCst)
@@ -453,7 +463,8 @@ impl PostStreamHandler {
 
         // Pure decision
         let input = ObjectiveCheckInput {
-            had_tool_use,
+            had_productive_tool_use,
+            had_conclusive_tool_use,
             auto_continue_allowed,
             hit_error_max_turns,
             interrupted: self.interrupt_flag.load(Ordering::SeqCst),
@@ -611,7 +622,8 @@ pub(crate) struct PendingTaskInfo {
 
 /// Inputs to the objective tracking decision (decoupled from async/Arc state).
 pub(crate) struct ObjectiveCheckInput {
-    pub had_tool_use: bool,
+    pub had_productive_tool_use: bool,
+    pub had_conclusive_tool_use: bool,
     pub auto_continue_allowed: bool,
     pub hit_error_max_turns: bool,
     pub interrupted: bool,
@@ -628,12 +640,15 @@ pub(crate) struct ObjectiveCheckInput {
 ///
 /// This function has NO side effects and is fully testable without mocks.
 pub(crate) fn check_objective_reminder(input: &ObjectiveCheckInput) -> Option<String> {
-    // Guard 1: only fire when agent concluded without tools
-    if input.had_tool_use
-        || input.auto_continue_allowed
-        || input.hit_error_max_turns
-        || input.interrupted
-    {
+    // Guard 1: skip if auto-continue or error/interrupt
+    if input.auto_continue_allowed || input.hit_error_max_turns || input.interrupted {
+        return None;
+    }
+
+    // Guard 1b: skip if productive tools were used WITHOUT conclusive tools.
+    // When the agent used productive tools AND committed (conclusive), we still
+    // want to check — the agent may have done partial work then wrapped up.
+    if input.had_productive_tool_use && !input.had_conclusive_tool_use {
         return None;
     }
 
@@ -695,7 +710,8 @@ mod tests {
 
     fn base_input() -> ObjectiveCheckInput {
         ObjectiveCheckInput {
-            had_tool_use: false,
+            had_productive_tool_use: false,
+            had_conclusive_tool_use: false,
             auto_continue_allowed: false,
             hit_error_max_turns: false,
             interrupted: false,
@@ -723,10 +739,40 @@ mod tests {
     }
 
     #[test]
-    fn test_no_reminder_when_tools_were_used() {
+    fn test_no_reminder_when_productive_tools_were_used() {
         let mut input = base_input();
-        input.had_tool_use = true;
+        input.had_productive_tool_use = true;
         assert!(check_objective_reminder(&input).is_none());
+    }
+
+    #[test]
+    fn test_reminder_fires_when_only_conclusive_tools_used() {
+        // When the agent only used git commit/push (conclusive tools),
+        // had_productive_tool_use is false → reminder should fire
+        let input = base_input(); // had_productive_tool_use = false by default
+        let result = check_objective_reminder(&input);
+        assert!(
+            result.is_some(),
+            "reminder should fire after conclusive-only tools"
+        );
+        let msg = result.unwrap();
+        assert!(msg.contains("not finished"));
+    }
+
+    #[test]
+    fn test_reminder_fires_when_productive_and_conclusive_tools_mixed() {
+        // Scenario: agent does Edit + Bash(git commit) in the same turn
+        // Both productive AND conclusive → reminder should fire because agent is wrapping up
+        let mut input = base_input();
+        input.had_productive_tool_use = true;
+        input.had_conclusive_tool_use = true;
+        let result = check_objective_reminder(&input);
+        assert!(
+            result.is_some(),
+            "reminder should fire when agent does work AND commits"
+        );
+        let msg = result.unwrap();
+        assert!(msg.contains("not finished"));
     }
 
     #[test]
@@ -783,7 +829,8 @@ mod tests {
     #[test]
     fn test_objective_reminder_enriched() {
         let input = ObjectiveCheckInput {
-            had_tool_use: false,
+            had_productive_tool_use: false,
+            had_conclusive_tool_use: false,
             auto_continue_allowed: false,
             hit_error_max_turns: false,
             interrupted: false,
@@ -889,7 +936,8 @@ mod tests {
     #[test]
     fn test_objective_reminder_multiple_tasks_all_shown() {
         let input = ObjectiveCheckInput {
-            had_tool_use: false,
+            had_productive_tool_use: false,
+            had_conclusive_tool_use: false,
             auto_continue_allowed: false,
             hit_error_max_turns: false,
             interrupted: false,
@@ -1125,7 +1173,9 @@ mod integration_tests {
         .await;
 
         // Call with had_tool_use=false → should inject reminder
-        handler.handle_objective_tracking(false, false, false).await;
+        handler
+            .handle_objective_tracking(false, false, false, false)
+            .await;
 
         let pending = handler.pending_messages.lock().await;
         assert_eq!(pending.len(), 1, "Expected 1 pending SystemHint message");
@@ -1151,7 +1201,9 @@ mod integration_tests {
         let handler = build_handler(graph, Some(slug), "test-session-2", true).await;
 
         // Call with had_tool_use=true → no reminder
-        handler.handle_objective_tracking(true, false, false).await;
+        handler
+            .handle_objective_tracking(true, false, false, false)
+            .await;
 
         let pending = handler.pending_messages.lock().await;
         assert!(
@@ -1173,7 +1225,9 @@ mod integration_tests {
         )
         .await;
 
-        handler.handle_objective_tracking(false, false, false).await;
+        handler
+            .handle_objective_tracking(false, false, false, false)
+            .await;
 
         let pending = handler.pending_messages.lock().await;
         assert!(
@@ -1193,7 +1247,9 @@ mod integration_tests {
 
         let handler = build_handler(graph, Some(slug), "test-session-4", true).await;
 
-        handler.handle_objective_tracking(false, false, false).await;
+        handler
+            .handle_objective_tracking(false, false, false, false)
+            .await;
 
         let pending = handler.pending_messages.lock().await;
         assert!(
@@ -1210,7 +1266,9 @@ mod integration_tests {
         let handler = build_handler(graph, Some(slug), "test-session-5", true).await;
 
         // First call (turn 0) → should fire
-        handler.handle_objective_tracking(false, false, false).await;
+        handler
+            .handle_objective_tracking(false, false, false, false)
+            .await;
         assert_eq!(
             handler.pending_messages.lock().await.len(),
             1,
@@ -1223,7 +1281,9 @@ mod integration_tests {
         // Second call: after first reminder, cooldown_turns was reset to 1.
         // The handler increments it via fetch_add(1) → reads 1, which meets
         // COOLDOWN=1 → fires again. With cooldown=1, reminders fire every turn.
-        handler.handle_objective_tracking(false, false, false).await;
+        handler
+            .handle_objective_tracking(false, false, false, false)
+            .await;
         assert_eq!(
             handler.pending_messages.lock().await.len(),
             1,
