@@ -819,8 +819,8 @@ pub struct AppState {
     /// Trajectory store — Neo4j CRUD + vector search for stored trajectories.
     pub trajectory_store: Arc<dyn neural_routing_runtime::TrajectoryStore>,
     /// MCP Federation registry — external MCP server connections.
-    /// None when federation is disabled (default — backward compat).
-    pub mcp_registry: Option<mcp_federation::registry::SharedRegistry>,
+    /// Always initialized (empty registry). Servers are added/removed dynamically via API.
+    pub mcp_registry: mcp_federation::registry::SharedRegistry,
 }
 
 impl AppState {
@@ -892,7 +892,7 @@ impl AppState {
             trajectory_collector: Arc::new(std::sync::RwLock::new(trajectory_collector_inner)),
             trajectory_store_neo4j: Some(nr_store.clone()),
             trajectory_store: trajectory_store_api,
-            mcp_registry: None,
+            mcp_registry: mcp_federation::registry::new_shared_registry(),
         })
     }
 }
@@ -1494,7 +1494,7 @@ pub async fn start_server(mut config: Config) -> Result<()> {
         },
         reactor_counters: std::sync::OnceLock::new(),
         confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
-        mcp_registry: None, // initialized lazily when first MCP server connects
+        mcp_registry: mcp_federation::registry::new_shared_registry(),
     });
 
     // ── EventReactor: build, register built-in reactions, and spawn ──

@@ -114,8 +114,8 @@ pub struct ToolHandler {
     /// None when collection is disabled.
     collector: Option<std::sync::Arc<neural_routing_runtime::TrajectoryCollector>>,
     /// MCP Federation registry for external tool dispatch.
-    /// None when federation is disabled (default — backward compat).
-    mcp_registry: Option<crate::mcp_federation::registry::SharedRegistry>,
+    /// Always initialized (empty registry). Servers are added/removed dynamically.
+    mcp_registry: crate::mcp_federation::registry::SharedRegistry,
 }
 
 impl ToolHandler {
@@ -124,7 +124,7 @@ impl ToolHandler {
         Self {
             client: http_client,
             collector: None,
-            mcp_registry: None,
+            mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
         }
     }
 
@@ -136,13 +136,13 @@ impl ToolHandler {
         Self {
             client: http_client,
             collector: Some(collector),
-            mcp_registry: None,
+            mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
         }
     }
 
     /// Set the MCP federation registry for external tool dispatch.
     pub fn set_mcp_registry(&mut self, registry: crate::mcp_federation::registry::SharedRegistry) {
-        self.mcp_registry = Some(registry);
+        self.mcp_registry = registry;
     }
 
     /// Get the HTTP client.
@@ -682,16 +682,9 @@ impl ToolHandler {
 
         // ── External MCP dispatch (server_id::tool_name) ────────────────
         if let Some((server_id, tool_name)) = name.split_once("::") {
-            if let Some(ref registry) = self.mcp_registry {
-                return self
-                    .handle_external(registry, server_id, tool_name, args, start)
-                    .await;
-            } else {
-                return Err(anyhow!(
-                    "External tool '{}' requested but MCP federation is not configured",
-                    name
-                ));
-            }
+            return self
+                .handle_external(&self.mcp_registry, server_id, tool_name, args, start)
+                .await;
         }
 
         // ── Mega-tool resolution ────────────────────────────────────────
@@ -916,9 +909,7 @@ impl ToolHandler {
 
     /// Handle mcp_federation mega-tool actions that operate directly on the SharedRegistry.
     async fn handle_mcp_federation(&self, resolved_name: &str, args: &Value) -> Result<Value> {
-        let registry = self.mcp_registry.as_ref().ok_or_else(|| {
-            anyhow!("MCP federation is not configured. Set mcp_registry on the handler.")
-        })?;
+        let registry = &self.mcp_registry;
 
         match resolved_name {
             "__mcp_federation_connect" => {
@@ -10876,8 +10867,8 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn test_no_registry_rejects_external_call() {
-            // handler with no registry set — should reject "::" calls
+        async fn test_empty_registry_rejects_external_call() {
+            // handler with empty registry — should reject "::" calls for unknown servers
             let handler = make_handler();
             let err = handler
                 .handle("grafeo::query", Some(json!({})))
@@ -10885,8 +10876,8 @@ mod tests {
                 .unwrap_err();
 
             assert!(
-                err.to_string().contains("not configured"),
-                "Expected 'not configured' error, got: {}",
+                err.to_string().contains("not connected"),
+                "Expected 'not connected' error, got: {}",
                 err
             );
         }

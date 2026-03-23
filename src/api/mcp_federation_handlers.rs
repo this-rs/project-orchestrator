@@ -62,15 +62,11 @@ pub struct ActionResponse {
 // Helper
 // ============================================================================
 
-/// Extract the shared registry from state, returning 501 if federation is not configured.
+/// Extract the shared registry from state.
 fn get_registry(
     state: &OrchestratorState,
-) -> Result<&crate::mcp_federation::registry::SharedRegistry, AppError> {
-    state.mcp_registry.as_ref().ok_or_else(|| {
-        AppError::Internal(anyhow::anyhow!(
-            "MCP Federation is not configured. Enable it in the server configuration."
-        ))
-    })
+) -> &crate::mcp_federation::registry::SharedRegistry {
+    &state.mcp_registry
 }
 
 /// Build an `McpTransport` from the connect body.
@@ -121,7 +117,7 @@ pub(crate) fn build_transport(body: &ConnectServerBody) -> Result<McpTransport, 
 pub async fn list_servers(
     State(state): State<OrchestratorState>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let registry = get_registry(&state)?;
+    let registry = get_registry(&state);
     let reg = registry.read().await;
     let servers = reg.list();
     Ok(Json(serde_json::to_value(servers).map_err(|e| {
@@ -136,7 +132,7 @@ pub async fn connect_server(
     State(state): State<OrchestratorState>,
     Json(body): Json<ConnectServerBody>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
-    let registry = get_registry(&state)?;
+    let registry = get_registry(&state);
     let transport = build_transport(&body)?;
 
     let config = McpTransportConfig {
@@ -164,7 +160,7 @@ pub async fn get_server_status(
     State(state): State<OrchestratorState>,
     Path(server_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let registry = get_registry(&state)?;
+    let registry = get_registry(&state);
     let reg = registry.read().await;
 
     // Find this server in the list
@@ -186,7 +182,7 @@ pub async fn disconnect_server(
     State(state): State<OrchestratorState>,
     Path(server_id): Path<String>,
 ) -> Result<Json<ActionResponse>, AppError> {
-    let registry = get_registry(&state)?;
+    let registry = get_registry(&state);
     let mut reg = registry.write().await;
     reg.disconnect(&server_id)
         .await
@@ -206,7 +202,7 @@ pub async fn list_server_tools(
     State(state): State<OrchestratorState>,
     Path(server_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let registry = get_registry(&state)?;
+    let registry = get_registry(&state);
     let reg = registry.read().await;
 
     let tools = reg.tools_for_server(&server_id);
@@ -232,7 +228,7 @@ pub async fn probe_server(
     State(state): State<OrchestratorState>,
     Path(server_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let registry = get_registry(&state)?;
+    let registry = get_registry(&state);
     let mut reg = registry.write().await;
 
     let conn = reg
@@ -267,7 +263,7 @@ pub async fn reconnect_server(
     State(state): State<OrchestratorState>,
     Path(server_id): Path<String>,
 ) -> Result<Json<ActionResponse>, AppError> {
-    let registry = get_registry(&state)?;
+    let registry = get_registry(&state);
 
     // Get the existing transport config before disconnecting
     let transport_config = {
@@ -321,7 +317,7 @@ mod tests {
     use std::sync::Arc;
     use tower::ServiceExt;
 
-    /// App WITHOUT mcp_registry (None)
+    /// App with empty mcp_registry (no servers connected)
     async fn test_app() -> axum::Router {
         let app_state = mock_app_state();
         let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
@@ -352,7 +348,7 @@ mod tests {
             identity: None,
             reactor_counters: std::sync::OnceLock::new(),
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
-            mcp_registry: None,
+            mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
         });
         create_router(state)
     }
@@ -389,7 +385,7 @@ mod tests {
             identity: None,
             reactor_counters: std::sync::OnceLock::new(),
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
-            mcp_registry: Some(registry),
+            mcp_registry: registry,
         });
         create_router(state)
     }
@@ -429,7 +425,7 @@ mod tests {
     }
 
     // ========================================================================
-    // 1. list_servers when mcp_registry is None => 500
+    // 1. list_servers with default (empty) registry => 200 + empty array
     // ========================================================================
 
     #[tokio::test]
@@ -439,7 +435,9 @@ mod tests {
             .oneshot(auth_get("/api/mcp-federation/servers"))
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert!(json.as_array().unwrap().is_empty());
     }
 
     // ========================================================================
@@ -797,7 +795,7 @@ mod tests {
             identity: None,
             reactor_counters: std::sync::OnceLock::new(),
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
-            mcp_registry: Some(shared_registry),
+            mcp_registry: shared_registry,
         });
         create_router(state)
     }

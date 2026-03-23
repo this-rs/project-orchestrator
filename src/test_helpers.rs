@@ -133,7 +133,7 @@ pub fn mock_app_state() -> AppState {
         trajectory_collector: Arc::new(std::sync::RwLock::new(None)),
         trajectory_store_neo4j: None,
         trajectory_store: mock_trajectory_store(),
-        mcp_registry: None,
+        mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
     }
 }
 
@@ -181,7 +181,7 @@ pub fn mock_app_state_with(graph: MockGraphStore, search: MockSearchStore) -> Ap
         trajectory_collector: Arc::new(std::sync::RwLock::new(None)),
         trajectory_store_neo4j: None,
         trajectory_store: mock_trajectory_store(),
-        mcp_registry: None,
+        mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
     }
 }
 
@@ -229,7 +229,7 @@ pub fn mock_app_state_with_graph(graph: Arc<MockGraphStore>) -> AppState {
         trajectory_collector: Arc::new(std::sync::RwLock::new(None)),
         trajectory_store_neo4j: None,
         trajectory_store: mock_trajectory_store(),
-        mcp_registry: None,
+        mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
     }
 }
 
@@ -282,7 +282,7 @@ pub fn mock_app_state_with_stores() -> (AppState, Arc<MockGraphStore>, Arc<MockS
         trajectory_collector: Arc::new(std::sync::RwLock::new(None)),
         trajectory_store_neo4j: None,
         trajectory_store: mock_trajectory_store(),
-        mcp_registry: None,
+        mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
     };
     (state, graph, meili)
 }

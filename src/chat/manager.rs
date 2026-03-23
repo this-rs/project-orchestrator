@@ -201,8 +201,8 @@ pub struct ChatManager {
     /// dashboard metrics and log NN route matches.
     pub(crate) nn_router: Option<Arc<tokio::sync::RwLock<neural_routing_runtime::DualTrackRouter>>>,
     /// MCP Federation registry for external server connections.
-    /// When Some, the McpFederationStage injects tool availability into prompts.
-    pub(crate) mcp_registry: Option<crate::mcp_federation::registry::SharedRegistry>,
+    /// The McpFederationStage injects tool availability into prompts when servers are connected.
+    pub(crate) mcp_registry: crate::mcp_federation::registry::SharedRegistry,
 }
 
 // ============================================================================
@@ -559,7 +559,7 @@ impl ChatManager {
             neural_routing_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             dual_track_router: Arc::new(std::sync::RwLock::new(None)),
             nn_router: None,
-            mcp_registry: None,
+            mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
         }
     }
 
@@ -614,7 +614,7 @@ impl ChatManager {
             neural_routing_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             dual_track_router: Arc::new(std::sync::RwLock::new(None)),
             nn_router: None,
-            mcp_registry: None,
+            mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
         }
     }
 
@@ -655,7 +655,7 @@ impl ChatManager {
             &self.search,
             Some(&engine),
             tc_guard.as_ref(),
-            self.mcp_registry.as_ref(),
+            Some(&self.mcp_registry),
         );
         drop(tc_guard);
         self
@@ -1760,11 +1760,7 @@ impl ChatManager {
 
         // ── Compose via FsmPromptComposer ───────────────────────────────
         // Check if external MCP servers are connected
-        let external_tools_available = if let Some(ref registry) = self.mcp_registry {
-            !registry.read().await.is_empty()
-        } else {
-            false
-        };
+        let external_tools_available = !self.mcp_registry.read().await.is_empty();
 
         let input = ComposerInput {
             scaffolding_level,

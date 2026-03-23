@@ -1245,7 +1245,7 @@ mod tests {
             identity: None,
             reactor_counters: std::sync::OnceLock::new(),
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
-            mcp_registry: None,
+            mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
         });
         create_router(state)
     }
@@ -1283,7 +1283,7 @@ mod tests {
             identity: None,
             reactor_counters: std::sync::OnceLock::new(),
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
-            mcp_registry: None,
+            mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
         });
         (create_router(state), project_id)
     }
@@ -1375,7 +1375,7 @@ mod tests {
             identity: None,
             reactor_counters: std::sync::OnceLock::new(),
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
-            mcp_registry: None,
+            mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
         });
         let app = create_router(state);
 
@@ -1435,7 +1435,7 @@ mod tests {
             identity: None,
             reactor_counters: std::sync::OnceLock::new(),
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
-            mcp_registry: None,
+            mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
         });
         let app = create_router(state);
 
@@ -1482,7 +1482,7 @@ mod tests {
             identity: None,
             reactor_counters: std::sync::OnceLock::new(),
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
-            mcp_registry: None,
+            mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
         });
         let app = create_router(state);
 
@@ -1532,7 +1532,7 @@ mod tests {
             identity: None,
             reactor_counters: std::sync::OnceLock::new(),
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
-            mcp_registry: None,
+            mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
         });
         let app = create_router(state);
 
@@ -1587,7 +1587,7 @@ mod tests {
             identity: None,
             reactor_counters: std::sync::OnceLock::new(),
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
-            mcp_registry: None,
+            mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
         });
         let app = create_router(state);
 

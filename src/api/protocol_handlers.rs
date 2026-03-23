@@ -2129,7 +2129,7 @@ mod tests {
             identity: None,
             reactor_counters: std::sync::OnceLock::new(),
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
-            mcp_registry: None,
+            mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
             oidc_client: None,
             neural_router: crate::test_helpers::mock_neural_router(),
             trajectory_collector: std::sync::RwLock::new(None),
