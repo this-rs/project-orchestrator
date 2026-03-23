@@ -109,6 +109,10 @@ pub enum CrudAction {
     /// Payload contains `project_id`, `patterns_count`.
     /// Used by the learning loop to trigger materialization (T3).
     PatternsDetected,
+    /// Feedback patterns detected from runner observation notes.
+    /// Payload contains `project_id`, `patterns_count`, `suggestion_note_ids`.
+    /// Emitted by the FeedbackAnalyzer reaction for frontend notification.
+    FeedbackPatternsDetected,
 }
 
 /// A related entity for Linked/Unlinked actions
@@ -412,6 +416,7 @@ mod tests {
             CrudAction::StatusChanged,
             CrudAction::Collected,
             CrudAction::PatternsDetected,
+            CrudAction::FeedbackPatternsDetected,
         ];
 
         for variant in &variants {

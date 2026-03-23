@@ -39,7 +39,9 @@
 //! ```
 
 use super::prompt::TOOL_REFERENCE;
-use super::prompt_sections::{assemble_sections, assemble_sections_weighted, extract_tool_reference};
+use super::prompt_sections::{
+    assemble_sections, assemble_sections_weighted, extract_tool_reference,
+};
 use super::routing::{HeuristicRouter, RoutingContext, RoutingDecisionRecord, RoutingProvider};
 use super::stages::status_injection::ProtocolRunStatus;
 
@@ -452,18 +454,12 @@ impl FsmPromptComposer {
                 trunc_enrichment
             };
             let fc = if has_continuity && extra_for_continuity > 0 {
-                truncate_markdown_semantically(
-                    continuity,
-                    continuity_budget + extra_for_continuity,
-                )
+                truncate_markdown_semantically(continuity, continuity_budget + extra_for_continuity)
             } else {
                 trunc_continuity
             };
             let fp = if has_project && extra_for_project > 0 {
-                truncate_markdown_semantically(
-                    project_context,
-                    project_budget + extra_for_project,
-                )
+                truncate_markdown_semantically(project_context, project_budget + extra_for_project)
             } else {
                 trunc_project
             };
@@ -1126,8 +1122,7 @@ mod tests {
             project.push_str(&format!("- [Low] Generic info item {}\n", i));
         }
 
-        let result =
-            FsmPromptComposer::build_dynamic_section("", &project, &enrichment, budget);
+        let result = FsmPromptComposer::build_dynamic_section("", &project, &enrichment, budget);
 
         // Enrichment should appear first (it's assembled first)
         let enrichment_pos = result.find("Active Skills");
@@ -1165,8 +1160,7 @@ mod tests {
             project.push_str(&format!("- Project item {} with some padding text\n", i));
         }
 
-        let result =
-            FsmPromptComposer::build_dynamic_section("", &project, &enrichment, budget);
+        let result = FsmPromptComposer::build_dynamic_section("", &project, &enrichment, budget);
 
         // Count how much enrichment content survived vs project content
         let enrichment_lines = result
@@ -1212,8 +1206,7 @@ mod tests {
             project.push_str(&format!("- Project item {} with padding text\n", i));
         }
 
-        let result =
-            FsmPromptComposer::build_dynamic_section("", &project, enrichment, budget);
+        let result = FsmPromptComposer::build_dynamic_section("", &project, enrichment, budget);
 
         // Project should get more than its 30% base allocation thanks to
         // surplus from enrichment's unused 40%.
