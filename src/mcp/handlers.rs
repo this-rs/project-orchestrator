@@ -105,11 +105,17 @@ fn unstringify_json_values(args: &mut Value) {
 }
 
 /// Handles MCP tool calls by proxying to the REST API.
+///
+/// For external MCP tools (FQN format "server_id::tool_name"), the handler
+/// routes directly to the connected MCP server via the federation registry.
 pub struct ToolHandler {
     client: McpHttpClient,
     /// Trajectory collector for decision capture (fire-and-forget).
     /// None when collection is disabled.
     collector: Option<std::sync::Arc<neural_routing_runtime::TrajectoryCollector>>,
+    /// MCP Federation registry for external tool dispatch.
+    /// None when federation is disabled (default — backward compat).
+    mcp_registry: Option<crate::mcp_federation::registry::SharedRegistry>,
 }
 
 impl ToolHandler {
@@ -118,6 +124,7 @@ impl ToolHandler {
         Self {
             client: http_client,
             collector: None,
+            mcp_registry: None,
         }
     }
 
@@ -129,7 +136,13 @@ impl ToolHandler {
         Self {
             client: http_client,
             collector: Some(collector),
+            mcp_registry: None,
         }
+    }
+
+    /// Set the MCP federation registry for external tool dispatch.
+    pub fn set_mcp_registry(&mut self, registry: crate::mcp_federation::registry::SharedRegistry) {
+        self.mcp_registry = Some(registry);
     }
 
     /// Get the HTTP client.
@@ -656,6 +669,20 @@ impl ToolHandler {
         let args = args.unwrap_or(json!({}));
         let start = std::time::Instant::now();
 
+        // ── External MCP dispatch (server_id::tool_name) ────────────────
+        if let Some((server_id, tool_name)) = name.split_once("::") {
+            if let Some(ref registry) = self.mcp_registry {
+                return self
+                    .handle_external(registry, server_id, tool_name, args, start)
+                    .await;
+            } else {
+                return Err(anyhow!(
+                    "External tool '{}' requested but MCP federation is not configured",
+                    name
+                ));
+            }
+        }
+
         // ── Mega-tool resolution ────────────────────────────────────────
         let (resolved_name, resolved_args) = self.resolve_mega_tool(name, &args)?;
         let name = resolved_name.as_str();
@@ -718,6 +745,159 @@ impl ToolHandler {
             Ok(None) => Err(anyhow!("Unknown tool: '{}'", name)),
             Err(e) => Err(e),
         }
+    }
+
+    // ========================================================================
+    // External MCP dispatch (federation)
+    // ========================================================================
+
+    /// Dispatch a tool call to an external MCP server via the federation registry.
+    ///
+    /// Flow: lookup server → circuit breaker check → call_tool with adaptive timeout
+    /// → record success/failure → update stats → optional trajectory recording.
+    async fn handle_external(
+        &self,
+        registry: &crate::mcp_federation::registry::SharedRegistry,
+        server_id: &str,
+        tool_name: &str,
+        args: Value,
+        start: std::time::Instant,
+    ) -> Result<Value> {
+        let fqn = format!("{}::{}", server_id, tool_name);
+
+        // 1. Circuit breaker check (needs write lock for state transition)
+        {
+            let mut reg = registry.write().await;
+            let conn = reg.get_mut(server_id).ok_or_else(|| {
+                anyhow!(
+                    "External MCP server '{}' is not connected. Use mcp_federation(action: \"connect\") first.",
+                    server_id
+                )
+            })?;
+
+            if !conn.circuit_breaker.allow_request() {
+                return Err(anyhow!(
+                    "Circuit breaker OPEN for MCP server '{}' — too many recent failures. \
+                     Will retry automatically after cooldown.",
+                    server_id
+                ));
+            }
+        }
+
+        // 2. Compute adaptive timeout: max(30s, p95 * 3)
+        let timeout_duration = {
+            let reg = registry.read().await;
+            let timeout_ms = reg
+                .get(server_id)
+                .map(|conn| {
+                    let p95 = conn.stats.latency_p95();
+                    if p95 > 0 {
+                        (p95 * 3).max(30_000)
+                    } else {
+                        30_000 // default 30s for first calls
+                    }
+                })
+                .unwrap_or(30_000);
+            std::time::Duration::from_millis(timeout_ms)
+        };
+
+        // 3. Execute the call with timeout (read lock — call_tool is &self)
+        let call_result = {
+            let reg = registry.read().await;
+            let conn = reg.get(server_id).ok_or_else(|| {
+                anyhow!("MCP server '{}' disconnected during call", server_id)
+            })?;
+
+            tokio::time::timeout(
+                timeout_duration,
+                conn.client.call_tool(tool_name, Some(args.clone())),
+            )
+            .await
+        };
+
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+
+        // 4. Process result and update stats + circuit breaker
+        let result = match call_result {
+            Ok(Ok(value)) => {
+                // Success
+                let mut reg = registry.write().await;
+                if let Some(conn) = reg.get_mut(server_id) {
+                    conn.circuit_breaker.record_success();
+                    conn.stats.record_call(elapsed_ms, true);
+                }
+                Ok(value)
+            }
+            Ok(Err(e)) => {
+                // Tool call failed
+                let error_msg = format!("{}", e);
+                let mut reg = registry.write().await;
+                if let Some(conn) = reg.get_mut(server_id) {
+                    conn.circuit_breaker.record_failure();
+                    conn.stats.record_call(elapsed_ms, false);
+                    conn.stats.record_error(error_msg.clone());
+                }
+                Err(anyhow!(
+                    "External tool '{}' failed: {}",
+                    fqn,
+                    error_msg
+                ))
+            }
+            Err(_timeout) => {
+                // Timeout
+                let mut reg = registry.write().await;
+                if let Some(conn) = reg.get_mut(server_id) {
+                    conn.circuit_breaker.record_failure();
+                    conn.stats.record_call(elapsed_ms, false);
+                    conn.stats.record_error(format!(
+                        "Timeout after {}ms",
+                        timeout_duration.as_millis()
+                    ));
+                }
+                Err(anyhow!(
+                    "External tool '{}' timed out after {}ms",
+                    fqn,
+                    timeout_duration.as_millis()
+                ))
+            }
+        };
+
+        // 5. Trajectory recording (fire-and-forget) for external calls
+        if let Some(ref collector) = self.collector {
+            let success = result.is_ok();
+            let tool_usage = neural_routing_runtime::ToolUsage {
+                tool_name: fqn.clone(),
+                action: tool_name.to_string(),
+                params_hash: {
+                    let keys: Vec<&str> = args
+                        .as_object()
+                        .map(|m| m.keys().map(|k| k.as_str()).collect())
+                        .unwrap_or_default();
+                    format!("{:?}", keys)
+                },
+                duration_ms: Some(elapsed_ms),
+                success,
+            };
+
+            collector.record_decision(neural_routing_runtime::DecisionRecord {
+                session_id: "mcp-direct".to_string(),
+                context_embedding: vec![],
+                action_type: fqn,
+                action_params: args,
+                alternatives_count: 1,
+                chosen_index: 0,
+                confidence: if success { 0.7 } else { 0.1 },
+                tool_usages: vec![tool_usage],
+                touched_entities: vec![],
+                timestamp_ms: elapsed_ms,
+                query_embedding: vec![],
+                node_features: vec![],
+                protocol_run_id: None,
+                protocol_state: None,
+            });
+        }
+
+        result
     }
 
     // ========================================================================
@@ -10201,5 +10381,332 @@ mod tests {
             .as_str()
             .unwrap()
             .ends_with("/blockers"));
+    }
+
+    // ========================================================================
+    // External MCP dispatch tests
+    // ========================================================================
+
+    mod external_dispatch {
+        use super::*;
+        use crate::mcp_federation::circuit_breaker::CircuitBreaker;
+        use crate::mcp_federation::client::McpClient;
+        use crate::mcp_federation::registry::{
+            ConnectionStatus, McpServerConnection, McpServerRegistry, ServerStats,
+        };
+        use crate::mcp_federation::McpTransport;
+        use anyhow::Result;
+        use async_trait::async_trait;
+        use chrono::Utc;
+        use std::sync::Arc;
+        use tokio::sync::RwLock;
+
+        // ── Mock MCP client ──────────────────────────────────────────────
+
+        #[derive(Debug)]
+        struct MockExternalClient {
+            response: Value,
+        }
+
+        #[async_trait]
+        impl McpClient for MockExternalClient {
+            async fn initialize(
+                &self,
+            ) -> Result<crate::mcp_federation::client::InitializeResult> {
+                unimplemented!()
+            }
+            async fn initialized_notification(&self) -> Result<()> {
+                unimplemented!()
+            }
+            async fn tools_list(
+                &self,
+            ) -> Result<Vec<crate::mcp_federation::client::McpToolDef>> {
+                unimplemented!()
+            }
+            async fn call_tool(
+                &self,
+                _name: &str,
+                _arguments: Option<Value>,
+            ) -> Result<Value> {
+                Ok(self.response.clone())
+            }
+            async fn ping(&self) -> Result<()> {
+                Ok(())
+            }
+            async fn shutdown(&self) -> Result<()> {
+                Ok(())
+            }
+            fn transport_name(&self) -> &'static str {
+                "mock"
+            }
+        }
+
+        #[derive(Debug)]
+        struct ErrorExternalClient;
+
+        #[async_trait]
+        impl McpClient for ErrorExternalClient {
+            async fn initialize(
+                &self,
+            ) -> Result<crate::mcp_federation::client::InitializeResult> {
+                unimplemented!()
+            }
+            async fn initialized_notification(&self) -> Result<()> {
+                unimplemented!()
+            }
+            async fn tools_list(
+                &self,
+            ) -> Result<Vec<crate::mcp_federation::client::McpToolDef>> {
+                unimplemented!()
+            }
+            async fn call_tool(
+                &self,
+                _name: &str,
+                _arguments: Option<Value>,
+            ) -> Result<Value> {
+                Err(anyhow::anyhow!("external call failed"))
+            }
+            async fn ping(&self) -> Result<()> {
+                Ok(())
+            }
+            async fn shutdown(&self) -> Result<()> {
+                Ok(())
+            }
+            fn transport_name(&self) -> &'static str {
+                "mock"
+            }
+        }
+
+        // ── Helper: build a registry with one mock server ────────────────
+
+        fn make_registry_with_server(
+            server_id: &str,
+            client: Box<dyn McpClient>,
+        ) -> Arc<RwLock<McpServerRegistry>> {
+            let mut registry = McpServerRegistry::new();
+            // We can't use registry.connect() (needs real handshake), so insert directly
+            let conn = McpServerConnection {
+                id: server_id.to_string(),
+                display_name: server_id.to_string(),
+                transport: McpTransport::Sse {
+                    url: "http://mock:8080/sse".to_string(),
+                    headers: Default::default(),
+                },
+                status: ConnectionStatus::Connected,
+                client,
+                discovered_tools: vec![],
+                circuit_breaker: CircuitBreaker::new(),
+                stats: ServerStats::new(),
+                connected_at: Utc::now(),
+                server_protocol_version: Some("2025-03-26".to_string()),
+                server_name: Some("mock-server".to_string()),
+            };
+            // Insert via internal access (servers is pub in tests)
+            registry.insert_connection_for_test(conn);
+            Arc::new(RwLock::new(registry))
+        }
+
+        fn make_handler_with_registry(
+            registry: Arc<RwLock<McpServerRegistry>>,
+        ) -> ToolHandler {
+            let client = McpHttpClient::new("http://localhost:0".to_string(), None);
+            let mut handler = ToolHandler::new(client);
+            handler.set_mcp_registry(registry);
+            handler
+        }
+
+        // ── Tests ────────────────────────────────────────────────────────
+
+        #[tokio::test]
+        async fn test_external_dispatch_success() {
+            let response = json!({"result": "hello from grafeo"});
+            let registry = make_registry_with_server(
+                "grafeo",
+                Box::new(MockExternalClient {
+                    response: response.clone(),
+                }),
+            );
+            let handler = make_handler_with_registry(registry);
+
+            let result = handler
+                .handle("grafeo::query", Some(json!({"q": "test"})))
+                .await
+                .expect("external call should succeed");
+
+            assert_eq!(result, response);
+        }
+
+        #[tokio::test]
+        async fn test_external_dispatch_unknown_server() {
+            let registry = Arc::new(RwLock::new(McpServerRegistry::new()));
+            let handler = make_handler_with_registry(registry);
+
+            let err = handler
+                .handle("unknown_server::tool", Some(json!({})))
+                .await
+                .unwrap_err();
+
+            assert!(
+                err.to_string().contains("not connected"),
+                "Expected 'not connected' error, got: {}",
+                err
+            );
+        }
+
+        #[tokio::test]
+        async fn test_external_dispatch_circuit_breaker_open() {
+            let registry = make_registry_with_server(
+                "broken",
+                Box::new(ErrorExternalClient),
+            );
+
+            // Trip the circuit breaker by recording many failures
+            {
+                let mut reg = registry.write().await;
+                let conn = reg.get_mut("broken").unwrap();
+                for _ in 0..20 {
+                    conn.circuit_breaker.record_failure();
+                }
+                assert_eq!(
+                    conn.circuit_breaker.state(),
+                    crate::mcp_federation::circuit_breaker::CircuitState::Open
+                );
+            }
+
+            let handler = make_handler_with_registry(registry);
+            let err = handler
+                .handle("broken::query", Some(json!({})))
+                .await
+                .unwrap_err();
+
+            assert!(
+                err.to_string().contains("Circuit breaker OPEN"),
+                "Expected circuit breaker error, got: {}",
+                err
+            );
+        }
+
+        #[tokio::test]
+        async fn test_external_dispatch_failure_records_stats() {
+            let registry = make_registry_with_server(
+                "failing",
+                Box::new(ErrorExternalClient),
+            );
+            let handler = make_handler_with_registry(registry.clone());
+
+            let _ = handler
+                .handle("failing::query", Some(json!({})))
+                .await;
+
+            // Check stats were updated
+            let reg = registry.read().await;
+            let conn = reg.get("failing").unwrap();
+            assert_eq!(conn.stats.call_count, 1);
+            assert_eq!(conn.stats.error_count, 1);
+            assert!(conn.stats.last_error.is_some());
+        }
+
+        #[tokio::test]
+        async fn test_internal_dispatch_unchanged_with_registry() {
+            // Internal tools (no "::") should still route to HTTP, not to external
+            let registry = Arc::new(RwLock::new(McpServerRegistry::new()));
+            let handler = make_handler_with_registry(registry);
+
+            // This will fail because no HTTP server is running, but it should NOT
+            // try the external path — it should go through resolve_mega_tool + HTTP
+            let result = handler
+                .handle("project", Some(json!({"action": "list"})))
+                .await;
+
+            // We expect a connection refused error (HTTP), not an "external tool" error
+            match result {
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(
+                        !msg.contains("External tool") && !msg.contains("not connected"),
+                        "Internal tool incorrectly routed to external dispatch: {}",
+                        msg
+                    );
+                }
+                Ok(_) => {
+                    // Shouldn't succeed with no HTTP server, but not a test failure
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn test_no_registry_rejects_external_call() {
+            // handler with no registry set — should reject "::" calls
+            let handler = make_handler();
+            let err = handler
+                .handle("grafeo::query", Some(json!({})))
+                .await
+                .unwrap_err();
+
+            assert!(
+                err.to_string().contains("not configured"),
+                "Expected 'not configured' error, got: {}",
+                err
+            );
+        }
+
+        #[tokio::test]
+        async fn test_external_dispatch_success_records_stats() {
+            // Verify that a successful external call updates server stats
+            let response = json!({"data": [1, 2, 3]});
+            let registry = make_registry_with_server(
+                "grafeo",
+                Box::new(MockExternalClient {
+                    response: response.clone(),
+                }),
+            );
+            let handler = make_handler_with_registry(registry.clone());
+
+            let result = handler
+                .handle("grafeo::query", Some(json!({"q": "test"})))
+                .await;
+
+            assert!(result.is_ok());
+
+            // Check that stats were recorded
+            let reg = registry.read().await;
+            let conn = reg.get("grafeo").unwrap();
+            assert_eq!(conn.stats.call_count, 1);
+            assert_eq!(conn.stats.error_count, 0);
+            assert!(conn.stats.last_call_at.is_some());
+            assert!(conn.stats.latency_samples.len() == 1);
+        }
+
+        #[tokio::test]
+        async fn test_external_action_type_format() {
+            // Verify the FQN format "server_id::tool_name" is what gets dispatched.
+            // The trajectory recording uses this as action_type.
+            let response = json!({"ok": true});
+            let registry = make_registry_with_server(
+                "grafeo",
+                Box::new(MockExternalClient { response }),
+            );
+            let handler = make_handler_with_registry(registry);
+
+            // The call should succeed — confirming the "grafeo::query" format
+            // is correctly split into server_id="grafeo", tool_name="query"
+            let result = handler
+                .handle("grafeo::query", Some(json!({"q": "test"})))
+                .await;
+            assert!(result.is_ok());
+
+            // Also test with nested namespaces
+            let registry2 = make_registry_with_server(
+                "github",
+                Box::new(MockExternalClient {
+                    response: json!({"pr": 42}),
+                }),
+            );
+            let handler2 = make_handler_with_registry(registry2);
+            let result2 = handler2
+                .handle("github::create_pr", Some(json!({"title": "test"})))
+                .await;
+            assert!(result2.is_ok());
+        }
     }
 }

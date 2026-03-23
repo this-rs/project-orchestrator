@@ -471,6 +471,16 @@ impl McpServerRegistry {
     pub fn server_ids(&self) -> Vec<&str> {
         self.servers.keys().map(|s| s.as_str()).collect()
     }
+
+    /// Insert a pre-built connection directly (for testing without handshake).
+    #[cfg(test)]
+    pub fn insert_connection_for_test(&mut self, conn: McpServerConnection) {
+        let server_id = conn.id.clone();
+        for tool in &conn.discovered_tools {
+            self.tool_index.insert(tool.fqn.clone(), server_id.clone());
+        }
+        self.servers.insert(server_id, conn);
+    }
 }
 
 /// Thread-safe wrapper for the registry (used in AppState).
