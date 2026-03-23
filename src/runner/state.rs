@@ -139,7 +139,11 @@ impl RunnerState {
     // ========================================================================
 
     /// Add an active agent tracking a running task.
+    ///
+    /// Defensively removes any existing agent with the same task_id first
+    /// to prevent phantom duplicates (e.g., from retries).
     pub fn add_agent(&mut self, agent: ActiveAgent) {
+        self.active_agents.retain(|a| a.task_id != agent.task_id);
         self.active_agents.push(agent);
         self.sync_current_task_compat();
     }

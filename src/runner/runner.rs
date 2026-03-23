@@ -1117,7 +1117,7 @@ impl PlanRunner {
                     "Skipping wave {} — all {} tasks already completed",
                     wave_number, wave.task_count
                 );
-                // Still track completed tasks in runner state
+                // Still track completed tasks in runner state and persist
                 {
                     let mut global = RUNNER_STATE.write().await;
                     if let Some(ref mut s) = *global {
@@ -1127,6 +1127,9 @@ impl PlanRunner {
                             }
                         }
                         s.current_wave = wave_number;
+                        if let Err(e) = self.graph.update_plan_run(s).await {
+                            warn!("Failed to persist skipped wave state to Neo4j: {}", e);
+                        }
                     }
                 }
                 continue;
@@ -1140,11 +1143,14 @@ impl PlanRunner {
                 return Ok(());
             }
 
-            // Update current wave
+            // Update current wave and persist to Neo4j
             {
                 let mut global = RUNNER_STATE.write().await;
                 if let Some(ref mut s) = *global {
                     s.current_wave = wave_number;
+                    if let Err(e) = self.graph.update_plan_run(s).await {
+                        warn!("Failed to persist wave transition to Neo4j: {}", e);
+                    }
                 }
             }
 
@@ -2190,6 +2196,60 @@ impl PlanRunner {
             }
         }
 
+        // =====================================================================
+        // Post-wave watchdog: detect orphaned agents and step-complete tasks
+        // =====================================================================
+        // After all JoinSet results and retries, check for tasks that have all
+        // steps completed but were never marked as completed (phantom agents).
+        // This catches the edge case where an agent finishes its work but the
+        // Result event was lost or the agent panicked after completing steps.
+        {
+            let orphan_task_ids: Vec<(Uuid, String)> = {
+                let global = RUNNER_STATE.read().await;
+                global
+                    .as_ref()
+                    .map(|s| {
+                        s.active_agents
+                            .iter()
+                            .map(|a| (a.task_id, a.task_title.clone()))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+
+            for (orphan_id, orphan_title) in &orphan_task_ids {
+                // Skip tasks already in completed/failed lists
+                if wave_result.tasks_completed.contains(orphan_id)
+                    || wave_result.tasks_failed.iter().any(|(id, _)| id == orphan_id)
+                {
+                    continue;
+                }
+
+                if let Some(true) = self.check_step_coherence(*orphan_id).await {
+                    warn!(
+                        "Post-wave watchdog: task {} ({}) has all steps completed but agent still active — auto-completing",
+                        orphan_id, orphan_title
+                    );
+                    self.on_task_completed(run_id, *orphan_id, 0.0, 0.0, Some(cwd))
+                        .await?;
+                    wave_result.tasks_completed.push(*orphan_id);
+                } else {
+                    // Agent is truly orphaned (steps not all done) — clean up
+                    warn!(
+                        "Post-wave watchdog: task {} ({}) has orphaned agent — removing from active_agents",
+                        orphan_id, orphan_title
+                    );
+                    let mut global = RUNNER_STATE.write().await;
+                    if let Some(ref mut s) = *global {
+                        s.remove_agent(orphan_id);
+                        if let Err(e) = self.graph.update_plan_run(s).await {
+                            warn!("Failed to persist orphan cleanup to Neo4j: {}", e);
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(wave_result)
     }
 
@@ -2215,11 +2275,14 @@ impl PlanRunner {
             info!("Executing task {}: {}", task_id, task_title);
         }
 
-        // Update global state — register active agent
+        // Update global state — register active agent and persist to Neo4j
         {
             let mut global = RUNNER_STATE.write().await;
             if let Some(ref mut s) = *global {
                 s.add_agent(ActiveAgent::new(task_id, task_title.to_string()));
+                if let Err(e) = self.graph.update_plan_run(s).await {
+                    warn!("Failed to persist agent spawn to Neo4j: {}", e);
+                }
             }
         }
 
@@ -2613,6 +2676,9 @@ impl PlanRunner {
             if let Some(ref mut s) = *global {
                 s.update_agent_status(&task_id, TaskRunStatus::Running);
                 s.set_agent_session(&task_id, session_uuid);
+                if let Err(e) = self.graph.update_plan_run(s).await {
+                    warn!("Failed to persist agent running status to Neo4j: {}", e);
+                }
             }
         }
 
@@ -3186,11 +3252,17 @@ impl PlanRunner {
         };
 
         if should_retry {
-            // Increment retry count
+            // Remove the failed agent BEFORE retry to prevent phantom duplicates.
+            // Without this, execute_task's add_agent() creates a second entry
+            // for the same task_id, causing "ghost agents" that block the wave.
             {
                 let mut global = RUNNER_STATE.write().await;
                 if let Some(ref mut s) = *global {
+                    s.remove_agent(&task_id);
                     *s.retry_counts.entry(task_id).or_insert(0) += 1;
+                    if let Err(e) = self.graph.update_plan_run(s).await {
+                        warn!("Failed to persist retry cleanup to Neo4j: {}", e);
+                    }
                 }
             }
 
