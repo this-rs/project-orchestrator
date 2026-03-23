@@ -626,7 +626,13 @@ impl CompactionContext {
                     "skipped" => "⏭️",
                     _ => "⬜",
                 };
-                let _ = write!(out, "{icon} {}. {} [{}]; ", step.order, truncate(&step.description, 80), step.status);
+                let _ = write!(
+                    out,
+                    "{icon} {}. {} [{}]; ",
+                    step.order,
+                    truncate(&step.description, 80),
+                    step.status
+                );
                 if out.len() > MAX_CUSTOM_INSTRUCTIONS_CHARS - 600 {
                     break;
                 }
@@ -634,11 +640,7 @@ impl CompactionContext {
         }
 
         // Key file paths to preserve (from task + work_log)
-        let mut all_files: Vec<&str> = self
-            .affected_files
-            .iter()
-            .map(|f| f.as_str())
-            .collect();
+        let mut all_files: Vec<&str> = self.affected_files.iter().map(|f| f.as_str()).collect();
         if let Some(wl) = work_log {
             for f in &wl.files_modified {
                 if !all_files.contains(&f.as_str()) {
@@ -680,7 +682,11 @@ impl CompactionContext {
                 out.push_str(". ");
             }
             if !wl.files_modified.is_empty() {
-                let _ = write!(out, "Files already modified this session: {}. ", wl.files_modified.join(", "));
+                let _ = write!(
+                    out,
+                    "Files already modified this session: {}. ",
+                    wl.files_modified.join(", ")
+                );
             }
         }
 

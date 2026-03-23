@@ -317,7 +317,10 @@ impl PostStreamHandler {
             if !sleep_cancelled && !self.interrupt_flag.load(Ordering::SeqCst) {
                 let continue_msg = 'build_msg: {
                     let mut parts = Vec::new();
-                    parts.push("Continue where you left off. Do NOT restart work already done.".to_string());
+                    parts.push(
+                        "Continue where you left off. Do NOT restart work already done."
+                            .to_string(),
+                    );
 
                     // Append CompactionContext markdown (task/step context)
                     if let Some(ref slug) = self.ctx.project_slug {
@@ -396,14 +399,14 @@ impl PostStreamHandler {
         };
 
         // Fetch pending objectives from graph (only if we might need them)
-        let objectives = if !had_tool_use
+        let (pending_tasks, work_log_summary) = if !had_tool_use
             && !auto_continue_allowed
             && !hit_error_max_turns
             && !self.interrupt_flag.load(Ordering::SeqCst)
             && tracking_enabled
             && (cooldown_turns == 0 || cooldown_turns >= OBJECTIVE_REMINDER_COOLDOWN)
         {
-            if let Some(ref slug) = self.ctx.project_slug {
+            let tasks = if let Some(ref slug) = self.ctx.project_slug {
                 let builder =
                     super::compaction_context::CompactionContextBuilder::new(self.graph.clone());
                 if let Ok(Ok(ctx)) = tokio::time::timeout(
@@ -412,15 +415,32 @@ impl PostStreamHandler {
                 )
                 .await
                 {
-                    ctx.pending_objectives_oneliner()
+                    ctx.pending_tasks
+                        .iter()
+                        .filter(|t| t.status == "inprogress" || t.status == "pending")
+                        .take(4)
+                        .map(|t| PendingTaskInfo {
+                            title: t.title.clone(),
+                            status: t.status.clone(),
+                            pending_steps: t
+                                .steps
+                                .iter()
+                                .filter(|s| s.status != "completed" && s.status != "skipped")
+                                .map(|s| s.description.clone())
+                                .collect(),
+                            affected_files: t.affected_files.clone(),
+                        })
+                        .collect()
                 } else {
-                    String::new()
+                    vec![]
                 }
             } else {
-                String::new()
-            }
+                vec![]
+            };
+            let wl = self.work_log.lock().await.to_summary_markdown();
+            (tasks, wl)
         } else {
-            String::new()
+            (vec![], String::new())
         };
 
         // Pure decision
@@ -431,7 +451,8 @@ impl PostStreamHandler {
             interrupted: self.interrupt_flag.load(Ordering::SeqCst),
             tracking_enabled,
             cooldown_turns,
-            objectives,
+            pending_tasks,
+            work_log_summary,
         };
 
         if let Some(reminder) = check_objective_reminder(&input) {
@@ -569,7 +590,16 @@ impl PostStreamHandler {
 // ── Pure logic for objective tracking (testable without Graph) ─────────
 
 /// Cooldown threshold for objective reminders (same as PostStreamHandler).
-pub(crate) const OBJECTIVE_REMINDER_COOLDOWN: u32 = 3;
+pub(crate) const OBJECTIVE_REMINDER_COOLDOWN: u32 = 1;
+
+/// Summary of a pending task for the structured objective reminder.
+#[derive(Debug, Clone)]
+pub(crate) struct PendingTaskInfo {
+    pub title: String,
+    pub status: String,
+    pub pending_steps: Vec<String>,       // descriptions of non-completed steps
+    pub affected_files: Vec<String>,      // files this task modifies
+}
 
 /// Inputs to the objective tracking decision (decoupled from async/Arc state).
 pub(crate) struct ObjectiveCheckInput {
@@ -579,7 +609,10 @@ pub(crate) struct ObjectiveCheckInput {
     pub interrupted: bool,
     pub tracking_enabled: bool,
     pub cooldown_turns: u32,
-    pub objectives: String,
+    /// Structured pending tasks (replaces the old objectives oneliner).
+    pub pending_tasks: Vec<PendingTaskInfo>,
+    /// Work already done this session (from SessionWorkLog::to_summary_markdown).
+    pub work_log_summary: String,
 }
 
 /// Pure decision function: given the objective check inputs, return the
@@ -607,15 +640,49 @@ pub(crate) fn check_objective_reminder(input: &ObjectiveCheckInput) -> Option<St
     }
 
     // Guard 4: must have pending objectives
-    if input.objectives.is_empty() {
+    if input.pending_tasks.is_empty() {
         return None;
     }
 
-    Some(format!(
-        "You stopped without using any tools. \
-         Check if you have completed all objectives before concluding.{}",
-        input.objectives
-    ))
+    // Build structured reminder
+    let mut parts = Vec::new();
+    parts.push(
+        "⚠️ **You have not finished your current task. Here is what remains:**".to_string(),
+    );
+
+    for task in &input.pending_tasks {
+        parts.push(format!("\n### {} [{}]", task.title, task.status));
+
+        if !task.pending_steps.is_empty() {
+            parts.push("**Pending steps:**".to_string());
+            for step in &task.pending_steps {
+                parts.push(format!("- [ ] {}", step));
+            }
+        }
+
+        if !task.affected_files.is_empty() {
+            parts.push(format!(
+                "**Remaining files:** {}",
+                task.affected_files
+                    .iter()
+                    .map(|f| format!("`{}`", f))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+    }
+
+    // Include work already done (prevents agent from restarting completed work)
+    if !input.work_log_summary.is_empty() {
+        parts.push("\n### Already done this session".to_string());
+        parts.push(input.work_log_summary.clone());
+    }
+
+    parts.push(
+        "\n**Do NOT conclude. Continue working on the pending steps above.**".to_string(),
+    );
+
+    Some(parts.join("\n"))
 }
 
 #[cfg(test)]
@@ -630,7 +697,16 @@ mod tests {
             interrupted: false,
             tracking_enabled: true,
             cooldown_turns: 0, // first turn → should fire
-            objectives: " Remaining objectives: T1, T2".to_string(),
+            pending_tasks: vec![PendingTaskInfo {
+                title: "Implement feature T1".to_string(),
+                status: "inprogress".to_string(),
+                pending_steps: vec![
+                    "Write the handler".to_string(),
+                    "Add tests".to_string(),
+                ],
+                affected_files: vec!["src/handler.rs".to_string()],
+            }],
+            work_log_summary: String::new(),
         }
     }
 
@@ -640,8 +716,9 @@ mod tests {
         let result = check_objective_reminder(&input);
         assert!(result.is_some());
         let msg = result.unwrap();
-        assert!(msg.contains("You stopped without using any tools"));
-        assert!(msg.contains("T1, T2"));
+        assert!(msg.contains("not finished"));
+        assert!(msg.contains("Implement feature T1"));
+        assert!(msg.contains("Write the handler"));
     }
 
     #[test]
@@ -653,17 +730,13 @@ mod tests {
 
     #[test]
     fn test_cooldown_respected() {
-        // turns=1 is within cooldown (COOLDOWN=3), should NOT fire
+        // turns=0 is first turn → should fire
         let mut input = base_input();
+        input.cooldown_turns = 0;
+        assert!(check_objective_reminder(&input).is_some());
+
+        // turns=1 meets cooldown threshold (COOLDOWN=1) → should fire
         input.cooldown_turns = 1;
-        assert!(check_objective_reminder(&input).is_none());
-
-        // turns=2 is still within cooldown
-        input.cooldown_turns = 2;
-        assert!(check_objective_reminder(&input).is_none());
-
-        // turns=3 meets cooldown threshold → should fire
-        input.cooldown_turns = 3;
         assert!(check_objective_reminder(&input).is_some());
 
         // turns=0 is first turn → should fire
@@ -681,7 +754,7 @@ mod tests {
     #[test]
     fn test_no_reminder_without_pending_objectives() {
         let mut input = base_input();
-        input.objectives = String::new();
+        input.pending_tasks = vec![];
         assert!(check_objective_reminder(&input).is_none());
     }
 
@@ -704,6 +777,94 @@ mod tests {
         let mut input = base_input();
         input.interrupted = true;
         assert!(check_objective_reminder(&input).is_none());
+    }
+
+    #[test]
+    fn test_objective_reminder_enriched() {
+        let input = ObjectiveCheckInput {
+            had_tool_use: false,
+            auto_continue_allowed: false,
+            hit_error_max_turns: false,
+            interrupted: false,
+            tracking_enabled: true,
+            cooldown_turns: 0,
+            pending_tasks: vec![
+                PendingTaskInfo {
+                    title: "Add REST endpoint".to_string(),
+                    status: "inprogress".to_string(),
+                    pending_steps: vec![
+                        "Implement handler".to_string(),
+                        "Register route".to_string(),
+                    ],
+                    affected_files: vec![
+                        "src/api/handlers.rs".to_string(),
+                        "src/api/routes.rs".to_string(),
+                    ],
+                },
+                PendingTaskInfo {
+                    title: "Write integration tests".to_string(),
+                    status: "pending".to_string(),
+                    pending_steps: vec!["Add test for GET /api/foo".to_string()],
+                    affected_files: vec!["tests/api.rs".to_string()],
+                },
+            ],
+            work_log_summary: "**Files modified (2):** `src/main.rs`, `src/lib.rs`".to_string(),
+        };
+
+        let result = check_objective_reminder(&input);
+        assert!(result.is_some(), "reminder should fire");
+        let msg = result.unwrap();
+
+        // Must contain the "not finished" header
+        assert!(
+            msg.contains("not finished"),
+            "missing 'not finished' in: {}",
+            msg
+        );
+
+        // Must contain pending steps
+        assert!(
+            msg.contains("Implement handler"),
+            "missing step in: {}",
+            msg
+        );
+        assert!(
+            msg.contains("Register route"),
+            "missing step in: {}",
+            msg
+        );
+        assert!(
+            msg.contains("Add test for GET /api/foo"),
+            "missing step from second task in: {}",
+            msg
+        );
+
+        // Must contain affected files
+        assert!(
+            msg.contains("`src/api/handlers.rs`"),
+            "missing affected file in: {}",
+            msg
+        );
+
+        // Must contain "Already done" section with work log
+        assert!(
+            msg.contains("Already done"),
+            "missing 'Already done' section in: {}",
+            msg
+        );
+        assert!(
+            msg.contains("src/main.rs"),
+            "missing work_log file in: {}",
+            msg
+        );
+
+        // Reminder should be substantial (>200 chars)
+        assert!(
+            msg.len() > 200,
+            "reminder too short ({} chars): {}",
+            msg.len(),
+            msg
+        );
     }
 }
 
@@ -920,8 +1081,8 @@ mod integration_tests {
         let msg = &pending[0];
         assert_eq!(msg.kind, PendingMessageKind::SystemHint);
         assert!(
-            msg.content.contains("You stopped without using any tools"),
-            "Reminder text missing: {}",
+            msg.content.contains("not finished"),
+            "Reminder text missing 'not finished': {}",
             msg.content
         );
         assert!(
@@ -1008,26 +1169,14 @@ mod integration_tests {
         // Clear pending for next check
         handler.pending_messages.lock().await.clear();
 
-        // Second call (turn 1, within cooldown) → should NOT fire
-        handler.handle_objective_tracking(false, false, false).await;
-        assert!(
-            handler.pending_messages.lock().await.is_empty(),
-            "Second call should be blocked by cooldown"
-        );
-
-        // Third call (turn 2, still within cooldown) → should NOT fire
-        handler.handle_objective_tracking(false, false, false).await;
-        assert!(
-            handler.pending_messages.lock().await.is_empty(),
-            "Third call should still be blocked by cooldown"
-        );
-
-        // Fourth call (turn 3, cooldown met) → should fire
+        // Second call: after first reminder, cooldown_turns was reset to 1.
+        // The handler increments it via fetch_add(1) → reads 1, which meets
+        // COOLDOWN=1 → fires again. With cooldown=1, reminders fire every turn.
         handler.handle_objective_tracking(false, false, false).await;
         assert_eq!(
             handler.pending_messages.lock().await.len(),
             1,
-            "Fourth call should inject reminder (cooldown met)"
+            "Second call should fire (cooldown=1 means every turn after reset)"
         );
     }
 
@@ -1070,7 +1219,11 @@ mod integration_tests {
             .update_step_status(step1.id, StepStatus::Completed)
             .await
             .unwrap();
-        let step2 = StepNode::new(2, "Step two pending".to_string(), Some("verify2".to_string()));
+        let step2 = StepNode::new(
+            2,
+            "Step two pending".to_string(),
+            Some("verify2".to_string()),
+        );
         graph.create_step(task1.id, &step2).await.unwrap();
 
         let mut task2 = test_task_titled("Write unit tests");
@@ -1136,7 +1289,9 @@ mod integration_tests {
 
         // Must contain CompactionContext sections (task/step info)
         assert!(
-            content.contains("Task Context") || content.contains("Active Plans") || content.contains("Pending Objectives"),
+            content.contains("Task Context")
+                || content.contains("Active Plans")
+                || content.contains("Pending Objectives"),
             "Missing CompactionContext sections in auto-continue message"
         );
 
@@ -1145,10 +1300,7 @@ mod integration_tests {
             content.contains("Session Work Log") || content.contains("Files modified"),
             "Missing SessionWorkLog section"
         );
-        assert!(
-            content.contains("/src/main.rs"),
-            "Missing file in work log"
-        );
+        assert!(content.contains("/src/main.rs"), "Missing file in work log");
 
         // Must be >500 chars (enriched, not just "Continue")
         assert!(

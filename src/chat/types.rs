@@ -897,7 +897,11 @@ impl SessionWorkLog {
             parts.push(format!(
                 "**Files modified ({}):** {}",
                 files.len(),
-                files.iter().map(|f| format!("`{}`", f)).collect::<Vec<_>>().join(", ")
+                files
+                    .iter()
+                    .map(|f| format!("`{}`", f))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ));
         }
 
@@ -907,7 +911,11 @@ impl SessionWorkLog {
             parts.push(format!(
                 "**Files read ({}):** {}",
                 files.len(),
-                files.iter().map(|f| format!("`{}`", f)).collect::<Vec<_>>().join(", ")
+                files
+                    .iter()
+                    .map(|f| format!("`{}`", f))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ));
         }
 
@@ -935,7 +943,10 @@ impl SessionWorkLog {
         }
 
         if let Some(ref tool) = self.last_tool_name {
-            parts.push(format!("**Last tool:** {} (total: {})", tool, self.tool_use_count));
+            parts.push(format!(
+                "**Last tool:** {} (total: {})",
+                tool, self.tool_use_count
+            ));
         }
 
         if parts.is_empty() {
@@ -2113,10 +2124,7 @@ mod tests {
         assert_eq!(log.tool_use_count, 2);
 
         // Read tool
-        log.record_tool_use(
-            "Read",
-            &serde_json::json!({"file_path": "/src/types.rs"}),
-        );
+        log.record_tool_use("Read", &serde_json::json!({"file_path": "/src/types.rs"}));
         assert!(log.files_read.contains("/src/types.rs"));
         assert_eq!(log.tool_use_count, 3);
     }
@@ -2262,8 +2270,14 @@ mod tests {
     #[test]
     fn test_session_work_log_glob_grep_tracking() {
         let mut log = SessionWorkLog::default();
-        log.record_tool_use("Glob", &serde_json::json!({"path": "/src", "pattern": "*.rs"}));
-        log.record_tool_use("Grep", &serde_json::json!({"path": "/src/lib.rs", "pattern": "fn main"}));
+        log.record_tool_use(
+            "Glob",
+            &serde_json::json!({"path": "/src", "pattern": "*.rs"}),
+        );
+        log.record_tool_use(
+            "Grep",
+            &serde_json::json!({"path": "/src/lib.rs", "pattern": "fn main"}),
+        );
         assert!(log.files_read.contains("/src"));
         assert!(log.files_read.contains("/src/lib.rs"));
     }
