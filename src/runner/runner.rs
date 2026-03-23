@@ -2220,7 +2220,10 @@ impl PlanRunner {
             for (orphan_id, orphan_title) in &orphan_task_ids {
                 // Skip tasks already in completed/failed lists
                 if wave_result.tasks_completed.contains(orphan_id)
-                    || wave_result.tasks_failed.iter().any(|(id, _)| id == orphan_id)
+                    || wave_result
+                        .tasks_failed
+                        .iter()
+                        .any(|(id, _)| id == orphan_id)
                 {
                     continue;
                 }
@@ -2234,18 +2237,24 @@ impl PlanRunner {
                         .await?;
                     wave_result.tasks_completed.push(*orphan_id);
                 } else {
-                    // Agent is truly orphaned (steps not all done) — clean up
+                    // Agent is truly orphaned (steps not all done) — mark as failed and clean up.
+                    // Without this, the task stays in_progress forever after the run completes.
                     warn!(
-                        "Post-wave watchdog: task {} ({}) has orphaned agent — removing from active_agents",
+                        "Post-wave watchdog: task {} ({}) has orphaned agent with incomplete steps — marking failed",
                         orphan_id, orphan_title
                     );
-                    let mut global = RUNNER_STATE.write().await;
-                    if let Some(ref mut s) = *global {
-                        s.remove_agent(orphan_id);
-                        if let Err(e) = self.graph.update_plan_run(s).await {
-                            warn!("Failed to persist orphan cleanup to Neo4j: {}", e);
-                        }
-                    }
+                    self.on_task_failed(
+                        run_id,
+                        plan_id,
+                        *orphan_id,
+                        "Post-wave watchdog: agent orphaned with incomplete steps after all retries",
+                        0.0,
+                        0.0,
+                    )
+                    .await?;
+                    wave_result
+                        .tasks_failed
+                        .push((*orphan_id, "orphaned agent".to_string()));
                 }
             }
         }
