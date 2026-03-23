@@ -181,6 +181,22 @@ pub struct EnrichmentContext {
     pub skipped_stages: Vec<String>,
 }
 
+/// Typed source of an enrichment section, used for deterministic mapping
+/// to [`PromptSection`] variants without relying on title string matching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum EnrichmentSource {
+    SkillActivation,
+    KnowledgeInjection,
+    StatusInjection,
+    Persona,
+    Reflex,
+    FileContext,
+    Biomimicry,
+    UserProfile,
+    #[default]
+    Other,
+}
+
 /// A single section of enrichment content.
 #[derive(Debug, Clone, Serialize)]
 pub struct EnrichmentSection {
@@ -188,8 +204,10 @@ pub struct EnrichmentSection {
     pub title: String,
     /// Section content (markdown formatted).
     pub content: String,
-    /// Source stage name.
-    pub source: String,
+    /// Source stage name (string identifier for logging/debugging).
+    pub stage_name: String,
+    /// Typed source for deterministic PromptSection mapping.
+    pub source: EnrichmentSource,
 }
 
 impl EnrichmentContext {
@@ -198,12 +216,14 @@ impl EnrichmentContext {
         &mut self,
         title: impl Into<String>,
         content: impl Into<String>,
-        source: impl Into<String>,
+        stage_name: impl Into<String>,
+        source: EnrichmentSource,
     ) {
         self.sections.push(EnrichmentSection {
             title: title.into(),
             content: content.into(),
-            source: source.into(),
+            stage_name: stage_name.into(),
+            source,
         });
     }
 
@@ -233,38 +253,41 @@ impl EnrichmentContext {
     /// stages continue producing EnrichmentSections internally, but the
     /// output can be consumed as PromptSections by the FsmPromptComposer.
     ///
-    /// Mapping:
-    /// - "Activated Skills" → PromptSection::SkillContext
-    /// - "Relevant Notes" / "Contextual Notes" → PromptSection::KnowledgeNotes
-    /// - "Propagated Notes" → PromptSection::PropagatedNotes
-    /// - "File Context" / "Symbols" → PromptSection::FileContext
-    /// - "Persona" → PromptSection::PersonaContext
-    /// - Other → PromptSection::Enrichment
+    /// Mapping uses the typed [`EnrichmentSource`] enum for deterministic dispatch:
+    /// - `SkillActivation` → `PromptSection::SkillContext`
+    /// - `KnowledgeInjection` → `PromptSection::KnowledgeNotes`
+    /// - `FileContext` → `PromptSection::FileContext`
+    /// - `Persona` → `PromptSection::PersonaContext`
+    /// - Others → `PromptSection::Enrichment`
     pub fn to_prompt_sections(&self) -> Vec<crate::runner::prompt::PromptSection> {
         use crate::runner::prompt::PromptSection;
 
         self.sections
             .iter()
-            .map(|section| {
-                let title_lower = section.title.to_lowercase();
-                if title_lower.contains("skill") {
+            .map(|section| match section.source {
+                EnrichmentSource::SkillActivation => {
                     PromptSection::SkillContext(section.content.clone())
-                } else if title_lower.contains("propagated") {
-                    PromptSection::PropagatedNotes(section.content.clone())
-                } else if title_lower.contains("note")
-                    || title_lower.contains("guideline")
-                    || title_lower.contains("gotcha")
-                    || title_lower.contains("knowledge")
-                {
-                    PromptSection::KnowledgeNotes(section.content.clone())
-                } else if title_lower.contains("file")
-                    || title_lower.contains("symbol")
-                    || title_lower.contains("dependency")
-                {
+                }
+                EnrichmentSource::KnowledgeInjection => {
+                    // Distinguish propagated notes by title (sub-category within same source)
+                    let title_lower = section.title.to_lowercase();
+                    if title_lower.contains("propagated") {
+                        PromptSection::PropagatedNotes(section.content.clone())
+                    } else {
+                        PromptSection::KnowledgeNotes(section.content.clone())
+                    }
+                }
+                EnrichmentSource::FileContext => {
                     PromptSection::FileContext(section.content.clone())
-                } else if title_lower.contains("persona") {
+                }
+                EnrichmentSource::Persona => {
                     PromptSection::PersonaContext(section.content.clone())
-                } else {
+                }
+                EnrichmentSource::StatusInjection
+                | EnrichmentSource::Reflex
+                | EnrichmentSource::Biomimicry
+                | EnrichmentSource::UserProfile
+                | EnrichmentSource::Other => {
                     PromptSection::Enrichment(section.content.clone())
                 }
             })
@@ -348,12 +371,14 @@ impl StageOutput {
         &mut self,
         title: impl Into<String>,
         content: impl Into<String>,
-        source: impl Into<String>,
+        stage_name: impl Into<String>,
+        source: EnrichmentSource,
     ) {
         self.sections.push(EnrichmentSection {
             title: title.into(),
             content: content.into(),
-            source: source.into(),
+            stage_name: stage_name.into(),
+            source,
         });
     }
 
@@ -581,7 +606,7 @@ mod tests {
             }
             let mut output = StageOutput::new(self.name.clone());
             if let Some((title, content)) = &self.content {
-                output.add_section(title.clone(), content.clone(), self.name.clone());
+                output.add_section(title.clone(), content.clone(), self.name.clone(), EnrichmentSource::Other);
             }
             Ok(output)
         }
@@ -633,7 +658,7 @@ mod tests {
         assert_eq!(ctx.sections.len(), 1);
         assert_eq!(ctx.sections[0].title, "Test Section");
         assert_eq!(ctx.sections[0].content, "test content");
-        assert_eq!(ctx.sections[0].source, "test_stage");
+        assert_eq!(ctx.sections[0].stage_name, "test_stage");
         assert_eq!(ctx.stage_timings.len(), 1);
     }
 
@@ -709,8 +734,8 @@ mod tests {
     #[tokio::test]
     async fn test_enrichment_context_render() {
         let mut ctx = EnrichmentContext::default();
-        ctx.add_section("Notes", "- Note 1\n- Note 2", "knowledge");
-        ctx.add_section("Skills", "- Skill A", "skills");
+        ctx.add_section("Notes", "- Note 1\n- Note 2", "knowledge", EnrichmentSource::KnowledgeInjection);
+        ctx.add_section("Skills", "- Skill A", "skills", EnrichmentSource::SkillActivation);
 
         let rendered = ctx.render();
         assert!(rendered.contains("<enrichment_context>"));
@@ -729,7 +754,7 @@ mod tests {
     #[tokio::test]
     async fn test_enrich_prompt_with_content() {
         let mut ctx = EnrichmentContext::default();
-        ctx.add_section("Context", "some context", "test");
+        ctx.add_section("Context", "some context", "test", EnrichmentSource::Other);
 
         let enriched = enrich_prompt("original message", &ctx);
         assert!(enriched.starts_with("<enrichment_context>"));
@@ -995,8 +1020,8 @@ mod tests {
             "All 8 stages should produce sections"
         );
         // Sections should be in registration order
-        assert_eq!(ctx.sections[0].source, "latent_0");
-        assert_eq!(ctx.sections[7].source, "latent_7");
+        assert_eq!(ctx.sections[0].stage_name, "latent_0");
+        assert_eq!(ctx.sections[7].stage_name, "latent_7");
 
         // Parallel: should complete in ~50-80ms, definitely < 150ms
         assert!(

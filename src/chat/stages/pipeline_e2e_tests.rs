@@ -767,7 +767,7 @@ mod tests {
         );
 
         // Check that we have sections from multiple sources
-        let sources: Vec<&str> = ctx.sections.iter().map(|s| s.source.as_str()).collect();
+        let sources: Vec<&str> = ctx.sections.iter().map(|s| s.stage_name.as_str()).collect();
         assert!(
             sources.len() >= 2,
             "Should have sections from at least 2 stages. Got {} sections from: {:?}",
