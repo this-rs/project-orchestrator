@@ -649,6 +649,17 @@ impl ToolHandler {
             ("lifecycle_hook", "update") => "update_lifecycle_hook",
             ("lifecycle_hook", "delete") => "delete_lifecycle_hook",
 
+            // MCP Federation (registry actions handled directly, backfills via HTTP)
+            ("mcp_federation", "connect") => "__mcp_federation_connect",
+            ("mcp_federation", "disconnect") => "__mcp_federation_disconnect",
+            ("mcp_federation", "list") => "__mcp_federation_list",
+            ("mcp_federation", "status") => "__mcp_federation_status",
+            ("mcp_federation", "tools") => "__mcp_federation_tools",
+            ("mcp_federation", "probe") => "__mcp_federation_probe",
+            ("mcp_federation", "reconnect") => "__mcp_federation_reconnect",
+            ("mcp_federation", "backfill_relations") => "backfill_co_activated_with",
+            ("mcp_federation", "backfill_sequences") => "backfill_often_follows",
+
             _ => {
                 return Err(anyhow!(
                     "Unknown action '{}' for mega-tool '{}'",
@@ -688,6 +699,11 @@ impl ToolHandler {
         let name = resolved_name.as_str();
         let mut args = resolved_args;
         unstringify_json_values(&mut args);
+
+        // ── MCP Federation (direct registry dispatch) ────────────────
+        if name.starts_with("__mcp_federation_") {
+            return self.handle_mcp_federation(name, &args).await;
+        }
 
         // ── HTTP routing ────────────────────────────────────────────────
         let result = self.try_handle_http(name, &args).await;
@@ -898,6 +914,249 @@ impl ToolHandler {
         }
 
         result
+    }
+
+    // ========================================================================
+    // MCP Federation (direct registry dispatch)
+    // ========================================================================
+
+    /// Handle mcp_federation mega-tool actions that operate directly on the SharedRegistry.
+    async fn handle_mcp_federation(&self, resolved_name: &str, args: &Value) -> Result<Value> {
+        let registry = self
+            .mcp_registry
+            .as_ref()
+            .ok_or_else(|| anyhow!("MCP federation is not configured. Set mcp_registry on the handler."))?;
+
+        match resolved_name {
+            "__mcp_federation_connect" => {
+                let server_id = args
+                    .get("server_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("server_id is required for connect"))?;
+                let transport_str = args
+                    .get("transport")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("transport is required for connect (stdio, sse, streamable_http)"))?;
+                let display_name = args.get("display_name").and_then(|v| v.as_str()).map(|s| s.to_string());
+
+                let transport = match transport_str {
+                    "stdio" => {
+                        let command = args
+                            .get("command")
+                            .and_then(|v| v.as_str())
+                            .ok_or_else(|| anyhow!("command is required for stdio transport"))?
+                            .to_string();
+                        let cmd_args: Vec<String> = args
+                            .get("args")
+                            .and_then(|v| v.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        let env: std::collections::HashMap<String, String> = args
+                            .get("env")
+                            .and_then(|v| v.as_object())
+                            .map(|obj| {
+                                obj.iter()
+                                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        crate::mcp_federation::McpTransport::Stdio {
+                            command,
+                            args: cmd_args,
+                            env,
+                        }
+                    }
+                    "sse" => {
+                        let url = args
+                            .get("url")
+                            .and_then(|v| v.as_str())
+                            .ok_or_else(|| anyhow!("url is required for sse transport"))?
+                            .to_string();
+                        let headers: std::collections::HashMap<String, String> = args
+                            .get("headers")
+                            .and_then(|v| v.as_object())
+                            .map(|obj| {
+                                obj.iter()
+                                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        crate::mcp_federation::McpTransport::Sse { url, headers }
+                    }
+                    "streamable_http" => {
+                        let url = args
+                            .get("url")
+                            .and_then(|v| v.as_str())
+                            .ok_or_else(|| anyhow!("url is required for streamable_http transport"))?
+                            .to_string();
+                        let headers: std::collections::HashMap<String, String> = args
+                            .get("headers")
+                            .and_then(|v| v.as_object())
+                            .map(|obj| {
+                                obj.iter()
+                                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        crate::mcp_federation::McpTransport::StreamableHttp { url, headers }
+                    }
+                    other => {
+                        return Err(anyhow!(
+                            "Unknown transport '{}'. Expected: stdio, sse, streamable_http",
+                            other
+                        ))
+                    }
+                };
+
+                let config = crate::mcp_federation::client::McpTransportConfig {
+                    server_id: server_id.to_string(),
+                    display_name,
+                    transport,
+                };
+
+                let mut reg = registry.write().await;
+                let summary = reg.connect(config).await?;
+                Ok(serde_json::to_value(summary)?)
+            }
+
+            "__mcp_federation_disconnect" => {
+                let server_id = args
+                    .get("server_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("server_id is required for disconnect"))?;
+                let mut reg = registry.write().await;
+                reg.disconnect(server_id).await?;
+                Ok(json!({"disconnected": true, "server_id": server_id}))
+            }
+
+            "__mcp_federation_list" => {
+                let reg = registry.read().await;
+                let servers = reg.list();
+                Ok(serde_json::to_value(servers)?)
+            }
+
+            "__mcp_federation_status" => {
+                let server_id = args
+                    .get("server_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("server_id is required for status"))?;
+                let reg = registry.read().await;
+                let conn = reg.get(server_id).ok_or_else(|| {
+                    anyhow!("MCP server '{}' is not connected", server_id)
+                })?;
+                Ok(json!({
+                    "server_id": conn.id,
+                    "display_name": conn.display_name,
+                    "status": format!("{:?}", conn.status),
+                    "transport": conn.client.transport_name(),
+                    "tool_count": conn.discovered_tools.len(),
+                    "connected_at": conn.connected_at.to_rfc3339(),
+                    "circuit_breaker": format!("{:?}", conn.circuit_breaker.state()),
+                    "error_rate": conn.stats.error_rate(),
+                    "latency_p50": conn.stats.latency_p50(),
+                    "latency_p95": conn.stats.latency_p95(),
+                    "total_calls": conn.stats.call_count,
+                    "total_errors": conn.stats.error_count,
+                    "server_name": conn.server_name,
+                    "protocol_version": conn.server_protocol_version,
+                }))
+            }
+
+            "__mcp_federation_tools" => {
+                let server_id = args
+                    .get("server_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("server_id is required for tools"))?;
+                let reg = registry.read().await;
+                let tools = reg.tools_for_server(server_id);
+                if tools.is_empty() {
+                    let exists = reg.get(server_id).is_some();
+                    if !exists {
+                        return Err(anyhow!("MCP server '{}' is not connected", server_id));
+                    }
+                }
+                let tool_list: Vec<Value> = tools
+                    .iter()
+                    .map(|t| {
+                        json!({
+                            "name": t.name,
+                            "fqn": t.fqn,
+                            "description": t.description,
+                            "category": format!("{:?}", t.category),
+                            "similar_internal": t.similar_internal,
+                            "probed": t.profile.is_some(),
+                        })
+                    })
+                    .collect();
+                Ok(json!(tool_list))
+            }
+
+            "__mcp_federation_probe" => {
+                let server_id = args
+                    .get("server_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("server_id is required for probe"))?;
+                // Probe needs write lock (mutates discovered_tools) and client access
+                let mut reg = registry.write().await;
+                let conn = reg.get_mut(server_id).ok_or_else(|| {
+                    anyhow!("MCP server '{}' is not connected", server_id)
+                })?;
+                let prober = crate::mcp_federation::prober::ToolProber::new(
+                    crate::mcp_federation::prober::ProberConfig::default(),
+                );
+                prober
+                    .probe_batch(conn.client.as_ref(), &mut conn.discovered_tools)
+                    .await;
+                let probed_count = conn
+                    .discovered_tools
+                    .iter()
+                    .filter(|t| t.profile.is_some())
+                    .count();
+                Ok(json!({
+                    "server_id": server_id,
+                    "probed": probed_count,
+                    "total": conn.discovered_tools.len(),
+                }))
+            }
+
+            "__mcp_federation_reconnect" => {
+                let server_id = args
+                    .get("server_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("server_id is required for reconnect"))?;
+
+                // Extract transport config from the existing connection before dropping it
+                let (transport, display_name) = {
+                    let reg = registry.read().await;
+                    let conn = reg.get(server_id).ok_or_else(|| {
+                        anyhow!("MCP server '{}' is not connected", server_id)
+                    })?;
+                    (conn.transport.clone(), conn.display_name.clone())
+                };
+
+                // Disconnect
+                {
+                    let mut reg = registry.write().await;
+                    reg.disconnect(server_id).await?;
+                }
+
+                // Reconnect with the same transport config
+                let config = crate::mcp_federation::client::McpTransportConfig {
+                    server_id: server_id.to_string(),
+                    display_name: Some(display_name),
+                    transport,
+                };
+                let mut reg = registry.write().await;
+                let summary = reg.connect(config).await?;
+                Ok(serde_json::to_value(summary)?)
+            }
+
+            other => Err(anyhow!("Unknown mcp_federation action: {}", other)),
+        }
     }
 
     // ========================================================================
