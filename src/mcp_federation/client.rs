@@ -735,4 +735,140 @@ mod tests {
         let roundtrip: McpTransportConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(roundtrip.server_id, "grafeo");
     }
+
+    #[test]
+    fn test_create_client_streamable_http() {
+        // StreamableHttpMcpClient::new() does not require network
+        let client = StreamableHttpMcpClient::new("https://example.com/mcp", HashMap::new());
+        assert_eq!(client.url, "https://example.com/mcp");
+        assert_eq!(client.transport_name(), "streamable_http");
+    }
+
+    #[test]
+    fn test_create_client_sse() {
+        let client = SseMcpClient::new("https://example.com/sse", HashMap::new());
+        assert_eq!(client.base_url, "https://example.com/sse");
+        assert_eq!(client.transport_name(), "sse");
+    }
+
+    #[test]
+    fn test_next_request_id_increments() {
+        let id1 = next_request_id();
+        let id2 = next_request_id();
+        assert!(id2 > id1, "Second ID ({}) should be greater than first ({})", id2, id1);
+    }
+
+    #[test]
+    fn test_make_request_notification() {
+        let req = make_request("notifications/initialized", None);
+        assert_eq!(req.method, "notifications/initialized");
+        assert!(req.params.is_none());
+        assert_eq!(req.jsonrpc, "2.0");
+    }
+
+    #[test]
+    fn test_parse_response_error() {
+        let response = JsonRpcClientResponse {
+            jsonrpc: "2.0".to_string(),
+            result: None,
+            error: Some(JsonRpcClientError {
+                code: -32600,
+                message: "Invalid Request".to_string(),
+                data: None,
+            }),
+            id: Some(Value::Number(42.into())),
+        };
+        let err = parse_response(response).unwrap_err();
+        assert!(err.to_string().contains("-32600"));
+        assert!(err.to_string().contains("Invalid Request"));
+    }
+
+    #[test]
+    fn test_parse_response_no_result_no_error() {
+        let response = JsonRpcClientResponse {
+            jsonrpc: "2.0".to_string(),
+            result: None,
+            error: None,
+            id: Some(Value::Number(1.into())),
+        };
+        let err = parse_response(response).unwrap_err();
+        assert!(
+            err.to_string().contains("neither result nor error"),
+            "Expected 'neither result nor error' in: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_json_rpc_error_display() {
+        let error = JsonRpcClientError {
+            code: -32601,
+            message: "Method not found".to_string(),
+            data: Some(serde_json::json!({"detail": "unknown"})),
+        };
+        let display = format!("{}", error);
+        assert_eq!(display, "JSON-RPC error -32601: Method not found");
+    }
+
+    #[test]
+    fn test_transport_config_serde_roundtrip() {
+        let config = McpTransportConfig {
+            server_id: "test-srv".to_string(),
+            display_name: None,
+            transport: McpTransport::Sse {
+                url: "https://example.com/sse".to_string(),
+                headers: {
+                    let mut h = HashMap::new();
+                    h.insert("Authorization".to_string(), "Bearer tok".to_string());
+                    h
+                },
+            },
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let roundtrip: McpTransportConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(roundtrip.server_id, "test-srv");
+        assert!(roundtrip.display_name.is_none());
+        match roundtrip.transport {
+            McpTransport::Sse { ref url, ref headers } => {
+                assert_eq!(url, "https://example.com/sse");
+                assert_eq!(headers.get("Authorization").unwrap(), "Bearer tok");
+            }
+            _ => panic!("Expected Sse transport"),
+        }
+    }
+
+    #[test]
+    fn test_initialize_result_serde() {
+        let result = InitializeResult {
+            protocol_version: "2024-11-05".to_string(),
+            capabilities: serde_json::json!({"tools": {"listChanged": true}}),
+            server_info: Some(ServerInfoResult {
+                name: "my-server".to_string(),
+                version: Some("1.2.3".to_string()),
+            }),
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let roundtrip: InitializeResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(roundtrip.protocol_version, "2024-11-05");
+        assert_eq!(roundtrip.server_info.as_ref().unwrap().name, "my-server");
+        assert_eq!(
+            roundtrip.server_info.as_ref().unwrap().version,
+            Some("1.2.3".to_string())
+        );
+    }
+
+    #[test]
+    fn test_mcp_tool_def_serde_minimal() {
+        // McpToolDef with only name — description and input_schema use defaults
+        let json = serde_json::json!({"name": "bare_tool"});
+        let tool: McpToolDef = serde_json::from_value(json).unwrap();
+        assert_eq!(tool.name, "bare_tool");
+        assert!(tool.description.is_none());
+        assert_eq!(tool.input_schema, Value::Null);
+
+        // Roundtrip
+        let serialized = serde_json::to_string(&tool).unwrap();
+        let back: McpToolDef = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(back.name, "bare_tool");
+    }
 }

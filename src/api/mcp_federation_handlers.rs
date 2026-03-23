@@ -74,7 +74,7 @@ fn get_registry(
 }
 
 /// Build an `McpTransport` from the connect body.
-fn build_transport(body: &ConnectServerBody) -> Result<McpTransport, AppError> {
+pub(crate) fn build_transport(body: &ConnectServerBody) -> Result<McpTransport, AppError> {
     match body.transport.as_str() {
         "stdio" => {
             let command = body.command.clone().ok_or_else(|| {
@@ -303,4 +303,552 @@ pub async fn reconnect_server(
         server_id,
         message: "Server reconnected successfully".to_string(),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{body::Body, http::{Request, StatusCode}};
+    use tower::ServiceExt;
+    use crate::api::routes::create_router;
+    use crate::test_helpers::{test_auth_config, test_bearer_token, mock_app_state};
+    use crate::events::EventBus;
+    use crate::orchestrator::{Orchestrator, FileWatcher};
+    use crate::api::handlers::ServerState;
+    use std::sync::Arc;
+    use std::collections::HashMap;
+
+    /// App WITHOUT mcp_registry (None)
+    async fn test_app() -> axum::Router {
+        let app_state = mock_app_state();
+        let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
+        let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(orchestrator.clone())));
+        let state = Arc::new(ServerState {
+            orchestrator,
+            watcher,
+            chat_manager: None,
+            event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(EventBus::default()))),
+            nats_emitter: None,
+            auth_config: Some(test_auth_config()),
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+            setup_completed: true,
+            server_port: 6600,
+            public_url: None,
+            ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
+            registry_remote_url: None,
+            oidc_client: None,
+            neural_router: crate::test_helpers::mock_neural_router(),
+            trajectory_collector: std::sync::RwLock::new(None),
+            trajectory_store_neo4j: None,
+            trajectory_store: None,
+            identity: None,
+            reactor_counters: std::sync::OnceLock::new(),
+            confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
+            mcp_registry: None,
+        });
+        create_router(state)
+    }
+
+    /// App WITH mcp_registry enabled (empty registry)
+    async fn test_app_with_registry() -> axum::Router {
+        let app_state = mock_app_state();
+        let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
+        let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(orchestrator.clone())));
+        let registry = crate::mcp_federation::registry::new_shared_registry();
+        let state = Arc::new(ServerState {
+            orchestrator,
+            watcher,
+            chat_manager: None,
+            event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(EventBus::default()))),
+            nats_emitter: None,
+            auth_config: Some(test_auth_config()),
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+            setup_completed: true,
+            server_port: 6600,
+            public_url: None,
+            ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
+            registry_remote_url: None,
+            oidc_client: None,
+            neural_router: crate::test_helpers::mock_neural_router(),
+            trajectory_collector: std::sync::RwLock::new(None),
+            trajectory_store_neo4j: None,
+            trajectory_store: None,
+            identity: None,
+            reactor_counters: std::sync::OnceLock::new(),
+            confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
+            mcp_registry: Some(registry),
+        });
+        create_router(state)
+    }
+
+    fn auth_get(uri: &str) -> Request<Body> {
+        Request::builder()
+            .uri(uri)
+            .header("authorization", test_bearer_token())
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    fn auth_delete(uri: &str) -> Request<Body> {
+        Request::builder()
+            .method("DELETE")
+            .uri(uri)
+            .header("authorization", test_bearer_token())
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    fn auth_post(uri: &str, body: serde_json::Value) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("authorization", test_bearer_token())
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap()
+    }
+
+    async fn body_json(resp: axum::http::Response<Body>) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    // ========================================================================
+    // 1. list_servers when mcp_registry is None => 500
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_list_servers_no_registry() {
+        let app = test_app().await;
+        let resp = app.oneshot(auth_get("/api/mcp-federation/servers")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    // ========================================================================
+    // 2. list_servers with empty registry => 200 + empty array
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_list_servers_empty() {
+        let app = test_app_with_registry().await;
+        let resp = app.oneshot(auth_get("/api/mcp-federation/servers")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert!(json.is_array(), "Expected JSON array, got: {:?}", json);
+        assert_eq!(json.as_array().unwrap().len(), 0);
+    }
+
+    // ========================================================================
+    // 3. get_server_status for nonexistent server => 404
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_get_server_not_found() {
+        let app = test_app_with_registry().await;
+        let resp = app
+            .oneshot(auth_get("/api/mcp-federation/servers/nonexistent"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ========================================================================
+    // 4. disconnect nonexistent server => 500 (registry.disconnect returns Err)
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_disconnect_server_not_found() {
+        let app = test_app_with_registry().await;
+        let resp = app
+            .oneshot(auth_delete("/api/mcp-federation/servers/nonexistent"))
+            .await
+            .unwrap();
+        // disconnect returns anyhow::Error mapped to AppError::Internal (500)
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    // ========================================================================
+    // 5. list_tools for nonexistent server => 404
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_list_tools_not_found() {
+        let app = test_app_with_registry().await;
+        let resp = app
+            .oneshot(auth_get("/api/mcp-federation/servers/nonexistent/tools"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ========================================================================
+    // 6. connect with invalid transport type => 400
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_connect_server_invalid_transport() {
+        let app = test_app_with_registry().await;
+        let body = serde_json::json!({
+            "server_id": "test-srv",
+            "transport": "carrier_pigeon"
+        });
+        let resp = app
+            .oneshot(auth_post("/api/mcp-federation/servers", body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let json = body_json(resp).await;
+        let err = json["error"].as_str().unwrap();
+        assert!(err.contains("Unknown transport"), "Error was: {}", err);
+    }
+
+    // ========================================================================
+    // 7. connect stdio without command => 400
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_connect_server_missing_command() {
+        let app = test_app_with_registry().await;
+        let body = serde_json::json!({
+            "server_id": "test-srv",
+            "transport": "stdio"
+        });
+        let resp = app
+            .oneshot(auth_post("/api/mcp-federation/servers", body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let json = body_json(resp).await;
+        let err = json["error"].as_str().unwrap();
+        assert!(err.contains("command"), "Error was: {}", err);
+    }
+
+    // ========================================================================
+    // 8. connect sse without url => 400
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_connect_server_missing_url() {
+        let app = test_app_with_registry().await;
+        let body = serde_json::json!({
+            "server_id": "test-srv",
+            "transport": "sse"
+        });
+        let resp = app
+            .oneshot(auth_post("/api/mcp-federation/servers", body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let json = body_json(resp).await;
+        let err = json["error"].as_str().unwrap();
+        assert!(err.contains("url"), "Error was: {}", err);
+    }
+
+    // ========================================================================
+    // 9. build_transport: valid stdio
+    // ========================================================================
+
+    #[test]
+    fn test_build_transport_stdio() {
+        let body = ConnectServerBody {
+            server_id: "s1".into(),
+            display_name: None,
+            transport: "stdio".into(),
+            command: Some("node".into()),
+            args: vec!["server.js".into()],
+            env: HashMap::from([("FOO".into(), "bar".into())]),
+            url: None,
+            headers: HashMap::new(),
+        };
+        let transport = build_transport(&body).unwrap();
+        match transport {
+            McpTransport::Stdio { command, args, env } => {
+                assert_eq!(command, "node");
+                assert_eq!(args, vec!["server.js"]);
+                assert_eq!(env.get("FOO").unwrap(), "bar");
+            }
+            other => panic!("Expected Stdio, got {:?}", other),
+        }
+    }
+
+    // ========================================================================
+    // 10. build_transport: valid SSE
+    // ========================================================================
+
+    #[test]
+    fn test_build_transport_sse() {
+        let body = ConnectServerBody {
+            server_id: "s2".into(),
+            display_name: Some("My SSE".into()),
+            transport: "sse".into(),
+            command: None,
+            args: vec![],
+            env: HashMap::new(),
+            url: Some("http://localhost:8080/sse".into()),
+            headers: HashMap::from([("Authorization".into(), "Bearer tok".into())]),
+        };
+        let transport = build_transport(&body).unwrap();
+        match transport {
+            McpTransport::Sse { url, headers } => {
+                assert_eq!(url, "http://localhost:8080/sse");
+                assert_eq!(headers.get("Authorization").unwrap(), "Bearer tok");
+            }
+            other => panic!("Expected Sse, got {:?}", other),
+        }
+    }
+
+    // ========================================================================
+    // 11. build_transport: valid streamable_http
+    // ========================================================================
+
+    #[test]
+    fn test_build_transport_streamable_http() {
+        let body = ConnectServerBody {
+            server_id: "s3".into(),
+            display_name: None,
+            transport: "streamable_http".into(),
+            command: None,
+            args: vec![],
+            env: HashMap::new(),
+            url: Some("http://localhost:9090/mcp".into()),
+            headers: HashMap::new(),
+        };
+        let transport = build_transport(&body).unwrap();
+        match transport {
+            McpTransport::StreamableHttp { url, headers } => {
+                assert_eq!(url, "http://localhost:9090/mcp");
+                assert!(headers.is_empty());
+            }
+            other => panic!("Expected StreamableHttp, got {:?}", other),
+        }
+    }
+
+    // ========================================================================
+    // 12. build_transport: unknown transport => error
+    // ========================================================================
+
+    #[test]
+    fn test_build_transport_unknown() {
+        let body = ConnectServerBody {
+            server_id: "s4".into(),
+            display_name: None,
+            transport: "websocket".into(),
+            command: None,
+            args: vec![],
+            env: HashMap::new(),
+            url: None,
+            headers: HashMap::new(),
+        };
+        let result = build_transport(&body);
+        assert!(result.is_err());
+        // Verify it's a BadRequest
+        match result.unwrap_err() {
+            AppError::BadRequest(msg) => {
+                assert!(msg.contains("Unknown transport"), "Message was: {}", msg);
+                assert!(msg.contains("websocket"), "Message was: {}", msg);
+            }
+            other => panic!("Expected BadRequest, got {:?}", other),
+        }
+    }
+
+    // ========================================================================
+    // Helper: app with a pre-populated registry (one server with 2 tools)
+    // ========================================================================
+
+    async fn test_app_with_populated_registry() -> axum::Router {
+        use crate::mcp_federation::registry::{
+            McpServerConnection, McpServerRegistry, ConnectionStatus, ServerStats,
+        };
+        use crate::mcp_federation::circuit_breaker::CircuitBreaker;
+        use crate::mcp_federation::discovery::{DiscoveredTool, InferredCategory};
+
+        let app_state = mock_app_state();
+        let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
+        let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(orchestrator.clone())));
+
+        // Build a registry with a mock server
+        let mut registry = McpServerRegistry::new();
+
+        // Mock client (minimal)
+        #[derive(Debug)]
+        struct MinimalMockClient;
+        #[async_trait::async_trait]
+        impl crate::mcp_federation::client::McpClient for MinimalMockClient {
+            async fn initialize(&self) -> anyhow::Result<crate::mcp_federation::client::InitializeResult> {
+                unimplemented!()
+            }
+            async fn initialized_notification(&self) -> anyhow::Result<()> { Ok(()) }
+            async fn tools_list(&self) -> anyhow::Result<Vec<crate::mcp_federation::client::McpToolDef>> {
+                Ok(vec![])
+            }
+            async fn call_tool(&self, _: &str, _: Option<serde_json::Value>) -> anyhow::Result<serde_json::Value> {
+                Ok(serde_json::json!({}))
+            }
+            async fn ping(&self) -> anyhow::Result<()> { Ok(()) }
+            async fn shutdown(&self) -> anyhow::Result<()> { Ok(()) }
+            fn transport_name(&self) -> &'static str { "mock" }
+        }
+
+        let tools = vec![
+            DiscoveredTool {
+                name: "list_items".to_string(),
+                fqn: "test-srv::list_items".to_string(),
+                description: "List all items".to_string(),
+                input_schema: serde_json::json!({"type": "object"}),
+                category: InferredCategory::Query,
+                embedding: None,
+                similar_internal: vec![],
+                profile: None,
+            },
+            DiscoveredTool {
+                name: "get_item".to_string(),
+                fqn: "test-srv::get_item".to_string(),
+                description: "Get a single item".to_string(),
+                input_schema: serde_json::json!({"type": "object", "properties": {"id": {"type": "string"}}}),
+                category: InferredCategory::Query,
+                embedding: None,
+                similar_internal: vec![],
+                profile: None,
+            },
+        ];
+
+        let conn = McpServerConnection {
+            id: "test-srv".to_string(),
+            display_name: "Test Server".to_string(),
+            transport: crate::mcp_federation::McpTransport::Stdio {
+                command: "echo".to_string(),
+                args: vec![],
+                env: HashMap::new(),
+            },
+            status: ConnectionStatus::Connected,
+            client: Box::new(MinimalMockClient),
+            discovered_tools: tools,
+            circuit_breaker: CircuitBreaker::default(),
+            stats: ServerStats::new(),
+            connected_at: chrono::Utc::now(),
+            server_protocol_version: Some("2024-11-05".to_string()),
+            server_name: Some("MockMCP".to_string()),
+        };
+
+        registry.insert_connection_for_test(conn);
+
+        let shared_registry = std::sync::Arc::new(tokio::sync::RwLock::new(registry));
+
+        let state = Arc::new(ServerState {
+            orchestrator,
+            watcher,
+            chat_manager: None,
+            event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(EventBus::default()))),
+            nats_emitter: None,
+            auth_config: Some(test_auth_config()),
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+            setup_completed: true,
+            server_port: 6600,
+            public_url: None,
+            ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
+            registry_remote_url: None,
+            oidc_client: None,
+            neural_router: crate::test_helpers::mock_neural_router(),
+            trajectory_collector: std::sync::RwLock::new(None),
+            trajectory_store_neo4j: None,
+            trajectory_store: None,
+            identity: None,
+            reactor_counters: std::sync::OnceLock::new(),
+            confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
+            mcp_registry: Some(shared_registry),
+        });
+        create_router(state)
+    }
+
+    // ========================================================================
+    // 13. list_servers with populated registry => server details
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_list_servers_with_data() {
+        let app = test_app_with_populated_registry().await;
+        let resp = app.oneshot(auth_get("/api/mcp-federation/servers")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        let arr = json.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["id"], "test-srv");
+        assert_eq!(arr[0]["display_name"], "Test Server");
+        assert_eq!(arr[0]["tool_count"], 2);
+        assert_eq!(arr[0]["status"], "connected");
+    }
+
+    // ========================================================================
+    // 14. get_server_status with populated registry => server found
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_get_server_status_found() {
+        let app = test_app_with_populated_registry().await;
+        let resp = app
+            .oneshot(auth_get("/api/mcp-federation/servers/test-srv"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["id"], "test-srv");
+        assert_eq!(json["display_name"], "Test Server");
+        assert_eq!(json["tool_count"], 2);
+        assert!(!json["server_name"].is_null());
+    }
+
+    // ========================================================================
+    // 15. list_tools with populated registry => tools returned
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_list_server_tools_with_data() {
+        let app = test_app_with_populated_registry().await;
+        let resp = app
+            .oneshot(auth_get("/api/mcp-federation/servers/test-srv/tools"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        let arr = json.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+    }
+
+    // ========================================================================
+    // 16. disconnect with populated registry => success
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_disconnect_server_success() {
+        let app = test_app_with_populated_registry().await;
+        let resp = app
+            .oneshot(auth_delete("/api/mcp-federation/servers/test-srv"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["success"], true);
+        assert_eq!(json["server_id"], "test-srv");
+    }
+
+    // ========================================================================
+    // 17. connect streamable_http missing url => 400
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_connect_server_streamable_http_missing_url() {
+        let app = test_app_with_registry().await;
+        let body = serde_json::json!({
+            "server_id": "test-srv",
+            "transport": "streamable_http"
+        });
+        let resp = app
+            .oneshot(auth_post("/api/mcp-federation/servers", body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
 }
