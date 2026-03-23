@@ -1757,6 +1757,13 @@ impl ChatManager {
         };
 
         // ── Compose via FsmPromptComposer ───────────────────────────────
+        // Check if external MCP servers are connected
+        let external_tools_available = if let Some(ref registry) = self.mcp_registry {
+            !registry.read().await.is_empty()
+        } else {
+            false
+        };
+
         let input = ComposerInput {
             scaffolding_level,
             protocol_runs: &protocol_runs,
@@ -1770,6 +1777,7 @@ impl ChatManager {
             task_count,
             model: model.unwrap_or(""),
             message_embedding: message_embedding.as_ref(),
+            external_tools_available,
         };
 
         // Use compose_with_record to get the routing decision for trajectory tracking.

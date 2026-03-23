@@ -56,6 +56,10 @@ pub struct RoutingContext {
     /// Whether the project has sibling projects (multi-project workspace).
     pub is_multi_project: bool,
 
+    // ── External MCP servers ────────────────────────────────────────
+    /// Whether external MCP servers are connected (triggers External tool group).
+    pub external_tools_available: bool,
+
     // ── FSM state ──────────────────────────────────────────────────
     /// Tool names whitelisted by the current FSM state's `available_tools`.
     /// Empty = no FSM restriction.
@@ -203,6 +207,7 @@ impl RoutingProvider for HeuristicRouter {
             scaffolding_level: ctx.scaffolding_level,
             has_active_protocol: ctx.has_active_protocol,
             is_multi_project: ctx.is_multi_project,
+            external_tools_available: ctx.external_tools_available,
             fsm_available_tools: ctx.fsm_available_tools.clone(),
             user_intent_keywords: vec![ctx.user_message.clone()],
         };
@@ -507,14 +512,15 @@ mod tests {
             has_active_protocol: true,
             task_count: 10,
             is_multi_project: true,
+            external_tools_available: true,
             ..Default::default()
         };
 
         let decision = router.route(&ctx);
 
-        // At L0 with everything active, all 16 sections should be included
+        // At L0 with everything active, all 17 sections should be included
         assert_eq!(decision.sections.len(), PromptSectionId::ALL.len());
-        // All 7 tool groups should be included
+        // All 8 tool groups should be included
         assert_eq!(decision.tool_groups.len(), ToolRefGroupId::ALL.len());
         // No hints from heuristic router
         assert!(decision.section_hints.is_empty());

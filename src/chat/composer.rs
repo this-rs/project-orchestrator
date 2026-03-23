@@ -84,6 +84,8 @@ pub struct ComposerInput<'a> {
     /// Pre-computed embedding of the user message (for DualTrackRouter).
     /// `None` if embeddings are unavailable → routing falls back to heuristics.
     pub message_embedding: Option<&'a Vec<f32>>,
+    /// Whether external MCP servers are connected (triggers External tool group).
+    pub external_tools_available: bool,
 }
 
 // Default is derived — all numeric fields default to 0, bools to false,
@@ -190,6 +192,7 @@ impl FsmPromptComposer {
             has_active_protocol: !input.protocol_runs.is_empty(),
             task_count: input.task_count,
             is_multi_project: input.is_multi_project,
+            external_tools_available: input.external_tools_available,
             fsm_available_tools: fsm_tools,
             user_message: input.user_message.to_string(),
             detected_intent: None, // Future: from enrichment hints
@@ -514,6 +517,7 @@ impl FsmPromptComposer {
             has_active_protocol: !input.protocol_runs.is_empty(),
             task_count: input.task_count,
             is_multi_project: input.is_multi_project,
+            external_tools_available: input.external_tools_available,
             fsm_available_tools: fsm_tools,
             user_message: input.user_message.to_string(),
             detected_intent: None,
