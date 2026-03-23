@@ -1,7 +1,9 @@
 //! Enrichment pipeline stages.
 //!
-//! Each stage implements [`super::enrichment::EnrichmentStage`] and is
-//! registered in the pipeline at startup.
+//! Each stage implements [`super::enrichment::ParallelEnrichmentStage`] and is
+//! registered in the pipeline at startup. All stages run concurrently via
+//! `futures::join_all` and return [`super::enrichment::StageOutput`] which
+//! the pipeline merges in registration order.
 
 pub mod biomimicry;
 pub mod file_context;

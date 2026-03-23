@@ -340,9 +340,7 @@ const NON_RFC_CONFIDENCE_THRESHOLD: f64 = 0.80;
 
 /// Map an observation's `note_type` string to the corresponding `NoteType`,
 /// `NoteImportance`, energy level, and category tag.
-fn map_observation(
-    note_type_str: &str,
-) -> Option<(NoteType, NoteImportance, f64, &'static str)> {
+fn map_observation(note_type_str: &str) -> Option<(NoteType, NoteImportance, f64, &'static str)> {
     match note_type_str {
         "gotcha" => Some((NoteType::Gotcha, NoteImportance::High, 0.3, "gotcha")),
         "guideline" => Some((
@@ -443,10 +441,7 @@ async fn create_observation_note(
     note.importance = importance;
     note.energy = energy;
     note.memory_horizon = MemoryHorizon::Ephemeral;
-    note.tags = vec![
-        "auto-observed".to_string(),
-        category_tag.to_string(),
-    ];
+    note.tags = vec!["auto-observed".to_string(), category_tag.to_string()];
 
     match graph.create_note(&note).await {
         Ok(()) => {
@@ -510,8 +505,9 @@ async fn link_note_to_session_entities(
     match graph.get_session_entities(session_id, project_id).await {
         Ok(entities) => {
             for entity in &entities {
-                if let Ok(etype) =
-                    entity.entity_type.parse::<crate::notes::models::EntityType>()
+                if let Ok(etype) = entity
+                    .entity_type
+                    .parse::<crate::notes::models::EntityType>()
                 {
                     if let Err(e) = graph
                         .link_note_to_entity(note.id, &etype, &entity.entity_id, None, None)
@@ -1248,12 +1244,7 @@ mod tests {
         let uuid3 = Uuid::new_v4();
 
         // Root with a valid UUID entity_id
-        let mut root = ReasoningNode::new(
-            EntitySource::Note,
-            uuid1.to_string(),
-            0.9,
-            "root note",
-        );
+        let mut root = ReasoningNode::new(EntitySource::Note, uuid1.to_string(), 0.9, "root note");
 
         // Child with a valid UUID
         let mut child = ReasoningNode::new(
@@ -1274,13 +1265,8 @@ mod tests {
         .with_depth(2);
 
         // Child with a file path (not a UUID) — should be filtered out
-        let file_child = ReasoningNode::new(
-            EntitySource::File,
-            "src/main.rs",
-            0.6,
-            "file node",
-        )
-        .with_depth(1);
+        let file_child =
+            ReasoningNode::new(EntitySource::File, "src/main.rs", 0.6, "file node").with_depth(1);
 
         // Child with a function name (not a UUID) — should be filtered out
         let func_child = ReasoningNode::new(

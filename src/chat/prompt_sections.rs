@@ -1121,6 +1121,117 @@ pub fn assemble_sections(sections: &[BasePromptSection]) -> String {
         .join("\n\n")
 }
 
+/// Assemble sections with weight-based truncation.
+///
+/// When the total base prompt exceeds `max_chars`, sections with the lowest
+/// weights (from `SectionHint`) are truncated first. Sections not in the
+/// hints map are treated as weight 1.0 (kept at full size).
+///
+/// Truncation strategy:
+/// 1. Sections with weight 0.0 are excluded entirely
+/// 2. Remaining sections are sorted by weight ascending
+/// 3. Lowest-weight sections are progressively truncated (to 50% then 25% then 0%)
+///    until the total fits within `max_chars`
+pub fn assemble_sections_weighted(
+    sections: &[BasePromptSection],
+    hints: &[(PromptSectionId, f32)],
+    max_chars: usize,
+) -> String {
+    use std::collections::HashMap;
+
+    let weight_map: HashMap<PromptSectionId, f32> =
+        hints.iter().cloned().collect();
+
+    // Filter out weight=0.0 sections and empty sections
+    let weighted: Vec<(&BasePromptSection, f32)> = sections
+        .iter()
+        .filter(|s| !s.content.is_empty())
+        .filter_map(|s| {
+            let w = weight_map.get(&s.id).copied().unwrap_or(1.0);
+            if w <= 0.0 {
+                None
+            } else {
+                Some((s, w))
+            }
+        })
+        .collect();
+
+    // Check if we're under budget with all sections
+    let total: usize = weighted.iter().map(|(s, _)| s.content.len()).sum();
+    if total <= max_chars {
+        return weighted
+            .iter()
+            .map(|(s, _)| s.content)
+            .collect::<Vec<_>>()
+            .join("\n\n");
+    }
+
+    // Over budget: progressively truncate lowest-weight sections
+    // Sort by weight ascending (lowest weight = truncated first)
+    let mut by_weight: Vec<(usize, f32)> = weighted
+        .iter()
+        .enumerate()
+        .map(|(i, (_, w))| (i, *w))
+        .collect();
+    by_weight.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Build content with truncation ratios
+    let mut ratios: Vec<f32> = vec![1.0; weighted.len()];
+    let truncation_steps = [0.5, 0.25, 0.0]; // Progressive truncation
+
+    'outer: for &step in &truncation_steps {
+        for &(idx, _weight) in &by_weight {
+            ratios[idx] = step;
+            let current_total: usize = weighted
+                .iter()
+                .enumerate()
+                .map(|(i, (s, _))| {
+                    let content_len = s.content.len();
+                    (content_len as f32 * ratios[i]) as usize
+                })
+                .sum();
+            if current_total <= max_chars {
+                break 'outer;
+            }
+        }
+    }
+
+    // Render with applied ratios
+    weighted
+        .iter()
+        .enumerate()
+        .filter_map(|(i, (s, _))| {
+            let ratio = ratios[i];
+            if ratio <= 0.0 {
+                return None;
+            }
+            if ratio >= 1.0 {
+                return Some(s.content.to_string());
+            }
+            // Truncate to ratio of original length
+            let target_len = (s.content.len() as f32 * ratio) as usize;
+            let boundary = floor_char_boundary_pub(s.content, target_len);
+            let mut truncated = s.content[..boundary].to_string();
+            truncated.push_str("\n\n[... section truncated]");
+            Some(truncated)
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// Find the largest char boundary <= the given byte index.
+/// Public variant for use from other modules.
+pub fn floor_char_boundary_pub(s: &str, index: usize) -> usize {
+    if index >= s.len() {
+        return s.len();
+    }
+    let mut i = index;
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
 // ============================================================================
 // Tool Reference Groups — selective rendering of TOOL_REFERENCE
 // ============================================================================

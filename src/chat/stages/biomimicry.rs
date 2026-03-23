@@ -19,7 +19,7 @@ use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
 use crate::chat::enrichment::{
-    EnrichmentConfig, EnrichmentContext, EnrichmentInput, EnrichmentStage,
+    EnrichmentConfig, EnrichmentInput, ParallelEnrichmentStage, StageOutput,
 };
 use crate::neo4j::traits::GraphStore;
 use crate::skills::maintenance::SkillMaintenanceConfig;
@@ -37,8 +37,10 @@ impl BiomimicryStage {
 }
 
 #[async_trait::async_trait]
-impl EnrichmentStage for BiomimicryStage {
-    async fn execute(&self, input: &EnrichmentInput, ctx: &mut EnrichmentContext) -> Result<()> {
+impl ParallelEnrichmentStage for BiomimicryStage {
+    async fn execute(&self, input: &EnrichmentInput) -> Result<StageOutput> {
+        let mut output = StageOutput::new(self.name());
+
         let project_id = match input.project_id {
             Some(id) => id,
             None => {
@@ -46,10 +48,10 @@ impl EnrichmentStage for BiomimicryStage {
                 if let Some(slug) = &input.project_slug {
                     match self.graph.get_project_by_slug(slug).await {
                         Ok(Some(p)) => p.id,
-                        _ => return Ok(()),
+                        _ => return Ok(output),
                     }
                 } else {
-                    return Ok(());
+                    return Ok(output);
                 }
             }
         };
@@ -148,10 +150,10 @@ impl EnrichmentStage for BiomimicryStage {
         }
 
         if !sections.is_empty() {
-            ctx.add_section("Bio-Cognitive Health", sections.join("\n"), self.name());
+            output.add_section("Bio-Cognitive Health", sections.join("\n"), self.name());
         }
 
-        Ok(())
+        Ok(output)
     }
 
     fn name(&self) -> &str {

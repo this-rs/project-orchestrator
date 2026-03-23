@@ -16,7 +16,7 @@ use tokio::time::timeout;
 use tracing::{debug, warn};
 
 use crate::chat::enrichment::{
-    EnrichmentConfig, EnrichmentContext, EnrichmentInput, EnrichmentStage,
+    EnrichmentConfig, EnrichmentInput, ParallelEnrichmentStage, StageOutput,
 };
 use crate::neo4j::traits::GraphStore;
 
@@ -51,18 +51,20 @@ fn extract_file_paths(message: &str) -> Vec<String> {
 }
 
 #[async_trait::async_trait]
-impl EnrichmentStage for PersonaStage {
-    async fn execute(&self, input: &EnrichmentInput, ctx: &mut EnrichmentContext) -> Result<()> {
+impl ParallelEnrichmentStage for PersonaStage {
+    async fn execute(&self, input: &EnrichmentInput) -> Result<StageOutput> {
+        let mut output = StageOutput::new(self.name());
+
         let project_id = match input.project_id {
             Some(id) => id,
             None => {
                 if let Some(slug) = &input.project_slug {
                     match self.graph.get_project_by_slug(slug).await {
                         Ok(Some(p)) => p.id,
-                        _ => return Ok(()),
+                        _ => return Ok(output),
                     }
                 } else {
-                    return Ok(());
+                    return Ok(output);
                 }
             }
         };
@@ -70,7 +72,7 @@ impl EnrichmentStage for PersonaStage {
         let file_paths = extract_file_paths(&input.message);
         if file_paths.is_empty() {
             debug!("PersonaStage: no file paths detected in message");
-            return Ok(());
+            return Ok(output);
         }
 
         debug!(
@@ -112,11 +114,11 @@ impl EnrichmentStage for PersonaStage {
             Ok(Some((p, w))) => (p, w),
             Ok(None) => {
                 debug!("PersonaStage: no matching persona found for detected files");
-                return Ok(());
+                return Ok(output);
             }
             Err(_) => {
                 warn!("PersonaStage: timed out finding personas");
-                return Ok(());
+                return Ok(output);
             }
         };
 
@@ -137,14 +139,12 @@ impl EnrichmentStage for PersonaStage {
         }
 
         // Set hint so downstream stages know which persona is active
-        ctx.hints
-            .insert("active_persona".to_string(), persona.name.clone());
-        ctx.hints
-            .insert("active_persona_id".to_string(), persona.id.to_string());
+        output.set_hint("active_persona", persona.name.clone());
+        output.set_hint("active_persona_id", persona.id.to_string());
 
-        ctx.add_section("Persona Context", section, "persona");
+        output.add_section("Persona Context", section, "persona");
 
-        Ok(())
+        Ok(output)
     }
 
     fn name(&self) -> &str {
@@ -159,7 +159,7 @@ impl EnrichmentStage for PersonaStage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chat::enrichment::EnrichmentContext;
+    use crate::chat::enrichment::{EnrichmentContext, ParallelEnrichmentStage};
     use crate::neo4j::mock::MockGraphStore;
     use crate::neo4j::models::{PersonaNode, PersonaStatus};
     use uuid::Uuid;
@@ -275,10 +275,9 @@ mod tests {
         let mock = Arc::new(MockGraphStore::new());
         let stage = PersonaStage::new(mock);
         let input = make_input("Look at src/lib.rs", None);
-        let mut ctx = EnrichmentContext::default();
 
-        stage.execute(&input, &mut ctx).await.unwrap();
-        assert!(ctx.sections.is_empty());
+        let output = stage.execute(&input).await.unwrap();
+        assert!(output.sections.is_empty());
     }
 
     #[tokio::test]
@@ -287,10 +286,9 @@ mod tests {
         let stage = PersonaStage::new(mock);
         let project_id = Uuid::new_v4();
         let input = make_input("What is the architecture?", Some(project_id));
-        let mut ctx = EnrichmentContext::default();
 
-        stage.execute(&input, &mut ctx).await.unwrap();
-        assert!(ctx.sections.is_empty());
+        let output = stage.execute(&input).await.unwrap();
+        assert!(output.sections.is_empty());
     }
 
     #[tokio::test]
@@ -299,11 +297,10 @@ mod tests {
         let stage = PersonaStage::new(mock);
         let project_id = Uuid::new_v4();
         let input = make_input("Check src/lib.rs", Some(project_id));
-        let mut ctx = EnrichmentContext::default();
 
-        stage.execute(&input, &mut ctx).await.unwrap();
+        let output = stage.execute(&input).await.unwrap();
         // No persona registered → no section injected
-        assert!(ctx.sections.is_empty());
+        assert!(output.sections.is_empty());
     }
 
     #[tokio::test]
@@ -324,23 +321,22 @@ mod tests {
 
         let stage = PersonaStage::new(mock);
         let input = make_input("Fix the bug in src/neo4j/client.rs", Some(project_id));
-        let mut ctx = EnrichmentContext::default();
 
-        stage.execute(&input, &mut ctx).await.unwrap();
+        let output = stage.execute(&input).await.unwrap();
 
         // Should have injected a section
-        assert_eq!(ctx.sections.len(), 1);
-        assert_eq!(ctx.sections[0].title, "Persona Context");
-        assert!(ctx.sections[0].content.contains("neo4j-expert"));
-        assert!(ctx.sections[0].content.contains("90%")); // weight 0.9 → 90%
-        assert!(ctx.sections[0]
+        assert_eq!(output.sections.len(), 1);
+        assert_eq!(output.sections[0].title, "Persona Context");
+        assert!(output.sections[0].content.contains("neo4j-expert"));
+        assert!(output.sections[0].content.contains("90%")); // weight 0.9 → 90%
+        assert!(output.sections[0]
             .content
             .contains("Specialist in graph database queries"));
 
         // Should have set hints
-        assert_eq!(ctx.hints.get("active_persona").unwrap(), "neo4j-expert");
+        assert_eq!(output.hints.get("active_persona").unwrap(), "neo4j-expert");
         assert_eq!(
-            ctx.hints.get("active_persona_id").unwrap(),
+            output.hints.get("active_persona_id").unwrap(),
             &persona.id.to_string()
         );
     }
@@ -367,13 +363,12 @@ mod tests {
             "Refactor src/lib.rs and src/chat/manager.rs",
             Some(project_id),
         );
-        let mut ctx = EnrichmentContext::default();
 
-        stage.execute(&input, &mut ctx).await.unwrap();
+        let output = stage.execute(&input).await.unwrap();
 
-        assert_eq!(ctx.sections.len(), 1);
-        assert!(ctx.sections[0].content.contains("high-weight"));
-        assert_eq!(ctx.hints.get("active_persona").unwrap(), "high-weight");
+        assert_eq!(output.sections.len(), 1);
+        assert!(output.sections[0].content.contains("high-weight"));
+        assert_eq!(output.hints.get("active_persona").unwrap(), "high-weight");
     }
 
     #[tokio::test]
@@ -389,15 +384,14 @@ mod tests {
 
         let stage = PersonaStage::new(mock);
         let input = make_input("Check src/main.rs", Some(project_id));
-        let mut ctx = EnrichmentContext::default();
 
-        stage.execute(&input, &mut ctx).await.unwrap();
+        let output = stage.execute(&input).await.unwrap();
 
-        assert_eq!(ctx.sections.len(), 1);
+        assert_eq!(output.sections.len(), 1);
         // Should have the header but NOT an empty description line
-        assert!(ctx.sections[0].content.contains("minimal"));
+        assert!(output.sections[0].content.contains("minimal"));
         // Content should only have the header line (no extra newlines from empty description)
-        let lines: Vec<&str> = ctx.sections[0].content.trim().lines().collect();
+        let lines: Vec<&str> = output.sections[0].content.trim().lines().collect();
         assert_eq!(lines.len(), 1); // Just the "## Active Persona: ..." line
     }
 }

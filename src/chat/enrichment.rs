@@ -4,9 +4,9 @@
 //! with relevant context from the knowledge graph.
 //!
 //! Architecture:
-//! - [`EnrichmentStage`] trait — pluggable stages executed sequentially
-//! - [`EnrichmentPipeline`] — ordered `Vec` of stages with graceful degradation
-//! - [`EnrichmentContext`] — accumulator for enrichment data across stages
+//! - [`ParallelEnrichmentStage`] trait — pluggable stages returning [`StageOutput`]
+//! - [`EnrichmentPipeline`] — runs stages in parallel via `futures::join_all`, merges in order
+//! - [`EnrichmentContext`] — accumulator for enrichment data (populated by pipeline merge)
 //! - [`EnrichmentInput`] — immutable input data for all stages
 //!
 //! Stages added by later tasks (TP2.2–TP2.4):
@@ -315,20 +315,67 @@ impl EnrichmentContext {
 }
 
 // ============================================================================
-// Stage trait
+// Stage output (parallel pipeline)
 // ============================================================================
 
-/// A pluggable enrichment stage in the pipeline.
+/// Output produced by a single enrichment stage in the parallel pipeline.
 ///
-/// Each stage asynchronously enriches the context with a specific category
-/// of information (skills, notes, tasks, reasoning tree, etc.).
+/// Instead of mutating an `EnrichmentContext` directly, each stage returns
+/// a `StageOutput` which the pipeline merges in registration order.
+#[derive(Debug, Clone, Default)]
+pub struct StageOutput {
+    /// Sections produced by this stage.
+    pub sections: Vec<EnrichmentSection>,
+    /// Hints to merge into the context (last writer wins across stages).
+    pub hints: HashMap<String, String>,
+    /// Stage name (for logging/timing).
+    pub stage_name: String,
+    /// Execution duration in milliseconds.
+    pub duration_ms: u64,
+}
+
+impl StageOutput {
+    /// Create a new empty StageOutput for the given stage name.
+    pub fn new(stage_name: impl Into<String>) -> Self {
+        Self {
+            stage_name: stage_name.into(),
+            ..Default::default()
+        }
+    }
+
+    /// Add a section to this output.
+    pub fn add_section(
+        &mut self,
+        title: impl Into<String>,
+        content: impl Into<String>,
+        source: impl Into<String>,
+    ) {
+        self.sections.push(EnrichmentSection {
+            title: title.into(),
+            content: content.into(),
+            source: source.into(),
+        });
+    }
+
+    /// Set a hint in this output.
+    pub fn set_hint(&mut self, key: impl Into<String>, value: impl Into<String>) {
+        self.hints.insert(key.into(), value.into());
+    }
+}
+
+// ============================================================================
+// Stage traits
+// ============================================================================
+
+/// A parallel enrichment stage that returns a [`StageOutput`] instead of
+/// mutating an `EnrichmentContext`.
 ///
-/// Stages are executed sequentially in insertion order. If a stage fails,
-/// the pipeline logs the error and continues (graceful degradation).
+/// All stages implementing this trait can run concurrently via `futures::join_all`.
+/// The pipeline merges outputs in registration order after all stages complete.
 #[async_trait::async_trait]
-pub trait EnrichmentStage: Send + Sync {
-    /// Execute the stage, adding data to the enrichment context.
-    async fn execute(&self, input: &EnrichmentInput, ctx: &mut EnrichmentContext) -> Result<()>;
+pub trait ParallelEnrichmentStage: Send + Sync {
+    /// Execute the stage and return its output.
+    async fn execute(&self, input: &EnrichmentInput) -> Result<StageOutput>;
 
     /// Human-readable name for logging and debugging.
     fn name(&self) -> &str;
@@ -343,13 +390,13 @@ pub trait EnrichmentStage: Send + Sync {
 
 /// Ordered pipeline of enrichment stages.
 ///
-/// Executes stages sequentially with graceful degradation:
-/// if a stage fails, its error is logged and the pipeline continues.
-///
-/// The pipeline enforces a time budget (`max_pipeline_ms`). If the budget
-/// is exceeded, remaining stages are skipped.
+/// Executes all enabled stages **in parallel** via `futures::join_all`,
+/// then merges their outputs in registration order. Each stage has an
+/// individual timeout; errors and timeouts produce an empty `StageOutput`
+/// and are recorded in `skipped_stages`. A global pipeline timeout
+/// (`max_pipeline_ms`) wraps the entire parallel execution.
 pub struct EnrichmentPipeline {
-    stages: Vec<Box<dyn EnrichmentStage>>,
+    stages: Vec<Box<dyn ParallelEnrichmentStage>>,
     config: EnrichmentConfig,
 }
 
@@ -362,35 +409,30 @@ impl EnrichmentPipeline {
         }
     }
 
-    /// Add a stage to the pipeline (executed in insertion order).
-    pub fn add_stage(&mut self, stage: Box<dyn EnrichmentStage>) {
+    /// Add a stage to the pipeline.
+    pub fn add_parallel_stage(&mut self, stage: Box<dyn ParallelEnrichmentStage>) {
         self.stages.push(stage);
     }
 
-    /// Execute all enabled stages sequentially.
+    /// Execute all enabled stages in parallel.
     ///
-    /// Graceful degradation: if a stage fails, its error is logged
-    /// and the pipeline continues with the remaining stages.
-    /// Returns the enriched context even if some stages failed.
+    /// Graceful degradation: if a stage fails or times out, its error is logged
+    /// and the pipeline continues with the remaining stages' outputs.
+    /// Sections are merged in registration order to preserve deterministic output.
     pub async fn execute(&self, input: &EnrichmentInput) -> EnrichmentContext {
         let pipeline_start = Instant::now();
         let mut ctx = EnrichmentContext::default();
-        let deadline = Duration::from_millis(self.config.max_pipeline_ms);
+        let global_deadline = Duration::from_millis(self.config.max_pipeline_ms);
+        // Per-stage timeout: use the global budget (each stage can use the full budget
+        // since they run in parallel; the global timeout wraps everything).
+        let per_stage_timeout = global_deadline;
 
-        for stage in &self.stages {
-            // Check time budget
-            if pipeline_start.elapsed() >= deadline {
-                // Record all remaining enabled stages as skipped
-                warn!(
-                    "[enrichment] Pipeline hit time budget ({}ms) after {}ms, skipping remaining stages",
-                    self.config.max_pipeline_ms,
-                    pipeline_start.elapsed().as_millis()
-                );
-                break;
-            }
-
-            // Check if enabled
-            if !stage.is_enabled(&self.config) {
+        // Collect indices of enabled stages; record disabled ones as skipped.
+        let mut enabled_indices = Vec::new();
+        for (i, stage) in self.stages.iter().enumerate() {
+            if stage.is_enabled(&self.config) {
+                enabled_indices.push(i);
+            } else {
                 ctx.skipped_stages.push(stage.name().to_string());
                 if self.config.debug {
                     debug!(
@@ -398,36 +440,83 @@ impl EnrichmentPipeline {
                         stage.name()
                     );
                 }
-                continue;
             }
+        }
 
-            // Execute with timing
-            let stage_start = Instant::now();
-            match stage.execute(input, &mut ctx).await {
-                Ok(()) => {
+        // Build futures for all enabled stages.
+        let futures: Vec<_> = enabled_indices
+            .iter()
+            .map(|&i| {
+                let stage = &self.stages[i];
+                let stage_name = stage.name().to_string();
+                let timeout_dur = per_stage_timeout;
+                async move {
+                    let stage_start = Instant::now();
+                    let result = tokio::time::timeout(timeout_dur, stage.execute(input)).await;
                     let elapsed = stage_start.elapsed().as_millis() as u64;
-                    ctx.stage_timings.push((stage.name().to_string(), elapsed));
+                    (i, stage_name, result, elapsed)
+                }
+            })
+            .collect();
+
+        // Run all stages in parallel, wrapped in a global timeout.
+        let results =
+            match tokio::time::timeout(global_deadline, futures::future::join_all(futures)).await {
+                Ok(results) => results,
+                Err(_) => {
+                    warn!(
+                        "[enrichment] Pipeline hit global time budget ({}ms) after {}ms",
+                        self.config.max_pipeline_ms,
+                        pipeline_start.elapsed().as_millis()
+                    );
+                    // All stages timed out — return empty results
+                    Vec::new()
+                }
+            };
+
+        // Collect results keyed by registration index for ordered merge.
+        let mut outputs: std::collections::BTreeMap<usize, StageOutput> =
+            std::collections::BTreeMap::new();
+
+        for (idx, stage_name, result, elapsed) in results {
+            match result {
+                Ok(Ok(mut output)) => {
+                    output.duration_ms = elapsed;
                     if self.config.debug {
                         debug!(
-                            "[enrichment] Stage '{}' completed in {}ms ({} sections total)",
-                            stage.name(),
+                            "[enrichment] Stage '{}' completed in {}ms ({} sections)",
+                            stage_name,
                             elapsed,
-                            ctx.sections.len()
+                            output.sections.len()
                         );
                     }
+                    ctx.stage_timings.push((stage_name, elapsed));
+                    outputs.insert(idx, output);
                 }
-                Err(e) => {
-                    let elapsed = stage_start.elapsed().as_millis() as u64;
-                    ctx.stage_timings.push((stage.name().to_string(), elapsed));
-                    ctx.skipped_stages.push(format!("{}(error)", stage.name()));
+                Ok(Err(e)) => {
+                    ctx.stage_timings.push((stage_name.clone(), elapsed));
+                    ctx.skipped_stages.push(format!("{}(error)", stage_name));
                     warn!(
                         "[enrichment] Stage '{}' failed after {}ms: {} — continuing pipeline",
-                        stage.name(),
-                        elapsed,
-                        e
+                        stage_name, elapsed, e
+                    );
+                }
+                Err(_) => {
+                    ctx.stage_timings.push((stage_name.clone(), elapsed));
+                    ctx.skipped_stages.push(format!("{}(timeout)", stage_name));
+                    warn!(
+                        "[enrichment] Stage '{}' timed out after {}ms",
+                        stage_name, elapsed
                     );
                 }
             }
+        }
+
+        // Merge outputs in registration order (preserves deterministic section ordering).
+        for (_idx, output) in outputs {
+            ctx.sections.extend(output.sections);
+            // Hints: last writer wins (ordered by registration index).
+            ctx.hints.extend(output.hints);
         }
 
         ctx.total_time_ms = pipeline_start.elapsed().as_millis() as u64;
@@ -485,19 +574,16 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl EnrichmentStage for MockStage {
-        async fn execute(
-            &self,
-            _input: &EnrichmentInput,
-            ctx: &mut EnrichmentContext,
-        ) -> Result<()> {
+    impl ParallelEnrichmentStage for MockStage {
+        async fn execute(&self, _input: &EnrichmentInput) -> Result<StageOutput> {
             if self.should_fail {
                 anyhow::bail!("Mock stage failure");
             }
+            let mut output = StageOutput::new(self.name.clone());
             if let Some((title, content)) = &self.content {
-                ctx.add_section(title.clone(), content.clone(), self.name.clone());
+                output.add_section(title.clone(), content.clone(), self.name.clone());
             }
-            Ok(())
+            Ok(output)
         }
 
         fn name(&self) -> &str {
@@ -535,7 +621,7 @@ mod tests {
     #[tokio::test]
     async fn test_pipeline_with_mock_stage() {
         let mut pipeline = EnrichmentPipeline::new(EnrichmentConfig::default());
-        pipeline.add_stage(Box::new(MockStage {
+        pipeline.add_parallel_stage(Box::new(MockStage {
             name: "test_stage".to_string(),
             enabled: true,
             should_fail: false,
@@ -554,13 +640,13 @@ mod tests {
     #[tokio::test]
     async fn test_pipeline_multiple_stages() {
         let mut pipeline = EnrichmentPipeline::new(EnrichmentConfig::default());
-        pipeline.add_stage(Box::new(MockStage {
+        pipeline.add_parallel_stage(Box::new(MockStage {
             name: "stage_a".to_string(),
             enabled: true,
             should_fail: false,
             content: Some(("Section A".to_string(), "content A".to_string())),
         }));
-        pipeline.add_stage(Box::new(MockStage {
+        pipeline.add_parallel_stage(Box::new(MockStage {
             name: "stage_b".to_string(),
             enabled: true,
             should_fail: false,
@@ -579,7 +665,7 @@ mod tests {
         let mut pipeline = EnrichmentPipeline::new(EnrichmentConfig::default());
 
         // Stage 1: fails
-        pipeline.add_stage(Box::new(MockStage {
+        pipeline.add_parallel_stage(Box::new(MockStage {
             name: "failing_stage".to_string(),
             enabled: true,
             should_fail: true,
@@ -587,7 +673,7 @@ mod tests {
         }));
 
         // Stage 2: succeeds (should still execute despite Stage 1 failure)
-        pipeline.add_stage(Box::new(MockStage {
+        pipeline.add_parallel_stage(Box::new(MockStage {
             name: "success_stage".to_string(),
             enabled: true,
             should_fail: false,
@@ -608,7 +694,7 @@ mod tests {
     #[tokio::test]
     async fn test_pipeline_disabled_stage() {
         let mut pipeline = EnrichmentPipeline::new(EnrichmentConfig::default());
-        pipeline.add_stage(Box::new(MockStage {
+        pipeline.add_parallel_stage(Box::new(MockStage {
             name: "disabled_stage".to_string(),
             enabled: false,
             should_fail: false,
@@ -677,15 +763,12 @@ mod tests {
         struct SlowStage;
 
         #[async_trait::async_trait]
-        impl EnrichmentStage for SlowStage {
-            async fn execute(
-                &self,
-                _input: &EnrichmentInput,
-                ctx: &mut EnrichmentContext,
-            ) -> Result<()> {
+        impl ParallelEnrichmentStage for SlowStage {
+            async fn execute(&self, _input: &EnrichmentInput) -> Result<StageOutput> {
                 sleep(Duration::from_millis(600)).await;
-                ctx.add_section("Slow", "should not appear", "slow");
-                Ok(())
+                let mut output = StageOutput::new("slow_stage");
+                output.add_section("Slow", "should not appear", "slow");
+                Ok(output)
             }
 
             fn name(&self) -> &str {
@@ -704,7 +787,7 @@ mod tests {
         let mut pipeline = EnrichmentPipeline::new(config);
 
         // Fast stage first
-        pipeline.add_stage(Box::new(MockStage {
+        pipeline.add_parallel_stage(Box::new(MockStage {
             name: "fast_stage".to_string(),
             enabled: true,
             should_fail: false,
@@ -712,7 +795,7 @@ mod tests {
         }));
 
         // Slow stage — should either execute (within budget) or be skipped
-        pipeline.add_stage(Box::new(SlowStage));
+        pipeline.add_parallel_stage(Box::new(SlowStage));
 
         let ctx = pipeline.execute(&test_input()).await;
         // At minimum, the fast stage should have completed
@@ -855,5 +938,86 @@ mod tests {
     async fn test_to_system_prompt_markdown_empty() {
         let ctx = EnrichmentContext::default();
         assert_eq!(ctx.to_system_prompt_markdown(), "");
+    }
+
+    // ── Parallel pipeline benchmark ───────────────────────────────────
+
+    /// A mock stage that sleeps to simulate I/O latency.
+    struct LatentMockStage {
+        stage_name: String,
+        latency_ms: u64,
+    }
+
+    #[async_trait::async_trait]
+    impl ParallelEnrichmentStage for LatentMockStage {
+        async fn execute(&self, _input: &EnrichmentInput) -> Result<StageOutput> {
+            tokio::time::sleep(Duration::from_millis(self.latency_ms)).await;
+            let mut output = StageOutput::new(self.stage_name.clone());
+            output.add_section(
+                format!("Section from {}", self.stage_name),
+                "content",
+                self.stage_name.clone(),
+            );
+            Ok(output)
+        }
+
+        fn name(&self) -> &str {
+            &self.stage_name
+        }
+
+        fn is_enabled(&self, _config: &EnrichmentConfig) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn test_parallel_pipeline_faster_than_sequential() {
+        // 8 stages × 50ms = 400ms sequential, but parallel should be < 150ms
+        let mut pipeline = EnrichmentPipeline::new(EnrichmentConfig {
+            max_pipeline_ms: 1000,
+            ..Default::default()
+        });
+        for i in 0..8 {
+            pipeline.add_parallel_stage(Box::new(LatentMockStage {
+                stage_name: format!("latent_{}", i),
+                latency_ms: 50,
+            }));
+        }
+
+        let start = Instant::now();
+        let ctx = pipeline.execute(&test_input()).await;
+        let elapsed = start.elapsed().as_millis();
+
+        // All 8 stages should have produced sections
+        assert_eq!(
+            ctx.sections.len(),
+            8,
+            "All 8 stages should produce sections"
+        );
+        // Sections should be in registration order
+        assert_eq!(ctx.sections[0].source, "latent_0");
+        assert_eq!(ctx.sections[7].source, "latent_7");
+
+        // Parallel: should complete in ~50-80ms, definitely < 150ms
+        assert!(
+            elapsed < 150,
+            "Parallel pipeline with 8×50ms stages should complete in < 150ms, got {}ms",
+            elapsed
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stage_output_helpers() {
+        let mut output = StageOutput::new("test");
+        assert_eq!(output.stage_name, "test");
+        assert!(output.sections.is_empty());
+        assert!(output.hints.is_empty());
+
+        output.add_section("Title", "Content", "source");
+        assert_eq!(output.sections.len(), 1);
+        assert_eq!(output.sections[0].title, "Title");
+
+        output.set_hint("key", "value");
+        assert_eq!(output.hints.get("key").unwrap(), "value");
     }
 }

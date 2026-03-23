@@ -432,32 +432,32 @@ impl ChatManager {
         } else {
             skill_stage
         };
-        pipeline.add_stage(Box::new(skill_stage));
-        pipeline.add_stage(Box::new(super::stages::BiomimicryStage::new(graph.clone())));
-        pipeline.add_stage(Box::new(super::stages::UserProfileStage::new(
+        pipeline.add_parallel_stage(Box::new(skill_stage));
+        pipeline.add_parallel_stage(Box::new(super::stages::BiomimicryStage::new(graph.clone())));
+        pipeline.add_parallel_stage(Box::new(super::stages::UserProfileStage::new(
             graph.clone(),
         )));
-        pipeline.add_stage(Box::new(super::stages::PersonaStage::new(graph.clone())));
+        pipeline.add_parallel_stage(Box::new(super::stages::PersonaStage::new(graph.clone())));
         let ki_stage = super::stages::KnowledgeInjectionStage::new(graph.clone(), search.clone());
         let ki_stage = if let Some(tc) = trajectory_collector {
             ki_stage.with_collector(tc.clone())
         } else {
             ki_stage
         };
-        pipeline.add_stage(Box::new(ki_stage));
-        pipeline.add_stage(Box::new(super::stages::StatusInjectionStage::with_config(
+        pipeline.add_parallel_stage(Box::new(ki_stage));
+        pipeline.add_parallel_stage(Box::new(super::stages::StatusInjectionStage::with_config(
             graph.clone(),
             reasoning_engine.cloned(),
             Arc::new(super::stages::GraphProtocolProvider::new(graph.clone())),
             super::stages::StatusInjectionConfig::default(),
         )));
-        pipeline.add_stage(Box::new(super::stages::FileContextStage::new(
+        pipeline.add_parallel_stage(Box::new(super::stages::FileContextStage::new(
             graph.clone(),
         )));
         // Reflex stage: injects scar warnings, episode recall, co-change reminders
         // from the autonomous learning loop (T1→T2→T3 materialized knowledge).
         // Controlled by ENRICHMENT_REFLEX env var (default: true).
-        pipeline.add_stage(Box::new(crate::reflex::stage::ReflexStage::new(
+        pipeline.add_parallel_stage(Box::new(crate::reflex::stage::ReflexStage::new(
             graph.clone(),
         )));
         Arc::new(pipeline)
@@ -2798,7 +2798,13 @@ impl ChatManager {
                             let sessions = active_sessions.read().await;
                             sessions
                                 .get(&uuid.to_string())
-                                .map(|s| (s.protocol_run_id, s.protocol_state.clone(), Some(s.reasoning_path_tracker.clone())))
+                                .map(|s| {
+                                    (
+                                        s.protocol_run_id,
+                                        s.protocol_state.clone(),
+                                        Some(s.reasoning_path_tracker.clone()),
+                                    )
+                                })
                                 .unwrap_or((None, None, None))
                         };
                         Some(super::enrichment::EnrichmentInput {

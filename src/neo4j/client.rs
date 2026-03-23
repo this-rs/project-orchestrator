@@ -2,11 +2,20 @@
 
 use anyhow::{Context, Result};
 use neo4rs::{query, Graph, Query};
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
+use tokio::sync::RwLock;
+use uuid::Uuid;
 
 /// Client for Neo4j operations
 pub struct Neo4jClient {
     pub(crate) graph: Arc<Graph>,
+    /// TTL cache for pairwise coupling scores between projects.
+    /// Key: (min(project_a, project_b), max(project_a, project_b)) — sorted for symmetry.
+    /// Value: (coupling_score, cached_at).
+    /// Entries expire after `COUPLING_CACHE_TTL` (5 minutes).
+    pub(crate) coupling_cache: RwLock<HashMap<(Uuid, Uuid), (f64, Instant)>>,
 }
 
 /// Convert PascalCase to snake_case (e.g., "InProgress" -> "in_progress")
@@ -154,6 +163,7 @@ impl Neo4jClient {
 
         let client = Self {
             graph: Arc::new(graph),
+            coupling_cache: RwLock::new(HashMap::new()),
         };
 
         // Initialize schema

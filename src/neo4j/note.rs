@@ -1050,9 +1050,36 @@ impl Neo4jClient {
     /// Returns a value in [0.0, 1.0] based on 4 signals:
     /// structural twins, imported skills, shared notes, tag overlap.
     /// Used to weight cross-project note propagation (biomimicry P2P coupling).
-    async fn get_pairwise_coupling(&self, project_a_id: Uuid, project_b_id: Uuid) -> Result<f64> {
+    ///
+    /// Results are cached with a 5-minute TTL to avoid 4 Neo4j queries per
+    /// foreign project on every chat request.
+    pub async fn get_pairwise_coupling(
+        &self,
+        project_a_id: Uuid,
+        project_b_id: Uuid,
+    ) -> Result<f64> {
         if project_a_id == project_b_id {
             return Ok(1.0);
+        }
+
+        // Sorted key for cache symmetry: coupling(A,B) == coupling(B,A)
+        let cache_key = if project_a_id < project_b_id {
+            (project_a_id, project_b_id)
+        } else {
+            (project_b_id, project_a_id)
+        };
+
+        const COUPLING_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(300); // 5 minutes
+
+        // Check cache (read lock)
+        {
+            let cache = self.coupling_cache.read().await;
+            if let Some((score, cached_at)) = cache.get(&cache_key) {
+                if cached_at.elapsed() < COUPLING_CACHE_TTL {
+                    return Ok(*score);
+                }
+                // Expired — fall through to recompute
+            }
         }
 
         const W_TWINS: f64 = 0.35;
@@ -1164,6 +1191,17 @@ impl Neo4jClient {
 
         let coupling =
             W_TWINS * twins + W_SKILLS * skills + W_NOTES * shared_notes + W_TAGS * tag_overlap;
+
+        // Store in cache (write lock)
+        {
+            let mut cache = self.coupling_cache.write().await;
+            cache.insert(cache_key, (coupling, std::time::Instant::now()));
+            // Lazy expiration: remove expired entries when cache grows large
+            if cache.len() > 100 {
+                cache.retain(|_, (_, cached_at)| cached_at.elapsed() < COUPLING_CACHE_TTL);
+            }
+        }
+
         Ok(coupling)
     }
 

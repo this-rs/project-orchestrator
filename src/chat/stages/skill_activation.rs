@@ -21,7 +21,7 @@ use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::chat::enrichment::{
-    EnrichmentConfig, EnrichmentContext, EnrichmentInput, EnrichmentStage,
+    EnrichmentConfig, EnrichmentInput, ParallelEnrichmentStage, StageOutput,
 };
 use crate::neo4j::traits::GraphStore;
 use crate::neurons::intent::{IntentDetector, QueryIntentMode};
@@ -188,18 +188,20 @@ impl SkillActivationStage {
 }
 
 #[async_trait::async_trait]
-impl EnrichmentStage for SkillActivationStage {
-    async fn execute(&self, input: &EnrichmentInput, ctx: &mut EnrichmentContext) -> Result<()> {
+impl ParallelEnrichmentStage for SkillActivationStage {
+    async fn execute(&self, input: &EnrichmentInput) -> Result<StageOutput> {
+        let mut output = StageOutput::new(self.name());
+
         // Need a project scope for skill matching
         let project_id = if let Some(id) = input.project_id {
             id
         } else if let Some(ref slug) = input.project_slug {
             match self.resolve_project_id(slug).await? {
                 Some(id) => id,
-                None => return Ok(()), // No project found, skip
+                None => return Ok(output), // No project found, skip
             }
         } else {
-            return Ok(()); // No project scope, skip
+            return Ok(output); // No project scope, skip
         };
 
         // Match skills against the message
@@ -208,13 +210,13 @@ impl EnrichmentStage for SkillActivationStage {
         if matches.is_empty() {
             // No skill match — detect intent from message keywords as fallback
             let intent = detect_intent_from_message(&input.message);
-            ctx.set_hint("intent", intent);
-            return Ok(());
+            output.set_hint("intent", intent);
+            return Ok(output);
         }
 
         // Emit intent hint based on matched skill tags/names
         let intent = detect_intent_from_skills(&matches, &input.message);
-        ctx.set_hint("intent", intent);
+        output.set_hint("intent", intent);
 
         // Build enrichment content from activated skills
         let mut content_parts: Vec<String> = Vec::new();
@@ -246,7 +248,7 @@ impl EnrichmentStage for SkillActivationStage {
         }
 
         if !content_parts.is_empty() {
-            ctx.add_section("Activated Skills", content_parts.join("\n"), self.name());
+            output.add_section("Activated Skills", content_parts.join("\n"), self.name());
         }
 
         // ── Trajectory collection: record skill activation decision ────────
@@ -327,7 +329,7 @@ impl EnrichmentStage for SkillActivationStage {
             });
         }
 
-        Ok(())
+        Ok(output)
     }
 
     fn name(&self) -> &str {
@@ -422,6 +424,7 @@ fn detect_intent_from_message(message: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chat::enrichment::EnrichmentContext;
 
     #[test]
     fn test_extract_file_paths_basic() {
@@ -507,10 +510,7 @@ mod tests {
             detect_intent_from_message("implement the feature"),
             "planning"
         );
-        assert_eq!(
-            detect_intent_from_message("refactor this module"),
-            "review"
-        );
+        assert_eq!(detect_intent_from_message("refactor this module"), "review");
     }
 
     #[test]
@@ -520,10 +520,7 @@ mod tests {
 
     #[test]
     fn test_detect_intent_explore() {
-        assert_eq!(
-            detect_intent_from_message("how does this work?"),
-            "explore"
-        );
+        assert_eq!(detect_intent_from_message("how does this work?"), "explore");
     }
 
     #[test]

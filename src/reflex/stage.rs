@@ -10,7 +10,7 @@ use tracing::debug;
 
 use super::{RefContext, ReflexEngine};
 use crate::chat::enrichment::{
-    EnrichmentConfig, EnrichmentContext, EnrichmentInput, EnrichmentStage,
+    EnrichmentConfig, EnrichmentInput, ParallelEnrichmentStage, StageOutput,
 };
 use crate::neo4j::traits::GraphStore;
 
@@ -29,28 +29,23 @@ impl ReflexStage {
 }
 
 #[async_trait::async_trait]
-impl EnrichmentStage for ReflexStage {
-    async fn execute(&self, input: &EnrichmentInput, ctx: &mut EnrichmentContext) -> Result<()> {
+impl ParallelEnrichmentStage for ReflexStage {
+    async fn execute(&self, input: &EnrichmentInput) -> Result<StageOutput> {
+        let mut output = StageOutput::new(self.name());
+
         let project_id = match input.project_id {
             Some(id) => id,
             None => {
                 debug!("[reflex] No project_id, skipping reflex stage");
-                return Ok(());
+                return Ok(output);
             }
         };
 
         // Build RefContext from EnrichmentInput.
-        // Merge file paths extracted from the message with any files detected
-        // by earlier pipeline stages (e.g. FileContextStage sets `detected_files` hint).
-        let mut affected = extract_file_paths(&input.message);
-        if let Some(hint_files) = ctx.get_hint("detected_files") {
-            for f in hint_files.split(',') {
-                let f = f.trim().to_string();
-                if !f.is_empty() && !affected.contains(&f) {
-                    affected.push(f);
-                }
-            }
-        }
+        // Note: the `detected_files` hint from other stages is no longer available
+        // in parallel mode (it was never set by anyone anyway — task description confirms).
+        // We extract file paths directly from the message.
+        let affected = extract_file_paths(&input.message);
 
         let ref_ctx = RefContext {
             affected_files: affected,
@@ -63,17 +58,17 @@ impl EnrichmentStage for ReflexStage {
         // Skip if no affected files
         if ref_ctx.affected_files.is_empty() {
             debug!("[reflex] No affected files detected, skipping");
-            return Ok(());
+            return Ok(output);
         }
 
         let suggestions = self.engine.suggest(&ref_ctx).await;
 
         if !suggestions.is_empty() {
             let markdown = ReflexEngine::format_markdown(&suggestions);
-            ctx.add_section("Reflexes", markdown, self.name());
+            output.add_section("Reflexes", markdown, self.name());
         }
 
-        Ok(())
+        Ok(output)
     }
 
     fn name(&self) -> &str {
@@ -123,6 +118,7 @@ fn looks_like_file_path(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chat::enrichment::{EnrichmentContext, ParallelEnrichmentStage};
     use std::collections::HashSet;
 
     #[test]
@@ -165,13 +161,13 @@ mod tests {
             excluded_note_ids: HashSet::new(),
             reasoning_path_tracker: None,
         };
-        let mut ctx = EnrichmentContext::default();
         let config = EnrichmentConfig::default();
 
         assert!(stage.is_enabled(&config)); // reflex defaults to true
-        let result = stage.execute(&input, &mut ctx).await;
+        let result = stage.execute(&input).await;
         assert!(result.is_ok());
-        assert!(ctx.sections.is_empty(), "Should skip when no project_id");
+        let output = result.unwrap();
+        assert!(output.sections.is_empty(), "Should skip when no project_id");
     }
 
     #[tokio::test]
@@ -191,9 +187,8 @@ mod tests {
             excluded_note_ids: HashSet::new(),
             reasoning_path_tracker: None,
         };
-        let mut ctx = EnrichmentContext::default();
 
-        let result = stage.execute(&input, &mut ctx).await;
+        let result = stage.execute(&input).await;
         assert!(result.is_ok());
         // Mock graph has no scar notes, so sections should be empty
         // but the stage should run without error

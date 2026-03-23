@@ -39,7 +39,7 @@
 //! ```
 
 use super::prompt::TOOL_REFERENCE;
-use super::prompt_sections::{assemble_sections, extract_tool_reference};
+use super::prompt_sections::{assemble_sections, assemble_sections_weighted, extract_tool_reference};
 use super::routing::{HeuristicRouter, RoutingContext, RoutingDecisionRecord, RoutingProvider};
 use super::stages::status_injection::ProtocolRunStatus;
 
@@ -198,7 +198,32 @@ impl FsmPromptComposer {
         let decision = router.route(&routing_ctx);
 
         // ── Step 3: Assemble base sections ────────────────────────────
-        let base_prompt = assemble_sections(&decision.sections);
+        // Merge section_hints from the router decision with optional input hints
+        let merged_hints: Vec<(super::prompt_sections::PromptSectionId, f32)> = {
+            let mut hints: Vec<_> = decision
+                .section_hints
+                .iter()
+                .map(|h| (h.section_id, h.weight))
+                .collect();
+            // Input routing_hints override/extend router hints
+            if let Some(input_hints) = input.routing_hints {
+                for h in input_hints {
+                    // Remove existing hint for same section, then add the override
+                    hints.retain(|(id, _)| *id != h.section_id);
+                    hints.push((h.section_id, h.weight));
+                }
+            }
+            hints
+        };
+
+        let base_prompt = if !merged_hints.is_empty() {
+            // Weighted assembly: truncate low-weight base sections when over budget.
+            // Use 60% of the model's context window (in chars) as the base section budget.
+            let model_budget = compute_dynamic_budget(input.model, 0) * 6;
+            assemble_sections_weighted(&decision.sections, &merged_hints, model_budget)
+        } else {
+            assemble_sections(&decision.sections)
+        };
 
         // ── Step 4: Inject FSM prompt fragments ───────────────────────
         let fsm_section = Self::build_fsm_section(input.protocol_runs);
@@ -314,31 +339,151 @@ impl FsmPromptComposer {
         enrichment: &str,
         char_budget: usize,
     ) -> String {
-        let mut parts = Vec::new();
+        let has_continuity = !continuity.is_empty();
+        let has_enrichment = !enrichment.is_empty();
+        let has_project = !project_context.is_empty();
 
-        if !continuity.is_empty() {
-            parts.push(continuity);
-        }
-        if !enrichment.is_empty() {
-            parts.push(enrichment);
-        }
-        if !project_context.is_empty() {
-            parts.push(project_context);
-        }
-
-        if parts.is_empty() {
+        if !has_continuity && !has_enrichment && !has_project {
             return String::new();
         }
 
-        let full = parts.join("\n\n");
+        // Quick path: everything fits without truncation
+        let total_len = continuity.len()
+            + enrichment.len()
+            + project_context.len()
+            + if has_continuity { 2 } else { 0 }
+            + if has_enrichment { 2 } else { 0 };
 
-        // Under budget → return as-is
-        if full.len() <= char_budget {
-            return full;
+        if total_len <= char_budget {
+            let mut parts = Vec::new();
+            if has_enrichment {
+                parts.push(enrichment);
+            }
+            if has_continuity {
+                parts.push(continuity);
+            }
+            if has_project {
+                parts.push(project_context);
+            }
+            return parts.join("\n\n");
         }
 
-        // Over budget → semantic truncation
-        truncate_markdown_semantically(&full, char_budget)
+        // Over budget → sub-budget allocation: enrichment 40%, continuity 30%, project 30%
+        // Enrichment gets the largest share because it's the most contextually relevant
+        // (freshly searched knowledge, active skills, propagated notes).
+        let active_count = [has_enrichment, has_continuity, has_project]
+            .iter()
+            .filter(|&&b| b)
+            .count();
+
+        let (enrichment_budget, continuity_budget, project_budget) = if active_count == 1 {
+            // Single source gets the whole budget
+            (char_budget, char_budget, char_budget)
+        } else {
+            (
+                if has_enrichment {
+                    (char_budget * 40) / 100
+                } else {
+                    0
+                },
+                if has_continuity {
+                    (char_budget * 30) / 100
+                } else {
+                    0
+                },
+                if has_project {
+                    (char_budget * 30) / 100
+                } else {
+                    0
+                },
+            )
+        };
+
+        // Truncate each source within its own budget
+        let trunc_enrichment = if has_enrichment {
+            truncate_with_boost(enrichment, enrichment_budget, ENRICHMENT_SCORE_BONUS)
+        } else {
+            String::new()
+        };
+        let trunc_continuity = if has_continuity {
+            truncate_markdown_semantically(continuity, continuity_budget)
+        } else {
+            String::new()
+        };
+        let trunc_project = if has_project {
+            truncate_markdown_semantically(project_context, project_budget)
+        } else {
+            String::new()
+        };
+
+        // Redistribute surplus: if a source used less than its budget,
+        // give the remainder to the others (enrichment gets priority).
+        // Only compute surplus for ACTIVE sources to avoid phantom surplus.
+        let enrichment_surplus = if has_enrichment {
+            enrichment_budget.saturating_sub(trunc_enrichment.len())
+        } else {
+            0
+        };
+        let continuity_surplus = if has_continuity {
+            continuity_budget.saturating_sub(trunc_continuity.len())
+        } else {
+            0
+        };
+        let project_surplus = if has_project {
+            project_budget.saturating_sub(trunc_project.len())
+        } else {
+            0
+        };
+        let total_surplus = enrichment_surplus + continuity_surplus + project_surplus;
+
+        // Re-truncate with expanded budgets if there's meaningful surplus
+        let (final_enrichment, final_continuity, final_project) = if total_surplus > 500 {
+            let extra_for_enrichment = continuity_surplus + project_surplus;
+            let extra_for_continuity = enrichment_surplus + project_surplus;
+            let extra_for_project = enrichment_surplus + continuity_surplus;
+
+            let fe = if has_enrichment && extra_for_enrichment > 0 {
+                truncate_with_boost(
+                    enrichment,
+                    enrichment_budget + extra_for_enrichment,
+                    ENRICHMENT_SCORE_BONUS,
+                )
+            } else {
+                trunc_enrichment
+            };
+            let fc = if has_continuity && extra_for_continuity > 0 {
+                truncate_markdown_semantically(
+                    continuity,
+                    continuity_budget + extra_for_continuity,
+                )
+            } else {
+                trunc_continuity
+            };
+            let fp = if has_project && extra_for_project > 0 {
+                truncate_markdown_semantically(
+                    project_context,
+                    project_budget + extra_for_project,
+                )
+            } else {
+                trunc_project
+            };
+            (fe, fc, fp)
+        } else {
+            (trunc_enrichment, trunc_continuity, trunc_project)
+        };
+
+        // Assemble: enrichment first (most relevant), then continuity, then project
+        let mut parts = Vec::new();
+        if !final_enrichment.is_empty() {
+            parts.push(final_enrichment);
+        }
+        if !final_continuity.is_empty() {
+            parts.push(final_continuity);
+        }
+        if !final_project.is_empty() {
+            parts.push(final_project);
+        }
+        parts.join("\n\n")
     }
 
     /// Estimate token count (~4 chars per token).
@@ -403,6 +548,11 @@ struct MdSection {
     /// List items with importance scores (higher = more important)
     items: Vec<(u8, String)>,
 }
+
+/// Score bonus applied to enrichment items during truncation.
+/// Enrichment content is freshly searched and contextually relevant,
+/// so it should survive truncation over static project_context/continuity.
+const ENRICHMENT_SCORE_BONUS: u8 = 30;
 
 /// Score a markdown list item by importance markers.
 ///
@@ -573,6 +723,25 @@ fn render_section(sec: &MdSection, max_items: usize) -> String {
     lines.join("\n")
 }
 
+/// Semantically truncate markdown with an additive score boost on all items.
+///
+/// Same as `truncate_markdown_semantically` but applies `score_boost` to every item's
+/// importance score before truncation. Used for enrichment content which should
+/// survive truncation over lower-value static content.
+fn truncate_with_boost(text: &str, char_budget: usize, score_boost: u8) -> String {
+    if text.len() <= char_budget {
+        return text.to_string();
+    }
+    let mut sections = parse_markdown_sections(text);
+    // Apply score boost to all items
+    for sec in &mut sections {
+        for item in &mut sec.items {
+            item.0 = item.0.saturating_add(score_boost);
+        }
+    }
+    render_sections_budgeted(&mut sections, char_budget)
+}
+
 /// Semantically truncate markdown by parsing sections and keeping top-N items by importance.
 ///
 /// Unlike blind character truncation, this:
@@ -580,6 +749,9 @@ fn render_section(sec: &MdSection, max_items: usize) -> String {
 /// - Prioritizes items by importance markers ([Critical] > [High] > [Medium] > [Low])
 /// - Uniformly reduces items per section to fit the budget
 fn truncate_markdown_semantically(text: &str, char_budget: usize) -> String {
+    if text.len() <= char_budget {
+        return text.to_string();
+    }
     let mut sections = parse_markdown_sections(text);
     render_sections_budgeted(&mut sections, char_budget)
 }
@@ -932,6 +1104,125 @@ mod tests {
 
         // Should indicate truncation
         assert!(result.contains("more items omitted"));
+    }
+
+    // ── Sub-budgeting and enrichment priority tests ──────────────────
+
+    #[test]
+    fn test_enrichment_gets_priority_in_truncation() {
+        // Enrichment should survive truncation better than project_context
+        // thanks to the +30 score boost and 40% budget allocation.
+        let budget = 2000;
+
+        // Build enrichment with critical items
+        let mut enrichment = String::from("## Active Skills\n");
+        for i in 0..20 {
+            enrichment.push_str(&format!("- Skill {} with relevant context\n", i));
+        }
+
+        // Build project context with low items
+        let mut project = String::from("## Project Info\n");
+        for i in 0..20 {
+            project.push_str(&format!("- [Low] Generic info item {}\n", i));
+        }
+
+        let result =
+            FsmPromptComposer::build_dynamic_section("", &project, &enrichment, budget);
+
+        // Enrichment should appear first (it's assembled first)
+        let enrichment_pos = result.find("Active Skills");
+        let project_pos = result.find("Project Info");
+        assert!(
+            enrichment_pos.is_some(),
+            "Enrichment should be present in output"
+        );
+        assert!(
+            project_pos.is_some(),
+            "Project context should be present in output"
+        );
+        assert!(
+            enrichment_pos.unwrap() < project_pos.unwrap(),
+            "Enrichment should come before project context"
+        );
+    }
+
+    #[test]
+    fn test_sub_budget_reserves_enrichment_space() {
+        // When both enrichment and project_context are large, enrichment
+        // should get 40% of the budget (more than the 30% for project).
+        let budget = 3000;
+
+        let mut enrichment = String::from("## Enrichment\n");
+        for i in 0..50 {
+            enrichment.push_str(&format!(
+                "- Enrichment item {} with important context data\n",
+                i
+            ));
+        }
+
+        let mut project = String::from("## Project\n");
+        for i in 0..50 {
+            project.push_str(&format!("- Project item {} with some padding text\n", i));
+        }
+
+        let result =
+            FsmPromptComposer::build_dynamic_section("", &project, &enrichment, budget);
+
+        // Count how much enrichment content survived vs project content
+        let enrichment_lines = result
+            .lines()
+            .filter(|l| l.contains("Enrichment item"))
+            .count();
+        let project_lines = result
+            .lines()
+            .filter(|l| l.contains("Project item"))
+            .count();
+
+        assert!(
+            enrichment_lines >= project_lines,
+            "Enrichment ({} items) should get at least as many items as project ({} items) due to 40% vs 30% budget",
+            enrichment_lines,
+            project_lines
+        );
+    }
+
+    #[test]
+    fn test_enrichment_score_boost_preserves_items() {
+        // The ENRICHMENT_SCORE_BONUS (+30) should make enrichment items
+        // score higher than default (40) → they become 70, surviving over
+        // low-priority items at 20.
+        let boosted = truncate_with_boost(
+            "## Skills\n- Skill A\n- Skill B\n- Skill C\n",
+            200,
+            ENRICHMENT_SCORE_BONUS,
+        );
+        // All items should survive since the text is under budget
+        assert!(boosted.contains("Skill A"));
+        assert!(boosted.contains("Skill B"));
+        assert!(boosted.contains("Skill C"));
+    }
+
+    #[test]
+    fn test_surplus_redistribution() {
+        // If enrichment is small, its surplus should be given to project_context.
+        let budget = 3000;
+        let enrichment = "## Skills\n- One active skill\n";
+        let mut project = String::from("## Project\n");
+        for i in 0..60 {
+            project.push_str(&format!("- Project item {} with padding text\n", i));
+        }
+
+        let result =
+            FsmPromptComposer::build_dynamic_section("", &project, enrichment, budget);
+
+        // Project should get more than its 30% base allocation thanks to
+        // surplus from enrichment's unused 40%.
+        assert!(
+            result.len() > budget * 30 / 100,
+            "Result ({} chars) should exceed the 30% base project allocation ({})",
+            result.len(),
+            budget * 30 / 100
+        );
     }
 
     // ── compute_dynamic_budget tests ─────────────────────────────────

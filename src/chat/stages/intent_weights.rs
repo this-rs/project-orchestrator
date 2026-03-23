@@ -103,8 +103,7 @@ impl IntentWeightMap {
     #[doc(hidden)]
     pub fn from_env_override(intent: &str) -> Option<Self> {
         let json_str = std::env::var("ENRICHMENT_INTENT_WEIGHTS_JSON").ok()?;
-        let parsed: HashMap<String, HashMap<String, f64>> =
-            serde_json::from_str(&json_str).ok()?;
+        let parsed: HashMap<String, HashMap<String, f64>> = serde_json::from_str(&json_str).ok()?;
         let weights = parsed.get(intent)?;
         Some(Self {
             weights: weights.clone(),
