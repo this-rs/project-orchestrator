@@ -32,7 +32,7 @@ pub struct RGCNConfig {
 impl Default for RGCNConfig {
     fn default() -> Self {
         Self {
-            input_dim: 168,
+            input_dim: 169,
             output_dim: 256,
             num_relations: 8,
             num_bases: 4,
@@ -366,7 +366,7 @@ mod tests {
     fn test_rgcn_100_nodes() -> Result<()> {
         let device = Device::Cpu;
         let num_nodes = 100;
-        let input_dim = 168; // TOTAL_FEATURE_DIM
+        let input_dim = 169; // TOTAL_FEATURE_DIM
 
         let x = Tensor::randn(0.0f32, 1.0, (num_nodes, input_dim), &device)?;
 
@@ -388,7 +388,7 @@ mod tests {
         let varmap = VarMap::new();
         let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
 
-        let model = RGCN::new(168, 256, 256, 3, 8, 4, 0.1, vb)?;
+        let model = RGCN::new(169, 256, 256, 3, 8, 4, 0.1, vb)?;
         let output = model.forward(&x, &edge_index, Some(&edge_type), num_nodes)?;
 
         assert_eq!(output.dims(), &[100, 256]);

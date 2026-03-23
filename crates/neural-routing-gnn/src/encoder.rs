@@ -43,7 +43,7 @@ pub enum GNNArchitecture {
 impl Default for GraphEncoderConfig {
     fn default() -> Self {
         Self {
-            input_dim: 168, // TOTAL_FEATURE_DIM from features.rs
+            input_dim: 169, // TOTAL_FEATURE_DIM from features.rs
             hidden_dim: 256,
             output_dim: 256,
             num_layers: 3,
@@ -197,7 +197,7 @@ mod tests {
     #[test]
     fn test_encoder_default_config() {
         let config = GraphEncoderConfig::default();
-        assert_eq!(config.input_dim, 168);
+        assert_eq!(config.input_dim, 169);
         assert_eq!(config.output_dim, 256);
         assert_eq!(config.architecture, GNNArchitecture::GraphSAGE);
     }
