@@ -1494,6 +1494,7 @@ pub async fn start_server(mut config: Config) -> Result<()> {
         },
         reactor_counters: std::sync::OnceLock::new(),
         confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
+        mcp_registry: None, // initialized lazily when first MCP server connects
     });
 
     // ── EventReactor: build, register built-in reactions, and spawn ──
