@@ -4,7 +4,7 @@
 //! persona (via KNOWS relations), and injects the persona's context into the
 //! enrichment output.
 //!
-//! Controlled by `ENRICHMENT_PERSONA=true` (disabled by default).
+//! Enabled by default. Disable with `ENRICHMENT_PERSONA=false`.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -128,7 +128,7 @@ impl ParallelEnrichmentStage for PersonaStage {
         output.set_hint("active_persona", persona.name.clone());
         output.set_hint("active_persona_id", persona.id.to_string());
 
-        output.add_section("Persona Context", section, "persona");
+        output.add_section("Persona Context", section, "persona", crate::chat::enrichment::EnrichmentSource::Persona);
 
         Ok(output)
     }

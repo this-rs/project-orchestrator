@@ -1675,7 +1675,15 @@ pub fn select_tool_groups_by_keywords(user_message: &str) -> Vec<&'static ToolGr
             group
                 .keywords
                 .iter()
-                .any(|kw| words.iter().any(|w| w.contains(kw)))
+                .any(|kw| {
+                    if kw.contains(' ') {
+                        // Multi-word keyword: substring match on full message
+                        msg_lower.contains(kw)
+                    } else {
+                        // Single-word keyword: exact word match
+                        words.iter().any(|w| *w == *kw)
+                    }
+                })
         })
         .collect();
 

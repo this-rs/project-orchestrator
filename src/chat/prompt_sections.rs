@@ -1452,7 +1452,14 @@ impl ToolRefGroupId {
             Self::Structural => &["admin"],
             Self::Behavioral => &["protocol", "skill", "persona", "episode", "lifecycle_hook"],
             Self::Workspace => &["workspace", "workspace_milestone", "resource", "component"],
-            Self::Collaboration => &["chat", "feature_graph", "sharing", "reasoning", "neural_routing", "trajectory"],
+            Self::Collaboration => &[
+                "chat",
+                "feature_graph",
+                "sharing",
+                "reasoning",
+                "neural_routing",
+                "trajectory",
+            ],
         }
     }
 
@@ -1463,9 +1470,13 @@ impl ToolRefGroupId {
             Self::Knowledge => "Knowledge (Notes, Decisions, Commits)",
             Self::CodeExploration => "Code Exploration & Analytics",
             Self::Structural => "Admin & Sync",
-            Self::Behavioral => "Behavioral (Protocols, Skills, Personas, Episodes, Lifecycle Hooks)",
+            Self::Behavioral => {
+                "Behavioral (Protocols, Skills, Personas, Episodes, Lifecycle Hooks)"
+            }
             Self::Workspace => "Workspace (Multi-project)",
-            Self::Collaboration => "Collaboration (Chat, Features, Sharing, Reasoning, Neural Routing)",
+            Self::Collaboration => {
+                "Collaboration (Chat, Features, Sharing, Reasoning, Neural Routing)"
+            }
         }
     }
 }
@@ -1484,6 +1495,39 @@ pub struct ToolGroupSelectionContext {
 }
 
 // Default is derived — all fields have natural defaults (0, false, empty vecs).
+
+/// Check if `text` contains `keyword` as a whole word (not as a substring).
+///
+/// Uses word-boundary detection: the character before and after the keyword
+/// must be non-alphanumeric (or absent). This prevents "profile" matching "file",
+/// "findings" matching "find", etc.
+///
+/// Multi-word keywords (e.g. "call graph", "state machine") are matched via
+/// simple substring contains, since they are already specific enough.
+fn contains_word(text: &str, keyword: &str) -> bool {
+    // Multi-word keywords: substring match is fine (already specific)
+    if keyword.contains(' ') {
+        return text.contains(keyword);
+    }
+    // Single-word: require word boundaries
+    let kw_bytes = keyword.as_bytes();
+    let text_bytes = text.as_bytes();
+    let kw_len = kw_bytes.len();
+    if kw_len > text_bytes.len() {
+        return false;
+    }
+    for i in 0..=(text_bytes.len() - kw_len) {
+        if &text_bytes[i..i + kw_len] == kw_bytes {
+            let before_ok = i == 0 || !text_bytes[i - 1].is_ascii_alphanumeric();
+            let after_ok =
+                i + kw_len == text_bytes.len() || !text_bytes[i + kw_len].is_ascii_alphanumeric();
+            if before_ok && after_ok {
+                return true;
+            }
+        }
+    }
+    false
+}
 
 /// Intent keywords that trigger specific tool groups.
 const CODE_KEYWORDS: &[&str] = &[
@@ -1581,11 +1625,11 @@ pub fn select_tool_groups(ctx: &ToolGroupSelectionContext) -> Vec<ToolRefGroupId
     let msg_lower: String = ctx.user_intent_keywords.join(" ").to_lowercase();
 
     // Intent-based inclusion
-    let has_code_intent = CODE_KEYWORDS.iter().any(|kw| msg_lower.contains(kw));
-    let has_structural_intent = STRUCTURAL_KEYWORDS.iter().any(|kw| msg_lower.contains(kw));
-    let has_behavioral_intent = BEHAVIORAL_KEYWORDS.iter().any(|kw| msg_lower.contains(kw));
-    let has_workspace_intent = WORKSPACE_KEYWORDS.iter().any(|kw| msg_lower.contains(kw));
-    let has_collab_intent = COLLAB_KEYWORDS.iter().any(|kw| msg_lower.contains(kw));
+    let has_code_intent = CODE_KEYWORDS.iter().any(|kw| contains_word(&msg_lower, kw));
+    let has_structural_intent = STRUCTURAL_KEYWORDS.iter().any(|kw| contains_word(&msg_lower, kw));
+    let has_behavioral_intent = BEHAVIORAL_KEYWORDS.iter().any(|kw| contains_word(&msg_lower, kw));
+    let has_workspace_intent = WORKSPACE_KEYWORDS.iter().any(|kw| contains_word(&msg_lower, kw));
+    let has_collab_intent = COLLAB_KEYWORDS.iter().any(|kw| contains_word(&msg_lower, kw));
 
     // CodeExploration: included by intent OR at L0-L2 (common need)
     if has_code_intent || ctx.scaffolding_level <= 2 {
@@ -2197,5 +2241,61 @@ mod tests {
         let no_compact = ActivationCondition::scaffolding_range(0, 1);
         assert!(!no_compact.use_compact(0));
         assert!(!no_compact.use_compact(1));
+    }
+
+    // ── contains_word tests ───────────────────────────────────────
+
+    #[test]
+    fn test_contains_word_exact_match() {
+        assert!(contains_word("read the file content", "file"));
+        assert!(contains_word("file is here", "file"));
+        assert!(contains_word("the file", "file"));
+        assert!(contains_word("file", "file"));
+    }
+
+    #[test]
+    fn test_contains_word_rejects_substring() {
+        // "profile" should NOT match "file"
+        assert!(!contains_word("check the user profile settings", "file"));
+        // "findings" should NOT match "find"
+        assert!(!contains_word("search for findings", "find"));
+        // "import" should NOT match "port"
+        assert!(!contains_word("import the module", "port"));
+    }
+
+    #[test]
+    fn test_contains_word_with_punctuation() {
+        assert!(contains_word("open file.", "file"));
+        assert!(contains_word("file, folder", "file"));
+        assert!(contains_word("(file)", "file"));
+        assert!(contains_word("the file's content", "file"));
+    }
+
+    #[test]
+    fn test_contains_word_multi_word_keyword() {
+        assert!(contains_word("analyze the call graph", "call graph"));
+        assert!(contains_word("state machine transitions", "state machine"));
+        // Multi-word uses substring match, so embedded is OK
+        assert!(contains_word("recall graph data", "call graph"));
+    }
+
+    #[test]
+    fn test_contains_word_no_false_positive_code_keywords() {
+        // "profile" should not trigger "file"
+        let msg = "check the user profile settings";
+        assert!(!CODE_KEYWORDS.iter().any(|kw| contains_word(msg, kw)));
+
+        // "findings" should not trigger "find"
+        let msg2 = "review the findings report";
+        assert!(!CODE_KEYWORDS.iter().any(|kw| contains_word(msg2, kw)));
+    }
+
+    #[test]
+    fn test_contains_word_true_positive_code_keywords() {
+        let msg = "read the file content";
+        assert!(CODE_KEYWORDS.iter().any(|kw| contains_word(msg, kw)));
+
+        let msg2 = "find the function definition";
+        assert!(CODE_KEYWORDS.iter().any(|kw| contains_word(msg2, kw)));
     }
 }
