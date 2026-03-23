@@ -239,6 +239,8 @@ pub(crate) struct CompactionNotifier {
     graph: Option<Arc<dyn GraphStore>>,
     /// Context source: task (runner) or session (interactive)
     context_source: CompactionContextSource,
+    /// Session work log for enriching custom_instructions during compaction
+    work_log: Option<Arc<tokio::sync::Mutex<SessionWorkLog>>>,
 }
 
 impl CompactionNotifier {
@@ -253,6 +255,7 @@ impl CompactionNotifier {
             session_id,
             graph: None,
             context_source: CompactionContextSource::None,
+            work_log: None,
         }
     }
 
@@ -264,6 +267,12 @@ impl CompactionNotifier {
     ) -> Self {
         self.graph = Some(graph);
         self.context_source = source;
+        self
+    }
+
+    /// Attach a session work log for enriching custom_instructions with modified files.
+    pub fn with_work_log(mut self, work_log: Arc<tokio::sync::Mutex<SessionWorkLog>>) -> Self {
+        self.work_log = Some(work_log);
         self
     }
 
@@ -291,9 +300,16 @@ impl CompactionNotifier {
             CompactionContextSource::None => return None,
         };
 
+        // Take work_log snapshot if available
+        let work_log_snapshot = if let Some(ref wl) = self.work_log {
+            Some(wl.lock().await.snapshot())
+        } else {
+            None
+        };
+
         match ctx {
             Ok(context) => {
-                let instructions = context.to_custom_instructions();
+                let instructions = context.to_custom_instructions(work_log_snapshot.as_ref());
                 if instructions.is_empty() {
                     None
                 } else {
@@ -2338,6 +2354,9 @@ impl ChatManager {
         // Create broadcast channel early so CompactionNotifier can use the sender
         let (events_tx, _) = broadcast::channel(BROADCAST_BUFFER);
 
+        // Create work_log early so CompactionNotifier can reference it
+        let work_log = Arc::new(Mutex::new(SessionWorkLog::default()));
+
         // Build session hooks: PreCompact (compaction notifier) + PreToolUse (skill activation)
         let session_hooks = {
             let mut hooks = std::collections::HashMap::new();
@@ -2358,7 +2377,8 @@ impl ChatManager {
                 self.nats.clone(),
                 session_id.to_string(),
             )
-            .with_context(self.graph.clone(), context_source);
+            .with_context(self.graph.clone(), context_source)
+            .with_work_log(work_log.clone());
             hooks.insert(
                 "PreCompact".to_string(),
                 vec![nexus_claude::HookMatcher {
@@ -2552,7 +2572,7 @@ impl ChatManager {
                     reasoning_path_tracker: super::feedback::ReasoningPathTracker::new(),
                     objective_tracking: true,
                     objective_reminder_turns_since: Arc::new(AtomicU32::new(0)),
-                    work_log: Arc::new(Mutex::new(SessionWorkLog::default())),
+                    work_log: work_log.clone(),
                 },
             );
             interrupt_flag
@@ -4374,6 +4394,9 @@ impl ChatManager {
         // Create broadcast channel early so CompactionNotifier can use the sender
         let (events_tx, _) = broadcast::channel(BROADCAST_BUFFER);
 
+        // Create work_log early so CompactionNotifier can reference it
+        let work_log = Arc::new(Mutex::new(SessionWorkLog::default()));
+
         // Build session hooks: PreCompact (compaction notifier) + PreToolUse (skill activation)
         let session_hooks = {
             let mut hooks = std::collections::HashMap::new();
@@ -4389,7 +4412,8 @@ impl ChatManager {
                 self.nats.clone(),
                 session_id.to_string(),
             )
-            .with_context(self.graph.clone(), context_source);
+            .with_context(self.graph.clone(), context_source)
+            .with_work_log(work_log.clone());
             hooks.insert(
                 "PreCompact".to_string(),
                 vec![nexus_claude::HookMatcher {
@@ -4567,7 +4591,7 @@ impl ChatManager {
                     reasoning_path_tracker: super::feedback::ReasoningPathTracker::new(),
                     objective_tracking: true,
                     objective_reminder_turns_since: Arc::new(AtomicU32::new(0)),
-                    work_log: Arc::new(Mutex::new(SessionWorkLog::default())),
+                    work_log: work_log.clone(),
                 },
             );
             interrupt_flag
