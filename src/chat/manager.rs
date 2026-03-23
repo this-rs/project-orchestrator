@@ -126,6 +126,9 @@ pub struct ActiveSession {
     /// Persists across messages in a session — when 2+ consecutive responses
     /// contain RFC-qualifying patterns, auto-creates an RFC draft note.
     pub rfc_accumulator: Arc<Mutex<super::observation_detector::RfcAccumulator>>,
+    /// Reasoning path tracker for Hebbian reinforcement on session close.
+    /// Records reasoning tree paths during enrichment; reinforced when the session ends.
+    pub reasoning_path_tracker: super::feedback::ReasoningPathTracker,
     /// Whether objective tracking is enabled for this session.
     /// When `true`, the backend checks for pending plan tasks after each stream turn
     /// where the agent did NOT use any tools (= conclusion/summary mode).
@@ -429,32 +432,32 @@ impl ChatManager {
         } else {
             skill_stage
         };
-        pipeline.add_stage(Box::new(skill_stage));
-        pipeline.add_stage(Box::new(super::stages::BiomimicryStage::new(graph.clone())));
-        pipeline.add_stage(Box::new(super::stages::UserProfileStage::new(
+        pipeline.add_parallel_stage(Box::new(skill_stage));
+        pipeline.add_parallel_stage(Box::new(super::stages::BiomimicryStage::new(graph.clone())));
+        pipeline.add_parallel_stage(Box::new(super::stages::UserProfileStage::new(
             graph.clone(),
         )));
-        pipeline.add_stage(Box::new(super::stages::PersonaStage::new(graph.clone())));
+        pipeline.add_parallel_stage(Box::new(super::stages::PersonaStage::new(graph.clone())));
         let ki_stage = super::stages::KnowledgeInjectionStage::new(graph.clone(), search.clone());
         let ki_stage = if let Some(tc) = trajectory_collector {
             ki_stage.with_collector(tc.clone())
         } else {
             ki_stage
         };
-        pipeline.add_stage(Box::new(ki_stage));
-        pipeline.add_stage(Box::new(super::stages::StatusInjectionStage::with_config(
+        pipeline.add_parallel_stage(Box::new(ki_stage));
+        pipeline.add_parallel_stage(Box::new(super::stages::StatusInjectionStage::with_config(
             graph.clone(),
             reasoning_engine.cloned(),
             Arc::new(super::stages::GraphProtocolProvider::new(graph.clone())),
             super::stages::StatusInjectionConfig::default(),
         )));
-        pipeline.add_stage(Box::new(super::stages::FileContextStage::new(
+        pipeline.add_parallel_stage(Box::new(super::stages::FileContextStage::new(
             graph.clone(),
         )));
         // Reflex stage: injects scar warnings, episode recall, co-change reminders
         // from the autonomous learning loop (T1→T2→T3 materialized knowledge).
         // Controlled by ENRICHMENT_REFLEX env var (default: true).
-        pipeline.add_stage(Box::new(crate::reflex::stage::ReflexStage::new(
+        pipeline.add_parallel_stage(Box::new(crate::reflex::stage::ReflexStage::new(
             graph.clone(),
         )));
         Arc::new(pipeline)
@@ -2542,6 +2545,7 @@ impl ChatManager {
                     )),
                     protocol_run_id: spawned_protocol_run_id,
                     protocol_state: spawned_protocol_state.clone(),
+                    reasoning_path_tracker: super::feedback::ReasoningPathTracker::new(),
                     objective_tracking: true,
                     objective_reminder_turns_since: Arc::new(AtomicU32::new(0)),
                 },
@@ -2790,12 +2794,18 @@ impl ChatManager {
                 match graph.get_chat_session(uuid).await {
                     Ok(Some(node)) => {
                         // Read protocol context from the active session (if any)
-                        let (proto_run_id, proto_state) = {
+                        let (proto_run_id, proto_state, reasoning_tracker) = {
                             let sessions = active_sessions.read().await;
                             sessions
                                 .get(&uuid.to_string())
-                                .map(|s| (s.protocol_run_id, s.protocol_state.clone()))
-                                .unwrap_or((None, None))
+                                .map(|s| {
+                                    (
+                                        s.protocol_run_id,
+                                        s.protocol_state.clone(),
+                                        Some(s.reasoning_path_tracker.clone()),
+                                    )
+                                })
+                                .unwrap_or((None, None, None))
                         };
                         Some(super::enrichment::EnrichmentInput {
                             message: prompt.clone(),
@@ -2806,6 +2816,7 @@ impl ChatManager {
                             protocol_run_id: proto_run_id,
                             protocol_state: proto_state,
                             excluded_note_ids: Default::default(), // no dedup in send_message path
+                            reasoning_path_tracker: reasoning_tracker,
                         })
                     }
                     _ => None,
@@ -4536,6 +4547,7 @@ impl ChatManager {
                     )),
                     protocol_run_id: None,
                     protocol_state: None,
+                    reasoning_path_tracker: super::feedback::ReasoningPathTracker::new(),
                     objective_tracking: true,
                     objective_reminder_turns_since: Arc::new(AtomicU32::new(0)),
                 },
@@ -7108,6 +7120,7 @@ mod tests {
             )),
             protocol_run_id: None,
             protocol_state: None,
+            reasoning_path_tracker: crate::chat::feedback::ReasoningPathTracker::new(),
             objective_tracking: false,
             objective_reminder_turns_since: Arc::new(AtomicU32::new(0)),
         };
@@ -8002,6 +8015,7 @@ mod tests {
             )),
             protocol_run_id: None,
             protocol_state: None,
+            reasoning_path_tracker: crate::chat::feedback::ReasoningPathTracker::new(),
             objective_tracking: false,
             objective_reminder_turns_since: Arc::new(AtomicU32::new(0)),
         };

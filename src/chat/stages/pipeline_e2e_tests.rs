@@ -44,12 +44,12 @@ mod tests {
         search: Arc<MockSearchStore>,
     ) -> EnrichmentPipeline {
         let mut pipeline = EnrichmentPipeline::new(EnrichmentConfig::default());
-        pipeline.add_stage(Box::new(SkillActivationStage::new(graph.clone())));
-        pipeline.add_stage(Box::new(KnowledgeInjectionStage::new(
+        pipeline.add_parallel_stage(Box::new(SkillActivationStage::new(graph.clone())));
+        pipeline.add_parallel_stage(Box::new(KnowledgeInjectionStage::new(
             graph.clone(),
             search.clone(),
         )));
-        pipeline.add_stage(Box::new(StatusInjectionStage::new(graph.clone())));
+        pipeline.add_parallel_stage(Box::new(StatusInjectionStage::new(graph.clone())));
         pipeline
     }
 
@@ -278,6 +278,7 @@ mod tests {
             protocol_run_id: None,
             protocol_state: None,
             excluded_note_ids: Default::default(),
+            reasoning_path_tracker: None,
         }
     }
 
@@ -609,18 +610,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_e2e_graceful_degradation_failing_stage() {
-        use crate::chat::enrichment::EnrichmentStage;
+        use crate::chat::enrichment::{ParallelEnrichmentStage, StageOutput};
 
         /// A stage that always errors.
         struct FailingStage;
 
         #[async_trait::async_trait]
-        impl EnrichmentStage for FailingStage {
-            async fn execute(
-                &self,
-                _input: &EnrichmentInput,
-                _ctx: &mut crate::chat::enrichment::EnrichmentContext,
-            ) -> anyhow::Result<()> {
+        impl ParallelEnrichmentStage for FailingStage {
+            async fn execute(&self, _input: &EnrichmentInput) -> anyhow::Result<StageOutput> {
                 anyhow::bail!("Simulated stage failure for E2E test")
             }
 
@@ -649,13 +646,13 @@ mod tests {
 
         // Build pipeline with a failing stage inserted in the middle
         let mut pipeline = EnrichmentPipeline::new(EnrichmentConfig::default());
-        pipeline.add_stage(Box::new(SkillActivationStage::new(graph.clone())));
-        pipeline.add_stage(Box::new(FailingStage)); // <-- This fails
-        pipeline.add_stage(Box::new(KnowledgeInjectionStage::new(
+        pipeline.add_parallel_stage(Box::new(SkillActivationStage::new(graph.clone())));
+        pipeline.add_parallel_stage(Box::new(FailingStage)); // <-- This fails
+        pipeline.add_parallel_stage(Box::new(KnowledgeInjectionStage::new(
             graph.clone(),
             search.clone(),
         )));
-        pipeline.add_stage(Box::new(StatusInjectionStage::new(graph.clone())));
+        pipeline.add_parallel_stage(Box::new(StatusInjectionStage::new(graph.clone())));
 
         let input = make_input("Show me what's in progress", Some(&slug), Some(project_id));
         let ctx = pipeline.execute(&input).await;

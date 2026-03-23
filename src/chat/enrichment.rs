@@ -4,9 +4,9 @@
 //! with relevant context from the knowledge graph.
 //!
 //! Architecture:
-//! - [`EnrichmentStage`] trait — pluggable stages executed sequentially
-//! - [`EnrichmentPipeline`] — ordered `Vec` of stages with graceful degradation
-//! - [`EnrichmentContext`] — accumulator for enrichment data across stages
+//! - [`ParallelEnrichmentStage`] trait — pluggable stages returning [`StageOutput`]
+//! - [`EnrichmentPipeline`] — runs stages in parallel via `futures::join_all`, merges in order
+//! - [`EnrichmentContext`] — accumulator for enrichment data (populated by pipeline merge)
 //! - [`EnrichmentInput`] — immutable input data for all stages
 //!
 //! Stages added by later tasks (TP2.2–TP2.4):
@@ -144,6 +144,10 @@ pub struct EnrichmentInput {
     /// Note IDs already included in the system prompt (from ProjectContext guidelines/gotchas).
     /// Used by KnowledgeInjectionStage to avoid duplicating notes that are already present.
     pub excluded_note_ids: HashSet<String>,
+    /// Optional reasoning path tracker for Hebbian reinforcement.
+    /// When Some, StatusInjectionStage records traversed reasoning tree paths
+    /// so they can be reinforced on session close.
+    pub reasoning_path_tracker: Option<crate::chat::feedback::ReasoningPathTracker>,
 }
 
 /// Mutable context that accumulates enrichment data across stages.
@@ -151,9 +155,12 @@ pub struct EnrichmentInput {
 /// Each stage can read what previous stages added and add its own data.
 /// The context is [`Serialize`] for debug logging.
 ///
-/// **Hints**: stages can communicate inter-stage signals via `set_hint`/`get_hint`.
-/// For example, SkillActivationStage sets `intent=planning` which KnowledgeInjectionStage
-/// can read to filter notes by intent.
+/// **Hints**: stages communicate inter-stage signals via `set_hint`/`get_hint`.
+/// SkillActivationStage detects intent via `IntentDetector::detect()`, maps it to a
+/// hint string (`"debug"`, `"explore"`, `"review"`, `"planning"`, `"general"`), and
+/// sets `hint("intent")`. KnowledgeInjectionStage reads `hint("intent")`, builds an
+/// `IntentWeightMap`, multiplies each note's BM25 score by the per-note-type weight,
+/// and re-sorts notes by intent-adjusted score before rendering.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct EnrichmentContext {
     /// Sections of enriched content to prepend to the prompt.
@@ -174,6 +181,31 @@ pub struct EnrichmentContext {
     pub skipped_stages: Vec<String>,
 }
 
+/// Typed source of an enrichment section, used for deterministic mapping
+/// to [`PromptSection`] variants without relying on title string matching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum EnrichmentSource {
+    /// Skill activation stage.
+    SkillActivation,
+    /// Knowledge injection stage (notes, decisions, propagated).
+    KnowledgeInjection,
+    /// Status injection stage (tasks, plans in progress).
+    StatusInjection,
+    /// Persona auto-detection stage.
+    Persona,
+    /// Reflex stage (co-change, episode recall, scar warnings).
+    Reflex,
+    /// File context stage (context cards, symbols).
+    FileContext,
+    /// Biomimicry stage (stagnation detection, homeostasis).
+    Biomimicry,
+    /// User profile stage (adaptive behavioral profile).
+    UserProfile,
+    /// Fallback for stages without a specific source type.
+    #[default]
+    Other,
+}
+
 /// A single section of enrichment content.
 #[derive(Debug, Clone, Serialize)]
 pub struct EnrichmentSection {
@@ -181,22 +213,26 @@ pub struct EnrichmentSection {
     pub title: String,
     /// Section content (markdown formatted).
     pub content: String,
-    /// Source stage name.
+    /// Source stage name (string identifier for logging/debugging).
     pub source: String,
+    /// Typed source for deterministic PromptSection mapping.
+    pub enrichment_source: EnrichmentSource,
 }
 
 impl EnrichmentContext {
-    /// Add a new section of enriched content.
+    /// Add a new section of enriched content with a typed source.
     pub fn add_section(
         &mut self,
         title: impl Into<String>,
         content: impl Into<String>,
         source: impl Into<String>,
+        enrichment_source: EnrichmentSource,
     ) {
         self.sections.push(EnrichmentSection {
             title: title.into(),
             content: content.into(),
             source: source.into(),
+            enrichment_source,
         });
     }
 
@@ -226,40 +262,39 @@ impl EnrichmentContext {
     /// stages continue producing EnrichmentSections internally, but the
     /// output can be consumed as PromptSections by the FsmPromptComposer.
     ///
-    /// Mapping:
-    /// - "Activated Skills" → PromptSection::SkillContext
-    /// - "Relevant Notes" / "Contextual Notes" → PromptSection::KnowledgeNotes
-    /// - "Propagated Notes" → PromptSection::PropagatedNotes
-    /// - "File Context" / "Symbols" → PromptSection::FileContext
-    /// - "Persona" → PromptSection::PersonaContext
-    /// - Other → PromptSection::Enrichment
+    /// Mapping uses the typed [`EnrichmentSource`] enum for deterministic dispatch:
+    /// - `SkillActivation` → `PromptSection::SkillContext`
+    /// - `KnowledgeInjection` → `PromptSection::KnowledgeNotes` (or `PropagatedNotes` for propagated)
+    /// - `FileContext` → `PromptSection::FileContext`
+    /// - `Persona` → `PromptSection::PersonaContext`
+    /// - Others → `PromptSection::Enrichment`
     pub fn to_prompt_sections(&self) -> Vec<crate::runner::prompt::PromptSection> {
         use crate::runner::prompt::PromptSection;
 
         self.sections
             .iter()
-            .map(|section| {
-                let title_lower = section.title.to_lowercase();
-                if title_lower.contains("skill") {
+            .map(|section| match section.enrichment_source {
+                EnrichmentSource::SkillActivation => {
                     PromptSection::SkillContext(section.content.clone())
-                } else if title_lower.contains("propagated") {
-                    PromptSection::PropagatedNotes(section.content.clone())
-                } else if title_lower.contains("note")
-                    || title_lower.contains("guideline")
-                    || title_lower.contains("gotcha")
-                    || title_lower.contains("knowledge")
-                {
-                    PromptSection::KnowledgeNotes(section.content.clone())
-                } else if title_lower.contains("file")
-                    || title_lower.contains("symbol")
-                    || title_lower.contains("dependency")
-                {
-                    PromptSection::FileContext(section.content.clone())
-                } else if title_lower.contains("persona") {
-                    PromptSection::PersonaContext(section.content.clone())
-                } else {
-                    PromptSection::Enrichment(section.content.clone())
                 }
+                EnrichmentSource::KnowledgeInjection => {
+                    // Distinguish propagated notes by title (sub-category within same source)
+                    let title_lower = section.title.to_lowercase();
+                    if title_lower.contains("propagated") {
+                        PromptSection::PropagatedNotes(section.content.clone())
+                    } else {
+                        PromptSection::KnowledgeNotes(section.content.clone())
+                    }
+                }
+                EnrichmentSource::FileContext => {
+                    PromptSection::FileContext(section.content.clone())
+                }
+                EnrichmentSource::Persona => PromptSection::PersonaContext(section.content.clone()),
+                EnrichmentSource::StatusInjection
+                | EnrichmentSource::Reflex
+                | EnrichmentSource::Biomimicry
+                | EnrichmentSource::UserProfile
+                | EnrichmentSource::Other => PromptSection::Enrichment(section.content.clone()),
             })
             .collect()
     }
@@ -308,20 +343,69 @@ impl EnrichmentContext {
 }
 
 // ============================================================================
-// Stage trait
+// Stage output (parallel pipeline)
 // ============================================================================
 
-/// A pluggable enrichment stage in the pipeline.
+/// Output produced by a single enrichment stage in the parallel pipeline.
 ///
-/// Each stage asynchronously enriches the context with a specific category
-/// of information (skills, notes, tasks, reasoning tree, etc.).
+/// Instead of mutating an `EnrichmentContext` directly, each stage returns
+/// a `StageOutput` which the pipeline merges in registration order.
+#[derive(Debug, Clone, Default)]
+pub struct StageOutput {
+    /// Sections produced by this stage.
+    pub sections: Vec<EnrichmentSection>,
+    /// Hints to merge into the context (last writer wins across stages).
+    pub hints: HashMap<String, String>,
+    /// Stage name (for logging/timing).
+    pub stage_name: String,
+    /// Execution duration in milliseconds.
+    pub duration_ms: u64,
+}
+
+impl StageOutput {
+    /// Create a new empty StageOutput for the given stage name.
+    pub fn new(stage_name: impl Into<String>) -> Self {
+        Self {
+            stage_name: stage_name.into(),
+            ..Default::default()
+        }
+    }
+
+    /// Add a section to this output with a typed source.
+    pub fn add_section(
+        &mut self,
+        title: impl Into<String>,
+        content: impl Into<String>,
+        source: impl Into<String>,
+        enrichment_source: EnrichmentSource,
+    ) {
+        self.sections.push(EnrichmentSection {
+            title: title.into(),
+            content: content.into(),
+            source: source.into(),
+            enrichment_source,
+        });
+    }
+
+    /// Set a hint in this output.
+    pub fn set_hint(&mut self, key: impl Into<String>, value: impl Into<String>) {
+        self.hints.insert(key.into(), value.into());
+    }
+}
+
+// ============================================================================
+// Stage traits
+// ============================================================================
+
+/// A parallel enrichment stage that returns a [`StageOutput`] instead of
+/// mutating an `EnrichmentContext`.
 ///
-/// Stages are executed sequentially in insertion order. If a stage fails,
-/// the pipeline logs the error and continues (graceful degradation).
+/// All stages implementing this trait can run concurrently via `futures::join_all`.
+/// The pipeline merges outputs in registration order after all stages complete.
 #[async_trait::async_trait]
-pub trait EnrichmentStage: Send + Sync {
-    /// Execute the stage, adding data to the enrichment context.
-    async fn execute(&self, input: &EnrichmentInput, ctx: &mut EnrichmentContext) -> Result<()>;
+pub trait ParallelEnrichmentStage: Send + Sync {
+    /// Execute the stage and return its output.
+    async fn execute(&self, input: &EnrichmentInput) -> Result<StageOutput>;
 
     /// Human-readable name for logging and debugging.
     fn name(&self) -> &str;
@@ -336,13 +420,13 @@ pub trait EnrichmentStage: Send + Sync {
 
 /// Ordered pipeline of enrichment stages.
 ///
-/// Executes stages sequentially with graceful degradation:
-/// if a stage fails, its error is logged and the pipeline continues.
-///
-/// The pipeline enforces a time budget (`max_pipeline_ms`). If the budget
-/// is exceeded, remaining stages are skipped.
+/// Executes all enabled stages **in parallel** via `futures::join_all`,
+/// then merges their outputs in registration order. Each stage has an
+/// individual timeout; errors and timeouts produce an empty `StageOutput`
+/// and are recorded in `skipped_stages`. A global pipeline timeout
+/// (`max_pipeline_ms`) wraps the entire parallel execution.
 pub struct EnrichmentPipeline {
-    stages: Vec<Box<dyn EnrichmentStage>>,
+    stages: Vec<Box<dyn ParallelEnrichmentStage>>,
     config: EnrichmentConfig,
 }
 
@@ -355,35 +439,30 @@ impl EnrichmentPipeline {
         }
     }
 
-    /// Add a stage to the pipeline (executed in insertion order).
-    pub fn add_stage(&mut self, stage: Box<dyn EnrichmentStage>) {
+    /// Add a stage to the pipeline.
+    pub fn add_parallel_stage(&mut self, stage: Box<dyn ParallelEnrichmentStage>) {
         self.stages.push(stage);
     }
 
-    /// Execute all enabled stages sequentially.
+    /// Execute all enabled stages in parallel.
     ///
-    /// Graceful degradation: if a stage fails, its error is logged
-    /// and the pipeline continues with the remaining stages.
-    /// Returns the enriched context even if some stages failed.
+    /// Graceful degradation: if a stage fails or times out, its error is logged
+    /// and the pipeline continues with the remaining stages' outputs.
+    /// Sections are merged in registration order to preserve deterministic output.
     pub async fn execute(&self, input: &EnrichmentInput) -> EnrichmentContext {
         let pipeline_start = Instant::now();
         let mut ctx = EnrichmentContext::default();
-        let deadline = Duration::from_millis(self.config.max_pipeline_ms);
+        let global_deadline = Duration::from_millis(self.config.max_pipeline_ms);
+        // Per-stage timeout: use the global budget (each stage can use the full budget
+        // since they run in parallel; the global timeout wraps everything).
+        let per_stage_timeout = global_deadline;
 
-        for stage in &self.stages {
-            // Check time budget
-            if pipeline_start.elapsed() >= deadline {
-                // Record all remaining enabled stages as skipped
-                warn!(
-                    "[enrichment] Pipeline hit time budget ({}ms) after {}ms, skipping remaining stages",
-                    self.config.max_pipeline_ms,
-                    pipeline_start.elapsed().as_millis()
-                );
-                break;
-            }
-
-            // Check if enabled
-            if !stage.is_enabled(&self.config) {
+        // Collect indices of enabled stages; record disabled ones as skipped.
+        let mut enabled_indices = Vec::new();
+        for (i, stage) in self.stages.iter().enumerate() {
+            if stage.is_enabled(&self.config) {
+                enabled_indices.push(i);
+            } else {
                 ctx.skipped_stages.push(stage.name().to_string());
                 if self.config.debug {
                     debug!(
@@ -391,36 +470,83 @@ impl EnrichmentPipeline {
                         stage.name()
                     );
                 }
-                continue;
             }
+        }
 
-            // Execute with timing
-            let stage_start = Instant::now();
-            match stage.execute(input, &mut ctx).await {
-                Ok(()) => {
+        // Build futures for all enabled stages.
+        let futures: Vec<_> = enabled_indices
+            .iter()
+            .map(|&i| {
+                let stage = &self.stages[i];
+                let stage_name = stage.name().to_string();
+                let timeout_dur = per_stage_timeout;
+                async move {
+                    let stage_start = Instant::now();
+                    let result = tokio::time::timeout(timeout_dur, stage.execute(input)).await;
                     let elapsed = stage_start.elapsed().as_millis() as u64;
-                    ctx.stage_timings.push((stage.name().to_string(), elapsed));
+                    (i, stage_name, result, elapsed)
+                }
+            })
+            .collect();
+
+        // Run all stages in parallel, wrapped in a global timeout.
+        let results =
+            match tokio::time::timeout(global_deadline, futures::future::join_all(futures)).await {
+                Ok(results) => results,
+                Err(_) => {
+                    warn!(
+                        "[enrichment] Pipeline hit global time budget ({}ms) after {}ms",
+                        self.config.max_pipeline_ms,
+                        pipeline_start.elapsed().as_millis()
+                    );
+                    // All stages timed out — return empty results
+                    Vec::new()
+                }
+            };
+
+        // Collect results keyed by registration index for ordered merge.
+        let mut outputs: std::collections::BTreeMap<usize, StageOutput> =
+            std::collections::BTreeMap::new();
+
+        for (idx, stage_name, result, elapsed) in results {
+            match result {
+                Ok(Ok(mut output)) => {
+                    output.duration_ms = elapsed;
                     if self.config.debug {
                         debug!(
-                            "[enrichment] Stage '{}' completed in {}ms ({} sections total)",
-                            stage.name(),
+                            "[enrichment] Stage '{}' completed in {}ms ({} sections)",
+                            stage_name,
                             elapsed,
-                            ctx.sections.len()
+                            output.sections.len()
                         );
                     }
+                    ctx.stage_timings.push((stage_name, elapsed));
+                    outputs.insert(idx, output);
                 }
-                Err(e) => {
-                    let elapsed = stage_start.elapsed().as_millis() as u64;
-                    ctx.stage_timings.push((stage.name().to_string(), elapsed));
-                    ctx.skipped_stages.push(format!("{}(error)", stage.name()));
+                Ok(Err(e)) => {
+                    ctx.stage_timings.push((stage_name.clone(), elapsed));
+                    ctx.skipped_stages.push(format!("{}(error)", stage_name));
                     warn!(
                         "[enrichment] Stage '{}' failed after {}ms: {} — continuing pipeline",
-                        stage.name(),
-                        elapsed,
-                        e
+                        stage_name, elapsed, e
+                    );
+                }
+                Err(_) => {
+                    ctx.stage_timings.push((stage_name.clone(), elapsed));
+                    ctx.skipped_stages.push(format!("{}(timeout)", stage_name));
+                    warn!(
+                        "[enrichment] Stage '{}' timed out after {}ms",
+                        stage_name, elapsed
                     );
                 }
             }
+        }
+
+        // Merge outputs in registration order (preserves deterministic section ordering).
+        for (_idx, output) in outputs {
+            ctx.sections.extend(output.sections);
+            // Hints: last writer wins (ordered by registration index).
+            ctx.hints.extend(output.hints);
         }
 
         ctx.total_time_ms = pipeline_start.elapsed().as_millis() as u64;
@@ -478,19 +604,21 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl EnrichmentStage for MockStage {
-        async fn execute(
-            &self,
-            _input: &EnrichmentInput,
-            ctx: &mut EnrichmentContext,
-        ) -> Result<()> {
+    impl ParallelEnrichmentStage for MockStage {
+        async fn execute(&self, _input: &EnrichmentInput) -> Result<StageOutput> {
             if self.should_fail {
                 anyhow::bail!("Mock stage failure");
             }
+            let mut output = StageOutput::new(self.name.clone());
             if let Some((title, content)) = &self.content {
-                ctx.add_section(title.clone(), content.clone(), self.name.clone());
+                output.add_section(
+                    title.clone(),
+                    content.clone(),
+                    self.name.clone(),
+                    EnrichmentSource::Other,
+                );
             }
-            Ok(())
+            Ok(output)
         }
 
         fn name(&self) -> &str {
@@ -512,6 +640,7 @@ mod tests {
             protocol_run_id: None,
             protocol_state: None,
             excluded_note_ids: Default::default(),
+            reasoning_path_tracker: None,
         }
     }
 
@@ -527,7 +656,7 @@ mod tests {
     #[tokio::test]
     async fn test_pipeline_with_mock_stage() {
         let mut pipeline = EnrichmentPipeline::new(EnrichmentConfig::default());
-        pipeline.add_stage(Box::new(MockStage {
+        pipeline.add_parallel_stage(Box::new(MockStage {
             name: "test_stage".to_string(),
             enabled: true,
             should_fail: false,
@@ -546,13 +675,13 @@ mod tests {
     #[tokio::test]
     async fn test_pipeline_multiple_stages() {
         let mut pipeline = EnrichmentPipeline::new(EnrichmentConfig::default());
-        pipeline.add_stage(Box::new(MockStage {
+        pipeline.add_parallel_stage(Box::new(MockStage {
             name: "stage_a".to_string(),
             enabled: true,
             should_fail: false,
             content: Some(("Section A".to_string(), "content A".to_string())),
         }));
-        pipeline.add_stage(Box::new(MockStage {
+        pipeline.add_parallel_stage(Box::new(MockStage {
             name: "stage_b".to_string(),
             enabled: true,
             should_fail: false,
@@ -571,7 +700,7 @@ mod tests {
         let mut pipeline = EnrichmentPipeline::new(EnrichmentConfig::default());
 
         // Stage 1: fails
-        pipeline.add_stage(Box::new(MockStage {
+        pipeline.add_parallel_stage(Box::new(MockStage {
             name: "failing_stage".to_string(),
             enabled: true,
             should_fail: true,
@@ -579,7 +708,7 @@ mod tests {
         }));
 
         // Stage 2: succeeds (should still execute despite Stage 1 failure)
-        pipeline.add_stage(Box::new(MockStage {
+        pipeline.add_parallel_stage(Box::new(MockStage {
             name: "success_stage".to_string(),
             enabled: true,
             should_fail: false,
@@ -600,7 +729,7 @@ mod tests {
     #[tokio::test]
     async fn test_pipeline_disabled_stage() {
         let mut pipeline = EnrichmentPipeline::new(EnrichmentConfig::default());
-        pipeline.add_stage(Box::new(MockStage {
+        pipeline.add_parallel_stage(Box::new(MockStage {
             name: "disabled_stage".to_string(),
             enabled: false,
             should_fail: false,
@@ -615,8 +744,18 @@ mod tests {
     #[tokio::test]
     async fn test_enrichment_context_render() {
         let mut ctx = EnrichmentContext::default();
-        ctx.add_section("Notes", "- Note 1\n- Note 2", "knowledge");
-        ctx.add_section("Skills", "- Skill A", "skills");
+        ctx.add_section(
+            "Notes",
+            "- Note 1\n- Note 2",
+            "knowledge",
+            EnrichmentSource::KnowledgeInjection,
+        );
+        ctx.add_section(
+            "Skills",
+            "- Skill A",
+            "skills",
+            EnrichmentSource::SkillActivation,
+        );
 
         let rendered = ctx.render();
         assert!(rendered.contains("<enrichment_context>"));
@@ -635,7 +774,7 @@ mod tests {
     #[tokio::test]
     async fn test_enrich_prompt_with_content() {
         let mut ctx = EnrichmentContext::default();
-        ctx.add_section("Context", "some context", "test");
+        ctx.add_section("Context", "some context", "test", EnrichmentSource::Other);
 
         let enriched = enrich_prompt("original message", &ctx);
         assert!(enriched.starts_with("<enrichment_context>"));
@@ -652,7 +791,7 @@ mod tests {
     #[tokio::test]
     async fn test_enrichment_context_serializable() {
         let mut ctx = EnrichmentContext::default();
-        ctx.add_section("Test", "content", "source");
+        ctx.add_section("Test", "content", "source", EnrichmentSource::Other);
         ctx.stage_timings.push(("test".to_string(), 42));
         ctx.total_time_ms = 42;
 
@@ -669,15 +808,12 @@ mod tests {
         struct SlowStage;
 
         #[async_trait::async_trait]
-        impl EnrichmentStage for SlowStage {
-            async fn execute(
-                &self,
-                _input: &EnrichmentInput,
-                ctx: &mut EnrichmentContext,
-            ) -> Result<()> {
+        impl ParallelEnrichmentStage for SlowStage {
+            async fn execute(&self, _input: &EnrichmentInput) -> Result<StageOutput> {
                 sleep(Duration::from_millis(600)).await;
-                ctx.add_section("Slow", "should not appear", "slow");
-                Ok(())
+                let mut output = StageOutput::new("slow_stage");
+                output.add_section("Slow", "should not appear", "slow", EnrichmentSource::Other);
+                Ok(output)
             }
 
             fn name(&self) -> &str {
@@ -696,7 +832,7 @@ mod tests {
         let mut pipeline = EnrichmentPipeline::new(config);
 
         // Fast stage first
-        pipeline.add_stage(Box::new(MockStage {
+        pipeline.add_parallel_stage(Box::new(MockStage {
             name: "fast_stage".to_string(),
             enabled: true,
             should_fail: false,
@@ -704,7 +840,7 @@ mod tests {
         }));
 
         // Slow stage — should either execute (within budget) or be skipped
-        pipeline.add_stage(Box::new(SlowStage));
+        pipeline.add_parallel_stage(Box::new(SlowStage));
 
         let ctx = pipeline.execute(&test_input()).await;
         // At minimum, the fast stage should have completed
@@ -810,12 +946,42 @@ mod tests {
         use crate::runner::prompt::PromptSection;
 
         let mut ctx = EnrichmentContext::default();
-        ctx.add_section("Activated Skills", "skill content", "skill_stage");
-        ctx.add_section("Relevant Notes", "note content", "knowledge_stage");
-        ctx.add_section("Propagated Notes", "propagated content", "knowledge_stage");
-        ctx.add_section("File Context", "file content", "file_stage");
-        ctx.add_section("Persona Context", "persona content", "persona_stage");
-        ctx.add_section("Active Work", "task content", "status_stage");
+        ctx.add_section(
+            "Activated Skills",
+            "skill content",
+            "skill_stage",
+            EnrichmentSource::SkillActivation,
+        );
+        ctx.add_section(
+            "Relevant Notes",
+            "note content",
+            "knowledge_stage",
+            EnrichmentSource::KnowledgeInjection,
+        );
+        ctx.add_section(
+            "Propagated Notes",
+            "propagated content",
+            "knowledge_stage",
+            EnrichmentSource::KnowledgeInjection,
+        );
+        ctx.add_section(
+            "File Context",
+            "file content",
+            "file_stage",
+            EnrichmentSource::FileContext,
+        );
+        ctx.add_section(
+            "Persona Context",
+            "persona content",
+            "persona_stage",
+            EnrichmentSource::Persona,
+        );
+        ctx.add_section(
+            "Active Work",
+            "task content",
+            "status_stage",
+            EnrichmentSource::StatusInjection,
+        );
 
         let sections = ctx.to_prompt_sections();
         assert_eq!(sections.len(), 6, "Should produce 6 PromptSections");
@@ -830,10 +996,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_to_prompt_sections_all_enrichment_variants() {
+        use crate::runner::prompt::PromptSection;
+
+        // Verify Biomimicry, Reflex, UserProfile, and Other all map to Enrichment
+        let mut ctx = EnrichmentContext::default();
+        ctx.add_section("Bio", "bio", "bio", EnrichmentSource::Biomimicry);
+        ctx.add_section("Reflex", "reflex", "reflex", EnrichmentSource::Reflex);
+        ctx.add_section(
+            "Profile",
+            "profile",
+            "profile",
+            EnrichmentSource::UserProfile,
+        );
+        ctx.add_section("Other", "other", "other", EnrichmentSource::Other);
+
+        let sections = ctx.to_prompt_sections();
+        assert_eq!(sections.len(), 4);
+        for (i, section) in sections.iter().enumerate() {
+            assert!(
+                matches!(section, PromptSection::Enrichment(_)),
+                "Section {} ({:?}) should map to Enrichment",
+                i,
+                section
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn test_to_system_prompt_markdown() {
         let mut ctx = EnrichmentContext::default();
-        ctx.add_section("Skills", "- Skill A", "test");
-        ctx.add_section("Notes", "- Note 1", "test");
+        ctx.add_section(
+            "Skills",
+            "- Skill A",
+            "test",
+            EnrichmentSource::SkillActivation,
+        );
+        ctx.add_section(
+            "Notes",
+            "- Note 1",
+            "test",
+            EnrichmentSource::KnowledgeInjection,
+        );
 
         let md = ctx.to_system_prompt_markdown();
         assert!(md.contains("## Skills"));
@@ -847,5 +1051,87 @@ mod tests {
     async fn test_to_system_prompt_markdown_empty() {
         let ctx = EnrichmentContext::default();
         assert_eq!(ctx.to_system_prompt_markdown(), "");
+    }
+
+    // ── Parallel pipeline benchmark ───────────────────────────────────
+
+    /// A mock stage that sleeps to simulate I/O latency.
+    struct LatentMockStage {
+        stage_name: String,
+        latency_ms: u64,
+    }
+
+    #[async_trait::async_trait]
+    impl ParallelEnrichmentStage for LatentMockStage {
+        async fn execute(&self, _input: &EnrichmentInput) -> Result<StageOutput> {
+            tokio::time::sleep(Duration::from_millis(self.latency_ms)).await;
+            let mut output = StageOutput::new(self.stage_name.clone());
+            output.add_section(
+                format!("Section from {}", self.stage_name),
+                "content",
+                self.stage_name.clone(),
+                EnrichmentSource::Other,
+            );
+            Ok(output)
+        }
+
+        fn name(&self) -> &str {
+            &self.stage_name
+        }
+
+        fn is_enabled(&self, _config: &EnrichmentConfig) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn test_parallel_pipeline_faster_than_sequential() {
+        // 8 stages × 50ms = 400ms sequential, but parallel should be < 150ms
+        let mut pipeline = EnrichmentPipeline::new(EnrichmentConfig {
+            max_pipeline_ms: 1000,
+            ..Default::default()
+        });
+        for i in 0..8 {
+            pipeline.add_parallel_stage(Box::new(LatentMockStage {
+                stage_name: format!("latent_{}", i),
+                latency_ms: 50,
+            }));
+        }
+
+        let start = Instant::now();
+        let ctx = pipeline.execute(&test_input()).await;
+        let elapsed = start.elapsed().as_millis();
+
+        // All 8 stages should have produced sections
+        assert_eq!(
+            ctx.sections.len(),
+            8,
+            "All 8 stages should produce sections"
+        );
+        // Sections should be in registration order
+        assert_eq!(ctx.sections[0].source, "latent_0");
+        assert_eq!(ctx.sections[7].source, "latent_7");
+
+        // Parallel: should complete in ~50-80ms, definitely < 150ms
+        assert!(
+            elapsed < 150,
+            "Parallel pipeline with 8×50ms stages should complete in < 150ms, got {}ms",
+            elapsed
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stage_output_helpers() {
+        let mut output = StageOutput::new("test");
+        assert_eq!(output.stage_name, "test");
+        assert!(output.sections.is_empty());
+        assert!(output.hints.is_empty());
+
+        output.add_section("Title", "Content", "source", EnrichmentSource::Other);
+        assert_eq!(output.sections.len(), 1);
+        assert_eq!(output.sections[0].title, "Title");
+
+        output.set_hint("key", "value");
+        assert_eq!(output.hints.get("key").unwrap(), "value");
     }
 }

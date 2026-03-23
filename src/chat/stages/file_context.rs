@@ -11,7 +11,7 @@
 //! - Total stage budget: 100ms
 
 use crate::chat::enrichment::{
-    EnrichmentConfig, EnrichmentContext, EnrichmentInput, EnrichmentStage,
+    EnrichmentConfig, EnrichmentInput, ParallelEnrichmentStage, StageOutput,
 };
 use crate::graph::models::ContextCard;
 use crate::neo4j::traits::GraphStore;
@@ -45,19 +45,7 @@ impl FileContextStage {
 
     /// Extract file paths from the user message (look for paths like src/foo/bar.rs).
     fn extract_file_paths(message: &str) -> Vec<String> {
-        let mut paths = Vec::new();
-        for word in message.split_whitespace() {
-            let cleaned =
-                word.trim_matches(|c: char| c == '`' || c == '\'' || c == '"' || c == ',');
-            // Match file-like patterns (contains / and a dot extension)
-            if cleaned.contains('/')
-                && cleaned.contains('.')
-                && !cleaned.starts_with("http")
-                && !cleaned.starts_with("//")
-            {
-                paths.push(cleaned.to_string());
-            }
-        }
+        let mut paths = crate::utils::file_path_extractor::extract_file_paths(message);
         paths.truncate(MAX_FILES);
         paths
     }
@@ -180,7 +168,7 @@ impl FileContextStage {
 }
 
 #[async_trait::async_trait]
-impl EnrichmentStage for FileContextStage {
+impl ParallelEnrichmentStage for FileContextStage {
     fn name(&self) -> &str {
         "file_context"
     }
@@ -190,15 +178,17 @@ impl EnrichmentStage for FileContextStage {
         true
     }
 
-    async fn execute(&self, input: &EnrichmentInput, ctx: &mut EnrichmentContext) -> Result<()> {
+    async fn execute(&self, input: &EnrichmentInput) -> Result<StageOutput> {
+        let mut output = StageOutput::new(self.name());
+
         let project_id = match input.project_id {
             Some(id) => id,
-            None => return Ok(()), // No project context → skip
+            None => return Ok(output), // No project context → skip
         };
 
         let file_paths = Self::extract_file_paths(&input.message);
         if file_paths.is_empty() {
-            return Ok(());
+            return Ok(output);
         }
 
         let project_id_str = project_id.to_string();
@@ -235,14 +225,15 @@ impl EnrichmentStage for FileContextStage {
 
         if !profiles.is_empty() {
             let content = profiles.join("\n\n");
-            ctx.add_section(
+            output.add_section(
                 "File Intelligence".to_string(),
                 content,
                 "file_context".to_string(),
+                crate::chat::enrichment::EnrichmentSource::FileContext,
             );
         }
 
-        Ok(())
+        Ok(output)
     }
 }
 

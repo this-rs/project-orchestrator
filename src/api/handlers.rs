@@ -5656,7 +5656,40 @@ pub async fn get_plan_run(
         .await
         .map_err(AppError::Internal)?
         .ok_or_else(|| AppError::NotFound(format!("Run {} not found", run_id)))?;
-    Ok(Json(serde_json::to_value(&run).unwrap_or_default()))
+
+    let mut result = serde_json::to_value(&run).unwrap_or_default();
+
+    // If this run is currently active in memory, enrich the Neo4j response
+    // with live data (current_wave, active_agents, cost, progress).
+    // This fixes the inconsistency between get_run (stale Neo4j) and
+    // run_status (live in-memory) during active execution.
+    let live_status = crate::runner::PlanRunner::status().await;
+    if live_status.running && live_status.run_id == Some(run_id) {
+        if let Some(obj) = result.as_object_mut() {
+            obj.insert(
+                "current_wave".to_string(),
+                serde_json::json!(live_status.current_wave),
+            );
+            obj.insert(
+                "active_agents".to_string(),
+                serde_json::json!(live_status.active_agents),
+            );
+            obj.insert(
+                "cost_usd".to_string(),
+                serde_json::json!(live_status.cost_usd),
+            );
+            obj.insert(
+                "progress_pct".to_string(),
+                serde_json::json!(live_status.progress_pct),
+            );
+            obj.insert(
+                "tasks_completed".to_string(),
+                serde_json::json!(live_status.tasks_completed),
+            );
+        }
+    }
+
+    Ok(Json(result))
 }
 
 /// POST /api/plans/:plan_id/runs/compare — Compare multiple plan runs.

@@ -14,7 +14,7 @@ use tokio::time::timeout;
 use tracing::debug;
 
 use crate::chat::enrichment::{
-    EnrichmentConfig, EnrichmentContext, EnrichmentInput, EnrichmentStage,
+    EnrichmentConfig, EnrichmentInput, ParallelEnrichmentStage, StageOutput,
 };
 use crate::neo4j::traits::GraphStore;
 
@@ -31,8 +31,10 @@ impl UserProfileStage {
 }
 
 #[async_trait::async_trait]
-impl EnrichmentStage for UserProfileStage {
-    async fn execute(&self, input: &EnrichmentInput, ctx: &mut EnrichmentContext) -> Result<()> {
+impl ParallelEnrichmentStage for UserProfileStage {
+    async fn execute(&self, input: &EnrichmentInput) -> Result<StageOutput> {
+        let mut output = StageOutput::new(self.name());
+
         // Derive user_id from the session_id (same convention as aggregator)
         let user_id = format!("session:{}", input.session_id);
 
@@ -54,21 +56,21 @@ impl EnrichmentStage for UserProfileStage {
                     "[user_profile_stage] No profile for '{}', skipping",
                     user_id
                 );
-                return Ok(());
+                return Ok(output);
             }
             Ok(Err(e)) => {
                 debug!(
                     "[user_profile_stage] Failed to load profile for '{}': {}",
                     user_id, e
                 );
-                return Ok(());
+                return Ok(output);
             }
             Err(_) => {
                 debug!(
                     "[user_profile_stage] Profile load timed out for '{}'",
                     user_id
                 );
-                return Ok(());
+                return Ok(output);
             }
         };
 
@@ -78,19 +80,24 @@ impl EnrichmentStage for UserProfileStage {
                 "[user_profile_stage] Profile for '{}' has no interactions yet, skipping",
                 user_id
             );
-            return Ok(());
+            return Ok(output);
         }
 
         // Format as concise markdown (< 50 tokens)
         let markdown = profile.to_prompt_markdown();
-        ctx.add_section("User Profile", markdown, self.name());
+        output.add_section(
+            "User Profile",
+            markdown,
+            self.name(),
+            crate::chat::enrichment::EnrichmentSource::UserProfile,
+        );
 
         debug!(
             "[user_profile_stage] Injected profile for '{}' (interactions: {})",
             user_id, profile.interaction_count
         );
 
-        Ok(())
+        Ok(output)
     }
 
     fn name(&self) -> &str {
@@ -119,26 +126,28 @@ mod tests {
             protocol_run_id: None,
             protocol_state: None,
             excluded_note_ids: Default::default(),
+            reasoning_path_tracker: None,
         }
     }
 
     #[tokio::test]
     async fn test_no_profile_skips() {
+        use crate::chat::enrichment::ParallelEnrichmentStage;
         let mock = Arc::new(crate::neo4j::mock::MockGraphStore::new());
         let stage = UserProfileStage::new(mock);
 
         let input = test_input();
-        let mut ctx = EnrichmentContext::default();
-        stage.execute(&input, &mut ctx).await.unwrap();
+        let output = stage.execute(&input).await.unwrap();
 
         assert!(
-            !ctx.has_content(),
+            output.sections.is_empty(),
             "Should not inject anything when no profile exists"
         );
     }
 
     #[tokio::test]
     async fn test_zero_interactions_skips() {
+        use crate::chat::enrichment::ParallelEnrichmentStage;
         let mock = Arc::new(crate::neo4j::mock::MockGraphStore::new());
         let input = test_input();
 
@@ -147,17 +156,17 @@ mod tests {
         mock.create_or_get_user_profile(&user_id).await.unwrap();
 
         let stage = UserProfileStage::new(mock);
-        let mut ctx = EnrichmentContext::default();
-        stage.execute(&input, &mut ctx).await.unwrap();
+        let output = stage.execute(&input).await.unwrap();
 
         assert!(
-            !ctx.has_content(),
+            output.sections.is_empty(),
             "Should not inject for 0-interaction profiles"
         );
     }
 
     #[tokio::test]
     async fn test_active_profile_injected() {
+        use crate::chat::enrichment::ParallelEnrichmentStage;
         let mock = Arc::new(crate::neo4j::mock::MockGraphStore::new());
         let input = test_input();
 
@@ -170,13 +179,12 @@ mod tests {
         mock.update_user_profile(&profile).await.unwrap();
 
         let stage = UserProfileStage::new(mock);
-        let mut ctx = EnrichmentContext::default();
-        stage.execute(&input, &mut ctx).await.unwrap();
+        let output = stage.execute(&input).await.unwrap();
 
-        assert!(ctx.has_content(), "Should inject profile data");
-        assert_eq!(ctx.sections.len(), 1);
-        assert_eq!(ctx.sections[0].title, "User Profile");
-        assert!(ctx.sections[0].content.contains("fr"));
-        assert!(ctx.sections[0].content.contains("detailed"));
+        assert!(!output.sections.is_empty(), "Should inject profile data");
+        assert_eq!(output.sections.len(), 1);
+        assert_eq!(output.sections[0].title, "User Profile");
+        assert!(output.sections[0].content.contains("fr"));
+        assert!(output.sections[0].content.contains("detailed"));
     }
 }

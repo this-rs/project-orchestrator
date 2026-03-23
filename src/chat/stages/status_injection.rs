@@ -27,7 +27,7 @@ use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::chat::enrichment::{
-    EnrichmentConfig, EnrichmentContext, EnrichmentInput, EnrichmentStage,
+    EnrichmentConfig, EnrichmentInput, ParallelEnrichmentStage, StageOutput,
 };
 use crate::neo4j::models::TaskStatus;
 use crate::neo4j::traits::GraphStore;
@@ -426,12 +426,14 @@ fn truncate(s: &str, max_len: usize) -> &str {
 }
 
 #[async_trait::async_trait]
-impl EnrichmentStage for StatusInjectionStage {
-    async fn execute(&self, input: &EnrichmentInput, ctx: &mut EnrichmentContext) -> Result<()> {
+impl ParallelEnrichmentStage for StatusInjectionStage {
+    async fn execute(&self, input: &EnrichmentInput) -> Result<StageOutput> {
+        let mut output = StageOutput::new(self.name());
+
         // Need a project scope
         let project_slug = match &input.project_slug {
             Some(slug) => slug.clone(),
-            None => return Ok(()), // No project scope, skip
+            None => return Ok(output), // No project scope, skip
         };
 
         let project_id = if let Some(id) = input.project_id {
@@ -532,22 +534,42 @@ impl EnrichmentStage for StatusInjectionStage {
 
         // ── Inject sections ─────────────────────────────────────────────
         if let Some(content) = status_content {
-            ctx.add_section("Work In Progress", content, self.name());
+            output.add_section(
+                "Work In Progress",
+                content,
+                self.name(),
+                crate::chat::enrichment::EnrichmentSource::StatusInjection,
+            );
         }
 
         if let Some(content) = protocol_content {
-            ctx.add_section("Active Protocols", content, self.name());
+            output.add_section(
+                "Active Protocols",
+                content,
+                self.name(),
+                crate::chat::enrichment::EnrichmentSource::StatusInjection,
+            );
         }
 
         if let Some(content) = protocol_context {
-            ctx.add_section("Active Protocol Context", content, self.name());
+            output.add_section(
+                "Active Protocol Context",
+                content,
+                self.name(),
+                crate::chat::enrichment::EnrichmentSource::StatusInjection,
+            );
         }
 
         if let Some(content) = reasoning_content {
-            ctx.add_section("Suggested Reasoning Plan", content, self.name());
+            output.add_section(
+                "Suggested Reasoning Plan",
+                content,
+                self.name(),
+                crate::chat::enrichment::EnrichmentSource::StatusInjection,
+            );
         }
 
-        Ok(())
+        Ok(output)
     }
 
     fn name(&self) -> &str {
@@ -566,7 +588,7 @@ impl EnrichmentStage for StatusInjectionStage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chat::enrichment::EnrichmentContext;
+    use crate::chat::enrichment::ParallelEnrichmentStage;
 
     // ── Config tests ────────────────────────────────────────────────────
 
@@ -810,10 +832,13 @@ mod tests {
             protocol_run_id: None,
             protocol_state: None,
             excluded_note_ids: Default::default(),
+            reasoning_path_tracker: None,
         };
-        let mut ctx = EnrichmentContext::default();
-        stage.execute(&input, &mut ctx).await.unwrap();
-        assert!(!ctx.has_content(), "Should skip when no project scope");
+        let output = stage.execute(&input).await.unwrap();
+        assert!(
+            output.sections.is_empty(),
+            "Should skip when no project scope"
+        );
     }
 
     #[tokio::test]
@@ -828,11 +853,11 @@ mod tests {
             protocol_run_id: None,
             protocol_state: None,
             excluded_note_ids: Default::default(),
+            reasoning_path_tracker: None,
         };
-        let mut ctx = EnrichmentContext::default();
 
         // With mock graph (no data), should complete without errors
-        let result = stage.execute(&input, &mut ctx).await;
+        let result = stage.execute(&input).await;
         assert!(result.is_ok(), "Stage should not error with mock graph");
     }
 

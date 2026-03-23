@@ -132,6 +132,11 @@ pub struct ActivationCondition {
     /// If true, this section is ALWAYS included regardless of other conditions.
     /// Overrides all other fields.
     pub always: bool,
+    /// Scaffolding level range `(min, max)` for which the compact variant should be used
+    /// instead of the full content. `None` = always use full content.
+    /// When the current scaffolding level falls in `[min, max]` (inclusive), the section's
+    /// `compact_content` (if present) replaces the main `content`.
+    pub compact_scaffolding_range: Option<(u8, u8)>,
 }
 
 impl ActivationCondition {
@@ -144,6 +149,7 @@ impl ActivationCondition {
             requires_active_protocol: false,
             min_task_count: None,
             always: true,
+            compact_scaffolding_range: None,
         }
     }
 
@@ -156,6 +162,26 @@ impl ActivationCondition {
             requires_active_protocol: false,
             min_task_count: None,
             always: false,
+            compact_scaffolding_range: None,
+        }
+    }
+
+    /// Section is included for scaffolding levels in [min, max] (inclusive),
+    /// with a compact variant used for levels in [compact_min, compact_max].
+    pub const fn scaffolding_range_with_compact(
+        min: u8,
+        max: u8,
+        compact_min: u8,
+        compact_max: u8,
+    ) -> Self {
+        Self {
+            scaffolding_min: Some(min),
+            scaffolding_max: Some(max),
+            requires_active_plan: false,
+            requires_active_protocol: false,
+            min_task_count: None,
+            always: false,
+            compact_scaffolding_range: Some((compact_min, compact_max)),
         }
     }
 
@@ -168,6 +194,7 @@ impl ActivationCondition {
             requires_active_protocol: false,
             min_task_count: None,
             always: false,
+            compact_scaffolding_range: None,
         }
     }
 
@@ -180,6 +207,16 @@ impl ActivationCondition {
             requires_active_protocol: true,
             min_task_count: None,
             always: false,
+            compact_scaffolding_range: None,
+        }
+    }
+
+    /// Whether the compact variant should be used at the given scaffolding level.
+    pub fn use_compact(&self, scaffolding_level: u8) -> bool {
+        if let Some((min, max)) = self.compact_scaffolding_range {
+            scaffolding_level >= min && scaffolding_level <= max
+        } else {
+            false
         }
     }
 
@@ -275,6 +312,9 @@ pub struct BasePromptSection {
     pub priority: u8,
     /// When this section should be included in the prompt.
     pub condition: ActivationCondition,
+    /// Optional compact variant content, used when the scaffolding level
+    /// falls within `condition.compact_scaffolding_range`.
+    pub compact_content: Option<&'static str>,
 }
 
 // ============================================================================
@@ -291,7 +331,7 @@ All MCP tool interactions, code, and technical identifiers remain in English reg
 ## 1. Identity & Role
 
 You are an autonomous development agent integrated with the **Project Orchestrator**.
-You have **25 MCP mega-tools** covering the full project lifecycle: planning, execution, tracking, code exploration, knowledge management, neural skills, reasoning, behavioral patterns, living personas, episodic memory, sharing.
+You have **28 MCP mega-tools** covering the full project lifecycle: planning, execution, tracking, code exploration, knowledge management, neural skills, reasoning, behavioral patterns, living personas, episodic memory, sharing.
 
 **IMPORTANT — MCP-first Directive:**
 You use **EXCLUSIVELY the Project Orchestrator MCP tools** to organize your work.
@@ -312,7 +352,7 @@ Each tool has an `action` parameter that determines the operation:
 tool_name(action: "<action>", param1: value1, param2: value2, ...)
 ```
 
-The 25 mega-tools: `project`, `plan`, `task`, `step`, `decision`, `constraint`, `release`, `milestone`, `commit`, `note`, `workspace`, `workspace_milestone`, `resource`, `component`, `chat`, `feature_graph`, `code`, `reasoning`, `admin`, `skill`, `analysis_profile`, `protocol`, `persona`, `episode`, `sharing`"#;
+The 28 mega-tools: `project`, `plan`, `task`, `step`, `decision`, `constraint`, `release`, `milestone`, `commit`, `note`, `workspace`, `workspace_milestone`, `resource`, `component`, `chat`, `feature_graph`, `code`, `reasoning`, `admin`, `skill`, `analysis_profile`, `protocol`, `persona`, `episode`, `sharing`, `neural_routing`, `trajectory`, `lifecycle_hook`"#;
 
 /// §3 — Data Model (Entity hierarchy, relations, code graph, notes)
 pub const SECTION_DATA_MODEL: &str = r#"## 3. Data Model
@@ -913,6 +953,102 @@ The system auto-adapts prompt complexity based on project maturity (0-4):
 - `project(action: "get_scaffolding_level", slug)` — get current level (auto-computed from maturity metrics)
 - `project(action: "set_scaffolding_override", slug, level)` — override level (null = auto)"#;
 
+/// §12 compact — Best Practices Advanced (condensed for L1, ~1000 tokens)
+/// Removes code examples, detailed hierarchical protocol composition,
+/// wave dispatch gotchas, and condenses sub-sections into bullet points.
+pub const SECTION_BP_ADVANCED_COMPACT: &str = r#"### Advanced Protocols (compact)
+
+**Hierarchical Protocols** — Protocols support parent/child composition via `sub_protocol_id` on states.
+- Parent pauses on macro-state until child completes; child linked via `parent_run_id`
+- CompletionStrategy: `all_complete` (default) | `any_complete` | `manual`
+- OnFailureStrategy: `abort` (default) | `skip` | `retry(N)`
+- Create child protocol first, then reference it in parent state's `sub_protocol_id`
+- Entering a macro-state auto-spawns the child run; parent waits for completion
+- Inspect hierarchy: `get_run` (single run), `get_run_tree` (full hierarchy), `get_run_children` (direct children)
+- Use cases: multi-phase workflows (plan→implement→review), RFC lifecycle with embedded review protocols
+
+**Knowledge Fabric** — Connects all graph entities via semantic relations:
+- Automatic: TOUCHES (commit→file, with additions/deletions), CO_CHANGED (temporal coupling from TOUCHES), SYNAPSE (note↔note neural links from spreading activation)
+- Explicit: AFFECTS (decision→code), DISCUSSED (session→code), LINKED_TO (note→code)
+- Neural cycle: linked notes develop synapses → energy propagates → weak synapses decay → inactive notes lose energy
+- Maintenance: `bootstrap_knowledge_fabric` (initialize), `update_fabric_scores` (recalculate GDS), `update_staleness_scores` (note freshness)
+
+**Workspace (multi-project):**
+- `workspace(action: "get_overview", slug)` — workspace overview
+- `workspace_milestone(action: "create", slug, title)` — cross-project milestones
+- `workspace(action: "get_topology", slug)` — components and service dependencies
+- `resource(action: "list", workspace_slug)` — API contracts, shared schemas
+
+**Inheritance strategy** — Before modifying a class in an OOP language:
+- `code(action: "get_class_hierarchy", type_name)` — check parents AND children
+- `code(action: "find_subclasses", class_name)` — all transitive subclasses
+- `code(action: "find_interface_implementors", interface_name)` — all implementations
+- Rule: always check hierarchy BEFORE modifying a protected/public method
+
+**Process detection** — Business processes are BFS traces on CALLS graph:
+- `code(action: "get_entry_points/list_processes/get_process")` — discover and inspect processes
+- Before modifying cross-cutting code, explore processes that traverse it to anticipate side effects
+
+**Co-change patterns** — Complement structural impact analysis with temporal coupling:
+- `code(action: "get_co_change_graph/get_file_co_changers")` — files often modified together
+- Files that co-change are often coupled even without direct imports
+
+**Community-aware planning** — `code(action: "get_communities")` to segment tasks:
+- Each community = cluster of tightly coupled files (cohesion score)
+- A task should not cross more than 2 communities unless cross-cutting refactoring
+- `code(action: "enrich_communities")` — enrich labels via LLM
+
+**Wave Dispatch** — For plans with parallelizable tasks:
+- `plan(action: "get_waves")` → launch sub-agents per wave (one per task, `run_in_background: true`) → `TaskOutput(block: true)` before next wave
+- Each sub-agent gets context via `task(action: "get_prompt")` and autonomously updates steps/notes/decisions
+
+**Global vs project-scoped notes:**
+- Project-scoped (with `project_id`): project-specific gotchas/patterns
+- Global (without `project_id`): cross-project conventions
+- `note(action: "list_project")` for project notes, `note(action: "list")` includes global
+
+**add_discussed mandatory** — Call `chat(action: "add_discussed", session_id, entities)` for every file/function significantly modified or analyzed. Feeds DISCUSSED relations in the Knowledge Fabric."#;
+
+/// §13 compact — Best Practices Personas (condensed for L1, ~800 tokens)
+/// Condenses persona workflow, episodes, structural analysis, memory, and intent search
+/// into concise bullet points without detailed tool parameter listings.
+pub const SECTION_BP_PERSONAS_COMPACT: &str = r#"### Personas & Advanced Features (compact)
+
+**Living Personas** — Adaptive knowledge agents scoped to code regions, accumulating KNOWS relations:
+- `persona(action: "detect", project_id)` — auto-detect from graph clusters (communities + skill distribution)
+- `persona(action: "auto_build", project_id)` — auto-build from detected patterns
+- `persona(action: "find_for_file", project_id, file_path)` — find best persona (KNOWS + inheritance)
+- `persona(action: "activate", persona_id, query)` — context-aware activation
+- Compose: `add_file`, `add_function`, `add_skill`, `add_protocol`, `add_extends` (inheritance)
+- Workflow: detect → auto_build → (optional refinement) → find_for_file/activate during work
+
+**Episodic Memory** — Cognitive snapshots from protocol runs (stimulus → process → outcome):
+- `episode(action: "collect", run_id)` — collect after significant protocol runs (system-inference, code-review, wave-execution)
+- `episode(action: "list/get/export")` — retrieval and cross-instance portability
+- Episodes feed pattern recognition for future similar situations
+
+**Structural Analysis Advanced:**
+- Context Cards: `get_context_card` (dependencies, co-changers, notes, hotspot), `refresh_context_cards` (after changes)
+- Structural DNA & Twins: `get_structural_profile` (fingerprint), `find_structural_twins` (DNA cosine similarity), `cluster_dna` (K-means), `find_cross_project_twins` (workspace-wide)
+- Stress Testing: `stress_test_node/edge/cascade` (simulate failures), `find_bridges` (single points of failure)
+- Homeostasis & Drift: `get_homeostasis` (stability metrics), `get_structural_drift` (evolution tracking)
+- Link Prediction: `predict_missing_links` (discover missing edges), `check_link_plausibility` (specific link check)
+
+**Memory Horizons & Neural Scars:**
+- Notes lifecycle: ephemeral (recent) → consolidated (battle-tested, promoted by age + activation count)
+- `admin(action: "consolidate_memory")` — promote eligible notes
+- Neural scars: `scar_intensity` tracks pain points, influences search priority and context propagation
+- `admin(action: "heal_scars", node_id)` — reset after root cause resolved
+
+**Intent-Aware Search** — `note(action: "search_semantic")` and `code(action: "search")` support:
+- `temperature` (0-1): result diversity (0 = precise, 1 = exploratory)
+- `intent_mode`: "explore" | "plan" | "debug" | "review" — match to current phase
+- `profile`: analysis profile name for custom edge/fusion weights
+
+**Scaffolding Levels** — Auto-adapts prompt complexity based on project maturity (0-4):
+- L0 (New) → L1 (Early) → L2 (Growing) → L3 (Mature) → L4 (Expert)
+- `project(action: "get_scaffolding_level/set_scaffolding_override")`"#;
+
 /// §14 — Deep Maintenance
 pub const SECTION_DEEP_MAINTENANCE: &str = r#"### Deep Maintenance
 
@@ -988,36 +1124,42 @@ pub fn all_base_sections() -> Vec<BasePromptSection> {
             content: SECTION_IDENTITY_ROLE,
             priority: 0,
             condition: ActivationCondition::always(),
+            compact_content: None,
         },
         BasePromptSection {
             id: PromptSectionId::MegatoolsSyntax,
             content: SECTION_MEGATOOLS_SYNTAX,
             priority: 1,
             condition: ActivationCondition::always(),
+            compact_content: None,
         },
         BasePromptSection {
             id: PromptSectionId::DataModel,
             content: SECTION_DATA_MODEL,
             priority: 2,
             condition: ActivationCondition::scaffolding_range(0, 2),
+            compact_content: None,
         },
         BasePromptSection {
             id: PromptSectionId::TreeSitterSync,
             content: SECTION_TREE_SITTER,
             priority: 3,
             condition: ActivationCondition::scaffolding_range(0, 2),
+            compact_content: None,
         },
         BasePromptSection {
             id: PromptSectionId::GitWorkflow,
             content: SECTION_GIT_WORKFLOW,
             priority: 4,
             condition: ActivationCondition::scaffolding_range(0, 3),
+            compact_content: None,
         },
         BasePromptSection {
             id: PromptSectionId::TaskExecutionProtocol,
             content: SECTION_TASK_EXECUTION,
             priority: 5,
             condition: ActivationCondition::when_plan_active(),
+            compact_content: None,
         },
         BasePromptSection {
             id: PromptSectionId::PlanningProtocol,
@@ -1025,54 +1167,65 @@ pub fn all_base_sections() -> Vec<BasePromptSection> {
             priority: 6,
             // Always included since planning can be requested at any time
             condition: ActivationCondition::scaffolding_range(0, 3),
+            compact_content: None,
         },
         BasePromptSection {
             id: PromptSectionId::StatusManagement,
             content: SECTION_STATUS_MANAGEMENT,
             priority: 7,
             condition: ActivationCondition::scaffolding_range(0, 2),
+            compact_content: None,
         },
         BasePromptSection {
             id: PromptSectionId::BestPracticesImpact,
             content: SECTION_BP_IMPACT,
             priority: 8,
             condition: ActivationCondition::always(),
+            compact_content: None,
         },
         BasePromptSection {
             id: PromptSectionId::BestPracticesSearch,
             content: SECTION_BP_SEARCH,
             priority: 9,
             condition: ActivationCondition::scaffolding_range(0, 3),
+            compact_content: None,
         },
         BasePromptSection {
             id: PromptSectionId::BestPracticesKnowledge,
             content: SECTION_BP_KNOWLEDGE,
             priority: 10,
             condition: ActivationCondition::always(),
+            compact_content: None,
         },
         BasePromptSection {
             id: PromptSectionId::BestPracticesAdvanced,
             content: SECTION_BP_ADVANCED,
             priority: 11,
-            condition: ActivationCondition::scaffolding_range(0, 1),
+            // L0: full content, L1: compact variant
+            condition: ActivationCondition::scaffolding_range_with_compact(0, 1, 1, 1),
+            compact_content: Some(SECTION_BP_ADVANCED_COMPACT),
         },
         BasePromptSection {
             id: PromptSectionId::BestPracticesPersonas,
             content: SECTION_BP_PERSONAS,
             priority: 12,
-            condition: ActivationCondition::scaffolding_range(0, 1),
+            // L0: full content, L1: compact variant
+            condition: ActivationCondition::scaffolding_range_with_compact(0, 1, 1, 1),
+            compact_content: Some(SECTION_BP_PERSONAS_COMPACT),
         },
         BasePromptSection {
             id: PromptSectionId::DeepMaintenance,
             content: SECTION_DEEP_MAINTENANCE,
             priority: 13,
             condition: ActivationCondition::scaffolding_range(0, 1),
+            compact_content: None,
         },
         BasePromptSection {
             id: PromptSectionId::PlanExecutionAutomation,
             content: SECTION_PLAN_EXECUTION,
             priority: 14,
             condition: ActivationCondition::when_plan_active(),
+            compact_content: None,
         },
         BasePromptSection {
             id: PromptSectionId::DelegationAwareness,
@@ -1085,7 +1238,9 @@ pub fn all_base_sections() -> Vec<BasePromptSection> {
                 requires_active_protocol: false,
                 min_task_count: Some(2), // Only show when there are multiple tasks
                 always: false,
+                compact_scaffolding_range: None,
             },
+            compact_content: None,
         },
         // §17 — Tool Reference is handled separately (selective by group)
         // but included in the registry for completeness
@@ -1094,6 +1249,7 @@ pub fn all_base_sections() -> Vec<BasePromptSection> {
             content: "", // Content comes from TOOL_REFERENCE or selected groups
             priority: 20,
             condition: ActivationCondition::always(),
+            compact_content: None,
         },
     ]
 }
@@ -1101,10 +1257,20 @@ pub fn all_base_sections() -> Vec<BasePromptSection> {
 /// Select sections that are active given the current context.
 ///
 /// Returns sections filtered by their activation conditions, sorted by priority.
+/// When a section has a compact variant and the scaffolding level falls within
+/// its `compact_scaffolding_range`, the compact content replaces the full content.
 pub fn select_sections(ctx: &ComposerContext) -> Vec<BasePromptSection> {
     all_base_sections()
         .into_iter()
         .filter(|s| s.condition.is_active(ctx))
+        .map(|mut s| {
+            if s.condition.use_compact(ctx.scaffolding_level) {
+                if let Some(compact) = s.compact_content {
+                    s.content = compact;
+                }
+            }
+            s
+        })
         .collect()
 }
 
@@ -1119,6 +1285,116 @@ pub fn assemble_sections(sections: &[BasePromptSection]) -> String {
         .map(|s| s.content)
         .collect::<Vec<_>>()
         .join("\n\n")
+}
+
+/// Assemble sections with weight-based truncation.
+///
+/// When the total base prompt exceeds `max_chars`, sections with the lowest
+/// weights (from `SectionHint`) are truncated first. Sections not in the
+/// hints map are treated as weight 1.0 (kept at full size).
+///
+/// Truncation strategy:
+/// 1. Sections with weight 0.0 are excluded entirely
+/// 2. Remaining sections are sorted by weight ascending
+/// 3. Lowest-weight sections are progressively truncated (to 50% then 25% then 0%)
+///    until the total fits within `max_chars`
+pub fn assemble_sections_weighted(
+    sections: &[BasePromptSection],
+    hints: &[(PromptSectionId, f32)],
+    max_chars: usize,
+) -> String {
+    use std::collections::HashMap;
+
+    let weight_map: HashMap<PromptSectionId, f32> = hints.iter().cloned().collect();
+
+    // Filter out weight=0.0 sections and empty sections
+    let weighted: Vec<(&BasePromptSection, f32)> = sections
+        .iter()
+        .filter(|s| !s.content.is_empty())
+        .filter_map(|s| {
+            let w = weight_map.get(&s.id).copied().unwrap_or(1.0);
+            if w <= 0.0 {
+                None
+            } else {
+                Some((s, w))
+            }
+        })
+        .collect();
+
+    // Check if we're under budget with all sections
+    let total: usize = weighted.iter().map(|(s, _)| s.content.len()).sum();
+    if total <= max_chars {
+        return weighted
+            .iter()
+            .map(|(s, _)| s.content)
+            .collect::<Vec<_>>()
+            .join("\n\n");
+    }
+
+    // Over budget: progressively truncate lowest-weight sections
+    // Sort by weight ascending (lowest weight = truncated first)
+    let mut by_weight: Vec<(usize, f32)> = weighted
+        .iter()
+        .enumerate()
+        .map(|(i, (_, w))| (i, *w))
+        .collect();
+    by_weight.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Build content with truncation ratios
+    let mut ratios: Vec<f32> = vec![1.0; weighted.len()];
+    let truncation_steps = [0.5, 0.25, 0.0]; // Progressive truncation
+
+    'outer: for &step in &truncation_steps {
+        for &(idx, _weight) in &by_weight {
+            ratios[idx] = step;
+            let current_total: usize = weighted
+                .iter()
+                .enumerate()
+                .map(|(i, (s, _))| {
+                    let content_len = s.content.len();
+                    (content_len as f32 * ratios[i]) as usize
+                })
+                .sum();
+            if current_total <= max_chars {
+                break 'outer;
+            }
+        }
+    }
+
+    // Render with applied ratios
+    weighted
+        .iter()
+        .enumerate()
+        .filter_map(|(i, (s, _))| {
+            let ratio = ratios[i];
+            if ratio <= 0.0 {
+                return None;
+            }
+            if ratio >= 1.0 {
+                return Some(s.content.to_string());
+            }
+            // Truncate to ratio of original length
+            let target_len = (s.content.len() as f32 * ratio) as usize;
+            let boundary = floor_char_boundary_pub(s.content, target_len);
+            let mut truncated = s.content[..boundary].to_string();
+            truncated.push_str("\n\n[... section truncated]");
+            Some(truncated)
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// Find the largest char boundary <= the given byte index.
+/// Public variant for use from other modules.
+pub fn floor_char_boundary_pub(s: &str, index: usize) -> usize {
+    if index >= s.len() {
+        return s.len();
+    }
+    let mut i = index;
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
 }
 
 // ============================================================================
@@ -1139,11 +1415,11 @@ pub enum ToolRefGroupId {
     CodeExploration,
     /// admin — included at L0-L1 or when GDS/maintenance requested
     Structural,
-    /// protocol, skill, persona, episode — included when protocols active or L0-L1
+    /// protocol, skill, persona, episode, lifecycle_hook — included when protocols active or L0-L1
     Behavioral,
     /// workspace, workspace_milestone, resource, component — included in multi-project
     Workspace,
-    /// chat, feature_graph, sharing, reasoning — included on demand
+    /// chat, feature_graph, sharing, reasoning, neural_routing, trajectory — included on demand
     Collaboration,
 }
 
@@ -1174,9 +1450,16 @@ impl ToolRefGroupId {
             Self::Knowledge => &["note", "decision", "commit"],
             Self::CodeExploration => &["code", "analysis_profile"],
             Self::Structural => &["admin"],
-            Self::Behavioral => &["protocol", "skill", "persona", "episode"],
+            Self::Behavioral => &["protocol", "skill", "persona", "episode", "lifecycle_hook"],
             Self::Workspace => &["workspace", "workspace_milestone", "resource", "component"],
-            Self::Collaboration => &["chat", "feature_graph", "sharing", "reasoning"],
+            Self::Collaboration => &[
+                "chat",
+                "feature_graph",
+                "sharing",
+                "reasoning",
+                "neural_routing",
+                "trajectory",
+            ],
         }
     }
 
@@ -1187,9 +1470,13 @@ impl ToolRefGroupId {
             Self::Knowledge => "Knowledge (Notes, Decisions, Commits)",
             Self::CodeExploration => "Code Exploration & Analytics",
             Self::Structural => "Admin & Sync",
-            Self::Behavioral => "Behavioral (Protocols, Skills, Personas, Episodes)",
+            Self::Behavioral => {
+                "Behavioral (Protocols, Skills, Personas, Episodes, Lifecycle Hooks)"
+            }
             Self::Workspace => "Workspace (Multi-project)",
-            Self::Collaboration => "Collaboration (Chat, Features, Sharing, Reasoning)",
+            Self::Collaboration => {
+                "Collaboration (Chat, Features, Sharing, Reasoning, Neural Routing)"
+            }
         }
     }
 }
@@ -1208,6 +1495,39 @@ pub struct ToolGroupSelectionContext {
 }
 
 // Default is derived — all fields have natural defaults (0, false, empty vecs).
+
+/// Check if `text` contains `keyword` as a whole word (not as a substring).
+///
+/// Uses word-boundary detection: the character before and after the keyword
+/// must be non-alphanumeric (or absent). This prevents "profile" matching "file",
+/// "findings" matching "find", etc.
+///
+/// Multi-word keywords (e.g. "call graph", "state machine") are matched via
+/// simple substring contains, since they are already specific enough.
+fn contains_word(text: &str, keyword: &str) -> bool {
+    // Multi-word keywords: substring match is fine (already specific)
+    if keyword.contains(' ') {
+        return text.contains(keyword);
+    }
+    // Single-word: require word boundaries
+    let kw_bytes = keyword.as_bytes();
+    let text_bytes = text.as_bytes();
+    let kw_len = kw_bytes.len();
+    if kw_len > text_bytes.len() {
+        return false;
+    }
+    for i in 0..=(text_bytes.len() - kw_len) {
+        if &text_bytes[i..i + kw_len] == kw_bytes {
+            let before_ok = i == 0 || !text_bytes[i - 1].is_ascii_alphanumeric();
+            let after_ok =
+                i + kw_len == text_bytes.len() || !text_bytes[i + kw_len].is_ascii_alphanumeric();
+            if before_ok && after_ok {
+                return true;
+            }
+        }
+    }
+    false
+}
 
 /// Intent keywords that trigger specific tool groups.
 const CODE_KEYWORDS: &[&str] = &[
@@ -1305,11 +1625,19 @@ pub fn select_tool_groups(ctx: &ToolGroupSelectionContext) -> Vec<ToolRefGroupId
     let msg_lower: String = ctx.user_intent_keywords.join(" ").to_lowercase();
 
     // Intent-based inclusion
-    let has_code_intent = CODE_KEYWORDS.iter().any(|kw| msg_lower.contains(kw));
-    let has_structural_intent = STRUCTURAL_KEYWORDS.iter().any(|kw| msg_lower.contains(kw));
-    let has_behavioral_intent = BEHAVIORAL_KEYWORDS.iter().any(|kw| msg_lower.contains(kw));
-    let has_workspace_intent = WORKSPACE_KEYWORDS.iter().any(|kw| msg_lower.contains(kw));
-    let has_collab_intent = COLLAB_KEYWORDS.iter().any(|kw| msg_lower.contains(kw));
+    let has_code_intent = CODE_KEYWORDS.iter().any(|kw| contains_word(&msg_lower, kw));
+    let has_structural_intent = STRUCTURAL_KEYWORDS
+        .iter()
+        .any(|kw| contains_word(&msg_lower, kw));
+    let has_behavioral_intent = BEHAVIORAL_KEYWORDS
+        .iter()
+        .any(|kw| contains_word(&msg_lower, kw));
+    let has_workspace_intent = WORKSPACE_KEYWORDS
+        .iter()
+        .any(|kw| contains_word(&msg_lower, kw));
+    let has_collab_intent = COLLAB_KEYWORDS
+        .iter()
+        .any(|kw| contains_word(&msg_lower, kw));
 
     // CodeExploration: included by intent OR at L0-L2 (common need)
     if has_code_intent || ctx.scaffolding_level <= 2 {
@@ -1617,17 +1945,17 @@ mod tests {
     // ── Tool Reference Group tests ───────────────────────────────────
 
     #[test]
-    fn test_tool_groups_cover_all_25_tools() {
+    fn test_tool_groups_cover_all_28_tools() {
         let mut all_tools: Vec<&str> = ToolRefGroupId::ALL
             .iter()
             .flat_map(|g| g.tool_names().iter().copied())
             .collect();
         all_tools.sort();
         all_tools.dedup();
-        // 25 mega-tools + analysis_profile + neural_routing/trajectory = at least 25
+        // Must cover all 28 mega-tools defined in mcp/tools.rs
         assert!(
-            all_tools.len() >= 25,
-            "Groups should cover at least 25 tools, got {}",
+            all_tools.len() >= 28,
+            "Groups should cover at least 28 tools, got {}",
             all_tools.len()
         );
     }
@@ -1767,5 +2095,215 @@ mod tests {
             "Core+Knowledge should be <60% of full reference, got {:.1}%",
             ratio * 100.0
         );
+    }
+
+    // ── Compact variant tests ───────────────────────────────────────
+
+    #[test]
+    fn test_compact_variants_size_under_60_percent() {
+        let advanced_full = SECTION_BP_ADVANCED.len();
+        let advanced_compact = SECTION_BP_ADVANCED_COMPACT.len();
+        let personas_full = SECTION_BP_PERSONAS.len();
+        let personas_compact = SECTION_BP_PERSONAS_COMPACT.len();
+
+        let adv_ratio = advanced_compact as f64 / advanced_full as f64;
+        let pers_ratio = personas_compact as f64 / personas_full as f64;
+
+        assert!(
+            adv_ratio <= 0.60,
+            "SECTION_BP_ADVANCED_COMPACT should be ≤60% of original, got {:.1}%",
+            adv_ratio * 100.0
+        );
+        assert!(
+            pers_ratio <= 0.60,
+            "SECTION_BP_PERSONAS_COMPACT should be ≤60% of original, got {:.1}%",
+            pers_ratio * 100.0
+        );
+    }
+
+    #[test]
+    fn test_l0_uses_full_content() {
+        let ctx = ComposerContext {
+            scaffolding_level: 0,
+            has_active_plan: true,
+            has_active_protocol: true,
+            task_count: 10,
+        };
+        let sections = select_sections(&ctx);
+
+        let advanced = sections
+            .iter()
+            .find(|s| s.id == PromptSectionId::BestPracticesAdvanced)
+            .expect("BestPracticesAdvanced should be present at L0");
+        assert_eq!(
+            advanced.content, SECTION_BP_ADVANCED,
+            "L0 should use full BestPracticesAdvanced content"
+        );
+
+        let personas = sections
+            .iter()
+            .find(|s| s.id == PromptSectionId::BestPracticesPersonas)
+            .expect("BestPracticesPersonas should be present at L0");
+        assert_eq!(
+            personas.content, SECTION_BP_PERSONAS,
+            "L0 should use full BestPracticesPersonas content"
+        );
+    }
+
+    #[test]
+    fn test_l1_uses_compact_variants() {
+        let ctx = ComposerContext {
+            scaffolding_level: 1,
+            has_active_plan: true,
+            has_active_protocol: true,
+            task_count: 10,
+        };
+        let sections = select_sections(&ctx);
+
+        let advanced = sections
+            .iter()
+            .find(|s| s.id == PromptSectionId::BestPracticesAdvanced)
+            .expect("BestPracticesAdvanced should be present at L1");
+        assert_eq!(
+            advanced.content, SECTION_BP_ADVANCED_COMPACT,
+            "L1 should use compact BestPracticesAdvanced content"
+        );
+
+        let personas = sections
+            .iter()
+            .find(|s| s.id == PromptSectionId::BestPracticesPersonas)
+            .expect("BestPracticesPersonas should be present at L1");
+        assert_eq!(
+            personas.content, SECTION_BP_PERSONAS_COMPACT,
+            "L1 should use compact BestPracticesPersonas content"
+        );
+    }
+
+    #[test]
+    fn test_l2_excludes_advanced_and_personas() {
+        let ctx = ComposerContext {
+            scaffolding_level: 2,
+            has_active_plan: true,
+            has_active_protocol: true,
+            task_count: 10,
+        };
+        let sections = select_sections(&ctx);
+        let ids: Vec<_> = sections.iter().map(|s| s.id).collect();
+
+        assert!(
+            !ids.contains(&PromptSectionId::BestPracticesAdvanced),
+            "BestPracticesAdvanced should be absent at L2"
+        );
+        assert!(
+            !ids.contains(&PromptSectionId::BestPracticesPersonas),
+            "BestPracticesPersonas should be absent at L2"
+        );
+    }
+
+    #[test]
+    fn test_l0_l1_differentiated_content_size() {
+        let ctx_l0 = ComposerContext {
+            scaffolding_level: 0,
+            has_active_plan: true,
+            has_active_protocol: true,
+            task_count: 10,
+        };
+        let ctx_l1 = ComposerContext {
+            scaffolding_level: 1,
+            has_active_plan: true,
+            has_active_protocol: true,
+            task_count: 10,
+        };
+
+        let sections_l0 = select_sections(&ctx_l0);
+        let sections_l1 = select_sections(&ctx_l1);
+
+        // Same number of sections (both include the same sections)
+        assert_eq!(sections_l0.len(), sections_l1.len());
+
+        // But L1 total content is smaller due to compact variants
+        let total_l0: usize = sections_l0.iter().map(|s| s.content.len()).sum();
+        let total_l1: usize = sections_l1.iter().map(|s| s.content.len()).sum();
+        assert!(
+            total_l1 < total_l0,
+            "L1 total content ({}) should be smaller than L0 ({})",
+            total_l1,
+            total_l0
+        );
+
+        // The difference should be significant (~1400 tokens = ~5600 chars)
+        let diff = total_l0 - total_l1;
+        assert!(
+            diff > 4000,
+            "L0→L1 content reduction should be >4000 chars, got {}",
+            diff
+        );
+    }
+
+    #[test]
+    fn test_use_compact_method() {
+        let cond = ActivationCondition::scaffolding_range_with_compact(0, 1, 1, 1);
+        assert!(!cond.use_compact(0), "L0 should NOT use compact");
+        assert!(cond.use_compact(1), "L1 SHOULD use compact");
+
+        let no_compact = ActivationCondition::scaffolding_range(0, 1);
+        assert!(!no_compact.use_compact(0));
+        assert!(!no_compact.use_compact(1));
+    }
+
+    // ── contains_word tests ───────────────────────────────────────
+
+    #[test]
+    fn test_contains_word_exact_match() {
+        assert!(contains_word("read the file content", "file"));
+        assert!(contains_word("file is here", "file"));
+        assert!(contains_word("the file", "file"));
+        assert!(contains_word("file", "file"));
+    }
+
+    #[test]
+    fn test_contains_word_rejects_substring() {
+        // "profile" should NOT match "file"
+        assert!(!contains_word("check the user profile settings", "file"));
+        // "findings" should NOT match "find"
+        assert!(!contains_word("search for findings", "find"));
+        // "import" should NOT match "port"
+        assert!(!contains_word("import the module", "port"));
+    }
+
+    #[test]
+    fn test_contains_word_with_punctuation() {
+        assert!(contains_word("open file.", "file"));
+        assert!(contains_word("file, folder", "file"));
+        assert!(contains_word("(file)", "file"));
+        assert!(contains_word("the file's content", "file"));
+    }
+
+    #[test]
+    fn test_contains_word_multi_word_keyword() {
+        assert!(contains_word("analyze the call graph", "call graph"));
+        assert!(contains_word("state machine transitions", "state machine"));
+        // Multi-word uses substring match, so embedded is OK
+        assert!(contains_word("recall graph data", "call graph"));
+    }
+
+    #[test]
+    fn test_contains_word_no_false_positive_code_keywords() {
+        // "profile" should not trigger "file"
+        let msg = "check the user profile settings";
+        assert!(!CODE_KEYWORDS.iter().any(|kw| contains_word(msg, kw)));
+
+        // "findings" should not trigger "find"
+        let msg2 = "review the findings report";
+        assert!(!CODE_KEYWORDS.iter().any(|kw| contains_word(msg2, kw)));
+    }
+
+    #[test]
+    fn test_contains_word_true_positive_code_keywords() {
+        let msg = "read the file content";
+        assert!(CODE_KEYWORDS.iter().any(|kw| contains_word(msg, kw)));
+
+        let msg2 = "find the function definition";
+        assert!(CODE_KEYWORDS.iter().any(|kw| contains_word(msg2, kw)));
     }
 }

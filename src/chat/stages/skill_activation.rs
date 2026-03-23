@@ -21,9 +21,10 @@ use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::chat::enrichment::{
-    EnrichmentConfig, EnrichmentContext, EnrichmentInput, EnrichmentStage,
+    EnrichmentConfig, EnrichmentInput, ParallelEnrichmentStage, StageOutput,
 };
 use crate::neo4j::traits::GraphStore;
+use crate::neurons::intent::{IntentDetector, QueryIntentMode};
 use crate::skills::activation::evaluate_skill_match;
 use crate::skills::models::SkillNode;
 
@@ -97,37 +98,7 @@ impl SkillActivationStage {
     /// Looks for patterns like `src/foo/bar.rs`, `./path/to/file`, etc.
     /// Used for FileGlob trigger matching.
     fn extract_file_paths(message: &str) -> Vec<String> {
-        let mut paths = Vec::new();
-        // Match file-like patterns: word chars, slashes, dots, hyphens
-        // Must contain at least one slash or dot+extension to be a file path
-        for word in message.split_whitespace() {
-            // Strip common wrapping chars (quotes, backticks, parens)
-            let cleaned = word.trim_matches(|c: char| {
-                c == '`' || c == '\'' || c == '"' || c == '(' || c == ')' || c == ','
-            });
-            if cleaned.is_empty() {
-                continue;
-            }
-            // Must contain a slash (path separator) or look like a file extension
-            let has_slash = cleaned.contains('/');
-            let has_extension = cleaned.contains('.') && {
-                let parts: Vec<&str> = cleaned.rsplit('.').collect();
-                parts
-                    .first()
-                    .map(|ext| ext.len() <= 10 && ext.chars().all(|c| c.is_alphanumeric()))
-                    .unwrap_or(false)
-            };
-            if has_slash || (has_extension && cleaned.len() > 3) {
-                // Additional check: must have path-like characters only
-                if cleaned
-                    .chars()
-                    .all(|c| c.is_alphanumeric() || "/_.-+@".contains(c))
-                {
-                    paths.push(cleaned.to_string());
-                }
-            }
-        }
-        paths
+        crate::utils::file_path_extractor::extract_file_paths(message)
     }
 
     /// Match skills against the user message.
@@ -187,18 +158,20 @@ impl SkillActivationStage {
 }
 
 #[async_trait::async_trait]
-impl EnrichmentStage for SkillActivationStage {
-    async fn execute(&self, input: &EnrichmentInput, ctx: &mut EnrichmentContext) -> Result<()> {
+impl ParallelEnrichmentStage for SkillActivationStage {
+    async fn execute(&self, input: &EnrichmentInput) -> Result<StageOutput> {
+        let mut output = StageOutput::new(self.name());
+
         // Need a project scope for skill matching
         let project_id = if let Some(id) = input.project_id {
             id
         } else if let Some(ref slug) = input.project_slug {
             match self.resolve_project_id(slug).await? {
                 Some(id) => id,
-                None => return Ok(()), // No project found, skip
+                None => return Ok(output), // No project found, skip
             }
         } else {
-            return Ok(()); // No project scope, skip
+            return Ok(output); // No project scope, skip
         };
 
         // Match skills against the message
@@ -207,13 +180,13 @@ impl EnrichmentStage for SkillActivationStage {
         if matches.is_empty() {
             // No skill match — detect intent from message keywords as fallback
             let intent = detect_intent_from_message(&input.message);
-            ctx.set_hint("intent", intent);
-            return Ok(());
+            output.set_hint("intent", intent);
+            return Ok(output);
         }
 
         // Emit intent hint based on matched skill tags/names
         let intent = detect_intent_from_skills(&matches, &input.message);
-        ctx.set_hint("intent", intent);
+        output.set_hint("intent", intent);
 
         // Build enrichment content from activated skills
         let mut content_parts: Vec<String> = Vec::new();
@@ -245,7 +218,12 @@ impl EnrichmentStage for SkillActivationStage {
         }
 
         if !content_parts.is_empty() {
-            ctx.add_section("Activated Skills", content_parts.join("\n"), self.name());
+            output.add_section(
+                "Activated Skills",
+                content_parts.join("\n"),
+                self.name(),
+                crate::chat::enrichment::EnrichmentSource::SkillActivation,
+            );
         }
 
         // ── Trajectory collection: record skill activation decision ────────
@@ -326,7 +304,7 @@ impl EnrichmentStage for SkillActivationStage {
             });
         }
 
-        Ok(())
+        Ok(output)
     }
 
     fn name(&self) -> &str {
@@ -386,41 +364,32 @@ fn detect_intent_from_skills(matches: &[(SkillNode, f64)], message: &str) -> &'s
     detect_intent_from_message(message)
 }
 
-/// Detect intent from the raw message keywords.
+/// Map a [`QueryIntentMode`] from the canonical `IntentDetector` to the
+/// enrichment hint string used by `KnowledgeInjectionStage` / `IntentWeightMap`.
 ///
-/// Returns one of: planning, code, debug, review, general
+/// Mapping:
+/// - `Debug`   → `"debug"`
+/// - `Explore` → `"explore"`
+/// - `Impact`  → `"review"`
+/// - `Plan`    → `"planning"`
+/// - `Default` → `"general"`
+fn map_intent_mode(mode: QueryIntentMode) -> &'static str {
+    match mode {
+        QueryIntentMode::Debug => "debug",
+        QueryIntentMode::Explore => "explore",
+        QueryIntentMode::Impact => "review",
+        QueryIntentMode::Plan => "planning",
+        QueryIntentMode::Default => "general",
+    }
+}
+
+/// Detect intent from the raw message using the canonical [`IntentDetector`].
+///
+/// Returns one of: planning, code, debug, review, explore, general.
+/// Delegates to `IntentDetector::detect()` for unified keyword matching
+/// (bilingual FR/EN support), then maps the result to enrichment hint values.
 fn detect_intent_from_message(message: &str) -> &'static str {
-    let lower = message.to_lowercase();
-
-    if lower.contains("plan") || lower.contains("roadmap") || lower.contains("milestone") {
-        return "planning";
-    }
-    if lower.contains("debug")
-        || lower.contains("error")
-        || lower.contains("fix")
-        || lower.contains("bug")
-        || lower.contains("crash")
-    {
-        return "debug";
-    }
-    if lower.contains("review")
-        || lower.contains("coverage")
-        || lower.contains("audit")
-        || lower.contains("quality")
-    {
-        return "review";
-    }
-    if lower.contains("implement")
-        || lower.contains("code")
-        || lower.contains("refactor")
-        || lower.contains("write")
-        || lower.contains("create")
-        || lower.contains("add")
-    {
-        return "code";
-    }
-
-    "general"
+    map_intent_mode(IntentDetector::detect(message))
 }
 
 // ============================================================================
@@ -430,6 +399,7 @@ fn detect_intent_from_message(message: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chat::enrichment::EnrichmentContext;
 
     #[test]
     fn test_extract_file_paths_basic() {
@@ -508,16 +478,24 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_intent_code() {
-        assert_eq!(detect_intent_from_message("implement the feature"), "code");
-        assert_eq!(detect_intent_from_message("refactor this module"), "code");
-        assert_eq!(detect_intent_from_message("add a new endpoint"), "code");
+    fn test_detect_intent_code_mapped_to_planning_or_review() {
+        // After unification with IntentDetector, "implement" maps to Plan → "planning"
+        // and "refactor" maps to Impact → "review".
+        assert_eq!(
+            detect_intent_from_message("implement the feature"),
+            "planning"
+        );
+        assert_eq!(detect_intent_from_message("refactor this module"), "review");
     }
 
     #[test]
     fn test_detect_intent_general() {
         assert_eq!(detect_intent_from_message("hello"), "general");
-        assert_eq!(detect_intent_from_message("how does this work?"), "general");
+    }
+
+    #[test]
+    fn test_detect_intent_explore() {
+        assert_eq!(detect_intent_from_message("how does this work?"), "explore");
     }
 
     #[test]

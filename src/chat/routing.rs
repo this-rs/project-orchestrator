@@ -865,4 +865,79 @@ mod tests {
         };
         assert_eq!(hint_with_budget.token_budget, Some(2000));
     }
+
+    // ── Compact variant routing tests ───────────────────────────────
+
+    #[test]
+    fn test_heuristic_router_l0_uses_full_content() {
+        let router = HeuristicRouter;
+        let ctx = RoutingContext {
+            scaffolding_level: 0,
+            has_active_plan: true,
+            has_active_protocol: true,
+            task_count: 10,
+            ..Default::default()
+        };
+
+        let decision = router.route(&ctx);
+        let advanced = decision
+            .sections
+            .iter()
+            .find(|s| s.id == PromptSectionId::BestPracticesAdvanced)
+            .expect("BestPracticesAdvanced should be present at L0");
+
+        // L0 should use full content (contains code examples)
+        assert!(
+            advanced.content.contains("```"),
+            "L0 BestPracticesAdvanced should contain code examples"
+        );
+    }
+
+    #[test]
+    fn test_heuristic_router_l1_uses_compact_content() {
+        let router = HeuristicRouter;
+        let ctx = RoutingContext {
+            scaffolding_level: 1,
+            has_active_plan: true,
+            has_active_protocol: true,
+            task_count: 10,
+            ..Default::default()
+        };
+
+        let decision = router.route(&ctx);
+        let advanced = decision
+            .sections
+            .iter()
+            .find(|s| s.id == PromptSectionId::BestPracticesAdvanced)
+            .expect("BestPracticesAdvanced should be present at L1");
+
+        // L1 should use compact content (no code examples)
+        assert!(
+            !advanced.content.contains("```"),
+            "L1 BestPracticesAdvanced should NOT contain code examples"
+        );
+        assert!(
+            advanced.content.contains("(compact)"),
+            "L1 BestPracticesAdvanced should be the compact variant"
+        );
+    }
+
+    #[test]
+    fn test_heuristic_router_l2_excludes_advanced() {
+        let router = HeuristicRouter;
+        let ctx = RoutingContext {
+            scaffolding_level: 2,
+            has_active_plan: true,
+            has_active_protocol: true,
+            task_count: 10,
+            ..Default::default()
+        };
+
+        let decision = router.route(&ctx);
+        let ids: Vec<_> = decision.sections.iter().map(|s| s.id).collect();
+        assert!(
+            !ids.contains(&PromptSectionId::BestPracticesAdvanced),
+            "BestPracticesAdvanced should be absent at L2"
+        );
+    }
 }

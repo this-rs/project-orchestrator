@@ -43,16 +43,19 @@ pub enum PromptSection {
 impl PromptSection {
     /// Priority order for sorting (lower = rendered first).
     fn priority(&self) -> u8 {
+        // Enrichment is placed right after Constraints (priority 3) because it contains
+        // the most contextually relevant content (freshly searched knowledge, active skills,
+        // propagated notes). FileContext is demoted below it.
         match self {
             Self::TaskDescription(_) => 0,
             Self::Steps(_) => 1,
             Self::Constraints(_) => 2,
-            Self::KnowledgeNotes(_) => 3,
-            Self::PropagatedNotes(_) => 4,
-            Self::PersonaContext(_) => 5,
-            Self::SkillContext(_) => 6,
-            Self::FileContext(_) => 7,
-            Self::Enrichment(_) => 8,
+            Self::Enrichment(_) => 3,
+            Self::SkillContext(_) => 4,
+            Self::KnowledgeNotes(_) => 5,
+            Self::PropagatedNotes(_) => 6,
+            Self::PersonaContext(_) => 7,
+            Self::FileContext(_) => 8,
             Self::RunnerConstraints(_) => 9,
             Self::Custom(_) => 10,
         }
@@ -852,8 +855,8 @@ mod tests {
     #[test]
     fn test_persona_context_section_priority() {
         let section = PromptSection::PersonaContext("test".to_string());
-        // PersonaContext priority = 5 (after PropagatedNotes=4, before SkillContext=6)
-        assert_eq!(section.priority(), 5);
+        // PersonaContext priority = 7 (after PropagatedNotes=6, before FileContext=8)
+        assert_eq!(section.priority(), 7);
     }
 
     #[test]
@@ -895,7 +898,7 @@ mod tests {
     }
 
     #[test]
-    fn test_persona_context_ordering_before_skill_context() {
+    fn test_persona_context_ordering_after_skill_context() {
         let prompt = PromptBuilder::new()
             .with_skill_context("skill content")
             .with_persona_context("persona content")
@@ -904,8 +907,8 @@ mod tests {
         let persona_pos = prompt.find("## Persona Context").unwrap();
         let skill_pos = prompt.find("## Skill Context").unwrap();
         assert!(
-            persona_pos < skill_pos,
-            "PersonaContext (priority 5) should render before SkillContext (priority 6)"
+            skill_pos < persona_pos,
+            "SkillContext (priority 4) should render before PersonaContext (priority 7)"
         );
     }
 
@@ -920,7 +923,7 @@ mod tests {
         let persona_pos = prompt.find("## Persona Context").unwrap();
         assert!(
             propagated_pos < persona_pos,
-            "PropagatedNotes (priority 4) should render before PersonaContext (priority 5)"
+            "PropagatedNotes (priority 6) should render before PersonaContext (priority 7)"
         );
     }
 
@@ -936,7 +939,10 @@ mod tests {
 
     #[test]
     fn test_persona_context_in_full_prompt() {
-        // Simulate a full runner prompt with persona context included
+        // Simulate a full runner prompt with persona context included.
+        // New priority order: Task(0), Steps(1), Constraints(2), Enrichment(3),
+        // SkillContext(4), KnowledgeNotes(5), PropagatedNotes(6),
+        // PersonaContext(7), FileContext(8), RunnerConstraints(9), Custom(10).
         let prompt = PromptBuilder::new()
             .with_task("Implement cache layer")
             .with_steps("1. Add Redis\n2. Wire up")
@@ -951,15 +957,15 @@ mod tests {
             .with_runner_constraints("Branch: feat/cache")
             .build();
 
-        // Verify all sections present and in order
+        // Verify all sections present and in new priority order
         let positions: Vec<usize> = vec![
             prompt.find("# Task").unwrap(),
             prompt.find("## Steps").unwrap(),
             prompt.find("## Constraints").unwrap(),
+            prompt.find("## Skill Context").unwrap(),
             prompt.find("## Knowledge Notes").unwrap(),
             prompt.find("## Propagated Knowledge").unwrap(),
             prompt.find("## Persona Context").unwrap(),
-            prompt.find("## Skill Context").unwrap(),
             prompt.find("## Files to Modify").unwrap(),
             prompt.find("## Runner Constraints").unwrap(),
         ];
@@ -1013,6 +1019,29 @@ mod tests {
         // Both should appear (PromptBuilder doesn't deduplicate)
         assert!(prompt.contains("Persona A context"));
         assert!(prompt.contains("Persona B context"));
+    }
+
+    #[test]
+    fn test_enrichment_before_knowledge_notes_in_runner() {
+        // T2.2 requirement: Enrichment (priority 3) should render before
+        // KnowledgeNotes (priority 5) in the runner prompt.
+        let prompt = PromptBuilder::new()
+            .with_knowledge_notes("- Use tokio::sync")
+            .with_enrichment("Active skill context")
+            .build();
+
+        let enrichment_pos = prompt.find("## Enrichment Context").unwrap();
+        let knowledge_pos = prompt.find("## Knowledge Notes").unwrap();
+        assert!(
+            enrichment_pos < knowledge_pos,
+            "Enrichment (priority 3) should render before KnowledgeNotes (priority 5)"
+        );
+    }
+
+    #[test]
+    fn test_enrichment_priority_is_3() {
+        let section = PromptSection::Enrichment("test".to_string());
+        assert_eq!(section.priority(), 3, "Enrichment should have priority 3");
     }
 
     // ========================================================================

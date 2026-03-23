@@ -25,15 +25,17 @@ use std::time::Duration;
 
 use anyhow::Result;
 use tokio::time::timeout;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::chat::enrichment::{
-    EnrichmentConfig, EnrichmentContext, EnrichmentInput, EnrichmentStage,
+    EnrichmentConfig, EnrichmentInput, ParallelEnrichmentStage, StageOutput,
 };
 use crate::chat::entity_extractor::{self, EntityType as ChatEntityType, ExtractedEntity};
+use crate::chat::stages::intent_weights::IntentWeightMap;
 use crate::meilisearch::SearchStore;
 use crate::neo4j::traits::GraphStore;
+use crate::neurons::intent::{IntentDetector, QueryIntentMode};
 use crate::notes::models::EntityType as NoteEntityType;
 
 // ============================================================================
@@ -272,7 +274,12 @@ impl KnowledgeInjectionStage {
         entities: &[ExtractedEntity],
         referenced_uuids: &[Uuid],
         config: &KnowledgeInjectionConfig,
-    ) -> (Vec<ScoredNote>, Vec<ScoredDecision>, Vec<PredictedFile>) {
+    ) -> (
+        Vec<ScoredNote>,
+        Vec<ScoredDecision>,
+        Vec<PredictedFile>,
+        Vec<ScoredNote>,
+    ) {
         let query_timeout = Duration::from_millis(config.query_timeout_ms);
 
         // ── Query 1: BM25 notes search ──────────────────────────────────
@@ -324,6 +331,7 @@ impl KnowledgeInjectionStage {
             .collect();
         let max_entity_notes = config.max_entity_notes;
         let max_propagated_per_file = config.max_propagated_per_file;
+        let project_id_for_propagation = _project_id;
 
         let entity_notes_future = async move {
             let mut notes = Vec::new();
@@ -358,16 +366,19 @@ impl KnowledgeInjectionStage {
             }
 
             // Propagated notes for files (graph traversal)
+            // Pass source_project_id to enable cross-project note propagation
+            // with coupling-attenuated scores. min_score lowered to 0.15 because
+            // coupling × score produces low values for sibling projects.
             for file_path in &file_entities {
                 match graph_clone
                     .get_propagated_notes(
                         &NoteEntityType::File,
                         file_path,
-                        2,     // max_depth
-                        0.3,   // min_score
-                        None,  // all relation types
-                        None,  // source_project_id (no cross-project filtering in chat)
-                        false, // force_cross_project
+                        2,                          // max_depth
+                        0.15, // min_score (lowered for cross-project coupling attenuation)
+                        None, // all relation types
+                        project_id_for_propagation, // source_project_id for cross-project filtering
+                        false, // force_cross_project (safe default)
                     )
                     .await
                 {
@@ -534,13 +545,50 @@ impl KnowledgeInjectionStage {
             preds
         };
 
+        // ── Query 6: Workspace-level notes ────────────────────────────────
+        let graph_clone4 = self.graph.clone();
+        let workspace_notes_future = async move {
+            let mut ws_notes: Vec<ScoredNote> = Vec::new();
+            if let Some(pid) = _project_id {
+                match graph_clone4
+                    .get_workspace_notes_for_project(pid, 1.0) // full propagation, we score at 0.6
+                    .await
+                {
+                    Ok(propagated) => {
+                        for pn in propagated.into_iter().take(3) {
+                            ws_notes.push(ScoredNote {
+                                id: pn.note.id.to_string(),
+                                note_type: format!("{:?}", pn.note.note_type),
+                                importance: format!("{:?}", pn.note.importance),
+                                content: pn.note.content,
+                                score: 0.6, // Between entity notes (0.8) and propagated
+                                source: "workspace",
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        debug!(error = %e, "Failed to get workspace notes for project");
+                    }
+                }
+            }
+            ws_notes
+        };
+
         // ── Execute all queries in parallel with timeouts ────────────────
-        let (notes_result, decisions_result, entity_notes_result, uuid_result, discussed_result) = tokio::join!(
+        let (
+            notes_result,
+            decisions_result,
+            entity_notes_result,
+            uuid_result,
+            discussed_result,
+            workspace_result,
+        ) = tokio::join!(
             timeout(query_timeout, notes_future),
             timeout(query_timeout, decisions_future),
             timeout(query_timeout, entity_notes_future),
             timeout(query_timeout, uuid_lookup_future),
             timeout(query_timeout, discussed_future),
+            timeout(query_timeout, workspace_notes_future),
         );
 
         // ── Collect & deduplicate notes ─────────────────────────────────
@@ -695,23 +743,55 @@ impl KnowledgeInjectionStage {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        (notes, decisions, predicted_files)
+        // Workspace notes (Query 6)
+        let workspace_notes = if let Ok(ws_notes) = workspace_result {
+            ws_notes
+        } else {
+            debug!("[knowledge_injection] Workspace notes query timed out");
+            Vec::new()
+        };
+
+        (notes, decisions, predicted_files, workspace_notes)
     }
 
-    /// Render notes, decisions, and predicted files into markdown sections for the enrichment context.
+    /// Render notes, decisions, predicted files, and workspace guidelines into markdown sections.
     fn render_knowledge(
         &self,
         notes: &[ScoredNote],
         decisions: &[ScoredDecision],
         predictions: &[PredictedFile],
+        workspace_notes: &[ScoredNote],
         max_content_chars: usize,
     ) -> Option<String> {
-        if notes.is_empty() && decisions.is_empty() && predictions.is_empty() {
+        if notes.is_empty()
+            && decisions.is_empty()
+            && predictions.is_empty()
+            && workspace_notes.is_empty()
+        {
             return None;
         }
 
         let mut content = String::new();
         let mut chars_used = 0;
+
+        // Render workspace guidelines (high-priority, shown first)
+        if !workspace_notes.is_empty() && chars_used < max_content_chars {
+            content.push_str("### Workspace Guidelines\n");
+            for note in workspace_notes {
+                let entry = format!(
+                    "- **[{}|{}]** {}\n",
+                    note.note_type.to_lowercase(),
+                    note.importance.to_lowercase(),
+                    truncate_content(&note.content, 300),
+                );
+                if chars_used + entry.len() > max_content_chars {
+                    break;
+                }
+                content.push_str(&entry);
+                chars_used += entry.len();
+            }
+            content.push('\n');
+        }
 
         // Render notes
         if !notes.is_empty() {
@@ -798,13 +878,30 @@ fn truncate_content(content: &str, max_chars: usize) -> String {
     }
 }
 
+/// Map an [`IntentDetector`] result to the enrichment hint string
+/// used by [`IntentWeightMap`].
+///
+/// This duplicates the mapping from `skill_activation.rs` to avoid
+/// the inter-stage dependency on the `intent` hint. CPU-only, <1ms.
+fn map_intent_mode(mode: QueryIntentMode) -> &'static str {
+    match mode {
+        QueryIntentMode::Debug => "debug",
+        QueryIntentMode::Explore => "explore",
+        QueryIntentMode::Impact => "review",
+        QueryIntentMode::Plan => "planning",
+        QueryIntentMode::Default => "general",
+    }
+}
+
 #[async_trait::async_trait]
-impl EnrichmentStage for KnowledgeInjectionStage {
-    async fn execute(&self, input: &EnrichmentInput, ctx: &mut EnrichmentContext) -> Result<()> {
+impl ParallelEnrichmentStage for KnowledgeInjectionStage {
+    async fn execute(&self, input: &EnrichmentInput) -> Result<StageOutput> {
+        let mut output = StageOutput::new(self.name());
+
         // Need a project scope for knowledge search
         let project_slug = match &input.project_slug {
             Some(slug) => slug.clone(),
-            None => return Ok(()), // No project scope, skip
+            None => return Ok(output), // No project scope, skip
         };
 
         let project_id = if let Some(id) = input.project_id {
@@ -814,16 +911,14 @@ impl EnrichmentStage for KnowledgeInjectionStage {
         };
 
         // ── Scaffolding-adaptive config ──────────────────────────────────
-        // Compute the project's scaffolding level (with 100ms timeout + fallback).
-        // This modulates how much knowledge we inject: L0 = maximum, L4 = minimal.
         let scaffolding_enabled = std::env::var("ENRICHMENT_SCAFFOLDING")
             .map(|v| v == "true" || v == "1")
-            .unwrap_or(false);
+            .unwrap_or(true);
 
         let effective_config = if scaffolding_enabled {
             if let Some(pid) = project_id {
                 let graph_clone = self.graph.clone();
-                let scaffolding_override = None; // Use auto-computed level
+                let scaffolding_override = None;
                 match timeout(
                     Duration::from_millis(100),
                     graph_clone.compute_scaffolding_level(pid, scaffolding_override),
@@ -832,11 +927,11 @@ impl EnrichmentStage for KnowledgeInjectionStage {
                 {
                     Ok(Ok(level)) => {
                         let config = scaffolding_config(level.level);
-                        debug!(
-                            "[knowledge_injection] Scaffolding L{} ({}): max_notes={}, max_content={}",
+                        info!(
+                            "[knowledge_injection] Scaffolding L{} ({}) auto-computed: max_notes={}, max_content={}",
                             level.level, level.label, config.max_notes, config.max_content_chars
                         );
-                        ctx.add_section(
+                        output.add_section(
                             "Scaffolding Level",
                             format!(
                                 "L{} ({}) — competence: {:.0}%, pain: {:.0}%",
@@ -846,6 +941,7 @@ impl EnrichmentStage for KnowledgeInjectionStage {
                                 level.homeostasis_pain * 100.0
                             ),
                             self.name(),
+                            crate::chat::enrichment::EnrichmentSource::KnowledgeInjection,
                         );
                         config
                     }
@@ -862,9 +958,11 @@ impl EnrichmentStage for KnowledgeInjectionStage {
                     }
                 }
             } else {
+                info!("[knowledge_injection] Scaffolding enabled (auto-computed) but no project_id, using default config");
                 self.config.clone()
             }
         } else {
+            info!("[knowledge_injection] Scaffolding disabled via ENRICHMENT_SCAFFOLDING env var, using default L2 config");
             self.config.clone()
         };
 
@@ -879,7 +977,7 @@ impl EnrichmentStage for KnowledgeInjectionStage {
         );
 
         // Run all knowledge queries in parallel (using scaffolding-adjusted config)
-        let (mut notes, decisions, predictions) = self
+        let (mut notes, decisions, predictions, workspace_notes) = self
             .query_knowledge_with_config(
                 &input.message,
                 Some(&project_slug),
@@ -903,12 +1001,27 @@ impl EnrichmentStage for KnowledgeInjectionStage {
             }
         }
 
+        // ── Intent-aware reweighting ────────────────────────────────────
+        // Detect intent locally (duplicated from SkillActivationStage) to avoid
+        // the inter-stage dependency on the `intent` hint. CPU-only, <1ms.
+        let intent = map_intent_mode(IntentDetector::detect(&input.message));
+        let weight_map = IntentWeightMap::for_intent(intent);
+        for note in &mut notes {
+            note.score *= weight_map.get(&note.note_type);
+        }
+        notes.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
         debug!(
-            "[knowledge_injection] Found {} notes ({} deduped), {} decisions, {} predictions",
+            "[knowledge_injection] Found {} notes ({} deduped), {} decisions, {} predictions (intent={})",
             notes.len(),
             pre_dedup_count - notes.len(),
             decisions.len(),
-            predictions.len()
+            predictions.len(),
+            intent
         );
 
         // ── Trajectory collection: record context loading decision ────────
@@ -965,17 +1078,23 @@ impl EnrichmentStage for KnowledgeInjectionStage {
             });
         }
 
-        // Render and inject into context
+        // Render and inject into output
         if let Some(content) = self.render_knowledge(
             &notes,
             &decisions,
             &predictions,
+            &workspace_notes,
             effective_config.max_content_chars,
         ) {
-            ctx.add_section("Relevant Knowledge", content, self.name());
+            output.add_section(
+                "Relevant Knowledge",
+                content,
+                self.name(),
+                crate::chat::enrichment::EnrichmentSource::KnowledgeInjection,
+            );
         }
 
-        Ok(())
+        Ok(output)
     }
 
     fn name(&self) -> &str {
@@ -1093,7 +1212,7 @@ mod tests {
     #[test]
     fn test_render_empty() {
         let stage = make_test_stage();
-        let result = stage.render_knowledge(&[], &[], &[], 3000);
+        let result = stage.render_knowledge(&[], &[], &[], &[], 3000);
         assert!(result.is_none());
     }
 
@@ -1108,7 +1227,7 @@ mod tests {
             score: 0.9,
             source: "bm25_search",
         }];
-        let result = stage.render_knowledge(&notes, &[], &[], 3000);
+        let result = stage.render_knowledge(&notes, &[], &[], &[], 3000);
         assert!(result.is_some());
         let content = result.unwrap();
         assert!(content.contains("Relevant Notes"));
@@ -1125,7 +1244,7 @@ mod tests {
             rationale: "No EmbeddingProvider available in ChatManager".to_string(),
             score: 0.95,
         }];
-        let result = stage.render_knowledge(&[], &decisions, &[], 3000);
+        let result = stage.render_knowledge(&[], &decisions, &[], &[], 3000);
         assert!(result.is_some());
         let content = result.unwrap();
         assert!(content.contains("Relevant Decisions"));
@@ -1150,7 +1269,7 @@ mod tests {
             rationale: "Individual timeouts per query".to_string(),
             score: 0.9,
         }];
-        let result = stage.render_knowledge(&notes, &decisions, &[], 3000);
+        let result = stage.render_knowledge(&notes, &decisions, &[], &[], 3000);
         assert!(result.is_some());
         let content = result.unwrap();
         assert!(content.contains("Relevant Notes"));
@@ -1180,7 +1299,7 @@ mod tests {
             })
             .collect();
 
-        let result = stage.render_knowledge(&notes, &[], &[], 100);
+        let result = stage.render_knowledge(&notes, &[], &[], &[], 100);
         assert!(result.is_some());
         let content = result.unwrap();
         // Should be truncated — not all 20 notes rendered
@@ -1196,6 +1315,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_stage_no_project_skips() {
+        use crate::chat::enrichment::ParallelEnrichmentStage;
         let stage = make_test_stage();
         let input = EnrichmentInput {
             message: "Hello world".to_string(),
@@ -1206,14 +1326,18 @@ mod tests {
             protocol_run_id: None,
             protocol_state: None,
             excluded_note_ids: Default::default(),
+            reasoning_path_tracker: None,
         };
-        let mut ctx = EnrichmentContext::default();
-        stage.execute(&input, &mut ctx).await.unwrap();
-        assert!(!ctx.has_content(), "Should skip when no project scope");
+        let output = stage.execute(&input).await.unwrap();
+        assert!(
+            output.sections.is_empty(),
+            "Should skip when no project scope"
+        );
     }
 
     #[tokio::test]
     async fn test_stage_is_enabled_checks_config() {
+        use crate::chat::enrichment::ParallelEnrichmentStage;
         let stage = make_test_stage();
         let config = EnrichmentConfig {
             knowledge_injection: true,
@@ -1230,12 +1354,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_stage_name() {
+        use crate::chat::enrichment::ParallelEnrichmentStage;
         let stage = make_test_stage();
         assert_eq!(stage.name(), "knowledge_injection");
     }
 
     #[tokio::test]
     async fn test_stage_with_project_runs_queries() {
+        use crate::chat::enrichment::ParallelEnrichmentStage;
         let stage = make_test_stage();
         let input = EnrichmentInput {
             message: "Look at src/chat/manager.rs and the build_prompt function".to_string(),
@@ -1246,16 +1372,17 @@ mod tests {
             protocol_run_id: None,
             protocol_state: None,
             excluded_note_ids: Default::default(),
+            reasoning_path_tracker: None,
         };
-        let mut ctx = EnrichmentContext::default();
 
         // With mocks, this should complete without errors (empty results)
-        let result = stage.execute(&input, &mut ctx).await;
+        let result = stage.execute(&input).await;
         assert!(result.is_ok(), "Stage should not error with mock stores");
     }
 
     #[tokio::test]
     async fn test_stage_with_protocol_context_propagates_to_decision_record() {
+        use crate::chat::enrichment::ParallelEnrichmentStage;
         let stage = make_test_stage();
         let proto_run_id = Uuid::new_v4();
         let input = EnrichmentInput {
@@ -1267,12 +1394,12 @@ mod tests {
             protocol_run_id: Some(proto_run_id),
             protocol_state: Some("implement".to_string()),
             excluded_note_ids: Default::default(),
+            reasoning_path_tracker: None,
         };
-        let mut ctx = EnrichmentContext::default();
 
         // The stage should complete without errors; protocol context is passed through
         // to the DecisionRecord via input.protocol_run_id / input.protocol_state
-        let result = stage.execute(&input, &mut ctx).await;
+        let result = stage.execute(&input).await;
         assert!(
             result.is_ok(),
             "Stage should not error with protocol context"
@@ -1494,7 +1621,9 @@ mod tests {
         assert_eq!(deduped.len(), 2, "Should have 2 unique notes, not 3");
 
         // Render should have no duplicates
-        let content = stage.render_knowledge(&deduped, &[], &[], 3000).unwrap();
+        let content = stage
+            .render_knowledge(&deduped, &[], &[], &[], 3000)
+            .unwrap();
         let count = content.matches("Watch out for null").count();
         assert_eq!(
             count, 1,
@@ -1564,7 +1693,7 @@ mod tests {
             })
             .collect();
 
-        let result = stage.render_knowledge(&notes, &[], &[], 3000);
+        let result = stage.render_knowledge(&notes, &[], &[], &[], 3000);
         assert!(result.is_some());
         let content = result.unwrap();
         assert!(
@@ -1646,5 +1775,360 @@ mod tests {
                 configs[i + 1].max_content_chars,
             );
         }
+    }
+
+    // ── Intent reweighting tests ───────────────────────────────────────
+
+    #[test]
+    fn test_intent_reweighting_debug_gotcha_above_guideline() {
+        // Simulate: 1 guideline (score 0.9), 1 gotcha (score 0.7), 1 pattern (score 0.8)
+        // With "debug" intent: gotcha×1.5=1.05, pattern×1.0=0.8, guideline×0.7=0.63
+        // Expected ranking: gotcha > pattern > guideline
+        let mut notes = vec![
+            ScoredNote {
+                id: "guideline-1".to_string(),
+                note_type: "guideline".to_string(),
+                importance: "high".to_string(),
+                content: "Always use structured logging".to_string(),
+                score: 0.9,
+                source: "bm25_search",
+            },
+            ScoredNote {
+                id: "gotcha-1".to_string(),
+                note_type: "gotcha".to_string(),
+                importance: "critical".to_string(),
+                content: "Mutex deadlock when calling from async context".to_string(),
+                score: 0.7,
+                source: "bm25_search",
+            },
+            ScoredNote {
+                id: "pattern-1".to_string(),
+                note_type: "pattern".to_string(),
+                importance: "medium".to_string(),
+                content: "Use Arc<dyn Trait> for shared services".to_string(),
+                score: 0.8,
+                source: "bm25_search",
+            },
+        ];
+
+        // Apply debug intent reweighting
+        let weight_map = IntentWeightMap::for_intent("debug");
+        for note in &mut notes {
+            note.score *= weight_map.get(&note.note_type);
+        }
+        notes.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        // gotcha: 0.7 * 1.5 = 1.05
+        assert_eq!(
+            notes[0].id, "gotcha-1",
+            "Gotcha should rank first for debug intent"
+        );
+        assert!((notes[0].score - 1.05).abs() < 1e-10);
+
+        // pattern: 0.8 * 1.0 = 0.8
+        assert_eq!(
+            notes[1].id, "pattern-1",
+            "Pattern should rank second for debug intent"
+        );
+        assert!((notes[1].score - 0.8).abs() < 1e-10);
+
+        // guideline: 0.9 * 0.7 = 0.63
+        assert_eq!(
+            notes[2].id, "guideline-1",
+            "Guideline should rank last for debug intent"
+        );
+        assert!((notes[2].score - 0.63).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_intent_reweighting_general_preserves_order() {
+        // With "general" intent, all weights are 1.0 → original order preserved
+        let mut notes = vec![
+            ScoredNote {
+                id: "high".to_string(),
+                note_type: "guideline".to_string(),
+                importance: "high".to_string(),
+                content: "high score".to_string(),
+                score: 0.9,
+                source: "bm25_search",
+            },
+            ScoredNote {
+                id: "mid".to_string(),
+                note_type: "gotcha".to_string(),
+                importance: "high".to_string(),
+                content: "mid score".to_string(),
+                score: 0.7,
+                source: "bm25_search",
+            },
+        ];
+
+        let weight_map = IntentWeightMap::for_intent("general");
+        for note in &mut notes {
+            note.score *= weight_map.get(&note.note_type);
+        }
+        notes.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        assert_eq!(
+            notes[0].id, "high",
+            "Original order preserved with general intent"
+        );
+        assert!((notes[0].score - 0.9).abs() < f64::EPSILON);
+        assert_eq!(notes[1].id, "mid");
+        assert!((notes[1].score - 0.7).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_intent_reweighting_unknown_type_gets_one() {
+        let mut notes = vec![ScoredNote {
+            id: "custom".to_string(),
+            note_type: "unknown_custom_type".to_string(),
+            importance: "low".to_string(),
+            content: "some content".to_string(),
+            score: 0.5,
+            source: "bm25_search",
+        }];
+
+        let weight_map = IntentWeightMap::for_intent("debug");
+        for note in &mut notes {
+            note.score *= weight_map.get(&note.note_type);
+        }
+
+        assert!(
+            (notes[0].score - 0.5).abs() < f64::EPSILON,
+            "Unknown note type should get weight 1.0 (score unchanged)"
+        );
+    }
+
+    // ── Scaffolding integration tests ─────────────────────────────────
+
+    /// Helper: create a KnowledgeInjectionStage with a pre-populated MockGraphStore
+    async fn make_stage_with_mock_data(
+        project_id: Uuid,
+        completed_tasks: usize,
+        failed_tasks: usize,
+        frustration: f64,
+        note_count: usize,
+        scar_intensity: f64,
+    ) -> KnowledgeInjectionStage {
+        use crate::meilisearch::mock::MockSearchStore;
+        use crate::neo4j::mock::MockGraphStore;
+        use crate::neo4j::models::TaskStatus;
+        use crate::test_helpers::{test_plan_for_project, test_task};
+
+        let graph = Arc::new(MockGraphStore::new());
+
+        // Create plan for this project
+        let plan = test_plan_for_project(project_id);
+        let plan_id = plan.id;
+        graph.create_plan(&plan).await.unwrap();
+
+        // Create completed tasks
+        for i in 0..completed_tasks {
+            let mut task = test_task();
+            task.title = Some(format!("Completed task {}", i));
+            task.status = TaskStatus::Completed;
+            task.frustration_score = frustration;
+            graph.create_task(plan_id, &task).await.unwrap();
+        }
+
+        // Create failed tasks
+        for i in 0..failed_tasks {
+            let mut task = test_task();
+            task.title = Some(format!("Failed task {}", i));
+            task.status = TaskStatus::Failed;
+            task.frustration_score = frustration;
+            graph.create_task(plan_id, &task).await.unwrap();
+        }
+
+        // Create notes with scar intensity
+        for i in 0..note_count {
+            use crate::notes::models::{Note, NoteType};
+            let mut note = Note::new(
+                Some(project_id),
+                NoteType::Observation,
+                format!("Note content {}", i),
+                "test-agent".to_string(),
+            );
+            note.scar_intensity = scar_intensity;
+            graph.create_note(&note).await.unwrap();
+        }
+
+        let search = Arc::new(MockSearchStore::new());
+        KnowledgeInjectionStage {
+            graph: graph as Arc<dyn crate::neo4j::traits::GraphStore>,
+            search: search as Arc<dyn crate::meilisearch::traits::SearchStore>,
+            config: KnowledgeInjectionConfig::default(),
+            collector: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_scaffolding_integration_mature_project_uses_reduced_config() {
+        // Mature project: many completed tasks, no failures, no frustration
+        // competence = (1.0*0.5 + 1.0*0.2 + (1-0)*0.15 + 1.0*0.15) = 1.0 → L4
+        let project_id = Uuid::new_v4();
+        let stage = make_stage_with_mock_data(
+            project_id, 20,  // completed tasks
+            0,   // failed tasks
+            0.0, // frustration
+            10,  // notes (no scars)
+            0.0, // scar_intensity
+        )
+        .await;
+
+        // Compute scaffolding level directly
+        let level = stage
+            .graph
+            .compute_scaffolding_level(project_id, None)
+            .await
+            .unwrap();
+
+        assert!(
+            level.level >= 3,
+            "Mature project (high success) should be L3 or L4, got L{}",
+            level.level
+        );
+        assert!(
+            level.competence_score >= 0.75,
+            "competence_score should be >= 0.75, got {:.2}",
+            level.competence_score
+        );
+
+        let config = scaffolding_config(level.level);
+        assert!(
+            config.max_notes <= 3,
+            "L{} should have max_notes <= 3, got {}",
+            level.level,
+            config.max_notes
+        );
+    }
+
+    #[tokio::test]
+    async fn test_scaffolding_integration_struggling_project_uses_generous_config() {
+        // Struggling project: mostly failed tasks, high frustration, scarred notes
+        // task_success_rate = 2/(2+18) = 0.1
+        // avg_frustration = 0.9
+        // scar_density = 0.8
+        // competence = (0.1*0.5 + 0.1*0.2 + 0.2*0.15 + 1.0*0.15) = 0.05+0.02+0.03+0.15 = 0.25 → L0
+        let project_id = Uuid::new_v4();
+        let stage = make_stage_with_mock_data(
+            project_id, 2,   // completed tasks
+            18,  // failed tasks
+            0.9, // high frustration
+            10,  // notes with scars
+            0.8, // high scar_intensity
+        )
+        .await;
+
+        let level = stage
+            .graph
+            .compute_scaffolding_level(project_id, None)
+            .await
+            .unwrap();
+
+        assert!(
+            level.level <= 1,
+            "Struggling project should be L0 or L1, got L{}",
+            level.level
+        );
+        assert!(
+            level.competence_score < 0.5,
+            "competence_score should be < 0.5, got {:.2}",
+            level.competence_score
+        );
+
+        let config = scaffolding_config(level.level);
+        assert!(
+            config.max_notes >= 6,
+            "L{} should have max_notes >= 6 (generous scaffolding), got {}",
+            level.level,
+            config.max_notes
+        );
+    }
+
+    #[tokio::test]
+    async fn test_scaffolding_integration_empty_project_gets_high_level() {
+        // Empty project: no tasks, no notes → defaults give competence = 1.0 → L4
+        let project_id = Uuid::new_v4();
+        let stage = make_stage_with_mock_data(
+            project_id, 0,   // no tasks
+            0,   // no tasks
+            0.0, // no frustration
+            0,   // no notes
+            0.0, // no scars
+        )
+        .await;
+
+        let level = stage
+            .graph
+            .compute_scaffolding_level(project_id, None)
+            .await
+            .unwrap();
+
+        // Empty project defaults to high competence (no failures = success)
+        assert_eq!(
+            level.level, 4,
+            "Empty project with no data should default to L4, got L{}",
+            level.level
+        );
+        let config = scaffolding_config(level.level);
+        assert_eq!(config.max_notes, 2, "L4 should have max_notes=2");
+    }
+
+    #[tokio::test]
+    async fn test_scaffolding_disabled_via_env_uses_default() {
+        // When ENRICHMENT_SCAFFOLDING=false, scaffolding is disabled → L2 default config
+        let config_disabled = scaffolding_config(2); // L2 = default
+        let config_default = KnowledgeInjectionConfig::default();
+        assert_eq!(
+            config_disabled.max_notes, config_default.max_notes,
+            "L2 config should match default config"
+        );
+    }
+
+    #[test]
+    fn test_intent_reweighting_planning_boosts_guideline() {
+        let mut notes = vec![
+            ScoredNote {
+                id: "gotcha-1".to_string(),
+                note_type: "gotcha".to_string(),
+                importance: "high".to_string(),
+                content: "Gotcha content".to_string(),
+                score: 0.9,
+                source: "bm25_search",
+            },
+            ScoredNote {
+                id: "guideline-1".to_string(),
+                note_type: "guideline".to_string(),
+                importance: "high".to_string(),
+                content: "Guideline content".to_string(),
+                score: 0.7,
+                source: "bm25_search",
+            },
+        ];
+
+        // Planning: guideline×1.5=1.05, gotcha×0.8=0.72
+        let weight_map = IntentWeightMap::for_intent("planning");
+        for note in &mut notes {
+            note.score *= weight_map.get(&note.note_type);
+        }
+        notes.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        assert_eq!(
+            notes[0].id, "guideline-1",
+            "Guideline should rank first for planning intent"
+        );
     }
 }

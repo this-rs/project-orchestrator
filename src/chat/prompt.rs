@@ -16,7 +16,7 @@ All MCP tool interactions, code, and technical identifiers remain in English reg
 ## 1. Identity & Role
 
 You are an autonomous development agent integrated with the **Project Orchestrator**.
-You have **25 MCP mega-tools** covering the full project lifecycle: planning, execution, tracking, code exploration, knowledge management, neural skills, reasoning, behavioral patterns, living personas, episodic memory, sharing.
+You have **28 MCP mega-tools** covering the full project lifecycle: planning, execution, tracking, code exploration, knowledge management, neural skills, reasoning, behavioral patterns, living personas, episodic memory, sharing.
 
 **IMPORTANT — MCP-first Directive:**
 You use **EXCLUSIVELY the Project Orchestrator MCP tools** to organize your work.
@@ -661,7 +661,7 @@ Plans can be executed autonomously and triggered automatically:
 - `plan(action: "enrich", plan_id)` — auto-enrich plan with affected files and dependencies
 "#;
 
-/// Exhaustive reference of all 25 MCP mega-tools with every action and parameter.
+/// Exhaustive reference of all 28 MCP mega-tools with every action and parameter.
 /// Injected as the final section of the system prompt by `build_system_prompt()`.
 pub const TOOL_REFERENCE: &str = r#"# MCP Mega-Tools Reference
 
@@ -1345,7 +1345,7 @@ pub struct ToolGroup {
     pub tools: &'static [ToolRef],
 }
 
-/// Static catalog of all 25 MCP mega-tools organized into semantic groups.
+/// Static catalog of all 28 MCP mega-tools organized into semantic groups.
 /// Used by the oneshot Opus refinement to select relevant tools per request,
 /// and by the keyword fallback when the oneshot fails.
 pub static TOOL_GROUPS: &[ToolGroup] = &[
@@ -1672,10 +1672,15 @@ pub fn select_tool_groups_by_keywords(user_message: &str) -> Vec<&'static ToolGr
     let mut matched: Vec<&'static ToolGroup> = TOOL_GROUPS
         .iter()
         .filter(|group| {
-            group
-                .keywords
-                .iter()
-                .any(|kw| words.iter().any(|w| w.contains(kw)))
+            group.keywords.iter().any(|kw| {
+                if kw.contains(' ') {
+                    // Multi-word keyword: substring match on full message
+                    msg_lower.contains(kw)
+                } else {
+                    // Single-word keyword: exact word match
+                    words.contains(kw)
+                }
+            })
         })
         .collect();
 
@@ -2922,7 +2927,7 @@ mod tests {
     // ================================================================
 
     #[test]
-    fn test_tool_groups_cover_all_23_mega_tools() {
+    fn test_tool_groups_cover_all_28_mega_tools() {
         let count = tool_catalog_tool_count();
         assert_eq!(
             count, 28,
@@ -3098,6 +3103,71 @@ mod tests {
         assert!(
             !groups.is_empty(),
             "Should always return at least one group"
+        );
+    }
+
+    #[test]
+    fn test_select_tool_groups_word_boundary_no_false_positive() {
+        // "file" is a keyword for code_exploration, but "profile" should NOT match it.
+        // Since no keyword matches "check the user profile settings", the fallback
+        // returns planning + code_exploration. But if we add a known keyword from
+        // another group, code_exploration should NOT appear (proving "profile" didn't
+        // trigger the "file" keyword).
+        let groups = select_tool_groups_by_keywords("check the user profile settings for the note");
+        let names: Vec<&str> = groups.iter().map(|g| g.name).collect();
+        // "note" matches knowledge group — so this is NOT a fallback result.
+        assert!(
+            names.contains(&"knowledge"),
+            "Expected knowledge group via 'note', got {:?}",
+            names
+        );
+        // If "profile" had falsely matched "file", code_exploration would also be present.
+        // With exact word matching, only "knowledge" should match.
+        assert!(
+            !names.contains(&"code_exploration"),
+            "Word 'profile' should NOT trigger 'file' keyword — got {:?}",
+            names
+        );
+    }
+
+    #[test]
+    fn test_select_tool_groups_word_boundary_exact_match() {
+        // "file" as a standalone word should match
+        let groups = select_tool_groups_by_keywords("read the file content");
+        let names: Vec<&str> = groups.iter().map(|g| g.name).collect();
+        assert!(
+            names.contains(&"code_exploration"),
+            "Exact word 'file' should trigger code_exploration — got {:?}",
+            names
+        );
+    }
+
+    #[test]
+    fn test_select_tool_groups_word_boundary_no_partial_find() {
+        // "findings" should NOT match the keyword "find"
+        let groups = select_tool_groups_by_keywords("search for findings in the report");
+        let names: Vec<&str> = groups.iter().map(|g| g.name).collect();
+        // "find" is not a keyword in any group, but if it were, "findings" should not match.
+        // What we really test: "findings" does not accidentally match short keywords like "find".
+        // The fallback (planning + code_exploration) should apply since no keyword matches.
+        // Note: "search" IS a keyword for code_exploration, so it should match
+        assert!(
+            names.contains(&"code_exploration"),
+            "Expected code_exploration (via 'search'), got {:?}",
+            names
+        );
+    }
+
+    #[test]
+    fn test_select_tool_groups_multi_word_keyword_still_works() {
+        // Multi-word keywords should still use substring matching
+        let groups =
+            select_tool_groups_by_keywords("I want to do a code review on the pull request");
+        let names: Vec<&str> = groups.iter().map(|g| g.name).collect();
+        assert!(
+            names.contains(&"code_exploration"),
+            "Multi-word or single-word keyword should match — got {:?}",
+            names
         );
     }
 

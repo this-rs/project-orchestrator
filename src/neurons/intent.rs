@@ -37,7 +37,7 @@ impl std::fmt::Display for QueryIntentMode {
 
 const DEBUG_KEYWORDS: &[&str] = &[
     "pourquoi", "échoue", "bug", "erreur", "crash", "plantage", "why", "fail", "broken", "error",
-    "panic", "trace",
+    "panic", "trace", "fix", "debug",
 ];
 
 const EXPLORE_KEYWORDS: &[&str] = &[
@@ -65,6 +65,10 @@ const IMPACT_KEYWORDS: &[&str] = &[
     "delete",
     "supprim",
     "déplacer",
+    "review",
+    "audit",
+    "coverage",
+    "quality",
 ];
 
 const PLAN_KEYWORDS: &[&str] = &[
@@ -78,6 +82,8 @@ const PLAN_KEYWORDS: &[&str] = &[
     "add feature",
     "nouvelle",
     "design",
+    "roadmap",
+    "milestone",
 ];
 
 /// Lightweight intent detector using keyword heuristics.

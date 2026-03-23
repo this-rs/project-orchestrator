@@ -139,7 +139,11 @@ impl RunnerState {
     // ========================================================================
 
     /// Add an active agent tracking a running task.
+    ///
+    /// Defensively removes any existing agent with the same task_id first
+    /// to prevent phantom duplicates (e.g., from retries).
     pub fn add_agent(&mut self, agent: ActiveAgent) {
+        self.active_agents.retain(|a| a.task_id != agent.task_id);
         self.active_agents.push(agent);
         self.sync_current_task_compat();
     }
@@ -393,5 +397,39 @@ mod tests {
         assert_eq!(state.retry_counts.get(&task_id).copied().unwrap_or(0), 0);
         *state.retry_counts.entry(task_id).or_insert(0) += 1;
         assert_eq!(state.retry_counts[&task_id], 1);
+    }
+
+    #[test]
+    fn test_add_agent_dedup_prevents_phantom() {
+        let mut state = RunnerState::new(Uuid::new_v4(), Uuid::new_v4(), 3, TriggerSource::Manual);
+        let task_id = Uuid::new_v4();
+
+        // First add
+        state.add_agent(ActiveAgent::new(task_id, "Task A".to_string()));
+        assert_eq!(state.active_agents.len(), 1);
+
+        // Second add with same task_id (simulates retry) — should replace, not duplicate
+        state.add_agent(ActiveAgent::new(task_id, "Task A (retry)".to_string()));
+        assert_eq!(
+            state.active_agents.len(),
+            1,
+            "add_agent should dedup by task_id — no phantom agents"
+        );
+        assert_eq!(state.active_agents[0].task_title, "Task A (retry)");
+    }
+
+    #[test]
+    fn test_add_agent_different_tasks_not_deduped() {
+        let mut state = RunnerState::new(Uuid::new_v4(), Uuid::new_v4(), 3, TriggerSource::Manual);
+        let task_a = Uuid::new_v4();
+        let task_b = Uuid::new_v4();
+
+        state.add_agent(ActiveAgent::new(task_a, "Task A".to_string()));
+        state.add_agent(ActiveAgent::new(task_b, "Task B".to_string()));
+        assert_eq!(
+            state.active_agents.len(),
+            2,
+            "Different task_ids should not be deduped"
+        );
     }
 }
