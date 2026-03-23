@@ -1619,6 +1619,7 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
             "staleness", "decay", "backfill", "hooks", "detect", "maintain",
             "deep maintenance", "consolidate", "stagnation", "anchor", "reconstruct",
             "fission", "fusion", "heal", "scar", "isomorphic",
+            "mcp federation", "external server", "serveur externe", "probe", "reconnect",
         ],
         tools: &[
             ToolRef {
@@ -1633,12 +1634,16 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
                 name: "trajectory",
                 description: "Query decision trajectories (list/get/search_similar/stats) — explore stored reasoning paths and find similar past decisions",
             },
+            ToolRef {
+                name: "mcp_federation",
+                description: "Manage external MCP server connections (connect/disconnect/list/status/tools/probe/reconnect/backfill_relations/backfill_sequences) — federation layer for consuming external MCP servers",
+            },
         ],
     },
 ];
 
 /// Total number of unique tools across all groups.
-/// Must match the MCP tools.rs count (currently 28 mega-tools).
+/// Must match the MCP tools.rs count (currently 29 mega-tools).
 pub fn tool_catalog_tool_count() -> usize {
     let mut names: Vec<&str> = TOOL_GROUPS
         .iter()
@@ -2927,11 +2932,11 @@ mod tests {
     // ================================================================
 
     #[test]
-    fn test_tool_groups_cover_all_28_mega_tools() {
+    fn test_tool_groups_cover_all_29_mega_tools() {
         let count = tool_catalog_tool_count();
         assert_eq!(
-            count, 28,
-            "TOOL_GROUPS must cover exactly 28 unique mega-tools (got {}). \
+            count, 29,
+            "TOOL_GROUPS must cover exactly 29 unique mega-tools (got {}). \
              Update the catalog when adding/removing MCP tools.",
             count
         );
