@@ -19,21 +19,19 @@
 //!         └── ...
 //! ```
 
-pub mod client;
 pub mod circuit_breaker;
+pub mod client;
 pub mod discovery;
 pub mod prober;
 pub mod registry;
 pub mod security;
 
 // Re-exports
-pub use client::{McpClient, McpTransportConfig};
 pub use circuit_breaker::CircuitBreaker;
+pub use client::{McpClient, McpTransportConfig};
 pub use discovery::{DiscoveredTool, InferredCategory, ToolIntrospector, ToolProfile};
 pub use prober::ToolProber;
-pub use registry::{
-    ConnectionStatus, McpServerConnection, McpServerRegistry, ServerStats,
-};
+pub use registry::{ConnectionStatus, McpServerConnection, McpServerRegistry, ServerStats};
 pub use security::{McpSecurityPolicy, PolicyViolation, RateLimiter, SecurityEnforcer};
 
 use serde::{Deserialize, Serialize};

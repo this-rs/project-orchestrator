@@ -820,9 +820,9 @@ impl ToolHandler {
         // 3. Execute the call with timeout (read lock — call_tool is &self)
         let call_result = {
             let reg = registry.read().await;
-            let conn = reg.get(server_id).ok_or_else(|| {
-                anyhow!("MCP server '{}' disconnected during call", server_id)
-            })?;
+            let conn = reg
+                .get(server_id)
+                .ok_or_else(|| anyhow!("MCP server '{}' disconnected during call", server_id))?;
 
             tokio::time::timeout(
                 timeout_duration,
@@ -853,11 +853,7 @@ impl ToolHandler {
                     conn.stats.record_call(elapsed_ms, false);
                     conn.stats.record_error(error_msg.clone());
                 }
-                Err(anyhow!(
-                    "External tool '{}' failed: {}",
-                    fqn,
-                    error_msg
-                ))
+                Err(anyhow!("External tool '{}' failed: {}", fqn, error_msg))
             }
             Err(_timeout) => {
                 // Timeout
@@ -865,10 +861,8 @@ impl ToolHandler {
                 if let Some(conn) = reg.get_mut(server_id) {
                     conn.circuit_breaker.record_failure();
                     conn.stats.record_call(elapsed_ms, false);
-                    conn.stats.record_error(format!(
-                        "Timeout after {}ms",
-                        timeout_duration.as_millis()
-                    ));
+                    conn.stats
+                        .record_error(format!("Timeout after {}ms", timeout_duration.as_millis()));
                 }
                 Err(anyhow!(
                     "External tool '{}' timed out after {}ms",
@@ -922,10 +916,9 @@ impl ToolHandler {
 
     /// Handle mcp_federation mega-tool actions that operate directly on the SharedRegistry.
     async fn handle_mcp_federation(&self, resolved_name: &str, args: &Value) -> Result<Value> {
-        let registry = self
-            .mcp_registry
-            .as_ref()
-            .ok_or_else(|| anyhow!("MCP federation is not configured. Set mcp_registry on the handler."))?;
+        let registry = self.mcp_registry.as_ref().ok_or_else(|| {
+            anyhow!("MCP federation is not configured. Set mcp_registry on the handler.")
+        })?;
 
         match resolved_name {
             "__mcp_federation_connect" => {
@@ -933,11 +926,18 @@ impl ToolHandler {
                     .get("server_id")
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| anyhow!("server_id is required for connect"))?;
-                let transport_str = args
-                    .get("transport")
+                let transport_str =
+                    args.get("transport")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "transport is required for connect (stdio, sse, streamable_http)"
+                            )
+                        })?;
+                let display_name = args
+                    .get("display_name")
                     .and_then(|v| v.as_str())
-                    .ok_or_else(|| anyhow!("transport is required for connect (stdio, sse, streamable_http)"))?;
-                let display_name = args.get("display_name").and_then(|v| v.as_str()).map(|s| s.to_string());
+                    .map(|s| s.to_string());
 
                 let transport = match transport_str {
                     "stdio" => {
@@ -960,7 +960,9 @@ impl ToolHandler {
                             .and_then(|v| v.as_object())
                             .map(|obj| {
                                 obj.iter()
-                                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                                    .filter_map(|(k, v)| {
+                                        v.as_str().map(|s| (k.clone(), s.to_string()))
+                                    })
                                     .collect()
                             })
                             .unwrap_or_default();
@@ -981,7 +983,9 @@ impl ToolHandler {
                             .and_then(|v| v.as_object())
                             .map(|obj| {
                                 obj.iter()
-                                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                                    .filter_map(|(k, v)| {
+                                        v.as_str().map(|s| (k.clone(), s.to_string()))
+                                    })
                                     .collect()
                             })
                             .unwrap_or_default();
@@ -991,14 +995,18 @@ impl ToolHandler {
                         let url = args
                             .get("url")
                             .and_then(|v| v.as_str())
-                            .ok_or_else(|| anyhow!("url is required for streamable_http transport"))?
+                            .ok_or_else(|| {
+                                anyhow!("url is required for streamable_http transport")
+                            })?
                             .to_string();
                         let headers: std::collections::HashMap<String, String> = args
                             .get("headers")
                             .and_then(|v| v.as_object())
                             .map(|obj| {
                                 obj.iter()
-                                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                                    .filter_map(|(k, v)| {
+                                        v.as_str().map(|s| (k.clone(), s.to_string()))
+                                    })
                                     .collect()
                             })
                             .unwrap_or_default();
@@ -1045,9 +1053,9 @@ impl ToolHandler {
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| anyhow!("server_id is required for status"))?;
                 let reg = registry.read().await;
-                let conn = reg.get(server_id).ok_or_else(|| {
-                    anyhow!("MCP server '{}' is not connected", server_id)
-                })?;
+                let conn = reg
+                    .get(server_id)
+                    .ok_or_else(|| anyhow!("MCP server '{}' is not connected", server_id))?;
                 Ok(json!({
                     "server_id": conn.id,
                     "display_name": conn.display_name,
@@ -1102,9 +1110,9 @@ impl ToolHandler {
                     .ok_or_else(|| anyhow!("server_id is required for probe"))?;
                 // Probe needs write lock (mutates discovered_tools) and client access
                 let mut reg = registry.write().await;
-                let conn = reg.get_mut(server_id).ok_or_else(|| {
-                    anyhow!("MCP server '{}' is not connected", server_id)
-                })?;
+                let conn = reg
+                    .get_mut(server_id)
+                    .ok_or_else(|| anyhow!("MCP server '{}' is not connected", server_id))?;
                 let prober = crate::mcp_federation::prober::ToolProber::new(
                     crate::mcp_federation::prober::ProberConfig::default(),
                 );
@@ -1132,9 +1140,9 @@ impl ToolHandler {
                 // Extract transport config from the existing connection before dropping it
                 let (transport, display_name) = {
                     let reg = registry.read().await;
-                    let conn = reg.get(server_id).ok_or_else(|| {
-                        anyhow!("MCP server '{}' is not connected", server_id)
-                    })?;
+                    let conn = reg
+                        .get(server_id)
+                        .ok_or_else(|| anyhow!("MCP server '{}' is not connected", server_id))?;
                     (conn.transport.clone(), conn.display_name.clone())
                 };
 
@@ -10669,24 +10677,16 @@ mod tests {
 
         #[async_trait]
         impl McpClient for MockExternalClient {
-            async fn initialize(
-                &self,
-            ) -> Result<crate::mcp_federation::client::InitializeResult> {
+            async fn initialize(&self) -> Result<crate::mcp_federation::client::InitializeResult> {
                 unimplemented!()
             }
             async fn initialized_notification(&self) -> Result<()> {
                 unimplemented!()
             }
-            async fn tools_list(
-                &self,
-            ) -> Result<Vec<crate::mcp_federation::client::McpToolDef>> {
+            async fn tools_list(&self) -> Result<Vec<crate::mcp_federation::client::McpToolDef>> {
                 unimplemented!()
             }
-            async fn call_tool(
-                &self,
-                _name: &str,
-                _arguments: Option<Value>,
-            ) -> Result<Value> {
+            async fn call_tool(&self, _name: &str, _arguments: Option<Value>) -> Result<Value> {
                 Ok(self.response.clone())
             }
             async fn ping(&self) -> Result<()> {
@@ -10705,24 +10705,16 @@ mod tests {
 
         #[async_trait]
         impl McpClient for ErrorExternalClient {
-            async fn initialize(
-                &self,
-            ) -> Result<crate::mcp_federation::client::InitializeResult> {
+            async fn initialize(&self) -> Result<crate::mcp_federation::client::InitializeResult> {
                 unimplemented!()
             }
             async fn initialized_notification(&self) -> Result<()> {
                 unimplemented!()
             }
-            async fn tools_list(
-                &self,
-            ) -> Result<Vec<crate::mcp_federation::client::McpToolDef>> {
+            async fn tools_list(&self) -> Result<Vec<crate::mcp_federation::client::McpToolDef>> {
                 unimplemented!()
             }
-            async fn call_tool(
-                &self,
-                _name: &str,
-                _arguments: Option<Value>,
-            ) -> Result<Value> {
+            async fn call_tool(&self, _name: &str, _arguments: Option<Value>) -> Result<Value> {
                 Err(anyhow::anyhow!("external call failed"))
             }
             async fn ping(&self) -> Result<()> {
@@ -10765,9 +10757,7 @@ mod tests {
             Arc::new(RwLock::new(registry))
         }
 
-        fn make_handler_with_registry(
-            registry: Arc<RwLock<McpServerRegistry>>,
-        ) -> ToolHandler {
+        fn make_handler_with_registry(registry: Arc<RwLock<McpServerRegistry>>) -> ToolHandler {
             let client = McpHttpClient::new("http://localhost:0".to_string(), None);
             let mut handler = ToolHandler::new(client);
             handler.set_mcp_registry(registry);
@@ -10814,10 +10804,7 @@ mod tests {
 
         #[tokio::test]
         async fn test_external_dispatch_circuit_breaker_open() {
-            let registry = make_registry_with_server(
-                "broken",
-                Box::new(ErrorExternalClient),
-            );
+            let registry = make_registry_with_server("broken", Box::new(ErrorExternalClient));
 
             // Trip the circuit breaker by recording many failures
             {
@@ -10847,15 +10834,10 @@ mod tests {
 
         #[tokio::test]
         async fn test_external_dispatch_failure_records_stats() {
-            let registry = make_registry_with_server(
-                "failing",
-                Box::new(ErrorExternalClient),
-            );
+            let registry = make_registry_with_server("failing", Box::new(ErrorExternalClient));
             let handler = make_handler_with_registry(registry.clone());
 
-            let _ = handler
-                .handle("failing::query", Some(json!({})))
-                .await;
+            let _ = handler.handle("failing::query", Some(json!({}))).await;
 
             // Check stats were updated
             let reg = registry.read().await;
@@ -10941,10 +10923,8 @@ mod tests {
             // Verify the FQN format "server_id::tool_name" is what gets dispatched.
             // The trajectory recording uses this as action_type.
             let response = json!({"ok": true});
-            let registry = make_registry_with_server(
-                "grafeo",
-                Box::new(MockExternalClient { response }),
-            );
+            let registry =
+                make_registry_with_server("grafeo", Box::new(MockExternalClient { response }));
             let handler = make_handler_with_registry(registry);
 
             // The call should succeed — confirming the "grafeo::query" format

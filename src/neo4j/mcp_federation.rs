@@ -202,10 +202,7 @@ impl Neo4jClient {
         Ok(())
     }
 
-    pub async fn list_mcp_tools_for_server(
-        &self,
-        server_id: &str,
-    ) -> Result<Vec<McpToolNode>> {
+    pub async fn list_mcp_tools_for_server(&self, server_id: &str) -> Result<Vec<McpToolNode>> {
         let q = query(
             r#"
             MATCH (t:McpTool {server_id: $server_id})
@@ -330,12 +327,29 @@ impl Neo4jClient {
             server_id: node.get("server_id")?,
             display_name: node.get("display_name").unwrap_or_default(),
             transport_type: node.get("transport_type").unwrap_or_default(),
-            transport_url: node.get("transport_url").ok().filter(|s: &String| !s.is_empty()),
-            transport_command: node.get("transport_command").ok().filter(|s: &String| !s.is_empty()),
-            transport_args: node.get("transport_args").ok().filter(|s: &String| !s.is_empty()),
-            status: node.get("status").unwrap_or_else(|_| "disconnected".to_string()),
-            protocol_version: node.get("protocol_version").ok().filter(|s: &String| !s.is_empty()),
-            server_name: node.get("server_name").ok().filter(|s: &String| !s.is_empty()),
+            transport_url: node
+                .get("transport_url")
+                .ok()
+                .filter(|s: &String| !s.is_empty()),
+            transport_command: node
+                .get("transport_command")
+                .ok()
+                .filter(|s: &String| !s.is_empty()),
+            transport_args: node
+                .get("transport_args")
+                .ok()
+                .filter(|s: &String| !s.is_empty()),
+            status: node
+                .get("status")
+                .unwrap_or_else(|_| "disconnected".to_string()),
+            protocol_version: node
+                .get("protocol_version")
+                .ok()
+                .filter(|s: &String| !s.is_empty()),
+            server_name: node
+                .get("server_name")
+                .ok()
+                .filter(|s: &String| !s.is_empty()),
             tool_count: node.get::<i64>("tool_count").unwrap_or(0) as usize,
             created_at: DateTime::parse_from_rfc3339(&created_at_str)
                 .map(|dt| dt.with_timezone(&Utc))
@@ -450,9 +464,16 @@ impl Neo4jClient {
             name: node.get("name")?,
             fqn: node.get("fqn")?,
             description: node.get("description").unwrap_or_default(),
-            input_schema: node.get("input_schema").unwrap_or_else(|_| "{}".to_string()),
-            category: node.get("category").unwrap_or_else(|_| "unknown".to_string()),
-            embedding: node.get("embedding").ok().filter(|s: &String| !s.is_empty()),
+            input_schema: node
+                .get("input_schema")
+                .unwrap_or_else(|_| "{}".to_string()),
+            category: node
+                .get("category")
+                .unwrap_or_else(|_| "unknown".to_string()),
+            embedding: node
+                .get("embedding")
+                .ok()
+                .filter(|s: &String| !s.is_empty()),
             created_at: DateTime::parse_from_rfc3339(&created_at_str)
                 .map(|dt| dt.with_timezone(&Utc))
                 .unwrap_or_else(|_| Utc::now()),

@@ -183,8 +183,8 @@ pub fn classify_tool(name: &str, description: &str) -> InferredCategory {
 fn classify_by_name(name: &str) -> Option<InferredCategory> {
     // Delete patterns (check first — "remove_from_list" should be Delete, not Query)
     let delete_patterns = [
-        "delete", "remove", "destroy", "drop", "purge", "unlink", "detach",
-        "erase", "clear", "clean",
+        "delete", "remove", "destroy", "drop", "purge", "unlink", "detach", "erase", "clear",
+        "clean",
     ];
     for pat in &delete_patterns {
         if name.contains(pat) {
@@ -194,8 +194,17 @@ fn classify_by_name(name: &str) -> Option<InferredCategory> {
 
     // Create patterns
     let create_patterns = [
-        "create", "add", "insert", "new", "register", "post", "generate",
-        "init", "bootstrap", "setup", "provision",
+        "create",
+        "add",
+        "insert",
+        "new",
+        "register",
+        "post",
+        "generate",
+        "init",
+        "bootstrap",
+        "setup",
+        "provision",
     ];
     for pat in &create_patterns {
         if name.contains(pat) {
@@ -205,13 +214,46 @@ fn classify_by_name(name: &str) -> Option<InferredCategory> {
 
     // Mutation patterns
     let mutation_patterns = [
-        "update", "patch", "set", "modify", "edit", "rename", "move",
-        "assign", "reassign", "change", "toggle", "enable", "disable",
-        "approve", "reject", "merge", "close", "reopen", "archive",
-        "restore", "sync", "refresh", "reset", "configure", "link",
-        "connect", "disconnect", "start", "stop", "pause", "resume",
-        "cancel", "retry", "replay", "advance", "supersede",
-        "confirm", "invalidate", "publish", "unpublish",
+        "update",
+        "patch",
+        "set",
+        "modify",
+        "edit",
+        "rename",
+        "move",
+        "assign",
+        "reassign",
+        "change",
+        "toggle",
+        "enable",
+        "disable",
+        "approve",
+        "reject",
+        "merge",
+        "close",
+        "reopen",
+        "archive",
+        "restore",
+        "sync",
+        "refresh",
+        "reset",
+        "configure",
+        "link",
+        "connect",
+        "disconnect",
+        "start",
+        "stop",
+        "pause",
+        "resume",
+        "cancel",
+        "retry",
+        "replay",
+        "advance",
+        "supersede",
+        "confirm",
+        "invalidate",
+        "publish",
+        "unpublish",
     ];
     for pat in &mutation_patterns {
         if name.contains(pat) {
@@ -221,8 +263,8 @@ fn classify_by_name(name: &str) -> Option<InferredCategory> {
 
     // Search patterns (check before Query — "search_notes" is Search, not Query)
     let search_patterns = [
-        "search", "find", "lookup", "filter", "query", "match",
-        "discover", "explore", "scan", "detect",
+        "search", "find", "lookup", "filter", "query", "match", "discover", "explore", "scan",
+        "detect",
     ];
     for pat in &search_patterns {
         if name.contains(pat) {
@@ -232,11 +274,34 @@ fn classify_by_name(name: &str) -> Option<InferredCategory> {
 
     // Query patterns
     let query_patterns = [
-        "get", "list", "fetch", "describe", "show", "read", "view",
-        "inspect", "check", "count", "exists", "is_", "has_",
-        "status", "info", "health", "ping", "version", "whoami",
-        "analyze", "compute", "calculate", "estimate", "predict",
-        "compare", "diff", "export", "download",
+        "get",
+        "list",
+        "fetch",
+        "describe",
+        "show",
+        "read",
+        "view",
+        "inspect",
+        "check",
+        "count",
+        "exists",
+        "is_",
+        "has_",
+        "status",
+        "info",
+        "health",
+        "ping",
+        "version",
+        "whoami",
+        "analyze",
+        "compute",
+        "calculate",
+        "estimate",
+        "predict",
+        "compare",
+        "diff",
+        "export",
+        "download",
     ];
     for pat in &query_patterns {
         if name.contains(pat) {
@@ -259,38 +324,58 @@ fn classify_by_description(desc: &str) -> Option<InferredCategory> {
     ];
 
     let query_keywords = [
-        "retriev", "return", "get", "list", "fetch", "read-only", "readonly",
-        "inspect", "view", "show", "display",
+        "retriev",
+        "return",
+        "get",
+        "list",
+        "fetch",
+        "read-only",
+        "readonly",
+        "inspect",
+        "view",
+        "show",
+        "display",
     ];
     let search_keywords = [
-        "search", "find", "look up", "filter", "semantic", "full-text",
-        "vector", "similar",
+        "search",
+        "find",
+        "look up",
+        "filter",
+        "semantic",
+        "full-text",
+        "vector",
+        "similar",
     ];
-    let create_keywords = [
-        "create", "add", "insert", "new", "register", "generate",
-    ];
+    let create_keywords = ["create", "add", "insert", "new", "register", "generate"];
     let mutation_keywords = [
-        "update", "modify", "change", "set", "edit", "patch", "mutate",
-        "write",
+        "update", "modify", "change", "set", "edit", "patch", "mutate", "write",
     ];
-    let delete_keywords = [
-        "delete", "remove", "destroy", "drop", "purge", "erase",
-    ];
+    let delete_keywords = ["delete", "remove", "destroy", "drop", "purge", "erase"];
 
     for kw in &query_keywords {
-        if desc.contains(kw) { scores[0].1 += 1; }
+        if desc.contains(kw) {
+            scores[0].1 += 1;
+        }
     }
     for kw in &search_keywords {
-        if desc.contains(kw) { scores[1].1 += 1; }
+        if desc.contains(kw) {
+            scores[1].1 += 1;
+        }
     }
     for kw in &create_keywords {
-        if desc.contains(kw) { scores[2].1 += 1; }
+        if desc.contains(kw) {
+            scores[2].1 += 1;
+        }
     }
     for kw in &mutation_keywords {
-        if desc.contains(kw) { scores[3].1 += 1; }
+        if desc.contains(kw) {
+            scores[3].1 += 1;
+        }
     }
     for kw in &delete_keywords {
-        if desc.contains(kw) { scores[4].1 += 1; }
+        if desc.contains(kw) {
+            scores[4].1 += 1;
+        }
     }
 
     // Find the max
@@ -315,7 +400,11 @@ fn classify_by_description(desc: &str) -> Option<InferredCategory> {
 /// Build a canonical text representation from a tool's metadata for embedding.
 ///
 /// Format: "tool_name: description. Parameters: param1 (type), param2 (type), ..."
-pub fn build_canonical_text(name: &str, description: &str, input_schema: &serde_json::Value) -> String {
+pub fn build_canonical_text(
+    name: &str,
+    description: &str,
+    input_schema: &serde_json::Value,
+) -> String {
     let mut text = format!("{}: {}", name, description);
 
     // Extract parameter names and types from JSON Schema
@@ -485,11 +574,7 @@ impl ToolIntrospector {
     /// Run the full introspection pipeline on a batch of tools from an external server.
     ///
     /// For each tool: classify → embed → find_similar → build DiscoveredTool.
-    pub async fn introspect(
-        &self,
-        server_id: &str,
-        tools: &[McpToolDef],
-    ) -> Vec<DiscoveredTool> {
+    pub async fn introspect(&self, server_id: &str, tools: &[McpToolDef]) -> Vec<DiscoveredTool> {
         // 1. Classify all tools (instant, no I/O)
         let categories: Vec<InferredCategory> = tools
             .iter()
@@ -565,10 +650,7 @@ impl ToolIntrospector {
             .map(|(name, desc, schema)| build_canonical_text(name, desc, schema))
             .collect();
 
-        let fqns: Vec<String> = tools
-            .iter()
-            .map(|(name, _, _)| name.clone())
-            .collect();
+        let fqns: Vec<String> = tools.iter().map(|(name, _, _)| name.clone()).collect();
 
         let embeddings = provider.embed_batch(&texts).await?;
 
@@ -576,11 +658,13 @@ impl ToolIntrospector {
             .into_iter()
             .zip(texts.into_iter())
             .zip(embeddings.into_iter())
-            .map(|((fqn, canonical_text), embedding)| InternalToolDescriptor {
-                fqn,
-                canonical_text,
-                embedding: Some(embedding),
-            })
+            .map(
+                |((fqn, canonical_text), embedding)| InternalToolDescriptor {
+                    fqn,
+                    canonical_text,
+                    embedding: Some(embedding),
+                },
+            )
             .collect())
     }
 }
@@ -599,51 +683,138 @@ mod tests {
 
     #[test]
     fn test_classify_query_tools() {
-        assert_eq!(classify_tool("get_user", "Get a user by ID"), InferredCategory::Query);
-        assert_eq!(classify_tool("list_projects", "List all projects"), InferredCategory::Query);
-        assert_eq!(classify_tool("fetch_data", "Fetch data from source"), InferredCategory::Query);
-        assert_eq!(classify_tool("describe_table", "Describe table schema"), InferredCategory::Query);
-        assert_eq!(classify_tool("show_status", "Show current status"), InferredCategory::Query);
-        assert_eq!(classify_tool("count_items", "Count items in collection"), InferredCategory::Query);
-        assert_eq!(classify_tool("check_health", "Health check endpoint"), InferredCategory::Query);
-        assert_eq!(classify_tool("analyze_impact", "Analyze code impact"), InferredCategory::Query);
+        assert_eq!(
+            classify_tool("get_user", "Get a user by ID"),
+            InferredCategory::Query
+        );
+        assert_eq!(
+            classify_tool("list_projects", "List all projects"),
+            InferredCategory::Query
+        );
+        assert_eq!(
+            classify_tool("fetch_data", "Fetch data from source"),
+            InferredCategory::Query
+        );
+        assert_eq!(
+            classify_tool("describe_table", "Describe table schema"),
+            InferredCategory::Query
+        );
+        assert_eq!(
+            classify_tool("show_status", "Show current status"),
+            InferredCategory::Query
+        );
+        assert_eq!(
+            classify_tool("count_items", "Count items in collection"),
+            InferredCategory::Query
+        );
+        assert_eq!(
+            classify_tool("check_health", "Health check endpoint"),
+            InferredCategory::Query
+        );
+        assert_eq!(
+            classify_tool("analyze_impact", "Analyze code impact"),
+            InferredCategory::Query
+        );
     }
 
     #[test]
     fn test_classify_search_tools() {
-        assert_eq!(classify_tool("search_notes", "Search notes by query"), InferredCategory::Search);
-        assert_eq!(classify_tool("find_references", "Find symbol references"), InferredCategory::Search);
-        assert_eq!(classify_tool("lookup_user", "Look up user by email"), InferredCategory::Search);
-        assert_eq!(classify_tool("filter_tasks", "Filter tasks by criteria"), InferredCategory::Search);
-        assert_eq!(classify_tool("discover_tools", "Discover available tools"), InferredCategory::Search);
+        assert_eq!(
+            classify_tool("search_notes", "Search notes by query"),
+            InferredCategory::Search
+        );
+        assert_eq!(
+            classify_tool("find_references", "Find symbol references"),
+            InferredCategory::Search
+        );
+        assert_eq!(
+            classify_tool("lookup_user", "Look up user by email"),
+            InferredCategory::Search
+        );
+        assert_eq!(
+            classify_tool("filter_tasks", "Filter tasks by criteria"),
+            InferredCategory::Search
+        );
+        assert_eq!(
+            classify_tool("discover_tools", "Discover available tools"),
+            InferredCategory::Search
+        );
     }
 
     #[test]
     fn test_classify_create_tools() {
-        assert_eq!(classify_tool("create_issue", "Create a new issue"), InferredCategory::Create);
-        assert_eq!(classify_tool("add_comment", "Add a comment"), InferredCategory::Create);
-        assert_eq!(classify_tool("insert_record", "Insert a new record"), InferredCategory::Create);
-        assert_eq!(classify_tool("register_webhook", "Register a webhook"), InferredCategory::Create);
-        assert_eq!(classify_tool("generate_report", "Generate a report"), InferredCategory::Create);
+        assert_eq!(
+            classify_tool("create_issue", "Create a new issue"),
+            InferredCategory::Create
+        );
+        assert_eq!(
+            classify_tool("add_comment", "Add a comment"),
+            InferredCategory::Create
+        );
+        assert_eq!(
+            classify_tool("insert_record", "Insert a new record"),
+            InferredCategory::Create
+        );
+        assert_eq!(
+            classify_tool("register_webhook", "Register a webhook"),
+            InferredCategory::Create
+        );
+        assert_eq!(
+            classify_tool("generate_report", "Generate a report"),
+            InferredCategory::Create
+        );
     }
 
     #[test]
     fn test_classify_mutation_tools() {
-        assert_eq!(classify_tool("update_task", "Update task fields"), InferredCategory::Mutation);
-        assert_eq!(classify_tool("patch_config", "Patch configuration"), InferredCategory::Mutation);
-        assert_eq!(classify_tool("set_status", "Set the status"), InferredCategory::Mutation);
-        assert_eq!(classify_tool("modify_permissions", "Modify permissions"), InferredCategory::Mutation);
-        assert_eq!(classify_tool("rename_file", "Rename a file"), InferredCategory::Mutation);
-        assert_eq!(classify_tool("enable_feature", "Enable a feature flag"), InferredCategory::Mutation);
-        assert_eq!(classify_tool("sync_data", "Sync data from remote"), InferredCategory::Mutation);
+        assert_eq!(
+            classify_tool("update_task", "Update task fields"),
+            InferredCategory::Mutation
+        );
+        assert_eq!(
+            classify_tool("patch_config", "Patch configuration"),
+            InferredCategory::Mutation
+        );
+        assert_eq!(
+            classify_tool("set_status", "Set the status"),
+            InferredCategory::Mutation
+        );
+        assert_eq!(
+            classify_tool("modify_permissions", "Modify permissions"),
+            InferredCategory::Mutation
+        );
+        assert_eq!(
+            classify_tool("rename_file", "Rename a file"),
+            InferredCategory::Mutation
+        );
+        assert_eq!(
+            classify_tool("enable_feature", "Enable a feature flag"),
+            InferredCategory::Mutation
+        );
+        assert_eq!(
+            classify_tool("sync_data", "Sync data from remote"),
+            InferredCategory::Mutation
+        );
     }
 
     #[test]
     fn test_classify_delete_tools() {
-        assert_eq!(classify_tool("delete_user", "Delete a user"), InferredCategory::Delete);
-        assert_eq!(classify_tool("remove_member", "Remove a team member"), InferredCategory::Delete);
-        assert_eq!(classify_tool("purge_cache", "Purge the cache"), InferredCategory::Delete);
-        assert_eq!(classify_tool("drop_index", "Drop a database index"), InferredCategory::Delete);
+        assert_eq!(
+            classify_tool("delete_user", "Delete a user"),
+            InferredCategory::Delete
+        );
+        assert_eq!(
+            classify_tool("remove_member", "Remove a team member"),
+            InferredCategory::Delete
+        );
+        assert_eq!(
+            classify_tool("purge_cache", "Purge the cache"),
+            InferredCategory::Delete
+        );
+        assert_eq!(
+            classify_tool("drop_index", "Drop a database index"),
+            InferredCategory::Delete
+        );
     }
 
     #[test]
@@ -853,11 +1024,8 @@ mod tests {
     #[tokio::test]
     async fn test_introspect_ten_tools() {
         let provider = Arc::new(MockEmbeddingProvider::new(768));
-        let introspector = ToolIntrospector::new(
-            Some(provider),
-            vec![],
-            IntrospectorConfig::default(),
-        );
+        let introspector =
+            ToolIntrospector::new(Some(provider), vec![], IntrospectorConfig::default());
 
         let tools: Vec<McpToolDef> = (0..10)
             .map(|i| McpToolDef {

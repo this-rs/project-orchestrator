@@ -56,11 +56,7 @@ pub fn generate_probe_args(input_schema: &Value) -> Option<Value> {
     let required = input_schema
         .get("required")
         .and_then(|r| r.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str())
-                .collect::<Vec<&str>>()
-        })
+        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<&str>>())
         .unwrap_or_default();
 
     if required.is_empty() && properties.is_empty() {
@@ -177,9 +173,7 @@ fn detect_pagination(value: &Value) -> bool {
         }
 
         // Also detect: has both a data array + offset/total/page
-        let has_data_array = obj
-            .values()
-            .any(|v| v.is_array());
+        let has_data_array = obj.values().any(|v| v.is_array());
         let has_pagination_meta = obj.contains_key("offset")
             || obj.contains_key("page")
             || obj.contains_key("total")
@@ -245,11 +239,7 @@ impl ToolProber {
     ///
     /// **Safety**: Returns `ToolProfile::not_probed()` if the tool is NOT
     /// classified as Query or Search. This is the critical safety guard.
-    pub async fn probe(
-        &self,
-        client: &dyn McpClient,
-        tool: &DiscoveredTool,
-    ) -> ToolProfile {
+    pub async fn probe(&self, client: &dyn McpClient, tool: &DiscoveredTool) -> ToolProfile {
         // SAFETY GUARD: NEVER probe mutations
         if !tool.category.is_safe_to_probe() {
             debug!(
@@ -278,11 +268,7 @@ impl ToolProber {
         let start = Instant::now();
         let timeout = std::time::Duration::from_millis(self.config.probe_timeout_ms);
 
-        let result = tokio::time::timeout(
-            timeout,
-            client.call_tool(&tool.name, args),
-        )
-        .await;
+        let result = tokio::time::timeout(timeout, client.call_tool(&tool.name, args)).await;
 
         let latency_ms = start.elapsed().as_millis() as u64;
 
@@ -316,9 +302,8 @@ impl ToolProber {
                 );
 
                 // Try to extract error format from the error message
-                let error_format = detect_error_format(
-                    &serde_json::json!({"message": e.to_string()}),
-                );
+                let error_format =
+                    detect_error_format(&serde_json::json!({"message": e.to_string()}));
 
                 ToolProfile {
                     latency_ms,
@@ -350,11 +335,7 @@ impl ToolProber {
     ///
     /// Only probes tools with safe categories (Query/Search).
     /// Returns a map of tool name → ToolProfile.
-    pub async fn probe_batch(
-        &self,
-        client: &dyn McpClient,
-        tools: &mut [DiscoveredTool],
-    ) {
+    pub async fn probe_batch(&self, client: &dyn McpClient, tools: &mut [DiscoveredTool]) {
         let safe_indices: Vec<usize> = tools
             .iter()
             .enumerate()
@@ -384,8 +365,8 @@ impl ToolProber {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::discovery::InferredCategory;
+    use super::*;
     use anyhow::{anyhow, Result};
     use async_trait::async_trait;
     use serde_json::json;
@@ -746,8 +727,12 @@ mod tests {
 
     #[test]
     fn test_detect_pagination_cursor() {
-        assert!(detect_pagination(&json!({"data": [], "next_cursor": "abc"})));
-        assert!(detect_pagination(&json!({"items": [], "nextCursor": "xyz"})));
+        assert!(detect_pagination(
+            &json!({"data": [], "next_cursor": "abc"})
+        ));
+        assert!(detect_pagination(
+            &json!({"items": [], "nextCursor": "xyz"})
+        ));
         assert!(detect_pagination(&json!({"has_more": true})));
         assert!(detect_pagination(&json!({"hasNext": false})));
     }
@@ -771,7 +756,10 @@ mod tests {
     fn test_response_shape_detection() {
         assert_eq!(analyze_response_shape(&json!({})), ResponseShape::Object);
         assert_eq!(analyze_response_shape(&json!([])), ResponseShape::Array);
-        assert_eq!(analyze_response_shape(&json!("hello")), ResponseShape::Scalar);
+        assert_eq!(
+            analyze_response_shape(&json!("hello")),
+            ResponseShape::Scalar
+        );
         assert_eq!(analyze_response_shape(&json!(42)), ResponseShape::Scalar);
         assert_eq!(analyze_response_shape(&json!(true)), ResponseShape::Scalar);
         assert_eq!(analyze_response_shape(&json!(null)), ResponseShape::Scalar);

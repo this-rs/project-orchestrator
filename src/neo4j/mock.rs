@@ -10868,10 +10868,7 @@ impl GraphStore for MockGraphStore {
         let idx = self.mcp_server_tools.read().await;
         let tools = self.mcp_tools.read().await;
         let ids = idx.get(server_id).cloned().unwrap_or_default();
-        let mut result: Vec<_> = ids
-            .iter()
-            .filter_map(|id| tools.get(id).cloned())
-            .collect();
+        let mut result: Vec<_> = ids.iter().filter_map(|id| tools.get(id).cloned()).collect();
         result.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(result)
     }
@@ -10896,10 +10893,10 @@ impl GraphStore for MockGraphStore {
         similar_to_fqn: &str,
         score: f64,
     ) -> Result<()> {
-        self.mcp_similar_to.write().await.insert(
-            (tool_fqn.to_string(), similar_to_fqn.to_string()),
-            score,
-        );
+        self.mcp_similar_to
+            .write()
+            .await
+            .insert((tool_fqn.to_string(), similar_to_fqn.to_string()), score);
         Ok(())
     }
 
@@ -10909,10 +10906,10 @@ impl GraphStore for MockGraphStore {
         tool_fqn_b: &str,
         count: i64,
     ) -> Result<()> {
-        self.mcp_co_activated.write().await.insert(
-            (tool_fqn_a.to_string(), tool_fqn_b.to_string()),
-            count,
-        );
+        self.mcp_co_activated
+            .write()
+            .await
+            .insert((tool_fqn_a.to_string(), tool_fqn_b.to_string()), count);
         Ok(())
     }
 

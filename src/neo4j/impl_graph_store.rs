@@ -3939,10 +3939,7 @@ impl GraphStore for Neo4jClient {
         self.create_mcp_tool(tool).await
     }
 
-    async fn list_mcp_tools_for_server(
-        &self,
-        server_id: &str,
-    ) -> anyhow::Result<Vec<McpToolNode>> {
+    async fn list_mcp_tools_for_server(&self, server_id: &str) -> anyhow::Result<Vec<McpToolNode>> {
         self.list_mcp_tools_for_server(server_id).await
     }
 

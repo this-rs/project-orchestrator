@@ -539,7 +539,8 @@ impl ChatManager {
             auto_update_cli: config.auto_update_cli,
             auto_update_app: config.auto_update_app,
         }));
-        let enrichment_pipeline = Self::build_enrichment_pipeline(&graph, &search, None, None, None);
+        let enrichment_pipeline =
+            Self::build_enrichment_pipeline(&graph, &search, None, None, None);
         Self {
             graph,
             search,
@@ -593,7 +594,8 @@ impl ChatManager {
             auto_update_cli: config.auto_update_cli,
             auto_update_app: config.auto_update_app,
         }));
-        let enrichment_pipeline = Self::build_enrichment_pipeline(&graph, &search, None, None, None);
+        let enrichment_pipeline =
+            Self::build_enrichment_pipeline(&graph, &search, None, None, None);
         Self {
             graph,
             search,

@@ -87,13 +87,14 @@ impl ParallelEnrichmentStage for McpFederationStage {
 
         // Build the prompt section
         let header = format!(
-            "## External MCP Servers ({} connected)\n\
+                "## External MCP Servers ({} connected)\n\
              Call external tools using the `server_id::tool_name` format.\n",
-            servers
-                .iter()
-                .filter(|s| s.status == crate::mcp_federation::registry::ConnectionStatus::Connected)
-                .count()
-        );
+                servers
+                    .iter()
+                    .filter(|s| s.status
+                        == crate::mcp_federation::registry::ConnectionStatus::Connected)
+                    .count()
+            );
 
         let content = format!("{}\n{}", header, sections.join("\n\n"));
 
@@ -156,11 +157,7 @@ mod tests {
         ) -> anyhow::Result<Vec<crate::mcp_federation::client::McpToolDef>> {
             unimplemented!()
         }
-        async fn call_tool(
-            &self,
-            _name: &str,
-            _arguments: Option<Value>,
-        ) -> anyhow::Result<Value> {
+        async fn call_tool(&self, _name: &str, _arguments: Option<Value>) -> anyhow::Result<Value> {
             unimplemented!()
         }
         async fn ping(&self) -> anyhow::Result<()> {

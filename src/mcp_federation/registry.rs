@@ -257,13 +257,11 @@ impl McpServerRegistry {
         );
 
         // 2. Initialize handshake
-        let init_result = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            client.initialize(),
-        )
-        .await
-        .map_err(|_| anyhow!("Initialize handshake timed out (30s)"))?
-        .map_err(|e| anyhow!("Initialize handshake failed: {}", e))?;
+        let init_result =
+            tokio::time::timeout(std::time::Duration::from_secs(30), client.initialize())
+                .await
+                .map_err(|_| anyhow!("Initialize handshake timed out (30s)"))?
+                .map_err(|e| anyhow!("Initialize handshake failed: {}", e))?;
 
         debug!(
             server_id = %server_id,
@@ -278,13 +276,11 @@ impl McpServerRegistry {
         }
 
         // 4. List available tools
-        let tool_defs = tokio::time::timeout(
-            std::time::Duration::from_secs(15),
-            client.tools_list(),
-        )
-        .await
-        .map_err(|_| anyhow!("tools/list timed out (15s)"))?
-        .map_err(|e| anyhow!("tools/list failed: {}", e))?;
+        let tool_defs =
+            tokio::time::timeout(std::time::Duration::from_secs(15), client.tools_list())
+                .await
+                .map_err(|_| anyhow!("tools/list timed out (15s)"))?
+                .map_err(|e| anyhow!("tools/list failed: {}", e))?;
 
         info!(
             server_id = %server_id,
@@ -309,7 +305,9 @@ impl McpServerRegistry {
         // 6. Probe read-only tools (optional)
         if self.config.probe_on_connect {
             let prober = ToolProber::new(self.config.prober.clone());
-            prober.probe_batch(client.as_ref(), &mut discovered_tools).await;
+            prober
+                .probe_batch(client.as_ref(), &mut discovered_tools)
+                .await;
 
             let probed_count = discovered_tools
                 .iter()
@@ -327,14 +325,9 @@ impl McpServerRegistry {
             self.tool_index.insert(tool.fqn.clone(), server_id.clone());
         }
 
-        let display_name = config
-            .display_name
-            .unwrap_or_else(|| server_id.clone());
+        let display_name = config.display_name.unwrap_or_else(|| server_id.clone());
 
-        let server_name = init_result
-            .server_info
-            .as_ref()
-            .map(|si| si.name.clone());
+        let server_name = init_result.server_info.as_ref().map(|si| si.name.clone());
 
         let connection = McpServerConnection {
             id: server_id.clone(),
@@ -578,17 +571,13 @@ mod tests {
 
     #[async_trait::async_trait]
     impl super::super::client::McpClient for MockLifecycleClient {
-        async fn initialize(
-            &self,
-        ) -> anyhow::Result<super::super::client::InitializeResult> {
+        async fn initialize(&self) -> anyhow::Result<super::super::client::InitializeResult> {
             unimplemented!()
         }
         async fn initialized_notification(&self) -> anyhow::Result<()> {
             unimplemented!()
         }
-        async fn tools_list(
-            &self,
-        ) -> anyhow::Result<Vec<super::super::client::McpToolDef>> {
+        async fn tools_list(&self) -> anyhow::Result<Vec<super::super::client::McpToolDef>> {
             unimplemented!()
         }
         async fn call_tool(
@@ -645,9 +634,7 @@ mod tests {
                 env: std::collections::HashMap::new(),
             },
             status: ConnectionStatus::Connected,
-            client: Box::new(MockLifecycleClient {
-                should_fail: false,
-            }),
+            client: Box::new(MockLifecycleClient { should_fail: false }),
             discovered_tools: tools,
             circuit_breaker: super::super::circuit_breaker::CircuitBreaker::default(),
             stats: ServerStats::new(),
@@ -801,7 +788,11 @@ mod tests {
         for tool in &tools {
             let result = enforcer.enforce("secure-srv", &tool.name, &tool.category);
             if tool.category.is_mutating() {
-                assert!(result.is_err(), "Mutation tool {} should be blocked", tool.name);
+                assert!(
+                    result.is_err(),
+                    "Mutation tool {} should be blocked",
+                    tool.name
+                );
             } else {
                 assert!(result.is_ok(), "Query tool {} should pass", tool.name);
             }

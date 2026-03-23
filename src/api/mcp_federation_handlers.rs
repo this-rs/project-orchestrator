@@ -97,9 +97,7 @@ fn build_transport(body: &ConnectServerBody) -> Result<McpTransport, AppError> {
         }
         "streamable_http" => {
             let url = body.url.clone().ok_or_else(|| {
-                AppError::BadRequest(
-                    "'url' is required for streamable_http transport".to_string(),
-                )
+                AppError::BadRequest("'url' is required for streamable_http transport".to_string())
             })?;
             Ok(McpTransport::StreamableHttp {
                 url,
@@ -152,9 +150,10 @@ pub async fn connect_server(
 
     Ok((
         StatusCode::CREATED,
-        Json(serde_json::to_value(summary).map_err(|e| {
-            AppError::Internal(anyhow::anyhow!("Serialization error: {}", e))
-        })?),
+        Json(
+            serde_json::to_value(summary)
+                .map_err(|e| AppError::Internal(anyhow::anyhow!("Serialization error: {}", e)))?,
+        ),
     ))
 }
 
@@ -173,9 +172,7 @@ pub async fn get_server_status(
     let server = servers
         .into_iter()
         .find(|s| s.id == server_id)
-        .ok_or_else(|| {
-            AppError::NotFound(format!("MCP server '{}' not found", server_id))
-        })?;
+        .ok_or_else(|| AppError::NotFound(format!("MCP server '{}' not found", server_id)))?;
 
     Ok(Json(serde_json::to_value(server).map_err(|e| {
         AppError::Internal(anyhow::anyhow!("Serialization error: {}", e))
@@ -238,9 +235,9 @@ pub async fn probe_server(
     let registry = get_registry(&state)?;
     let mut reg = registry.write().await;
 
-    let conn = reg.get_mut(&server_id).ok_or_else(|| {
-        AppError::NotFound(format!("MCP server '{}' not found", server_id))
-    })?;
+    let conn = reg
+        .get_mut(&server_id)
+        .ok_or_else(|| AppError::NotFound(format!("MCP server '{}' not found", server_id)))?;
 
     // Probe all safe (read-only) tools on this server
     let prober = crate::mcp_federation::prober::ToolProber::new(
@@ -275,9 +272,9 @@ pub async fn reconnect_server(
     // Get the existing transport config before disconnecting
     let transport_config = {
         let reg = registry.read().await;
-        let conn = reg.get(&server_id).ok_or_else(|| {
-            AppError::NotFound(format!("MCP server '{}' not found", server_id))
-        })?;
+        let conn = reg
+            .get(&server_id)
+            .ok_or_else(|| AppError::NotFound(format!("MCP server '{}' not found", server_id)))?;
         McpTransportConfig {
             server_id: conn.id.clone(),
             display_name: Some(conn.display_name.clone()),

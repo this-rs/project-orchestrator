@@ -247,10 +247,7 @@ impl StdioMcpClient {
             let mut stdout = self.stdout.lock().await;
             let n = stdout.read_line(&mut line).await?;
             if n == 0 {
-                return Err(anyhow!(
-                    "MCP server closed stdout (method: {})",
-                    method
-                ));
+                return Err(anyhow!("MCP server closed stdout (method: {})", method));
             }
         }
 
@@ -287,22 +284,22 @@ impl StdioMcpClient {
 impl McpClient for StdioMcpClient {
     async fn initialize(&self) -> Result<InitializeResult> {
         let params = super::initialize_params();
-        let result = self.send_request(make_request("initialize", Some(params))).await?;
+        let result = self
+            .send_request(make_request("initialize", Some(params)))
+            .await?;
         let init: InitializeResult = serde_json::from_value(result)?;
         Ok(init)
     }
 
     async fn initialized_notification(&self) -> Result<()> {
-        self.send_notification("notifications/initialized", None).await
+        self.send_notification("notifications/initialized", None)
+            .await
     }
 
     async fn tools_list(&self) -> Result<Vec<McpToolDef>> {
         let result = self.send_request(make_request("tools/list", None)).await?;
         // Response is { tools: [...] }
-        let tools_val = result
-            .get("tools")
-            .cloned()
-            .unwrap_or(Value::Array(vec![]));
+        let tools_val = result.get("tools").cloned().unwrap_or(Value::Array(vec![]));
         let tools: Vec<McpToolDef> = serde_json::from_value(tools_val)?;
         Ok(tools)
     }
@@ -312,7 +309,8 @@ impl McpClient for StdioMcpClient {
             "name": name,
             "arguments": arguments.unwrap_or(Value::Object(Default::default())),
         });
-        self.send_request(make_request("tools/call", Some(params))).await
+        self.send_request(make_request("tools/call", Some(params)))
+            .await
     }
 
     async fn ping(&self) -> Result<()> {
@@ -322,7 +320,10 @@ impl McpClient for StdioMcpClient {
 
     async fn shutdown(&self) -> Result<()> {
         // Try graceful shutdown, then kill
-        if let Err(e) = self.send_notification("notifications/cancelled", None).await {
+        if let Err(e) = self
+            .send_notification("notifications/cancelled", None)
+            .await
+        {
             debug!(error = %e, "Failed to send shutdown notification (server may have exited)");
         }
         let mut child = self.child.lock().await;
@@ -396,7 +397,9 @@ impl StreamableHttpMcpClient {
 impl McpClient for StreamableHttpMcpClient {
     async fn initialize(&self) -> Result<InitializeResult> {
         let params = super::initialize_params();
-        let result = self.post_rpc(make_request("initialize", Some(params))).await?;
+        let result = self
+            .post_rpc(make_request("initialize", Some(params)))
+            .await?;
         let init: InitializeResult = serde_json::from_value(result)?;
         Ok(init)
     }
@@ -418,10 +421,7 @@ impl McpClient for StreamableHttpMcpClient {
 
     async fn tools_list(&self) -> Result<Vec<McpToolDef>> {
         let result = self.post_rpc(make_request("tools/list", None)).await?;
-        let tools_val = result
-            .get("tools")
-            .cloned()
-            .unwrap_or(Value::Array(vec![]));
+        let tools_val = result.get("tools").cloned().unwrap_or(Value::Array(vec![]));
         let tools: Vec<McpToolDef> = serde_json::from_value(tools_val)?;
         Ok(tools)
     }
@@ -431,7 +431,8 @@ impl McpClient for StreamableHttpMcpClient {
             "name": name,
             "arguments": arguments.unwrap_or(Value::Object(Default::default())),
         });
-        self.post_rpc(make_request("tools/call", Some(params))).await
+        self.post_rpc(make_request("tools/call", Some(params)))
+            .await
     }
 
     async fn ping(&self) -> Result<()> {
@@ -511,10 +512,14 @@ impl SseMcpClient {
         for line in body.lines() {
             if let Some(data) = line.strip_prefix("data: ") {
                 let trimmed = data.trim();
-                if trimmed.starts_with("http://") || trimmed.starts_with("https://") || trimmed.starts_with('/') {
+                if trimmed.starts_with("http://")
+                    || trimmed.starts_with("https://")
+                    || trimmed.starts_with('/')
+                {
                     let url = if trimmed.starts_with('/') {
                         // Relative URL — resolve against base
-                        let base_origin = self.base_url.split("/sse").next().unwrap_or(&self.base_url);
+                        let base_origin =
+                            self.base_url.split("/sse").next().unwrap_or(&self.base_url);
                         format!("{}{}", base_origin, trimmed)
                     } else {
                         trimmed.to_string()
@@ -566,7 +571,10 @@ impl SseMcpClient {
             }
         }
 
-        Err(anyhow!("Could not parse response for {} from SSE server", method))
+        Err(anyhow!(
+            "Could not parse response for {} from SSE server",
+            method
+        ))
     }
 }
 
@@ -579,7 +587,9 @@ impl McpClient for SseMcpClient {
         }
 
         let params = super::initialize_params();
-        let result = self.post_message(make_request("initialize", Some(params))).await?;
+        let result = self
+            .post_message(make_request("initialize", Some(params)))
+            .await?;
         let init: InitializeResult = serde_json::from_value(result)?;
         Ok(init)
     }
@@ -600,10 +610,7 @@ impl McpClient for SseMcpClient {
 
     async fn tools_list(&self) -> Result<Vec<McpToolDef>> {
         let result = self.post_message(make_request("tools/list", None)).await?;
-        let tools_val = result
-            .get("tools")
-            .cloned()
-            .unwrap_or(Value::Array(vec![]));
+        let tools_val = result.get("tools").cloned().unwrap_or(Value::Array(vec![]));
         let tools: Vec<McpToolDef> = serde_json::from_value(tools_val)?;
         Ok(tools)
     }
@@ -613,7 +620,8 @@ impl McpClient for SseMcpClient {
             "name": name,
             "arguments": arguments.unwrap_or(Value::Object(Default::default())),
         });
-        self.post_message(make_request("tools/call", Some(params))).await
+        self.post_message(make_request("tools/call", Some(params)))
+            .await
     }
 
     async fn ping(&self) -> Result<()> {
@@ -708,10 +716,7 @@ mod tests {
 
     #[test]
     fn test_streamable_http_client_creation() {
-        let client = StreamableHttpMcpClient::new(
-            "https://example.com/mcp",
-            HashMap::new(),
-        );
+        let client = StreamableHttpMcpClient::new("https://example.com/mcp", HashMap::new());
         assert_eq!(client.url, "https://example.com/mcp");
     }
 

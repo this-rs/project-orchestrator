@@ -89,10 +89,7 @@ impl McpSecurityPolicy {
             if !allowed.iter().any(|s| s == server_id) {
                 return Err(PolicyViolation {
                     rule: "allowed_servers".to_string(),
-                    message: format!(
-                        "Server '{}' is not in the allowed servers list",
-                        server_id
-                    ),
+                    message: format!("Server '{}' is not in the allowed servers list", server_id),
                     server_id: server_id.to_string(),
                     tool_name: tool_name.to_string(),
                 });
@@ -144,10 +141,7 @@ impl RateLimiter {
         let now = Instant::now();
         let window = Duration::from_secs(60);
 
-        let timestamps = self
-            .windows
-            .entry(server_id.to_string())
-            .or_default();
+        let timestamps = self.windows.entry(server_id.to_string()).or_default();
 
         // Prune old entries outside the window
         timestamps.retain(|t| now.duration_since(*t) < window);
