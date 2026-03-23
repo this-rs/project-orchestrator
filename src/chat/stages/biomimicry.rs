@@ -150,7 +150,12 @@ impl ParallelEnrichmentStage for BiomimicryStage {
         }
 
         if !sections.is_empty() {
-            output.add_section("Bio-Cognitive Health", sections.join("\n"), self.name());
+            output.add_section(
+                "Bio-Cognitive Health",
+                sections.join("\n"),
+                self.name(),
+                crate::chat::enrichment::EnrichmentSource::Biomimicry,
+            );
         }
 
         Ok(output)

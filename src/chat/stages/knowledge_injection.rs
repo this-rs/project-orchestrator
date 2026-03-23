@@ -941,6 +941,7 @@ impl ParallelEnrichmentStage for KnowledgeInjectionStage {
                                 level.homeostasis_pain * 100.0
                             ),
                             self.name(),
+                            crate::chat::enrichment::EnrichmentSource::KnowledgeInjection,
                         );
                         config
                     }
@@ -1085,7 +1086,12 @@ impl ParallelEnrichmentStage for KnowledgeInjectionStage {
             &workspace_notes,
             effective_config.max_content_chars,
         ) {
-            output.add_section("Relevant Knowledge", content, self.name());
+            output.add_section(
+                "Relevant Knowledge",
+                content,
+                self.name(),
+                crate::chat::enrichment::EnrichmentSource::KnowledgeInjection,
+            );
         }
 
         Ok(output)

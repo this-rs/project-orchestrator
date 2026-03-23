@@ -128,7 +128,12 @@ impl ParallelEnrichmentStage for PersonaStage {
         output.set_hint("active_persona", persona.name.clone());
         output.set_hint("active_persona_id", persona.id.to_string());
 
-        output.add_section("Persona Context", section, "persona", crate::chat::enrichment::EnrichmentSource::Persona);
+        output.add_section(
+            "Persona Context",
+            section,
+            "persona",
+            crate::chat::enrichment::EnrichmentSource::Persona,
+        );
 
         Ok(output)
     }

@@ -65,7 +65,12 @@ impl ParallelEnrichmentStage for ReflexStage {
 
         if !suggestions.is_empty() {
             let markdown = ReflexEngine::format_markdown(&suggestions);
-            output.add_section("Reflexes", markdown, self.name());
+            output.add_section(
+                "Reflexes",
+                markdown,
+                self.name(),
+                crate::chat::enrichment::EnrichmentSource::Reflex,
+            );
         }
 
         Ok(output)

@@ -229,6 +229,7 @@ impl ParallelEnrichmentStage for FileContextStage {
                 "File Intelligence".to_string(),
                 content,
                 "file_context".to_string(),
+                crate::chat::enrichment::EnrichmentSource::FileContext,
             );
         }
 

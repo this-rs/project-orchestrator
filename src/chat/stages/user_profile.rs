@@ -85,7 +85,12 @@ impl ParallelEnrichmentStage for UserProfileStage {
 
         // Format as concise markdown (< 50 tokens)
         let markdown = profile.to_prompt_markdown();
-        output.add_section("User Profile", markdown, self.name());
+        output.add_section(
+            "User Profile",
+            markdown,
+            self.name(),
+            crate::chat::enrichment::EnrichmentSource::UserProfile,
+        );
 
         debug!(
             "[user_profile_stage] Injected profile for '{}' (interactions: {})",

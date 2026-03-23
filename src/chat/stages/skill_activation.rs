@@ -218,7 +218,12 @@ impl ParallelEnrichmentStage for SkillActivationStage {
         }
 
         if !content_parts.is_empty() {
-            output.add_section("Activated Skills", content_parts.join("\n"), self.name());
+            output.add_section(
+                "Activated Skills",
+                content_parts.join("\n"),
+                self.name(),
+                crate::chat::enrichment::EnrichmentSource::SkillActivation,
+            );
         }
 
         // ── Trajectory collection: record skill activation decision ────────

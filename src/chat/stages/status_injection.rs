@@ -534,19 +534,39 @@ impl ParallelEnrichmentStage for StatusInjectionStage {
 
         // ── Inject sections ─────────────────────────────────────────────
         if let Some(content) = status_content {
-            output.add_section("Work In Progress", content, self.name());
+            output.add_section(
+                "Work In Progress",
+                content,
+                self.name(),
+                crate::chat::enrichment::EnrichmentSource::StatusInjection,
+            );
         }
 
         if let Some(content) = protocol_content {
-            output.add_section("Active Protocols", content, self.name());
+            output.add_section(
+                "Active Protocols",
+                content,
+                self.name(),
+                crate::chat::enrichment::EnrichmentSource::StatusInjection,
+            );
         }
 
         if let Some(content) = protocol_context {
-            output.add_section("Active Protocol Context", content, self.name());
+            output.add_section(
+                "Active Protocol Context",
+                content,
+                self.name(),
+                crate::chat::enrichment::EnrichmentSource::StatusInjection,
+            );
         }
 
         if let Some(content) = reasoning_content {
-            output.add_section("Suggested Reasoning Plan", content, self.name());
+            output.add_section(
+                "Suggested Reasoning Plan",
+                content,
+                self.name(),
+                crate::chat::enrichment::EnrichmentSource::StatusInjection,
+            );
         }
 
         Ok(output)
