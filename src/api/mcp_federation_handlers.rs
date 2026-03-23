@@ -63,9 +63,7 @@ pub struct ActionResponse {
 // ============================================================================
 
 /// Extract the shared registry from state.
-fn get_registry(
-    state: &OrchestratorState,
-) -> &crate::mcp_federation::registry::SharedRegistry {
+fn get_registry(state: &OrchestratorState) -> &crate::mcp_federation::registry::SharedRegistry {
     &state.mcp_registry
 }
 
