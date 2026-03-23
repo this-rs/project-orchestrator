@@ -3586,73 +3586,96 @@ impl PlanRunner {
         // Clear budget override
         RUNNER_BUDGET.store(0, std::sync::atomic::Ordering::Relaxed);
 
-        // Extract lifecycle_run_id before finalizing state
-        let lifecycle_run_id = {
-            let global = RUNNER_STATE.read().await;
-            global.as_ref().and_then(|s| s.lifecycle_run_id)
+        // ============================================================
+        // Phase 1: Acquire write lock, finalize state, extract all
+        // needed data, then DROP the lock before any async work.
+        // This prevents deadlocks (create_failure_note, fire_lifecycle_transition
+        // etc. may also acquire RUNNER_STATE).
+        // ============================================================
+        struct StateSnapshot {
+            plan_id: Uuid,
+            project_id: Option<Uuid>,
+            lifecycle_run_id: Option<Uuid>,
+            total_cost: f64,
+            total_duration: f64,
+            completed_tasks: Vec<Uuid>,
+            failed_tasks: Vec<Uuid>,
+            started_at: chrono::DateTime<chrono::Utc>,
+        }
+
+        let snapshot = {
+            let mut global = RUNNER_STATE.write().await;
+            if let Some(ref mut s) = *global {
+                s.finalize(status);
+                self.graph.update_plan_run(s).await?;
+            }
+
+            // Finalize the execution vector from the collector
+            if let Some(ref state) = *global {
+                let collector = VECTOR_COLLECTOR.read().await;
+                let vector = collector.finalize(state);
+                info!(
+                    "Run {} vector: efficiency={:.2}, velocity={:.3}, stability={:.2}",
+                    run_id,
+                    vector.efficiency(),
+                    vector.velocity(),
+                    vector.stability()
+                );
+            }
+
+            // Extract everything we need, then drop the lock
+            global.as_ref().map(|s| StateSnapshot {
+                plan_id: s.plan_id,
+                project_id: s.project_id,
+                lifecycle_run_id: s.lifecycle_run_id,
+                total_cost: s.cost_usd,
+                total_duration: s.elapsed_secs(),
+                completed_tasks: s.completed_tasks.clone(),
+                failed_tasks: s.failed_tasks.clone(),
+                started_at: s.started_at,
+            })
+        };
+        // ============================================================
+        // Write lock is now RELEASED — safe to call async methods
+        // ============================================================
+
+        let snap = match snapshot {
+            Some(s) => s,
+            None => return Ok(()),
         };
 
-        let mut global = RUNNER_STATE.write().await;
-        if let Some(ref mut s) = *global {
-            s.finalize(status);
-            self.graph.update_plan_run(s).await?;
-        }
-
-        // Finalize the execution vector from the collector
-        if let Some(ref state) = *global {
-            let collector = VECTOR_COLLECTOR.read().await;
-            let vector = collector.finalize(state);
-            // Log the derived metrics
-            info!(
-                "Run {} vector: efficiency={:.2}, velocity={:.3}, stability={:.2}",
-                run_id,
-                vector.efficiency(),
-                vector.velocity(),
-                vector.stability()
-            );
-            // TODO: persist vector to PlanRun node in Neo4j when schema supports it
-        }
+        let plan_id = snap.plan_id;
+        let lifecycle_run_id = snap.lifecycle_run_id;
+        let total_cost = snap.total_cost;
+        let total_duration = snap.total_duration;
+        let tc = snap.completed_tasks.len();
+        let tf = snap.failed_tasks.len();
 
         // Transition plan status to match the run's terminal state
-        let plan_id = global.as_ref().map(|s| s.plan_id).unwrap_or(Uuid::nil());
-        {
-            if plan_id != Uuid::nil() {
-                let plan_status = match status {
-                    PlanRunStatus::Completed => Some(PlanStatus::Completed),
-                    PlanRunStatus::CompletedWithErrors => Some(PlanStatus::InProgress),
-                    PlanRunStatus::Failed | PlanRunStatus::BudgetExceeded => {
-                        Some(PlanStatus::Cancelled)
-                    }
-                    PlanRunStatus::Cancelled => Some(PlanStatus::Cancelled),
-                    _ => None,
-                };
-                if let Some(ps) = plan_status {
-                    if let Err(e) = self.graph.update_plan_status(plan_id, ps.clone()).await {
-                        warn!(
-                            "Failed to set plan {} status to {:?} (idempotent, continuing): {}",
-                            plan_id, ps, e
-                        );
-                    } else {
-                        info!("Plan {} status set to {:?}", plan_id, ps);
-                    }
+        if plan_id != Uuid::nil() {
+            let plan_status = match status {
+                PlanRunStatus::Completed => Some(PlanStatus::Completed),
+                PlanRunStatus::CompletedWithErrors => Some(PlanStatus::InProgress),
+                PlanRunStatus::Failed | PlanRunStatus::BudgetExceeded => {
+                    Some(PlanStatus::Cancelled)
+                }
+                PlanRunStatus::Cancelled => Some(PlanStatus::Cancelled),
+                _ => None,
+            };
+            if let Some(ps) = plan_status {
+                if let Err(e) = self.graph.update_plan_status(plan_id, ps.clone()).await {
+                    warn!(
+                        "Failed to set plan {} status to {:?} (idempotent, continuing): {}",
+                        plan_id, ps, e
+                    );
+                } else {
+                    info!("Plan {} status set to {:?}", plan_id, ps);
                 }
             }
         }
 
         match status {
             PlanRunStatus::Completed => {
-                let (total_cost, total_duration, tc, tf) = global
-                    .as_ref()
-                    .map(|s| {
-                        (
-                            s.cost_usd,
-                            s.elapsed_secs(),
-                            s.completed_tasks.len(),
-                            s.failed_tasks.len(),
-                        )
-                    })
-                    .unwrap_or((0.0, 0.0, 0, 0));
-
                 // ============================================================
                 // Lifecycle FSM: child_completed → post_run
                 // ============================================================
@@ -3664,23 +3687,21 @@ impl PlanRunner {
                 // Post-run enricher sweep: catch commits missed by per-task enrichment
                 // (e.g., mega-commit at end instead of atomic per-task commits)
                 if let Some(cwd) = cwd {
-                    if let Some(ref state) = *global {
-                        let enricher = TaskEnricher::new(self.graph.clone());
-                        let sweep_linked = enricher
-                            .post_run_sweep(
-                                state.plan_id,
-                                &state.completed_tasks,
-                                state.started_at,
-                                state.project_id,
-                                cwd,
-                            )
-                            .await;
-                        if sweep_linked > 0 {
-                            info!(
-                                "Post-run sweep linked {} commit→task relations",
-                                sweep_linked
-                            );
-                        }
+                    let enricher = TaskEnricher::new(self.graph.clone());
+                    let sweep_linked = enricher
+                        .post_run_sweep(
+                            snap.plan_id,
+                            &snap.completed_tasks,
+                            snap.started_at,
+                            snap.project_id,
+                            cwd,
+                        )
+                        .await;
+                    if sweep_linked > 0 {
+                        info!(
+                            "Post-run sweep linked {} commit→task relations",
+                            sweep_linked
+                        );
                     }
                 }
 
@@ -3748,18 +3769,6 @@ impl PlanRunner {
                 info!("Plan run {} completed successfully", run_id);
             }
             PlanRunStatus::CompletedWithErrors => {
-                let (total_cost, total_duration, tc, tf) = global
-                    .as_ref()
-                    .map(|s| {
-                        (
-                            s.cost_usd,
-                            s.elapsed_secs(),
-                            s.completed_tasks.len(),
-                            s.failed_tasks.len(),
-                        )
-                    })
-                    .unwrap_or((0.0, 0.0, 0, 0));
-
                 // Lifecycle FSM: child_completed (partial success is still completion)
                 if let Some(lc_run_id) = lifecycle_run_id {
                     self.fire_lifecycle_transition(run_id, lc_run_id, "child_completed")
@@ -3768,23 +3777,21 @@ impl PlanRunner {
 
                 // Post-run enricher sweep (same as Completed — partial work still has commits)
                 if let Some(cwd) = cwd {
-                    if let Some(ref state) = *global {
-                        let enricher = TaskEnricher::new(self.graph.clone());
-                        let sweep_linked = enricher
-                            .post_run_sweep(
-                                state.plan_id,
-                                &state.completed_tasks,
-                                state.started_at,
-                                state.project_id,
-                                cwd,
-                            )
-                            .await;
-                        if sweep_linked > 0 {
-                            info!(
-                                "Post-run sweep linked {} commit→task relations",
-                                sweep_linked
-                            );
-                        }
+                    let enricher = TaskEnricher::new(self.graph.clone());
+                    let sweep_linked = enricher
+                        .post_run_sweep(
+                            snap.plan_id,
+                            &snap.completed_tasks,
+                            snap.started_at,
+                            snap.project_id,
+                            cwd,
+                        )
+                        .await;
+                    if sweep_linked > 0 {
+                        info!(
+                            "Post-run sweep linked {} commit→task relations",
+                            sweep_linked
+                        );
                     }
                 }
 
@@ -3806,7 +3813,8 @@ impl PlanRunner {
 
                 // Create a gotcha note with error context
                 if plan_id != Uuid::nil() {
-                    self.create_failure_note(plan_id, run_id).await;
+                    self.create_failure_note(plan_id, run_id, &snap.failed_tasks, snap.project_id)
+                        .await;
                 }
             }
             PlanRunStatus::Failed => {
@@ -3820,7 +3828,8 @@ impl PlanRunner {
 
                 // Create a gotcha note with error context for failed runs
                 if plan_id != Uuid::nil() {
-                    self.create_failure_note(plan_id, run_id).await;
+                    self.create_failure_note(plan_id, run_id, &snap.failed_tasks, snap.project_id)
+                        .await;
                 }
             }
             PlanRunStatus::Cancelled => {
@@ -3947,15 +3956,13 @@ impl PlanRunner {
     /// Create a gotcha note when a plan run fails.
     ///
     /// Captures error context (failed tasks, run_id) for debugging.
-    async fn create_failure_note(&self, plan_id: Uuid, run_id: Uuid) {
-        let (failed_tasks, project_id) = {
-            let global = RUNNER_STATE.read().await;
-            global
-                .as_ref()
-                .map(|s| (s.failed_tasks.clone(), s.project_id))
-                .unwrap_or_default()
-        };
-
+    async fn create_failure_note(
+        &self,
+        plan_id: Uuid,
+        run_id: Uuid,
+        failed_tasks: &[Uuid],
+        project_id: Option<Uuid>,
+    ) {
         let failed_summary: Vec<String> = failed_tasks
             .iter()
             .map(|id| format!("- Task {}", id))
@@ -5771,6 +5778,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_on_task_completed_removes_agent_from_active_agents() {
+        let _guard = TEST_MUTEX.lock().await;
+        reset_globals().await;
+
         use crate::neo4j::models::TaskStatus;
         use crate::test_helpers::{test_plan, test_task};
 
@@ -6008,6 +6018,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_on_task_completed_with_cwd_runs_cargo_fmt() {
+        let _guard = TEST_MUTEX.lock().await;
+        reset_globals().await;
+
         use crate::neo4j::models::TaskStatus;
         use crate::test_helpers::{test_plan, test_task};
 
@@ -6051,6 +6064,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_on_task_failed_definitive_marks_failed_and_removes_agent() {
+        let _guard = TEST_MUTEX.lock().await;
+        reset_globals().await;
+
         use crate::neo4j::models::TaskStatus;
         use crate::test_helpers::{test_plan, test_task};
 
@@ -6115,6 +6131,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_on_task_failed_retryable_marks_pending() {
+        let _guard = TEST_MUTEX.lock().await;
+        reset_globals().await;
+
         use crate::neo4j::models::TaskStatus;
         use crate::test_helpers::{test_plan, test_task};
 
@@ -6165,6 +6184,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_finalize_run_completed_with_errors() {
+        let _guard = TEST_MUTEX.lock().await;
+        reset_globals().await;
+
         use crate::neo4j::models::TaskStatus;
         use crate::test_helpers::{test_plan, test_task};
 
@@ -6215,6 +6237,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_finalize_run_completed_success() {
+        let _guard = TEST_MUTEX.lock().await;
+        reset_globals().await;
+
         use crate::test_helpers::test_plan;
 
         let (runner, graph) = test_plan_runner_with_graph();
@@ -6364,6 +6389,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_finalize_run_failed_creates_note() {
+        let _guard = TEST_MUTEX.lock().await;
+        reset_globals().await;
+
         use crate::test_helpers::test_plan;
 
         let (runner, graph) = test_plan_runner_with_graph();
@@ -6405,6 +6433,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_finalize_run_cancelled() {
+        let _guard = TEST_MUTEX.lock().await;
+        reset_globals().await;
+
         use crate::test_helpers::test_plan;
 
         let (runner, graph) = test_plan_runner_with_graph();
@@ -6443,6 +6474,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_finalize_run_budget_exceeded() {
+        let _guard = TEST_MUTEX.lock().await;
+        reset_globals().await;
+
         use crate::test_helpers::test_plan;
 
         let (runner, graph) = test_plan_runner_with_graph();
@@ -6481,6 +6515,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_failure_note_creates_gotcha() {
+        let _guard = TEST_MUTEX.lock().await;
+        reset_globals().await;
+
         use crate::test_helpers::test_plan;
 
         let (runner, graph) = test_plan_runner_with_graph();
@@ -6491,14 +6528,11 @@ mod tests {
 
         let run_id = Uuid::new_v4();
         let failed_task = Uuid::new_v4();
-        {
-            let mut global = RUNNER_STATE.write().await;
-            let mut state = RunnerState::new(run_id, plan_id, 1, TriggerSource::Manual);
-            state.failed_tasks.push(failed_task);
-            *global = Some(state);
-        }
+        let failed_tasks = vec![failed_task];
 
-        runner.create_failure_note(plan_id, run_id).await;
+        runner
+            .create_failure_note(plan_id, run_id, &failed_tasks, None)
+            .await;
 
         // Verify note was created (the mock stores notes)
         let (notes, _count) = graph
@@ -6795,6 +6829,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_on_task_completed_without_cwd_skips_fmt() {
+        let _guard = TEST_MUTEX.lock().await;
+        reset_globals().await;
+
         use crate::neo4j::models::TaskStatus;
         use crate::test_helpers::{test_plan, test_task};
 
@@ -6837,6 +6874,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_on_task_failed_no_global_state() {
+        let _guard = TEST_MUTEX.lock().await;
+        reset_globals().await;
+
         use crate::neo4j::models::TaskStatus;
         use crate::test_helpers::{test_plan, test_task};
 
@@ -6915,6 +6955,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_finalize_run_with_cwd_attempts_worktree_cleanup() {
+        let _guard = TEST_MUTEX.lock().await;
+        reset_globals().await;
+
         use crate::test_helpers::test_plan;
 
         let (runner, graph) = test_plan_runner_with_graph();
@@ -6954,6 +6997,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_finalize_run_completed_with_errors_creates_failure_note() {
+        let _guard = TEST_MUTEX.lock().await;
+        reset_globals().await;
+
         use crate::neo4j::models::TaskStatus;
         use crate::test_helpers::{test_plan, test_task};
 
@@ -7019,6 +7065,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_on_task_completed_with_session_id_closes_session() {
+        let _guard = TEST_MUTEX.lock().await;
+        reset_globals().await;
+
         use crate::neo4j::models::TaskStatus;
         use crate::test_helpers::{test_plan, test_task};
 
@@ -7078,6 +7127,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_on_task_failed_definitive_with_session_id_closes_session() {
+        let _guard = TEST_MUTEX.lock().await;
+        reset_globals().await;
+
         use crate::neo4j::models::TaskStatus;
         use crate::test_helpers::{test_plan, test_task};
 
@@ -7150,6 +7202,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_on_task_completed_records_vector_collector() {
+        let _guard = TEST_MUTEX.lock().await;
+        reset_globals().await;
+
         use crate::neo4j::models::TaskStatus;
         use crate::test_helpers::{test_plan, test_task};
 
@@ -7209,6 +7264,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_add_agent_cost_via_runner_state() {
+        let _guard = TEST_MUTEX.lock().await;
+        reset_globals().await;
+
         let task_id = Uuid::new_v4();
         let run_id = Uuid::new_v4();
         let plan_id = Uuid::new_v4();
@@ -7303,6 +7361,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_on_task_completed_emits_event() {
+        let _guard = TEST_MUTEX.lock().await;
+        reset_globals().await;
+
         use crate::neo4j::models::TaskStatus;
         use crate::test_helpers::{test_plan, test_task};
 
@@ -7370,6 +7431,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_on_task_failed_definitive_emits_event() {
+        let _guard = TEST_MUTEX.lock().await;
+        reset_globals().await;
+
         use crate::neo4j::models::TaskStatus;
         use crate::test_helpers::{test_plan, test_task};
 
