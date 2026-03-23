@@ -147,7 +147,7 @@ impl RateLimiter {
         let timestamps = self
             .windows
             .entry(server_id.to_string())
-            .or_insert_with(Vec::new);
+            .or_default();
 
         // Prune old entries outside the window
         timestamps.retain(|t| now.duration_since(*t) < window);
