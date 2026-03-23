@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use tokio::time::timeout;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::chat::enrichment::{
@@ -913,7 +913,7 @@ impl ParallelEnrichmentStage for KnowledgeInjectionStage {
         // ── Scaffolding-adaptive config ──────────────────────────────────
         let scaffolding_enabled = std::env::var("ENRICHMENT_SCAFFOLDING")
             .map(|v| v == "true" || v == "1")
-            .unwrap_or(false);
+            .unwrap_or(true);
 
         let effective_config = if scaffolding_enabled {
             if let Some(pid) = project_id {
@@ -927,8 +927,8 @@ impl ParallelEnrichmentStage for KnowledgeInjectionStage {
                 {
                     Ok(Ok(level)) => {
                         let config = scaffolding_config(level.level);
-                        debug!(
-                            "[knowledge_injection] Scaffolding L{} ({}): max_notes={}, max_content={}",
+                        info!(
+                            "[knowledge_injection] Scaffolding L{} ({}) auto-computed: max_notes={}, max_content={}",
                             level.level, level.label, config.max_notes, config.max_content_chars
                         );
                         output.add_section(
@@ -957,9 +957,11 @@ impl ParallelEnrichmentStage for KnowledgeInjectionStage {
                     }
                 }
             } else {
+                info!("[knowledge_injection] Scaffolding enabled (auto-computed) but no project_id, using default config");
                 self.config.clone()
             }
         } else {
+            info!("[knowledge_injection] Scaffolding disabled via ENRICHMENT_SCAFFOLDING env var, using default L2 config");
             self.config.clone()
         };
 
@@ -1896,6 +1898,193 @@ mod tests {
         assert!(
             (notes[0].score - 0.5).abs() < f64::EPSILON,
             "Unknown note type should get weight 1.0 (score unchanged)"
+        );
+    }
+
+    // ── Scaffolding integration tests ─────────────────────────────────
+
+    /// Helper: create a KnowledgeInjectionStage with a pre-populated MockGraphStore
+    async fn make_stage_with_mock_data(
+        project_id: Uuid,
+        completed_tasks: usize,
+        failed_tasks: usize,
+        frustration: f64,
+        note_count: usize,
+        scar_intensity: f64,
+    ) -> KnowledgeInjectionStage {
+        use crate::meilisearch::mock::MockSearchStore;
+        use crate::neo4j::mock::MockGraphStore;
+        use crate::neo4j::models::TaskStatus;
+        use crate::test_helpers::{test_plan_for_project, test_task};
+
+        let graph = Arc::new(MockGraphStore::new());
+
+        // Create plan for this project
+        let plan = test_plan_for_project(project_id);
+        let plan_id = plan.id;
+        graph.create_plan(&plan).await.unwrap();
+
+        // Create completed tasks
+        for i in 0..completed_tasks {
+            let mut task = test_task();
+            task.title = Some(format!("Completed task {}", i));
+            task.status = TaskStatus::Completed;
+            task.frustration_score = frustration;
+            graph.create_task(plan_id, &task).await.unwrap();
+        }
+
+        // Create failed tasks
+        for i in 0..failed_tasks {
+            let mut task = test_task();
+            task.title = Some(format!("Failed task {}", i));
+            task.status = TaskStatus::Failed;
+            task.frustration_score = frustration;
+            graph.create_task(plan_id, &task).await.unwrap();
+        }
+
+        // Create notes with scar intensity
+        for i in 0..note_count {
+            use crate::notes::models::{Note, NoteType};
+            let mut note = Note::new(
+                Some(project_id),
+                NoteType::Observation,
+                format!("Note content {}", i),
+                "test-agent".to_string(),
+            );
+            note.scar_intensity = scar_intensity;
+            graph.create_note(&note).await.unwrap();
+        }
+
+        let search = Arc::new(MockSearchStore::new());
+        KnowledgeInjectionStage {
+            graph: graph as Arc<dyn crate::neo4j::traits::GraphStore>,
+            search: search as Arc<dyn crate::meilisearch::traits::SearchStore>,
+            config: KnowledgeInjectionConfig::default(),
+            collector: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_scaffolding_integration_mature_project_uses_reduced_config() {
+        // Mature project: many completed tasks, no failures, no frustration
+        // competence = (1.0*0.5 + 1.0*0.2 + (1-0)*0.15 + 1.0*0.15) = 1.0 → L4
+        let project_id = Uuid::new_v4();
+        let stage = make_stage_with_mock_data(
+            project_id, 20,  // completed tasks
+            0,   // failed tasks
+            0.0, // frustration
+            10,  // notes (no scars)
+            0.0, // scar_intensity
+        )
+        .await;
+
+        // Compute scaffolding level directly
+        let level = stage
+            .graph
+            .compute_scaffolding_level(project_id, None)
+            .await
+            .unwrap();
+
+        assert!(
+            level.level >= 3,
+            "Mature project (high success) should be L3 or L4, got L{}",
+            level.level
+        );
+        assert!(
+            level.competence_score >= 0.75,
+            "competence_score should be >= 0.75, got {:.2}",
+            level.competence_score
+        );
+
+        let config = scaffolding_config(level.level);
+        assert!(
+            config.max_notes <= 3,
+            "L{} should have max_notes <= 3, got {}",
+            level.level,
+            config.max_notes
+        );
+    }
+
+    #[tokio::test]
+    async fn test_scaffolding_integration_struggling_project_uses_generous_config() {
+        // Struggling project: mostly failed tasks, high frustration, scarred notes
+        // task_success_rate = 2/(2+18) = 0.1
+        // avg_frustration = 0.9
+        // scar_density = 0.8
+        // competence = (0.1*0.5 + 0.1*0.2 + 0.2*0.15 + 1.0*0.15) = 0.05+0.02+0.03+0.15 = 0.25 → L0
+        let project_id = Uuid::new_v4();
+        let stage = make_stage_with_mock_data(
+            project_id, 2,   // completed tasks
+            18,  // failed tasks
+            0.9, // high frustration
+            10,  // notes with scars
+            0.8, // high scar_intensity
+        )
+        .await;
+
+        let level = stage
+            .graph
+            .compute_scaffolding_level(project_id, None)
+            .await
+            .unwrap();
+
+        assert!(
+            level.level <= 1,
+            "Struggling project should be L0 or L1, got L{}",
+            level.level
+        );
+        assert!(
+            level.competence_score < 0.5,
+            "competence_score should be < 0.5, got {:.2}",
+            level.competence_score
+        );
+
+        let config = scaffolding_config(level.level);
+        assert!(
+            config.max_notes >= 6,
+            "L{} should have max_notes >= 6 (generous scaffolding), got {}",
+            level.level,
+            config.max_notes
+        );
+    }
+
+    #[tokio::test]
+    async fn test_scaffolding_integration_empty_project_gets_high_level() {
+        // Empty project: no tasks, no notes → defaults give competence = 1.0 → L4
+        let project_id = Uuid::new_v4();
+        let stage = make_stage_with_mock_data(
+            project_id, 0,   // no tasks
+            0,   // no tasks
+            0.0, // no frustration
+            0,   // no notes
+            0.0, // no scars
+        )
+        .await;
+
+        let level = stage
+            .graph
+            .compute_scaffolding_level(project_id, None)
+            .await
+            .unwrap();
+
+        // Empty project defaults to high competence (no failures = success)
+        assert_eq!(
+            level.level, 4,
+            "Empty project with no data should default to L4, got L{}",
+            level.level
+        );
+        let config = scaffolding_config(level.level);
+        assert_eq!(config.max_notes, 2, "L4 should have max_notes=2");
+    }
+
+    #[tokio::test]
+    async fn test_scaffolding_disabled_via_env_uses_default() {
+        // When ENRICHMENT_SCAFFOLDING=false, scaffolding is disabled → L2 default config
+        let config_disabled = scaffolding_config(2); // L2 = default
+        let config_default = KnowledgeInjectionConfig::default();
+        assert_eq!(
+            config_disabled.max_notes, config_default.max_notes,
+            "L2 config should match default config"
         );
     }
 
