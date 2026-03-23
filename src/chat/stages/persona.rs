@@ -150,7 +150,7 @@ impl ParallelEnrichmentStage for PersonaStage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chat::enrichment::{EnrichmentContext, ParallelEnrichmentStage};
+    use crate::chat::enrichment::ParallelEnrichmentStage;
     use crate::neo4j::mock::MockGraphStore;
     use crate::neo4j::models::{PersonaNode, PersonaStatus};
     use uuid::Uuid;

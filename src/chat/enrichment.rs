@@ -996,6 +996,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_to_prompt_sections_all_enrichment_variants() {
+        use crate::runner::prompt::PromptSection;
+
+        // Verify Biomimicry, Reflex, UserProfile, and Other all map to Enrichment
+        let mut ctx = EnrichmentContext::default();
+        ctx.add_section("Bio", "bio", "bio", EnrichmentSource::Biomimicry);
+        ctx.add_section("Reflex", "reflex", "reflex", EnrichmentSource::Reflex);
+        ctx.add_section(
+            "Profile",
+            "profile",
+            "profile",
+            EnrichmentSource::UserProfile,
+        );
+        ctx.add_section("Other", "other", "other", EnrichmentSource::Other);
+
+        let sections = ctx.to_prompt_sections();
+        assert_eq!(sections.len(), 4);
+        for (i, section) in sections.iter().enumerate() {
+            assert!(
+                matches!(section, PromptSection::Enrichment(_)),
+                "Section {} ({:?}) should map to Enrichment",
+                i,
+                section
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn test_to_system_prompt_markdown() {
         let mut ctx = EnrichmentContext::default();
         ctx.add_section(

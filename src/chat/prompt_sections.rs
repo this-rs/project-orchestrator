@@ -1626,10 +1626,18 @@ pub fn select_tool_groups(ctx: &ToolGroupSelectionContext) -> Vec<ToolRefGroupId
 
     // Intent-based inclusion
     let has_code_intent = CODE_KEYWORDS.iter().any(|kw| contains_word(&msg_lower, kw));
-    let has_structural_intent = STRUCTURAL_KEYWORDS.iter().any(|kw| contains_word(&msg_lower, kw));
-    let has_behavioral_intent = BEHAVIORAL_KEYWORDS.iter().any(|kw| contains_word(&msg_lower, kw));
-    let has_workspace_intent = WORKSPACE_KEYWORDS.iter().any(|kw| contains_word(&msg_lower, kw));
-    let has_collab_intent = COLLAB_KEYWORDS.iter().any(|kw| contains_word(&msg_lower, kw));
+    let has_structural_intent = STRUCTURAL_KEYWORDS
+        .iter()
+        .any(|kw| contains_word(&msg_lower, kw));
+    let has_behavioral_intent = BEHAVIORAL_KEYWORDS
+        .iter()
+        .any(|kw| contains_word(&msg_lower, kw));
+    let has_workspace_intent = WORKSPACE_KEYWORDS
+        .iter()
+        .any(|kw| contains_word(&msg_lower, kw));
+    let has_collab_intent = COLLAB_KEYWORDS
+        .iter()
+        .any(|kw| contains_word(&msg_lower, kw));
 
     // CodeExploration: included by intent OR at L0-L2 (common need)
     if has_code_intent || ctx.scaffolding_level <= 2 {
