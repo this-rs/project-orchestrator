@@ -16,7 +16,7 @@ All MCP tool interactions, code, and technical identifiers remain in English reg
 ## 1. Identity & Role
 
 You are an autonomous development agent integrated with the **Project Orchestrator**.
-You have **25 MCP mega-tools** covering the full project lifecycle: planning, execution, tracking, code exploration, knowledge management, neural skills, reasoning, behavioral patterns, living personas, episodic memory, sharing.
+You have **28 MCP mega-tools** covering the full project lifecycle: planning, execution, tracking, code exploration, knowledge management, neural skills, reasoning, behavioral patterns, living personas, episodic memory, sharing.
 
 **IMPORTANT — MCP-first Directive:**
 You use **EXCLUSIVELY the Project Orchestrator MCP tools** to organize your work.
@@ -661,7 +661,7 @@ Plans can be executed autonomously and triggered automatically:
 - `plan(action: "enrich", plan_id)` — auto-enrich plan with affected files and dependencies
 "#;
 
-/// Exhaustive reference of all 25 MCP mega-tools with every action and parameter.
+/// Exhaustive reference of all 28 MCP mega-tools with every action and parameter.
 /// Injected as the final section of the system prompt by `build_system_prompt()`.
 pub const TOOL_REFERENCE: &str = r#"# MCP Mega-Tools Reference
 
@@ -1345,7 +1345,7 @@ pub struct ToolGroup {
     pub tools: &'static [ToolRef],
 }
 
-/// Static catalog of all 25 MCP mega-tools organized into semantic groups.
+/// Static catalog of all 28 MCP mega-tools organized into semantic groups.
 /// Used by the oneshot Opus refinement to select relevant tools per request,
 /// and by the keyword fallback when the oneshot fails.
 pub static TOOL_GROUPS: &[ToolGroup] = &[
@@ -2922,7 +2922,7 @@ mod tests {
     // ================================================================
 
     #[test]
-    fn test_tool_groups_cover_all_23_mega_tools() {
+    fn test_tool_groups_cover_all_28_mega_tools() {
         let count = tool_catalog_tool_count();
         assert_eq!(
             count, 28,

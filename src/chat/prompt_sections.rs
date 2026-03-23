@@ -331,7 +331,7 @@ All MCP tool interactions, code, and technical identifiers remain in English reg
 ## 1. Identity & Role
 
 You are an autonomous development agent integrated with the **Project Orchestrator**.
-You have **25 MCP mega-tools** covering the full project lifecycle: planning, execution, tracking, code exploration, knowledge management, neural skills, reasoning, behavioral patterns, living personas, episodic memory, sharing.
+You have **28 MCP mega-tools** covering the full project lifecycle: planning, execution, tracking, code exploration, knowledge management, neural skills, reasoning, behavioral patterns, living personas, episodic memory, sharing.
 
 **IMPORTANT — MCP-first Directive:**
 You use **EXCLUSIVELY the Project Orchestrator MCP tools** to organize your work.
@@ -352,7 +352,7 @@ Each tool has an `action` parameter that determines the operation:
 tool_name(action: "<action>", param1: value1, param2: value2, ...)
 ```
 
-The 25 mega-tools: `project`, `plan`, `task`, `step`, `decision`, `constraint`, `release`, `milestone`, `commit`, `note`, `workspace`, `workspace_milestone`, `resource`, `component`, `chat`, `feature_graph`, `code`, `reasoning`, `admin`, `skill`, `analysis_profile`, `protocol`, `persona`, `episode`, `sharing`"#;
+The 28 mega-tools: `project`, `plan`, `task`, `step`, `decision`, `constraint`, `release`, `milestone`, `commit`, `note`, `workspace`, `workspace_milestone`, `resource`, `component`, `chat`, `feature_graph`, `code`, `reasoning`, `admin`, `skill`, `analysis_profile`, `protocol`, `persona`, `episode`, `sharing`, `neural_routing`, `trajectory`, `lifecycle_hook`"#;
 
 /// §3 — Data Model (Entity hierarchy, relations, code graph, notes)
 pub const SECTION_DATA_MODEL: &str = r#"## 3. Data Model
@@ -1415,11 +1415,11 @@ pub enum ToolRefGroupId {
     CodeExploration,
     /// admin — included at L0-L1 or when GDS/maintenance requested
     Structural,
-    /// protocol, skill, persona, episode — included when protocols active or L0-L1
+    /// protocol, skill, persona, episode, lifecycle_hook — included when protocols active or L0-L1
     Behavioral,
     /// workspace, workspace_milestone, resource, component — included in multi-project
     Workspace,
-    /// chat, feature_graph, sharing, reasoning — included on demand
+    /// chat, feature_graph, sharing, reasoning, neural_routing, trajectory — included on demand
     Collaboration,
 }
 
@@ -1450,9 +1450,9 @@ impl ToolRefGroupId {
             Self::Knowledge => &["note", "decision", "commit"],
             Self::CodeExploration => &["code", "analysis_profile"],
             Self::Structural => &["admin"],
-            Self::Behavioral => &["protocol", "skill", "persona", "episode"],
+            Self::Behavioral => &["protocol", "skill", "persona", "episode", "lifecycle_hook"],
             Self::Workspace => &["workspace", "workspace_milestone", "resource", "component"],
-            Self::Collaboration => &["chat", "feature_graph", "sharing", "reasoning"],
+            Self::Collaboration => &["chat", "feature_graph", "sharing", "reasoning", "neural_routing", "trajectory"],
         }
     }
 
@@ -1463,9 +1463,9 @@ impl ToolRefGroupId {
             Self::Knowledge => "Knowledge (Notes, Decisions, Commits)",
             Self::CodeExploration => "Code Exploration & Analytics",
             Self::Structural => "Admin & Sync",
-            Self::Behavioral => "Behavioral (Protocols, Skills, Personas, Episodes)",
+            Self::Behavioral => "Behavioral (Protocols, Skills, Personas, Episodes, Lifecycle Hooks)",
             Self::Workspace => "Workspace (Multi-project)",
-            Self::Collaboration => "Collaboration (Chat, Features, Sharing, Reasoning)",
+            Self::Collaboration => "Collaboration (Chat, Features, Sharing, Reasoning, Neural Routing)",
         }
     }
 }
@@ -1893,17 +1893,17 @@ mod tests {
     // ── Tool Reference Group tests ───────────────────────────────────
 
     #[test]
-    fn test_tool_groups_cover_all_25_tools() {
+    fn test_tool_groups_cover_all_28_tools() {
         let mut all_tools: Vec<&str> = ToolRefGroupId::ALL
             .iter()
             .flat_map(|g| g.tool_names().iter().copied())
             .collect();
         all_tools.sort();
         all_tools.dedup();
-        // 25 mega-tools + analysis_profile + neural_routing/trajectory = at least 25
+        // Must cover all 28 mega-tools defined in mcp/tools.rs
         assert!(
-            all_tools.len() >= 25,
-            "Groups should cover at least 25 tools, got {}",
+            all_tools.len() >= 28,
+            "Groups should cover at least 28 tools, got {}",
             all_tools.len()
         );
     }
