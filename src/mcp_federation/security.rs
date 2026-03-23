@@ -506,9 +506,9 @@ mod tests {
         };
         let json = serde_json::to_string(&policy).unwrap();
         let back: McpSecurityPolicy = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.allow_mutations, true);
+        assert!(back.allow_mutations);
         assert_eq!(back.max_calls_per_minute, 120);
-        assert_eq!(back.credential_isolation, false);
+        assert!(!back.credential_isolation);
         assert_eq!(back.allowed_servers.unwrap().len(), 2);
     }
 
