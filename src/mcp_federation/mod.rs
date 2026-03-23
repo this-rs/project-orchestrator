@@ -24,6 +24,7 @@ pub mod circuit_breaker;
 pub mod discovery;
 pub mod prober;
 pub mod registry;
+pub mod security;
 
 // Re-exports
 pub use client::{McpClient, McpTransportConfig};
@@ -33,6 +34,7 @@ pub use prober::ToolProber;
 pub use registry::{
     ConnectionStatus, McpServerConnection, McpServerRegistry, ServerStats,
 };
+pub use security::{McpSecurityPolicy, PolicyViolation, RateLimiter, SecurityEnforcer};
 
 use serde::{Deserialize, Serialize};
 
