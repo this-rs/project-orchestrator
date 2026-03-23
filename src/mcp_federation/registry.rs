@@ -568,4 +568,274 @@ mod tests {
         // Just verify it compiles and creates
         assert!(Arc::strong_count(&registry) == 1);
     }
+
+    // ── Mock MCP client for lifecycle tests ──────────────────────────────
+
+    #[derive(Debug)]
+    struct MockLifecycleClient {
+        should_fail: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl super::super::client::McpClient for MockLifecycleClient {
+        async fn initialize(
+            &self,
+        ) -> anyhow::Result<super::super::client::InitializeResult> {
+            unimplemented!()
+        }
+        async fn initialized_notification(&self) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+        async fn tools_list(
+            &self,
+        ) -> anyhow::Result<Vec<super::super::client::McpToolDef>> {
+            unimplemented!()
+        }
+        async fn call_tool(
+            &self,
+            _name: &str,
+            _arguments: Option<serde_json::Value>,
+        ) -> anyhow::Result<serde_json::Value> {
+            if self.should_fail {
+                Err(anyhow::anyhow!("simulated failure"))
+            } else {
+                Ok(serde_json::json!({"ok": true}))
+            }
+        }
+        async fn ping(&self) -> anyhow::Result<()> {
+            if self.should_fail {
+                Err(anyhow::anyhow!("ping failed"))
+            } else {
+                Ok(())
+            }
+        }
+        async fn shutdown(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn transport_name(&self) -> &'static str {
+            "mock"
+        }
+    }
+
+    /// Helper: build a test McpServerConnection with the mock client.
+    fn mock_connection(server_id: &str, tool_count: usize) -> McpServerConnection {
+        let tools: Vec<super::super::discovery::DiscoveredTool> = (0..tool_count)
+            .map(|i| super::super::discovery::DiscoveredTool {
+                name: format!("tool_{}", i),
+                fqn: format!("{}::tool_{}", server_id, i),
+                description: format!("Mock tool {}", i),
+                input_schema: serde_json::json!({"type": "object"}),
+                category: if i % 2 == 0 {
+                    super::super::discovery::InferredCategory::Query
+                } else {
+                    super::super::discovery::InferredCategory::Mutation
+                },
+                embedding: None,
+                similar_internal: vec![],
+                profile: None,
+            })
+            .collect();
+
+        McpServerConnection {
+            id: server_id.to_string(),
+            display_name: format!("Test {}", server_id),
+            transport: super::super::McpTransport::Stdio {
+                command: "echo".to_string(),
+                args: vec![],
+                env: std::collections::HashMap::new(),
+            },
+            status: ConnectionStatus::Connected,
+            client: Box::new(MockLifecycleClient {
+                should_fail: false,
+            }),
+            discovered_tools: tools,
+            circuit_breaker: super::super::circuit_breaker::CircuitBreaker::default(),
+            stats: ServerStats::new(),
+            connected_at: chrono::Utc::now(),
+            server_protocol_version: Some("2024-11-05".to_string()),
+            server_name: Some("MockServer".to_string()),
+        }
+    }
+
+    // ── Lifecycle Integration Tests ──────────────────────────────────────
+
+    #[test]
+    fn test_lifecycle_insert_list_disconnect() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut registry = McpServerRegistry::new();
+
+            // Insert a mock connection
+            let conn = mock_connection("test-server", 3);
+            registry.insert_connection_for_test(conn);
+
+            // List should return 1 server
+            let servers = registry.list();
+            assert_eq!(servers.len(), 1);
+            assert_eq!(servers[0].id, "test-server");
+            assert_eq!(servers[0].tool_count, 3);
+            assert_eq!(servers[0].status, ConnectionStatus::Connected);
+
+            // Tools should be indexed
+            assert_eq!(registry.all_tools().len(), 3);
+            assert!(!registry.is_empty());
+            assert_eq!(registry.len(), 1);
+
+            // Disconnect
+            registry.disconnect("test-server").await.unwrap();
+            assert!(registry.is_empty());
+            assert!(registry.list().is_empty());
+            assert!(registry.all_tools().is_empty());
+        });
+    }
+
+    #[test]
+    fn test_lifecycle_tools_for_server() {
+        let mut registry = McpServerRegistry::new();
+        let conn = mock_connection("alpha", 4);
+        registry.insert_connection_for_test(conn);
+
+        let tools = registry.tools_for_server("alpha");
+        assert_eq!(tools.len(), 4);
+        assert_eq!(tools[0].fqn, "alpha::tool_0");
+
+        // Non-existent server returns empty
+        assert!(registry.tools_for_server("nonexistent").is_empty());
+    }
+
+    #[test]
+    fn test_lifecycle_resolve_tool_fqn() {
+        let mut registry = McpServerRegistry::new();
+        let conn = mock_connection("beta", 2);
+        registry.insert_connection_for_test(conn);
+
+        // Resolve existing tool FQN
+        let server_id = registry.resolve_tool("beta::tool_0");
+        assert_eq!(server_id, Some("beta"));
+
+        // Non-existent tool
+        assert!(registry.resolve_tool("beta::nonexistent").is_none());
+        assert!(registry.resolve_tool("gamma::tool_0").is_none());
+    }
+
+    #[test]
+    fn test_lifecycle_multiple_servers() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut registry = McpServerRegistry::new();
+
+            registry.insert_connection_for_test(mock_connection("server-a", 2));
+            registry.insert_connection_for_test(mock_connection("server-b", 3));
+
+            assert_eq!(registry.len(), 2);
+            assert_eq!(registry.all_tools().len(), 5); // 2 + 3
+
+            // List returns both
+            let servers = registry.list();
+            assert_eq!(servers.len(), 2);
+
+            // Disconnect one
+            registry.disconnect("server-a").await.unwrap();
+            assert_eq!(registry.len(), 1);
+            assert_eq!(registry.all_tools().len(), 3); // only server-b's tools
+
+            // server-b tools still accessible
+            assert!(registry.resolve_tool("server-b::tool_0").is_some());
+            // server-a tools gone
+            assert!(registry.resolve_tool("server-a::tool_0").is_none());
+        });
+    }
+
+    #[test]
+    fn test_lifecycle_disconnect_nonexistent_fails() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut registry = McpServerRegistry::new();
+            let result = registry.disconnect("ghost").await;
+            assert!(result.is_err());
+        });
+    }
+
+    #[test]
+    fn test_lifecycle_server_ids() {
+        let mut registry = McpServerRegistry::new();
+        registry.insert_connection_for_test(mock_connection("x", 1));
+        registry.insert_connection_for_test(mock_connection("y", 1));
+
+        let mut ids = registry.server_ids();
+        ids.sort();
+        assert_eq!(ids, vec!["x", "y"]);
+    }
+
+    #[test]
+    fn test_lifecycle_get_and_get_mut() {
+        let mut registry = McpServerRegistry::new();
+        registry.insert_connection_for_test(mock_connection("srv", 2));
+
+        // get (immutable)
+        let conn = registry.get("srv").unwrap();
+        assert_eq!(conn.display_name, "Test srv");
+        assert_eq!(conn.discovered_tools.len(), 2);
+
+        // get non-existent
+        assert!(registry.get("nope").is_none());
+
+        // get_mut
+        let conn_mut = registry.get_mut("srv").unwrap();
+        conn_mut.stats.record_call(42, true);
+        assert_eq!(conn_mut.stats.call_count, 1);
+    }
+
+    #[test]
+    fn test_lifecycle_security_policy_integration() {
+        use super::super::security::{McpSecurityPolicy, SecurityEnforcer};
+
+        let mut registry = McpServerRegistry::new();
+        let conn = mock_connection("secure-srv", 4);
+        registry.insert_connection_for_test(conn);
+
+        // Default policy blocks mutations
+        let mut enforcer = SecurityEnforcer::new(McpSecurityPolicy::default());
+
+        let tools = registry.tools_for_server("secure-srv");
+        for tool in &tools {
+            let result = enforcer.enforce("secure-srv", &tool.name, &tool.category);
+            if tool.category.is_mutating() {
+                assert!(result.is_err(), "Mutation tool {} should be blocked", tool.name);
+            } else {
+                assert!(result.is_ok(), "Query tool {} should pass", tool.name);
+            }
+        }
+    }
+
+    #[test]
+    fn test_lifecycle_circuit_breaker_integration() {
+        let mut registry = McpServerRegistry::new();
+        registry.insert_connection_for_test(mock_connection("cb-srv", 1));
+
+        let conn = registry.get_mut("cb-srv").unwrap();
+
+        // Circuit breaker starts closed
+        assert!(conn.circuit_breaker.allow_request());
+
+        // Record failures to trip it
+        for _ in 0..10 {
+            conn.circuit_breaker.record_failure();
+        }
+        assert!(!conn.circuit_breaker.allow_request());
+
+        // Record success to start recovery
+        conn.circuit_breaker.record_success();
+    }
+
+    #[test]
+    fn test_lifecycle_all_external_tool_infos() {
+        let mut registry = McpServerRegistry::new();
+        registry.insert_connection_for_test(mock_connection("ext-srv", 3));
+
+        let infos = registry.all_external_tool_infos();
+        assert_eq!(infos.len(), 3);
+        assert_eq!(infos[0].fqn, "ext-srv::tool_0");
+        assert_eq!(infos[0].description, "Mock tool 0");
+    }
 }
