@@ -575,11 +575,7 @@ impl CompactionContext {
                     );
                 }
                 if !wl.steps_completed.is_empty() {
-                    let _ = writeln!(
-                        out,
-                        "**Steps completed:** {}",
-                        wl.steps_completed.len()
-                    );
+                    let _ = writeln!(out, "**Steps completed:** {}", wl.steps_completed.len());
                 }
                 if wl.tool_use_count > 0 {
                     let _ = writeln!(out, "**Tool uses this session:** {}", wl.tool_use_count);
@@ -1467,6 +1463,187 @@ mod tests {
         assert!(
             ci.contains("CRITICAL"),
             "Missing CRITICAL instruction even without work_log: {}",
+            ci
+        );
+    }
+
+    #[test]
+    fn test_custom_instructions_work_log_files_already_modified() {
+        let ctx = sample_context();
+        let wl = SessionWorkLogSnapshot {
+            files_modified: vec!["src/new_file.rs".to_string(), "src/other.rs".to_string()],
+            files_read: vec![],
+            steps_completed: vec![],
+            step_in_progress: None,
+            decisions_summary: vec![],
+            last_tool_name: None,
+            tool_use_count: 0,
+        };
+        let ci = ctx.to_custom_instructions(Some(&wl));
+
+        assert!(
+            ci.contains("Files already modified this session"),
+            "Missing files already modified line: {}",
+            ci
+        );
+        assert!(
+            ci.contains("src/new_file.rs"),
+            "Missing work_log file: {}",
+            ci
+        );
+    }
+
+    #[test]
+    fn test_custom_instructions_work_log_session_decisions() {
+        let ctx = sample_context();
+        let wl = SessionWorkLogSnapshot {
+            files_modified: vec![],
+            files_read: vec![],
+            steps_completed: vec![],
+            step_in_progress: None,
+            decisions_summary: vec!["bash: cargo test".to_string(), "bash: cargo check".to_string()],
+            last_tool_name: None,
+            tool_use_count: 0,
+        };
+        let ci = ctx.to_custom_instructions(Some(&wl));
+
+        assert!(
+            ci.contains("Session decisions"),
+            "Missing session decisions: {}",
+            ci
+        );
+        assert!(
+            ci.contains("cargo test"),
+            "Missing decision content: {}",
+            ci
+        );
+    }
+
+    #[test]
+    fn test_custom_instructions_active_plans_included() {
+        let ctx = CompactionContext {
+            project_name: Some("test-project".to_string()),
+            active_plans: vec![
+                PlanSummary {
+                    title: "Plan A".to_string(),
+                    total_tasks: 5,
+                    completed_tasks: 2,
+                    in_progress_tasks: 1,
+                    pending_tasks: 2,
+                },
+            ],
+            pending_tasks: vec![
+                TaskSummary {
+                    title: "Do something".to_string(),
+                    status: "inprogress".to_string(),
+                    affected_files: vec![],
+                    steps: vec![],
+                },
+            ],
+            ..Default::default()
+        };
+        let ci = ctx.to_custom_instructions(None);
+
+        assert!(
+            ci.contains("Active plans: Plan A"),
+            "Missing active plan: {}",
+            ci
+        );
+        assert!(
+            ci.contains("Pending objectives: Do something"),
+            "Missing pending objective: {}",
+            ci
+        );
+    }
+
+    #[test]
+    fn test_custom_instructions_truncation_at_budget() {
+        // Build a context with many steps to exceed 2000 chars
+        let ctx = CompactionContext {
+            task_title: Some("Very long task name".to_string()),
+            steps: (0..50)
+                .map(|i| StepSummary {
+                    order: i,
+                    description: format!("Step {} with a fairly long description to fill up chars", i),
+                    status: "pending".to_string(),
+                })
+                .collect(),
+            affected_files: (0..20)
+                .map(|i| format!("src/module_{}/handler_{}.rs", i, i))
+                .collect(),
+            ..Default::default()
+        };
+        let ci = ctx.to_custom_instructions(None);
+
+        assert!(
+            ci.len() <= MAX_CUSTOM_INSTRUCTIONS_CHARS,
+            "Custom instructions {} chars exceeds budget {}",
+            ci.len(),
+            MAX_CUSTOM_INSTRUCTIONS_CHARS
+        );
+        // When content exceeds budget, it gets truncated
+        // The budget check is the important assertion above
+    }
+
+    #[test]
+    fn test_to_markdown_work_log_under_budget() {
+        let mut ctx = sample_context();
+        ctx.work_log = Some(SessionWorkLogSnapshot {
+            files_modified: vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
+            files_read: vec!["src/c.rs".to_string()],
+            steps_completed: vec![uuid::Uuid::new_v4()],
+            step_in_progress: None,
+            decisions_summary: vec!["bash: cargo check".to_string()],
+            last_tool_name: Some("Edit".to_string()),
+            tool_use_count: 10,
+        });
+        let md = ctx.to_markdown();
+
+        assert!(
+            md.len() <= MAX_MARKDOWN_CHARS,
+            "Markdown {} exceeds budget {}",
+            md.len(),
+            MAX_MARKDOWN_CHARS
+        );
+        assert!(
+            md.contains("## Work Already Done"),
+            "Missing Work Already Done section: {}",
+            md
+        );
+        assert!(
+            md.contains("`src/a.rs`"),
+            "Missing work_log file: {}",
+            md
+        );
+    }
+
+    #[test]
+    fn test_custom_instructions_work_log_merges_affected_files() {
+        let ctx = CompactionContext {
+            task_title: Some("Test task".to_string()),
+            affected_files: vec!["src/existing.rs".to_string()],
+            ..Default::default()
+        };
+        let wl = SessionWorkLogSnapshot {
+            files_modified: vec!["src/new.rs".to_string()],
+            files_read: vec![],
+            steps_completed: vec![],
+            step_in_progress: None,
+            decisions_summary: vec![],
+            last_tool_name: None,
+            tool_use_count: 0,
+        };
+        let ci = ctx.to_custom_instructions(Some(&wl));
+
+        // Both files should appear in "Affected files"
+        assert!(
+            ci.contains("src/existing.rs"),
+            "Missing task affected file: {}",
+            ci
+        );
+        assert!(
+            ci.contains("src/new.rs") || ci.contains("Files already modified"),
+            "Missing work_log file in output: {}",
             ci
         );
     }

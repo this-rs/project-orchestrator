@@ -2281,4 +2281,114 @@ mod tests {
         assert!(log.files_read.contains("/src"));
         assert!(log.files_read.contains("/src/lib.rs"));
     }
+
+    #[test]
+    fn test_session_work_log_notebook_edit_tracking() {
+        let mut log = SessionWorkLog::default();
+        log.record_tool_use(
+            "NotebookEdit",
+            &serde_json::json!({"file_path": "/notebooks/analysis.ipynb", "cell_index": 0}),
+        );
+        assert!(log.files_modified.contains("/notebooks/analysis.ipynb"));
+        assert_eq!(log.tool_use_count, 1);
+        assert_eq!(log.last_tool_name.as_deref(), Some("NotebookEdit"));
+    }
+
+    #[test]
+    fn test_session_work_log_step_update_non_update_action_ignored() {
+        let mut log = SessionWorkLog::default();
+        let step = Uuid::new_v4();
+        // action: "list" should be ignored by record_step_update
+        log.record_tool_use(
+            "mcp__project-orchestrator__step",
+            &serde_json::json!({"action": "list", "task_id": step.to_string()}),
+        );
+        assert!(log.steps_completed.is_empty());
+        assert!(log.step_in_progress.is_none());
+    }
+
+    #[test]
+    fn test_session_work_log_step_update_invalid_uuid_ignored() {
+        let mut log = SessionWorkLog::default();
+        log.record_tool_use(
+            "mcp__project-orchestrator__step",
+            &serde_json::json!({"action": "update", "step_id": "not-a-uuid", "status": "completed"}),
+        );
+        assert!(log.steps_completed.is_empty());
+    }
+
+    #[test]
+    fn test_session_work_log_step_completed_dedup() {
+        let mut log = SessionWorkLog::default();
+        let step = Uuid::new_v4();
+        // Complete the same step twice
+        log.record_tool_use(
+            "mcp__project-orchestrator__step",
+            &serde_json::json!({"action": "update", "step_id": step.to_string(), "status": "completed"}),
+        );
+        log.record_tool_use(
+            "mcp__project-orchestrator__step",
+            &serde_json::json!({"action": "update", "step_id": step.to_string(), "status": "completed"}),
+        );
+        assert_eq!(log.steps_completed.len(), 1);
+    }
+
+    #[test]
+    fn test_session_work_log_summary_with_step_in_progress_and_decisions() {
+        let mut log = SessionWorkLog::default();
+        let step = Uuid::new_v4();
+        log.step_in_progress = Some(step);
+        log.decisions_summary.push("Use trait-based approach".to_string());
+        log.last_tool_name = Some("Edit".to_string());
+        log.tool_use_count = 5;
+
+        let md = log.to_summary_markdown();
+        assert!(md.contains("## Session Work Log"));
+        assert!(md.contains("Step in progress:"));
+        assert!(md.contains(&step.to_string()));
+        assert!(md.contains("Decisions:"));
+        assert!(md.contains("Use trait-based approach"));
+        assert!(
+            md.contains("Last tool:") && md.contains("Edit") && md.contains("total: 5"),
+            "Missing last tool info in: {}",
+            md
+        );
+    }
+
+    #[test]
+    fn test_session_work_log_bash_truncation_at_80_chars() {
+        let mut log = SessionWorkLog::default();
+        let long_cmd = "a".repeat(120);
+        log.record_tool_use("Bash", &serde_json::json!({"command": long_cmd}));
+        assert_eq!(log.decisions_summary.len(), 1);
+        // "bash: " prefix (6 chars) + 80 chars of command = 86 total
+        assert!(
+            log.decisions_summary[0].len() <= 86,
+            "Decision should be truncated, got len {}",
+            log.decisions_summary[0].len()
+        );
+    }
+
+    #[test]
+    fn test_session_work_log_unknown_tool_ignored() {
+        let mut log = SessionWorkLog::default();
+        log.record_tool_use(
+            "SomeRandomTool",
+            &serde_json::json!({"whatever": "value"}),
+        );
+        assert!(log.files_modified.is_empty());
+        assert!(log.files_read.is_empty());
+        assert!(log.decisions_summary.is_empty());
+        assert_eq!(log.tool_use_count, 1); // still counted
+        assert_eq!(log.last_tool_name.as_deref(), Some("SomeRandomTool"));
+    }
+
+    #[test]
+    fn test_session_work_log_tool_missing_file_path() {
+        let mut log = SessionWorkLog::default();
+        // Write without file_path key
+        log.record_tool_use("Write", &serde_json::json!({"content": "hello"}));
+        assert!(log.files_modified.is_empty());
+        assert_eq!(log.tool_use_count, 1);
+    }
 }

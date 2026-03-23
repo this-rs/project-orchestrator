@@ -863,6 +863,60 @@ mod tests {
             msg
         );
     }
+
+    #[test]
+    fn test_objective_reminder_contains_do_not_conclude() {
+        let input = base_input();
+        let msg = check_objective_reminder(&input).unwrap();
+        assert!(
+            msg.contains("Do NOT conclude"),
+            "Missing 'Do NOT conclude' directive in: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_objective_reminder_no_work_log_no_already_done_section() {
+        let input = base_input(); // work_log_summary is empty
+        let msg = check_objective_reminder(&input).unwrap();
+        assert!(
+            !msg.contains("Already done"),
+            "Should not have 'Already done' section when work_log is empty: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_objective_reminder_multiple_tasks_all_shown() {
+        let input = ObjectiveCheckInput {
+            had_tool_use: false,
+            auto_continue_allowed: false,
+            hit_error_max_turns: false,
+            interrupted: false,
+            tracking_enabled: true,
+            cooldown_turns: 0,
+            pending_tasks: vec![
+                PendingTaskInfo {
+                    title: "Task A".to_string(),
+                    status: "inprogress".to_string(),
+                    pending_steps: vec!["Step A1".to_string()],
+                    affected_files: vec!["a.rs".to_string()],
+                },
+                PendingTaskInfo {
+                    title: "Task B".to_string(),
+                    status: "pending".to_string(),
+                    pending_steps: vec![],
+                    affected_files: vec!["b.rs".to_string()],
+                },
+            ],
+            work_log_summary: String::new(),
+        };
+        let msg = check_objective_reminder(&input).unwrap();
+        assert!(msg.contains("Task A"), "Missing Task A: {}", msg);
+        assert!(msg.contains("Task B"), "Missing Task B: {}", msg);
+        assert!(msg.contains("`a.rs`"), "Missing file a.rs: {}", msg);
+        assert!(msg.contains("`b.rs`"), "Missing file b.rs: {}", msg);
+    }
 }
 
 #[cfg(test)]
