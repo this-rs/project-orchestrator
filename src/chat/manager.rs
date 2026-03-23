@@ -385,6 +385,38 @@ pub struct SpawnedByContext {
     pub scaffolding_level: Option<u8>,
 }
 
+/// Classify a tool use as "conclusive" (wrapping-up, not productive work).
+///
+/// Conclusive tools are git finalization commands (commit, push, tag, status-after-commit).
+/// When a turn contains ONLY conclusive tools and no productive ones, the objective
+/// reminder should still fire — the agent may be concluding prematurely.
+///
+/// Returns `true` if the tool use is a finalization/wrap-up action.
+fn is_conclusive_tool(tool_name: &str, input: &serde_json::Value) -> bool {
+    if tool_name == "Bash" {
+        if let Some(cmd) = input.get("command").and_then(|v| v.as_str()) {
+            let cmd_trimmed = cmd.trim();
+            // Git finalization commands — the agent is wrapping up, not doing productive work
+            let conclusive_patterns = [
+                "git commit",
+                "git push",
+                "git tag",
+                "git status", // often run after commit to verify
+                "git log",    // often run to show what was committed
+            ];
+            for pattern in &conclusive_patterns {
+                if cmd_trimmed.starts_with(pattern)
+                    || cmd_trimmed.contains(&format!("&& {}", pattern))
+                    || cmd_trimmed.contains(&format!("; {}", pattern))
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 /// Parse a `spawned_by` JSON string and extract parent session info + protocol FSM context.
 ///
 /// Returns `None` if the JSON is invalid.
@@ -2796,8 +2828,14 @@ impl ChatManager {
         // Track whether this stream ended with error_max_turns (for auto-continue)
         let mut hit_error_max_turns = false;
 
-        // Track whether any tool_use occurred in this stream turn (for objective tracking)
-        let mut had_tool_use = false;
+        // Track whether any *productive* tool_use occurred in this stream turn.
+        // "Conclusive" tools (git commit/push/status, git tag) don't count — the agent
+        // may be wrapping up without actually finishing the task.
+        let mut had_productive_tool_use = false;
+        // Track conclusive tool use separately — when BOTH productive and conclusive
+        // happen in the same turn (Edit + git commit), the agent may be finishing
+        // AND concluding in one shot. We still want to check objectives in that case.
+        let mut had_conclusive_tool_use = false;
 
         // Track whether a CompactBoundary was received during this stream turn.
         // When true, we'll rebuild and re-inject project context after the stream ends.
@@ -3503,7 +3541,11 @@ impl ChatManager {
                                         ..
                                     } = event
                                     {
-                                        had_tool_use = true;
+                                        if is_conclusive_tool(tool, input) {
+                                            had_conclusive_tool_use = true;
+                                        } else {
+                                            had_productive_tool_use = true;
+                                        }
                                         work_log.lock().await.record_tool_use(tool, input);
                                     }
 
@@ -3664,9 +3706,17 @@ impl ChatManager {
         // 3. Auto-continue
         let auto_continue_allowed = post_handler.handle_auto_continue(hit_error_max_turns).await;
 
-        // 4. Objective tracking
+        // 4. Objective tracking — uses had_productive_tool_use (not had_tool_use)
+        // so that conclusive-only turns (git commit/push) still trigger reminders.
+        // Also passes had_conclusive_tool_use so that mixed turns (Edit + git commit)
+        // still check for pending objectives.
         post_handler
-            .handle_objective_tracking(had_tool_use, auto_continue_allowed, hit_error_max_turns)
+            .handle_objective_tracking(
+                had_productive_tool_use,
+                had_conclusive_tool_use,
+                auto_continue_allowed,
+                hit_error_max_turns,
+            )
             .await;
 
         // 5. Streaming status update
@@ -9584,5 +9634,80 @@ mod tests {
         let ctx = parse_spawned_by(json).unwrap();
         assert_eq!(ctx.protocol_run_id, None);
         assert_eq!(ctx.run_id, None);
+    }
+
+    // ── is_conclusive_tool tests ────────────────────────────────────────
+
+    #[test]
+    fn test_git_commit_is_conclusive() {
+        let input = serde_json::json!({"command": "git commit -m 'feat: add stuff'"});
+        assert!(is_conclusive_tool("Bash", &input));
+    }
+
+    #[test]
+    fn test_git_push_is_conclusive() {
+        let input = serde_json::json!({"command": "git push origin feature-branch"});
+        assert!(is_conclusive_tool("Bash", &input));
+    }
+
+    #[test]
+    fn test_git_status_is_conclusive() {
+        let input = serde_json::json!({"command": "git status"});
+        assert!(is_conclusive_tool("Bash", &input));
+    }
+
+    #[test]
+    fn test_git_log_is_conclusive() {
+        let input = serde_json::json!({"command": "git log --oneline -5"});
+        assert!(is_conclusive_tool("Bash", &input));
+    }
+
+    #[test]
+    fn test_git_tag_is_conclusive() {
+        let input = serde_json::json!({"command": "git tag v1.0.0"});
+        assert!(is_conclusive_tool("Bash", &input));
+    }
+
+    #[test]
+    fn test_chained_git_commit_push_is_conclusive() {
+        let input = serde_json::json!({"command": "git commit -m 'fix' && git push"});
+        assert!(is_conclusive_tool("Bash", &input));
+    }
+
+    #[test]
+    fn test_cargo_build_is_not_conclusive() {
+        let input = serde_json::json!({"command": "cargo build"});
+        assert!(!is_conclusive_tool("Bash", &input));
+    }
+
+    #[test]
+    fn test_npm_test_is_not_conclusive() {
+        let input = serde_json::json!({"command": "npm test"});
+        assert!(!is_conclusive_tool("Bash", &input));
+    }
+
+    #[test]
+    fn test_edit_tool_is_not_conclusive() {
+        let input =
+            serde_json::json!({"file_path": "src/main.rs", "old_string": "a", "new_string": "b"});
+        assert!(!is_conclusive_tool("Edit", &input));
+    }
+
+    #[test]
+    fn test_read_tool_is_not_conclusive() {
+        let input = serde_json::json!({"file_path": "src/main.rs"});
+        assert!(!is_conclusive_tool("Read", &input));
+    }
+
+    #[test]
+    fn test_write_tool_is_not_conclusive() {
+        let input = serde_json::json!({"file_path": "src/main.rs", "content": "fn main() {}"});
+        assert!(!is_conclusive_tool("Write", &input));
+    }
+
+    #[test]
+    fn test_bash_without_command_is_not_conclusive() {
+        let input = serde_json::json!({});
+        assert!(!is_conclusive_tool("Bash", &input));
     }
 }
