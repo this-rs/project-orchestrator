@@ -190,6 +190,20 @@ pub struct MockGraphStore {
     // LifecycleHook stores
     pub lifecycle_hooks: RwLock<HashMap<Uuid, LifecycleHook>>,
 
+    // MCP Federation stores
+    pub mcp_servers: RwLock<HashMap<Uuid, McpServerNode>>,
+    pub mcp_tools: RwLock<HashMap<Uuid, McpToolNode>>,
+    /// server_id (string) -> Vec<tool_id>
+    pub mcp_server_tools: RwLock<HashMap<String, Vec<Uuid>>>,
+    /// project_id -> Vec<server_id (uuid)>
+    pub mcp_project_servers: RwLock<HashMap<Uuid, Vec<Uuid>>>,
+    /// fqn -> fqn -> score (SIMILAR_TO)
+    pub mcp_similar_to: RwLock<HashMap<(String, String), f64>>,
+    /// fqn -> fqn -> count (CO_ACTIVATED_WITH)
+    pub mcp_co_activated: RwLock<HashMap<(String, String), i64>>,
+    /// fqn -> fqn -> (count, avg_delta_ms) (OFTEN_FOLLOWS)
+    pub mcp_often_follows: RwLock<HashMap<(String, String), (i64, f64)>>,
+
     // Test flags
     /// Controls what `has_context_cards()` returns (default: false)
     pub mock_has_context_cards: std::sync::atomic::AtomicBool,
@@ -293,6 +307,13 @@ impl MockGraphStore {
             works_on: RwLock::new(HashMap::new()),
             alerts: RwLock::new(HashMap::new()),
             lifecycle_hooks: RwLock::new(HashMap::new()),
+            mcp_servers: RwLock::new(HashMap::new()),
+            mcp_tools: RwLock::new(HashMap::new()),
+            mcp_server_tools: RwLock::new(HashMap::new()),
+            mcp_project_servers: RwLock::new(HashMap::new()),
+            mcp_similar_to: RwLock::new(HashMap::new()),
+            mcp_co_activated: RwLock::new(HashMap::new()),
+            mcp_often_follows: RwLock::new(HashMap::new()),
             mock_has_context_cards: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -10762,6 +10783,151 @@ impl GraphStore for MockGraphStore {
             .collect();
         result.sort_by_key(|h| h.priority);
         Ok(result)
+    }
+
+    // ========================================================================
+    // MCP Federation operations
+    // ========================================================================
+
+    async fn create_mcp_server(&self, server: &McpServerNode) -> Result<()> {
+        let sid = server.id;
+        self.mcp_project_servers
+            .write()
+            .await
+            .entry(server.project_id)
+            .or_default()
+            .push(sid);
+        self.mcp_servers.write().await.insert(sid, server.clone());
+        Ok(())
+    }
+
+    async fn get_mcp_server(&self, id: Uuid) -> Result<Option<McpServerNode>> {
+        Ok(self.mcp_servers.read().await.get(&id).cloned())
+    }
+
+    async fn list_mcp_servers(&self, project_id: Uuid) -> Result<Vec<McpServerNode>> {
+        let idx = self.mcp_project_servers.read().await;
+        let servers = self.mcp_servers.read().await;
+        let ids = idx.get(&project_id).cloned().unwrap_or_default();
+        let mut result: Vec<_> = ids
+            .iter()
+            .filter_map(|id| servers.get(id).cloned())
+            .collect();
+        result.sort_by(|a, b| a.server_id.cmp(&b.server_id));
+        Ok(result)
+    }
+
+    async fn delete_mcp_server(&self, id: Uuid) -> Result<()> {
+        if let Some(server) = self.mcp_servers.write().await.remove(&id) {
+            // Remove from project index
+            if let Some(ids) = self
+                .mcp_project_servers
+                .write()
+                .await
+                .get_mut(&server.project_id)
+            {
+                ids.retain(|i| *i != id);
+            }
+            // Remove associated tools
+            let server_id = server.server_id;
+            let tool_ids = self
+                .mcp_server_tools
+                .write()
+                .await
+                .remove(&server_id)
+                .unwrap_or_default();
+            let mut tools = self.mcp_tools.write().await;
+            for tid in tool_ids {
+                tools.remove(&tid);
+            }
+        }
+        Ok(())
+    }
+
+    async fn update_mcp_server_status(&self, id: Uuid, status: &str) -> Result<()> {
+        if let Some(s) = self.mcp_servers.write().await.get_mut(&id) {
+            s.status = status.to_string();
+            s.updated_at = Some(Utc::now());
+        }
+        Ok(())
+    }
+
+    async fn create_mcp_tool(&self, tool: &McpToolNode) -> Result<()> {
+        let tid = tool.id;
+        self.mcp_server_tools
+            .write()
+            .await
+            .entry(tool.server_id.clone())
+            .or_default()
+            .push(tid);
+        self.mcp_tools.write().await.insert(tid, tool.clone());
+        Ok(())
+    }
+
+    async fn list_mcp_tools_for_server(&self, server_id: &str) -> Result<Vec<McpToolNode>> {
+        let idx = self.mcp_server_tools.read().await;
+        let tools = self.mcp_tools.read().await;
+        let ids = idx.get(server_id).cloned().unwrap_or_default();
+        let mut result: Vec<_> = ids
+            .iter()
+            .filter_map(|id| tools.get(id).cloned())
+            .collect();
+        result.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(result)
+    }
+
+    async fn delete_mcp_tools_for_server(&self, server_id: &str) -> Result<()> {
+        let tool_ids = self
+            .mcp_server_tools
+            .write()
+            .await
+            .remove(server_id)
+            .unwrap_or_default();
+        let mut tools = self.mcp_tools.write().await;
+        for tid in tool_ids {
+            tools.remove(&tid);
+        }
+        Ok(())
+    }
+
+    async fn create_mcp_similar_to(
+        &self,
+        tool_fqn: &str,
+        similar_to_fqn: &str,
+        score: f64,
+    ) -> Result<()> {
+        self.mcp_similar_to.write().await.insert(
+            (tool_fqn.to_string(), similar_to_fqn.to_string()),
+            score,
+        );
+        Ok(())
+    }
+
+    async fn create_mcp_co_activated(
+        &self,
+        tool_fqn_a: &str,
+        tool_fqn_b: &str,
+        count: i64,
+    ) -> Result<()> {
+        self.mcp_co_activated.write().await.insert(
+            (tool_fqn_a.to_string(), tool_fqn_b.to_string()),
+            count,
+        );
+        Ok(())
+    }
+
+    async fn create_mcp_often_follows(
+        &self,
+        tool_fqn_a: &str,
+        tool_fqn_b: &str,
+        count: i64,
+        avg_delta_ms: f64,
+    ) -> Result<()> {
+        self.mcp_often_follows.write().await.insert(
+            (tool_fqn_a.to_string(), tool_fqn_b.to_string()),
+            (count, avg_delta_ms),
+        );
+        Ok(())
     }
 }
 

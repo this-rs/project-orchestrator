@@ -3280,4 +3280,57 @@ pub trait GraphStore: Send + Sync {
         on_status: &str,
         project_id: Option<Uuid>,
     ) -> Result<Vec<LifecycleHook>>;
+
+    // ========================================================================
+    // MCP Federation operations
+    // ========================================================================
+
+    /// Create an MCP server node
+    async fn create_mcp_server(&self, server: &McpServerNode) -> Result<()>;
+
+    /// Get an MCP server by UUID
+    async fn get_mcp_server(&self, id: Uuid) -> Result<Option<McpServerNode>>;
+
+    /// List MCP servers for a project
+    async fn list_mcp_servers(&self, project_id: Uuid) -> Result<Vec<McpServerNode>>;
+
+    /// Delete an MCP server and its tools
+    async fn delete_mcp_server(&self, id: Uuid) -> Result<()>;
+
+    /// Update MCP server connection status
+    async fn update_mcp_server_status(&self, id: Uuid, status: &str) -> Result<()>;
+
+    /// Create an MCP tool node
+    async fn create_mcp_tool(&self, tool: &McpToolNode) -> Result<()>;
+
+    /// List tools for an MCP server
+    async fn list_mcp_tools_for_server(&self, server_id: &str) -> Result<Vec<McpToolNode>>;
+
+    /// Delete all tools for an MCP server
+    async fn delete_mcp_tools_for_server(&self, server_id: &str) -> Result<()>;
+
+    /// Create SIMILAR_TO relation between two MCP tools
+    async fn create_mcp_similar_to(
+        &self,
+        tool_fqn: &str,
+        similar_to_fqn: &str,
+        score: f64,
+    ) -> Result<()>;
+
+    /// Create CO_ACTIVATED_WITH relation (tools used in the same session)
+    async fn create_mcp_co_activated(
+        &self,
+        tool_fqn_a: &str,
+        tool_fqn_b: &str,
+        count: i64,
+    ) -> Result<()>;
+
+    /// Create OFTEN_FOLLOWS relation (tool B called after tool A)
+    async fn create_mcp_often_follows(
+        &self,
+        tool_fqn_a: &str,
+        tool_fqn_b: &str,
+        count: i64,
+        avg_delta_ms: f64,
+    ) -> Result<()>;
 }

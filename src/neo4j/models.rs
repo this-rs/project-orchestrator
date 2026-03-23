@@ -2235,6 +2235,63 @@ impl AlertNode {
     }
 }
 
+// ============================================================================
+// MCP Federation nodes
+// ============================================================================
+
+/// An external MCP server registered in the knowledge graph.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpServerNode {
+    pub id: Uuid,
+    /// Project this server is associated with.
+    pub project_id: Uuid,
+    /// Unique server identifier (used as key in registry, e.g., "grafeo").
+    pub server_id: String,
+    /// Human-readable display name.
+    pub display_name: String,
+    /// Transport type: "stdio", "sse", or "streamable_http".
+    pub transport_type: String,
+    /// Transport URL (for SSE/StreamableHTTP).
+    pub transport_url: Option<String>,
+    /// Transport command (for Stdio).
+    pub transport_command: Option<String>,
+    /// Transport args (for Stdio, JSON array as string).
+    pub transport_args: Option<String>,
+    /// Current connection status: "connected", "disconnected", "error".
+    pub status: String,
+    /// MCP protocol version reported by the server.
+    pub protocol_version: Option<String>,
+    /// Server name reported during initialization.
+    pub server_name: Option<String>,
+    /// Number of tools discovered on this server.
+    pub tool_count: usize,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: Option<DateTime<Utc>>,
+    pub last_connected_at: Option<DateTime<Utc>>,
+}
+
+/// An external MCP tool discovered on a federated server.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpToolNode {
+    pub id: Uuid,
+    /// The server this tool belongs to.
+    pub server_id: String,
+    /// Tool name (local to the server).
+    pub name: String,
+    /// Fully-qualified name: `server_id::tool_name`.
+    pub fqn: String,
+    /// Tool description from the server.
+    pub description: String,
+    /// JSON Schema of the tool's input parameters (stored as JSON string).
+    pub input_schema: String,
+    /// Inferred category: "query", "mutation", "action", "analysis", "unknown".
+    pub category: String,
+    /// Optional embedding vector (stored as JSON array).
+    pub embedding: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: Option<DateTime<Utc>>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2837,6 +2894,29 @@ mod tests {
 
         let serialized = serde_json::to_string(&PersonaOrigin::AutoBuild).unwrap();
         assert_eq!(serialized, r#""auto_build""#);
+    }
+
+    #[test]
+    fn test_mcp_server_node_defaults() {
+        let node = McpServerNode {
+            id: uuid::Uuid::new_v4(),
+            project_id: uuid::Uuid::new_v4(),
+            server_id: "grafeo".to_string(),
+            display_name: "Grafeo Knowledge Graph".to_string(),
+            transport_type: "sse".to_string(),
+            transport_url: Some("http://localhost:8080/sse".to_string()),
+            transport_command: None,
+            transport_args: None,
+            status: "connected".to_string(),
+            protocol_version: Some("2025-03-26".to_string()),
+            server_name: Some("Grafeo".to_string()),
+            tool_count: 5,
+            created_at: chrono::Utc::now(),
+            updated_at: None,
+            last_connected_at: Some(chrono::Utc::now()),
+        };
+        assert_eq!(node.server_id, "grafeo");
+        assert_eq!(node.tool_count, 5);
     }
 
     #[test]
