@@ -174,6 +174,7 @@ mod tests {
             protocol_run_id: None,
             protocol_state: None,
             excluded_note_ids: Default::default(),
+            reasoning_path_tracker: None,
         }
     }
 

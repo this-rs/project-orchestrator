@@ -511,7 +511,7 @@ impl PostStreamHandler {
                         super::feedback::SessionDiscussedCache::new(),
                     );
 
-                    // RFC auto-detection
+                    // Observation auto-detection (RFC + all categories)
                     let rfc_acc = {
                         let sessions = self.active_sessions.read().await;
                         sessions
@@ -519,7 +519,7 @@ impl PostStreamHandler {
                             .map(|s| s.rfc_accumulator.clone())
                     };
                     if let Some(rfc_acc) = rfc_acc {
-                        super::feedback::spawn_rfc_processing(
+                        super::feedback::spawn_observation_processing(
                             self.graph.clone(),
                             self.search.clone(),
                             project_id,
@@ -819,6 +819,7 @@ mod integration_tests {
                 )),
                 objective_tracking,
                 objective_reminder_turns_since: Arc::new(AtomicU32::new(0)),
+                reasoning_path_tracker: crate::chat::feedback::ReasoningPathTracker::new(),
             };
             active_sessions
                 .write()

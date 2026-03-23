@@ -24,6 +24,7 @@ use crate::chat::enrichment::{
     EnrichmentConfig, EnrichmentContext, EnrichmentInput, EnrichmentStage,
 };
 use crate::neo4j::traits::GraphStore;
+use crate::neurons::intent::{IntentDetector, QueryIntentMode};
 use crate::skills::activation::evaluate_skill_match;
 use crate::skills::models::SkillNode;
 
@@ -386,41 +387,32 @@ fn detect_intent_from_skills(matches: &[(SkillNode, f64)], message: &str) -> &'s
     detect_intent_from_message(message)
 }
 
-/// Detect intent from the raw message keywords.
+/// Map a [`QueryIntentMode`] from the canonical `IntentDetector` to the
+/// enrichment hint string used by `KnowledgeInjectionStage` / `IntentWeightMap`.
 ///
-/// Returns one of: planning, code, debug, review, general
+/// Mapping:
+/// - `Debug`   → `"debug"`
+/// - `Explore` → `"explore"`
+/// - `Impact`  → `"review"`
+/// - `Plan`    → `"planning"`
+/// - `Default` → `"general"`
+fn map_intent_mode(mode: QueryIntentMode) -> &'static str {
+    match mode {
+        QueryIntentMode::Debug => "debug",
+        QueryIntentMode::Explore => "explore",
+        QueryIntentMode::Impact => "review",
+        QueryIntentMode::Plan => "planning",
+        QueryIntentMode::Default => "general",
+    }
+}
+
+/// Detect intent from the raw message using the canonical [`IntentDetector`].
+///
+/// Returns one of: planning, code, debug, review, explore, general.
+/// Delegates to `IntentDetector::detect()` for unified keyword matching
+/// (bilingual FR/EN support), then maps the result to enrichment hint values.
 fn detect_intent_from_message(message: &str) -> &'static str {
-    let lower = message.to_lowercase();
-
-    if lower.contains("plan") || lower.contains("roadmap") || lower.contains("milestone") {
-        return "planning";
-    }
-    if lower.contains("debug")
-        || lower.contains("error")
-        || lower.contains("fix")
-        || lower.contains("bug")
-        || lower.contains("crash")
-    {
-        return "debug";
-    }
-    if lower.contains("review")
-        || lower.contains("coverage")
-        || lower.contains("audit")
-        || lower.contains("quality")
-    {
-        return "review";
-    }
-    if lower.contains("implement")
-        || lower.contains("code")
-        || lower.contains("refactor")
-        || lower.contains("write")
-        || lower.contains("create")
-        || lower.contains("add")
-    {
-        return "code";
-    }
-
-    "general"
+    map_intent_mode(IntentDetector::detect(message))
 }
 
 // ============================================================================
@@ -508,16 +500,30 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_intent_code() {
-        assert_eq!(detect_intent_from_message("implement the feature"), "code");
-        assert_eq!(detect_intent_from_message("refactor this module"), "code");
-        assert_eq!(detect_intent_from_message("add a new endpoint"), "code");
+    fn test_detect_intent_code_mapped_to_planning_or_review() {
+        // After unification with IntentDetector, "implement" maps to Plan → "planning"
+        // and "refactor" maps to Impact → "review".
+        assert_eq!(
+            detect_intent_from_message("implement the feature"),
+            "planning"
+        );
+        assert_eq!(
+            detect_intent_from_message("refactor this module"),
+            "review"
+        );
     }
 
     #[test]
     fn test_detect_intent_general() {
         assert_eq!(detect_intent_from_message("hello"), "general");
-        assert_eq!(detect_intent_from_message("how does this work?"), "general");
+    }
+
+    #[test]
+    fn test_detect_intent_explore() {
+        assert_eq!(
+            detect_intent_from_message("how does this work?"),
+            "explore"
+        );
     }
 
     #[test]

@@ -32,6 +32,7 @@ use crate::chat::enrichment::{
     EnrichmentConfig, EnrichmentContext, EnrichmentInput, EnrichmentStage,
 };
 use crate::chat::entity_extractor::{self, EntityType as ChatEntityType, ExtractedEntity};
+use crate::chat::stages::intent_weights::IntentWeightMap;
 use crate::meilisearch::SearchStore;
 use crate::neo4j::traits::GraphStore;
 use crate::notes::models::EntityType as NoteEntityType;
@@ -903,12 +904,31 @@ impl EnrichmentStage for KnowledgeInjectionStage {
             }
         }
 
+        // ── Intent-aware reweighting ────────────────────────────────────
+        // Read the intent hint set by SkillActivationStage (or default to "general").
+        // Apply per-note-type multipliers so that e.g. gotchas rank higher during
+        // debugging, while guidelines rank higher during planning.
+        let intent = ctx
+            .get_hint("intent")
+            .unwrap_or("general")
+            .to_string();
+        let weight_map = IntentWeightMap::for_intent(&intent);
+        for note in &mut notes {
+            note.score *= weight_map.get(&note.note_type);
+        }
+        notes.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
         debug!(
-            "[knowledge_injection] Found {} notes ({} deduped), {} decisions, {} predictions",
+            "[knowledge_injection] Found {} notes ({} deduped), {} decisions, {} predictions (intent={})",
             notes.len(),
             pre_dedup_count - notes.len(),
             decisions.len(),
-            predictions.len()
+            predictions.len(),
+            intent
         );
 
         // ── Trajectory collection: record context loading decision ────────
@@ -1206,6 +1226,7 @@ mod tests {
             protocol_run_id: None,
             protocol_state: None,
             excluded_note_ids: Default::default(),
+            reasoning_path_tracker: None,
         };
         let mut ctx = EnrichmentContext::default();
         stage.execute(&input, &mut ctx).await.unwrap();
@@ -1246,6 +1267,7 @@ mod tests {
             protocol_run_id: None,
             protocol_state: None,
             excluded_note_ids: Default::default(),
+            reasoning_path_tracker: None,
         };
         let mut ctx = EnrichmentContext::default();
 
@@ -1267,6 +1289,7 @@ mod tests {
             protocol_run_id: Some(proto_run_id),
             protocol_state: Some("implement".to_string()),
             excluded_note_ids: Default::default(),
+            reasoning_path_tracker: None,
         };
         let mut ctx = EnrichmentContext::default();
 
@@ -1646,5 +1669,161 @@ mod tests {
                 configs[i + 1].max_content_chars,
             );
         }
+    }
+
+    // ── Intent reweighting tests ───────────────────────────────────────
+
+    #[test]
+    fn test_intent_reweighting_debug_gotcha_above_guideline() {
+        // Simulate: 1 guideline (score 0.9), 1 gotcha (score 0.7), 1 pattern (score 0.8)
+        // With "debug" intent: gotcha×1.5=1.05, pattern×1.0=0.8, guideline×0.7=0.63
+        // Expected ranking: gotcha > pattern > guideline
+        let mut notes = vec![
+            ScoredNote {
+                id: "guideline-1".to_string(),
+                note_type: "guideline".to_string(),
+                importance: "high".to_string(),
+                content: "Always use structured logging".to_string(),
+                score: 0.9,
+                source: "bm25_search",
+            },
+            ScoredNote {
+                id: "gotcha-1".to_string(),
+                note_type: "gotcha".to_string(),
+                importance: "critical".to_string(),
+                content: "Mutex deadlock when calling from async context".to_string(),
+                score: 0.7,
+                source: "bm25_search",
+            },
+            ScoredNote {
+                id: "pattern-1".to_string(),
+                note_type: "pattern".to_string(),
+                importance: "medium".to_string(),
+                content: "Use Arc<dyn Trait> for shared services".to_string(),
+                score: 0.8,
+                source: "bm25_search",
+            },
+        ];
+
+        // Apply debug intent reweighting
+        let weight_map = IntentWeightMap::for_intent("debug");
+        for note in &mut notes {
+            note.score *= weight_map.get(&note.note_type);
+        }
+        notes.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        // gotcha: 0.7 * 1.5 = 1.05
+        assert_eq!(notes[0].id, "gotcha-1", "Gotcha should rank first for debug intent");
+        assert!((notes[0].score - 1.05).abs() < 1e-10);
+
+        // pattern: 0.8 * 1.0 = 0.8
+        assert_eq!(notes[1].id, "pattern-1", "Pattern should rank second for debug intent");
+        assert!((notes[1].score - 0.8).abs() < 1e-10);
+
+        // guideline: 0.9 * 0.7 = 0.63
+        assert_eq!(notes[2].id, "guideline-1", "Guideline should rank last for debug intent");
+        assert!((notes[2].score - 0.63).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_intent_reweighting_general_preserves_order() {
+        // With "general" intent, all weights are 1.0 → original order preserved
+        let mut notes = vec![
+            ScoredNote {
+                id: "high".to_string(),
+                note_type: "guideline".to_string(),
+                importance: "high".to_string(),
+                content: "high score".to_string(),
+                score: 0.9,
+                source: "bm25_search",
+            },
+            ScoredNote {
+                id: "mid".to_string(),
+                note_type: "gotcha".to_string(),
+                importance: "high".to_string(),
+                content: "mid score".to_string(),
+                score: 0.7,
+                source: "bm25_search",
+            },
+        ];
+
+        let weight_map = IntentWeightMap::for_intent("general");
+        for note in &mut notes {
+            note.score *= weight_map.get(&note.note_type);
+        }
+        notes.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        assert_eq!(notes[0].id, "high", "Original order preserved with general intent");
+        assert!((notes[0].score - 0.9).abs() < f64::EPSILON);
+        assert_eq!(notes[1].id, "mid");
+        assert!((notes[1].score - 0.7).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_intent_reweighting_unknown_type_gets_one() {
+        let mut notes = vec![ScoredNote {
+            id: "custom".to_string(),
+            note_type: "unknown_custom_type".to_string(),
+            importance: "low".to_string(),
+            content: "some content".to_string(),
+            score: 0.5,
+            source: "bm25_search",
+        }];
+
+        let weight_map = IntentWeightMap::for_intent("debug");
+        for note in &mut notes {
+            note.score *= weight_map.get(&note.note_type);
+        }
+
+        assert!(
+            (notes[0].score - 0.5).abs() < f64::EPSILON,
+            "Unknown note type should get weight 1.0 (score unchanged)"
+        );
+    }
+
+    #[test]
+    fn test_intent_reweighting_planning_boosts_guideline() {
+        let mut notes = vec![
+            ScoredNote {
+                id: "gotcha-1".to_string(),
+                note_type: "gotcha".to_string(),
+                importance: "high".to_string(),
+                content: "Gotcha content".to_string(),
+                score: 0.9,
+                source: "bm25_search",
+            },
+            ScoredNote {
+                id: "guideline-1".to_string(),
+                note_type: "guideline".to_string(),
+                importance: "high".to_string(),
+                content: "Guideline content".to_string(),
+                score: 0.7,
+                source: "bm25_search",
+            },
+        ];
+
+        // Planning: guideline×1.5=1.05, gotcha×0.8=0.72
+        let weight_map = IntentWeightMap::for_intent("planning");
+        for note in &mut notes {
+            note.score *= weight_map.get(&note.note_type);
+        }
+        notes.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        assert_eq!(
+            notes[0].id, "guideline-1",
+            "Guideline should rank first for planning intent"
+        );
     }
 }

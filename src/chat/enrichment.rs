@@ -144,6 +144,10 @@ pub struct EnrichmentInput {
     /// Note IDs already included in the system prompt (from ProjectContext guidelines/gotchas).
     /// Used by KnowledgeInjectionStage to avoid duplicating notes that are already present.
     pub excluded_note_ids: HashSet<String>,
+    /// Optional reasoning path tracker for Hebbian reinforcement.
+    /// When Some, StatusInjectionStage records traversed reasoning tree paths
+    /// so they can be reinforced on session close.
+    pub reasoning_path_tracker: Option<crate::chat::feedback::ReasoningPathTracker>,
 }
 
 /// Mutable context that accumulates enrichment data across stages.
@@ -151,9 +155,12 @@ pub struct EnrichmentInput {
 /// Each stage can read what previous stages added and add its own data.
 /// The context is [`Serialize`] for debug logging.
 ///
-/// **Hints**: stages can communicate inter-stage signals via `set_hint`/`get_hint`.
-/// For example, SkillActivationStage sets `intent=planning` which KnowledgeInjectionStage
-/// can read to filter notes by intent.
+/// **Hints**: stages communicate inter-stage signals via `set_hint`/`get_hint`.
+/// SkillActivationStage detects intent via `IntentDetector::detect()`, maps it to a
+/// hint string (`"debug"`, `"explore"`, `"review"`, `"planning"`, `"general"`), and
+/// sets `hint("intent")`. KnowledgeInjectionStage reads `hint("intent")`, builds an
+/// `IntentWeightMap`, multiplies each note's BM25 score by the per-note-type weight,
+/// and re-sorts notes by intent-adjusted score before rendering.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct EnrichmentContext {
     /// Sections of enriched content to prepend to the prompt.
@@ -512,6 +519,7 @@ mod tests {
             protocol_run_id: None,
             protocol_state: None,
             excluded_note_ids: Default::default(),
+            reasoning_path_tracker: None,
         }
     }
 

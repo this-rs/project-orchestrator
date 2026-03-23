@@ -163,6 +163,7 @@ mod tests {
             protocol_run_id: None,
             protocol_state: None,
             excluded_note_ids: HashSet::new(),
+            reasoning_path_tracker: None,
         };
         let mut ctx = EnrichmentContext::default();
         let config = EnrichmentConfig::default();
@@ -188,6 +189,7 @@ mod tests {
             protocol_run_id: None,
             protocol_state: None,
             excluded_note_ids: HashSet::new(),
+            reasoning_path_tracker: None,
         };
         let mut ctx = EnrichmentContext::default();
 

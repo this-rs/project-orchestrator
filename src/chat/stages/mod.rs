@@ -5,6 +5,7 @@
 
 pub mod biomimicry;
 pub mod file_context;
+pub mod intent_weights;
 pub mod knowledge_injection;
 pub mod persona;
 #[cfg(test)]

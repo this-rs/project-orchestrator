@@ -810,6 +810,7 @@ mod tests {
             protocol_run_id: None,
             protocol_state: None,
             excluded_note_ids: Default::default(),
+            reasoning_path_tracker: None,
         };
         let mut ctx = EnrichmentContext::default();
         stage.execute(&input, &mut ctx).await.unwrap();
@@ -828,6 +829,7 @@ mod tests {
             protocol_run_id: None,
             protocol_state: None,
             excluded_note_ids: Default::default(),
+            reasoning_path_tracker: None,
         };
         let mut ctx = EnrichmentContext::default();
 

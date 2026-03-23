@@ -8,6 +8,22 @@
 //! 5. **Observation detection**: Detects implicit insights and suggests note creation
 //!
 //! **Performance target:** < 50ms post-response, entirely asynchronous (zero latency added).
+//!
+//! ## Reinforcement paths
+//!
+//! There are **two** distinct reinforcement mechanisms. They must NOT be mixed:
+//!
+//! - **IMPLICIT (Hebbian):** [`ReasoningPathTracker`] records reasoning tree paths during
+//!   enrichment (StatusInjectionStage). On session close, [`reinforce_tracked_paths()`]
+//!   boosts energy and synapses for all traversed nodes. This is automatic and
+//!   requires no user action — "neurons that fire together wire together."
+//!
+//! - **EXPLICIT (user feedback):** The `POST /api/reason/feedback` REST handler
+//!   (in `reason_handlers.rs`) lets the user explicitly rate a reasoning tree.
+//!   It performs its own energy + synapse boost independently.
+//!
+//! **Do NOT** wire `record_path()` into `reason_handlers.rs` — that would cause
+//! double reinforcement for explicitly-rated trees.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -21,7 +37,7 @@ use crate::chat::observation_detector::{detect_observations, DetectedObservation
 use crate::events::EventEmitter;
 use crate::meilisearch::SearchStore;
 use crate::neo4j::traits::GraphStore;
-use crate::notes::models::{Note, NoteImportance, NoteType};
+use crate::notes::models::{MemoryHorizon, Note, NoteImportance, NoteType};
 
 // ============================================================================
 // Types
@@ -124,6 +140,30 @@ impl Default for ReasoningPathTracker {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Recursively collect all entity IDs from a ReasoningNode tree that are valid UUIDs.
+///
+/// Traverses the tree (roots -> children) and parses each `entity_id` with
+/// `Uuid::parse_str`. Non-UUID strings (e.g., file paths) are silently filtered out.
+/// Results are deduplicated via HashSet.
+pub fn collect_node_ids(roots: &[crate::reasoning::models::ReasoningNode]) -> Vec<Uuid> {
+    let mut seen = HashSet::new();
+
+    fn walk(node: &crate::reasoning::models::ReasoningNode, seen: &mut HashSet<Uuid>) {
+        if let Ok(id) = Uuid::parse_str(&node.entity_id) {
+            seen.insert(id);
+        }
+        for child in &node.children {
+            walk(child, seen);
+        }
+    }
+
+    for root in roots {
+        walk(root, &mut seen);
+    }
+
+    seen.into_iter().collect()
 }
 
 /// Reinforce all tracked reasoning paths after successful actions.
@@ -284,9 +324,222 @@ fn resolve_entity_id(entity: &ValidatedEntity) -> String {
 // RFC Auto-Creation (conversation intelligence)
 // ============================================================================
 
-/// Similarity threshold for RFC deduplication.
-/// If an existing RFC note scores above this, skip creation.
-const RFC_DEDUP_SIMILARITY_THRESHOLD: f64 = 0.85;
+/// Similarity threshold for observation deduplication.
+/// If an existing note scores above this, skip creation.
+const OBSERVATION_DEDUP_SIMILARITY_THRESHOLD: f64 = 0.85;
+
+/// Maximum number of auto-observed notes per message cycle.
+const MAX_AUTO_OBSERVED_PER_CYCLE: usize = 3;
+
+/// Minimum confidence for non-RFC observations to be auto-created.
+const NON_RFC_CONFIDENCE_THRESHOLD: f64 = 0.80;
+
+// ============================================================================
+// ObservationCategory → NoteType mapping
+// ============================================================================
+
+/// Map an observation's `note_type` string to the corresponding `NoteType`,
+/// `NoteImportance`, energy level, and category tag.
+fn map_observation(
+    note_type_str: &str,
+) -> Option<(NoteType, NoteImportance, f64, &'static str)> {
+    match note_type_str {
+        "gotcha" => Some((NoteType::Gotcha, NoteImportance::High, 0.3, "gotcha")),
+        "guideline" => Some((
+            NoteType::Guideline,
+            NoteImportance::Medium,
+            0.3,
+            "convention",
+        )),
+        "pattern" => Some((NoteType::Pattern, NoteImportance::Medium, 0.3, "pattern")),
+        "rfc" => Some((NoteType::Rfc, NoteImportance::High, 0.5, "rfc")),
+        _ => None,
+    }
+}
+
+// ============================================================================
+// Deduplication (reusable across all observation types)
+// ============================================================================
+
+/// Check whether a similar note already exists in the search index.
+///
+/// Returns `true` if a duplicate was found (creation should be skipped).
+async fn deduplicate_observation(
+    search: &Arc<dyn SearchStore>,
+    content: &str,
+    note_type_filter: &str,
+) -> bool {
+    let first_line = content.lines().nth(2).unwrap_or(content);
+    let search_query = if first_line.len() > 100 {
+        &first_line[..100]
+    } else {
+        first_line
+    };
+
+    match search
+        .search_notes_with_scores(search_query, 3, None, Some(note_type_filter), None, None)
+        .await
+    {
+        Ok(hits) => {
+            if let Some(hit) = hits.first() {
+                if hit.score > OBSERVATION_DEDUP_SIMILARITY_THRESHOLD {
+                    debug!(
+                        "[feedback] Observation dedup: found similar note '{}' (score: {:.3}), skipping creation",
+                        hit.document.id, hit.score
+                    );
+                    return true;
+                }
+            }
+            false
+        }
+        Err(e) => {
+            warn!(
+                "[feedback] Observation dedup search failed: {} — proceeding with creation",
+                e
+            );
+            false
+        }
+    }
+}
+
+// ============================================================================
+// Non-RFC Observation Auto-Creation
+// ============================================================================
+
+/// Process a single non-RFC observation: deduplicate, create note, link entities, emit event.
+///
+/// Returns `true` if a new note was created.
+async fn create_observation_note(
+    observation: &DetectedObservation,
+    graph: &Arc<dyn GraphStore>,
+    search: &Arc<dyn SearchStore>,
+    project_id: Option<Uuid>,
+    session_id: Option<Uuid>,
+    event_emitter: Option<&Arc<dyn EventEmitter>>,
+) -> bool {
+    let Some((note_type, importance, energy, category_tag)) =
+        map_observation(&observation.note_type)
+    else {
+        debug!(
+            "[feedback] Unknown observation type '{}', skipping",
+            observation.note_type
+        );
+        return false;
+    };
+
+    // Deduplication check
+    let note_type_str = note_type.to_string();
+    if deduplicate_observation(search, &observation.suggested_content, &note_type_str).await {
+        return false;
+    }
+
+    // Create the note — FULLY AUTOMATIC, no needs_review
+    let mut note = Note::new(
+        project_id,
+        note_type,
+        observation.suggested_content.clone(),
+        "system/observation-detector".to_string(),
+    );
+    note.importance = importance;
+    note.energy = energy;
+    note.memory_horizon = MemoryHorizon::Ephemeral;
+    note.tags = vec![
+        "auto-observed".to_string(),
+        category_tag.to_string(),
+    ];
+
+    match graph.create_note(&note).await {
+        Ok(()) => {
+            debug!(
+                "[feedback] Created {} note {} from observation (energy: {}, horizon: ephemeral)",
+                observation.note_type, note.id, energy
+            );
+
+            // Entity linking: link note to entities discussed in this session
+            if let Some(sid) = session_id {
+                link_note_to_session_entities(graph, &note, sid, project_id).await;
+            }
+
+            // Emit informational WS notification (NOT approval)
+            if let Some(emitter) = event_emitter {
+                let content_preview = if observation.suggested_content.len() > 100 {
+                    format!("{}...", &observation.suggested_content[..100])
+                } else {
+                    observation.suggested_content.clone()
+                };
+                emitter.emit_created(
+                    crate::events::EntityType::Note,
+                    &note.id.to_string(),
+                    serde_json::json!({
+                        "event_type": "observation_captured",
+                        "note_type": observation.note_type,
+                        "category": category_tag,
+                        "importance": format!("{}", importance),
+                        "content_preview": content_preview,
+                        "source": "system/observation-detector",
+                        "memory_horizon": "ephemeral",
+                        "energy": energy,
+                    }),
+                    project_id.map(|pid| pid.to_string()),
+                );
+                debug!(
+                    "[feedback] Emitted observation_captured WS event for note {}",
+                    note.id
+                );
+            }
+
+            true
+        }
+        Err(e) => {
+            warn!(
+                "[feedback] Failed to create {} note: {} — non-blocking",
+                observation.note_type, e
+            );
+            false
+        }
+    }
+}
+
+/// Link a note to all entities discussed in the current session.
+async fn link_note_to_session_entities(
+    graph: &Arc<dyn GraphStore>,
+    note: &Note,
+    session_id: Uuid,
+    project_id: Option<Uuid>,
+) {
+    match graph.get_session_entities(session_id, project_id).await {
+        Ok(entities) => {
+            for entity in &entities {
+                if let Ok(etype) =
+                    entity.entity_type.parse::<crate::notes::models::EntityType>()
+                {
+                    if let Err(e) = graph
+                        .link_note_to_entity(note.id, &etype, &entity.entity_id, None, None)
+                        .await
+                    {
+                        debug!(
+                            "[feedback] Failed to link note to {}/{}: {}",
+                            entity.entity_type, entity.entity_id, e
+                        );
+                    }
+                }
+            }
+            if !entities.is_empty() {
+                debug!(
+                    "[feedback] Linked note {} to {} discussed entities",
+                    note.id,
+                    entities.len()
+                );
+            }
+        }
+        Err(e) => {
+            debug!(
+                "[feedback] Failed to get session entities for linking: {}",
+                e
+            );
+        }
+    }
+}
 
 /// Process an observation through the RFC accumulator.
 ///
@@ -316,38 +569,12 @@ pub async fn process_rfc_observation(
 
     debug!("[feedback] RFC accumulator triggered, checking for duplicates");
 
-    // Deduplication: search existing RFC notes for similarity
-    let first_line = content.lines().nth(2).unwrap_or(&content);
-    let search_query = if first_line.len() > 100 {
-        &first_line[..100]
-    } else {
-        first_line
-    };
-
-    match search
-        .search_notes_with_scores(search_query, 3, None, Some("rfc"), None, None)
-        .await
-    {
-        Ok(hits) => {
-            if let Some(hit) = hits.first() {
-                if hit.score > RFC_DEDUP_SIMILARITY_THRESHOLD {
-                    debug!(
-                        "[feedback] RFC dedup: found similar note '{}' (score: {:.3}), skipping creation",
-                        hit.document.id, hit.score
-                    );
-                    // Reset accumulator after dedup skip to avoid re-triggering
-                    let mut acc = accumulator.lock().await;
-                    acc.reset();
-                    return false;
-                }
-            }
-        }
-        Err(e) => {
-            warn!(
-                "[feedback] RFC dedup search failed: {} — proceeding with creation",
-                e
-            );
-        }
+    // Deduplication via shared helper
+    if deduplicate_observation(search, &content, "rfc").await {
+        // Reset accumulator after dedup skip to avoid re-triggering
+        let mut acc = accumulator.lock().await;
+        acc.reset();
+        return false;
     }
 
     // Create the RFC note
@@ -358,7 +585,9 @@ pub async fn process_rfc_observation(
         "system/rfc-detector".to_string(),
     );
     note.importance = NoteImportance::High;
-    note.tags = vec!["auto-detected".to_string(), "rfc".to_string()];
+    note.energy = 0.5;
+    note.memory_horizon = MemoryHorizon::Ephemeral;
+    note.tags = vec!["auto-observed".to_string(), "rfc".to_string()];
 
     match graph.create_note(&note).await {
         Ok(()) => {
@@ -367,63 +596,35 @@ pub async fn process_rfc_observation(
                 note.id
             );
 
-            // Entity linking: link RFC note to entities discussed in this session
+            // Entity linking via shared helper
             if let Some(sid) = session_id {
-                match graph.get_session_entities(sid, project_id).await {
-                    Ok(entities) => {
-                        for entity in &entities {
-                            if let Ok(etype) = entity
-                                .entity_type
-                                .parse::<crate::notes::models::EntityType>()
-                            {
-                                if let Err(e) = graph
-                                    .link_note_to_entity(
-                                        note.id,
-                                        &etype,
-                                        &entity.entity_id,
-                                        None,
-                                        None,
-                                    )
-                                    .await
-                                {
-                                    debug!(
-                                        "[feedback] Failed to link RFC note to {}/{}: {}",
-                                        entity.entity_type, entity.entity_id, e
-                                    );
-                                }
-                            }
-                        }
-                        if !entities.is_empty() {
-                            debug!(
-                                "[feedback] Linked RFC note {} to {} discussed entities",
-                                note.id,
-                                entities.len()
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        debug!(
-                            "[feedback] Failed to get session entities for linking: {}",
-                            e
-                        );
-                    }
-                }
+                link_note_to_session_entities(graph, &note, sid, project_id).await;
             }
 
-            // Emit WS event: note.created
+            // Emit WS event: observation_captured
             if let Some(emitter) = event_emitter {
+                let content_preview = if note.content.len() > 100 {
+                    format!("{}...", &note.content[..100])
+                } else {
+                    note.content.clone()
+                };
                 emitter.emit_created(
                     crate::events::EntityType::Note,
                     &note.id.to_string(),
                     serde_json::json!({
+                        "event_type": "observation_captured",
                         "note_type": "rfc",
+                        "category": "rfc",
                         "importance": "high",
+                        "content_preview": content_preview,
                         "source": "system/rfc-detector",
+                        "memory_horizon": "ephemeral",
+                        "energy": 0.5,
                     }),
                     project_id.map(|pid| pid.to_string()),
                 );
                 debug!(
-                    "[feedback] Emitted note.created WS event for RFC note {}",
+                    "[feedback] Emitted observation_captured WS event for RFC note {}",
                     note.id
                 );
             }
@@ -465,14 +666,16 @@ pub fn spawn_feedback(
     });
 }
 
-/// Spawn async RFC observation processing.
+/// Spawn async observation processing for ALL categories.
 ///
-/// Detects RFC-qualifying patterns in the response text, feeds them to the
-/// session's `RfcAccumulator`, and auto-creates an RFC draft note when the
-/// threshold is reached (2+ consecutive architectural discussions).
+/// Detects observations in the response text and:
+/// - **RFC**: Feeds to the `RfcAccumulator` (threshold of 2 consecutive observations)
+/// - **Non-RFC** (BugResolution, Convention, Gotcha, Pattern): Auto-creates notes
+///   immediately with `memory_horizon: ephemeral`, `energy: 0.3`, and `status: active`.
 ///
-/// Includes deduplication: skips creation if a similar RFC note already exists.
-pub fn spawn_rfc_processing(
+/// Rate-limited to max 3 auto-observed notes per message cycle.
+/// Includes deduplication: skips creation if a similar note already exists.
+pub fn spawn_observation_processing(
     graph: Arc<dyn GraphStore>,
     search: Arc<dyn SearchStore>,
     project_id: Option<Uuid>,
@@ -483,20 +686,100 @@ pub fn spawn_rfc_processing(
 ) {
     tokio::spawn(async move {
         let observation = detect_response_observations(&response_text);
-        let rfc_created = process_rfc_observation(
-            observation.as_ref(),
-            &rfc_accumulator,
-            &graph,
-            &search,
-            project_id,
-            session_id,
-            event_emitter.as_ref(),
-        )
-        .await;
-        if rfc_created {
-            debug!("[feedback] RFC note auto-created from conversation intelligence");
+
+        // Track how many notes we create this cycle (rate-limiting)
+        let mut notes_created: usize = 0;
+
+        if let Some(ref obs) = observation {
+            if obs.note_type == "rfc" {
+                // RFC path: use accumulator (threshold = 2 consecutive)
+                let rfc_created = process_rfc_observation(
+                    Some(obs),
+                    &rfc_accumulator,
+                    &graph,
+                    &search,
+                    project_id,
+                    session_id,
+                    event_emitter.as_ref(),
+                )
+                .await;
+                if rfc_created {
+                    notes_created += 1;
+                    debug!("[feedback] RFC note auto-created from conversation intelligence");
+                }
+            } else if obs.confidence >= NON_RFC_CONFIDENCE_THRESHOLD {
+                // Non-RFC path: auto-create immediately (no accumulator needed)
+                if notes_created < MAX_AUTO_OBSERVED_PER_CYCLE {
+                    let created = create_observation_note(
+                        obs,
+                        &graph,
+                        &search,
+                        project_id,
+                        session_id,
+                        event_emitter.as_ref(),
+                    )
+                    .await;
+                    if created {
+                        notes_created += 1;
+                        debug!(
+                            "[feedback] {} note auto-created from observation ({}/{})",
+                            obs.note_type, notes_created, MAX_AUTO_OBSERVED_PER_CYCLE
+                        );
+                    }
+                } else {
+                    warn!(
+                        "[feedback] Rate limit reached ({}/{}), skipping {} observation",
+                        notes_created, MAX_AUTO_OBSERVED_PER_CYCLE, obs.note_type
+                    );
+                }
+
+                // Reset RFC accumulator on non-RFC observation (preserve existing behavior)
+                let mut acc = rfc_accumulator.lock().await;
+                acc.feed(Some(obs));
+            }
+        } else {
+            // No observation detected — reset RFC accumulator
+            process_rfc_observation(
+                None,
+                &rfc_accumulator,
+                &graph,
+                &search,
+                project_id,
+                session_id,
+                event_emitter.as_ref(),
+            )
+            .await;
+        }
+
+        if notes_created > 0 {
+            debug!(
+                "[feedback] Observation processing complete: {} notes created",
+                notes_created
+            );
         }
     });
+}
+
+/// Backward-compatible alias for `spawn_observation_processing`.
+#[deprecated(note = "Use spawn_observation_processing instead")]
+pub fn spawn_rfc_processing(
+    graph: Arc<dyn GraphStore>,
+    search: Arc<dyn SearchStore>,
+    project_id: Option<Uuid>,
+    response_text: String,
+    rfc_accumulator: Arc<Mutex<RfcAccumulator>>,
+    session_id: Option<Uuid>,
+    event_emitter: Option<Arc<dyn EventEmitter>>,
+) {
+    spawn_observation_processing(
+        graph,
+        search,
+        project_id,
+        response_text,
+        rfc_accumulator,
+        session_id,
+        event_emitter,
+    );
 }
 
 // ============================================================================
@@ -765,7 +1048,7 @@ mod tests {
         let note = notes.values().next().unwrap();
         assert_eq!(note.note_type, NoteType::Rfc);
         assert_eq!(note.importance, NoteImportance::High);
-        assert!(note.tags.contains(&"auto-detected".to_string()));
+        assert!(note.tags.contains(&"auto-observed".to_string()));
         assert!(note.tags.contains(&"rfc".to_string()));
         assert!(note.content.contains("## Problem"));
         assert!(note.content.contains("## Proposed Solution"));
@@ -952,5 +1235,101 @@ mod tests {
         assert!(note
             .content
             .contains("2 consecutive architectural discussions"));
+    }
+
+    // ── collect_node_ids tests ───────────────────────────────────────
+
+    #[test]
+    fn test_collect_node_ids_filters_non_uuids_and_deduplicates() {
+        use crate::reasoning::models::{EntitySource, ReasoningNode};
+
+        let uuid1 = Uuid::new_v4();
+        let uuid2 = Uuid::new_v4();
+        let uuid3 = Uuid::new_v4();
+
+        // Root with a valid UUID entity_id
+        let mut root = ReasoningNode::new(
+            EntitySource::Note,
+            uuid1.to_string(),
+            0.9,
+            "root note",
+        );
+
+        // Child with a valid UUID
+        let mut child = ReasoningNode::new(
+            EntitySource::Decision,
+            uuid2.to_string(),
+            0.8,
+            "child decision",
+        )
+        .with_depth(1);
+
+        // Grandchild with a valid UUID
+        let grandchild = ReasoningNode::new(
+            EntitySource::Skill,
+            uuid3.to_string(),
+            0.7,
+            "grandchild skill",
+        )
+        .with_depth(2);
+
+        // Child with a file path (not a UUID) — should be filtered out
+        let file_child = ReasoningNode::new(
+            EntitySource::File,
+            "src/main.rs",
+            0.6,
+            "file node",
+        )
+        .with_depth(1);
+
+        // Child with a function name (not a UUID) — should be filtered out
+        let func_child = ReasoningNode::new(
+            EntitySource::Function,
+            "handle_request",
+            0.5,
+            "function node",
+        )
+        .with_depth(1);
+
+        child.add_child(grandchild);
+        root.add_child(child);
+        root.add_child(file_child);
+        root.add_child(func_child);
+
+        let ids = collect_node_ids(&[root]);
+
+        // Should have exactly 3 UUIDs (uuid1, uuid2, uuid3), not the file/function strings
+        assert_eq!(ids.len(), 3);
+        assert!(ids.contains(&uuid1));
+        assert!(ids.contains(&uuid2));
+        assert!(ids.contains(&uuid3));
+    }
+
+    // ── E2E tracker + reinforce test ─────────────────────────────────
+
+    #[tokio::test]
+    async fn test_tracker_record_and_reinforce_e2e() {
+        let tracker = ReasoningPathTracker::new();
+        let tree_id = Uuid::new_v4();
+        let node1 = Uuid::new_v4();
+        let node2 = Uuid::new_v4();
+        let node3 = Uuid::new_v4();
+
+        // Record a path
+        tracker
+            .record_path(tree_id, vec![node1, node2, node3])
+            .await;
+        assert_eq!(tracker.len().await, 1);
+
+        // Reinforce using mock graph
+        let mock = crate::neo4j::mock::MockGraphStore::new();
+        let graph: Arc<dyn crate::neo4j::traits::GraphStore> = Arc::new(mock);
+        let count = reinforce_tracked_paths(graph, &tracker).await;
+
+        // MockGraphStore's reinforce_synapses creates actual synapse pairs.
+        // 3 nodes → C(3,2)=3 pairs × 2 directions = 6 synapses created/reinforced.
+        assert_eq!(count, 6);
+        // Tracker should be drained after reinforcement
+        assert!(tracker.is_empty().await);
     }
 }
