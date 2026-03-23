@@ -21,11 +21,15 @@
 
 pub mod client;
 pub mod circuit_breaker;
+pub mod discovery;
+pub mod prober;
 pub mod registry;
 
 // Re-exports
 pub use client::{McpClient, McpTransportConfig};
 pub use circuit_breaker::CircuitBreaker;
+pub use discovery::{DiscoveredTool, InferredCategory, ToolIntrospector, ToolProfile};
+pub use prober::ToolProber;
 pub use registry::{
     ConnectionStatus, McpServerConnection, McpServerRegistry, ServerStats,
 };

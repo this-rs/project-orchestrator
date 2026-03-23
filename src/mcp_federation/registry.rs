@@ -10,7 +10,12 @@ use tracing::{debug, info, warn};
 
 use super::circuit_breaker::{CircuitBreaker, CircuitState};
 use super::client::{create_client, McpClient, McpTransportConfig};
+use super::discovery::{
+    DiscoveredTool, InternalToolDescriptor, IntrospectorConfig, ToolIntrospector,
+};
+use super::prober::{ProberConfig, ToolProber};
 use super::{ExternalToolInfo, McpTransport, ServerId, ToolFqn};
+use crate::embeddings::EmbeddingProvider;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
@@ -111,7 +116,8 @@ pub struct McpServerConnection {
     pub transport: McpTransport,
     pub status: ConnectionStatus,
     pub client: Box<dyn McpClient>,
-    pub tools: Vec<ExternalToolInfo>,
+    /// Discovered tools with introspection data (category, embedding, similar_internal).
+    pub discovered_tools: Vec<DiscoveredTool>,
     pub circuit_breaker: CircuitBreaker,
     pub stats: ServerStats,
     pub connected_at: DateTime<Utc>,
@@ -126,7 +132,7 @@ impl std::fmt::Debug for McpServerConnection {
             .field("id", &self.id)
             .field("display_name", &self.display_name)
             .field("status", &self.status)
-            .field("tools_count", &self.tools.len())
+            .field("tools_count", &self.discovered_tools.len())
             .field("transport", &self.client.transport_name())
             .finish()
     }
@@ -150,12 +156,55 @@ pub struct ServerSummary {
 // Registry
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Configuration for the registry's discovery and probing behavior.
+#[derive(Debug, Clone)]
+pub struct RegistryConfig {
+    /// Whether to probe read-only tools on connect.
+    pub probe_on_connect: bool,
+    /// Introspector configuration.
+    pub introspector: IntrospectorConfig,
+    /// Prober configuration.
+    pub prober: ProberConfig,
+}
+
+impl Default for RegistryConfig {
+    fn default() -> Self {
+        Self {
+            probe_on_connect: true,
+            introspector: IntrospectorConfig::default(),
+            prober: ProberConfig::default(),
+        }
+    }
+}
+
 /// Thread-safe registry of connected MCP servers.
-#[derive(Debug, Default)]
 pub struct McpServerRegistry {
     servers: HashMap<ServerId, McpServerConnection>,
     /// Index: tool FQN → server ID for O(1) dispatch.
     tool_index: HashMap<ToolFqn, ServerId>,
+    /// Embedding provider for tool introspection (None = skip embeddings).
+    embedding_provider: Option<Arc<dyn EmbeddingProvider>>,
+    /// Pre-computed descriptors for our internal MCP tools.
+    internal_tools: Vec<InternalToolDescriptor>,
+    /// Configuration.
+    config: RegistryConfig,
+}
+
+impl std::fmt::Debug for McpServerRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpServerRegistry")
+            .field("server_count", &self.servers.len())
+            .field("tool_count", &self.tool_index.len())
+            .field("has_embedding_provider", &self.embedding_provider.is_some())
+            .field("internal_tools_count", &self.internal_tools.len())
+            .finish()
+    }
+}
+
+impl Default for McpServerRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl McpServerRegistry {
@@ -163,12 +212,30 @@ impl McpServerRegistry {
         Self {
             servers: HashMap::new(),
             tool_index: HashMap::new(),
+            embedding_provider: None,
+            internal_tools: vec![],
+            config: RegistryConfig::default(),
+        }
+    }
+
+    /// Create a registry with full introspection capabilities.
+    pub fn with_introspection(
+        embedding_provider: Option<Arc<dyn EmbeddingProvider>>,
+        internal_tools: Vec<InternalToolDescriptor>,
+        config: RegistryConfig,
+    ) -> Self {
+        Self {
+            servers: HashMap::new(),
+            tool_index: HashMap::new(),
+            embedding_provider,
+            internal_tools,
+            config,
         }
     }
 
     /// Connect to an external MCP server.
     ///
-    /// Flow: create transport → connect → initialize → tools/list → store.
+    /// Flow: create transport → initialize → tools/list → introspect → probe → store.
     pub async fn connect(&mut self, config: McpTransportConfig) -> Result<ServerSummary> {
         let server_id = config.server_id.clone();
 
@@ -225,22 +292,38 @@ impl McpServerRegistry {
             "Discovered tools from MCP server"
         );
 
-        // 5. Convert to ExternalToolInfo
-        let tools: Vec<ExternalToolInfo> = tool_defs
-            .into_iter()
-            .map(|td| {
-                let fqn = format!("{}::{}", server_id, td.name);
-                ExternalToolInfo {
-                    name: td.name,
-                    fqn,
-                    description: td.description.unwrap_or_default(),
-                    input_schema: td.input_schema,
-                }
-            })
-            .collect();
+        // 5. Introspect tools (classify + embed + find similar)
+        let introspector = ToolIntrospector::new(
+            self.embedding_provider.clone(),
+            self.internal_tools.clone(),
+            self.config.introspector.clone(),
+        );
+        let mut discovered_tools = introspector.introspect(&server_id, &tool_defs).await;
 
-        // 6. Build the tool index
-        for tool in &tools {
+        info!(
+            server_id = %server_id,
+            tool_count = discovered_tools.len(),
+            "Introspected tools"
+        );
+
+        // 6. Probe read-only tools (optional)
+        if self.config.probe_on_connect {
+            let prober = ToolProber::new(self.config.prober.clone());
+            prober.probe_batch(client.as_ref(), &mut discovered_tools).await;
+
+            let probed_count = discovered_tools
+                .iter()
+                .filter(|t| t.profile.is_some())
+                .count();
+            info!(
+                server_id = %server_id,
+                probed_count = probed_count,
+                "Probed read-only tools"
+            );
+        }
+
+        // 7. Build the tool index
+        for tool in &discovered_tools {
             self.tool_index.insert(tool.fqn.clone(), server_id.clone());
         }
 
@@ -259,7 +342,7 @@ impl McpServerRegistry {
             transport: config.transport,
             status: ConnectionStatus::Connected,
             client,
-            tools,
+            discovered_tools,
             circuit_breaker: CircuitBreaker::new(),
             stats: ServerStats::new(),
             connected_at: Utc::now(),
@@ -272,7 +355,7 @@ impl McpServerRegistry {
             display_name,
             status: ConnectionStatus::Connected,
             transport_type: connection.client.transport_name().to_string(),
-            tool_count: connection.tools.len(),
+            tool_count: connection.discovered_tools.len(),
             connected_at: connection.connected_at,
             stats: connection.stats.clone(),
             circuit_breaker_state: CircuitState::Closed,
@@ -294,7 +377,7 @@ impl McpServerRegistry {
         info!(server_id = %server_id, "Disconnecting MCP server");
 
         // Remove from tool index
-        for tool in &connection.tools {
+        for tool in &connection.discovered_tools {
             self.tool_index.remove(&tool.fqn);
         }
 
@@ -334,7 +417,7 @@ impl McpServerRegistry {
                 display_name: conn.display_name.clone(),
                 status: conn.status,
                 transport_type: conn.client.transport_name().to_string(),
-                tool_count: conn.tools.len(),
+                tool_count: conn.discovered_tools.len(),
                 connected_at: conn.connected_at,
                 stats: conn.stats.clone(),
                 circuit_breaker_state: conn.circuit_breaker.state(),
@@ -343,20 +426,35 @@ impl McpServerRegistry {
             .collect()
     }
 
-    /// List all tools from all connected servers.
-    pub fn all_tools(&self) -> Vec<&ExternalToolInfo> {
+    /// List all discovered tools from all connected servers.
+    pub fn all_tools(&self) -> Vec<&DiscoveredTool> {
         self.servers
             .values()
-            .flat_map(|conn| conn.tools.iter())
+            .flat_map(|conn| conn.discovered_tools.iter())
             .collect()
     }
 
-    /// Get all tools for a specific server.
-    pub fn tools_for_server(&self, server_id: &str) -> Vec<&ExternalToolInfo> {
+    /// Get all discovered tools for a specific server.
+    pub fn tools_for_server(&self, server_id: &str) -> Vec<&DiscoveredTool> {
         self.servers
             .get(server_id)
-            .map(|conn| conn.tools.iter().collect())
+            .map(|conn| conn.discovered_tools.iter().collect())
             .unwrap_or_default()
+    }
+
+    /// Convert discovered tools to legacy ExternalToolInfo (for backward compatibility).
+    pub fn all_external_tool_infos(&self) -> Vec<ExternalToolInfo> {
+        self.servers
+            .values()
+            .flat_map(|conn| {
+                conn.discovered_tools.iter().map(|dt| ExternalToolInfo {
+                    name: dt.name.clone(),
+                    fqn: dt.fqn.clone(),
+                    description: dt.description.clone(),
+                    input_schema: dt.input_schema.clone(),
+                })
+            })
+            .collect()
     }
 
     /// Check if any servers are connected.
