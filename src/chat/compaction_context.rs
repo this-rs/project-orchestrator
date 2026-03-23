@@ -78,6 +78,9 @@ pub struct CompactionContext {
 
     // Pending/in-progress tasks across active plans
     pub pending_tasks: Vec<TaskSummary>,
+
+    // Work already done this session (from SessionWorkLog snapshot)
+    pub work_log: Option<SessionWorkLogSnapshot>,
 }
 
 /// Summary of an active plan for post-compaction context.
@@ -551,6 +554,40 @@ impl CompactionContext {
             out.push('\n');
         }
 
+        // § Work Already Done (from SessionWorkLog — prevents re-doing completed work)
+        if let Some(wl) = &self.work_log {
+            let has_content = !wl.files_modified.is_empty()
+                || !wl.steps_completed.is_empty()
+                || wl.tool_use_count > 0;
+            if has_content && out.len() < MAX_MARKDOWN_CHARS - 600 {
+                out.push_str("## Work Already Done\n");
+                if !wl.files_modified.is_empty() {
+                    let _ = writeln!(
+                        out,
+                        "**Files modified ({}):** {}",
+                        wl.files_modified.len(),
+                        wl.files_modified
+                            .iter()
+                            .take(10)
+                            .map(|f| format!("`{f}`"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                }
+                if !wl.steps_completed.is_empty() {
+                    let _ = writeln!(
+                        out,
+                        "**Steps completed:** {}",
+                        wl.steps_completed.len()
+                    );
+                }
+                if wl.tool_use_count > 0 {
+                    let _ = writeln!(out, "**Tool uses this session:** {}", wl.tool_use_count);
+                }
+                out.push('\n');
+            }
+        }
+
         // § Active Constraints
         if !self.constraints.is_empty() && out.len() < MAX_MARKDOWN_CHARS - 600 {
             out.push_str("## Active Constraints\n");
@@ -872,6 +909,7 @@ mod tests {
             project_description: None,
             active_plans: vec![],
             pending_tasks: vec![],
+            work_log: None,
         }
     }
 
@@ -1359,6 +1397,64 @@ mod tests {
             "Enriched custom instructions {} chars exceeds budget {}",
             ci.len(),
             MAX_CUSTOM_INSTRUCTIONS_CHARS
+        );
+    }
+
+    #[test]
+    fn test_post_compaction_work_log_in_markdown() {
+        let mut ctx = sample_context();
+        let step1 = Uuid::new_v4();
+        ctx.work_log = Some(SessionWorkLogSnapshot {
+            files_modified: vec!["src/main.rs".to_string(), "src/lib.rs".to_string()],
+            files_read: vec!["src/utils.rs".to_string()],
+            steps_completed: vec![step1],
+            step_in_progress: None,
+            decisions_summary: vec![],
+            last_tool_name: None,
+            tool_use_count: 15,
+        });
+
+        let md = ctx.to_markdown();
+        assert!(
+            md.contains("## Work Already Done"),
+            "Missing Work Already Done section in: {}",
+            md
+        );
+        assert!(
+            md.contains("`src/main.rs`"),
+            "Missing files_modified in: {}",
+            md
+        );
+        assert!(
+            md.contains("`src/lib.rs`"),
+            "Missing second file in: {}",
+            md
+        );
+        assert!(
+            md.contains("Files modified (2)"),
+            "Missing file count in: {}",
+            md
+        );
+        assert!(
+            md.contains("**Steps completed:** 1"),
+            "Missing steps completed count in: {}",
+            md
+        );
+        assert!(
+            md.contains("**Tool uses this session:** 15"),
+            "Missing tool_use_count in: {}",
+            md
+        );
+    }
+
+    #[test]
+    fn test_post_compaction_work_log_none_no_section() {
+        let ctx = sample_context();
+        // Default has work_log = None
+        let md = ctx.to_markdown();
+        assert!(
+            !md.contains("## Work Already Done"),
+            "Should not have Work Already Done when work_log is None"
         );
     }
 

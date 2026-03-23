@@ -126,7 +126,15 @@ impl PostStreamHandler {
             let build_latency_ms = build_start.elapsed().as_millis() as u64;
 
             let (hint_len, recovery_success) = match build_result {
-                Ok(ctx) => {
+                Ok(mut ctx) => {
+                    // Inject SessionWorkLog snapshot so to_markdown() includes "Work Already Done"
+                    let snapshot = self.work_log.lock().await.snapshot();
+                    let has_work = !snapshot.files_modified.is_empty()
+                        || !snapshot.steps_completed.is_empty()
+                        || snapshot.tool_use_count > 0;
+                    if has_work {
+                        ctx.work_log = Some(snapshot);
+                    }
                     let hint = ctx.to_markdown();
                     let len = hint.len();
                     if !hint.is_empty() {
@@ -597,8 +605,8 @@ pub(crate) const OBJECTIVE_REMINDER_COOLDOWN: u32 = 1;
 pub(crate) struct PendingTaskInfo {
     pub title: String,
     pub status: String,
-    pub pending_steps: Vec<String>,       // descriptions of non-completed steps
-    pub affected_files: Vec<String>,      // files this task modifies
+    pub pending_steps: Vec<String>, // descriptions of non-completed steps
+    pub affected_files: Vec<String>, // files this task modifies
 }
 
 /// Inputs to the objective tracking decision (decoupled from async/Arc state).
@@ -646,9 +654,7 @@ pub(crate) fn check_objective_reminder(input: &ObjectiveCheckInput) -> Option<St
 
     // Build structured reminder
     let mut parts = Vec::new();
-    parts.push(
-        "⚠️ **You have not finished your current task. Here is what remains:**".to_string(),
-    );
+    parts.push("⚠️ **You have not finished your current task. Here is what remains:**".to_string());
 
     for task in &input.pending_tasks {
         parts.push(format!("\n### {} [{}]", task.title, task.status));
@@ -678,9 +684,7 @@ pub(crate) fn check_objective_reminder(input: &ObjectiveCheckInput) -> Option<St
         parts.push(input.work_log_summary.clone());
     }
 
-    parts.push(
-        "\n**Do NOT conclude. Continue working on the pending steps above.**".to_string(),
-    );
+    parts.push("\n**Do NOT conclude. Continue working on the pending steps above.**".to_string());
 
     Some(parts.join("\n"))
 }
@@ -700,10 +704,7 @@ mod tests {
             pending_tasks: vec![PendingTaskInfo {
                 title: "Implement feature T1".to_string(),
                 status: "inprogress".to_string(),
-                pending_steps: vec![
-                    "Write the handler".to_string(),
-                    "Add tests".to_string(),
-                ],
+                pending_steps: vec!["Write the handler".to_string(), "Add tests".to_string()],
                 affected_files: vec!["src/handler.rs".to_string()],
             }],
             work_log_summary: String::new(),
@@ -828,11 +829,7 @@ mod tests {
             "missing step in: {}",
             msg
         );
-        assert!(
-            msg.contains("Register route"),
-            "missing step in: {}",
-            msg
-        );
+        assert!(msg.contains("Register route"), "missing step in: {}", msg);
         assert!(
             msg.contains("Add test for GET /api/foo"),
             "missing step from second task in: {}",
