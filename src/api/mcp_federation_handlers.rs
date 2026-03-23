@@ -308,26 +308,33 @@ pub async fn reconnect_server(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{body::Body, http::{Request, StatusCode}};
-    use tower::ServiceExt;
-    use crate::api::routes::create_router;
-    use crate::test_helpers::{test_auth_config, test_bearer_token, mock_app_state};
-    use crate::events::EventBus;
-    use crate::orchestrator::{Orchestrator, FileWatcher};
     use crate::api::handlers::ServerState;
-    use std::sync::Arc;
+    use crate::api::routes::create_router;
+    use crate::events::EventBus;
+    use crate::orchestrator::{FileWatcher, Orchestrator};
+    use crate::test_helpers::{mock_app_state, test_auth_config, test_bearer_token};
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+    };
     use std::collections::HashMap;
+    use std::sync::Arc;
+    use tower::ServiceExt;
 
     /// App WITHOUT mcp_registry (None)
     async fn test_app() -> axum::Router {
         let app_state = mock_app_state();
         let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
-        let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(orchestrator.clone())));
+        let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
+            orchestrator.clone(),
+        )));
         let state = Arc::new(ServerState {
             orchestrator,
             watcher,
             chat_manager: None,
-            event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(EventBus::default()))),
+            event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(
+                EventBus::default(),
+            ))),
             nats_emitter: None,
             auth_config: Some(test_auth_config()),
             serve_frontend: false,
@@ -354,13 +361,17 @@ mod tests {
     async fn test_app_with_registry() -> axum::Router {
         let app_state = mock_app_state();
         let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
-        let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(orchestrator.clone())));
+        let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
+            orchestrator.clone(),
+        )));
         let registry = crate::mcp_federation::registry::new_shared_registry();
         let state = Arc::new(ServerState {
             orchestrator,
             watcher,
             chat_manager: None,
-            event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(EventBus::default()))),
+            event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(
+                EventBus::default(),
+            ))),
             nats_emitter: None,
             auth_config: Some(test_auth_config()),
             serve_frontend: false,
@@ -411,7 +422,9 @@ mod tests {
     }
 
     async fn body_json(resp: axum::http::Response<Body>) -> serde_json::Value {
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         serde_json::from_slice(&bytes).unwrap()
     }
 
@@ -422,7 +435,10 @@ mod tests {
     #[tokio::test]
     async fn test_list_servers_no_registry() {
         let app = test_app().await;
-        let resp = app.oneshot(auth_get("/api/mcp-federation/servers")).await.unwrap();
+        let resp = app
+            .oneshot(auth_get("/api/mcp-federation/servers"))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
@@ -433,7 +449,10 @@ mod tests {
     #[tokio::test]
     async fn test_list_servers_empty() {
         let app = test_app_with_registry().await;
-        let resp = app.oneshot(auth_get("/api/mcp-federation/servers")).await.unwrap();
+        let resp = app
+            .oneshot(auth_get("/api/mcp-federation/servers"))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let json = body_json(resp).await;
         assert!(json.is_array(), "Expected JSON array, got: {:?}", json);
@@ -658,15 +677,17 @@ mod tests {
     // ========================================================================
 
     async fn test_app_with_populated_registry() -> axum::Router {
-        use crate::mcp_federation::registry::{
-            McpServerConnection, McpServerRegistry, ConnectionStatus, ServerStats,
-        };
         use crate::mcp_federation::circuit_breaker::CircuitBreaker;
         use crate::mcp_federation::discovery::{DiscoveredTool, InferredCategory};
+        use crate::mcp_federation::registry::{
+            ConnectionStatus, McpServerConnection, McpServerRegistry, ServerStats,
+        };
 
         let app_state = mock_app_state();
         let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
-        let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(orchestrator.clone())));
+        let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
+            orchestrator.clone(),
+        )));
 
         // Build a registry with a mock server
         let mut registry = McpServerRegistry::new();
@@ -676,19 +697,35 @@ mod tests {
         struct MinimalMockClient;
         #[async_trait::async_trait]
         impl crate::mcp_federation::client::McpClient for MinimalMockClient {
-            async fn initialize(&self) -> anyhow::Result<crate::mcp_federation::client::InitializeResult> {
+            async fn initialize(
+                &self,
+            ) -> anyhow::Result<crate::mcp_federation::client::InitializeResult> {
                 unimplemented!()
             }
-            async fn initialized_notification(&self) -> anyhow::Result<()> { Ok(()) }
-            async fn tools_list(&self) -> anyhow::Result<Vec<crate::mcp_federation::client::McpToolDef>> {
+            async fn initialized_notification(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn tools_list(
+                &self,
+            ) -> anyhow::Result<Vec<crate::mcp_federation::client::McpToolDef>> {
                 Ok(vec![])
             }
-            async fn call_tool(&self, _: &str, _: Option<serde_json::Value>) -> anyhow::Result<serde_json::Value> {
+            async fn call_tool(
+                &self,
+                _: &str,
+                _: Option<serde_json::Value>,
+            ) -> anyhow::Result<serde_json::Value> {
                 Ok(serde_json::json!({}))
             }
-            async fn ping(&self) -> anyhow::Result<()> { Ok(()) }
-            async fn shutdown(&self) -> anyhow::Result<()> { Ok(()) }
-            fn transport_name(&self) -> &'static str { "mock" }
+            async fn ping(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn shutdown(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn transport_name(&self) -> &'static str {
+                "mock"
+            }
         }
 
         let tools = vec![
@@ -740,7 +777,9 @@ mod tests {
             orchestrator,
             watcher,
             chat_manager: None,
-            event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(EventBus::default()))),
+            event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(
+                EventBus::default(),
+            ))),
             nats_emitter: None,
             auth_config: Some(test_auth_config()),
             serve_frontend: false,
@@ -770,7 +809,10 @@ mod tests {
     #[tokio::test]
     async fn test_list_servers_with_data() {
         let app = test_app_with_populated_registry().await;
-        let resp = app.oneshot(auth_get("/api/mcp-federation/servers")).await.unwrap();
+        let resp = app
+            .oneshot(auth_get("/api/mcp-federation/servers"))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let json = body_json(resp).await;
         let arr = json.as_array().unwrap();

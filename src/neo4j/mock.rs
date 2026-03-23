@@ -14590,11 +14590,7 @@ mod tests {
             .unwrap()
             .is_empty());
         // Project index empty
-        assert!(store
-            .list_mcp_servers(project_id)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(store.list_mcp_servers(project_id).await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -14718,10 +14714,7 @@ mod tests {
 
         let map = store.mcp_similar_to.read().await;
         let score = map
-            .get(&(
-                "server-a::read".to_string(),
-                "server-b::fetch".to_string(),
-            ))
+            .get(&("server-a::read".to_string(), "server-b::fetch".to_string()))
             .copied();
         assert_eq!(score, Some(0.92));
     }
@@ -14736,10 +14729,7 @@ mod tests {
 
         let map = store.mcp_co_activated.read().await;
         let count = map
-            .get(&(
-                "server-a::read".to_string(),
-                "server-a::write".to_string(),
-            ))
+            .get(&("server-a::read".to_string(), "server-a::write".to_string()))
             .copied();
         assert_eq!(count, Some(17));
     }
@@ -14754,10 +14744,7 @@ mod tests {
 
         let map = store.mcp_often_follows.read().await;
         let entry = map
-            .get(&(
-                "server-x::init".to_string(),
-                "server-x::run".to_string(),
-            ))
+            .get(&("server-x::init".to_string(), "server-x::run".to_string()))
             .copied();
         assert_eq!(entry, Some((42, 150.5)));
     }
@@ -14775,9 +14762,7 @@ mod tests {
             .unwrap();
 
         let map = store.mcp_similar_to.read().await;
-        let score = map
-            .get(&("a::x".to_string(), "b::y".to_string()))
-            .copied();
+        let score = map.get(&("a::x".to_string(), "b::y".to_string())).copied();
         assert_eq!(score, Some(0.99), "Later insert should overwrite earlier");
     }
 }

@@ -755,7 +755,12 @@ mod tests {
     fn test_next_request_id_increments() {
         let id1 = next_request_id();
         let id2 = next_request_id();
-        assert!(id2 > id1, "Second ID ({}) should be greater than first ({})", id2, id1);
+        assert!(
+            id2 > id1,
+            "Second ID ({}) should be greater than first ({})",
+            id2,
+            id1
+        );
     }
 
     #[test]
@@ -829,7 +834,10 @@ mod tests {
         assert_eq!(roundtrip.server_id, "test-srv");
         assert!(roundtrip.display_name.is_none());
         match roundtrip.transport {
-            McpTransport::Sse { ref url, ref headers } => {
+            McpTransport::Sse {
+                ref url,
+                ref headers,
+            } => {
                 assert_eq!(url, "https://example.com/sse");
                 assert_eq!(headers.get("Authorization").unwrap(), "Bearer tok");
             }

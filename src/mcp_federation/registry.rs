@@ -1155,26 +1155,19 @@ mod tests {
         let mut registry = McpServerRegistry::new();
         let client1 = MockLifecycleClient::new(false).with_tools(mock_tool_defs(1));
         registry
-            .connect_with_client(
-                "dup".to_string(),
-                None,
-                mock_transport(),
-                Box::new(client1),
-            )
+            .connect_with_client("dup".to_string(), None, mock_transport(), Box::new(client1))
             .await
             .unwrap();
 
         let client2 = MockLifecycleClient::new(false).with_tools(mock_tool_defs(1));
         let result = registry
-            .connect_with_client(
-                "dup".to_string(),
-                None,
-                mock_transport(),
-                Box::new(client2),
-            )
+            .connect_with_client("dup".to_string(), None, mock_transport(), Box::new(client2))
             .await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("already connected"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("already connected"));
     }
 
     #[tokio::test]
@@ -1191,7 +1184,10 @@ mod tests {
             )
             .await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("initialize failed"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("initialize failed"));
         // Server should NOT be in registry
         assert!(registry.is_empty());
     }
