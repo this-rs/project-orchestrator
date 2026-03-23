@@ -22,6 +22,7 @@ pub mod homeostasis;
 pub mod identity;
 pub mod lifecycle;
 pub mod mcp;
+pub mod mcp_federation;
 pub mod meilisearch;
 pub mod neo4j;
 pub mod neurons;

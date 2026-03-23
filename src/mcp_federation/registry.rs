@@ -1,0 +1,463 @@
+//! MCP Server Registry — manages connections to external MCP servers.
+
+use anyhow::{anyhow, Result};
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::RwLock;
+use tracing::{debug, info, warn};
+
+use super::circuit_breaker::{CircuitBreaker, CircuitState};
+use super::client::{create_client, McpClient, McpTransportConfig};
+use super::{ExternalToolInfo, McpTransport, ServerId, ToolFqn};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Types
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Connection status of an external MCP server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectionStatus {
+    Connected,
+    Disconnected,
+    Error,
+    Reconnecting,
+}
+
+/// Statistics for an external MCP server.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerStats {
+    pub call_count: u64,
+    pub error_count: u64,
+    pub latency_samples: Vec<u64>,
+    pub last_call_at: Option<DateTime<Utc>>,
+    pub last_error: Option<String>,
+}
+
+impl ServerStats {
+    pub fn new() -> Self {
+        Self {
+            call_count: 0,
+            error_count: 0,
+            latency_samples: Vec::new(),
+            last_call_at: None,
+            last_error: None,
+        }
+    }
+
+    /// Record a call outcome.
+    pub fn record_call(&mut self, latency_ms: u64, success: bool) {
+        self.call_count += 1;
+        self.last_call_at = Some(Utc::now());
+
+        // Keep last 100 latency samples
+        if self.latency_samples.len() >= 100 {
+            self.latency_samples.remove(0);
+        }
+        self.latency_samples.push(latency_ms);
+
+        if !success {
+            self.error_count += 1;
+        }
+    }
+
+    /// Record an error message.
+    pub fn record_error(&mut self, error: String) {
+        self.last_error = Some(error);
+    }
+
+    /// Get p50 latency in ms.
+    pub fn latency_p50(&self) -> u64 {
+        percentile(&self.latency_samples, 50)
+    }
+
+    /// Get p95 latency in ms.
+    pub fn latency_p95(&self) -> u64 {
+        percentile(&self.latency_samples, 95)
+    }
+
+    /// Get error rate (0.0–1.0).
+    pub fn error_rate(&self) -> f64 {
+        if self.call_count == 0 {
+            0.0
+        } else {
+            self.error_count as f64 / self.call_count as f64
+        }
+    }
+}
+
+impl Default for ServerStats {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn percentile(samples: &[u64], pct: usize) -> u64 {
+    if samples.is_empty() {
+        return 0;
+    }
+    let mut sorted = samples.to_vec();
+    sorted.sort_unstable();
+    let idx = (sorted.len() * pct / 100).min(sorted.len() - 1);
+    sorted[idx]
+}
+
+/// A connected MCP server with its client, tools, and stats.
+pub struct McpServerConnection {
+    pub id: ServerId,
+    pub display_name: String,
+    pub transport: McpTransport,
+    pub status: ConnectionStatus,
+    pub client: Box<dyn McpClient>,
+    pub tools: Vec<ExternalToolInfo>,
+    pub circuit_breaker: CircuitBreaker,
+    pub stats: ServerStats,
+    pub connected_at: DateTime<Utc>,
+    pub server_protocol_version: Option<String>,
+    pub server_name: Option<String>,
+}
+
+// Manual Debug impl because Box<dyn McpClient> is Debug but we want nicer output
+impl std::fmt::Debug for McpServerConnection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpServerConnection")
+            .field("id", &self.id)
+            .field("display_name", &self.display_name)
+            .field("status", &self.status)
+            .field("tools_count", &self.tools.len())
+            .field("transport", &self.client.transport_name())
+            .finish()
+    }
+}
+
+/// Summary of a connected server (serializable, no client reference).
+#[derive(Debug, Clone, Serialize)]
+pub struct ServerSummary {
+    pub id: ServerId,
+    pub display_name: String,
+    pub status: ConnectionStatus,
+    pub transport_type: String,
+    pub tool_count: usize,
+    pub connected_at: DateTime<Utc>,
+    pub stats: ServerStats,
+    pub circuit_breaker_state: CircuitState,
+    pub server_name: Option<String>,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Registry
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Thread-safe registry of connected MCP servers.
+#[derive(Debug, Default)]
+pub struct McpServerRegistry {
+    servers: HashMap<ServerId, McpServerConnection>,
+    /// Index: tool FQN → server ID for O(1) dispatch.
+    tool_index: HashMap<ToolFqn, ServerId>,
+}
+
+impl McpServerRegistry {
+    pub fn new() -> Self {
+        Self {
+            servers: HashMap::new(),
+            tool_index: HashMap::new(),
+        }
+    }
+
+    /// Connect to an external MCP server.
+    ///
+    /// Flow: create transport → connect → initialize → tools/list → store.
+    pub async fn connect(&mut self, config: McpTransportConfig) -> Result<ServerSummary> {
+        let server_id = config.server_id.clone();
+
+        if self.servers.contains_key(&server_id) {
+            return Err(anyhow!(
+                "MCP server '{}' is already connected. Disconnect first.",
+                server_id
+            ));
+        }
+
+        info!(server_id = %server_id, "Connecting to MCP server");
+
+        // 1. Create the client
+        let client = create_client(&config.transport).await?;
+        debug!(
+            server_id = %server_id,
+            transport = client.transport_name(),
+            "MCP client created"
+        );
+
+        // 2. Initialize handshake
+        let init_result = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            client.initialize(),
+        )
+        .await
+        .map_err(|_| anyhow!("Initialize handshake timed out (30s)"))?
+        .map_err(|e| anyhow!("Initialize handshake failed: {}", e))?;
+
+        debug!(
+            server_id = %server_id,
+            protocol_version = %init_result.protocol_version,
+            server_info = ?init_result.server_info,
+            "MCP initialize handshake completed"
+        );
+
+        // 3. Send initialized notification
+        if let Err(e) = client.initialized_notification().await {
+            debug!(error = %e, "Failed to send initialized notification (non-fatal)");
+        }
+
+        // 4. List available tools
+        let tool_defs = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            client.tools_list(),
+        )
+        .await
+        .map_err(|_| anyhow!("tools/list timed out (15s)"))?
+        .map_err(|e| anyhow!("tools/list failed: {}", e))?;
+
+        info!(
+            server_id = %server_id,
+            tool_count = tool_defs.len(),
+            "Discovered tools from MCP server"
+        );
+
+        // 5. Convert to ExternalToolInfo
+        let tools: Vec<ExternalToolInfo> = tool_defs
+            .into_iter()
+            .map(|td| {
+                let fqn = format!("{}::{}", server_id, td.name);
+                ExternalToolInfo {
+                    name: td.name,
+                    fqn,
+                    description: td.description.unwrap_or_default(),
+                    input_schema: td.input_schema,
+                }
+            })
+            .collect();
+
+        // 6. Build the tool index
+        for tool in &tools {
+            self.tool_index.insert(tool.fqn.clone(), server_id.clone());
+        }
+
+        let display_name = config
+            .display_name
+            .unwrap_or_else(|| server_id.clone());
+
+        let server_name = init_result
+            .server_info
+            .as_ref()
+            .map(|si| si.name.clone());
+
+        let connection = McpServerConnection {
+            id: server_id.clone(),
+            display_name: display_name.clone(),
+            transport: config.transport,
+            status: ConnectionStatus::Connected,
+            client,
+            tools,
+            circuit_breaker: CircuitBreaker::new(),
+            stats: ServerStats::new(),
+            connected_at: Utc::now(),
+            server_protocol_version: Some(init_result.protocol_version),
+            server_name: server_name.clone(),
+        };
+
+        let summary = ServerSummary {
+            id: server_id.clone(),
+            display_name,
+            status: ConnectionStatus::Connected,
+            transport_type: connection.client.transport_name().to_string(),
+            tool_count: connection.tools.len(),
+            connected_at: connection.connected_at,
+            stats: connection.stats.clone(),
+            circuit_breaker_state: CircuitState::Closed,
+            server_name,
+        };
+
+        self.servers.insert(server_id, connection);
+
+        Ok(summary)
+    }
+
+    /// Disconnect from an MCP server.
+    pub async fn disconnect(&mut self, server_id: &str) -> Result<()> {
+        let connection = self
+            .servers
+            .remove(server_id)
+            .ok_or_else(|| anyhow!("MCP server '{}' is not connected", server_id))?;
+
+        info!(server_id = %server_id, "Disconnecting MCP server");
+
+        // Remove from tool index
+        for tool in &connection.tools {
+            self.tool_index.remove(&tool.fqn);
+        }
+
+        // Graceful shutdown
+        if let Err(e) = connection.client.shutdown().await {
+            warn!(
+                server_id = %server_id,
+                error = %e,
+                "Error during MCP server shutdown (non-fatal)"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Get a reference to a connected server.
+    pub fn get(&self, server_id: &str) -> Option<&McpServerConnection> {
+        self.servers.get(server_id)
+    }
+
+    /// Get a mutable reference to a connected server.
+    pub fn get_mut(&mut self, server_id: &str) -> Option<&mut McpServerConnection> {
+        self.servers.get_mut(server_id)
+    }
+
+    /// Look up which server owns a tool FQN.
+    pub fn resolve_tool(&self, fqn: &str) -> Option<&str> {
+        self.tool_index.get(fqn).map(|s| s.as_str())
+    }
+
+    /// List all connected servers.
+    pub fn list(&self) -> Vec<ServerSummary> {
+        self.servers
+            .values()
+            .map(|conn| ServerSummary {
+                id: conn.id.clone(),
+                display_name: conn.display_name.clone(),
+                status: conn.status,
+                transport_type: conn.client.transport_name().to_string(),
+                tool_count: conn.tools.len(),
+                connected_at: conn.connected_at,
+                stats: conn.stats.clone(),
+                circuit_breaker_state: conn.circuit_breaker.state(),
+                server_name: conn.server_name.clone(),
+            })
+            .collect()
+    }
+
+    /// List all tools from all connected servers.
+    pub fn all_tools(&self) -> Vec<&ExternalToolInfo> {
+        self.servers
+            .values()
+            .flat_map(|conn| conn.tools.iter())
+            .collect()
+    }
+
+    /// Get all tools for a specific server.
+    pub fn tools_for_server(&self, server_id: &str) -> Vec<&ExternalToolInfo> {
+        self.servers
+            .get(server_id)
+            .map(|conn| conn.tools.iter().collect())
+            .unwrap_or_default()
+    }
+
+    /// Check if any servers are connected.
+    pub fn is_empty(&self) -> bool {
+        self.servers.is_empty()
+    }
+
+    /// Number of connected servers.
+    pub fn len(&self) -> usize {
+        self.servers.len()
+    }
+
+    /// Get all connected server IDs.
+    pub fn server_ids(&self) -> Vec<&str> {
+        self.servers.keys().map(|s| s.as_str()).collect()
+    }
+}
+
+/// Thread-safe wrapper for the registry (used in AppState).
+pub type SharedRegistry = Arc<RwLock<McpServerRegistry>>;
+
+/// Create a new shared registry.
+pub fn new_shared_registry() -> SharedRegistry {
+    Arc::new(RwLock::new(McpServerRegistry::new()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_new_registry_is_empty() {
+        let registry = McpServerRegistry::new();
+        assert!(registry.is_empty());
+        assert_eq!(registry.len(), 0);
+        assert!(registry.list().is_empty());
+    }
+
+    #[test]
+    fn test_server_stats_new() {
+        let stats = ServerStats::new();
+        assert_eq!(stats.call_count, 0);
+        assert_eq!(stats.error_count, 0);
+        assert_eq!(stats.error_rate(), 0.0);
+        assert_eq!(stats.latency_p50(), 0);
+    }
+
+    #[test]
+    fn test_server_stats_recording() {
+        let mut stats = ServerStats::new();
+        stats.record_call(10, true);
+        stats.record_call(20, true);
+        stats.record_call(100, false);
+
+        assert_eq!(stats.call_count, 3);
+        assert_eq!(stats.error_count, 1);
+        assert!((stats.error_rate() - 0.333).abs() < 0.01);
+        assert!(stats.last_call_at.is_some());
+    }
+
+    #[test]
+    fn test_latency_percentiles() {
+        let mut stats = ServerStats::new();
+        for ms in [5, 10, 15, 20, 25, 30, 35, 40, 45, 50] {
+            stats.record_call(ms, true);
+        }
+        assert!(stats.latency_p50() > 0);
+        assert!(stats.latency_p95() > stats.latency_p50());
+    }
+
+    #[test]
+    fn test_server_summary_serialization() {
+        let summary = ServerSummary {
+            id: "test".to_string(),
+            display_name: "Test Server".to_string(),
+            status: ConnectionStatus::Connected,
+            transport_type: "stdio".to_string(),
+            tool_count: 5,
+            connected_at: Utc::now(),
+            stats: ServerStats::new(),
+            circuit_breaker_state: CircuitState::Closed,
+            server_name: Some("TestMCP".to_string()),
+        };
+        let json = serde_json::to_string(&summary).unwrap();
+        assert!(json.contains("\"status\":\"connected\""));
+        assert!(json.contains("\"tool_count\":5"));
+    }
+
+    #[test]
+    fn test_connection_status_serde() {
+        let status = ConnectionStatus::Connected;
+        let json = serde_json::to_string(&status).unwrap();
+        assert_eq!(json, "\"connected\"");
+        let back: ConnectionStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, ConnectionStatus::Connected);
+    }
+
+    #[test]
+    fn test_shared_registry_creation() {
+        let registry = new_shared_registry();
+        // Just verify it compiles and creates
+        assert!(Arc::strong_count(&registry) == 1);
+    }
+}
