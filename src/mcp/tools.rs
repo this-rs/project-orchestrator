@@ -40,6 +40,7 @@ pub fn all_tools() -> Vec<ToolDefinition> {
         neural_routing_tool(),
         trajectory_tool(),
         lifecycle_hook_tool(),
+        mcp_federation_tool(),
     ]
 }
 
@@ -1373,6 +1374,47 @@ fn lifecycle_hook_tool() -> ToolDefinition {
     }
 }
 
+fn mcp_federation_tool() -> ToolDefinition {
+    ToolDefinition {
+        name: "mcp_federation".to_string(),
+        description: "Manage external MCP server connections (federation). Actions: connect, disconnect, list, status, tools, probe, reconnect, backfill_relations, backfill_sequences".to_string(),
+        input_schema: InputSchema {
+            schema_type: "object".to_string(),
+            properties: Some(json!({
+                "action": {
+                    "type": "string",
+                    "enum": ["connect", "disconnect", "list", "status", "tools", "probe", "reconnect", "backfill_relations", "backfill_sequences"],
+                    "description": "Operation to perform"
+                },
+                "server_id": {"type": "string", "description": "Server identifier (connect/disconnect/status/tools/probe/reconnect)"},
+                "transport": {
+                    "type": "string",
+                    "enum": ["stdio", "sse", "streamable_http"],
+                    "description": "Transport type (connect)"
+                },
+                "url": {"type": "string", "description": "Server URL (connect, for sse/streamable_http transports)"},
+                "command": {"type": "string", "description": "Command to spawn (connect, for stdio transport)"},
+                "args": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Command arguments (connect, for stdio transport)"
+                },
+                "env": {
+                    "type": "object",
+                    "description": "Environment variables (connect, for stdio transport)"
+                },
+                "headers": {
+                    "type": "object",
+                    "description": "HTTP headers (connect, for sse/streamable_http transports)"
+                },
+                "display_name": {"type": "string", "description": "Human-readable name (connect, optional)"},
+                "auto_probe": {"type": "boolean", "description": "Probe read-only tools on connect (connect, default true)"}
+            })),
+            required: Some(vec!["action".to_string()]),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1382,8 +1424,8 @@ mod tests {
         let tools = all_tools();
         assert_eq!(
             tools.len(),
-            28,
-            "Expected 28 mega-tools, got {}",
+            29,
+            "Expected 29 mega-tools, got {}",
             tools.len()
         );
     }
