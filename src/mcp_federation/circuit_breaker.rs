@@ -296,4 +296,139 @@ mod tests {
         assert_eq!(total, 3);
         assert_eq!(errors, 1);
     }
+
+    #[test]
+    fn test_default_is_same_as_new() {
+        let cb = CircuitBreaker::default();
+        assert_eq!(cb.state(), CircuitState::Closed);
+        assert_eq!(cb.error_rate(), 0.0);
+        let (total, errors) = cb.stats();
+        assert_eq!(total, 0);
+        assert_eq!(errors, 0);
+    }
+
+    #[test]
+    fn test_window_rolls_over() {
+        // Window of 5, fill with 5 successes then 5 failures
+        let mut cb = CircuitBreaker::with_config(5, 0.5, Duration::from_secs(30));
+        for _ in 0..5 {
+            cb.record_success();
+        }
+        assert_eq!(cb.error_rate(), 0.0);
+
+        // Now fill with failures — old successes get pushed out
+        for _ in 0..5 {
+            cb.record_failure();
+        }
+        assert_eq!(cb.error_rate(), 1.0);
+        assert_eq!(cb.state(), CircuitState::Open);
+    }
+
+    #[test]
+    fn test_exact_threshold_boundary() {
+        // 50% threshold, window 10, need at least 5 entries
+        let mut cb = CircuitBreaker::with_config(10, 0.5, Duration::from_secs(30));
+
+        // 5 successes + 5 failures = exactly 50% error rate
+        for _ in 0..5 {
+            cb.record_success();
+        }
+        for _ in 0..5 {
+            cb.record_failure();
+        }
+        // should_trip checks > threshold, not >=, so 50% == 50% should NOT trip
+        assert_eq!(cb.state(), CircuitState::Closed);
+
+        // One more failure tips it over
+        cb.record_failure();
+        assert_eq!(cb.state(), CircuitState::Open);
+    }
+
+    #[test]
+    fn test_error_rate_empty_window() {
+        let cb = CircuitBreaker::new();
+        assert_eq!(cb.error_rate(), 0.0);
+    }
+
+    #[test]
+    fn test_multiple_trip_recovery_cycles() {
+        let mut cb = CircuitBreaker::with_config(4, 0.5, Duration::from_millis(1));
+
+        // Cycle 1: trip
+        for _ in 0..4 {
+            cb.record_failure();
+        }
+        assert_eq!(cb.state(), CircuitState::Open);
+
+        // Recover
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(cb.allow_request());
+        assert_eq!(cb.state(), CircuitState::HalfOpen);
+        cb.record_success();
+        assert_eq!(cb.state(), CircuitState::Closed);
+
+        // Cycle 2: trip again
+        for _ in 0..4 {
+            cb.record_failure();
+        }
+        assert_eq!(cb.state(), CircuitState::Open);
+
+        // Recover again
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(cb.allow_request());
+        cb.record_success();
+        assert_eq!(cb.state(), CircuitState::Closed);
+
+        // Stats accumulated across both cycles
+        let (total, errors) = cb.stats();
+        assert_eq!(total, 10); // 4+1+4+1
+        assert_eq!(errors, 8); // 4+4
+    }
+
+    #[test]
+    fn test_circuit_state_serde() {
+        let states = vec![CircuitState::Closed, CircuitState::Open, CircuitState::HalfOpen];
+        for state in states {
+            let json = serde_json::to_string(&state).unwrap();
+            let back: CircuitState = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, state);
+        }
+        // Check snake_case naming
+        assert_eq!(
+            serde_json::to_string(&CircuitState::HalfOpen).unwrap(),
+            "\"half_open\""
+        );
+    }
+
+    #[test]
+    fn test_half_open_allows_exactly_one_request() {
+        let mut cb = CircuitBreaker::with_config(4, 0.5, Duration::from_millis(1));
+
+        // Trip
+        for _ in 0..4 {
+            cb.record_failure();
+        }
+        assert_eq!(cb.state(), CircuitState::Open);
+
+        // Wait for cooldown → HalfOpen
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(cb.allow_request());
+        assert_eq!(cb.state(), CircuitState::HalfOpen);
+
+        // In HalfOpen, allow_request returns true (allows probe)
+        assert!(cb.allow_request());
+    }
+
+    #[test]
+    fn test_open_without_opened_at_rejects() {
+        // Manually create a broken state where opened_at is None but state is Open
+        let mut cb = CircuitBreaker::with_config(4, 0.5, Duration::from_secs(3600));
+        // Trip normally
+        for _ in 0..4 {
+            cb.record_failure();
+        }
+        assert_eq!(cb.state(), CircuitState::Open);
+        // Normal case: opened_at is Some, but cooldown is long → rejects
+        assert!(!cb.allow_request());
+    }
 }

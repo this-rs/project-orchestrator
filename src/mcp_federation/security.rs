@@ -376,4 +376,169 @@ mod tests {
         assert!(InferredCategory::Delete.is_mutating());
         assert!(InferredCategory::Unknown.is_mutating());
     }
+
+    // ====================================================================
+    // Additional edge-case tests
+    // ====================================================================
+
+    #[test]
+    fn test_policy_violation_display() {
+        let v = PolicyViolation {
+            rule: "rate_limit".to_string(),
+            message: "Too many calls".to_string(),
+            server_id: "grafeo".to_string(),
+            tool_name: "query".to_string(),
+        };
+        let display = format!("{}", v);
+        assert!(display.contains("rate_limit"));
+        assert!(display.contains("grafeo"));
+        assert!(display.contains("Too many calls"));
+    }
+
+    #[test]
+    fn test_policy_violation_is_error() {
+        let v = PolicyViolation {
+            rule: "test".to_string(),
+            message: "msg".to_string(),
+            server_id: "srv".to_string(),
+            tool_name: "tool".to_string(),
+        };
+        // PolicyViolation implements std::error::Error
+        let err: &dyn std::error::Error = &v;
+        assert!(err.to_string().contains("test"));
+    }
+
+    #[test]
+    fn test_empty_allowlist_blocks_everything() {
+        let policy = McpSecurityPolicy {
+            allowed_servers: Some(vec![]),
+            ..Default::default()
+        };
+        let result = policy.enforce("any-server", "any-tool", &InferredCategory::Query);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().rule, "allowed_servers");
+    }
+
+    #[test]
+    fn test_none_allowlist_allows_everything() {
+        let policy = McpSecurityPolicy {
+            allowed_servers: None,
+            ..Default::default()
+        };
+        let result = policy.enforce("any-server", "list_items", &InferredCategory::Query);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_rate_limiter_different_servers_independent() {
+        let mut limiter = RateLimiter::new(2);
+
+        assert!(limiter.check_and_record("srv1", "tool").is_ok());
+        assert!(limiter.check_and_record("srv1", "tool").is_ok());
+        assert!(limiter.check_and_record("srv1", "tool").is_err()); // srv1 at limit
+
+        // srv2 should still be fine
+        assert!(limiter.check_and_record("srv2", "tool").is_ok());
+        assert!(limiter.check_and_record("srv2", "tool").is_ok());
+        assert!(limiter.check_and_record("srv2", "tool").is_err()); // srv2 at limit
+    }
+
+    #[test]
+    fn test_rate_limiter_different_tools_same_server_share_limit() {
+        let mut limiter = RateLimiter::new(2);
+
+        assert!(limiter.check_and_record("srv", "tool_a").is_ok());
+        assert!(limiter.check_and_record("srv", "tool_b").is_ok());
+        // Even though different tools, rate limit is per-server
+        assert!(limiter.check_and_record("srv", "tool_c").is_err());
+    }
+
+    #[test]
+    fn test_enforcer_allowlist_checked_before_rate_limit() {
+        let policy = McpSecurityPolicy {
+            allowed_servers: Some(vec!["allowed".to_string()]),
+            max_calls_per_minute: 1000,
+            ..Default::default()
+        };
+        let mut enforcer = SecurityEnforcer::new(policy);
+
+        // Blocked server fails on allowlist, not rate limit
+        let result = enforcer.enforce("blocked", "list", &InferredCategory::Query);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().rule, "allowed_servers");
+
+        // Allowed server passes
+        assert!(enforcer
+            .enforce("allowed", "list", &InferredCategory::Query)
+            .is_ok());
+    }
+
+    #[test]
+    fn test_enforcer_mutation_checked_before_rate_limit() {
+        let policy = McpSecurityPolicy {
+            allow_mutations: false,
+            max_calls_per_minute: 1000,
+            ..Default::default()
+        };
+        let mut enforcer = SecurityEnforcer::new(policy);
+
+        // Mutation fails on policy, not rate limit
+        let result = enforcer.enforce("srv", "delete_all", &InferredCategory::Delete);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().rule, "allow_mutations");
+    }
+
+    #[test]
+    fn test_enforcer_default() {
+        let enforcer = SecurityEnforcer::default();
+        assert!(!enforcer.policy.allow_mutations);
+        assert!(enforcer.policy.credential_isolation);
+        assert_eq!(enforcer.policy.max_calls_per_minute, 60);
+    }
+
+    #[test]
+    fn test_security_policy_serde_roundtrip() {
+        let policy = McpSecurityPolicy {
+            allow_mutations: true,
+            allowed_servers: Some(vec!["srv1".to_string(), "srv2".to_string()]),
+            max_calls_per_minute: 120,
+            credential_isolation: false,
+        };
+        let json = serde_json::to_string(&policy).unwrap();
+        let back: McpSecurityPolicy = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.allow_mutations, true);
+        assert_eq!(back.max_calls_per_minute, 120);
+        assert_eq!(back.credential_isolation, false);
+        assert_eq!(back.allowed_servers.unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_policy_all_non_mutating_categories_allowed() {
+        let policy = McpSecurityPolicy::default();
+        // Query and Search should always pass with default policy
+        for cat in &[InferredCategory::Query, InferredCategory::Search] {
+            assert!(
+                policy.enforce("any", "any", cat).is_ok(),
+                "Category {:?} should be allowed",
+                cat
+            );
+        }
+    }
+
+    #[test]
+    fn test_policy_all_mutating_categories_blocked() {
+        let policy = McpSecurityPolicy::default();
+        for cat in &[
+            InferredCategory::Create,
+            InferredCategory::Mutation,
+            InferredCategory::Delete,
+            InferredCategory::Unknown,
+        ] {
+            assert!(
+                policy.enforce("any", "any", cat).is_err(),
+                "Category {:?} should be blocked",
+                cat
+            );
+        }
+    }
 }
