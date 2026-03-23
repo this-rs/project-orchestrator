@@ -80,39 +80,12 @@ impl ParallelEnrichmentStage for ReflexStage {
     }
 }
 
-/// Extract file paths from a message (simple heuristic).
+/// Extract file paths from a message.
 ///
-/// Looks for backtick-quoted paths and bare paths matching common patterns.
+/// Delegates to the shared `file_path_extractor` module for consistent
+/// path extraction across the codebase.
 fn extract_file_paths(message: &str) -> Vec<String> {
-    let mut paths = Vec::new();
-
-    // Extract backtick-quoted paths
-    for part in message.split('`') {
-        let trimmed = part.trim();
-        if looks_like_file_path(trimmed) {
-            paths.push(trimmed.to_string());
-        }
-    }
-
-    paths.dedup();
-    paths
-}
-
-/// Check if a string looks like a file path.
-fn looks_like_file_path(s: &str) -> bool {
-    if s.is_empty() || s.len() > 256 {
-        return false;
-    }
-    // Must contain a dot or slash
-    if !s.contains('.') && !s.contains('/') {
-        return false;
-    }
-    // Common file extensions
-    let extensions = [
-        ".rs", ".ts", ".tsx", ".js", ".jsx", ".py", ".go", ".java", ".toml", ".yaml", ".yml",
-        ".json", ".md", ".sql", ".sh", ".css", ".html",
-    ];
-    extensions.iter().any(|ext| s.ends_with(ext)) || (s.contains('/') && !s.contains(' '))
+    crate::utils::file_path_extractor::extract_file_paths(message)
 }
 
 #[cfg(test)]
@@ -206,13 +179,5 @@ mod tests {
     fn test_extract_file_paths_no_paths() {
         let paths = extract_file_paths("Hello, how are you?");
         assert!(paths.is_empty());
-    }
-
-    #[test]
-    fn test_looks_like_file_path() {
-        assert!(looks_like_file_path("src/main.rs"));
-        assert!(looks_like_file_path("Cargo.toml"));
-        assert!(!looks_like_file_path("hello world"));
-        assert!(!looks_like_file_path(""));
     }
 }

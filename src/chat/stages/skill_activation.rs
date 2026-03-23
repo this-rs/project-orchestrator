@@ -98,37 +98,7 @@ impl SkillActivationStage {
     /// Looks for patterns like `src/foo/bar.rs`, `./path/to/file`, etc.
     /// Used for FileGlob trigger matching.
     fn extract_file_paths(message: &str) -> Vec<String> {
-        let mut paths = Vec::new();
-        // Match file-like patterns: word chars, slashes, dots, hyphens
-        // Must contain at least one slash or dot+extension to be a file path
-        for word in message.split_whitespace() {
-            // Strip common wrapping chars (quotes, backticks, parens)
-            let cleaned = word.trim_matches(|c: char| {
-                c == '`' || c == '\'' || c == '"' || c == '(' || c == ')' || c == ','
-            });
-            if cleaned.is_empty() {
-                continue;
-            }
-            // Must contain a slash (path separator) or look like a file extension
-            let has_slash = cleaned.contains('/');
-            let has_extension = cleaned.contains('.') && {
-                let parts: Vec<&str> = cleaned.rsplit('.').collect();
-                parts
-                    .first()
-                    .map(|ext| ext.len() <= 10 && ext.chars().all(|c| c.is_alphanumeric()))
-                    .unwrap_or(false)
-            };
-            if has_slash || (has_extension && cleaned.len() > 3) {
-                // Additional check: must have path-like characters only
-                if cleaned
-                    .chars()
-                    .all(|c| c.is_alphanumeric() || "/_.-+@".contains(c))
-                {
-                    paths.push(cleaned.to_string());
-                }
-            }
-        }
-        paths
+        crate::utils::file_path_extractor::extract_file_paths(message)
     }
 
     /// Match skills against the user message.

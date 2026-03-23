@@ -1,5 +1,6 @@
 //! Shared utility helpers.
 
+pub mod file_path_extractor;
 pub mod paths;
 
 /// Stable equivalent of the nightly-only `str::floor_char_boundary`.

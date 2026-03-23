@@ -199,47 +199,17 @@ pub fn extract_entities(text: &str) -> Vec<ExtractedEntity> {
 
 /// Strategy 1: Extract file paths from text.
 ///
-/// Matches patterns like:
-/// - `src/main.rs`, `src/neo4j/client.rs`
-/// - `Cargo.toml`, `package.json`
-/// - Paths with or without leading `/` or `./`
+/// Delegates to the shared `file_path_extractor` module and wraps results
+/// as `ExtractedEntity` values.
 fn extract_file_paths(text: &str) -> Vec<ExtractedEntity> {
-    let mut results = Vec::new();
-
-    // Split text into tokens (whitespace, backticks, quotes, parens)
-    for token in tokenize(text) {
-        let cleaned = token.trim_matches(|c: char| {
-            c == '`'
-                || c == '\''
-                || c == '"'
-                || c == '('
-                || c == ')'
-                || c == '['
-                || c == ']'
-                || c == '{'
-                || c == '}'
-                || c == ','
-                || c == ';'
-                || c == ':'
-        });
-
-        if cleaned.is_empty() {
-            continue;
-        }
-
-        // Check if token looks like a file path
-        if is_file_path(cleaned) {
-            // Normalize: strip leading ./
-            let normalized = cleaned.strip_prefix("./").unwrap_or(cleaned);
-            results.push(ExtractedEntity {
-                entity_type: EntityType::File,
-                identifier: normalized.to_string(),
-                source: ExtractionSource::FilePath,
-            });
-        }
-    }
-
-    results
+    crate::utils::file_path_extractor::extract_file_paths(text)
+        .into_iter()
+        .map(|path| ExtractedEntity {
+            entity_type: EntityType::File,
+            identifier: path,
+            source: ExtractionSource::FilePath,
+        })
+        .collect()
 }
 
 /// Check if a token looks like a file path.
@@ -482,13 +452,6 @@ fn classify_identifier(s: &str) -> EntityType {
 
     // Starts with lowercase or _ → likely function
     EntityType::Function
-}
-
-/// Tokenize text by splitting on whitespace and common delimiters.
-fn tokenize(text: &str) -> Vec<&str> {
-    text.split(|c: char| c.is_ascii_whitespace() || c == '`' || c == '"' || c == '\'' || c == '|')
-        .filter(|s| !s.is_empty())
-        .collect()
 }
 
 // ─── Validation ─────────────────────────────────────────────────────────────

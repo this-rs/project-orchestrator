@@ -6,12 +6,10 @@
 //!
 //! Controlled by `ENRICHMENT_PERSONA=true` (disabled by default).
 
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use regex::Regex;
 use tokio::time::timeout;
 use tracing::{debug, warn};
 
@@ -35,19 +33,7 @@ impl PersonaStage {
 
 /// Extract file-like paths from a message (e.g., `src/chat/manager.rs`, `lib/foo.ts`).
 fn extract_file_paths(message: &str) -> Vec<String> {
-    // Match paths like: word/word.ext, src/foo/bar.rs, etc.
-    // Must contain at least one `/` and end with a file extension.
-    let re = Regex::new(r#"(?:^|[\s`"'(])([a-zA-Z0-9_.\-]+(?:/[a-zA-Z0-9_.\-]+)+\.[a-zA-Z0-9]+)"#)
-        .expect("valid regex");
-    let mut paths: Vec<String> = Vec::new();
-    let mut seen = HashSet::new();
-    for cap in re.captures_iter(message) {
-        let path = cap[1].to_string();
-        if seen.insert(path.clone()) {
-            paths.push(path);
-        }
-    }
-    paths
+    crate::utils::file_path_extractor::extract_file_paths(message)
 }
 
 #[async_trait::async_trait]

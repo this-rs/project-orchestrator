@@ -45,19 +45,7 @@ impl FileContextStage {
 
     /// Extract file paths from the user message (look for paths like src/foo/bar.rs).
     fn extract_file_paths(message: &str) -> Vec<String> {
-        let mut paths = Vec::new();
-        for word in message.split_whitespace() {
-            let cleaned =
-                word.trim_matches(|c: char| c == '`' || c == '\'' || c == '"' || c == ',');
-            // Match file-like patterns (contains / and a dot extension)
-            if cleaned.contains('/')
-                && cleaned.contains('.')
-                && !cleaned.starts_with("http")
-                && !cleaned.starts_with("//")
-            {
-                paths.push(cleaned.to_string());
-            }
-        }
+        let mut paths = crate::utils::file_path_extractor::extract_file_paths(message);
         paths.truncate(MAX_FILES);
         paths
     }
