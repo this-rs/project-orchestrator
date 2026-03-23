@@ -200,6 +200,9 @@ pub struct ChatManager {
     /// When Some, `build_system_prompt()` queries this router after compose() to populate
     /// dashboard metrics and log NN route matches.
     pub(crate) nn_router: Option<Arc<tokio::sync::RwLock<neural_routing_runtime::DualTrackRouter>>>,
+    /// MCP Federation registry for external server connections.
+    /// When Some, the McpFederationStage injects tool availability into prompts.
+    pub(crate) mcp_registry: Option<crate::mcp_federation::registry::SharedRegistry>,
 }
 
 // ============================================================================
@@ -474,6 +477,7 @@ impl ChatManager {
         search: &Arc<dyn SearchStore>,
         reasoning_engine: Option<&Arc<crate::reasoning::ReasoningTreeEngine>>,
         trajectory_collector: Option<&std::sync::Arc<neural_routing_runtime::TrajectoryCollector>>,
+        mcp_registry: Option<&crate::mcp_federation::registry::SharedRegistry>,
     ) -> Arc<super::enrichment::EnrichmentPipeline> {
         let mut pipeline = super::enrichment::EnrichmentPipeline::new(
             super::enrichment::EnrichmentConfig::from_env(),
@@ -512,6 +516,13 @@ impl ChatManager {
         pipeline.add_parallel_stage(Box::new(crate::reflex::stage::ReflexStage::new(
             graph.clone(),
         )));
+        // MCP Federation stage: injects external tool availability into the prompt.
+        // Only adds content when MCP servers are connected (0 overhead otherwise).
+        if let Some(registry) = mcp_registry {
+            pipeline.add_parallel_stage(Box::new(super::stages::McpFederationStage::new(
+                registry.clone(),
+            )));
+        }
         Arc::new(pipeline)
     }
 
@@ -528,7 +539,7 @@ impl ChatManager {
             auto_update_cli: config.auto_update_cli,
             auto_update_app: config.auto_update_app,
         }));
-        let enrichment_pipeline = Self::build_enrichment_pipeline(&graph, &search, None, None);
+        let enrichment_pipeline = Self::build_enrichment_pipeline(&graph, &search, None, None, None);
         Self {
             graph,
             search,
@@ -547,6 +558,7 @@ impl ChatManager {
             neural_routing_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             dual_track_router: Arc::new(std::sync::RwLock::new(None)),
             nn_router: None,
+            mcp_registry: None,
         }
     }
 
@@ -581,7 +593,7 @@ impl ChatManager {
             auto_update_cli: config.auto_update_cli,
             auto_update_app: config.auto_update_app,
         }));
-        let enrichment_pipeline = Self::build_enrichment_pipeline(&graph, &search, None, None);
+        let enrichment_pipeline = Self::build_enrichment_pipeline(&graph, &search, None, None, None);
         Self {
             graph,
             search,
@@ -600,6 +612,7 @@ impl ChatManager {
             neural_routing_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             dual_track_router: Arc::new(std::sync::RwLock::new(None)),
             nn_router: None,
+            mcp_registry: None,
         }
     }
 
@@ -640,6 +653,7 @@ impl ChatManager {
             &self.search,
             Some(&engine),
             tc_guard.as_ref(),
+            self.mcp_registry.as_ref(),
         );
         drop(tc_guard);
         self

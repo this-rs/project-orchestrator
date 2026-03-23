@@ -48,6 +48,9 @@ pub struct EnrichmentConfig {
     /// Enable the persona stage (auto-detect relevant persona for mentioned files).
     #[serde(default)]
     pub persona: bool,
+    /// Enable the MCP federation stage (inject external tool availability into prompt).
+    #[serde(default)]
+    pub mcp_federation: bool,
     /// Enable the reasoning tree injection stage.
     pub reasoning_tree: bool,
     /// Enable debug mode (logs timing and content of each stage).
@@ -66,6 +69,7 @@ impl Default for EnrichmentConfig {
             reflex: true,      // Enabled by default — auto-skips when no reflexes match
             user_profile: false, // Disabled by default — opt-in via ENRICHMENT_USER_PROFILE=true
             persona: true,     // Enabled by default — auto-skips when no personas match
+            mcp_federation: true, // Enabled by default — auto-skips when no MCP servers connected
             reasoning_tree: true,
             debug: false,
             max_pipeline_ms: 500,
@@ -104,6 +108,9 @@ impl EnrichmentConfig {
                 .map(|v| v == "true" || v == "1")
                 .unwrap_or(false),
             persona: std::env::var("ENRICHMENT_PERSONA")
+                .map(|v| v != "false" && v != "0")
+                .unwrap_or(true),
+            mcp_federation: std::env::var("ENRICHMENT_MCP_FEDERATION")
                 .map(|v| v != "false" && v != "0")
                 .unwrap_or(true),
             reasoning_tree: std::env::var("ENRICHMENT_REASONING_TREE")
@@ -201,6 +208,8 @@ pub enum EnrichmentSource {
     Biomimicry,
     /// User profile stage (adaptive behavioral profile).
     UserProfile,
+    /// MCP Federation stage (external tool availability).
+    McpFederation,
     /// Fallback for stages without a specific source type.
     #[default]
     Other,
@@ -294,6 +303,7 @@ impl EnrichmentContext {
                 | EnrichmentSource::Reflex
                 | EnrichmentSource::Biomimicry
                 | EnrichmentSource::UserProfile
+                | EnrichmentSource::McpFederation
                 | EnrichmentSource::Other => PromptSection::Enrichment(section.content.clone()),
             })
             .collect()
@@ -927,6 +937,7 @@ mod tests {
             reflex: false,
             user_profile: false,
             persona: false,
+            mcp_federation: true,
             reasoning_tree: true,
             debug: true,
             max_pipeline_ms: 1000,
