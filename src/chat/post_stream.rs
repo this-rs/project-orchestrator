@@ -95,6 +95,7 @@ pub(crate) struct PostStreamHandler {
     pub event_emitter: Option<Arc<dyn crate::events::EventEmitter>>,
     pub search: Arc<dyn SearchStore>,
     pub auto_continue: Arc<AtomicBool>,
+    pub work_log: Arc<Mutex<super::types::SessionWorkLog>>,
 }
 
 impl PostStreamHandler {
@@ -315,6 +316,10 @@ impl PostStreamHandler {
 
             if !sleep_cancelled && !self.interrupt_flag.load(Ordering::SeqCst) {
                 let continue_msg = 'build_msg: {
+                    let mut parts = Vec::new();
+                    parts.push("Continue where you left off. Do NOT restart work already done.".to_string());
+
+                    // Append CompactionContext markdown (task/step context)
                     if let Some(ref slug) = self.ctx.project_slug {
                         let builder = super::compaction_context::CompactionContextBuilder::new(
                             self.graph.clone(),
@@ -325,13 +330,20 @@ impl PostStreamHandler {
                         )
                         .await
                         {
-                            let objectives = ctx.pending_objectives_oneliner();
-                            if !objectives.is_empty() {
-                                break 'build_msg format!("Continue.{objectives}");
+                            let md = ctx.to_markdown();
+                            if !md.is_empty() {
+                                parts.push(md);
                             }
                         }
                     }
-                    "Continue".to_string()
+
+                    // Append SessionWorkLog summary (files modified, steps done)
+                    let work_summary = self.work_log.lock().await.to_summary_markdown();
+                    if !work_summary.is_empty() {
+                        parts.push(work_summary);
+                    }
+
+                    break 'build_msg parts.join("\n\n");
                 };
 
                 self.pending_messages
@@ -849,6 +861,7 @@ mod integration_tests {
             event_emitter: None,
             search: Arc::new(MockSearchStore::new()),
             auto_continue: Arc::new(AtomicBool::new(false)),
+            work_log: Arc::new(Mutex::new(crate::chat::types::SessionWorkLog::default())),
         }
     }
 
@@ -1015,6 +1028,133 @@ mod integration_tests {
             handler.pending_messages.lock().await.len(),
             1,
             "Fourth call should inject reminder (cooldown met)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_auto_continue_enriched() {
+        use crate::neo4j::models::{PlanNode, PlanStatus, StepNode, StepStatus, TaskStatus};
+
+        let graph = Arc::new(MockGraphStore::new());
+
+        // Seed project + plan + tasks + steps
+        let project = test_project_named("enrich-project");
+        let slug = project.slug.clone();
+        graph.create_project(&project).await.unwrap();
+
+        let mut plan = PlanNode::new_for_project(
+            "Enriched Plan".to_string(),
+            "Plan with steps".to_string(),
+            "test".to_string(),
+            50,
+            project.id,
+        );
+        plan.status = PlanStatus::InProgress;
+        graph.create_plan(&plan).await.unwrap();
+        graph
+            .update_plan_status(plan.id, PlanStatus::InProgress)
+            .await
+            .unwrap();
+
+        let mut task1 = test_task_titled("Implement feature A");
+        task1.status = TaskStatus::InProgress;
+        graph.create_task(plan.id, &task1).await.unwrap();
+        graph
+            .update_task_status(task1.id, TaskStatus::InProgress)
+            .await
+            .unwrap();
+
+        let step1 = StepNode::new(1, "Step one done".to_string(), Some("verify1".to_string()));
+        graph.create_step(task1.id, &step1).await.unwrap();
+        graph
+            .update_step_status(step1.id, StepStatus::Completed)
+            .await
+            .unwrap();
+        let step2 = StepNode::new(2, "Step two pending".to_string(), Some("verify2".to_string()));
+        graph.create_step(task1.id, &step2).await.unwrap();
+
+        let mut task2 = test_task_titled("Write unit tests");
+        task2.status = TaskStatus::Pending;
+        graph.create_task(plan.id, &task2).await.unwrap();
+
+        // Build handler with auto_continue enabled
+        let mut handler = build_handler(graph, Some(slug), "enrich-session", false).await;
+        handler.auto_continue = Arc::new(AtomicBool::new(true));
+
+        // Configure session for auto_continue
+        {
+            let mut sessions = handler.active_sessions.write().await;
+            let session = sessions.get_mut("enrich-session").unwrap();
+            session.auto_continue = Arc::new(AtomicBool::new(true));
+            session.max_auto_continues = 5;
+        }
+
+        // Populate work_log with 3 modified files
+        {
+            let mut log = handler.work_log.lock().await;
+            log.record_tool_use(
+                "Write",
+                &serde_json::json!({"file_path": "/src/main.rs", "content": "fn main() {}"}),
+            );
+            log.record_tool_use(
+                "Edit",
+                &serde_json::json!({"file_path": "/src/lib.rs", "old_string": "a", "new_string": "b"}),
+            );
+            log.record_tool_use(
+                "Write",
+                &serde_json::json!({"file_path": "/src/utils.rs", "content": "pub fn util() {}"}),
+            );
+            // Mark a step completed
+            log.steps_completed.push(Uuid::new_v4());
+        }
+
+        // Trigger auto-continue (hit_error_max_turns = true)
+        let allowed = handler.handle_auto_continue(true).await;
+        assert!(allowed, "Auto-continue should be allowed");
+
+        // Check the enqueued message
+        let messages = handler.pending_messages.lock().await;
+        assert_eq!(messages.len(), 1, "Should have one pending message");
+        let msg = &messages[0];
+        assert_eq!(
+            msg.kind,
+            PendingMessageKind::SystemHint,
+            "Should be SystemHint"
+        );
+        let content = &msg.content;
+
+        // Must contain the "do not restart" instruction
+        assert!(
+            content.contains("Continue where you left off"),
+            "Missing continue instruction in: {}",
+            &content[..content.len().min(200)]
+        );
+        assert!(
+            content.contains("Do NOT restart work already done"),
+            "Missing do-not-restart instruction"
+        );
+
+        // Must contain CompactionContext sections (task/step info)
+        assert!(
+            content.contains("Task Context") || content.contains("Active Plans") || content.contains("Pending Objectives"),
+            "Missing CompactionContext sections in auto-continue message"
+        );
+
+        // Must contain SessionWorkLog data (files modified)
+        assert!(
+            content.contains("Session Work Log") || content.contains("Files modified"),
+            "Missing SessionWorkLog section"
+        );
+        assert!(
+            content.contains("/src/main.rs"),
+            "Missing file in work log"
+        );
+
+        // Must be >500 chars (enriched, not just "Continue")
+        assert!(
+            content.len() > 500,
+            "Auto-continue message too short ({} chars), expected >500",
+            content.len()
         );
     }
 }

@@ -14,8 +14,7 @@ use super::post_tool_hook;
 use super::skill_hook;
 use super::types::{
     classify_api_error, truncate_snippet, ChatEvent, ChatEventPage, ChatRequest,
-    CreateSessionResponse, MessageSearchHit, MessageSearchResult, PendingMessage,
-    SessionWorkLog,
+    CreateSessionResponse, MessageSearchHit, MessageSearchResult, PendingMessage, SessionWorkLog,
 };
 use crate::meilisearch::SearchStore;
 use crate::neo4j::models::ChatEventRecord;
@@ -3629,6 +3628,7 @@ impl ChatManager {
             event_emitter: event_emitter.clone(),
             search: search.clone(),
             auto_continue: auto_continue.clone(),
+            work_log: work_log.clone(),
         };
 
         // 1. Post-compaction context re-injection
