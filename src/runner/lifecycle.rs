@@ -327,7 +327,9 @@ mod tests {
     #[test]
     fn test_constants() {
         assert_eq!(RUNNER_PROTOCOL_PREFIX, "plan-runner-");
-        assert!(MIN_AFFINITY_THRESHOLD > 0.0);
-        assert!(MIN_AFFINITY_THRESHOLD < 1.0);
+        // Validate threshold is in valid range (0, 1)
+        let threshold = MIN_AFFINITY_THRESHOLD;
+        assert!(threshold > 0.0);
+        assert!(threshold < 1.0);
     }
 }
