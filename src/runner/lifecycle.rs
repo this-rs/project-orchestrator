@@ -241,4 +241,93 @@ mod tests {
             .unwrap();
         assert!(result.is_none(), "Should return None when plan not found");
     }
+
+    #[tokio::test]
+    async fn test_route_with_lifecycle_protocol_happy_path() {
+        use crate::protocol::models::{Protocol, ProtocolState, ProtocolTransition};
+
+        let mock = Arc::new(MockGraphStore::new());
+        let (plan_id, project_id) = setup_plan_with_project(&mock).await;
+
+        // Create a lifecycle protocol with states and transitions
+        let protocol_id = Uuid::new_v4();
+        let init_state = ProtocolState::start(protocol_id, "init");
+        let executing_state = ProtocolState::new(protocol_id, "executing");
+
+        let mut protocol = Protocol::new(project_id, "plan-runner-full", init_state.id);
+        protocol.id = protocol_id;
+        protocol.terminal_states = vec![];
+
+        mock.upsert_protocol(&protocol).await.unwrap();
+        mock.upsert_protocol_state(&init_state).await.unwrap();
+        mock.upsert_protocol_state(&executing_state).await.unwrap();
+
+        // Add transition: init --run_started--> executing
+        let transition = ProtocolTransition::new(
+            protocol_id,
+            init_state.id,
+            executing_state.id,
+            "run_started",
+        );
+        mock.upsert_protocol_transition(&transition).await.unwrap();
+
+        let graph: Arc<dyn GraphStore> = mock;
+        let result = route_lifecycle_protocol(&graph, plan_id, 5).await.unwrap();
+
+        assert!(result.is_some(), "Should route to a lifecycle protocol");
+        let route = result.unwrap();
+        assert_eq!(route.protocol_id, protocol_id);
+        assert_eq!(route.protocol_name, "plan-runner-full");
+        assert!(route.affinity_score >= MIN_AFFINITY_THRESHOLD);
+    }
+
+    #[tokio::test]
+    async fn test_route_filters_non_runner_protocols() {
+        use crate::protocol::models::{Protocol, ProtocolState};
+
+        let mock = Arc::new(MockGraphStore::new());
+        let (plan_id, project_id) = setup_plan_with_project(&mock).await;
+
+        // Create a protocol that does NOT start with "plan-runner-"
+        let protocol_id = Uuid::new_v4();
+        let init_state = ProtocolState::start(protocol_id, "init");
+
+        let mut protocol = Protocol::new(project_id, "code-review-protocol", init_state.id);
+        protocol.id = protocol_id;
+
+        mock.upsert_protocol(&protocol).await.unwrap();
+        mock.upsert_protocol_state(&init_state).await.unwrap();
+
+        let graph: Arc<dyn GraphStore> = mock;
+        let result = route_lifecycle_protocol(&graph, plan_id, 5).await.unwrap();
+
+        assert!(
+            result.is_none(),
+            "Should return None when no plan-runner-* protocols exist"
+        );
+    }
+
+    #[test]
+    fn test_lifecycle_route_result_debug_clone() {
+        let result = LifecycleRouteResult {
+            protocol_id: Uuid::new_v4(),
+            protocol_name: "plan-runner-full".to_string(),
+            affinity_score: 0.85,
+            run_id: Uuid::new_v4(),
+        };
+
+        // Verify Debug and Clone are implemented
+        let cloned = result.clone();
+        assert_eq!(cloned.protocol_name, "plan-runner-full");
+        assert!((cloned.affinity_score - 0.85).abs() < f64::EPSILON);
+        let debug_str = format!("{:?}", result);
+        assert!(debug_str.contains("plan-runner-full"));
+    }
+
+    #[test]
+    fn test_constants() {
+        assert_eq!(RUNNER_PROTOCOL_PREFIX, "plan-runner-");
+        assert!(MIN_AFFINITY_THRESHOLD > 0.0);
+        assert!(MIN_AFFINITY_THRESHOLD < 1.0);
+    }
 }

@@ -1116,39 +1116,24 @@ mod tests {
     #[test]
     fn test_apply_token_budget_dispensable_by_type_grouping() {
         // Verify that dispensable notes are grouped by section name in BTreeMap
-        let mut notes = Vec::new();
-
         // One note of each dispensable type
-        notes.push(make_note(
-            NoteType::Pattern,
-            NoteImportance::Low,
-            "A pattern",
-            vec![],
-        ));
-        notes.push(make_note(
-            NoteType::Assertion,
-            NoteImportance::Low,
-            "An assertion",
-            vec![],
-        ));
-        notes.push(make_note(
-            NoteType::Tip,
-            NoteImportance::Low,
-            "A tip",
-            vec![],
-        ));
-        notes.push(make_note(
-            NoteType::Context,
-            NoteImportance::Low,
-            "A context",
-            vec![],
-        ));
-        notes.push(make_note(
-            NoteType::Observation,
-            NoteImportance::Low,
-            "An observation",
-            vec![],
-        ));
+        let notes = vec![
+            make_note(NoteType::Pattern, NoteImportance::Low, "A pattern", vec![]),
+            make_note(
+                NoteType::Assertion,
+                NoteImportance::Low,
+                "An assertion",
+                vec![],
+            ),
+            make_note(NoteType::Tip, NoteImportance::Low, "A tip", vec![]),
+            make_note(NoteType::Context, NoteImportance::Low, "A context", vec![]),
+            make_note(
+                NoteType::Observation,
+                NoteImportance::Low,
+                "An observation",
+                vec![],
+            ),
+        ];
 
         // Under budget, so all sections should appear
         let template = generate_context_template("Grouping", "Test grouping", &notes);
@@ -1163,20 +1148,20 @@ mod tests {
     #[test]
     fn test_apply_token_budget_rfc_as_dispensable() {
         // RFC type with low importance is dispensable and maps to "Other" in the budget code
-        let mut notes = Vec::new();
-
-        notes.push(make_note(
-            NoteType::Guideline,
-            NoteImportance::Critical,
-            "Anchor",
-            vec![],
-        ));
-        notes.push(make_note(
-            NoteType::Rfc,
-            NoteImportance::Low,
-            "Dispensable RFC",
-            vec![],
-        ));
+        let notes = vec![
+            make_note(
+                NoteType::Guideline,
+                NoteImportance::Critical,
+                "Anchor",
+                vec![],
+            ),
+            make_note(
+                NoteType::Rfc,
+                NoteImportance::Low,
+                "Dispensable RFC",
+                vec![],
+            ),
+        ];
 
         // Not enough to trigger budget, so it stays
         let template = generate_context_template("RFC Test", "Test", &notes);

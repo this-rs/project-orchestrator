@@ -864,4 +864,330 @@ mod tests {
         let result = verifier.verify_has_commits(Path::new("/tmp")).await;
         assert!(result.is_ok());
     }
+
+    // ========================================================================
+    // Additional coverage tests
+    // ========================================================================
+
+    #[test]
+    fn test_project_language_detect_python_setup_py() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("setup.py"), "from setuptools import setup").unwrap();
+        assert_eq!(ProjectLanguage::detect(tmp.path()), ProjectLanguage::Python);
+    }
+
+    #[test]
+    fn test_project_language_test_commands() {
+        // Rust
+        let (cmd, args) = ProjectLanguage::Rust.test_command().unwrap();
+        assert_eq!(cmd, "cargo");
+        assert!(args.contains(&"test"));
+
+        // Node
+        let (cmd, args) = ProjectLanguage::Node.test_command().unwrap();
+        assert_eq!(cmd, "npm");
+        assert!(args.contains(&"test"));
+
+        // Go
+        let (cmd, args) = ProjectLanguage::Go.test_command().unwrap();
+        assert_eq!(cmd, "go");
+        assert!(args.contains(&"test"));
+
+        // Python
+        let (cmd, args) = ProjectLanguage::Python.test_command().unwrap();
+        assert_eq!(cmd, "python");
+        assert!(args.contains(&"pytest"));
+
+        // Unknown
+        assert!(ProjectLanguage::Unknown.test_command().is_none());
+    }
+
+    #[test]
+    fn test_project_language_build_command_values() {
+        let (cmd, args) = ProjectLanguage::Rust.build_command().unwrap();
+        assert_eq!(cmd, "cargo");
+        assert_eq!(args, &["check"]);
+
+        let (cmd, args) = ProjectLanguage::Node.build_command().unwrap();
+        assert_eq!(cmd, "npm");
+        assert_eq!(args, &["run", "build"]);
+
+        let (cmd, args) = ProjectLanguage::Go.build_command().unwrap();
+        assert_eq!(cmd, "go");
+        assert_eq!(args, &["build", "./..."]);
+    }
+
+    #[test]
+    fn test_is_sensitive_file_remaining_patterns() {
+        // Exact filename patterns not yet tested
+        assert!(is_sensitive_file("secrets.yaml"));
+        assert!(is_sensitive_file("secrets.yml"));
+        assert!(is_sensitive_file("service-account.json"));
+
+        // Extension patterns not yet fully tested
+        assert!(is_sensitive_file("keystore.pfx"));
+
+        // With directory paths
+        assert!(is_sensitive_file("deploy/secrets.yaml"));
+        assert!(is_sensitive_file("config/secrets.yml"));
+        assert!(is_sensitive_file("gcp/service-account.json"));
+        assert!(is_sensitive_file("certs/client.pfx"));
+    }
+
+    #[test]
+    fn test_is_sensitive_file_negative_cases() {
+        assert!(!is_sensitive_file("Cargo.toml"));
+        assert!(!is_sensitive_file("package.json"));
+        assert!(!is_sensitive_file("src/main.rs"));
+        assert!(!is_sensitive_file("secrets_test.go")); // Not exact match
+        assert!(!is_sensitive_file("my-env-file.txt")); // Not .env
+        assert!(!is_sensitive_file(".envrc")); // Not exact match
+    }
+
+    #[test]
+    fn test_extract_stat_number_edge_cases() {
+        // Single insertion
+        assert_eq!(
+            extract_stat_number(" 1 file changed, 1 insertion(+)", "insertion"),
+            Some(1)
+        );
+
+        // No number before keyword (keyword at start)
+        assert_eq!(extract_stat_number("insertion(+)", "insertion"), None);
+
+        // Empty string
+        assert_eq!(extract_stat_number("", "insertion"), None);
+
+        // Keyword not present
+        assert_eq!(
+            extract_stat_number(" 5 files changed, 120 foobar", "insertion"),
+            None
+        );
+
+        // Non-numeric value before keyword
+        assert_eq!(
+            extract_stat_number("abc insertions(+)", "insertion"),
+            None
+        );
+
+        // Extract file count
+        assert_eq!(
+            extract_stat_number(" 5 files changed, 120 insertions(+), 30 deletions(-)", "files"),
+            Some(5)
+        );
+    }
+
+    #[test]
+    fn test_verify_result_fail_reasons() {
+        let result = VerifyResult::Fail {
+            reasons: vec!["build failed".to_string(), "tests failed".to_string()],
+        };
+        assert!(!result.is_pass());
+
+        // Verify Debug is implemented
+        let debug_str = format!("{:?}", result);
+        assert!(debug_str.contains("build failed"));
+        assert!(debug_str.contains("tests failed"));
+
+        // Verify Clone is implemented
+        let cloned = result.clone();
+        assert!(!cloned.is_pass());
+    }
+
+    #[test]
+    fn test_task_verifier_construction() {
+        use crate::neo4j::mock::MockGraphStore;
+
+        let graph: Arc<dyn GraphStore> = Arc::new(MockGraphStore::new());
+
+        // Test new()
+        let v = TaskVerifier::new(graph.clone(), true, true);
+        assert!(v.build_check_enabled);
+        assert!(v.test_runner_enabled);
+        assert!(v.base_commit.is_none());
+        assert_eq!(v.command_timeout, Duration::from_secs(600));
+
+        // Test with_base_commit()
+        let v2 = TaskVerifier::with_base_commit(
+            graph.clone(),
+            false,
+            true,
+            "abc123def456".to_string(),
+        );
+        assert!(!v2.build_check_enabled);
+        assert!(v2.test_runner_enabled);
+        assert_eq!(v2.base_commit, Some("abc123def456".to_string()));
+
+        // Test new() with both disabled
+        let v3 = TaskVerifier::new(graph, false, false);
+        assert!(!v3.build_check_enabled);
+        assert!(!v3.test_runner_enabled);
+    }
+
+    #[tokio::test]
+    async fn test_verify_steps_empty_steps_passes() {
+        let (graph, task_id) = setup_mock_with_task().await;
+
+        // No steps at all — should pass (0 incomplete)
+        let verifier = TaskVerifier::new(graph, false, false);
+        let result = verifier.verify_steps(task_id).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_verify_steps_in_progress_fails() {
+        let (graph, task_id) = setup_mock_with_task().await;
+
+        let step = make_step("WIP step", StepStatus::InProgress);
+        graph.create_step(task_id, &step).await.unwrap();
+
+        let verifier = TaskVerifier::new(graph, false, false);
+        let result = verifier.verify_steps(task_id).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("WIP step"),
+            "Error should mention InProgress step: {}",
+            err
+        );
+        assert!(err.contains("InProgress"), "Should mention status: {}", err);
+    }
+
+    #[tokio::test]
+    async fn test_verify_steps_mixed_statuses() {
+        let (graph, task_id) = setup_mock_with_task().await;
+
+        let step1 = make_step("Done", StepStatus::Completed);
+        let step2 = make_step("Skipped", StepStatus::Skipped);
+        let step3 = make_step("Still pending", StepStatus::Pending);
+        let step4 = make_step("Still in progress", StepStatus::InProgress);
+        graph.create_step(task_id, &step1).await.unwrap();
+        graph.create_step(task_id, &step2).await.unwrap();
+        graph.create_step(task_id, &step3).await.unwrap();
+        graph.create_step(task_id, &step4).await.unwrap();
+
+        let verifier = TaskVerifier::new(graph, false, false);
+        let result = verifier.verify_steps(task_id).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        // Should report 2 incomplete steps
+        assert!(err.contains("2 step(s)"), "Should count 2 failures: {}", err);
+        assert!(err.contains("Still pending"));
+        assert!(err.contains("Still in progress"));
+    }
+
+    #[tokio::test]
+    async fn test_verify_full_with_no_steps_passes() {
+        let (graph, task_id) = setup_mock_with_task().await;
+
+        // No steps, build/test disabled — should pass
+        let verifier = TaskVerifier::new(graph, false, false);
+        let result = verifier.verify(task_id, "/tmp").await;
+        assert!(result.is_pass());
+    }
+
+    #[tokio::test]
+    async fn test_verify_has_commits_detects_uncommitted_changes() {
+        // Create a temp git repo with one commit, then leave dirty working tree
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path();
+
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        std::fs::write(cwd.join("file.txt"), "initial").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "initial"])
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+
+        let sha_output = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        let base_sha = String::from_utf8_lossy(&sha_output.stdout)
+            .trim()
+            .to_string();
+
+        // Create uncommitted changes (dirty working tree, no new commits)
+        std::fs::write(cwd.join("new_file.rs"), "fn main() {}").unwrap();
+
+        let (graph, _task_id) = setup_mock_with_task().await;
+        let verifier = TaskVerifier::with_base_commit(graph, false, false, base_sha);
+        let result = verifier.verify_has_commits(cwd).await;
+
+        // Should fail with specific message about uncommitted changes
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("uncommitted changes"),
+            "Should mention uncommitted changes: {}",
+            err
+        );
+        assert!(
+            err.contains("git add"),
+            "Should hint about git add: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_sensitive_patterns_and_extensions_constants() {
+        // Verify the constant arrays contain expected entries
+        assert!(SENSITIVE_PATTERNS.contains(&".env"));
+        assert!(SENSITIVE_PATTERNS.contains(&"credentials.json"));
+        assert!(SENSITIVE_PATTERNS.contains(&"service-account.json"));
+        assert!(SENSITIVE_PATTERNS.contains(&"secrets.yaml"));
+        assert!(SENSITIVE_PATTERNS.contains(&"secrets.yml"));
+
+        assert!(SENSITIVE_EXTENSIONS.contains(&".key"));
+        assert!(SENSITIVE_EXTENSIONS.contains(&".pem"));
+        assert!(SENSITIVE_EXTENSIONS.contains(&".p12"));
+        assert!(SENSITIVE_EXTENSIONS.contains(&".pfx"));
+        assert!(SENSITIVE_EXTENSIONS.contains(&".secret"));
+    }
+
+    #[test]
+    fn test_project_language_debug_clone_eq() {
+        let lang = ProjectLanguage::Rust;
+        let cloned = lang.clone();
+        assert_eq!(lang, cloned);
+
+        // Verify Debug
+        let debug = format!("{:?}", ProjectLanguage::Unknown);
+        assert_eq!(debug, "Unknown");
+
+        // All variants are Eq
+        assert_eq!(ProjectLanguage::Node, ProjectLanguage::Node);
+        assert_ne!(ProjectLanguage::Rust, ProjectLanguage::Go);
+    }
+
+    #[test]
+    fn test_project_language_detect_priority() {
+        // When both Cargo.toml and package.json exist, Rust should win
+        // (it's checked first)
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("Cargo.toml"), "[package]").unwrap();
+        std::fs::write(tmp.path().join("package.json"), "{}").unwrap();
+        assert_eq!(ProjectLanguage::detect(tmp.path()), ProjectLanguage::Rust);
+    }
 }
