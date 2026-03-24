@@ -2897,10 +2897,10 @@ mod tests {
     }
 
     #[test]
-    fn test_mcp_server_node_defaults() {
+    fn test_mcp_server_node_serialization_roundtrip() {
         let node = McpServerNode {
-            id: uuid::Uuid::new_v4(),
-            project_id: uuid::Uuid::new_v4(),
+            id: Uuid::new_v4(),
+            project_id: Uuid::new_v4(),
             server_id: "grafeo".to_string(),
             display_name: "Grafeo Knowledge Graph".to_string(),
             transport_type: "sse".to_string(),
@@ -2911,12 +2911,134 @@ mod tests {
             protocol_version: Some("2025-03-26".to_string()),
             server_name: Some("Grafeo".to_string()),
             tool_count: 5,
-            created_at: chrono::Utc::now(),
+            created_at: Utc::now(),
             updated_at: None,
-            last_connected_at: Some(chrono::Utc::now()),
+            last_connected_at: Some(Utc::now()),
         };
-        assert_eq!(node.server_id, "grafeo");
-        assert_eq!(node.tool_count, 5);
+
+        let json = serde_json::to_string(&node).unwrap();
+        let de: McpServerNode = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(de.id, node.id);
+        assert_eq!(de.project_id, node.project_id);
+        assert_eq!(de.server_id, "grafeo");
+        assert_eq!(de.display_name, "Grafeo Knowledge Graph");
+        assert_eq!(de.transport_type, "sse");
+        assert_eq!(
+            de.transport_url.as_deref(),
+            Some("http://localhost:8080/sse")
+        );
+        assert!(de.transport_command.is_none());
+        assert!(de.transport_args.is_none());
+        assert_eq!(de.status, "connected");
+        assert_eq!(de.protocol_version.as_deref(), Some("2025-03-26"));
+        assert_eq!(de.server_name.as_deref(), Some("Grafeo"));
+        assert_eq!(de.tool_count, 5);
+        assert!(de.updated_at.is_none());
+        assert!(de.last_connected_at.is_some());
+    }
+
+    #[test]
+    fn test_mcp_server_node_stdio_transport() {
+        let node = McpServerNode {
+            id: Uuid::new_v4(),
+            project_id: Uuid::new_v4(),
+            server_id: "github-mcp".to_string(),
+            display_name: "GitHub".to_string(),
+            transport_type: "stdio".to_string(),
+            transport_url: None,
+            transport_command: Some("npx".to_string()),
+            transport_args: Some(r#"["-y","@modelcontextprotocol/server-github"]"#.to_string()),
+            status: "connected".to_string(),
+            protocol_version: Some("2024-11-05".to_string()),
+            server_name: None,
+            tool_count: 10,
+            created_at: Utc::now(),
+            updated_at: None,
+            last_connected_at: None,
+        };
+
+        let json = serde_json::to_string(&node).unwrap();
+        let de: McpServerNode = serde_json::from_str(&json).unwrap();
+        assert_eq!(de.transport_type, "stdio");
+        assert_eq!(de.transport_command.as_deref(), Some("npx"));
+        assert!(de.transport_url.is_none());
+        assert!(de.server_name.is_none());
+    }
+
+    #[test]
+    fn test_mcp_tool_node_serialization_roundtrip() {
+        let tool = McpToolNode {
+            id: Uuid::new_v4(),
+            server_id: "grafeo".to_string(),
+            name: "run_cypher".to_string(),
+            fqn: "grafeo::run_cypher".to_string(),
+            description: "Execute a Cypher query against the knowledge graph".to_string(),
+            input_schema:
+                r#"{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}"#
+                    .to_string(),
+            category: "query".to_string(),
+            embedding: Some("[0.1,0.2,0.3]".to_string()),
+            created_at: Utc::now(),
+            updated_at: None,
+        };
+
+        let json = serde_json::to_string(&tool).unwrap();
+        let de: McpToolNode = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(de.id, tool.id);
+        assert_eq!(de.server_id, "grafeo");
+        assert_eq!(de.name, "run_cypher");
+        assert_eq!(de.fqn, "grafeo::run_cypher");
+        assert!(de.description.contains("Cypher query"));
+        assert!(de.input_schema.contains("query"));
+        assert_eq!(de.category, "query");
+        assert!(de.embedding.is_some());
+        assert!(de.updated_at.is_none());
+    }
+
+    #[test]
+    fn test_mcp_tool_node_without_embedding() {
+        let tool = McpToolNode {
+            id: Uuid::new_v4(),
+            server_id: "srv".to_string(),
+            name: "ping".to_string(),
+            fqn: "srv::ping".to_string(),
+            description: "Health check".to_string(),
+            input_schema: "{}".to_string(),
+            category: "action".to_string(),
+            embedding: None,
+            created_at: Utc::now(),
+            updated_at: Some(Utc::now()),
+        };
+
+        let json = serde_json::to_string(&tool).unwrap();
+        let de: McpToolNode = serde_json::from_str(&json).unwrap();
+        assert!(de.embedding.is_none());
+        assert!(de.updated_at.is_some());
+    }
+
+    #[test]
+    fn test_mcp_tool_node_all_categories() {
+        for category in &[
+            "query", "search", "mutation", "create", "delete", "action", "analysis", "unknown",
+        ] {
+            let tool = McpToolNode {
+                id: Uuid::new_v4(),
+                server_id: "srv".to_string(),
+                name: "tool".to_string(),
+                fqn: "srv::tool".to_string(),
+                description: "desc".to_string(),
+                input_schema: "{}".to_string(),
+                category: category.to_string(),
+                embedding: None,
+                created_at: Utc::now(),
+                updated_at: None,
+            };
+            let json = serde_json::to_string(&tool).unwrap();
+            let de: McpToolNode = serde_json::from_str(&json).unwrap();
+            assert_eq!(de.category, *category);
+        }
     }
 
     #[test]

@@ -198,4 +198,145 @@ mod tests {
     fn test_mcp_protocol_version_constant() {
         assert_eq!(MCP_PROTOCOL_VERSION, "2024-11-05");
     }
+
+    #[test]
+    fn test_transport_stdio_with_env_and_args() {
+        let mut env = std::collections::HashMap::new();
+        env.insert("NODE_ENV".to_string(), "production".to_string());
+        env.insert("DEBUG".to_string(), "true".to_string());
+
+        let transport = McpTransport::Stdio {
+            command: "npx".to_string(),
+            args: vec!["-y".to_string(), "@modelcontextprotocol/server".to_string()],
+            env: env.clone(),
+        };
+
+        let json = serde_json::to_string(&transport).unwrap();
+        let back: McpTransport = serde_json::from_str(&json).unwrap();
+        match back {
+            McpTransport::Stdio {
+                command,
+                args,
+                env: back_env,
+            } => {
+                assert_eq!(command, "npx");
+                assert_eq!(args.len(), 2);
+                assert_eq!(back_env.len(), 2);
+                assert_eq!(back_env.get("NODE_ENV").unwrap(), "production");
+            }
+            _ => panic!("Expected Stdio"),
+        }
+    }
+
+    #[test]
+    fn test_transport_sse_with_headers() {
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("Authorization".to_string(), "Bearer secret".to_string());
+        headers.insert("X-Custom".to_string(), "value".to_string());
+
+        let transport = McpTransport::Sse {
+            url: "https://api.example.com/sse".to_string(),
+            headers: headers.clone(),
+        };
+
+        let json = serde_json::to_string(&transport).unwrap();
+        let back: McpTransport = serde_json::from_str(&json).unwrap();
+        match back {
+            McpTransport::Sse { url, headers } => {
+                assert_eq!(url, "https://api.example.com/sse");
+                assert_eq!(headers.len(), 2);
+                assert_eq!(headers.get("Authorization").unwrap(), "Bearer secret");
+            }
+            _ => panic!("Expected Sse"),
+        }
+    }
+
+    #[test]
+    fn test_transport_streamable_http_empty_headers() {
+        let transport = McpTransport::StreamableHttp {
+            url: "http://localhost:3000/mcp".to_string(),
+            headers: std::collections::HashMap::new(),
+        };
+
+        let json = serde_json::to_string(&transport).unwrap();
+        let back: McpTransport = serde_json::from_str(&json).unwrap();
+        match back {
+            McpTransport::StreamableHttp { url, headers } => {
+                assert_eq!(url, "http://localhost:3000/mcp");
+                assert!(headers.is_empty());
+            }
+            _ => panic!("Expected StreamableHttp"),
+        }
+    }
+
+    #[test]
+    fn test_external_tool_info_with_complex_schema() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "The query"},
+                "limit": {"type": "integer", "minimum": 0, "maximum": 100},
+                "options": {
+                    "type": "object",
+                    "properties": {
+                        "nested": {"type": "boolean"}
+                    }
+                }
+            },
+            "required": ["query"]
+        });
+
+        let info = ExternalToolInfo {
+            name: "search".to_string(),
+            fqn: "elastic::search".to_string(),
+            description: "Full-text search".to_string(),
+            input_schema: schema.clone(),
+        };
+
+        let json = serde_json::to_string(&info).unwrap();
+        let back: ExternalToolInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.input_schema, schema);
+        assert_eq!(back.input_schema["required"][0], "query");
+    }
+
+    #[test]
+    fn test_external_tool_info_empty_schema() {
+        let info = ExternalToolInfo {
+            name: "ping".to_string(),
+            fqn: "srv::ping".to_string(),
+            description: "Health check".to_string(),
+            input_schema: serde_json::json!({}),
+        };
+
+        let json = serde_json::to_string(&info).unwrap();
+        let back: ExternalToolInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.input_schema, serde_json::json!({}));
+    }
+
+    #[test]
+    fn test_transport_deserialization_from_raw_json() {
+        // Simulate JSON coming from an API
+        let raw = r#"{"type":"stdio","command":"python","args":["-m","mcp_server"],"env":{}}"#;
+        let t: McpTransport = serde_json::from_str(raw).unwrap();
+        match t {
+            McpTransport::Stdio { command, args, env } => {
+                assert_eq!(command, "python");
+                assert_eq!(args, vec!["-m", "mcp_server"]);
+                assert!(env.is_empty());
+            }
+            _ => panic!("Expected Stdio"),
+        }
+    }
+
+    #[test]
+    fn test_initialize_params_structure() {
+        let params = initialize_params();
+        // Must have protocolVersion, capabilities, clientInfo
+        assert!(params.get("protocolVersion").is_some());
+        assert!(params.get("capabilities").is_some());
+        assert!(params.get("clientInfo").is_some());
+        // capabilities should have roots
+        assert!(params["capabilities"]["roots"].is_object());
+        assert_eq!(params["capabilities"]["roots"]["listChanged"], false);
+    }
 }

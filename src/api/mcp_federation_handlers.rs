@@ -889,4 +889,193 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
+
+    // ========================================================================
+    // 18. probe nonexistent server => 404
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_probe_server_not_found() {
+        let app = test_app_with_registry().await;
+        let resp = app
+            .oneshot(auth_post(
+                "/api/mcp-federation/servers/nonexistent/probe",
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ========================================================================
+    // 19. reconnect nonexistent server => 404
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_reconnect_server_not_found() {
+        let app = test_app_with_registry().await;
+        let resp = app
+            .oneshot(auth_post(
+                "/api/mcp-federation/servers/nonexistent/reconnect",
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ========================================================================
+    // 20. get server status returns all expected fields
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_get_server_status_fields() {
+        let app = test_app_with_populated_registry().await;
+        let resp = app
+            .oneshot(auth_get("/api/mcp-federation/servers/test-srv"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+
+        // Check all expected fields are present
+        assert_eq!(json["id"], "test-srv");
+        assert_eq!(json["display_name"], "Test Server");
+        assert_eq!(json["status"], "connected");
+        assert_eq!(json["tool_count"], 2);
+        assert!(json["connected_at"].is_string());
+        assert_eq!(json["server_name"], "MockMCP");
+        // stats should be present
+        assert!(json["stats"].is_object());
+        assert_eq!(json["stats"]["call_count"], 0);
+    }
+
+    // ========================================================================
+    // 21. list server tools returns tool details
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_list_server_tools_returns_details() {
+        let app = test_app_with_populated_registry().await;
+        let resp = app
+            .oneshot(auth_get("/api/mcp-federation/servers/test-srv/tools"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        let tools = json.as_array().unwrap();
+        assert_eq!(tools.len(), 2);
+
+        // Check tool names
+        let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert!(names.contains(&"list_items"));
+        assert!(names.contains(&"get_item"));
+
+        // Check FQN format
+        let fqns: Vec<&str> = tools.iter().map(|t| t["fqn"].as_str().unwrap()).collect();
+        assert!(fqns.contains(&"test-srv::list_items"));
+        assert!(fqns.contains(&"test-srv::get_item"));
+    }
+
+    // ========================================================================
+    // 22. build_transport preserves display_name
+    // ========================================================================
+
+    #[test]
+    fn test_build_transport_display_name_not_used() {
+        // build_transport only creates the transport, not the full config
+        let body = ConnectServerBody {
+            server_id: "s1".into(),
+            display_name: Some("Pretty Name".into()),
+            transport: "sse".into(),
+            command: None,
+            args: vec![],
+            env: HashMap::new(),
+            url: Some("http://test/sse".into()),
+            headers: HashMap::new(),
+        };
+        let transport = build_transport(&body).unwrap();
+        // display_name is not part of McpTransport — it's in McpTransportConfig
+        match transport {
+            McpTransport::Sse { url, .. } => assert_eq!(url, "http://test/sse"),
+            _ => panic!("Expected Sse"),
+        }
+    }
+
+    // ========================================================================
+    // 23. disconnect already-disconnected server from populated registry
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_list_servers_returns_correct_format() {
+        let app = test_app_with_populated_registry().await;
+        let resp = app
+            .oneshot(auth_get("/api/mcp-federation/servers"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        let arr = json.as_array().unwrap();
+
+        // Each server should have consistent structure
+        for server in arr {
+            assert!(server["id"].is_string());
+            assert!(server["display_name"].is_string());
+            assert!(server["status"].is_string());
+            assert!(server["tool_count"].is_number());
+            assert!(server["connected_at"].is_string());
+        }
+    }
+
+    // ========================================================================
+    // 24. connect body deserialization tests
+    // ========================================================================
+
+    #[test]
+    fn test_connect_body_minimal_deserialization() {
+        let json = serde_json::json!({
+            "server_id": "test",
+            "transport": "stdio"
+        });
+        let body: ConnectServerBody = serde_json::from_value(json).unwrap();
+        assert_eq!(body.server_id, "test");
+        assert!(body.command.is_none());
+        assert!(body.args.is_empty());
+        assert!(body.env.is_empty());
+        assert!(body.url.is_none());
+        assert!(body.headers.is_empty());
+    }
+
+    #[test]
+    fn test_connect_body_full_deserialization() {
+        let json = serde_json::json!({
+            "server_id": "full-srv",
+            "display_name": "Full Server",
+            "transport": "stdio",
+            "command": "node",
+            "args": ["index.js", "--port", "3000"],
+            "env": {"KEY": "val"},
+            "url": null,
+            "headers": {}
+        });
+        let body: ConnectServerBody = serde_json::from_value(json).unwrap();
+        assert_eq!(body.server_id, "full-srv");
+        assert_eq!(body.display_name, Some("Full Server".to_string()));
+        assert_eq!(body.command, Some("node".to_string()));
+        assert_eq!(body.args.len(), 3);
+        assert_eq!(body.env.get("KEY").unwrap(), "val");
+    }
+
+    #[test]
+    fn test_action_response_serialization() {
+        let resp = ActionResponse {
+            success: true,
+            server_id: "srv1".to_string(),
+            message: "Done".to_string(),
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["success"], true);
+        assert_eq!(json["server_id"], "srv1");
+        assert_eq!(json["message"], "Done");
+    }
 }

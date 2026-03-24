@@ -387,7 +387,11 @@ mod tests {
 
     #[test]
     fn test_circuit_state_serde() {
-        let states = vec![CircuitState::Closed, CircuitState::Open, CircuitState::HalfOpen];
+        let states = vec![
+            CircuitState::Closed,
+            CircuitState::Open,
+            CircuitState::HalfOpen,
+        ];
         for state in states {
             let json = serde_json::to_string(&state).unwrap();
             let back: CircuitState = serde_json::from_str(&json).unwrap();
