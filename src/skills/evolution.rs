@@ -1347,7 +1347,11 @@ mod tests {
             )),
         };
         assert!(fc.blocked_by_guardrail);
-        assert!(fc.guardrail_reason.as_ref().unwrap().contains("exceeds maximum"));
+        assert!(fc
+            .guardrail_reason
+            .as_ref()
+            .unwrap()
+            .contains("exceeds maximum"));
     }
 
     // ================================================================
@@ -1566,7 +1570,10 @@ mod tests {
             .iter()
             .filter(|e| matches!(e, SkillEvolution::Split { .. }))
             .count();
-        assert_eq!(split_count, 1, "Split at exact member threshold should be allowed");
+        assert_eq!(
+            split_count, 1,
+            "Split at exact member threshold should be allowed"
+        );
     }
 
     // ================================================================
@@ -1727,7 +1734,10 @@ mod tests {
         let note_id = Uuid::new_v4();
         let note = make_test_note(project_id, note_id);
         store.create_note(&note).await.unwrap();
-        store.add_skill_member(skill.id, "note", note_id).await.unwrap();
+        store
+            .add_skill_member(skill.id, "note", note_id)
+            .await
+            .unwrap();
 
         let candidate = make_candidate(0, vec!["a"]);
         let evolutions = vec![SkillEvolution::Stable {
@@ -1772,7 +1782,10 @@ mod tests {
         let old_note_id = Uuid::new_v4();
         let old_note = make_test_note(project_id, old_note_id);
         store.create_note(&old_note).await.unwrap();
-        store.add_skill_member(skill.id, "note", old_note_id).await.unwrap();
+        store
+            .add_skill_member(skill.id, "note", old_note_id)
+            .await
+            .unwrap();
 
         let new_note_id = Uuid::new_v4();
         let new_note = make_test_note(project_id, new_note_id);
@@ -1818,9 +1831,7 @@ mod tests {
         skill.status = crate::skills::SkillStatus::Active;
         store.create_skill(&skill).await.unwrap();
 
-        let evolutions = vec![SkillEvolution::Orphan {
-            skill_id: skill.id,
-        }];
+        let evolutions = vec![SkillEvolution::Orphan { skill_id: skill.id }];
 
         let _result = execute_evolution(&*store, &evolutions, &HashMap::new(), project_id)
             .await
@@ -1856,9 +1867,7 @@ mod tests {
         skill.status = crate::skills::SkillStatus::Archived;
         store.create_skill(&skill).await.unwrap();
 
-        let evolutions = vec![SkillEvolution::Orphan {
-            skill_id: skill.id,
-        }];
+        let evolutions = vec![SkillEvolution::Orphan { skill_id: skill.id }];
 
         // Should not fail on already-archived skill
         let _result = execute_evolution(&*store, &evolutions, &HashMap::new(), project_id)
@@ -1950,7 +1959,10 @@ mod tests {
         let note_id = Uuid::new_v4();
         let note = make_test_note(project_id, note_id);
         store.create_note(&note).await.unwrap();
-        store.add_skill_member(skill_b.id, "note", note_id).await.unwrap();
+        store
+            .add_skill_member(skill_b.id, "note", note_id)
+            .await
+            .unwrap();
 
         let candidate = SkillCandidate {
             community_id: 0,
@@ -2013,8 +2025,14 @@ mod tests {
         let nb = make_test_note(project_id, note_b);
         store.create_note(&na).await.unwrap();
         store.create_note(&nb).await.unwrap();
-        store.add_skill_member(skill.id, "note", note_a).await.unwrap();
-        store.add_skill_member(skill.id, "note", note_b).await.unwrap();
+        store
+            .add_skill_member(skill.id, "note", note_a)
+            .await
+            .unwrap();
+        store
+            .add_skill_member(skill.id, "note", note_b)
+            .await
+            .unwrap();
 
         let mut notes_map = HashMap::new();
         notes_map.insert(note_a.to_string(), na);
@@ -2198,11 +2216,20 @@ mod tests {
         let nb = make_test_note(project_id, note_b);
         store.create_note(&na).await.unwrap();
         store.create_note(&nb).await.unwrap();
-        store.add_skill_member(skill_a.id, "note", note_a).await.unwrap();
-        store.add_skill_member(skill_b.id, "note", note_b).await.unwrap();
+        store
+            .add_skill_member(skill_a.id, "note", note_a)
+            .await
+            .unwrap();
+        store
+            .add_skill_member(skill_b.id, "note", note_b)
+            .await
+            .unwrap();
 
         let result = detect_skill_fusion(&*store, project_id, 0.7).await.unwrap();
-        assert!(result.is_empty(), "No overlap should produce no fusion candidates");
+        assert!(
+            result.is_empty(),
+            "No overlap should produce no fusion candidates"
+        );
     }
 
     #[tokio::test]
@@ -2242,10 +2269,22 @@ mod tests {
         store.create_note(&n1).await.unwrap();
         store.create_note(&n2).await.unwrap();
 
-        store.add_skill_member(skill_a.id, "note", note1).await.unwrap();
-        store.add_skill_member(skill_a.id, "note", note2).await.unwrap();
-        store.add_skill_member(skill_b.id, "note", note1).await.unwrap();
-        store.add_skill_member(skill_b.id, "note", note2).await.unwrap();
+        store
+            .add_skill_member(skill_a.id, "note", note1)
+            .await
+            .unwrap();
+        store
+            .add_skill_member(skill_a.id, "note", note2)
+            .await
+            .unwrap();
+        store
+            .add_skill_member(skill_b.id, "note", note1)
+            .await
+            .unwrap();
+        store
+            .add_skill_member(skill_b.id, "note", note2)
+            .await
+            .unwrap();
 
         let result = detect_skill_fusion(&*store, project_id, 0.7).await.unwrap();
         assert_eq!(result.len(), 1);
@@ -2286,11 +2325,20 @@ mod tests {
         let note1 = Uuid::new_v4();
         let n1 = make_test_note(project_id, note1);
         store.create_note(&n1).await.unwrap();
-        store.add_skill_member(skill_a.id, "note", note1).await.unwrap();
-        store.add_skill_member(skill_b.id, "note", note1).await.unwrap();
+        store
+            .add_skill_member(skill_a.id, "note", note1)
+            .await
+            .unwrap();
+        store
+            .add_skill_member(skill_b.id, "note", note1)
+            .await
+            .unwrap();
 
         let result = detect_skill_fusion(&*store, project_id, 0.7).await.unwrap();
-        assert!(result.is_empty(), "Archived skills should be excluded from fusion detection");
+        assert!(
+            result.is_empty(),
+            "Archived skills should be excluded from fusion detection"
+        );
     }
 
     // ================================================================
@@ -2303,7 +2351,9 @@ mod tests {
         let project_id = Uuid::new_v4();
 
         // Mock store returns empty synapse graph → InsufficientData → empty result
-        let result = detect_skill_fission(&*store, project_id, 0.5).await.unwrap();
+        let result = detect_skill_fission(&*store, project_id, 0.5)
+            .await
+            .unwrap();
         assert!(result.is_empty());
     }
 

@@ -613,7 +613,9 @@ mod tests {
         assert_eq!(importance_rank(&NoteImportance::Medium), 2);
         assert_eq!(importance_rank(&NoteImportance::Low), 1);
         // Verify ordering
-        assert!(importance_rank(&NoteImportance::Critical) > importance_rank(&NoteImportance::High));
+        assert!(
+            importance_rank(&NoteImportance::Critical) > importance_rank(&NoteImportance::High)
+        );
         assert!(importance_rank(&NoteImportance::High) > importance_rank(&NoteImportance::Medium));
         assert!(importance_rank(&NoteImportance::Medium) > importance_rank(&NoteImportance::Low));
     }
@@ -707,12 +709,7 @@ mod tests {
             "Medium note",
             vec![],
         );
-        let note_low = make_note(
-            NoteType::Guideline,
-            NoteImportance::Low,
-            "Low note",
-            vec![],
-        );
+        let note_low = make_note(NoteType::Guideline, NoteImportance::Low, "Low note", vec![]);
 
         let section = format_section("## Test", &[&note_medium, &note_low]);
         // Medium and Low should not have badges
@@ -744,7 +741,10 @@ mod tests {
 
         let section = format_section("## Test", &[&note_critical, &note_high]);
 
-        let critical_line = section.lines().find(|l| l.contains("Critical note")).unwrap();
+        let critical_line = section
+            .lines()
+            .find(|l| l.contains("Critical note"))
+            .unwrap();
         assert!(critical_line.contains('🔴'), "Critical badge missing");
         let high_line = section.lines().find(|l| l.contains("High note")).unwrap();
         assert!(high_line.contains('🟠'), "High badge missing");
@@ -1119,11 +1119,36 @@ mod tests {
         let mut notes = Vec::new();
 
         // One note of each dispensable type
-        notes.push(make_note(NoteType::Pattern, NoteImportance::Low, "A pattern", vec![]));
-        notes.push(make_note(NoteType::Assertion, NoteImportance::Low, "An assertion", vec![]));
-        notes.push(make_note(NoteType::Tip, NoteImportance::Low, "A tip", vec![]));
-        notes.push(make_note(NoteType::Context, NoteImportance::Low, "A context", vec![]));
-        notes.push(make_note(NoteType::Observation, NoteImportance::Low, "An observation", vec![]));
+        notes.push(make_note(
+            NoteType::Pattern,
+            NoteImportance::Low,
+            "A pattern",
+            vec![],
+        ));
+        notes.push(make_note(
+            NoteType::Assertion,
+            NoteImportance::Low,
+            "An assertion",
+            vec![],
+        ));
+        notes.push(make_note(
+            NoteType::Tip,
+            NoteImportance::Low,
+            "A tip",
+            vec![],
+        ));
+        notes.push(make_note(
+            NoteType::Context,
+            NoteImportance::Low,
+            "A context",
+            vec![],
+        ));
+        notes.push(make_note(
+            NoteType::Observation,
+            NoteImportance::Low,
+            "An observation",
+            vec![],
+        ));
 
         // Under budget, so all sections should appear
         let template = generate_context_template("Grouping", "Test grouping", &notes);
@@ -1184,7 +1209,12 @@ mod tests {
     #[test]
     fn test_generate_template_single_note_type() {
         let notes = vec![
-            make_note(NoteType::Context, NoteImportance::Medium, "Context A", vec![]),
+            make_note(
+                NoteType::Context,
+                NoteImportance::Medium,
+                "Context A",
+                vec![],
+            ),
             make_note(NoteType::Context, NoteImportance::High, "Context B", vec![]),
         ];
 

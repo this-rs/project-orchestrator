@@ -526,14 +526,8 @@ mod tests {
 
     #[test]
     fn test_merge_all_remote_duplicates_filtered() {
-        let local = vec![
-            make_summary("A", 0.8, false),
-            make_summary("B", 0.6, false),
-        ];
-        let remote = vec![
-            make_summary("A", 0.9, true),
-            make_summary("B", 0.95, true),
-        ];
+        let local = vec![make_summary("A", 0.8, false), make_summary("B", 0.6, false)];
+        let remote = vec![make_summary("A", 0.9, true), make_summary("B", 0.95, true)];
 
         let merged = merge_search_results(local, remote);
         assert_eq!(merged.len(), 2);
@@ -583,8 +577,7 @@ mod tests {
         let package = make_test_package();
         let published = build_published_skill(&skill, package, "Proj".to_string(), None);
 
-        let mut json_val: serde_json::Value =
-            serde_json::to_value(&published).expect("to value");
+        let mut json_val: serde_json::Value = serde_json::to_value(&published).expect("to value");
         // Remove import_count from the JSON
         json_val.as_object_mut().unwrap().remove("import_count");
 
@@ -612,8 +605,7 @@ mod tests {
     #[test]
     fn test_summary_is_remote_defaults_to_false() {
         let summary = make_summary("X", 0.5, false);
-        let mut json_val: serde_json::Value =
-            serde_json::to_value(&summary).expect("to value");
+        let mut json_val: serde_json::Value = serde_json::to_value(&summary).expect("to value");
         json_val.as_object_mut().unwrap().remove("is_remote");
 
         let deser: PublishedSkillSummary =
@@ -676,14 +668,12 @@ mod tests {
     #[test]
     fn test_search_result_serde_round_trip() {
         let result = RegistrySearchResult {
-            items: vec![
-                PublishedSkillSummary::from(&build_published_skill(
-                    &make_test_skill(),
-                    make_test_package(),
-                    "P".to_string(),
-                    None,
-                )),
-            ],
+            items: vec![PublishedSkillSummary::from(&build_published_skill(
+                &make_test_skill(),
+                make_test_package(),
+                "P".to_string(),
+                None,
+            ))],
             total: 42,
         };
 
