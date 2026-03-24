@@ -965,14 +965,14 @@ mod tests {
         );
 
         // Non-numeric value before keyword
-        assert_eq!(
-            extract_stat_number("abc insertions(+)", "insertion"),
-            None
-        );
+        assert_eq!(extract_stat_number("abc insertions(+)", "insertion"), None);
 
         // Extract file count
         assert_eq!(
-            extract_stat_number(" 5 files changed, 120 insertions(+), 30 deletions(-)", "files"),
+            extract_stat_number(
+                " 5 files changed, 120 insertions(+), 30 deletions(-)",
+                "files"
+            ),
             Some(5)
         );
     }
@@ -1008,12 +1008,8 @@ mod tests {
         assert_eq!(v.command_timeout, Duration::from_secs(600));
 
         // Test with_base_commit()
-        let v2 = TaskVerifier::with_base_commit(
-            graph.clone(),
-            false,
-            true,
-            "abc123def456".to_string(),
-        );
+        let v2 =
+            TaskVerifier::with_base_commit(graph.clone(), false, true, "abc123def456".to_string());
         assert!(!v2.build_check_enabled);
         assert!(v2.test_runner_enabled);
         assert_eq!(v2.base_commit, Some("abc123def456".to_string()));
@@ -1071,7 +1067,11 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         // Should report 2 incomplete steps
-        assert!(err.contains("2 step(s)"), "Should count 2 failures: {}", err);
+        assert!(
+            err.contains("2 step(s)"),
+            "Should count 2 failures: {}",
+            err
+        );
         assert!(err.contains("Still pending"));
         assert!(err.contains("Still in progress"));
     }
