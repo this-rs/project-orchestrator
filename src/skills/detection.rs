@@ -1454,4 +1454,338 @@ mod tests {
         assert_eq!(result.anchors_created, 0);
         assert_eq!(result.status, ClusterDetectionStatus::InsufficientData);
     }
+
+    // ================================================================
+    // persist_detected_skills tests
+    // ================================================================
+
+    #[tokio::test]
+    async fn test_persist_new_skill() {
+        use crate::neo4j::mock::MockGraphStore;
+        use crate::neo4j::traits::GraphStore;
+
+        let store = MockGraphStore::new();
+        let project_id = Uuid::new_v4();
+
+        // Create notes in the store
+        let note1 = make_test_note(
+            "00000000-0000-0000-0000-000000000001",
+            0.8,
+            crate::notes::NoteImportance::High,
+            vec!["api", "rest"],
+        );
+        let note2 = make_test_note(
+            "00000000-0000-0000-0000-000000000002",
+            0.6,
+            crate::notes::NoteImportance::Medium,
+            vec!["api", "handler"],
+        );
+        store.create_note(&note1).await.unwrap();
+        store.create_note(&note2).await.unwrap();
+
+        let candidate = SkillCandidate {
+            community_id: 0,
+            member_note_ids: vec![note1.id.to_string(), note2.id.to_string()],
+            cohesion: 0.85,
+            size: 2,
+            label: "api-cluster".into(),
+        };
+        let outcomes = vec![DeduplicationOutcome::New(candidate)];
+
+        let mut notes_map = HashMap::new();
+        notes_map.insert(note1.id.to_string(), note1.clone());
+        notes_map.insert(note2.id.to_string(), note2.clone());
+
+        let ids = persist_detected_skills(&store, &outcomes, &notes_map, project_id, 10)
+            .await
+            .unwrap();
+        assert_eq!(ids.len(), 1);
+
+        // Verify skill was created
+        let skill = store.get_skill(ids[0]).await.unwrap().unwrap();
+        assert_eq!(skill.cohesion, 0.85);
+        assert!(skill.energy > 0.0);
+    }
+
+    #[tokio::test]
+    async fn test_persist_merge_existing_skill() {
+        use crate::neo4j::mock::MockGraphStore;
+        use crate::neo4j::traits::GraphStore;
+
+        let store = MockGraphStore::new();
+        let project_id = Uuid::new_v4();
+
+        // Create an existing skill
+        let mut existing_skill = crate::skills::SkillNode::new(project_id, "existing-skill");
+        existing_skill.energy = 0.5;
+        existing_skill.cohesion = 0.6;
+        let existing_id = existing_skill.id;
+        store.create_skill(&existing_skill).await.unwrap();
+
+        // Create note
+        let note = make_test_note(
+            "00000000-0000-0000-0000-000000000001",
+            0.9,
+            crate::notes::NoteImportance::Critical,
+            vec!["core"],
+        );
+        store.create_note(&note).await.unwrap();
+
+        let candidate = SkillCandidate {
+            community_id: 0,
+            member_note_ids: vec![note.id.to_string()],
+            cohesion: 0.95,
+            size: 1,
+            label: "updated".into(),
+        };
+        let outcomes = vec![DeduplicationOutcome::Merge {
+            existing_skill_id: existing_id,
+            candidate,
+            jaccard: 0.9,
+        }];
+
+        let mut notes_map = HashMap::new();
+        notes_map.insert(note.id.to_string(), note.clone());
+
+        let ids = persist_detected_skills(&store, &outcomes, &notes_map, project_id, 5)
+            .await
+            .unwrap();
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids[0], existing_id);
+
+        // Verify skill was updated
+        let updated = store.get_skill(existing_id).await.unwrap().unwrap();
+        assert_eq!(updated.cohesion, 0.95);
+    }
+
+    #[tokio::test]
+    async fn test_persist_merge_missing_skill_skipped() {
+        use crate::neo4j::mock::MockGraphStore;
+
+        let store = MockGraphStore::new();
+        let project_id = Uuid::new_v4();
+
+        // Merge with a non-existent skill → should be skipped
+        let candidate = SkillCandidate {
+            community_id: 0,
+            member_note_ids: vec![],
+            cohesion: 0.5,
+            size: 0,
+            label: "ghost".into(),
+        };
+        let outcomes = vec![DeduplicationOutcome::Merge {
+            existing_skill_id: Uuid::new_v4(),
+            candidate,
+            jaccard: 0.8,
+        }];
+        let notes_map = HashMap::new();
+
+        let ids = persist_detected_skills(&store, &outcomes, &notes_map, project_id, 0)
+            .await
+            .unwrap();
+        assert!(ids.is_empty());
+    }
+
+    // ================================================================
+    // cluster_to_skill edge cases
+    // ================================================================
+
+    #[test]
+    fn test_cluster_to_skill_no_notes() {
+        let candidate = SkillCandidate {
+            community_id: 0,
+            member_note_ids: vec![],
+            cohesion: 0.5,
+            size: 0,
+            label: "empty".into(),
+        };
+        let notes: Vec<crate::notes::Note> = vec![];
+        let skill = cluster_to_skill(&candidate, &notes, Uuid::nil(), 0);
+        // Default energy when no notes
+        assert!((skill.energy - 0.5).abs() < 0.01);
+        assert_eq!(skill.note_count, 0);
+        assert_eq!(skill.coverage, 0);
+    }
+
+    #[test]
+    fn test_cluster_to_skill_deduplicates_tags() {
+        let candidate = SkillCandidate {
+            community_id: 0,
+            member_note_ids: vec!["a".into(), "b".into()],
+            cohesion: 0.7,
+            size: 2,
+            label: "test".into(),
+        };
+
+        let notes = vec![
+            make_test_note(
+                "00000000-0000-0000-0000-000000000001",
+                0.5,
+                crate::notes::NoteImportance::Medium,
+                vec!["api", "rest"],
+            ),
+            make_test_note(
+                "00000000-0000-0000-0000-000000000002",
+                0.5,
+                crate::notes::NoteImportance::Medium,
+                vec!["api", "handler"],
+            ),
+        ];
+
+        let skill = cluster_to_skill(&candidate, &notes, Uuid::nil(), 10);
+        // "api" should appear only once
+        let api_count = skill.tags.iter().filter(|t| *t == "api").count();
+        assert_eq!(api_count, 1, "Tags should be deduplicated");
+        assert!(skill.tags.contains(&"rest".to_string()));
+        assert!(skill.tags.contains(&"handler".to_string()));
+    }
+
+    // ================================================================
+    // DetectSkillsPipelineResult serde
+    // ================================================================
+
+    #[test]
+    fn test_pipeline_result_serde() {
+        let result = DetectSkillsPipelineResult {
+            status: ClusterDetectionStatus::Success,
+            skills_detected: 3,
+            skills_created: 2,
+            skills_updated: 1,
+            total_notes: 15,
+            total_synapses: 30,
+            modularity: 0.75,
+            message: "test".into(),
+            skill_ids: vec![Uuid::new_v4()],
+            anchors_created: 5,
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let back: DetectSkillsPipelineResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.skills_detected, 3);
+        assert_eq!(back.anchors_created, 5);
+    }
+
+    #[test]
+    fn test_pipeline_result_serde_default_anchors() {
+        // anchors_created has #[serde(default)] — verify deserialization without it
+        let json = r#"{"status":"Success","skills_detected":1,"skills_created":1,"skills_updated":0,"total_notes":5,"total_synapses":10,"modularity":0.5,"message":"ok","skill_ids":[]}"#;
+        let result: DetectSkillsPipelineResult = serde_json::from_str(json).unwrap();
+        assert_eq!(result.anchors_created, 0);
+    }
+
+    // ================================================================
+    // ClusterDetectionResult serde
+    // ================================================================
+
+    #[test]
+    fn test_cluster_detection_result_serde() {
+        let result = ClusterDetectionResult {
+            status: ClusterDetectionStatus::Success,
+            candidates: vec![SkillCandidate {
+                community_id: 1,
+                member_note_ids: vec!["a".into()],
+                cohesion: 0.8,
+                size: 1,
+                label: "test".into(),
+            }],
+            total_notes: 10,
+            total_synapses: 20,
+            modularity: 0.65,
+            message: "ok".into(),
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let back: ClusterDetectionResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.status, ClusterDetectionStatus::Success);
+        assert_eq!(back.candidates.len(), 1);
+    }
+
+    // ================================================================
+    // SkillDetectionConfig serde
+    // ================================================================
+
+    #[test]
+    fn test_config_serde_roundtrip() {
+        let config = SkillDetectionConfig {
+            min_synapse_weight: 0.2,
+            min_cluster_size: 5,
+            min_cohesion: 0.4,
+            louvain_resolution: 2.0,
+            overlap_threshold: 0.8,
+            min_notes_for_detection: 20,
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let back: SkillDetectionConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.min_synapse_weight, 0.2);
+        assert_eq!(back.min_cluster_size, 5);
+        assert_eq!(back.louvain_resolution, 2.0);
+    }
+
+    // ================================================================
+    // build_synapse_graph edge cases
+    // ================================================================
+
+    #[test]
+    fn test_build_synapse_graph_empty() {
+        let edges: Vec<(String, String, f64)> = vec![];
+        let graph = build_synapse_graph(&edges, "proj-1");
+        assert_eq!(graph.node_count(), 0);
+        assert_eq!(graph.edge_count(), 0);
+    }
+
+    #[test]
+    fn test_build_synapse_graph_self_loop() {
+        let edges = vec![("a".to_string(), "a".to_string(), 0.5)];
+        let graph = build_synapse_graph(&edges, "proj-1");
+        assert_eq!(graph.node_count(), 1); // Only "a"
+    }
+
+    // ================================================================
+    // filter_weak_members edge cases
+    // ================================================================
+
+    #[test]
+    fn test_filter_weak_members_empty_input() {
+        let result = filter_weak_members(vec![], &[], 3);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_filter_weak_members_multiple_clusters() {
+        // Two clusters: one strong, one weak
+        let edges = vec![
+            // Cluster 1: strong
+            ("a1".into(), "a2".into(), 0.9),
+            ("a1".into(), "a3".into(), 0.8),
+            ("a1".into(), "a4".into(), 0.7),
+            ("a2".into(), "a3".into(), 0.9),
+            ("a2".into(), "a4".into(), 0.8),
+            ("a3".into(), "a4".into(), 0.9),
+            // Cluster 2: all weak internal connections
+            ("b1".into(), "b2".into(), 0.01),
+            ("b1".into(), "b3".into(), 0.01),
+            ("b1".into(), "b4".into(), 0.01),
+            ("b2".into(), "b3".into(), 0.01),
+        ];
+
+        let candidates = vec![
+            SkillCandidate {
+                community_id: 0,
+                member_note_ids: vec!["a1".into(), "a2".into(), "a3".into(), "a4".into()],
+                cohesion: 0.8,
+                size: 4,
+                label: "strong".into(),
+            },
+            SkillCandidate {
+                community_id: 1,
+                member_note_ids: vec!["b1".into(), "b2".into(), "b3".into(), "b4".into()],
+                cohesion: 0.1,
+                size: 4,
+                label: "weak".into(),
+            },
+        ];
+
+        let result = filter_weak_members(candidates, &edges, 3);
+        // Strong cluster should survive, weak one should be removed
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].label, "strong");
+    }
 }

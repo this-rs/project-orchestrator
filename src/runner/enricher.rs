@@ -902,4 +902,613 @@ mod tests {
         let added2 = enricher.enrich_decision_affects(task_id, &files).await;
         assert_eq!(added2, 0);
     }
+
+    // ========================================================================
+    // Additional coverage tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_enrich_decision_affects_empty_files() {
+        use crate::test_helpers::{test_plan, test_task};
+
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+
+        let plan = test_plan();
+        let plan_id = plan.id;
+        graph.create_plan(&plan).await.unwrap();
+
+        let task = test_task();
+        let task_id = task.id;
+        graph.create_task(plan_id, &task).await.unwrap();
+
+        let enricher = TaskEnricher::new(graph.clone());
+        let empty_files: Vec<String> = vec![];
+
+        // Should short-circuit and return 0 when no modified files
+        let added = enricher
+            .enrich_decision_affects(task_id, &empty_files)
+            .await;
+        assert_eq!(added, 0);
+    }
+
+    #[tokio::test]
+    async fn test_enrich_decision_affects_no_decisions() {
+        use crate::test_helpers::{test_plan, test_task};
+
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+
+        let plan = test_plan();
+        let plan_id = plan.id;
+        graph.create_plan(&plan).await.unwrap();
+
+        let task = test_task();
+        let task_id = task.id;
+        graph.create_task(plan_id, &task).await.unwrap();
+
+        let enricher = TaskEnricher::new(graph.clone());
+        let files = vec!["src/main.rs".to_string()];
+
+        // No decisions exist for this task, should return 0
+        let added = enricher.enrich_decision_affects(task_id, &files).await;
+        assert_eq!(added, 0);
+    }
+
+    #[tokio::test]
+    async fn test_enrich_discussed_empty_files() {
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let enricher = TaskEnricher::new(graph.clone());
+
+        let session_id = Uuid::new_v4();
+        let empty_files: Vec<String> = vec![];
+
+        // Should short-circuit and return 0
+        let count = enricher.enrich_discussed(session_id, &empty_files).await;
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_enrich_discussed_returns_entity_count() {
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let enricher = TaskEnricher::new(graph.clone());
+
+        let session_id = Uuid::new_v4();
+        let files = vec![
+            "src/main.rs".to_string(),
+            "src/lib.rs".to_string(),
+            "Cargo.toml".to_string(),
+        ];
+
+        // MockGraphStore returns entities.len() for add_discussed
+        let count = enricher.enrich_discussed(session_id, &files).await;
+        assert_eq!(count, 3);
+    }
+
+    #[tokio::test]
+    async fn test_build_note_content_empty_commits() {
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let enricher = TaskEnricher::new(graph);
+
+        let commits: Vec<GitCommitInfo> = vec![];
+        let modified_files: Vec<String> = vec![];
+
+        let content = enricher
+            .build_note_content(&commits, &modified_files, "/tmp")
+            .await;
+
+        assert!(content.contains("## Task Implementation Summary"));
+        assert!(content.contains("### Commits"));
+        assert!(content.contains("Files Modified (0)"));
+    }
+
+    #[tokio::test]
+    async fn test_build_note_content_short_hash() {
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let enricher = TaskEnricher::new(graph);
+
+        // Hash shorter than 7 characters — should not panic
+        let commits = vec![GitCommitInfo {
+            hash: "abc".to_string(),
+            message: "short hash commit".to_string(),
+            author: "Test".to_string(),
+            timestamp: Utc::now(),
+            files: vec![],
+        }];
+        let modified_files = vec!["src/foo.rs".to_string()];
+
+        let content = enricher
+            .build_note_content(&commits, &modified_files, "/tmp")
+            .await;
+
+        assert!(content.contains("`abc`"));
+        assert!(content.contains("short hash commit"));
+    }
+
+    #[tokio::test]
+    async fn test_build_note_content_single_file() {
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let enricher = TaskEnricher::new(graph);
+
+        let commits = vec![GitCommitInfo {
+            hash: "1234567890abcdef".to_string(),
+            message: "feat: add feature".to_string(),
+            author: "Alice".to_string(),
+            timestamp: Utc::now(),
+            files: vec![FileChangedInfo {
+                path: "src/feature.rs".to_string(),
+                additions: Some(50),
+                deletions: Some(10),
+            }],
+        }];
+        let modified_files = vec!["src/feature.rs".to_string()];
+
+        let content = enricher
+            .build_note_content(&commits, &modified_files, "/tmp")
+            .await;
+
+        assert!(content.contains("`1234567`")); // truncated to 7
+        assert!(content.contains("feat: add feature"));
+        assert!(content.contains("Files Modified (1)"));
+        assert!(content.contains("`src/feature.rs`"));
+    }
+
+    #[tokio::test]
+    async fn test_enrich_commits_multiple() {
+        use crate::test_helpers::{test_plan, test_task};
+
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+
+        let plan = test_plan();
+        let plan_id = plan.id;
+        graph.create_plan(&plan).await.unwrap();
+
+        let task = test_task();
+        let task_id = task.id;
+        graph.create_task(plan_id, &task).await.unwrap();
+
+        let enricher = TaskEnricher::new(graph.clone());
+
+        let commits = vec![
+            GitCommitInfo {
+                hash: "aaa111bbb222".to_string(),
+                message: "feat: first commit".to_string(),
+                author: "Test".to_string(),
+                timestamp: Utc::now(),
+                files: vec![FileChangedInfo {
+                    path: "src/a.rs".to_string(),
+                    additions: Some(10),
+                    deletions: Some(0),
+                }],
+            },
+            GitCommitInfo {
+                hash: "ccc333ddd444".to_string(),
+                message: "fix: second commit".to_string(),
+                author: "Test".to_string(),
+                timestamp: Utc::now(),
+                files: vec![FileChangedInfo {
+                    path: "src/b.rs".to_string(),
+                    additions: Some(5),
+                    deletions: Some(3),
+                }],
+            },
+            GitCommitInfo {
+                hash: "eee555fff666".to_string(),
+                message: "refactor: third commit".to_string(),
+                author: "Test".to_string(),
+                timestamp: Utc::now(),
+                files: vec![], // no files changed
+            },
+        ];
+
+        let linked = enricher
+            .enrich_commits(&commits, task_id, plan_id, None)
+            .await;
+        assert_eq!(linked, 3);
+
+        // All three should be linked to the task
+        let task_commits = graph.get_task_commits(task_id).await.unwrap();
+        assert_eq!(task_commits.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_enrich_commits_with_project_id() {
+        use crate::test_helpers::{test_plan, test_project, test_task};
+
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+
+        let project = test_project();
+        let project_id = project.id;
+        graph.create_project(&project).await.unwrap();
+
+        let plan = test_plan();
+        let plan_id = plan.id;
+        graph.create_plan(&plan).await.unwrap();
+
+        let task = test_task();
+        let task_id = task.id;
+        graph.create_task(plan_id, &task).await.unwrap();
+
+        let enricher = TaskEnricher::new(graph.clone());
+
+        let commits = vec![GitCommitInfo {
+            hash: "proj123456789".to_string(),
+            message: "feat: with project".to_string(),
+            author: "Test".to_string(),
+            timestamp: Utc::now(),
+            files: vec![],
+        }];
+
+        let linked = enricher
+            .enrich_commits(&commits, task_id, plan_id, Some(project_id))
+            .await;
+        assert_eq!(linked, 1);
+    }
+
+    #[tokio::test]
+    async fn test_enrich_auto_note_with_multiple_files() {
+        use crate::test_helpers::{test_plan, test_task};
+
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+
+        let plan = test_plan();
+        let plan_id = plan.id;
+        graph.create_plan(&plan).await.unwrap();
+
+        let task = test_task();
+        let task_id = task.id;
+        graph.create_task(plan_id, &task).await.unwrap();
+
+        let enricher = TaskEnricher::new(graph.clone());
+
+        let commits = vec![GitCommitInfo {
+            hash: "multi123456789".to_string(),
+            message: "feat: multi-file change".to_string(),
+            author: "Test".to_string(),
+            timestamp: Utc::now(),
+            files: vec![
+                FileChangedInfo {
+                    path: "src/a.rs".to_string(),
+                    additions: Some(10),
+                    deletions: Some(0),
+                },
+                FileChangedInfo {
+                    path: "src/b.rs".to_string(),
+                    additions: Some(5),
+                    deletions: Some(2),
+                },
+            ],
+        }];
+        let modified_files = vec!["src/a.rs".to_string(), "src/b.rs".to_string()];
+
+        let note_id = enricher
+            .enrich_auto_note(&commits, &modified_files, task_id, None, "/tmp")
+            .await;
+        assert!(note_id.is_some());
+
+        let note = graph.get_note(note_id.unwrap()).await.unwrap().unwrap();
+        assert!(note.content.contains("src/a.rs"));
+        assert!(note.content.contains("src/b.rs"));
+        assert!(note.tags.contains(&format!("task:{}", task_id)));
+    }
+
+    #[tokio::test]
+    async fn test_enrich_auto_note_with_project_id() {
+        use crate::test_helpers::{test_plan, test_project, test_task};
+
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+
+        let project = test_project();
+        let project_id = project.id;
+        graph.create_project(&project).await.unwrap();
+
+        let plan = test_plan();
+        let plan_id = plan.id;
+        graph.create_plan(&plan).await.unwrap();
+
+        let task = test_task();
+        let task_id = task.id;
+        graph.create_task(plan_id, &task).await.unwrap();
+
+        let enricher = TaskEnricher::new(graph.clone());
+
+        let commits = vec![GitCommitInfo {
+            hash: "projnote123456".to_string(),
+            message: "feat: with project note".to_string(),
+            author: "Test".to_string(),
+            timestamp: Utc::now(),
+            files: vec![],
+        }];
+        let modified_files = vec!["src/main.rs".to_string()];
+
+        let note_id = enricher
+            .enrich_auto_note(&commits, &modified_files, task_id, Some(project_id), "/tmp")
+            .await;
+        assert!(note_id.is_some());
+
+        let note = graph.get_note(note_id.unwrap()).await.unwrap().unwrap();
+        assert_eq!(note.project_id, Some(project_id));
+    }
+
+    #[tokio::test]
+    async fn test_enrich_decision_affects_multiple_decisions() {
+        use crate::neo4j::models::{DecisionNode, DecisionStatus};
+        use crate::test_helpers::{test_plan, test_task};
+
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+
+        let plan = test_plan();
+        let plan_id = plan.id;
+        graph.create_plan(&plan).await.unwrap();
+
+        let task = test_task();
+        let task_id = task.id;
+        graph.create_task(plan_id, &task).await.unwrap();
+
+        // Create two decisions for the same task
+        let decision1 = DecisionNode {
+            id: Uuid::new_v4(),
+            description: "Decision one".to_string(),
+            rationale: "Reason one".to_string(),
+            alternatives: vec![],
+            chosen_option: None,
+            status: DecisionStatus::Accepted,
+            decided_at: Utc::now(),
+            decided_by: "agent".to_string(),
+            scar_intensity: 0.0,
+            embedding: None,
+            embedding_model: None,
+        };
+        let decision2 = DecisionNode {
+            id: Uuid::new_v4(),
+            description: "Decision two".to_string(),
+            rationale: "Reason two".to_string(),
+            alternatives: vec![],
+            chosen_option: None,
+            status: DecisionStatus::Accepted,
+            decided_at: Utc::now(),
+            decided_by: "agent".to_string(),
+            scar_intensity: 0.0,
+            embedding: None,
+            embedding_model: None,
+        };
+        graph.create_decision(task_id, &decision1).await.unwrap();
+        graph.create_decision(task_id, &decision2).await.unwrap();
+
+        let enricher = TaskEnricher::new(graph.clone());
+        let files = vec!["src/main.rs".to_string(), "src/lib.rs".to_string()];
+
+        // Each decision should get AFFECTS for each file = 2 * 2 = 4
+        let added = enricher.enrich_decision_affects(task_id, &files).await;
+        assert_eq!(added, 4);
+
+        // Verify both decisions have affects
+        let affects1 = graph.list_decision_affects(decision1.id).await.unwrap();
+        assert_eq!(affects1.len(), 2);
+        let affects2 = graph.list_decision_affects(decision2.id).await.unwrap();
+        assert_eq!(affects2.len(), 2);
+    }
+
+    #[test]
+    fn test_enrich_result_fields() {
+        let result = EnrichResult {
+            commits_linked: 5,
+            note_created: true,
+            affects_added: 10,
+            discussed_added: 3,
+        };
+
+        assert_eq!(result.commits_linked, 5);
+        assert!(result.note_created);
+        assert_eq!(result.affects_added, 10);
+        assert_eq!(result.discussed_added, 3);
+    }
+
+    #[test]
+    fn test_enrich_result_clone() {
+        let result = EnrichResult {
+            commits_linked: 2,
+            note_created: true,
+            affects_added: 3,
+            discussed_added: 1,
+        };
+        let cloned = result.clone();
+        assert_eq!(cloned.commits_linked, 2);
+        assert!(cloned.note_created);
+        assert_eq!(cloned.affects_added, 3);
+        assert_eq!(cloned.discussed_added, 1);
+    }
+
+    #[test]
+    fn test_enrich_result_debug() {
+        let result = EnrichResult::default();
+        let debug_str = format!("{:?}", result);
+        assert!(debug_str.contains("EnrichResult"));
+        assert!(debug_str.contains("commits_linked"));
+    }
+
+    #[test]
+    fn test_git_commit_info_clone() {
+        let info = GitCommitInfo {
+            hash: "abc123".to_string(),
+            message: "test".to_string(),
+            author: "Author".to_string(),
+            timestamp: Utc::now(),
+            files: vec![
+                FileChangedInfo {
+                    path: "a.rs".to_string(),
+                    additions: Some(1),
+                    deletions: None,
+                },
+                FileChangedInfo {
+                    path: "b.rs".to_string(),
+                    additions: None,
+                    deletions: Some(5),
+                },
+            ],
+        };
+        let cloned = info.clone();
+        assert_eq!(cloned.hash, "abc123");
+        assert_eq!(cloned.files.len(), 2);
+        assert_eq!(cloned.files[1].deletions, Some(5));
+    }
+
+    #[test]
+    fn test_git_commit_info_debug() {
+        let info = GitCommitInfo {
+            hash: "xyz".to_string(),
+            message: "msg".to_string(),
+            author: "author".to_string(),
+            timestamp: Utc::now(),
+            files: vec![],
+        };
+        let debug_str = format!("{:?}", info);
+        assert!(debug_str.contains("GitCommitInfo"));
+        assert!(debug_str.contains("xyz"));
+    }
+
+    #[test]
+    fn test_task_enricher_new() {
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let _enricher = TaskEnricher::new(graph);
+        // Just verify construction does not panic
+    }
+
+    #[tokio::test]
+    async fn test_enrich_auto_note_empty_modified_files() {
+        use crate::test_helpers::{test_plan, test_task};
+
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+
+        let plan = test_plan();
+        let plan_id = plan.id;
+        graph.create_plan(&plan).await.unwrap();
+
+        let task = test_task();
+        let task_id = task.id;
+        graph.create_task(plan_id, &task).await.unwrap();
+
+        let enricher = TaskEnricher::new(graph.clone());
+
+        let commits = vec![GitCommitInfo {
+            hash: "empty123456789".to_string(),
+            message: "chore: no files".to_string(),
+            author: "Test".to_string(),
+            timestamp: Utc::now(),
+            files: vec![],
+        }];
+        let modified_files: Vec<String> = vec![];
+
+        // Should still create a note even with no modified files
+        let note_id = enricher
+            .enrich_auto_note(&commits, &modified_files, task_id, None, "/tmp")
+            .await;
+        assert!(note_id.is_some());
+
+        let note = graph.get_note(note_id.unwrap()).await.unwrap().unwrap();
+        assert!(note.content.contains("Files Modified (0)"));
+    }
+
+    #[tokio::test]
+    async fn test_build_note_content_many_commits() {
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let enricher = TaskEnricher::new(graph);
+
+        let commits: Vec<GitCommitInfo> = (0..5)
+            .map(|i| GitCommitInfo {
+                hash: format!("hash{:03}abcdef0123", i),
+                message: format!("commit number {}", i),
+                author: "Test".to_string(),
+                timestamp: Utc::now(),
+                files: vec![FileChangedInfo {
+                    path: format!("src/file{}.rs", i),
+                    additions: Some(i as i64 * 10),
+                    deletions: Some(i as i64),
+                }],
+            })
+            .collect();
+
+        let modified_files: Vec<String> = (0..5).map(|i| format!("src/file{}.rs", i)).collect();
+
+        let content = enricher
+            .build_note_content(&commits, &modified_files, "/tmp")
+            .await;
+
+        // Verify all commits are listed
+        for i in 0..5 {
+            assert!(content.contains(&format!("commit number {}", i)));
+        }
+        assert!(content.contains("Files Modified (5)"));
+    }
+
+    #[tokio::test]
+    async fn test_enrich_commits_empty_list() {
+        use crate::test_helpers::{test_plan, test_task};
+
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+
+        let plan = test_plan();
+        let plan_id = plan.id;
+        graph.create_plan(&plan).await.unwrap();
+
+        let task = test_task();
+        let task_id = task.id;
+        graph.create_task(plan_id, &task).await.unwrap();
+
+        let enricher = TaskEnricher::new(graph.clone());
+        let commits: Vec<GitCommitInfo> = vec![];
+
+        let linked = enricher
+            .enrich_commits(&commits, task_id, plan_id, None)
+            .await;
+        assert_eq!(linked, 0);
+    }
+
+    #[tokio::test]
+    async fn test_enrich_decision_affects_with_existing_affects() {
+        use crate::neo4j::models::{DecisionNode, DecisionStatus};
+        use crate::test_helpers::{test_plan, test_task};
+
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+
+        let plan = test_plan();
+        let plan_id = plan.id;
+        graph.create_plan(&plan).await.unwrap();
+
+        let task = test_task();
+        let task_id = task.id;
+        graph.create_task(plan_id, &task).await.unwrap();
+
+        let decision = DecisionNode {
+            id: Uuid::new_v4(),
+            description: "Test with pre-existing".to_string(),
+            rationale: String::new(),
+            alternatives: vec![],
+            chosen_option: None,
+            status: DecisionStatus::Accepted,
+            decided_at: Utc::now(),
+            decided_by: "agent".to_string(),
+            scar_intensity: 0.0,
+            embedding: None,
+            embedding_model: None,
+        };
+        graph.create_decision(task_id, &decision).await.unwrap();
+
+        // Pre-add an AFFECTS relation
+        graph
+            .add_decision_affects(decision.id, "File", "src/existing.rs", Some("pre-existing"))
+            .await
+            .unwrap();
+
+        let enricher = TaskEnricher::new(graph.clone());
+        let files = vec![
+            "src/existing.rs".to_string(), // already exists
+            "src/new.rs".to_string(),      // new
+        ];
+
+        let added = enricher.enrich_decision_affects(task_id, &files).await;
+        // Only the new file should be added
+        assert_eq!(added, 1);
+
+        let affects = graph.list_decision_affects(decision.id).await.unwrap();
+        assert_eq!(affects.len(), 2);
+    }
 }

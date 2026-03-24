@@ -1272,4 +1272,753 @@ mod tests {
         let content = "No JSON here.";
         assert!(analyzer.extract_protocol_json(content).is_err());
     }
+
+    #[test]
+    fn test_extract_protocol_json_unclosed() {
+        let analyzer = FeedbackAnalyzer::new(Arc::new(MockGraphStore::new()));
+        let content = "## RFC\n```json\n{\"name\": \"test\"}\nno closing";
+        assert!(analyzer.extract_protocol_json(content).is_err());
+    }
+
+    // ========================================================================
+    // Display impls
+    // ========================================================================
+
+    #[test]
+    fn test_feedback_pattern_type_display() {
+        assert_eq!(
+            FeedbackPatternType::ManualCommitPostRun.to_string(),
+            "manual_commit_post_run"
+        );
+        assert_eq!(
+            FeedbackPatternType::SkipPrInFullRun.to_string(),
+            "skip_pr_in_full_run"
+        );
+        assert_eq!(
+            FeedbackPatternType::RepeatedStateOverride {
+                state_name: "review".into()
+            }
+            .to_string(),
+            "repeated_state_override:review"
+        );
+        assert_eq!(
+            FeedbackPatternType::MissingStepComplaint.to_string(),
+            "missing_step_complaint"
+        );
+        assert_eq!(
+            FeedbackPatternType::RepeatedCustomTransition {
+                trigger_name: "skip_tests".into()
+            }
+            .to_string(),
+            "repeated_custom_transition:skip_tests"
+        );
+    }
+
+    #[test]
+    fn test_pattern_suggestion_display() {
+        assert_eq!(
+            PatternSuggestion::UpgradeToFull.to_string(),
+            "suggest_upgrade_to_full"
+        );
+        assert_eq!(
+            PatternSuggestion::DowngradeToLight.to_string(),
+            "suggest_downgrade_to_light"
+        );
+        assert_eq!(
+            PatternSuggestion::CreateVariantWithout {
+                state_name: "pr".into()
+            }
+            .to_string(),
+            "create_variant_without:pr"
+        );
+        assert_eq!(
+            PatternSuggestion::FormalizeTransition {
+                trigger_name: "fast_path".into()
+            }
+            .to_string(),
+            "formalize_transition:fast_path"
+        );
+        assert_eq!(
+            PatternSuggestion::AddMissingStep.to_string(),
+            "add_missing_step"
+        );
+        assert_eq!(
+            PatternSuggestion::KeepCollecting.to_string(),
+            "keep_collecting"
+        );
+    }
+
+    // ========================================================================
+    // classify_note — additional tag paths
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_classify_override_transition() {
+        let mock = Arc::new(MockGraphStore::new());
+        let project_id = Uuid::new_v4();
+
+        // Create 4 notes with "runner-override-transition" tag
+        for _ in 0..4 {
+            let run_id = Uuid::new_v4();
+            let mut note = Note::new(
+                Some(project_id),
+                NoteType::Observation,
+                format!(
+                    "## Override: Custom Transition\n**Run ID**: {}\n**Custom trigger**: skip_tests\n",
+                    run_id
+                ),
+                "runner-feedback".to_string(),
+            );
+            note.tags = vec![
+                "runner-feedback".to_string(),
+                "runner-override-transition".to_string(),
+            ];
+            mock.notes.write().await.insert(note.id, note);
+        }
+
+        let analyzer = FeedbackAnalyzer::new(mock as Arc<dyn GraphStore>);
+        let report = analyzer
+            .analyze_runner_feedback(Some(project_id))
+            .await
+            .unwrap();
+
+        assert_eq!(report.actionable_count, 1);
+        let pattern = report.patterns.first().unwrap();
+        assert!(
+            matches!(
+                &pattern.pattern_type,
+                FeedbackPatternType::RepeatedCustomTransition { trigger_name } if trigger_name == "skip_tests"
+            ),
+            "Expected RepeatedCustomTransition, got {:?}",
+            pattern.pattern_type
+        );
+        assert!(matches!(
+            &pattern.suggestion,
+            PatternSuggestion::FormalizeTransition { trigger_name } if trigger_name == "skip_tests"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_classify_override_step() {
+        let mock = Arc::new(MockGraphStore::new());
+        let project_id = Uuid::new_v4();
+
+        for _ in 0..4 {
+            let mut note = Note::new(
+                Some(project_id),
+                NoteType::Observation,
+                "Missing step in execution".to_string(),
+                "runner-feedback".to_string(),
+            );
+            note.tags = vec![
+                "runner-feedback".to_string(),
+                "runner-override-step".to_string(),
+            ];
+            mock.notes.write().await.insert(note.id, note);
+        }
+
+        let analyzer = FeedbackAnalyzer::new(mock as Arc<dyn GraphStore>);
+        let report = analyzer
+            .analyze_runner_feedback(Some(project_id))
+            .await
+            .unwrap();
+
+        assert_eq!(report.actionable_count, 1);
+        let pattern = report.patterns.first().unwrap();
+        assert_eq!(
+            pattern.pattern_type,
+            FeedbackPatternType::MissingStepComplaint
+        );
+        assert!(matches!(
+            pattern.suggestion,
+            PatternSuggestion::AddMissingStep
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_classify_episode_tag() {
+        let mock = Arc::new(MockGraphStore::new());
+        let project_id = Uuid::new_v4();
+
+        let mut note = Note::new(
+            Some(project_id),
+            NoteType::Observation,
+            "Episode data".to_string(),
+            "runner-feedback".to_string(),
+        );
+        note.tags = vec!["runner-feedback".to_string(), "runner-episode".to_string()];
+        mock.notes.write().await.insert(note.id, note);
+
+        let analyzer = FeedbackAnalyzer::new(mock as Arc<dyn GraphStore>);
+        let report = analyzer
+            .analyze_runner_feedback(Some(project_id))
+            .await
+            .unwrap();
+
+        assert_eq!(report.total_notes_analyzed, 1);
+        // Episode notes go to "episode" bucket, not actionable with 1 entry
+        assert_eq!(report.actionable_count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_classify_fallback_other() {
+        let mock = Arc::new(MockGraphStore::new());
+        let project_id = Uuid::new_v4();
+
+        let mut note = Note::new(
+            Some(project_id),
+            NoteType::Observation,
+            "Some generic feedback".to_string(),
+            "runner-feedback".to_string(),
+        );
+        note.tags = vec!["runner-feedback".to_string()];
+        mock.notes.write().await.insert(note.id, note);
+
+        let analyzer = FeedbackAnalyzer::new(mock as Arc<dyn GraphStore>);
+        let report = analyzer
+            .analyze_runner_feedback(Some(project_id))
+            .await
+            .unwrap();
+
+        assert_eq!(report.total_notes_analyzed, 1);
+        assert_eq!(report.actionable_count, 0);
+    }
+
+    // ========================================================================
+    // generate_protocol_spec & generate_rationale — all suggestion variants
+    // ========================================================================
+
+    fn make_detected_pattern(
+        suggestion: PatternSuggestion,
+        pattern_type: FeedbackPatternType,
+        count: usize,
+    ) -> DetectedPattern {
+        DetectedPattern {
+            pattern_type,
+            count,
+            evidence_note_ids: vec![Uuid::new_v4()],
+            run_ids: vec![Uuid::new_v4()],
+            is_actionable: count > PATTERN_THRESHOLD,
+            suggestion,
+        }
+    }
+
+    #[test]
+    fn test_protocol_spec_upgrade_to_full() {
+        let analyzer = FeedbackAnalyzer::new(Arc::new(MockGraphStore::new()));
+        let pattern = make_detected_pattern(
+            PatternSuggestion::UpgradeToFull,
+            FeedbackPatternType::ManualCommitPostRun,
+            5,
+        );
+        let spec = analyzer.generate_protocol_spec(&pattern);
+        assert!(spec.contains("plan-runner-full-upgraded"));
+        assert!(spec.contains("creating_pr"));
+    }
+
+    #[test]
+    fn test_protocol_spec_downgrade_to_light() {
+        let analyzer = FeedbackAnalyzer::new(Arc::new(MockGraphStore::new()));
+        let pattern = make_detected_pattern(
+            PatternSuggestion::DowngradeToLight,
+            FeedbackPatternType::SkipPrInFullRun,
+            5,
+        );
+        let spec = analyzer.generate_protocol_spec(&pattern);
+        assert!(spec.contains("plan-runner-light-downgraded"));
+        assert!(!spec.contains("creating_pr"));
+    }
+
+    #[test]
+    fn test_protocol_spec_create_variant_without() {
+        let analyzer = FeedbackAnalyzer::new(Arc::new(MockGraphStore::new()));
+        let pattern = make_detected_pattern(
+            PatternSuggestion::CreateVariantWithout {
+                state_name: "review".into(),
+            },
+            FeedbackPatternType::RepeatedStateOverride {
+                state_name: "review".into(),
+            },
+            5,
+        );
+        let spec = analyzer.generate_protocol_spec(&pattern);
+        assert!(spec.contains("plan-runner-no-review"));
+        assert!(spec.contains("removed_state"));
+    }
+
+    #[test]
+    fn test_protocol_spec_formalize_transition() {
+        let analyzer = FeedbackAnalyzer::new(Arc::new(MockGraphStore::new()));
+        let pattern = make_detected_pattern(
+            PatternSuggestion::FormalizeTransition {
+                trigger_name: "fast_path".into(),
+            },
+            FeedbackPatternType::RepeatedCustomTransition {
+                trigger_name: "fast_path".into(),
+            },
+            5,
+        );
+        let spec = analyzer.generate_protocol_spec(&pattern);
+        assert!(spec.contains("plan-runner-with-fast_path"));
+        assert!(spec.contains("added_transition"));
+    }
+
+    #[test]
+    fn test_protocol_spec_add_missing_step() {
+        let analyzer = FeedbackAnalyzer::new(Arc::new(MockGraphStore::new()));
+        let pattern = make_detected_pattern(
+            PatternSuggestion::AddMissingStep,
+            FeedbackPatternType::MissingStepComplaint,
+            5,
+        );
+        let spec = analyzer.generate_protocol_spec(&pattern);
+        assert!(spec.contains("plan-runner-extended"));
+    }
+
+    #[test]
+    fn test_protocol_spec_keep_collecting() {
+        let analyzer = FeedbackAnalyzer::new(Arc::new(MockGraphStore::new()));
+        let pattern = make_detected_pattern(
+            PatternSuggestion::KeepCollecting,
+            FeedbackPatternType::ManualCommitPostRun,
+            2,
+        );
+        let spec = analyzer.generate_protocol_spec(&pattern);
+        assert_eq!(spec, "{}");
+    }
+
+    #[test]
+    fn test_rationale_upgrade() {
+        let analyzer = FeedbackAnalyzer::new(Arc::new(MockGraphStore::new()));
+        let pattern = make_detected_pattern(
+            PatternSuggestion::UpgradeToFull,
+            FeedbackPatternType::ManualCommitPostRun,
+            5,
+        );
+        let rationale = analyzer.generate_rationale(&pattern);
+        assert!(rationale.contains("manually created commits"));
+    }
+
+    #[test]
+    fn test_rationale_downgrade() {
+        let analyzer = FeedbackAnalyzer::new(Arc::new(MockGraphStore::new()));
+        let pattern = make_detected_pattern(
+            PatternSuggestion::DowngradeToLight,
+            FeedbackPatternType::SkipPrInFullRun,
+            5,
+        );
+        let rationale = analyzer.generate_rationale(&pattern);
+        assert!(rationale.contains("skipped the PR creation step"));
+    }
+
+    #[test]
+    fn test_rationale_create_variant() {
+        let analyzer = FeedbackAnalyzer::new(Arc::new(MockGraphStore::new()));
+        let pattern = make_detected_pattern(
+            PatternSuggestion::CreateVariantWithout {
+                state_name: "pr".into(),
+            },
+            FeedbackPatternType::RepeatedStateOverride {
+                state_name: "pr".into(),
+            },
+            5,
+        );
+        let rationale = analyzer.generate_rationale(&pattern);
+        assert!(rationale.contains("overrode the 'pr' state"));
+    }
+
+    #[test]
+    fn test_rationale_formalize_transition() {
+        let analyzer = FeedbackAnalyzer::new(Arc::new(MockGraphStore::new()));
+        let pattern = make_detected_pattern(
+            PatternSuggestion::FormalizeTransition {
+                trigger_name: "skip".into(),
+            },
+            FeedbackPatternType::RepeatedCustomTransition {
+                trigger_name: "skip".into(),
+            },
+            5,
+        );
+        let rationale = analyzer.generate_rationale(&pattern);
+        assert!(rationale.contains("custom 'skip' transition"));
+    }
+
+    #[test]
+    fn test_rationale_add_missing_step() {
+        let analyzer = FeedbackAnalyzer::new(Arc::new(MockGraphStore::new()));
+        let pattern = make_detected_pattern(
+            PatternSuggestion::AddMissingStep,
+            FeedbackPatternType::MissingStepComplaint,
+            5,
+        );
+        let rationale = analyzer.generate_rationale(&pattern);
+        assert!(rationale.contains("complaints about missing steps"));
+    }
+
+    #[test]
+    fn test_rationale_keep_collecting() {
+        let analyzer = FeedbackAnalyzer::new(Arc::new(MockGraphStore::new()));
+        let pattern = make_detected_pattern(
+            PatternSuggestion::KeepCollecting,
+            FeedbackPatternType::ManualCommitPostRun,
+            2,
+        );
+        let rationale = analyzer.generate_rationale(&pattern);
+        assert!(rationale.contains("Not enough data"));
+    }
+
+    // ========================================================================
+    // build_rfc_content
+    // ========================================================================
+
+    #[test]
+    fn test_build_rfc_content_includes_all_sections() {
+        let analyzer = FeedbackAnalyzer::new(Arc::new(MockGraphStore::new()));
+        let pattern = make_detected_pattern(
+            PatternSuggestion::UpgradeToFull,
+            FeedbackPatternType::ManualCommitPostRun,
+            5,
+        );
+        let content = analyzer.build_rfc_content(&pattern);
+        assert!(content.contains("## RFC: Protocol Adjustment"));
+        assert!(content.contains("### Problem Detected"));
+        assert!(content.contains("### Evidence"));
+        assert!(content.contains("### Proposed Protocol"));
+        assert!(content.contains("```json"));
+        assert!(content.contains("### Rationale"));
+        assert!(content.contains("### Status"));
+        assert!(content.contains("Proposed"));
+    }
+
+    // ========================================================================
+    // apply_accepted_rfc edge cases
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_apply_rfc_wrong_note_type() {
+        let mock = Arc::new(MockGraphStore::new());
+        let project_id = Uuid::new_v4();
+
+        // Create a note that's NOT an RFC
+        let mut note = Note::new(
+            Some(project_id),
+            NoteType::Tip, // wrong type
+            "Not an RFC".to_string(),
+            "some tip".to_string(),
+        );
+        note.tags = vec!["runner-feedback-rfc".to_string()];
+        let note_id = note.id;
+        mock.notes.write().await.insert(note_id, note);
+
+        let analyzer = FeedbackAnalyzer::new(mock as Arc<dyn GraphStore>);
+        let result = analyzer
+            .apply_accepted_rfc(note_id, project_id)
+            .await
+            .unwrap();
+        assert!(result.is_none(), "Should reject non-RFC note type");
+    }
+
+    #[tokio::test]
+    async fn test_apply_rfc_missing_tag() {
+        let mock = Arc::new(MockGraphStore::new());
+        let project_id = Uuid::new_v4();
+
+        // Create an RFC without the required tag
+        let note = Note::new(
+            Some(project_id),
+            NoteType::Rfc,
+            "```json\n{\"name\": \"test\"}\n```".to_string(),
+            "RFC without tag".to_string(),
+        );
+        let note_id = note.id;
+        mock.notes.write().await.insert(note_id, note);
+
+        let analyzer = FeedbackAnalyzer::new(mock as Arc<dyn GraphStore>);
+        let result = analyzer
+            .apply_accepted_rfc(note_id, project_id)
+            .await
+            .unwrap();
+        assert!(result.is_none(), "Should reject RFC without feedback tag");
+    }
+
+    // ========================================================================
+    // Trust edge cases
+    // ========================================================================
+
+    #[test]
+    fn test_trust_new_with_many_episodes() {
+        // 10+ episodes → base = 0.3 + min(10*0.02, 0.15) = 0.45
+        let trust = ProtocolTrust::new(10);
+        assert!((trust.score - 0.45).abs() < 0.01);
+        assert_eq!(trust.status, TrustStatus::Emerging);
+    }
+
+    #[test]
+    fn test_trust_new_capped_at_045() {
+        // 100 episodes → still capped at 0.3 + 0.15 = 0.45
+        let trust = ProtocolTrust::new(100);
+        assert!((trust.score - 0.45).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_trust_zero_episodes() {
+        let trust = ProtocolTrust::new(0);
+        assert!((trust.score - 0.3).abs() < 0.01);
+        assert_eq!(trust.status, TrustStatus::Emerging);
+    }
+
+    #[test]
+    fn test_compute_trust_all_negative() {
+        let trust = FeedbackAnalyzer::compute_trust(0, 0, 10);
+        assert_eq!(trust.score, 0.0);
+        assert_eq!(trust.status, TrustStatus::Emerging);
+    }
+
+    // ========================================================================
+    // extract_field edge cases
+    // ========================================================================
+
+    #[test]
+    fn test_extract_field_empty_value() {
+        let analyzer = FeedbackAnalyzer::new(Arc::new(MockGraphStore::new()));
+        let content = "**Empty field**: \n**Next**: value\n";
+        assert_eq!(analyzer.extract_field(content, "Empty field"), None);
+    }
+
+    #[test]
+    fn test_extract_field_at_end_of_content() {
+        let analyzer = FeedbackAnalyzer::new(Arc::new(MockGraphStore::new()));
+        let content = "**Last field**: final_value";
+        assert_eq!(
+            analyzer.extract_field(content, "Last field"),
+            Some("final_value".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_run_id_invalid_uuid() {
+        let analyzer = FeedbackAnalyzer::new(Arc::new(MockGraphStore::new()));
+        let content = "**Run ID**: not-a-uuid\n";
+        assert_eq!(analyzer.extract_run_id_from_content(content), None);
+    }
+
+    #[test]
+    fn test_extract_run_id_missing() {
+        let analyzer = FeedbackAnalyzer::new(Arc::new(MockGraphStore::new()));
+        let content = "No run id here";
+        assert_eq!(analyzer.extract_run_id_from_content(content), None);
+    }
+
+    // ========================================================================
+    // key_to_pattern_type
+    // ========================================================================
+
+    #[test]
+    fn test_key_to_pattern_type_variants() {
+        let analyzer = FeedbackAnalyzer::new(Arc::new(MockGraphStore::new()));
+
+        assert_eq!(
+            analyzer.key_to_pattern_type("manual_commit_post_run"),
+            FeedbackPatternType::ManualCommitPostRun
+        );
+        assert_eq!(
+            analyzer.key_to_pattern_type("chat_dissatisfaction"),
+            FeedbackPatternType::MissingStepComplaint
+        );
+        assert_eq!(
+            analyzer.key_to_pattern_type("missing_step"),
+            FeedbackPatternType::MissingStepComplaint
+        );
+        assert!(matches!(
+            analyzer.key_to_pattern_type("state_override:review"),
+            FeedbackPatternType::RepeatedStateOverride { state_name } if state_name == "review"
+        ));
+        assert!(matches!(
+            analyzer.key_to_pattern_type("custom_transition:skip"),
+            FeedbackPatternType::RepeatedCustomTransition { trigger_name } if trigger_name == "skip"
+        ));
+        // Unknown key falls back to MissingStepComplaint
+        assert_eq!(
+            analyzer.key_to_pattern_type("unknown_key"),
+            FeedbackPatternType::MissingStepComplaint
+        );
+    }
+
+    // ========================================================================
+    // map_key_to_pattern above threshold
+    // ========================================================================
+
+    #[test]
+    fn test_map_key_chat_dissatisfaction_above_threshold() {
+        let analyzer = FeedbackAnalyzer::new(Arc::new(MockGraphStore::new()));
+        let (pt, suggestion) = analyzer.map_key_to_pattern("chat_dissatisfaction", 5);
+        assert_eq!(pt, FeedbackPatternType::MissingStepComplaint);
+        assert!(matches!(suggestion, PatternSuggestion::AddMissingStep));
+    }
+
+    #[test]
+    fn test_map_key_unknown_above_threshold() {
+        let analyzer = FeedbackAnalyzer::new(Arc::new(MockGraphStore::new()));
+        let (_, suggestion) = analyzer.map_key_to_pattern("some_random_key", 5);
+        assert!(matches!(suggestion, PatternSuggestion::KeepCollecting));
+    }
+
+    // ========================================================================
+    // Serde round-trip
+    // ========================================================================
+
+    #[test]
+    fn test_feedback_report_serde() {
+        let report = FeedbackReport {
+            total_notes_analyzed: 10,
+            patterns: vec![DetectedPattern {
+                pattern_type: FeedbackPatternType::ManualCommitPostRun,
+                count: 5,
+                evidence_note_ids: vec![Uuid::new_v4()],
+                run_ids: vec![Uuid::new_v4()],
+                is_actionable: true,
+                suggestion: PatternSuggestion::UpgradeToFull,
+            }],
+            actionable_count: 1,
+            analyzed_at: "2024-01-01T00:00:00Z".into(),
+        };
+        let json = serde_json::to_string(&report).unwrap();
+        let back: FeedbackReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.total_notes_analyzed, 10);
+        assert_eq!(back.patterns.len(), 1);
+        assert_eq!(back.actionable_count, 1);
+    }
+
+    #[test]
+    fn test_protocol_trust_serde() {
+        let trust = ProtocolTrust::new(5);
+        let json = serde_json::to_string(&trust).unwrap();
+        let back: ProtocolTrust = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.source_episode_count, 5);
+        assert_eq!(back.status, TrustStatus::Emerging);
+    }
+
+    #[test]
+    fn test_applied_protocol_serde() {
+        let applied = AppliedProtocol {
+            name: "test".into(),
+            description: "desc".into(),
+            project_id: Uuid::new_v4(),
+            protocol_spec: serde_json::json!({"name": "test"}),
+            trust: ProtocolTrust::new(3),
+            rfc_note_id: Uuid::new_v4(),
+        };
+        let json = serde_json::to_string(&applied).unwrap();
+        let back: AppliedProtocol = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.name, "test");
+    }
+
+    // ========================================================================
+    // RFC generation with multiple patterns
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_generate_rfc_skips_non_actionable() {
+        let mock = Arc::new(MockGraphStore::new());
+        let project_id = Uuid::new_v4();
+
+        // Create only 2 manual action notes (below threshold)
+        create_feedback_notes(
+            &mock,
+            project_id,
+            "runner-manual-action",
+            2,
+            "## Manual\n**Run ID**: {run_id}\n",
+        )
+        .await;
+
+        let analyzer = FeedbackAnalyzer::new(mock.clone() as Arc<dyn GraphStore>);
+        let report = analyzer
+            .analyze_runner_feedback(Some(project_id))
+            .await
+            .unwrap();
+        let rfc_ids = analyzer
+            .generate_rfc_proposals(project_id, &report)
+            .await
+            .unwrap();
+
+        assert!(
+            rfc_ids.is_empty(),
+            "Should not generate RFC for non-actionable patterns"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_generate_multiple_rfcs() {
+        let mock = Arc::new(MockGraphStore::new());
+        let project_id = Uuid::new_v4();
+
+        // 5 manual-action notes (actionable)
+        create_feedback_notes(
+            &mock,
+            project_id,
+            "runner-manual-action",
+            5,
+            "## Manual\n**Run ID**: {run_id}\n",
+        )
+        .await;
+
+        // 4 chat-feedback notes (actionable)
+        create_feedback_notes(
+            &mock,
+            project_id,
+            "runner-chat-feedback",
+            4,
+            "## Chat\n**Run ID**: {run_id}\n",
+        )
+        .await;
+
+        let analyzer = FeedbackAnalyzer::new(mock.clone() as Arc<dyn GraphStore>);
+        let report = analyzer
+            .analyze_runner_feedback(Some(project_id))
+            .await
+            .unwrap();
+        let rfc_ids = analyzer
+            .generate_rfc_proposals(project_id, &report)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            rfc_ids.len(),
+            2,
+            "Should generate 2 RFCs for 2 actionable patterns"
+        );
+    }
+
+    // ========================================================================
+    // apply_accepted_rfc — extract defaults
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_apply_rfc_missing_fields_uses_defaults() {
+        let mock = Arc::new(MockGraphStore::new());
+        let project_id = Uuid::new_v4();
+
+        // RFC with minimal JSON (no name, no description, no evidence_count)
+        let mut rfc = Note::new(
+            Some(project_id),
+            NoteType::Rfc,
+            "## RFC\n```json\n{\"states\": []}\n```\n".to_string(),
+            "RFC minimal".to_string(),
+        );
+        rfc.tags = vec!["runner-feedback-rfc".to_string()];
+        let rfc_id = rfc.id;
+        mock.notes.write().await.insert(rfc_id, rfc);
+
+        let analyzer = FeedbackAnalyzer::new(mock as Arc<dyn GraphStore>);
+        let result = analyzer
+            .apply_accepted_rfc(rfc_id, project_id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(result.name, "feedback-protocol"); // default
+        assert_eq!(result.description, ""); // default
+        assert_eq!(result.trust.source_episode_count, 0); // default
+    }
 }
