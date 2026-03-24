@@ -37,7 +37,7 @@ pub struct GraphSAGEConfig {
 impl Default for GraphSAGEConfig {
     fn default() -> Self {
         Self {
-            input_dim: 168,
+            input_dim: 169,
             output_dim: 256,
             num_relations: 8,
             dropout: 0.1,
@@ -384,7 +384,7 @@ mod tests {
     fn test_graphsage_100_nodes() -> Result<()> {
         let device = Device::Cpu;
         let num_nodes = 100;
-        let input_dim = 168;
+        let input_dim = 169;
 
         let x = Tensor::randn(0.0f32, 1.0, (num_nodes, input_dim), &device)?;
 
@@ -405,7 +405,7 @@ mod tests {
         let varmap = VarMap::new();
         let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
 
-        let model = GraphSAGE::new(168, 256, 256, 3, 8, 0.0, vb)?;
+        let model = GraphSAGE::new(169, 256, 256, 3, 8, 0.0, vb)?;
         let output = model.forward(&x, &edge_index, Some(&edge_type), num_nodes)?;
 
         assert_eq!(output.dims(), &[100, 256]);

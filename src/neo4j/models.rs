@@ -2235,6 +2235,63 @@ impl AlertNode {
     }
 }
 
+// ============================================================================
+// MCP Federation nodes
+// ============================================================================
+
+/// An external MCP server registered in the knowledge graph.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpServerNode {
+    pub id: Uuid,
+    /// Project this server is associated with.
+    pub project_id: Uuid,
+    /// Unique server identifier (used as key in registry, e.g., "grafeo").
+    pub server_id: String,
+    /// Human-readable display name.
+    pub display_name: String,
+    /// Transport type: "stdio", "sse", or "streamable_http".
+    pub transport_type: String,
+    /// Transport URL (for SSE/StreamableHTTP).
+    pub transport_url: Option<String>,
+    /// Transport command (for Stdio).
+    pub transport_command: Option<String>,
+    /// Transport args (for Stdio, JSON array as string).
+    pub transport_args: Option<String>,
+    /// Current connection status: "connected", "disconnected", "error".
+    pub status: String,
+    /// MCP protocol version reported by the server.
+    pub protocol_version: Option<String>,
+    /// Server name reported during initialization.
+    pub server_name: Option<String>,
+    /// Number of tools discovered on this server.
+    pub tool_count: usize,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: Option<DateTime<Utc>>,
+    pub last_connected_at: Option<DateTime<Utc>>,
+}
+
+/// An external MCP tool discovered on a federated server.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpToolNode {
+    pub id: Uuid,
+    /// The server this tool belongs to.
+    pub server_id: String,
+    /// Tool name (local to the server).
+    pub name: String,
+    /// Fully-qualified name: `server_id::tool_name`.
+    pub fqn: String,
+    /// Tool description from the server.
+    pub description: String,
+    /// JSON Schema of the tool's input parameters (stored as JSON string).
+    pub input_schema: String,
+    /// Inferred category: "query", "mutation", "action", "analysis", "unknown".
+    pub category: String,
+    /// Optional embedding vector (stored as JSON array).
+    pub embedding: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: Option<DateTime<Utc>>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2837,6 +2894,151 @@ mod tests {
 
         let serialized = serde_json::to_string(&PersonaOrigin::AutoBuild).unwrap();
         assert_eq!(serialized, r#""auto_build""#);
+    }
+
+    #[test]
+    fn test_mcp_server_node_serialization_roundtrip() {
+        let node = McpServerNode {
+            id: Uuid::new_v4(),
+            project_id: Uuid::new_v4(),
+            server_id: "grafeo".to_string(),
+            display_name: "Grafeo Knowledge Graph".to_string(),
+            transport_type: "sse".to_string(),
+            transport_url: Some("http://localhost:8080/sse".to_string()),
+            transport_command: None,
+            transport_args: None,
+            status: "connected".to_string(),
+            protocol_version: Some("2025-03-26".to_string()),
+            server_name: Some("Grafeo".to_string()),
+            tool_count: 5,
+            created_at: Utc::now(),
+            updated_at: None,
+            last_connected_at: Some(Utc::now()),
+        };
+
+        let json = serde_json::to_string(&node).unwrap();
+        let de: McpServerNode = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(de.id, node.id);
+        assert_eq!(de.project_id, node.project_id);
+        assert_eq!(de.server_id, "grafeo");
+        assert_eq!(de.display_name, "Grafeo Knowledge Graph");
+        assert_eq!(de.transport_type, "sse");
+        assert_eq!(
+            de.transport_url.as_deref(),
+            Some("http://localhost:8080/sse")
+        );
+        assert!(de.transport_command.is_none());
+        assert!(de.transport_args.is_none());
+        assert_eq!(de.status, "connected");
+        assert_eq!(de.protocol_version.as_deref(), Some("2025-03-26"));
+        assert_eq!(de.server_name.as_deref(), Some("Grafeo"));
+        assert_eq!(de.tool_count, 5);
+        assert!(de.updated_at.is_none());
+        assert!(de.last_connected_at.is_some());
+    }
+
+    #[test]
+    fn test_mcp_server_node_stdio_transport() {
+        let node = McpServerNode {
+            id: Uuid::new_v4(),
+            project_id: Uuid::new_v4(),
+            server_id: "github-mcp".to_string(),
+            display_name: "GitHub".to_string(),
+            transport_type: "stdio".to_string(),
+            transport_url: None,
+            transport_command: Some("npx".to_string()),
+            transport_args: Some(r#"["-y","@modelcontextprotocol/server-github"]"#.to_string()),
+            status: "connected".to_string(),
+            protocol_version: Some("2024-11-05".to_string()),
+            server_name: None,
+            tool_count: 10,
+            created_at: Utc::now(),
+            updated_at: None,
+            last_connected_at: None,
+        };
+
+        let json = serde_json::to_string(&node).unwrap();
+        let de: McpServerNode = serde_json::from_str(&json).unwrap();
+        assert_eq!(de.transport_type, "stdio");
+        assert_eq!(de.transport_command.as_deref(), Some("npx"));
+        assert!(de.transport_url.is_none());
+        assert!(de.server_name.is_none());
+    }
+
+    #[test]
+    fn test_mcp_tool_node_serialization_roundtrip() {
+        let tool = McpToolNode {
+            id: Uuid::new_v4(),
+            server_id: "grafeo".to_string(),
+            name: "run_cypher".to_string(),
+            fqn: "grafeo::run_cypher".to_string(),
+            description: "Execute a Cypher query against the knowledge graph".to_string(),
+            input_schema:
+                r#"{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}"#
+                    .to_string(),
+            category: "query".to_string(),
+            embedding: Some("[0.1,0.2,0.3]".to_string()),
+            created_at: Utc::now(),
+            updated_at: None,
+        };
+
+        let json = serde_json::to_string(&tool).unwrap();
+        let de: McpToolNode = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(de.id, tool.id);
+        assert_eq!(de.server_id, "grafeo");
+        assert_eq!(de.name, "run_cypher");
+        assert_eq!(de.fqn, "grafeo::run_cypher");
+        assert!(de.description.contains("Cypher query"));
+        assert!(de.input_schema.contains("query"));
+        assert_eq!(de.category, "query");
+        assert!(de.embedding.is_some());
+        assert!(de.updated_at.is_none());
+    }
+
+    #[test]
+    fn test_mcp_tool_node_without_embedding() {
+        let tool = McpToolNode {
+            id: Uuid::new_v4(),
+            server_id: "srv".to_string(),
+            name: "ping".to_string(),
+            fqn: "srv::ping".to_string(),
+            description: "Health check".to_string(),
+            input_schema: "{}".to_string(),
+            category: "action".to_string(),
+            embedding: None,
+            created_at: Utc::now(),
+            updated_at: Some(Utc::now()),
+        };
+
+        let json = serde_json::to_string(&tool).unwrap();
+        let de: McpToolNode = serde_json::from_str(&json).unwrap();
+        assert!(de.embedding.is_none());
+        assert!(de.updated_at.is_some());
+    }
+
+    #[test]
+    fn test_mcp_tool_node_all_categories() {
+        for category in &[
+            "query", "search", "mutation", "create", "delete", "action", "analysis", "unknown",
+        ] {
+            let tool = McpToolNode {
+                id: Uuid::new_v4(),
+                server_id: "srv".to_string(),
+                name: "tool".to_string(),
+                fqn: "srv::tool".to_string(),
+                description: "desc".to_string(),
+                input_schema: "{}".to_string(),
+                category: category.to_string(),
+                embedding: None,
+                created_at: Utc::now(),
+                updated_at: None,
+            };
+            let json = serde_json::to_string(&tool).unwrap();
+            let de: McpToolNode = serde_json::from_str(&json).unwrap();
+            assert_eq!(de.category, *category);
+        }
     }
 
     #[test]

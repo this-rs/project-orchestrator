@@ -10,6 +10,7 @@ use super::episode_handlers;
 use super::feedback_handlers;
 use super::handlers::{self, OrchestratorState};
 use super::hook_handlers;
+use super::mcp_federation_handlers;
 use super::neural_routing_handlers;
 use super::note_handlers;
 use super::persona_handlers;
@@ -1667,6 +1668,31 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/chat/cli/auth-status",
             get(chat_handlers::get_cli_auth_status),
         )
+        // ================================================================
+        // MCP Federation (external MCP server connections)
+        // ================================================================
+        .route(
+            "/api/mcp-federation/servers",
+            get(mcp_federation_handlers::list_servers)
+                .post(mcp_federation_handlers::connect_server),
+        )
+        .route(
+            "/api/mcp-federation/servers/{id}",
+            get(mcp_federation_handlers::get_server_status)
+                .delete(mcp_federation_handlers::disconnect_server),
+        )
+        .route(
+            "/api/mcp-federation/servers/{id}/tools",
+            get(mcp_federation_handlers::list_server_tools),
+        )
+        .route(
+            "/api/mcp-federation/servers/{id}/probe",
+            post(mcp_federation_handlers::probe_server),
+        )
+        .route(
+            "/api/mcp-federation/servers/{id}/reconnect",
+            post(mcp_federation_handlers::reconnect_server),
+        )
 }
 
 // ============================================================================
@@ -1714,6 +1740,7 @@ mod tests {
             identity: None,
             reactor_counters: std::sync::OnceLock::new(),
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
+            mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
         });
         create_router(state)
     }
@@ -1747,6 +1774,7 @@ mod tests {
             identity: None,
             reactor_counters: std::sync::OnceLock::new(),
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
+            mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
         });
         create_router(state)
     }

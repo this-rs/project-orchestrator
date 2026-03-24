@@ -190,6 +190,20 @@ pub struct MockGraphStore {
     // LifecycleHook stores
     pub lifecycle_hooks: RwLock<HashMap<Uuid, LifecycleHook>>,
 
+    // MCP Federation stores
+    pub mcp_servers: RwLock<HashMap<Uuid, McpServerNode>>,
+    pub mcp_tools: RwLock<HashMap<Uuid, McpToolNode>>,
+    /// server_id (string) -> Vec<tool_id>
+    pub mcp_server_tools: RwLock<HashMap<String, Vec<Uuid>>>,
+    /// project_id -> Vec<server_id (uuid)>
+    pub mcp_project_servers: RwLock<HashMap<Uuid, Vec<Uuid>>>,
+    /// fqn -> fqn -> score (SIMILAR_TO)
+    pub mcp_similar_to: RwLock<HashMap<(String, String), f64>>,
+    /// fqn -> fqn -> count (CO_ACTIVATED_WITH)
+    pub mcp_co_activated: RwLock<HashMap<(String, String), i64>>,
+    /// fqn -> fqn -> (count, avg_delta_ms) (OFTEN_FOLLOWS)
+    pub mcp_often_follows: RwLock<HashMap<(String, String), (i64, f64)>>,
+
     // Test flags
     /// Controls what `has_context_cards()` returns (default: false)
     pub mock_has_context_cards: std::sync::atomic::AtomicBool,
@@ -293,6 +307,13 @@ impl MockGraphStore {
             works_on: RwLock::new(HashMap::new()),
             alerts: RwLock::new(HashMap::new()),
             lifecycle_hooks: RwLock::new(HashMap::new()),
+            mcp_servers: RwLock::new(HashMap::new()),
+            mcp_tools: RwLock::new(HashMap::new()),
+            mcp_server_tools: RwLock::new(HashMap::new()),
+            mcp_project_servers: RwLock::new(HashMap::new()),
+            mcp_similar_to: RwLock::new(HashMap::new()),
+            mcp_co_activated: RwLock::new(HashMap::new()),
+            mcp_often_follows: RwLock::new(HashMap::new()),
             mock_has_context_cards: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -10763,6 +10784,158 @@ impl GraphStore for MockGraphStore {
         result.sort_by_key(|h| h.priority);
         Ok(result)
     }
+
+    // ========================================================================
+    // MCP Federation operations
+    // ========================================================================
+
+    async fn create_mcp_server(&self, server: &McpServerNode) -> Result<()> {
+        let sid = server.id;
+        self.mcp_project_servers
+            .write()
+            .await
+            .entry(server.project_id)
+            .or_default()
+            .push(sid);
+        self.mcp_servers.write().await.insert(sid, server.clone());
+        Ok(())
+    }
+
+    async fn get_mcp_server(&self, id: Uuid) -> Result<Option<McpServerNode>> {
+        Ok(self.mcp_servers.read().await.get(&id).cloned())
+    }
+
+    async fn list_mcp_servers(&self, project_id: Uuid) -> Result<Vec<McpServerNode>> {
+        let idx = self.mcp_project_servers.read().await;
+        let servers = self.mcp_servers.read().await;
+        let ids = idx.get(&project_id).cloned().unwrap_or_default();
+        let mut result: Vec<_> = ids
+            .iter()
+            .filter_map(|id| servers.get(id).cloned())
+            .collect();
+        result.sort_by(|a, b| a.server_id.cmp(&b.server_id));
+        Ok(result)
+    }
+
+    async fn delete_mcp_server(&self, id: Uuid) -> Result<()> {
+        if let Some(server) = self.mcp_servers.write().await.remove(&id) {
+            // Remove from project index
+            if let Some(ids) = self
+                .mcp_project_servers
+                .write()
+                .await
+                .get_mut(&server.project_id)
+            {
+                ids.retain(|i| *i != id);
+            }
+            // Remove associated tools
+            let server_id = server.server_id;
+            let tool_ids = self
+                .mcp_server_tools
+                .write()
+                .await
+                .remove(&server_id)
+                .unwrap_or_default();
+            let mut tools = self.mcp_tools.write().await;
+            for tid in tool_ids {
+                tools.remove(&tid);
+            }
+        }
+        Ok(())
+    }
+
+    async fn update_mcp_server_status(&self, id: Uuid, status: &str) -> Result<()> {
+        if let Some(s) = self.mcp_servers.write().await.get_mut(&id) {
+            s.status = status.to_string();
+            s.updated_at = Some(Utc::now());
+        }
+        Ok(())
+    }
+
+    async fn create_mcp_tool(&self, tool: &McpToolNode) -> Result<()> {
+        let tid = tool.id;
+        self.mcp_server_tools
+            .write()
+            .await
+            .entry(tool.server_id.clone())
+            .or_default()
+            .push(tid);
+        self.mcp_tools.write().await.insert(tid, tool.clone());
+        Ok(())
+    }
+
+    async fn list_mcp_tools_for_server(&self, server_id: &str) -> Result<Vec<McpToolNode>> {
+        let idx = self.mcp_server_tools.read().await;
+        let tools = self.mcp_tools.read().await;
+        let ids = idx.get(server_id).cloned().unwrap_or_default();
+        let mut result: Vec<_> = ids.iter().filter_map(|id| tools.get(id).cloned()).collect();
+        result.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(result)
+    }
+
+    async fn delete_mcp_tools_for_server(&self, server_id: &str) -> Result<()> {
+        let tool_ids = self
+            .mcp_server_tools
+            .write()
+            .await
+            .remove(server_id)
+            .unwrap_or_default();
+        let mut tools = self.mcp_tools.write().await;
+        for tid in tool_ids {
+            tools.remove(&tid);
+        }
+        Ok(())
+    }
+
+    async fn create_mcp_similar_to(
+        &self,
+        tool_fqn: &str,
+        similar_to_fqn: &str,
+        score: f64,
+    ) -> Result<()> {
+        self.mcp_similar_to
+            .write()
+            .await
+            .insert((tool_fqn.to_string(), similar_to_fqn.to_string()), score);
+        Ok(())
+    }
+
+    async fn create_mcp_co_activated(
+        &self,
+        tool_fqn_a: &str,
+        tool_fqn_b: &str,
+        count: i64,
+    ) -> Result<()> {
+        self.mcp_co_activated
+            .write()
+            .await
+            .insert((tool_fqn_a.to_string(), tool_fqn_b.to_string()), count);
+        Ok(())
+    }
+
+    async fn create_mcp_often_follows(
+        &self,
+        tool_fqn_a: &str,
+        tool_fqn_b: &str,
+        count: i64,
+        avg_delta_ms: f64,
+    ) -> Result<()> {
+        self.mcp_often_follows.write().await.insert(
+            (tool_fqn_a.to_string(), tool_fqn_b.to_string()),
+            (count, avg_delta_ms),
+        );
+        Ok(())
+    }
+
+    async fn backfill_co_activated_with(&self) -> Result<usize> {
+        // Mock: no chat event records to scan, return 0
+        Ok(0)
+    }
+
+    async fn backfill_often_follows(&self) -> Result<usize> {
+        // Mock: no chat event records to scan, return 0
+        Ok(0)
+    }
 }
 
 #[cfg(test)]
@@ -14282,5 +14455,314 @@ mod tests {
             staleness_with_ping,
             staleness_without_ping
         );
+    }
+
+    // ====================================================================
+    // MCP Federation tests
+    // ====================================================================
+
+    fn test_mcp_server(project_id: Uuid) -> McpServerNode {
+        McpServerNode {
+            id: Uuid::new_v4(),
+            project_id,
+            server_id: "test-server".to_string(),
+            display_name: "Test Server".to_string(),
+            transport_type: "stdio".to_string(),
+            transport_url: None,
+            transport_command: Some("echo".to_string()),
+            transport_args: None,
+            status: "connected".to_string(),
+            protocol_version: Some("2024-11-05".to_string()),
+            server_name: Some("TestMCP".to_string()),
+            tool_count: 0,
+            created_at: Utc::now(),
+            updated_at: None,
+            last_connected_at: Some(Utc::now()),
+        }
+    }
+
+    fn test_mcp_tool(server_id: &str, name: &str) -> McpToolNode {
+        McpToolNode {
+            id: Uuid::new_v4(),
+            server_id: server_id.to_string(),
+            name: name.to_string(),
+            fqn: format!("{}::{}", server_id, name),
+            description: format!("Test tool {}", name),
+            input_schema: "{}".to_string(),
+            category: "query".to_string(),
+            embedding: None,
+            created_at: Utc::now(),
+            updated_at: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_mcp_create_and_get_server() {
+        let store = MockGraphStore::new();
+        let project_id = Uuid::new_v4();
+        let server = test_mcp_server(project_id);
+        let server_id = server.id;
+
+        store.create_mcp_server(&server).await.unwrap();
+
+        let retrieved = store.get_mcp_server(server_id).await.unwrap();
+        assert!(retrieved.is_some());
+        let retrieved = retrieved.unwrap();
+        assert_eq!(retrieved.id, server_id);
+        assert_eq!(retrieved.project_id, project_id);
+        assert_eq!(retrieved.server_id, "test-server");
+        assert_eq!(retrieved.display_name, "Test Server");
+        assert_eq!(retrieved.transport_type, "stdio");
+        assert_eq!(retrieved.status, "connected");
+    }
+
+    #[tokio::test]
+    async fn test_mcp_get_server_not_found() {
+        let store = MockGraphStore::new();
+        let result = store.get_mcp_server(Uuid::new_v4()).await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_mcp_list_servers_empty() {
+        let store = MockGraphStore::new();
+        let servers = store.list_mcp_servers(Uuid::new_v4()).await.unwrap();
+        assert!(servers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_mcp_list_servers_multiple() {
+        let store = MockGraphStore::new();
+        let project_id = Uuid::new_v4();
+
+        let mut s1 = test_mcp_server(project_id);
+        s1.server_id = "alpha-server".to_string();
+        let mut s2 = test_mcp_server(project_id);
+        s2.server_id = "beta-server".to_string();
+        // Different project -- should not appear
+        let other_project = Uuid::new_v4();
+        let s3 = test_mcp_server(other_project);
+
+        store.create_mcp_server(&s1).await.unwrap();
+        store.create_mcp_server(&s2).await.unwrap();
+        store.create_mcp_server(&s3).await.unwrap();
+
+        let servers = store.list_mcp_servers(project_id).await.unwrap();
+        assert_eq!(servers.len(), 2);
+        // Sorted by server_id
+        assert_eq!(servers[0].server_id, "alpha-server");
+        assert_eq!(servers[1].server_id, "beta-server");
+
+        // Other project has exactly 1
+        let other = store.list_mcp_servers(other_project).await.unwrap();
+        assert_eq!(other.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_mcp_delete_server_removes_tools_and_index() {
+        let store = MockGraphStore::new();
+        let project_id = Uuid::new_v4();
+        let server = test_mcp_server(project_id);
+        let server_uuid = server.id;
+        let sid = server.server_id.clone();
+
+        store.create_mcp_server(&server).await.unwrap();
+
+        // Add tools to this server
+        let t1 = test_mcp_tool(&sid, "read");
+        let t2 = test_mcp_tool(&sid, "write");
+        store.create_mcp_tool(&t1).await.unwrap();
+        store.create_mcp_tool(&t2).await.unwrap();
+        assert_eq!(
+            store.list_mcp_tools_for_server(&sid).await.unwrap().len(),
+            2
+        );
+
+        // Delete server
+        store.delete_mcp_server(server_uuid).await.unwrap();
+
+        // Server gone
+        assert!(store.get_mcp_server(server_uuid).await.unwrap().is_none());
+        // Tools gone
+        assert!(store
+            .list_mcp_tools_for_server(&sid)
+            .await
+            .unwrap()
+            .is_empty());
+        // Project index empty
+        assert!(store.list_mcp_servers(project_id).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_mcp_delete_server_not_found_is_ok() {
+        let store = MockGraphStore::new();
+        // Deleting a non-existent server should succeed silently
+        store.delete_mcp_server(Uuid::new_v4()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_mcp_update_server_status() {
+        let store = MockGraphStore::new();
+        let project_id = Uuid::new_v4();
+        let server = test_mcp_server(project_id);
+        let server_id = server.id;
+        assert!(server.updated_at.is_none());
+
+        store.create_mcp_server(&server).await.unwrap();
+
+        store
+            .update_mcp_server_status(server_id, "disconnected")
+            .await
+            .unwrap();
+
+        let updated = store.get_mcp_server(server_id).await.unwrap().unwrap();
+        assert_eq!(updated.status, "disconnected");
+        assert!(
+            updated.updated_at.is_some(),
+            "updated_at should be set after status change"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mcp_update_server_status_not_found_is_ok() {
+        let store = MockGraphStore::new();
+        // Updating a non-existent server should succeed silently
+        store
+            .update_mcp_server_status(Uuid::new_v4(), "error")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_mcp_create_and_list_tools() {
+        let store = MockGraphStore::new();
+        let sid = "my-server";
+        let t1 = test_mcp_tool(sid, "get_data");
+        let t2 = test_mcp_tool(sid, "put_data");
+        let t3 = test_mcp_tool("other-server", "unrelated");
+
+        store.create_mcp_tool(&t1).await.unwrap();
+        store.create_mcp_tool(&t2).await.unwrap();
+        store.create_mcp_tool(&t3).await.unwrap();
+
+        let tools = store.list_mcp_tools_for_server(sid).await.unwrap();
+        assert_eq!(tools.len(), 2);
+        // Sorted by name
+        assert_eq!(tools[0].name, "get_data");
+        assert_eq!(tools[1].name, "put_data");
+        assert_eq!(tools[0].fqn, "my-server::get_data");
+
+        // Other server has its own tool
+        let other = store
+            .list_mcp_tools_for_server("other-server")
+            .await
+            .unwrap();
+        assert_eq!(other.len(), 1);
+        assert_eq!(other[0].name, "unrelated");
+    }
+
+    #[tokio::test]
+    async fn test_mcp_list_tools_empty() {
+        let store = MockGraphStore::new();
+        let tools = store
+            .list_mcp_tools_for_server("nonexistent")
+            .await
+            .unwrap();
+        assert!(tools.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_mcp_delete_tools_for_server() {
+        let store = MockGraphStore::new();
+        let sid = "target-server";
+        let other_sid = "keep-server";
+
+        let t1 = test_mcp_tool(sid, "tool_a");
+        let t2 = test_mcp_tool(sid, "tool_b");
+        let t3 = test_mcp_tool(other_sid, "tool_c");
+
+        store.create_mcp_tool(&t1).await.unwrap();
+        store.create_mcp_tool(&t2).await.unwrap();
+        store.create_mcp_tool(&t3).await.unwrap();
+
+        store.delete_mcp_tools_for_server(sid).await.unwrap();
+
+        // Target server tools gone
+        assert!(store
+            .list_mcp_tools_for_server(sid)
+            .await
+            .unwrap()
+            .is_empty());
+        // Other server tools untouched
+        assert_eq!(
+            store
+                .list_mcp_tools_for_server(other_sid)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mcp_create_similar_to() {
+        let store = MockGraphStore::new();
+        store
+            .create_mcp_similar_to("server-a::read", "server-b::fetch", 0.92)
+            .await
+            .unwrap();
+
+        let map = store.mcp_similar_to.read().await;
+        let score = map
+            .get(&("server-a::read".to_string(), "server-b::fetch".to_string()))
+            .copied();
+        assert_eq!(score, Some(0.92));
+    }
+
+    #[tokio::test]
+    async fn test_mcp_create_co_activated() {
+        let store = MockGraphStore::new();
+        store
+            .create_mcp_co_activated("server-a::read", "server-a::write", 17)
+            .await
+            .unwrap();
+
+        let map = store.mcp_co_activated.read().await;
+        let count = map
+            .get(&("server-a::read".to_string(), "server-a::write".to_string()))
+            .copied();
+        assert_eq!(count, Some(17));
+    }
+
+    #[tokio::test]
+    async fn test_mcp_create_often_follows() {
+        let store = MockGraphStore::new();
+        store
+            .create_mcp_often_follows("server-x::init", "server-x::run", 42, 150.5)
+            .await
+            .unwrap();
+
+        let map = store.mcp_often_follows.read().await;
+        let entry = map
+            .get(&("server-x::init".to_string(), "server-x::run".to_string()))
+            .copied();
+        assert_eq!(entry, Some((42, 150.5)));
+    }
+
+    #[tokio::test]
+    async fn test_mcp_similar_to_overwrites() {
+        let store = MockGraphStore::new();
+        store
+            .create_mcp_similar_to("a::x", "b::y", 0.5)
+            .await
+            .unwrap();
+        store
+            .create_mcp_similar_to("a::x", "b::y", 0.99)
+            .await
+            .unwrap();
+
+        let map = store.mcp_similar_to.read().await;
+        let score = map.get(&("a::x".to_string(), "b::y".to_string())).copied();
+        assert_eq!(score, Some(0.99), "Later insert should overwrite earlier");
     }
 }

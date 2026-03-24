@@ -22,6 +22,7 @@ pub mod homeostasis;
 pub mod identity;
 pub mod lifecycle;
 pub mod mcp;
+pub mod mcp_federation;
 pub mod meilisearch;
 pub mod neo4j;
 pub mod neurons;
@@ -100,6 +101,49 @@ pub struct YamlConfig {
     /// Neural routing section (optional — trajectory-based route learning)
     #[serde(default)]
     pub neural_routing: neural_routing_runtime::NeuralRoutingConfig,
+    /// MCP Federation section (optional — connect to external MCP servers)
+    #[serde(default)]
+    pub mcp_federation: McpFederationConfig,
+}
+
+/// MCP Federation configuration section.
+///
+/// Configures PO's ability to connect to external MCP servers as a client,
+/// making their tools available alongside PO's own tools.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct McpFederationConfig {
+    /// Pre-configured servers to connect to on startup.
+    #[serde(default)]
+    pub servers: Vec<ServerPresetConfig>,
+    /// Whether to probe read-only tools on connect (default: true).
+    #[serde(default = "default_true")]
+    pub probe_on_connect: bool,
+    /// Health check interval in seconds (0 = disabled, default: 60).
+    #[serde(default = "default_health_check_interval")]
+    pub health_check_interval_secs: u64,
+    /// Maximum reconnection attempts for failed servers (default: 3).
+    #[serde(default = "default_reconnect_retries")]
+    pub reconnect_max_retries: u32,
+}
+
+/// A pre-configured MCP server to connect to on startup.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ServerPresetConfig {
+    /// Unique server identifier (e.g., "grafeo", "github").
+    pub id: String,
+    /// Human-readable display name (optional, defaults to id).
+    pub display_name: Option<String>,
+    /// Transport configuration.
+    pub transport: mcp_federation::McpTransport,
+}
+
+fn default_health_check_interval() -> u64 {
+    60
+}
+
+fn default_reconnect_retries() -> u32 {
+    3
 }
 
 /// Skill registry configuration section (optional)
@@ -774,6 +818,9 @@ pub struct AppState {
     pub trajectory_store_neo4j: Option<Arc<neural_routing_runtime::Neo4jTrajectoryStore>>,
     /// Trajectory store — Neo4j CRUD + vector search for stored trajectories.
     pub trajectory_store: Arc<dyn neural_routing_runtime::TrajectoryStore>,
+    /// MCP Federation registry — external MCP server connections.
+    /// Always initialized (empty registry). Servers are added/removed dynamically via API.
+    pub mcp_registry: mcp_federation::registry::SharedRegistry,
 }
 
 impl AppState {
@@ -845,6 +892,7 @@ impl AppState {
             trajectory_collector: Arc::new(std::sync::RwLock::new(trajectory_collector_inner)),
             trajectory_store_neo4j: Some(nr_store.clone()),
             trajectory_store: trajectory_store_api,
+            mcp_registry: mcp_federation::registry::new_shared_registry(),
         })
     }
 }
@@ -1446,6 +1494,7 @@ pub async fn start_server(mut config: Config) -> Result<()> {
         },
         reactor_counters: std::sync::OnceLock::new(),
         confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
+        mcp_registry: mcp_federation::registry::new_shared_registry(),
     });
 
     // ── EventReactor: build, register built-in reactions, and spawn ──

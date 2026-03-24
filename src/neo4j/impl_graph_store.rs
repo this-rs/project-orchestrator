@@ -3910,4 +3910,79 @@ impl GraphStore for Neo4jClient {
         self.list_hooks_for_scope(scope, on_status, project_id)
             .await
     }
+
+    // ========================================================================
+    // MCP Federation operations
+    // ========================================================================
+
+    async fn create_mcp_server(&self, server: &McpServerNode) -> anyhow::Result<()> {
+        self.create_mcp_server(server).await
+    }
+
+    async fn get_mcp_server(&self, id: Uuid) -> anyhow::Result<Option<McpServerNode>> {
+        self.get_mcp_server(id).await
+    }
+
+    async fn list_mcp_servers(&self, project_id: Uuid) -> anyhow::Result<Vec<McpServerNode>> {
+        self.list_mcp_servers(project_id).await
+    }
+
+    async fn delete_mcp_server(&self, id: Uuid) -> anyhow::Result<()> {
+        self.delete_mcp_server(id).await
+    }
+
+    async fn update_mcp_server_status(&self, id: Uuid, status: &str) -> anyhow::Result<()> {
+        self.update_mcp_server_status(id, status).await
+    }
+
+    async fn create_mcp_tool(&self, tool: &McpToolNode) -> anyhow::Result<()> {
+        self.create_mcp_tool(tool).await
+    }
+
+    async fn list_mcp_tools_for_server(&self, server_id: &str) -> anyhow::Result<Vec<McpToolNode>> {
+        self.list_mcp_tools_for_server(server_id).await
+    }
+
+    async fn delete_mcp_tools_for_server(&self, server_id: &str) -> anyhow::Result<()> {
+        self.delete_mcp_tools_for_server(server_id).await
+    }
+
+    async fn create_mcp_similar_to(
+        &self,
+        tool_fqn: &str,
+        similar_to_fqn: &str,
+        score: f64,
+    ) -> anyhow::Result<()> {
+        self.create_mcp_similar_to(tool_fqn, similar_to_fqn, score)
+            .await
+    }
+
+    async fn create_mcp_co_activated(
+        &self,
+        tool_fqn_a: &str,
+        tool_fqn_b: &str,
+        count: i64,
+    ) -> anyhow::Result<()> {
+        self.create_mcp_co_activated(tool_fqn_a, tool_fqn_b, count)
+            .await
+    }
+
+    async fn create_mcp_often_follows(
+        &self,
+        tool_fqn_a: &str,
+        tool_fqn_b: &str,
+        count: i64,
+        avg_delta_ms: f64,
+    ) -> anyhow::Result<()> {
+        self.create_mcp_often_follows(tool_fqn_a, tool_fqn_b, count, avg_delta_ms)
+            .await
+    }
+
+    async fn backfill_co_activated_with(&self) -> anyhow::Result<usize> {
+        self.backfill_co_activated_with().await
+    }
+
+    async fn backfill_often_follows(&self) -> anyhow::Result<usize> {
+        self.backfill_often_follows().await
+    }
 }

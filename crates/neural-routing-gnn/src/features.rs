@@ -3,11 +3,11 @@
 //! Each node in the knowledge graph gets a feature vector composed of 5 blocks:
 //! 1. **Voyage embedding projected** (128d): linear projection of 768d Voyage embeddings
 //! 2. **GDS features** (12d): pagerank, betweenness, clustering coefficients, etc.
-//! 3. **Type one-hot** (8d): File, Function, Struct, Note, Decision, Skill, Trajectory, TrajectoryNode
+//! 3. **Type one-hot** (9d): File, Function, Struct, Note, Decision, Skill, Trajectory, TrajectoryNode, McpTool
 //! 4. **Local metrics** (16d): co-change, synapse, energy, scar, staleness, etc.
 //! 5. **Temporal features** (4d): age, recency, modification frequency
 //!
-//! Total: 168 dimensions per node.
+//! Total: 169 dimensions per node.
 //!
 //! Missing features are imputed to 0.0 (simple imputation v1).
 
@@ -23,7 +23,7 @@ pub const VOYAGE_DIM: usize = 128;
 /// GDS structural features dimension.
 pub const GDS_DIM: usize = 12;
 /// Node type one-hot dimension.
-pub const TYPE_DIM: usize = 8;
+pub const TYPE_DIM: usize = 9;
 /// Local metrics dimension.
 pub const LOCAL_DIM: usize = 16;
 /// Temporal features dimension.
@@ -48,6 +48,7 @@ pub enum NodeType {
     Skill = 5,
     Trajectory = 6,
     TrajectoryNode = 7,
+    McpTool = 8,
 }
 
 impl NodeType {
@@ -61,6 +62,7 @@ impl NodeType {
             "Skill" => Some(Self::Skill),
             "Trajectory" => Some(Self::Trajectory),
             "TrajectoryNode" => Some(Self::TrajectoryNode),
+            "McpTool" => Some(Self::McpTool),
             _ => None,
         }
     }
@@ -478,7 +480,7 @@ mod tests {
 
     #[test]
     fn test_total_dim_constant() {
-        assert_eq!(TOTAL_FEATURE_DIM, 168);
+        assert_eq!(TOTAL_FEATURE_DIM, 169);
     }
 
     #[test]

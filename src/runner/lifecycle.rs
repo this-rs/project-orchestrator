@@ -241,4 +241,380 @@ mod tests {
             .unwrap();
         assert!(result.is_none(), "Should return None when plan not found");
     }
+
+    #[tokio::test]
+    async fn test_route_with_lifecycle_protocol_happy_path() {
+        use crate::protocol::models::{Protocol, ProtocolState, ProtocolTransition};
+
+        let mock = Arc::new(MockGraphStore::new());
+        let (plan_id, project_id) = setup_plan_with_project(&mock).await;
+
+        // Create a lifecycle protocol with states and transitions
+        let protocol_id = Uuid::new_v4();
+        let init_state = ProtocolState::start(protocol_id, "init");
+        let executing_state = ProtocolState::new(protocol_id, "executing");
+
+        let mut protocol = Protocol::new(project_id, "plan-runner-full", init_state.id);
+        protocol.id = protocol_id;
+        protocol.terminal_states = vec![];
+
+        mock.upsert_protocol(&protocol).await.unwrap();
+        mock.upsert_protocol_state(&init_state).await.unwrap();
+        mock.upsert_protocol_state(&executing_state).await.unwrap();
+
+        // Add transition: init --run_started--> executing
+        let transition = ProtocolTransition::new(
+            protocol_id,
+            init_state.id,
+            executing_state.id,
+            "run_started",
+        );
+        mock.upsert_protocol_transition(&transition).await.unwrap();
+
+        let graph: Arc<dyn GraphStore> = mock;
+        let result = route_lifecycle_protocol(&graph, plan_id, 5).await.unwrap();
+
+        assert!(result.is_some(), "Should route to a lifecycle protocol");
+        let route = result.unwrap();
+        assert_eq!(route.protocol_id, protocol_id);
+        assert_eq!(route.protocol_name, "plan-runner-full");
+        assert!(route.affinity_score >= MIN_AFFINITY_THRESHOLD);
+    }
+
+    #[tokio::test]
+    async fn test_route_filters_non_runner_protocols() {
+        use crate::protocol::models::{Protocol, ProtocolState};
+
+        let mock = Arc::new(MockGraphStore::new());
+        let (plan_id, project_id) = setup_plan_with_project(&mock).await;
+
+        // Create a protocol that does NOT start with "plan-runner-"
+        let protocol_id = Uuid::new_v4();
+        let init_state = ProtocolState::start(protocol_id, "init");
+
+        let mut protocol = Protocol::new(project_id, "code-review-protocol", init_state.id);
+        protocol.id = protocol_id;
+
+        mock.upsert_protocol(&protocol).await.unwrap();
+        mock.upsert_protocol_state(&init_state).await.unwrap();
+
+        let graph: Arc<dyn GraphStore> = mock;
+        let result = route_lifecycle_protocol(&graph, plan_id, 5).await.unwrap();
+
+        assert!(
+            result.is_none(),
+            "Should return None when no plan-runner-* protocols exist"
+        );
+    }
+
+    #[test]
+    fn test_lifecycle_route_result_debug_clone() {
+        let result = LifecycleRouteResult {
+            protocol_id: Uuid::new_v4(),
+            protocol_name: "plan-runner-full".to_string(),
+            affinity_score: 0.85,
+            run_id: Uuid::new_v4(),
+        };
+
+        // Verify Debug and Clone are implemented
+        let cloned = result.clone();
+        assert_eq!(cloned.protocol_name, "plan-runner-full");
+        assert!((cloned.affinity_score - 0.85).abs() < f64::EPSILON);
+        let debug_str = format!("{:?}", result);
+        assert!(debug_str.contains("plan-runner-full"));
+    }
+
+    #[test]
+    fn test_constants() {
+        assert_eq!(RUNNER_PROTOCOL_PREFIX, "plan-runner-");
+        // Validate threshold is in valid range (0, 1)
+        let threshold = MIN_AFFINITY_THRESHOLD;
+        assert!(threshold > 0.0);
+        assert!(threshold < 1.0);
+    }
+
+    #[tokio::test]
+    async fn test_route_below_affinity_threshold() {
+        use crate::protocol::models::{Protocol, ProtocolState};
+        use crate::protocol::routing::RelevanceVector;
+
+        let mock = Arc::new(MockGraphStore::new());
+        let (plan_id, project_id) = setup_plan_with_project(&mock).await;
+
+        // Create a lifecycle protocol with a relevance vector that is maximally
+        // different from the context vector produced by from_plan_context("execution", 5, 0, 0, 0.0).
+        // Context will be roughly: phase=0.5, structure~0.39, domain=0.5, resource=1.0, lifecycle=0.0
+        // Setting relevance to opposite extremes should push affinity below 0.3.
+        let protocol_id = Uuid::new_v4();
+        let init_state = ProtocolState::start(protocol_id, "init");
+
+        let mut protocol = Protocol::new(project_id, "plan-runner-low-affinity", init_state.id);
+        protocol.id = protocol_id;
+        protocol.relevance_vector = Some(RelevanceVector {
+            phase: 0.0,     // context has 0.5 → distance 0.5
+            structure: 1.0, // context has ~0.39 → distance ~0.61
+            domain: 0.0,    // context has 0.5 → distance 0.5
+            resource: 0.0,  // context has 1.0 → distance 1.0 → similarity 0.0
+            lifecycle: 1.0, // context has 0.0 → distance 1.0 → similarity 0.0
+        });
+
+        mock.upsert_protocol(&protocol).await.unwrap();
+        mock.upsert_protocol_state(&init_state).await.unwrap();
+
+        let graph: Arc<dyn GraphStore> = mock;
+        let result = route_lifecycle_protocol(&graph, plan_id, 5).await.unwrap();
+        assert!(
+            result.is_none(),
+            "Should return None when best affinity is below threshold"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_route_fire_transition_error_is_non_fatal() {
+        use crate::protocol::models::{Protocol, ProtocolState};
+
+        let mock = Arc::new(MockGraphStore::new());
+        let (plan_id, project_id) = setup_plan_with_project(&mock).await;
+
+        // Create a lifecycle protocol with init state but NO transition for "run_started".
+        // start_run will succeed (creates a run at init), but fire_transition will fail
+        // because there's no transition matching (init, "run_started").
+        // The function should still return Ok(Some(...)) — the error is non-fatal.
+        let protocol_id = Uuid::new_v4();
+        let init_state = ProtocolState::start(protocol_id, "init");
+
+        let mut protocol = Protocol::new(project_id, "plan-runner-full", init_state.id);
+        protocol.id = protocol_id;
+        protocol.terminal_states = vec![];
+
+        mock.upsert_protocol(&protocol).await.unwrap();
+        mock.upsert_protocol_state(&init_state).await.unwrap();
+        // Deliberately NOT adding any transition
+
+        let graph: Arc<dyn GraphStore> = mock;
+        let result = route_lifecycle_protocol(&graph, plan_id, 5).await.unwrap();
+
+        assert!(
+            result.is_some(),
+            "Should still return Some even when fire_transition fails"
+        );
+        let route = result.unwrap();
+        assert_eq!(route.protocol_id, protocol_id);
+        assert_eq!(route.protocol_name, "plan-runner-full");
+    }
+
+    #[tokio::test]
+    async fn test_route_selects_best_among_multiple_protocols() {
+        use crate::protocol::models::{Protocol, ProtocolState, ProtocolTransition};
+        use crate::protocol::routing::RelevanceVector;
+
+        let mock = Arc::new(MockGraphStore::new());
+        let (plan_id, project_id) = setup_plan_with_project(&mock).await;
+
+        // Protocol A: relevance vector close to context → high affinity
+        let proto_a_id = Uuid::new_v4();
+        let init_a = ProtocolState::start(proto_a_id, "init");
+        let exec_a = ProtocolState::new(proto_a_id, "executing");
+
+        let mut proto_a = Protocol::new(project_id, "plan-runner-full", init_a.id);
+        proto_a.id = proto_a_id;
+        proto_a.terminal_states = vec![];
+        // Context: phase=0.5, structure~0.39, domain=0.5, resource=1.0, lifecycle=0.0
+        proto_a.relevance_vector = Some(RelevanceVector {
+            phase: 0.5,
+            structure: 0.4,
+            domain: 0.5,
+            resource: 1.0,
+            lifecycle: 0.0,
+        });
+
+        mock.upsert_protocol(&proto_a).await.unwrap();
+        mock.upsert_protocol_state(&init_a).await.unwrap();
+        mock.upsert_protocol_state(&exec_a).await.unwrap();
+        let trans_a = ProtocolTransition::new(proto_a_id, init_a.id, exec_a.id, "run_started");
+        mock.upsert_protocol_transition(&trans_a).await.unwrap();
+
+        // Protocol B: relevance vector slightly worse match
+        let proto_b_id = Uuid::new_v4();
+        let init_b = ProtocolState::start(proto_b_id, "init");
+        let exec_b = ProtocolState::new(proto_b_id, "executing");
+
+        let mut proto_b = Protocol::new(project_id, "plan-runner-light", init_b.id);
+        proto_b.id = proto_b_id;
+        proto_b.terminal_states = vec![];
+        proto_b.relevance_vector = Some(RelevanceVector {
+            phase: 0.5,
+            structure: 0.4,
+            domain: 0.5,
+            resource: 0.5,  // further from context's 1.0
+            lifecycle: 0.5, // further from context's 0.0
+        });
+
+        mock.upsert_protocol(&proto_b).await.unwrap();
+        mock.upsert_protocol_state(&init_b).await.unwrap();
+        mock.upsert_protocol_state(&exec_b).await.unwrap();
+        let trans_b = ProtocolTransition::new(proto_b_id, init_b.id, exec_b.id, "run_started");
+        mock.upsert_protocol_transition(&trans_b).await.unwrap();
+
+        let graph: Arc<dyn GraphStore> = mock;
+        let result = route_lifecycle_protocol(&graph, plan_id, 5).await.unwrap();
+
+        assert!(result.is_some(), "Should route to best protocol");
+        let route = result.unwrap();
+        // Protocol A has a closer relevance vector, so it should win
+        assert_eq!(route.protocol_id, proto_a_id);
+        assert_eq!(route.protocol_name, "plan-runner-full");
+    }
+
+    #[tokio::test]
+    async fn test_route_with_many_tasks() {
+        use crate::protocol::models::{Protocol, ProtocolState, ProtocolTransition};
+
+        let mock = Arc::new(MockGraphStore::new());
+        let (plan_id, project_id) = setup_plan_with_project(&mock).await;
+
+        let protocol_id = Uuid::new_v4();
+        let init_state = ProtocolState::start(protocol_id, "init");
+        let executing_state = ProtocolState::new(protocol_id, "executing");
+
+        let mut protocol = Protocol::new(project_id, "plan-runner-full", init_state.id);
+        protocol.id = protocol_id;
+        protocol.terminal_states = vec![];
+
+        mock.upsert_protocol(&protocol).await.unwrap();
+        mock.upsert_protocol_state(&init_state).await.unwrap();
+        mock.upsert_protocol_state(&executing_state).await.unwrap();
+
+        let transition = ProtocolTransition::new(
+            protocol_id,
+            init_state.id,
+            executing_state.id,
+            "run_started",
+        );
+        mock.upsert_protocol_transition(&transition).await.unwrap();
+
+        // Use a large task count to push structure dimension higher
+        let graph: Arc<dyn GraphStore> = mock;
+        let result = route_lifecycle_protocol(&graph, plan_id, 100)
+            .await
+            .unwrap();
+
+        assert!(result.is_some(), "Should route even with many tasks");
+        let route = result.unwrap();
+        assert_eq!(route.protocol_name, "plan-runner-full");
+        assert!(route.affinity_score >= MIN_AFFINITY_THRESHOLD);
+    }
+
+    #[tokio::test]
+    async fn test_route_with_zero_tasks() {
+        use crate::protocol::models::{Protocol, ProtocolState, ProtocolTransition};
+
+        let mock = Arc::new(MockGraphStore::new());
+        let (plan_id, project_id) = setup_plan_with_project(&mock).await;
+
+        let protocol_id = Uuid::new_v4();
+        let init_state = ProtocolState::start(protocol_id, "init");
+        let executing_state = ProtocolState::new(protocol_id, "executing");
+
+        let mut protocol = Protocol::new(project_id, "plan-runner-light", init_state.id);
+        protocol.id = protocol_id;
+        protocol.terminal_states = vec![];
+
+        mock.upsert_protocol(&protocol).await.unwrap();
+        mock.upsert_protocol_state(&init_state).await.unwrap();
+        mock.upsert_protocol_state(&executing_state).await.unwrap();
+
+        let transition = ProtocolTransition::new(
+            protocol_id,
+            init_state.id,
+            executing_state.id,
+            "run_started",
+        );
+        mock.upsert_protocol_transition(&transition).await.unwrap();
+
+        let graph: Arc<dyn GraphStore> = mock;
+        let result = route_lifecycle_protocol(&graph, plan_id, 0).await.unwrap();
+
+        assert!(result.is_some(), "Should route even with zero tasks");
+        let route = result.unwrap();
+        assert_eq!(route.protocol_name, "plan-runner-light");
+    }
+
+    #[tokio::test]
+    async fn test_route_result_contains_valid_run_id() {
+        use crate::protocol::models::{Protocol, ProtocolState, ProtocolTransition};
+
+        let mock = Arc::new(MockGraphStore::new());
+        let (plan_id, project_id) = setup_plan_with_project(&mock).await;
+
+        let protocol_id = Uuid::new_v4();
+        let init_state = ProtocolState::start(protocol_id, "init");
+        let executing_state = ProtocolState::new(protocol_id, "executing");
+
+        let mut protocol = Protocol::new(project_id, "plan-runner-reviewed", init_state.id);
+        protocol.id = protocol_id;
+        protocol.terminal_states = vec![];
+
+        mock.upsert_protocol(&protocol).await.unwrap();
+        mock.upsert_protocol_state(&init_state).await.unwrap();
+        mock.upsert_protocol_state(&executing_state).await.unwrap();
+
+        let transition = ProtocolTransition::new(
+            protocol_id,
+            init_state.id,
+            executing_state.id,
+            "run_started",
+        );
+        mock.upsert_protocol_transition(&transition).await.unwrap();
+
+        let graph: Arc<dyn GraphStore> = mock.clone();
+        let result = route_lifecycle_protocol(&graph, plan_id, 5).await.unwrap();
+
+        let route = result.unwrap();
+        // Verify the run actually exists in the store
+        let run = mock
+            .get_protocol_run(route.run_id)
+            .await
+            .unwrap()
+            .expect("Run should exist in store");
+        assert_eq!(run.protocol_id, protocol_id);
+        assert_eq!(run.plan_id, Some(plan_id));
+    }
+
+    #[tokio::test]
+    async fn test_route_mixed_runner_and_non_runner_protocols() {
+        use crate::protocol::models::{Protocol, ProtocolState, ProtocolTransition};
+
+        let mock = Arc::new(MockGraphStore::new());
+        let (plan_id, project_id) = setup_plan_with_project(&mock).await;
+
+        // Create a non-runner protocol (should be filtered out)
+        let non_runner_id = Uuid::new_v4();
+        let nr_init = ProtocolState::start(non_runner_id, "init");
+        let mut non_runner = Protocol::new(project_id, "code-review-protocol", nr_init.id);
+        non_runner.id = non_runner_id;
+        mock.upsert_protocol(&non_runner).await.unwrap();
+        mock.upsert_protocol_state(&nr_init).await.unwrap();
+
+        // Create a runner protocol (should be selected)
+        let runner_id = Uuid::new_v4();
+        let r_init = ProtocolState::start(runner_id, "init");
+        let r_exec = ProtocolState::new(runner_id, "executing");
+        let mut runner = Protocol::new(project_id, "plan-runner-full", r_init.id);
+        runner.id = runner_id;
+        runner.terminal_states = vec![];
+        mock.upsert_protocol(&runner).await.unwrap();
+        mock.upsert_protocol_state(&r_init).await.unwrap();
+        mock.upsert_protocol_state(&r_exec).await.unwrap();
+        let trans = ProtocolTransition::new(runner_id, r_init.id, r_exec.id, "run_started");
+        mock.upsert_protocol_transition(&trans).await.unwrap();
+
+        let graph: Arc<dyn GraphStore> = mock;
+        let result = route_lifecycle_protocol(&graph, plan_id, 5).await.unwrap();
+
+        assert!(result.is_some());
+        let route = result.unwrap();
+        assert_eq!(route.protocol_id, runner_id);
+        assert_eq!(route.protocol_name, "plan-runner-full");
+    }
 }

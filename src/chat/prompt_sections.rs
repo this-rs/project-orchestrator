@@ -1421,6 +1421,8 @@ pub enum ToolRefGroupId {
     Workspace,
     /// chat, feature_graph, sharing, reasoning, neural_routing, trajectory — included on demand
     Collaboration,
+    /// mcp_federation — included when external MCP servers are connected
+    External,
 }
 
 impl ToolRefGroupId {
@@ -1433,6 +1435,7 @@ impl ToolRefGroupId {
         Self::Behavioral,
         Self::Workspace,
         Self::Collaboration,
+        Self::External,
     ];
 
     /// Tool names belonging to this group.
@@ -1460,6 +1463,7 @@ impl ToolRefGroupId {
                 "neural_routing",
                 "trajectory",
             ],
+            Self::External => &["mcp_federation"],
         }
     }
 
@@ -1477,6 +1481,7 @@ impl ToolRefGroupId {
             Self::Collaboration => {
                 "Collaboration (Chat, Features, Sharing, Reasoning, Neural Routing)"
             }
+            Self::External => "External (MCP Federation)",
         }
     }
 }
@@ -1487,6 +1492,8 @@ pub struct ToolGroupSelectionContext {
     pub scaffolding_level: u8,
     pub has_active_protocol: bool,
     pub is_multi_project: bool,
+    /// Whether external MCP servers are connected (triggers External group).
+    pub external_tools_available: bool,
     /// Tool names whitelisted by the current FSM state's `available_tools`.
     /// Empty = no FSM restriction (include all).
     pub fsm_available_tools: Vec<String>,
@@ -1662,6 +1669,11 @@ pub fn select_tool_groups(ctx: &ToolGroupSelectionContext) -> Vec<ToolRefGroupId
     // Collaboration: included by intent OR L0
     if has_collab_intent || ctx.scaffolding_level == 0 {
         selected.push(ToolRefGroupId::Collaboration);
+    }
+
+    // External: included when external MCP servers are connected
+    if ctx.external_tools_available {
+        selected.push(ToolRefGroupId::External);
     }
 
     selected
@@ -1952,10 +1964,10 @@ mod tests {
             .collect();
         all_tools.sort();
         all_tools.dedup();
-        // Must cover all 28 mega-tools defined in mcp/tools.rs
+        // Must cover all 29 mega-tools (28 existing + mcp_federation)
         assert!(
-            all_tools.len() >= 28,
-            "Groups should cover at least 28 tools, got {}",
+            all_tools.len() >= 29,
+            "Groups should cover at least 29 tools, got {}",
             all_tools.len()
         );
     }

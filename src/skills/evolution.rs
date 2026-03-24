@@ -1171,6 +1171,1192 @@ mod tests {
         assert!(!has_stable, "Low-cohesion skill should NOT remain Stable");
     }
 
+    // ================================================================
+    // Struct serialization / construction tests
+    // ================================================================
+
+    #[test]
+    fn test_evolution_result_default() {
+        let result = EvolutionResult::default();
+        assert!(result.merged.is_empty());
+        assert!(result.split.is_empty());
+        assert!(result.grown.is_empty());
+        assert!(result.shrunk.is_empty());
+        assert_eq!(result.unchanged, 0);
+    }
+
+    #[test]
+    fn test_evolution_result_serialization_roundtrip() {
+        let result = EvolutionResult {
+            merged: vec![MergeEvent {
+                survivor_id: Uuid::new_v4(),
+                absorbed_id: Uuid::new_v4(),
+                overlap: 0.85,
+            }],
+            split: vec![SplitEvent {
+                original_id: Uuid::new_v4(),
+                new_skill_ids: vec![Uuid::new_v4(), Uuid::new_v4()],
+            }],
+            grown: vec![GrowEvent {
+                skill_id: Uuid::new_v4(),
+                notes_added: 3,
+            }],
+            shrunk: vec![ShrinkEvent {
+                skill_id: Uuid::new_v4(),
+                notes_removed: 2,
+            }],
+            unchanged: 5,
+        };
+
+        let json = serde_json::to_string(&result).unwrap();
+        let deserialized: EvolutionResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.merged.len(), 1);
+        assert_eq!(deserialized.split.len(), 1);
+        assert_eq!(deserialized.grown.len(), 1);
+        assert_eq!(deserialized.shrunk.len(), 1);
+        assert_eq!(deserialized.unchanged, 5);
+        assert!((deserialized.merged[0].overlap - 0.85).abs() < f64::EPSILON);
+        assert_eq!(deserialized.grown[0].notes_added, 3);
+        assert_eq!(deserialized.shrunk[0].notes_removed, 2);
+        assert_eq!(deserialized.split[0].new_skill_ids.len(), 2);
+    }
+
+    #[test]
+    fn test_merge_event_serialization() {
+        let event = MergeEvent {
+            survivor_id: Uuid::nil(),
+            absorbed_id: Uuid::nil(),
+            overlap: 0.75,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("survivor_id"));
+        assert!(json.contains("absorbed_id"));
+        assert!(json.contains("0.75"));
+    }
+
+    #[test]
+    fn test_split_event_serialization() {
+        let id1 = Uuid::new_v4();
+        let id2 = Uuid::new_v4();
+        let event = SplitEvent {
+            original_id: Uuid::nil(),
+            new_skill_ids: vec![id1, id2],
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let de: SplitEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(de.new_skill_ids.len(), 2);
+        assert_eq!(de.original_id, Uuid::nil());
+    }
+
+    #[test]
+    fn test_grow_event_serialization() {
+        let event = GrowEvent {
+            skill_id: Uuid::nil(),
+            notes_added: 10,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let de: GrowEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(de.notes_added, 10);
+    }
+
+    #[test]
+    fn test_shrink_event_serialization() {
+        let event = ShrinkEvent {
+            skill_id: Uuid::nil(),
+            notes_removed: 7,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let de: ShrinkEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(de.notes_removed, 7);
+    }
+
+    #[test]
+    fn test_fission_candidate_serialization() {
+        let fc = FissionCandidate {
+            skill_id: Uuid::nil(),
+            skill_name: "test-skill".to_string(),
+            member_count: 8,
+            cohesion: 0.6,
+            sub_cluster_count: 3,
+            sub_cluster_sizes: vec![3, 3, 2],
+            blocked_by_guardrail: false,
+            guardrail_reason: None,
+        };
+        let json = serde_json::to_string(&fc).unwrap();
+        let de: FissionCandidate = serde_json::from_str(&json).unwrap();
+        assert_eq!(de.skill_name, "test-skill");
+        assert_eq!(de.member_count, 8);
+        assert_eq!(de.sub_cluster_count, 3);
+        assert_eq!(de.sub_cluster_sizes, vec![3, 3, 2]);
+        assert!(!de.blocked_by_guardrail);
+        assert!(de.guardrail_reason.is_none());
+    }
+
+    #[test]
+    fn test_fission_candidate_with_guardrail_block() {
+        let fc = FissionCandidate {
+            skill_id: Uuid::nil(),
+            skill_name: "tiny-skill".to_string(),
+            member_count: 3,
+            cohesion: 0.5,
+            sub_cluster_count: 2,
+            sub_cluster_sizes: vec![2, 1],
+            blocked_by_guardrail: true,
+            guardrail_reason: Some(format!(
+                "Skill has {} members, minimum {} required for split",
+                3, MIN_MEMBERS_FOR_SPLIT
+            )),
+        };
+        let json = serde_json::to_string(&fc).unwrap();
+        let de: FissionCandidate = serde_json::from_str(&json).unwrap();
+        assert!(de.blocked_by_guardrail);
+        assert!(de.guardrail_reason.unwrap().contains("minimum"));
+    }
+
+    #[test]
+    fn test_fusion_candidate_serialization() {
+        let id_a = Uuid::new_v4();
+        let id_b = Uuid::new_v4();
+        let fc = FusionCandidate {
+            skill_ids: vec![id_a, id_b],
+            skill_names: vec!["skill-a".to_string(), "skill-b".to_string()],
+            overlap: 0.82,
+            combined_member_count: 12,
+            blocked_by_guardrail: false,
+            guardrail_reason: None,
+        };
+        let json = serde_json::to_string(&fc).unwrap();
+        let de: FusionCandidate = serde_json::from_str(&json).unwrap();
+        assert_eq!(de.skill_ids.len(), 2);
+        assert_eq!(de.skill_names, vec!["skill-a", "skill-b"]);
+        assert!((de.overlap - 0.82).abs() < f64::EPSILON);
+        assert_eq!(de.combined_member_count, 12);
+    }
+
+    #[test]
+    fn test_fusion_candidate_with_guardrail_block() {
+        let fc = FusionCandidate {
+            skill_ids: vec![Uuid::new_v4(), Uuid::new_v4()],
+            skill_names: vec!["big-a".to_string(), "big-b".to_string()],
+            overlap: 0.9,
+            combined_member_count: 25,
+            blocked_by_guardrail: true,
+            guardrail_reason: Some(format!(
+                "Combined {} members exceeds maximum {}",
+                25, MAX_MEMBERS_AFTER_MERGE
+            )),
+        };
+        assert!(fc.blocked_by_guardrail);
+        assert!(fc
+            .guardrail_reason
+            .as_ref()
+            .unwrap()
+            .contains("exceeds maximum"));
+    }
+
+    // ================================================================
+    // Constants tests
+    // ================================================================
+
+    #[test]
+    fn test_guardrail_constants() {
+        assert_eq!(MIN_MEMBERS_FOR_SPLIT, 4);
+        assert_eq!(MAX_MEMBERS_AFTER_MERGE, 20);
+        assert!((MIN_COHESION_THRESHOLD - 0.15).abs() < f64::EPSILON);
+    }
+
+    // ================================================================
+    // SkillEvolution enum coverage
+    // ================================================================
+
+    #[test]
+    fn test_skill_evolution_enum_variants_debug() {
+        let stable = SkillEvolution::Stable {
+            skill_id: Uuid::nil(),
+            candidate: make_candidate(0, vec!["a"]),
+            notes_to_add: vec!["b".into()],
+            notes_to_remove: vec!["c".into()],
+        };
+        let debug_str = format!("{:?}", stable);
+        assert!(debug_str.contains("Stable"));
+
+        let merge = SkillEvolution::Merge {
+            skill_ids: vec![Uuid::nil()],
+            candidate: make_candidate(0, vec!["a"]),
+        };
+        assert!(format!("{:?}", merge).contains("Merge"));
+
+        let split = SkillEvolution::Split {
+            skill_id: Uuid::nil(),
+            candidates: vec![make_candidate(0, vec!["a"]), make_candidate(1, vec!["b"])],
+        };
+        assert!(format!("{:?}", split).contains("Split"));
+
+        let new = SkillEvolution::New {
+            candidate: make_candidate(0, vec!["a"]),
+        };
+        assert!(format!("{:?}", new).contains("New"));
+
+        let orphan = SkillEvolution::Orphan {
+            skill_id: Uuid::nil(),
+        };
+        assert!(format!("{:?}", orphan).contains("Orphan"));
+    }
+
+    // ================================================================
+    // Additional analyze_evolution edge case tests
+    // ================================================================
+
+    #[test]
+    fn test_evolution_empty_inputs() {
+        let existing: Vec<(Uuid, Vec<String>)> = vec![];
+        let candidates: Vec<SkillCandidate> = vec![];
+        let evolutions = analyze_evolution(&existing, &candidates, 0.7);
+        assert!(evolutions.is_empty());
+    }
+
+    #[test]
+    fn test_evolution_multiple_new_clusters_no_existing() {
+        let existing: Vec<(Uuid, Vec<String>)> = vec![];
+        let candidates = vec![
+            make_candidate(0, vec!["a", "b"]),
+            make_candidate(1, vec!["c", "d"]),
+            make_candidate(2, vec!["e", "f"]),
+        ];
+        let evolutions = analyze_evolution(&existing, &candidates, 0.7);
+        assert_eq!(evolutions.len(), 3);
+        for ev in &evolutions {
+            assert!(matches!(ev, SkillEvolution::New { .. }));
+        }
+    }
+
+    #[test]
+    fn test_evolution_multiple_orphans_no_candidates() {
+        let s1 = Uuid::new_v4();
+        let s2 = Uuid::new_v4();
+        let existing = vec![
+            (s1, vec!["a".into(), "b".into()]),
+            (s2, vec!["c".into(), "d".into()]),
+        ];
+        let candidates: Vec<SkillCandidate> = vec![];
+        let evolutions = analyze_evolution(&existing, &candidates, 0.7);
+        assert_eq!(evolutions.len(), 2);
+        for ev in &evolutions {
+            assert!(matches!(ev, SkillEvolution::Orphan { .. }));
+        }
+    }
+
+    #[test]
+    fn test_evolution_grow_and_shrink_same_skill() {
+        let skill_id = Uuid::new_v4();
+        // Old: {a, b, c, d} → New: {a, b, c, e}
+        // Jaccard = 3/5 = 0.6 — use 0.5 threshold so it matches
+        let existing = vec![(
+            skill_id,
+            vec!["a".into(), "b".into(), "c".into(), "d".into()],
+        )];
+        let candidates = vec![make_candidate(0, vec!["a", "b", "c", "e"])];
+
+        let evolutions = analyze_evolution(&existing, &candidates, 0.5);
+        assert_eq!(evolutions.len(), 1);
+        match &evolutions[0] {
+            SkillEvolution::Stable {
+                notes_to_add,
+                notes_to_remove,
+                ..
+            } => {
+                assert_eq!(notes_to_add, &vec!["e".to_string()]);
+                assert_eq!(notes_to_remove, &vec!["d".to_string()]);
+            }
+            other => panic!("Expected Stable, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_evolution_low_threshold_matches_more() {
+        let skill_id = Uuid::new_v4();
+        let existing = vec![(skill_id, vec!["a".into(), "b".into(), "c".into()])];
+        // Candidate: {a, b, x} → Jaccard vs {a, b, c} = 2/4 = 0.5
+        let candidates = vec![make_candidate(0, vec!["a", "b", "x"])];
+
+        // At 0.7 threshold → orphan + new (0.5 < 0.7)
+        let evolutions_high = analyze_evolution(&existing, &candidates, 0.7);
+        let has_orphan = evolutions_high
+            .iter()
+            .any(|e| matches!(e, SkillEvolution::Orphan { .. }));
+        assert!(has_orphan);
+
+        // At 0.4 threshold → stable (0.5 >= 0.4)
+        let evolutions_low = analyze_evolution(&existing, &candidates, 0.4);
+        let has_stable = evolutions_low
+            .iter()
+            .any(|e| matches!(e, SkillEvolution::Stable { .. }));
+        assert!(has_stable);
+    }
+
+    #[test]
+    fn test_evolution_cohesion_at_threshold_boundary() {
+        let skill_id = Uuid::new_v4();
+        let existing = vec![(skill_id, vec!["a".into(), "b".into(), "c".into()])];
+
+        // Cohesion exactly at threshold — should remain Stable
+        let mut candidate = make_candidate(0, vec!["a", "b", "c"]);
+        candidate.cohesion = MIN_COHESION_THRESHOLD; // 0.15 — exactly at boundary
+        let candidates = vec![candidate];
+
+        let evolutions = analyze_evolution(&existing, &candidates, 0.7);
+        let has_stable = evolutions
+            .iter()
+            .any(|e| matches!(e, SkillEvolution::Stable { .. }));
+        assert!(has_stable, "Cohesion at threshold should stay Stable");
+    }
+
+    #[test]
+    fn test_evolution_cohesion_just_below_threshold() {
+        let skill_id = Uuid::new_v4();
+        let existing = vec![(skill_id, vec!["a".into(), "b".into(), "c".into()])];
+
+        let mut candidate = make_candidate(0, vec!["a", "b", "c"]);
+        candidate.cohesion = MIN_COHESION_THRESHOLD - 0.01; // just below
+        let candidates = vec![candidate];
+
+        let evolutions = analyze_evolution(&existing, &candidates, 0.7);
+        let has_orphan = evolutions
+            .iter()
+            .any(|e| matches!(e, SkillEvolution::Orphan { .. }));
+        assert!(has_orphan, "Cohesion just below threshold should be Orphan");
+    }
+
+    #[test]
+    fn test_evolution_merge_exactly_at_member_limit() {
+        // Two skills whose combined members = exactly MAX_MEMBERS_AFTER_MERGE (20)
+        let skill_a = Uuid::new_v4();
+        let skill_b = Uuid::new_v4();
+        let members_a: Vec<String> = (0..10).map(|i| format!("a{}", i)).collect();
+        let members_b: Vec<String> = (0..10).map(|i| format!("b{}", i)).collect();
+        let existing = vec![(skill_a, members_a.clone()), (skill_b, members_b.clone())];
+
+        let mut all_members: Vec<&str> = members_a.iter().map(|s| s.as_str()).collect();
+        all_members.extend(members_b.iter().map(|s| s.as_str()));
+        let candidates = vec![make_candidate(0, all_members)];
+
+        let evolutions = analyze_evolution(&existing, &candidates, 0.5);
+        // Combined = 20, not > 20, so merge should proceed
+        let merge_count = evolutions
+            .iter()
+            .filter(|e| matches!(e, SkillEvolution::Merge { .. }))
+            .count();
+        assert_eq!(merge_count, 1, "Merge at exact limit should be allowed");
+    }
+
+    #[test]
+    fn test_evolution_split_exactly_at_member_threshold() {
+        let skill_id = Uuid::new_v4();
+        // Skill with exactly MIN_MEMBERS_FOR_SPLIT (4) members — should allow split
+        let existing = vec![(
+            skill_id,
+            vec!["a".into(), "b".into(), "c".into(), "d".into()],
+        )];
+        // Two candidates both overlapping with the skill
+        // Candidate 0: {a, b, c} → Jaccard vs {a,b,c,d} = 3/4 = 0.75
+        // Candidate 1: {b, c, d} → Jaccard vs {a,b,c,d} = 3/4 = 0.75
+        let candidates = vec![
+            make_candidate(0, vec!["a", "b", "c"]),
+            make_candidate(1, vec!["b", "c", "d"]),
+        ];
+
+        let evolutions = analyze_evolution(&existing, &candidates, 0.7);
+        let split_count = evolutions
+            .iter()
+            .filter(|e| matches!(e, SkillEvolution::Split { .. }))
+            .count();
+        assert_eq!(
+            split_count, 1,
+            "Split at exact member threshold should be allowed"
+        );
+    }
+
+    // ================================================================
+    // execute_evolution tests (async with MockGraphStore)
+    // ================================================================
+
+    use crate::neo4j::mock::MockGraphStore;
+    use crate::skills::SkillNode;
+    use std::sync::Arc;
+
+    fn make_test_skill(project_id: Uuid) -> SkillNode {
+        SkillNode::new(project_id, "test-skill")
+    }
+
+    fn make_test_note(project_id: Uuid, id: Uuid) -> crate::notes::Note {
+        crate::notes::Note {
+            id,
+            project_id: Some(project_id),
+            note_type: NoteType::Observation,
+            status: NoteStatus::Active,
+            importance: NoteImportance::Medium,
+            scope: NoteScope::Project,
+            content: format!("Test note {}", id),
+            tags: vec!["test".to_string()],
+            anchors: vec![],
+            created_at: Utc::now(),
+            created_by: "test".to_string(),
+            last_confirmed_at: None,
+            last_confirmed_by: None,
+            staleness_score: 0.0,
+            energy: 0.5,
+            last_activated: None,
+            reactivation_count: 0,
+            last_reactivated: None,
+            freshness_pinged_at: None,
+            activation_count: 0,
+            scar_intensity: 0.0,
+            memory_horizon: MemoryHorizon::Operational,
+            supersedes: None,
+            superseded_by: None,
+            changes: vec![],
+            assertion_rule: None,
+            last_assertion_result: None,
+            sharing_consent: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_execute_evolution_stable_unchanged() {
+        let store = Arc::new(MockGraphStore::new());
+        let project_id = Uuid::new_v4();
+
+        // Create project so skill creation works
+        let project = crate::neo4j::models::ProjectNode {
+            id: project_id,
+            name: "test".to_string(),
+            slug: "test".to_string(),
+            root_path: "/tmp/test".to_string(),
+            description: None,
+            created_at: Utc::now(),
+            last_synced: None,
+            analytics_computed_at: None,
+            last_co_change_computed_at: None,
+            default_note_energy: None,
+            scaffolding_override: None,
+            sharing_policy: None,
+        };
+        store.create_project(&project).await.unwrap();
+
+        let skill = make_test_skill(project_id);
+        store.create_skill(&skill).await.unwrap();
+
+        let candidate = make_candidate(0, vec!["a", "b", "c"]);
+        let evolutions = vec![SkillEvolution::Stable {
+            skill_id: skill.id,
+            candidate,
+            notes_to_add: vec![],
+            notes_to_remove: vec![],
+        }];
+
+        let result = execute_evolution(&*store, &evolutions, &HashMap::new(), project_id)
+            .await
+            .unwrap();
+        assert_eq!(result.unchanged, 1);
+        assert!(result.grown.is_empty());
+        assert!(result.shrunk.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_execute_evolution_stable_grow() {
+        let store = Arc::new(MockGraphStore::new());
+        let project_id = Uuid::new_v4();
+
+        let project = crate::neo4j::models::ProjectNode {
+            id: project_id,
+            name: "test".to_string(),
+            slug: "test".to_string(),
+            root_path: "/tmp/test".to_string(),
+            description: None,
+            created_at: Utc::now(),
+            last_synced: None,
+            analytics_computed_at: None,
+            last_co_change_computed_at: None,
+            default_note_energy: None,
+            scaffolding_override: None,
+            sharing_policy: None,
+        };
+        store.create_project(&project).await.unwrap();
+
+        let skill = make_test_skill(project_id);
+        store.create_skill(&skill).await.unwrap();
+
+        // Create a note to add
+        let note_id = Uuid::new_v4();
+        let note = make_test_note(project_id, note_id);
+        store.create_note(&note).await.unwrap();
+
+        let candidate = make_candidate(0, vec!["a", "b"]);
+        let evolutions = vec![SkillEvolution::Stable {
+            skill_id: skill.id,
+            candidate,
+            notes_to_add: vec![note_id.to_string()],
+            notes_to_remove: vec![],
+        }];
+
+        let result = execute_evolution(&*store, &evolutions, &HashMap::new(), project_id)
+            .await
+            .unwrap();
+        assert_eq!(result.grown.len(), 1);
+        assert_eq!(result.grown[0].skill_id, skill.id);
+        assert_eq!(result.grown[0].notes_added, 1);
+    }
+
+    #[tokio::test]
+    async fn test_execute_evolution_stable_shrink() {
+        let store = Arc::new(MockGraphStore::new());
+        let project_id = Uuid::new_v4();
+
+        let project = crate::neo4j::models::ProjectNode {
+            id: project_id,
+            name: "test".to_string(),
+            slug: "test".to_string(),
+            root_path: "/tmp/test".to_string(),
+            description: None,
+            created_at: Utc::now(),
+            last_synced: None,
+            analytics_computed_at: None,
+            last_co_change_computed_at: None,
+            default_note_energy: None,
+            scaffolding_override: None,
+            sharing_policy: None,
+        };
+        store.create_project(&project).await.unwrap();
+
+        let skill = make_test_skill(project_id);
+        store.create_skill(&skill).await.unwrap();
+
+        let note_id = Uuid::new_v4();
+        let note = make_test_note(project_id, note_id);
+        store.create_note(&note).await.unwrap();
+        store
+            .add_skill_member(skill.id, "note", note_id)
+            .await
+            .unwrap();
+
+        let candidate = make_candidate(0, vec!["a"]);
+        let evolutions = vec![SkillEvolution::Stable {
+            skill_id: skill.id,
+            candidate,
+            notes_to_add: vec![],
+            notes_to_remove: vec![note_id.to_string()],
+        }];
+
+        let result = execute_evolution(&*store, &evolutions, &HashMap::new(), project_id)
+            .await
+            .unwrap();
+        assert_eq!(result.shrunk.len(), 1);
+        assert_eq!(result.shrunk[0].skill_id, skill.id);
+        assert_eq!(result.shrunk[0].notes_removed, 1);
+    }
+
+    #[tokio::test]
+    async fn test_execute_evolution_stable_grow_and_shrink() {
+        let store = Arc::new(MockGraphStore::new());
+        let project_id = Uuid::new_v4();
+
+        let project = crate::neo4j::models::ProjectNode {
+            id: project_id,
+            name: "test".to_string(),
+            slug: "test".to_string(),
+            root_path: "/tmp/test".to_string(),
+            description: None,
+            created_at: Utc::now(),
+            last_synced: None,
+            analytics_computed_at: None,
+            last_co_change_computed_at: None,
+            default_note_energy: None,
+            scaffolding_override: None,
+            sharing_policy: None,
+        };
+        store.create_project(&project).await.unwrap();
+
+        let skill = make_test_skill(project_id);
+        store.create_skill(&skill).await.unwrap();
+
+        let old_note_id = Uuid::new_v4();
+        let old_note = make_test_note(project_id, old_note_id);
+        store.create_note(&old_note).await.unwrap();
+        store
+            .add_skill_member(skill.id, "note", old_note_id)
+            .await
+            .unwrap();
+
+        let new_note_id = Uuid::new_v4();
+        let new_note = make_test_note(project_id, new_note_id);
+        store.create_note(&new_note).await.unwrap();
+
+        let candidate = make_candidate(0, vec!["a"]);
+        let evolutions = vec![SkillEvolution::Stable {
+            skill_id: skill.id,
+            candidate,
+            notes_to_add: vec![new_note_id.to_string()],
+            notes_to_remove: vec![old_note_id.to_string()],
+        }];
+
+        let result = execute_evolution(&*store, &evolutions, &HashMap::new(), project_id)
+            .await
+            .unwrap();
+        assert_eq!(result.grown.len(), 1);
+        assert_eq!(result.shrunk.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_execute_evolution_orphan() {
+        let store = Arc::new(MockGraphStore::new());
+        let project_id = Uuid::new_v4();
+
+        let project = crate::neo4j::models::ProjectNode {
+            id: project_id,
+            name: "test".to_string(),
+            slug: "test".to_string(),
+            root_path: "/tmp/test".to_string(),
+            description: None,
+            created_at: Utc::now(),
+            last_synced: None,
+            analytics_computed_at: None,
+            last_co_change_computed_at: None,
+            default_note_energy: None,
+            scaffolding_override: None,
+            sharing_policy: None,
+        };
+        store.create_project(&project).await.unwrap();
+
+        let mut skill = make_test_skill(project_id);
+        skill.status = crate::skills::SkillStatus::Active;
+        store.create_skill(&skill).await.unwrap();
+
+        let evolutions = vec![SkillEvolution::Orphan { skill_id: skill.id }];
+
+        let _result = execute_evolution(&*store, &evolutions, &HashMap::new(), project_id)
+            .await
+            .unwrap();
+
+        // Verify skill is archived
+        let updated = store.get_skill(skill.id).await.unwrap().unwrap();
+        assert_eq!(updated.status, crate::skills::SkillStatus::Archived);
+    }
+
+    #[tokio::test]
+    async fn test_execute_evolution_orphan_already_archived() {
+        let store = Arc::new(MockGraphStore::new());
+        let project_id = Uuid::new_v4();
+
+        let project = crate::neo4j::models::ProjectNode {
+            id: project_id,
+            name: "test".to_string(),
+            slug: "test".to_string(),
+            root_path: "/tmp/test".to_string(),
+            description: None,
+            created_at: Utc::now(),
+            last_synced: None,
+            analytics_computed_at: None,
+            last_co_change_computed_at: None,
+            default_note_energy: None,
+            scaffolding_override: None,
+            sharing_policy: None,
+        };
+        store.create_project(&project).await.unwrap();
+
+        let mut skill = make_test_skill(project_id);
+        skill.status = crate::skills::SkillStatus::Archived;
+        store.create_skill(&skill).await.unwrap();
+
+        let evolutions = vec![SkillEvolution::Orphan { skill_id: skill.id }];
+
+        // Should not fail on already-archived skill
+        let _result = execute_evolution(&*store, &evolutions, &HashMap::new(), project_id)
+            .await
+            .unwrap();
+        // No error — gracefully skips already-archived skills
+    }
+
+    #[tokio::test]
+    async fn test_execute_evolution_new_skill() {
+        let store = Arc::new(MockGraphStore::new());
+        let project_id = Uuid::new_v4();
+
+        let project = crate::neo4j::models::ProjectNode {
+            id: project_id,
+            name: "test".to_string(),
+            slug: "test".to_string(),
+            root_path: "/tmp/test".to_string(),
+            description: None,
+            created_at: Utc::now(),
+            last_synced: None,
+            analytics_computed_at: None,
+            last_co_change_computed_at: None,
+            default_note_energy: None,
+            scaffolding_override: None,
+            sharing_policy: None,
+        };
+        store.create_project(&project).await.unwrap();
+
+        let note_id = Uuid::new_v4();
+        let note = make_test_note(project_id, note_id);
+        store.create_note(&note).await.unwrap();
+
+        let mut notes_map = HashMap::new();
+        notes_map.insert(note_id.to_string(), note);
+
+        let candidate = SkillCandidate {
+            community_id: 0,
+            member_note_ids: vec![note_id.to_string()],
+            cohesion: 0.8,
+            size: 1,
+            label: "new-cluster".to_string(),
+        };
+
+        let evolutions = vec![SkillEvolution::New { candidate }];
+
+        let _result = execute_evolution(&*store, &evolutions, &notes_map, project_id)
+            .await
+            .unwrap();
+
+        // Verify a new skill was created in the store
+        let skills = store.get_skills_for_project(project_id).await.unwrap();
+        assert_eq!(skills.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_execute_evolution_merge() {
+        let store = Arc::new(MockGraphStore::new());
+        let project_id = Uuid::new_v4();
+
+        let project = crate::neo4j::models::ProjectNode {
+            id: project_id,
+            name: "test".to_string(),
+            slug: "test".to_string(),
+            root_path: "/tmp/test".to_string(),
+            description: None,
+            created_at: Utc::now(),
+            last_synced: None,
+            analytics_computed_at: None,
+            last_co_change_computed_at: None,
+            default_note_energy: None,
+            scaffolding_override: None,
+            sharing_policy: None,
+        };
+        store.create_project(&project).await.unwrap();
+
+        // Create two skills — skill_a has higher energy
+        let mut skill_a = make_test_skill(project_id);
+        skill_a.energy = 0.9;
+        skill_a.name = "skill-a".to_string();
+        store.create_skill(&skill_a).await.unwrap();
+
+        let mut skill_b = make_test_skill(project_id);
+        skill_b.energy = 0.3;
+        skill_b.name = "skill-b".to_string();
+        store.create_skill(&skill_b).await.unwrap();
+
+        // Add notes to skill_b (to be transferred)
+        let note_id = Uuid::new_v4();
+        let note = make_test_note(project_id, note_id);
+        store.create_note(&note).await.unwrap();
+        store
+            .add_skill_member(skill_b.id, "note", note_id)
+            .await
+            .unwrap();
+
+        let candidate = SkillCandidate {
+            community_id: 0,
+            member_note_ids: vec![note_id.to_string()],
+            cohesion: 0.75,
+            size: 3,
+            label: "merged-cluster".to_string(),
+        };
+
+        let evolutions = vec![SkillEvolution::Merge {
+            skill_ids: vec![skill_a.id, skill_b.id],
+            candidate,
+        }];
+
+        let result = execute_evolution(&*store, &evolutions, &HashMap::new(), project_id)
+            .await
+            .unwrap();
+
+        assert_eq!(result.merged.len(), 1);
+        assert_eq!(result.merged[0].survivor_id, skill_a.id);
+        assert_eq!(result.merged[0].absorbed_id, skill_b.id);
+
+        // Verify skill_b is archived
+        let updated_b = store.get_skill(skill_b.id).await.unwrap().unwrap();
+        assert_eq!(updated_b.status, crate::skills::SkillStatus::Archived);
+
+        // Verify survivor's version was incremented
+        let updated_a = store.get_skill(skill_a.id).await.unwrap().unwrap();
+        assert!(updated_a.version > skill_a.version);
+    }
+
+    #[tokio::test]
+    async fn test_execute_evolution_split() {
+        let store = Arc::new(MockGraphStore::new());
+        let project_id = Uuid::new_v4();
+
+        let project = crate::neo4j::models::ProjectNode {
+            id: project_id,
+            name: "test".to_string(),
+            slug: "test".to_string(),
+            root_path: "/tmp/test".to_string(),
+            description: None,
+            created_at: Utc::now(),
+            last_synced: None,
+            analytics_computed_at: None,
+            last_co_change_computed_at: None,
+            default_note_energy: None,
+            scaffolding_override: None,
+            sharing_policy: None,
+        };
+        store.create_project(&project).await.unwrap();
+
+        let skill = make_test_skill(project_id);
+        store.create_skill(&skill).await.unwrap();
+
+        // Create notes for sub-clusters
+        let note_a = Uuid::new_v4();
+        let note_b = Uuid::new_v4();
+        let na = make_test_note(project_id, note_a);
+        let nb = make_test_note(project_id, note_b);
+        store.create_note(&na).await.unwrap();
+        store.create_note(&nb).await.unwrap();
+        store
+            .add_skill_member(skill.id, "note", note_a)
+            .await
+            .unwrap();
+        store
+            .add_skill_member(skill.id, "note", note_b)
+            .await
+            .unwrap();
+
+        let mut notes_map = HashMap::new();
+        notes_map.insert(note_a.to_string(), na);
+        notes_map.insert(note_b.to_string(), nb);
+
+        let cand1 = SkillCandidate {
+            community_id: 0,
+            member_note_ids: vec![note_a.to_string()],
+            cohesion: 0.8,
+            size: 1,
+            label: "sub-a".to_string(),
+        };
+        let cand2 = SkillCandidate {
+            community_id: 1,
+            member_note_ids: vec![note_b.to_string()],
+            cohesion: 0.8,
+            size: 1,
+            label: "sub-b".to_string(),
+        };
+
+        let evolutions = vec![SkillEvolution::Split {
+            skill_id: skill.id,
+            candidates: vec![cand1, cand2],
+        }];
+
+        let result = execute_evolution(&*store, &evolutions, &notes_map, project_id)
+            .await
+            .unwrap();
+
+        assert_eq!(result.split.len(), 1);
+        assert_eq!(result.split[0].original_id, skill.id);
+        assert_eq!(result.split[0].new_skill_ids.len(), 2);
+
+        // Original skill should be archived
+        let original = store.get_skill(skill.id).await.unwrap().unwrap();
+        assert_eq!(original.status, crate::skills::SkillStatus::Archived);
+
+        // New skills should exist
+        let all_skills = store.get_skills_for_project(project_id).await.unwrap();
+        assert_eq!(all_skills.len(), 3); // original (archived) + 2 new
+    }
+
+    #[tokio::test]
+    async fn test_execute_evolution_mixed() {
+        let store = Arc::new(MockGraphStore::new());
+        let project_id = Uuid::new_v4();
+
+        let project = crate::neo4j::models::ProjectNode {
+            id: project_id,
+            name: "test".to_string(),
+            slug: "test".to_string(),
+            root_path: "/tmp/test".to_string(),
+            description: None,
+            created_at: Utc::now(),
+            last_synced: None,
+            analytics_computed_at: None,
+            last_co_change_computed_at: None,
+            default_note_energy: None,
+            scaffolding_override: None,
+            sharing_policy: None,
+        };
+        store.create_project(&project).await.unwrap();
+
+        // Stable unchanged skill
+        let skill_stable = make_test_skill(project_id);
+        store.create_skill(&skill_stable).await.unwrap();
+
+        // Orphan skill
+        let mut skill_orphan = make_test_skill(project_id);
+        skill_orphan.status = crate::skills::SkillStatus::Active;
+        store.create_skill(&skill_orphan).await.unwrap();
+
+        let candidate = make_candidate(0, vec!["a"]);
+        let evolutions = vec![
+            SkillEvolution::Stable {
+                skill_id: skill_stable.id,
+                candidate,
+                notes_to_add: vec![],
+                notes_to_remove: vec![],
+            },
+            SkillEvolution::Orphan {
+                skill_id: skill_orphan.id,
+            },
+        ];
+
+        let result = execute_evolution(&*store, &evolutions, &HashMap::new(), project_id)
+            .await
+            .unwrap();
+
+        assert_eq!(result.unchanged, 1);
+        let orphan_archived = store.get_skill(skill_orphan.id).await.unwrap().unwrap();
+        assert_eq!(orphan_archived.status, crate::skills::SkillStatus::Archived);
+    }
+
+    #[tokio::test]
+    async fn test_execute_evolution_stable_with_invalid_uuid_in_notes() {
+        let store = Arc::new(MockGraphStore::new());
+        let project_id = Uuid::new_v4();
+
+        let project = crate::neo4j::models::ProjectNode {
+            id: project_id,
+            name: "test".to_string(),
+            slug: "test".to_string(),
+            root_path: "/tmp/test".to_string(),
+            description: None,
+            created_at: Utc::now(),
+            last_synced: None,
+            analytics_computed_at: None,
+            last_co_change_computed_at: None,
+            default_note_energy: None,
+            scaffolding_override: None,
+            sharing_policy: None,
+        };
+        store.create_project(&project).await.unwrap();
+
+        let skill = make_test_skill(project_id);
+        store.create_skill(&skill).await.unwrap();
+
+        let candidate = make_candidate(0, vec!["a"]);
+        // "not-a-uuid" will fail Uuid::parse_str — should not crash
+        let evolutions = vec![SkillEvolution::Stable {
+            skill_id: skill.id,
+            candidate,
+            notes_to_add: vec!["not-a-uuid".to_string()],
+            notes_to_remove: vec!["also-not-uuid".to_string()],
+        }];
+
+        let result = execute_evolution(&*store, &evolutions, &HashMap::new(), project_id)
+            .await
+            .unwrap();
+        // Still reports grow/shrink based on list lengths
+        assert_eq!(result.grown.len(), 1);
+        assert_eq!(result.shrunk.len(), 1);
+    }
+
+    // ================================================================
+    // detect_skill_fusion tests (async with MockGraphStore)
+    // ================================================================
+
+    #[tokio::test]
+    async fn test_detect_skill_fusion_no_skills() {
+        let store = Arc::new(MockGraphStore::new());
+        let project_id = Uuid::new_v4();
+
+        let result = detect_skill_fusion(&*store, project_id, 0.7).await.unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_detect_skill_fusion_no_overlap() {
+        let store = Arc::new(MockGraphStore::new());
+        let project_id = Uuid::new_v4();
+
+        let project = crate::neo4j::models::ProjectNode {
+            id: project_id,
+            name: "test".to_string(),
+            slug: "test".to_string(),
+            root_path: "/tmp/test".to_string(),
+            description: None,
+            created_at: Utc::now(),
+            last_synced: None,
+            analytics_computed_at: None,
+            last_co_change_computed_at: None,
+            default_note_energy: None,
+            scaffolding_override: None,
+            sharing_policy: None,
+        };
+        store.create_project(&project).await.unwrap();
+
+        // Two skills with completely different members
+        let skill_a = make_test_skill(project_id);
+        store.create_skill(&skill_a).await.unwrap();
+
+        let mut skill_b = make_test_skill(project_id);
+        skill_b.name = "skill-b".to_string();
+        store.create_skill(&skill_b).await.unwrap();
+
+        let note_a = Uuid::new_v4();
+        let note_b = Uuid::new_v4();
+        let na = make_test_note(project_id, note_a);
+        let nb = make_test_note(project_id, note_b);
+        store.create_note(&na).await.unwrap();
+        store.create_note(&nb).await.unwrap();
+        store
+            .add_skill_member(skill_a.id, "note", note_a)
+            .await
+            .unwrap();
+        store
+            .add_skill_member(skill_b.id, "note", note_b)
+            .await
+            .unwrap();
+
+        let result = detect_skill_fusion(&*store, project_id, 0.7).await.unwrap();
+        assert!(
+            result.is_empty(),
+            "No overlap should produce no fusion candidates"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_detect_skill_fusion_with_overlap() {
+        let store = Arc::new(MockGraphStore::new());
+        let project_id = Uuid::new_v4();
+
+        let project = crate::neo4j::models::ProjectNode {
+            id: project_id,
+            name: "test".to_string(),
+            slug: "test".to_string(),
+            root_path: "/tmp/test".to_string(),
+            description: None,
+            created_at: Utc::now(),
+            last_synced: None,
+            analytics_computed_at: None,
+            last_co_change_computed_at: None,
+            default_note_energy: None,
+            scaffolding_override: None,
+            sharing_policy: None,
+        };
+        store.create_project(&project).await.unwrap();
+
+        // Two skills sharing the same member notes
+        let skill_a = make_test_skill(project_id);
+        store.create_skill(&skill_a).await.unwrap();
+
+        let mut skill_b = make_test_skill(project_id);
+        skill_b.name = "skill-b".to_string();
+        store.create_skill(&skill_b).await.unwrap();
+
+        // Both skills share the same notes → Jaccard = 1.0
+        let note1 = Uuid::new_v4();
+        let note2 = Uuid::new_v4();
+        let n1 = make_test_note(project_id, note1);
+        let n2 = make_test_note(project_id, note2);
+        store.create_note(&n1).await.unwrap();
+        store.create_note(&n2).await.unwrap();
+
+        store
+            .add_skill_member(skill_a.id, "note", note1)
+            .await
+            .unwrap();
+        store
+            .add_skill_member(skill_a.id, "note", note2)
+            .await
+            .unwrap();
+        store
+            .add_skill_member(skill_b.id, "note", note1)
+            .await
+            .unwrap();
+        store
+            .add_skill_member(skill_b.id, "note", note2)
+            .await
+            .unwrap();
+
+        let result = detect_skill_fusion(&*store, project_id, 0.7).await.unwrap();
+        assert_eq!(result.len(), 1);
+        assert!((result[0].overlap - 1.0).abs() < f64::EPSILON);
+        assert_eq!(result[0].combined_member_count, 2);
+        assert!(!result[0].blocked_by_guardrail);
+    }
+
+    #[tokio::test]
+    async fn test_detect_skill_fusion_skips_archived() {
+        let store = Arc::new(MockGraphStore::new());
+        let project_id = Uuid::new_v4();
+
+        let project = crate::neo4j::models::ProjectNode {
+            id: project_id,
+            name: "test".to_string(),
+            slug: "test".to_string(),
+            root_path: "/tmp/test".to_string(),
+            description: None,
+            created_at: Utc::now(),
+            last_synced: None,
+            analytics_computed_at: None,
+            last_co_change_computed_at: None,
+            default_note_energy: None,
+            scaffolding_override: None,
+            sharing_policy: None,
+        };
+        store.create_project(&project).await.unwrap();
+
+        let skill_a = make_test_skill(project_id);
+        store.create_skill(&skill_a).await.unwrap();
+
+        let mut skill_b = make_test_skill(project_id);
+        skill_b.status = crate::skills::SkillStatus::Archived;
+        store.create_skill(&skill_b).await.unwrap();
+
+        // Even though they share members, archived skill should be skipped
+        let note1 = Uuid::new_v4();
+        let n1 = make_test_note(project_id, note1);
+        store.create_note(&n1).await.unwrap();
+        store
+            .add_skill_member(skill_a.id, "note", note1)
+            .await
+            .unwrap();
+        store
+            .add_skill_member(skill_b.id, "note", note1)
+            .await
+            .unwrap();
+
+        let result = detect_skill_fusion(&*store, project_id, 0.7).await.unwrap();
+        assert!(
+            result.is_empty(),
+            "Archived skills should be excluded from fusion detection"
+        );
+    }
+
+    // ================================================================
+    // detect_skill_fission tests (async with MockGraphStore)
+    // ================================================================
+
+    #[tokio::test]
+    async fn test_detect_skill_fission_empty_graph() {
+        let store = Arc::new(MockGraphStore::new());
+        let project_id = Uuid::new_v4();
+
+        // Mock store returns empty synapse graph → InsufficientData → empty result
+        let result = detect_skill_fission(&*store, project_id, 0.5)
+            .await
+            .unwrap();
+        assert!(result.is_empty());
+    }
+
     #[test]
     fn test_evolution_split_one_skill_into_two_clusters() {
         let skill_id = Uuid::new_v4();

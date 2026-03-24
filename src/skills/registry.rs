@@ -497,4 +497,330 @@ mod tests {
         assert_eq!(merged[0].name, "Remote Only");
         assert!(merged[0].is_remote);
     }
+
+    #[test]
+    fn test_merge_both_empty() {
+        let merged = merge_search_results(vec![], vec![]);
+        assert!(merged.is_empty());
+    }
+
+    #[test]
+    fn test_merge_equal_trust_falls_back_to_published_at() {
+        // When trust scores are equal, the tiebreaker is published_at DESC
+        let mut older = make_summary("Older", 0.7, false);
+        older.published_at = chrono::DateTime::parse_from_rfc3339("2025-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let mut newer = make_summary("Newer", 0.7, true);
+        newer.published_at = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let merged = merge_search_results(vec![older], vec![newer]);
+        assert_eq!(merged.len(), 2);
+        // Newer published_at should come first (DESC)
+        assert_eq!(merged[0].name, "Newer");
+        assert_eq!(merged[1].name, "Older");
+    }
+
+    #[test]
+    fn test_merge_all_remote_duplicates_filtered() {
+        let local = vec![make_summary("A", 0.8, false), make_summary("B", 0.6, false)];
+        let remote = vec![make_summary("A", 0.9, true), make_summary("B", 0.95, true)];
+
+        let merged = merge_search_results(local, remote);
+        assert_eq!(merged.len(), 2);
+        // All remote entries are duplicates, so only locals remain
+        for item in &merged {
+            assert!(!item.is_remote);
+        }
+    }
+
+    // =====================================================================
+    // default_limit
+    // =====================================================================
+
+    #[test]
+    fn test_default_limit() {
+        assert_eq!(default_limit(), 20);
+    }
+
+    // =====================================================================
+    // Serde round-trip: PublishedSkill
+    // =====================================================================
+
+    #[test]
+    fn test_published_skill_serde_round_trip() {
+        let skill = make_test_skill();
+        let package = make_test_package();
+        let published = build_published_skill(&skill, package, "Proj".to_string(), None);
+
+        let json = serde_json::to_string(&published).expect("serialize");
+        let deser: PublishedSkill = serde_json::from_str(&json).expect("deserialize");
+
+        assert_eq!(deser.id, published.id);
+        assert_eq!(deser.name, published.name);
+        assert_eq!(deser.description, published.description);
+        assert_eq!(deser.tags, published.tags);
+        assert!((deser.trust_score - published.trust_score).abs() < f64::EPSILON);
+        assert_eq!(deser.source_project_id, published.source_project_id);
+        assert_eq!(deser.source_project_name, published.source_project_name);
+        assert_eq!(deser.published_by, published.published_by);
+        assert_eq!(deser.import_count, published.import_count);
+    }
+
+    #[test]
+    fn test_published_skill_import_count_defaults_to_zero() {
+        // import_count has #[serde(default)], so omitting it should yield 0
+        let skill = make_test_skill();
+        let package = make_test_package();
+        let published = build_published_skill(&skill, package, "Proj".to_string(), None);
+
+        let mut json_val: serde_json::Value = serde_json::to_value(&published).expect("to value");
+        // Remove import_count from the JSON
+        json_val.as_object_mut().unwrap().remove("import_count");
+
+        let deser: PublishedSkill =
+            serde_json::from_value(json_val).expect("deserialize without import_count");
+        assert_eq!(deser.import_count, 0);
+    }
+
+    // =====================================================================
+    // Serde round-trip: PublishedSkillSummary
+    // =====================================================================
+
+    #[test]
+    fn test_published_skill_summary_serde_round_trip() {
+        let summary = make_summary("Test", 0.75, false);
+        let json = serde_json::to_string(&summary).expect("serialize");
+        let deser: PublishedSkillSummary = serde_json::from_str(&json).expect("deserialize");
+
+        assert_eq!(deser.name, "Test");
+        assert!((deser.trust_score - 0.75).abs() < f64::EPSILON);
+        assert!(!deser.is_remote);
+        assert!(deser.remote_url.is_none());
+    }
+
+    #[test]
+    fn test_summary_is_remote_defaults_to_false() {
+        let summary = make_summary("X", 0.5, false);
+        let mut json_val: serde_json::Value = serde_json::to_value(&summary).expect("to value");
+        json_val.as_object_mut().unwrap().remove("is_remote");
+
+        let deser: PublishedSkillSummary =
+            serde_json::from_value(json_val).expect("deserialize without is_remote");
+        assert!(!deser.is_remote);
+    }
+
+    #[test]
+    fn test_summary_remote_url_skipped_when_none() {
+        let summary = make_summary("Local", 0.6, false);
+        let json = serde_json::to_string(&summary).expect("serialize");
+        // remote_url is None, so skip_serializing_if should omit it
+        assert!(!json.contains("remote_url"));
+    }
+
+    #[test]
+    fn test_summary_remote_url_present_when_some() {
+        let summary = make_summary("Remote", 0.6, true);
+        let json = serde_json::to_string(&summary).expect("serialize");
+        assert!(json.contains("remote_url"));
+        assert!(json.contains("https://remote.example.com"));
+    }
+
+    // =====================================================================
+    // Serde: RegistrySearchParams
+    // =====================================================================
+
+    #[test]
+    fn test_search_params_defaults() {
+        let json = r#"{}"#;
+        let params: RegistrySearchParams = serde_json::from_str(json).expect("deser");
+        assert!(params.query.is_none());
+        assert!(params.min_trust.is_none());
+        assert!(params.tags.is_none());
+        assert_eq!(params.limit, 20); // default_limit()
+        assert_eq!(params.offset, 0); // serde(default)
+    }
+
+    #[test]
+    fn test_search_params_all_fields() {
+        let json = r#"{
+            "query": "deployment",
+            "min_trust": 0.7,
+            "tags": ["devops", "ci"],
+            "limit": 50,
+            "offset": 10
+        }"#;
+        let params: RegistrySearchParams = serde_json::from_str(json).expect("deser");
+        assert_eq!(params.query.as_deref(), Some("deployment"));
+        assert!((params.min_trust.unwrap() - 0.7).abs() < f64::EPSILON);
+        assert_eq!(params.tags.as_ref().unwrap().len(), 2);
+        assert_eq!(params.limit, 50);
+        assert_eq!(params.offset, 10);
+    }
+
+    // =====================================================================
+    // Serde: RegistrySearchResult
+    // =====================================================================
+
+    #[test]
+    fn test_search_result_serde_round_trip() {
+        let result = RegistrySearchResult {
+            items: vec![PublishedSkillSummary::from(&build_published_skill(
+                &make_test_skill(),
+                make_test_package(),
+                "P".to_string(),
+                None,
+            ))],
+            total: 42,
+        };
+
+        let json = serde_json::to_string(&result).expect("serialize");
+        let deser: RegistrySearchResult = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(deser.total, 42);
+        assert_eq!(deser.items.len(), 1);
+        assert_eq!(deser.items[0].name, "Test Skill");
+    }
+
+    #[test]
+    fn test_search_result_empty_items() {
+        let result = RegistrySearchResult {
+            items: vec![],
+            total: 0,
+        };
+        let json = serde_json::to_string(&result).expect("serialize");
+        let deser: RegistrySearchResult = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(deser.total, 0);
+        assert!(deser.items.is_empty());
+    }
+
+    // =====================================================================
+    // Serde: PublishRequest
+    // =====================================================================
+
+    #[test]
+    fn test_publish_request_deser() {
+        let skill_id = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+        let json = format!(
+            r#"{{"skill_id":"{}","project_id":"{}"}}"#,
+            skill_id, project_id
+        );
+        let req: PublishRequest = serde_json::from_str(&json).expect("deser");
+        assert_eq!(req.skill_id, skill_id);
+        assert_eq!(req.project_id, project_id);
+        assert!(req.source_project_name.is_none());
+    }
+
+    #[test]
+    fn test_publish_request_with_source_name() {
+        let skill_id = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+        let json = format!(
+            r#"{{"skill_id":"{}","project_id":"{}","source_project_name":"My Proj"}}"#,
+            skill_id, project_id
+        );
+        let req: PublishRequest = serde_json::from_str(&json).expect("deser");
+        assert_eq!(req.source_project_name.as_deref(), Some("My Proj"));
+    }
+
+    // =====================================================================
+    // Serde: RemoteSearchResponse
+    // =====================================================================
+
+    #[test]
+    fn test_remote_search_response_deser() {
+        let summary = make_summary("Remote Skill", 0.8, true);
+        let items_json = serde_json::to_string(&vec![&summary]).expect("ser items");
+        let json = format!(r#"{{"items":{},"total":1}}"#, items_json);
+        let resp: RemoteSearchResponse = serde_json::from_str(&json).expect("deser");
+        assert_eq!(resp.total, 1);
+        assert_eq!(resp.items.len(), 1);
+        assert_eq!(resp.items[0].name, "Remote Skill");
+    }
+
+    // =====================================================================
+    // build_published_skill edge cases
+    // =====================================================================
+
+    #[test]
+    fn test_build_published_skill_copies_tags() {
+        let mut skill = make_test_skill();
+        skill.tags = vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()];
+        let package = make_test_package();
+        let published = build_published_skill(&skill, package, "P".to_string(), None);
+        assert_eq!(published.tags, vec!["alpha", "beta", "gamma"]);
+    }
+
+    #[test]
+    fn test_build_published_skill_published_by_is_agent() {
+        let skill = make_test_skill();
+        let package = make_test_package();
+        let published = build_published_skill(&skill, package, "P".to_string(), None);
+        assert_eq!(published.published_by, "agent");
+    }
+
+    #[test]
+    fn test_build_published_skill_source_project_id_from_skill() {
+        let skill = make_test_skill();
+        let expected_project_id = skill.project_id;
+        let package = make_test_package();
+        let published = build_published_skill(&skill, package, "P".to_string(), None);
+        assert_eq!(published.source_project_id, expected_project_id);
+    }
+
+    #[test]
+    fn test_build_published_skill_generates_unique_ids() {
+        let skill = make_test_skill();
+        let p1 = build_published_skill(&skill, make_test_package(), "P".to_string(), None);
+        let p2 = build_published_skill(&skill, make_test_package(), "P".to_string(), None);
+        assert_ne!(p1.id, p2.id);
+    }
+
+    // =====================================================================
+    // PublishedSkillSummary from PublishedSkill: field mapping
+    // =====================================================================
+
+    #[test]
+    fn test_summary_from_published_maps_all_fields() {
+        let mut skill = make_test_skill();
+        skill.tags = vec!["tag1".to_string(), "tag2".to_string()];
+        skill.description = "Custom desc".to_string();
+        let mut package = make_test_package();
+        package.protocols = vec![crate::skills::package::PortableProtocol {
+            name: "proto1".to_string(),
+            description: "A protocol".to_string(),
+            category: "business".to_string(),
+            relevance_vector: None,
+            states: vec![],
+            transitions: vec![],
+        }];
+        let published = build_published_skill(&skill, package, "Big Project".to_string(), None);
+        let summary = PublishedSkillSummary::from(&published);
+
+        assert_eq!(summary.id, published.id);
+        assert_eq!(summary.description, "Custom desc");
+        assert_eq!(summary.tags, vec!["tag1", "tag2"]);
+        assert_eq!(summary.trust_level, published.trust_level);
+        assert_eq!(summary.source_project_name, "Big Project");
+        assert_eq!(summary.published_at, published.published_at);
+        assert_eq!(summary.note_count, 1);
+        assert_eq!(summary.protocol_count, 1);
+        assert_eq!(summary.import_count, 0);
+        assert!(!summary.is_remote);
+        assert!(summary.remote_url.is_none());
+    }
+
+    #[test]
+    fn test_summary_from_published_with_import_count() {
+        let skill = make_test_skill();
+        let package = make_test_package();
+        let mut published = build_published_skill(&skill, package, "P".to_string(), None);
+        published.import_count = 42;
+
+        let summary = PublishedSkillSummary::from(&published);
+        assert_eq!(summary.import_count, 42);
+    }
 }

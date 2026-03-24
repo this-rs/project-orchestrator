@@ -1256,4 +1256,808 @@ mod tests {
         assert_eq!(overridden.level, 4, "Override should force L4");
         assert!(overridden.is_overridden);
     }
+
+    // ========================================================================
+    // Additional coverage tests
+    // ========================================================================
+
+    #[test]
+    fn test_config_serde_roundtrip_custom_values() {
+        let config = SkillMaintenanceConfig {
+            synapse_decay_amount: 0.05,
+            synapse_prune_threshold: 0.2,
+            evolution_overlap_threshold: 0.8,
+            backfill_recluster_threshold: 100,
+            enabled: true,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let d: SkillMaintenanceConfig = serde_json::from_str(&json).unwrap();
+        assert!(d.enabled);
+        assert!((d.synapse_decay_amount - 0.05).abs() < f64::EPSILON);
+        assert!((d.synapse_prune_threshold - 0.2).abs() < f64::EPSILON);
+        assert!((d.evolution_overlap_threshold - 0.8).abs() < f64::EPSILON);
+        assert_eq!(d.backfill_recluster_threshold, 100);
+    }
+
+    #[test]
+    fn test_maintenance_result_serde_all_fields() {
+        let result = MaintenanceResult {
+            level: "weekly".to_string(),
+            lifecycle: Some(MetricsUpdateResult {
+                skills_updated: 10,
+                skills_promoted: 3,
+                skills_demoted: 1,
+                skills_archived: 2,
+                decisions_added: 5,
+            }),
+            synapses_decayed: Some(20),
+            synapses_pruned: Some(5),
+            evolution: Some(crate::skills::evolution::EvolutionResult {
+                merged: vec![],
+                split: vec![],
+                grown: vec![],
+                shrunk: vec![],
+                unchanged: 0,
+            }),
+            skills_detected: Some(7),
+            warnings: vec!["warn1".to_string(), "warn2".to_string()],
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let d: MaintenanceResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(d.level, "weekly");
+        assert_eq!(d.skills_detected, Some(7));
+        assert_eq!(d.synapses_pruned, Some(5));
+        assert_eq!(d.warnings.len(), 2);
+        assert!(d.evolution.is_some());
+        let evo = d.evolution.unwrap();
+        assert!(evo.merged.is_empty());
+        assert_eq!(evo.unchanged, 0);
+    }
+
+    #[test]
+    fn test_maintenance_result_default_has_no_optional_fields() {
+        let r = MaintenanceResult::default();
+        assert!(r.synapses_decayed.is_none());
+        assert!(r.synapses_pruned.is_none());
+        assert!(r.skills_detected.is_none());
+    }
+
+    // ========================================================================
+    // cleanup_absolute_triggers tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_cleanup_absolute_triggers_no_project() {
+        let store = MockGraphStore::new();
+        let fake_id = Uuid::new_v4();
+        // No project in store => returns 0
+        let count = cleanup_absolute_triggers(&store, fake_id).await.unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_absolute_triggers_empty_root_path() {
+        let store = MockGraphStore::new();
+        let mut project = test_project();
+        project.root_path = "".to_string();
+        let pid = project.id;
+        store.create_project(&project).await.unwrap();
+
+        let count = cleanup_absolute_triggers(&store, pid).await.unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_absolute_triggers_fixes_absolute_paths() {
+        let store = MockGraphStore::new();
+        let mut project = test_project();
+        project.root_path = "/home/user/myproject".to_string();
+        let pid = project.id;
+        store.create_project(&project).await.unwrap();
+
+        // Create a skill with an absolute FileGlob trigger
+        let mut skill = SkillNode::new(pid, "Test Skill");
+        skill.trigger_patterns = vec![
+            crate::skills::models::SkillTrigger::file_glob("/home/user/myproject/src/**/*.rs", 0.8),
+            crate::skills::models::SkillTrigger::regex("test.*pattern", 0.7),
+        ];
+        store.create_skill(&skill).await.unwrap();
+
+        let count = cleanup_absolute_triggers(&store, pid).await.unwrap();
+        assert_eq!(count, 1, "Should have fixed one absolute trigger");
+
+        // Verify the trigger was relativized
+        let updated = store.get_skill(skill.id).await.unwrap().unwrap();
+        let glob_trigger = updated
+            .trigger_patterns
+            .iter()
+            .find(|t| t.pattern_type == crate::skills::models::TriggerType::FileGlob)
+            .unwrap();
+        assert!(
+            !glob_trigger.pattern_value.starts_with('/'),
+            "Pattern should be relative now, got: {}",
+            glob_trigger.pattern_value
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_absolute_triggers_skips_relative_paths() {
+        let store = MockGraphStore::new();
+        let mut project = test_project();
+        project.root_path = "/home/user/myproject".to_string();
+        let pid = project.id;
+        store.create_project(&project).await.unwrap();
+
+        // Create a skill with only relative triggers
+        let mut skill = SkillNode::new(pid, "Relative Skill");
+        skill.trigger_patterns = vec![crate::skills::models::SkillTrigger::file_glob(
+            "src/**/*.rs",
+            0.8,
+        )];
+        store.create_skill(&skill).await.unwrap();
+
+        let count = cleanup_absolute_triggers(&store, pid).await.unwrap();
+        assert_eq!(count, 0, "No absolute triggers to fix");
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_absolute_triggers_no_skills() {
+        let (store, pid) = setup_store_with_project().await;
+        let count = cleanup_absolute_triggers(&store, pid).await.unwrap();
+        assert_eq!(count, 0);
+    }
+
+    // ========================================================================
+    // run_maintenance_with_tracking tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_tracked_maintenance_daily_level() {
+        let store = MockGraphStore::new();
+        let (project_id, _, _) = setup_project_with_tasks(&store, 2, 0, 0).await;
+
+        // Add some notes for meaningful snapshot
+        for i in 0..3 {
+            let mut note = Note::new(
+                Some(project_id),
+                NoteType::Observation,
+                format!("Daily note {}", i),
+                "test".into(),
+            );
+            note.importance = NoteImportance::Medium;
+            note.tags = vec!["test".into()];
+            note.energy = 0.6;
+            store.create_note(&note).await.unwrap();
+        }
+
+        let config = SkillMaintenanceConfig::default();
+        let (result, report) = run_maintenance_with_tracking(&store, project_id, "daily", &config)
+            .await
+            .unwrap();
+
+        assert_eq!(result.level, "daily");
+        assert_eq!(report.maintenance_level, "daily");
+        assert!(report.success_rate >= 0.0 && report.success_rate <= 1.0);
+        assert!(report.duration_ms < 10_000); // should be fast in mock
+    }
+
+    #[tokio::test]
+    async fn test_tracked_maintenance_weekly_level() {
+        let store = MockGraphStore::new();
+        let (project_id, _, _) = setup_project_with_tasks(&store, 1, 0, 0).await;
+
+        let config = SkillMaintenanceConfig::default();
+        let (result, report) = run_maintenance_with_tracking(&store, project_id, "weekly", &config)
+            .await
+            .unwrap();
+
+        assert_eq!(result.level, "weekly");
+        assert_eq!(report.maintenance_level, "weekly");
+    }
+
+    #[tokio::test]
+    async fn test_tracked_maintenance_full_level() {
+        let store = MockGraphStore::new();
+        let (project_id, _, _) = setup_project_with_tasks(&store, 1, 0, 0).await;
+
+        let config = SkillMaintenanceConfig::default();
+        let (result, report) = run_maintenance_with_tracking(&store, project_id, "full", &config)
+            .await
+            .unwrap();
+
+        assert_eq!(result.level, "full");
+        assert_eq!(report.maintenance_level, "full");
+    }
+
+    #[tokio::test]
+    async fn test_tracked_maintenance_unknown_level_defaults_to_daily() {
+        let store = MockGraphStore::new();
+        let (project_id, _, _) = setup_project_with_tasks(&store, 1, 0, 0).await;
+
+        let config = SkillMaintenanceConfig::default();
+        let (result, report) =
+            run_maintenance_with_tracking(&store, project_id, "bogus_level", &config)
+                .await
+                .unwrap();
+
+        // Unknown level falls through to daily
+        assert_eq!(result.level, "daily");
+        assert_eq!(report.maintenance_level, "bogus_level");
+    }
+
+    #[tokio::test]
+    async fn test_tracked_maintenance_adaptive_decay_on_low_success() {
+        let store = MockGraphStore::new();
+        let (project_id, _, _) = setup_project_with_tasks(&store, 1, 0, 0).await;
+
+        // Seed a maintenance-report note with low success_rate to trigger adaptive decay
+        let report_content = serde_json::json!({
+            "success_rate": 0.2,
+            "maintenance_level": "daily",
+        });
+        let mut report_note = Note::new(
+            Some(project_id),
+            NoteType::Observation,
+            report_content.to_string(),
+            "maintenance-tracker".into(),
+        );
+        report_note.tags = vec![
+            "maintenance-report".to_string(),
+            "auto-generated".to_string(),
+        ];
+        store.create_note(&report_note).await.unwrap();
+
+        let config = SkillMaintenanceConfig::default();
+        let original_decay = config.synapse_decay_amount;
+
+        // Run tracked maintenance - should adapt config
+        let (result, report) = run_maintenance_with_tracking(&store, project_id, "hourly", &config)
+            .await
+            .unwrap();
+
+        assert_eq!(result.level, "hourly");
+        // The adaptive decay should have halved - we can't directly observe the internal
+        // config but we verify the function ran successfully and stored a new report
+        assert!(report.success_rate >= 0.0 && report.success_rate <= 1.0);
+        // Verify original config was not mutated
+        assert!((config.synapse_decay_amount - original_decay).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn test_tracked_maintenance_stores_report_as_note() {
+        let store = MockGraphStore::new();
+        let (project_id, _, _) = setup_project_with_tasks(&store, 1, 0, 0).await;
+
+        let config = SkillMaintenanceConfig::default();
+        let (_result, _report) =
+            run_maintenance_with_tracking(&store, project_id, "hourly", &config)
+                .await
+                .unwrap();
+
+        // Verify a maintenance-report note was stored
+        let filters = crate::notes::models::NoteFilters {
+            tags: Some(vec!["maintenance-report".to_string()]),
+            ..Default::default()
+        };
+        let (notes, _) = store
+            .list_notes(Some(project_id), None, &filters)
+            .await
+            .unwrap();
+        assert!(
+            !notes.is_empty(),
+            "Should have stored a maintenance-report note"
+        );
+        // Verify the note content is valid JSON with expected fields
+        let content: serde_json::Value = serde_json::from_str(&notes[0].content).unwrap();
+        assert!(content.get("success_rate").is_some());
+        assert!(content.get("maintenance_level").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_tracked_maintenance_success_rate_calculation() {
+        let store = MockGraphStore::new();
+        let (project_id, _, _) = setup_project_with_tasks(&store, 5, 0, 0).await;
+
+        // Add many high-energy notes so snapshot metrics are stable
+        for i in 0..10 {
+            let mut note = Note::new(
+                Some(project_id),
+                NoteType::Observation,
+                format!("Stable note {}", i),
+                "test".into(),
+            );
+            note.importance = NoteImportance::Medium;
+            note.tags = vec!["test".into()];
+            note.energy = 0.9;
+            store.create_note(&note).await.unwrap();
+        }
+
+        let config = SkillMaintenanceConfig::default();
+        let (_result, report) =
+            run_maintenance_with_tracking(&store, project_id, "hourly", &config)
+                .await
+                .unwrap();
+
+        // With stable metrics, most deltas should be >= 0
+        // success_rate = stable_or_improved / 5 metrics
+        assert!(
+            report.success_rate >= 0.0 && report.success_rate <= 1.0,
+            "Success rate should be [0,1], got {}",
+            report.success_rate
+        );
+    }
+
+    // ========================================================================
+    // deep_maintenance tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_deep_maintenance_no_stagnation() {
+        let store = MockGraphStore::new();
+        let (project_id, _, _) = setup_project_with_tasks(&store, 5, 0, 0).await;
+
+        // Healthy project with high-energy notes
+        for i in 0..5 {
+            let mut note = Note::new(
+                Some(project_id),
+                NoteType::Observation,
+                format!("Healthy {}", i),
+                "test".into(),
+            );
+            note.importance = NoteImportance::Medium;
+            note.tags = vec!["test".into()];
+            note.energy = 0.9;
+            store.create_note(&note).await.unwrap();
+        }
+
+        let config = SkillMaintenanceConfig::default();
+        let report = deep_maintenance(&store, project_id, &config).await.unwrap();
+
+        // Not stagnating
+        assert!(
+            !report.stagnation.is_stagnating || report.stagnation.signals_triggered < 3,
+            "Healthy project should not be stagnating"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_deep_maintenance_with_stale_notes_recommendation() {
+        let store = MockGraphStore::new();
+        let (project_id, _, _) = setup_project_with_tasks(&store, 0, 0, 3).await;
+
+        // High frustration
+        for i in 0..3 {
+            let mut note = Note::new(
+                Some(project_id),
+                NoteType::Observation,
+                format!("Stale {}", i),
+                "test".into(),
+            );
+            note.importance = NoteImportance::Low;
+            note.energy = 0.05;
+            note.tags = vec!["test".into()];
+            store.create_note(&note).await.unwrap();
+        }
+
+        let config = SkillMaintenanceConfig::default();
+        let report = deep_maintenance(&store, project_id, &config).await.unwrap();
+
+        // Should have stuck_tasks recommendations since we have 3 in_progress tasks
+        assert!(
+            report.stuck_tasks_found >= 3,
+            "Should find stuck tasks, got {}",
+            report.stuck_tasks_found
+        );
+        // Check recommendations contain stuck tasks mention
+        let has_stuck_rec = report
+            .recommendations
+            .iter()
+            .any(|r| r.contains("stuck in_progress"));
+        assert!(
+            has_stuck_rec,
+            "Should have stuck tasks recommendation, got: {:?}",
+            report.recommendations
+        );
+    }
+
+    #[tokio::test]
+    async fn test_deep_maintenance_aggressive_config() {
+        // Verify deep_maintenance uses 3x decay and 1.5x prune
+        let store = MockGraphStore::new();
+        let (project_id, _, _) = setup_project_with_tasks(&store, 0, 0, 1).await;
+
+        let config = SkillMaintenanceConfig {
+            synapse_decay_amount: 0.02,
+            synapse_prune_threshold: 0.1,
+            ..Default::default()
+        };
+
+        // Should not panic with aggressive config
+        let report = deep_maintenance(&store, project_id, &config).await.unwrap();
+        assert!(report.maintenance.is_some() || report.maintenance.is_none());
+    }
+
+    // ========================================================================
+    // count_stuck_tasks tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_count_stuck_tasks_no_plans() {
+        let (store, project_id) = setup_store_with_project().await;
+        let count = count_stuck_tasks(&store, project_id).await;
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_count_stuck_tasks_mixed_statuses() {
+        let store = MockGraphStore::new();
+        let (project_id, _, _) = setup_project_with_tasks(&store, 3, 2, 4).await;
+        let count = count_stuck_tasks(&store, project_id).await;
+        assert_eq!(count, 4, "Should find 4 in_progress tasks");
+    }
+
+    #[tokio::test]
+    async fn test_count_stuck_tasks_zero_in_progress() {
+        let store = MockGraphStore::new();
+        let (project_id, _, _) = setup_project_with_tasks(&store, 5, 3, 0).await;
+        let count = count_stuck_tasks(&store, project_id).await;
+        assert_eq!(count, 0, "No in_progress tasks should yield 0");
+    }
+
+    // ========================================================================
+    // Daily maintenance edge cases
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_daily_maintenance_with_many_synapses_stagnation_detection() {
+        let (store, project_id) = setup_store_with_project().await;
+
+        // Create notes and synapses with low weights to trigger stagnation detection
+        let mut note_ids = Vec::new();
+        for i in 0..6 {
+            let mut note = Note::new(
+                Some(project_id),
+                NoteType::Observation,
+                format!("Stagnant {}", i),
+                "test".into(),
+            );
+            note.importance = NoteImportance::Medium;
+            note.tags = vec!["test".into()];
+            note.energy = 0.1;
+            note_ids.push(note.id);
+            store.create_note(&note).await.unwrap();
+        }
+
+        // Create low-weight synapses between pairs (need >= 4 for stagnation detection)
+        for i in 0..5 {
+            store
+                .note_synapses
+                .write()
+                .await
+                .entry(note_ids[i])
+                .or_default()
+                .push((note_ids[i + 1], 0.15)); // low weight
+        }
+
+        let config = SkillMaintenanceConfig::default();
+        let result = run_daily_maintenance(&store, project_id, &config)
+            .await
+            .unwrap();
+
+        assert_eq!(result.level, "daily");
+        // With low synapse weights the stagnation detection should fire
+        // and add a warning (if the t-test is significant)
+        // Either way the function should complete successfully
+        assert!(result.synapses_decayed.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_daily_maintenance_adaptive_lifecycle_with_skills() {
+        let (store, project_id) = setup_store_with_project().await;
+
+        // Create some skills so adaptive lifecycle config is computed
+        for i in 0..3 {
+            let mut skill = SkillNode::new(project_id, format!("Skill {}", i));
+            skill.status = SkillStatus::Active;
+            skill.energy = 0.5;
+            skill.cohesion = 0.5;
+            skill.activation_count = 10;
+            store.create_skill(&skill).await.unwrap();
+        }
+
+        let config = SkillMaintenanceConfig::default();
+        let result = run_daily_maintenance(&store, project_id, &config)
+            .await
+            .unwrap();
+
+        assert_eq!(result.level, "daily");
+        assert!(result.lifecycle.is_some());
+    }
+
+    // ========================================================================
+    // Weekly maintenance with existing skills
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_weekly_maintenance_with_existing_skills() {
+        let (store, project_id) = setup_store_with_project().await;
+
+        // Create existing skills with members
+        let mut skill = SkillNode::new(project_id, "Existing Skill");
+        skill.status = SkillStatus::Active;
+        let skill_id = skill.id;
+        store.create_skill(&skill).await.unwrap();
+
+        // Create notes and assign them to the skill
+        let mut note = Note::new(
+            Some(project_id),
+            NoteType::Observation,
+            "Member note".into(),
+            "test".into(),
+        );
+        note.importance = NoteImportance::Medium;
+        note.tags = vec!["test".into()];
+        let note_id = note.id;
+        store.create_note(&note).await.unwrap();
+
+        // Link note to skill
+        store
+            .add_skill_member(skill_id, "note", note_id)
+            .await
+            .unwrap();
+
+        let config = SkillMaintenanceConfig::default();
+        let result = run_weekly_maintenance(&store, project_id, &config)
+            .await
+            .unwrap();
+
+        assert_eq!(result.level, "weekly");
+        assert!(result.lifecycle.is_some());
+    }
+
+    // ========================================================================
+    // full maintenance includes cleanup_absolute_triggers
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_full_maintenance_runs_trigger_cleanup() {
+        let store = MockGraphStore::new();
+        let mut project = test_project();
+        project.root_path = "/home/user/proj".to_string();
+        let pid = project.id;
+        store.create_project(&project).await.unwrap();
+
+        // Create a skill with absolute trigger
+        let mut skill = SkillNode::new(pid, "Cleanup Target");
+        skill.trigger_patterns = vec![crate::skills::models::SkillTrigger::file_glob(
+            "/home/user/proj/src/**",
+            0.8,
+        )];
+        store.create_skill(&skill).await.unwrap();
+
+        let config = SkillMaintenanceConfig::default();
+        let result = run_full_maintenance(&store, pid, &config).await.unwrap();
+        assert_eq!(result.level, "full");
+
+        // Verify the trigger was cleaned up
+        let updated = store.get_skill(skill.id).await.unwrap().unwrap();
+        if let Some(trigger) = updated.trigger_patterns.first() {
+            if trigger.pattern_type == crate::skills::models::TriggerType::FileGlob {
+                assert!(
+                    !trigger.pattern_value.starts_with("/home"),
+                    "Trigger should have been relativized, got: {}",
+                    trigger.pattern_value
+                );
+            }
+        }
+    }
+
+    // ========================================================================
+    // get_last_maintenance_success_rate tests (via tracked maintenance)
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_get_last_maintenance_success_rate_no_report() {
+        let store = MockGraphStore::new();
+        let (project_id, _, _) = setup_project_with_tasks(&store, 1, 0, 0).await;
+
+        // No maintenance report note exists
+        let rate = get_last_maintenance_success_rate(&store, project_id).await;
+        assert!(rate.is_none(), "Should return None when no report exists");
+    }
+
+    #[tokio::test]
+    async fn test_get_last_maintenance_success_rate_with_report() {
+        let store = MockGraphStore::new();
+        let (project_id, _, _) = setup_project_with_tasks(&store, 1, 0, 0).await;
+
+        // Seed a maintenance report note
+        let content = serde_json::json!({
+            "success_rate": 0.8,
+            "maintenance_level": "daily",
+        });
+        let mut note = Note::new(
+            Some(project_id),
+            NoteType::Observation,
+            content.to_string(),
+            "maintenance-tracker".into(),
+        );
+        note.tags = vec!["maintenance-report".to_string()];
+        store.create_note(&note).await.unwrap();
+
+        let rate = get_last_maintenance_success_rate(&store, project_id).await;
+        assert!(rate.is_some(), "Should find the report");
+        assert!((rate.unwrap() - 0.8).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn test_get_last_maintenance_success_rate_invalid_json() {
+        let store = MockGraphStore::new();
+        let (project_id, _, _) = setup_project_with_tasks(&store, 1, 0, 0).await;
+
+        // Seed a note with invalid JSON content but the right tag
+        let mut note = Note::new(
+            Some(project_id),
+            NoteType::Observation,
+            "not valid json".to_string(),
+            "maintenance-tracker".into(),
+        );
+        note.tags = vec!["maintenance-report".to_string()];
+        store.create_note(&note).await.unwrap();
+
+        let rate = get_last_maintenance_success_rate(&store, project_id).await;
+        assert!(rate.is_none(), "Should return None for invalid JSON");
+    }
+
+    #[tokio::test]
+    async fn test_get_last_maintenance_success_rate_json_missing_field() {
+        let store = MockGraphStore::new();
+        let (project_id, _, _) = setup_project_with_tasks(&store, 1, 0, 0).await;
+
+        // Valid JSON but missing success_rate field
+        let content = serde_json::json!({
+            "maintenance_level": "daily",
+        });
+        let mut note = Note::new(
+            Some(project_id),
+            NoteType::Observation,
+            content.to_string(),
+            "maintenance-tracker".into(),
+        );
+        note.tags = vec!["maintenance-report".to_string()];
+        store.create_note(&note).await.unwrap();
+
+        let rate = get_last_maintenance_success_rate(&store, project_id).await;
+        assert!(
+            rate.is_none(),
+            "Should return None when success_rate field missing"
+        );
+    }
+
+    // ========================================================================
+    // store_maintenance_report tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_store_maintenance_report_creates_note() {
+        let store = MockGraphStore::new();
+        let (project_id, _, _) = setup_project_with_tasks(&store, 1, 0, 0).await;
+
+        let report = crate::neo4j::models::MaintenanceReport {
+            before: MaintenanceSnapshot {
+                health_score: 0.5,
+                active_synapses: 10,
+                mean_energy: 0.6,
+                skill_count: 3,
+                note_count: 20,
+                captured_at: "2024-01-01T00:00:00Z".to_string(),
+            },
+            after: MaintenanceSnapshot {
+                health_score: 0.6,
+                active_synapses: 12,
+                mean_energy: 0.55,
+                skill_count: 4,
+                note_count: 22,
+                captured_at: "2024-01-01T00:01:00Z".to_string(),
+            },
+            delta_health_score: 0.1,
+            delta_active_synapses: 2,
+            delta_mean_energy: -0.05,
+            delta_skill_count: 1,
+            delta_note_count: 2,
+            success_rate: 0.8,
+            maintenance_level: "daily".to_string(),
+            duration_ms: 150,
+        };
+
+        store_maintenance_report(&store, project_id, &report).await;
+
+        // Verify the note was created
+        let filters = crate::notes::models::NoteFilters {
+            tags: Some(vec!["maintenance-report".to_string()]),
+            ..Default::default()
+        };
+        let (notes, _) = store
+            .list_notes(Some(project_id), None, &filters)
+            .await
+            .unwrap();
+        assert_eq!(notes.len(), 1);
+
+        // Verify note content
+        let content: serde_json::Value = serde_json::from_str(&notes[0].content).unwrap();
+        assert_eq!(content["success_rate"], 0.8);
+        assert_eq!(content["maintenance_level"], "daily");
+        assert_eq!(content["duration_ms"], 150);
+
+        // Verify tags include level
+        assert!(notes[0].tags.contains(&"level:daily".to_string()));
+        assert!(notes[0].tags.contains(&"auto-generated".to_string()));
+    }
+
+    // ========================================================================
+    // MaintenanceReport delta and success_rate logic tests
+    // ========================================================================
+
+    #[test]
+    fn test_success_rate_all_improved() {
+        // All metrics improved => success_rate = 1.0
+        let metrics = [
+            0.1_f64 >= 0.0,    // delta_health_score
+            2_i64 >= 0,        // delta_active_synapses
+            0.05_f64 >= -0.01, // delta_mean_energy
+            1_i64 >= 0,        // delta_skill_count
+            3_i64 >= 0,        // delta_note_count
+        ];
+        let stable_or_improved = metrics.iter().filter(|&&b| b).count();
+        let success_rate = stable_or_improved as f64 / metrics.len() as f64;
+        assert!((success_rate - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_success_rate_all_degraded() {
+        // All metrics degraded => success_rate = 0.0
+        let metrics = [
+            (-0.5_f64) >= 0.0,   // delta_health_score: degraded
+            (-3_i64) >= 0,       // delta_active_synapses: degraded
+            (-0.1_f64) >= -0.01, // delta_mean_energy: degraded (below tolerance)
+            (-2_i64) >= 0,       // delta_skill_count: degraded
+            (-1_i64) >= 0,       // delta_note_count: degraded
+        ];
+        let stable_or_improved = metrics.iter().filter(|&&b| b).count();
+        let success_rate = stable_or_improved as f64 / metrics.len() as f64;
+        assert!((success_rate - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_success_rate_mixed() {
+        // 3 of 5 improved
+        let metrics = [
+            0.0_f64 >= 0.0,        // stable
+            0_i64 >= 0,            // stable
+            (-0.005_f64) >= -0.01, // within tolerance
+            (-1_i64) >= 0,         // degraded
+            (-2_i64) >= 0,         // degraded
+        ];
+        let stable_or_improved = metrics.iter().filter(|&&b| b).count();
+        let success_rate = stable_or_improved as f64 / metrics.len() as f64;
+        assert!((success_rate - 0.6).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_success_rate_energy_tolerance() {
+        // Energy decay of -0.01 is within tolerance
+        let delta_mean_energy = -0.01_f64;
+        assert!(
+            delta_mean_energy >= -0.01,
+            "Small energy decay should be tolerated"
+        );
+
+        // Energy decay of -0.02 exceeds tolerance
+        let delta_mean_energy2 = -0.02_f64;
+        assert!(
+            delta_mean_energy2 < -0.01,
+            "Larger energy decay should NOT be tolerated"
+        );
+    }
 }

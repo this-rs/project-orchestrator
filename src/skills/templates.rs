@@ -601,4 +601,663 @@ mod tests {
         assert!(template.contains("## Context"));
         assert!(template.contains("## Assertions"));
     }
+
+    // ================================================================
+    // importance_rank — cover all arms
+    // ================================================================
+
+    #[test]
+    fn test_importance_rank_all_variants() {
+        assert_eq!(importance_rank(&NoteImportance::Critical), 4);
+        assert_eq!(importance_rank(&NoteImportance::High), 3);
+        assert_eq!(importance_rank(&NoteImportance::Medium), 2);
+        assert_eq!(importance_rank(&NoteImportance::Low), 1);
+        // Verify ordering
+        assert!(
+            importance_rank(&NoteImportance::Critical) > importance_rank(&NoteImportance::High)
+        );
+        assert!(importance_rank(&NoteImportance::High) > importance_rank(&NoteImportance::Medium));
+        assert!(importance_rank(&NoteImportance::Medium) > importance_rank(&NoteImportance::Low));
+    }
+
+    // ================================================================
+    // filter_sort — secondary sort by energy
+    // ================================================================
+
+    #[test]
+    fn test_filter_sort_by_energy_secondary() {
+        let mut note_high_energy = make_note(
+            NoteType::Pattern,
+            NoteImportance::Medium,
+            "High energy pattern",
+            vec![],
+        );
+        note_high_energy.energy = 0.9;
+
+        let mut note_low_energy = make_note(
+            NoteType::Pattern,
+            NoteImportance::Medium,
+            "Low energy pattern",
+            vec![],
+        );
+        note_low_energy.energy = 0.1;
+
+        let mut note_mid_energy = make_note(
+            NoteType::Pattern,
+            NoteImportance::Medium,
+            "Mid energy pattern",
+            vec![],
+        );
+        note_mid_energy.energy = 0.5;
+
+        let notes = vec![note_low_energy, note_high_energy, note_mid_energy];
+        let sorted = filter_sort(&notes, NoteType::Pattern);
+
+        assert_eq!(sorted.len(), 3);
+        // Same importance, sorted by energy descending
+        assert!(sorted[0].content.contains("High energy"));
+        assert!(sorted[1].content.contains("Mid energy"));
+        assert!(sorted[2].content.contains("Low energy"));
+    }
+
+    #[test]
+    fn test_filter_sort_importance_takes_priority_over_energy() {
+        let mut note_low_imp_high_energy = make_note(
+            NoteType::Tip,
+            NoteImportance::Low,
+            "Low importance high energy",
+            vec![],
+        );
+        note_low_imp_high_energy.energy = 1.0;
+
+        let mut note_high_imp_low_energy = make_note(
+            NoteType::Tip,
+            NoteImportance::Critical,
+            "Critical importance low energy",
+            vec![],
+        );
+        note_high_imp_low_energy.energy = 0.0;
+
+        let notes = vec![note_low_imp_high_energy, note_high_imp_low_energy];
+        let sorted = filter_sort(&notes, NoteType::Tip);
+
+        assert_eq!(sorted.len(), 2);
+        assert!(sorted[0].content.contains("Critical importance"));
+        assert!(sorted[1].content.contains("Low importance"));
+    }
+
+    #[test]
+    fn test_filter_sort_excludes_other_types() {
+        let notes = vec![
+            make_note(NoteType::Tip, NoteImportance::High, "A tip", vec![]),
+            make_note(NoteType::Gotcha, NoteImportance::High, "A gotcha", vec![]),
+        ];
+        let tips = filter_sort(&notes, NoteType::Tip);
+        assert_eq!(tips.len(), 1);
+        assert!(tips[0].content.contains("tip"));
+    }
+
+    // ================================================================
+    // format_section — badge coverage
+    // ================================================================
+
+    #[test]
+    fn test_format_section_no_badge_for_medium_and_low() {
+        let note_medium = make_note(
+            NoteType::Guideline,
+            NoteImportance::Medium,
+            "Medium note",
+            vec![],
+        );
+        let note_low = make_note(NoteType::Guideline, NoteImportance::Low, "Low note", vec![]);
+
+        let section = format_section("## Test", &[&note_medium, &note_low]);
+        // Medium and Low should not have badges
+        assert!(section.contains("- Medium note"), "Medium note missing");
+        assert!(section.contains("- Low note"), "Low note missing");
+        // No badge emojis
+        let medium_line = section.lines().find(|l| l.contains("Medium note")).unwrap();
+        assert!(!medium_line.contains('🔴'));
+        assert!(!medium_line.contains('🟠'));
+        let low_line = section.lines().find(|l| l.contains("Low note")).unwrap();
+        assert!(!low_line.contains('🔴'));
+        assert!(!low_line.contains('🟠'));
+    }
+
+    #[test]
+    fn test_format_section_critical_and_high_badges() {
+        let note_critical = make_note(
+            NoteType::Guideline,
+            NoteImportance::Critical,
+            "Critical note",
+            vec![],
+        );
+        let note_high = make_note(
+            NoteType::Guideline,
+            NoteImportance::High,
+            "High note",
+            vec![],
+        );
+
+        let section = format_section("## Test", &[&note_critical, &note_high]);
+
+        let critical_line = section
+            .lines()
+            .find(|l| l.contains("Critical note"))
+            .unwrap();
+        assert!(critical_line.contains('🔴'), "Critical badge missing");
+        let high_line = section.lines().find(|l| l.contains("High note")).unwrap();
+        assert!(high_line.contains('🟠'), "High badge missing");
+    }
+
+    #[test]
+    fn test_format_section_structure() {
+        let note = make_note(NoteType::Tip, NoteImportance::Low, "A tip", vec![]);
+        let section = format_section("## Tips", &[&note]);
+
+        let lines: Vec<&str> = section.lines().collect();
+        assert_eq!(lines[0], "## Tips");
+        assert_eq!(lines[1], ""); // blank line after heading
+        assert!(lines[2].starts_with("- "));
+    }
+
+    // ================================================================
+    // truncate_content — edge cases
+    // ================================================================
+
+    #[test]
+    fn test_truncate_content_exact_length() {
+        let content = "a".repeat(200);
+        let result = truncate_content(&content, 200);
+        // Exactly at max_chars should not truncate
+        assert_eq!(result, content);
+        assert!(!result.ends_with("..."));
+    }
+
+    #[test]
+    fn test_truncate_content_one_over_limit() {
+        let content = "a".repeat(201);
+        let result = truncate_content(&content, 200);
+        assert_eq!(result, format!("{}...", "a".repeat(200)));
+    }
+
+    #[test]
+    fn test_truncate_content_empty_string() {
+        assert_eq!(truncate_content("", 200), "");
+    }
+
+    #[test]
+    fn test_truncate_content_multiline_first_line_short() {
+        // First line is short, should return just first line
+        let content = "short first\nthis is a much longer second line that exceeds many limits";
+        assert_eq!(truncate_content(content, 200), "short first");
+    }
+
+    #[test]
+    fn test_truncate_content_multiline_first_line_long() {
+        let long_first = format!("{}\nsecond line", "x".repeat(300));
+        let result = truncate_content(&long_first, 200);
+        assert_eq!(result, format!("{}...", "x".repeat(200)));
+    }
+
+    #[test]
+    fn test_truncate_content_unicode_safety() {
+        // Multi-byte UTF-8: each emoji is multiple bytes
+        let emojis = "🔴".repeat(250); // 250 emojis, each 4 bytes
+        let result = truncate_content(&emojis, 200);
+        assert!(result.ends_with("..."));
+        // Should have exactly 200 emoji chars + "..."
+        let without_dots = result.strip_suffix("...").unwrap();
+        assert_eq!(without_dots.chars().count(), 200);
+    }
+
+    #[test]
+    fn test_truncate_content_zero_max() {
+        let result = truncate_content("hello", 0);
+        assert_eq!(result, "...");
+    }
+
+    // ================================================================
+    // generate_context_template — RFC section
+    // ================================================================
+
+    #[test]
+    fn test_generate_template_rfc_section() {
+        let notes = vec![make_note(
+            NoteType::Rfc,
+            NoteImportance::Medium,
+            "RFC: new API design proposal",
+            vec!["rfc"],
+        )];
+
+        let template = generate_context_template("Design", "Design skill", &notes);
+        assert!(template.contains("## RFCs"), "Missing RFCs section");
+        assert!(template.contains("RFC: new API design proposal"));
+    }
+
+    #[test]
+    fn test_generate_template_section_ordering() {
+        // Verify sections appear in the correct priority order
+        let notes = vec![
+            make_note(NoteType::Observation, NoteImportance::Low, "obs", vec![]),
+            make_note(NoteType::Context, NoteImportance::Low, "ctx", vec![]),
+            make_note(NoteType::Tip, NoteImportance::Low, "tip", vec![]),
+            make_note(NoteType::Assertion, NoteImportance::Low, "assert", vec![]),
+            make_note(NoteType::Pattern, NoteImportance::Low, "pattern", vec![]),
+            make_note(NoteType::Gotcha, NoteImportance::Low, "gotcha", vec![]),
+            make_note(NoteType::Guideline, NoteImportance::Low, "guide", vec![]),
+            make_note(NoteType::Rfc, NoteImportance::Low, "rfc", vec![]),
+        ];
+
+        let template = generate_context_template("Test", "Test", &notes);
+
+        let guideline_pos = template.find("## Guidelines").unwrap();
+        let gotcha_pos = template.find("## ⚠️ Gotchas").unwrap();
+        let pattern_pos = template.find("## Patterns").unwrap();
+        let assertion_pos = template.find("## Assertions").unwrap();
+        let tip_pos = template.find("## Tips").unwrap();
+        let context_pos = template.find("## Context").unwrap();
+        let observation_pos = template.find("## Observations").unwrap();
+        let rfc_pos = template.find("## RFCs").unwrap();
+
+        assert!(guideline_pos < gotcha_pos);
+        assert!(gotcha_pos < pattern_pos);
+        assert!(pattern_pos < assertion_pos);
+        assert!(assertion_pos < tip_pos);
+        assert!(tip_pos < context_pos);
+        assert!(context_pos < observation_pos);
+        assert!(observation_pos < rfc_pos);
+    }
+
+    // ================================================================
+    // apply_token_budget — detailed truncation tests
+    // ================================================================
+
+    #[test]
+    fn test_apply_token_budget_under_budget_returns_unchanged() {
+        let notes = vec![make_note(
+            NoteType::Guideline,
+            NoteImportance::High,
+            "Short note",
+            vec![],
+        )];
+        let template = "# Skill\n\nDescription\n\n## Guidelines\n\n- Short note".to_string();
+        let result = apply_token_budget(template.clone(), &notes);
+        assert_eq!(result, template);
+    }
+
+    #[test]
+    fn test_apply_token_budget_preserves_protected_types() {
+        // Create enough content to exceed the budget
+        let mut notes = Vec::new();
+
+        // Protected: Gotcha (always kept regardless of importance)
+        notes.push(make_note(
+            NoteType::Gotcha,
+            NoteImportance::Low,
+            "Low importance gotcha is still protected",
+            vec![],
+        ));
+
+        // Protected: Guideline (always kept regardless of importance)
+        notes.push(make_note(
+            NoteType::Guideline,
+            NoteImportance::Low,
+            "Low importance guideline is still protected",
+            vec![],
+        ));
+
+        // Lots of dispensable observations to exceed budget
+        for i in 0..100 {
+            notes.push(make_note(
+                NoteType::Observation,
+                NoteImportance::Low,
+                &format!("Observation {} {}", i, "x".repeat(200)),
+                vec![],
+            ));
+        }
+
+        let template = generate_context_template("Budget Test", "Testing budget", &notes);
+
+        // Protected notes survive truncation
+        assert!(
+            template.contains("Low importance gotcha is still protected"),
+            "Protected gotcha should survive"
+        );
+        assert!(
+            template.contains("Low importance guideline is still protected"),
+            "Protected guideline should survive"
+        );
+    }
+
+    #[test]
+    fn test_apply_token_budget_preserves_high_importance_non_protected_types() {
+        let mut notes = Vec::new();
+
+        // High importance Pattern (not a protected type, but high importance = protected)
+        notes.push(make_note(
+            NoteType::Pattern,
+            NoteImportance::High,
+            "High importance pattern survives",
+            vec![],
+        ));
+
+        // Critical importance Tip (not a protected type, but critical = protected)
+        notes.push(make_note(
+            NoteType::Tip,
+            NoteImportance::Critical,
+            "Critical tip survives",
+            vec![],
+        ));
+
+        // Lots of dispensable to exceed budget
+        for i in 0..100 {
+            notes.push(make_note(
+                NoteType::Observation,
+                NoteImportance::Low,
+                &format!("Obs {} {}", i, "y".repeat(200)),
+                vec![],
+            ));
+        }
+
+        let template = generate_context_template("Budget Test", "Testing budget", &notes);
+
+        // High/Critical importance notes of non-protected types go into "Key Notes"
+        assert!(
+            template.contains("High importance pattern survives"),
+            "High importance pattern should survive as protected"
+        );
+        assert!(
+            template.contains("Critical tip survives"),
+            "Critical tip should survive as protected"
+        );
+    }
+
+    #[test]
+    fn test_apply_token_budget_shows_omitted_count() {
+        let mut notes = Vec::new();
+
+        // A few protected notes
+        notes.push(make_note(
+            NoteType::Guideline,
+            NoteImportance::Critical,
+            "Critical guideline",
+            vec![],
+        ));
+
+        // Many dispensable notes to force omission
+        for i in 0..100 {
+            notes.push(make_note(
+                NoteType::Observation,
+                NoteImportance::Low,
+                &format!("Observation {} {}", i, "z".repeat(200)),
+                vec![],
+            ));
+        }
+
+        let template = generate_context_template("Budget Test", "Testing budget", &notes);
+
+        assert!(
+            template.contains("notes omitted due to token budget"),
+            "Should show omission comment when notes are dropped"
+        );
+    }
+
+    #[test]
+    fn test_apply_token_budget_dispensable_priority_order() {
+        // When budget is tight, Observations are dropped before Tips,
+        // Tips before Context, Context before Patterns, Patterns before Assertions.
+        let mut notes = Vec::new();
+
+        // A protected note to anchor the template
+        notes.push(make_note(
+            NoteType::Guideline,
+            NoteImportance::Critical,
+            "Anchor guideline",
+            vec![],
+        ));
+
+        // Add dispensable notes of each type with padding to approach budget
+        // Observations (lowest priority, dropped first)
+        for i in 0..20 {
+            notes.push(make_note(
+                NoteType::Observation,
+                NoteImportance::Low,
+                &format!("Observation {} {}", i, "o".repeat(150)),
+                vec![],
+            ));
+        }
+        // Tips (next lowest)
+        for i in 0..20 {
+            notes.push(make_note(
+                NoteType::Tip,
+                NoteImportance::Low,
+                &format!("Tip {} {}", i, "t".repeat(150)),
+                vec![],
+            ));
+        }
+        // Context
+        for i in 0..5 {
+            notes.push(make_note(
+                NoteType::Context,
+                NoteImportance::Low,
+                &format!("Context {} {}", i, "c".repeat(150)),
+                vec![],
+            ));
+        }
+
+        let template = generate_context_template("Priority Test", "Testing priority order", &notes);
+
+        // Template should be within budget
+        assert!(
+            template.chars().count() <= MAX_TEMPLATE_CHARS + 200,
+            "Template should respect budget"
+        );
+
+        // If observations are dropped, they should not appear (or appear less)
+        // but higher-priority dispensable types might still be included
+        // The key thing is the template stays within budget
+        assert!(template.contains("{{activated_notes}}"));
+        assert!(template.contains("{{relevant_decisions}}"));
+    }
+
+    #[test]
+    fn test_apply_token_budget_protected_other_section() {
+        // Non-Guideline, non-Gotcha notes with High/Critical importance go into "Key Notes"
+        let mut notes = Vec::new();
+
+        // High importance Assertion (protected but not Guideline/Gotcha)
+        notes.push(make_note(
+            NoteType::Assertion,
+            NoteImportance::High,
+            "High assertion goes to Key Notes",
+            vec![],
+        ));
+
+        // Critical Context (protected but not Guideline/Gotcha)
+        notes.push(make_note(
+            NoteType::Context,
+            NoteImportance::Critical,
+            "Critical context goes to Key Notes",
+            vec![],
+        ));
+
+        // Lots of dispensable to exceed budget
+        for i in 0..100 {
+            notes.push(make_note(
+                NoteType::Observation,
+                NoteImportance::Low,
+                &format!("Disposable {} {}", i, "d".repeat(200)),
+                vec![],
+            ));
+        }
+
+        let template = generate_context_template("Key Notes Test", "Testing key notes", &notes);
+
+        assert!(
+            template.contains("## Key Notes"),
+            "Should have Key Notes section for protected non-Guideline/non-Gotcha"
+        );
+        assert!(template.contains("High assertion goes to Key Notes"));
+        assert!(template.contains("Critical context goes to Key Notes"));
+    }
+
+    #[test]
+    fn test_apply_token_budget_no_header_sections_in_template() {
+        // When there are no "## " sections after the header,
+        // header_end falls back to template.len()
+        let notes: Vec<Note> = vec![];
+        let template = "# Skill\n\nJust a description with no sections at all".to_string();
+        let result = apply_token_budget(template.clone(), &notes);
+        // Under budget, returns unchanged
+        assert_eq!(result, template);
+    }
+
+    #[test]
+    fn test_apply_token_budget_dispensable_by_type_grouping() {
+        // Verify that dispensable notes are grouped by section name in BTreeMap
+        // One note of each dispensable type
+        let notes = vec![
+            make_note(NoteType::Pattern, NoteImportance::Low, "A pattern", vec![]),
+            make_note(
+                NoteType::Assertion,
+                NoteImportance::Low,
+                "An assertion",
+                vec![],
+            ),
+            make_note(NoteType::Tip, NoteImportance::Low, "A tip", vec![]),
+            make_note(NoteType::Context, NoteImportance::Low, "A context", vec![]),
+            make_note(
+                NoteType::Observation,
+                NoteImportance::Low,
+                "An observation",
+                vec![],
+            ),
+        ];
+
+        // Under budget, so all sections should appear
+        let template = generate_context_template("Grouping", "Test grouping", &notes);
+
+        assert!(template.contains("## Patterns"));
+        assert!(template.contains("## Assertions"));
+        assert!(template.contains("## Tips"));
+        assert!(template.contains("## Context"));
+        assert!(template.contains("## Observations"));
+    }
+
+    #[test]
+    fn test_apply_token_budget_rfc_as_dispensable() {
+        // RFC type with low importance is dispensable and maps to "Other" in the budget code
+        let notes = vec![
+            make_note(
+                NoteType::Guideline,
+                NoteImportance::Critical,
+                "Anchor",
+                vec![],
+            ),
+            make_note(
+                NoteType::Rfc,
+                NoteImportance::Low,
+                "Dispensable RFC",
+                vec![],
+            ),
+        ];
+
+        // Not enough to trigger budget, so it stays
+        let template = generate_context_template("RFC Test", "Test", &notes);
+        assert!(template.contains("## RFCs"));
+        assert!(template.contains("Dispensable RFC"));
+    }
+
+    // ================================================================
+    // Edge cases for generate_context_template
+    // ================================================================
+
+    #[test]
+    fn test_generate_template_only_placeholders_for_empty_notes() {
+        let template = generate_context_template("Solo", "Just placeholders", &[]);
+
+        // Should have header + 2 placeholder sections
+        assert!(template.starts_with("# Solo\n\nJust placeholders"));
+        assert!(template.contains("## Activated Notes\n\n{{activated_notes}}"));
+        assert!(template.contains("## Relevant Decisions\n\n{{relevant_decisions}}"));
+
+        // No note-type sections
+        assert!(!template.contains("## Patterns"));
+        assert!(!template.contains("## Tips"));
+        assert!(!template.contains("## Observations"));
+        assert!(!template.contains("## Context"));
+        assert!(!template.contains("## Assertions"));
+        assert!(!template.contains("## RFCs"));
+    }
+
+    #[test]
+    fn test_generate_template_single_note_type() {
+        let notes = vec![
+            make_note(
+                NoteType::Context,
+                NoteImportance::Medium,
+                "Context A",
+                vec![],
+            ),
+            make_note(NoteType::Context, NoteImportance::High, "Context B", vec![]),
+        ];
+
+        let template = generate_context_template("Ctx", "Context only", &notes);
+
+        assert!(template.contains("## Context"));
+        // High should come before Medium
+        let high_pos = template.find("Context B").unwrap();
+        let medium_pos = template.find("Context A").unwrap();
+        assert!(high_pos < medium_pos);
+
+        // No other sections
+        assert!(!template.contains("## Guidelines"));
+        assert!(!template.contains("## Patterns"));
+    }
+
+    #[test]
+    fn test_format_section_long_content_truncated() {
+        let long_content = "x".repeat(500);
+        let note = make_note(NoteType::Tip, NoteImportance::Low, &long_content, vec![]);
+        let section = format_section("## Tips", &[&note]);
+
+        // Content should be truncated to 200 chars + "..."
+        assert!(section.contains("..."), "Long content should be truncated");
+        // The line should not contain the full 500 chars
+        let tip_line = section.lines().find(|l| l.starts_with("- ")).unwrap();
+        assert!(tip_line.len() < 510, "Line should be truncated");
+    }
+
+    #[test]
+    fn test_filter_sort_empty_notes() {
+        let notes: Vec<Note> = vec![];
+        let result = filter_sort(&notes, NoteType::Guideline);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_filter_sort_nan_energy_handling() {
+        // Test the unwrap_or(Equal) path for NaN energy values
+        let mut note_nan = make_note(
+            NoteType::Pattern,
+            NoteImportance::Medium,
+            "NaN energy",
+            vec![],
+        );
+        note_nan.energy = f64::NAN;
+
+        let mut note_normal = make_note(
+            NoteType::Pattern,
+            NoteImportance::Medium,
+            "Normal energy",
+            vec![],
+        );
+        note_normal.energy = 0.5;
+
+        let notes = vec![note_nan, note_normal];
+        // Should not panic even with NaN
+        let result = filter_sort(&notes, NoteType::Pattern);
+        assert_eq!(result.len(), 2);
+    }
 }

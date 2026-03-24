@@ -25,7 +25,7 @@ pub mod transformer;
 
 pub use ab_testing::{ABConfig, ABReport, ABRouter, Bucket, BucketMetrics, SequentialTester};
 pub use action_decoder::{ActionDecoder, DecodeResult, DecodedAction};
-pub use codebook::{ActionCodebook, CodebookBuilder, CodebookEntry};
+pub use codebook::{ActionCodebook, CodebookBuilder, CodebookEntry, DynamicCodebook};
 pub use cql::CQLPolicy;
 pub use dataloader::{TrajectoryDataLoader, TrajectoryDataLoaderConfig};
 pub use dataset::{

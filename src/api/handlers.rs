@@ -81,6 +81,9 @@ pub struct ServerState {
     /// # References
     /// - ELL (2025) — "Experience-driven Lifelong Learning" — 4th pillar: self-evaluation
     pub confidence_tracker: Arc<crate::graph::confidence::ConfidenceTracker>,
+    /// MCP Federation registry — external MCP server connections.
+    /// Always initialized (empty registry). Servers are added/removed dynamically via API.
+    pub mcp_registry: crate::mcp_federation::registry::SharedRegistry,
 }
 
 /// Shared orchestrator state
@@ -6237,6 +6240,7 @@ mod tests {
             identity: None,
             reactor_counters: std::sync::OnceLock::new(),
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
+            mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
         });
         (create_router(state), milestone.id, task1.id, task2.id)
     }
@@ -6449,6 +6453,7 @@ mod tests {
             identity: None,
             reactor_counters: std::sync::OnceLock::new(),
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
+            mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
         }
     }
 
@@ -6608,6 +6613,7 @@ mod tests {
             identity: None,
             reactor_counters: std::sync::OnceLock::new(),
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
+            mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
         });
         create_router(state)
     }
@@ -7384,6 +7390,7 @@ mod tests {
             identity: None,
             reactor_counters: std::sync::OnceLock::new(),
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
+            mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
         });
         (create_router(state), plan.id, task1.id, task2.id)
     }
@@ -7492,6 +7499,7 @@ mod tests {
             identity: None,
             reactor_counters: std::sync::OnceLock::new(),
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
+            mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
         });
         let app = create_router(state);
 
@@ -7667,6 +7675,7 @@ mod tests {
             identity: None,
             reactor_counters,
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
+            mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
         });
         let app = create_router(state);
 
@@ -7716,6 +7725,7 @@ mod tests {
             identity: None,
             reactor_counters,
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
+            mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
         });
         let app = create_router(state);
 

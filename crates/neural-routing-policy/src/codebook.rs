@@ -12,6 +12,7 @@
 //! and discrete MCP actions (tool_name, action_name, param_template).
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 use crate::dataset::ACTION_DIM;
 
@@ -84,45 +85,200 @@ impl CodebookEntry {
 // ---------------------------------------------------------------------------
 
 /// The action codebook: a catalog of all known MCP actions with embeddings.
+///
+/// Supports both **core entries** (static, from training) and **external entries**
+/// (dynamic, from connected MCP servers). All search methods (nearest_neighbor,
+/// top_k) operate across both sets transparently.
+///
+/// External entries are indexed by FQN for O(1) lookup and can be
+/// registered/unregistered at runtime without affecting core entries.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActionCodebook {
-    /// All codebook entries, sorted by frequency (most common first).
+    /// Core codebook entries (static, from training data).
     pub entries: Vec<CodebookEntry>,
+    /// Dynamic external entries (from connected MCP servers).
+    #[serde(default)]
+    pub external_entries: Vec<CodebookEntry>,
+    /// FQN → index into `external_entries` for O(1) lookup.
+    #[serde(skip)]
+    pub fqn_index: HashMap<String, usize>,
     /// OOD threshold: if best cosine similarity < threshold, the action is OOD.
     /// Calibrated on validation set.
     pub ood_threshold: f32,
 }
+
+/// Type alias for backward compatibility and clarity.
+pub type DynamicCodebook = ActionCodebook;
 
 impl ActionCodebook {
     /// Create an empty codebook.
     pub fn new() -> Self {
         Self {
             entries: Vec::new(),
+            external_entries: Vec::new(),
+            fqn_index: HashMap::new(),
             ood_threshold: 0.5, // default, should be calibrated
         }
     }
 
-    /// Number of actions in the codebook.
+    /// Total number of actions (core + external).
     pub fn len(&self) -> usize {
+        self.entries.len() + self.external_entries.len()
+    }
+
+    /// Number of core (internal) entries.
+    pub fn core_len(&self) -> usize {
         self.entries.len()
     }
 
-    /// Whether the codebook is empty.
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+    /// Number of external entries.
+    pub fn external_len(&self) -> usize {
+        self.external_entries.len()
     }
 
-    /// Add an entry to the codebook.
+    /// Whether the codebook is empty (no core or external entries).
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty() && self.external_entries.is_empty()
+    }
+
+    /// Add a core entry to the codebook.
     pub fn add_entry(&mut self, entry: CodebookEntry) {
         self.entries.push(entry);
     }
 
+    // ─── Dynamic external entry management ───────────────────────────────
+
+    /// Register an external tool in the codebook.
+    ///
+    /// The tool is stored with `frequency=0` and `avg_reward=0.5` (neutral prior).
+    /// The embedding should be 256d (ACTION_DIM). If the tool is already registered
+    /// (same FQN), it will be replaced.
+    ///
+    /// # Arguments
+    /// * `server_id` — MCP server identifier (used as `tool` field)
+    /// * `tool_name` — tool name (used as `action` field)
+    /// * `embedding` — 256d embedding vector
+    pub fn register_external_tool(
+        &mut self,
+        server_id: &str,
+        tool_name: &str,
+        embedding: Vec<f32>,
+    ) {
+        let fqn = format!("{}::{}", server_id, tool_name);
+
+        // Replace if already registered
+        if let Some(&idx) = self.fqn_index.get(&fqn) {
+            self.external_entries[idx] = CodebookEntry::new(
+                server_id.to_string(),
+                tool_name.to_string(),
+                embedding,
+                0,
+                0.5,
+            );
+            return;
+        }
+
+        let idx = self.external_entries.len();
+        self.external_entries.push(CodebookEntry::new(
+            server_id.to_string(),
+            tool_name.to_string(),
+            embedding,
+            0,
+            0.5,
+        ));
+        self.fqn_index.insert(fqn, idx);
+    }
+
+    /// Unregister all external tools from a specific server.
+    ///
+    /// Removes all entries whose `tool` field matches `server_id`
+    /// and rebuilds the FQN index.
+    pub fn unregister_server(&mut self, server_id: &str) {
+        self.external_entries
+            .retain(|entry| entry.tool != server_id);
+        self.rebuild_fqn_index();
+    }
+
+    /// Update an external tool's embedding and reward via running mean.
+    ///
+    /// Formula: `new_value = (old * (n-1) + observed) / n`
+    ///
+    /// Returns `true` if the tool was found and updated.
+    pub fn update_from_trajectory(
+        &mut self,
+        fqn: &str,
+        context_embedding: &[f32],
+        reward: f32,
+    ) -> bool {
+        let idx = match self.fqn_index.get(fqn) {
+            Some(&i) => i,
+            None => return false,
+        };
+
+        let entry = &mut self.external_entries[idx];
+        entry.frequency += 1;
+        let n = entry.frequency as f32;
+
+        // Running mean update for embedding
+        if context_embedding.len() == entry.embedding.len() {
+            for (old, new) in entry.embedding.iter_mut().zip(context_embedding.iter()) {
+                *old = (*old * (n - 1.0) + *new) / n;
+            }
+        }
+
+        // Running mean update for reward
+        entry.avg_reward = (entry.avg_reward * (n - 1.0) + reward) / n;
+
+        // Recalculate norm
+        entry.norm = l2_norm(&entry.embedding);
+
+        true
+    }
+
+    /// Get an external entry by FQN.
+    pub fn get_external(&self, fqn: &str) -> Option<&CodebookEntry> {
+        self.fqn_index
+            .get(fqn)
+            .and_then(|&idx| self.external_entries.get(idx))
+    }
+
+    /// Rebuild the FQN index after modifications to external_entries.
+    fn rebuild_fqn_index(&mut self) {
+        self.fqn_index.clear();
+        for (i, entry) in self.external_entries.iter().enumerate() {
+            let fqn = format!("{}::{}", entry.tool, entry.action);
+            self.fqn_index.insert(fqn, i);
+        }
+    }
+
+    /// Rebuild FQN index from deserialized data (call after load_json).
+    pub fn rebuild_index(&mut self) {
+        self.rebuild_fqn_index();
+    }
+
+    // ─── Search (across core + external) ─────────────────────────────────
+
+    /// Iterate over all entries (core + external).
+    fn all_entries(&self) -> impl Iterator<Item = (usize, &CodebookEntry, bool)> {
+        self.entries
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (i, e, false))
+            .chain(
+                self.external_entries
+                    .iter()
+                    .enumerate()
+                    .map(|(i, e)| (self.entries.len() + i, e, true)),
+            )
+    }
+
     /// Find the nearest neighbor to a query vector.
     ///
-    /// Returns `(entry_index, cosine_similarity)`.
-    /// If the codebook is empty, returns `None`.
+    /// Searches across both core and external entries.
+    /// Returns `(entry_index, cosine_similarity)` where the index is into
+    /// the combined [core..external] space. Use `get_entry()` to retrieve it.
     pub fn nearest_neighbor(&self, query: &[f32]) -> Option<(usize, f32)> {
-        if self.entries.is_empty() || query.len() != ACTION_DIM {
+        if self.is_empty() || query.len() != ACTION_DIM {
             return None;
         }
 
@@ -134,7 +290,7 @@ impl ActionCodebook {
         let mut best_idx = 0;
         let mut best_sim = f32::NEG_INFINITY;
 
-        for (i, entry) in self.entries.iter().enumerate() {
+        for (i, entry, _) in self.all_entries() {
             let sim = entry.cosine_similarity(query, query_norm);
             if sim > best_sim {
                 best_sim = sim;
@@ -145,29 +301,41 @@ impl ActionCodebook {
         Some((best_idx, best_sim))
     }
 
-    /// Find top-K nearest neighbors.
+    /// Find top-K nearest neighbors across core + external entries.
     ///
     /// Returns Vec of `(entry_index, cosine_similarity)`, sorted by similarity descending.
     pub fn top_k(&self, query: &[f32], k: usize) -> Vec<(usize, f32)> {
-        if self.entries.is_empty() || query.len() != ACTION_DIM {
+        if self.is_empty() || query.len() != ACTION_DIM {
             return Vec::new();
         }
 
         let query_norm = l2_norm(query);
         let mut scored: Vec<(usize, f32)> = self
-            .entries
-            .iter()
-            .enumerate()
-            .map(|(i, entry)| (i, entry.cosine_similarity(query, query_norm)))
+            .all_entries()
+            .map(|(i, entry, _)| (i, entry.cosine_similarity(query, query_norm)))
             .collect();
 
-        // Sort descending by similarity
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         scored.truncate(k);
         scored
     }
 
-    /// Sort entries by frequency (most common first).
+    /// Get an entry by combined index (core + external).
+    pub fn get_entry(&self, index: usize) -> Option<&CodebookEntry> {
+        if index < self.entries.len() {
+            self.entries.get(index)
+        } else {
+            self.external_entries.get(index - self.entries.len())
+        }
+    }
+
+    /// Check if an index refers to an external entry.
+    pub fn is_external(&self, index: usize) -> bool {
+        index >= self.entries.len()
+    }
+
+    /// Sort core entries by frequency (most common first).
+    /// External entries are not sorted (they use FQN index).
     pub fn sort_by_frequency(&mut self) {
         self.entries.sort_by(|a, b| b.frequency.cmp(&a.frequency));
     }
@@ -552,5 +720,236 @@ mod tests {
         assert_eq!(codebook.entries[0].frequency, 100);
         assert_eq!(codebook.entries[1].frequency, 50);
         assert_eq!(codebook.entries[2].frequency, 1);
+    }
+
+    // ── Dynamic external entry tests ──────────────────────────────────
+
+    #[test]
+    fn test_register_external_tool() {
+        let mut codebook = ActionCodebook::new();
+        let emb = make_embedding(42.0);
+        codebook.register_external_tool("grafeo", "run_cypher", emb.clone());
+
+        assert_eq!(codebook.external_len(), 1);
+        assert_eq!(codebook.len(), 1); // total
+        assert_eq!(codebook.core_len(), 0);
+
+        // FQN index works
+        let entry = codebook.get_external("grafeo::run_cypher").unwrap();
+        assert_eq!(entry.tool, "grafeo");
+        assert_eq!(entry.action, "run_cypher");
+        assert_eq!(entry.frequency, 0);
+        assert!((entry.avg_reward - 0.5).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_register_multiple_tools() {
+        let mut codebook = ActionCodebook::new();
+        codebook.register_external_tool("s1", "get_data", make_embedding(1.0));
+        codebook.register_external_tool("s1", "list_items", make_embedding(2.0));
+        codebook.register_external_tool("s2", "search", make_embedding(3.0));
+
+        assert_eq!(codebook.external_len(), 3);
+        assert!(codebook.get_external("s1::get_data").is_some());
+        assert!(codebook.get_external("s1::list_items").is_some());
+        assert!(codebook.get_external("s2::search").is_some());
+    }
+
+    #[test]
+    fn test_register_replaces_existing() {
+        let mut codebook = ActionCodebook::new();
+        let emb1 = make_embedding(1.0);
+        let emb2 = make_embedding(2.0);
+
+        codebook.register_external_tool("s1", "tool", emb1);
+        assert_eq!(codebook.external_len(), 1);
+
+        codebook.register_external_tool("s1", "tool", emb2.clone());
+        assert_eq!(codebook.external_len(), 1); // Still 1, replaced
+
+        let entry = codebook.get_external("s1::tool").unwrap();
+        assert!((entry.embedding[0] - emb2[0]).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_unregister_server() {
+        let mut codebook = ActionCodebook::new();
+        codebook.register_external_tool("s1", "a", make_embedding(1.0));
+        codebook.register_external_tool("s1", "b", make_embedding(2.0));
+        codebook.register_external_tool("s2", "c", make_embedding(3.0));
+
+        assert_eq!(codebook.external_len(), 3);
+
+        codebook.unregister_server("s1");
+
+        assert_eq!(codebook.external_len(), 1);
+        assert!(codebook.get_external("s1::a").is_none());
+        assert!(codebook.get_external("s1::b").is_none());
+        assert!(codebook.get_external("s2::c").is_some());
+    }
+
+    #[test]
+    fn test_unregister_nonexistent_server() {
+        let mut codebook = ActionCodebook::new();
+        codebook.register_external_tool("s1", "a", make_embedding(1.0));
+
+        codebook.unregister_server("nonexistent");
+        assert_eq!(codebook.external_len(), 1); // Unchanged
+    }
+
+    #[test]
+    fn test_nearest_neighbor_finds_external() {
+        let mut codebook = ActionCodebook::new();
+
+        // Add core entry with seed 0
+        codebook.add_entry(CodebookEntry::new(
+            "note".into(),
+            "create".into(),
+            make_embedding(0.0),
+            10,
+            0.8,
+        ));
+
+        // Add external entry with seed 50 (different from core)
+        codebook.register_external_tool("ext", "query", make_embedding(50.0));
+
+        // Query with exact external embedding
+        let query = make_embedding(50.0);
+        let (idx, sim) = codebook.nearest_neighbor(&query).unwrap();
+
+        // Should match the external entry (index 1 = after 1 core entry)
+        assert_eq!(idx, 1);
+        assert!(codebook.is_external(idx));
+        assert!((sim - 1.0).abs() < 1e-5);
+
+        // Verify get_entry works
+        let entry = codebook.get_entry(idx).unwrap();
+        assert_eq!(entry.tool, "ext");
+        assert_eq!(entry.action, "query");
+    }
+
+    #[test]
+    fn test_top_k_mixed_core_and_external() {
+        let mut codebook = ActionCodebook::new();
+
+        // 3 core entries
+        for i in 0..3 {
+            codebook.add_entry(CodebookEntry::new(
+                "core".into(),
+                format!("action_{i}"),
+                make_embedding(i as f32 * 50.0),
+                10,
+                0.5,
+            ));
+        }
+
+        // 2 external entries
+        codebook.register_external_tool("ext", "tool_a", make_embedding(150.0));
+        codebook.register_external_tool("ext", "tool_b", make_embedding(200.0));
+
+        assert_eq!(codebook.len(), 5);
+
+        let top5 = codebook.top_k(&make_embedding(0.0), 5);
+        assert_eq!(top5.len(), 5);
+
+        // First should be exact match (core action_0)
+        assert_eq!(top5[0].0, 0);
+        assert!(!codebook.is_external(top5[0].0));
+    }
+
+    #[test]
+    fn test_update_from_trajectory() {
+        let mut codebook = ActionCodebook::new();
+        let initial = vec![1.0; ACTION_DIM];
+        codebook.register_external_tool("s1", "tool", initial);
+
+        // Update 10 times with embedding [3.0; 256]
+        let update_emb = vec![3.0; ACTION_DIM];
+        for _ in 0..10 {
+            assert!(codebook.update_from_trajectory("s1::tool", &update_emb, 0.9));
+        }
+
+        let entry = codebook.get_external("s1::tool").unwrap();
+        assert_eq!(entry.frequency, 10);
+
+        // After 10 updates with [3.0; 256], starting from freq=0:
+        // First update: freq=1, emb = (1.0*0 + 3.0)/1 = 3.0 (initial discarded, freq was 0)
+        // All subsequent: emb stays 3.0 (running mean of identical values)
+        assert!(
+            (entry.embedding[0] - 3.0).abs() < 0.01,
+            "Expected ~3.0, got {}",
+            entry.embedding[0]
+        );
+
+        // avg_reward: same pattern, freq=0 means initial 0.5 is discarded
+        // 10 updates of 0.9 → converges to 0.9
+        assert!(
+            (entry.avg_reward - 0.9).abs() < 0.01,
+            "Expected reward ~0.9, got {}",
+            entry.avg_reward
+        );
+    }
+
+    #[test]
+    fn test_update_from_trajectory_unknown_fqn() {
+        let mut codebook = ActionCodebook::new();
+        assert!(!codebook.update_from_trajectory("nonexistent::tool", &[0.0; ACTION_DIM], 1.0));
+    }
+
+    #[test]
+    fn test_backward_compat_empty_external() {
+        // ActionCodebook with no external entries should behave exactly like before
+        let mut codebook = ActionCodebook::new();
+        assert!(codebook.external_entries.is_empty());
+        assert_eq!(codebook.external_len(), 0);
+
+        // Core operations unchanged
+        codebook.add_entry(CodebookEntry::new(
+            "note".into(),
+            "create".into(),
+            make_embedding(1.0),
+            5,
+            0.7,
+        ));
+
+        assert_eq!(codebook.len(), 1);
+        assert_eq!(codebook.core_len(), 1);
+        assert!(!codebook.is_empty());
+
+        let (idx, _) = codebook.nearest_neighbor(&make_embedding(1.0)).unwrap();
+        assert_eq!(idx, 0);
+        assert!(!codebook.is_external(idx));
+    }
+
+    #[test]
+    fn test_dynamic_codebook_type_alias() {
+        // DynamicCodebook is just ActionCodebook
+        let _codebook: DynamicCodebook = ActionCodebook::new();
+    }
+
+    #[test]
+    fn test_get_entry_core_and_external() {
+        let mut codebook = ActionCodebook::new();
+        codebook.add_entry(CodebookEntry::new(
+            "core".into(),
+            "act".into(),
+            make_embedding(0.0),
+            1,
+            0.5,
+        ));
+        codebook.register_external_tool("ext", "tool", make_embedding(1.0));
+
+        // Index 0 = core
+        let core = codebook.get_entry(0).unwrap();
+        assert_eq!(core.tool, "core");
+        assert!(!codebook.is_external(0));
+
+        // Index 1 = external
+        let ext = codebook.get_entry(1).unwrap();
+        assert_eq!(ext.tool, "ext");
+        assert!(codebook.is_external(1));
+
+        // Index 2 = out of bounds
+        assert!(codebook.get_entry(2).is_none());
     }
 }
