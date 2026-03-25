@@ -5821,9 +5821,7 @@ impl ToolHandler {
             }
 
             "federation_connect" => {
-                let result = http
-                    .post("/api/mcp-federation/servers", args)
-                    .await?;
+                let result = http.post("/api/mcp-federation/servers", args).await?;
                 Ok(Some(result))
             }
 
