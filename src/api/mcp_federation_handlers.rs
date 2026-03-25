@@ -1268,7 +1268,13 @@ mod tests {
             args: vec!["-y".to_string(), "@pasympa/discord-mcp".to_string()],
             env: HashMap::new(),
         };
-        let node = build_server_node("discord", Some("Discord Bot"), &transport, Some("discord-mcp"), 90);
+        let node = build_server_node(
+            "discord",
+            Some("Discord Bot"),
+            &transport,
+            Some("discord-mcp"),
+            90,
+        );
         assert_eq!(node.server_id, "discord");
         assert_eq!(node.display_name, "Discord Bot");
         assert_eq!(node.transport_type, "stdio");
@@ -1302,9 +1308,18 @@ mod tests {
             url: "http://localhost:9090/mcp".to_string(),
             headers: HashMap::new(),
         };
-        let node = build_server_node("grafeo", Some("Grafeo"), &transport, Some("grafeo-server"), 12);
+        let node = build_server_node(
+            "grafeo",
+            Some("Grafeo"),
+            &transport,
+            Some("grafeo-server"),
+            12,
+        );
         assert_eq!(node.transport_type, "streamable_http");
-        assert_eq!(node.transport_url.as_deref(), Some("http://localhost:9090/mcp"));
+        assert_eq!(
+            node.transport_url.as_deref(),
+            Some("http://localhost:9090/mcp")
+        );
         assert!(node.transport_command.is_none());
         assert!(node.transport_args.is_none());
     }
@@ -1317,7 +1332,11 @@ mod tests {
     fn test_server_node_roundtrip_stdio() {
         let original = McpTransport::Stdio {
             command: "node".to_string(),
-            args: vec!["server.js".to_string(), "--port".to_string(), "3000".to_string()],
+            args: vec![
+                "server.js".to_string(),
+                "--port".to_string(),
+                "3000".to_string(),
+            ],
             env: HashMap::new(),
         };
         let node = build_server_node("srv", None, &original, None, 0);
