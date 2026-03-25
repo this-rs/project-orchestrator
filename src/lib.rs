@@ -978,11 +978,13 @@ pub async fn start_server(mut config: Config) -> Result<()> {
     // source of truth — WS handlers only need to listen to the local bus.
     event_bus.start_nats_bridge();
 
-    // Extract neural_router, trajectory_collector, trajectory_store, and trajectory_store_neo4j before state is moved into Orchestrator
+    // Extract neural_router, trajectory_collector, trajectory_store, trajectory_store_neo4j,
+    // and mcp_registry before state is moved into Orchestrator
     let neural_router = state.neural_router.clone();
     let trajectory_collector = state.trajectory_collector.clone();
     let trajectory_store = state.trajectory_store.clone();
     let trajectory_store_neo4j = state.trajectory_store_neo4j.clone();
+    let mcp_registry = state.mcp_registry.clone();
 
     // Create orchestrator with hybrid emitter
     let orchestrator =
@@ -1494,7 +1496,7 @@ pub async fn start_server(mut config: Config) -> Result<()> {
         },
         reactor_counters: std::sync::OnceLock::new(),
         confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
-        mcp_registry: mcp_federation::registry::new_shared_registry(),
+        mcp_registry: mcp_registry.clone(),
     });
 
     // ── EventReactor: build, register built-in reactions, and spawn ──
@@ -1545,6 +1547,149 @@ pub async fn start_server(mut config: Config) -> Result<()> {
                 }
                 Err(e) => {
                     tracing::warn!("Failed to check lifecycle hooks at startup: {}", e);
+                }
+            }
+        });
+    }
+
+    // Bootstrap MCP federated servers from Neo4j (non-blocking)
+    {
+        let registry = mcp_registry.clone();
+        let orch = server_state.orchestrator.clone();
+        tokio::spawn(async move {
+            match orch.neo4j().list_all_mcp_servers().await {
+                Ok(servers) if servers.is_empty() => {
+                    tracing::debug!("MCP federation: no saved servers to restore");
+                }
+                Ok(servers) => {
+                    // Deduplicate by server_id (multiple projects may reference the same server)
+                    let mut seen = std::collections::HashSet::new();
+                    let unique_servers: Vec<_> = servers
+                        .into_iter()
+                        .filter(|s| seen.insert(s.server_id.clone()))
+                        .collect();
+
+                    tracing::info!(
+                        "MCP federation: restoring {} saved server(s)...",
+                        unique_servers.len()
+                    );
+
+                    let mut connected = 0usize;
+                    let mut failed = 0usize;
+
+                    for server in &unique_servers {
+                        // Rebuild McpTransport from stored fields
+                        let transport = match server.transport_type.as_str() {
+                            "stdio" => {
+                                let Some(ref command) = server.transport_command else {
+                                    tracing::warn!(
+                                        "MCP federation: skipping '{}' — stdio server missing command",
+                                        server.server_id
+                                    );
+                                    failed += 1;
+                                    continue;
+                                };
+                                let args: Vec<String> = server
+                                    .transport_args
+                                    .as_deref()
+                                    .and_then(|a| serde_json::from_str(a).ok())
+                                    .unwrap_or_default();
+                                mcp_federation::McpTransport::Stdio {
+                                    command: command.clone(),
+                                    args,
+                                    env: std::collections::HashMap::new(),
+                                }
+                            }
+                            "sse" => {
+                                let Some(ref url) = server.transport_url else {
+                                    tracing::warn!(
+                                        "MCP federation: skipping '{}' — SSE server missing URL",
+                                        server.server_id
+                                    );
+                                    failed += 1;
+                                    continue;
+                                };
+                                mcp_federation::McpTransport::Sse {
+                                    url: url.clone(),
+                                    headers: std::collections::HashMap::new(),
+                                }
+                            }
+                            "streamable_http" => {
+                                let Some(ref url) = server.transport_url else {
+                                    tracing::warn!(
+                                        "MCP federation: skipping '{}' — HTTP server missing URL",
+                                        server.server_id
+                                    );
+                                    failed += 1;
+                                    continue;
+                                };
+                                mcp_federation::McpTransport::StreamableHttp {
+                                    url: url.clone(),
+                                    headers: std::collections::HashMap::new(),
+                                }
+                            }
+                            other => {
+                                tracing::warn!(
+                                    "MCP federation: skipping '{}' — unknown transport type '{}'",
+                                    server.server_id,
+                                    other
+                                );
+                                failed += 1;
+                                continue;
+                            }
+                        };
+
+                        let config = mcp_federation::McpTransportConfig {
+                            server_id: server.server_id.clone(),
+                            display_name: Some(server.display_name.clone()),
+                            transport,
+                        };
+
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(30),
+                            registry.write().await.connect(config),
+                        )
+                        .await
+                        {
+                            Ok(Ok(_summary)) => {
+                                tracing::info!("MCP federation: restored '{}'", server.server_id);
+                                connected += 1;
+                            }
+                            Ok(Err(e)) => {
+                                tracing::warn!(
+                                    "MCP federation: failed to restore '{}': {}",
+                                    server.server_id,
+                                    e
+                                );
+                                // Update status in Neo4j to reflect the failure
+                                let _ = orch
+                                    .neo4j()
+                                    .update_mcp_server_status(server.id, "disconnected")
+                                    .await;
+                                failed += 1;
+                            }
+                            Err(_) => {
+                                tracing::warn!(
+                                    "MCP federation: timeout restoring '{}' (30s)",
+                                    server.server_id
+                                );
+                                let _ = orch
+                                    .neo4j()
+                                    .update_mcp_server_status(server.id, "disconnected")
+                                    .await;
+                                failed += 1;
+                            }
+                        }
+                    }
+
+                    tracing::info!(
+                        "MCP federation bootstrap: {} connected, {} failed",
+                        connected,
+                        failed
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!("MCP federation: failed to load saved servers: {}", e);
                 }
             }
         });

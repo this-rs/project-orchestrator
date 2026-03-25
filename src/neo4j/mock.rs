@@ -10817,6 +10817,13 @@ impl GraphStore for MockGraphStore {
         Ok(result)
     }
 
+    async fn list_all_mcp_servers(&self) -> Result<Vec<McpServerNode>> {
+        let servers = self.mcp_servers.read().await;
+        let mut result: Vec<_> = servers.values().cloned().collect();
+        result.sort_by(|a, b| a.server_id.cmp(&b.server_id));
+        Ok(result)
+    }
+
     async fn delete_mcp_server(&self, id: Uuid) -> Result<()> {
         if let Some(server) = self.mcp_servers.write().await.remove(&id) {
             // Remove from project index
@@ -10840,6 +10847,21 @@ impl GraphStore for MockGraphStore {
             for tid in tool_ids {
                 tools.remove(&tid);
             }
+        }
+        Ok(())
+    }
+
+    async fn delete_mcp_server_by_server_id(&self, server_id: &str) -> Result<()> {
+        // Find the UUID for this server_id
+        let uuid = {
+            let servers = self.mcp_servers.read().await;
+            servers
+                .values()
+                .find(|s| s.server_id == server_id)
+                .map(|s| s.id)
+        };
+        if let Some(id) = uuid {
+            self.delete_mcp_server(id).await?;
         }
         Ok(())
     }
@@ -14631,6 +14653,71 @@ mod tests {
             .update_mcp_server_status(Uuid::new_v4(), "error")
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_mcp_delete_server_by_server_id() {
+        let store = MockGraphStore::new();
+        let project_id = Uuid::new_v4();
+        let server = test_mcp_server(project_id);
+        let sid = server.server_id.clone();
+        let uuid = server.id;
+
+        store.create_mcp_server(&server).await.unwrap();
+
+        // Add tools
+        let t1 = test_mcp_tool(&sid, "tool_a");
+        store.create_mcp_tool(&t1).await.unwrap();
+
+        // Delete by server_id string
+        store.delete_mcp_server_by_server_id(&sid).await.unwrap();
+
+        // Server and tools gone
+        assert!(store.get_mcp_server(uuid).await.unwrap().is_none());
+        assert!(store
+            .list_mcp_tools_for_server(&sid)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(store.list_mcp_servers(project_id).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_mcp_delete_server_by_server_id_not_found_is_ok() {
+        let store = MockGraphStore::new();
+        // Deleting a non-existent server_id should succeed silently
+        store
+            .delete_mcp_server_by_server_id("nonexistent")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_mcp_list_all_servers_cross_project() {
+        let store = MockGraphStore::new();
+        let p1 = Uuid::new_v4();
+        let p2 = Uuid::new_v4();
+
+        let mut s1 = test_mcp_server(p1);
+        s1.server_id = "discord".to_string();
+        let mut s2 = test_mcp_server(p1);
+        s2.id = Uuid::new_v4();
+        s2.server_id = "slack".to_string();
+        let mut s3 = test_mcp_server(p2);
+        s3.id = Uuid::new_v4();
+        s3.server_id = "github".to_string();
+
+        store.create_mcp_server(&s1).await.unwrap();
+        store.create_mcp_server(&s2).await.unwrap();
+        store.create_mcp_server(&s3).await.unwrap();
+
+        // list_all returns all 3 from both projects
+        let all = store.list_all_mcp_servers().await.unwrap();
+        assert_eq!(all.len(), 3);
+
+        // list per-project is scoped
+        assert_eq!(store.list_mcp_servers(p1).await.unwrap().len(), 2);
+        assert_eq!(store.list_mcp_servers(p2).await.unwrap().len(), 1);
     }
 
     #[tokio::test]

@@ -3294,8 +3294,14 @@ pub trait GraphStore: Send + Sync {
     /// List MCP servers for a project
     async fn list_mcp_servers(&self, project_id: Uuid) -> Result<Vec<McpServerNode>>;
 
+    /// List ALL MCP servers across all projects (used for startup bootstrap)
+    async fn list_all_mcp_servers(&self) -> Result<Vec<McpServerNode>>;
+
     /// Delete an MCP server and its tools
     async fn delete_mcp_server(&self, id: Uuid) -> Result<()>;
+
+    /// Delete an MCP server by its string server_id (e.g. "discord")
+    async fn delete_mcp_server_by_server_id(&self, server_id: &str) -> Result<()>;
 
     /// Update MCP server connection status
     async fn update_mcp_server_status(&self, id: Uuid, status: &str) -> Result<()>;
