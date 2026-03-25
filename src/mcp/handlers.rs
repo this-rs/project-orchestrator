@@ -192,6 +192,8 @@ impl ToolHandler {
             "sharing",
             "neural_routing",
             "trajectory",
+            "lifecycle_hook",
+            "mcp_federation",
         ];
 
         if !mega_tools.contains(&name) {
