@@ -126,6 +126,58 @@ pub async fn list_servers(
     })?))
 }
 
+/// Extract persistence fields from an `McpTransport`.
+///
+/// Returns `(transport_type, transport_url, transport_command, transport_args)`.
+pub(crate) fn extract_transport_fields(
+    transport: &McpTransport,
+) -> (String, Option<String>, Option<String>, Option<String>) {
+    match transport {
+        McpTransport::Stdio { command, args, .. } => (
+            "stdio".to_string(),
+            None,
+            Some(command.clone()),
+            Some(serde_json::to_string(args).unwrap_or_default()),
+        ),
+        McpTransport::Sse { url, .. } => ("sse".to_string(), Some(url.clone()), None, None),
+        McpTransport::StreamableHttp { url, .. } => {
+            ("streamable_http".to_string(), Some(url.clone()), None, None)
+        }
+    }
+}
+
+/// Build an `McpServerNode` from a connect request + server summary.
+pub(crate) fn build_server_node(
+    server_id: &str,
+    display_name: Option<&str>,
+    transport: &McpTransport,
+    server_name: Option<&str>,
+    tool_count: usize,
+) -> McpServerNode {
+    let (transport_type, transport_url, transport_command, transport_args) =
+        extract_transport_fields(transport);
+    let now = Utc::now();
+    McpServerNode {
+        id: Uuid::new_v4(),
+        project_id: Uuid::nil(), // cross-project; not tied to a specific project
+        server_id: server_id.to_string(),
+        display_name: display_name
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| server_id.to_string()),
+        transport_type,
+        transport_url,
+        transport_command,
+        transport_args,
+        status: "connected".to_string(),
+        protocol_version: server_name.map(|s| s.to_string()),
+        server_name: server_name.map(|s| s.to_string()),
+        tool_count,
+        created_at: now,
+        updated_at: Some(now),
+        last_connected_at: Some(now),
+    }
+}
+
 /// Connect to a new external MCP server.
 ///
 /// POST /api/mcp-federation/servers
@@ -145,52 +197,27 @@ pub async fn connect_server(
     let mut reg = registry.write().await;
     let summary = reg.connect(config).await.map_err(AppError::Internal)?;
 
-    // Persist to Neo4j so the server is restored on restart
-    let (transport_type, transport_url, transport_command, transport_args) = match &transport {
-        McpTransport::Stdio { command, args, .. } => (
-            "stdio".to_string(),
-            None,
-            Some(command.clone()),
-            Some(serde_json::to_string(args).unwrap_or_default()),
-        ),
-        McpTransport::Sse { url, .. } => ("sse".to_string(), Some(url.clone()), None, None),
-        McpTransport::StreamableHttp { url, .. } => {
-            ("streamable_http".to_string(), Some(url.clone()), None, None)
-        }
-    };
-
-    let now = Utc::now();
-    let server_node = McpServerNode {
-        id: Uuid::new_v4(),
-        project_id: Uuid::nil(), // cross-project; not tied to a specific project
-        server_id: body.server_id.clone(),
-        display_name: body.display_name.unwrap_or_else(|| body.server_id.clone()),
-        transport_type,
-        transport_url,
-        transport_command,
-        transport_args,
-        status: "connected".to_string(),
-        protocol_version: summary.server_name.clone(), // best-effort from summary
-        server_name: summary.server_name.clone(),
-        tool_count: summary.tool_count,
-        created_at: now,
-        updated_at: Some(now),
-        last_connected_at: Some(now),
-    };
+    // Build node for Neo4j persistence
+    let server_node = build_server_node(
+        &body.server_id,
+        body.display_name.as_deref(),
+        &transport,
+        summary.server_name.as_deref(),
+        summary.tool_count,
+    );
 
     // Fire-and-forget persistence — don't fail the connect if Neo4j write fails
     let neo4j = state.orchestrator.neo4j_arc();
-    let node = server_node;
     tokio::spawn(async move {
-        if let Err(e) = neo4j.create_mcp_server(&node).await {
+        if let Err(e) = neo4j.create_mcp_server(&server_node).await {
             tracing::warn!(
-                server_id = %node.server_id,
+                server_id = %server_node.server_id,
                 "Failed to persist MCP server to Neo4j: {}",
                 e
             );
         } else {
             tracing::info!(
-                server_id = %node.server_id,
+                server_id = %server_node.server_id,
                 "MCP server persisted to Neo4j for restart recovery"
             );
         }
@@ -1147,193 +1174,181 @@ mod tests {
     }
 
     // ========================================================================
-    // 25. McpServerNode construction from transport types
+    // 25. probe_server success path
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_probe_server_success() {
+        let app = test_app_with_populated_registry().await;
+        let resp = app
+            .oneshot(auth_post(
+                "/api/mcp-federation/servers/test-srv/probe",
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["server_id"], "test-srv");
+        assert!(json["total"].as_u64().unwrap() >= 2);
+        assert!(json["probed"].is_number());
+    }
+
+    // ========================================================================
+    // 26. disconnect cleans up and returns correct response
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_disconnect_server_response_format() {
+        let app = test_app_with_populated_registry().await;
+        let resp = app
+            .oneshot(auth_delete("/api/mcp-federation/servers/test-srv"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["success"], true);
+        assert_eq!(json["server_id"], "test-srv");
+        assert!(json["message"].as_str().unwrap().contains("disconnected"));
+    }
+
+    // ========================================================================
+    // 27. extract_transport_fields (tests the extracted helper)
     // ========================================================================
 
     #[test]
-    fn test_server_node_from_stdio_transport() {
+    fn test_extract_transport_fields_stdio() {
         let transport = McpTransport::Stdio {
             command: "npx".to_string(),
             args: vec!["-y".to_string(), "@pasympa/discord-mcp".to_string()],
             env: HashMap::new(),
         };
-        let (transport_type, transport_url, transport_command, transport_args) = match &transport {
-            McpTransport::Stdio { command, args, .. } => (
-                "stdio".to_string(),
-                None,
-                Some(command.clone()),
-                Some(serde_json::to_string(args).unwrap_or_default()),
-            ),
-            McpTransport::Sse { url, .. } => ("sse".to_string(), Some(url.clone()), None, None),
-            McpTransport::StreamableHttp { url, .. } => {
-                ("streamable_http".to_string(), Some(url.clone()), None, None)
-            }
-        };
-
-        assert_eq!(transport_type, "stdio");
-        assert!(transport_url.is_none());
-        assert_eq!(transport_command.unwrap(), "npx");
-        let args: Vec<String> = serde_json::from_str(&transport_args.unwrap()).unwrap();
+        let (tt, url, cmd, args_json) = extract_transport_fields(&transport);
+        assert_eq!(tt, "stdio");
+        assert!(url.is_none());
+        assert_eq!(cmd.unwrap(), "npx");
+        let args: Vec<String> = serde_json::from_str(&args_json.unwrap()).unwrap();
         assert_eq!(args, vec!["-y", "@pasympa/discord-mcp"]);
     }
 
     #[test]
-    fn test_server_node_from_sse_transport() {
+    fn test_extract_transport_fields_sse() {
         let transport = McpTransport::Sse {
             url: "http://localhost:8080/sse".to_string(),
             headers: HashMap::new(),
         };
-        let (transport_type, transport_url, transport_command, transport_args) = match &transport {
-            McpTransport::Stdio { command, args, .. } => (
-                "stdio".to_string(),
-                None,
-                Some(command.clone()),
-                Some(serde_json::to_string(args).unwrap_or_default()),
-            ),
-            McpTransport::Sse { url, .. } => ("sse".to_string(), Some(url.clone()), None, None),
-            McpTransport::StreamableHttp { url, .. } => {
-                ("streamable_http".to_string(), Some(url.clone()), None, None)
-            }
-        };
-
-        assert_eq!(transport_type, "sse");
-        assert_eq!(transport_url.unwrap(), "http://localhost:8080/sse");
-        assert!(transport_command.is_none());
-        assert!(transport_args.is_none());
+        let (tt, url, cmd, args) = extract_transport_fields(&transport);
+        assert_eq!(tt, "sse");
+        assert_eq!(url.unwrap(), "http://localhost:8080/sse");
+        assert!(cmd.is_none());
+        assert!(args.is_none());
     }
 
     #[test]
-    fn test_server_node_from_streamable_http_transport() {
+    fn test_extract_transport_fields_streamable_http() {
         let transport = McpTransport::StreamableHttp {
             url: "http://localhost:9090/mcp".to_string(),
             headers: HashMap::new(),
         };
-        let (transport_type, transport_url, transport_command, transport_args) = match &transport {
-            McpTransport::Stdio { command, args, .. } => (
-                "stdio".to_string(),
-                None,
-                Some(command.clone()),
-                Some(serde_json::to_string(args).unwrap_or_default()),
-            ),
-            McpTransport::Sse { url, .. } => ("sse".to_string(), Some(url.clone()), None, None),
-            McpTransport::StreamableHttp { url, .. } => {
-                ("streamable_http".to_string(), Some(url.clone()), None, None)
-            }
+        let (tt, url, cmd, args) = extract_transport_fields(&transport);
+        assert_eq!(tt, "streamable_http");
+        assert_eq!(url.unwrap(), "http://localhost:9090/mcp");
+        assert!(cmd.is_none());
+        assert!(args.is_none());
+    }
+
+    // ========================================================================
+    // 28. build_server_node (tests the extracted helper)
+    // ========================================================================
+
+    #[test]
+    fn test_build_server_node_stdio_with_display_name() {
+        let transport = McpTransport::Stdio {
+            command: "npx".to_string(),
+            args: vec!["-y".to_string(), "@pasympa/discord-mcp".to_string()],
+            env: HashMap::new(),
         };
-
-        assert_eq!(transport_type, "streamable_http");
-        assert_eq!(transport_url.unwrap(), "http://localhost:9090/mcp");
-        assert!(transport_command.is_none());
-        assert!(transport_args.is_none());
+        let node = build_server_node("discord", Some("Discord Bot"), &transport, Some("discord-mcp"), 90);
+        assert_eq!(node.server_id, "discord");
+        assert_eq!(node.display_name, "Discord Bot");
+        assert_eq!(node.transport_type, "stdio");
+        assert!(node.transport_url.is_none());
+        assert_eq!(node.transport_command.as_deref(), Some("npx"));
+        assert_eq!(node.server_name.as_deref(), Some("discord-mcp"));
+        assert_eq!(node.tool_count, 90);
+        assert_eq!(node.status, "connected");
+        assert!(node.updated_at.is_some());
+        assert!(node.last_connected_at.is_some());
+        assert_eq!(node.project_id, Uuid::nil());
     }
 
-    // ========================================================================
-    // 26. McpServerNode display_name fallback
-    // ========================================================================
-
     #[test]
-    fn test_server_node_display_name_fallback() {
-        // Test the fallback logic used in connect_server
-        fn resolve_display_name(display_name: Option<String>, server_id: &str) -> String {
-            display_name.unwrap_or_else(|| server_id.to_string())
-        }
-
+    fn test_build_server_node_display_name_fallback() {
+        let transport = McpTransport::Sse {
+            url: "http://host/sse".to_string(),
+            headers: HashMap::new(),
+        };
         // When display_name is None, server_id should be used
-        assert_eq!(resolve_display_name(None, "discord"), "discord");
+        let node = build_server_node("my-server", None, &transport, None, 5);
+        assert_eq!(node.display_name, "my-server");
+        assert_eq!(node.transport_type, "sse");
+        assert_eq!(node.transport_url.as_deref(), Some("http://host/sse"));
+        assert!(node.server_name.is_none());
+    }
 
-        // When display_name is provided, it should be used
-        assert_eq!(
-            resolve_display_name(Some("Discord Bot".to_string()), "discord"),
-            "Discord Bot"
-        );
+    #[test]
+    fn test_build_server_node_streamable_http() {
+        let transport = McpTransport::StreamableHttp {
+            url: "http://localhost:9090/mcp".to_string(),
+            headers: HashMap::new(),
+        };
+        let node = build_server_node("grafeo", Some("Grafeo"), &transport, Some("grafeo-server"), 12);
+        assert_eq!(node.transport_type, "streamable_http");
+        assert_eq!(node.transport_url.as_deref(), Some("http://localhost:9090/mcp"));
+        assert!(node.transport_command.is_none());
+        assert!(node.transport_args.is_none());
     }
 
     // ========================================================================
-    // 27. McpServerNode round-trip: build from transport, reconstruct transport
+    // 29. Round-trip: build_server_node → reconstruct transport from stored fields
     // ========================================================================
 
     #[test]
-    fn test_server_node_transport_roundtrip_stdio() {
-        // Simulate what connect_server does: extract fields from transport
+    fn test_server_node_roundtrip_stdio() {
         let original = McpTransport::Stdio {
             command: "node".to_string(),
-            args: vec![
-                "server.js".to_string(),
-                "--port".to_string(),
-                "3000".to_string(),
-            ],
+            args: vec!["server.js".to_string(), "--port".to_string(), "3000".to_string()],
             env: HashMap::new(),
         };
+        let node = build_server_node("srv", None, &original, None, 0);
 
-        let (tt, _url, cmd, args_json) = match &original {
-            McpTransport::Stdio { command, args, .. } => (
-                "stdio",
-                None::<String>,
-                Some(command.clone()),
-                Some(serde_json::to_string(args).unwrap()),
-            ),
-            _ => unreachable!(),
-        };
-
-        // Simulate what bootstrap does: reconstruct transport from stored fields
-        assert_eq!(tt, "stdio");
-        let command = cmd.unwrap();
-        let args: Vec<String> = serde_json::from_str(&args_json.unwrap()).unwrap();
-        let reconstructed = McpTransport::Stdio {
-            command: command.clone(),
-            args: args.clone(),
-            env: HashMap::new(),
-        };
-
-        match (&original, &reconstructed) {
-            (
-                McpTransport::Stdio {
-                    command: c1,
-                    args: a1,
-                    ..
-                },
-                McpTransport::Stdio {
-                    command: c2,
-                    args: a2,
-                    ..
-                },
-            ) => {
-                assert_eq!(c1, c2);
-                assert_eq!(a1, a2);
-            }
-            _ => panic!("Transport type mismatch"),
-        }
+        // Reconstruct transport from stored fields (simulates bootstrap)
+        assert_eq!(node.transport_type, "stdio");
+        let command = node.transport_command.unwrap();
+        let args: Vec<String> = serde_json::from_str(&node.transport_args.unwrap()).unwrap();
+        assert_eq!(command, "node");
+        assert_eq!(args, vec!["server.js", "--port", "3000"]);
     }
 
     #[test]
-    fn test_server_node_transport_roundtrip_sse() {
-        let original_url = "http://localhost:8080/sse";
-        let (tt, url) = ("sse", Some(original_url.to_string()));
-
-        assert_eq!(tt, "sse");
-        let reconstructed = McpTransport::Sse {
-            url: url.unwrap(),
+    fn test_server_node_roundtrip_sse() {
+        let original = McpTransport::Sse {
+            url: "http://localhost:8080/sse".to_string(),
             headers: HashMap::new(),
         };
-        match &reconstructed {
-            McpTransport::Sse { url, .. } => assert_eq!(url, original_url),
-            _ => panic!("Expected Sse"),
-        }
+        let node = build_server_node("srv", None, &original, None, 0);
+        assert_eq!(node.transport_type, "sse");
+        assert_eq!(node.transport_url.unwrap(), "http://localhost:8080/sse");
     }
 
     #[test]
-    fn test_server_node_transport_roundtrip_streamable_http() {
-        let original_url = "http://localhost:9090/mcp";
-        let (tt, url) = ("streamable_http", Some(original_url.to_string()));
-
-        assert_eq!(tt, "streamable_http");
-        let reconstructed = McpTransport::StreamableHttp {
-            url: url.unwrap(),
+    fn test_server_node_roundtrip_streamable_http() {
+        let original = McpTransport::StreamableHttp {
+            url: "http://localhost:9090/mcp".to_string(),
             headers: HashMap::new(),
         };
-        match &reconstructed {
-            McpTransport::StreamableHttp { url, .. } => assert_eq!(url, original_url),
-            _ => panic!("Expected StreamableHttp"),
-        }
+        let node = build_server_node("srv", None, &original, None, 0);
+        assert_eq!(node.transport_type, "streamable_http");
+        assert_eq!(node.transport_url.unwrap(), "http://localhost:9090/mcp");
     }
 }
