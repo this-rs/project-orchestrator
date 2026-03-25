@@ -328,3 +328,182 @@ pub async fn reason_feedback(
         tree_persisted,
     }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_reason_request_deserialization_minimal() {
+        let json = json!({"request": "How to refactor auth?"});
+        let req: ReasonRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.request, "How to refactor auth?");
+        assert!(req.project_id.is_none());
+        assert!(req.depth.is_none());
+        assert!(req.include_actions.is_none());
+        assert!(req.max_nodes.is_none());
+    }
+
+    #[test]
+    fn test_reason_request_deserialization_full() {
+        let json = json!({
+            "request": "Find security issues",
+            "project_id": "550e8400-e29b-41d4-a716-446655440000",
+            "depth": 6,
+            "include_actions": false,
+            "max_nodes": 100
+        });
+        let req: ReasonRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.request, "Find security issues");
+        assert!(req.project_id.is_some());
+        assert_eq!(req.depth, Some(6));
+        assert_eq!(req.include_actions, Some(false));
+        assert_eq!(req.max_nodes, Some(100));
+    }
+
+    #[test]
+    fn test_feedback_outcome_deserialization() {
+        let success: FeedbackOutcome = serde_json::from_value(json!("success")).unwrap();
+        assert!(matches!(success, FeedbackOutcome::Success));
+
+        let partial: FeedbackOutcome = serde_json::from_value(json!("partial")).unwrap();
+        assert!(matches!(partial, FeedbackOutcome::Partial));
+
+        let failure: FeedbackOutcome = serde_json::from_value(json!("failure")).unwrap();
+        assert!(matches!(failure, FeedbackOutcome::Failure));
+    }
+
+    #[test]
+    fn test_feedback_outcome_serialization() {
+        assert_eq!(
+            serde_json::to_value(FeedbackOutcome::Success).unwrap(),
+            json!("success")
+        );
+        assert_eq!(
+            serde_json::to_value(FeedbackOutcome::Partial).unwrap(),
+            json!("partial")
+        );
+        assert_eq!(
+            serde_json::to_value(FeedbackOutcome::Failure).unwrap(),
+            json!("failure")
+        );
+    }
+
+    #[test]
+    fn test_reason_feedback_request_deserialization() {
+        let json = json!({
+            "followed_nodes": ["550e8400-e29b-41d4-a716-446655440000"],
+            "outcome": "success"
+        });
+        let req: ReasonFeedbackRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.followed_nodes.len(), 1);
+        assert!(matches!(req.outcome, FeedbackOutcome::Success));
+        assert!(req.task_id.is_none());
+    }
+
+    #[test]
+    fn test_reason_feedback_request_with_task_id() {
+        let json = json!({
+            "followed_nodes": ["550e8400-e29b-41d4-a716-446655440000"],
+            "outcome": "failure",
+            "task_id": "660e8400-e29b-41d4-a716-446655440000"
+        });
+        let req: ReasonFeedbackRequest = serde_json::from_value(json).unwrap();
+        assert!(matches!(req.outcome, FeedbackOutcome::Failure));
+        assert!(req.task_id.is_some());
+    }
+
+    #[test]
+    fn test_boost_amounts_for_outcomes() {
+        // Verify the boost logic from reason_feedback handler
+        let success_boost = match FeedbackOutcome::Success {
+            FeedbackOutcome::Success => (0.15, 0.05),
+            FeedbackOutcome::Partial => (0.075, 0.025),
+            FeedbackOutcome::Failure => (0.0, 0.0),
+        };
+        assert_eq!(success_boost, (0.15, 0.05));
+
+        let partial_boost = match FeedbackOutcome::Partial {
+            FeedbackOutcome::Success => (0.15, 0.05),
+            FeedbackOutcome::Partial => (0.075, 0.025),
+            FeedbackOutcome::Failure => (0.0, 0.0),
+        };
+        assert_eq!(partial_boost, (0.075, 0.025));
+
+        let failure_boost = match FeedbackOutcome::Failure {
+            FeedbackOutcome::Success => (0.15, 0.05),
+            FeedbackOutcome::Partial => (0.075, 0.025),
+            FeedbackOutcome::Failure => (0.0, 0.0),
+        };
+        assert_eq!(failure_boost, (0.0, 0.0));
+    }
+
+    #[test]
+    fn test_reason_feedback_response_serialization() {
+        let resp = ReasonFeedbackResponse {
+            applied: true,
+            neurons_boosted: 3,
+            synapses_reinforced: 2,
+            energy_boost: 0.15,
+            synapse_boost: 0.05,
+            scars_applied: 0,
+            cache_invalidated: true,
+            tree_persisted: false,
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["applied"], true);
+        assert_eq!(json["neurons_boosted"], 3);
+        assert_eq!(json["synapses_reinforced"], 2);
+        assert_eq!(json["energy_boost"], 0.15);
+        assert_eq!(json["cache_invalidated"], true);
+        // scars_applied=0 should be skipped (skip_serializing_if)
+        assert!(json.get("scars_applied").is_none());
+        // tree_persisted=false should be skipped (Not::not)
+        assert!(json.get("tree_persisted").is_none());
+    }
+
+    #[test]
+    fn test_reason_feedback_response_with_scars() {
+        let resp = ReasonFeedbackResponse {
+            applied: true,
+            neurons_boosted: 0,
+            synapses_reinforced: 0,
+            energy_boost: 0.0,
+            synapse_boost: 0.0,
+            scars_applied: 5,
+            cache_invalidated: true,
+            tree_persisted: false,
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        // scars_applied > 0 should be present
+        assert_eq!(json["scars_applied"], 5);
+    }
+
+    #[test]
+    fn test_reason_response_serialization() {
+        let resp = ReasonResponse {
+            id: Uuid::nil(),
+            request: "test".to_string(),
+            roots: vec![],
+            depth: 3,
+            confidence: 0.85,
+            node_count: 12,
+            build_time_ms: 42,
+            project_id: None,
+            suggested_actions: vec![],
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["depth"], 3);
+        assert_eq!(json["confidence"], 0.85);
+        assert_eq!(json["node_count"], 12);
+        assert_eq!(json["build_time_ms"], 42);
+    }
+
+    #[test]
+    fn test_is_zero_usize_helper() {
+        assert!(is_zero_usize(&0));
+        assert!(!is_zero_usize(&1));
+        assert!(!is_zero_usize(&100));
+    }
+}

@@ -194,6 +194,7 @@ impl ToolHandler {
             "trajectory",
             "lifecycle_hook",
             "mcp_federation",
+            "reasoning",
         ];
 
         if !mega_tools.contains(&name) {
@@ -6101,6 +6102,13 @@ mod tests {
             ("analysis_profile", "list"),
             ("protocol", "list"),
             ("persona", "list"),
+            ("episode", "list"),
+            ("trajectory", "list"),
+            ("lifecycle_hook", "list"),
+            ("mcp_federation", "list"),
+            ("neural_routing", "status"),
+            ("reasoning", "reason"),
+            ("sharing", "status"),
         ];
 
         for (tool, action) in mega_tools_with_action {
@@ -10438,6 +10446,656 @@ mod tests {
             .as_str()
             .unwrap()
             .ends_with("/blockers"));
+    }
+
+    // ========================================================================
+    // Mega-tool resolution tests (missing mega-tools)
+    // ========================================================================
+
+    #[test]
+    fn test_resolve_mega_tool_trajectory_actions() {
+        let handler = make_handler();
+        for (action, expected) in [
+            ("list", "list_trajectories"),
+            ("get", "get_trajectory"),
+            ("search_similar", "search_similar_trajectories"),
+            ("stats", "get_trajectory_stats"),
+        ] {
+            let args = json!({"action": action});
+            let (name, _) = handler.resolve_mega_tool("trajectory", &args).unwrap();
+            assert_eq!(
+                name, expected,
+                "trajectory action '{}' should resolve to '{}'",
+                action, expected
+            );
+        }
+    }
+
+    #[test]
+    fn test_resolve_mega_tool_episode_actions() {
+        let handler = make_handler();
+        for (action, expected) in [
+            ("collect", "collect_episode"),
+            ("list", "list_episodes"),
+            ("anonymize", "anonymize_episode"),
+            ("export_artifact", "export_artifact"),
+        ] {
+            let args = json!({"action": action});
+            let (name, _) = handler.resolve_mega_tool("episode", &args).unwrap();
+            assert_eq!(
+                name, expected,
+                "episode action '{}' should resolve to '{}'",
+                action, expected
+            );
+        }
+    }
+
+    #[test]
+    fn test_resolve_mega_tool_lifecycle_hook_actions() {
+        let handler = make_handler();
+        for (action, expected) in [
+            ("list", "list_lifecycle_hooks"),
+            ("create", "create_lifecycle_hook"),
+            ("get", "get_lifecycle_hook"),
+            ("update", "update_lifecycle_hook"),
+            ("delete", "delete_lifecycle_hook"),
+        ] {
+            let args = json!({"action": action});
+            let (name, _) = handler.resolve_mega_tool("lifecycle_hook", &args).unwrap();
+            assert_eq!(
+                name, expected,
+                "lifecycle_hook action '{}' should resolve to '{}'",
+                action, expected
+            );
+        }
+    }
+
+    #[test]
+    fn test_resolve_mega_tool_mcp_federation_actions() {
+        let handler = make_handler();
+        for (action, expected) in [
+            ("connect", "federation_connect"),
+            ("disconnect", "federation_disconnect"),
+            ("list", "federation_list"),
+            ("status", "federation_status"),
+            ("tools", "federation_tools"),
+            ("probe", "federation_probe"),
+            ("reconnect", "federation_reconnect"),
+            ("backfill_relations", "backfill_co_activated_with"),
+            ("backfill_sequences", "backfill_often_follows"),
+        ] {
+            let args = json!({"action": action});
+            let (name, _) = handler.resolve_mega_tool("mcp_federation", &args).unwrap();
+            assert_eq!(
+                name, expected,
+                "mcp_federation action '{}' should resolve to '{}'",
+                action, expected
+            );
+        }
+    }
+
+    #[test]
+    fn test_resolve_mega_tool_neural_routing_actions() {
+        let handler = make_handler();
+        for (action, expected) in [
+            ("status", "get_neural_routing_status"),
+            ("get_config", "get_neural_routing_config"),
+            ("enable", "enable_neural_routing"),
+            ("disable", "disable_neural_routing"),
+            ("set_mode", "set_neural_routing_mode"),
+            ("update_config", "update_neural_routing_config"),
+        ] {
+            let args = json!({"action": action});
+            let (name, _) = handler.resolve_mega_tool("neural_routing", &args).unwrap();
+            assert_eq!(
+                name, expected,
+                "neural_routing action '{}' should resolve to '{}'",
+                action, expected
+            );
+        }
+    }
+
+    #[test]
+    fn test_resolve_mega_tool_reasoning_actions() {
+        let handler = make_handler();
+        for (action, expected) in [("reason", "reason"), ("reason_feedback", "reason_feedback")] {
+            let args = json!({"action": action});
+            let (name, _) = handler.resolve_mega_tool("reasoning", &args).unwrap();
+            assert_eq!(
+                name, expected,
+                "reasoning action '{}' should resolve to '{}'",
+                action, expected
+            );
+        }
+    }
+
+    #[test]
+    fn test_resolve_mega_tool_sharing_actions() {
+        let handler = make_handler();
+        for (action, expected) in [
+            ("status", "get_sharing_status"),
+            ("enable", "enable_sharing"),
+            ("disable", "disable_sharing"),
+            ("set_policy", "set_sharing_policy"),
+            ("get_policy", "get_sharing_policy"),
+            ("set_consent", "set_sharing_consent"),
+            ("history", "get_sharing_history"),
+            ("preview", "preview_sharing"),
+            ("suggest", "suggest_sharing"),
+            ("retract", "retract_sharing"),
+            ("list_tombstones", "list_tombstones"),
+            ("last_report", "get_last_privacy_report"),
+        ] {
+            let args = json!({"action": action});
+            let (name, _) = handler.resolve_mega_tool("sharing", &args).unwrap();
+            assert_eq!(
+                name, expected,
+                "sharing action '{}' should resolve to '{}'",
+                action, expected
+            );
+        }
+    }
+
+    // ========================================================================
+    // HTTP routing tests (missing mega-tools)
+    // ========================================================================
+
+    // -- Lifecycle Hooks -------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_http_list_lifecycle_hooks() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("list_lifecycle_hooks", Some(json!({})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert_eq!(result["path"], "/api/lifecycle-hooks");
+    }
+
+    #[tokio::test]
+    async fn test_http_list_lifecycle_hooks_with_project_filter() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "list_lifecycle_hooks",
+                Some(json!({"project_id": "abc-123"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert_eq!(result["path"], "/api/lifecycle-hooks");
+        let query = result["query"].as_str().unwrap();
+        assert!(query.contains("project_id=abc-123"));
+    }
+
+    #[tokio::test]
+    async fn test_http_create_lifecycle_hook() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "create_lifecycle_hook",
+                Some(json!({
+                    "name": "post-deploy",
+                    "on_status": "completed"
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert_eq!(result["path"], "/api/lifecycle-hooks");
+        assert_eq!(result["body"]["name"], "post-deploy");
+    }
+
+    #[tokio::test]
+    async fn test_http_get_lifecycle_hook() {
+        let (handler, _) = make_http_handler().await;
+        let hook_id = "550e8400-e29b-41d4-a716-446655440000";
+        let result = handler
+            .handle("get_lifecycle_hook", Some(json!({"hook_id": hook_id})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert_eq!(result["path"], format!("/api/lifecycle-hooks/{}", hook_id));
+    }
+
+    #[tokio::test]
+    async fn test_http_update_lifecycle_hook() {
+        let (handler, _) = make_http_handler().await;
+        let hook_id = "550e8400-e29b-41d4-a716-446655440000";
+        let result = handler
+            .handle(
+                "update_lifecycle_hook",
+                Some(json!({
+                    "hook_id": hook_id,
+                    "name": "updated-hook",
+                    "enabled": false
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "PATCH");
+        assert!(result["path"].as_str().unwrap().contains(hook_id));
+        assert_eq!(result["body"]["name"], "updated-hook");
+        assert_eq!(result["body"]["enabled"], false);
+    }
+
+    #[tokio::test]
+    async fn test_http_delete_lifecycle_hook() {
+        let (handler, _) = make_http_handler().await;
+        let hook_id = "550e8400-e29b-41d4-a716-446655440000";
+        let result = handler
+            .handle("delete_lifecycle_hook", Some(json!({"hook_id": hook_id})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "DELETE");
+        assert!(result["path"].as_str().unwrap().contains(hook_id));
+    }
+
+    // -- MCP Federation --------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_http_federation_list() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("federation_list", Some(json!({})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert_eq!(result["path"], "/api/mcp-federation/servers");
+    }
+
+    #[tokio::test]
+    async fn test_http_federation_connect() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "federation_connect",
+                Some(json!({
+                    "server_id": "discord",
+                    "transport": "stdio",
+                    "command": "npx"
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert_eq!(result["path"], "/api/mcp-federation/servers");
+        assert_eq!(result["body"]["server_id"], "discord");
+    }
+
+    #[tokio::test]
+    async fn test_http_federation_status() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("federation_status", Some(json!({"server_id": "discord"})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert_eq!(result["path"], "/api/mcp-federation/servers/discord");
+    }
+
+    #[tokio::test]
+    async fn test_http_federation_disconnect() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "federation_disconnect",
+                Some(json!({"server_id": "discord"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "DELETE");
+        assert_eq!(result["path"], "/api/mcp-federation/servers/discord");
+    }
+
+    #[tokio::test]
+    async fn test_http_federation_tools() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("federation_tools", Some(json!({"server_id": "discord"})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert_eq!(result["path"], "/api/mcp-federation/servers/discord/tools");
+    }
+
+    #[tokio::test]
+    async fn test_http_federation_probe() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("federation_probe", Some(json!({"server_id": "discord"})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert_eq!(result["path"], "/api/mcp-federation/servers/discord/probe");
+    }
+
+    #[tokio::test]
+    async fn test_http_federation_reconnect() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "federation_reconnect",
+                Some(json!({"server_id": "discord"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert_eq!(
+            result["path"],
+            "/api/mcp-federation/servers/discord/reconnect"
+        );
+    }
+
+    // -- Trajectories ----------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_http_list_trajectories() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("list_trajectories", Some(json!({})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert_eq!(result["path"], "/api/trajectories");
+    }
+
+    #[tokio::test]
+    async fn test_http_list_trajectories_with_filters() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "list_trajectories",
+                Some(json!({
+                    "session_id": "sess-123",
+                    "min_reward": 0.5,
+                    "limit": 5
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        let query = result["query"].as_str().unwrap();
+        assert!(query.contains("session_id=sess-123"));
+        assert!(query.contains("min_reward=0.5"));
+        assert!(query.contains("limit=5"));
+    }
+
+    #[tokio::test]
+    async fn test_http_get_trajectory() {
+        let (handler, _) = make_http_handler().await;
+        let tid = "550e8400-e29b-41d4-a716-446655440000";
+        let result = handler
+            .handle("get_trajectory", Some(json!({"trajectory_id": tid})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert_eq!(result["path"], format!("/api/trajectories/{}", tid));
+    }
+
+    #[tokio::test]
+    async fn test_http_search_similar_trajectories() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "search_similar_trajectories",
+                Some(json!({
+                    "embedding": [0.1, 0.2, 0.3],
+                    "top_k": 5
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert_eq!(result["path"], "/api/trajectories/similar");
+    }
+
+    #[tokio::test]
+    async fn test_http_get_trajectory_stats() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("get_trajectory_stats", Some(json!({})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert_eq!(result["path"], "/api/trajectories/stats");
+    }
+
+    // -- Episodes --------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_http_collect_episode() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "collect_episode",
+                Some(json!({
+                    "run_id": "550e8400-e29b-41d4-a716-446655440000",
+                    "project_id": "660e8400-e29b-41d4-a716-446655440000"
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert_eq!(result["path"], "/api/episodes/collect");
+    }
+
+    #[tokio::test]
+    async fn test_http_list_episodes() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "list_episodes",
+                Some(json!({
+                    "project_id": "550e8400-e29b-41d4-a716-446655440000"
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert_eq!(result["path"], "/api/episodes");
+    }
+
+    #[tokio::test]
+    async fn test_http_anonymize_episode() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "anonymize_episode",
+                Some(json!({
+                    "run_id": "550e8400-e29b-41d4-a716-446655440000",
+                    "project_id": "660e8400-e29b-41d4-a716-446655440000"
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert_eq!(result["path"], "/api/episodes/anonymize");
+    }
+
+    #[tokio::test]
+    async fn test_http_export_artifact() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "export_artifact",
+                Some(json!({
+                    "project_id": "550e8400-e29b-41d4-a716-446655440000"
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert_eq!(result["path"], "/api/episodes/export-artifact");
+    }
+
+    // -- Reasoning (reason, reason_feedback) -----------------------------------
+
+    #[tokio::test]
+    async fn test_http_reason() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "reason",
+                Some(json!({
+                    "request": "How should I refactor the auth module?"
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert_eq!(result["path"], "/api/reason");
+        assert_eq!(
+            result["body"]["request"],
+            "How should I refactor the auth module?"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_http_reason_feedback() {
+        let (handler, _) = make_http_handler().await;
+        let tree_id = "550e8400-e29b-41d4-a716-446655440000";
+        let result = handler
+            .handle(
+                "reason_feedback",
+                Some(json!({
+                    "tree_id": tree_id,
+                    "followed_nodes": ["a", "b"],
+                    "outcome": "success"
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert!(result["path"].as_str().unwrap().contains(tree_id));
+        assert!(result["path"].as_str().unwrap().contains("feedback"));
+    }
+
+    // -- Analysis Profiles -----------------------------------------------------
+
+    #[tokio::test]
+    async fn test_http_list_analysis_profiles() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("list_analysis_profiles", Some(json!({})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert_eq!(result["path"], "/api/analysis-profiles");
+    }
+
+    #[tokio::test]
+    async fn test_http_create_analysis_profile() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "create_analysis_profile",
+                Some(json!({
+                    "name": "debug",
+                    "edge_weights": {"IMPORTS": 0.8}
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert_eq!(result["path"], "/api/analysis-profiles");
+        assert_eq!(result["body"]["name"], "debug");
+    }
+
+    #[tokio::test]
+    async fn test_http_get_analysis_profile() {
+        let (handler, _) = make_http_handler().await;
+        let pid = "550e8400-e29b-41d4-a716-446655440000";
+        let result = handler
+            .handle("get_analysis_profile", Some(json!({"id": pid})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert_eq!(result["path"], format!("/api/analysis-profiles/{}", pid));
+    }
+
+    #[tokio::test]
+    async fn test_http_delete_analysis_profile() {
+        let (handler, _) = make_http_handler().await;
+        let pid = "550e8400-e29b-41d4-a716-446655440000";
+        let result = handler
+            .handle("delete_analysis_profile", Some(json!({"id": pid})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "DELETE");
+        assert_eq!(result["path"], format!("/api/analysis-profiles/{}", pid));
+    }
+
+    // -- Neural Routing --------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_http_get_neural_routing_status() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("get_neural_routing_status", Some(json!({})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert_eq!(result["path"], "/api/neural-routing/status");
+    }
+
+    #[tokio::test]
+    async fn test_http_get_neural_routing_config() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("get_neural_routing_config", Some(json!({})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert_eq!(result["path"], "/api/neural-routing/config");
+    }
+
+    #[tokio::test]
+    async fn test_http_enable_neural_routing() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("enable_neural_routing", Some(json!({})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert_eq!(result["path"], "/api/neural-routing/enable");
+    }
+
+    #[tokio::test]
+    async fn test_http_disable_neural_routing() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("disable_neural_routing", Some(json!({})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert_eq!(result["path"], "/api/neural-routing/disable");
+    }
+
+    #[tokio::test]
+    async fn test_http_set_neural_routing_mode() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("set_neural_routing_mode", Some(json!({"mode": "nn_only"})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "PUT");
+        assert_eq!(result["path"], "/api/neural-routing/mode");
+    }
+
+    #[tokio::test]
+    async fn test_http_update_neural_routing_config() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "update_neural_routing_config",
+                Some(json!({"exploration_rate": 0.2})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "PUT");
+        assert_eq!(result["path"], "/api/neural-routing/config");
     }
 
     // ========================================================================
