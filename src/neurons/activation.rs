@@ -65,6 +65,63 @@ fn default_entity_type() -> String {
 }
 
 // ============================================================================
+// Search Result types (spreading activation as search signal)
+// ============================================================================
+
+/// A search result produced by spreading activation over the graph.
+///
+/// Unlike `ActivatedNote` (which carries the full Note), this is a lightweight
+/// struct designed for integration with search pipelines — it carries only
+/// the node ID, activation level, hop distance, and the path taken.
+///
+/// Use cases:
+/// - **Recommendation**: activate a purchased product → find related products
+/// - **Knowledge exploration**: activate a concept → discover related concepts
+/// - **Influence detection**: activate a node → measure propagation reach
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActivationSearchResult {
+    /// ID of the activated node.
+    pub node_id: Uuid,
+    /// Final activation level after propagation (normalized 0.0–1.0).
+    pub activation_level: f64,
+    /// Number of hops from the source node (0 = source itself).
+    pub hop_distance: usize,
+    /// Path from the source to this node (list of node IDs traversed).
+    pub path: Vec<Uuid>,
+}
+
+/// Configuration for the `activate_and_collect` search mode.
+#[derive(Debug, Clone)]
+pub struct ActivationSearchConfig {
+    /// Maximum number of results to return (top-K by activation level).
+    pub top_k: usize,
+    /// Maximum hops from the source node.
+    pub max_hops: usize,
+    /// Decay factor per hop (0.0–1.0). Each hop multiplies by this factor.
+    pub decay_per_hop: f64,
+    /// Minimum activation level to include in results.
+    pub min_activation: f64,
+    /// Maximum number of nodes to visit (circuit breaker). Prevents
+    /// runaway traversals in dense graphs.
+    pub max_visited: usize,
+    /// Minimum energy for a node to participate in spreading.
+    pub min_energy: f64,
+}
+
+impl Default for ActivationSearchConfig {
+    fn default() -> Self {
+        Self {
+            top_k: 10,
+            max_hops: 3,
+            decay_per_hop: 0.5,
+            min_activation: 0.05,
+            max_visited: 500,
+            min_energy: 0.05,
+        }
+    }
+}
+
+// ============================================================================
 // Engine
 // ============================================================================
 
@@ -428,6 +485,168 @@ impl SpreadingActivationEngine {
             direct_count,
             propagated_count,
             results.first().map(|r| r.activation_score).unwrap_or(0.0)
+        );
+
+        Ok(results)
+    }
+
+    /// Activate a source node and collect the top-K most activated nodes
+    /// as search results, using BFS spreading through synapses.
+    ///
+    /// This is a **structural search** — instead of searching by query text,
+    /// you activate a known node and observe how activation propagates through
+    /// the graph. Nodes that are strongly connected to the source (via high-weight
+    /// synapses, short paths) rank highest.
+    ///
+    /// The circuit breaker (`config.max_visited`) prevents runaway traversals
+    /// in dense graphs.
+    ///
+    /// # Arguments
+    /// * `source_id` — the node to activate (must exist in the graph)
+    /// * `config` — search parameters (top-K, max hops, decay, circuit breaker)
+    ///
+    /// # Returns
+    /// Top-K `ActivationSearchResult`s sorted by activation_level descending.
+    pub async fn activate_and_collect(
+        &self,
+        source_id: Uuid,
+        config: &ActivationSearchConfig,
+    ) -> Result<Vec<ActivationSearchResult>> {
+        // Verify source exists
+        let source_note = self
+            .graph_store
+            .get_note(source_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Source node {} not found", source_id))?;
+
+        if source_note.computed_energy() < config.min_energy {
+            return Ok(vec![]);
+        }
+
+        // activation_map: node_id → (activation_level, hop_distance, path)
+        let mut activation_map: HashMap<Uuid, (f64, usize, Vec<Uuid>)> = HashMap::new();
+        activation_map.insert(source_id, (1.0, 0, vec![source_id]));
+
+        // BFS frontier: (node_id, activation_level, path)
+        let mut frontier: Vec<(Uuid, f64, Vec<Uuid>)> = vec![(source_id, 1.0, vec![source_id])];
+        let mut visited: HashSet<Uuid> = HashSet::new();
+        visited.insert(source_id);
+
+        let mut total_visited: usize = 1;
+
+        for hop in 0..config.max_hops {
+            if frontier.is_empty() {
+                break;
+            }
+
+            // Circuit breaker: stop if we've visited too many nodes
+            if total_visited >= config.max_visited {
+                debug!(
+                    "activate_and_collect: circuit breaker at {} visited nodes (limit: {})",
+                    total_visited, config.max_visited
+                );
+                break;
+            }
+
+            let mut next_frontier: Vec<(Uuid, f64, Vec<Uuid>)> = Vec::new();
+
+            for (node_id, parent_activation, parent_path) in &frontier {
+                // Budget remaining before circuit breaker trips
+                let budget = config.max_visited.saturating_sub(total_visited);
+                if budget == 0 {
+                    break;
+                }
+
+                let synapses = match self.graph_store.get_synapses(*node_id).await {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+
+                for (neighbor_id, synapse_weight) in synapses {
+                    if visited.contains(&neighbor_id) {
+                        continue;
+                    }
+                    if total_visited >= config.max_visited {
+                        break;
+                    }
+
+                    // Check neighbor energy
+                    let neighbor_energy = match self.graph_store.get_note(neighbor_id).await {
+                        Ok(Some(n)) => n.computed_energy(),
+                        _ => continue,
+                    };
+                    if neighbor_energy < config.min_energy {
+                        continue;
+                    }
+
+                    let spread_score =
+                        parent_activation * synapse_weight * neighbor_energy * config.decay_per_hop;
+
+                    if spread_score < config.min_activation {
+                        continue;
+                    }
+
+                    let mut path = parent_path.clone();
+                    path.push(neighbor_id);
+
+                    let hop_distance = hop + 1;
+
+                    // Insert or update if better score
+                    let should_insert = match activation_map.get(&neighbor_id) {
+                        None => true,
+                        Some((existing, _, _)) => spread_score > *existing,
+                    };
+
+                    if should_insert {
+                        activation_map
+                            .insert(neighbor_id, (spread_score, hop_distance, path.clone()));
+                    }
+
+                    visited.insert(neighbor_id);
+                    total_visited += 1;
+                    next_frontier.push((neighbor_id, spread_score, path));
+                }
+            }
+
+            frontier = next_frontier;
+        }
+
+        // Remove source from results (caller already knows about it)
+        activation_map.remove(&source_id);
+
+        // Sort by activation_level descending, take top-K
+        let mut results: Vec<ActivationSearchResult> = activation_map
+            .into_iter()
+            .map(|(node_id, (level, hops, path))| ActivationSearchResult {
+                node_id,
+                activation_level: level,
+                hop_distance: hops,
+                path,
+            })
+            .collect();
+
+        results.sort_by(|a, b| {
+            b.activation_level
+                .partial_cmp(&a.activation_level)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        results.truncate(config.top_k);
+
+        // Normalize activation levels to [0, 1]
+        if let Some(max_level) = results.first().map(|r| r.activation_level) {
+            if max_level > 0.0 {
+                for r in &mut results {
+                    r.activation_level /= max_level;
+                }
+            }
+        }
+
+        debug!(
+            "activate_and_collect: source={}, visited={}, results={} (top score: {:.3})",
+            source_id,
+            total_visited,
+            results.len(),
+            results.first().map(|r| r.activation_level).unwrap_or(0.0)
         );
 
         Ok(results)
@@ -1385,6 +1604,279 @@ mod tests {
                 "Low SYNAPSE profile should dampen propagated score: {} < {}",
                 score_low,
                 score_none
+            );
+        }
+    }
+
+    // ========================================================================
+    // Spreading Search tests (activate_and_collect)
+    // ========================================================================
+
+    /// Test 1: Graph with 3 clusters — activate node in cluster A → results
+    /// biased toward cluster A nodes.
+    #[tokio::test]
+    async fn test_spreading_search_cluster_bias() {
+        let mock = Arc::new(MockGraphStore::new());
+        let store = gs(&mock);
+
+        // Cluster A: a1 → a2 → a3 (strong synapses)
+        let a1 = note_with_energy(Uuid::new_v4(), None, "cluster_a_1", 1.0);
+        let a2 = note_with_energy(Uuid::new_v4(), None, "cluster_a_2", 1.0);
+        let a3 = note_with_energy(Uuid::new_v4(), None, "cluster_a_3", 1.0);
+
+        // Cluster B: b1 → b2 (only weakly connected to A via a1-b1)
+        let b1 = note_with_energy(Uuid::new_v4(), None, "cluster_b_1", 1.0);
+        let b2 = note_with_energy(Uuid::new_v4(), None, "cluster_b_2", 1.0);
+
+        // Cluster C: c1 → c2 (not connected to A at all)
+        let c1 = note_with_energy(Uuid::new_v4(), None, "cluster_c_1", 1.0);
+        let c2 = note_with_energy(Uuid::new_v4(), None, "cluster_c_2", 1.0);
+
+        for n in [&a1, &a2, &a3, &b1, &b2, &c1, &c2] {
+            store.create_note(n).await.unwrap();
+        }
+
+        // Cluster A internal synapses (strong)
+        store.create_synapses(a1.id, &[(a2.id, 0.9)]).await.unwrap();
+        store
+            .create_synapses(a2.id, &[(a3.id, 0.85)])
+            .await
+            .unwrap();
+
+        // Weak cross-cluster link A→B
+        store.create_synapses(a1.id, &[(b1.id, 0.3)]).await.unwrap();
+
+        // Cluster B internal
+        store.create_synapses(b1.id, &[(b2.id, 0.8)]).await.unwrap();
+
+        // Cluster C internal (isolated from A)
+        store.create_synapses(c1.id, &[(c2.id, 0.9)]).await.unwrap();
+
+        let engine = SpreadingActivationEngine::new(store, mock_embedding_provider());
+
+        let config = ActivationSearchConfig {
+            top_k: 10,
+            max_hops: 3,
+            decay_per_hop: 0.7,
+            min_activation: 0.01,
+            max_visited: 100,
+            min_energy: 0.05,
+        };
+
+        let results = engine.activate_and_collect(a1.id, &config).await.unwrap();
+
+        // Cluster A nodes should appear and rank highest
+        let a_ids: HashSet<Uuid> = [a2.id, a3.id].iter().copied().collect();
+        let c_ids: HashSet<Uuid> = [c1.id, c2.id].iter().copied().collect();
+
+        let a_results: Vec<_> = results
+            .iter()
+            .filter(|r| a_ids.contains(&r.node_id))
+            .collect();
+        let c_results: Vec<_> = results
+            .iter()
+            .filter(|r| c_ids.contains(&r.node_id))
+            .collect();
+
+        // Cluster A should have results
+        assert!(!a_results.is_empty(), "Cluster A nodes should be activated");
+
+        // Cluster C should NOT have results (isolated)
+        assert!(
+            c_results.is_empty(),
+            "Cluster C nodes should not be reached (isolated)"
+        );
+
+        // The top result should be from cluster A (a2 is directly connected)
+        assert!(
+            a_ids.contains(&results[0].node_id),
+            "Top result should be from cluster A"
+        );
+    }
+
+    /// Test 2: activation_weight=0 effectively excludes activation signal.
+    /// (This is tested in search.rs pipeline, but we also verify
+    /// activate_and_collect returns empty for nonexistent source.)
+    #[tokio::test]
+    async fn test_spreading_search_nonexistent_source() {
+        let mock = Arc::new(MockGraphStore::new());
+        let engine = SpreadingActivationEngine::new(gs(&mock), mock_embedding_provider());
+
+        let result = engine
+            .activate_and_collect(Uuid::new_v4(), &ActivationSearchConfig::default())
+            .await;
+
+        // Should error — source not found
+        assert!(result.is_err(), "Nonexistent source should return error");
+    }
+
+    /// Test 3: Dense graph → circuit breaker limits visited nodes.
+    #[tokio::test]
+    async fn test_spreading_search_circuit_breaker() {
+        let mock = Arc::new(MockGraphStore::new());
+        let store = gs(&mock);
+
+        // Create a star graph: center connected to 50 nodes
+        let center = note_with_energy(Uuid::new_v4(), None, "center", 1.0);
+        store.create_note(&center).await.unwrap();
+
+        let mut spokes = Vec::new();
+        for i in 0..50 {
+            let spoke = note_with_energy(Uuid::new_v4(), None, &format!("spoke_{}", i), 1.0);
+            store.create_note(&spoke).await.unwrap();
+            spokes.push(spoke);
+        }
+
+        // Connect all spokes to center
+        let synapse_pairs: Vec<(Uuid, f64)> = spokes.iter().map(|s| (s.id, 0.8)).collect();
+        store
+            .create_synapses(center.id, &synapse_pairs)
+            .await
+            .unwrap();
+
+        // Also connect spokes to each other in a chain for depth
+        for i in 0..49 {
+            store
+                .create_synapses(spokes[i].id, &[(spokes[i + 1].id, 0.7)])
+                .await
+                .unwrap();
+        }
+
+        let engine = SpreadingActivationEngine::new(store, mock_embedding_provider());
+
+        // Set a very low circuit breaker limit
+        let config = ActivationSearchConfig {
+            top_k: 100,
+            max_hops: 5,
+            decay_per_hop: 0.8,
+            min_activation: 0.001,
+            max_visited: 10, // Circuit breaker at 10 nodes
+            min_energy: 0.05,
+        };
+
+        let results = engine
+            .activate_and_collect(center.id, &config)
+            .await
+            .unwrap();
+
+        // Circuit breaker should limit results — we should NOT get all 50 spokes
+        assert!(
+            results.len() < 50,
+            "Circuit breaker should limit results: got {} (expected < 50)",
+            results.len()
+        );
+        // But we should still get some results
+        assert!(
+            !results.is_empty(),
+            "Should still return some results before circuit breaker"
+        );
+    }
+
+    /// Test 4: Use-case example — recommendation via activation.
+    /// Activate a "purchased product" node → find related products
+    /// through the graph structure.
+    #[tokio::test]
+    async fn test_spreading_search_recommendation_use_case() {
+        let mock = Arc::new(MockGraphStore::new());
+        let store = gs(&mock);
+
+        // Product graph: user bought "Rust Book"
+        // Rust Book → (0.9) → Rust Cookbook → (0.8) → Async Programming
+        // Rust Book → (0.7) → Systems Programming → (0.6) → C Programming
+        let rust_book = note_with_energy(Uuid::new_v4(), None, "Rust Book", 1.0);
+        let rust_cookbook = note_with_energy(Uuid::new_v4(), None, "Rust Cookbook", 1.0);
+        let async_prog = note_with_energy(Uuid::new_v4(), None, "Async Programming in Rust", 1.0);
+        let systems_prog = note_with_energy(Uuid::new_v4(), None, "Systems Programming", 0.9);
+        let c_prog = note_with_energy(Uuid::new_v4(), None, "C Programming", 0.8);
+        let unrelated = note_with_energy(Uuid::new_v4(), None, "Cooking Recipes", 1.0);
+
+        for n in [
+            &rust_book,
+            &rust_cookbook,
+            &async_prog,
+            &systems_prog,
+            &c_prog,
+            &unrelated,
+        ] {
+            store.create_note(n).await.unwrap();
+        }
+
+        // Build the product graph
+        store
+            .create_synapses(
+                rust_book.id,
+                &[(rust_cookbook.id, 0.9), (systems_prog.id, 0.7)],
+            )
+            .await
+            .unwrap();
+        store
+            .create_synapses(rust_cookbook.id, &[(async_prog.id, 0.8)])
+            .await
+            .unwrap();
+        store
+            .create_synapses(systems_prog.id, &[(c_prog.id, 0.6)])
+            .await
+            .unwrap();
+        // "Cooking Recipes" is isolated — no synapses to the product graph
+
+        let engine = SpreadingActivationEngine::new(store, mock_embedding_provider());
+
+        let config = ActivationSearchConfig {
+            top_k: 5,
+            max_hops: 3,
+            decay_per_hop: 0.7,
+            min_activation: 0.01,
+            max_visited: 100,
+            min_energy: 0.05,
+        };
+
+        // User bought Rust Book → get recommendations
+        let recommendations = engine
+            .activate_and_collect(rust_book.id, &config)
+            .await
+            .unwrap();
+
+        // Should recommend related books
+        assert!(!recommendations.is_empty(), "Should have recommendations");
+
+        // Rust Cookbook should rank highest (direct, strong synapse)
+        assert_eq!(
+            recommendations[0].node_id, rust_cookbook.id,
+            "Rust Cookbook should be top recommendation"
+        );
+
+        // All recommendations should be from the connected graph
+        let recommended_ids: HashSet<Uuid> = recommendations.iter().map(|r| r.node_id).collect();
+        assert!(
+            !recommended_ids.contains(&unrelated.id),
+            "Unrelated 'Cooking Recipes' should NOT be recommended"
+        );
+
+        // Verify hop distances make sense
+        let cookbook_result = recommendations
+            .iter()
+            .find(|r| r.node_id == rust_cookbook.id)
+            .unwrap();
+        assert_eq!(
+            cookbook_result.hop_distance, 1,
+            "Rust Cookbook is 1 hop from Rust Book"
+        );
+
+        // Verify path: Rust Book → Rust Cookbook
+        assert_eq!(cookbook_result.path.len(), 2);
+        assert_eq!(cookbook_result.path[0], rust_book.id);
+        assert_eq!(cookbook_result.path[1], rust_cookbook.id);
+
+        // Async Programming should be further away
+        if let Some(async_result) = recommendations.iter().find(|r| r.node_id == async_prog.id) {
+            assert_eq!(
+                async_result.hop_distance, 2,
+                "Async Programming is 2 hops from Rust Book"
+            );
+            // Should have lower activation than Rust Cookbook
+            assert!(
+                async_result.activation_level < cookbook_result.activation_level,
+                "2-hop result should score lower than 1-hop"
             );
         }
     }

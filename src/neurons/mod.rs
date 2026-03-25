@@ -11,7 +11,12 @@
 pub mod activation;
 pub mod config;
 pub mod intent;
+pub mod search;
 
-pub use activation::{ActivatedNote, ActivationSource, SpreadingActivationEngine};
+pub use activation::{
+    ActivatedNote, ActivationSearchConfig, ActivationSearchResult, ActivationSource,
+    SpreadingActivationEngine,
+};
 pub use config::{AutoReinforcementConfig, SpreadingActivationConfig};
 pub use intent::{IntentDetector, QueryIntentMode};
+pub use search::{SearchPipeline, SearchResult, SearchWeights, SignalBreakdown};
