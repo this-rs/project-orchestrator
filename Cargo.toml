@@ -133,7 +133,7 @@ nexus-claude = { git = "https://github.com/this-rs/nexus.git", rev = "ab9610c", 
 tokio-stream = { workspace = true }
 
 # Auth
-jsonwebtoken = "9"
+jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 bcrypt = "0.16"
 
 # P2P Identity (M4)
