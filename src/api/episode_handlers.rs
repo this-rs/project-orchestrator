@@ -284,3 +284,183 @@ pub async fn export_artifact(
 
     Ok(Json(artifact))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_collect_episode_request_deserialization() {
+        let json = json!({
+            "run_id": "550e8400-e29b-41d4-a716-446655440000",
+            "project_id": "660e8400-e29b-41d4-a716-446655440000"
+        });
+        let req: CollectEpisodeRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            req.run_id.to_string(),
+            "550e8400-e29b-41d4-a716-446655440000"
+        );
+        assert_eq!(
+            req.project_id.to_string(),
+            "660e8400-e29b-41d4-a716-446655440000"
+        );
+    }
+
+    #[test]
+    fn test_list_episodes_query_deserialization() {
+        let json = json!({
+            "project_id": "550e8400-e29b-41d4-a716-446655440000",
+            "limit": 50
+        });
+        let query: ListEpisodesQuery = serde_json::from_value(json).unwrap();
+        assert_eq!(query.limit, Some(50));
+    }
+
+    #[test]
+    fn test_list_episodes_query_default_limit() {
+        let json = json!({
+            "project_id": "550e8400-e29b-41d4-a716-446655440000"
+        });
+        let query: ListEpisodesQuery = serde_json::from_value(json).unwrap();
+        assert!(query.limit.is_none());
+    }
+
+    #[test]
+    fn test_anonymize_request_deserialization() {
+        let json = json!({
+            "run_id": "550e8400-e29b-41d4-a716-446655440000",
+            "project_id": "660e8400-e29b-41d4-a716-446655440000"
+        });
+        let req: AnonymizeEpisodeRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            req.run_id.to_string(),
+            "550e8400-e29b-41d4-a716-446655440000"
+        );
+    }
+
+    #[test]
+    fn test_export_artifact_request_defaults() {
+        let json = json!({"project_id": "550e8400-e29b-41d4-a716-446655440000"});
+        let req: ExportArtifactRequest = serde_json::from_value(json).unwrap();
+        assert!(req.include_structure); // default_true()
+        assert!(req.max_episodes.is_none());
+    }
+
+    #[test]
+    fn test_export_artifact_request_override_include_structure() {
+        let json = json!({
+            "project_id": "550e8400-e29b-41d4-a716-446655440000",
+            "include_structure": false,
+            "max_episodes": 10
+        });
+        let req: ExportArtifactRequest = serde_json::from_value(json).unwrap();
+        assert!(!req.include_structure);
+        assert_eq!(req.max_episodes, Some(10));
+    }
+
+    #[test]
+    fn test_default_true_helper() {
+        assert!(default_true());
+    }
+
+    #[test]
+    fn test_artifact_edge_serialization_roundtrip() {
+        let edge = ArtifactEdge {
+            source: "src/auth/mod.rs".to_string(),
+            target: "src/auth/google.rs".to_string(),
+            relation: "CO_CHANGED".to_string(),
+            weight: 5.0,
+        };
+        let json = serde_json::to_value(&edge).unwrap();
+        assert_eq!(json["source"], "src/auth/mod.rs");
+        assert_eq!(json["weight"], 5.0);
+
+        let deserialized: ArtifactEdge = serde_json::from_value(json).unwrap();
+        assert_eq!(deserialized.source, edge.source);
+        assert_eq!(deserialized.weight, edge.weight);
+    }
+
+    #[test]
+    fn test_artifact_stats_serialization() {
+        let stats = ArtifactStats {
+            edge_count: 42,
+            episode_count: 10,
+            episodes_with_lessons: 7,
+            total_notes_produced: 25,
+            total_decisions_made: 8,
+        };
+        let json = serde_json::to_value(&stats).unwrap();
+        assert_eq!(json["edge_count"], 42);
+        assert_eq!(json["episodes_with_lessons"], 7);
+        assert_eq!(json["total_decisions_made"], 8);
+    }
+
+    #[test]
+    fn test_enriched_artifact_empty_structure_skipped() {
+        let artifact = EnrichedArtifact {
+            schema_version: 1,
+            exported_at: chrono::Utc::now(),
+            source_project: "test-project".to_string(),
+            structure: vec![],
+            episodes: vec![],
+            stats: ArtifactStats {
+                edge_count: 0,
+                episode_count: 0,
+                episodes_with_lessons: 0,
+                total_notes_produced: 0,
+                total_decisions_made: 0,
+            },
+        };
+        let json = serde_json::to_value(&artifact).unwrap();
+        assert_eq!(json["schema_version"], 1);
+        assert_eq!(json["source_project"], "test-project");
+        // Empty structure should be skipped (skip_serializing_if = "Vec::is_empty")
+        assert!(json.get("structure").is_none());
+    }
+
+    #[test]
+    fn test_enriched_artifact_with_structure() {
+        let artifact = EnrichedArtifact {
+            schema_version: 1,
+            exported_at: chrono::Utc::now(),
+            source_project: "test-project".to_string(),
+            structure: vec![ArtifactEdge {
+                source: "a.rs".to_string(),
+                target: "b.rs".to_string(),
+                relation: "CO_CHANGED".to_string(),
+                weight: 3.0,
+            }],
+            episodes: vec![],
+            stats: ArtifactStats {
+                edge_count: 1,
+                episode_count: 0,
+                episodes_with_lessons: 0,
+                total_notes_produced: 0,
+                total_decisions_made: 0,
+            },
+        };
+        let json = serde_json::to_value(&artifact).unwrap();
+        // Non-empty structure should be present
+        assert!(json.get("structure").is_some());
+        assert_eq!(json["structure"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_list_episodes_response_serialization() {
+        let resp = ListEpisodesResponse {
+            episodes: vec![],
+            count: 0,
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["count"], 0);
+        assert!(json["episodes"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_collect_episode_response_serialization() {
+        let resp = CollectEpisodeResponse { episode: None };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert!(json["episode"].is_null());
+    }
+}

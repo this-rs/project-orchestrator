@@ -3927,8 +3927,16 @@ impl GraphStore for Neo4jClient {
         self.list_mcp_servers(project_id).await
     }
 
+    async fn list_all_mcp_servers(&self) -> anyhow::Result<Vec<McpServerNode>> {
+        self.list_all_mcp_servers().await
+    }
+
     async fn delete_mcp_server(&self, id: Uuid) -> anyhow::Result<()> {
         self.delete_mcp_server(id).await
+    }
+
+    async fn delete_mcp_server_by_server_id(&self, server_id: &str) -> anyhow::Result<()> {
+        self.delete_mcp_server_by_server_id(server_id).await
     }
 
     async fn update_mcp_server_status(&self, id: Uuid, status: &str) -> anyhow::Result<()> {

@@ -126,6 +126,40 @@ impl Neo4jClient {
         Ok(servers)
     }
 
+    /// List ALL MCP servers across all projects (used for startup bootstrap).
+    pub async fn list_all_mcp_servers(&self) -> Result<Vec<McpServerNode>> {
+        let q = query(
+            r#"
+            MATCH (s:McpServer)
+            RETURN s ORDER BY s.server_id
+            "#,
+        );
+
+        let mut result = self.graph.execute(q).await?;
+        let mut servers = Vec::new();
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("s")?;
+            servers.push(self.parse_mcp_server_node(&node)?);
+        }
+        Ok(servers)
+    }
+
+    /// Delete an MCP server by its string server_id (e.g. "discord").
+    /// Used by disconnect handler which only knows the server_id, not the UUID.
+    pub async fn delete_mcp_server_by_server_id(&self, server_id: &str) -> Result<()> {
+        let q = query(
+            r#"
+            MATCH (s:McpServer {server_id: $server_id})
+            OPTIONAL MATCH (s)-[:EXPOSES]->(t:McpTool)
+            DETACH DELETE t, s
+            "#,
+        )
+        .param("server_id", server_id.to_string());
+
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
     pub async fn delete_mcp_server(&self, id: Uuid) -> Result<()> {
         // Delete all tools first, then the server
         let q = query(

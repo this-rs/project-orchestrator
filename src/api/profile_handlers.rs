@@ -174,3 +174,70 @@ pub async fn delete_analysis_profile(
 
     Ok(StatusCode::NO_CONTENT)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_create_profile_body_deserialization_minimal() {
+        let json = json!({"name": "debug"});
+        let body: CreateProfileBody = serde_json::from_value(json).unwrap();
+        assert_eq!(body.name, "debug");
+        assert!(body.description.is_none());
+        assert!(body.project_id.is_none());
+        assert!(body.edge_weights.is_empty());
+        assert!(body.fusion_weights.is_none());
+    }
+
+    #[test]
+    fn test_create_profile_body_deserialization_full() {
+        let json = json!({
+            "name": "security",
+            "description": "Security-focused profile",
+            "project_id": "abc-123",
+            "edge_weights": {"IMPORTS": 0.8, "CALLS": 0.5, "AFFECTS": 1.0}
+        });
+        let body: CreateProfileBody = serde_json::from_value(json).unwrap();
+        assert_eq!(body.name, "security");
+        assert_eq!(
+            body.description.as_deref(),
+            Some("Security-focused profile")
+        );
+        assert_eq!(body.project_id.as_deref(), Some("abc-123"));
+        assert_eq!(body.edge_weights.len(), 3);
+        assert_eq!(body.edge_weights["IMPORTS"], 0.8);
+    }
+
+    #[test]
+    fn test_list_profiles_query_deserialization() {
+        let json = json!({"project_id": "proj-1"});
+        let query: ListProfilesQuery = serde_json::from_value(json).unwrap();
+        assert_eq!(query.project_id.as_deref(), Some("proj-1"));
+    }
+
+    #[test]
+    fn test_list_profiles_query_empty() {
+        let json = json!({});
+        let query: ListProfilesQuery = serde_json::from_value(json).unwrap();
+        assert!(query.project_id.is_none());
+    }
+
+    #[test]
+    fn test_create_profile_body_edge_weights_empty_default() {
+        let json = json!({"name": "test"});
+        let body: CreateProfileBody = serde_json::from_value(json).unwrap();
+        assert!(body.edge_weights.is_empty());
+    }
+
+    #[test]
+    fn test_create_profile_body_with_zero_weight() {
+        let json = json!({
+            "name": "minimal",
+            "edge_weights": {"IMPORTS": 0.0}
+        });
+        let body: CreateProfileBody = serde_json::from_value(json).unwrap();
+        assert_eq!(body.edge_weights["IMPORTS"], 0.0);
+    }
+}
