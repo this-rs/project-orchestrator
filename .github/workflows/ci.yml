@@ -65,9 +65,17 @@ jobs:
           cargo install cargo-audit --locked
           cargo install cargo-deny --locked
 
+      - name: Clean stale lockfile entries
+        run: cargo generate-lockfile
+
       - name: Run cargo audit (fails on known vulnerabilities)
-        run: cargo audit
-        # Note: add --deny warnings to also fail on unmaintained/yanked crates
+        run: |
+          cargo audit \
+            --ignore RUSTSEC-2023-0071 \
+            --ignore RUSTSEC-2026-0049
+        # Ignored advisories (transitive, no fix available):
+        #   RUSTSEC-2023-0071: rsa — via jsonwebtoken 10.3.0 (upstream must bump)
+        #   RUSTSEC-2026-0049: rustls-webpki — via nexus-claude pinned reqwest 0.11
 
       - name: Run cargo deny (license + advisory check)
         run: cargo deny check advisories licenses
