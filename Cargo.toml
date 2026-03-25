@@ -111,7 +111,7 @@ petgraph = "0.7"
 rustworkx-core = "0.16"
 
 # LRU cache (for resolver)
-lru = "0.12"
+lru = "0.16"
 
 # Utilities
 uuid = { workspace = true }
@@ -133,7 +133,7 @@ nexus-claude = { git = "https://github.com/this-rs/nexus.git", rev = "ab9610c", 
 tokio-stream = { workspace = true }
 
 # Auth
-jsonwebtoken = "9"
+jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 bcrypt = "0.16"
 
 # P2P Identity (M4)
@@ -152,7 +152,7 @@ dirs = "6"
 regex = "1.12.3"
 
 # NATS message broker (inter-process event sync)
-async-nats = "0.39"
+async-nats = "0.46"
 
 # Config
 dotenvy = "0.15"

@@ -43,6 +43,45 @@ jobs:
           retention-days: 1
 
   # ==========================================================================
+  # Security Audit - Detect known vulnerabilities and license issues
+  # ==========================================================================
+  security-audit:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "ci-build"
+          save-if: false
+
+      - name: Install cargo-audit and cargo-deny
+        run: |
+          cargo install cargo-audit --locked
+          cargo install cargo-deny --locked
+
+      - name: Clean stale lockfile entries
+        run: cargo generate-lockfile
+
+      - name: Run cargo audit (fails on known vulnerabilities)
+        run: |
+          cargo audit \
+            --ignore RUSTSEC-2023-0071 \
+            --ignore RUSTSEC-2026-0049
+        # Ignored advisories (transitive, no fix available):
+        #   RUSTSEC-2023-0071: rsa — via jsonwebtoken 10.3.0 (upstream must bump)
+        #   RUSTSEC-2026-0049: rustls-webpki — via nexus-claude pinned reqwest 0.11
+
+      - name: Run cargo deny (license + advisory check)
+        run: cargo deny check advisories licenses
+        continue-on-error: true  # advisory until deny.toml is fully tuned
+
+  # ==========================================================================
   # Lint & Format - Fast feedback on code quality
   # ==========================================================================
   lint:
