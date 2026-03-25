@@ -111,7 +111,7 @@ petgraph = "0.7"
 rustworkx-core = "0.16"
 
 # LRU cache (for resolver)
-lru = "0.12"
+lru = "0.16"
 
 # Utilities
 uuid = { workspace = true }
