@@ -1233,16 +1233,19 @@ mod tests {
 
     #[test]
     fn test_server_node_display_name_fallback() {
+        // Test the fallback logic used in connect_server
+        fn resolve_display_name(display_name: Option<String>, server_id: &str) -> String {
+            display_name.unwrap_or_else(|| server_id.to_string())
+        }
+
         // When display_name is None, server_id should be used
-        let display_name: Option<String> = None;
-        let server_id = "discord".to_string();
-        let resolved = display_name.unwrap_or_else(|| server_id.clone());
-        assert_eq!(resolved, "discord");
+        assert_eq!(resolve_display_name(None, "discord"), "discord");
 
         // When display_name is provided, it should be used
-        let display_name: Option<String> = Some("Discord Bot".to_string());
-        let resolved = display_name.unwrap_or_else(|| server_id.clone());
-        assert_eq!(resolved, "Discord Bot");
+        assert_eq!(
+            resolve_display_name(Some("Discord Bot".to_string()), "discord"),
+            "Discord Bot"
+        );
     }
 
     // ========================================================================
@@ -1262,7 +1265,7 @@ mod tests {
             env: HashMap::new(),
         };
 
-        let (tt, url, cmd, args_json) = match &original {
+        let (tt, _url, cmd, args_json) = match &original {
             McpTransport::Stdio { command, args, .. } => (
                 "stdio",
                 None::<String>,
