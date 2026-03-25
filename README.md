@@ -26,6 +26,11 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT"></a>
   <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/Rust-1.75+-orange.svg" alt="Rust"></a>
   <a href="https://github.com/this-rs/project-orchestrator/releases/latest"><img src="https://img.shields.io/github/v/release/this-rs/project-orchestrator?label=release" alt="Latest Release"></a>
+  <a href="https://discord.gg/baXBmsJc"><img src="https://img.shields.io/badge/Discord-Join_Community-5865F2?style=flat&logo=discord&logoColor=white" alt="Discord"></a>
+</p>
+
+<p align="center">
+  💬 <a href="https://discord.gg/baXBmsJc"><strong>Join our Discord</strong></a> — Get help, share feedback, and connect with the community.
 </p>
 
 Project Orchestrator gives your AI agents a shared brain. Instead of each agent starting from scratch, they share code understanding, plans, decisions, and progress through a central knowledge base.
