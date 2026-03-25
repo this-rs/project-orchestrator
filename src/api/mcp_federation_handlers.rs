@@ -153,9 +153,7 @@ pub async fn connect_server(
             Some(command.clone()),
             Some(serde_json::to_string(args).unwrap_or_default()),
         ),
-        McpTransport::Sse { url, .. } => {
-            ("sse".to_string(), Some(url.clone()), None, None)
-        }
+        McpTransport::Sse { url, .. } => ("sse".to_string(), Some(url.clone()), None, None),
         McpTransport::StreamableHttp { url, .. } => {
             ("streamable_http".to_string(), Some(url.clone()), None, None)
         }
@@ -1166,9 +1164,7 @@ mod tests {
                 Some(command.clone()),
                 Some(serde_json::to_string(args).unwrap_or_default()),
             ),
-            McpTransport::Sse { url, .. } => {
-                ("sse".to_string(), Some(url.clone()), None, None)
-            }
+            McpTransport::Sse { url, .. } => ("sse".to_string(), Some(url.clone()), None, None),
             McpTransport::StreamableHttp { url, .. } => {
                 ("streamable_http".to_string(), Some(url.clone()), None, None)
             }
@@ -1194,9 +1190,7 @@ mod tests {
                 Some(command.clone()),
                 Some(serde_json::to_string(args).unwrap_or_default()),
             ),
-            McpTransport::Sse { url, .. } => {
-                ("sse".to_string(), Some(url.clone()), None, None)
-            }
+            McpTransport::Sse { url, .. } => ("sse".to_string(), Some(url.clone()), None, None),
             McpTransport::StreamableHttp { url, .. } => {
                 ("streamable_http".to_string(), Some(url.clone()), None, None)
             }
@@ -1221,9 +1215,7 @@ mod tests {
                 Some(command.clone()),
                 Some(serde_json::to_string(args).unwrap_or_default()),
             ),
-            McpTransport::Sse { url, .. } => {
-                ("sse".to_string(), Some(url.clone()), None, None)
-            }
+            McpTransport::Sse { url, .. } => ("sse".to_string(), Some(url.clone()), None, None),
             McpTransport::StreamableHttp { url, .. } => {
                 ("streamable_http".to_string(), Some(url.clone()), None, None)
             }
@@ -1262,7 +1254,11 @@ mod tests {
         // Simulate what connect_server does: extract fields from transport
         let original = McpTransport::Stdio {
             command: "node".to_string(),
-            args: vec!["server.js".to_string(), "--port".to_string(), "3000".to_string()],
+            args: vec![
+                "server.js".to_string(),
+                "--port".to_string(),
+                "3000".to_string(),
+            ],
             env: HashMap::new(),
         };
 
@@ -1288,8 +1284,16 @@ mod tests {
 
         match (&original, &reconstructed) {
             (
-                McpTransport::Stdio { command: c1, args: a1, .. },
-                McpTransport::Stdio { command: c2, args: a2, .. },
+                McpTransport::Stdio {
+                    command: c1,
+                    args: a1,
+                    ..
+                },
+                McpTransport::Stdio {
+                    command: c2,
+                    args: a2,
+                    ..
+                },
             ) => {
                 assert_eq!(c1, c2);
                 assert_eq!(a1, a2);
