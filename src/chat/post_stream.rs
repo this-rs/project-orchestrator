@@ -413,18 +413,21 @@ impl PostStreamHandler {
         };
 
         // Should we check for pending objectives?
-        // Yes when: (a) no productive tools, OR (b) productive + conclusive (agent wrapping up)
-        let should_check = !had_productive_tool_use || had_conclusive_tool_use;
+        // Yes when: (a) no productive tools, OR (b) productive + conclusive (agent wrapping up),
+        // OR (c) productive tools used (to detect HARD GATE violations — code without plan).
+        let should_check = !had_productive_tool_use
+            || had_conclusive_tool_use
+            || had_productive_tool_use; // always check when code was written (HARD GATE)
 
         // Fetch pending objectives from graph (only if we might need them)
-        let (pending_tasks, work_log_summary) = if should_check
-            && !auto_continue_allowed
+        let (pending_tasks, work_log_summary, no_active_plan) = if !auto_continue_allowed
             && !hit_error_max_turns
             && !self.interrupt_flag.load(Ordering::SeqCst)
             && tracking_enabled
+            && (should_check || had_productive_tool_use)
             && (cooldown_turns == 0 || cooldown_turns >= OBJECTIVE_REMINDER_COOLDOWN)
         {
-            let tasks = if let Some(ref slug) = self.ctx.project_slug {
+            let (tasks, no_plan) = if let Some(ref slug) = self.ctx.project_slug {
                 let builder =
                     super::compaction_context::CompactionContextBuilder::new(self.graph.clone());
                 if let Ok(Ok(ctx)) = tokio::time::timeout(
@@ -433,7 +436,9 @@ impl PostStreamHandler {
                 )
                 .await
                 {
-                    ctx.pending_tasks
+                    let no_plan = ctx.active_plans.is_empty();
+                    let tasks = ctx
+                        .pending_tasks
                         .iter()
                         .filter(|t| t.status == "inprogress" || t.status == "pending")
                         .take(4)
@@ -448,17 +453,18 @@ impl PostStreamHandler {
                                 .collect(),
                             affected_files: t.affected_files.clone(),
                         })
-                        .collect()
+                        .collect();
+                    (tasks, no_plan)
                 } else {
-                    vec![]
+                    (vec![], false)
                 }
             } else {
-                vec![]
+                (vec![], false)
             };
             let wl = self.work_log.lock().await.to_summary_markdown();
-            (tasks, wl)
+            (tasks, wl, no_plan)
         } else {
-            (vec![], String::new())
+            (vec![], String::new(), false)
         };
 
         // Pure decision
@@ -472,6 +478,7 @@ impl PostStreamHandler {
             cooldown_turns,
             pending_tasks,
             work_log_summary,
+            no_active_plan,
         };
 
         if let Some(reminder) = check_objective_reminder(&input) {
@@ -633,6 +640,9 @@ pub(crate) struct ObjectiveCheckInput {
     pub pending_tasks: Vec<PendingTaskInfo>,
     /// Work already done this session (from SessionWorkLog::to_summary_markdown).
     pub work_log_summary: String,
+    /// True when no active plan exists in the project graph.
+    /// Used to fire the HARD GATE reminder when the agent writes code without a plan.
+    pub no_active_plan: bool,
 }
 
 /// Pure decision function: given the objective check inputs, return the
@@ -645,15 +655,34 @@ pub(crate) fn check_objective_reminder(input: &ObjectiveCheckInput) -> Option<St
         return None;
     }
 
+    // Guard 2: tracking must be enabled for this session
+    if !input.tracking_enabled {
+        return None;
+    }
+
+    // HARD GATE check: agent wrote code (productive tools) but no active plan exists.
+    // This fires even when Guard 1b would normally skip (productive without conclusive).
+    if input.had_productive_tool_use && input.no_active_plan {
+        return Some(
+            "⛔ **HARD GATE VIOLATION**: You wrote or edited code but no active Plan exists in \
+            the Project Orchestrator. Every code change MUST be linked to a plan and task.\n\
+            \n\
+            Please immediately:\n\
+            1. `plan(action: \"create\", title: \"...\", project_id: \"...\")`\n\
+            2. `task(action: \"create\", plan_id: \"...\", title: \"...\")`\n\
+            3. `step(action: \"create\", task_id: \"...\", description: \"...\")`\n\
+            4. `task(action: \"update\", task_id: \"...\", status: \"in_progress\")`\n\
+            5. Link the commits you already made: `commit(action: \"create\")` + `commit(action: \"link_to_task\")`\n\
+            \n\
+            Do not write more code until the plan and task are created."
+                .to_string(),
+        );
+    }
+
     // Guard 1b: skip if productive tools were used WITHOUT conclusive tools.
     // When the agent used productive tools AND committed (conclusive), we still
     // want to check — the agent may have done partial work then wrapped up.
     if input.had_productive_tool_use && !input.had_conclusive_tool_use {
-        return None;
-    }
-
-    // Guard 2: tracking must be enabled for this session
-    if !input.tracking_enabled {
         return None;
     }
 
@@ -724,6 +753,7 @@ mod tests {
                 affected_files: vec!["src/handler.rs".to_string()],
             }],
             work_log_summary: String::new(),
+            no_active_plan: false,
         }
     }
 
@@ -836,6 +866,7 @@ mod tests {
             interrupted: false,
             tracking_enabled: true,
             cooldown_turns: 0,
+            no_active_plan: false,
             pending_tasks: vec![
                 PendingTaskInfo {
                     title: "Add REST endpoint".to_string(),
@@ -934,6 +965,48 @@ mod tests {
     }
 
     #[test]
+    fn test_hard_gate_fires_when_code_written_without_plan() {
+        // Agent wrote code (productive tools) but no active plan exists
+        let mut input = base_input();
+        input.had_productive_tool_use = true;
+        input.had_conclusive_tool_use = false;
+        input.no_active_plan = true;
+        let result = check_objective_reminder(&input);
+        assert!(result.is_some(), "HARD GATE reminder should fire");
+        let msg = result.unwrap();
+        assert!(
+            msg.contains("HARD GATE VIOLATION"),
+            "Missing HARD GATE header in: {}",
+            msg
+        );
+        assert!(
+            msg.contains("plan(action"),
+            "Missing plan creation instruction in: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_hard_gate_does_not_fire_when_plan_exists() {
+        // Agent wrote code AND a plan exists → no HARD GATE, normal flow
+        let mut input = base_input();
+        input.had_productive_tool_use = true;
+        input.had_conclusive_tool_use = false;
+        input.no_active_plan = false;
+        // Guard 1b: productive without conclusive → skip normal reminder
+        assert!(check_objective_reminder(&input).is_none());
+    }
+
+    #[test]
+    fn test_hard_gate_does_not_fire_when_tracking_disabled() {
+        let mut input = base_input();
+        input.had_productive_tool_use = true;
+        input.no_active_plan = true;
+        input.tracking_enabled = false;
+        assert!(check_objective_reminder(&input).is_none());
+    }
+
+    #[test]
     fn test_objective_reminder_multiple_tasks_all_shown() {
         let input = ObjectiveCheckInput {
             had_productive_tool_use: false,
@@ -943,6 +1016,7 @@ mod tests {
             interrupted: false,
             tracking_enabled: true,
             cooldown_turns: 0,
+            no_active_plan: false,
             pending_tasks: vec![
                 PendingTaskInfo {
                     title: "Task A".to_string(),

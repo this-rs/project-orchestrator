@@ -52,6 +52,20 @@ task(action: "update", task_id, status: "in_progress")
 
 **No exceptions**: "It's a small fix" is not an exception. "I'll create the plan after" is not acceptable. The plan and task MUST exist BEFORE the first line of code is written.
 
+### ⚠️ If MCP Tools Are Not Available
+
+If you start a session and the Project Orchestrator MCP tools (`plan`, `task`, `step`, `note`, etc.) do NOT appear in your available tool list:
+
+1. **STOP immediately** — do NOT fall back to "I'll explore with available tools instead"
+2. **Warn the user** clearly: the MCP server is not connected
+3. **Do NOT write, edit, or generate any code** — the HARD GATE applies regardless
+4. **Provide setup instructions**: the user must ensure `mcp_server` is running and configured in `~/.claude/mcp.json`
+
+**Why this matters**: without MCP tools, no plan/task/commit tracking is possible. Proceeding without tracking silently breaks the entire project management workflow and produces untracked, unlinked, undocumented work.
+
+The correct response when MCP tools are absent:
+> "⚠️ The Project Orchestrator MCP tools are not available in this session (no `plan`, `task`, `step` tools found). I cannot proceed with implementation work without them — all code changes require an active plan and task for tracking. Please verify that the MCP server is running and configured. See CLAUDE.md § MCP Server for setup instructions."
+
 ## 2. Mega-tools — Call Syntax
 
 Each tool has an `action` parameter that determines the operation:

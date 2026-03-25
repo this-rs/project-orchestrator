@@ -750,6 +750,11 @@ impl CompactionContext {
             out.push_str("CRITICAL: In your summary, preserve: (1) which steps are completed vs pending, (2) files already modified, (3) architectural decisions taken. ");
         }
 
+        // HARD GATE — always preserved through compaction
+        out.push_str("RULE (always active): Never write or edit code without an active Plan and an in_progress Task. \
+            If no plan exists, create one first with plan(action:\"create\") + task(action:\"create\") + step(action:\"create\"). \
+            If MCP tools are unavailable, warn the user and stop — do not fall back to untracked coding. ");
+
         // Truncate to budget
         if out.len() > MAX_CUSTOM_INSTRUCTIONS_CHARS {
             out.truncate(MAX_CUSTOM_INSTRUCTIONS_CHARS - 3);
