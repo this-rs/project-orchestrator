@@ -107,6 +107,7 @@ pub struct ProjectSummary {
     pub id: String,
     pub name: String,
     pub slug: String,
+    pub root_path: String,
 }
 
 // ============================================================================
@@ -563,6 +564,7 @@ pub async fn get_workspace_overview(
                 id: p.id.to_string(),
                 name: p.name,
                 slug: p.slug,
+                root_path: p.root_path,
             })
             .collect(),
         milestones: milestones
