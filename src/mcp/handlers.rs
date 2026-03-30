@@ -7970,10 +7970,7 @@ mod tests {
     #[tokio::test]
     async fn test_http_stop_watch_without_project_id() {
         let (handler, _) = make_http_handler().await;
-        let result = handler
-            .handle("stop_watch", Some(json!({})))
-            .await
-            .unwrap();
+        let result = handler.handle("stop_watch", Some(json!({}))).await.unwrap();
         assert_eq!(result["method"], "DELETE");
         assert_eq!(result["path"], "/api/watch");
         assert_eq!(result["query"], "", "no query param when no project_id");

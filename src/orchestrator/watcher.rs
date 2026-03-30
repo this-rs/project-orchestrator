@@ -2202,8 +2202,20 @@ mod tests {
             watched.insert(path2.clone());
 
             let mut pm = project_map.write().await;
-            pm.insert(path1.clone(), ProjectContext { project_id: pid1, project_slug: "proj-a".to_string() });
-            pm.insert(path2.clone(), ProjectContext { project_id: pid2, project_slug: "proj-b".to_string() });
+            pm.insert(
+                path1.clone(),
+                ProjectContext {
+                    project_id: pid1,
+                    project_slug: "proj-a".to_string(),
+                },
+            );
+            pm.insert(
+                path2.clone(),
+                ProjectContext {
+                    project_id: pid2,
+                    project_slug: "proj-b".to_string(),
+                },
+            );
         }
 
         assert_eq!(watched_paths.read().await.len(), 2);
@@ -2251,8 +2263,20 @@ mod tests {
             watched.insert(path1.clone());
             watched.insert(path2.clone());
             let mut pm = project_map.write().await;
-            pm.insert(path1.clone(), ProjectContext { project_id: pid1, project_slug: "proj-a".to_string() });
-            pm.insert(path2.clone(), ProjectContext { project_id: pid2, project_slug: "proj-b".to_string() });
+            pm.insert(
+                path1.clone(),
+                ProjectContext {
+                    project_id: pid1,
+                    project_slug: "proj-a".to_string(),
+                },
+            );
+            pm.insert(
+                path2.clone(),
+                ProjectContext {
+                    project_id: pid2,
+                    project_slug: "proj-b".to_string(),
+                },
+            );
         }
 
         // Replicate stop_project logic: unregister pid1, check remaining state
@@ -2314,7 +2338,13 @@ mod tests {
             let mut watched = watched_paths.write().await;
             watched.insert(path.clone());
             let mut pm = project_map.write().await;
-            pm.insert(path, ProjectContext { project_id: Uuid::new_v4(), project_slug: "test".to_string() });
+            pm.insert(
+                path,
+                ProjectContext {
+                    project_id: Uuid::new_v4(),
+                    project_slug: "test".to_string(),
+                },
+            );
         }
 
         assert_eq!(watched_paths.read().await.len(), 1);

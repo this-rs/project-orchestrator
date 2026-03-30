@@ -2797,7 +2797,7 @@ mod tests {
             default_note_energy: None,
             scaffolding_override: None,
             sharing_policy: None,
-        watch_enabled: true,
+            watch_enabled: true,
         };
         store.create_project(&project).await.unwrap();
 
@@ -4171,7 +4171,7 @@ mod tests {
             default_note_energy: None,
             scaffolding_override: None,
             sharing_policy: None,
-        watch_enabled: true,
+            watch_enabled: true,
         };
         store.create_project(&project).await.unwrap();
 
@@ -4225,7 +4225,7 @@ mod tests {
             default_note_energy: None,
             scaffolding_override: None,
             sharing_policy: None,
-        watch_enabled: true,
+            watch_enabled: true,
         };
         store.create_project(&project).await.unwrap();
 
@@ -4287,7 +4287,7 @@ mod tests {
             default_note_energy: None,
             scaffolding_override: None,
             sharing_policy: None,
-        watch_enabled: true,
+            watch_enabled: true,
         };
         store.create_project(&project).await.unwrap();
 
@@ -4341,7 +4341,7 @@ mod tests {
             default_note_energy: None,
             scaffolding_override: None,
             sharing_policy: None,
-        watch_enabled: true,
+            watch_enabled: true,
         };
         store.create_project(&project).await.unwrap();
 
