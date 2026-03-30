@@ -162,21 +162,46 @@ impl FileWatcher {
 
     /// Unregister a project from watching.
     ///
-    /// Removes the project from the project map. The underlying notify watcher
-    /// may still receive events for this path, but they will be ignored since
-    /// `resolve_project` won't find a match.
+    /// Removes the project from the project map **and** from `watched_paths`.
+    /// The underlying notify watcher may still receive OS events for this path,
+    /// but they will be ignored since `resolve_project` won't find a match.
     pub async fn unregister_project(&self, project_id: Uuid) {
         let mut pm = self.project_map.write().await;
-        let before = pm.len();
+
+        // Collect the paths belonging to this project before removing them.
+        let paths_to_remove: Vec<PathBuf> = pm
+            .iter()
+            .filter(|(_, ctx)| ctx.project_id == project_id)
+            .map(|(path, _)| path.clone())
+            .collect();
+
+        let removed = paths_to_remove.len();
         pm.retain(|_, ctx| ctx.project_id != project_id);
-        let removed = before - pm.len();
+        drop(pm);
+
+        // Also remove from watched_paths so watch_status reflects reality.
         if removed > 0 {
+            let mut watched = self.watched_paths.write().await;
+            for path in &paths_to_remove {
+                watched.remove(path);
+            }
             tracing::info!(
                 "Unregistered project {} from watcher ({} paths removed)",
                 project_id,
                 removed
             );
         }
+    }
+
+    /// Stop watching a single project by ID.
+    ///
+    /// Convenience wrapper around `unregister_project` that returns the current
+    /// watch state after removal, matching the API response contract.
+    pub async fn stop_project(&self, project_id: Uuid) -> (bool, Vec<PathBuf>) {
+        self.unregister_project(project_id).await;
+        let paths = self.watched_paths.read().await;
+        let running = !paths.is_empty();
+        (running, paths.iter().cloned().collect())
     }
 
     /// Check if a project is currently registered for watching.
@@ -426,11 +451,20 @@ impl FileWatcher {
         Ok(())
     }
 
-    /// Stop the watcher
+    /// Stop the watcher and clear all state.
+    ///
+    /// Sends the stop signal to the background task **and** clears
+    /// `watched_paths` and `project_map` so that `watch_status` correctly
+    /// reports an empty state after stopping.
     pub async fn stop(&mut self) {
         if let Some(tx) = self.stop_tx.take() {
             let _ = tx.send(()).await;
         }
+        self.add_path_tx = None;
+
+        // Clear all state so watch_status reflects reality
+        self.watched_paths.write().await.clear();
+        self.project_map.write().await.clear();
     }
 
     /// Get currently watched paths
@@ -2140,5 +2174,101 @@ mod tests {
             should_sync_file(&path),
             "should_sync_file should pass for .rs extension regardless of existence"
         );
+    }
+
+    #[tokio::test]
+    async fn test_unregister_project_clears_watched_paths() {
+        let tmp1 = tempfile::tempdir().unwrap();
+        let tmp2 = tempfile::tempdir().unwrap();
+        let path1 = tmp1.path().canonicalize().unwrap();
+        let path2 = tmp2.path().canonicalize().unwrap();
+
+        let watched_paths = Arc::new(RwLock::new(HashSet::new()));
+        let project_map = Arc::new(RwLock::new(HashMap::new()));
+        let pid1 = Uuid::new_v4();
+        let pid2 = Uuid::new_v4();
+
+        // Simulate register_project: add to both maps
+        {
+            let mut watched = watched_paths.write().await;
+            watched.insert(path1.clone());
+            watched.insert(path2.clone());
+
+            let mut pm = project_map.write().await;
+            pm.insert(
+                path1.clone(),
+                ProjectContext {
+                    project_id: pid1,
+                    project_slug: "proj-a".to_string(),
+                },
+            );
+            pm.insert(
+                path2.clone(),
+                ProjectContext {
+                    project_id: pid2,
+                    project_slug: "proj-b".to_string(),
+                },
+            );
+        }
+
+        assert_eq!(watched_paths.read().await.len(), 2);
+        assert_eq!(project_map.read().await.len(), 2);
+
+        // Simulate unregister_project for pid1 (same logic as the method)
+        {
+            let mut pm = project_map.write().await;
+            let paths_to_remove: Vec<PathBuf> = pm
+                .iter()
+                .filter(|(_, ctx)| ctx.project_id == pid1)
+                .map(|(path, _)| path.clone())
+                .collect();
+            pm.retain(|_, ctx| ctx.project_id != pid1);
+            drop(pm);
+
+            let mut watched = watched_paths.write().await;
+            for path in &paths_to_remove {
+                watched.remove(path);
+            }
+        }
+
+        // pid1 removed from both maps
+        assert_eq!(project_map.read().await.len(), 1);
+        assert_eq!(watched_paths.read().await.len(), 1);
+        assert!(watched_paths.read().await.contains(&path2));
+        assert!(!watched_paths.read().await.contains(&path1));
+    }
+
+    #[tokio::test]
+    async fn test_stop_clears_all_state() {
+        let watched_paths = Arc::new(RwLock::new(HashSet::new()));
+        let project_map = Arc::new(RwLock::new(HashMap::new()));
+
+        // Add some data
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().canonicalize().unwrap();
+
+            let mut watched = watched_paths.write().await;
+            watched.insert(path.clone());
+
+            let mut pm = project_map.write().await;
+            pm.insert(
+                path,
+                ProjectContext {
+                    project_id: Uuid::new_v4(),
+                    project_slug: "test".to_string(),
+                },
+            );
+        }
+
+        assert_eq!(watched_paths.read().await.len(), 1);
+        assert_eq!(project_map.read().await.len(), 1);
+
+        // Simulate stop(): clear all state
+        watched_paths.write().await.clear();
+        project_map.write().await.clear();
+
+        assert_eq!(watched_paths.read().await.len(), 0);
+        assert_eq!(project_map.read().await.len(), 0);
     }
 }

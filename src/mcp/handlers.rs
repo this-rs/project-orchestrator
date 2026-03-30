@@ -4408,7 +4408,12 @@ impl ToolHandler {
             }
 
             "stop_watch" => {
-                let result = http.delete("/api/watch").await?;
+                let url = if let Some(pid) = args.get("project_id").and_then(|v| v.as_str()) {
+                    format!("/api/watch?project_id={}", pid)
+                } else {
+                    "/api/watch".to_string()
+                };
+                let result = http.delete(&url).await?;
                 Ok(Some(result))
             }
 
@@ -7947,7 +7952,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_http_stop_watch() {
+    async fn test_http_stop_watch_with_project_id() {
         let (handler, _) = make_http_handler().await;
         let result = handler
             .handle("stop_watch", Some(json!({"project_id": UUID1})))
@@ -7955,6 +7960,23 @@ mod tests {
             .unwrap();
         assert_eq!(result["method"], "DELETE");
         assert_eq!(result["path"], "/api/watch");
+        assert_eq!(
+            result["query"],
+            format!("project_id={}", UUID1),
+            "project_id should be forwarded as query param"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_http_stop_watch_without_project_id() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("stop_watch", Some(json!({})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "DELETE");
+        assert_eq!(result["path"], "/api/watch");
+        assert_eq!(result["query"], "", "no query param when no project_id");
     }
 
     #[tokio::test]

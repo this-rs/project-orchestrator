@@ -1864,17 +1864,42 @@ pub async fn start_watch(
     }))
 }
 
-/// Stop the file watcher
+/// Query parameters for stop_watch
+#[derive(Deserialize)]
+pub struct StopWatchQuery {
+    pub project_id: Option<String>,
+}
+
+/// Stop the file watcher.
+///
+/// - `DELETE /api/watch?project_id=UUID` — stop watching a single project
+/// - `DELETE /api/watch` — stop all watchers and clear all state
 pub async fn stop_watch(
     State(state): State<OrchestratorState>,
+    axum::extract::Query(query): axum::extract::Query<StopWatchQuery>,
 ) -> Result<Json<WatchStatusResponse>, AppError> {
-    let mut watcher = state.watcher.write().await;
-    watcher.stop().await;
-
-    Ok(Json(WatchStatusResponse {
-        running: false,
-        watched_paths: vec![],
-    }))
+    if let Some(ref pid_str) = query.project_id {
+        // Per-project stop: unregister only this project
+        let pid = uuid::Uuid::parse_str(pid_str)
+            .map_err(|e| anyhow::anyhow!("Invalid project_id: {}", e))?;
+        let watcher = state.watcher.read().await;
+        let (running, paths) = watcher.stop_project(pid).await;
+        Ok(Json(WatchStatusResponse {
+            running,
+            watched_paths: paths
+                .iter()
+                .map(|p| p.to_string_lossy().to_string())
+                .collect(),
+        }))
+    } else {
+        // Stop all: send stop signal and clear all state
+        let mut watcher = state.watcher.write().await;
+        watcher.stop().await;
+        Ok(Json(WatchStatusResponse {
+            running: false,
+            watched_paths: vec![],
+        }))
+    }
 }
 
 /// Get watcher status
