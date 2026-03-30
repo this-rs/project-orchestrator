@@ -37,6 +37,14 @@ pub struct ProjectNode {
     /// Serialized as JSON string in Neo4j. None = sharing disabled (opt-in default).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub sharing_policy: Option<crate::episodes::distill_models::SharingPolicy>,
+    /// Whether the file watcher should auto-start for this project at boot.
+    /// Defaults to true for backward compatibility with existing projects.
+    #[serde(default = "default_watch_enabled")]
+    pub watch_enabled: bool,
+}
+
+fn default_watch_enabled() -> bool {
+    true
 }
 
 // ============================================================================

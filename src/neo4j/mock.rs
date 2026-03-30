@@ -2660,6 +2660,14 @@ impl GraphStore for MockGraphStore {
         Ok(())
     }
 
+    async fn set_watch_enabled(&self, project_id: Uuid, enabled: bool) -> Result<()> {
+        let mut projects = self.projects.write().await;
+        if let Some(p) = projects.get_mut(&project_id) {
+            p.watch_enabled = enabled;
+        }
+        Ok(())
+    }
+
     async fn set_default_note_energy(&self, project_id: Uuid, energy: Option<f64>) -> Result<()> {
         let mut projects = self.projects.write().await;
         if let Some(p) = projects.get_mut(&project_id) {

@@ -21,7 +21,8 @@ impl Neo4jClient {
                 slug: $slug,
                 root_path: $root_path,
                 description: $description,
-                created_at: datetime($created_at)
+                created_at: datetime($created_at),
+                watch_enabled: $watch_enabled
             })
             "#,
         )
@@ -33,7 +34,8 @@ impl Neo4jClient {
             "description",
             project.description.clone().unwrap_or_default(),
         )
-        .param("created_at", project.created_at.to_rfc3339());
+        .param("created_at", project.created_at.to_rfc3339())
+        .param("watch_enabled", project.watch_enabled);
 
         self.graph.run(q).await?;
         Ok(())
@@ -199,6 +201,17 @@ impl Neo4jClient {
             query("MATCH (p:Project {id: $id}) REMOVE p.scaffolding_override")
                 .param("id", id.to_string())
         };
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
+    /// Set the watch_enabled flag on a project.
+    ///
+    /// When false, the file watcher will not auto-start for this project at boot.
+    pub async fn set_watch_enabled(&self, id: Uuid, enabled: bool) -> Result<()> {
+        let q = query("MATCH (p:Project {id: $id}) SET p.watch_enabled = $enabled")
+            .param("id", id.to_string())
+            .param("enabled", enabled);
         self.graph.run(q).await?;
         Ok(())
     }
@@ -402,6 +415,7 @@ impl Neo4jClient {
                 .get::<String>("sharing_policy")
                 .ok()
                 .and_then(|s| serde_json::from_str(&s).ok()),
+            watch_enabled: node.get::<bool>("watch_enabled").unwrap_or(true),
         })
     }
 

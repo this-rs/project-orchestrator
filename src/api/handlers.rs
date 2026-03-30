@@ -1845,6 +1845,8 @@ pub async fn start_watch(
                     .register_project(path, project.id, project.slug)
                     .await
                     .map_err(|e| anyhow::anyhow!("Failed to register project: {}", e))?;
+                // Persist watch_enabled=true so the watcher restarts on boot
+                let _ = state.orchestrator.neo4j().set_watch_enabled(pid, true).await;
             }
         }
     } else {
@@ -1884,6 +1886,8 @@ pub async fn stop_watch(
             .map_err(|e| anyhow::anyhow!("Invalid project_id: {}", e))?;
         let watcher = state.watcher.read().await;
         let (running, paths) = watcher.stop_project(pid).await;
+        // Persist watch_enabled=false so the watcher stays off after reboot
+        let _ = state.orchestrator.neo4j().set_watch_enabled(pid, false).await;
         Ok(Json(WatchStatusResponse {
             running,
             watched_paths: paths

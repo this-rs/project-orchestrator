@@ -664,6 +664,9 @@ pub trait GraphStore: Send + Sync {
     /// Set or clear the scaffolding level override on a project (biomimicry T8).
     async fn set_scaffolding_override(&self, project_id: Uuid, level: Option<u8>) -> Result<()>;
 
+    /// Set the watch_enabled flag on a project.
+    async fn set_watch_enabled(&self, project_id: Uuid, enabled: bool) -> Result<()>;
+
     /// Set or clear the default note energy on a project (homeostasis).
     /// When `Some(energy)`, new notes created in this project start at this energy.
     /// When `None`, new notes start at the default energy (1.0).
