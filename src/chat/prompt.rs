@@ -2604,6 +2604,7 @@ mod tests {
                 default_note_energy: None,
                 scaffolding_override: None,
                 sharing_policy: None,
+        watch_enabled: true,
             }),
             ..Default::default()
         };
@@ -2629,6 +2630,7 @@ mod tests {
                 default_note_energy: None,
                 scaffolding_override: None,
                 sharing_policy: None,
+        watch_enabled: true,
             }),
             language_stats: vec![LanguageStatsNode {
                 language: "Rust".into(),
@@ -2783,6 +2785,7 @@ mod tests {
                 default_note_energy: None,
                 scaffolding_override: None,
                 sharing_policy: None,
+        watch_enabled: true,
             }),
             workspace: Some(WorkspaceNode {
                 id: uuid::Uuid::new_v4(),
@@ -2807,6 +2810,7 @@ mod tests {
                     default_note_energy: None,
                     scaffolding_override: None,
                     sharing_policy: None,
+        watch_enabled: true,
                 },
                 ProjectNode {
                     id: uuid::Uuid::new_v4(),
@@ -2821,6 +2825,7 @@ mod tests {
                     default_note_energy: None,
                     scaffolding_override: None,
                     sharing_policy: None,
+        watch_enabled: true,
                 },
             ],
             ..Default::default()
@@ -2901,6 +2906,7 @@ mod tests {
                 default_note_energy: None,
                 scaffolding_override: None,
                 sharing_policy: None,
+        watch_enabled: true,
             }),
             global_guidelines: vec![{
                 let mut n = crate::notes::Note::new(
@@ -3192,6 +3198,7 @@ mod tests {
                 default_note_energy: None,
                 scaffolding_override: None,
                 sharing_policy: None,
+        watch_enabled: true,
             }),
             ..Default::default()
         };
@@ -3234,6 +3241,7 @@ mod tests {
                 default_note_energy: None,
                 scaffolding_override: None,
                 sharing_policy: None,
+        watch_enabled: true,
             }),
             feature_graphs: make_feature_graphs(3),
             ..Default::default()
@@ -3265,6 +3273,7 @@ mod tests {
                 default_note_energy: None,
                 scaffolding_override: None,
                 sharing_policy: None,
+        watch_enabled: true,
             }),
             ..Default::default()
         };
@@ -3304,6 +3313,7 @@ mod tests {
                 default_note_energy: None,
                 scaffolding_override: None,
                 sharing_policy: None,
+        watch_enabled: true,
             }),
             feature_graphs: fgs,
             ..Default::default()

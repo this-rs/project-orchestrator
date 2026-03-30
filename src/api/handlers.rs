@@ -1846,7 +1846,9 @@ pub async fn start_watch(
                     .await
                     .map_err(|e| anyhow::anyhow!("Failed to register project: {}", e))?;
                 // Persist watch_enabled=true so the watcher restarts on boot
-                let _ = state.orchestrator.neo4j().set_watch_enabled(pid, true).await;
+                if let Err(e) = state.orchestrator.neo4j().set_watch_enabled(pid, true).await {
+                    tracing::warn!("Failed to persist watch_enabled=true for {pid}: {e}");
+                }
             }
         }
     } else {
@@ -1887,7 +1889,9 @@ pub async fn stop_watch(
         let watcher = state.watcher.read().await;
         let (running, paths) = watcher.stop_project(pid).await;
         // Persist watch_enabled=false so the watcher stays off after reboot
-        let _ = state.orchestrator.neo4j().set_watch_enabled(pid, false).await;
+        if let Err(e) = state.orchestrator.neo4j().set_watch_enabled(pid, false).await {
+            tracing::warn!("Failed to persist watch_enabled=false for {pid}: {e}");
+        }
         Ok(Json(WatchStatusResponse {
             running,
             watched_paths: paths
@@ -1896,8 +1900,14 @@ pub async fn stop_watch(
                 .collect(),
         }))
     } else {
-        // Stop all: send stop signal and clear all state
+        // Stop all: persist watch_enabled=false for all registered projects,
+        // then send stop signal and clear all in-memory state.
         let mut watcher = state.watcher.write().await;
+        for (pid, _slug, _path) in watcher.registered_projects().await {
+            if let Err(e) = state.orchestrator.neo4j().set_watch_enabled(pid, false).await {
+                tracing::warn!("Failed to persist watch_enabled=false for {pid}: {e}");
+            }
+        }
         watcher.stop().await;
         Ok(Json(WatchStatusResponse {
             running: false,

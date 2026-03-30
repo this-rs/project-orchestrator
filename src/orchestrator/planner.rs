@@ -1893,6 +1893,7 @@ mod tests {
             default_note_energy: None,
             scaffolding_override: None,
             sharing_policy: None,
+        watch_enabled: true,
         };
         let pid = project.id;
         graph.create_project(&project).await.unwrap();
@@ -2820,6 +2821,7 @@ mod tests {
             default_note_energy: None,
             scaffolding_override: None,
             sharing_policy: None,
+        watch_enabled: true,
         };
         let pid = project.id;
         graph.create_project(&project).await.unwrap();
@@ -3146,6 +3148,7 @@ mod tests {
             default_note_energy: None,
             scaffolding_override: None,
             sharing_policy: None,
+        watch_enabled: true,
         };
         let pid = project.id;
         graph.create_project(&project).await.unwrap();
@@ -3361,6 +3364,7 @@ mod tests {
             default_note_energy: None,
             scaffolding_override: None,
             sharing_policy: None,
+        watch_enabled: true,
         };
         let pid = project.id;
         graph.create_project(&project).await.unwrap();

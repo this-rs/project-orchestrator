@@ -2176,6 +2176,13 @@ mod tests {
         );
     }
 
+    /// Helper to create a FileWatcher without a real Orchestrator.
+    // ── unregister / stop logic tests ──────────────────────────────
+    //
+    // These tests exercise the unregister_project, stop_project, and stop
+    // logic without constructing a FileWatcher (which needs a real Orchestrator).
+    // They test the same data-structure mutations those methods perform.
+
     #[tokio::test]
     async fn test_unregister_project_clears_watched_paths() {
         let tmp1 = tempfile::tempdir().unwrap();
@@ -2183,38 +2190,26 @@ mod tests {
         let path1 = tmp1.path().canonicalize().unwrap();
         let path2 = tmp2.path().canonicalize().unwrap();
 
-        let watched_paths = Arc::new(RwLock::new(HashSet::new()));
-        let project_map = Arc::new(RwLock::new(HashMap::new()));
         let pid1 = Uuid::new_v4();
         let pid2 = Uuid::new_v4();
 
-        // Simulate register_project: add to both maps
+        let watched_paths = Arc::new(RwLock::new(HashSet::new()));
+        let project_map = Arc::new(RwLock::new(HashMap::new()));
+
         {
             let mut watched = watched_paths.write().await;
             watched.insert(path1.clone());
             watched.insert(path2.clone());
 
             let mut pm = project_map.write().await;
-            pm.insert(
-                path1.clone(),
-                ProjectContext {
-                    project_id: pid1,
-                    project_slug: "proj-a".to_string(),
-                },
-            );
-            pm.insert(
-                path2.clone(),
-                ProjectContext {
-                    project_id: pid2,
-                    project_slug: "proj-b".to_string(),
-                },
-            );
+            pm.insert(path1.clone(), ProjectContext { project_id: pid1, project_slug: "proj-a".to_string() });
+            pm.insert(path2.clone(), ProjectContext { project_id: pid2, project_slug: "proj-b".to_string() });
         }
 
         assert_eq!(watched_paths.read().await.len(), 2);
         assert_eq!(project_map.read().await.len(), 2);
 
-        // Simulate unregister_project for pid1 (same logic as the method)
+        // Replicate unregister_project logic for pid1
         {
             let mut pm = project_map.write().await;
             let paths_to_remove: Vec<PathBuf> = pm
@@ -2239,32 +2234,93 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_stop_clears_all_state() {
+    async fn test_stop_project_returns_correct_state() {
+        let tmp1 = tempfile::tempdir().unwrap();
+        let tmp2 = tempfile::tempdir().unwrap();
+        let path1 = tmp1.path().canonicalize().unwrap();
+        let path2 = tmp2.path().canonicalize().unwrap();
+
+        let pid1 = Uuid::new_v4();
+        let pid2 = Uuid::new_v4();
+
         let watched_paths = Arc::new(RwLock::new(HashSet::new()));
         let project_map = Arc::new(RwLock::new(HashMap::new()));
 
-        // Add some data
         {
-            let tmp = tempfile::tempdir().unwrap();
-            let path = tmp.path().canonicalize().unwrap();
+            let mut watched = watched_paths.write().await;
+            watched.insert(path1.clone());
+            watched.insert(path2.clone());
+            let mut pm = project_map.write().await;
+            pm.insert(path1.clone(), ProjectContext { project_id: pid1, project_slug: "proj-a".to_string() });
+            pm.insert(path2.clone(), ProjectContext { project_id: pid2, project_slug: "proj-b".to_string() });
+        }
+
+        // Replicate stop_project logic: unregister pid1, check remaining state
+        {
+            let mut pm = project_map.write().await;
+            let paths_to_remove: Vec<PathBuf> = pm
+                .iter()
+                .filter(|(_, ctx)| ctx.project_id == pid1)
+                .map(|(path, _)| path.clone())
+                .collect();
+            pm.retain(|_, ctx| ctx.project_id != pid1);
+            drop(pm);
 
             let mut watched = watched_paths.write().await;
-            watched.insert(path.clone());
+            for path in &paths_to_remove {
+                watched.remove(path);
+            }
+        }
 
+        let paths: Vec<PathBuf> = watched_paths.read().await.iter().cloned().collect();
+        let running = !paths.is_empty();
+
+        assert!(running, "should still be running with one project left");
+        assert_eq!(paths.len(), 1);
+        assert!(paths.contains(&path2));
+
+        // Stop the last project (pid2)
+        {
             let mut pm = project_map.write().await;
-            pm.insert(
-                path,
-                ProjectContext {
-                    project_id: Uuid::new_v4(),
-                    project_slug: "test".to_string(),
-                },
-            );
+            let paths_to_remove: Vec<PathBuf> = pm
+                .iter()
+                .filter(|(_, ctx)| ctx.project_id == pid2)
+                .map(|(path, _)| path.clone())
+                .collect();
+            pm.retain(|_, ctx| ctx.project_id != pid2);
+            drop(pm);
+
+            let mut watched = watched_paths.write().await;
+            for path in &paths_to_remove {
+                watched.remove(path);
+            }
+        }
+
+        let paths: Vec<PathBuf> = watched_paths.read().await.iter().cloned().collect();
+        let running = !paths.is_empty();
+        assert!(!running, "should not be running with no projects");
+        assert!(paths.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_stop_clears_all_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().canonicalize().unwrap();
+
+        let watched_paths = Arc::new(RwLock::new(HashSet::new()));
+        let project_map = Arc::new(RwLock::new(HashMap::new()));
+
+        {
+            let mut watched = watched_paths.write().await;
+            watched.insert(path.clone());
+            let mut pm = project_map.write().await;
+            pm.insert(path, ProjectContext { project_id: Uuid::new_v4(), project_slug: "test".to_string() });
         }
 
         assert_eq!(watched_paths.read().await.len(), 1);
         assert_eq!(project_map.read().await.len(), 1);
 
-        // Simulate stop(): clear all state
+        // Replicate stop() logic: clear all state
         watched_paths.write().await.clear();
         project_map.write().await.clear();
 
