@@ -2176,12 +2176,37 @@ mod tests {
         );
     }
 
-    /// Helper to create a FileWatcher without a real Orchestrator.
     // ── unregister / stop logic tests ──────────────────────────────
     //
-    // These tests exercise the unregister_project, stop_project, and stop
-    // logic without constructing a FileWatcher (which needs a real Orchestrator).
-    // They test the same data-structure mutations those methods perform.
+    // These tests call the REAL FileWatcher methods (unregister_project,
+    // stop_project, stop) using a mock Orchestrator built from mock_app_state().
+
+    /// Build a FileWatcher backed by a mock Orchestrator.
+    /// Pre-populates watched_paths and project_map with the given entries.
+    async fn make_test_watcher(entries: Vec<(PathBuf, Uuid, &str)>) -> FileWatcher {
+        let state = crate::test_helpers::mock_app_state();
+        let orchestrator = Arc::new(
+            crate::orchestrator::runner::Orchestrator::new(state)
+                .await
+                .expect("mock orchestrator"),
+        );
+        let watcher = FileWatcher::new(orchestrator);
+        {
+            let mut watched = watcher.watched_paths.write().await;
+            let mut pm = watcher.project_map.write().await;
+            for (path, pid, slug) in entries {
+                watched.insert(path.clone());
+                pm.insert(
+                    path,
+                    ProjectContext {
+                        project_id: pid,
+                        project_slug: slug.to_string(),
+                    },
+                );
+            }
+        }
+        watcher
+    }
 
     #[tokio::test]
     async fn test_unregister_project_clears_watched_paths() {
@@ -2189,60 +2214,42 @@ mod tests {
         let tmp2 = tempfile::tempdir().unwrap();
         let path1 = tmp1.path().canonicalize().unwrap();
         let path2 = tmp2.path().canonicalize().unwrap();
-
         let pid1 = Uuid::new_v4();
         let pid2 = Uuid::new_v4();
 
-        let watched_paths = Arc::new(RwLock::new(HashSet::new()));
-        let project_map = Arc::new(RwLock::new(HashMap::new()));
+        let watcher = make_test_watcher(vec![
+            (path1.clone(), pid1, "proj-a"),
+            (path2.clone(), pid2, "proj-b"),
+        ])
+        .await;
 
-        {
-            let mut watched = watched_paths.write().await;
-            watched.insert(path1.clone());
-            watched.insert(path2.clone());
+        assert_eq!(watcher.watched_paths().await.len(), 2);
+        assert_eq!(watcher.registered_project_count().await, 2);
 
-            let mut pm = project_map.write().await;
-            pm.insert(
-                path1.clone(),
-                ProjectContext {
-                    project_id: pid1,
-                    project_slug: "proj-a".to_string(),
-                },
-            );
-            pm.insert(
-                path2.clone(),
-                ProjectContext {
-                    project_id: pid2,
-                    project_slug: "proj-b".to_string(),
-                },
-            );
-        }
-
-        assert_eq!(watched_paths.read().await.len(), 2);
-        assert_eq!(project_map.read().await.len(), 2);
-
-        // Replicate unregister_project logic for pid1
-        {
-            let mut pm = project_map.write().await;
-            let paths_to_remove: Vec<PathBuf> = pm
-                .iter()
-                .filter(|(_, ctx)| ctx.project_id == pid1)
-                .map(|(path, _)| path.clone())
-                .collect();
-            pm.retain(|_, ctx| ctx.project_id != pid1);
-            drop(pm);
-
-            let mut watched = watched_paths.write().await;
-            for path in &paths_to_remove {
-                watched.remove(path);
-            }
-        }
+        // Call the real method
+        watcher.unregister_project(pid1).await;
 
         // pid1 removed from both maps
-        assert_eq!(project_map.read().await.len(), 1);
-        assert_eq!(watched_paths.read().await.len(), 1);
-        assert!(watched_paths.read().await.contains(&path2));
-        assert!(!watched_paths.read().await.contains(&path1));
+        assert_eq!(watcher.registered_project_count().await, 1);
+        assert_eq!(watcher.watched_paths().await.len(), 1);
+        assert!(watcher.watched_paths().await.contains(&path2));
+        assert!(!watcher.watched_paths().await.contains(&path1));
+    }
+
+    #[tokio::test]
+    async fn test_unregister_nonexistent_project_is_noop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().canonicalize().unwrap();
+        let pid = Uuid::new_v4();
+
+        let watcher = make_test_watcher(vec![(path.clone(), pid, "proj-a")]).await;
+
+        // Unregister a project that doesn't exist
+        watcher.unregister_project(Uuid::new_v4()).await;
+
+        // Nothing changed
+        assert_eq!(watcher.registered_project_count().await, 1);
+        assert_eq!(watcher.watched_paths().await.len(), 1);
     }
 
     #[tokio::test]
@@ -2251,79 +2258,42 @@ mod tests {
         let tmp2 = tempfile::tempdir().unwrap();
         let path1 = tmp1.path().canonicalize().unwrap();
         let path2 = tmp2.path().canonicalize().unwrap();
-
         let pid1 = Uuid::new_v4();
         let pid2 = Uuid::new_v4();
 
-        let watched_paths = Arc::new(RwLock::new(HashSet::new()));
-        let project_map = Arc::new(RwLock::new(HashMap::new()));
+        let watcher = make_test_watcher(vec![
+            (path1.clone(), pid1, "proj-a"),
+            (path2.clone(), pid2, "proj-b"),
+        ])
+        .await;
 
-        {
-            let mut watched = watched_paths.write().await;
-            watched.insert(path1.clone());
-            watched.insert(path2.clone());
-            let mut pm = project_map.write().await;
-            pm.insert(
-                path1.clone(),
-                ProjectContext {
-                    project_id: pid1,
-                    project_slug: "proj-a".to_string(),
-                },
-            );
-            pm.insert(
-                path2.clone(),
-                ProjectContext {
-                    project_id: pid2,
-                    project_slug: "proj-b".to_string(),
-                },
-            );
-        }
-
-        // Replicate stop_project logic: unregister pid1, check remaining state
-        {
-            let mut pm = project_map.write().await;
-            let paths_to_remove: Vec<PathBuf> = pm
-                .iter()
-                .filter(|(_, ctx)| ctx.project_id == pid1)
-                .map(|(path, _)| path.clone())
-                .collect();
-            pm.retain(|_, ctx| ctx.project_id != pid1);
-            drop(pm);
-
-            let mut watched = watched_paths.write().await;
-            for path in &paths_to_remove {
-                watched.remove(path);
-            }
-        }
-
-        let paths: Vec<PathBuf> = watched_paths.read().await.iter().cloned().collect();
-        let running = !paths.is_empty();
+        // Call the real stop_project method
+        let (running, paths) = watcher.stop_project(pid1).await;
 
         assert!(running, "should still be running with one project left");
         assert_eq!(paths.len(), 1);
         assert!(paths.contains(&path2));
 
-        // Stop the last project (pid2)
-        {
-            let mut pm = project_map.write().await;
-            let paths_to_remove: Vec<PathBuf> = pm
-                .iter()
-                .filter(|(_, ctx)| ctx.project_id == pid2)
-                .map(|(path, _)| path.clone())
-                .collect();
-            pm.retain(|_, ctx| ctx.project_id != pid2);
-            drop(pm);
-
-            let mut watched = watched_paths.write().await;
-            for path in &paths_to_remove {
-                watched.remove(path);
-            }
-        }
-
-        let paths: Vec<PathBuf> = watched_paths.read().await.iter().cloned().collect();
-        let running = !paths.is_empty();
+        // Stop the last project
+        let (running, paths) = watcher.stop_project(pid2).await;
         assert!(!running, "should not be running with no projects");
         assert!(paths.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_stop_project_nonexistent_returns_current_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().canonicalize().unwrap();
+        let pid = Uuid::new_v4();
+
+        let watcher = make_test_watcher(vec![(path.clone(), pid, "proj-a")]).await;
+
+        // Stop a non-existent project
+        let (running, paths) = watcher.stop_project(Uuid::new_v4()).await;
+
+        assert!(running, "existing project should still be running");
+        assert_eq!(paths.len(), 1);
+        assert!(paths.contains(&path));
     }
 
     #[tokio::test]
@@ -2331,30 +2301,26 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().canonicalize().unwrap();
 
-        let watched_paths = Arc::new(RwLock::new(HashSet::new()));
-        let project_map = Arc::new(RwLock::new(HashMap::new()));
+        let mut watcher = make_test_watcher(vec![(path, Uuid::new_v4(), "test")]).await;
 
-        {
-            let mut watched = watched_paths.write().await;
-            watched.insert(path.clone());
-            let mut pm = project_map.write().await;
-            pm.insert(
-                path,
-                ProjectContext {
-                    project_id: Uuid::new_v4(),
-                    project_slug: "test".to_string(),
-                },
-            );
-        }
+        assert_eq!(watcher.watched_paths().await.len(), 1);
+        assert_eq!(watcher.registered_project_count().await, 1);
 
-        assert_eq!(watched_paths.read().await.len(), 1);
-        assert_eq!(project_map.read().await.len(), 1);
+        // Call the real stop method
+        watcher.stop().await;
 
-        // Replicate stop() logic: clear all state
-        watched_paths.write().await.clear();
-        project_map.write().await.clear();
+        assert_eq!(watcher.watched_paths().await.len(), 0);
+        assert_eq!(watcher.registered_project_count().await, 0);
+    }
 
-        assert_eq!(watched_paths.read().await.len(), 0);
-        assert_eq!(project_map.read().await.len(), 0);
+    #[tokio::test]
+    async fn test_stop_empty_watcher_is_noop() {
+        let mut watcher = make_test_watcher(vec![]).await;
+
+        // Stopping an empty watcher should not panic
+        watcher.stop().await;
+
+        assert_eq!(watcher.watched_paths().await.len(), 0);
+        assert_eq!(watcher.registered_project_count().await, 0);
     }
 }

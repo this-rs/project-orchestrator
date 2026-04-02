@@ -14860,4 +14860,34 @@ mod tests {
         let score = map.get(&("a::x".to_string(), "b::y".to_string())).copied();
         assert_eq!(score, Some(0.99), "Later insert should overwrite earlier");
     }
+
+    #[tokio::test]
+    async fn test_set_watch_enabled() {
+        let store = MockGraphStore::new();
+        let pid = Uuid::new_v4();
+
+        // Create a project first
+        let mut project = crate::test_helpers::test_project();
+        project.id = pid;
+        assert!(project.watch_enabled); // default is true
+        store.create_project(&project).await.unwrap();
+
+        // Disable watch
+        store.set_watch_enabled(pid, false).await.unwrap();
+        let updated = store.get_project(pid).await.unwrap().unwrap();
+        assert!(!updated.watch_enabled);
+
+        // Re-enable watch
+        store.set_watch_enabled(pid, true).await.unwrap();
+        let updated = store.get_project(pid).await.unwrap().unwrap();
+        assert!(updated.watch_enabled);
+    }
+
+    #[tokio::test]
+    async fn test_set_watch_enabled_nonexistent_project() {
+        let store = MockGraphStore::new();
+        // Should not error, just no-op
+        let result = store.set_watch_enabled(Uuid::new_v4(), false).await;
+        assert!(result.is_ok());
+    }
 }

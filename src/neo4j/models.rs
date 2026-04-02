@@ -3061,4 +3061,43 @@ mod tests {
             assert_eq!(de, expected);
         }
     }
+
+    #[test]
+    fn test_default_watch_enabled_is_true() {
+        assert!(super::default_watch_enabled());
+    }
+
+    #[test]
+    fn test_project_node_watch_enabled_defaults_to_true_on_deserialize() {
+        // Simulate a ProjectNode JSON without watch_enabled (old data in Neo4j)
+        let json = r#"{
+            "id": "00000000-0000-0000-0000-000000000001",
+            "name": "test",
+            "slug": "test",
+            "root_path": "/tmp/test",
+            "created_at": "2026-01-01T00:00:00Z"
+        }"#;
+        let project: ProjectNode = serde_json::from_str(json).unwrap();
+        assert!(
+            project.watch_enabled,
+            "watch_enabled should default to true for backward compatibility"
+        );
+    }
+
+    #[test]
+    fn test_project_node_watch_enabled_respects_explicit_false() {
+        let json = r#"{
+            "id": "00000000-0000-0000-0000-000000000001",
+            "name": "test",
+            "slug": "test",
+            "root_path": "/tmp/test",
+            "created_at": "2026-01-01T00:00:00Z",
+            "watch_enabled": false
+        }"#;
+        let project: ProjectNode = serde_json::from_str(json).unwrap();
+        assert!(
+            !project.watch_enabled,
+            "watch_enabled should be false when explicitly set"
+        );
+    }
 }

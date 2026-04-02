@@ -7794,4 +7794,21 @@ mod tests {
         // Should NOT have the error field when reactor is initialized
         assert!(json.get("error").is_none());
     }
+
+    #[test]
+    fn test_stop_watch_query_with_project_id() {
+        let json = r#"{"project_id":"550e8400-e29b-41d4-a716-446655440000"}"#;
+        let query: StopWatchQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            query.project_id,
+            Some("550e8400-e29b-41d4-a716-446655440000".to_string())
+        );
+    }
+
+    #[test]
+    fn test_stop_watch_query_without_project_id() {
+        let json = r#"{}"#;
+        let query: StopWatchQuery = serde_json::from_str(json).unwrap();
+        assert!(query.project_id.is_none());
+    }
 }
