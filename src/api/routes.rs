@@ -1625,7 +1625,9 @@ fn protected_routes() -> Router<OrchestratorState> {
         )
         .route(
             "/api/chat/sessions/{id}",
-            get(chat_handlers::get_session).delete(chat_handlers::delete_session),
+            get(chat_handlers::get_session)
+                .patch(chat_handlers::update_session)
+                .delete(chat_handlers::delete_session),
         )
         .route(
             "/api/chat/sessions/{id}/messages",
