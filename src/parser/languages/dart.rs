@@ -171,9 +171,8 @@ fn extract_function_from_signature(
         .map(|b| b.end_position().row as u32 + 1)
         .unwrap_or(sig.end_position().row as u32 + 1);
 
-    let is_async = body.is_some_and(|b| {
-        get_text(b, source).is_some_and(|t| t.starts_with("async"))
-    });
+    let is_async =
+        body.is_some_and(|b| get_text(b, source).is_some_and(|t| t.starts_with("async")));
 
     let complexity = body.map(|b| calculate_complexity(b)).unwrap_or(1);
 
@@ -441,9 +440,7 @@ fn extract_imports_regex(source: &str, file_path: &str, parsed: &mut ParsedFile)
         if let Some(uri) = uri {
             let alias = if let Some(as_pos) = trimmed.find(" as ") {
                 let after_as = &trimmed[as_pos + 4..];
-                let end = after_as
-                    .find([';', ' '])
-                    .unwrap_or(after_as.len());
+                let end = after_as.find([';', ' ']).unwrap_or(after_as.len());
                 Some(after_as[..end].to_string())
             } else {
                 None
