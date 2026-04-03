@@ -6693,13 +6693,6 @@ mod tests {
             .unwrap()
     }
 
-    /// Parse response body as JSON
-    async fn body_json(resp: axum::http::Response<Body>) -> serde_json::Value {
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        serde_json::from_slice(&bytes).unwrap()
-    }
 
     // ----------------------------------------------------------------
     // Decision semantic search
