@@ -2560,6 +2560,14 @@ mod tests {
         let ws = test_workspace();
         let slug = ws.slug.clone();
         app_state.neo4j.create_workspace(&ws).await.unwrap();
+        // Add a project so the ProjectSummary mapping (incl. root_path) is exercised
+        let project = crate::test_helpers::test_project();
+        app_state.neo4j.create_project(&project).await.unwrap();
+        app_state
+            .neo4j
+            .add_project_to_workspace(ws.id, project.id)
+            .await
+            .unwrap();
         let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
         let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
             orchestrator.clone(),
@@ -2597,6 +2605,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), HttpStatus::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let projects = json["projects"].as_array().unwrap();
+        assert_eq!(projects.len(), 1);
+        assert!(projects[0].get("root_path").is_some());
     }
 
     #[tokio::test]
