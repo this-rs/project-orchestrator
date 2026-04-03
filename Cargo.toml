@@ -94,6 +94,7 @@ tree-sitter-c-sharp = "0.23"
 tree-sitter-scala = "0.24"
 tree-sitter-zig = "1.1"
 tree-sitter-hcl = { path = "crates/tree-sitter-hcl" }
+tree-sitter-dart = { path = "crates/tree-sitter-dart" }
 
 # CLI
 clap = { version = "4.5", features = ["derive", "env"] }
