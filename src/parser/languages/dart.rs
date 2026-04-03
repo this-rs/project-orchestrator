@@ -171,8 +171,8 @@ fn extract_function_from_signature(
         .map(|b| b.end_position().row as u32 + 1)
         .unwrap_or(sig.end_position().row as u32 + 1);
 
-    let is_async = body.map_or(false, |b| {
-        get_text(b, source).map_or(false, |t| t.starts_with("async"))
+    let is_async = body.is_some_and(|b| {
+        get_text(b, source).is_some_and(|t| t.starts_with("async"))
     });
 
     let complexity = body.map(|b| calculate_complexity(b)).unwrap_or(1);
@@ -230,7 +230,7 @@ fn extract_function_from_member(
     // Check for async in function_body sibling
     let is_async = find_child_by_kind(node, "function_body")
         .and_then(|b| get_text(&b, source))
-        .map_or(false, |t| t.starts_with("async"));
+        .is_some_and(|t| t.starts_with("async"));
 
     let complexity = find_child_by_kind(node, "function_body")
         .map(|b| calculate_complexity(&b))
@@ -442,7 +442,7 @@ fn extract_imports_regex(source: &str, file_path: &str, parsed: &mut ParsedFile)
             let alias = if let Some(as_pos) = trimmed.find(" as ") {
                 let after_as = &trimmed[as_pos + 4..];
                 let end = after_as
-                    .find(|c: char| c == ';' || c == ' ')
+                    .find([';', ' '])
                     .unwrap_or(after_as.len());
                 Some(after_as[..end].to_string())
             } else {
