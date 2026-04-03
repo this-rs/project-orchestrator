@@ -482,7 +482,7 @@ mod tests {
     #[test]
     fn test_entity_type_has_26_variants() {
         // Ensure we don't accidentally add/remove variants
-        let all = vec![
+        let all = [
             EntityType::Project,
             EntityType::Plan,
             EntityType::Task,
