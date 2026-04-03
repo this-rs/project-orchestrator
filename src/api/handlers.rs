@@ -7821,10 +7821,7 @@ mod tests {
     use axum::Router;
 
     // oneshot requires tower::ServiceExt which is re-exported by axum
-    async fn oneshot_req(
-        app: Router,
-        req: axum::http::Request<Body>,
-    ) -> axum::response::Response {
+    async fn oneshot_req(app: Router, req: axum::http::Request<Body>) -> axum::response::Response {
         use tower::ServiceExt as _;
         app.oneshot(req).await.unwrap()
     }
@@ -7870,9 +7867,7 @@ mod tests {
             trajectory_store: None,
             identity: None,
             reactor_counters: std::sync::OnceLock::new(),
-            confidence_tracker: Arc::new(
-                crate::graph::confidence::ConfidenceTracker::default(),
-            ),
+            confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
         })
     }
@@ -7988,8 +7983,8 @@ mod tests {
 
     /// Helper: build a mock state with a pre-seeded project in the graph store.
     /// Returns (state, project) so callers can use the project's ID.
-    async fn mock_server_state_with_project() -> (OrchestratorState, crate::neo4j::models::ProjectNode)
-    {
+    async fn mock_server_state_with_project(
+    ) -> (OrchestratorState, crate::neo4j::models::ProjectNode) {
         let project = crate::test_helpers::test_project();
         let state = mock_server_state().await;
         state
