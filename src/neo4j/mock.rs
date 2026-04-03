@@ -207,6 +207,8 @@ pub struct MockGraphStore {
     // Test flags
     /// Controls what `has_context_cards()` returns (default: false)
     pub mock_has_context_cards: std::sync::atomic::AtomicBool,
+    /// When true, `set_watch_enabled()` returns an error (default: false)
+    pub mock_fail_set_watch_enabled: std::sync::atomic::AtomicBool,
 }
 
 #[allow(dead_code)]
@@ -315,6 +317,7 @@ impl MockGraphStore {
             mcp_co_activated: RwLock::new(HashMap::new()),
             mcp_often_follows: RwLock::new(HashMap::new()),
             mock_has_context_cards: std::sync::atomic::AtomicBool::new(false),
+            mock_fail_set_watch_enabled: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -2661,6 +2664,12 @@ impl GraphStore for MockGraphStore {
     }
 
     async fn set_watch_enabled(&self, project_id: Uuid, enabled: bool) -> Result<()> {
+        if self
+            .mock_fail_set_watch_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(anyhow::anyhow!("mock: set_watch_enabled forced failure"));
+        }
         let mut projects = self.projects.write().await;
         if let Some(p) = projects.get_mut(&project_id) {
             p.watch_enabled = enabled;

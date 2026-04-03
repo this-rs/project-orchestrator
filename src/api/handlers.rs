@@ -6693,7 +6693,6 @@ mod tests {
             .unwrap()
     }
 
-
     // ----------------------------------------------------------------
     // Decision semantic search
     // ----------------------------------------------------------------
@@ -7987,6 +7986,145 @@ mod tests {
             .await
             .unwrap();
         (state, project)
+    }
+
+    /// Build a mock state with a project AND a failing `set_watch_enabled` mock.
+    /// Returns (state, project, graph_store) so callers can toggle the flag.
+    async fn mock_server_state_with_failing_watch() -> (
+        OrchestratorState,
+        crate::neo4j::models::ProjectNode,
+        std::sync::Arc<crate::neo4j::mock::MockGraphStore>,
+    ) {
+        let (app_state, graph, _meili) = crate::test_helpers::mock_app_state_with_stores();
+        let project = crate::test_helpers::test_project();
+        use crate::neo4j::traits::GraphStore as _;
+        graph.create_project(&project).await.unwrap();
+        graph
+            .mock_fail_set_watch_enabled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let event_bus = std::sync::Arc::new(crate::events::HybridEmitter::new(
+            std::sync::Arc::new(crate::events::EventBus::default()),
+        ));
+        let orchestrator = std::sync::Arc::new(
+            crate::orchestrator::runner::Orchestrator::with_event_bus(app_state, event_bus.clone())
+                .await
+                .unwrap(),
+        );
+        let watcher = crate::orchestrator::watcher::FileWatcher::new(orchestrator.clone());
+
+        let state = std::sync::Arc::new(ServerState {
+            orchestrator,
+            watcher: std::sync::Arc::new(tokio::sync::RwLock::new(watcher)),
+            chat_manager: None,
+            event_bus,
+            nats_emitter: None,
+            auth_config: None,
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+            setup_completed: true,
+            server_port: 0,
+            public_url: None,
+            ws_ticket_store: std::sync::Arc::new(crate::api::ws_auth::WsTicketStore::new()),
+            registry_remote_url: None,
+            oidc_client: None,
+            neural_router: crate::test_helpers::mock_neural_router(),
+            trajectory_collector: std::sync::RwLock::new(None),
+            trajectory_store_neo4j: None,
+            trajectory_store: None,
+            identity: None,
+            reactor_counters: std::sync::OnceLock::new(),
+            confidence_tracker: std::sync::Arc::new(
+                crate::graph::confidence::ConfidenceTracker::default(),
+            ),
+            mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
+        });
+        (state, project, graph)
+    }
+
+    #[tokio::test]
+    async fn test_handler_start_watch_set_watch_enabled_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, project, _graph) = mock_server_state_with_failing_watch().await;
+        let app = watch_router(state);
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/watch")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "path": tmp.path().to_string_lossy().to_string(),
+                    "project_id": project.id.to_string()
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+
+        // Should still succeed — set_watch_enabled error is logged but not fatal
+        let resp = oneshot_req(app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_handler_stop_watch_per_project_set_watch_enabled_error() {
+        let (state, project, _graph) = mock_server_state_with_failing_watch().await;
+        let app = watch_router(state);
+
+        let req = axum::http::Request::builder()
+            .method("DELETE")
+            .uri(format!("/api/watch?project_id={}", project.id))
+            .body(Body::empty())
+            .unwrap();
+
+        // Should still succeed — set_watch_enabled error is logged but not fatal
+        let resp = oneshot_req(app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_handler_stop_all_set_watch_enabled_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, project, graph) = mock_server_state_with_failing_watch().await;
+
+        // Temporarily allow set_watch_enabled so start_watch can register
+        graph
+            .mock_fail_set_watch_enabled
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+
+        let app = watch_router(state.clone());
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/watch")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "path": tmp.path().to_string_lossy().to_string(),
+                    "project_id": project.id.to_string()
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let resp = oneshot_req(app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Now fail set_watch_enabled
+        graph
+            .mock_fail_set_watch_enabled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        // Stop all — should still succeed despite persistence error
+        let app = watch_router(state);
+        let req = axum::http::Request::builder()
+            .method("DELETE")
+            .uri("/api/watch")
+            .body(Body::empty())
+            .unwrap();
+        let resp = oneshot_req(app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let json = resp_json(resp).await;
+        assert_eq!(json["running"], false);
     }
 
     #[tokio::test]
