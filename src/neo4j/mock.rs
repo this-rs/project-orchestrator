@@ -207,6 +207,8 @@ pub struct MockGraphStore {
     // Test flags
     /// Controls what `has_context_cards()` returns (default: false)
     pub mock_has_context_cards: std::sync::atomic::AtomicBool,
+    /// When true, `set_watch_enabled()` returns an error (default: false)
+    pub mock_fail_set_watch_enabled: std::sync::atomic::AtomicBool,
 }
 
 #[allow(dead_code)]
@@ -315,6 +317,7 @@ impl MockGraphStore {
             mcp_co_activated: RwLock::new(HashMap::new()),
             mcp_often_follows: RwLock::new(HashMap::new()),
             mock_has_context_cards: std::sync::atomic::AtomicBool::new(false),
+            mock_fail_set_watch_enabled: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -2656,6 +2659,20 @@ impl GraphStore for MockGraphStore {
         let mut projects = self.projects.write().await;
         if let Some(p) = projects.get_mut(&project_id) {
             p.scaffolding_override = level.map(|l| l.min(4));
+        }
+        Ok(())
+    }
+
+    async fn set_watch_enabled(&self, project_id: Uuid, enabled: bool) -> Result<()> {
+        if self
+            .mock_fail_set_watch_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(anyhow::anyhow!("mock: set_watch_enabled forced failure"));
+        }
+        let mut projects = self.projects.write().await;
+        if let Some(p) = projects.get_mut(&project_id) {
+            p.watch_enabled = enabled;
         }
         Ok(())
     }
@@ -14851,5 +14868,35 @@ mod tests {
         let map = store.mcp_similar_to.read().await;
         let score = map.get(&("a::x".to_string(), "b::y".to_string())).copied();
         assert_eq!(score, Some(0.99), "Later insert should overwrite earlier");
+    }
+
+    #[tokio::test]
+    async fn test_set_watch_enabled() {
+        let store = MockGraphStore::new();
+        let pid = Uuid::new_v4();
+
+        // Create a project first
+        let mut project = crate::test_helpers::test_project();
+        project.id = pid;
+        assert!(project.watch_enabled); // default is true
+        store.create_project(&project).await.unwrap();
+
+        // Disable watch
+        store.set_watch_enabled(pid, false).await.unwrap();
+        let updated = store.get_project(pid).await.unwrap().unwrap();
+        assert!(!updated.watch_enabled);
+
+        // Re-enable watch
+        store.set_watch_enabled(pid, true).await.unwrap();
+        let updated = store.get_project(pid).await.unwrap().unwrap();
+        assert!(updated.watch_enabled);
+    }
+
+    #[tokio::test]
+    async fn test_set_watch_enabled_nonexistent_project() {
+        let store = MockGraphStore::new();
+        // Should not error, just no-op
+        let result = store.set_watch_enabled(Uuid::new_v4(), false).await;
+        assert!(result.is_ok());
     }
 }

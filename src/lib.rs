@@ -990,16 +990,24 @@ pub async fn start_server(mut config: Config) -> Result<()> {
     let orchestrator =
         Arc::new(orchestrator::Orchestrator::with_event_bus(state, event_bus.clone()).await?);
 
-    // Create file watcher and auto-register all projects
+    // Create file watcher and auto-register projects with watch_enabled=true
     let watcher = {
         let mut w = orchestrator::FileWatcher::new(orchestrator.clone());
 
-        // Auto-register all known projects for watching
+        // Only auto-register projects that have watch_enabled=true (default for existing projects)
         match orchestrator.neo4j().list_projects().await {
             Ok(projects) => {
                 let mut registered = 0usize;
                 let mut skipped = 0usize;
                 for project in &projects {
+                    if !project.watch_enabled {
+                        tracing::debug!(
+                            "Auto-watch: skipping project '{}' — watch_enabled=false",
+                            project.slug,
+                        );
+                        skipped += 1;
+                        continue;
+                    }
                     let expanded = expand_tilde(&project.root_path);
                     let path = std::path::Path::new(&expanded);
                     if !path.exists() {

@@ -162,21 +162,46 @@ impl FileWatcher {
 
     /// Unregister a project from watching.
     ///
-    /// Removes the project from the project map. The underlying notify watcher
-    /// may still receive events for this path, but they will be ignored since
-    /// `resolve_project` won't find a match.
+    /// Removes the project from the project map **and** from `watched_paths`.
+    /// The underlying notify watcher may still receive OS events for this path,
+    /// but they will be ignored since `resolve_project` won't find a match.
     pub async fn unregister_project(&self, project_id: Uuid) {
         let mut pm = self.project_map.write().await;
-        let before = pm.len();
+
+        // Collect the paths belonging to this project before removing them.
+        let paths_to_remove: Vec<PathBuf> = pm
+            .iter()
+            .filter(|(_, ctx)| ctx.project_id == project_id)
+            .map(|(path, _)| path.clone())
+            .collect();
+
+        let removed = paths_to_remove.len();
         pm.retain(|_, ctx| ctx.project_id != project_id);
-        let removed = before - pm.len();
+        drop(pm);
+
+        // Also remove from watched_paths so watch_status reflects reality.
         if removed > 0 {
+            let mut watched = self.watched_paths.write().await;
+            for path in &paths_to_remove {
+                watched.remove(path);
+            }
             tracing::info!(
                 "Unregistered project {} from watcher ({} paths removed)",
                 project_id,
                 removed
             );
         }
+    }
+
+    /// Stop watching a single project by ID.
+    ///
+    /// Convenience wrapper around `unregister_project` that returns the current
+    /// watch state after removal, matching the API response contract.
+    pub async fn stop_project(&self, project_id: Uuid) -> (bool, Vec<PathBuf>) {
+        self.unregister_project(project_id).await;
+        let paths = self.watched_paths.read().await;
+        let running = !paths.is_empty();
+        (running, paths.iter().cloned().collect())
     }
 
     /// Check if a project is currently registered for watching.
@@ -426,11 +451,20 @@ impl FileWatcher {
         Ok(())
     }
 
-    /// Stop the watcher
+    /// Stop the watcher and clear all state.
+    ///
+    /// Sends the stop signal to the background task **and** clears
+    /// `watched_paths` and `project_map` so that `watch_status` correctly
+    /// reports an empty state after stopping.
     pub async fn stop(&mut self) {
         if let Some(tx) = self.stop_tx.take() {
             let _ = tx.send(()).await;
         }
+        self.add_path_tx = None;
+
+        // Clear all state so watch_status reflects reality
+        self.watched_paths.write().await.clear();
+        self.project_map.write().await.clear();
     }
 
     /// Get currently watched paths
@@ -2140,5 +2174,153 @@ mod tests {
             should_sync_file(&path),
             "should_sync_file should pass for .rs extension regardless of existence"
         );
+    }
+
+    // ── unregister / stop logic tests ──────────────────────────────
+    //
+    // These tests call the REAL FileWatcher methods (unregister_project,
+    // stop_project, stop) using a mock Orchestrator built from mock_app_state().
+
+    /// Build a FileWatcher backed by a mock Orchestrator.
+    /// Pre-populates watched_paths and project_map with the given entries.
+    async fn make_test_watcher(entries: Vec<(PathBuf, Uuid, &str)>) -> FileWatcher {
+        let state = crate::test_helpers::mock_app_state();
+        let orchestrator = Arc::new(
+            crate::orchestrator::runner::Orchestrator::new(state)
+                .await
+                .expect("mock orchestrator"),
+        );
+        let watcher = FileWatcher::new(orchestrator);
+        {
+            let mut watched = watcher.watched_paths.write().await;
+            let mut pm = watcher.project_map.write().await;
+            for (path, pid, slug) in entries {
+                watched.insert(path.clone());
+                pm.insert(
+                    path,
+                    ProjectContext {
+                        project_id: pid,
+                        project_slug: slug.to_string(),
+                    },
+                );
+            }
+        }
+        watcher
+    }
+
+    #[tokio::test]
+    async fn test_unregister_project_clears_watched_paths() {
+        let tmp1 = tempfile::tempdir().unwrap();
+        let tmp2 = tempfile::tempdir().unwrap();
+        let path1 = tmp1.path().canonicalize().unwrap();
+        let path2 = tmp2.path().canonicalize().unwrap();
+        let pid1 = Uuid::new_v4();
+        let pid2 = Uuid::new_v4();
+
+        let watcher = make_test_watcher(vec![
+            (path1.clone(), pid1, "proj-a"),
+            (path2.clone(), pid2, "proj-b"),
+        ])
+        .await;
+
+        assert_eq!(watcher.watched_paths().await.len(), 2);
+        assert_eq!(watcher.registered_project_count().await, 2);
+
+        // Call the real method
+        watcher.unregister_project(pid1).await;
+
+        // pid1 removed from both maps
+        assert_eq!(watcher.registered_project_count().await, 1);
+        assert_eq!(watcher.watched_paths().await.len(), 1);
+        assert!(watcher.watched_paths().await.contains(&path2));
+        assert!(!watcher.watched_paths().await.contains(&path1));
+    }
+
+    #[tokio::test]
+    async fn test_unregister_nonexistent_project_is_noop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().canonicalize().unwrap();
+        let pid = Uuid::new_v4();
+
+        let watcher = make_test_watcher(vec![(path.clone(), pid, "proj-a")]).await;
+
+        // Unregister a project that doesn't exist
+        watcher.unregister_project(Uuid::new_v4()).await;
+
+        // Nothing changed
+        assert_eq!(watcher.registered_project_count().await, 1);
+        assert_eq!(watcher.watched_paths().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_stop_project_returns_correct_state() {
+        let tmp1 = tempfile::tempdir().unwrap();
+        let tmp2 = tempfile::tempdir().unwrap();
+        let path1 = tmp1.path().canonicalize().unwrap();
+        let path2 = tmp2.path().canonicalize().unwrap();
+        let pid1 = Uuid::new_v4();
+        let pid2 = Uuid::new_v4();
+
+        let watcher = make_test_watcher(vec![
+            (path1.clone(), pid1, "proj-a"),
+            (path2.clone(), pid2, "proj-b"),
+        ])
+        .await;
+
+        // Call the real stop_project method
+        let (running, paths) = watcher.stop_project(pid1).await;
+
+        assert!(running, "should still be running with one project left");
+        assert_eq!(paths.len(), 1);
+        assert!(paths.contains(&path2));
+
+        // Stop the last project
+        let (running, paths) = watcher.stop_project(pid2).await;
+        assert!(!running, "should not be running with no projects");
+        assert!(paths.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_stop_project_nonexistent_returns_current_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().canonicalize().unwrap();
+        let pid = Uuid::new_v4();
+
+        let watcher = make_test_watcher(vec![(path.clone(), pid, "proj-a")]).await;
+
+        // Stop a non-existent project
+        let (running, paths) = watcher.stop_project(Uuid::new_v4()).await;
+
+        assert!(running, "existing project should still be running");
+        assert_eq!(paths.len(), 1);
+        assert!(paths.contains(&path));
+    }
+
+    #[tokio::test]
+    async fn test_stop_clears_all_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().canonicalize().unwrap();
+
+        let mut watcher = make_test_watcher(vec![(path, Uuid::new_v4(), "test")]).await;
+
+        assert_eq!(watcher.watched_paths().await.len(), 1);
+        assert_eq!(watcher.registered_project_count().await, 1);
+
+        // Call the real stop method
+        watcher.stop().await;
+
+        assert_eq!(watcher.watched_paths().await.len(), 0);
+        assert_eq!(watcher.registered_project_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_stop_empty_watcher_is_noop() {
+        let mut watcher = make_test_watcher(vec![]).await;
+
+        // Stopping an empty watcher should not panic
+        watcher.stop().await;
+
+        assert_eq!(watcher.watched_paths().await.len(), 0);
+        assert_eq!(watcher.registered_project_count().await, 0);
     }
 }

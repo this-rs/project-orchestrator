@@ -1845,6 +1845,15 @@ pub async fn start_watch(
                     .register_project(path, project.id, project.slug)
                     .await
                     .map_err(|e| anyhow::anyhow!("Failed to register project: {}", e))?;
+                // Persist watch_enabled=true so the watcher restarts on boot
+                if let Err(e) = state
+                    .orchestrator
+                    .neo4j()
+                    .set_watch_enabled(pid, true)
+                    .await
+                {
+                    tracing::warn!("Failed to persist watch_enabled=true for {pid}: {e}");
+                }
             }
         }
     } else {
@@ -1864,17 +1873,62 @@ pub async fn start_watch(
     }))
 }
 
-/// Stop the file watcher
+/// Query parameters for stop_watch
+#[derive(Deserialize)]
+pub struct StopWatchQuery {
+    pub project_id: Option<String>,
+}
+
+/// Stop the file watcher.
+///
+/// - `DELETE /api/watch?project_id=UUID` — stop watching a single project
+/// - `DELETE /api/watch` — stop all watchers and clear all state
 pub async fn stop_watch(
     State(state): State<OrchestratorState>,
+    axum::extract::Query(query): axum::extract::Query<StopWatchQuery>,
 ) -> Result<Json<WatchStatusResponse>, AppError> {
-    let mut watcher = state.watcher.write().await;
-    watcher.stop().await;
-
-    Ok(Json(WatchStatusResponse {
-        running: false,
-        watched_paths: vec![],
-    }))
+    if let Some(ref pid_str) = query.project_id {
+        // Per-project stop: unregister only this project
+        let pid = uuid::Uuid::parse_str(pid_str)
+            .map_err(|e| anyhow::anyhow!("Invalid project_id: {}", e))?;
+        let watcher = state.watcher.read().await;
+        let (running, paths) = watcher.stop_project(pid).await;
+        // Persist watch_enabled=false so the watcher stays off after reboot
+        if let Err(e) = state
+            .orchestrator
+            .neo4j()
+            .set_watch_enabled(pid, false)
+            .await
+        {
+            tracing::warn!("Failed to persist watch_enabled=false for {pid}: {e}");
+        }
+        Ok(Json(WatchStatusResponse {
+            running,
+            watched_paths: paths
+                .iter()
+                .map(|p| p.to_string_lossy().to_string())
+                .collect(),
+        }))
+    } else {
+        // Stop all: persist watch_enabled=false for all registered projects,
+        // then send stop signal and clear all in-memory state.
+        let mut watcher = state.watcher.write().await;
+        for (pid, _slug, _path) in watcher.registered_projects().await {
+            if let Err(e) = state
+                .orchestrator
+                .neo4j()
+                .set_watch_enabled(pid, false)
+                .await
+            {
+                tracing::warn!("Failed to persist watch_enabled=false for {pid}: {e}");
+            }
+        }
+        watcher.stop().await;
+        Ok(Json(WatchStatusResponse {
+            running: false,
+            watched_paths: vec![],
+        }))
+    }
 }
 
 /// Get watcher status
@@ -6639,14 +6693,6 @@ mod tests {
             .unwrap()
     }
 
-    /// Parse response body as JSON
-    async fn body_json(resp: axum::http::Response<Body>) -> serde_json::Value {
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        serde_json::from_slice(&bytes).unwrap()
-    }
-
     // ----------------------------------------------------------------
     // Decision semantic search
     // ----------------------------------------------------------------
@@ -6661,7 +6707,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), HttpStatus::OK);
-        let json = body_json(resp).await;
+        let json = resp_json(resp).await;
         assert!(json.is_array());
         assert_eq!(json.as_array().unwrap().len(), 0);
     }
@@ -6692,7 +6738,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), HttpStatus::OK);
-        let json = body_json(resp).await;
+        let json = resp_json(resp).await;
         assert!(json.is_array());
         assert_eq!(json.as_array().unwrap().len(), 0);
     }
@@ -6747,7 +6793,7 @@ mod tests {
         let uri = format!("/api/decisions/{}/affects", decision_id);
         let resp = app.oneshot(auth_get(&uri)).await.unwrap();
         assert_eq!(resp.status(), HttpStatus::OK);
-        let json = body_json(resp).await;
+        let json = resp_json(resp).await;
         assert!(json.is_array());
         assert_eq!(json.as_array().unwrap().len(), 0);
     }
@@ -6810,7 +6856,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), HttpStatus::OK);
-        let json = body_json(resp).await;
+        let json = resp_json(resp).await;
         assert!(json.is_array());
         assert_eq!(json.as_array().unwrap().len(), 0);
     }
@@ -6848,7 +6894,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), HttpStatus::OK);
-        let json = body_json(resp).await;
+        let json = resp_json(resp).await;
         assert!(json.is_array());
         assert_eq!(json.as_array().unwrap().len(), 0);
     }
@@ -6867,7 +6913,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), HttpStatus::OK);
-        let json = body_json(resp).await;
+        let json = resp_json(resp).await;
         assert!(json.is_array());
         assert_eq!(json.as_array().unwrap().len(), 0);
     }
@@ -6901,7 +6947,7 @@ mod tests {
         let uri = format!("/api/projects/{}/co-changes", project_id);
         let resp = app.oneshot(auth_get(&uri)).await.unwrap();
         assert_eq!(resp.status(), HttpStatus::OK);
-        let json = body_json(resp).await;
+        let json = resp_json(resp).await;
         assert!(json.is_array());
         assert_eq!(json.as_array().unwrap().len(), 0);
     }
@@ -6930,7 +6976,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), HttpStatus::OK);
-        let json = body_json(resp).await;
+        let json = resp_json(resp).await;
         assert!(json.is_array());
         assert_eq!(json.as_array().unwrap().len(), 0);
     }
@@ -6977,7 +7023,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), HttpStatus::OK);
-        let json = body_json(resp).await;
+        let json = resp_json(resp).await;
         assert!(json["decisions_processed"].is_number());
         assert!(json["embeddings_created"].is_number());
     }
@@ -7002,7 +7048,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), HttpStatus::OK);
-        let json = body_json(resp).await;
+        let json = resp_json(resp).await;
         assert!(json["decisions_processed"].is_number());
         assert!(json["decisions_updated"].is_number());
     }
@@ -7027,7 +7073,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), HttpStatus::OK);
-        let json = body_json(resp).await;
+        let json = resp_json(resp).await;
         assert_eq!(json["sessions_processed"], 0);
         assert_eq!(json["entities_found"], 0);
         assert_eq!(json["relations_created"], 0);
@@ -7527,7 +7573,7 @@ mod tests {
         let app = test_app().await;
         let resp = app.oneshot(auth_get("/api/runs")).await.unwrap();
         assert_eq!(resp.status(), HttpStatus::OK);
-        let json = body_json(resp).await;
+        let json = resp_json(resp).await;
         assert!(json.is_array());
         assert_eq!(json.as_array().unwrap().len(), 0);
     }
@@ -7537,7 +7583,7 @@ mod tests {
         let app = test_app().await;
         let resp = app.oneshot(auth_get("/api/runs?limit=10")).await.unwrap();
         assert_eq!(resp.status(), HttpStatus::OK);
-        let json = body_json(resp).await;
+        let json = resp_json(resp).await;
         assert!(json.is_array());
     }
 
@@ -7546,7 +7592,7 @@ mod tests {
         let app = test_app().await;
         let resp = app.oneshot(auth_get("/api/runs?offset=5")).await.unwrap();
         assert_eq!(resp.status(), HttpStatus::OK);
-        let json = body_json(resp).await;
+        let json = resp_json(resp).await;
         assert!(json.is_array());
     }
 
@@ -7558,7 +7604,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), HttpStatus::OK);
-        let json = body_json(resp).await;
+        let json = resp_json(resp).await;
         assert!(json.is_array());
     }
 
@@ -7570,7 +7616,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), HttpStatus::OK);
-        let json = body_json(resp).await;
+        let json = resp_json(resp).await;
         assert!(json.is_array());
         assert_eq!(json.as_array().unwrap().len(), 0);
     }
@@ -7583,7 +7629,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), HttpStatus::OK);
-        let json = body_json(resp).await;
+        let json = resp_json(resp).await;
         assert!(json.is_array());
     }
 
@@ -7593,7 +7639,7 @@ mod tests {
         // Non-numeric limit should be ignored, falling back to default (50)
         let resp = app.oneshot(auth_get("/api/runs?limit=abc")).await.unwrap();
         assert_eq!(resp.status(), HttpStatus::OK);
-        let json = body_json(resp).await;
+        let json = resp_json(resp).await;
         assert!(json.is_array());
     }
 
@@ -7603,7 +7649,7 @@ mod tests {
         // Non-numeric offset should be ignored, falling back to default (0)
         let resp = app.oneshot(auth_get("/api/runs?offset=xyz")).await.unwrap();
         assert_eq!(resp.status(), HttpStatus::OK);
-        let json = body_json(resp).await;
+        let json = resp_json(resp).await;
         assert!(json.is_array());
     }
 
@@ -7617,7 +7663,7 @@ mod tests {
         let app = test_app().await;
         let resp = app.oneshot(auth_get("/api/reactor/status")).await.unwrap();
         assert_eq!(resp.status(), HttpStatus::OK);
-        let json = body_json(resp).await;
+        let json = resp_json(resp).await;
         assert_eq!(json["running"], false);
         assert_eq!(json["error"], "reactor not initialized");
     }
@@ -7681,7 +7727,7 @@ mod tests {
 
         let resp = app.oneshot(auth_get("/api/reactor/status")).await.unwrap();
         assert_eq!(resp.status(), HttpStatus::OK);
-        let json = body_json(resp).await;
+        let json = resp_json(resp).await;
         assert_eq!(json["running"], true);
         assert_eq!(json["events_received"], 42);
         assert_eq!(json["events_matched"], 10);
@@ -7731,7 +7777,7 @@ mod tests {
 
         let resp = app.oneshot(auth_get("/api/reactor/status")).await.unwrap();
         assert_eq!(resp.status(), HttpStatus::OK);
-        let json = body_json(resp).await;
+        let json = resp_json(resp).await;
         assert_eq!(json["running"], false);
         assert_eq!(json["events_received"], 0);
         assert_eq!(json["events_matched"], 0);
@@ -7739,5 +7785,518 @@ mod tests {
         assert_eq!(json["handler_errors"], 0);
         // Should NOT have the error field when reactor is initialized
         assert!(json.get("error").is_none());
+    }
+
+    #[test]
+    fn test_stop_watch_query_with_project_id() {
+        let json = r#"{"project_id":"550e8400-e29b-41d4-a716-446655440000"}"#;
+        let query: StopWatchQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            query.project_id,
+            Some("550e8400-e29b-41d4-a716-446655440000".to_string())
+        );
+    }
+
+    #[test]
+    fn test_stop_watch_query_without_project_id() {
+        let json = r#"{}"#;
+        let query: StopWatchQuery = serde_json::from_str(json).unwrap();
+        assert!(query.project_id.is_none());
+    }
+
+    // ── Handler-level tests (axum oneshot) ──────────────────────────
+    //
+    // These call the real stop_watch / start_watch / watch_status handlers
+    // via axum Router::oneshot with a mock ServerState.
+
+    use axum::routing::get as axum_get;
+    use axum::Router;
+
+    // oneshot requires tower::ServiceExt which is re-exported by axum
+    async fn oneshot_req(app: Router, req: axum::http::Request<Body>) -> axum::response::Response {
+        use tower::ServiceExt as _;
+        app.oneshot(req).await.unwrap()
+    }
+
+    async fn resp_json(resp: axum::response::Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// Build a mock OrchestratorState for handler tests.
+    async fn mock_server_state() -> OrchestratorState {
+        let state = crate::test_helpers::mock_app_state();
+        let event_bus = Arc::new(crate::events::HybridEmitter::new(Arc::new(
+            crate::events::EventBus::default(),
+        )));
+        let orchestrator = Arc::new(
+            crate::orchestrator::runner::Orchestrator::with_event_bus(state, event_bus.clone())
+                .await
+                .unwrap(),
+        );
+        let watcher = crate::orchestrator::watcher::FileWatcher::new(orchestrator.clone());
+
+        Arc::new(ServerState {
+            orchestrator,
+            watcher: Arc::new(tokio::sync::RwLock::new(watcher)),
+            chat_manager: None,
+            event_bus,
+            nats_emitter: None,
+            auth_config: None,
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+            setup_completed: true,
+            server_port: 0,
+            public_url: None,
+            ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
+            registry_remote_url: None,
+            oidc_client: None,
+            neural_router: crate::test_helpers::mock_neural_router(),
+            trajectory_collector: std::sync::RwLock::new(None),
+            trajectory_store_neo4j: None,
+            trajectory_store: None,
+            identity: None,
+            reactor_counters: std::sync::OnceLock::new(),
+            confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
+            mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
+        })
+    }
+
+    fn watch_router(state: OrchestratorState) -> Router {
+        Router::new()
+            .route(
+                "/api/watch",
+                axum_get(watch_status).post(start_watch).delete(stop_watch),
+            )
+            .with_state(state)
+    }
+
+    #[tokio::test]
+    async fn test_handler_watch_status_empty() {
+        let state = mock_server_state().await;
+        let app = watch_router(state);
+
+        let req = axum::http::Request::builder()
+            .method("GET")
+            .uri("/api/watch")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = oneshot_req(app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let json = resp_json(resp).await;
+        assert_eq!(json["running"], false);
+        assert!(json["watched_paths"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_handler_stop_watch_all_empty() {
+        let state = mock_server_state().await;
+        let app = watch_router(state);
+
+        let req = axum::http::Request::builder()
+            .method("DELETE")
+            .uri("/api/watch")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = oneshot_req(app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let json = resp_json(resp).await;
+        assert_eq!(json["running"], false);
+        assert!(json["watched_paths"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_handler_stop_watch_per_project() {
+        let state = mock_server_state().await;
+        let pid = uuid::Uuid::new_v4();
+        let app = watch_router(state);
+
+        let req = axum::http::Request::builder()
+            .method("DELETE")
+            .uri(format!("/api/watch?project_id={}", pid))
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = oneshot_req(app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let json = resp_json(resp).await;
+        assert_eq!(json["running"], false);
+        assert!(json["watched_paths"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_handler_stop_watch_invalid_project_id() {
+        let state = mock_server_state().await;
+        let app = watch_router(state);
+
+        let req = axum::http::Request::builder()
+            .method("DELETE")
+            .uri("/api/watch?project_id=not-a-uuid")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = oneshot_req(app, req).await;
+        // Should return 500 (invalid UUID parse error)
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn test_handler_start_watch_with_valid_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = mock_server_state().await;
+        let app = watch_router(state);
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/watch")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "path": tmp.path().to_string_lossy().to_string()
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+
+        let resp = oneshot_req(app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let json = resp_json(resp).await;
+        assert_eq!(json["running"], true);
+        assert!(!json["watched_paths"].as_array().unwrap().is_empty());
+    }
+
+    /// Helper: build a mock state with a pre-seeded project in the graph store.
+    /// Returns (state, project) so callers can use the project's ID.
+    async fn mock_server_state_with_project(
+    ) -> (OrchestratorState, crate::neo4j::models::ProjectNode) {
+        let project = crate::test_helpers::test_project();
+        let state = mock_server_state().await;
+        state
+            .orchestrator
+            .neo4j()
+            .create_project(&project)
+            .await
+            .unwrap();
+        (state, project)
+    }
+
+    /// Build a mock state with a project AND a failing `set_watch_enabled` mock.
+    /// Returns (state, project, graph_store) so callers can toggle the flag.
+    async fn mock_server_state_with_failing_watch() -> (
+        OrchestratorState,
+        crate::neo4j::models::ProjectNode,
+        std::sync::Arc<crate::neo4j::mock::MockGraphStore>,
+    ) {
+        let (app_state, graph, _meili) = crate::test_helpers::mock_app_state_with_stores();
+        let project = crate::test_helpers::test_project();
+        use crate::neo4j::traits::GraphStore as _;
+        graph.create_project(&project).await.unwrap();
+        graph
+            .mock_fail_set_watch_enabled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let event_bus = std::sync::Arc::new(crate::events::HybridEmitter::new(
+            std::sync::Arc::new(crate::events::EventBus::default()),
+        ));
+        let orchestrator = std::sync::Arc::new(
+            crate::orchestrator::runner::Orchestrator::with_event_bus(app_state, event_bus.clone())
+                .await
+                .unwrap(),
+        );
+        let watcher = crate::orchestrator::watcher::FileWatcher::new(orchestrator.clone());
+
+        let state = std::sync::Arc::new(ServerState {
+            orchestrator,
+            watcher: std::sync::Arc::new(tokio::sync::RwLock::new(watcher)),
+            chat_manager: None,
+            event_bus,
+            nats_emitter: None,
+            auth_config: None,
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+            setup_completed: true,
+            server_port: 0,
+            public_url: None,
+            ws_ticket_store: std::sync::Arc::new(crate::api::ws_auth::WsTicketStore::new()),
+            registry_remote_url: None,
+            oidc_client: None,
+            neural_router: crate::test_helpers::mock_neural_router(),
+            trajectory_collector: std::sync::RwLock::new(None),
+            trajectory_store_neo4j: None,
+            trajectory_store: None,
+            identity: None,
+            reactor_counters: std::sync::OnceLock::new(),
+            confidence_tracker: std::sync::Arc::new(
+                crate::graph::confidence::ConfidenceTracker::default(),
+            ),
+            mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
+        });
+        (state, project, graph)
+    }
+
+    #[tokio::test]
+    async fn test_handler_start_watch_set_watch_enabled_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, project, _graph) = mock_server_state_with_failing_watch().await;
+        let app = watch_router(state);
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/watch")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "path": tmp.path().to_string_lossy().to_string(),
+                    "project_id": project.id.to_string()
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+
+        // Should still succeed — set_watch_enabled error is logged but not fatal
+        let resp = oneshot_req(app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_handler_stop_watch_per_project_set_watch_enabled_error() {
+        let (state, project, _graph) = mock_server_state_with_failing_watch().await;
+        let app = watch_router(state);
+
+        let req = axum::http::Request::builder()
+            .method("DELETE")
+            .uri(format!("/api/watch?project_id={}", project.id))
+            .body(Body::empty())
+            .unwrap();
+
+        // Should still succeed — set_watch_enabled error is logged but not fatal
+        let resp = oneshot_req(app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_handler_stop_all_set_watch_enabled_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, project, graph) = mock_server_state_with_failing_watch().await;
+
+        // Temporarily allow set_watch_enabled so start_watch can register
+        graph
+            .mock_fail_set_watch_enabled
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+
+        let app = watch_router(state.clone());
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/watch")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "path": tmp.path().to_string_lossy().to_string(),
+                    "project_id": project.id.to_string()
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let resp = oneshot_req(app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Now fail set_watch_enabled
+        graph
+            .mock_fail_set_watch_enabled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        // Stop all — should still succeed despite persistence error
+        let app = watch_router(state);
+        let req = axum::http::Request::builder()
+            .method("DELETE")
+            .uri("/api/watch")
+            .body(Body::empty())
+            .unwrap();
+        let resp = oneshot_req(app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let json = resp_json(resp).await;
+        assert_eq!(json["running"], false);
+    }
+
+    #[tokio::test]
+    async fn test_handler_start_watch_with_project_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, project) = mock_server_state_with_project().await;
+        let app = watch_router(state.clone());
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/watch")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "path": tmp.path().to_string_lossy().to_string(),
+                    "project_id": project.id.to_string()
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+
+        let resp = oneshot_req(app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let json = resp_json(resp).await;
+        assert_eq!(json["running"], true);
+
+        // Verify watch_enabled was persisted to true
+        let p = state
+            .orchestrator
+            .neo4j()
+            .get_project(project.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(p.watch_enabled);
+    }
+
+    #[tokio::test]
+    async fn test_handler_stop_watch_per_project_with_registered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, project) = mock_server_state_with_project().await;
+
+        // First start watching with the project
+        let app = watch_router(state.clone());
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/watch")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "path": tmp.path().to_string_lossy().to_string(),
+                    "project_id": project.id.to_string()
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let resp = oneshot_req(app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Now stop that specific project
+        let app = watch_router(state.clone());
+        let req = axum::http::Request::builder()
+            .method("DELETE")
+            .uri(format!("/api/watch?project_id={}", project.id))
+            .body(Body::empty())
+            .unwrap();
+        let resp = oneshot_req(app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Verify watch_enabled was persisted to false
+        let p = state
+            .orchestrator
+            .neo4j()
+            .get_project(project.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!p.watch_enabled);
+    }
+
+    #[tokio::test]
+    async fn test_handler_stop_all_persists_watch_enabled_false() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, project) = mock_server_state_with_project().await;
+
+        // Start watching with the project
+        let app = watch_router(state.clone());
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/watch")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "path": tmp.path().to_string_lossy().to_string(),
+                    "project_id": project.id.to_string()
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let resp = oneshot_req(app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Stop all
+        let app = watch_router(state.clone());
+        let req = axum::http::Request::builder()
+            .method("DELETE")
+            .uri("/api/watch")
+            .body(Body::empty())
+            .unwrap();
+        let resp = oneshot_req(app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let json = resp_json(resp).await;
+        assert_eq!(json["running"], false);
+        assert!(json["watched_paths"].as_array().unwrap().is_empty());
+
+        // Verify watch_enabled was persisted to false for the project
+        let p = state
+            .orchestrator
+            .neo4j()
+            .get_project(project.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!p.watch_enabled);
+    }
+
+    #[tokio::test]
+    async fn test_handler_start_then_stop_all() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = mock_server_state().await;
+
+        // Start watching
+        let app = watch_router(state.clone());
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/watch")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "path": tmp.path().to_string_lossy().to_string()
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let resp = oneshot_req(app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Stop all
+        let app = watch_router(state.clone());
+        let req = axum::http::Request::builder()
+            .method("DELETE")
+            .uri("/api/watch")
+            .body(Body::empty())
+            .unwrap();
+        let resp = oneshot_req(app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let json = resp_json(resp).await;
+        assert_eq!(json["running"], false);
+        assert!(json["watched_paths"].as_array().unwrap().is_empty());
+
+        // Verify status confirms stopped
+        let app = watch_router(state);
+        let req = axum::http::Request::builder()
+            .method("GET")
+            .uri("/api/watch")
+            .body(Body::empty())
+            .unwrap();
+        let resp = oneshot_req(app, req).await;
+        let json = resp_json(resp).await;
+        assert_eq!(json["running"], false);
     }
 }

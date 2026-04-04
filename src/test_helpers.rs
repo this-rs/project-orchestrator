@@ -345,6 +345,7 @@ pub fn test_project() -> ProjectNode {
         default_note_energy: None,
         scaffolding_override: None,
         sharing_policy: None,
+        watch_enabled: true,
     }
 }
 
@@ -362,6 +363,7 @@ pub fn test_project_named(name: &str) -> ProjectNode {
         last_co_change_computed_at: None,
         default_note_energy: None,
         scaffolding_override: None,
+        watch_enabled: true,
         sharing_policy: None,
     }
 }

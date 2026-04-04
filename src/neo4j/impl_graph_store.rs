@@ -826,6 +826,10 @@ impl GraphStore for Neo4jClient {
         self.set_scaffolding_override(project_id, level).await
     }
 
+    async fn set_watch_enabled(&self, project_id: Uuid, enabled: bool) -> anyhow::Result<()> {
+        self.set_watch_enabled(project_id, enabled).await
+    }
+
     async fn set_default_note_energy(
         &self,
         project_id: Uuid,

@@ -195,6 +195,7 @@ async fn test_workspace_project_association() {
         default_note_energy: None,
         scaffolding_override: None,
         sharing_policy: None,
+        watch_enabled: true,
     };
     state.neo4j.create_project(&project).await.unwrap();
 
@@ -434,6 +435,7 @@ async fn test_resource_project_links() {
         default_note_energy: None,
         scaffolding_override: None,
         sharing_policy: None,
+        watch_enabled: true,
     };
     state.neo4j.create_project(&api_project).await.unwrap();
 
@@ -450,6 +452,7 @@ async fn test_resource_project_links() {
         default_note_energy: None,
         scaffolding_override: None,
         sharing_policy: None,
+        watch_enabled: true,
     };
     state.neo4j.create_project(&frontend_project).await.unwrap();
 
@@ -694,6 +697,7 @@ async fn test_component_project_mapping() {
         default_note_energy: None,
         scaffolding_override: None,
         sharing_policy: None,
+        watch_enabled: true,
     };
     state.neo4j.create_project(&project).await.unwrap();
 
@@ -1094,6 +1098,7 @@ async fn test_multiple_projects_in_workspace() {
             default_note_energy: None,
             scaffolding_override: None,
             sharing_policy: None,
+            watch_enabled: true,
         };
         state.neo4j.create_project(&project).await.unwrap();
         state
