@@ -34,6 +34,7 @@ pub enum SupportedLanguage {
     Scala,
     Zig,
     Hcl,
+    Dart,
 }
 
 impl SupportedLanguage {
@@ -57,6 +58,7 @@ impl SupportedLanguage {
             "scala" | "sc" => Some(Self::Scala),
             "zig" => Some(Self::Zig),
             "tf" | "tfvars" => Some(Self::Hcl),
+            "dart" => Some(Self::Dart),
             _ => None,
         }
     }
@@ -80,6 +82,7 @@ impl SupportedLanguage {
             Self::Scala => tree_sitter_scala::LANGUAGE.into(),
             Self::Zig => tree_sitter_zig::LANGUAGE.into(),
             Self::Hcl => tree_sitter_hcl::LANGUAGE.into(),
+            Self::Dart => tree_sitter_dart::LANGUAGE.into(),
         }
     }
 
@@ -102,6 +105,7 @@ impl SupportedLanguage {
             Self::Scala => "scala",
             Self::Zig => "zig",
             Self::Hcl => "hcl",
+            Self::Dart => "dart",
         }
     }
 
@@ -124,6 +128,7 @@ impl SupportedLanguage {
             Self::Scala,
             Self::Zig,
             Self::Hcl,
+            Self::Dart,
         ]
     }
 }
@@ -239,6 +244,9 @@ impl CodeParser {
             }
             SupportedLanguage::Hcl => {
                 languages::hcl::extract(&root, content, &path_str, &mut parsed)?;
+            }
+            SupportedLanguage::Dart => {
+                languages::dart::extract(&root, content, &path_str, &mut parsed)?;
             }
         }
 
@@ -598,12 +606,13 @@ mod tests {
         assert_eq!(SupportedLanguage::Scala.as_str(), "scala");
         assert_eq!(SupportedLanguage::Zig.as_str(), "zig");
         assert_eq!(SupportedLanguage::Hcl.as_str(), "hcl");
+        assert_eq!(SupportedLanguage::Dart.as_str(), "dart");
     }
 
     #[test]
-    fn test_all_returns_16_languages() {
+    fn test_all_returns_17_languages() {
         let all = SupportedLanguage::all();
-        assert_eq!(all.len(), 16);
+        assert_eq!(all.len(), 17);
     }
 
     #[test]
@@ -625,6 +634,7 @@ mod tests {
         assert!(all.contains(&SupportedLanguage::Scala));
         assert!(all.contains(&SupportedLanguage::Zig));
         assert!(all.contains(&SupportedLanguage::Hcl));
+        assert!(all.contains(&SupportedLanguage::Dart));
     }
 
     // =========================================================================

@@ -1,0 +1,14 @@
+[package]
+name = "tree-sitter-dart"
+version = "0.1.0"
+edition = "2021"
+description = "Dart grammar for tree-sitter (ABI 14 compatible)"
+license = "MIT"
+# Built from nielsenko/tree-sitter-dart v0.1.0
+# Grammar ABI version patched to 14, compatible with tree-sitter 0.24.x
+
+[dependencies]
+tree-sitter-language = "0.1"
+
+[build-dependencies]
+cc = "1.0"
