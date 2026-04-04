@@ -344,6 +344,63 @@ pub async fn delete_session(
 }
 
 // ============================================================================
+// Update session (rename)
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateSessionRequest {
+    pub title: Option<String>,
+}
+
+/// PATCH /api/chat/sessions/{id} — Update a session (currently: rename)
+pub async fn update_session(
+    State(state): State<OrchestratorState>,
+    Path(session_id): Path<Uuid>,
+    Json(request): Json<UpdateSessionRequest>,
+) -> Result<Json<ChatSession>, AppError> {
+    let updated = state
+        .orchestrator
+        .neo4j()
+        .update_chat_session(session_id, None, request.title, None, None, None, None)
+        .await
+        .map_err(AppError::Internal)?
+        .ok_or_else(|| AppError::NotFound(format!("Session {} not found", session_id)))?;
+
+    // Emit CRUD event for live refresh
+    state.event_bus.emit(
+        CrudEvent::new(
+            EntityType::ChatSession,
+            CrudAction::Updated,
+            session_id.to_string(),
+        )
+        .with_payload(serde_json::json!({
+            "title": updated.title,
+        })),
+    );
+
+    Ok(Json(ChatSession {
+        id: updated.id.to_string(),
+        cli_session_id: updated.cli_session_id,
+        project_slug: updated.project_slug,
+        workspace_slug: updated.workspace_slug,
+        cwd: updated.cwd,
+        title: updated.title,
+        model: updated.model,
+        created_at: updated.created_at.to_rfc3339(),
+        updated_at: updated.updated_at.to_rfc3339(),
+        message_count: updated.message_count,
+        total_cost_usd: updated.total_cost_usd,
+        conversation_id: updated.conversation_id,
+        preview: updated.preview,
+        permission_mode: updated.permission_mode,
+        add_dirs: updated.add_dirs,
+        spawned_by: updated
+            .spawned_by
+            .and_then(|sb| serde_json::from_str(&sb).ok()),
+    }))
+}
+
+// ============================================================================
 // Search messages across sessions
 // ============================================================================
 
