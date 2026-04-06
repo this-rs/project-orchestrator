@@ -28,7 +28,7 @@ pub mod security;
 
 // Re-exports
 pub use circuit_breaker::CircuitBreaker;
-pub use client::{McpClient, McpTransportConfig};
+pub use client::{create_client, McpClient, McpTransportConfig, StreamableHttpMcpClient};
 pub use discovery::{DiscoveredTool, InferredCategory, ToolIntrospector, ToolProfile};
 pub use prober::ToolProber;
 pub use registry::{ConnectionStatus, McpServerConnection, McpServerRegistry, ServerStats};
@@ -82,7 +82,7 @@ pub struct ExternalToolInfo {
 }
 
 /// MCP protocol version we speak as a client.
-pub const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
+pub const MCP_PROTOCOL_VERSION: &str = "2025-03-26";
 
 /// Our client info sent during initialize handshake.
 pub fn client_info() -> serde_json::Value {
@@ -196,7 +196,7 @@ mod tests {
 
     #[test]
     fn test_mcp_protocol_version_constant() {
-        assert_eq!(MCP_PROTOCOL_VERSION, "2024-11-05");
+        assert_eq!(MCP_PROTOCOL_VERSION, "2025-03-26");
     }
 
     #[test]
