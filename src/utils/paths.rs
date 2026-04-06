@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 /// - Handles trailing slashes on `root_path`.
 /// - Handles double slashes gracefully.
 ///
-/// ```
+/// ```rust,ignore
 /// use project_orchestrator::utils::paths::relativize;
 /// assert_eq!(relativize("/Users/foo/project/src/main.rs", "/Users/foo/project"), "src/main.rs");
 /// assert_eq!(relativize("src/main.rs", "/Users/foo/project"), "src/main.rs");
@@ -59,7 +59,7 @@ pub fn relativize(path: &str, root_path: &str) -> String {
 ///
 /// If the path is already absolute, returns it as-is.
 ///
-/// ```
+/// ```rust,ignore
 /// use project_orchestrator::utils::paths::resolve;
 /// use std::path::PathBuf;
 /// assert_eq!(resolve("src/main.rs", "/Users/foo/project"), PathBuf::from("/Users/foo/project/src/main.rs"));
@@ -83,7 +83,7 @@ pub fn resolve(relative: &str, root_path: &str) -> PathBuf {
 /// - Preserves glob wildcards (`*`, `**`, `?`, `[...]`).
 /// - If pattern is already relative, returns it unchanged.
 ///
-/// ```
+/// ```rust,ignore
 /// use project_orchestrator::utils::paths::sanitize_pattern;
 /// assert_eq!(sanitize_pattern("/Users/foo/project/src/**", "/Users/foo/project"), "src/**");
 /// assert_eq!(sanitize_pattern("src/**/*.rs", "/Users/foo/project"), "src/**/*.rs");

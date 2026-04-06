@@ -196,6 +196,7 @@ vendored-openssl = ["dep:openssl-sys"]
 [dev-dependencies]
 tokio-test = "0.4"
 tempfile = "3.14"
+wiremock = "0.6.5"
 
 [[bin]]
 name = "orchestrator"
