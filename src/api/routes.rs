@@ -491,6 +491,11 @@ fn protected_routes() -> Router<OrchestratorState> {
                 .patch(handlers::update_lifecycle_hook)
                 .delete(handlers::delete_lifecycle_hook),
         )
+        // Plan ↔ Session linking
+        .route(
+            "/api/plans/{plan_id}/sessions",
+            get(chat_handlers::get_plan_sessions),
+        )
         // Tasks (global listing)
         .route("/api/tasks", get(handlers::list_all_tasks))
         // Tasks (plan-scoped)
@@ -500,6 +505,11 @@ fn protected_routes() -> Router<OrchestratorState> {
             get(handlers::get_task)
                 .patch(handlers::update_task)
                 .delete(handlers::delete_task),
+        )
+        // Task ↔ Session linking
+        .route(
+            "/api/tasks/{task_id}/sessions",
+            get(chat_handlers::get_task_sessions),
         )
         // Task dependencies
         .route(
@@ -1649,6 +1659,11 @@ fn protected_routes() -> Router<OrchestratorState> {
         .route(
             "/api/chat/sessions/{id}/discussed",
             post(chat_handlers::add_discussed).get(chat_handlers::get_session_entities),
+        )
+        // ASSOCIATED_WITH relation (ChatSession → Plan/Task)
+        .route(
+            "/api/chat/sessions/{id}/associate",
+            post(chat_handlers::associate_session),
         )
         // Chat permission config (runtime GET/PUT)
         .route(

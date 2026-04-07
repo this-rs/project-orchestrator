@@ -4,6 +4,7 @@ use super::client::Neo4jClient;
 use super::models::*;
 use anyhow::Result;
 use neo4rs::query;
+use std::collections::HashMap;
 use uuid::Uuid;
 
 impl Neo4jClient {
@@ -1337,5 +1338,418 @@ impl Neo4jClient {
         }
 
         Ok((sessions, discussed))
+    }
+
+    // ========================================================================
+    // Chat ↔ Plan/Task/RFC linking
+    // ========================================================================
+
+    /// Create or merge an ASSOCIATED_WITH relation between a ChatSession and a Plan or Task.
+    pub async fn create_associated_with(
+        &self,
+        session_id: Uuid,
+        entity_type: &str,
+        entity_id: Uuid,
+        source: &str,
+    ) -> Result<bool> {
+        let label = match entity_type {
+            "Plan" => "Plan",
+            "Task" => "Task",
+            _ => anyhow::bail!("Invalid entity_type for ASSOCIATED_WITH: {}", entity_type),
+        };
+        let cypher = format!(
+            r#"
+            MATCH (s:ChatSession {{id: $session_id}})
+            MATCH (e:{label} {{id: $entity_id}})
+            MERGE (s)-[r:ASSOCIATED_WITH]->(e)
+            ON CREATE SET r.source = $source, r.created_at = datetime()
+            RETURN true AS created
+            "#,
+        );
+        let q = query(&cypher)
+            .param("session_id", session_id.to_string())
+            .param("entity_id", entity_id.to_string())
+            .param("source", source);
+        let mut result = self.graph.execute(q).await?;
+        Ok(result.next().await?.is_some())
+    }
+
+    /// Get all plans, tasks, and RFCs linked to a session (via both AgentExecution and ASSOCIATED_WITH).
+    pub async fn get_session_links(&self, session_id: Uuid) -> Result<LinkedSessionInfo> {
+        let q = query(
+            r#"
+            MATCH (s:ChatSession {id: $session_id})
+
+            // Path A: runner tasks via AgentExecution
+            OPTIONAL MATCH (ae:AgentExecution {session_id: $session_id})-[:EXECUTES]->(t_runner:Task)
+            OPTIONAL MATCH (p_runner:Plan)-[:HAS_TASK]->(t_runner)
+
+            // Path B: ASSOCIATED_WITH tasks
+            OPTIONAL MATCH (s)-[aw_t:ASSOCIATED_WITH]->(t_assoc:Task)
+            OPTIONAL MATCH (p_assoc:Plan)-[:HAS_TASK]->(t_assoc)
+
+            // Path C: ASSOCIATED_WITH plans
+            OPTIONAL MATCH (s)-[aw_p:ASSOCIATED_WITH]->(p_direct:Plan)
+
+            WITH collect(DISTINCT {id: t_runner.id, title: t_runner.title, source: 'runner'}) +
+                 collect(DISTINCT {id: t_assoc.id, title: t_assoc.title, source: COALESCE(aw_t.source, 'manual')}) AS raw_tasks,
+                 collect(DISTINCT {id: p_runner.id, title: p_runner.title, source: 'runner'}) +
+                 collect(DISTINCT {id: p_assoc.id, title: p_assoc.title, source: 'runner'}) +
+                 collect(DISTINCT {id: p_direct.id, title: p_direct.title, source: COALESCE(aw_p.source, 'manual')}) AS raw_plans
+
+            WITH [t IN raw_tasks WHERE t.id IS NOT NULL | t] AS tasks,
+                 [p IN raw_plans WHERE p.id IS NOT NULL | p] AS plans
+
+            // Get RFCs for these plans
+            UNWIND CASE WHEN size(plans) = 0 THEN [null] ELSE plans END AS plan_item
+            OPTIONAL MATCH (rfc:Note {note_type: 'rfc'})-[:LINKED_TO]->(pn:Plan)
+            WHERE plan_item IS NOT NULL AND pn.id = plan_item.id
+
+            WITH tasks, plans,
+                 collect(DISTINCT {id: rfc.id, content: rfc.content}) AS raw_rfcs
+
+            RETURN tasks,
+                   plans,
+                   [r IN raw_rfcs WHERE r.id IS NOT NULL | r] AS rfcs
+            "#,
+        )
+        .param("session_id", session_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut info = LinkedSessionInfo::default();
+
+        if let Some(row) = result.next().await? {
+            // Parse tasks
+            if let Ok(tasks_val) = row.get::<serde_json::Value>("tasks") {
+                if let Some(arr) = tasks_val.as_array() {
+                    for t in arr {
+                        if let (Some(id_str), Some(title)) = (
+                            t.get("id").and_then(|v| v.as_str()),
+                            t.get("title").and_then(|v| v.as_str()),
+                        ) {
+                            if let Ok(id) = id_str.parse::<Uuid>() {
+                                let source = t
+                                    .get("source")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("manual")
+                                    .to_string();
+                                info.linked_tasks.push(LinkedTaskInfo {
+                                    id,
+                                    title: title.to_string(),
+                                    source,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            // Parse plans
+            if let Ok(plans_val) = row.get::<serde_json::Value>("plans") {
+                if let Some(arr) = plans_val.as_array() {
+                    for p in arr {
+                        if let (Some(id_str), Some(title)) = (
+                            p.get("id").and_then(|v| v.as_str()),
+                            p.get("title").and_then(|v| v.as_str()),
+                        ) {
+                            if let Ok(id) = id_str.parse::<Uuid>() {
+                                let source = p
+                                    .get("source")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("manual")
+                                    .to_string();
+                                info.linked_plans.push(LinkedPlanInfo {
+                                    id,
+                                    title: title.to_string(),
+                                    source,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            // Parse RFCs
+            if let Ok(rfcs_val) = row.get::<serde_json::Value>("rfcs") {
+                if let Some(arr) = rfcs_val.as_array() {
+                    for r in arr {
+                        if let (Some(id_str), Some(content)) = (
+                            r.get("id").and_then(|v| v.as_str()),
+                            r.get("content").and_then(|v| v.as_str()),
+                        ) {
+                            if let Ok(id) = id_str.parse::<Uuid>() {
+                                let title = content
+                                    .lines()
+                                    .find(|l| !l.trim().is_empty())
+                                    .unwrap_or("RFC")
+                                    .trim_start_matches('#')
+                                    .trim()
+                                    .chars()
+                                    .take(100)
+                                    .collect::<String>();
+                                info.linked_rfcs.push(LinkedRfcInfo { id, title });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(info)
+    }
+
+    /// Get all sessions linked to a plan (via runner execution, direct ASSOCIATED_WITH, or task association).
+    pub async fn get_sessions_for_plan(&self, plan_id: Uuid) -> Result<Vec<SessionWithLinks>> {
+        let q = query(
+            r#"
+            // Path 1: AgentExecution sessions
+            OPTIONAL MATCH (ae:AgentExecution)-[:EXECUTES]->(t:Task)<-[:HAS_TASK]-(p:Plan {id: $plan_id})
+            WHERE ae.session_id IS NOT NULL
+            WITH collect(DISTINCT {sid: ae.session_id, source: 'runner'}) AS runner_sids
+
+            // Path 2: ASSOCIATED_WITH → Plan
+            OPTIONAL MATCH (s2:ChatSession)-[r2:ASSOCIATED_WITH]->(p2:Plan {id: $plan_id})
+            WITH runner_sids, collect(DISTINCT {sid: s2.id, source: COALESCE(r2.source, 'manual')}) AS direct_sids
+
+            // Path 3: ASSOCIATED_WITH → Task → Plan
+            OPTIONAL MATCH (s3:ChatSession)-[r3:ASSOCIATED_WITH]->(t3:Task)<-[:HAS_TASK]-(p3:Plan {id: $plan_id})
+            WITH runner_sids, direct_sids, collect(DISTINCT {sid: s3.id, source: COALESCE(r3.source, 'manual')}) AS task_sids
+            WITH runner_sids + direct_sids + task_sids AS all_sids
+
+            UNWIND all_sids AS entry
+            WITH DISTINCT entry.sid AS sid, entry.source AS source
+            WHERE sid IS NOT NULL
+
+            MATCH (s:ChatSession {id: sid})
+            RETURN s, source
+            ORDER BY s.created_at DESC
+            "#,
+        )
+        .param("plan_id", plan_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut sessions = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            if let Ok(node) = row.get::<neo4rs::Node>("s") {
+                if let Ok(session) = Self::parse_chat_session_node(&node) {
+                    let source = row
+                        .get::<String>("source")
+                        .unwrap_or_else(|_| "unknown".to_string());
+                    sessions.push(SessionWithLinks {
+                        session,
+                        links: LinkedSessionInfo::default(),
+                        source,
+                    });
+                }
+            }
+        }
+        Ok(sessions)
+    }
+
+    /// Get all sessions linked to a task.
+    pub async fn get_sessions_for_task(&self, task_id: Uuid) -> Result<Vec<SessionWithLinks>> {
+        let q = query(
+            r#"
+            // Path 1: AgentExecution
+            OPTIONAL MATCH (ae:AgentExecution)-[:EXECUTES]->(t:Task {id: $task_id})
+            WHERE ae.session_id IS NOT NULL
+            WITH collect(DISTINCT {sid: ae.session_id, source: 'runner'}) AS runner_sids
+
+            // Path 2: ASSOCIATED_WITH
+            OPTIONAL MATCH (s2:ChatSession)-[r2:ASSOCIATED_WITH]->(t2:Task {id: $task_id})
+            WITH runner_sids, collect(DISTINCT {sid: s2.id, source: COALESCE(r2.source, 'manual')}) AS assoc_sids
+            WITH runner_sids + assoc_sids AS all_sids
+
+            UNWIND all_sids AS entry
+            WITH DISTINCT entry.sid AS sid, entry.source AS source
+            WHERE sid IS NOT NULL
+
+            MATCH (s:ChatSession {id: sid})
+            RETURN s, source
+            ORDER BY s.created_at DESC
+            "#,
+        )
+        .param("task_id", task_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut sessions = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            if let Ok(node) = row.get::<neo4rs::Node>("s") {
+                if let Ok(session) = Self::parse_chat_session_node(&node) {
+                    let source = row
+                        .get::<String>("source")
+                        .unwrap_or_else(|_| "unknown".to_string());
+                    sessions.push(SessionWithLinks {
+                        session,
+                        links: LinkedSessionInfo::default(),
+                        source,
+                    });
+                }
+            }
+        }
+        Ok(sessions)
+    }
+
+    /// Batch version of get_session_links for multiple sessions.
+    pub async fn get_session_links_batch(
+        &self,
+        session_ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, LinkedSessionInfo>> {
+        if session_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let sid_strings: Vec<String> = session_ids.iter().map(|id| id.to_string()).collect();
+
+        let q = query(
+            r#"
+            UNWIND $session_ids AS sid
+            MATCH (s:ChatSession {id: sid})
+
+            // Path A: runner tasks via AgentExecution
+            OPTIONAL MATCH (ae:AgentExecution {session_id: sid})-[:EXECUTES]->(t_runner:Task)
+            OPTIONAL MATCH (p_runner:Plan)-[:HAS_TASK]->(t_runner)
+
+            // Path B: ASSOCIATED_WITH tasks
+            OPTIONAL MATCH (s)-[aw_t:ASSOCIATED_WITH]->(t_assoc:Task)
+            OPTIONAL MATCH (p_assoc:Plan)-[:HAS_TASK]->(t_assoc)
+
+            // Path C: ASSOCIATED_WITH plans
+            OPTIONAL MATCH (s)-[aw_p:ASSOCIATED_WITH]->(p_direct:Plan)
+
+            WITH sid,
+                 collect(DISTINCT {id: t_runner.id, title: t_runner.title, source: 'runner'}) +
+                 collect(DISTINCT {id: t_assoc.id, title: t_assoc.title, source: COALESCE(aw_t.source, 'manual')}) AS raw_tasks,
+                 collect(DISTINCT {id: p_runner.id, title: p_runner.title, source: 'runner'}) +
+                 collect(DISTINCT {id: p_assoc.id, title: p_assoc.title, source: 'runner'}) +
+                 collect(DISTINCT {id: p_direct.id, title: p_direct.title, source: COALESCE(aw_p.source, 'manual')}) AS raw_plans
+
+            WITH sid,
+                 [t IN raw_tasks WHERE t.id IS NOT NULL | t] AS tasks,
+                 [p IN raw_plans WHERE p.id IS NOT NULL | p] AS plans
+
+            // Get RFCs for these plans
+            UNWIND CASE WHEN size(plans) = 0 THEN [null] ELSE plans END AS plan_item
+            OPTIONAL MATCH (rfc:Note {note_type: 'rfc'})-[:LINKED_TO]->(pn:Plan)
+            WHERE plan_item IS NOT NULL AND pn.id = plan_item.id
+
+            WITH sid, tasks, plans,
+                 collect(DISTINCT {id: rfc.id, content: rfc.content}) AS raw_rfcs
+
+            RETURN sid,
+                   tasks,
+                   plans,
+                   [r IN raw_rfcs WHERE r.id IS NOT NULL | r] AS rfcs
+            "#,
+        )
+        .param("session_ids", sid_strings);
+
+        let mut result = self.graph.execute(q).await?;
+        let mut map = HashMap::new();
+
+        while let Some(row) = result.next().await? {
+            let sid_str: String = row.get("sid")?;
+            let sid: Uuid = match sid_str.parse() {
+                Ok(id) => id,
+                Err(_) => continue,
+            };
+
+            let mut info = LinkedSessionInfo::default();
+
+            // Parse tasks
+            if let Ok(tasks_val) = row.get::<serde_json::Value>("tasks") {
+                if let Some(arr) = tasks_val.as_array() {
+                    for t in arr {
+                        if let (Some(id_str), Some(title)) = (
+                            t.get("id").and_then(|v| v.as_str()),
+                            t.get("title").and_then(|v| v.as_str()),
+                        ) {
+                            if let Ok(id) = id_str.parse::<Uuid>() {
+                                let source = t
+                                    .get("source")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("manual")
+                                    .to_string();
+                                info.linked_tasks.push(LinkedTaskInfo {
+                                    id,
+                                    title: title.to_string(),
+                                    source,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            // Parse plans
+            if let Ok(plans_val) = row.get::<serde_json::Value>("plans") {
+                if let Some(arr) = plans_val.as_array() {
+                    for p in arr {
+                        if let (Some(id_str), Some(title)) = (
+                            p.get("id").and_then(|v| v.as_str()),
+                            p.get("title").and_then(|v| v.as_str()),
+                        ) {
+                            if let Ok(id) = id_str.parse::<Uuid>() {
+                                let source = p
+                                    .get("source")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("manual")
+                                    .to_string();
+                                info.linked_plans.push(LinkedPlanInfo {
+                                    id,
+                                    title: title.to_string(),
+                                    source,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            // Parse RFCs
+            if let Ok(rfcs_val) = row.get::<serde_json::Value>("rfcs") {
+                if let Some(arr) = rfcs_val.as_array() {
+                    for r in arr {
+                        if let (Some(id_str), Some(content)) = (
+                            r.get("id").and_then(|v| v.as_str()),
+                            r.get("content").and_then(|v| v.as_str()),
+                        ) {
+                            if let Ok(id) = id_str.parse::<Uuid>() {
+                                let title = content
+                                    .lines()
+                                    .find(|l| !l.trim().is_empty())
+                                    .unwrap_or("RFC")
+                                    .trim_start_matches('#')
+                                    .trim()
+                                    .chars()
+                                    .take(100)
+                                    .collect::<String>();
+                                info.linked_rfcs.push(LinkedRfcInfo { id, title });
+                            }
+                        }
+                    }
+                }
+            }
+
+            map.insert(sid, info);
+        }
+        Ok(map)
+    }
+
+    /// Get the plan_id for a task (via HAS_TASK relation).
+    pub async fn get_task_plan_id(&self, task_id: Uuid) -> Result<Option<Uuid>> {
+        let q = query(
+            r#"
+            MATCH (p:Plan)-[:HAS_TASK]->(t:Task {id: $task_id})
+            RETURN p.id AS plan_id
+            LIMIT 1
+            "#,
+        )
+        .param("task_id", task_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let pid_str: String = row.get("plan_id")?;
+            Ok(pid_str.parse::<Uuid>().ok())
+        } else {
+            Ok(None)
+        }
     }
 }

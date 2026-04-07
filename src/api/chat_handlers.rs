@@ -2,7 +2,10 @@
 
 use crate::api::handlers::{AppError, OrchestratorState};
 use crate::api::query::{PaginatedResponse, PaginationParams};
-use crate::chat::types::{ChatRequest, ChatSession, CreateSessionResponse, MessageSearchResult};
+use crate::chat::types::{
+    ChatLinkedPlan, ChatLinkedRfc, ChatLinkedTask, ChatRequest, ChatSession, CreateSessionResponse,
+    MessageSearchResult,
+};
 use crate::events::{CrudAction, CrudEvent, EntityType, EventEmitter};
 use axum::{
     extract::{Path, Query, State},
@@ -150,6 +153,12 @@ pub struct SessionsListQuery {
     pub project_slug: Option<String>,
     #[serde(default)]
     pub workspace_slug: Option<String>,
+    /// Filter by plan ID — returns sessions linked to this plan (both runner + manual).
+    #[serde(default)]
+    pub plan_id: Option<Uuid>,
+    /// Filter by task ID — returns sessions linked to this task.
+    #[serde(default)]
+    pub task_id: Option<Uuid>,
     /// Include detached sessions (spawned by runner/sub-agent). Defaults to false.
     #[serde(default)]
     pub include_detached: bool,
@@ -157,16 +166,131 @@ pub struct SessionsListQuery {
     pub pagination: PaginationParams,
 }
 
+/// Convert a ChatSessionNode to a ChatSession API response (without links).
+fn session_node_to_response(s: crate::neo4j::models::ChatSessionNode) -> ChatSession {
+    ChatSession {
+        id: s.id.to_string(),
+        cli_session_id: s.cli_session_id,
+        project_slug: s.project_slug,
+        workspace_slug: s.workspace_slug,
+        cwd: s.cwd,
+        title: s.title,
+        model: s.model,
+        created_at: s.created_at.to_rfc3339(),
+        updated_at: s.updated_at.to_rfc3339(),
+        message_count: s.message_count,
+        total_cost_usd: s.total_cost_usd,
+        conversation_id: s.conversation_id,
+        preview: s.preview,
+        permission_mode: s.permission_mode,
+        add_dirs: s.add_dirs,
+        spawned_by: s.spawned_by.and_then(|sb| serde_json::from_str(&sb).ok()),
+        linked_plans: Vec::new(),
+        linked_tasks: Vec::new(),
+        linked_rfcs: Vec::new(),
+    }
+}
+
+/// Enrich a ChatSession with linked plans/tasks/RFCs from a LinkedSessionInfo.
+fn enrich_session_with_links(
+    session: &mut ChatSession,
+    links: &crate::neo4j::models::LinkedSessionInfo,
+) {
+    session.linked_plans = links
+        .linked_plans
+        .iter()
+        .map(|p| ChatLinkedPlan {
+            id: p.id.to_string(),
+            title: p.title.clone(),
+            source: p.source.clone(),
+        })
+        .collect();
+    session.linked_tasks = links
+        .linked_tasks
+        .iter()
+        .map(|t| ChatLinkedTask {
+            id: t.id.to_string(),
+            title: t.title.clone(),
+            source: t.source.clone(),
+        })
+        .collect();
+    session.linked_rfcs = links
+        .linked_rfcs
+        .iter()
+        .map(|r| ChatLinkedRfc {
+            id: r.id.to_string(),
+            title: r.title.clone(),
+        })
+        .collect();
+}
+
 /// GET /api/chat/sessions — List chat sessions
+///
+/// Supports filtering by `plan_id` or `task_id` (returns linked sessions via dual-path query).
+/// When neither is provided, falls back to the standard project_slug/workspace_slug filter.
 pub async fn list_sessions(
     State(state): State<OrchestratorState>,
     Query(query): Query<SessionsListQuery>,
 ) -> Result<Json<PaginatedResponse<ChatSession>>, AppError> {
     query.pagination.validate().map_err(AppError::BadRequest)?;
 
-    let (sessions, total) = state
-        .orchestrator
-        .neo4j()
+    let neo4j = state.orchestrator.neo4j();
+
+    // If plan_id or task_id is provided, use the specialized query
+    if let Some(plan_id) = query.plan_id {
+        let sessions_with_links = neo4j
+            .get_sessions_for_plan(plan_id)
+            .await
+            .map_err(AppError::Internal)?;
+
+        let total = sessions_with_links.len();
+        let items: Vec<ChatSession> = sessions_with_links
+            .into_iter()
+            .skip(query.pagination.offset)
+            .take(query.pagination.validated_limit())
+            .map(|sw| {
+                let mut session = session_node_to_response(sw.session);
+                enrich_session_with_links(&mut session, &sw.links);
+                session
+            })
+            .collect();
+
+        return Ok(Json(PaginatedResponse::new(
+            items,
+            total,
+            query.pagination.validated_limit(),
+            query.pagination.offset,
+        )));
+    }
+
+    if let Some(task_id) = query.task_id {
+        let sessions_with_links = neo4j
+            .get_sessions_for_task(task_id)
+            .await
+            .map_err(AppError::Internal)?;
+
+        let total = sessions_with_links.len();
+        let items: Vec<ChatSession> = sessions_with_links
+            .into_iter()
+            .skip(query.pagination.offset)
+            .take(query.pagination.validated_limit())
+            .map(|sw| {
+                let mut session = session_node_to_response(sw.session);
+                enrich_session_with_links(&mut session, &sw.links);
+                session
+            })
+            .collect();
+
+        return Ok(Json(PaginatedResponse::new(
+            items,
+            total,
+            query.pagination.validated_limit(),
+            query.pagination.offset,
+        )));
+    }
+
+    // Standard list with optional project_slug/workspace_slug filter
+    let (sessions, total) = neo4j
         .list_chat_sessions(
             query.project_slug.as_deref(),
             query.workspace_slug.as_deref(),
@@ -177,26 +301,22 @@ pub async fn list_sessions(
         .await
         .map_err(AppError::Internal)?;
 
-    // Convert ChatSessionNode → ChatSession
+    // Batch-enrich with links
+    let session_ids: Vec<Uuid> = sessions.iter().map(|s| s.id).collect();
+    let links_map = neo4j
+        .get_session_links_batch(&session_ids)
+        .await
+        .unwrap_or_default();
+
     let items: Vec<ChatSession> = sessions
         .into_iter()
-        .map(|s| ChatSession {
-            id: s.id.to_string(),
-            cli_session_id: s.cli_session_id,
-            project_slug: s.project_slug,
-            workspace_slug: s.workspace_slug,
-            cwd: s.cwd,
-            title: s.title,
-            model: s.model,
-            created_at: s.created_at.to_rfc3339(),
-            updated_at: s.updated_at.to_rfc3339(),
-            message_count: s.message_count,
-            total_cost_usd: s.total_cost_usd,
-            conversation_id: s.conversation_id,
-            preview: s.preview,
-            permission_mode: s.permission_mode,
-            add_dirs: s.add_dirs,
-            spawned_by: s.spawned_by.and_then(|sb| serde_json::from_str(&sb).ok()),
+        .map(|s| {
+            let sid = s.id;
+            let mut session = session_node_to_response(s);
+            if let Some(links) = links_map.get(&sid) {
+                enrich_session_with_links(&mut session, links);
+            }
+            session
         })
         .collect();
 
@@ -208,39 +328,27 @@ pub async fn list_sessions(
     )))
 }
 
-/// GET /api/chat/sessions/{id} — Get session details
+/// GET /api/chat/sessions/{id} — Get session details (enriched with linked plans/tasks/RFCs)
 pub async fn get_session(
     State(state): State<OrchestratorState>,
     Path(session_id): Path<Uuid>,
 ) -> Result<Json<ChatSession>, AppError> {
-    let node = state
-        .orchestrator
-        .neo4j()
+    let neo4j = state.orchestrator.neo4j();
+
+    let node = neo4j
         .get_chat_session(session_id)
         .await
         .map_err(AppError::Internal)?
         .ok_or_else(|| AppError::NotFound(format!("Session {} not found", session_id)))?;
 
-    Ok(Json(ChatSession {
-        id: node.id.to_string(),
-        cli_session_id: node.cli_session_id,
-        project_slug: node.project_slug,
-        workspace_slug: node.workspace_slug,
-        cwd: node.cwd,
-        title: node.title,
-        model: node.model,
-        created_at: node.created_at.to_rfc3339(),
-        updated_at: node.updated_at.to_rfc3339(),
-        message_count: node.message_count,
-        total_cost_usd: node.total_cost_usd,
-        conversation_id: node.conversation_id,
-        preview: node.preview,
-        permission_mode: node.permission_mode,
-        add_dirs: node.add_dirs,
-        spawned_by: node
-            .spawned_by
-            .and_then(|sb| serde_json::from_str(&sb).ok()),
-    }))
+    let mut session = session_node_to_response(node);
+
+    // Enrich with linked entities (best-effort — don't fail if enrichment fails)
+    if let Ok(links) = neo4j.get_session_links(session_id).await {
+        enrich_session_with_links(&mut session, &links);
+    }
+
+    Ok(Json(session))
 }
 
 /// GET /api/chat/sessions/{id}/children — Get child sessions spawned by this session
@@ -255,27 +363,7 @@ pub async fn get_session_children(
         .await
         .map_err(AppError::Internal)?;
 
-    let items: Vec<ChatSession> = children
-        .into_iter()
-        .map(|s| ChatSession {
-            id: s.id.to_string(),
-            cli_session_id: s.cli_session_id,
-            project_slug: s.project_slug,
-            workspace_slug: s.workspace_slug,
-            cwd: s.cwd,
-            title: s.title,
-            model: s.model,
-            created_at: s.created_at.to_rfc3339(),
-            updated_at: s.updated_at.to_rfc3339(),
-            message_count: s.message_count,
-            total_cost_usd: s.total_cost_usd,
-            conversation_id: s.conversation_id,
-            preview: s.preview,
-            permission_mode: s.permission_mode,
-            add_dirs: s.add_dirs,
-            spawned_by: s.spawned_by.and_then(|sb| serde_json::from_str(&sb).ok()),
-        })
-        .collect();
+    let items: Vec<ChatSession> = children.into_iter().map(session_node_to_response).collect();
 
     Ok(Json(items))
 }
@@ -397,6 +485,9 @@ pub async fn update_session(
         spawned_by: updated
             .spawned_by
             .and_then(|sb| serde_json::from_str(&sb).ok()),
+        linked_plans: Vec::new(),
+        linked_tasks: Vec::new(),
+        linked_rfcs: Vec::new(),
     }))
 }
 
@@ -800,6 +891,83 @@ pub struct SessionEntitiesQuery {
     /// Optional project_id to scope results (security: no cross-project leaks)
     #[serde(default)]
     pub project_id: Option<String>,
+}
+
+// ============================================================================
+// Plan ↔ Session linking
+// ============================================================================
+
+/// GET /api/plans/{id}/sessions — Get all chat sessions linked to a plan
+pub async fn get_plan_sessions(
+    State(state): State<OrchestratorState>,
+    Path(plan_id): Path<Uuid>,
+) -> Result<Json<Vec<crate::neo4j::models::SessionWithLinks>>, AppError> {
+    let sessions = state
+        .orchestrator
+        .neo4j()
+        .get_sessions_for_plan(plan_id)
+        .await
+        .map_err(AppError::Internal)?;
+    Ok(Json(sessions))
+}
+
+/// GET /api/tasks/{id}/sessions — Get all chat sessions linked to a task
+pub async fn get_task_sessions(
+    State(state): State<OrchestratorState>,
+    Path(task_id): Path<Uuid>,
+) -> Result<Json<Vec<crate::neo4j::models::SessionWithLinks>>, AppError> {
+    let sessions = state
+        .orchestrator
+        .neo4j()
+        .get_sessions_for_task(task_id)
+        .await
+        .map_err(AppError::Internal)?;
+    Ok(Json(sessions))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AssociateSessionRequest {
+    pub entity_type: String,
+    pub entity_id: Uuid,
+    #[serde(default = "default_associate_source")]
+    pub source: String,
+}
+
+fn default_associate_source() -> String {
+    "manual".to_string()
+}
+
+/// POST /api/chat/sessions/{id}/associate — Create ASSOCIATED_WITH relation
+pub async fn associate_session(
+    State(state): State<OrchestratorState>,
+    Path(session_id): Path<Uuid>,
+    Json(body): Json<AssociateSessionRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    // Validate entity_type
+    match body.entity_type.as_str() {
+        "Plan" | "Task" => {}
+        other => {
+            return Err(AppError::BadRequest(format!(
+                "Invalid entity_type '{}', must be 'Plan' or 'Task'",
+                other
+            )));
+        }
+    }
+
+    let created = state
+        .orchestrator
+        .neo4j()
+        .create_associated_with(session_id, &body.entity_type, body.entity_id, &body.source)
+        .await
+        .map_err(AppError::Internal)?;
+
+    Ok(Json(serde_json::json!({
+        "created": created,
+        "session_id": session_id,
+        "entity_type": body.entity_type,
+        "entity_id": body.entity_id,
+        "source": body.source
+    })))
 }
 
 #[cfg(test)]

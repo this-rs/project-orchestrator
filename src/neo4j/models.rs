@@ -185,6 +185,47 @@ pub struct DiscussedEntity {
 }
 
 // ============================================================================
+// Chat ↔ Plan/Task/RFC linking
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LinkedPlanInfo {
+    pub id: Uuid,
+    pub title: String,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LinkedTaskInfo {
+    pub id: Uuid,
+    pub title: String,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LinkedRfcInfo {
+    pub id: Uuid,
+    pub title: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LinkedSessionInfo {
+    #[serde(default)]
+    pub linked_plans: Vec<LinkedPlanInfo>,
+    #[serde(default)]
+    pub linked_tasks: Vec<LinkedTaskInfo>,
+    #[serde(default)]
+    pub linked_rfcs: Vec<LinkedRfcInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionWithLinks {
+    pub session: ChatSessionNode,
+    pub links: LinkedSessionInfo,
+    pub source: String,
+}
+
+// ============================================================================
 // Graph visualization — PM layer lightweight structs
 // ============================================================================
 
