@@ -979,8 +979,8 @@ mod tests {
             input_schema: json!({}),
         }];
 
-        let discovered = introspector.introspect("grafeo", &tools).await;
-        assert_eq!(discovered[0].fqn, "grafeo::run_cypher");
+        let discovered = introspector.introspect("obrain", &tools).await;
+        assert_eq!(discovered[0].fqn, "obrain::run_cypher");
     }
 
     #[tokio::test]

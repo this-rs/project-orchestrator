@@ -8,7 +8,7 @@
 //!
 //! ```text
 //! McpServerRegistry (Arc<RwLock<>>)
-//!   ├── server "grafeo-shared"
+//!   ├── server "obrain-shared"
 //!   │     ├── transport: StreamableHttp { url }
 //!   │     ├── client: Box<dyn McpClient>
 //!   │     ├── circuit_breaker: CircuitBreaker
@@ -36,7 +36,7 @@ pub use security::{McpSecurityPolicy, PolicyViolation, RateLimiter, SecurityEnfo
 
 use serde::{Deserialize, Serialize};
 
-/// Unique identifier for a connected MCP server (e.g. "grafeo-shared", "github").
+/// Unique identifier for a connected MCP server (e.g. "obrain-shared", "github").
 pub type ServerId = String;
 
 /// Fully-qualified tool name: "server_id::tool_name".
@@ -129,7 +129,7 @@ mod tests {
     fn test_external_tool_info_serde_roundtrip() {
         let info = ExternalToolInfo {
             name: "run_cypher".to_string(),
-            fqn: "grafeo::run_cypher".to_string(),
+            fqn: "obrain::run_cypher".to_string(),
             description: "Execute a Cypher query".to_string(),
             input_schema: serde_json::json!({"type": "object", "properties": {"query": {"type": "string"}}}),
         };
@@ -138,7 +138,7 @@ mod tests {
         let roundtrip: ExternalToolInfo = serde_json::from_str(&json).unwrap();
 
         assert_eq!(roundtrip.name, "run_cypher");
-        assert_eq!(roundtrip.fqn, "grafeo::run_cypher");
+        assert_eq!(roundtrip.fqn, "obrain::run_cypher");
         assert_eq!(roundtrip.description, "Execute a Cypher query");
         assert_eq!(roundtrip.input_schema["type"], "object");
     }

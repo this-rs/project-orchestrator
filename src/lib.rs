@@ -130,7 +130,7 @@ pub struct McpFederationConfig {
 /// A pre-configured MCP server to connect to on startup.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServerPresetConfig {
-    /// Unique server identifier (e.g., "grafeo", "github").
+    /// Unique server identifier (e.g., "obrain", "github").
     pub id: String,
     /// Human-readable display name (optional, defaults to id).
     pub display_name: Option<String>,

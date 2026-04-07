@@ -960,17 +960,17 @@ mod tests {
     #[test]
     fn test_transport_config_serde() {
         let config = McpTransportConfig {
-            server_id: "grafeo".to_string(),
-            display_name: Some("GrafeoDB".to_string()),
+            server_id: "obrain".to_string(),
+            display_name: Some("ObrainDB".to_string()),
             transport: McpTransport::StreamableHttp {
-                url: "https://grafeo.example.com/mcp".to_string(),
+                url: "https://obrain.example.com/mcp".to_string(),
                 headers: HashMap::new(),
             },
         };
         let json = serde_json::to_string(&config).unwrap();
         assert!(json.contains("streamable_http"));
         let roundtrip: McpTransportConfig = serde_json::from_str(&json).unwrap();
-        assert_eq!(roundtrip.server_id, "grafeo");
+        assert_eq!(roundtrip.server_id, "obrain");
     }
 
     #[test]

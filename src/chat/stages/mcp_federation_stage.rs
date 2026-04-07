@@ -214,8 +214,8 @@ mod tests {
     async fn test_connected_server_produces_section() {
         let mut reg = McpServerRegistry::new();
         let conn = McpServerConnection {
-            id: "grafeo".to_string(),
-            display_name: "Grafeo".to_string(),
+            id: "obrain".to_string(),
+            display_name: "Obrain".to_string(),
             transport: McpTransport::Sse {
                 url: "http://mock:8080/sse".to_string(),
                 headers: Default::default(),
@@ -223,14 +223,14 @@ mod tests {
             status: ConnectionStatus::Connected,
             client: Box::new(DummyClient),
             discovered_tools: vec![
-                make_discovered_tool("query", "grafeo"),
-                make_discovered_tool("mutate", "grafeo"),
+                make_discovered_tool("query", "obrain"),
+                make_discovered_tool("mutate", "obrain"),
             ],
             circuit_breaker: CircuitBreaker::new(),
             stats: ServerStats::new(),
             connected_at: Utc::now(),
             server_protocol_version: Some("2025-03-26".to_string()),
-            server_name: Some("Grafeo Knowledge Graph".to_string()),
+            server_name: Some("Obrain Knowledge Graph".to_string()),
         };
         reg.insert_connection_for_test(conn);
 
@@ -241,9 +241,9 @@ mod tests {
         assert_eq!(output.sections.len(), 1);
 
         let content = &output.sections[0].content;
-        assert!(content.contains("grafeo::query"));
-        assert!(content.contains("grafeo::mutate"));
-        assert!(content.contains("Grafeo Knowledge Graph"));
+        assert!(content.contains("obrain::query"));
+        assert!(content.contains("obrain::mutate"));
+        assert!(content.contains("Obrain Knowledge Graph"));
         assert!(content.contains("2 tools"));
     }
 

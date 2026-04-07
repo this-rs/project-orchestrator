@@ -728,15 +728,15 @@ mod tests {
     fn test_register_external_tool() {
         let mut codebook = ActionCodebook::new();
         let emb = make_embedding(42.0);
-        codebook.register_external_tool("grafeo", "run_cypher", emb.clone());
+        codebook.register_external_tool("obrain", "run_cypher", emb.clone());
 
         assert_eq!(codebook.external_len(), 1);
         assert_eq!(codebook.len(), 1); // total
         assert_eq!(codebook.core_len(), 0);
 
         // FQN index works
-        let entry = codebook.get_external("grafeo::run_cypher").unwrap();
-        assert_eq!(entry.tool, "grafeo");
+        let entry = codebook.get_external("obrain::run_cypher").unwrap();
+        assert_eq!(entry.tool, "obrain");
         assert_eq!(entry.action, "run_cypher");
         assert_eq!(entry.frequency, 0);
         assert!((entry.avg_reward - 0.5).abs() < 1e-5);

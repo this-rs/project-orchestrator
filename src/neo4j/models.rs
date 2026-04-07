@@ -2294,7 +2294,7 @@ pub struct McpServerNode {
     pub id: Uuid,
     /// Project this server is associated with.
     pub project_id: Uuid,
-    /// Unique server identifier (used as key in registry, e.g., "grafeo").
+    /// Unique server identifier (used as key in registry, e.g., "obrain").
     pub server_id: String,
     /// Human-readable display name.
     pub display_name: String,
@@ -2950,15 +2950,15 @@ mod tests {
         let node = McpServerNode {
             id: Uuid::new_v4(),
             project_id: Uuid::new_v4(),
-            server_id: "grafeo".to_string(),
-            display_name: "Grafeo Knowledge Graph".to_string(),
+            server_id: "obrain".to_string(),
+            display_name: "Obrain Knowledge Graph".to_string(),
             transport_type: "sse".to_string(),
             transport_url: Some("http://localhost:8080/sse".to_string()),
             transport_command: None,
             transport_args: None,
             status: "connected".to_string(),
             protocol_version: Some("2025-03-26".to_string()),
-            server_name: Some("Grafeo".to_string()),
+            server_name: Some("Obrain".to_string()),
             tool_count: 5,
             created_at: Utc::now(),
             updated_at: None,
@@ -2970,8 +2970,8 @@ mod tests {
 
         assert_eq!(de.id, node.id);
         assert_eq!(de.project_id, node.project_id);
-        assert_eq!(de.server_id, "grafeo");
-        assert_eq!(de.display_name, "Grafeo Knowledge Graph");
+        assert_eq!(de.server_id, "obrain");
+        assert_eq!(de.display_name, "Obrain Knowledge Graph");
         assert_eq!(de.transport_type, "sse");
         assert_eq!(
             de.transport_url.as_deref(),
@@ -2981,7 +2981,7 @@ mod tests {
         assert!(de.transport_args.is_none());
         assert_eq!(de.status, "connected");
         assert_eq!(de.protocol_version.as_deref(), Some("2025-03-26"));
-        assert_eq!(de.server_name.as_deref(), Some("Grafeo"));
+        assert_eq!(de.server_name.as_deref(), Some("Obrain"));
         assert_eq!(de.tool_count, 5);
         assert!(de.updated_at.is_none());
         assert!(de.last_connected_at.is_some());
@@ -3019,9 +3019,9 @@ mod tests {
     fn test_mcp_tool_node_serialization_roundtrip() {
         let tool = McpToolNode {
             id: Uuid::new_v4(),
-            server_id: "grafeo".to_string(),
+            server_id: "obrain".to_string(),
             name: "run_cypher".to_string(),
-            fqn: "grafeo::run_cypher".to_string(),
+            fqn: "obrain::run_cypher".to_string(),
             description: "Execute a Cypher query against the knowledge graph".to_string(),
             input_schema:
                 r#"{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}"#
@@ -3036,9 +3036,9 @@ mod tests {
         let de: McpToolNode = serde_json::from_str(&json).unwrap();
 
         assert_eq!(de.id, tool.id);
-        assert_eq!(de.server_id, "grafeo");
+        assert_eq!(de.server_id, "obrain");
         assert_eq!(de.name, "run_cypher");
-        assert_eq!(de.fqn, "grafeo::run_cypher");
+        assert_eq!(de.fqn, "obrain::run_cypher");
         assert!(de.description.contains("Cypher query"));
         assert!(de.input_schema.contains("query"));
         assert_eq!(de.category, "query");

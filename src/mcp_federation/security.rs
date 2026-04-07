@@ -386,12 +386,12 @@ mod tests {
         let v = PolicyViolation {
             rule: "rate_limit".to_string(),
             message: "Too many calls".to_string(),
-            server_id: "grafeo".to_string(),
+            server_id: "obrain".to_string(),
             tool_name: "query".to_string(),
         };
         let display = format!("{}", v);
         assert!(display.contains("rate_limit"));
-        assert!(display.contains("grafeo"));
+        assert!(display.contains("obrain"));
         assert!(display.contains("Too many calls"));
     }
 

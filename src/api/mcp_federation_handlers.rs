@@ -30,7 +30,7 @@ use uuid::Uuid;
 /// Body for POST /api/mcp-federation/servers (connect).
 #[derive(Debug, Deserialize)]
 pub struct ConnectServerBody {
-    /// Unique identifier for this server connection (e.g. "grafeo-shared").
+    /// Unique identifier for this server connection (e.g. "obrain-shared").
     pub server_id: String,
     /// Optional human-readable display name.
     pub display_name: Option<String>,
@@ -1309,10 +1309,10 @@ mod tests {
             headers: HashMap::new(),
         };
         let node = build_server_node(
-            "grafeo",
-            Some("Grafeo"),
+            "obrain",
+            Some("Obrain"),
             &transport,
-            Some("grafeo-server"),
+            Some("obrain-server"),
             12,
         );
         assert_eq!(node.transport_type, "streamable_http");

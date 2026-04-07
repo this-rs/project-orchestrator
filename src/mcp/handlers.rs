@@ -11423,9 +11423,9 @@ mod tests {
 
         #[tokio::test]
         async fn test_external_dispatch_success() {
-            let response = json!({"result": "hello from grafeo"});
+            let response = json!({"result": "hello from obrain"});
             let registry = make_registry_with_server(
-                "grafeo",
+                "obrain",
                 Box::new(MockExternalClient {
                     response: response.clone(),
                 }),
@@ -11433,7 +11433,7 @@ mod tests {
             let handler = make_handler_with_registry(registry);
 
             let result = handler
-                .handle("grafeo::query", Some(json!({"q": "test"})))
+                .handle("obrain::query", Some(json!({"q": "test"})))
                 .await
                 .expect("external call should succeed");
 
@@ -11535,7 +11535,7 @@ mod tests {
             // handler with empty registry — should reject "::" calls for unknown servers
             let handler = make_handler();
             let err = handler
-                .handle("grafeo::query", Some(json!({})))
+                .handle("obrain::query", Some(json!({})))
                 .await
                 .unwrap_err();
 
@@ -11551,7 +11551,7 @@ mod tests {
             // Verify that a successful external call updates server stats
             let response = json!({"data": [1, 2, 3]});
             let registry = make_registry_with_server(
-                "grafeo",
+                "obrain",
                 Box::new(MockExternalClient {
                     response: response.clone(),
                 }),
@@ -11559,14 +11559,14 @@ mod tests {
             let handler = make_handler_with_registry(registry.clone());
 
             let result = handler
-                .handle("grafeo::query", Some(json!({"q": "test"})))
+                .handle("obrain::query", Some(json!({"q": "test"})))
                 .await;
 
             assert!(result.is_ok());
 
             // Check that stats were recorded
             let reg = registry.read().await;
-            let conn = reg.get("grafeo").unwrap();
+            let conn = reg.get("obrain").unwrap();
             assert_eq!(conn.stats.call_count, 1);
             assert_eq!(conn.stats.error_count, 0);
             assert!(conn.stats.last_call_at.is_some());
@@ -11579,13 +11579,13 @@ mod tests {
             // The trajectory recording uses this as action_type.
             let response = json!({"ok": true});
             let registry =
-                make_registry_with_server("grafeo", Box::new(MockExternalClient { response }));
+                make_registry_with_server("obrain", Box::new(MockExternalClient { response }));
             let handler = make_handler_with_registry(registry);
 
-            // The call should succeed — confirming the "grafeo::query" format
-            // is correctly split into server_id="grafeo", tool_name="query"
+            // The call should succeed — confirming the "obrain::query" format
+            // is correctly split into server_id="obrain", tool_name="query"
             let result = handler
-                .handle("grafeo::query", Some(json!({"q": "test"})))
+                .handle("obrain::query", Some(json!({"q": "test"})))
                 .await;
             assert!(result.is_ok());
 
