@@ -6084,17 +6084,10 @@ pub enum AppError {
     Unauthorized(String),
     Forbidden(String),
     Conflict(String),
-    /// 409 Conflict with a structured JSON payload (e.g., completion guard errors).
-    ConflictJson(serde_json::Value),
 }
 
 impl IntoResponse for AppError {
     fn into_response(self) -> axum::response::Response {
-        // ConflictJson returns a pre-built JSON payload directly
-        if let AppError::ConflictJson(payload) = self {
-            return (StatusCode::CONFLICT, Json(payload)).into_response();
-        }
-
         let (status, message) = match self {
             AppError::Internal(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
             AppError::NotFound(msg) => (StatusCode::NOT_FOUND, msg),
@@ -6102,7 +6095,6 @@ impl IntoResponse for AppError {
             AppError::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, msg),
             AppError::Forbidden(msg) => (StatusCode::FORBIDDEN, msg),
             AppError::Conflict(msg) => (StatusCode::CONFLICT, msg),
-            AppError::ConflictJson(_) => unreachable!(), // handled above
         };
 
         let body = Json(serde_json::json!({
@@ -6115,33 +6107,6 @@ impl IntoResponse for AppError {
 
 impl From<anyhow::Error> for AppError {
     fn from(err: anyhow::Error) -> Self {
-        // Check for CompletionGuardError → map to 409 Conflict with structured payload
-        if let Some(guard_err) = err.downcast_ref::<crate::plan::models::CompletionGuardError>() {
-            use crate::plan::models::CompletionGuardError;
-            let payload = match guard_err {
-                CompletionGuardError::TaskHasUncompletedSteps {
-                    task_id,
-                    uncompleted_steps,
-                } => serde_json::json!({
-                    "error": "completion_guard",
-                    "message": guard_err.to_string(),
-                    "entity_type": "task",
-                    "entity_id": task_id.to_string(),
-                    "uncompleted_items": uncompleted_steps,
-                }),
-                CompletionGuardError::PlanHasUncompletedTasks {
-                    plan_id,
-                    uncompleted_tasks,
-                } => serde_json::json!({
-                    "error": "completion_guard",
-                    "message": guard_err.to_string(),
-                    "entity_type": "plan",
-                    "entity_id": plan_id.to_string(),
-                    "uncompleted_items": uncompleted_tasks,
-                }),
-            };
-            return AppError::ConflictJson(payload);
-        }
         AppError::Internal(err)
     }
 }
