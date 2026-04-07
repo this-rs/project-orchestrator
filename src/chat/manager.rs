@@ -1951,6 +1951,7 @@ impl ChatManager {
         hooks: Option<std::collections::HashMap<String, Vec<nexus_claude::HookMatcher>>>,
         add_dirs: &[String],
         user_claims: Option<&crate::auth::jwt::Claims>,
+        session_id: Option<&str>,
     ) -> ClaudeCodeOptions {
         // Expand tilde in cwd (shell doesn't expand ~ when passed via Command)
         let cwd = expand_tilde(cwd);
@@ -2002,6 +2003,13 @@ impl ChatManager {
                     );
                 }
             }
+        }
+
+        // Inject session ID so MCP subprocess can send it as X-Session-Id header
+        // on all REST API calls — enables server-side auto-linking of sessions
+        // to tasks/plans without the agent needing to pass session_id explicitly.
+        if let Some(sid) = session_id {
+            env.insert("PO_SESSION_ID".into(), sid.to_string());
         }
 
         let mcp_config = McpServerConfig::Stdio {
@@ -2469,6 +2477,7 @@ impl ChatManager {
         };
 
         // Build options and create InteractiveClient
+        let sid_str = session_id.to_string();
         let options = self
             .build_options(
                 &request.cwd,
@@ -2479,6 +2488,7 @@ impl ChatManager {
                 Some(session_hooks),
                 &resolved_add_dirs,
                 request.user_claims.as_ref(),
+                Some(&sid_str),
             )
             .await;
         let mut client = InteractiveClient::new(options)
@@ -4526,6 +4536,7 @@ impl ChatManager {
                 Some(session_hooks),
                 &resume_add_dirs,
                 user_claims,
+                Some(session_id),
             )
             .await;
 
@@ -5507,6 +5518,7 @@ mod tests {
                 None,
                 &[],
                 None,
+                None,
             )
             .await;
         assert!(matches!(opts.permission_mode, PermissionMode::Default));
@@ -5535,6 +5547,7 @@ mod tests {
                 None,
                 &[],
                 None,
+                None,
             )
             .await;
         assert!(matches!(opts.permission_mode, PermissionMode::Default));
@@ -5558,6 +5571,7 @@ mod tests {
                 None,
                 &[],
                 None,
+                None,
             )
             .await;
         assert!(matches!(
@@ -5575,6 +5589,7 @@ mod tests {
                 None,
                 None,
                 &[],
+                None,
                 None,
             )
             .await;
@@ -5645,6 +5660,7 @@ mod tests {
                 None,
                 &[],
                 None,
+                None,
             )
             .await;
         assert!(matches!(opts.permission_mode, PermissionMode::Default));
@@ -5669,6 +5685,7 @@ mod tests {
                 None,
                 None,
                 &[],
+                None,
                 None,
             )
             .await;
@@ -5739,6 +5756,7 @@ mod tests {
                 None,
                 &[],
                 None,
+                None,
             )
             .await;
 
@@ -5763,6 +5781,7 @@ mod tests {
                 None,
                 &[],
                 None,
+                None,
             )
             .await;
 
@@ -5776,7 +5795,7 @@ mod tests {
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, config);
 
         let options = manager
-            .build_options("/tmp", "model", "prompt", None, None, None, &[], None)
+            .build_options("/tmp", "model", "prompt", None, None, None, &[], None, None)
             .await;
 
         let mcp = options.mcp_servers.get("project-orchestrator").unwrap();
@@ -5821,6 +5840,7 @@ mod tests {
                 Some(hooks),
                 &[],
                 None,
+                None,
             )
             .await;
 
@@ -5838,7 +5858,7 @@ mod tests {
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
 
         let opts = manager
-            .build_options("/tmp", "model", "prompt", None, None, None, &[], None)
+            .build_options("/tmp", "model", "prompt", None, None, None, &[], None, None)
             .await;
 
         // No hooks configured
@@ -5937,7 +5957,9 @@ mod tests {
 
         let dirs = ["/extra/dir1".to_string(), "/extra/dir2".to_string()];
         let opts = manager
-            .build_options("/tmp", "model", "prompt", None, None, None, &dirs, None)
+            .build_options(
+                "/tmp", "model", "prompt", None, None, None, &dirs, None, None,
+            )
             .await;
 
         assert_eq!(opts.add_dirs.len(), 2);
@@ -5955,10 +5977,64 @@ mod tests {
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
 
         let opts = manager
-            .build_options("/tmp", "model", "prompt", None, None, None, &[], None)
+            .build_options("/tmp", "model", "prompt", None, None, None, &[], None, None)
             .await;
 
         assert!(opts.add_dirs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_build_options_injects_session_id_env() {
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+
+        // With session_id → PO_SESSION_ID should be in MCP server env
+        let opts = manager
+            .build_options(
+                "/tmp",
+                "model",
+                "prompt",
+                None,
+                None,
+                None,
+                &[],
+                None,
+                Some("abc-def-123"),
+            )
+            .await;
+
+        // PO_SESSION_ID is injected into the MCP server config env, not ClaudeCodeOptions.env
+        let mcp = opts.mcp_servers.get("project-orchestrator").unwrap();
+        let mcp_env = match mcp {
+            nexus_claude::McpServerConfig::Stdio { env, .. } => env.as_ref().unwrap(),
+            _ => panic!("Expected Stdio config"),
+        };
+        assert_eq!(
+            mcp_env.get("PO_SESSION_ID").map(|s| s.as_str()),
+            Some("abc-def-123"),
+            "PO_SESSION_ID should be injected into MCP server env when session_id is provided"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_build_options_no_session_id_no_env() {
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+
+        // Without session_id → PO_SESSION_ID should NOT be in MCP server env
+        let opts = manager
+            .build_options("/tmp", "model", "prompt", None, None, None, &[], None, None)
+            .await;
+
+        let mcp = opts.mcp_servers.get("project-orchestrator").unwrap();
+        let mcp_env = match mcp {
+            nexus_claude::McpServerConfig::Stdio { env, .. } => env.as_ref().unwrap(),
+            _ => panic!("Expected Stdio config"),
+        };
+        assert!(
+            !mcp_env.contains_key("PO_SESSION_ID"),
+            "PO_SESSION_ID should not be in MCP server env when session_id is None"
+        );
     }
 
     // ====================================================================
@@ -9252,6 +9328,7 @@ mod tests {
                 None,
                 &[],
                 None,
+                None,
             )
             .await;
 
@@ -9287,6 +9364,7 @@ mod tests {
                 None,
                 None,
                 &[],
+                None,
                 None,
             )
             .await;
@@ -9361,6 +9439,7 @@ mod tests {
                 None,
                 &[],
                 None,
+                None,
             )
             .await;
         assert!(!options.env.contains_key("PATH"));
@@ -9383,6 +9462,7 @@ mod tests {
                 None,
                 None,
                 &[],
+                None,
                 None,
             )
             .await;
