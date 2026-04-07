@@ -9068,10 +9068,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result["method"], "GET");
-        assert!(result["path"]
-            .as_str()
-            .unwrap()
-            .contains("/plans/"));
+        assert!(result["path"].as_str().unwrap().contains("/plans/"));
         assert!(result["path"].as_str().unwrap().ends_with("/sessions"));
     }
 
@@ -9083,10 +9080,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result["method"], "GET");
-        assert!(result["path"]
-            .as_str()
-            .unwrap()
-            .contains("/tasks/"));
+        assert!(result["path"].as_str().unwrap().contains("/tasks/"));
         assert!(result["path"].as_str().unwrap().ends_with("/sessions"));
     }
 
@@ -9113,10 +9107,7 @@ mod tests {
     async fn test_http_list_sessions_with_plan_filter() {
         let (handler, _) = make_http_handler().await;
         let result = handler
-            .handle(
-                "list_chat_sessions",
-                Some(json!({"plan_id": UUID1})),
-            )
+            .handle("list_chat_sessions", Some(json!({"plan_id": UUID1})))
             .await
             .unwrap();
         assert_eq!(result["method"], "GET");
@@ -9129,10 +9120,7 @@ mod tests {
     async fn test_http_list_sessions_with_task_filter() {
         let (handler, _) = make_http_handler().await;
         let result = handler
-            .handle(
-                "list_chat_sessions",
-                Some(json!({"task_id": UUID1})),
-            )
+            .handle("list_chat_sessions", Some(json!({"task_id": UUID1})))
             .await
             .unwrap();
         assert_eq!(result["method"], "GET");
@@ -9145,7 +9133,10 @@ mod tests {
     async fn test_mega_tool_plan_get_sessions() {
         let (handler, _) = make_http_handler().await;
         let result = handler
-            .handle("plan", Some(json!({"action": "get_sessions", "plan_id": UUID1})))
+            .handle(
+                "plan",
+                Some(json!({"action": "get_sessions", "plan_id": UUID1})),
+            )
             .await
             .unwrap();
         assert_eq!(result["method"], "GET");
@@ -9156,7 +9147,10 @@ mod tests {
     async fn test_mega_tool_task_get_sessions() {
         let (handler, _) = make_http_handler().await;
         let result = handler
-            .handle("task", Some(json!({"action": "get_sessions", "task_id": UUID1})))
+            .handle(
+                "task",
+                Some(json!({"action": "get_sessions", "task_id": UUID1})),
+            )
             .await
             .unwrap();
         assert_eq!(result["method"], "GET");
