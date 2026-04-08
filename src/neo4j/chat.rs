@@ -305,7 +305,8 @@ impl Neo4jClient {
 
     /// Update the model field on a chat session node (mid-session model switch)
     pub async fn update_chat_session_model(&self, id: Uuid, model: &str) -> Result<()> {
-        let cypher = "MATCH (s:ChatSession {id: $id}) SET s.model = $model, s.updated_at = datetime()";
+        let cypher =
+            "MATCH (s:ChatSession {id: $id}) SET s.model = $model, s.updated_at = datetime()";
         let q = query(cypher)
             .param("id", id.to_string())
             .param("model", model.to_string());
@@ -543,7 +544,11 @@ impl Neo4jClient {
     }
 
     /// Get direct fork children of a session.
-    pub async fn get_fork_children(&self, session_id: &str, include_archived: bool) -> Result<Vec<ChatSessionNode>> {
+    pub async fn get_fork_children(
+        &self,
+        session_id: &str,
+        include_archived: bool,
+    ) -> Result<Vec<ChatSessionNode>> {
         let archived_filter = if include_archived {
             ""
         } else {

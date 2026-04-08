@@ -112,7 +112,10 @@ fn render_persona_section(cp: &crate::chat::enrichment::CachedPersona) -> String
         out.push_str("\n**Knowledge notes:**\n");
         let max_notes = (budget / 200).clamp(2, 8);
         for rel in sub.notes.iter().take(max_notes) {
-            out.push_str(&format!("- [note:{}] (w:{:.2})\n", rel.entity_id, rel.weight));
+            out.push_str(&format!(
+                "- [note:{}] (w:{:.2})\n",
+                rel.entity_id, rel.weight
+            ));
         }
     }
 
@@ -608,7 +611,9 @@ mod tests {
         weight: f64,
         files: Vec<(&str, f64)>,
     ) -> crate::chat::enrichment::CachedPersona {
-        use crate::neo4j::models::{PersonaSubgraph, PersonaSubgraphStats, PersonaWeightedRelation};
+        use crate::neo4j::models::{
+            PersonaSubgraph, PersonaSubgraphStats, PersonaWeightedRelation,
+        };
 
         crate::chat::enrichment::CachedPersona {
             persona_id: Uuid::new_v4(),
@@ -713,11 +718,7 @@ mod tests {
 
         let stage = PersonaStage::new(mock);
         // Message with file paths that match the weaker persona
-        let input = make_input_with_cache(
-            "Check src/lib.rs",
-            Some(project_id),
-            Some(cached),
-        );
+        let input = make_input_with_cache("Check src/lib.rs", Some(project_id), Some(cached));
 
         let output = stage.execute(&input).await.unwrap();
 
@@ -737,12 +738,8 @@ mod tests {
         let project_id = Uuid::new_v4();
 
         // Cached persona with low weight
-        let cached = make_cached_persona(
-            "old-persona",
-            "Old persona",
-            0.4,
-            vec![("src/old.rs", 0.4)],
-        );
+        let cached =
+            make_cached_persona("old-persona", "Old persona", 0.4, vec![("src/old.rs", 0.4)]);
 
         // New persona with higher weight
         let strong = make_persona("new-persona", "New strong persona", project_id);
@@ -752,11 +749,7 @@ mod tests {
             .unwrap();
 
         let stage = PersonaStage::new(mock);
-        let input = make_input_with_cache(
-            "Fix src/new.rs",
-            Some(project_id),
-            Some(cached),
-        );
+        let input = make_input_with_cache("Fix src/new.rs", Some(project_id), Some(cached));
 
         let output = stage.execute(&input).await.unwrap();
 
@@ -802,7 +795,9 @@ mod tests {
         let mut files: Vec<(&str, f64)> = Vec::new();
         for i in 0..100 {
             // Leak strings to get &str — only in test
-            let path: &str = Box::leak(format!("src/module_{:03}/very_long_file_name_{:03}.rs", i, i).into_boxed_str());
+            let path: &str = Box::leak(
+                format!("src/module_{:03}/very_long_file_name_{:03}.rs", i, i).into_boxed_str(),
+            );
             files.push((path, 0.5));
         }
         let cached = make_cached_persona(
@@ -838,11 +833,7 @@ mod tests {
         let stage = PersonaStage::new(mock);
         let project_id = Uuid::new_v4();
 
-        let input = make_input_with_cache(
-            "What is the architecture?",
-            Some(project_id),
-            None,
-        );
+        let input = make_input_with_cache("What is the architecture?", Some(project_id), None);
 
         let output = stage.execute(&input).await.unwrap();
         assert!(output.sections.is_empty());

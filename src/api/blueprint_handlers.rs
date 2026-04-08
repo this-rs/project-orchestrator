@@ -176,14 +176,8 @@ pub async fn create_blueprint(
         )));
     }
 
-    let scope = body
-        .scope
-        .parse::<BlueprintScope>()
-        .ok();
-    let category = body
-        .category
-        .parse::<BlueprintCategory>()
-        .ok();
+    let scope = body.scope.parse::<BlueprintScope>().ok();
+    let category = body.category.parse::<BlueprintCategory>().ok();
     let difficulty = body
         .difficulty
         .as_deref()
@@ -240,10 +234,7 @@ pub async fn get_blueprint(
     Path(id_or_slug): Path<String>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let tier: i32 = params
-        .get("tier")
-        .and_then(|t| t.parse().ok())
-        .unwrap_or(3);
+    let tier: i32 = params.get("tier").and_then(|t| t.parse().ok()).unwrap_or(3);
 
     // Try by UUID first, then by slug
     let blueprint = if id_or_slug.contains('-') && id_or_slug.len() > 30 {
@@ -262,8 +253,8 @@ pub async fn get_blueprint(
             .map_err(AppError::Internal)?
     };
 
-    let blueprint =
-        blueprint.ok_or_else(|| AppError::NotFound(format!("Blueprint '{}' not found", id_or_slug)))?;
+    let blueprint = blueprint
+        .ok_or_else(|| AppError::NotFound(format!("Blueprint '{}' not found", id_or_slug)))?;
 
     let response = blueprint.to_response(tier);
     Ok(Json(serde_json::to_value(response).unwrap()))
@@ -353,11 +344,9 @@ pub async fn delete_blueprint(
         .await
         .map_err(AppError::Internal)?;
 
-    state.event_bus.emit_deleted(
-        crate::events::EntityType::Blueprint,
-        &blueprint_id,
-        None,
-    );
+    state
+        .event_bus
+        .emit_deleted(crate::events::EntityType::Blueprint, &blueprint_id, None);
 
     Ok(StatusCode::NO_CONTENT)
 }

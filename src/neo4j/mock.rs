@@ -6714,7 +6714,11 @@ impl GraphStore for MockGraphStore {
         Ok(())
     }
 
-    async fn get_fork_children(&self, _session_id: &str, _include_archived: bool) -> Result<Vec<ChatSessionNode>> {
+    async fn get_fork_children(
+        &self,
+        _session_id: &str,
+        _include_archived: bool,
+    ) -> Result<Vec<ChatSessionNode>> {
         Ok(vec![])
     }
 
@@ -6746,7 +6750,10 @@ impl GraphStore for MockGraphStore {
         Ok(())
     }
 
-    async fn get_session_notes(&self, _session_id: &str) -> Result<Vec<crate::notes::models::Note>> {
+    async fn get_session_notes(
+        &self,
+        _session_id: &str,
+    ) -> Result<Vec<crate::notes::models::Note>> {
         Ok(vec![])
     }
 

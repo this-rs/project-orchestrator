@@ -38,7 +38,7 @@ pub mod models;
 pub mod parser;
 
 pub use models::*;
-pub use parser::{parse_blueprint, extract_references, ParsedBlueprint};
+pub use parser::{extract_references, parse_blueprint, ParsedBlueprint};
 
 /// Maximum length for blueprint name
 pub const MAX_BLUEPRINT_NAME_LEN: usize = 200;

@@ -2195,7 +2195,11 @@ impl GraphStore for Neo4jClient {
             .await
     }
 
-    async fn get_fork_children(&self, session_id: &str, include_archived: bool) -> anyhow::Result<Vec<ChatSessionNode>> {
+    async fn get_fork_children(
+        &self,
+        session_id: &str,
+        include_archived: bool,
+    ) -> anyhow::Result<Vec<ChatSessionNode>> {
         self.get_fork_children(session_id, include_archived).await
     }
 
@@ -2228,7 +2232,10 @@ impl GraphStore for Neo4jClient {
         self.archive_session(session_id).await
     }
 
-    async fn get_session_notes(&self, session_id: &str) -> anyhow::Result<Vec<crate::notes::models::Note>> {
+    async fn get_session_notes(
+        &self,
+        session_id: &str,
+    ) -> anyhow::Result<Vec<crate::notes::models::Note>> {
         self.get_session_notes(session_id).await
     }
 
@@ -2267,11 +2274,7 @@ impl GraphStore for Neo4jClient {
         .await
     }
 
-    async fn update_chat_session_model(
-        &self,
-        id: Uuid,
-        model: &str,
-    ) -> anyhow::Result<()> {
+    async fn update_chat_session_model(&self, id: Uuid, model: &str) -> anyhow::Result<()> {
         self.update_chat_session_model(id, model).await
     }
 
@@ -3103,7 +3106,8 @@ impl GraphStore for Neo4jClient {
         to_slug: &str,
         relation_type: crate::blueprint::BlueprintRelationType,
     ) -> anyhow::Result<()> {
-        self.add_blueprint_relation(from_slug, to_slug, relation_type).await
+        self.add_blueprint_relation(from_slug, to_slug, relation_type)
+            .await
     }
 
     async fn remove_blueprint_relation(
@@ -3112,7 +3116,8 @@ impl GraphStore for Neo4jClient {
         to_slug: &str,
         relation_type: crate::blueprint::BlueprintRelationType,
     ) -> anyhow::Result<()> {
-        self.remove_blueprint_relation(from_slug, to_slug, relation_type).await
+        self.remove_blueprint_relation(from_slug, to_slug, relation_type)
+            .await
     }
 
     async fn get_blueprint_dependencies(
@@ -3142,7 +3147,8 @@ impl GraphStore for Neo4jClient {
         project_id: &str,
         relevance: f64,
     ) -> anyhow::Result<()> {
-        self.link_blueprint_to_project(slug, project_id, relevance).await
+        self.link_blueprint_to_project(slug, project_id, relevance)
+            .await
     }
 
     async fn unlink_blueprint_from_project(

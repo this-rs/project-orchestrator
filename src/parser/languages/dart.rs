@@ -12,7 +12,6 @@
 //! switch back to AST-based extraction.
 
 use crate::neo4j::models::*;
-use crate::parser::helpers::*;
 use crate::parser::ParsedFile;
 use anyhow::Result;
 use regex::Regex;
@@ -27,18 +26,14 @@ static RE_CLASS: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 static RE_MIXIN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r"(?m)^[ \t]*mixin\s+(\w+)(?:<[^>]*>)?\s*(?:on\s+([\w<>, ]+?))?\s*\{"
-    ).unwrap()
+    Regex::new(r"(?m)^[ \t]*mixin\s+(\w+)(?:<[^>]*>)?\s*(?:on\s+([\w<>, ]+?))?\s*\{").unwrap()
 });
 
-static RE_ENUM: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?m)^[ \t]*enum\s+(\w+)\s*\{").unwrap()
-});
+static RE_ENUM: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?m)^[ \t]*enum\s+(\w+)\s*\{").unwrap());
 
 static RE_EXTENSION: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?m)^[ \t]*extension\s+(\w+)?(?:<[^>]*>)?\s+on\s+([\w<>, ]+?)\s*\{")
-        .unwrap()
+    Regex::new(r"(?m)^[ \t]*extension\s+(\w+)?(?:<[^>]*>)?\s+on\s+([\w<>, ]+?)\s*\{").unwrap()
 });
 
 /// extension type Foo(Type value) implements Bar { ... }
@@ -62,19 +57,67 @@ static RE_GETTER: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 /// Matches setter declarations
-static RE_SETTER: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?m)^[ \t]*(?:static\s+)?set\s+(\w+)\s*\(").unwrap()
-});
+static RE_SETTER: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?m)^[ \t]*(?:static\s+)?set\s+(\w+)\s*\(").unwrap());
 
 // ─── Dart keywords that should NOT be treated as function names ───────────────
 const DART_KEYWORDS: &[&str] = &[
-    "if", "else", "for", "while", "do", "switch", "case", "break", "continue",
-    "return", "try", "catch", "finally", "throw", "rethrow", "new", "const",
-    "var", "final", "late", "class", "enum", "mixin", "extension", "typedef",
-    "import", "export", "part", "library", "show", "hide", "as", "is", "in",
-    "await", "yield", "async", "sync", "super", "this", "true", "false", "null",
-    "void", "assert", "with", "implements", "extends", "abstract", "sealed",
-    "base", "interface", "required", "covariant", "factory", "operator",
+    "if",
+    "else",
+    "for",
+    "while",
+    "do",
+    "switch",
+    "case",
+    "break",
+    "continue",
+    "return",
+    "try",
+    "catch",
+    "finally",
+    "throw",
+    "rethrow",
+    "new",
+    "const",
+    "var",
+    "final",
+    "late",
+    "class",
+    "enum",
+    "mixin",
+    "extension",
+    "typedef",
+    "import",
+    "export",
+    "part",
+    "library",
+    "show",
+    "hide",
+    "as",
+    "is",
+    "in",
+    "await",
+    "yield",
+    "async",
+    "sync",
+    "super",
+    "this",
+    "true",
+    "false",
+    "null",
+    "void",
+    "assert",
+    "with",
+    "implements",
+    "extends",
+    "abstract",
+    "sealed",
+    "base",
+    "interface",
+    "required",
+    "covariant",
+    "factory",
+    "operator",
 ];
 
 // ─── Public API ───────────────────────────────────────────────────────────────
@@ -472,7 +515,10 @@ fn extract_enum_variants(body: &str) -> Vec<String> {
 
         // Variant names start with lowercase in Dart convention
         // Skip method declarations (have return types before name)
-        if name.chars().next().is_some_and(|c| c.is_lowercase() || c == '_')
+        if name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_lowercase() || c == '_')
             && name.chars().all(|c| c.is_alphanumeric() || c == '_')
         {
             variants.push(name.to_string());
@@ -920,7 +966,9 @@ fn extract_doc_comment(source: &str, decl_offset: usize, line_offsets: &[usize])
 fn estimate_complexity(body: &str) -> u32 {
     let mut complexity = 1u32;
     // Count branching keywords
-    for keyword in &["if ", "else ", "for ", "while ", "case ", "catch ", "?", "&&", "||"] {
+    for keyword in &[
+        "if ", "else ", "for ", "while ", "case ", "catch ", "?", "&&", "||",
+    ] {
         complexity += body.matches(keyword).count() as u32;
     }
     complexity

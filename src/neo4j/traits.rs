@@ -1830,7 +1830,11 @@ pub trait GraphStore: Send + Sync {
     ) -> Result<()>;
 
     /// Get direct fork children of a session.
-    async fn get_fork_children(&self, session_id: &str, include_archived: bool) -> Result<Vec<ChatSessionNode>>;
+    async fn get_fork_children(
+        &self,
+        session_id: &str,
+        include_archived: bool,
+    ) -> Result<Vec<ChatSessionNode>>;
 
     /// Get the full fork tree (max depth levels via FORKED_FROM).
     async fn get_fork_tree(&self, session_id: &str, max_depth: u32)
@@ -2656,10 +2660,7 @@ pub trait GraphStore: Send + Sync {
     async fn delete_blueprint(&self, id: &str) -> Result<()>;
 
     /// List blueprints with filters and pagination.
-    async fn list_blueprints(
-        &self,
-        query: &ListBlueprintsQuery,
-    ) -> Result<Vec<BlueprintResponse>>;
+    async fn list_blueprints(&self, query: &ListBlueprintsQuery) -> Result<Vec<BlueprintResponse>>;
 
     /// Add a typed relation between two blueprints.
     async fn add_blueprint_relation(
@@ -2678,22 +2679,13 @@ pub trait GraphStore: Send + Sync {
     ) -> Result<()>;
 
     /// Get transitive dependencies (forward DEPENDS_ON).
-    async fn get_blueprint_dependencies(
-        &self,
-        slug: &str,
-    ) -> Result<Vec<BlueprintResponse>>;
+    async fn get_blueprint_dependencies(&self, slug: &str) -> Result<Vec<BlueprintResponse>>;
 
     /// Get transitive dependents (reverse DEPENDS_ON).
-    async fn get_blueprint_dependents(
-        &self,
-        slug: &str,
-    ) -> Result<Vec<BlueprintResponse>>;
+    async fn get_blueprint_dependents(&self, slug: &str) -> Result<Vec<BlueprintResponse>>;
 
     /// Get paired blueprints (bidirectional PAIRS_WITH).
-    async fn get_blueprint_pairs(
-        &self,
-        slug: &str,
-    ) -> Result<Vec<BlueprintResponse>>;
+    async fn get_blueprint_pairs(&self, slug: &str) -> Result<Vec<BlueprintResponse>>;
 
     /// Link a blueprint to a project (APPLIES_TO).
     async fn link_blueprint_to_project(
@@ -2704,17 +2696,10 @@ pub trait GraphStore: Send + Sync {
     ) -> Result<()>;
 
     /// Unlink a blueprint from a project.
-    async fn unlink_blueprint_from_project(
-        &self,
-        slug: &str,
-        project_id: &str,
-    ) -> Result<()>;
+    async fn unlink_blueprint_from_project(&self, slug: &str, project_id: &str) -> Result<()>;
 
     /// Get blueprints linked to a project.
-    async fn get_project_blueprints(
-        &self,
-        project_id: &str,
-    ) -> Result<Vec<BlueprintResponse>>;
+    async fn get_project_blueprints(&self, project_id: &str) -> Result<Vec<BlueprintResponse>>;
 
     // ========================================================================
     // Analysis Profile operations

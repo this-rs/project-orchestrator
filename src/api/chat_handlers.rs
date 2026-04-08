@@ -369,7 +369,9 @@ pub async fn list_forks(
     forks.sort_by(|a, b| {
         let a_active = a.fork_status.as_deref() == Some("active");
         let b_active = b.fork_status.as_deref() == Some("active");
-        b_active.cmp(&a_active).then(b.created_at.cmp(&a.created_at))
+        b_active
+            .cmp(&a_active)
+            .then(b.created_at.cmp(&a.created_at))
     });
 
     let total = forks.len();

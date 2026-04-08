@@ -3964,10 +3964,7 @@ impl ChatManager {
                         session_id,
                         node.fork_status.as_deref().unwrap_or("unknown")
                     );
-                    let _ = self
-                        .graph
-                        .update_fork_status(session_id, "active")
-                        .await;
+                    let _ = self.graph.update_fork_status(session_id, "active").await;
                 }
 
                 let _ = self
@@ -5500,10 +5497,7 @@ impl ChatManager {
             hooks
         };
 
-        let resolved_add_dirs = parent_node
-            .add_dirs
-            .clone()
-            .unwrap_or_default();
+        let resolved_add_dirs = parent_node.add_dirs.clone().unwrap_or_default();
 
         let options = self
             .build_options(
@@ -5631,7 +5625,10 @@ impl ChatManager {
 
     /// List active fork children for a given parent session.
     pub async fn list_forks(&self, parent_session_id: &str) -> Result<Vec<ForkInfo>> {
-        let children = self.graph.get_fork_children(parent_session_id, false).await?;
+        let children = self
+            .graph
+            .get_fork_children(parent_session_id, false)
+            .await?;
         Ok(children
             .into_iter()
             .map(|node| ForkInfo {
@@ -5662,25 +5659,29 @@ impl ChatManager {
         let fork_node = match self.graph.get_chat_session(fork_uuid).await? {
             Some(node) => node,
             None => {
-                warn!("Fork session {} not found for summarization", fork_session_id);
+                warn!(
+                    "Fork session {} not found for summarization",
+                    fork_session_id
+                );
                 return Ok(None);
             }
         };
 
         // 2. Extract parent_session_id and task_id from fork_context_snapshot
-        let (parent_session_id, task_id) = if let Some(ref snapshot) = fork_node.fork_context_snapshot {
-            let v: serde_json::Value = serde_json::from_str(snapshot).unwrap_or_default();
-            (
-                v.get("parent_session_id")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string()),
-                v.get("task_id")
-                    .and_then(|v| v.as_str())
-                    .and_then(|s| Uuid::parse_str(s).ok()),
-            )
-        } else {
-            (None, None)
-        };
+        let (parent_session_id, task_id) =
+            if let Some(ref snapshot) = fork_node.fork_context_snapshot {
+                let v: serde_json::Value = serde_json::from_str(snapshot).unwrap_or_default();
+                (
+                    v.get("parent_session_id")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
+                    v.get("task_id")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| Uuid::parse_str(s).ok()),
+                )
+            } else {
+                (None, None)
+            };
 
         // 3. Fetch chat events (all messages, up to 500)
         let events = self
@@ -5690,7 +5691,10 @@ impl ChatManager {
             .unwrap_or_default();
 
         if events.is_empty() {
-            debug!("Fork {} has no events, skipping summarization", fork_session_id);
+            debug!(
+                "Fork {} has no events, skipping summarization",
+                fork_session_id
+            );
             return Ok(None);
         }
 
@@ -5733,7 +5737,11 @@ impl ChatManager {
             msg_count,
             fork_session_id,
             truncated_transcript,
-            if was_truncated { "\n\n*[truncated]*" } else { "" },
+            if was_truncated {
+                "\n\n*[truncated]*"
+            } else {
+                ""
+            },
         );
 
         // 6. Create Note
@@ -5859,7 +5867,10 @@ impl ChatManager {
         parent_session_id: &'a str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u32>> + Send + 'a>> {
         Box::pin(async move {
-            let children = self.graph.get_fork_children(parent_session_id, false).await?;
+            let children = self
+                .graph
+                .get_fork_children(parent_session_id, false)
+                .await?;
             let mut closed = 0u32;
 
             for child in &children {

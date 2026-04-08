@@ -1053,8 +1053,7 @@ fn protected_routes() -> Router<OrchestratorState> {
         // ================================================================
         .route(
             "/api/blueprints",
-            get(blueprint_handlers::list_blueprints)
-                .post(blueprint_handlers::create_blueprint),
+            get(blueprint_handlers::list_blueprints).post(blueprint_handlers::create_blueprint),
         )
         .route(
             "/api/blueprints/relations",

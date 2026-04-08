@@ -47,23 +47,11 @@ impl ForkContextStage {
         let mut has_content = false;
 
         for child in &children {
-            let status = child
-                .fork_status
-                .as_deref()
-                .unwrap_or("unknown");
-            let fork_type = child
-                .fork_type
-                .as_deref()
-                .unwrap_or("unknown");
-            let title = child
-                .title
-                .as_deref()
-                .unwrap_or("Untitled");
+            let status = child.fork_status.as_deref().unwrap_or("unknown");
+            let fork_type = child.fork_type.as_deref().unwrap_or("unknown");
+            let title = child.title.as_deref().unwrap_or("Untitled");
 
-            let intent = child
-                .fork_intent
-                .as_deref()
-                .unwrap_or("unknown");
+            let intent = child.fork_intent.as_deref().unwrap_or("unknown");
 
             match status {
                 "completed" => {
@@ -119,8 +107,8 @@ impl ForkContextStage {
         lines.push("You are operating in a **sub-conversation** (fork).".to_string());
 
         // Parse context snapshot for task/persona info
-        let snapshot_value = context_snapshot
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
+        let snapshot_value =
+            context_snapshot.and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
 
         if let Some(ref v) = snapshot_value {
             if let Some(task_id) = v.get("task_id").and_then(|v| v.as_str()) {
@@ -143,7 +131,10 @@ impl ForkContextStage {
             "job" => {
                 lines.push(String::new());
                 lines.push("### Lifecycle: Job (one-off task)".to_string());
-                lines.push("You are focused on completing a specific task. When you have finished:".to_string());
+                lines.push(
+                    "You are focused on completing a specific task. When you have finished:"
+                        .to_string(),
+                );
                 lines.push("1. Summarize what you did".to_string());
                 lines.push("2. State explicitly that the job is done".to_string());
                 lines.push("3. The system will auto-close this conversation".to_string());
@@ -153,12 +144,17 @@ impl ForkContextStage {
                 lines.push("### Lifecycle: Role (persistent persona)".to_string());
                 lines.push("You embody a persistent role/persona. You are always available for questions in your domain.".to_string());
                 lines.push("This conversation never closes automatically — the user controls its lifecycle.".to_string());
-                lines.push("Stay in character. Provide expert guidance within your specialization.".to_string());
+                lines.push(
+                    "Stay in character. Provide expert guidance within your specialization."
+                        .to_string(),
+                );
             }
             "scope" => {
                 lines.push(String::new());
                 lines.push("### Lifecycle: Scope (sub-project)".to_string());
-                lines.push("You manage a defined scope (plan, milestone, or feature area).".to_string());
+                lines.push(
+                    "You manage a defined scope (plan, milestone, or feature area).".to_string(),
+                );
                 lines.push("Track progress across tasks. This conversation closes when the scope is fully completed.".to_string());
             }
             _ => {
