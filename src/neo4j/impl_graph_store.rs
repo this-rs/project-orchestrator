@@ -2321,6 +2321,44 @@ impl GraphStore for Neo4jClient {
     }
 
     // ========================================================================
+    // Chat ↔ Plan/Task/RFC linking (ASSOCIATED_WITH relation)
+    // ========================================================================
+
+    async fn create_associated_with(
+        &self,
+        session_id: Uuid,
+        entity_type: &str,
+        entity_id: Uuid,
+        source: &str,
+    ) -> anyhow::Result<bool> {
+        self.create_associated_with(session_id, entity_type, entity_id, source)
+            .await
+    }
+
+    async fn get_session_links(&self, session_id: Uuid) -> anyhow::Result<LinkedSessionInfo> {
+        self.get_session_links(session_id).await
+    }
+
+    async fn get_sessions_for_plan(&self, plan_id: Uuid) -> anyhow::Result<Vec<SessionWithLinks>> {
+        self.get_sessions_for_plan(plan_id).await
+    }
+
+    async fn get_sessions_for_task(&self, task_id: Uuid) -> anyhow::Result<Vec<SessionWithLinks>> {
+        self.get_sessions_for_task(task_id).await
+    }
+
+    async fn get_session_links_batch(
+        &self,
+        session_ids: &[Uuid],
+    ) -> anyhow::Result<std::collections::HashMap<Uuid, LinkedSessionInfo>> {
+        self.get_session_links_batch(session_ids).await
+    }
+
+    async fn get_task_plan_id(&self, task_id: Uuid) -> anyhow::Result<Option<Uuid>> {
+        self.get_task_plan_id(task_id).await
+    }
+
+    // ========================================================================
     // Graph visualization queries (PM + Chat layers)
     // ========================================================================
 

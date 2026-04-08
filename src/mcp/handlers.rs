@@ -262,6 +262,7 @@ impl ToolHandler {
             ("plan", "predict_run") => "predict_plan_run",
             ("plan", "enrich") => "enrich_plan",
             ("plan", "delegate_task") => "delegate_task",
+            ("plan", "get_sessions") => "get_plan_sessions",
 
             // Task
             ("task", "list") => "list_tasks",
@@ -278,6 +279,7 @@ impl ToolHandler {
             ("task", "get_prompt") => "get_task_prompt",
             ("task", "build_prompt") => "build_task_prompt",
             ("task", "enrich") => "enrich_task",
+            ("task", "get_sessions") => "get_task_sessions",
 
             // Step
             ("step", "list") => "list_steps",
@@ -416,6 +418,7 @@ impl ToolHandler {
             ("chat", "get_session_entities") => "get_session_entities",
             ("chat", "get_session_tree") => "get_session_tree",
             ("chat", "get_run_sessions") => "get_run_sessions",
+            ("chat", "associate_with") => "associate_session",
 
             // Feature Graph
             ("feature_graph", "create") => "create_feature_graph",
@@ -1516,6 +1519,9 @@ impl ToolHandler {
                 if let Some(v) = args.get("actual_complexity") {
                     body.insert("actual_complexity".to_string(), v.clone());
                 }
+                if let Some(v) = args.get("session_id") {
+                    body.insert("session_id".to_string(), v.clone());
+                }
                 let result = http
                     .patch(&format!("/api/tasks/{}", task_id), &Value::Object(body))
                     .await?;
@@ -1637,6 +1643,22 @@ impl ToolHandler {
                         &format!("/api/plans/{}/tasks/{}/delegate", plan_id, task_id),
                         args,
                     )
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "get_plan_sessions" => {
+                let plan_id = extract_id(args, "plan_id")?;
+                let result = http
+                    .get(&format!("/api/plans/{}/sessions", plan_id))
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "get_task_sessions" => {
+                let task_id = extract_id(args, "task_id")?;
+                let result = http
+                    .get(&format!("/api/tasks/{}/sessions", task_id))
                     .await?;
                 Ok(Some(result))
             }
@@ -3742,6 +3764,12 @@ impl ToolHandler {
                 if let Some(v) = args.get("offset").and_then(|v| v.as_u64()) {
                     query.push(("offset".to_string(), v.to_string()));
                 }
+                if let Some(v) = args.get("plan_id").and_then(|v| v.as_str()) {
+                    query.push(("plan_id".to_string(), v.to_string()));
+                }
+                if let Some(v) = args.get("task_id").and_then(|v| v.as_str()) {
+                    query.push(("task_id".to_string(), v.to_string()));
+                }
                 let result = http.get_with_query("/api/chat/sessions", &query).await?;
                 Ok(Some(result))
             }
@@ -3845,6 +3873,29 @@ impl ToolHandler {
                 }
                 let result = http
                     .get_with_query(&format!("/api/chat/sessions/{}/discussed", id), &query)
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "associate_session" => {
+                let id = extract_id(args, "session_id")?;
+                let mut body = serde_json::Map::new();
+                body.insert(
+                    "entity_type".to_string(),
+                    json!(extract_string(args, "entity_type")?),
+                );
+                body.insert(
+                    "entity_id".to_string(),
+                    json!(extract_id(args, "entity_id")?),
+                );
+                if let Some(v) = args.get("source").and_then(|v| v.as_str()) {
+                    body.insert("source".to_string(), json!(v));
+                }
+                let result = http
+                    .post(
+                        &format!("/api/chat/sessions/{}/associate", id),
+                        &Value::Object(body),
+                    )
                     .await?;
                 Ok(Some(result))
             }
@@ -5951,6 +6002,7 @@ mod tests {
             ("get_waves", "get_waves"),
             ("delete", "delete_plan"),
             ("delegate_task", "delegate_task"),
+            ("get_sessions", "get_plan_sessions"),
         ] {
             let args = json!({"action": action});
             let (name, _) = handler.resolve_mega_tool("plan", &args).unwrap();
@@ -5975,6 +6027,7 @@ mod tests {
             ("add_dependencies", "add_task_dependencies"),
             ("get_blockers", "get_task_blockers"),
             ("get_context", "get_task_context"),
+            ("get_sessions", "get_task_sessions"),
         ] {
             let args = json!({"action": action});
             let (name, _) = handler.resolve_mega_tool("task", &args).unwrap();
@@ -9005,6 +9058,140 @@ mod tests {
         assert!(result["path"].as_str().unwrap().ends_with("/discussed"));
     }
 
+    // -- Chat ↔ Plan/Task/RFC Linking ------------------------------------------
+
+    #[tokio::test]
+    async fn test_http_get_plan_sessions() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("get_plan_sessions", Some(json!({"plan_id": UUID1})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert!(result["path"].as_str().unwrap().contains("/plans/"));
+        assert!(result["path"].as_str().unwrap().ends_with("/sessions"));
+    }
+
+    #[tokio::test]
+    async fn test_http_get_task_sessions() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("get_task_sessions", Some(json!({"task_id": UUID1})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert!(result["path"].as_str().unwrap().contains("/tasks/"));
+        assert!(result["path"].as_str().unwrap().ends_with("/sessions"));
+    }
+
+    #[tokio::test]
+    async fn test_http_associate_session() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "associate_session",
+                Some(json!({
+                    "session_id": UUID1,
+                    "entity_type": "Plan",
+                    "entity_id": UUID2,
+                    "source": "manual"
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert!(result["path"].as_str().unwrap().ends_with("/associate"));
+    }
+
+    #[tokio::test]
+    async fn test_http_list_sessions_with_plan_filter() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("list_chat_sessions", Some(json!({"plan_id": UUID1})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert_eq!(result["path"], "/api/chat/sessions");
+        let query = result["query"].as_str().unwrap();
+        assert!(query.contains("plan_id"));
+    }
+
+    #[tokio::test]
+    async fn test_http_list_sessions_with_task_filter() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("list_chat_sessions", Some(json!({"task_id": UUID1})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert_eq!(result["path"], "/api/chat/sessions");
+        let query = result["query"].as_str().unwrap();
+        assert!(query.contains("task_id"));
+    }
+
+    #[tokio::test]
+    async fn test_mega_tool_plan_get_sessions() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "plan",
+                Some(json!({"action": "get_sessions", "plan_id": UUID1})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert!(result["path"].as_str().unwrap().ends_with("/sessions"));
+    }
+
+    #[tokio::test]
+    async fn test_mega_tool_task_get_sessions() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "task",
+                Some(json!({"action": "get_sessions", "task_id": UUID1})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert!(result["path"].as_str().unwrap().ends_with("/sessions"));
+    }
+
+    #[tokio::test]
+    async fn test_mega_tool_chat_associate_with() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "chat",
+                Some(json!({
+                    "action": "associate_with",
+                    "session_id": UUID1,
+                    "entity_type": "Plan",
+                    "entity_id": UUID2
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert!(result["path"].as_str().unwrap().ends_with("/associate"));
+    }
+
+    #[tokio::test]
+    async fn test_mega_tool_chat_list_sessions_with_plan_id() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "chat",
+                Some(json!({"action": "list_sessions", "plan_id": UUID1})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert_eq!(result["path"], "/api/chat/sessions");
+        let query = result["query"].as_str().unwrap();
+        assert!(query.contains("plan_id"));
+    }
+
     // -- Structural DNA -------------------------------------------------------
 
     #[tokio::test]
@@ -9796,6 +9983,7 @@ mod tests {
             ("get_session_entities", "get_session_entities"),
             ("get_session_tree", "get_session_tree"),
             ("get_run_sessions", "get_run_sessions"),
+            ("associate_with", "associate_session"),
         ] {
             let args = json!({"action": action});
             let (name, _) = handler.resolve_mega_tool("chat", &args).unwrap();

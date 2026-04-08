@@ -91,6 +91,10 @@ pub struct UpdateTaskRequest {
     pub actual_complexity: Option<u32>,
     #[serde(default)]
     pub estimated_complexity: Option<u32>,
+    /// Optional session_id for auto-linking: when status changes to in_progress,
+    /// creates ASSOCIATED_WITH between this session and the task + its parent plan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
 }
 
 /// Request to add a step to a task

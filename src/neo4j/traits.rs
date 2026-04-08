@@ -1916,6 +1916,38 @@ pub trait GraphStore: Send + Sync {
     async fn backfill_discussed(&self) -> Result<(usize, usize, usize)>;
 
     // ========================================================================
+    // Chat ↔ Plan/Task/RFC linking (ASSOCIATED_WITH relation)
+    // ========================================================================
+
+    /// Create an ASSOCIATED_WITH relation between a ChatSession and a Task or Plan.
+    /// Uses MERGE for idempotence. `entity_type` must be "Task" or "Plan".
+    async fn create_associated_with(
+        &self,
+        session_id: Uuid,
+        entity_type: &str,
+        entity_id: Uuid,
+        source: &str,
+    ) -> Result<bool>;
+
+    /// Get all linked plans, tasks, and RFCs for a chat session (dual-path query).
+    async fn get_session_links(&self, session_id: Uuid) -> Result<LinkedSessionInfo>;
+
+    /// Get all chat sessions linked to a plan (via AgentExecution + ASSOCIATED_WITH).
+    async fn get_sessions_for_plan(&self, plan_id: Uuid) -> Result<Vec<SessionWithLinks>>;
+
+    /// Get all chat sessions linked to a specific task.
+    async fn get_sessions_for_task(&self, task_id: Uuid) -> Result<Vec<SessionWithLinks>>;
+
+    /// Batch get linked session info for multiple sessions (avoids N+1).
+    async fn get_session_links_batch(
+        &self,
+        session_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, LinkedSessionInfo>>;
+
+    /// Get the plan_id for a task (via HAS_TASK relation).
+    async fn get_task_plan_id(&self, task_id: Uuid) -> Result<Option<Uuid>>;
+
+    // ========================================================================
     // Graph visualization queries (PM + Chat layers)
     // ========================================================================
 

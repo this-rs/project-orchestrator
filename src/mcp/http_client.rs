@@ -18,6 +18,10 @@ pub struct McpHttpClient {
     client: Client,
     base_url: String,
     auth_token: Option<String>,
+    /// Session ID injected by ChatManager via `PO_SESSION_ID` env var.
+    /// Sent as `X-Session-Id` header on all requests to enable server-side
+    /// auto-linking of chat sessions to tasks/plans.
+    session_id: Option<String>,
 }
 
 impl McpHttpClient {
@@ -38,6 +42,7 @@ impl McpHttpClient {
             client,
             base_url,
             auth_token,
+            session_id: None,
         }
     }
 
@@ -53,6 +58,9 @@ impl McpHttpClient {
     pub fn from_env() -> Option<Self> {
         let base_url = std::env::var("PO_SERVER_URL").ok()?;
         let auth_token = Self::resolve_auth_token();
+        let session_id = std::env::var("PO_SESSION_ID")
+            .ok()
+            .filter(|s| !s.is_empty());
 
         if auth_token.is_none() {
             warn!(
@@ -62,12 +70,15 @@ impl McpHttpClient {
         }
 
         debug!(
-            "McpHttpClient initialized: base_url={}, auth={}",
+            "McpHttpClient initialized: base_url={}, auth={}, session_id={:?}",
             base_url,
-            auth_token.is_some()
+            auth_token.is_some(),
+            session_id.as_deref()
         );
 
-        Some(Self::new(base_url, auth_token))
+        let mut client = Self::new(base_url, auth_token);
+        client.session_id = session_id;
+        Some(client)
     }
 
     /// Resolve auth token from environment.
@@ -192,10 +203,14 @@ impl McpHttpClient {
 
     // ── Helpers ──────────────────────────────────────────────────────────
 
-    /// Inject Authorization: Bearer header if token is available.
+    /// Inject Authorization: Bearer header and X-Session-Id header if available.
     fn inject_auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        match &self.auth_token {
+        let req = match &self.auth_token {
             Some(token) => req.bearer_auth(token),
+            None => req,
+        };
+        match &self.session_id {
+            Some(sid) => req.header("X-Session-Id", sid),
             None => req,
         }
     }
@@ -547,5 +562,152 @@ mod tests {
         // Cleanup
         std::env::remove_var("PO_AUTH_TOKEN");
         std::env::remove_var("PO_JWT_SECRET");
+    }
+
+    // ── session_id / X-Session-Id ───────────────────────────────────────
+
+    #[test]
+    fn test_new_has_no_session_id() {
+        let client = McpHttpClient::new("http://localhost:8080".to_string(), None);
+        assert!(client.session_id.is_none());
+    }
+
+    #[test]
+    fn test_session_id_can_be_set() {
+        let mut client = McpHttpClient::new("http://localhost:8080".to_string(), None);
+        client.session_id = Some("test-session-123".to_string());
+        assert_eq!(client.session_id.as_deref(), Some("test-session-123"));
+    }
+
+    /// Verify X-Session-Id header is sent when session_id is set.
+    #[tokio::test]
+    async fn test_inject_session_id_sends_header() {
+        let app = Router::new().route(
+            "/session-check",
+            get(|req: Request<Body>| async move {
+                let session_id = req
+                    .headers()
+                    .get("x-session-id")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                (
+                    AxumStatusCode::OK,
+                    axum::Json(json!({"session_id": session_id})),
+                )
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://{}", addr);
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        let mut client = McpHttpClient::new(base_url, Some("jwt-token".to_string()));
+        client.session_id = Some("abc-def-123".to_string());
+
+        let result = client.get("/session-check").await.unwrap();
+        assert_eq!(result["session_id"], "abc-def-123");
+    }
+
+    /// Verify no X-Session-Id header is sent when session_id is None.
+    #[tokio::test]
+    async fn test_no_session_id_sends_no_header() {
+        let app = Router::new().route(
+            "/session-check",
+            get(|req: Request<Body>| async move {
+                let has_header = req.headers().contains_key("x-session-id");
+                (
+                    AxumStatusCode::OK,
+                    axum::Json(json!({"has_session_id": has_header})),
+                )
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://{}", addr);
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        let client = McpHttpClient::new(base_url, None);
+        let result = client.get("/session-check").await.unwrap();
+        assert_eq!(result["has_session_id"], false);
+    }
+
+    /// Verify X-Session-Id is sent on POST requests too (not just GET).
+    #[tokio::test]
+    async fn test_session_id_on_post_request() {
+        let app = Router::new().route(
+            "/session-check",
+            axum::routing::post(|req: Request<Body>| async move {
+                let session_id = req
+                    .headers()
+                    .get("x-session-id")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                (
+                    AxumStatusCode::OK,
+                    axum::Json(json!({"session_id": session_id})),
+                )
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://{}", addr);
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        let mut client = McpHttpClient::new(base_url, Some("token".to_string()));
+        client.session_id = Some("post-session-456".to_string());
+
+        let result = client.post("/session-check", &json!({})).await.unwrap();
+        assert_eq!(result["session_id"], "post-session-456");
+    }
+
+    /// Verify X-Session-Id is sent on PATCH requests (used by task updates).
+    #[tokio::test]
+    async fn test_session_id_on_patch_request() {
+        let app = Router::new().route(
+            "/session-check",
+            axum::routing::patch(|req: Request<Body>| async move {
+                let session_id = req
+                    .headers()
+                    .get("x-session-id")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                let auth = req
+                    .headers()
+                    .get("authorization")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                (
+                    AxumStatusCode::OK,
+                    axum::Json(json!({"session_id": session_id, "auth": auth})),
+                )
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://{}", addr);
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        let mut client = McpHttpClient::new(base_url, Some("jwt-abc".to_string()));
+        client.session_id = Some("patch-session-789".to_string());
+
+        let result = client.patch("/session-check", &json!({})).await.unwrap();
+        assert_eq!(result["session_id"], "patch-session-789");
+        assert_eq!(result["auth"], "Bearer jwt-abc");
     }
 }

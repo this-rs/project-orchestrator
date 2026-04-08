@@ -6920,6 +6920,43 @@ impl GraphStore for MockGraphStore {
     }
 
     // ========================================================================
+    // Chat ↔ Plan/Task/RFC linking (ASSOCIATED_WITH relation)
+    // ========================================================================
+
+    async fn create_associated_with(
+        &self,
+        _session_id: Uuid,
+        _entity_type: &str,
+        _entity_id: Uuid,
+        _source: &str,
+    ) -> Result<bool> {
+        Ok(true)
+    }
+
+    async fn get_session_links(&self, _session_id: Uuid) -> Result<LinkedSessionInfo> {
+        Ok(LinkedSessionInfo::default())
+    }
+
+    async fn get_sessions_for_plan(&self, _plan_id: Uuid) -> Result<Vec<SessionWithLinks>> {
+        Ok(Vec::new())
+    }
+
+    async fn get_sessions_for_task(&self, _task_id: Uuid) -> Result<Vec<SessionWithLinks>> {
+        Ok(Vec::new())
+    }
+
+    async fn get_session_links_batch(
+        &self,
+        _session_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, LinkedSessionInfo>> {
+        Ok(std::collections::HashMap::new())
+    }
+
+    async fn get_task_plan_id(&self, _task_id: Uuid) -> Result<Option<Uuid>> {
+        Ok(None)
+    }
+
+    // ========================================================================
     // Graph visualization queries (PM + Chat layers)
     // ========================================================================
 

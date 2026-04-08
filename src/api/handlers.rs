@@ -600,10 +600,22 @@ pub async fn delete_task(
 /// Update task status
 pub async fn update_task(
     State(state): State<OrchestratorState>,
+    headers: axum::http::HeaderMap,
     Path(task_id): Path<Uuid>,
     Json(req): Json<UpdateTaskRequest>,
 ) -> Result<StatusCode, AppError> {
-    let status_change = if let Some(ref new_status_val) = req.status {
+    // Extract auto-linking fields before moving req.
+    // Priority: explicit session_id in body > X-Session-Id header (injected by MCP proxy)
+    let session_id_for_linking = req.session_id.clone().or_else(|| {
+        headers
+            .get("x-session-id")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string())
+    });
+    let new_status_str = req.status.as_ref().map(|s| format!("{:?}", s));
+    let is_transition_to_in_progress = new_status_str.as_deref() == Some("InProgress");
+
+    let status_change = if req.status.is_some() {
         let old_status = state
             .orchestrator
             .neo4j()
@@ -613,16 +625,53 @@ pub async fn update_task(
             .flatten()
             .map(|t| format!("{:?}", t.status))
             .unwrap_or_default();
-        let new_status = format!("{:?}", new_status_val);
-        Some((old_status, new_status))
+        Some((old_status, new_status_str.clone().unwrap_or_default()))
     } else {
         None
     };
+
     state
         .orchestrator
         .plan_manager()
         .update_task(task_id, req)
         .await?;
+
+    // Auto-link session to task + plan when transitioning to in_progress
+    if is_transition_to_in_progress {
+        if let Some(sid_str) = session_id_for_linking {
+            if let Ok(session_uuid) = sid_str.parse::<uuid::Uuid>() {
+                let neo4j = state.orchestrator.neo4j_arc();
+                tokio::spawn(async move {
+                    if let Err(e) = neo4j
+                        .create_associated_with(session_uuid, "Task", task_id, "auto")
+                        .await
+                    {
+                        tracing::warn!("Auto-link session→task failed: {}", e);
+                    }
+                    match neo4j.get_task_plan_id(task_id).await {
+                        Ok(Some(plan_id)) => {
+                            if let Err(e) = neo4j
+                                .create_associated_with(session_uuid, "Plan", plan_id, "auto")
+                                .await
+                            {
+                                tracing::warn!("Auto-link session→plan failed: {}", e);
+                            }
+                        }
+                        Ok(None) => {
+                            tracing::debug!(
+                                "Task {} has no parent plan, skipping plan link",
+                                task_id
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to resolve plan_id for task {}: {}", task_id, e);
+                        }
+                    }
+                });
+            }
+        }
+    }
+
     if let Some((old_status, new_status)) = status_change {
         state.event_bus.emit_status_changed(
             crate::events::EntityType::Task,

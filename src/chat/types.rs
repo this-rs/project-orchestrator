@@ -633,6 +633,38 @@ pub struct ChatSession {
     /// Origin of the session (runner, sub-conversation, or null for normal)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spawned_by: Option<serde_json::Value>,
+    /// Plans linked to this session (via ASSOCIATED_WITH or AgentExecution)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub linked_plans: Vec<ChatLinkedPlan>,
+    /// Tasks linked to this session
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub linked_tasks: Vec<ChatLinkedTask>,
+    /// RFCs transitively linked via plans
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub linked_rfcs: Vec<ChatLinkedRfc>,
+}
+
+/// A plan linked to a chat session (API response type).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatLinkedPlan {
+    pub id: String,
+    pub title: String,
+    pub source: String,
+}
+
+/// A task linked to a chat session (API response type).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatLinkedTask {
+    pub id: String,
+    pub title: String,
+    pub source: String,
+}
+
+/// An RFC linked to a chat session (API response type).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatLinkedRfc {
+    pub id: String,
+    pub title: String,
 }
 
 /// Response when creating a session
@@ -1683,6 +1715,9 @@ mod tests {
             permission_mode: None,
             add_dirs: None,
             spawned_by: None,
+            linked_plans: Vec::new(),
+            linked_tasks: Vec::new(),
+            linked_rfcs: Vec::new(),
         };
 
         let json = serde_json::to_string(&session).unwrap();
@@ -1897,6 +1932,9 @@ mod tests {
             permission_mode: None,
             add_dirs: Some(vec!["/dir/a".into(), "/dir/b".into()]),
             spawned_by: None,
+            linked_plans: Vec::new(),
+            linked_tasks: Vec::new(),
+            linked_rfcs: Vec::new(),
         };
 
         let json = serde_json::to_string(&session).unwrap();
