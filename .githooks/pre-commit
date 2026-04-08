@@ -1,0 +1,259 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ============================================================================
+# Pre-commit hook — KnowLoop (incremental)
+#
+# Only checks crates/modules affected by staged .rs files.
+# Each commit is green, but only runs what's necessary.
+#
+# Performance (warm cache):
+#   No .rs staged       → <50ms  (skip)
+#   1 file in src/      → ~10-20s (fmt + clippy + targeted tests)
+#   Sub-crate only      → ~5-15s
+#   Full root crate     → ~30-60s (many modules touched)
+#
+# Verifier tests are excluded (flaky during git state transitions).
+# ============================================================================
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+# ---- Step 1: Collect staged .rs files ----
+STAGED_RS=$(git diff --cached --name-only --diff-filter=d -- '*.rs' || true)
+
+if [ -z "$STAGED_RS" ]; then
+  echo -e "${GREEN}[pre-commit]${NC} No .rs files staged — skipping"
+  exit 0
+fi
+
+FILE_COUNT=$(echo "$STAGED_RS" | wc -l | tr -d ' ')
+echo -e "${CYAN}${BOLD}[pre-commit]${NC} ${FILE_COUNT} .rs file(s) staged — incremental check"
+
+# ---- Step 2: Map paths → crates + test filters ----
+
+# Reverse dependency chain for sub-crates
+declare -A IMPACT_CHAIN=(
+  ["neural-routing-core"]="neural-routing-core neural-routing-nn neural-routing-gnn neural-routing-policy neural-routing-runtime"
+  ["neural-routing-nn"]="neural-routing-nn neural-routing-runtime"
+  ["neural-routing-gnn"]="neural-routing-gnn neural-routing-runtime"
+  ["neural-routing-policy"]="neural-routing-policy neural-routing-runtime"
+  ["neural-routing-runtime"]="neural-routing-runtime"
+  ["tree-sitter-dart"]="tree-sitter-dart"
+  ["tree-sitter-hcl"]="tree-sitter-hcl"
+)
+
+declare -A CRATES_TO_CHECK
+declare -A TEST_MODULES  # test filter patterns for knowloop root crate
+ROOT_NEEDS_CHECK=false
+
+while IFS= read -r file; do
+  if [[ "$file" == crates/* ]]; then
+    # Extract crate name: crates/<name>/...
+    crate=$(echo "$file" | cut -d'/' -f2)
+    if [ -n "${IMPACT_CHAIN[$crate]+x}" ]; then
+      for dep in ${IMPACT_CHAIN[$crate]}; do
+        CRATES_TO_CHECK[$dep]=1
+      done
+    else
+      CRATES_TO_CHECK[$crate]=1
+    fi
+    # Root crate depends on all sub-crates
+    ROOT_NEEDS_CHECK=true
+  elif [[ "$file" == src/* ]]; then
+    ROOT_NEEDS_CHECK=true
+    # Extract module path for test filtering
+    # src/chat/manager.rs → chat::manager
+    # src/chat/stages/persona.rs → chat::stages::persona
+    # src/lib.rs, src/main.rs → skip (top-level, test all)
+    rel="${file#src/}"
+    rel="${rel%.rs}"
+    if [[ "$rel" == "lib" ]] || [[ "$rel" == "main" ]]; then
+      # Top-level file changed — can't target, flag to test broader
+      TEST_MODULES["__all__"]=1
+    elif [[ "$rel" == */mod ]]; then
+      # mod.rs → test the parent module
+      mod="${rel%/mod}"
+      mod="${mod//\//::\:}"
+      TEST_MODULES["$mod"]=1
+    else
+      mod="${rel//\//::}"
+      TEST_MODULES["$mod"]=1
+    fi
+  elif [[ "$file" == tests/* ]]; then
+    ROOT_NEEDS_CHECK=true
+    TEST_MODULES["__integration__"]=1
+  elif [[ "$file" == build.rs ]] || [[ "$file" == Cargo.toml ]]; then
+    ROOT_NEEDS_CHECK=true
+    TEST_MODULES["__all__"]=1
+  fi
+done <<< "$STAGED_RS"
+
+if [ "$ROOT_NEEDS_CHECK" = false ] && [ ${#CRATES_TO_CHECK[@]} -eq 0 ]; then
+  echo -e "${GREEN}[pre-commit]${NC} No known crates affected — skipping"
+  exit 0
+fi
+
+if [ "$ROOT_NEEDS_CHECK" = true ]; then
+  CRATES_TO_CHECK["knowloop"]=1
+fi
+
+# Build -p flags for clippy
+CLIPPY_PKGS=""
+for crate in "${!CRATES_TO_CHECK[@]}"; do
+  CLIPPY_PKGS="$CLIPPY_PKGS -p $crate"
+done
+
+echo -e "  Crates: ${CYAN}${!CRATES_TO_CHECK[*]}${NC}"
+
+# Build test filter for knowloop root
+TEST_FILTER=""
+RUN_PARSER_TESTS=false
+if [ -n "${TEST_MODULES[__all__]+x}" ]; then
+  TEST_FILTER="__all__"
+  RUN_PARSER_TESTS=true
+elif [ ${#TEST_MODULES[@]} -gt 0 ]; then
+  # Build a regex filter: "module1|module2|module3"
+  FILTERS=()
+  for mod in "${!TEST_MODULES[@]}"; do
+    if [ "$mod" = "__integration__" ]; then
+      RUN_PARSER_TESTS=true
+    else
+      FILTERS+=("$mod")
+    fi
+  done
+  if [ ${#FILTERS[@]} -gt 0 ]; then
+    TEST_FILTER=$(IFS='|'; echo "${FILTERS[*]}")
+  fi
+fi
+
+if [ -n "$TEST_FILTER" ] && [ "$TEST_FILTER" != "__all__" ]; then
+  echo -e "  Tests:  ${CYAN}${TEST_FILTER}${NC}"
+elif [ "$TEST_FILTER" = "__all__" ]; then
+  echo -e "  Tests:  ${CYAN}all (broad change detected)${NC}"
+fi
+echo ""
+
+FAILED=()
+START_TOTAL=$(date +%s)
+
+# ---- Check 1: rustfmt on staged files only ----
+# Must use `cargo fmt --` (not raw rustfmt) to pick up edition from Cargo.toml
+printf "  %-20s" "fmt"
+START=$(date +%s)
+if OUTPUT=$(cargo fmt -- --check $STAGED_RS 2>&1); then
+  END=$(date +%s)
+  echo -e "${GREEN}✓${NC} ($((END - START))s)"
+else
+  END=$(date +%s)
+  echo -e "${RED}✗${NC} ($((END - START))s)"
+  FAILED+=("fmt")
+  echo -e "${YELLOW}--- fmt output ---${NC}"
+  echo "$OUTPUT" | tail -20
+  echo ""
+fi
+
+# ---- Check 2: clippy on affected crates ----
+printf "  %-20s" "clippy"
+START=$(date +%s)
+if OUTPUT=$(cargo clippy $CLIPPY_PKGS --all-targets -- -D warnings 2>&1); then
+  END=$(date +%s)
+  echo -e "${GREEN}✓${NC} ($((END - START))s)"
+else
+  END=$(date +%s)
+  echo -e "${RED}✗${NC} ($((END - START))s)"
+  FAILED+=("clippy")
+  echo -e "${YELLOW}--- clippy output ---${NC}"
+  echo "$OUTPUT" | tail -30
+  echo ""
+fi
+
+# ---- Check 3: unit tests (targeted) ----
+# Sub-crate tests
+for crate in "${!CRATES_TO_CHECK[@]}"; do
+  if [ "$crate" = "knowloop" ]; then
+    continue  # handled separately with module filter
+  fi
+  printf "  %-20s" "test:$crate"
+  START=$(date +%s)
+  if OUTPUT=$(cargo test -p "$crate" 2>&1); then
+    END=$(date +%s)
+    echo -e "${GREEN}✓${NC} ($((END - START))s)"
+  else
+    END=$(date +%s)
+    echo -e "${RED}✗${NC} ($((END - START))s)"
+    FAILED+=("test:$crate")
+    echo -e "${YELLOW}--- test:$crate output ---${NC}"
+    echo "$OUTPUT" | tail -30
+    echo ""
+  fi
+done
+
+# Root crate tests (filtered by module)
+if [ -n "${CRATES_TO_CHECK[knowloop]+x}" ] && [ -n "$TEST_FILTER" ]; then
+  if [ "$TEST_FILTER" = "__all__" ]; then
+    printf "  %-20s" "test:knowloop"
+    START=$(date +%s)
+    if OUTPUT=$(cargo test --lib -p knowloop -- --test-threads=4 --skip runner::verifier::tests 2>&1); then
+      END=$(date +%s)
+      echo -e "${GREEN}✓${NC} ($((END - START))s)"
+    else
+      END=$(date +%s)
+      echo -e "${RED}✗${NC} ($((END - START))s)"
+      FAILED+=("test:knowloop")
+      echo -e "${YELLOW}--- test:knowloop output ---${NC}"
+      echo "$OUTPUT" | tail -30
+      echo ""
+    fi
+  else
+    printf "  %-20s" "test:knowloop"
+    START=$(date +%s)
+    if OUTPUT=$(cargo test --lib -p knowloop -- --test-threads=4 --skip runner::verifier::tests "$TEST_FILTER" 2>&1); then
+      END=$(date +%s)
+      echo -e "${GREEN}✓${NC} ($((END - START))s)"
+    else
+      END=$(date +%s)
+      echo -e "${RED}✗${NC} ($((END - START))s)"
+      FAILED+=("test:knowloop")
+      echo -e "${YELLOW}--- test:knowloop output ---${NC}"
+      echo "$OUTPUT" | tail -30
+      echo ""
+    fi
+  fi
+fi
+
+# ---- Check 4: parser integration tests (only if tests/ changed) ----
+if [ "$RUN_PARSER_TESTS" = true ]; then
+  printf "  %-20s" "parser-tests"
+  START=$(date +%s)
+  if OUTPUT=$(cargo test --test parser_tests 2>&1); then
+    END=$(date +%s)
+    echo -e "${GREEN}✓${NC} ($((END - START))s)"
+  else
+    END=$(date +%s)
+    echo -e "${RED}✗${NC} ($((END - START))s)"
+    FAILED+=("parser-tests")
+    echo -e "${YELLOW}--- parser-tests output ---${NC}"
+    echo "$OUTPUT" | tail -30
+    echo ""
+  fi
+fi
+
+# ---- Result ----
+END_TOTAL=$(date +%s)
+ELAPSED_TOTAL=$((END_TOTAL - START_TOTAL))
+
+TOTAL_CHECKS=$((2 + ${#CRATES_TO_CHECK[@]}))  # fmt + clippy + tests per crate
+echo ""
+if [ ${#FAILED[@]} -gt 0 ]; then
+  echo -e "${RED}[pre-commit] ${#FAILED[@]} check(s) failed (${ELAPSED_TOTAL}s total)${NC}"
+  echo -e "${RED}  Failed: ${FAILED[*]}${NC}"
+  echo -e "${YELLOW}  Tip: 'git commit --no-verify' to skip${NC}"
+  exit 1
+fi
+
+echo -e "${GREEN}[pre-commit] All checks passed! (${ELAPSED_TOTAL}s)${NC}"
