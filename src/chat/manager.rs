@@ -2858,6 +2858,11 @@ impl ChatManager {
         // Track whether this stream ended with error_max_turns (for auto-continue)
         let mut hit_error_max_turns = false;
 
+        // Track whether we received a proper Result message from the CLI.
+        // If the stream ends without one (CLI crash / hook AbortError), we
+        // synthesize an error event so the frontend doesn't see a silent cancel.
+        let mut received_result = false;
+
         // Track whether any *productive* tool_use occurred in this stream turn.
         // "Conclusive" tools (git commit/push/status, git tag) don't count — the agent
         // may be wrapping up without actually finishing the task.
@@ -3579,8 +3584,9 @@ impl ChatManager {
                                         work_log.lock().await.record_tool_use(tool, input);
                                     }
 
-                                    // Detect error_max_turns for auto-continue
+                                    // Detect Result message (any subtype) and error_max_turns for auto-continue
                                     if let ChatEvent::Result { ref subtype, .. } = event {
+                                        received_result = true;
                                         if subtype == "error_max_turns" {
                                             hit_error_max_turns = true;
                                         }
@@ -3697,6 +3703,39 @@ impl ChatManager {
         // being silently lost after the first message in a session).
         if sdk_control_rx.is_some() {
             *shared_sdk_control_rx.lock().await = sdk_control_rx;
+        }
+
+        // ===== CLI CRASH DETECTION =====
+        // If the stream ended without a Result message AND the user didn't interrupt,
+        // the CLI process likely crashed (e.g. hook AbortError). Emit a synthetic
+        // error so the frontend doesn't see a silent cancel, and treat it like
+        // error_max_turns to trigger auto-continue.
+        if !received_result && !interrupt_flag.load(Ordering::SeqCst) {
+            warn!(
+                session_id = %session_id,
+                "Stream ended without Result message — CLI likely crashed (hook AbortError?)"
+            );
+            let crash_event = ChatEvent::Error {
+                message: "CLI process terminated unexpectedly. The session will attempt to auto-continue.".to_string(),
+                parent_tool_use_id: None,
+            };
+            emit_chat(crash_event.clone(), &events_tx, &nats, &session_id);
+
+            // Persist the synthetic error
+            if let Some(uuid) = session_uuid {
+                let seq = next_seq.fetch_add(1, Ordering::SeqCst);
+                events_to_persist.push(ChatEventRecord {
+                    id: Uuid::new_v4(),
+                    session_id: uuid,
+                    seq,
+                    event_type: crash_event.event_type().to_string(),
+                    data: serde_json::to_string(&crash_event).unwrap_or_default(),
+                    created_at: chrono::Utc::now(),
+                });
+            }
+
+            // Treat as error_max_turns to trigger auto-continue recovery
+            hit_error_max_turns = true;
         }
 
         // ===== POST-STREAM PROCESSING =====

@@ -31,9 +31,13 @@ impl HeartbeatCheck for GitDriftCheck {
             let root_path = &project.root_path;
 
             // git fetch (quiet, timeout handled by engine)
+            // Disable interactive prompts — SSH passphrase / credential helpers
+            // would block indefinitely and cause the 5s heartbeat timeout.
             let fetch_output = tokio::process::Command::new("git")
                 .args(["fetch", "--quiet"])
                 .current_dir(root_path)
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes")
                 .output()
                 .await;
 
@@ -49,6 +53,7 @@ impl HeartbeatCheck for GitDriftCheck {
             let log_output = tokio::process::Command::new("git")
                 .args(["log", "--oneline", "HEAD..origin/main"])
                 .current_dir(root_path)
+                .env("GIT_TERMINAL_PROMPT", "0")
                 .output()
                 .await;
 
