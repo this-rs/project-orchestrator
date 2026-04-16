@@ -72,10 +72,12 @@ jobs:
         run: |
           cargo audit \
             --ignore RUSTSEC-2023-0071 \
-            --ignore RUSTSEC-2026-0049
+            --ignore RUSTSEC-2026-0049 \
+            --ignore RUSTSEC-2026-0098
         # Ignored advisories (transitive, no fix available):
         #   RUSTSEC-2023-0071: rsa — via jsonwebtoken 10.3.0 (upstream must bump)
-        #   RUSTSEC-2026-0049: rustls-webpki — via nexus-claude pinned reqwest 0.11
+        #   RUSTSEC-2026-0049: rustls-webpki 0.101.7 URI name constraints — via nexus-claude pinned reqwest 0.11
+        #   RUSTSEC-2026-0098: rustls-webpki 0.101.7 wildcard name constraints — same transitive dep
 
       - name: Run cargo deny (license + advisory check)
         run: cargo deny check advisories licenses
