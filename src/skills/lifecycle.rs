@@ -647,40 +647,40 @@ pub async fn update_skill_lifecycle(
                     }
                 }
             }
-            SkillStatus::Active
-                if evaluate_demotion(&current_skill, now, config) == DemotionAction::Demote =>
-            {
-                match demote_skill(graph_store, current_skill.id).await {
-                    Ok(()) => {
-                        result.skills_demoted += 1;
-                    }
-                    Err(e) => {
-                        warn!(
-                            skill_id = %current_skill.id,
-                            error = %e,
-                            "Failed to demote skill"
-                        );
-                    }
-                }
-            }
-            SkillStatus::Active => {}
-            SkillStatus::Dormant
-                if evaluate_demotion(&current_skill, now, config) == DemotionAction::Archive =>
-            {
-                match archive_skill(graph_store, current_skill.id).await {
-                    Ok(()) => {
-                        result.skills_archived += 1;
-                    }
-                    Err(e) => {
-                        warn!(
-                            skill_id = %current_skill.id,
-                            error = %e,
-                            "Failed to archive skill"
-                        );
+            #[allow(clippy::collapsible_match)]
+            SkillStatus::Active => {
+                if evaluate_demotion(&current_skill, now, config) == DemotionAction::Demote {
+                    match demote_skill(graph_store, current_skill.id).await {
+                        Ok(()) => {
+                            result.skills_demoted += 1;
+                        }
+                        Err(e) => {
+                            warn!(
+                                skill_id = %current_skill.id,
+                                error = %e,
+                                "Failed to demote skill"
+                            );
+                        }
                     }
                 }
             }
-            SkillStatus::Dormant => {}
+            #[allow(clippy::collapsible_match)]
+            SkillStatus::Dormant => {
+                if evaluate_demotion(&current_skill, now, config) == DemotionAction::Archive {
+                    match archive_skill(graph_store, current_skill.id).await {
+                        Ok(()) => {
+                            result.skills_archived += 1;
+                        }
+                        Err(e) => {
+                            warn!(
+                                skill_id = %current_skill.id,
+                                error = %e,
+                                "Failed to archive skill"
+                            );
+                        }
+                    }
+                }
+            }
             SkillStatus::Imported => {
                 // Imported skills: accelerated Darwinian selection
                 if crate::skills::validation::should_accelerate_archive(&current_skill, now) {
