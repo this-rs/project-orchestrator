@@ -647,6 +647,7 @@ pub async fn update_skill_lifecycle(
                     }
                 }
             }
+            #[allow(clippy::collapsible_match)]
             SkillStatus::Active => {
                 if evaluate_demotion(&current_skill, now, config) == DemotionAction::Demote {
                     match demote_skill(graph_store, current_skill.id).await {
@@ -663,6 +664,7 @@ pub async fn update_skill_lifecycle(
                     }
                 }
             }
+            #[allow(clippy::collapsible_match)]
             SkillStatus::Dormant => {
                 if evaluate_demotion(&current_skill, now, config) == DemotionAction::Archive {
                     match archive_skill(graph_store, current_skill.id).await {

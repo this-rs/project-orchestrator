@@ -599,7 +599,7 @@ impl ToolIntrospector {
         tools
             .iter()
             .zip(categories.iter())
-            .zip(embeddings.into_iter())
+            .zip(embeddings)
             .map(|((tool, &category), embedding)| {
                 let fqn = format!("{}::{}", server_id, tool.name);
 
@@ -656,8 +656,8 @@ impl ToolIntrospector {
 
         Ok(fqns
             .into_iter()
-            .zip(texts.into_iter())
-            .zip(embeddings.into_iter())
+            .zip(texts)
+            .zip(embeddings)
             .map(
                 |((fqn, canonical_text), embedding)| InternalToolDescriptor {
                     fqn,

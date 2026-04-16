@@ -411,7 +411,7 @@ impl DualTrackRouter {
 
         let centroids: Vec<SectionCentroid> = descriptions
             .iter()
-            .zip(embeddings.into_iter())
+            .zip(embeddings)
             .map(|((id, _), emb)| SectionCentroid {
                 section_id: *id,
                 embedding: emb,

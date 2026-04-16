@@ -1,4 +1,6 @@
 #![recursion_limit = "256"]
+// Allow sort_by with reverse ordering — sort_by_key(Reverse(..)) is less readable for complex keys
+#![allow(clippy::unnecessary_sort_by)]
 //! Project Orchestrator
 //!
 //! An AI agent orchestrator with:

@@ -84,6 +84,7 @@ pub fn extract(
                 // Extract `mod foo;` declarations as imports.
                 // Only file-level declarations (no body) — inline modules
                 // (`mod foo { ... }`) are not file imports.
+                #[allow(clippy::collapsible_match)]
                 if node.child_by_field_name("body").is_none() {
                     if let Some(name) = get_field_text(&node, "name", source) {
                         parsed.imports.push(ImportNode {

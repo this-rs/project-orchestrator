@@ -337,7 +337,7 @@ impl ActionCodebook {
     /// Sort core entries by frequency (most common first).
     /// External entries are not sorted (they use FQN index).
     pub fn sort_by_frequency(&mut self) {
-        self.entries.sort_by(|a, b| b.frequency.cmp(&a.frequency));
+        self.entries.sort_by_key(|e| std::cmp::Reverse(e.frequency));
     }
 
     /// Calibrate the OOD threshold from validation data.

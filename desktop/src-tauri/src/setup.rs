@@ -140,8 +140,8 @@ fn normalize_model_id(raw: &str) -> String {
     // Legacy model upgrades: old non-prefixed IDs → current prefixed IDs
     match raw {
         "sonnet-4-5" => return "claude-sonnet-4-6".into(),
-        "opus-4-5" => return "claude-opus-4-6".into(),
-        "opus-4-6" => return "claude-opus-4-6".into(),
+        "opus-4-5" | "opus-4-6" => return "claude-opus-4-6".into(),
+        "opus-4-7" => return "claude-opus-4-7".into(),
         "haiku-4-5" => return "claude-haiku-4-5".into(),
         _ => {}
     }

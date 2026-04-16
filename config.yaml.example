@@ -98,11 +98,11 @@ meilisearch:
 # Chat — Claude Code integration (optional, uses env vars)
 # -----------------------------------------------------------------------------
 chat:
-  default_model: "claude-opus-4-6"    # CHAT_DEFAULT_MODEL env override
+  default_model: "claude-opus-4-7"    # CHAT_DEFAULT_MODEL env override
   max_sessions: 10                     # CHAT_MAX_SESSIONS env override
   session_timeout_secs: 1800           # CHAT_SESSION_TIMEOUT_SECS env override
   max_turns: 50                        # CHAT_MAX_TURNS env override
-  prompt_builder_model: "claude-opus-4-6"  # PROMPT_BUILDER_MODEL env override
+  prompt_builder_model: "claude-opus-4-7"  # PROMPT_BUILDER_MODEL env override
 
 # -----------------------------------------------------------------------------
 # Neural Routing — Trajectory-based route learning (optional)
