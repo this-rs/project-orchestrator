@@ -31,7 +31,7 @@ use nexus_claude::{
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -41,6 +41,18 @@ use crate::expand_tilde;
 
 /// Broadcast channel buffer size for WebSocket subscribers
 const BROADCAST_BUFFER: usize = 256;
+
+/// OOB-triggered `stream_response` rate cap for interactive sessions.
+/// A misbehaving Monitor or background Bash that emits constantly could
+/// otherwise loop the session and inflate the LLM bill — this caps the
+/// number of OOB-driven LLM turns to 50 over a rolling 5-min window
+/// (T7 of plan 9a1684b2).
+pub(crate) const OOB_TRIGGER_CAP_INTERACTIVE: u32 = 50;
+/// Same cap for runner sessions, more conservative since they run
+/// autonomously without a human watching.
+pub(crate) const OOB_TRIGGER_CAP_RUNNER: u32 = 5;
+/// Rolling window for the OOB trigger cap.
+pub(crate) const OOB_TRIGGER_WINDOW_SECS: u64 = 300;
 
 /// An active chat session with a live Claude CLI subprocess
 pub struct ActiveSession {
@@ -142,6 +154,21 @@ pub struct ActiveSession {
     /// steps completed, last tool used. Source of truth for resumption after
     /// compaction or max_turns.
     pub work_log: Arc<Mutex<SessionWorkLog>>,
+    /// Sliding-window history of OOB-triggered `stream_response` spawn
+    /// timestamps (T7 of plan 9a1684b2). Used by `chat::oob_listener` to
+    /// enforce a rate cap that prevents a runaway Monitor / background
+    /// Bash from looping the session indefinitely.
+    pub oob_trigger_history: Arc<Mutex<VecDeque<Instant>>>,
+    /// Maximum OOB-triggered turns within `oob_trigger_window`. Set to
+    /// `OOB_TRIGGER_CAP_INTERACTIVE` (50) for interactive sessions and
+    /// `OOB_TRIGGER_CAP_RUNNER` (5) for runner sessions.
+    pub oob_trigger_cap: u32,
+    /// Rolling window for the OOB trigger cap. Defaults to 5 minutes.
+    pub oob_trigger_window: Duration,
+    /// Anti-spam flag: set to true the first time the cap is hit in a
+    /// window so we emit the SystemHint warning only once per window.
+    /// Reset to false the next time we observe `len < cap` after draining.
+    pub oob_capped_warned: Arc<AtomicBool>,
 }
 
 /// Runtime-mutable environment config for Claude CLI subprocess.
@@ -2588,6 +2615,13 @@ impl ChatManager {
         // Runner sessions: limit to 5 auto-continues to prevent infinite loops.
         // Interactive sessions: unlimited (0) — user can always interrupt manually.
         let max_auto_continues: u32 = if is_runner_session { 5 } else { 0 };
+        // OOB-trigger cap (T7 of plan 9a1684b2): conservative for runner
+        // sessions, generous for interactive (user can always interrupt).
+        let oob_trigger_cap: u32 = if is_runner_session {
+            OOB_TRIGGER_CAP_RUNNER
+        } else {
+            OOB_TRIGGER_CAP_INTERACTIVE
+        };
         let interrupt_flag = {
             let mut sessions = self.active_sessions.write().await;
             // Cancel stale NATS listeners from a previous session with the same ID
@@ -2635,6 +2669,10 @@ impl ChatManager {
                     objective_tracking: true,
                     objective_reminder_turns_since: Arc::new(AtomicU32::new(0)),
                     work_log: work_log.clone(),
+                    oob_trigger_history: Arc::new(Mutex::new(VecDeque::new())),
+                    oob_trigger_cap,
+                    oob_trigger_window: Duration::from_secs(OOB_TRIGGER_WINDOW_SECS),
+                    oob_capped_warned: Arc::new(AtomicBool::new(false)),
                 },
             );
             interrupt_flag
@@ -2659,7 +2697,35 @@ impl ChatManager {
         self.spawn_nats_rpc_listener(
             &session_id.to_string(),
             self.active_sessions.clone(),
+            nats_cancel.clone(),
+        );
+
+        // Spawn the permanent out-of-band SDK message listener (T4+T5 of
+        // plan 9a1684b2). Captures Messages emitted by the CLI subprocess
+        // between turns (background tool notifications, etc.) and
+        // surfaces them as ChatEvent::BackgroundOutput. When a turn is
+        // not active and an OOB event arrives, the listener also pushes
+        // a PendingMessage::BackgroundOutput and tries to claim
+        // is_streaming via compare_exchange to spawn a fresh
+        // stream_response — letting the LLM react autonomously without
+        // waiting for the next user turn.
+        super::oob_listener::spawn_oob_listener(
+            session_id.to_string(),
+            client.clone(),
+            events_tx.clone(),
+            is_streaming.clone(),
+            next_seq.clone(),
             nats_cancel,
+            super::oob_listener::OobListenerDeps {
+                graph: self.graph.clone(),
+                active_sessions: self.active_sessions.clone(),
+                context_injector: self.context_injector.clone(),
+                event_emitter: self.event_emitter.clone(),
+                retry_config: self.config.retry.clone(),
+                enrichment_pipeline: self.enrichment_pipeline.clone(),
+                search: self.search.clone(),
+                nats: self.nats.clone(),
+            },
         );
 
         // Persist the initial user_message event
@@ -4673,6 +4739,12 @@ impl ChatManager {
                     objective_tracking: true,
                     objective_reminder_turns_since: Arc::new(AtomicU32::new(0)),
                     work_log: work_log.clone(),
+                    // Resumed sessions = interactive: use the generous cap (50/5min).
+                    // T7 of plan 9a1684b2.
+                    oob_trigger_history: Arc::new(Mutex::new(VecDeque::new())),
+                    oob_trigger_cap: OOB_TRIGGER_CAP_INTERACTIVE,
+                    oob_trigger_window: Duration::from_secs(OOB_TRIGGER_WINDOW_SECS),
+                    oob_capped_warned: Arc::new(AtomicBool::new(false)),
                 },
             );
             interrupt_flag
@@ -4694,7 +4766,35 @@ impl ChatManager {
         );
 
         // Spawn NATS RPC send listener for cross-instance message routing
-        self.spawn_nats_rpc_listener(session_id, self.active_sessions.clone(), nats_cancel);
+        self.spawn_nats_rpc_listener(
+            session_id,
+            self.active_sessions.clone(),
+            nats_cancel.clone(),
+        );
+
+        // Spawn the permanent out-of-band SDK message listener (T4+T5 of
+        // plan 9a1684b2). Same as `create_session` — the resumed session
+        // needs its own listener bound to the new InteractiveClient. The
+        // old listener (if any) was already cancelled above via
+        // `old_session.nats_cancel.cancel()`.
+        super::oob_listener::spawn_oob_listener(
+            session_id.to_string(),
+            client.clone(),
+            events_tx.clone(),
+            is_streaming.clone(),
+            next_seq.clone(),
+            nats_cancel,
+            super::oob_listener::OobListenerDeps {
+                graph: self.graph.clone(),
+                active_sessions: self.active_sessions.clone(),
+                context_injector: self.context_injector.clone(),
+                event_emitter: self.event_emitter.clone(),
+                retry_config: self.config.retry.clone(),
+                enrichment_pipeline: self.enrichment_pipeline.clone(),
+                search: self.search.clone(),
+                nats: self.nats.clone(),
+            },
+        );
 
         // Persist the user_message event
         let user_event = ChatEventRecord {
@@ -7312,6 +7412,10 @@ mod tests {
             objective_tracking: false,
             objective_reminder_turns_since: Arc::new(AtomicU32::new(0)),
             work_log: Arc::new(Mutex::new(SessionWorkLog::default())),
+            oob_trigger_history: Arc::new(Mutex::new(VecDeque::new())),
+            oob_trigger_cap: OOB_TRIGGER_CAP_INTERACTIVE,
+            oob_trigger_window: Duration::from_secs(OOB_TRIGGER_WINDOW_SECS),
+            oob_capped_warned: Arc::new(AtomicBool::new(false)),
         };
 
         Some((session, pending_messages))
@@ -8208,6 +8312,10 @@ mod tests {
             objective_tracking: false,
             objective_reminder_turns_since: Arc::new(AtomicU32::new(0)),
             work_log: Arc::new(Mutex::new(SessionWorkLog::default())),
+            oob_trigger_history: Arc::new(Mutex::new(VecDeque::new())),
+            oob_trigger_cap: OOB_TRIGGER_CAP_INTERACTIVE,
+            oob_trigger_window: Duration::from_secs(OOB_TRIGGER_WINDOW_SECS),
+            oob_capped_warned: Arc::new(AtomicBool::new(false)),
         };
 
         (session, handle)

@@ -1093,6 +1093,12 @@ mod integration_tests {
                 objective_reminder_turns_since: Arc::new(AtomicU32::new(0)),
                 reasoning_path_tracker: crate::chat::feedback::ReasoningPathTracker::new(),
                 work_log: Arc::new(Mutex::new(crate::chat::types::SessionWorkLog::default())),
+                oob_trigger_history: Arc::new(Mutex::new(VecDeque::new())),
+                oob_trigger_cap: crate::chat::manager::OOB_TRIGGER_CAP_INTERACTIVE,
+                oob_trigger_window: std::time::Duration::from_secs(
+                    crate::chat::manager::OOB_TRIGGER_WINDOW_SECS,
+                ),
+                oob_capped_warned: Arc::new(AtomicBool::new(false)),
             };
             active_sessions
                 .write()

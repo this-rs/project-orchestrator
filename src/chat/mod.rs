@@ -16,6 +16,7 @@ pub mod entity_extractor;
 pub mod feedback;
 pub mod manager;
 pub mod observation_detector;
+pub(crate) mod oob_listener;
 pub mod path_detect;
 pub(crate) mod post_stream;
 pub(crate) mod post_tool_hook;

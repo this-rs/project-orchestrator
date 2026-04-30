@@ -59,79 +59,94 @@ pub(crate) async fn drain_pending_messages(
     };
 
     if let Some(next_msg) = next_message {
-        let is_system_hint = next_msg.kind == PendingMessageKind::SystemHint;
+        let kind = next_msg.kind.clone();
         let msg_content = next_msg.content;
 
         info!(
             "Processing queued {} for session {} (queue was non-empty after stream)",
-            if is_system_hint {
-                "system_hint"
-            } else {
-                "user_message"
+            match kind {
+                PendingMessageKind::SystemHint => "system_hint",
+                PendingMessageKind::User => "user_message",
+                PendingMessageKind::BackgroundOutput => "background_output",
             },
             session_id
         );
 
-        // Persist the event and update message count (only for user messages)
-        if let Some(uuid) = session_uuid {
-            if !is_system_hint {
-                if let Ok(Some(node)) = graph.get_chat_session(uuid).await {
-                    let _ = graph
-                        .update_chat_session(
-                            uuid,
-                            None,
-                            None,
-                            Some(node.message_count + 1),
-                            None,
-                            None,
-                            None,
-                        )
-                        .await;
+        // Persist the event and update message count.
+        // - SystemHint: persist as system_hint, no message_count bump
+        // - User: persist as user_message, bump message_count
+        // - BackgroundOutput: SKIP persist + SKIP broadcast — the OOB
+        //   listener has already done both before pushing to the queue
+        //   (see chat::oob_listener). Re-persisting would duplicate.
+        let needs_persist_and_broadcast = !matches!(kind, PendingMessageKind::BackgroundOutput);
+        if needs_persist_and_broadcast {
+            if let Some(uuid) = session_uuid {
+                if matches!(kind, PendingMessageKind::User) {
+                    if let Ok(Some(node)) = graph.get_chat_session(uuid).await {
+                        let _ = graph
+                            .update_chat_session(
+                                uuid,
+                                None,
+                                None,
+                                Some(node.message_count + 1),
+                                None,
+                                None,
+                                None,
+                            )
+                            .await;
+                    }
                 }
+
+                let (event_type, event_data) = match kind {
+                    PendingMessageKind::SystemHint => (
+                        "system_hint".to_string(),
+                        serde_json::to_string(&ChatEvent::SystemHint {
+                            content: msg_content.clone(),
+                        })
+                        .unwrap_or_default(),
+                    ),
+                    PendingMessageKind::User => (
+                        "user_message".to_string(),
+                        serde_json::to_string(&ChatEvent::UserMessage {
+                            content: msg_content.clone(),
+                        })
+                        .unwrap_or_default(),
+                    ),
+                    PendingMessageKind::BackgroundOutput => unreachable!(
+                        "BackgroundOutput is filtered out by needs_persist_and_broadcast"
+                    ),
+                };
+
+                let event_record = ChatEventRecord {
+                    id: Uuid::new_v4(),
+                    session_id: uuid,
+                    seq: next_seq.fetch_add(1, Ordering::SeqCst),
+                    event_type,
+                    data: event_data,
+                    created_at: chrono::Utc::now(),
+                };
+                let _ = graph.store_chat_events(uuid, vec![event_record]).await;
             }
 
-            let (event_type, event_data) = if is_system_hint {
-                (
-                    "system_hint".to_string(),
-                    serde_json::to_string(&ChatEvent::SystemHint {
-                        content: msg_content.clone(),
-                    })
-                    .unwrap_or_default(),
-                )
-            } else {
-                (
-                    "user_message".to_string(),
-                    serde_json::to_string(&ChatEvent::UserMessage {
-                        content: msg_content.clone(),
-                    })
-                    .unwrap_or_default(),
-                )
+            let chat_event = match kind {
+                PendingMessageKind::SystemHint => ChatEvent::SystemHint {
+                    content: msg_content.clone(),
+                },
+                PendingMessageKind::User => ChatEvent::UserMessage {
+                    content: msg_content.clone(),
+                },
+                PendingMessageKind::BackgroundOutput => unreachable!(),
             };
-
-            let event_record = ChatEventRecord {
-                id: Uuid::new_v4(),
-                session_id: uuid,
-                seq: next_seq.fetch_add(1, Ordering::SeqCst),
-                event_type,
-                data: event_data,
-                created_at: chrono::Utc::now(),
-            };
-            let _ = graph.store_chat_events(uuid, vec![event_record]).await;
-        }
-
-        // Emit the appropriate event on broadcast + NATS
-        let chat_event = if is_system_hint {
-            ChatEvent::SystemHint {
-                content: msg_content.clone(),
+            let _ = events_tx.send(chat_event.clone());
+            if let Some(ref nats) = nats {
+                nats.publish_chat_event(&session_id, chat_event);
             }
         } else {
-            ChatEvent::UserMessage {
-                content: msg_content.clone(),
-            }
-        };
-        let _ = events_tx.send(chat_event.clone());
-        if let Some(ref nats) = nats {
-            nats.publish_chat_event(&session_id, chat_event);
+            debug!(
+                session_id = %session_id,
+                "Drain: BackgroundOutput already persisted/broadcasted by OOB listener — \
+                 forwarding content to stream_response as prompt"
+            );
         }
 
         // Recursive call to process the queued message
