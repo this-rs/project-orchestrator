@@ -2659,6 +2659,20 @@ impl ChatManager {
         self.spawn_nats_rpc_listener(
             &session_id.to_string(),
             self.active_sessions.clone(),
+            nats_cancel.clone(),
+        );
+
+        // Spawn the permanent out-of-band SDK message listener (T4 of plan
+        // 9a1684b2). Captures Messages emitted by the CLI subprocess
+        // between turns (background tool notifications, etc.) and
+        // surfaces them as ChatEvent::BackgroundOutput on the session
+        // broadcast. Stops cleanly on `nats_cancel` (shared with NATS
+        // listeners — one cancel for all session-bound background tasks).
+        super::oob_listener::spawn_oob_listener(
+            session_id.to_string(),
+            client.clone(),
+            events_tx.clone(),
+            is_streaming.clone(),
             nats_cancel,
         );
 
@@ -4694,7 +4708,24 @@ impl ChatManager {
         );
 
         // Spawn NATS RPC send listener for cross-instance message routing
-        self.spawn_nats_rpc_listener(session_id, self.active_sessions.clone(), nats_cancel);
+        self.spawn_nats_rpc_listener(
+            session_id,
+            self.active_sessions.clone(),
+            nats_cancel.clone(),
+        );
+
+        // Spawn the permanent out-of-band SDK message listener (T4 of plan
+        // 9a1684b2). Same as `create_session` — the resumed session needs
+        // its own listener bound to the new InteractiveClient. The old
+        // listener (if any) was already cancelled above via
+        // `old_session.nats_cancel.cancel()`.
+        super::oob_listener::spawn_oob_listener(
+            session_id.to_string(),
+            client.clone(),
+            events_tx.clone(),
+            is_streaming.clone(),
+            nats_cancel,
+        );
 
         // Persist the user_message event
         let user_event = ChatEventRecord {
