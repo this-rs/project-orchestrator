@@ -130,7 +130,7 @@ async-trait = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 # Chat / Claude Code SDK
-nexus-claude = { git = "https://github.com/this-rs/nexus.git", rev = "c9e0da3", features = ["memory", "auto-download"] }
+nexus-claude = { git = "https://github.com/this-rs/nexus.git", rev = "fc00740", features = ["memory", "auto-download"] }
 tokio-stream = { workspace = true }
 
 # Auth
@@ -262,11 +262,3 @@ post_install_script = "packaging/rpm/postinst.sh"
 [package.metadata.generate-rpm.requires]
 systemd = "*"
 
-# =============================================================================
-# Local development: override nexus-claude with the local clone while we
-# iterate on the OOB listener feature (T3 of plan 9a1684b2). Once the SDK
-# changes are pushed and tagged, replace this block with a `rev = "..."` bump
-# in [dependencies].
-# =============================================================================
-[patch."https://github.com/this-rs/nexus.git"]
-nexus-claude = { path = "/Users/triviere/projects/project-orchestrator/nexus/claude-code-sdk-rs" }
