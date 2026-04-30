@@ -5269,33 +5269,27 @@ impl ChatManager {
             }
 
             // Kill descendant processes of the CLI (find, sleep, cargo, etc.)
-            // WITHOUT killing the CLI itself. Sending SIGINT to the entire process
-            // group (-pgid) would kill the CLI too, making the session unusable
-            // and causing "Failed to send message through channel" on the next message.
-            // Instead, enumerate child PIDs recursively and signal them individually.
-            #[cfg(unix)]
-            if let Some(pid) = child_pid {
-                let descendants = Self::get_descendant_pids(pid);
-                if !descendants.is_empty() {
-                    for &desc_pid in &descendants {
-                        unsafe {
-                            libc::kill(desc_pid as i32, libc::SIGINT);
-                        }
-                    }
-                    info!(
-                        session_id = %session_id,
-                        cli_pid = pid,
-                        descendant_count = descendants.len(),
-                        descendant_pids = ?descendants,
-                        "Sent SIGINT to CLI descendant processes (not the CLI itself)"
-                    );
-                } else {
-                    debug!(
-                        session_id = %session_id,
-                        cli_pid = pid,
-                        "No descendant processes found to kill"
-                    );
-                }
+            // WITHOUT killing the CLI itself. Delegated to `kill_descendants`
+            // which is also used by `cancel_running_tools` (T1 of plan
+            // 28e9afe3 — see decision d2bf0e7b for why these two paths share
+            // the SIGINT primitive but interrupt() additionally sets the
+            // flag/token + sends the control_request to end the turn,
+            // whereas cancel_running_tools deliberately does NEITHER).
+            let killed = Self::kill_descendants(child_pid);
+            if !killed.is_empty() {
+                info!(
+                    session_id = %session_id,
+                    cli_pid = ?child_pid,
+                    descendant_count = killed.len(),
+                    descendant_pids = ?killed,
+                    "Sent SIGINT to CLI descendant processes (not the CLI itself)"
+                );
+            } else if let Some(pid) = child_pid {
+                debug!(
+                    session_id = %session_id,
+                    cli_pid = pid,
+                    "No descendant processes found to kill"
+                );
             }
 
             info!(
@@ -5347,6 +5341,56 @@ impl ChatManager {
             stack.extend(get_children(child));
         }
         result
+    }
+
+    /// Send `SIGINT` to every descendant of `cli_pid` **without** sending the
+    /// SDK `interrupt` control_request and **without** touching the
+    /// `interrupt_flag`/`interrupt_token`. Returns the PIDs that received the
+    /// signal (empty if `cli_pid` is `None` or no descendants exist).
+    ///
+    /// ## Why this helper exists separately from `interrupt()`
+    ///
+    /// Decision `d2bf0e7b` (T1 of plan 28e9afe3) — empirical analysis of the
+    /// Claude Code CLI source (`bridge/bridgeMessaging.ts:362` →
+    /// `QueryEngine.ts:1158`) showed that the SDK control_request `interrupt`
+    /// triggers `QueryEngine.abortController.abort()`, which propagates to
+    /// **every** consumer of the AbortController (including the in-flight
+    /// fetch to the Anthropic API and the BashTool's `exec()`). The
+    /// AbortController is **never reset** within a `QueryEngine` instance, so
+    /// `abort()` ends the entire turn — the LLM cannot continue afterwards.
+    ///
+    /// In contrast, sending `SIGINT` directly to the descendant shell
+    /// (without touching the AbortController) makes BashTool's awaited
+    /// `exec()` see its child exit with code 130. BashTool reports a normal
+    /// `tool_result` with `isError: true` and the agent's turn continues
+    /// normally — exactly the behaviour required by `cancel_running_tools`.
+    ///
+    /// Therefore: `interrupt()` keeps using the control_request +
+    /// flag/token (turn-ending behaviour, by design), while
+    /// `cancel_running_tools()` calls **only** this helper.
+    ///
+    /// On non-unix platforms this is a no-op that returns an empty Vec.
+    fn kill_descendants(cli_pid: Option<u32>) -> Vec<u32> {
+        #[cfg(unix)]
+        {
+            let Some(pid) = cli_pid else { return Vec::new() };
+            let descendants = Self::get_descendant_pids(pid);
+            for &desc_pid in &descendants {
+                // SAFETY: libc::kill is FFI; SIGINT to a non-existent PID
+                // returns ESRCH which we silently ignore (idempotent —
+                // the tool may have finished naturally between snapshot
+                // and signal).
+                unsafe {
+                    libc::kill(desc_pid as i32, libc::SIGINT);
+                }
+            }
+            descendants
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = cli_pid;
+            Vec::new()
+        }
     }
 
     /// Close an active session: interrupt first, then disconnect and remove.
