@@ -109,6 +109,17 @@ impl NatsEmitter {
         format!("{}.chat.{}.interrupt", self.subject_prefix, session_id)
     }
 
+    /// Build the cancel-tools subject for a session
+    /// (e.g. "events.chat.{session_id}.cancel_tools").
+    ///
+    /// Distinct from `interrupt_subject` because the two have different
+    /// semantics: interrupt ends the LLM turn, cancel_tools just kills
+    /// the running tool subprocess(es) and lets the agent continue
+    /// (T2 of plan 28e9afe3 — see decision d2bf0e7b on T1).
+    pub fn cancel_tools_subject(&self, session_id: &str) -> String {
+        format!("{}.chat.{}.cancel_tools", self.subject_prefix, session_id)
+    }
+
     /// Publish a ChatEvent to the session's NATS subject.
     ///
     /// Fire-and-forget: errors are logged but never block the caller.
@@ -168,6 +179,36 @@ impl NatsEmitter {
                 debug!(
                     subject = %subject,
                     "Interrupt published to NATS"
+                );
+            }
+        });
+    }
+
+    /// Publish a cancel-tools signal for a chat session (T2 of plan
+    /// 28e9afe3). The instance owning the session reacts by calling
+    /// `ChatManager::cancel_running_tools` — SIGINT to descendants only,
+    /// no turn-ending behaviour. Distinct from `publish_interrupt`.
+    ///
+    /// Fire-and-forget: errors are logged but never block the caller.
+    pub fn publish_cancel_tools(&self, session_id: &str) {
+        let client = self.client.clone();
+        let subject = self.cancel_tools_subject(session_id);
+
+        tokio::spawn(async move {
+            let payload = b"{\"cancel_tools\":true}";
+            if let Err(e) = client
+                .publish(subject.clone(), payload.to_vec().into())
+                .await
+            {
+                warn!(
+                    subject = %subject,
+                    "Failed to publish cancel_tools to NATS: {}",
+                    e
+                );
+            } else {
+                debug!(
+                    subject = %subject,
+                    "cancel_tools published to NATS"
                 );
             }
         });
@@ -280,6 +321,24 @@ impl NatsEmitter {
             anyhow::anyhow!("Failed to subscribe to NATS interrupt {}: {}", subject, e)
         })?;
         debug!(subject = %subject, "Subscribed to NATS interrupt");
+        Ok(subscriber)
+    }
+
+    /// Subscribe to cancel-tools signals for a session from NATS (T2 of
+    /// plan 28e9afe3). Subject: `events.chat.{session_id}.cancel_tools`.
+    pub async fn subscribe_cancel_tools(
+        &self,
+        session_id: &str,
+    ) -> anyhow::Result<async_nats::Subscriber> {
+        let subject = self.cancel_tools_subject(session_id);
+        let subscriber = self.client.subscribe(subject.clone()).await.map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to subscribe to NATS cancel_tools {}: {}",
+                subject,
+                e
+            )
+        })?;
+        debug!(subject = %subject, "Subscribed to NATS cancel_tools");
         Ok(subscriber)
     }
 

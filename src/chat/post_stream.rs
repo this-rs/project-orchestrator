@@ -1099,6 +1099,11 @@ mod integration_tests {
                     crate::chat::manager::OOB_TRIGGER_WINDOW_SECS,
                 ),
                 oob_capped_warned: Arc::new(AtomicBool::new(false)),
+                cancel_tools_history: Arc::new(Mutex::new(VecDeque::new())),
+                cancel_tools_cap: crate::chat::manager::CANCEL_TOOLS_CAP,
+                cancel_tools_window: std::time::Duration::from_secs(
+                    crate::chat::manager::CANCEL_TOOLS_WINDOW_SECS,
+                ),
             };
             active_sessions
                 .write()
