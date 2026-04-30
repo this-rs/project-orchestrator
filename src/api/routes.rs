@@ -1665,6 +1665,13 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/chat/sessions/{id}/associate",
             post(chat_handlers::associate_session),
         )
+        // Cancel running tools (T3 of plan 28e9afe3) — kill the
+        // currently-running tool subprocess(es) WITHOUT ending the
+        // LLM turn. See chat_handlers::cancel_tools doc-comment.
+        .route(
+            "/api/chat/sessions/{id}/cancel-tools",
+            post(chat_handlers::cancel_tools),
+        )
         // Chat permission config (runtime GET/PUT)
         .route(
             "/api/chat/config/permissions",

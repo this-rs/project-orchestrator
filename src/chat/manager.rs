@@ -5426,13 +5426,14 @@ impl ChatManager {
                     s.cancel_tools_history.clone(),
                     s.cancel_tools_cap,
                     s.cancel_tools_window,
+                    s.events_tx.clone(),
                 )
             })
         };
 
         // Apply the rate cap — even when the session is remote (NATS
         // path), so a cross-instance click-spam can't loop forever.
-        let (cli_pid, history, cap, window) = match session_state {
+        let (cli_pid, history, cap, window, events_tx) = match session_state {
             Some(state) => state,
             None => {
                 // Session not local — still enforce a "soft" cap by
@@ -5479,10 +5480,24 @@ impl ChatManager {
             "cancel_running_tools: SIGINT sent to descendants (turn preserved)"
         );
 
-        // Cross-instance fan-out — even when local, so other instances
-        // observing this session via NATS can update their UI state.
+        // Broadcast a typed event so all clients of this session
+        // (multi-tab, sidebar, frontend logs) observe the cancel
+        // immediately — even if no `ToolResult` cancelled is emitted
+        // (e.g., agent was thinking, no tool was running).
+        let event = ChatEvent::ToolsCancelled {
+            cli_pid,
+            killed_count: killed_pids.len(),
+            requested_by: "user".to_string(),
+        };
+        let _ = events_tx.send(event.clone());
+
+        // Cross-instance fan-out — both the cancel SIGNAL (so the
+        // owning instance executes the SIGINT if remote) and the
+        // ChatEvent (so remote clients of this session see the cancel
+        // in their feed).
         if let Some(ref nats) = self.nats {
             nats.publish_cancel_tools(session_id);
+            nats.publish_chat_event(session_id, event);
         }
 
         Ok(CancelToolsResult {
