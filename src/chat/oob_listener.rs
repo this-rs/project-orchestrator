@@ -33,40 +33,78 @@
 //! `is_streaming == false`. In-stream messages are delegated to
 //! `stream_response`'s normal handling and we silently skip them here to
 //! avoid duplicate persistence/broadcast.
+//!
+//! ## Triggering on idle
+//!
+//! When an OOB event arrives and the session is idle (no active turn),
+//! the listener:
+//!   1. Persists the event as a `ChatEventRecord` of type `background_output`
+//!      (so it appears in `chat::list_messages` history)
+//!   2. Broadcasts a `ChatEvent::BackgroundOutput` (so WebSocket clients
+//!      see it in real time)
+//!   3. Pushes a `PendingMessage::BackgroundOutput` carrying the content
+//!   4. Tries to claim the streaming flag via `compare_exchange(false, true)`
+//!      and, if it wins the race, spawns a new `stream_response` so the
+//!      LLM reacts to the event without waiting for the next user turn
+//!   5. If it loses the race (a concurrent user message claimed the
+//!      flag first), the queued `PendingMessage` will be picked up by
+//!      `drain_pending_messages` after that turn ends — no event is
+//!      dropped.
 
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
 use chrono::Utc;
 use futures::StreamExt;
 use nexus_claude::{
     AssistantMessage, ContentBlock, ContentValue, InteractiveClient, Message, UserMessage,
 };
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::{Mutex, RwLock, broadcast};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
+use uuid::Uuid;
 
-use super::types::ChatEvent;
+use super::manager::{ActiveSession, ChatManager};
+use super::types::{ChatEvent, PendingMessage};
+use crate::meilisearch::SearchStore;
+use crate::neo4j::GraphStore;
+use crate::neo4j::models::ChatEventRecord;
+
+/// Dependencies needed to trigger a fresh `stream_response` from an
+/// idle session when an OOB event arrives. These are all
+/// `ChatManager`-bound (not session-bound) and are cloned once at spawn
+/// time. Session-bound state is looked up via `active_sessions` at
+/// trigger time, mirroring the pattern used by `spawn_nats_rpc_listener`.
+pub(crate) struct OobListenerDeps {
+    pub graph: Arc<dyn GraphStore>,
+    pub active_sessions: Arc<RwLock<HashMap<String, ActiveSession>>>,
+    pub context_injector: Option<Arc<nexus_claude::memory::ContextInjector>>,
+    pub event_emitter: Option<Arc<dyn crate::events::EventEmitter>>,
+    pub retry_config: super::config::RetryConfig,
+    pub enrichment_pipeline: Arc<super::enrichment::EnrichmentPipeline>,
+    pub search: Arc<dyn SearchStore>,
+    pub nats: Option<Arc<crate::events::NatsEmitter>>,
+}
 
 /// Spawn the OOB listener task for a session. Fire-and-forget — the task
 /// is owned by the tokio runtime and stops when `cancel` is fired.
 ///
 /// `session_id` is used only for tracing context.
-///
-/// `client` and `cancel` MUST outlive the task by the natural session
-/// lifecycle: when the `ActiveSession` is dropped or replaced (resume),
-/// the caller fires `cancel` and the task exits cleanly within ~100ms.
-pub fn spawn_oob_listener(
+pub(crate) fn spawn_oob_listener(
     session_id: String,
     client: Arc<Mutex<InteractiveClient>>,
     events_tx: broadcast::Sender<ChatEvent>,
     is_streaming: Arc<AtomicBool>,
+    next_seq: Arc<AtomicI64>,
     cancel: CancellationToken,
+    deps: OobListenerDeps,
 ) {
+    let session_uuid = Uuid::parse_str(&session_id).ok();
+
     tokio::spawn(async move {
         // Briefly take the client lock to call subscribe_messages(). The
-        // returned stream is `'static` and independent of the lock — the
-        // lock is released as soon as this block exits.
+        // returned stream is `'static` and independent of the lock.
         let stream = {
             let client = client.lock().await;
             client.subscribe_messages().await
@@ -97,9 +135,7 @@ pub fn spawn_oob_listener(
                     match next {
                         Some(Ok(message)) => {
                             // If a stream_response is currently running, that path
-                            // already consumes the same broadcast and converts the
-                            // message into proper ChatEvents (ToolUse, AssistantText, …).
-                            // Emitting BackgroundOutput here would duplicate the event.
+                            // already consumes the same broadcast. Skip silently.
                             if is_streaming.load(Ordering::Relaxed) {
                                 debug!(
                                     session_id = %session_id,
@@ -107,7 +143,17 @@ pub fn spawn_oob_listener(
                                 );
                                 continue;
                             }
-                            handle_oob_message(&session_id, &events_tx, &message);
+                            handle_oob_message(
+                                &session_id,
+                                session_uuid,
+                                &events_tx,
+                                &is_streaming,
+                                &next_seq,
+                                &client,
+                                &deps,
+                                &message,
+                            )
+                            .await;
                         }
                         Some(Err(e)) => {
                             warn!(
@@ -117,10 +163,6 @@ pub fn spawn_oob_listener(
                             );
                         }
                         None => {
-                            // Stream closed: the broadcast::Sender was dropped, which
-                            // means the subprocess transport is gone (CLI died or
-                            // disconnect() was called). The session is effectively
-                            // dead — let the caller know via SystemHint and exit.
                             warn!(
                                 session_id = %session_id,
                                 "OOB listener: SDK message broadcast closed (subprocess gone); exiting"
@@ -140,12 +182,17 @@ pub fn spawn_oob_listener(
     });
 }
 
-/// Convert an OOB `Message` to a `ChatEvent::BackgroundOutput` and emit it
-/// on the session's broadcast. Persistence and queueing for trigger are
-/// handled separately (T5).
-fn handle_oob_message(
+/// Handle a single OOB Message: persist, broadcast, push to queue, and
+/// try to claim the streaming flag to spawn a new turn.
+#[allow(clippy::too_many_arguments)]
+async fn handle_oob_message(
     session_id: &str,
+    session_uuid: Option<Uuid>,
     events_tx: &broadcast::Sender<ChatEvent>,
+    is_streaming: &Arc<AtomicBool>,
+    next_seq: &Arc<AtomicI64>,
+    _client: &Arc<Mutex<InteractiveClient>>,
+    deps: &OobListenerDeps,
     message: &Message,
 ) {
     let payload = extract_payload(message);
@@ -168,7 +215,7 @@ fn handle_oob_message(
 
     let event = ChatEvent::BackgroundOutput {
         source: source.clone(),
-        content,
+        content: content.clone(),
         received_at: Utc::now(),
         correlation_id,
     };
@@ -179,20 +226,184 @@ fn handle_oob_message(
         "OOB listener: emitting BackgroundOutput"
     );
 
-    // Fire-and-forget: if there are no subscribers (no WebSocket clients,
-    // no stream_response listening), the event is dropped. Persistence to
-    // the graph is added in T5/T9 — for now the broadcast is the only sink.
-    let _ = events_tx.send(event);
+    // 1. Persist as ChatEventRecord (so it appears in list_messages history)
+    if let Some(uuid) = session_uuid {
+        let record = ChatEventRecord {
+            id: Uuid::new_v4(),
+            session_id: uuid,
+            seq: next_seq.fetch_add(1, Ordering::SeqCst),
+            event_type: event.event_type().to_string(),
+            data: serde_json::to_string(&event).unwrap_or_default(),
+            created_at: chrono::Utc::now(),
+        };
+        if let Err(e) = deps.graph.store_chat_events(uuid, vec![record]).await {
+            warn!(
+                session_id = %session_id,
+                error = %e,
+                "OOB listener: failed to persist BackgroundOutput record (non-fatal)"
+            );
+        }
+    }
+
+    // 2. Broadcast on local channel + NATS so all WebSocket clients see it
+    let _ = events_tx.send(event.clone());
+    if let Some(ref nats) = deps.nats {
+        nats.publish_chat_event(session_id, event);
+    }
+
+    // 3 & 4. Push to pending_messages and try to claim streaming, then
+    //         maybe trigger a new stream_response.
+    maybe_trigger_stream(session_id, content, is_streaming, deps).await;
+}
+
+/// Push the OOB content as a `PendingMessage::BackgroundOutput` and, if
+/// the session is idle, atomically claim the streaming flag and spawn
+/// `stream_response` so the LLM reacts.
+///
+/// Race semantics: we use `compare_exchange(false, true)` on
+/// `is_streaming`. Whichever caller first transitions false→true owns
+/// the spawn; concurrent OOB events or user messages losing the race
+/// just leave their entries in the queue and the active stream's
+/// `drain_pending_messages` picks them up after Result.
+async fn maybe_trigger_stream(
+    session_id: &str,
+    oob_content: String,
+    is_streaming: &Arc<AtomicBool>,
+    deps: &OobListenerDeps,
+) {
+    // Look up session-bound state. If the session was just removed,
+    // there's nothing to do.
+    let session_state = {
+        let sessions = deps.active_sessions.read().await;
+        sessions.get(session_id).map(|s| {
+            (
+                s.client.clone(),
+                s.events_tx.clone(),
+                s.interrupt_flag.clone(),
+                s.memory_manager.clone(),
+                s.next_seq.clone(),
+                s.pending_messages.clone(),
+                s.is_streaming.clone(),
+                s.streaming_text.clone(),
+                s.streaming_events.clone(),
+                s.sdk_control_rx.clone(),
+                s.auto_continue.clone(),
+            )
+        })
+    };
+
+    let Some((
+        client,
+        events_tx,
+        interrupt_flag,
+        memory_manager,
+        next_seq,
+        pending_messages,
+        sess_is_streaming,
+        streaming_text,
+        streaming_events,
+        sdk_control_rx,
+        auto_continue,
+    )) = session_state
+    else {
+        debug!(
+            session_id = %session_id,
+            "OOB listener: session no longer in active_sessions — dropping trigger"
+        );
+        return;
+    };
+
+    // Push the OOB content as a queue entry so drain_pending_messages
+    // (or the spawned stream_response below) can process it later.
+    {
+        let mut queue = pending_messages.lock().await;
+        queue.push_back(PendingMessage::background_output(oob_content.clone()));
+    }
+
+    // Claim the streaming flag atomically. Loser leaves the message in
+    // the queue — drain will pick it up after the active turn ends.
+    let won_race = is_streaming
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok();
+
+    if !won_race {
+        debug!(
+            session_id = %session_id,
+            "OOB listener: lost is_streaming race — message queued for active stream's drain"
+        );
+        return;
+    }
+
+    info!(
+        session_id = %session_id,
+        "OOB listener: idle session, spawning stream_response for queued OOB event"
+    );
+
+    // Pop the entry we just pushed (drain will see it via the queue).
+    // Actually we WANT drain to handle it — but stream_response needs an
+    // initial prompt. Give it the OOB content directly; the queue
+    // remains for any subsequent OOB events that may have stacked up
+    // between the push and the spawn.
+    let prompt = {
+        let mut queue = pending_messages.lock().await;
+        queue.pop_front().map(|m| m.content).unwrap_or(oob_content)
+    };
+
+    // Spawn stream_response. Same call shape as in `spawn_nats_rpc_listener`.
+    let session_id_for_spawn = session_id.to_string();
+    let graph = deps.graph.clone();
+    let active_sessions = deps.active_sessions.clone();
+    let context_injector = deps.context_injector.clone();
+    let event_emitter = deps.event_emitter.clone();
+    let retry_config = deps.retry_config.clone();
+    let enrichment_pipeline = deps.enrichment_pipeline.clone();
+    let search = deps.search.clone();
+    let nats = deps.nats.clone();
+    // `client` was cloned earlier from ActiveSession but only the spawned
+    // stream_response below consumes it; touch it here to make ownership
+    // explicit without moving `sess_is_streaming`, which we still need
+    // below for the Arc::clone.
+    let _ = client.clone();
+
+    tokio::spawn(async move {
+        ChatManager::stream_response(
+            client,
+            events_tx,
+            prompt,
+            session_id_for_spawn,
+            graph,
+            active_sessions,
+            interrupt_flag,
+            memory_manager,
+            context_injector,
+            next_seq,
+            pending_messages,
+            // Pass the OUTER is_streaming flag — it's the same Arc as
+            // sess_is_streaming (cloned from the same source), but we
+            // already set it to true above so stream_response won't
+            // re-set it.
+            // SAFETY: same Arc<AtomicBool> across the session.
+            // NB: stream_response will set is_streaming=false at the
+            // end via post_stream::finalize_streaming_status.
+            std::sync::Arc::clone(&sess_is_streaming),
+            streaming_text,
+            streaming_events,
+            event_emitter,
+            nats,
+            sdk_control_rx,
+            auto_continue,
+            retry_config,
+            enrichment_pipeline,
+            search,
+        )
+        .await;
+    });
 }
 
 /// Map a `nexus_claude::Message` variant to `(source, content, correlation_id)`
 /// suitable for `ChatEvent::BackgroundOutput`. Returns `None` for variants
 /// that should be ignored at the OOB level (e.g. `Result` end-of-turn,
 /// `StreamEvent` partial tokens — these are in-stream artefacts).
-///
-/// `source` is a coarse label intended for UI categorisation; `content`
-/// is the human-readable payload; `correlation_id` is the parent tool_use
-/// ID when the message came from a sidechain (e.g. background `Task`).
 fn extract_payload(message: &Message) -> Option<(String, String, Option<String>)> {
     match message {
         Message::Assistant {
@@ -213,23 +424,14 @@ fn extract_payload(message: &Message) -> Option<(String, String, Option<String>)
         )),
         Message::System { subtype, data } => Some((
             format!("system:{subtype}"),
-            // System data is opaque JSON — surface it pretty-printed so
-            // humans can read it; the UI can collapse if too noisy.
             serde_json::to_string_pretty(data).unwrap_or_default(),
             None,
         )),
-        // Result and StreamEvent are turn-internal and shouldn't normally
-        // arrive OOB. If they do, we silently ignore them (a `Result`
-        // arriving without a turn is meaningless; a `StreamEvent` is a
-        // partial that has no value without its enclosing turn).
         Message::Result { .. } | Message::StreamEvent { .. } => None,
     }
 }
 
 fn assistant_text(m: &AssistantMessage) -> String {
-    // AssistantMessage::content is `Vec<ContentBlock>`. Concatenate text
-    // blocks; synthesise placeholders for non-text blocks so the UI sees
-    // something meaningful.
     m.content
         .iter()
         .map(|block| match block {
@@ -254,9 +456,6 @@ fn format_tool_result(t: &nexus_claude::ToolResultContent) -> String {
 }
 
 fn user_text(m: &UserMessage) -> String {
-    // UserMessage::content is a String (text content, possibly empty).
-    // UserMessage::content_blocks holds structured blocks (tool_result, ...).
-    // Concatenate both, preferring blocks when both are present.
     if let Some(blocks) = &m.content_blocks {
         let rendered: String = blocks
             .iter()
@@ -276,8 +475,6 @@ fn user_text(m: &UserMessage) -> String {
 }
 
 fn user_message_source(m: &UserMessage) -> String {
-    // If the message carries a tool_result block, label accordingly so the
-    // UI/dedup logic can distinguish from real user input.
     if let Some(blocks) = &m.content_blocks {
         for block in blocks {
             if matches!(block, ContentBlock::ToolResult(_)) {

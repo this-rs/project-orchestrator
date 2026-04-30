@@ -2662,18 +2662,32 @@ impl ChatManager {
             nats_cancel.clone(),
         );
 
-        // Spawn the permanent out-of-band SDK message listener (T4 of plan
-        // 9a1684b2). Captures Messages emitted by the CLI subprocess
+        // Spawn the permanent out-of-band SDK message listener (T4+T5 of
+        // plan 9a1684b2). Captures Messages emitted by the CLI subprocess
         // between turns (background tool notifications, etc.) and
-        // surfaces them as ChatEvent::BackgroundOutput on the session
-        // broadcast. Stops cleanly on `nats_cancel` (shared with NATS
-        // listeners — one cancel for all session-bound background tasks).
+        // surfaces them as ChatEvent::BackgroundOutput. When a turn is
+        // not active and an OOB event arrives, the listener also pushes
+        // a PendingMessage::BackgroundOutput and tries to claim
+        // is_streaming via compare_exchange to spawn a fresh
+        // stream_response — letting the LLM react autonomously without
+        // waiting for the next user turn.
         super::oob_listener::spawn_oob_listener(
             session_id.to_string(),
             client.clone(),
             events_tx.clone(),
             is_streaming.clone(),
+            next_seq.clone(),
             nats_cancel,
+            super::oob_listener::OobListenerDeps {
+                graph: self.graph.clone(),
+                active_sessions: self.active_sessions.clone(),
+                context_injector: self.context_injector.clone(),
+                event_emitter: self.event_emitter.clone(),
+                retry_config: self.config.retry.clone(),
+                enrichment_pipeline: self.enrichment_pipeline.clone(),
+                search: self.search.clone(),
+                nats: self.nats.clone(),
+            },
         );
 
         // Persist the initial user_message event
@@ -4714,17 +4728,28 @@ impl ChatManager {
             nats_cancel.clone(),
         );
 
-        // Spawn the permanent out-of-band SDK message listener (T4 of plan
-        // 9a1684b2). Same as `create_session` — the resumed session needs
-        // its own listener bound to the new InteractiveClient. The old
-        // listener (if any) was already cancelled above via
+        // Spawn the permanent out-of-band SDK message listener (T4+T5 of
+        // plan 9a1684b2). Same as `create_session` — the resumed session
+        // needs its own listener bound to the new InteractiveClient. The
+        // old listener (if any) was already cancelled above via
         // `old_session.nats_cancel.cancel()`.
         super::oob_listener::spawn_oob_listener(
             session_id.to_string(),
             client.clone(),
             events_tx.clone(),
             is_streaming.clone(),
+            next_seq.clone(),
             nats_cancel,
+            super::oob_listener::OobListenerDeps {
+                graph: self.graph.clone(),
+                active_sessions: self.active_sessions.clone(),
+                context_injector: self.context_injector.clone(),
+                event_emitter: self.event_emitter.clone(),
+                retry_config: self.config.retry.clone(),
+                enrichment_pipeline: self.enrichment_pipeline.clone(),
+                search: self.search.clone(),
+                nats: self.nats.clone(),
+            },
         );
 
         // Persist the user_message event
