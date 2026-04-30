@@ -425,6 +425,30 @@ pub enum ChatEvent {
         /// The error message that triggered the retry
         error_message: String,
     },
+    /// **Out-of-band** event captured between turns by the permanent OOB
+    /// listener (see `chat::manager::spawn_oob_listener`).
+    ///
+    /// These are `Message`s that arrived on the SDK broadcast while no active
+    /// `stream_response` was running — typically background tool notifications
+    /// (Monitor output, BashOutput from `run_in_background`, sub-Agent
+    /// completion events, etc.).
+    ///
+    /// Frontends should render these distinctly from in-turn events (e.g. a
+    /// dedicated badge or icon on the message bubble). Persisted as
+    /// `background_output` and does NOT increment `message_count`.
+    BackgroundOutput {
+        /// Source descriptor — typically the tool name (e.g. "Monitor",
+        /// "BashOutput") or "system" for non-tool spontaneous messages.
+        source: String,
+        /// Human-readable content of the spontaneous message.
+        content: String,
+        /// ISO-8601 timestamp at which the OOB listener received the event.
+        received_at: chrono::DateTime<chrono::Utc>,
+        /// Optional correlation ID linking this event to a prior tool_use
+        /// (e.g. the background bash ID, the parent task ID).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+    },
 }
 
 impl ChatEvent {
@@ -456,6 +480,7 @@ impl ChatEvent {
             ChatEvent::AutoContinue { .. } => "auto_continue",
             ChatEvent::AutoContinueStateChanged { .. } => "auto_continue_state_changed",
             ChatEvent::Retrying { .. } => "retrying",
+            ChatEvent::BackgroundOutput { .. } => "background_output",
         }
     }
 
@@ -549,6 +574,26 @@ impl ChatEvent {
                 max_attempts,
                 ..
             } => Some(format!("retrying:{}:{}", attempt, max_attempts)),
+
+            ChatEvent::BackgroundOutput {
+                source,
+                received_at,
+                correlation_id,
+                ..
+            } => {
+                // (source, received_at, correlation_id) is enough to dedup OOB
+                // events: the same tool firing twice at the same instant with
+                // the same correlation is the same event. Content is excluded
+                // from the fingerprint so a retry that reformats whitespace
+                // does not duplicate the entry.
+                let corr = correlation_id.as_deref().unwrap_or("-");
+                Some(format!(
+                    "background_output:{}:{}:{}",
+                    source,
+                    received_at.timestamp_millis(),
+                    corr
+                ))
+            }
 
             // StreamDelta and StreamingStatus are never in the snapshot
             ChatEvent::StreamDelta { .. } | ChatEvent::StreamingStatus { .. } => None,
@@ -827,6 +872,13 @@ pub enum PendingMessageKind {
     /// System-generated hint (post-compaction context, guard hint, auto-continue)
     /// — persisted as `system_hint`, does NOT increment message_count
     SystemHint,
+    /// Out-of-band background event captured by the OOB listener while idle
+    /// (e.g. Monitor notification, BashOutput from `run_in_background`).
+    /// Persisted as `background_output`, does NOT increment message_count.
+    /// The OOB listener has ALREADY persisted+broadcasted the corresponding
+    /// `ChatEvent::BackgroundOutput` before pushing this entry — `stream_response`
+    /// must therefore NOT re-persist it (dedup via this kind).
+    BackgroundOutput,
 }
 
 /// A typed entry in the pending_messages queue.
@@ -857,6 +909,16 @@ impl PendingMessage {
     pub fn system_hint(content: String) -> Self {
         Self {
             kind: PendingMessageKind::SystemHint,
+            content,
+        }
+    }
+
+    /// Construct a `BackgroundOutput` pending entry. The OOB listener uses
+    /// this when an event arrives while the session is idle and a new
+    /// `stream_response` must be triggered to surface it to the LLM.
+    pub fn background_output(content: String) -> Self {
+        Self {
+            kind: PendingMessageKind::BackgroundOutput,
             content,
         }
     }
@@ -2426,5 +2488,63 @@ mod tests {
         log.record_tool_use("Write", &serde_json::json!({"content": "hello"}));
         assert!(log.files_modified.is_empty());
         assert_eq!(log.tool_use_count, 1);
+    }
+
+    #[test]
+    fn test_background_output_event_roundtrip() {
+        let received_at = chrono::DateTime::parse_from_rfc3339("2026-04-30T13:45:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let event = ChatEvent::BackgroundOutput {
+            source: "Monitor".into(),
+            content: "[epoch 50] cos=0.871".into(),
+            received_at,
+            correlation_id: Some("bg-abc123".into()),
+        };
+
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"type\":\"background_output\""));
+        assert!(json.contains("\"source\":\"Monitor\""));
+        assert!(json.contains("\"correlation_id\":\"bg-abc123\""));
+
+        let parsed: ChatEvent = serde_json::from_str(&json).unwrap();
+        match parsed {
+            ChatEvent::BackgroundOutput {
+                source,
+                content,
+                correlation_id,
+                ..
+            } => {
+                assert_eq!(source, "Monitor");
+                assert_eq!(content, "[epoch 50] cos=0.871");
+                assert_eq!(correlation_id.as_deref(), Some("bg-abc123"));
+            }
+            other => panic!("expected BackgroundOutput, got {:?}", other),
+        }
+
+        assert_eq!(event.event_type(), "background_output");
+        let fp = event.fingerprint().expect("BackgroundOutput must have a fingerprint");
+        assert!(fp.starts_with("background_output:Monitor:"));
+        assert!(fp.ends_with(":bg-abc123"));
+    }
+
+    #[test]
+    fn test_background_output_omits_correlation_id_when_none() {
+        let event = ChatEvent::BackgroundOutput {
+            source: "BashOutput".into(),
+            content: "build complete".into(),
+            received_at: chrono::Utc::now(),
+            correlation_id: None,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        // None correlation_id should be skipped, not serialized as null
+        assert!(!json.contains("correlation_id"));
+    }
+
+    #[test]
+    fn test_pending_message_background_output() {
+        let msg = PendingMessage::background_output("monitor: epoch 100".into());
+        assert_eq!(msg.kind, PendingMessageKind::BackgroundOutput);
+        assert_eq!(msg.content, "monitor: epoch 100");
     }
 }
