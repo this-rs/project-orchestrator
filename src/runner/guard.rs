@@ -15,7 +15,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 // ============================================================================
@@ -294,6 +294,35 @@ impl AgentGuard {
                                  Make your best judgment and proceed.",
                             )
                             .await;
+                        }
+
+                        // OOB events from background tools (Monitor, BashOutput,
+                        // sub-Agent completion, etc., emitted between turns by
+                        // the SDK and surfaced by `chat::oob_listener`).
+                        //
+                        // These prove the *session* is alive (the subprocess is
+                        // still running and producing) so we MUST reset the idle
+                        // timer — otherwise the guard would inject "are you
+                        // stuck?" hints in the middle of a long-running Monitor.
+                        //
+                        // We deliberately do NOT touch:
+                        //   - `tool_history` / `loop_threshold`: these track
+                        //     *agent* tool-use patterns. A Monitor in a noisy
+                        //     loop must not mask a real agent loop.
+                        //   - `completion_signals`: same reasoning — the agent's
+                        //     repeated "done" signals are independent of
+                        //     background activity.
+                        //
+                        // T7 of plan 9a1684b2 — "OOB events update last_activity
+                        // but NOT loop detection counters."
+                        ChatEvent::BackgroundOutput { source, .. } => {
+                            last_activity = Instant::now();
+                            idle_warned = false;
+                            debug!(
+                                session_id = %self.session_id,
+                                source = %source,
+                                "Guard: OOB event reset idle timer (loop detection unchanged)"
+                            );
                         }
 
                         _ => {}
@@ -1406,5 +1435,172 @@ mod tests {
         let config = crate::runner::models::RunnerConfig::default();
         assert_eq!(config.completion_loop_threshold, 5);
         assert_eq!(config.completion_max_chars, 200);
+    }
+
+    // ── T7: BackgroundOutput interaction with idle / loop detection ─────
+
+    /// Guard must NOT fire its idle hint while a background tool (Monitor,
+    /// BashOutput, etc.) is actively producing OOB events. The arrival of
+    /// any `BackgroundOutput` must reset `last_activity` even though no
+    /// agent tool_use happens.
+    #[tokio::test]
+    async fn test_guard_idle_silenced_by_background_output() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let hint_count = Arc::new(AtomicUsize::new(0));
+        let hint_count_clone = hint_count.clone();
+
+        struct MockHintSender {
+            count: Arc<AtomicUsize>,
+        }
+        #[async_trait::async_trait]
+        impl HintSender for MockHintSender {
+            async fn send_hint(&self, _session_id: &str, _message: &str) -> anyhow::Result<()> {
+                self.count.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let (tx, rx) = broadcast::channel::<ChatEvent>(64);
+        let config = GuardConfig {
+            // Short idle timeout so the test runs quickly.
+            idle_timeout: Duration::from_millis(150),
+            task_timeout: Duration::from_millis(800),
+            check_interval: Duration::from_millis(40),
+            loop_threshold: 3,
+            ..Default::default()
+        };
+
+        let guard = AgentGuard::new(
+            "test-session".to_string(),
+            "Test Task".to_string(),
+            Uuid::new_v4(),
+            config,
+            rx,
+            Some(Arc::new(MockHintSender {
+                count: hint_count_clone,
+            })),
+            None,
+            None,
+        );
+
+        // Pump BackgroundOutput events at a fast cadence (every 50 ms,
+        // ~one third of idle_timeout) so `last_activity` is constantly
+        // bumped. End with a Result event to make the guard return
+        // Completed (drop(tx) wouldn't work — the test still holds `tx`).
+        let tx_clone = tx.clone();
+        tokio::spawn(async move {
+            for _ in 0..6 {
+                let _ = tx_clone.send(ChatEvent::BackgroundOutput {
+                    source: "Monitor".to_string(),
+                    content: "log line matched".to_string(),
+                    received_at: chrono::Utc::now(),
+                    correlation_id: None,
+                });
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            let _ = tx_clone.send(ChatEvent::Result {
+                session_id: "test".to_string(),
+                duration_ms: 300,
+                cost_usd: Some(0.0),
+                subtype: "success".to_string(),
+                is_error: false,
+                num_turns: Some(0),
+                result_text: None,
+            });
+        });
+
+        let verdict = guard.monitor().await;
+        assert!(matches!(verdict, GuardVerdict::Completed));
+        assert_eq!(
+            hint_count.load(Ordering::SeqCst),
+            0,
+            "OOB BackgroundOutput stream must keep the guard quiet — no idle hint expected"
+        );
+    }
+
+    /// Loop detection must remain sensitive to *agent* tool-use loops even
+    /// when interleaved with BackgroundOutput noise. A noisy Monitor
+    /// firing between repeated identical Read calls must NOT mask the
+    /// real loop.
+    #[tokio::test]
+    async fn test_guard_loop_detection_unaffected_by_background_output() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let hint_count = Arc::new(AtomicUsize::new(0));
+        let hint_count_clone = hint_count.clone();
+
+        struct MockHintSender {
+            count: Arc<AtomicUsize>,
+        }
+        #[async_trait::async_trait]
+        impl HintSender for MockHintSender {
+            async fn send_hint(&self, _session_id: &str, _message: &str) -> anyhow::Result<()> {
+                self.count.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let (tx, rx) = broadcast::channel::<ChatEvent>(64);
+        let config = GuardConfig {
+            idle_timeout: Duration::from_secs(100),
+            task_timeout: Duration::from_secs(5),
+            loop_threshold: 3,
+            ..Default::default()
+        };
+
+        let guard = AgentGuard::new(
+            "test-session".to_string(),
+            "Test Task".to_string(),
+            Uuid::new_v4(),
+            config,
+            rx,
+            Some(Arc::new(MockHintSender {
+                count: hint_count_clone,
+            })),
+            None,
+            None,
+        );
+
+        // Interleave BackgroundOutput between identical ToolUse events.
+        // The OOB events must not reset tool_history.
+        let tx_clone = tx.clone();
+        tokio::spawn(async move {
+            for _ in 0..3 {
+                let _ = tx_clone.send(ChatEvent::ToolUse {
+                    id: "tu_loop".to_string(),
+                    tool: "Read".to_string(),
+                    input: serde_json::json!({"path": "/same/file.rs"}),
+                    parent_tool_use_id: None,
+                });
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                // OOB noise between agent tool calls — MUST NOT reset
+                // tool_history or the loop will go undetected.
+                let _ = tx_clone.send(ChatEvent::BackgroundOutput {
+                    source: "BashOutput".to_string(),
+                    content: "bg noise".to_string(),
+                    received_at: chrono::Utc::now(),
+                    correlation_id: None,
+                });
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let _ = tx_clone.send(ChatEvent::Result {
+                session_id: "test".to_string(),
+                duration_ms: 1000,
+                cost_usd: Some(0.01),
+                subtype: "success".to_string(),
+                is_error: false,
+                num_turns: Some(3),
+                result_text: None,
+            });
+        });
+
+        let verdict = guard.monitor().await;
+        assert!(matches!(verdict, GuardVerdict::Completed));
+        assert!(
+            hint_count.load(Ordering::SeqCst) >= 1,
+            "Loop detection must still fire despite BackgroundOutput interleaving"
+        );
     }
 }

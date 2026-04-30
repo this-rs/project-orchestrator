@@ -51,9 +51,10 @@
 //!      `drain_pending_messages` after that turn ends — no event is
 //!      dropped.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use futures::StreamExt;
@@ -288,6 +289,10 @@ async fn maybe_trigger_stream(
                 s.streaming_events.clone(),
                 s.sdk_control_rx.clone(),
                 s.auto_continue.clone(),
+                s.oob_trigger_history.clone(),
+                s.oob_trigger_cap,
+                s.oob_trigger_window,
+                s.oob_capped_warned.clone(),
             )
         })
     };
@@ -304,6 +309,10 @@ async fn maybe_trigger_stream(
         streaming_events,
         sdk_control_rx,
         auto_continue,
+        oob_trigger_history,
+        oob_trigger_cap,
+        oob_trigger_window,
+        oob_capped_warned,
     )) = session_state
     else {
         debug!(
@@ -312,6 +321,27 @@ async fn maybe_trigger_stream(
         );
         return;
     };
+
+    // T7 — Rate cap (sliding window) on OOB-driven `stream_response` spawns.
+    // Drains entries older than the window, then either blocks (cap hit)
+    // or records a fresh timestamp. Blocking ALSO skips queueing the
+    // PendingMessage::BackgroundOutput so the queue cannot be flooded
+    // and dumped into the next user-driven turn — the OOB event is
+    // still persisted+broadcast (already done in `handle_oob_message`).
+    if check_and_record_trigger_cap(
+        session_id,
+        &events_tx,
+        &oob_trigger_history,
+        oob_trigger_cap,
+        oob_trigger_window,
+        &oob_capped_warned,
+    )
+    .await
+    {
+        // Cap hit — refuse to queue + spawn. Warning already emitted
+        // (at most once per window) by the helper.
+        return;
+    }
 
     // Push the OOB content as a queue entry so drain_pending_messages
     // (or the spawned stream_response below) can process it later.
@@ -398,6 +428,76 @@ async fn maybe_trigger_stream(
         )
         .await;
     });
+}
+
+/// Sliding-window rate cap for OOB-driven `stream_response` spawns
+/// (T7 of plan 9a1684b2). Returns `true` when the trigger should be
+/// **blocked** (cap hit), `false` when it can proceed.
+///
+/// Behaviour:
+/// 1. Lock the history deque, drain timestamps older than `window`.
+/// 2. If `len >= cap`: emit a `ChatEvent::SystemHint` warning **at most
+///    once per window** (gated by `capped_warned`), log a warn, return
+///    `true`.
+/// 3. Otherwise: clear the `capped_warned` flag (we're back below the
+///    cap), push `Instant::now()`, return `false`.
+async fn check_and_record_trigger_cap(
+    session_id: &str,
+    events_tx: &broadcast::Sender<ChatEvent>,
+    history: &Arc<Mutex<VecDeque<Instant>>>,
+    cap: u32,
+    window: Duration,
+    capped_warned: &Arc<AtomicBool>,
+) -> bool {
+    let mut hist = history.lock().await;
+    let now = Instant::now();
+
+    // Drain entries older than `window`. Since timestamps are pushed in
+    // chronological order, popping from the front while the head is too
+    // old is sufficient.
+    while let Some(front) = hist.front() {
+        if now.duration_since(*front) > window {
+            hist.pop_front();
+        } else {
+            break;
+        }
+    }
+
+    if (hist.len() as u32) >= cap {
+        // Capped. Emit warning once per window via the AtomicBool gate.
+        if capped_warned
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            let warn_msg = format!(
+                "⚠️ OOB auto-continue cap reached: {} background-triggered turns in the last \
+                 {}s. Further background events will be persisted but will NOT auto-restart \
+                 the agent until activity slows down. Send a message to continue manually \
+                 if needed.",
+                cap,
+                window.as_secs()
+            );
+            warn!(
+                session_id = %session_id,
+                cap = cap,
+                window_secs = window.as_secs(),
+                "OOB listener: trigger cap reached, throttling further auto-continues"
+            );
+            let _ = events_tx.send(ChatEvent::SystemHint { content: warn_msg });
+        } else {
+            debug!(
+                session_id = %session_id,
+                "OOB listener: trigger still capped (warning already emitted)"
+            );
+        }
+        return true;
+    }
+
+    // Below cap — clear the warned flag (so a new spike will re-warn)
+    // and record this trigger.
+    capped_warned.store(false, Ordering::SeqCst);
+    hist.push_back(now);
+    false
 }
 
 /// Map a `nexus_claude::Message` variant to `(source, content, correlation_id)`
@@ -576,5 +676,146 @@ mod tests {
             ],
         };
         assert_eq!(assistant_text(&m), "Hello\nworld");
+    }
+
+    // ── T7: trigger cap (sliding window) tests ──────────────────────────
+
+    /// Subscribe to the broadcast and collect all SystemHint warnings
+    /// received during the closure's execution.
+    async fn collect_warnings(
+        events_tx: &broadcast::Sender<ChatEvent>,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<String> {
+        let mut rx = events_tx.subscribe();
+        let (tx, out_rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Ok(ev) = rx.recv().await {
+                if let ChatEvent::SystemHint { content } = ev {
+                    let _ = tx.send(content);
+                }
+            }
+        });
+        out_rx
+    }
+
+    #[tokio::test]
+    async fn test_trigger_cap_blocks_after_cap_and_warns_once() {
+        let (events_tx, _rx_keep) = broadcast::channel(64);
+        let mut warn_rx = collect_warnings(&events_tx).await;
+        let history = Arc::new(Mutex::new(VecDeque::<Instant>::new()));
+        let cap: u32 = 3;
+        let window = Duration::from_secs(60);
+        let warned = Arc::new(AtomicBool::new(false));
+
+        // First `cap` calls: all allowed, no warning.
+        for _ in 0..cap {
+            let blocked = check_and_record_trigger_cap(
+                "test-session", &events_tx, &history, cap, window, &warned,
+            )
+            .await;
+            assert!(!blocked, "first {cap} triggers must not be blocked");
+        }
+
+        // Next 50 calls: all blocked, warning emitted exactly once.
+        for _ in 0..50 {
+            let blocked = check_and_record_trigger_cap(
+                "test-session", &events_tx, &history, cap, window, &warned,
+            )
+            .await;
+            assert!(blocked, "calls beyond cap must be blocked");
+        }
+
+        // Drain warnings — give the spawn loop a tick to flush.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let mut warnings = Vec::new();
+        while let Ok(w) = warn_rx.try_recv() {
+            warnings.push(w);
+        }
+        assert_eq!(
+            warnings.len(),
+            1,
+            "expected exactly one warning emitted per window, got: {warnings:?}"
+        );
+        assert!(
+            warnings[0].contains("OOB auto-continue cap reached"),
+            "warning content unexpected: {}",
+            warnings[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_trigger_cap_drops_old_entries() {
+        let (events_tx, _rx_keep) = broadcast::channel(16);
+        let history = Arc::new(Mutex::new(VecDeque::<Instant>::new()));
+        let cap: u32 = 2;
+        // Tiny window so we can age entries out in test time.
+        let window = Duration::from_millis(50);
+        let warned = Arc::new(AtomicBool::new(false));
+
+        // Fill the window.
+        for _ in 0..cap {
+            assert!(
+                !check_and_record_trigger_cap(
+                    "s", &events_tx, &history, cap, window, &warned
+                )
+                .await
+            );
+        }
+        assert!(
+            check_and_record_trigger_cap("s", &events_tx, &history, cap, window, &warned).await,
+            "cap should be hit"
+        );
+
+        // Wait past the window.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        // Now the window is empty again — should accept fresh triggers
+        // and re-arm the warning gate.
+        assert!(
+            !check_and_record_trigger_cap("s", &events_tx, &history, cap, window, &warned).await,
+            "after window expiry, triggers should be accepted again"
+        );
+        assert!(
+            !warned.load(Ordering::SeqCst),
+            "warned flag must reset when below cap again"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_trigger_cap_warning_rearms_after_recovery() {
+        let (events_tx, _rx_keep) = broadcast::channel(16);
+        let mut warn_rx = collect_warnings(&events_tx).await;
+        let history = Arc::new(Mutex::new(VecDeque::<Instant>::new()));
+        let cap: u32 = 1;
+        let window = Duration::from_millis(50);
+        let warned = Arc::new(AtomicBool::new(false));
+
+        // Hit the cap — first call OK, second blocked + warns.
+        assert!(
+            !check_and_record_trigger_cap("s", &events_tx, &history, cap, window, &warned).await
+        );
+        assert!(
+            check_and_record_trigger_cap("s", &events_tx, &history, cap, window, &warned).await
+        );
+        // Wait past window so entries drop.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        // First post-recovery call accepted, clears warned.
+        assert!(
+            !check_and_record_trigger_cap("s", &events_tx, &history, cap, window, &warned).await
+        );
+        // Hit cap again — should re-warn (not silently swallow).
+        assert!(
+            check_and_record_trigger_cap("s", &events_tx, &history, cap, window, &warned).await
+        );
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let mut warnings = Vec::new();
+        while let Ok(w) = warn_rx.try_recv() {
+            warnings.push(w);
+        }
+        assert_eq!(
+            warnings.len(),
+            2,
+            "expected two warnings (one per cap-hit episode), got: {warnings:?}"
+        );
     }
 }
