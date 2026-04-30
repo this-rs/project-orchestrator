@@ -52,10 +52,12 @@ pub(crate) async fn drain_pending_messages(
     enrichment_pipeline: Arc<super::enrichment::EnrichmentPipeline>,
     search: Arc<dyn SearchStore>,
 ) {
-    // Pop the next message from the queue
+    // Pop the next message from the queue, prioritising User > SystemHint
+    // > BackgroundOutput so a noisy Monitor cannot starve user messages
+    // (plan 806c8f2c, T2). FIFO is preserved within each priority class.
     let next_message = {
         let mut queue = pending_messages.lock().await;
-        queue.pop_front()
+        pop_highest_priority(&mut queue)
     };
 
     if let Some(next_msg) = next_message {
@@ -227,14 +229,41 @@ pub(crate) async fn drain_pending_messages(
 /// `O(n)` scan over the queue + `O(n)` `remove(idx)`. `n` is typically < 50;
 /// in practice the queue rarely exceeds 5-10 entries between drain cycles.
 ///
-/// ## STUB (T1 of plan 806c8f2c)
+/// ## Implementation
 ///
-/// This stub currently delegates to `pop_front()` — strict FIFO, buggy.
-/// The tests below will FAIL on this stub, demonstrating the bug. T2 of
-/// the same plan replaces the body with the real priority-aware impl.
+/// Scan the queue once, track the index of the first entry of the lowest
+/// priority value seen so far (lower number = higher priority). Then
+/// `remove(idx)` it. Both ops are O(n) on `VecDeque`; n is small enough
+/// that this is fine.
+///
+/// ## FIFO tie-break
+///
+/// Within a single priority class, the iteration finds the first match
+/// (oldest in the queue), so insertion order is preserved among equals.
 fn pop_highest_priority(queue: &mut VecDeque<PendingMessage>) -> Option<PendingMessage> {
-    // STUB — see doc-comment.
-    queue.pop_front()
+    fn priority(kind: &PendingMessageKind) -> u8 {
+        match kind {
+            PendingMessageKind::User => 0,
+            PendingMessageKind::SystemHint => 1,
+            PendingMessageKind::BackgroundOutput => 2,
+        }
+    }
+
+    // NB: must use `min_by` with explicit tie-break on the index, because
+    // `min_by_key` returns the LAST element on equal keys (cf std docs) —
+    // which would break our FIFO-intra-class invariant. Index is unique so
+    // the secondary `cmp` always disambiguates.
+    let best_idx = queue
+        .iter()
+        .enumerate()
+        .min_by(|(ia, a), (ib, b)| {
+            priority(&a.kind)
+                .cmp(&priority(&b.kind))
+                .then_with(|| ia.cmp(ib))
+        })
+        .map(|(i, _)| i)?;
+
+    queue.remove(best_idx)
 }
 
 #[cfg(test)]
