@@ -54,6 +54,15 @@ pub(crate) const OOB_TRIGGER_CAP_RUNNER: u32 = 5;
 /// Rolling window for the OOB trigger cap.
 pub(crate) const OOB_TRIGGER_WINDOW_SECS: u64 = 300;
 
+/// User-driven cancel-tools rate cap. The "Stop" button on a running tool
+/// could be click-spammed; capping at 10 per minute per session prevents a
+/// flood of `pgrep -P` invocations and keeps the CLI healthy. Much more
+/// generous than the OOB cap because each cancel is a deliberate user
+/// action, not an autonomous LLM trigger (T2 of plan 28e9afe3).
+pub(crate) const CANCEL_TOOLS_CAP: u32 = 10;
+/// Rolling window for the cancel-tools rate cap (60s).
+pub(crate) const CANCEL_TOOLS_WINDOW_SECS: u64 = 60;
+
 /// An active chat session with a live Claude CLI subprocess
 pub struct ActiveSession {
     /// Persistent broadcast sender — one per session lifetime, NOT replaced per message
@@ -169,6 +178,35 @@ pub struct ActiveSession {
     /// window so we emit the SystemHint warning only once per window.
     /// Reset to false the next time we observe `len < cap` after draining.
     pub oob_capped_warned: Arc<AtomicBool>,
+    /// Sliding-window history of `cancel_running_tools` invocations on this
+    /// session. Used to enforce a per-session click-spam cap so the user's
+    /// "Stop" button cannot saturate `pgrep` or the CLI (T2 of plan
+    /// 28e9afe3).
+    pub cancel_tools_history: Arc<Mutex<VecDeque<Instant>>>,
+    /// Maximum cancel_tools invocations allowed within `cancel_tools_window`.
+    /// Defaults to `CANCEL_TOOLS_CAP` (10).
+    pub cancel_tools_cap: u32,
+    /// Rolling window for the cancel_tools rate cap. Defaults to 60s.
+    pub cancel_tools_window: Duration,
+}
+
+/// Result of `ChatManager::cancel_running_tools`. Surfaced to REST/WS
+/// callers so the UI can display "killed N processes" feedback or
+/// degrade gracefully when the rate cap is hit (T2 of plan 28e9afe3).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CancelToolsResult {
+    /// PID of the Claude Code CLI subprocess (for client-side display).
+    /// `None` when the platform doesn't support PID capture or the
+    /// session has no live subprocess.
+    pub cli_pid: Option<u32>,
+    /// PIDs that received `SIGINT`. Empty when no descendants existed
+    /// at the time of the call (e.g., agent was thinking, no tool
+    /// running) — this is **not** an error condition.
+    pub killed_pids: Vec<u32>,
+    /// `true` when the rate cap was hit and the request was refused
+    /// (no SIGINT sent, no NATS publish). Caller should map to HTTP
+    /// 429 or display a "slow down" toast.
+    pub capped: bool,
 }
 
 /// Runtime-mutable environment config for Claude CLI subprocess.
@@ -2578,11 +2616,11 @@ impl ChatManager {
         // (which is held by stream_response during streaming → deadlock).
         let stdin_tx = client.clone_stdin_sender().await;
 
-        // CLI subprocess PID for process group signaling.
-        // TODO: re-add child_pid() to nexus SDK (was on feature branch, never merged to main).
-        // Without it, interrupt() relies solely on the SDK's stdin-based interrupt mechanism.
-        // The descendant-PID SIGINT cascade is disabled until child_pid() is available.
-        let child_pid: Option<u32> = None;
+        // Capture the CLI subprocess PID so descendant-PID SIGINT
+        // cascade in `interrupt()` and `cancel_running_tools()` works.
+        // (Plan 28e9afe3 — without this, kill_descendants always sees
+        // None and the per-tool Stop button is a no-op.)
+        let child_pid: Option<u32> = client.child_pid().await;
 
         info!(
             session_id = %session_id,
@@ -2673,6 +2711,9 @@ impl ChatManager {
                     oob_trigger_cap,
                     oob_trigger_window: Duration::from_secs(OOB_TRIGGER_WINDOW_SECS),
                     oob_capped_warned: Arc::new(AtomicBool::new(false)),
+                    cancel_tools_history: Arc::new(Mutex::new(VecDeque::new())),
+                    cancel_tools_cap: CANCEL_TOOLS_CAP,
+                    cancel_tools_window: Duration::from_secs(CANCEL_TOOLS_WINDOW_SECS),
                 },
             );
             interrupt_flag
@@ -2695,6 +2736,16 @@ impl ChatManager {
 
         // Spawn NATS RPC send listener for cross-instance message routing
         self.spawn_nats_rpc_listener(
+            &session_id.to_string(),
+            self.active_sessions.clone(),
+            nats_cancel.clone(),
+        );
+
+        // Spawn NATS cancel_tools listener (T2 of plan 28e9afe3) for
+        // cross-instance routing of user-initiated tool cancellation.
+        // Distinct subject from interrupt — different semantics
+        // (cf decision d2bf0e7b).
+        self.spawn_nats_cancel_tools_listener(
             &session_id.to_string(),
             self.active_sessions.clone(),
             nats_cancel.clone(),
@@ -4633,8 +4684,9 @@ impl ChatManager {
         // Clone stdin sender for lock-free permission responses (see create_session).
         let stdin_tx = client.clone_stdin_sender().await;
 
-        // CLI subprocess PID — see TODO in create_session (child_pid not yet in nexus main).
-        let child_pid: Option<u32> = None;
+        // CLI subprocess PID for descendant SIGINT cascade (T1+T2 of
+        // plan 28e9afe3). Same as create_session.
+        let child_pid: Option<u32> = client.child_pid().await;
 
         let client = Arc::new(Mutex::new(client));
 
@@ -4745,6 +4797,9 @@ impl ChatManager {
                     oob_trigger_cap: OOB_TRIGGER_CAP_INTERACTIVE,
                     oob_trigger_window: Duration::from_secs(OOB_TRIGGER_WINDOW_SECS),
                     oob_capped_warned: Arc::new(AtomicBool::new(false)),
+                    cancel_tools_history: Arc::new(Mutex::new(VecDeque::new())),
+                    cancel_tools_cap: CANCEL_TOOLS_CAP,
+                    cancel_tools_window: Duration::from_secs(CANCEL_TOOLS_WINDOW_SECS),
                 },
             );
             interrupt_flag
@@ -4767,6 +4822,15 @@ impl ChatManager {
 
         // Spawn NATS RPC send listener for cross-instance message routing
         self.spawn_nats_rpc_listener(
+            session_id,
+            self.active_sessions.clone(),
+            nats_cancel.clone(),
+        );
+
+        // Spawn NATS cancel_tools listener (T2 of plan 28e9afe3) — same
+        // as create_session. The old listener was cancelled above via
+        // old_session.nats_cancel.cancel().
+        self.spawn_nats_cancel_tools_listener(
             session_id,
             self.active_sessions.clone(),
             nats_cancel.clone(),
@@ -5269,33 +5333,27 @@ impl ChatManager {
             }
 
             // Kill descendant processes of the CLI (find, sleep, cargo, etc.)
-            // WITHOUT killing the CLI itself. Sending SIGINT to the entire process
-            // group (-pgid) would kill the CLI too, making the session unusable
-            // and causing "Failed to send message through channel" on the next message.
-            // Instead, enumerate child PIDs recursively and signal them individually.
-            #[cfg(unix)]
-            if let Some(pid) = child_pid {
-                let descendants = Self::get_descendant_pids(pid);
-                if !descendants.is_empty() {
-                    for &desc_pid in &descendants {
-                        unsafe {
-                            libc::kill(desc_pid as i32, libc::SIGINT);
-                        }
-                    }
-                    info!(
-                        session_id = %session_id,
-                        cli_pid = pid,
-                        descendant_count = descendants.len(),
-                        descendant_pids = ?descendants,
-                        "Sent SIGINT to CLI descendant processes (not the CLI itself)"
-                    );
-                } else {
-                    debug!(
-                        session_id = %session_id,
-                        cli_pid = pid,
-                        "No descendant processes found to kill"
-                    );
-                }
+            // WITHOUT killing the CLI itself. Delegated to `kill_descendants`
+            // which is also used by `cancel_running_tools` (T1 of plan
+            // 28e9afe3 — see decision d2bf0e7b for why these two paths share
+            // the SIGINT primitive but interrupt() additionally sets the
+            // flag/token + sends the control_request to end the turn,
+            // whereas cancel_running_tools deliberately does NEITHER).
+            let killed = Self::kill_descendants(child_pid);
+            if !killed.is_empty() {
+                info!(
+                    session_id = %session_id,
+                    cli_pid = ?child_pid,
+                    descendant_count = killed.len(),
+                    descendant_pids = ?killed,
+                    "Sent SIGINT to CLI descendant processes (not the CLI itself)"
+                );
+            } else if let Some(pid) = child_pid {
+                debug!(
+                    session_id = %session_id,
+                    cli_pid = pid,
+                    "No descendant processes found to kill"
+                );
             }
 
             info!(
@@ -5320,6 +5378,264 @@ impl ChatManager {
         }
 
         Ok(())
+    }
+
+    /// Cancel the currently-running tool subprocess(es) of a session
+    /// **without** ending the LLM turn (T2 of plan 28e9afe3).
+    ///
+    /// ## Semantics — what this does, and what it deliberately does NOT
+    ///
+    /// Sends `SIGINT` to every descendant of the CLI process via the
+    /// `kill_descendants` helper extracted in T1. The descendant shell
+    /// (running `find`, `npm install`, `cargo build`, …) exits with code
+    /// 130, BashTool's awaited `exec()` reports a normal `tool_result`
+    /// with `isError: true`, and the agent's turn continues — the LLM
+    /// can then decide to call another tool, abandon, retry, etc.
+    ///
+    /// **Critical invariants** (cf decision `d2bf0e7b` on T1):
+    /// - **Does NOT touch** `interrupt_flag` or `interrupt_token` —
+    ///   touching them would break the PO stream loop and end the turn,
+    ///   defeating the purpose of this method.
+    /// - **Does NOT send** the SDK control_request `interrupt` — that
+    ///   triggers `QueryEngine.abortController.abort()` in the CLI which
+    ///   ends the turn entirely (the AbortController is shared by the
+    ///   in-flight Anthropic API fetch and never reset).
+    ///
+    /// Both invariants have dedicated regression tests in T5.
+    ///
+    /// ## Rate limiting
+    ///
+    /// Sliding-window cap of `cancel_tools_cap` invocations per
+    /// `cancel_tools_window` (default 10/60s) prevents click-spam from
+    /// saturating `pgrep -P` and the CLI. When the cap is hit, the call
+    /// returns `capped: true` with `killed_pids: []` and **no SIGINT is
+    /// sent** — caller maps to HTTP 429 or a "slow down" toast.
+    ///
+    /// ## Cross-instance routing
+    ///
+    /// If the session is not local, the request is propagated via NATS
+    /// `chat.{session_id}.cancel_tools` so the owning instance executes
+    /// the SIGINT. The local rate cap still applies to prevent flooding
+    /// NATS itself.
+    pub async fn cancel_running_tools(&self, session_id: &str) -> Result<CancelToolsResult> {
+        // Look up session-local state in a single read lock.
+        let session_state = {
+            let sessions = self.active_sessions.read().await;
+            sessions.get(session_id).map(|s| {
+                (
+                    s.child_pid,
+                    s.cancel_tools_history.clone(),
+                    s.cancel_tools_cap,
+                    s.cancel_tools_window,
+                    s.events_tx.clone(),
+                )
+            })
+        };
+
+        // Apply the rate cap — even when the session is remote (NATS
+        // path), so a cross-instance click-spam can't loop forever.
+        let (cli_pid, history, cap, window, events_tx) = match session_state {
+            Some(state) => state,
+            None => {
+                // Session not local — still enforce a "soft" cap by
+                // doing nothing locally; remote owner has its own cap.
+                debug!(
+                    session_id = %session_id,
+                    "cancel_running_tools: session not active locally; routing via NATS only"
+                );
+                if let Some(ref nats) = self.nats {
+                    nats.publish_cancel_tools(session_id);
+                }
+                return Ok(CancelToolsResult {
+                    cli_pid: None,
+                    killed_pids: Vec::new(),
+                    capped: false,
+                });
+            }
+        };
+
+        // Check cap. The `false` return path is the happy path that
+        // also records the timestamp atomically.
+        let capped = !Self::check_and_record_cancel_cap(&history, cap, window).await;
+        if capped {
+            warn!(
+                session_id = %session_id,
+                cap = cap,
+                window_secs = window.as_secs(),
+                "cancel_running_tools: rate cap hit, refusing"
+            );
+            return Ok(CancelToolsResult {
+                cli_pid,
+                killed_pids: Vec::new(),
+                capped: true,
+            });
+        }
+
+        // SIGINT-only — never the control_request, never flag/token.
+        let killed_pids = Self::kill_descendants(cli_pid);
+        info!(
+            session_id = %session_id,
+            cli_pid = ?cli_pid,
+            descendant_count = killed_pids.len(),
+            descendant_pids = ?killed_pids,
+            "cancel_running_tools: SIGINT sent to descendants (turn preserved)"
+        );
+
+        // Broadcast a typed event so all clients of this session
+        // (multi-tab, sidebar, frontend logs) observe the cancel
+        // immediately — even if no `ToolResult` cancelled is emitted
+        // (e.g., agent was thinking, no tool was running).
+        let event = ChatEvent::ToolsCancelled {
+            cli_pid,
+            killed_count: killed_pids.len(),
+            requested_by: "user".to_string(),
+        };
+        let _ = events_tx.send(event.clone());
+
+        // Cross-instance fan-out — both the cancel SIGNAL (so the
+        // owning instance executes the SIGINT if remote) and the
+        // ChatEvent (so remote clients of this session see the cancel
+        // in their feed).
+        if let Some(ref nats) = self.nats {
+            nats.publish_cancel_tools(session_id);
+            nats.publish_chat_event(session_id, event);
+        }
+
+        Ok(CancelToolsResult {
+            cli_pid,
+            killed_pids,
+            capped: false,
+        })
+    }
+
+    /// Sliding-window rate cap helper for `cancel_running_tools`.
+    /// Returns `true` when the call is allowed (records the timestamp
+    /// atomically), `false` when the cap is hit (no record).
+    ///
+    /// Mirror of `chat::oob_listener::check_and_record_trigger_cap` but
+    /// without the warning-emission gate — cancel_tools is user-driven
+    /// and the caller surfaces the cap hit directly via the HTTP 429
+    /// or `capped: true` response.
+    async fn check_and_record_cancel_cap(
+        history: &Arc<Mutex<VecDeque<Instant>>>,
+        cap: u32,
+        window: Duration,
+    ) -> bool {
+        let mut hist = history.lock().await;
+        let now = Instant::now();
+
+        // Drain entries older than `window` from the front.
+        while let Some(front) = hist.front() {
+            if now.duration_since(*front) > window {
+                hist.pop_front();
+            } else {
+                break;
+            }
+        }
+
+        if (hist.len() as u32) >= cap {
+            return false;
+        }
+        hist.push_back(now);
+        true
+    }
+
+    /// Spawn the per-session NATS listener for `cancel_tools` signals
+    /// (T2 of plan 28e9afe3). Mirror of `spawn_nats_interrupt_listener`.
+    ///
+    /// On message, fetches the session's `child_pid` + cap state and
+    /// runs `kill_descendants` directly — does NOT re-enter
+    /// `cancel_running_tools` to avoid the routing loop where every
+    /// SIGINT would re-publish to NATS and trigger our own listener.
+    ///
+    /// Applies the rate cap **here** as well, so a remote instance
+    /// that publishes the cancel signal at high frequency cannot
+    /// bypass the local cap on the SIGINT actually executed. Without
+    /// this, spam-publishing on NATS would translate to spam SIGINT
+    /// on the owning instance.
+    fn spawn_nats_cancel_tools_listener(
+        &self,
+        session_id: &str,
+        active_sessions: Arc<RwLock<HashMap<String, ActiveSession>>>,
+        cancel: CancellationToken,
+    ) {
+        let Some(ref nats) = self.nats else {
+            return;
+        };
+
+        let nats = nats.clone();
+        let session_id = session_id.to_string();
+
+        tokio::spawn(async move {
+            let mut subscriber = match nats.subscribe_cancel_tools(&session_id).await {
+                Ok(sub) => sub,
+                Err(e) => {
+                    warn!(
+                        "Failed to subscribe to NATS cancel_tools for session {}: {}",
+                        session_id, e
+                    );
+                    return;
+                }
+            };
+
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => {
+                        debug!(
+                            "NATS cancel_tools listener cancelled for session {} (session replaced)",
+                            session_id
+                        );
+                        break;
+                    }
+                    msg = subscriber.next() => {
+                        let Some(_msg) = msg else { break; };
+
+                        // Pull the session's cli_pid + cap state (or stop
+                        // if the session was removed locally).
+                        let session_state = {
+                            let sessions = active_sessions.read().await;
+                            sessions.get(&session_id).map(|s| {
+                                (
+                                    s.child_pid,
+                                    s.cancel_tools_history.clone(),
+                                    s.cancel_tools_cap,
+                                    s.cancel_tools_window,
+                                )
+                            })
+                        };
+                        let Some((cli_pid, history, cap, window)) = session_state else {
+                            debug!(
+                                "Session {} no longer active, stopping NATS cancel_tools listener",
+                                session_id
+                            );
+                            break;
+                        };
+
+                        // Apply the cap on the SIGINT side too — protects
+                        // against a remote instance flooding the NATS
+                        // subject. Mirrors the cap applied by the
+                        // local-path of `cancel_running_tools`.
+                        if !Self::check_and_record_cancel_cap(&history, cap, window).await {
+                            warn!(
+                                session_id = %session_id,
+                                cap = cap,
+                                window_secs = window.as_secs(),
+                                "NATS cancel_tools listener: rate cap hit, dropping signal"
+                            );
+                            continue;
+                        }
+
+                        let killed = Self::kill_descendants(cli_pid);
+                        info!(
+                            session_id = %session_id,
+                            cli_pid = ?cli_pid,
+                            descendant_count = killed.len(),
+                            "NATS cancel_tools received, SIGINT sent to descendants"
+                        );
+                    }
+                }
+            }
+        });
     }
 
     /// Recursively enumerate all descendant PIDs of a given process.
@@ -5347,6 +5663,58 @@ impl ChatManager {
             stack.extend(get_children(child));
         }
         result
+    }
+
+    /// Send `SIGINT` to every descendant of `cli_pid` **without** sending the
+    /// SDK `interrupt` control_request and **without** touching the
+    /// `interrupt_flag`/`interrupt_token`. Returns the PIDs that received the
+    /// signal (empty if `cli_pid` is `None` or no descendants exist).
+    ///
+    /// ## Why this helper exists separately from `interrupt()`
+    ///
+    /// Decision `d2bf0e7b` (T1 of plan 28e9afe3) — empirical analysis of the
+    /// Claude Code CLI source (`bridge/bridgeMessaging.ts:362` →
+    /// `QueryEngine.ts:1158`) showed that the SDK control_request `interrupt`
+    /// triggers `QueryEngine.abortController.abort()`, which propagates to
+    /// **every** consumer of the AbortController (including the in-flight
+    /// fetch to the Anthropic API and the BashTool's `exec()`). The
+    /// AbortController is **never reset** within a `QueryEngine` instance, so
+    /// `abort()` ends the entire turn — the LLM cannot continue afterwards.
+    ///
+    /// In contrast, sending `SIGINT` directly to the descendant shell
+    /// (without touching the AbortController) makes BashTool's awaited
+    /// `exec()` see its child exit with code 130. BashTool reports a normal
+    /// `tool_result` with `isError: true` and the agent's turn continues
+    /// normally — exactly the behaviour required by `cancel_running_tools`.
+    ///
+    /// Therefore: `interrupt()` keeps using the control_request +
+    /// flag/token (turn-ending behaviour, by design), while
+    /// `cancel_running_tools()` calls **only** this helper.
+    ///
+    /// On non-unix platforms this is a no-op that returns an empty Vec.
+    fn kill_descendants(cli_pid: Option<u32>) -> Vec<u32> {
+        #[cfg(unix)]
+        {
+            let Some(pid) = cli_pid else {
+                return Vec::new();
+            };
+            let descendants = Self::get_descendant_pids(pid);
+            for &desc_pid in &descendants {
+                // SAFETY: libc::kill is FFI; SIGINT to a non-existent PID
+                // returns ESRCH which we silently ignore (idempotent —
+                // the tool may have finished naturally between snapshot
+                // and signal).
+                unsafe {
+                    libc::kill(desc_pid as i32, libc::SIGINT);
+                }
+            }
+            descendants
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = cli_pid;
+            Vec::new()
+        }
     }
 
     /// Close an active session: interrupt first, then disconnect and remove.
@@ -7416,6 +7784,9 @@ mod tests {
             oob_trigger_cap: OOB_TRIGGER_CAP_INTERACTIVE,
             oob_trigger_window: Duration::from_secs(OOB_TRIGGER_WINDOW_SECS),
             oob_capped_warned: Arc::new(AtomicBool::new(false)),
+            cancel_tools_history: Arc::new(Mutex::new(VecDeque::new())),
+            cancel_tools_cap: CANCEL_TOOLS_CAP,
+            cancel_tools_window: Duration::from_secs(CANCEL_TOOLS_WINDOW_SECS),
         };
 
         Some((session, pending_messages))
@@ -8316,6 +8687,9 @@ mod tests {
             oob_trigger_cap: OOB_TRIGGER_CAP_INTERACTIVE,
             oob_trigger_window: Duration::from_secs(OOB_TRIGGER_WINDOW_SECS),
             oob_capped_warned: Arc::new(AtomicBool::new(false)),
+            cancel_tools_history: Arc::new(Mutex::new(VecDeque::new())),
+            cancel_tools_cap: CANCEL_TOOLS_CAP,
+            cancel_tools_window: Duration::from_secs(CANCEL_TOOLS_WINDOW_SECS),
         };
 
         (session, handle)
@@ -9917,5 +10291,95 @@ mod tests {
     fn test_bash_without_command_is_not_conclusive() {
         let input = serde_json::json!({});
         assert!(!is_conclusive_tool("Bash", &input));
+    }
+
+    // ── T5 of plan 28e9afe3: cancel_running_tools tests ──────────────────
+    //
+    // Most invariants of `cancel_running_tools` are enforced by the type
+    // system: `kill_descendants` takes only `Option<u32>` (no
+    // `AtomicBool`/`CancellationToken` — cannot touch flag/token), and
+    // `check_and_record_cancel_cap` takes only `&Arc<Mutex<VecDeque>>`,
+    // `u32`, `Duration`. Runtime invariant (cancel doesn't break the
+    // stream) is covered by the live e2e test in T6.
+    //
+    // Unit tests below cover: rate cap (basics + recovery), kill helper
+    // edge cases, and CancelToolsResult serde shape.
+
+    #[tokio::test]
+    async fn test_cancel_cap_allows_up_to_cap_then_refuses() {
+        let history = Arc::new(Mutex::new(VecDeque::<Instant>::new()));
+        let cap: u32 = 10;
+        let window = Duration::from_secs(60);
+
+        for i in 0..cap {
+            assert!(
+                ChatManager::check_and_record_cancel_cap(&history, cap, window).await,
+                "call #{i} below cap must be allowed"
+            );
+        }
+        // 11th refused, history len stays at cap.
+        assert!(!ChatManager::check_and_record_cancel_cap(&history, cap, window).await);
+        assert_eq!(history.lock().await.len() as u32, cap);
+        // Subsequent refused calls don't add to history either.
+        assert!(!ChatManager::check_and_record_cancel_cap(&history, cap, window).await);
+        assert_eq!(history.lock().await.len() as u32, cap);
+    }
+
+    #[tokio::test]
+    async fn test_cancel_cap_recovers_after_window_expires() {
+        let history = Arc::new(Mutex::new(VecDeque::<Instant>::new()));
+        let cap: u32 = 2;
+        // Tiny window so we can age entries out within test time.
+        let window = Duration::from_millis(50);
+
+        assert!(ChatManager::check_and_record_cancel_cap(&history, cap, window).await);
+        assert!(ChatManager::check_and_record_cancel_cap(&history, cap, window).await);
+        assert!(!ChatManager::check_and_record_cancel_cap(&history, cap, window).await);
+
+        // Wait past the window, history should drain.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        assert!(
+            ChatManager::check_and_record_cancel_cap(&history, cap, window).await,
+            "after window expiry, calls should be allowed again"
+        );
+    }
+
+    #[test]
+    fn test_kill_descendants_with_no_pid_is_noop() {
+        // No PID → nothing to kill, returns empty Vec, no panic, no SIGINT.
+        let killed = ChatManager::kill_descendants(None);
+        assert!(killed.is_empty());
+    }
+
+    #[test]
+    fn test_cancel_tools_result_serde_roundtrip() {
+        let result = CancelToolsResult {
+            cli_pid: Some(12345),
+            killed_pids: vec![67890, 67891],
+            capped: false,
+        };
+        let json = serde_json::to_string(&result).expect("serialize");
+        // Spot-check the wire format the frontend will consume.
+        assert!(json.contains("\"cli_pid\":12345"));
+        assert!(json.contains("\"killed_pids\":[67890,67891]"));
+        assert!(json.contains("\"capped\":false"));
+
+        let parsed: CancelToolsResult = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed.cli_pid, Some(12345));
+        assert_eq!(parsed.killed_pids, vec![67890, 67891]);
+        assert!(!parsed.capped);
+    }
+
+    #[test]
+    fn test_cancel_tools_result_serde_capped_state() {
+        let result = CancelToolsResult {
+            cli_pid: Some(1234),
+            killed_pids: vec![],
+            capped: true,
+        };
+        let json = serde_json::to_string(&result).expect("serialize");
+        assert!(json.contains("\"capped\":true"));
+        assert!(json.contains("\"killed_pids\":[]"));
     }
 }

@@ -449,6 +449,27 @@ pub enum ChatEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         correlation_id: Option<String>,
     },
+    /// User-initiated cancellation of running tool subprocess(es) for a
+    /// session (T4 of plan 28e9afe3). Emitted when `cancel_running_tools`
+    /// successfully sent SIGINT to descendants.
+    ///
+    /// Frontends should display a transient "Cancelled by user" badge on
+    /// any in-flight `ToolUse` that doesn't yet have a matching
+    /// `ToolResult`, and rely on the actual cancelled `ToolResult`
+    /// arriving on the broadcast right after to finalise the bubble.
+    ///
+    /// Distinct from a regular `Error` event because no error occurred
+    /// at the protocol level — this is a deliberate user action.
+    ToolsCancelled {
+        /// PID of the Claude Code CLI subprocess (for client-side display).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cli_pid: Option<u32>,
+        /// Number of descendant subprocesses that received SIGINT.
+        killed_count: usize,
+        /// Who initiated the cancel — currently always `"user"`.
+        /// Reserved for future automation paths (`"agent"`, `"timeout"`).
+        requested_by: String,
+    },
     /// A session-level error that requires the user's attention — the CLI
     /// subprocess is gone, the transport is broken, or the session is
     /// otherwise unrecoverable without a fresh `create_session` /
@@ -506,6 +527,7 @@ impl ChatEvent {
             ChatEvent::Retrying { .. } => "retrying",
             ChatEvent::BackgroundOutput { .. } => "background_output",
             ChatEvent::SessionError { .. } => "session_error",
+            ChatEvent::ToolsCancelled { .. } => "tools_cancelled",
         }
     }
 
@@ -620,6 +642,21 @@ impl ChatEvent {
                 ))
             }
 
+            ChatEvent::ToolsCancelled {
+                cli_pid,
+                killed_count,
+                requested_by,
+            } => {
+                // (cli_pid, killed_count, requested_by) is enough to dedup
+                // — two cancels with the same exact shape at distinct times
+                // produce the same fingerprint, but those are user double-
+                // clicks the rate cap already de-dupes upstream.
+                let pid = cli_pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into());
+                Some(format!(
+                    "tools_cancelled:{}:{}:{}",
+                    pid, killed_count, requested_by
+                ))
+            }
             ChatEvent::SessionError {
                 reason,
                 received_at,

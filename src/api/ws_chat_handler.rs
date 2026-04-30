@@ -62,6 +62,11 @@ pub enum WsChatClientMessage {
     SetModel { model: String },
     /// Toggle auto-continue for the active session
     SetAutoContinue { enabled: bool },
+    /// Cancel the currently-running tool subprocess(es) WITHOUT
+    /// ending the LLM turn. Mirror of `POST /api/chat/sessions/{id}
+    /// /cancel-tools` for clients that prefer to stay on the WS
+    /// (T4 of plan 28e9afe3).
+    CancelTools,
 }
 
 /// WebSocket upgrade handler for `/ws/chat/{session_id}`
@@ -833,6 +838,32 @@ async fn handle_ws_chat_loop(
                                         debug!(session_id = %session_id, "WS: Received interrupt");
                                         if let Err(e) = chat_manager.interrupt(&session_id).await {
                                             warn!(session_id = %session_id, error = %e, "Failed to interrupt");
+                                        }
+                                    }
+
+                                    WsChatClientMessage::CancelTools => {
+                                        debug!(session_id = %session_id, "WS: Received cancel_tools");
+                                        // T4 of plan 28e9afe3 — kills running
+                                        // tool subprocess(es) without ending the
+                                        // turn. Broadcast of ChatEvent::ToolsCancelled
+                                        // happens inside cancel_running_tools so
+                                        // multi-tab clients see the cancel.
+                                        match chat_manager.cancel_running_tools(&session_id).await {
+                                            Ok(result) => {
+                                                debug!(
+                                                    session_id = %session_id,
+                                                    killed = result.killed_pids.len(),
+                                                    capped = result.capped,
+                                                    "WS: cancel_tools done"
+                                                );
+                                            }
+                                            Err(e) => {
+                                                warn!(
+                                                    session_id = %session_id,
+                                                    error = %e,
+                                                    "WS: cancel_tools failed"
+                                                );
+                                            }
                                         }
                                     }
 

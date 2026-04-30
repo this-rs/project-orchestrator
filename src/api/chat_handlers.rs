@@ -432,6 +432,64 @@ pub async fn delete_session(
 }
 
 // ============================================================================
+// Cancel running tools (T3 of plan 28e9afe3)
+// ============================================================================
+
+/// POST /api/chat/sessions/{id}/cancel-tools — Kill the currently-running
+/// tool subprocess(es) of a session WITHOUT ending the LLM turn.
+///
+/// Sends `SIGINT` to every descendant of the CLI process. The running
+/// shell child (find, npm install, …) exits with code 130, BashTool
+/// returns a normal `tool_result` with `isError: true`, and the agent's
+/// turn continues — it can decide to call another tool, abandon, retry…
+///
+/// Distinct from the existing interrupt mechanism, which ends the turn
+/// (sets `interrupt_flag` + sends the SDK control_request `interrupt`
+/// that triggers `QueryEngine.abortController.abort()` in the CLI).
+/// See decision `d2bf0e7b` of plan 28e9afe3 for the empirical analysis
+/// behind this distinction.
+///
+/// ## Response codes
+///
+/// Always **200** with `CancelToolsResult { cli_pid, killed_pids,
+/// capped }`. The frontend distinguishes:
+/// - `capped: false, !killed_pids.is_empty()` → tool(s) cancelled OK
+/// - `capped: false, killed_pids.is_empty()` → no tool was running
+///   (agent thinking, between turns) — silently no-op
+/// - `capped: true` → rate cap hit (10/60s/session), display a
+///   "slow down" toast and disable the button briefly
+///
+/// **404** — `chat_manager` not configured (server not started with
+/// chat support).
+///
+/// (Rationale for 200-not-429 on cap: matches existing PO patterns
+/// like `cancel_run` which returns 200 with structured body. Avoids
+/// adding an `AppError::TooManyRequests` variant just for one
+/// endpoint.)
+///
+/// ## Cross-instance routing
+///
+/// If the session lives on another instance, the request is forwarded
+/// transparently via the NATS subject `events.chat.{id}.cancel_tools`.
+/// The local response will have `cli_pid: None, killed_pids: []` since
+/// the SIGINT happens remotely.
+pub async fn cancel_tools(
+    State(state): State<OrchestratorState>,
+    Path(session_id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let chat_manager = state.chat_manager.as_ref().ok_or_else(|| {
+        AppError::NotFound("chat_manager not configured on this server".to_string())
+    })?;
+
+    let result = chat_manager
+        .cancel_running_tools(&session_id.to_string())
+        .await
+        .map_err(AppError::Internal)?;
+
+    Ok(Json(serde_json::to_value(&result).unwrap_or_default()))
+}
+
+// ============================================================================
 // Update session (rename)
 // ============================================================================
 
