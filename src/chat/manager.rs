@@ -5542,11 +5542,16 @@ impl ChatManager {
     /// Spawn the per-session NATS listener for `cancel_tools` signals
     /// (T2 of plan 28e9afe3). Mirror of `spawn_nats_interrupt_listener`.
     ///
-    /// On message, fetches the session's `child_pid` and runs
-    /// `kill_descendants` directly — does NOT re-enter
-    /// `cancel_running_tools` so we don't double-apply the rate cap
-    /// (the originating instance already did) and don't re-publish to
-    /// NATS (would create a routing loop).
+    /// On message, fetches the session's `child_pid` + cap state and
+    /// runs `kill_descendants` directly — does NOT re-enter
+    /// `cancel_running_tools` to avoid the routing loop where every
+    /// SIGINT would re-publish to NATS and trigger our own listener.
+    ///
+    /// Applies the rate cap **here** as well, so a remote instance
+    /// that publishes the cancel signal at high frequency cannot
+    /// bypass the local cap on the SIGINT actually executed. Without
+    /// this, spam-publishing on NATS would translate to spam SIGINT
+    /// on the owning instance.
     fn spawn_nats_cancel_tools_listener(
         &self,
         session_id: &str,
@@ -5584,20 +5589,40 @@ impl ChatManager {
                     msg = subscriber.next() => {
                         let Some(_msg) = msg else { break; };
 
-                        // Pull the session's CLI pid (or stop if removed).
-                        let cli_pid = {
+                        // Pull the session's cli_pid + cap state (or stop
+                        // if the session was removed locally).
+                        let session_state = {
                             let sessions = active_sessions.read().await;
-                            match sessions.get(&session_id) {
-                                Some(s) => s.child_pid,
-                                None => {
-                                    debug!(
-                                        "Session {} no longer active, stopping NATS cancel_tools listener",
-                                        session_id
-                                    );
-                                    break;
-                                }
-                            }
+                            sessions.get(&session_id).map(|s| {
+                                (
+                                    s.child_pid,
+                                    s.cancel_tools_history.clone(),
+                                    s.cancel_tools_cap,
+                                    s.cancel_tools_window,
+                                )
+                            })
                         };
+                        let Some((cli_pid, history, cap, window)) = session_state else {
+                            debug!(
+                                "Session {} no longer active, stopping NATS cancel_tools listener",
+                                session_id
+                            );
+                            break;
+                        };
+
+                        // Apply the cap on the SIGINT side too — protects
+                        // against a remote instance flooding the NATS
+                        // subject. Mirrors the cap applied by the
+                        // local-path of `cancel_running_tools`.
+                        if !Self::check_and_record_cancel_cap(&history, cap, window).await {
+                            warn!(
+                                session_id = %session_id,
+                                cap = cap,
+                                window_secs = window.as_secs(),
+                                "NATS cancel_tools listener: rate cap hit, dropping signal"
+                            );
+                            continue;
+                        }
 
                         let killed = Self::kill_descendants(cli_pid);
                         info!(
