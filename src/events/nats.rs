@@ -543,6 +543,22 @@ mod tests {
     }
 
     #[test]
+    fn test_cancel_tools_subject() {
+        // T2 of plan 28e9afe3 — distinct subject from interrupt because
+        // the two have different semantics (cancel_tools preserves the
+        // turn, interrupt ends it).
+        let prefix = "events";
+        let session_id = "abc-123";
+        let subject = format!("{}.chat.{}.cancel_tools", prefix, session_id);
+        assert_eq!(subject, "events.chat.abc-123.cancel_tools");
+        assert_ne!(
+            subject,
+            format!("{}.chat.{}.interrupt", prefix, session_id),
+            "cancel_tools subject must NOT collide with interrupt subject"
+        );
+    }
+
+    #[test]
     fn test_chat_subject_with_custom_prefix() {
         let prefix = "po.dev";
         let session_id = "sess-456";
