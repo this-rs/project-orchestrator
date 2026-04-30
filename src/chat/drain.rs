@@ -205,3 +205,91 @@ pub(crate) async fn drain_pending_messages(
         );
     }
 }
+
+/// Pop the highest-priority `PendingMessage` from the queue, preserving
+/// FIFO order within a single priority class.
+///
+/// Priority order (lowest number = highest priority):
+///   0 — `User` : the human's intent always wins
+///   1 — `SystemHint` : system instructions (AgentGuard hints, plan-runner reminders)
+///   2 — `BackgroundOutput` : passive observations from background tools (Monitor, BashOutput, …)
+///
+/// ## Why this exists (plan 806c8f2c)
+///
+/// Without prioritisation, a noisy `Monitor` (or any background-output-emitting
+/// tool) can starve user messages: BackgroundOutput entries accumulate in
+/// `pending_messages` while a stream is running, and a strict FIFO drain
+/// processes them all before reading the user's typed message — the user
+/// perceives the chat as "ignoring me" while ticks keep firing.
+///
+/// ## Complexity
+///
+/// `O(n)` scan over the queue + `O(n)` `remove(idx)`. `n` is typically < 50;
+/// in practice the queue rarely exceeds 5-10 entries between drain cycles.
+///
+/// ## STUB (T1 of plan 806c8f2c)
+///
+/// This stub currently delegates to `pop_front()` — strict FIFO, buggy.
+/// The tests below will FAIL on this stub, demonstrating the bug. T2 of
+/// the same plan replaces the body with the real priority-aware impl.
+fn pop_highest_priority(queue: &mut VecDeque<PendingMessage>) -> Option<PendingMessage> {
+    // STUB — see doc-comment.
+    queue.pop_front()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chat::types::PendingMessage;
+
+    fn user(content: &str) -> PendingMessage {
+        PendingMessage::user(content.to_string())
+    }
+    #[allow(dead_code)] // used by tests added in T3 of plan 806c8f2c
+    fn system_hint(content: &str) -> PendingMessage {
+        PendingMessage::system_hint(content.to_string())
+    }
+    fn bg(content: &str) -> PendingMessage {
+        PendingMessage::background_output(content.to_string())
+    }
+
+    /// **T1 of plan 806c8f2c — RED test that demonstrates the bug.**
+    ///
+    /// On main HEAD with `pop_highest_priority` stubbed to `pop_front`, this
+    /// test FAILS: the 3 BackgroundOutput entries are popped before the
+    /// User message, reproducing the starvation symptom observed in prod.
+    ///
+    /// After T2 replaces the stub with the real priority-aware impl, this
+    /// test PASSES — and serves as a permanent non-regression guard.
+    #[test]
+    fn test_user_message_drained_before_accumulated_background_outputs() {
+        let mut q = VecDeque::new();
+        q.push_back(bg("BG1"));
+        q.push_back(bg("BG2"));
+        q.push_back(bg("BG3"));
+        q.push_back(user("U1"));
+
+        // Expected behavior: User wins, then BG1 BG2 BG3 in FIFO order.
+        let first = pop_highest_priority(&mut q).expect("queue not empty");
+        assert_eq!(
+            first.kind,
+            PendingMessageKind::User,
+            "BUG: User message starved by accumulated BackgroundOutput. \
+             pop_highest_priority returned {:?} content={:?}",
+            first.kind, first.content
+        );
+        assert_eq!(first.content, "U1");
+
+        // FIFO within BackgroundOutput class is preserved.
+        for expected in ["BG1", "BG2", "BG3"] {
+            let next = pop_highest_priority(&mut q).expect("queue not empty");
+            assert_eq!(next.kind, PendingMessageKind::BackgroundOutput);
+            assert_eq!(
+                next.content, expected,
+                "FIFO intra-class violated: expected {expected}"
+            );
+        }
+
+        assert!(pop_highest_priority(&mut q).is_none());
+    }
+}
