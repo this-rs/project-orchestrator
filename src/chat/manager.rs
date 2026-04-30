@@ -10251,4 +10251,94 @@ mod tests {
         let input = serde_json::json!({});
         assert!(!is_conclusive_tool("Bash", &input));
     }
+
+    // ── T5 of plan 28e9afe3: cancel_running_tools tests ──────────────────
+    //
+    // Most invariants of `cancel_running_tools` are enforced by the type
+    // system: `kill_descendants` takes only `Option<u32>` (no
+    // `AtomicBool`/`CancellationToken` — cannot touch flag/token), and
+    // `check_and_record_cancel_cap` takes only `&Arc<Mutex<VecDeque>>`,
+    // `u32`, `Duration`. Runtime invariant (cancel doesn't break the
+    // stream) is covered by the live e2e test in T6.
+    //
+    // Unit tests below cover: rate cap (basics + recovery), kill helper
+    // edge cases, and CancelToolsResult serde shape.
+
+    #[tokio::test]
+    async fn test_cancel_cap_allows_up_to_cap_then_refuses() {
+        let history = Arc::new(Mutex::new(VecDeque::<Instant>::new()));
+        let cap: u32 = 10;
+        let window = Duration::from_secs(60);
+
+        for i in 0..cap {
+            assert!(
+                ChatManager::check_and_record_cancel_cap(&history, cap, window).await,
+                "call #{i} below cap must be allowed"
+            );
+        }
+        // 11th refused, history len stays at cap.
+        assert!(!ChatManager::check_and_record_cancel_cap(&history, cap, window).await);
+        assert_eq!(history.lock().await.len() as u32, cap);
+        // Subsequent refused calls don't add to history either.
+        assert!(!ChatManager::check_and_record_cancel_cap(&history, cap, window).await);
+        assert_eq!(history.lock().await.len() as u32, cap);
+    }
+
+    #[tokio::test]
+    async fn test_cancel_cap_recovers_after_window_expires() {
+        let history = Arc::new(Mutex::new(VecDeque::<Instant>::new()));
+        let cap: u32 = 2;
+        // Tiny window so we can age entries out within test time.
+        let window = Duration::from_millis(50);
+
+        assert!(ChatManager::check_and_record_cancel_cap(&history, cap, window).await);
+        assert!(ChatManager::check_and_record_cancel_cap(&history, cap, window).await);
+        assert!(!ChatManager::check_and_record_cancel_cap(&history, cap, window).await);
+
+        // Wait past the window, history should drain.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        assert!(
+            ChatManager::check_and_record_cancel_cap(&history, cap, window).await,
+            "after window expiry, calls should be allowed again"
+        );
+    }
+
+    #[test]
+    fn test_kill_descendants_with_no_pid_is_noop() {
+        // No PID → nothing to kill, returns empty Vec, no panic, no SIGINT.
+        let killed = ChatManager::kill_descendants(None);
+        assert!(killed.is_empty());
+    }
+
+    #[test]
+    fn test_cancel_tools_result_serde_roundtrip() {
+        let result = CancelToolsResult {
+            cli_pid: Some(12345),
+            killed_pids: vec![67890, 67891],
+            capped: false,
+        };
+        let json = serde_json::to_string(&result).expect("serialize");
+        // Spot-check the wire format the frontend will consume.
+        assert!(json.contains("\"cli_pid\":12345"));
+        assert!(json.contains("\"killed_pids\":[67890,67891]"));
+        assert!(json.contains("\"capped\":false"));
+
+        let parsed: CancelToolsResult = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed.cli_pid, Some(12345));
+        assert_eq!(parsed.killed_pids, vec![67890, 67891]);
+        assert!(!parsed.capped);
+    }
+
+    #[test]
+    fn test_cancel_tools_result_serde_capped_state() {
+        let result = CancelToolsResult {
+            cli_pid: Some(1234),
+            killed_pids: vec![],
+            capped: true,
+        };
+        let json = serde_json::to_string(&result).expect("serialize");
+        assert!(json.contains("\"capped\":true"));
+        assert!(json.contains("\"killed_pids\":[]"));
+    }
 }
