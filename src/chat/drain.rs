@@ -274,12 +274,27 @@ mod tests {
     fn user(content: &str) -> PendingMessage {
         PendingMessage::user(content.to_string())
     }
-    #[allow(dead_code)] // used by tests added in T3 of plan 806c8f2c
     fn system_hint(content: &str) -> PendingMessage {
         PendingMessage::system_hint(content.to_string())
     }
     fn bg(content: &str) -> PendingMessage {
         PendingMessage::background_output(content.to_string())
+    }
+
+    /// Helper: assert next pop is `expected_kind` with `expected_content`.
+    #[track_caller]
+    fn assert_next(
+        q: &mut VecDeque<PendingMessage>,
+        expected_kind: PendingMessageKind,
+        expected_content: &str,
+    ) {
+        let m = pop_highest_priority(q).expect("queue not empty");
+        assert_eq!(
+            m.kind, expected_kind,
+            "wrong kind: got {:?} content={:?}, expected {:?} content={:?}",
+            m.kind, m.content, expected_kind, expected_content
+        );
+        assert_eq!(m.content, expected_content);
     }
 
     /// **T1 of plan 806c8f2c — RED test that demonstrates the bug.**
@@ -318,6 +333,158 @@ mod tests {
                 "FIFO intra-class violated: expected {expected}"
             );
         }
+
+        assert!(pop_highest_priority(&mut q).is_none());
+    }
+
+    // ========================================================================
+    // T3 of plan 806c8f2c — Comprehensive priority + FIFO invariants.
+    //
+    // The 9 tests below cover the full truth table of `pop_highest_priority`:
+    //   - Single-priority comparisons (User > BG, User > SystemHint, SH > BG)
+    //   - FIFO intra-class for User and BackgroundOutput (the two dominant
+    //     classes in production)
+    //   - Edge cases: empty queue, single entry
+    //   - The full mixed scenario [BG, U, SH, BG, U, SH, BG] which is the
+    //     most valuable single test — exercises priority + FIFO together.
+    // ========================================================================
+
+    #[test]
+    fn test_priority_user_beats_background() {
+        let mut q = VecDeque::new();
+        q.push_back(bg("BG"));
+        q.push_back(user("U"));
+        assert_next(&mut q, PendingMessageKind::User, "U");
+        assert_next(&mut q, PendingMessageKind::BackgroundOutput, "BG");
+        assert!(pop_highest_priority(&mut q).is_none());
+    }
+
+    #[test]
+    fn test_priority_user_beats_systemhint() {
+        let mut q = VecDeque::new();
+        q.push_back(system_hint("SH"));
+        q.push_back(user("U"));
+        assert_next(&mut q, PendingMessageKind::User, "U");
+        assert_next(&mut q, PendingMessageKind::SystemHint, "SH");
+        assert!(pop_highest_priority(&mut q).is_none());
+    }
+
+    #[test]
+    fn test_priority_systemhint_beats_background() {
+        let mut q = VecDeque::new();
+        q.push_back(bg("BG"));
+        q.push_back(system_hint("SH"));
+        assert_next(&mut q, PendingMessageKind::SystemHint, "SH");
+        assert_next(&mut q, PendingMessageKind::BackgroundOutput, "BG");
+        assert!(pop_highest_priority(&mut q).is_none());
+    }
+
+    #[test]
+    fn test_priority_user_beats_multiple_backgrounds() {
+        // The User entry is in the MIDDLE of a sea of BGs — it must still
+        // win, then the remaining BGs come out in their original FIFO order
+        // (BG1, BG2, BG3, BG4 — note BG4 was inserted AFTER U so it stays
+        // last even though U was extracted before it).
+        let mut q = VecDeque::new();
+        q.push_back(bg("BG1"));
+        q.push_back(bg("BG2"));
+        q.push_back(bg("BG3"));
+        q.push_back(user("U"));
+        q.push_back(bg("BG4"));
+
+        assert_next(&mut q, PendingMessageKind::User, "U");
+        for expected in ["BG1", "BG2", "BG3", "BG4"] {
+            let next = pop_highest_priority(&mut q).expect("queue not empty");
+            assert_eq!(next.kind, PendingMessageKind::BackgroundOutput);
+            assert_eq!(
+                next.content, expected,
+                "FIFO intra-class violated: expected {expected}"
+            );
+        }
+        assert!(pop_highest_priority(&mut q).is_none());
+    }
+
+    #[test]
+    fn test_priority_fifo_within_user_class() {
+        // Three User messages in a row — strict insertion order out.
+        // Catches the `min_by_key` trap (returns LAST on equal keys).
+        let mut q = VecDeque::new();
+        q.push_back(user("U1"));
+        q.push_back(user("U2"));
+        q.push_back(user("U3"));
+        assert_next(&mut q, PendingMessageKind::User, "U1");
+        assert_next(&mut q, PendingMessageKind::User, "U2");
+        assert_next(&mut q, PendingMessageKind::User, "U3");
+        assert!(pop_highest_priority(&mut q).is_none());
+    }
+
+    #[test]
+    fn test_priority_fifo_within_background_class() {
+        // Three BackgroundOutput in a row — strict insertion order out.
+        // This is the "Monitor tick" case: agents must see ticks in the
+        // order they were produced, otherwise the assistant gets confused
+        // ("Tick 5" arriving before "Tick 4" makes no narrative sense).
+        let mut q = VecDeque::new();
+        q.push_back(bg("BG1"));
+        q.push_back(bg("BG2"));
+        q.push_back(bg("BG3"));
+        assert_next(&mut q, PendingMessageKind::BackgroundOutput, "BG1");
+        assert_next(&mut q, PendingMessageKind::BackgroundOutput, "BG2");
+        assert_next(&mut q, PendingMessageKind::BackgroundOutput, "BG3");
+        assert!(pop_highest_priority(&mut q).is_none());
+    }
+
+    #[test]
+    fn test_priority_empty_queue() {
+        let mut q: VecDeque<PendingMessage> = VecDeque::new();
+        assert!(
+            pop_highest_priority(&mut q).is_none(),
+            "empty queue must return None, not panic"
+        );
+    }
+
+    #[test]
+    fn test_priority_single_entry() {
+        let mut q = VecDeque::new();
+        q.push_back(bg("only"));
+        assert_next(&mut q, PendingMessageKind::BackgroundOutput, "only");
+        assert!(q.is_empty(), "queue must be empty after popping the sole entry");
+        assert!(pop_highest_priority(&mut q).is_none());
+    }
+
+    /// The most valuable single test of the suite. Mixes 3 priority classes
+    /// across 7 entries and asserts the full pop sequence:
+    ///
+    ///   queue (insertion order): BG1, U1, SH1, BG2, U2, SH2, BG3
+    ///   expected pop sequence:   U1, U2, SH1, SH2, BG1, BG2, BG3
+    ///
+    /// This single test would catch:
+    ///   - Any priority inversion (User not first)
+    ///   - Any FIFO-intra-class violation (U2 before U1, or SH2 before SH1)
+    ///   - The `min_by_key` trap (LAST on equal keys)
+    ///   - Off-by-one in the index tie-break
+    ///   - Failure to remove from the right index after `enumerate()`
+    #[test]
+    fn test_priority_mixed_complex() {
+        let mut q = VecDeque::new();
+        q.push_back(bg("BG1"));
+        q.push_back(user("U1"));
+        q.push_back(system_hint("SH1"));
+        q.push_back(bg("BG2"));
+        q.push_back(user("U2"));
+        q.push_back(system_hint("SH2"));
+        q.push_back(bg("BG3"));
+
+        // Users first, in FIFO order.
+        assert_next(&mut q, PendingMessageKind::User, "U1");
+        assert_next(&mut q, PendingMessageKind::User, "U2");
+        // Then SystemHints, in FIFO order.
+        assert_next(&mut q, PendingMessageKind::SystemHint, "SH1");
+        assert_next(&mut q, PendingMessageKind::SystemHint, "SH2");
+        // Then BackgroundOutputs, in FIFO order.
+        assert_next(&mut q, PendingMessageKind::BackgroundOutput, "BG1");
+        assert_next(&mut q, PendingMessageKind::BackgroundOutput, "BG2");
+        assert_next(&mut q, PendingMessageKind::BackgroundOutput, "BG3");
 
         assert!(pop_highest_priority(&mut q).is_none());
     }
