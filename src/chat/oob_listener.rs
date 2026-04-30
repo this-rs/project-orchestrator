@@ -92,6 +92,27 @@ pub(crate) struct OobListenerDeps {
 /// is owned by the tokio runtime and stops when `cancel` is fired.
 ///
 /// `session_id` is used only for tracing context.
+///
+/// ## Recovery semantics (T9 of plan 9a1684b2)
+///
+/// Recovery of interrupted runs at server boot — handled by
+/// `crate::runner::runner::Runner::recover_interrupted_runs` — does **not**
+/// need a dedicated `respawn_oob_listener` API. That recovery path
+/// re-enters the normal session lifecycle:
+///
+///   `recover_interrupted_runs → execute_plan → ChatManager::create_session
+///    → spawn_oob_listener (this function)`
+///
+/// Each restored runner session therefore gets its own fresh OOB
+/// listener bound to a freshly spawned `InteractiveClient`, identical
+/// to a never-interrupted session. The original cancellation token of
+/// the pre-crash listener is gone with the process — there's nothing to
+/// cancel — so we just spawn a new one.
+///
+/// `resume_session` (used when the user reconnects to an existing
+/// `cli_session_id` mid-conversation) follows the same pattern: the old
+/// `nats_cancel` token is fired before the new session is built, so any
+/// stale listener exits cleanly before the new one starts.
 pub(crate) fn spawn_oob_listener(
     session_id: String,
     client: Arc<Mutex<InteractiveClient>>,
@@ -164,16 +185,7 @@ pub(crate) fn spawn_oob_listener(
                             );
                         }
                         None => {
-                            warn!(
-                                session_id = %session_id,
-                                "OOB listener: SDK message broadcast closed (subprocess gone); exiting"
-                            );
-                            let _ = events_tx.send(ChatEvent::SystemHint {
-                                content: "The CLI subprocess for this session has exited. \
-                                          Send a message to start a new turn (will resume \
-                                          the session if possible)."
-                                    .into(),
-                            });
+                            emit_subprocess_death(&session_id, &events_tx);
                             return;
                         }
                     }
@@ -224,10 +236,14 @@ async fn handle_oob_message(
     info!(
         session_id = %session_id,
         source = %source,
+        oob_event_type = "background_output",
         "OOB listener: emitting BackgroundOutput"
     );
 
-    // 1. Persist as ChatEventRecord (so it appears in list_messages history)
+    // 1. Persist as ChatEventRecord (so it appears in list_messages history).
+    // Time the round-trip — `oob_persistence_latency_ms` is a structured
+    // tracing field that log-based metrics pipelines (e.g. Vector/Loki/
+    // Datadog) can extract as a histogram for production monitoring (T9).
     if let Some(uuid) = session_uuid {
         let record = ChatEventRecord {
             id: Uuid::new_v4(),
@@ -237,12 +253,27 @@ async fn handle_oob_message(
             data: serde_json::to_string(&event).unwrap_or_default(),
             created_at: chrono::Utc::now(),
         };
-        if let Err(e) = deps.graph.store_chat_events(uuid, vec![record]).await {
-            warn!(
-                session_id = %session_id,
-                error = %e,
-                "OOB listener: failed to persist BackgroundOutput record (non-fatal)"
-            );
+        let persist_start = Instant::now();
+        match deps.graph.store_chat_events(uuid, vec![record]).await {
+            Ok(_) => {
+                let latency_ms = persist_start.elapsed().as_millis() as u64;
+                debug!(
+                    session_id = %session_id,
+                    source = %source,
+                    oob_persistence_latency_ms = latency_ms,
+                    "OOB listener: persisted BackgroundOutput record"
+                );
+            }
+            Err(e) => {
+                let latency_ms = persist_start.elapsed().as_millis() as u64;
+                warn!(
+                    session_id = %session_id,
+                    source = %source,
+                    oob_persistence_latency_ms = latency_ms,
+                    error = %e,
+                    "OOB listener: failed to persist BackgroundOutput record (non-fatal)"
+                );
+            }
         }
     }
 
@@ -364,8 +395,15 @@ async fn maybe_trigger_stream(
         return;
     }
 
+    // T9 — Structured trigger log. `oob_trigger_count` is a structured
+    // tracing field (sliding-window depth at the moment of trigger),
+    // suitable for a counter via log-based metrics. Pair with the cap
+    // for a `oob_cap_utilization = count / cap` derived metric.
+    let trigger_count = oob_trigger_history.lock().await.len();
     info!(
         session_id = %session_id,
+        oob_trigger_count = trigger_count,
+        oob_trigger_cap = oob_trigger_cap,
         "OOB listener: idle session, spawning stream_response for queued OOB event"
     );
 
@@ -427,6 +465,34 @@ async fn maybe_trigger_stream(
             search,
         )
         .await;
+    });
+}
+
+/// Emit a `ChatEvent::SessionError` describing subprocess death and log
+/// a `warn!` (T9 of plan 9a1684b2). Extracted as a small helper so the
+/// behaviour is unit-testable without spinning up a real
+/// `InteractiveClient` and the full broadcast machinery.
+///
+/// Called from the listener loop's `None` branch — when
+/// `stream.next()` yields `None` the SDK transport's broadcast sender
+/// has been dropped, which means the CLI subprocess for this session
+/// has exited (clean shutdown OR crash). Subsequent `send_message`
+/// calls on this `session_id` will silently no-op until the session is
+/// recreated, so we surface a typed event the frontend can render
+/// prominently.
+fn emit_subprocess_death(session_id: &str, events_tx: &broadcast::Sender<ChatEvent>) {
+    warn!(
+        session_id = %session_id,
+        reason = "subprocess_exited",
+        "OOB listener: SDK message broadcast closed (subprocess gone); exiting"
+    );
+    let _ = events_tx.send(ChatEvent::SessionError {
+        reason: "subprocess_exited".to_string(),
+        message: "The CLI subprocess for this session has exited. \
+                  Send a message to start a new turn (will resume \
+                  the session if possible)."
+            .into(),
+        received_at: Utc::now(),
     });
 }
 
@@ -817,5 +883,45 @@ mod tests {
             2,
             "expected two warnings (one per cap-hit episode), got: {warnings:?}"
         );
+    }
+
+    // ── T9: subprocess death detection ──────────────────────────────────
+
+    /// `emit_subprocess_death` must publish exactly one
+    /// `ChatEvent::SessionError` with `reason = "subprocess_exited"` and
+    /// a non-empty user-facing message. The frontend uses the `reason`
+    /// field for routing (e.g., "transport_lost" vs "broadcast_dropped"
+    /// in future variants), so the string is part of the public contract.
+    #[tokio::test]
+    async fn test_emit_subprocess_death_emits_session_error() {
+        let (events_tx, mut rx) = broadcast::channel(8);
+        emit_subprocess_death("session-123", &events_tx);
+
+        // The send must have produced exactly one event.
+        let received = rx.try_recv().expect("expected one event on broadcast");
+        match received {
+            ChatEvent::SessionError {
+                reason,
+                message,
+                received_at,
+            } => {
+                assert_eq!(reason, "subprocess_exited");
+                assert!(
+                    message.contains("CLI subprocess"),
+                    "message must mention the subprocess for the user, got: {message}"
+                );
+                // Sanity: timestamp is within the last second.
+                let age = chrono::Utc::now()
+                    .signed_duration_since(received_at)
+                    .num_milliseconds()
+                    .unsigned_abs();
+                assert!(
+                    age < 1000,
+                    "received_at must be ~now, got age = {age}ms"
+                );
+            }
+            other => panic!("expected SessionError, got {other:?}"),
+        }
+        assert!(rx.try_recv().is_err(), "no further events expected");
     }
 }

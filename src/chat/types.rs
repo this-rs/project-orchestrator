@@ -449,6 +449,30 @@ pub enum ChatEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         correlation_id: Option<String>,
     },
+    /// A session-level error that requires the user's attention — the CLI
+    /// subprocess is gone, the transport is broken, or the session is
+    /// otherwise unrecoverable without a fresh `create_session` /
+    /// `resume_session` round-trip.
+    ///
+    /// Distinct from `Error`, which is used for in-stream tool errors
+    /// recoverable mid-turn. `SessionError` signals that subsequent
+    /// messages on this session_id will silently no-op until the user
+    /// (or runner) explicitly restarts the session — frontends should
+    /// surface this prominently.
+    ///
+    /// T9 of plan 9a1684b2 — emitted by `chat::oob_listener` when its
+    /// stream returns `None` (broadcast closed because the SDK transport
+    /// dropped its sender).
+    SessionError {
+        /// Short machine-readable reason code (e.g. "subprocess_exited",
+        /// "transport_closed", "broadcast_dropped"). Stable across
+        /// versions for log filtering.
+        reason: String,
+        /// Human-readable message safe to show to the end user.
+        message: String,
+        /// ISO-8601 timestamp at which the error was detected.
+        received_at: chrono::DateTime<chrono::Utc>,
+    },
 }
 
 impl ChatEvent {
@@ -481,6 +505,7 @@ impl ChatEvent {
             ChatEvent::AutoContinueStateChanged { .. } => "auto_continue_state_changed",
             ChatEvent::Retrying { .. } => "retrying",
             ChatEvent::BackgroundOutput { .. } => "background_output",
+            ChatEvent::SessionError { .. } => "session_error",
         }
     }
 
@@ -592,6 +617,21 @@ impl ChatEvent {
                     source,
                     received_at.timestamp_millis(),
                     corr
+                ))
+            }
+
+            ChatEvent::SessionError {
+                reason,
+                received_at,
+                ..
+            } => {
+                // (reason, timestamp) — the same subprocess can only die
+                // once at a given instant; replays at distinct moments
+                // are distinct events.
+                Some(format!(
+                    "session_error:{}:{}",
+                    reason,
+                    received_at.timestamp_millis()
                 ))
             }
 
@@ -1409,6 +1449,17 @@ mod tests {
                 max_attempts: 3,
                 delay_ms: 1000,
                 error_message: "api_error: Internal server error".into(),
+            },
+            // T9 of plan 9a1684b2 — SessionError variant.
+            ChatEvent::SessionError {
+                reason: "subprocess_exited".into(),
+                message: "The CLI subprocess for this session has exited.".into(),
+                received_at: chrono::Utc::now(),
+            },
+            ChatEvent::SessionError {
+                reason: "transport_closed".into(),
+                message: "Lost connection to the CLI transport.".into(),
+                received_at: chrono::Utc::now(),
             },
         ];
 
