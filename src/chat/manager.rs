@@ -2616,11 +2616,11 @@ impl ChatManager {
         // (which is held by stream_response during streaming → deadlock).
         let stdin_tx = client.clone_stdin_sender().await;
 
-        // CLI subprocess PID for process group signaling.
-        // TODO: re-add child_pid() to nexus SDK (was on feature branch, never merged to main).
-        // Without it, interrupt() relies solely on the SDK's stdin-based interrupt mechanism.
-        // The descendant-PID SIGINT cascade is disabled until child_pid() is available.
-        let child_pid: Option<u32> = None;
+        // Capture the CLI subprocess PID so descendant-PID SIGINT
+        // cascade in `interrupt()` and `cancel_running_tools()` works.
+        // (Plan 28e9afe3 — without this, kill_descendants always sees
+        // None and the per-tool Stop button is a no-op.)
+        let child_pid: Option<u32> = client.child_pid().await;
 
         info!(
             session_id = %session_id,
@@ -4684,8 +4684,9 @@ impl ChatManager {
         // Clone stdin sender for lock-free permission responses (see create_session).
         let stdin_tx = client.clone_stdin_sender().await;
 
-        // CLI subprocess PID — see TODO in create_session (child_pid not yet in nexus main).
-        let child_pid: Option<u32> = None;
+        // CLI subprocess PID for descendant SIGINT cascade (T1+T2 of
+        // plan 28e9afe3). Same as create_session.
+        let child_pid: Option<u32> = client.child_pid().await;
 
         let client = Arc::new(Mutex::new(client));
 
