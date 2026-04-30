@@ -2574,7 +2574,9 @@ mod tests {
         }
 
         assert_eq!(event.event_type(), "background_output");
-        let fp = event.fingerprint().expect("BackgroundOutput must have a fingerprint");
+        let fp = event
+            .fingerprint()
+            .expect("BackgroundOutput must have a fingerprint");
         assert!(fp.starts_with("background_output:Monitor:"));
         assert!(fp.ends_with(":bg-abc123"));
     }

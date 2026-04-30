@@ -52,8 +52,8 @@
 //!      dropped.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
@@ -61,7 +61,7 @@ use futures::StreamExt;
 use nexus_claude::{
     AssistantMessage, ContentBlock, ContentValue, InteractiveClient, Message, UserMessage,
 };
-use tokio::sync::{Mutex, RwLock, broadcast};
+use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -69,8 +69,8 @@ use uuid::Uuid;
 use super::manager::{ActiveSession, ChatManager};
 use super::types::{ChatEvent, PendingMessage};
 use crate::meilisearch::SearchStore;
-use crate::neo4j::GraphStore;
 use crate::neo4j::models::ChatEventRecord;
+use crate::neo4j::GraphStore;
 
 /// Dependencies needed to trigger a fresh `stream_response` from an
 /// idle session when an OOB event arrives. These are all
@@ -775,7 +775,12 @@ mod tests {
         // First `cap` calls: all allowed, no warning.
         for _ in 0..cap {
             let blocked = check_and_record_trigger_cap(
-                "test-session", &events_tx, &history, cap, window, &warned,
+                "test-session",
+                &events_tx,
+                &history,
+                cap,
+                window,
+                &warned,
             )
             .await;
             assert!(!blocked, "first {cap} triggers must not be blocked");
@@ -784,7 +789,12 @@ mod tests {
         // Next 50 calls: all blocked, warning emitted exactly once.
         for _ in 0..50 {
             let blocked = check_and_record_trigger_cap(
-                "test-session", &events_tx, &history, cap, window, &warned,
+                "test-session",
+                &events_tx,
+                &history,
+                cap,
+                window,
+                &warned,
             )
             .await;
             assert!(blocked, "calls beyond cap must be blocked");
@@ -820,10 +830,8 @@ mod tests {
         // Fill the window.
         for _ in 0..cap {
             assert!(
-                !check_and_record_trigger_cap(
-                    "s", &events_tx, &history, cap, window, &warned
-                )
-                .await
+                !check_and_record_trigger_cap("s", &events_tx, &history, cap, window, &warned)
+                    .await
             );
         }
         assert!(
@@ -894,15 +902,13 @@ mod tests {
     /// Returns: (events_rx, mock_graph, handle, cancel_token).
     /// Caller must `cancel_token.cancel()` to stop the listener after the
     /// test or rely on the test's tokio runtime tearing it down.
-    async fn spawn_listener_with_mock_transport()
-        -> (
-            broadcast::Receiver<ChatEvent>,
-            Arc<crate::neo4j::mock::MockGraphStore>,
-            nexus_claude::transport::mock::MockTransportHandle,
-            CancellationToken,
-            Uuid,
-        )
-    {
+    async fn spawn_listener_with_mock_transport() -> (
+        broadcast::Receiver<ChatEvent>,
+        Arc<crate::neo4j::mock::MockGraphStore>,
+        nexus_claude::transport::mock::MockTransportHandle,
+        CancellationToken,
+        Uuid,
+    ) {
         use tokio::sync::RwLock;
 
         let (transport, handle) = nexus_claude::transport::mock::MockTransport::pair();
@@ -1067,10 +1073,7 @@ mod tests {
         // surface them in order, with monotonically-increasing seq_num
         // captured by ChatEventRecord (verified via the mock graph).
         for i in 0..3 {
-            let msg = bash_output_message(
-                "bash-bg-42",
-                &format!("background bash line {i}"),
-            );
+            let msg = bash_output_message("bash-bg-42", &format!("background bash line {i}"));
             handle
                 .inbound_message_tx
                 .send(msg)
@@ -1118,10 +1121,7 @@ mod tests {
                 .unwrap_or_default()
         };
         for w in seqs.windows(2) {
-            assert!(
-                w[0] < w[1],
-                "seq must be strictly increasing, got {seqs:?}"
-            );
+            assert!(w[0] < w[1], "seq must be strictly increasing, got {seqs:?}");
         }
 
         cancel.cancel();
@@ -1157,10 +1157,7 @@ mod tests {
                     .signed_duration_since(received_at)
                     .num_milliseconds()
                     .unsigned_abs();
-                assert!(
-                    age < 1000,
-                    "received_at must be ~now, got age = {age}ms"
-                );
+                assert!(age < 1000, "received_at must be ~now, got age = {age}ms");
             }
             other => panic!("expected SessionError, got {other:?}"),
         }
