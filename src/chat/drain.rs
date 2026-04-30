@@ -320,7 +320,8 @@ mod tests {
             PendingMessageKind::User,
             "BUG: User message starved by accumulated BackgroundOutput. \
              pop_highest_priority returned {:?} content={:?}",
-            first.kind, first.content
+            first.kind,
+            first.content
         );
         assert_eq!(first.content, "U1");
 
@@ -448,7 +449,10 @@ mod tests {
         let mut q = VecDeque::new();
         q.push_back(bg("only"));
         assert_next(&mut q, PendingMessageKind::BackgroundOutput, "only");
-        assert!(q.is_empty(), "queue must be empty after popping the sole entry");
+        assert!(
+            q.is_empty(),
+            "queue must be empty after popping the sole entry"
+        );
         assert!(pop_highest_priority(&mut q).is_none());
     }
 
