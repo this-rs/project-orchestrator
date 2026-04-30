@@ -885,6 +885,248 @@ mod tests {
         );
     }
 
+    // ── T8: end-to-end via MockTransport ────────────────────────────────
+
+    /// Build a fully-wired OOB listener spawn using `MockTransport` so we
+    /// can drive the entire pipeline (transport broadcast → listener →
+    /// persist → events_tx) without launching a real Claude CLI.
+    ///
+    /// Returns: (events_rx, mock_graph, handle, cancel_token).
+    /// Caller must `cancel_token.cancel()` to stop the listener after the
+    /// test or rely on the test's tokio runtime tearing it down.
+    async fn spawn_listener_with_mock_transport()
+        -> (
+            broadcast::Receiver<ChatEvent>,
+            Arc<crate::neo4j::mock::MockGraphStore>,
+            nexus_claude::transport::mock::MockTransportHandle,
+            CancellationToken,
+            Uuid,
+        )
+    {
+        use tokio::sync::RwLock;
+
+        let (transport, handle) = nexus_claude::transport::mock::MockTransport::pair();
+        let mut client = InteractiveClient::from_transport(transport);
+        client.connect().await.expect("mock client connect");
+        let client = Arc::new(Mutex::new(client));
+
+        let (events_tx, events_rx) = broadcast::channel::<ChatEvent>(64);
+        let is_streaming = Arc::new(AtomicBool::new(false));
+        let next_seq = Arc::new(AtomicI64::new(1));
+        let cancel = CancellationToken::new();
+
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let search = Arc::new(crate::meilisearch::mock::MockSearchStore::new());
+        let enrichment_pipeline = Arc::new(crate::chat::enrichment::EnrichmentPipeline::new(
+            crate::chat::enrichment::EnrichmentConfig::default(),
+        ));
+        let active_sessions = Arc::new(RwLock::new(HashMap::new()));
+
+        let deps = OobListenerDeps {
+            graph: graph.clone(),
+            active_sessions,
+            context_injector: None,
+            event_emitter: None,
+            retry_config: crate::chat::config::RetryConfig::default(),
+            enrichment_pipeline,
+            search,
+            nats: None,
+        };
+
+        // session_id MUST be a UUID for the persistence branch to fire
+        // (Uuid::parse_str().ok() is the gate inside handle_oob_message).
+        let session_uuid = Uuid::new_v4();
+
+        spawn_oob_listener(
+            session_uuid.to_string(),
+            client,
+            events_tx,
+            is_streaming,
+            next_seq,
+            cancel.clone(),
+            deps,
+        );
+
+        // Give the spawned task a tick to subscribe to the broadcast
+        // before we inject — otherwise the first message races and is lost
+        // on the broadcast lag.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        (events_rx, graph, handle, cancel, session_uuid)
+    }
+
+    /// Build a Message that resembles what the CLI would emit when the
+    /// `Monitor` tool fires its `match_found` notification between turns
+    /// (User message carrying a ToolResult content block keyed on the
+    /// parent tool_use_id of the original Monitor invocation).
+    fn monitor_match_message(parent: &str, line: &str) -> Message {
+        Message::User {
+            message: UserMessage {
+                content: String::new(),
+                content_blocks: Some(vec![ContentBlock::ToolResult(ToolResultContent {
+                    tool_use_id: parent.to_string(),
+                    content: Some(ContentValue::Text(line.to_string())),
+                    is_error: Some(false),
+                })]),
+            },
+            parent_tool_use_id: Some(parent.to_string()),
+        }
+    }
+
+    /// Same shape but mimicking `BashOutput` from a `Bash run_in_background`
+    /// completion — both end up routed through the User+ToolResult path
+    /// in the SDK message stream.
+    fn bash_output_message(parent: &str, output: &str) -> Message {
+        Message::User {
+            message: UserMessage {
+                content: String::new(),
+                content_blocks: Some(vec![ContentBlock::ToolResult(ToolResultContent {
+                    tool_use_id: parent.to_string(),
+                    content: Some(ContentValue::Text(output.to_string())),
+                    is_error: Some(false),
+                })]),
+            },
+            parent_tool_use_id: Some(parent.to_string()),
+        }
+    }
+
+    /// Wait for the next BackgroundOutput on the broadcast, with a hard
+    /// 500 ms ceiling (T8 acceptance criterion: events must arrive in
+    /// under 500 ms). Returns the elapsed latency.
+    async fn await_background_output(
+        rx: &mut broadcast::Receiver<ChatEvent>,
+    ) -> (ChatEvent, Duration) {
+        let start = Instant::now();
+        let event = tokio::time::timeout(Duration::from_millis(500), async {
+            loop {
+                match rx.recv().await {
+                    Ok(ev) if matches!(ev, ChatEvent::BackgroundOutput { .. }) => return ev,
+                    Ok(_) => continue, // skip non-OOB events (SystemHint init, etc.)
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => {
+                        panic!("broadcast closed before BackgroundOutput arrived")
+                    }
+                }
+            }
+        })
+        .await
+        .expect("BackgroundOutput must arrive within 500 ms");
+        (event, start.elapsed())
+    }
+
+    /// E2E — Monitor scenario. Inject a Monitor `match_found` Message
+    /// into the mock transport and verify the listener surfaces it as
+    /// `ChatEvent::BackgroundOutput` on the session broadcast within
+    /// 500 ms (acceptance criterion of T8 / plan 9a1684b2).
+    #[tokio::test]
+    async fn test_e2e_monitor_event_propagates_to_broadcast() {
+        let (mut events_rx, _graph, handle, cancel, _sid) =
+            spawn_listener_with_mock_transport().await;
+
+        // Inject — same shape the CLI would emit when Monitor matches.
+        let msg = monitor_match_message("monitor-tool-1", "epoch 50 cos=0.871");
+        handle
+            .inbound_message_tx
+            .send(msg)
+            .expect("inject Monitor message");
+
+        let (event, latency) = await_background_output(&mut events_rx).await;
+        eprintln!("[T8 latency report] Monitor → broadcast: {latency:?}");
+
+        match event {
+            ChatEvent::BackgroundOutput {
+                source,
+                content,
+                correlation_id,
+                ..
+            } => {
+                assert_eq!(source, "tool_result");
+                assert!(content.contains("epoch 50 cos=0.871"));
+                assert_eq!(correlation_id.as_deref(), Some("monitor-tool-1"));
+            }
+            other => panic!("expected BackgroundOutput, got {other:?}"),
+        }
+        assert!(
+            latency < Duration::from_millis(500),
+            "T8 latency criterion violated: {latency:?} >= 500ms"
+        );
+
+        cancel.cancel();
+    }
+
+    /// E2E — BashOutput scenario. A `Bash run_in_background` task that
+    /// completes after several seconds emits a User+ToolResult message
+    /// with the captured stdout. Same routing as Monitor. Verifies
+    /// chronological ordering of consecutive OOB events on the broadcast.
+    #[tokio::test]
+    async fn test_e2e_bash_output_chronological_ordering() {
+        let (mut events_rx, graph, handle, cancel, session_uuid) =
+            spawn_listener_with_mock_transport().await;
+
+        // Inject 3 BashOutput events in sequence. The listener must
+        // surface them in order, with monotonically-increasing seq_num
+        // captured by ChatEventRecord (verified via the mock graph).
+        for i in 0..3 {
+            let msg = bash_output_message(
+                "bash-bg-42",
+                &format!("background bash line {i}"),
+            );
+            handle
+                .inbound_message_tx
+                .send(msg)
+                .expect("inject BashOutput message");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let mut received_contents: Vec<String> = Vec::new();
+        for _ in 0..3 {
+            let (event, latency) = await_background_output(&mut events_rx).await;
+            eprintln!("[T8 latency report] BashOutput → broadcast: {latency:?}");
+            if let ChatEvent::BackgroundOutput { content, .. } = event {
+                received_contents.push(content);
+            }
+        }
+
+        assert_eq!(received_contents.len(), 3);
+        for (i, content) in received_contents.iter().enumerate() {
+            assert!(
+                content.contains(&format!("background bash line {i}")),
+                "out-of-order: position {i} content was {content:?}"
+            );
+        }
+
+        // Persistence check: the mock graph should have received exactly
+        // 3 ChatEventRecords on the persist branch. Allow a brief settle
+        // time for the persist write to complete after the broadcast.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let stored = {
+            let map = graph.chat_events.read().await;
+            map.get(&session_uuid).map(|v| v.len()).unwrap_or(0)
+        };
+        assert_eq!(
+            stored, 3,
+            "expected exactly 3 ChatEventRecord persisted, got {stored}"
+        );
+
+        // Verify the persisted records have monotonically-increasing seq
+        // — this is the chronological ordering invariant on which
+        // chat::list_messages depends.
+        let seqs: Vec<i64> = {
+            let map = graph.chat_events.read().await;
+            map.get(&session_uuid)
+                .map(|v| v.iter().map(|r| r.seq).collect())
+                .unwrap_or_default()
+        };
+        for w in seqs.windows(2) {
+            assert!(
+                w[0] < w[1],
+                "seq must be strictly increasing, got {seqs:?}"
+            );
+        }
+
+        cancel.cancel();
+    }
+
     // ── T9: subprocess death detection ──────────────────────────────────
 
     /// `emit_subprocess_death` must publish exactly one
