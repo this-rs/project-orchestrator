@@ -6482,6 +6482,59 @@ impl ChatManager {
         }
     }
 
+    /// Send `SIGINT` to a single PID **and** all its descendants. Returns the
+    /// PIDs that received the signal (filters out ESRCH for already-dead
+    /// processes).
+    ///
+    /// Plan fc35b25e (T3, V2 cancel_task). Companion to `kill_descendants`
+    /// but with two key differences:
+    ///
+    /// | Aspect | `kill_descendants(cli_pid)` | `kill_subtree(root_pid)` |
+    /// |--------|------------------------------|---------------------------|
+    /// | Targets the root | **No** (preserves CLI) | **Yes** (root + descendants) |
+    /// | Use case | Global "Stop" — kill every running tool | Per-task cancel — kill one Monitor / Bash bg subtree |
+    /// | Caller | `cancel_running_tools` | `cancel_task` |
+    /// | Plan | `28e9afe3` (T2) | `fc35b25e` (T3) |
+    ///
+    /// The reason `kill_descendants` doesn't kill the root is that the root
+    /// is the Claude Code CLI subprocess — killing it would tear down the
+    /// whole session (cf decision `d2bf0e7b`). For `kill_subtree` the root
+    /// is a Monitor / Bash bg subprocess that we **do** want to terminate
+    /// (it has no protected status), so we include it in the SIGINT batch.
+    ///
+    /// On non-unix platforms this is a no-op that returns an empty Vec.
+    #[allow(dead_code)] // wired by T4 of plan fc35b25e
+    fn kill_subtree(root_pid: u32) -> Vec<u32> {
+        #[cfg(unix)]
+        {
+            let mut all_pids = vec![root_pid];
+            all_pids.extend(Self::get_descendant_pids(root_pid));
+
+            let mut killed = Vec::with_capacity(all_pids.len());
+            for &pid in &all_pids {
+                // SAFETY: libc::kill is FFI; SIGINT to a non-existent PID
+                // returns ESRCH which we silently ignore (idempotent —
+                // the subprocess may have finished naturally between
+                // pgrep snapshot and signal).
+                let rc = unsafe { libc::kill(pid as i32, libc::SIGINT) };
+                if rc == 0 {
+                    killed.push(pid);
+                } else {
+                    let errno = std::io::Error::last_os_error();
+                    if errno.raw_os_error() != Some(libc::ESRCH) {
+                        warn!(pid = pid, error = ?errno, "kill_subtree: SIGINT failed");
+                    }
+                }
+            }
+            killed
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = root_pid;
+            Vec::new()
+        }
+    }
+
     /// Close an active session: interrupt first, then disconnect and remove.
     ///
     /// T3 fix (Gap 5): call interrupt() BEFORE removing the session from
@@ -11123,6 +11176,57 @@ mod tests {
         // No PID → nothing to kill, returns empty Vec, no panic, no SIGINT.
         let killed = ChatManager::kill_descendants(None);
         assert!(killed.is_empty());
+    }
+
+    // ========================================================================
+    // T3 of plan fc35b25e — kill_subtree(pid) helper
+    // ========================================================================
+
+    #[test]
+    #[cfg(unix)]
+    fn test_kill_subtree_nonexistent_pid_is_noop() {
+        // PID 999_999 is almost certainly not a live process — kill returns
+        // ESRCH which we silently filter, so killed list is empty and the
+        // call must not panic.
+        let killed = ChatManager::kill_subtree(999_999);
+        assert!(
+            killed.is_empty(),
+            "expected empty killed list, got {killed:?}"
+        );
+    }
+
+    /// Spawn a real `sleep 30`, call `kill_subtree`, verify the subprocess
+    /// is reaped within a reasonable timeout. Marked `#[ignore]` because it
+    /// touches real processes — run with `cargo test -- --ignored`.
+    #[test]
+    #[ignore]
+    #[cfg(unix)]
+    fn test_kill_subtree_kills_real_sleep_subprocess() {
+        let mut child = match std::process::Command::new("sleep").arg("30").spawn() {
+            Ok(c) => c,
+            Err(_) => {
+                eprintln!("Skipping test: sleep not available");
+                return;
+            }
+        };
+        let pid = child.id();
+
+        // Give the OS a moment to register the process.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let killed = ChatManager::kill_subtree(pid);
+        assert!(
+            killed.contains(&pid),
+            "expected {pid} in killed list, got {killed:?}"
+        );
+
+        // Reap the zombie and confirm the process actually died (sleep was
+        // 30s — if it's already dead now, kill_subtree did its job).
+        let exit = child.wait().expect("waitpid");
+        assert!(
+            !exit.success(),
+            "subprocess should have been signalled, not exited cleanly"
+        );
     }
 
     #[test]
