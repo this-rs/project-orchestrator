@@ -303,6 +303,17 @@ pub struct BackgroundTaskInfo {
     /// `id`, but kept distinct for the recovery case where `id` is synthetic
     /// (`recovered-{pid}`) and the original tool_use is no longer known.
     pub parent_tool_use_id: Option<String>,
+    /// Last time we observed activity for this task (the most recent
+    /// `BackgroundOutput` tick whose `correlation_id` matched, or
+    /// `started_at` if no tick has arrived yet). Used by the death
+    /// detector (T3, plan 754a1379): an entry whose `last_seen_at`
+    /// is older than `BACKGROUND_TASK_IDLE_DEATH_SECS` is marked for
+    /// removal — covers the case of a subprocess that died silently
+    /// without emitting a final tick. The default timeout is generous
+    /// (30 min) so legitimately quiet Monitors (e.g. `tail -F` on a
+    /// log that doesn't change for a long time) aren't mistakenly
+    /// reaped.
+    pub last_seen_at: chrono::DateTime<chrono::Utc>,
     /// Two-phase removal marker. `None` while the task is alive; set to
     /// `Some(now)` by `cancel_task` or the death poller; entries are
     /// physically removed from the map by the poller after `GRACE_PERIOD`
@@ -2795,6 +2806,7 @@ mod tests {
             kind: BackgroundTaskKind::Monitor,
             description: "tail -F /tmp/build.log".to_string(),
             started_at: chrono::Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+            last_seen_at: chrono::Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
             pid: Some(42_424),
             parent_tool_use_id: Some("toolu_01ABC".to_string()),
             pending_removal_at: None,
@@ -2819,6 +2831,7 @@ mod tests {
             kind: BackgroundTaskKind::BashBackground,
             description: "npm install".into(),
             started_at: chrono::Utc::now(),
+            last_seen_at: chrono::Utc::now(),
             pid: Some(12345),
             parent_tool_use_id: Some("toolu_01XYZ".into()),
             pending_removal_at: Some(std::time::Instant::now()),
@@ -2844,6 +2857,7 @@ mod tests {
                     kind: BackgroundTaskKind::Monitor,
                     description: "tail -F /tmp/build.log".into(),
                     started_at: chrono::Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+                    last_seen_at: chrono::Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
                     pid: Some(42_424),
                     parent_tool_use_id: Some("toolu_01ABC".into()),
                     pending_removal_at: None,
@@ -2853,6 +2867,7 @@ mod tests {
                     kind: BackgroundTaskKind::BashBackground,
                     description: "cargo build".into(),
                     started_at: chrono::Utc.timestamp_opt(1_700_000_005, 0).unwrap(),
+                    last_seen_at: chrono::Utc.timestamp_opt(1_700_000_005, 0).unwrap(),
                     pid: Some(42_425),
                     parent_tool_use_id: Some("toolu_02XYZ".into()),
                     pending_removal_at: None,
@@ -2912,6 +2927,7 @@ mod tests {
             kind: BackgroundTaskKind::Monitor,
             description: "[recovered after restart] PID 42424".into(),
             started_at: chrono::Utc::now(),
+            last_seen_at: chrono::Utc::now(),
             pid: Some(42_424),
             parent_tool_use_id: None,
             pending_removal_at: None,
