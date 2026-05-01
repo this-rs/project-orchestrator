@@ -240,6 +240,31 @@ pub struct CancelToolsResult {
     pub capped: bool,
 }
 
+/// Result of `ChatManager::cancel_task`. Surfaced to REST/WS callers
+/// so the UI can update the cancelled task's status and surface rate
+/// cap hits gracefully. Plan 754a1379 (T7).
+///
+/// In V1 `killed_pids` is always empty — the cancel path is a
+/// map-side cancel only (entry marked for removal + broadcast); the
+/// underlying subprocess keeps running until the global Stop is hit
+/// or the session ends. PID-targeted kill is a follow-up enhancement
+/// once `identify_subprocess_kind` (T13) provides PID discovery.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CancelTaskResult {
+    /// `tool_use_id` (≡ map key, ≡ `correlation_id`) of the task that
+    /// was cancelled. Echoed back so the caller doesn't have to
+    /// remember which click corresponded to which task on a busy UI.
+    pub task_id: String,
+    /// PIDs that received `SIGINT`. Always empty in V1 (no precise
+    /// PID discovery yet). Reserved for the follow-up that adds
+    /// PID-targeted kill — keeping the field now avoids a wire-format
+    /// breaking change later.
+    pub killed_pids: Vec<u32>,
+    /// `true` when the rate cap was hit and the request was refused
+    /// (no map mutation, no broadcast).
+    pub capped: bool,
+}
+
 /// Runtime-mutable environment config for Claude CLI subprocess.
 ///
 /// These fields can be changed at runtime via the REST API and are
@@ -5697,6 +5722,145 @@ impl ChatManager {
         })
     }
 
+    /// Cancel a single tracked background task (Monitor, Bash bg) by id.
+    ///
+    /// Plan 754a1379 (T7). The granular companion to `cancel_running_tools`
+    /// — instead of killing every descendant of the CLI, this targets a
+    /// single tracked task by its `tool_use_id` (= map key).
+    ///
+    /// ## V1 semantics — map-side cancel only
+    ///
+    /// V1 marks the entry as `pending_removal_at = Some(now)` (the actual
+    /// physical purge happens after `GRACE_PERIOD` in T12) and broadcasts
+    /// a fresh `ChatEvent::ActiveTasksUpdate` so the frontend immediately
+    /// reflects the cancelled state. **It does NOT yet send SIGINT to
+    /// the subprocess** — PID-targeted kill requires a discovery
+    /// mechanism that maps `tool_use_id → root PID`, which is out of
+    /// scope for this commit (will land alongside T13 once
+    /// `identify_subprocess_kind` exists).
+    ///
+    /// **What this means in practice**: the user clicks Stop on a
+    /// specific Monitor → the toolbar pill disappears immediately, but
+    /// the underlying `tail -F` keeps emitting ticks for a short window.
+    /// Those orphan ticks are absorbed by the grace period (T12) and the
+    /// frontend's orphan-correlation_id buffer (F10).
+    ///
+    /// To actually kill the subprocess in V1, the user must use the
+    /// global `cancel_running_tools` (Stop button on the active turn) —
+    /// which kills every descendant. This is documented in the UX so
+    /// users with a single Monitor running get the same effect.
+    ///
+    /// ## Cap
+    ///
+    /// Reuses `check_and_record_cancel_cap` with the per-session
+    /// `cancel_task_history` (T9 fields). Default 30 invocations / 5
+    /// minutes. The cap is more generous than `cancel_running_tools`
+    /// (10/60s) because the per-task popover can naturally produce more
+    /// clicks (one per tracked task).
+    ///
+    /// ## NATS routing
+    ///
+    /// Cross-instance: if the session is owned by another instance,
+    /// publishes a `cancel_task` event over NATS so the owning instance
+    /// performs the local map mutation. (Mirror of
+    /// `publish_cancel_tools` — added in a follow-up alongside the
+    /// listener wiring.)
+    ///
+    /// ## Returns
+    ///
+    /// - `CancelTaskResult { task_id, killed_pids: vec![], capped: false }`
+    ///   on success — `killed_pids` always empty in V1.
+    /// - `capped: true` if the rate cap was hit (no broadcast, no map
+    ///   mutation).
+    /// - Returns `Ok(...)` even if the session is unknown or the
+    ///   task_id isn't in the map (idempotent — clicking Stop twice on
+    ///   the same task is fine).
+    pub async fn cancel_task(&self, session_id: &str, task_id: &str) -> Result<CancelTaskResult> {
+        let session_state = {
+            let sessions = self.active_sessions.read().await;
+            sessions.get(session_id).map(|s| {
+                (
+                    s.cancel_task_history.clone(),
+                    s.cancel_task_cap,
+                    s.cancel_task_window,
+                    s.events_tx.clone(),
+                    s.active_background_tasks.clone(),
+                )
+            })
+        };
+
+        let (history, cap, window, events_tx, tasks_arc) = match session_state {
+            Some(state) => state,
+            None => {
+                debug!(
+                    session_id = %session_id,
+                    task_id = %task_id,
+                    "cancel_task: session not active locally; idempotent no-op"
+                );
+                if let Some(ref _nats) = self.nats {
+                    // TODO follow-up: nats.publish_cancel_task(session_id, task_id)
+                    // once the cross-instance listener exists.
+                }
+                return Ok(CancelTaskResult {
+                    task_id: task_id.to_string(),
+                    killed_pids: Vec::new(),
+                    capped: false,
+                });
+            }
+        };
+
+        // Rate cap.
+        let capped = !Self::check_and_record_cancel_cap(&history, cap, window).await;
+        if capped {
+            warn!(
+                session_id = %session_id,
+                task_id = %task_id,
+                cap = cap,
+                window_secs = window.as_secs(),
+                "cancel_task: rate cap hit, refusing"
+            );
+            return Ok(CancelTaskResult {
+                task_id: task_id.to_string(),
+                killed_pids: Vec::new(),
+                capped: true,
+            });
+        }
+
+        // Mark for removal + capture snapshot for broadcast.
+        let snapshot = {
+            let mut tasks = tasks_arc.lock().await;
+            if let Some(entry) = tasks.get_mut(task_id) {
+                entry.pending_removal_at = Some(std::time::Instant::now());
+                info!(
+                    session_id = %session_id,
+                    task_id = %task_id,
+                    kind = ?entry.kind,
+                    "cancel_task: marked for removal (grace period via T12)"
+                );
+            } else {
+                debug!(
+                    session_id = %session_id,
+                    task_id = %task_id,
+                    "cancel_task: task_id unknown in map; idempotent no-op"
+                );
+            }
+            tasks.values().cloned().collect::<Vec<BackgroundTaskInfo>>()
+        };
+
+        let event = ChatEvent::ActiveTasksUpdate { tasks: snapshot };
+        let _ = events_tx.send(event.clone());
+        if let Some(ref nats) = self.nats {
+            nats.publish_chat_event(session_id, event);
+            // TODO follow-up: nats.publish_cancel_task(session_id, task_id);
+        }
+
+        Ok(CancelTaskResult {
+            task_id: task_id.to_string(),
+            killed_pids: Vec::new(),
+            capped: false,
+        })
+    }
+
     /// Sliding-window rate cap helper for `cancel_running_tools`.
     /// Returns `true` when the call is allowed (records the timestamp
     /// atomically), `false` when the cap is hit (no record).
@@ -10842,6 +11006,156 @@ mod tests {
             .await
             .len();
         assert_eq!(count, 0);
+    }
+
+    // ========================================================================
+    // T7 of plan 754a1379 — cancel_task (map-side cancel V1)
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_cancel_task_marks_for_removal_and_broadcasts() {
+        let Some((session, _)) = try_create_dummy_session(false, "", vec![]) else {
+            eprintln!("Skipping test: Claude CLI not installed");
+            return;
+        };
+        let mut events_rx = session.events_tx.subscribe();
+        // Pre-seed a task in the map.
+        session.active_background_tasks.lock().await.insert(
+            "tool_T1".into(),
+            BackgroundTaskInfo {
+                id: "tool_T1".into(),
+                kind: BackgroundTaskKind::Monitor,
+                description: "tail log".into(),
+                started_at: chrono::Utc::now(),
+                pid: None,
+                parent_tool_use_id: Some("tool_T1".into()),
+                pending_removal_at: None,
+            },
+        );
+
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        manager
+            .active_sessions
+            .write()
+            .await
+            .insert("s-cancel".into(), session);
+
+        let result = manager.cancel_task("s-cancel", "tool_T1").await.unwrap();
+        assert_eq!(result.task_id, "tool_T1");
+        assert!(result.killed_pids.is_empty(), "V1 returns no killed_pids");
+        assert!(!result.capped);
+
+        // Entry should be marked for removal but still in the map (T12 grace).
+        let sessions = manager.active_sessions.read().await;
+        let tasks = sessions
+            .get("s-cancel")
+            .unwrap()
+            .active_background_tasks
+            .lock()
+            .await;
+        assert_eq!(tasks.len(), 1);
+        assert!(tasks.get("tool_T1").unwrap().pending_removal_at.is_some());
+
+        // Broadcast: ActiveTasksUpdate carrying the snapshot (the entry is
+        // still visible — it's the grace-period state).
+        let event = events_rx.try_recv().expect("expected broadcast");
+        match event {
+            ChatEvent::ActiveTasksUpdate { tasks } => assert_eq!(tasks.len(), 1),
+            other => panic!("expected ActiveTasksUpdate, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cancel_task_unknown_task_id_idempotent() {
+        let Some((session, _)) = try_create_dummy_session(false, "", vec![]) else {
+            eprintln!("Skipping test: Claude CLI not installed");
+            return;
+        };
+        let mut events_rx = session.events_tx.subscribe();
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        manager
+            .active_sessions
+            .write()
+            .await
+            .insert("s-empty".into(), session);
+
+        // No tasks in the map — cancel still succeeds, just broadcasts an
+        // empty snapshot (idempotent: cancelling something that was never
+        // there is OK).
+        let result = manager.cancel_task("s-empty", "unknown_id").await.unwrap();
+        assert!(!result.capped);
+        assert!(result.killed_pids.is_empty());
+
+        let event = events_rx.try_recv().expect("broadcast still emitted");
+        match event {
+            ChatEvent::ActiveTasksUpdate { tasks } => assert!(tasks.is_empty()),
+            other => panic!("expected empty ActiveTasksUpdate, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cancel_task_unknown_session_idempotent() {
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+
+        // No session inserted at all.
+        let result = manager
+            .cancel_task("ghost-session", "tool_X")
+            .await
+            .unwrap();
+        assert_eq!(result.task_id, "tool_X");
+        assert!(!result.capped);
+        assert!(result.killed_pids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_cancel_task_rate_cap_enforced() {
+        let Some((mut session, _)) = try_create_dummy_session(false, "", vec![]) else {
+            eprintln!("Skipping test: Claude CLI not installed");
+            return;
+        };
+        // Tighten the cap so the test runs in milliseconds: 2 cancels /
+        // 60s window. Reusing the same window const would make the test
+        // either very slow or flaky.
+        session.cancel_task_cap = 2;
+        session.cancel_task_window = Duration::from_secs(60);
+
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        manager
+            .active_sessions
+            .write()
+            .await
+            .insert("s-cap".into(), session);
+
+        // 2 calls allowed.
+        for _ in 0..2 {
+            let r = manager.cancel_task("s-cap", "tool_W").await.unwrap();
+            assert!(!r.capped);
+        }
+        // 3rd call should be capped.
+        let r = manager.cancel_task("s-cap", "tool_W").await.unwrap();
+        assert!(r.capped, "3rd call must be capped");
+        assert!(r.killed_pids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_cancel_task_result_serde_round_trip() {
+        let r = CancelTaskResult {
+            task_id: "tool_abc".into(),
+            killed_pids: vec![],
+            capped: false,
+        };
+        let json = serde_json::to_string(&r).expect("serialize");
+        assert!(json.contains("\"task_id\":\"tool_abc\""));
+        assert!(json.contains("\"killed_pids\":[]"));
+        assert!(json.contains("\"capped\":false"));
+        let back: CancelTaskResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.task_id, "tool_abc");
+        assert!(back.killed_pids.is_empty());
+        assert!(!back.capped);
     }
 
     #[tokio::test]
