@@ -5861,6 +5861,32 @@ impl ChatManager {
         })
     }
 
+    /// Snapshot the current background task tracking map for a session.
+    ///
+    /// Returns an empty `Vec` if the session is unknown locally — the
+    /// caller (typically the REST snapshot endpoint, T6) treats this as
+    /// "no tasks active" rather than 404, since a fresh session legitimately
+    /// has none. Plan 754a1379 (T6).
+    ///
+    /// Used by the frontend on WebSocket reconnect to re-hydrate the
+    /// toolbar indicator and any in-progress MonitorCards before the
+    /// next `ChatEvent::ActiveTasksUpdate` lands.
+    pub async fn get_active_background_tasks(&self, session_id: &str) -> Vec<BackgroundTaskInfo> {
+        // Drop the read lock on `active_sessions` before taking the
+        // per-session mutex to avoid holding two locks simultaneously
+        // and keep the borrow-checker happy (the inner Arc clone moves
+        // out of the read guard's borrow scope).
+        let tasks_arc = {
+            let sessions = self.active_sessions.read().await;
+            match sessions.get(session_id) {
+                Some(active) => active.active_background_tasks.clone(),
+                None => return Vec::new(),
+            }
+        };
+        let result: Vec<BackgroundTaskInfo> = tasks_arc.lock().await.values().cloned().collect();
+        result
+    }
+
     /// Sliding-window rate cap helper for `cancel_running_tools`.
     /// Returns `true` when the call is allowed (records the timestamp
     /// atomically), `false` when the cap is hit (no record).

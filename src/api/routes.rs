@@ -1672,6 +1672,18 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/chat/sessions/{id}/cancel-tools",
             post(chat_handlers::cancel_tools),
         )
+        // Background tasks (T6 + T8 of plan 754a1379) — snapshot
+        // of the tracked Monitor / Bash bg subprocesses, plus the
+        // granular per-task cancel that targets a single tool_use_id
+        // instead of nuking every descendant.
+        .route(
+            "/api/chat/sessions/{id}/background-tasks",
+            get(chat_handlers::get_background_tasks),
+        )
+        .route(
+            "/api/chat/sessions/{id}/cancel-task/{task_id}",
+            post(chat_handlers::cancel_task),
+        )
         // Chat permission config (runtime GET/PUT)
         .route(
             "/api/chat/config/permissions",
