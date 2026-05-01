@@ -64,6 +64,16 @@ pub(crate) const CANCEL_TOOLS_CAP: u32 = 10;
 /// Rolling window for the cancel-tools rate cap (60s).
 pub(crate) const CANCEL_TOOLS_WINDOW_SECS: u64 = 60;
 
+/// User-driven cancel-task rate cap. Distinct from `CANCEL_TOOLS_CAP`:
+/// `cancel_task` targets a single background subprocess (one Monitor /
+/// Bash bg) rather than every descendant. The frontend popover may
+/// surface a Stop button per task, so click-spam is more plausible —
+/// the cap is more generous (30 per 5 min) but still bounded to keep
+/// pgrep-based PID enumeration cheap. Plan 754a1379 (T9).
+pub(crate) const CANCEL_TASK_CAP: u32 = 30;
+/// Rolling window for the cancel-task rate cap (300s = 5 minutes).
+pub(crate) const CANCEL_TASK_WINDOW_SECS: u64 = 300;
+
 /// An active chat session with a live Claude CLI subprocess
 pub struct ActiveSession {
     /// Persistent broadcast sender — one per session lifetime, NOT replaced per message
@@ -200,6 +210,15 @@ pub struct ActiveSession {
     /// `get_descendant_pids(child_pid)` (decision 33bce470, audit note
     /// 2482f4e0).
     pub active_background_tasks: Arc<Mutex<HashMap<String, BackgroundTaskInfo>>>,
+    /// Sliding-window history of `cancel_task` invocations on this session.
+    /// Same shape and intent as `cancel_tools_history`, but scoped to the
+    /// granular per-task cancel path introduced by plan 754a1379 (T9).
+    pub cancel_task_history: Arc<Mutex<VecDeque<Instant>>>,
+    /// Maximum cancel_task invocations allowed within `cancel_task_window`.
+    /// Defaults to `CANCEL_TASK_CAP` (30).
+    pub cancel_task_cap: u32,
+    /// Rolling window for the cancel_task rate cap. Defaults to 300s (5 min).
+    pub cancel_task_window: Duration,
 }
 
 /// Result of `ChatManager::cancel_running_tools`. Surfaced to REST/WS
@@ -2727,6 +2746,9 @@ impl ChatManager {
                     cancel_tools_cap: CANCEL_TOOLS_CAP,
                     cancel_tools_window: Duration::from_secs(CANCEL_TOOLS_WINDOW_SECS),
                     active_background_tasks: Arc::new(Mutex::new(HashMap::new())),
+                    cancel_task_history: Arc::new(Mutex::new(VecDeque::new())),
+                    cancel_task_cap: CANCEL_TASK_CAP,
+                    cancel_task_window: Duration::from_secs(CANCEL_TASK_WINDOW_SECS),
                 },
             );
             interrupt_flag
@@ -4814,6 +4836,9 @@ impl ChatManager {
                     cancel_tools_cap: CANCEL_TOOLS_CAP,
                     cancel_tools_window: Duration::from_secs(CANCEL_TOOLS_WINDOW_SECS),
                     active_background_tasks: Arc::new(Mutex::new(HashMap::new())),
+                    cancel_task_history: Arc::new(Mutex::new(VecDeque::new())),
+                    cancel_task_cap: CANCEL_TASK_CAP,
+                    cancel_task_window: Duration::from_secs(CANCEL_TASK_WINDOW_SECS),
                 },
             );
             interrupt_flag
@@ -7802,6 +7827,9 @@ mod tests {
             cancel_tools_cap: CANCEL_TOOLS_CAP,
             cancel_tools_window: Duration::from_secs(CANCEL_TOOLS_WINDOW_SECS),
             active_background_tasks: Arc::new(Mutex::new(HashMap::new())),
+            cancel_task_history: Arc::new(Mutex::new(VecDeque::new())),
+            cancel_task_cap: CANCEL_TASK_CAP,
+            cancel_task_window: Duration::from_secs(CANCEL_TASK_WINDOW_SECS),
         };
 
         Some((session, pending_messages))
@@ -8706,6 +8734,9 @@ mod tests {
             cancel_tools_cap: CANCEL_TOOLS_CAP,
             cancel_tools_window: Duration::from_secs(CANCEL_TOOLS_WINDOW_SECS),
             active_background_tasks: Arc::new(Mutex::new(HashMap::new())),
+            cancel_task_history: Arc::new(Mutex::new(VecDeque::new())),
+            cancel_task_cap: CANCEL_TASK_CAP,
+            cancel_task_window: Duration::from_secs(CANCEL_TASK_WINDOW_SECS),
         };
 
         (session, handle)
