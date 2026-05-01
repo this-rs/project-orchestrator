@@ -583,6 +583,38 @@ pub enum ChatEvent {
         /// ISO-8601 timestamp at which the error was detected.
         received_at: chrono::DateTime<chrono::Utc>,
     },
+    /// Snapshot of all background subprocesses currently attached to this
+    /// session. Emitted by the lifecycle hook (T3 of plan 754a1379) on every
+    /// mutation of `ActiveSession::active_background_tasks` — i.e.:
+    ///
+    /// - INSERT — a new `Monitor` / `Bash run_in_background` `ToolUse`
+    ///   was observed by the OOB listener.
+    /// - REMOVE — a `cancel_task` request fired, or the death poller
+    ///   detected that a tracked PID disappeared from
+    ///   `get_descendant_pids(child_pid)`, or the grace period expired
+    ///   and an entry marked `pending_removal_at` was purged (T12).
+    /// - RECOVERY — `create_session` / `resume_session` rebuilt the
+    ///   tracking map from `pgrep` after a server restart (T13), so the
+    ///   frontend can re-paint its toolbar indicator and any in-progress
+    ///   `MonitorCard`s without waiting for fresh ticks.
+    ///
+    /// The frontend uses this event to drive the toolbar indicator pill
+    /// (`👀 N Monitors • ⚙ M Bash`) and the per-card status badges. Each
+    /// emission carries the **full current snapshot** — never deltas —
+    /// so a client that misses one event simply gets the next refresh.
+    ///
+    /// Ephemeral: never persisted to Neo4j, never replayed in catch-up
+    /// snapshots (frontends use `GET /api/chat/sessions/:id/background-tasks`
+    /// at connection time instead, T6 of plan 754a1379). Returns `None`
+    /// from `fingerprint()` for the same reason — there is nothing to
+    /// dedup, every event is a fresh snapshot.
+    ActiveTasksUpdate {
+        /// Current snapshot of every tracked background task on the
+        /// session. Empty `Vec` is a legitimate value (means: no
+        /// background tasks active right now) and the frontend should
+        /// render the toolbar accordingly (no pill).
+        tasks: Vec<BackgroundTaskInfo>,
+    },
 }
 
 impl ChatEvent {
@@ -617,6 +649,7 @@ impl ChatEvent {
             ChatEvent::BackgroundOutput { .. } => "background_output",
             ChatEvent::SessionError { .. } => "session_error",
             ChatEvent::ToolsCancelled { .. } => "tools_cancelled",
+            ChatEvent::ActiveTasksUpdate { .. } => "active_tasks_update",
         }
     }
 
@@ -761,8 +794,13 @@ impl ChatEvent {
                 ))
             }
 
-            // StreamDelta and StreamingStatus are never in the snapshot
-            ChatEvent::StreamDelta { .. } | ChatEvent::StreamingStatus { .. } => None,
+            // StreamDelta and StreamingStatus are never in the snapshot.
+            // ActiveTasksUpdate is ephemeral — every emission is a fresh
+            // full snapshot, dedup is meaningless (and would actively hide
+            // useful state changes from the frontend). Plan 754a1379, T4.
+            ChatEvent::StreamDelta { .. }
+            | ChatEvent::StreamingStatus { .. }
+            | ChatEvent::ActiveTasksUpdate { .. } => None,
         }
     }
 }
@@ -2795,6 +2833,75 @@ mod tests {
         // Round-trip drops the field (becomes None on deserialise).
         let back: BackgroundTaskInfo = serde_json::from_str(&json).unwrap();
         assert!(back.pending_removal_at.is_none());
+    }
+
+    #[test]
+    fn test_active_tasks_update_serde_round_trip() {
+        let event = ChatEvent::ActiveTasksUpdate {
+            tasks: vec![
+                BackgroundTaskInfo {
+                    id: "toolu_01ABC".into(),
+                    kind: BackgroundTaskKind::Monitor,
+                    description: "tail -F /tmp/build.log".into(),
+                    started_at: chrono::Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+                    pid: Some(42_424),
+                    parent_tool_use_id: Some("toolu_01ABC".into()),
+                    pending_removal_at: None,
+                },
+                BackgroundTaskInfo {
+                    id: "toolu_02XYZ".into(),
+                    kind: BackgroundTaskKind::BashBackground,
+                    description: "cargo build".into(),
+                    started_at: chrono::Utc.timestamp_opt(1_700_000_005, 0).unwrap(),
+                    pid: Some(42_425),
+                    parent_tool_use_id: Some("toolu_02XYZ".into()),
+                    pending_removal_at: None,
+                },
+            ],
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        // Discriminator field should be present.
+        assert!(json.contains("\"type\":\"active_tasks_update\""));
+        // Both task ids should be present.
+        assert!(json.contains("toolu_01ABC"));
+        assert!(json.contains("toolu_02XYZ"));
+
+        let back: ChatEvent = serde_json::from_str(&json).unwrap();
+        match back {
+            ChatEvent::ActiveTasksUpdate { tasks } => {
+                assert_eq!(tasks.len(), 2);
+                assert_eq!(tasks[0].id, "toolu_01ABC");
+                assert_eq!(tasks[0].kind, BackgroundTaskKind::Monitor);
+                assert_eq!(tasks[1].kind, BackgroundTaskKind::BashBackground);
+            }
+            _ => panic!("expected ActiveTasksUpdate, got {:?}", back),
+        }
+    }
+
+    #[test]
+    fn test_active_tasks_update_empty_snapshot_round_trip() {
+        // Empty snapshot is a legitimate value — meaning "no background
+        // tasks active". The frontend uses it to clear its toolbar pill.
+        let event = ChatEvent::ActiveTasksUpdate { tasks: vec![] };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"tasks\":[]"));
+
+        let back: ChatEvent = serde_json::from_str(&json).unwrap();
+        match back {
+            ChatEvent::ActiveTasksUpdate { tasks } => assert!(tasks.is_empty()),
+            _ => panic!("round-trip lost the variant"),
+        }
+    }
+
+    #[test]
+    fn test_active_tasks_update_event_type_and_fingerprint() {
+        let event = ChatEvent::ActiveTasksUpdate { tasks: vec![] };
+        // event_type should be the snake_case variant name.
+        assert_eq!(event.event_type(), "active_tasks_update");
+        // fingerprint must be None — every emission is a fresh full
+        // snapshot, dedup would actively hide useful state changes
+        // (cf the doc-comment on the variant).
+        assert!(event.fingerprint().is_none());
     }
 
     #[test]
