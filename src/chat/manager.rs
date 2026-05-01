@@ -6337,6 +6337,99 @@ impl ChatManager {
         result
     }
 
+    /// Parse the `[[dd-]hh:]mm:ss` format returned by `ps -o etime=` into a
+    /// total elapsed-seconds count. Plan fc35b25e (T1, V2 cancel_task).
+    ///
+    /// `ps -o etime=` is the only locale-independent process-age field that
+    /// works identically on Linux and macOS — `etimes` (with `s`) is
+    /// Linux-only, and `lstart` is locale-formatted. See audit observation
+    /// `7dbde66b` for the full cross-platform investigation.
+    ///
+    /// Format examples:
+    /// - `"00:01"`        → 1 second
+    /// - `"12:34"`        → 754 seconds (12 min 34 s)
+    /// - `"02:12:34"`     → 7954 seconds
+    /// - `"01-02:12:34"`  → 94354 seconds (1 day 2 h …)
+    ///
+    /// Returns `None` on any parse failure rather than panicking — callers
+    /// fall back to skipping the PID in the diff sort.
+    #[allow(dead_code)] // wired by T2 of plan fc35b25e
+    pub(crate) fn parse_etime(s: &str) -> Option<u64> {
+        let s = s.trim();
+        if s.is_empty() {
+            return None;
+        }
+        // Optional "DD-" days prefix.
+        let (days, rest) = match s.find('-') {
+            Some(idx) => (s[..idx].parse::<u64>().ok()?, &s[idx + 1..]),
+            None => (0u64, s),
+        };
+        let parts: Vec<&str> = rest.split(':').collect();
+        let (hours, minutes, seconds) = match parts.as_slice() {
+            [sec] => (0u64, 0u64, sec.parse::<u64>().ok()?),
+            [m, sec] => (0u64, m.parse::<u64>().ok()?, sec.parse::<u64>().ok()?),
+            [h, m, sec] => (
+                h.parse::<u64>().ok()?,
+                m.parse::<u64>().ok()?,
+                sec.parse::<u64>().ok()?,
+            ),
+            _ => return None,
+        };
+        Some(days * 86_400 + hours * 3_600 + minutes * 60 + seconds)
+    }
+
+    /// Return the elapsed seconds since `pid` started, or `None` if the
+    /// process is gone / `ps` failed / the format couldn't be parsed.
+    /// Plan fc35b25e (T1).
+    ///
+    /// Cross-platform via `ps -p <pid> -o etime=`. Single code path for
+    /// Linux + macOS — see audit observation `7dbde66b` for why we
+    /// abandoned the original `/proc/<pid>/stat` + boot_time approach.
+    #[cfg(unix)]
+    #[allow(dead_code)] // wired by T2 of plan fc35b25e
+    pub(crate) fn process_etime_seconds(pid: u32) -> Option<u64> {
+        let output = std::process::Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "etime="])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let raw = String::from_utf8(output.stdout).ok()?;
+        Self::parse_etime(&raw)
+    }
+
+    /// Compute `after \ before` (set difference, treating each `Vec` as a
+    /// set) and return the new PIDs sorted by elapsed time **ascending**
+    /// (smallest etime first → most recently spawned first). PIDs whose
+    /// etime can't be read are placed at the end.
+    ///
+    /// Plan fc35b25e (T1, T2). The first element of the returned Vec is
+    /// the heuristic "claim" candidate for a freshly-observed
+    /// `ToolUse(Monitor | Bash run_in_background)` event — the assumption
+    /// being that the most recently spawned descendant of the CLI is the
+    /// subprocess this ToolUse just created.
+    ///
+    /// ## Race-tolerance caveat
+    ///
+    /// When two ToolUses fire within the diff window (1s), this function
+    /// returns multiple new PIDs and the first-PID claim heuristic
+    /// becomes ambiguous. V2 accepts this as documented degraded
+    /// behaviour — see plan constraint `e1dfeaa5`.
+    #[allow(dead_code)] // wired by T2 of plan fc35b25e
+    pub(crate) fn pid_discovery_diff(before: &[u32], after: &[u32]) -> Vec<u32> {
+        let before_set: std::collections::HashSet<u32> = before.iter().copied().collect();
+        let mut new_pids: Vec<u32> = after
+            .iter()
+            .copied()
+            .filter(|p| !before_set.contains(p))
+            .collect();
+        // Sort by etime ascending (smallest = most recent). Unreadable
+        // etimes (process gone, ps failed) sort last via u64::MAX.
+        new_pids.sort_by_key(|pid| Self::process_etime_seconds(*pid).unwrap_or(u64::MAX));
+        new_pids
+    }
+
     /// Send `SIGINT` to every descendant of `cli_pid` **without** sending the
     /// SDK `interrupt` control_request and **without** touching the
     /// `interrupt_flag`/`interrupt_token`. Returns the PIDs that received the
@@ -11459,6 +11552,117 @@ mod tests {
         let r = manager.cancel_task("s-cap", "tool_W").await.unwrap();
         assert!(r.capped, "3rd call must be capped");
         assert!(r.killed_pids.is_empty());
+    }
+
+    // ========================================================================
+    // T1 of plan fc35b25e — parse_etime + pid_discovery_diff helpers
+    // ========================================================================
+
+    #[test]
+    fn test_parse_etime_seconds_only() {
+        assert_eq!(ChatManager::parse_etime("00:01"), Some(1));
+        assert_eq!(ChatManager::parse_etime("00:42"), Some(42));
+        assert_eq!(ChatManager::parse_etime("00:00"), Some(0));
+    }
+
+    #[test]
+    fn test_parse_etime_minutes_seconds() {
+        assert_eq!(ChatManager::parse_etime("12:34"), Some(12 * 60 + 34));
+        assert_eq!(ChatManager::parse_etime("00:30"), Some(30));
+        assert_eq!(ChatManager::parse_etime("59:59"), Some(59 * 60 + 59));
+    }
+
+    #[test]
+    fn test_parse_etime_hours_minutes_seconds() {
+        assert_eq!(
+            ChatManager::parse_etime("02:12:34"),
+            Some(2 * 3600 + 12 * 60 + 34)
+        );
+        assert_eq!(ChatManager::parse_etime("01:00:00"), Some(3600));
+    }
+
+    #[test]
+    fn test_parse_etime_with_days() {
+        assert_eq!(
+            ChatManager::parse_etime("01-02:12:34"),
+            Some(86_400 + 2 * 3600 + 12 * 60 + 34)
+        );
+        assert_eq!(ChatManager::parse_etime("07-00:00:00"), Some(7 * 86_400));
+    }
+
+    #[test]
+    fn test_parse_etime_handles_whitespace() {
+        // `ps -o etime=` may pad with leading spaces.
+        assert_eq!(ChatManager::parse_etime("  00:42  "), Some(42));
+        assert_eq!(ChatManager::parse_etime("\n12:34\n"), Some(12 * 60 + 34));
+    }
+
+    #[test]
+    fn test_parse_etime_rejects_garbage() {
+        assert_eq!(ChatManager::parse_etime(""), None);
+        assert_eq!(ChatManager::parse_etime("hello"), None);
+        assert_eq!(ChatManager::parse_etime("1:2:3:4"), None); // too many parts
+        assert_eq!(ChatManager::parse_etime("aa:bb"), None);
+        assert_eq!(ChatManager::parse_etime("-1:00"), None);
+    }
+
+    #[test]
+    fn test_pid_discovery_diff_finds_new_pids() {
+        // before = [100, 200], after = [100, 200, 300] → new = [300]
+        let before = vec![100u32, 200];
+        let after = vec![100u32, 200, 300];
+        let diff = ChatManager::pid_discovery_diff(&before, &after);
+        // PID 300 doesn't exist in /proc, etime returns None → sorted last,
+        // but it's the only new entry so it's at index 0.
+        assert_eq!(diff, vec![300]);
+    }
+
+    #[test]
+    fn test_pid_discovery_diff_no_new_pids() {
+        let before = vec![100u32, 200, 300];
+        let after = vec![100u32, 200];
+        let diff = ChatManager::pid_discovery_diff(&before, &after);
+        // No PIDs in `after` that aren't in `before`.
+        assert!(diff.is_empty());
+    }
+
+    #[test]
+    fn test_pid_discovery_diff_empty_before() {
+        let before = Vec::<u32>::new();
+        let after = vec![1u32, 2, 3];
+        let diff = ChatManager::pid_discovery_diff(&before, &after);
+        assert_eq!(diff.len(), 3);
+        // Order is stable (etime returns None for fake PIDs → all u64::MAX,
+        // sort_by_key preserves insertion order on ties).
+    }
+
+    #[test]
+    fn test_pid_discovery_diff_with_real_subprocess() {
+        // Spawn a real `sleep 30` subprocess so we have a PID with a
+        // readable etime. Diff should put it before fake PIDs (which
+        // have unreadable etime → sorted last).
+        let mut child = match std::process::Command::new("sleep").arg("30").spawn() {
+            Ok(c) => c,
+            Err(_) => {
+                eprintln!("Skipping test: sleep not available");
+                return;
+            }
+        };
+        let real_pid = child.id();
+
+        // Give the OS a moment to register the process so `ps` sees it.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let before = Vec::<u32>::new();
+        let after = vec![999_999u32, real_pid, 999_998u32];
+        let diff = ChatManager::pid_discovery_diff(&before, &after);
+
+        // Real PID has etime ~0s (just spawned), fake PIDs have etime
+        // None → u64::MAX → sorted last. So real PID should be first.
+        assert_eq!(diff[0], real_pid, "real subprocess should sort first");
+
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     // ========================================================================
