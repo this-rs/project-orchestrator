@@ -273,26 +273,29 @@ pub struct CancelToolsResult {
 
 /// Result of `ChatManager::cancel_task`. Surfaced to REST/WS callers
 /// so the UI can update the cancelled task's status and surface rate
-/// cap hits gracefully. Plan 754a1379 (T7).
+/// cap hits gracefully.
 ///
-/// In V1 `killed_pids` is always empty — the cancel path is a
-/// map-side cancel only (entry marked for removal + broadcast); the
-/// underlying subprocess keeps running until the global Stop is hit
-/// or the session ends. PID-targeted kill is a follow-up enhancement
-/// once `identify_subprocess_kind` (T13) provides PID discovery.
+/// Plan 754a1379 (T7) introduced this with V1 semantics (map-side
+/// cancel only, `killed_pids` always empty). Plan fc35b25e (T4)
+/// upgraded the implementation to actually SIGINT the subprocess
+/// subtree via `kill_subtree`; `killed_pids` now reports the PIDs
+/// that received the signal in the common path. Empty `killed_pids`
+/// is now an edge case (claim race or subprocess crashed before
+/// PID discovery — falls back to V1 map-side cancel).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CancelTaskResult {
     /// `tool_use_id` (≡ map key, ≡ `correlation_id`) of the task that
     /// was cancelled. Echoed back so the caller doesn't have to
     /// remember which click corresponded to which task on a busy UI.
     pub task_id: String,
-    /// PIDs that received `SIGINT`. Always empty in V1 (no precise
-    /// PID discovery yet). Reserved for the follow-up that adds
-    /// PID-targeted kill — keeping the field now avoids a wire-format
-    /// breaking change later.
+    /// PIDs (root + descendants) that received `SIGINT` from
+    /// `kill_subtree`. Non-empty in the common V2 path. Empty when
+    /// the task entry's `pid` was still `None` at cancel time
+    /// (claim race or subprocess crashed before discovery — V1
+    /// fallback engaged).
     pub killed_pids: Vec<u32>,
     /// `true` when the rate cap was hit and the request was refused
-    /// (no map mutation, no broadcast).
+    /// (no map mutation, no broadcast, no kill).
     pub capped: bool,
 }
 
