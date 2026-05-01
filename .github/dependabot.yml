@@ -1,0 +1,49 @@
+# Dependabot configuration — automated dependency security PRs.
+#
+# Plan e81fb4de — Dependabot security audit (T7).
+#
+# Frontend deps (npm) are tracked separately in the
+# `this-rs/project-orchestrator-frontend` repo (its own dependabot
+# config). Not duplicated here.
+
+version: 2
+updates:
+  # Cargo workspace at the repo root. After T0 (#244), this is the
+  # only Cargo.lock in the tree — `desktop/src-tauri/Cargo.lock`
+  # was a stale leftover and has been removed; the desktop crate
+  # is a workspace member that uses the root lockfile.
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Europe/Paris"
+    open-pull-requests-limit: 10
+    labels:
+      - "dependencies"
+      - "security"
+
+  # Docker base images used by the multi-stage build at /Dockerfile
+  # (rust:1.75-alpine for builder, node:22-slim for frontend stage).
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Europe/Paris"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "security"
+      - "docker"
+
+  # Pinned action versions in .github/workflows/*.yml.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    labels:
+      - "dependencies"
+      - "ci"
