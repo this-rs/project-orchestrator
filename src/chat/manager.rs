@@ -13,8 +13,9 @@ use super::config::ChatConfig;
 use super::post_tool_hook;
 use super::skill_hook;
 use super::types::{
-    classify_api_error, truncate_snippet, ChatEvent, ChatEventPage, ChatRequest,
-    CreateSessionResponse, MessageSearchHit, MessageSearchResult, PendingMessage, SessionWorkLog,
+    classify_api_error, truncate_snippet, BackgroundTaskInfo, ChatEvent, ChatEventPage,
+    ChatRequest, CreateSessionResponse, MessageSearchHit, MessageSearchResult, PendingMessage,
+    SessionWorkLog,
 };
 use crate::meilisearch::SearchStore;
 use crate::neo4j::models::ChatEventRecord;
@@ -188,6 +189,17 @@ pub struct ActiveSession {
     pub cancel_tools_cap: u32,
     /// Rolling window for the cancel_tools rate cap. Defaults to 60s.
     pub cancel_tools_window: Duration,
+    /// Background subprocesses currently attached to this session
+    /// (`Monitor`, `Bash run_in_background`). Keyed by `BackgroundTaskInfo.id`
+    /// — which equals the SDK `tool_use_id` of the originating invocation
+    /// (and the `correlation_id` on every `BackgroundOutput` event from
+    /// this subprocess). Plan 754a1379 (T2). Mutated by the OOB lifecycle
+    /// hook (T3), the cancel_task path (T7), the grace-period purge (T12),
+    /// and the recovery rebuild (T13). The map is **ephemeral** — it is
+    /// reconstructed at create_session/resume_session via
+    /// `get_descendant_pids(child_pid)` (decision 33bce470, audit note
+    /// 2482f4e0).
+    pub active_background_tasks: Arc<Mutex<HashMap<String, BackgroundTaskInfo>>>,
 }
 
 /// Result of `ChatManager::cancel_running_tools`. Surfaced to REST/WS
@@ -2714,6 +2726,7 @@ impl ChatManager {
                     cancel_tools_history: Arc::new(Mutex::new(VecDeque::new())),
                     cancel_tools_cap: CANCEL_TOOLS_CAP,
                     cancel_tools_window: Duration::from_secs(CANCEL_TOOLS_WINDOW_SECS),
+                    active_background_tasks: Arc::new(Mutex::new(HashMap::new())),
                 },
             );
             interrupt_flag
@@ -4800,6 +4813,7 @@ impl ChatManager {
                     cancel_tools_history: Arc::new(Mutex::new(VecDeque::new())),
                     cancel_tools_cap: CANCEL_TOOLS_CAP,
                     cancel_tools_window: Duration::from_secs(CANCEL_TOOLS_WINDOW_SECS),
+                    active_background_tasks: Arc::new(Mutex::new(HashMap::new())),
                 },
             );
             interrupt_flag
@@ -7787,6 +7801,7 @@ mod tests {
             cancel_tools_history: Arc::new(Mutex::new(VecDeque::new())),
             cancel_tools_cap: CANCEL_TOOLS_CAP,
             cancel_tools_window: Duration::from_secs(CANCEL_TOOLS_WINDOW_SECS),
+            active_background_tasks: Arc::new(Mutex::new(HashMap::new())),
         };
 
         Some((session, pending_messages))
@@ -8690,6 +8705,7 @@ mod tests {
             cancel_tools_history: Arc::new(Mutex::new(VecDeque::new())),
             cancel_tools_cap: CANCEL_TOOLS_CAP,
             cancel_tools_window: Duration::from_secs(CANCEL_TOOLS_WINDOW_SECS),
+            active_background_tasks: Arc::new(Mutex::new(HashMap::new())),
         };
 
         (session, handle)

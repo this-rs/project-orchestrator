@@ -1104,6 +1104,7 @@ mod integration_tests {
                 cancel_tools_window: std::time::Duration::from_secs(
                     crate::chat::manager::CANCEL_TOOLS_WINDOW_SECS,
                 ),
+                active_background_tasks: Arc::new(Mutex::new(HashMap::new())),
             };
             active_sessions
                 .write()
