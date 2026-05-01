@@ -226,6 +226,26 @@ async fn handle_oob_message(
         return;
     }
 
+    // Lazy crash-recovery (plan 754a1379, T13): if this BackgroundOutput
+    // carries a correlation_id we don't currently track (because the PO
+    // server restarted while the Monitor / Bash bg subprocess was alive
+    // — the subprocess survives the PO restart, but the in-memory map
+    // doesn't), insert a recovered entry now. The frontend's toolbar
+    // pill and MonitorCard reappear via the `ActiveTasksUpdate` that
+    // `track_background_task_recovery_if_orphan` broadcasts.
+    //
+    // No-op when correlation_id is None or already known — it's an
+    // idempotent guard that runs on every BackgroundOutput.
+    let _ = crate::chat::manager::ChatManager::track_background_task_recovery_if_orphan(
+        session_id,
+        &deps.active_sessions,
+        events_tx,
+        &deps.nats,
+        correlation_id.as_deref(),
+        &source,
+    )
+    .await;
+
     let event = ChatEvent::BackgroundOutput {
         source: source.clone(),
         content: content.clone(),

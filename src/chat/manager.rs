@@ -3113,6 +3113,104 @@ impl ChatManager {
         true
     }
 
+    /// Lazy crash-recovery for `active_background_tasks`. When the OOB
+    /// listener constructs a `ChatEvent::BackgroundOutput` whose
+    /// `correlation_id` doesn't match any tracked entry, this helper
+    /// re-creates an entry on-the-fly so the toolbar pill and
+    /// MonitorCard reappear without a server-side rebuild step.
+    ///
+    /// ## Why lazy instead of `pgrep` rebuild at create_session
+    ///
+    /// See decision `f2151626` on the T13 task. Short version:
+    /// pgrep matching `tool_use_id → root PID` is imprecise (cmdline
+    /// doesn't carry the id), false-positive prone (random
+    /// CLI-internal helpers would also be listed), and platform-fragile
+    /// (/proc on Linux vs ps on macOS). Lazy recovery via
+    /// `BackgroundOutput` is automatically correct: only subprocesses
+    /// that are still emitting events reappear, and dead ones are
+    /// never resurrected.
+    ///
+    /// Plan 754a1379 (T13).
+    ///
+    /// ## Behaviour
+    ///
+    /// - `correlation_id == None` → no-op, returns `false`.
+    /// - `correlation_id` already in the map → no-op (live or
+    ///   `pending_removal_at`), returns `false`.
+    /// - `correlation_id` orphan + `source == "Monitor"` →
+    ///   insert as `Monitor`, broadcast `ActiveTasksUpdate`,
+    ///   returns `true`.
+    /// - `correlation_id` orphan + `source == "BashOutput"` →
+    ///   insert as `BashBackground`, broadcast, returns `true`.
+    /// - Any other source ("system", unknown) → returns `false`. We
+    ///   don't speculatively recover unknown kinds — the user can
+    ///   still cancel via the global Stop.
+    ///
+    /// Recovered entries carry `description = "(recovered after
+    /// restart)"`, `parent_tool_use_id = Some(correlation_id)`,
+    /// `pid = None`, `pending_removal_at = None`. The id field is
+    /// the original tool_use_id (= correlation_id), NOT a synthetic
+    /// `recovered-{pid}`.
+    pub(crate) async fn track_background_task_recovery_if_orphan(
+        session_id: &str,
+        active_sessions: &Arc<RwLock<HashMap<String, ActiveSession>>>,
+        events_tx: &broadcast::Sender<ChatEvent>,
+        nats: &Option<Arc<crate::events::NatsEmitter>>,
+        correlation_id: Option<&str>,
+        source: &str,
+    ) -> bool {
+        let Some(correlation_id) = correlation_id else {
+            return false;
+        };
+
+        let kind = match source {
+            "Monitor" => BackgroundTaskKind::Monitor,
+            "BashOutput" => BackgroundTaskKind::BashBackground,
+            _ => return false,
+        };
+
+        let snapshot = {
+            let tasks_arc = {
+                let sessions = active_sessions.read().await;
+                let Some(active) = sessions.get(session_id) else {
+                    return false;
+                };
+                active.active_background_tasks.clone()
+            };
+            let mut tasks = tasks_arc.lock().await;
+            if tasks.contains_key(correlation_id) {
+                return false; // already tracked, not an orphan
+            }
+            tasks.insert(
+                correlation_id.to_string(),
+                BackgroundTaskInfo {
+                    id: correlation_id.to_string(),
+                    kind,
+                    description: "(recovered after restart)".to_string(),
+                    started_at: chrono::Utc::now(),
+                    pid: None,
+                    parent_tool_use_id: Some(correlation_id.to_string()),
+                    pending_removal_at: None,
+                },
+            );
+            info!(
+                session_id = %session_id,
+                correlation_id = %correlation_id,
+                kind = ?kind,
+                source = %source,
+                "Lazy-recovered orphan BackgroundOutput as new BackgroundTaskInfo (T13)"
+            );
+            tasks.values().cloned().collect::<Vec<BackgroundTaskInfo>>()
+        };
+
+        let event = ChatEvent::ActiveTasksUpdate { tasks: snapshot };
+        let _ = events_tx.send(event.clone());
+        if let Some(ref nats) = nats {
+            nats.publish_chat_event(session_id, event);
+        }
+        true
+    }
+
     /// Spawn the per-session background-tasks poller. The poller wakes
     /// up every `BACKGROUND_TASKS_POLL_INTERVAL_SECS` seconds and runs
     /// `tick_purge_background_tasks`, which physically removes any
@@ -11300,6 +11398,210 @@ mod tests {
         let r = manager.cancel_task("s-cap", "tool_W").await.unwrap();
         assert!(r.capped, "3rd call must be capped");
         assert!(r.killed_pids.is_empty());
+    }
+
+    // ========================================================================
+    // T13 of plan 754a1379 — track_background_task_recovery_if_orphan
+    // (lazy crash-recovery via BackgroundOutput orphan correlation_id)
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_recovery_inserts_orphan_monitor() {
+        let Some((session, _)) = try_create_dummy_session(false, "", vec![]) else {
+            eprintln!("Skipping test: Claude CLI not installed");
+            return;
+        };
+        let mut events_rx = session.events_tx.subscribe();
+        let events_tx = session.events_tx.clone();
+
+        let map: Arc<RwLock<HashMap<String, ActiveSession>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        map.write().await.insert("s-rec".into(), session);
+
+        let inserted = ChatManager::track_background_task_recovery_if_orphan(
+            "s-rec",
+            &map,
+            &events_tx,
+            &None,
+            Some("toolu_orphan_M"),
+            "Monitor",
+        )
+        .await;
+        assert!(inserted);
+
+        // Map now has the recovered entry.
+        let sessions_guard = map.read().await;
+        let tasks = sessions_guard
+            .get("s-rec")
+            .unwrap()
+            .active_background_tasks
+            .lock()
+            .await;
+        assert_eq!(tasks.len(), 1);
+        let entry = tasks.get("toolu_orphan_M").unwrap();
+        assert_eq!(entry.kind, BackgroundTaskKind::Monitor);
+        assert_eq!(entry.description, "(recovered after restart)");
+        assert_eq!(
+            entry.parent_tool_use_id.as_deref(),
+            Some("toolu_orphan_M"),
+            "parent_tool_use_id mirrors the recovered id"
+        );
+        drop(tasks);
+        drop(sessions_guard);
+
+        // Broadcast carries the snapshot.
+        let event = events_rx.try_recv().expect("expected broadcast");
+        match event {
+            ChatEvent::ActiveTasksUpdate { tasks } => {
+                assert_eq!(tasks.len(), 1);
+                assert_eq!(tasks[0].id, "toolu_orphan_M");
+            }
+            other => panic!("expected ActiveTasksUpdate, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_recovery_inserts_orphan_bash_background() {
+        let Some((session, _)) = try_create_dummy_session(false, "", vec![]) else {
+            eprintln!("Skipping test: Claude CLI not installed");
+            return;
+        };
+        let events_tx = session.events_tx.clone();
+
+        let map: Arc<RwLock<HashMap<String, ActiveSession>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        map.write().await.insert("s-rec-b".into(), session);
+
+        let inserted = ChatManager::track_background_task_recovery_if_orphan(
+            "s-rec-b",
+            &map,
+            &events_tx,
+            &None,
+            Some("toolu_orphan_B"),
+            "BashOutput",
+        )
+        .await;
+        assert!(inserted);
+
+        let sessions_guard = map.read().await;
+        let tasks = sessions_guard
+            .get("s-rec-b")
+            .unwrap()
+            .active_background_tasks
+            .lock()
+            .await;
+        assert_eq!(
+            tasks.get("toolu_orphan_B").unwrap().kind,
+            BackgroundTaskKind::BashBackground
+        );
+    }
+
+    #[tokio::test]
+    async fn test_recovery_skips_already_tracked() {
+        let Some((session, _)) = try_create_dummy_session(false, "", vec![]) else {
+            eprintln!("Skipping test: Claude CLI not installed");
+            return;
+        };
+        let mut events_rx = session.events_tx.subscribe();
+        let events_tx = session.events_tx.clone();
+
+        // Pre-seed an entry under the same id.
+        session.active_background_tasks.lock().await.insert(
+            "toolu_existing".into(),
+            BackgroundTaskInfo {
+                id: "toolu_existing".into(),
+                kind: BackgroundTaskKind::Monitor,
+                description: "original".into(),
+                started_at: chrono::Utc::now(),
+                pid: None,
+                parent_tool_use_id: Some("toolu_existing".into()),
+                pending_removal_at: None,
+            },
+        );
+
+        let map: Arc<RwLock<HashMap<String, ActiveSession>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        map.write().await.insert("s-rec-skip".into(), session);
+
+        let inserted = ChatManager::track_background_task_recovery_if_orphan(
+            "s-rec-skip",
+            &map,
+            &events_tx,
+            &None,
+            Some("toolu_existing"),
+            "Monitor",
+        )
+        .await;
+        assert!(!inserted, "already-tracked id must not trigger insertion");
+
+        // Description preserved (we did NOT overwrite).
+        let sessions_guard = map.read().await;
+        let tasks = sessions_guard
+            .get("s-rec-skip")
+            .unwrap()
+            .active_background_tasks
+            .lock()
+            .await;
+        assert_eq!(tasks.get("toolu_existing").unwrap().description, "original");
+        drop(tasks);
+        drop(sessions_guard);
+
+        // No broadcast on no-op.
+        assert!(events_rx.try_recv().is_err(), "no broadcast for no-op");
+    }
+
+    #[tokio::test]
+    async fn test_recovery_ignores_unknown_source() {
+        let Some((session, _)) = try_create_dummy_session(false, "", vec![]) else {
+            eprintln!("Skipping test: Claude CLI not installed");
+            return;
+        };
+        let events_tx = session.events_tx.clone();
+
+        let map: Arc<RwLock<HashMap<String, ActiveSession>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        map.write().await.insert("s-rec-unk".into(), session);
+
+        for source in ["system", "WebFetch", "", "foobar"] {
+            let inserted = ChatManager::track_background_task_recovery_if_orphan(
+                "s-rec-unk",
+                &map,
+                &events_tx,
+                &None,
+                Some("toolu_X"),
+                source,
+            )
+            .await;
+            assert!(!inserted, "source `{}` should not trigger recovery", source);
+        }
+
+        let count = map
+            .read()
+            .await
+            .get("s-rec-unk")
+            .unwrap()
+            .active_background_tasks
+            .lock()
+            .await
+            .len();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_recovery_no_correlation_id_is_noop() {
+        let map: Arc<RwLock<HashMap<String, ActiveSession>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        let (events_tx, _rx) = broadcast::channel(8);
+        let inserted = ChatManager::track_background_task_recovery_if_orphan(
+            "s-anywhere",
+            &map,
+            &events_tx,
+            &None,
+            None,
+            "Monitor",
+        )
+        .await;
+        assert!(!inserted);
     }
 
     // ========================================================================
