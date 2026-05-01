@@ -711,6 +711,63 @@ chat:
 
 ---
 
+
+---
+
+## FAQ
+
+### What is Project Orchestrator?
+
+Project Orchestrator gives your AI coding agents a shared brain. Instead of each agent starting from scratch, they share code understanding, plans, decisions, and progress through a central knowledge base powered by Neo4j and Meilisearch.
+
+### How does the shared knowledge base work?
+
+Project Orchestrator uses a Neo4j graph database to store code structure, plans, decisions, and progress. All agents connected to the same project can access this shared knowledge, eliminating the need to re-explain codebases or repeat analysis.
+
+### What is Semantic Code Search?
+
+Powered by Meilisearch, semantic code search lets you find code by meaning rather than just keywords. Ask questions like "where is the authentication logic?" and get relevant results even if the exact words don't match.
+
+### Which languages are supported?
+
+Tree-sitter provides multi-language parsing for 16+ languages including Rust, TypeScript, JavaScript, Python, Go, Java, C/C++, Ruby, PHP, Kotlin, Swift, Bash, C#, Scala, Zig, and HCL/Terraform.
+
+### How does the Protocol FSM Engine work?
+
+Define hierarchical finite state machines for repeatable workflows. Each protocol specifies steps, dependencies, and transitions, enabling consistent execution patterns across different projects and teams.
+
+### What is the Knowledge Fabric?
+
+A bio-inspired neural network that connects notes, decisions, and code via synapses. It enables associative recall — when an agent encounters a concept, related knowledge is automatically surfaced.
+
+### How do MCP integrations work?
+
+Project Orchestrator provides 22 mega-tools available for Claude Code, OpenAI Agents, and Cursor. These tools give agents access to the shared knowledge base, plan management, and code search capabilities.
+
+### How does the Autonomous Runner work?
+
+Execute plans automatically with parallel wave dispatch and agent personas. The runner breaks down plans into waves of tasks, assigns them to appropriate agent personas, and tracks progress across the workflow.
+
+### What are the deployment options?
+
+- **Desktop App** — Native app for macOS, Windows, and Linux
+- **Docker** — Full deployment with embedded frontend or API-only mode
+- **Docker Compose** — Complete stack with Neo4j, Meilisearch, and NATS
+- **Package managers** — Homebrew (macOS/Linux), apt (Debian/Ubuntu), dnf (Fedora/RHEL)
+
+### What are the system requirements?
+
+- **Rust 1.75+** (for building from source)
+- **Docker and Docker Compose** (for full deployment)
+- **Git**
+- The desktop app runs on macOS (Apple Silicon and Intel), Windows (64-bit), and Linux (64-bit)
+
+### Where can I get help?
+
+- [Discord](https://discord.gg/baXBmsJc) — Join the community for help and feedback
+- [GitHub Issues](https://github.com/this-rs/project-orchestrator/issues) — Report bugs or request features
+- [Releases](https://github.com/this-rs/project-orchestrator/releases) — Download the latest version
+
 ## Contributing
 
 Contributions are welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
