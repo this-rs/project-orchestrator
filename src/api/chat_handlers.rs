@@ -490,6 +490,84 @@ pub async fn cancel_tools(
 }
 
 // ============================================================================
+// Background tasks (T6 + T8 of plan 754a1379)
+// ============================================================================
+
+/// GET /api/chat/sessions/{id}/background-tasks — Snapshot of the
+/// background subprocesses currently tracked for the session.
+///
+/// Returns the same `Vec<BackgroundTaskInfo>` carried by the live
+/// `ChatEvent::ActiveTasksUpdate` broadcasts. The frontend hits this
+/// endpoint on WebSocket connect / reconnect to re-hydrate its
+/// toolbar indicator and in-progress MonitorCards before the next
+/// live event arrives, avoiding a "blank toolbar" flicker.
+///
+/// ## Response codes
+///
+/// **200** — Always. An empty array is a legitimate response (no
+/// background subprocesses currently tracked, or the session is
+/// remote / unknown locally — the frontend treats both the same).
+///
+/// **404** — `chat_manager` not configured (server not started with
+/// chat support).
+pub async fn get_background_tasks(
+    State(state): State<OrchestratorState>,
+    Path(session_id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let chat_manager = state.chat_manager.as_ref().ok_or_else(|| {
+        AppError::NotFound("chat_manager not configured on this server".to_string())
+    })?;
+
+    let tasks = chat_manager
+        .get_active_background_tasks(&session_id.to_string())
+        .await;
+
+    Ok(Json(serde_json::json!({ "tasks": tasks })))
+}
+
+/// POST /api/chat/sessions/{id}/cancel-task/{task_id} — Cancel a
+/// single tracked background task by id.
+///
+/// Granular companion to `cancel-tools`: instead of nuking every
+/// descendant of the CLI, this targets one Monitor / Bash bg by its
+/// `tool_use_id` (= map key, ≡ `correlation_id` on the related
+/// BackgroundOutput events).
+///
+/// V1 semantics: marks the entry for removal in the tracking map and
+/// broadcasts a fresh `ActiveTasksUpdate` so the frontend reflects
+/// the cancelled state. The underlying subprocess is **not yet
+/// killed in this version** — see the doc-comment on
+/// `ChatManager::cancel_task` for the rationale and the follow-up
+/// path. Users who need the subprocess actually terminated should
+/// use the global `cancel-tools` button (current Stop UX).
+///
+/// ## Response codes
+///
+/// Always **200** with `CancelTaskResult { task_id, killed_pids,
+/// capped }`:
+/// - `capped: false` → cancel applied (idempotent on unknown
+///   task_id / unknown session — see `ChatManager::cancel_task`).
+/// - `capped: true` → rate cap hit (30/5min/session); display a
+///   "slow down" toast and disable the button briefly.
+///
+/// **404** — `chat_manager` not configured.
+pub async fn cancel_task(
+    State(state): State<OrchestratorState>,
+    Path((session_id, task_id)): Path<(Uuid, String)>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let chat_manager = state.chat_manager.as_ref().ok_or_else(|| {
+        AppError::NotFound("chat_manager not configured on this server".to_string())
+    })?;
+
+    let result = chat_manager
+        .cancel_task(&session_id.to_string(), &task_id)
+        .await
+        .map_err(AppError::Internal)?;
+
+    Ok(Json(serde_json::to_value(&result).unwrap_or_default()))
+}
+
+// ============================================================================
 // Update session (rename)
 // ============================================================================
 

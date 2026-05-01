@@ -13,8 +13,9 @@ use super::config::ChatConfig;
 use super::post_tool_hook;
 use super::skill_hook;
 use super::types::{
-    classify_api_error, truncate_snippet, ChatEvent, ChatEventPage, ChatRequest,
-    CreateSessionResponse, MessageSearchHit, MessageSearchResult, PendingMessage, SessionWorkLog,
+    classify_api_error, truncate_snippet, BackgroundTaskInfo, BackgroundTaskKind, ChatEvent,
+    ChatEventPage, ChatRequest, CreateSessionResponse, MessageSearchHit, MessageSearchResult,
+    PendingMessage, SessionWorkLog,
 };
 use crate::meilisearch::SearchStore;
 use crate::neo4j::models::ChatEventRecord;
@@ -62,6 +63,47 @@ pub(crate) const OOB_TRIGGER_WINDOW_SECS: u64 = 300;
 pub(crate) const CANCEL_TOOLS_CAP: u32 = 10;
 /// Rolling window for the cancel-tools rate cap (60s).
 pub(crate) const CANCEL_TOOLS_WINDOW_SECS: u64 = 60;
+
+/// User-driven cancel-task rate cap. Distinct from `CANCEL_TOOLS_CAP`:
+/// `cancel_task` targets a single background subprocess (one Monitor /
+/// Bash bg) rather than every descendant. The frontend popover may
+/// surface a Stop button per task, so click-spam is more plausible —
+/// the cap is more generous (30 per 5 min) but still bounded to keep
+/// pgrep-based PID enumeration cheap. Plan 754a1379 (T9).
+pub(crate) const CANCEL_TASK_CAP: u32 = 30;
+/// Rolling window for the cancel-task rate cap (300s = 5 minutes).
+pub(crate) const CANCEL_TASK_WINDOW_SECS: u64 = 300;
+
+/// Grace period applied between marking a `BackgroundTaskInfo` for removal
+/// (`pending_removal_at`) and physically purging it from the
+/// `active_background_tasks` map. 5 seconds absorbs in-flight
+/// `BackgroundOutput` ticks that arrive between the cancel SIGINT and
+/// the subprocess actually dying — they still match an entry in the map
+/// and are routed correctly to their (now greyed-out) MonitorCard,
+/// instead of becoming orphans on the frontend. Plan 754a1379 (T12).
+pub(crate) const BACKGROUND_TASK_PURGE_GRACE_SECS: u64 = 5;
+/// How often the background-tasks poller wakes up to apply the grace
+/// period purge AND the idle-based death detection. 5s matches the
+/// grace period — i.e. a marked entry is purged on the next tick
+/// after it ages past the grace, with at most an extra tick of
+/// latency. Plan 754a1379 (T12 + T3 REMOVE-on-death).
+pub(crate) const BACKGROUND_TASKS_POLL_INTERVAL_SECS: u64 = 5;
+
+/// Idle threshold for the death detector (T3 REMOVE-on-death side).
+/// An entry whose `last_seen_at` is older than this is marked
+/// `pending_removal_at = Some(now)` by the poller, then purged after
+/// the usual grace period.
+///
+/// Default 30 minutes — generous on purpose. Monitors with sparse
+/// output (e.g. `tail -F build.log` during a long compile) can be
+/// silent for ~10 min legitimately. The death detector errs on the
+/// side of false negatives (let live tasks linger) over false
+/// positives (reap a still-alive Monitor and confuse the user).
+///
+/// Subprocesses that died ungracefully and never emit again will
+/// still be cleaned up — just with a 30-min lag rather than instantly.
+/// Users who want immediate cleanup can `cancel_task` directly.
+pub(crate) const BACKGROUND_TASK_IDLE_DEATH_SECS: u64 = 1800;
 
 /// An active chat session with a live Claude CLI subprocess
 pub struct ActiveSession {
@@ -188,6 +230,26 @@ pub struct ActiveSession {
     pub cancel_tools_cap: u32,
     /// Rolling window for the cancel_tools rate cap. Defaults to 60s.
     pub cancel_tools_window: Duration,
+    /// Background subprocesses currently attached to this session
+    /// (`Monitor`, `Bash run_in_background`). Keyed by `BackgroundTaskInfo.id`
+    /// — which equals the SDK `tool_use_id` of the originating invocation
+    /// (and the `correlation_id` on every `BackgroundOutput` event from
+    /// this subprocess). Plan 754a1379 (T2). Mutated by the OOB lifecycle
+    /// hook (T3), the cancel_task path (T7), the grace-period purge (T12),
+    /// and the recovery rebuild (T13). The map is **ephemeral** — it is
+    /// reconstructed at create_session/resume_session via
+    /// `get_descendant_pids(child_pid)` (decision 33bce470, audit note
+    /// 2482f4e0).
+    pub active_background_tasks: Arc<Mutex<HashMap<String, BackgroundTaskInfo>>>,
+    /// Sliding-window history of `cancel_task` invocations on this session.
+    /// Same shape and intent as `cancel_tools_history`, but scoped to the
+    /// granular per-task cancel path introduced by plan 754a1379 (T9).
+    pub cancel_task_history: Arc<Mutex<VecDeque<Instant>>>,
+    /// Maximum cancel_task invocations allowed within `cancel_task_window`.
+    /// Defaults to `CANCEL_TASK_CAP` (30).
+    pub cancel_task_cap: u32,
+    /// Rolling window for the cancel_task rate cap. Defaults to 300s (5 min).
+    pub cancel_task_window: Duration,
 }
 
 /// Result of `ChatManager::cancel_running_tools`. Surfaced to REST/WS
@@ -206,6 +268,31 @@ pub struct CancelToolsResult {
     /// `true` when the rate cap was hit and the request was refused
     /// (no SIGINT sent, no NATS publish). Caller should map to HTTP
     /// 429 or display a "slow down" toast.
+    pub capped: bool,
+}
+
+/// Result of `ChatManager::cancel_task`. Surfaced to REST/WS callers
+/// so the UI can update the cancelled task's status and surface rate
+/// cap hits gracefully. Plan 754a1379 (T7).
+///
+/// In V1 `killed_pids` is always empty — the cancel path is a
+/// map-side cancel only (entry marked for removal + broadcast); the
+/// underlying subprocess keeps running until the global Stop is hit
+/// or the session ends. PID-targeted kill is a follow-up enhancement
+/// once `identify_subprocess_kind` (T13) provides PID discovery.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CancelTaskResult {
+    /// `tool_use_id` (≡ map key, ≡ `correlation_id`) of the task that
+    /// was cancelled. Echoed back so the caller doesn't have to
+    /// remember which click corresponded to which task on a busy UI.
+    pub task_id: String,
+    /// PIDs that received `SIGINT`. Always empty in V1 (no precise
+    /// PID discovery yet). Reserved for the follow-up that adds
+    /// PID-targeted kill — keeping the field now avoids a wire-format
+    /// breaking change later.
+    pub killed_pids: Vec<u32>,
+    /// `true` when the rate cap was hit and the request was refused
+    /// (no map mutation, no broadcast).
     pub capped: bool,
 }
 
@@ -2714,6 +2801,10 @@ impl ChatManager {
                     cancel_tools_history: Arc::new(Mutex::new(VecDeque::new())),
                     cancel_tools_cap: CANCEL_TOOLS_CAP,
                     cancel_tools_window: Duration::from_secs(CANCEL_TOOLS_WINDOW_SECS),
+                    active_background_tasks: Arc::new(Mutex::new(HashMap::new())),
+                    cancel_task_history: Arc::new(Mutex::new(VecDeque::new())),
+                    cancel_task_cap: CANCEL_TASK_CAP,
+                    cancel_task_window: Duration::from_secs(CANCEL_TASK_WINDOW_SECS),
                 },
             );
             interrupt_flag
@@ -2748,6 +2839,21 @@ impl ChatManager {
         self.spawn_nats_cancel_tools_listener(
             &session_id.to_string(),
             self.active_sessions.clone(),
+            nats_cancel.clone(),
+        );
+
+        // Spawn the per-session background-tasks poller (T12 of plan
+        // 754a1379). Wakes up every BACKGROUND_TASKS_POLL_INTERVAL_SECS
+        // seconds and physically purges any entries whose
+        // `pending_removal_at` aged past the grace period — absorbs
+        // in-flight `BackgroundOutput` ticks that arrive between the
+        // cancel SIGINT and the subprocess actually dying. Tied to
+        // `nats_cancel` so it terminates cleanly with the session.
+        Self::spawn_background_tasks_poller(
+            session_id.to_string(),
+            self.active_sessions.clone(),
+            events_tx.clone(),
+            self.nats.clone(),
             nats_cancel.clone(),
         );
 
@@ -2892,6 +2998,382 @@ impl ChatManager {
             session_id: session_id.to_string(),
             stream_url: format!("/ws/chat/{}", session_id),
         })
+    }
+
+    /// Track the start of a `Monitor` / `Bash run_in_background` invocation
+    /// in `ActiveSession::active_background_tasks`, then broadcast the
+    /// updated snapshot via `ChatEvent::ActiveTasksUpdate`.
+    ///
+    /// Plan 754a1379, T3 (INSERT side of lifecycle hooks). Called from
+    /// `stream_response` whenever a `ChatEvent::ToolUse` is observed, so
+    /// the entry materialises as soon as the SDK announces a tool call.
+    ///
+    /// ## Idempotence (two-pass call site)
+    ///
+    /// `stream_response` may call this helper twice for a single tool_use:
+    /// first when `ContentBlockStart` arrives with empty input, then when
+    /// `AssistantMessage` arrives with the full input. We use
+    /// `HashMap::entry(...).or_insert_with(...)` so the first call inserts
+    /// the placeholder entry and the second call only refreshes the
+    /// `description` field once it becomes available. Both passes also
+    /// emit a fresh `ActiveTasksUpdate` so the frontend reflects every
+    /// observable state change.
+    ///
+    /// ## Filtering
+    ///
+    /// - `tool_name == "Monitor"` → always tracked. Input is irrelevant
+    ///   to the kind decision.
+    /// - `tool_name == "Bash"` AND `input.run_in_background == true` →
+    ///   tracked as `BashBackground`. Synchronous Bash calls are ignored
+    ///   (their lifecycle is bounded by the turn).
+    /// - All other tools → ignored, returns `false` without touching
+    ///   the map or broadcasting.
+    ///
+    /// Note that Bash's `run_in_background` flag is only present on the
+    /// **second** pass (full input), so the first pass for a Bash call
+    /// returns `false` and the second pass performs the actual insert.
+    /// For Monitor, both passes succeed (the second one just updates
+    /// the description in place).
+    ///
+    /// ## Returns
+    ///
+    /// `true` if the tool is tracked (newly inserted or refreshed),
+    /// `false` if the tool isn't a tracked kind or the session is gone.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn track_background_task_start(
+        session_id: &str,
+        active_sessions: &Arc<RwLock<HashMap<String, ActiveSession>>>,
+        events_tx: &broadcast::Sender<ChatEvent>,
+        nats: &Option<Arc<crate::events::NatsEmitter>>,
+        tool_use_id: &str,
+        tool_name: &str,
+        input: &serde_json::Value,
+        parent_tool_use_id: Option<&str>,
+    ) -> bool {
+        // Decide whether the tool kind is something we track.
+        let kind = match tool_name {
+            "Monitor" => Some(BackgroundTaskKind::Monitor),
+            "Bash"
+                if input
+                    .get("run_in_background")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false) =>
+            {
+                Some(BackgroundTaskKind::BashBackground)
+            }
+            _ => None,
+        };
+        let Some(kind) = kind else {
+            return false;
+        };
+
+        // Best-effort description (input field, falls back to a placeholder
+        // before the second pass arrives with full input).
+        let description = input
+            .get("description")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("(no description)")
+            .to_string();
+
+        // Take the lock on `active_background_tasks`, upsert, and capture
+        // the fresh snapshot to broadcast outside the lock.
+        let snapshot = {
+            let sessions = active_sessions.read().await;
+            let Some(active) = sessions.get(session_id) else {
+                debug!(
+                    session_id = %session_id,
+                    "track_background_task_start: session not in active_sessions, dropping"
+                );
+                return false;
+            };
+            let mut tasks = active.active_background_tasks.lock().await;
+
+            let entry = tasks.entry(tool_use_id.to_string()).or_insert_with(|| {
+                let now = chrono::Utc::now();
+                BackgroundTaskInfo {
+                    id: tool_use_id.to_string(),
+                    kind,
+                    description: description.clone(),
+                    started_at: now,
+                    last_seen_at: now,
+                    pid: None,
+                    parent_tool_use_id: parent_tool_use_id.map(String::from),
+                    pending_removal_at: None,
+                }
+            });
+
+            // On the second pass (full input), refresh the description
+            // if we now have a real one.
+            if description != "(no description)" && !description.is_empty() {
+                entry.description = description;
+            }
+            // If the entry was previously marked for removal but the SDK
+            // surprises us with a fresh ToolUse on the same id, cancel
+            // the pending removal — the task is alive after all.
+            entry.pending_removal_at = None;
+
+            tasks.values().cloned().collect::<Vec<BackgroundTaskInfo>>()
+        };
+
+        let event = ChatEvent::ActiveTasksUpdate { tasks: snapshot };
+        let _ = events_tx.send(event.clone());
+        if let Some(ref nats) = nats {
+            nats.publish_chat_event(session_id, event);
+        }
+
+        info!(
+            session_id = %session_id,
+            tool_use_id = %tool_use_id,
+            kind = ?kind,
+            "Tracked background task start (plan 754a1379, T3)"
+        );
+        true
+    }
+
+    /// Touch the activity timestamp on a tracked background task,
+    /// AND lazy-recover orphan correlation_ids in the same call.
+    ///
+    /// Called by the OOB listener for every `BackgroundOutput` tick.
+    /// One of three outcomes:
+    ///
+    /// 1. Already-tracked id (live or `pending_removal_at`): updates
+    ///    `last_seen_at = Utc::now()`. No broadcast (the field is on
+    ///    the wire format but tick-by-tick refreshes are noise; the
+    ///    next state-change broadcast carries the latest value).
+    /// 2. Orphan correlation_id + recoverable source ("Monitor",
+    ///    "BashOutput"): inserts a recovered entry, broadcasts a fresh
+    ///    `ActiveTasksUpdate` (T13 lazy recovery).
+    /// 3. Otherwise (None / unknown source): no-op.
+    ///
+    /// ## Why lazy instead of `pgrep` rebuild at create_session
+    ///
+    /// See decision `f2151626` on the T13 task. Short version:
+    /// pgrep matching `tool_use_id → root PID` is imprecise (cmdline
+    /// doesn't carry the id), false-positive prone (random
+    /// CLI-internal helpers would also be listed), and platform-fragile
+    /// (/proc on Linux vs ps on macOS). Lazy recovery via
+    /// `BackgroundOutput` is automatically correct: only subprocesses
+    /// that are still emitting events reappear, and dead ones are
+    /// never resurrected.
+    ///
+    /// Plan 754a1379 (T13).
+    ///
+    /// ## Behaviour
+    ///
+    /// - `correlation_id == None` → no-op, returns `false`.
+    /// - `correlation_id` already in the map → no-op (live or
+    ///   `pending_removal_at`), returns `false`.
+    /// - `correlation_id` orphan + `source == "Monitor"` →
+    ///   insert as `Monitor`, broadcast `ActiveTasksUpdate`,
+    ///   returns `true`.
+    /// - `correlation_id` orphan + `source == "BashOutput"` →
+    ///   insert as `BashBackground`, broadcast, returns `true`.
+    /// - Any other source ("system", unknown) → returns `false`. We
+    ///   don't speculatively recover unknown kinds — the user can
+    ///   still cancel via the global Stop.
+    ///
+    /// Recovered entries carry `description = "(recovered after
+    /// restart)"`, `parent_tool_use_id = Some(correlation_id)`,
+    /// `pid = None`, `pending_removal_at = None`. The id field is
+    /// the original tool_use_id (= correlation_id), NOT a synthetic
+    /// `recovered-{pid}`.
+    pub(crate) async fn track_background_task_recovery_if_orphan(
+        session_id: &str,
+        active_sessions: &Arc<RwLock<HashMap<String, ActiveSession>>>,
+        events_tx: &broadcast::Sender<ChatEvent>,
+        nats: &Option<Arc<crate::events::NatsEmitter>>,
+        correlation_id: Option<&str>,
+        source: &str,
+    ) -> bool {
+        let Some(correlation_id) = correlation_id else {
+            return false;
+        };
+
+        let kind = match source {
+            "Monitor" => BackgroundTaskKind::Monitor,
+            "BashOutput" => BackgroundTaskKind::BashBackground,
+            _ => return false,
+        };
+
+        let snapshot = {
+            let tasks_arc = {
+                let sessions = active_sessions.read().await;
+                let Some(active) = sessions.get(session_id) else {
+                    return false;
+                };
+                active.active_background_tasks.clone()
+            };
+            let mut tasks = tasks_arc.lock().await;
+            if let Some(entry) = tasks.get_mut(correlation_id) {
+                // Path 1 — already tracked: refresh activity timestamp
+                // for the death detector. No broadcast (a tick-by-tick
+                // ActiveTasksUpdate would saturate the WebSocket on
+                // chatty Monitors).
+                entry.last_seen_at = chrono::Utc::now();
+                return false;
+            }
+            let now = chrono::Utc::now();
+            tasks.insert(
+                correlation_id.to_string(),
+                BackgroundTaskInfo {
+                    id: correlation_id.to_string(),
+                    kind,
+                    description: "(recovered after restart)".to_string(),
+                    started_at: now,
+                    last_seen_at: now,
+                    pid: None,
+                    parent_tool_use_id: Some(correlation_id.to_string()),
+                    pending_removal_at: None,
+                },
+            );
+            info!(
+                session_id = %session_id,
+                correlation_id = %correlation_id,
+                kind = ?kind,
+                source = %source,
+                "Lazy-recovered orphan BackgroundOutput as new BackgroundTaskInfo (T13)"
+            );
+            tasks.values().cloned().collect::<Vec<BackgroundTaskInfo>>()
+        };
+
+        let event = ChatEvent::ActiveTasksUpdate { tasks: snapshot };
+        let _ = events_tx.send(event.clone());
+        if let Some(ref nats) = nats {
+            nats.publish_chat_event(session_id, event);
+        }
+        true
+    }
+
+    /// Spawn the per-session background-tasks poller. The poller wakes
+    /// up every `BACKGROUND_TASKS_POLL_INTERVAL_SECS` seconds and runs
+    /// `tick_purge_background_tasks`, which physically removes any
+    /// entries whose `pending_removal_at` aged past
+    /// `BACKGROUND_TASK_PURGE_GRACE_SECS`.
+    ///
+    /// Plan 754a1379 (T12 — race-safe purge). The grace period absorbs
+    /// in-flight `BackgroundOutput` ticks that arrive between the
+    /// cancel SIGINT and the subprocess actually dying.
+    ///
+    /// The poller terminates when `cancel_token` is fired — typically
+    /// `nats_cancel` of the owning `ActiveSession`, which is also the
+    /// cancel token for the OOB listener. Tying both to the same token
+    /// guarantees a clean teardown on session end (or `resume_session`,
+    /// which cancels the previous session's tokens before spawning new
+    /// ones).
+    pub(crate) fn spawn_background_tasks_poller(
+        session_id: String,
+        active_sessions: Arc<RwLock<HashMap<String, ActiveSession>>>,
+        events_tx: broadcast::Sender<ChatEvent>,
+        nats: Option<Arc<crate::events::NatsEmitter>>,
+        cancel_token: CancellationToken,
+    ) {
+        tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(Duration::from_secs(BACKGROUND_TASKS_POLL_INTERVAL_SECS));
+            // Skip the immediate first tick so we don't run a purge
+            // before any state has even been mutated.
+            interval.tick().await;
+            let grace = Duration::from_secs(BACKGROUND_TASK_PURGE_GRACE_SECS);
+
+            loop {
+                tokio::select! {
+                    _ = cancel_token.cancelled() => {
+                        debug!(
+                            session_id = %session_id,
+                            "background_tasks_poller: cancelled, exiting"
+                        );
+                        return;
+                    }
+                    _ = interval.tick() => {
+                        Self::tick_purge_background_tasks(
+                            &session_id,
+                            &active_sessions,
+                            &events_tx,
+                            &nats,
+                            grace,
+                        )
+                        .await;
+                    }
+                }
+            }
+        });
+    }
+
+    /// One poller pass. Two-phase:
+    ///
+    /// 1. **Idle-death detection** — entries whose `last_seen_at` is
+    ///    older than `idle_death` AND have no `pending_removal_at` get
+    ///    marked `pending_removal_at = Some(now)` (T3 REMOVE side).
+    /// 2. **Grace-period purge** — entries whose `pending_removal_at`
+    ///    is older than `grace` are physically removed (T12).
+    ///
+    /// Broadcasts a single fresh `ActiveTasksUpdate` if **either**
+    /// phase mutated the map. No-op (no broadcast) on a quiet tick.
+    /// Public-crate so tests can drive it without waiting for the
+    /// real interval.
+    pub(crate) async fn tick_purge_background_tasks(
+        session_id: &str,
+        active_sessions: &Arc<RwLock<HashMap<String, ActiveSession>>>,
+        events_tx: &broadcast::Sender<ChatEvent>,
+        nats: &Option<Arc<crate::events::NatsEmitter>>,
+        grace: Duration,
+    ) {
+        let tasks_arc = {
+            let sessions = active_sessions.read().await;
+            match sessions.get(session_id) {
+                Some(active) => active.active_background_tasks.clone(),
+                None => return,
+            }
+        };
+
+        let now_inst = std::time::Instant::now();
+        let now_chrono = chrono::Utc::now();
+        let idle_death = chrono::Duration::seconds(BACKGROUND_TASK_IDLE_DEATH_SECS as i64);
+
+        let snapshot = {
+            let mut tasks = tasks_arc.lock().await;
+
+            // Phase 1: idle-death detection. Mark live entries that
+            // haven't emitted in too long.
+            let mut newly_marked = 0usize;
+            for info in tasks.values_mut() {
+                if info.pending_removal_at.is_some() {
+                    continue;
+                }
+                if (now_chrono - info.last_seen_at) >= idle_death {
+                    info.pending_removal_at = Some(now_inst);
+                    newly_marked += 1;
+                }
+            }
+
+            // Phase 2: physical purge of grace-expired entries.
+            let before = tasks.len();
+            tasks.retain(|_id, info| {
+                !matches!(
+                    info.pending_removal_at,
+                    Some(at) if now_inst.saturating_duration_since(at) >= grace
+                )
+            });
+            let purged = before - tasks.len();
+
+            if newly_marked == 0 && purged == 0 {
+                return;
+            }
+            info!(
+                session_id = %session_id,
+                idle_marked = newly_marked,
+                purged = purged,
+                remaining = tasks.len(),
+                "background_tasks_poller: idle-marked + purged (T3 + T12)"
+            );
+            tasks.values().cloned().collect::<Vec<BackgroundTaskInfo>>()
+        };
+
+        let event = ChatEvent::ActiveTasksUpdate { tasks: snapshot };
+        let _ = events_tx.send(event.clone());
+        if let Some(ref nats) = nats {
+            nats.publish_chat_event(session_id, event);
+        }
     }
 
     /// Internal: send a message to the client and stream the response to broadcast
@@ -3561,11 +4043,32 @@ impl ChatManager {
                                     //    record and streaming_events with the full input.
                                     if let ChatEvent::ToolUse {
                                         ref id,
+                                        ref tool,
                                         ref input,
                                         ref parent_tool_use_id,
-                                        ..
                                     } = event
                                     {
+                                        // Plan 754a1379, T3 — INSERT side of the
+                                        // background-task lifecycle. Idempotent across
+                                        // both ContentBlockStart (empty input) and
+                                        // AssistantMessage (full input) passes; for
+                                        // Monitor the first call inserts and the second
+                                        // refreshes the description, for Bash with
+                                        // run_in_background=true only the second call
+                                        // succeeds (the flag isn't visible on the first
+                                        // pass).
+                                        let _ = Self::track_background_task_start(
+                                            &session_id,
+                                            &active_sessions,
+                                            &events_tx,
+                                            &nats,
+                                            id,
+                                            tool,
+                                            input,
+                                            parent_tool_use_id.as_deref(),
+                                        )
+                                        .await;
+
                                         if let Some(persist_idx) = emitted_tool_use_ids.get(id) {
                                             // Duplicate — update persisted record with full input
                                             let has_real_input = input.is_object()
@@ -4800,6 +5303,10 @@ impl ChatManager {
                     cancel_tools_history: Arc::new(Mutex::new(VecDeque::new())),
                     cancel_tools_cap: CANCEL_TOOLS_CAP,
                     cancel_tools_window: Duration::from_secs(CANCEL_TOOLS_WINDOW_SECS),
+                    active_background_tasks: Arc::new(Mutex::new(HashMap::new())),
+                    cancel_task_history: Arc::new(Mutex::new(VecDeque::new())),
+                    cancel_task_cap: CANCEL_TASK_CAP,
+                    cancel_task_window: Duration::from_secs(CANCEL_TASK_WINDOW_SECS),
                 },
             );
             interrupt_flag
@@ -5506,6 +6013,171 @@ impl ChatManager {
             killed_pids,
             capped: false,
         })
+    }
+
+    /// Cancel a single tracked background task (Monitor, Bash bg) by id.
+    ///
+    /// Plan 754a1379 (T7). The granular companion to `cancel_running_tools`
+    /// — instead of killing every descendant of the CLI, this targets a
+    /// single tracked task by its `tool_use_id` (= map key).
+    ///
+    /// ## V1 semantics — map-side cancel only
+    ///
+    /// V1 marks the entry as `pending_removal_at = Some(now)` (the actual
+    /// physical purge happens after `GRACE_PERIOD` in T12) and broadcasts
+    /// a fresh `ChatEvent::ActiveTasksUpdate` so the frontend immediately
+    /// reflects the cancelled state. **It does NOT yet send SIGINT to
+    /// the subprocess** — PID-targeted kill requires a discovery
+    /// mechanism that maps `tool_use_id → root PID`, which is out of
+    /// scope for this commit (will land alongside T13 once
+    /// `identify_subprocess_kind` exists).
+    ///
+    /// **What this means in practice**: the user clicks Stop on a
+    /// specific Monitor → the toolbar pill disappears immediately, but
+    /// the underlying `tail -F` keeps emitting ticks for a short window.
+    /// Those orphan ticks are absorbed by the grace period (T12) and the
+    /// frontend's orphan-correlation_id buffer (F10).
+    ///
+    /// To actually kill the subprocess in V1, the user must use the
+    /// global `cancel_running_tools` (Stop button on the active turn) —
+    /// which kills every descendant. This is documented in the UX so
+    /// users with a single Monitor running get the same effect.
+    ///
+    /// ## Cap
+    ///
+    /// Reuses `check_and_record_cancel_cap` with the per-session
+    /// `cancel_task_history` (T9 fields). Default 30 invocations / 5
+    /// minutes. The cap is more generous than `cancel_running_tools`
+    /// (10/60s) because the per-task popover can naturally produce more
+    /// clicks (one per tracked task).
+    ///
+    /// ## NATS routing
+    ///
+    /// Cross-instance: if the session is owned by another instance,
+    /// publishes a `cancel_task` event over NATS so the owning instance
+    /// performs the local map mutation. (Mirror of
+    /// `publish_cancel_tools` — added in a follow-up alongside the
+    /// listener wiring.)
+    ///
+    /// ## Returns
+    ///
+    /// - `CancelTaskResult { task_id, killed_pids: vec![], capped: false }`
+    ///   on success — `killed_pids` always empty in V1.
+    /// - `capped: true` if the rate cap was hit (no broadcast, no map
+    ///   mutation).
+    /// - Returns `Ok(...)` even if the session is unknown or the
+    ///   task_id isn't in the map (idempotent — clicking Stop twice on
+    ///   the same task is fine).
+    pub async fn cancel_task(&self, session_id: &str, task_id: &str) -> Result<CancelTaskResult> {
+        let session_state = {
+            let sessions = self.active_sessions.read().await;
+            sessions.get(session_id).map(|s| {
+                (
+                    s.cancel_task_history.clone(),
+                    s.cancel_task_cap,
+                    s.cancel_task_window,
+                    s.events_tx.clone(),
+                    s.active_background_tasks.clone(),
+                )
+            })
+        };
+
+        let (history, cap, window, events_tx, tasks_arc) = match session_state {
+            Some(state) => state,
+            None => {
+                debug!(
+                    session_id = %session_id,
+                    task_id = %task_id,
+                    "cancel_task: session not active locally; idempotent no-op"
+                );
+                if let Some(ref _nats) = self.nats {
+                    // TODO follow-up: nats.publish_cancel_task(session_id, task_id)
+                    // once the cross-instance listener exists.
+                }
+                return Ok(CancelTaskResult {
+                    task_id: task_id.to_string(),
+                    killed_pids: Vec::new(),
+                    capped: false,
+                });
+            }
+        };
+
+        // Rate cap.
+        let capped = !Self::check_and_record_cancel_cap(&history, cap, window).await;
+        if capped {
+            warn!(
+                session_id = %session_id,
+                task_id = %task_id,
+                cap = cap,
+                window_secs = window.as_secs(),
+                "cancel_task: rate cap hit, refusing"
+            );
+            return Ok(CancelTaskResult {
+                task_id: task_id.to_string(),
+                killed_pids: Vec::new(),
+                capped: true,
+            });
+        }
+
+        // Mark for removal + capture snapshot for broadcast.
+        let snapshot = {
+            let mut tasks = tasks_arc.lock().await;
+            if let Some(entry) = tasks.get_mut(task_id) {
+                entry.pending_removal_at = Some(std::time::Instant::now());
+                info!(
+                    session_id = %session_id,
+                    task_id = %task_id,
+                    kind = ?entry.kind,
+                    "cancel_task: marked for removal (grace period via T12)"
+                );
+            } else {
+                debug!(
+                    session_id = %session_id,
+                    task_id = %task_id,
+                    "cancel_task: task_id unknown in map; idempotent no-op"
+                );
+            }
+            tasks.values().cloned().collect::<Vec<BackgroundTaskInfo>>()
+        };
+
+        let event = ChatEvent::ActiveTasksUpdate { tasks: snapshot };
+        let _ = events_tx.send(event.clone());
+        if let Some(ref nats) = self.nats {
+            nats.publish_chat_event(session_id, event);
+            // TODO follow-up: nats.publish_cancel_task(session_id, task_id);
+        }
+
+        Ok(CancelTaskResult {
+            task_id: task_id.to_string(),
+            killed_pids: Vec::new(),
+            capped: false,
+        })
+    }
+
+    /// Snapshot the current background task tracking map for a session.
+    ///
+    /// Returns an empty `Vec` if the session is unknown locally — the
+    /// caller (typically the REST snapshot endpoint, T6) treats this as
+    /// "no tasks active" rather than 404, since a fresh session legitimately
+    /// has none. Plan 754a1379 (T6).
+    ///
+    /// Used by the frontend on WebSocket reconnect to re-hydrate the
+    /// toolbar indicator and any in-progress MonitorCards before the
+    /// next `ChatEvent::ActiveTasksUpdate` lands.
+    pub async fn get_active_background_tasks(&self, session_id: &str) -> Vec<BackgroundTaskInfo> {
+        // Drop the read lock on `active_sessions` before taking the
+        // per-session mutex to avoid holding two locks simultaneously
+        // and keep the borrow-checker happy (the inner Arc clone moves
+        // out of the read guard's borrow scope).
+        let tasks_arc = {
+            let sessions = self.active_sessions.read().await;
+            match sessions.get(session_id) {
+                Some(active) => active.active_background_tasks.clone(),
+                None => return Vec::new(),
+            }
+        };
+        let result: Vec<BackgroundTaskInfo> = tasks_arc.lock().await.values().cloned().collect();
+        result
     }
 
     /// Sliding-window rate cap helper for `cancel_running_tools`.
@@ -7787,6 +8459,10 @@ mod tests {
             cancel_tools_history: Arc::new(Mutex::new(VecDeque::new())),
             cancel_tools_cap: CANCEL_TOOLS_CAP,
             cancel_tools_window: Duration::from_secs(CANCEL_TOOLS_WINDOW_SECS),
+            active_background_tasks: Arc::new(Mutex::new(HashMap::new())),
+            cancel_task_history: Arc::new(Mutex::new(VecDeque::new())),
+            cancel_task_cap: CANCEL_TASK_CAP,
+            cancel_task_window: Duration::from_secs(CANCEL_TASK_WINDOW_SECS),
         };
 
         Some((session, pending_messages))
@@ -8690,6 +9366,10 @@ mod tests {
             cancel_tools_history: Arc::new(Mutex::new(VecDeque::new())),
             cancel_tools_cap: CANCEL_TOOLS_CAP,
             cancel_tools_window: Duration::from_secs(CANCEL_TOOLS_WINDOW_SECS),
+            active_background_tasks: Arc::new(Mutex::new(HashMap::new())),
+            cancel_task_history: Arc::new(Mutex::new(VecDeque::new())),
+            cancel_task_cap: CANCEL_TASK_CAP,
+            cancel_task_window: Duration::from_secs(CANCEL_TASK_WINDOW_SECS),
         };
 
         (session, handle)
@@ -10381,5 +11061,944 @@ mod tests {
         let json = serde_json::to_string(&result).expect("serialize");
         assert!(json.contains("\"capped\":true"));
         assert!(json.contains("\"killed_pids\":[]"));
+    }
+
+    // ========================================================================
+    // T3 of plan 754a1379 — track_background_task_start (INSERT lifecycle hook)
+    // ========================================================================
+
+    /// Helper: insert a dummy session under the given id and return the
+    /// active_sessions map ready for the helper. Returns None if Claude
+    /// CLI is not installed (skipping the test).
+    async fn build_sessions_map_for_track_test(
+        session_id: &str,
+    ) -> Option<(
+        Arc<RwLock<HashMap<String, ActiveSession>>>,
+        broadcast::Sender<ChatEvent>,
+        broadcast::Receiver<ChatEvent>,
+    )> {
+        let (session, _) = try_create_dummy_session(false, "", vec![])?;
+        let events_tx = session.events_tx.clone();
+        let events_rx = events_tx.subscribe();
+        let map = Arc::new(RwLock::new(HashMap::new()));
+        map.write().await.insert(session_id.to_string(), session);
+        Some((map, events_tx, events_rx))
+    }
+
+    #[tokio::test]
+    async fn test_track_background_task_inserts_monitor_on_first_pass() {
+        let Some((sessions, events_tx, mut events_rx)) =
+            build_sessions_map_for_track_test("s-mon").await
+        else {
+            eprintln!("Skipping test: Claude CLI not installed");
+            return;
+        };
+
+        // First pass: ContentBlockStart with empty input.
+        let inserted = ChatManager::track_background_task_start(
+            "s-mon",
+            &sessions,
+            &events_tx,
+            &None,
+            "tool_M1",
+            "Monitor",
+            &serde_json::json!({}),
+            None,
+        )
+        .await;
+        assert!(inserted, "Monitor should be tracked on first pass");
+
+        // Map should now have one entry.
+        let session_guard = sessions.read().await;
+        let session = session_guard.get("s-mon").unwrap();
+        let tasks = session.active_background_tasks.lock().await;
+        assert_eq!(tasks.len(), 1);
+        let entry = tasks.get("tool_M1").unwrap();
+        assert_eq!(entry.kind, BackgroundTaskKind::Monitor);
+        assert_eq!(entry.description, "(no description)");
+
+        // Should have broadcast an ActiveTasksUpdate.
+        let event = events_rx.try_recv().expect("expected one broadcast");
+        match event {
+            ChatEvent::ActiveTasksUpdate { tasks } => assert_eq!(tasks.len(), 1),
+            other => panic!("expected ActiveTasksUpdate, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_track_background_task_updates_description_on_second_pass() {
+        let Some((sessions, events_tx, mut events_rx)) =
+            build_sessions_map_for_track_test("s-mon2").await
+        else {
+            eprintln!("Skipping test: Claude CLI not installed");
+            return;
+        };
+
+        // First pass — empty input, placeholder description.
+        ChatManager::track_background_task_start(
+            "s-mon2",
+            &sessions,
+            &events_tx,
+            &None,
+            "tool_M2",
+            "Monitor",
+            &serde_json::json!({}),
+            None,
+        )
+        .await;
+        // Drain first broadcast.
+        let _ = events_rx.try_recv();
+
+        // Second pass — full input with description.
+        ChatManager::track_background_task_start(
+            "s-mon2",
+            &sessions,
+            &events_tx,
+            &None,
+            "tool_M2",
+            "Monitor",
+            &serde_json::json!({
+                "command": "tail -F /tmp/build.log",
+                "description": "watch build log",
+                "persistent": false,
+                "timeout_ms": 300000,
+            }),
+            None,
+        )
+        .await;
+
+        let session_guard = sessions.read().await;
+        let tasks = session_guard
+            .get("s-mon2")
+            .unwrap()
+            .active_background_tasks
+            .lock()
+            .await;
+        // Still one entry (idempotent), description refreshed.
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks.get("tool_M2").unwrap().description, "watch build log");
+
+        // Two broadcasts total (one per pass).
+        events_rx.try_recv().expect("second broadcast missing");
+    }
+
+    #[tokio::test]
+    async fn test_track_background_task_bash_run_in_background_first_pass_skipped() {
+        let Some((sessions, events_tx, mut events_rx)) =
+            build_sessions_map_for_track_test("s-bash").await
+        else {
+            eprintln!("Skipping test: Claude CLI not installed");
+            return;
+        };
+
+        // First pass: empty input, run_in_background flag absent → not tracked.
+        let inserted = ChatManager::track_background_task_start(
+            "s-bash",
+            &sessions,
+            &events_tx,
+            &None,
+            "tool_B1",
+            "Bash",
+            &serde_json::json!({}),
+            None,
+        )
+        .await;
+        assert!(!inserted, "Bash with empty input must not be tracked yet");
+
+        // Second pass: full input with run_in_background=true → tracked.
+        let inserted = ChatManager::track_background_task_start(
+            "s-bash",
+            &sessions,
+            &events_tx,
+            &None,
+            "tool_B1",
+            "Bash",
+            &serde_json::json!({
+                "command": "cargo watch -x test",
+                "description": "run tests on change",
+                "run_in_background": true,
+            }),
+            None,
+        )
+        .await;
+        assert!(inserted, "Bash with run_in_background=true must be tracked");
+
+        let session_guard = sessions.read().await;
+        let tasks = session_guard
+            .get("s-bash")
+            .unwrap()
+            .active_background_tasks
+            .lock()
+            .await;
+        assert_eq!(tasks.len(), 1);
+        let entry = tasks.get("tool_B1").unwrap();
+        assert_eq!(entry.kind, BackgroundTaskKind::BashBackground);
+        assert_eq!(entry.description, "run tests on change");
+
+        // Only ONE broadcast (the second pass) since the first returned false.
+        events_rx.try_recv().expect("expected the second broadcast");
+        assert!(events_rx.try_recv().is_err(), "no extra broadcast");
+    }
+
+    #[tokio::test]
+    async fn test_track_background_task_bash_synchronous_not_tracked() {
+        let Some((sessions, events_tx, mut events_rx)) =
+            build_sessions_map_for_track_test("s-bash-sync").await
+        else {
+            eprintln!("Skipping test: Claude CLI not installed");
+            return;
+        };
+
+        // Synchronous Bash (run_in_background absent or false) — never tracked.
+        let inserted_a = ChatManager::track_background_task_start(
+            "s-bash-sync",
+            &sessions,
+            &events_tx,
+            &None,
+            "tool_B2",
+            "Bash",
+            &serde_json::json!({ "command": "ls" }),
+            None,
+        )
+        .await;
+        let inserted_b = ChatManager::track_background_task_start(
+            "s-bash-sync",
+            &sessions,
+            &events_tx,
+            &None,
+            "tool_B3",
+            "Bash",
+            &serde_json::json!({ "command": "pwd", "run_in_background": false }),
+            None,
+        )
+        .await;
+        assert!(!inserted_a);
+        assert!(!inserted_b);
+
+        let tasks = sessions
+            .read()
+            .await
+            .get("s-bash-sync")
+            .unwrap()
+            .active_background_tasks
+            .lock()
+            .await
+            .len();
+        assert_eq!(tasks, 0, "no Bash should be tracked");
+        assert!(
+            events_rx.try_recv().is_err(),
+            "no broadcast expected for untracked tools"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_track_background_task_other_tools_ignored() {
+        let Some((sessions, events_tx, _events_rx)) =
+            build_sessions_map_for_track_test("s-other").await
+        else {
+            eprintln!("Skipping test: Claude CLI not installed");
+            return;
+        };
+
+        for tool in ["Read", "Write", "Edit", "Glob", "Task"] {
+            let inserted = ChatManager::track_background_task_start(
+                "s-other",
+                &sessions,
+                &events_tx,
+                &None,
+                "tool_X",
+                tool,
+                &serde_json::json!({"description": "should be ignored"}),
+                None,
+            )
+            .await;
+            assert!(!inserted, "{} must not be tracked", tool);
+        }
+
+        let count = sessions
+            .read()
+            .await
+            .get("s-other")
+            .unwrap()
+            .active_background_tasks
+            .lock()
+            .await
+            .len();
+        assert_eq!(count, 0);
+    }
+
+    // ========================================================================
+    // T7 of plan 754a1379 — cancel_task (map-side cancel V1)
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_cancel_task_marks_for_removal_and_broadcasts() {
+        let Some((session, _)) = try_create_dummy_session(false, "", vec![]) else {
+            eprintln!("Skipping test: Claude CLI not installed");
+            return;
+        };
+        let mut events_rx = session.events_tx.subscribe();
+        // Pre-seed a task in the map.
+        session.active_background_tasks.lock().await.insert(
+            "tool_T1".into(),
+            BackgroundTaskInfo {
+                id: "tool_T1".into(),
+                kind: BackgroundTaskKind::Monitor,
+                description: "tail log".into(),
+                started_at: chrono::Utc::now(),
+                last_seen_at: chrono::Utc::now(),
+                pid: None,
+                parent_tool_use_id: Some("tool_T1".into()),
+                pending_removal_at: None,
+            },
+        );
+
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        manager
+            .active_sessions
+            .write()
+            .await
+            .insert("s-cancel".into(), session);
+
+        let result = manager.cancel_task("s-cancel", "tool_T1").await.unwrap();
+        assert_eq!(result.task_id, "tool_T1");
+        assert!(result.killed_pids.is_empty(), "V1 returns no killed_pids");
+        assert!(!result.capped);
+
+        // Entry should be marked for removal but still in the map (T12 grace).
+        let sessions = manager.active_sessions.read().await;
+        let tasks = sessions
+            .get("s-cancel")
+            .unwrap()
+            .active_background_tasks
+            .lock()
+            .await;
+        assert_eq!(tasks.len(), 1);
+        assert!(tasks.get("tool_T1").unwrap().pending_removal_at.is_some());
+
+        // Broadcast: ActiveTasksUpdate carrying the snapshot (the entry is
+        // still visible — it's the grace-period state).
+        let event = events_rx.try_recv().expect("expected broadcast");
+        match event {
+            ChatEvent::ActiveTasksUpdate { tasks } => assert_eq!(tasks.len(), 1),
+            other => panic!("expected ActiveTasksUpdate, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cancel_task_unknown_task_id_idempotent() {
+        let Some((session, _)) = try_create_dummy_session(false, "", vec![]) else {
+            eprintln!("Skipping test: Claude CLI not installed");
+            return;
+        };
+        let mut events_rx = session.events_tx.subscribe();
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        manager
+            .active_sessions
+            .write()
+            .await
+            .insert("s-empty".into(), session);
+
+        // No tasks in the map — cancel still succeeds, just broadcasts an
+        // empty snapshot (idempotent: cancelling something that was never
+        // there is OK).
+        let result = manager.cancel_task("s-empty", "unknown_id").await.unwrap();
+        assert!(!result.capped);
+        assert!(result.killed_pids.is_empty());
+
+        let event = events_rx.try_recv().expect("broadcast still emitted");
+        match event {
+            ChatEvent::ActiveTasksUpdate { tasks } => assert!(tasks.is_empty()),
+            other => panic!("expected empty ActiveTasksUpdate, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cancel_task_unknown_session_idempotent() {
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+
+        // No session inserted at all.
+        let result = manager
+            .cancel_task("ghost-session", "tool_X")
+            .await
+            .unwrap();
+        assert_eq!(result.task_id, "tool_X");
+        assert!(!result.capped);
+        assert!(result.killed_pids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_cancel_task_rate_cap_enforced() {
+        let Some((mut session, _)) = try_create_dummy_session(false, "", vec![]) else {
+            eprintln!("Skipping test: Claude CLI not installed");
+            return;
+        };
+        // Tighten the cap so the test runs in milliseconds: 2 cancels /
+        // 60s window. Reusing the same window const would make the test
+        // either very slow or flaky.
+        session.cancel_task_cap = 2;
+        session.cancel_task_window = Duration::from_secs(60);
+
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        manager
+            .active_sessions
+            .write()
+            .await
+            .insert("s-cap".into(), session);
+
+        // 2 calls allowed.
+        for _ in 0..2 {
+            let r = manager.cancel_task("s-cap", "tool_W").await.unwrap();
+            assert!(!r.capped);
+        }
+        // 3rd call should be capped.
+        let r = manager.cancel_task("s-cap", "tool_W").await.unwrap();
+        assert!(r.capped, "3rd call must be capped");
+        assert!(r.killed_pids.is_empty());
+    }
+
+    // ========================================================================
+    // T13 of plan 754a1379 — track_background_task_recovery_if_orphan
+    // (lazy crash-recovery via BackgroundOutput orphan correlation_id)
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_recovery_inserts_orphan_monitor() {
+        let Some((session, _)) = try_create_dummy_session(false, "", vec![]) else {
+            eprintln!("Skipping test: Claude CLI not installed");
+            return;
+        };
+        let mut events_rx = session.events_tx.subscribe();
+        let events_tx = session.events_tx.clone();
+
+        let map: Arc<RwLock<HashMap<String, ActiveSession>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        map.write().await.insert("s-rec".into(), session);
+
+        let inserted = ChatManager::track_background_task_recovery_if_orphan(
+            "s-rec",
+            &map,
+            &events_tx,
+            &None,
+            Some("toolu_orphan_M"),
+            "Monitor",
+        )
+        .await;
+        assert!(inserted);
+
+        // Map now has the recovered entry.
+        let sessions_guard = map.read().await;
+        let tasks = sessions_guard
+            .get("s-rec")
+            .unwrap()
+            .active_background_tasks
+            .lock()
+            .await;
+        assert_eq!(tasks.len(), 1);
+        let entry = tasks.get("toolu_orphan_M").unwrap();
+        assert_eq!(entry.kind, BackgroundTaskKind::Monitor);
+        assert_eq!(entry.description, "(recovered after restart)");
+        assert_eq!(
+            entry.parent_tool_use_id.as_deref(),
+            Some("toolu_orphan_M"),
+            "parent_tool_use_id mirrors the recovered id"
+        );
+        drop(tasks);
+        drop(sessions_guard);
+
+        // Broadcast carries the snapshot.
+        let event = events_rx.try_recv().expect("expected broadcast");
+        match event {
+            ChatEvent::ActiveTasksUpdate { tasks } => {
+                assert_eq!(tasks.len(), 1);
+                assert_eq!(tasks[0].id, "toolu_orphan_M");
+            }
+            other => panic!("expected ActiveTasksUpdate, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_recovery_inserts_orphan_bash_background() {
+        let Some((session, _)) = try_create_dummy_session(false, "", vec![]) else {
+            eprintln!("Skipping test: Claude CLI not installed");
+            return;
+        };
+        let events_tx = session.events_tx.clone();
+
+        let map: Arc<RwLock<HashMap<String, ActiveSession>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        map.write().await.insert("s-rec-b".into(), session);
+
+        let inserted = ChatManager::track_background_task_recovery_if_orphan(
+            "s-rec-b",
+            &map,
+            &events_tx,
+            &None,
+            Some("toolu_orphan_B"),
+            "BashOutput",
+        )
+        .await;
+        assert!(inserted);
+
+        let sessions_guard = map.read().await;
+        let tasks = sessions_guard
+            .get("s-rec-b")
+            .unwrap()
+            .active_background_tasks
+            .lock()
+            .await;
+        assert_eq!(
+            tasks.get("toolu_orphan_B").unwrap().kind,
+            BackgroundTaskKind::BashBackground
+        );
+    }
+
+    #[tokio::test]
+    async fn test_recovery_skips_already_tracked() {
+        let Some((session, _)) = try_create_dummy_session(false, "", vec![]) else {
+            eprintln!("Skipping test: Claude CLI not installed");
+            return;
+        };
+        let mut events_rx = session.events_tx.subscribe();
+        let events_tx = session.events_tx.clone();
+
+        // Pre-seed an entry under the same id.
+        session.active_background_tasks.lock().await.insert(
+            "toolu_existing".into(),
+            BackgroundTaskInfo {
+                id: "toolu_existing".into(),
+                kind: BackgroundTaskKind::Monitor,
+                description: "original".into(),
+                started_at: chrono::Utc::now(),
+                last_seen_at: chrono::Utc::now(),
+                pid: None,
+                parent_tool_use_id: Some("toolu_existing".into()),
+                pending_removal_at: None,
+            },
+        );
+
+        let map: Arc<RwLock<HashMap<String, ActiveSession>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        map.write().await.insert("s-rec-skip".into(), session);
+
+        let inserted = ChatManager::track_background_task_recovery_if_orphan(
+            "s-rec-skip",
+            &map,
+            &events_tx,
+            &None,
+            Some("toolu_existing"),
+            "Monitor",
+        )
+        .await;
+        assert!(!inserted, "already-tracked id must not trigger insertion");
+
+        // Description preserved (we did NOT overwrite).
+        let sessions_guard = map.read().await;
+        let tasks = sessions_guard
+            .get("s-rec-skip")
+            .unwrap()
+            .active_background_tasks
+            .lock()
+            .await;
+        assert_eq!(tasks.get("toolu_existing").unwrap().description, "original");
+        drop(tasks);
+        drop(sessions_guard);
+
+        // No broadcast on no-op.
+        assert!(events_rx.try_recv().is_err(), "no broadcast for no-op");
+    }
+
+    #[tokio::test]
+    async fn test_recovery_ignores_unknown_source() {
+        let Some((session, _)) = try_create_dummy_session(false, "", vec![]) else {
+            eprintln!("Skipping test: Claude CLI not installed");
+            return;
+        };
+        let events_tx = session.events_tx.clone();
+
+        let map: Arc<RwLock<HashMap<String, ActiveSession>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        map.write().await.insert("s-rec-unk".into(), session);
+
+        for source in ["system", "WebFetch", "", "foobar"] {
+            let inserted = ChatManager::track_background_task_recovery_if_orphan(
+                "s-rec-unk",
+                &map,
+                &events_tx,
+                &None,
+                Some("toolu_X"),
+                source,
+            )
+            .await;
+            assert!(!inserted, "source `{}` should not trigger recovery", source);
+        }
+
+        let count = map
+            .read()
+            .await
+            .get("s-rec-unk")
+            .unwrap()
+            .active_background_tasks
+            .lock()
+            .await
+            .len();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_recovery_touches_last_seen_at_on_known_correlation_id() {
+        // Path 1: known correlation_id → refresh last_seen_at, no broadcast,
+        // returns false (no insertion, but the refresh is the silent
+        // side-effect that drives idle-death detection).
+        let Some((session, _)) = try_create_dummy_session(false, "", vec![]) else {
+            eprintln!("Skipping test: Claude CLI not installed");
+            return;
+        };
+        let mut events_rx = session.events_tx.subscribe();
+        let events_tx = session.events_tx.clone();
+
+        // Pre-seed an old entry — last_seen_at deep in the past.
+        let old = chrono::Utc::now() - chrono::Duration::hours(2);
+        session.active_background_tasks.lock().await.insert(
+            "tool_known".into(),
+            BackgroundTaskInfo {
+                id: "tool_known".into(),
+                kind: BackgroundTaskKind::Monitor,
+                description: "watched a long time".into(),
+                started_at: old,
+                last_seen_at: old,
+                pid: None,
+                parent_tool_use_id: Some("tool_known".into()),
+                pending_removal_at: None,
+            },
+        );
+
+        let map: Arc<RwLock<HashMap<String, ActiveSession>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        map.write().await.insert("s-touch".into(), session);
+
+        let inserted = ChatManager::track_background_task_recovery_if_orphan(
+            "s-touch",
+            &map,
+            &events_tx,
+            &None,
+            Some("tool_known"),
+            "Monitor",
+        )
+        .await;
+        assert!(!inserted, "no insertion when id is already known");
+
+        // last_seen_at refreshed.
+        let sessions_guard = map.read().await;
+        let tasks = sessions_guard
+            .get("s-touch")
+            .unwrap()
+            .active_background_tasks
+            .lock()
+            .await;
+        let entry = tasks.get("tool_known").unwrap();
+        assert!(
+            entry.last_seen_at > old,
+            "last_seen_at must be refreshed (was {:?}, now {:?})",
+            old,
+            entry.last_seen_at
+        );
+        drop(tasks);
+        drop(sessions_guard);
+
+        // No broadcast (path 1 is silent — tick-by-tick refreshes would
+        // saturate the WebSocket on a chatty Monitor).
+        assert!(events_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn test_recovery_no_correlation_id_is_noop() {
+        let map: Arc<RwLock<HashMap<String, ActiveSession>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        let (events_tx, _rx) = broadcast::channel(8);
+        let inserted = ChatManager::track_background_task_recovery_if_orphan(
+            "s-anywhere",
+            &map,
+            &events_tx,
+            &None,
+            None,
+            "Monitor",
+        )
+        .await;
+        assert!(!inserted);
+    }
+
+    // ========================================================================
+    // T12 of plan 754a1379 — tick_purge_background_tasks (grace period purge)
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_tick_purge_removes_stale_pending_entries_and_broadcasts() {
+        let Some((session, _)) = try_create_dummy_session(false, "", vec![]) else {
+            eprintln!("Skipping test: Claude CLI not installed");
+            return;
+        };
+        let mut events_rx = session.events_tx.subscribe();
+        let events_tx = session.events_tx.clone();
+
+        // Insert: one expired (pending_removal_at far in the past),
+        // one fresh (no pending_removal_at).
+        let now = std::time::Instant::now();
+        let stale_at = now.checked_sub(Duration::from_secs(10)).unwrap_or(now);
+        {
+            let mut tasks = session.active_background_tasks.lock().await;
+            tasks.insert(
+                "tool_stale".into(),
+                BackgroundTaskInfo {
+                    id: "tool_stale".into(),
+                    kind: BackgroundTaskKind::Monitor,
+                    description: "stale".into(),
+                    started_at: chrono::Utc::now(),
+                    last_seen_at: chrono::Utc::now(),
+                    pid: None,
+                    parent_tool_use_id: None,
+                    pending_removal_at: Some(stale_at),
+                },
+            );
+            tasks.insert(
+                "tool_alive".into(),
+                BackgroundTaskInfo {
+                    id: "tool_alive".into(),
+                    kind: BackgroundTaskKind::BashBackground,
+                    description: "alive".into(),
+                    started_at: chrono::Utc::now(),
+                    last_seen_at: chrono::Utc::now(),
+                    pid: None,
+                    parent_tool_use_id: None,
+                    pending_removal_at: None,
+                },
+            );
+        }
+
+        let map: Arc<RwLock<HashMap<String, ActiveSession>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        map.write().await.insert("s-purge".into(), session);
+
+        ChatManager::tick_purge_background_tasks(
+            "s-purge",
+            &map,
+            &events_tx,
+            &None,
+            Duration::from_secs(BACKGROUND_TASK_PURGE_GRACE_SECS),
+        )
+        .await;
+
+        // Stale entry purged, alive entry kept.
+        let sessions_guard = map.read().await;
+        let tasks = sessions_guard
+            .get("s-purge")
+            .unwrap()
+            .active_background_tasks
+            .lock()
+            .await;
+        assert_eq!(tasks.len(), 1);
+        assert!(tasks.contains_key("tool_alive"));
+        assert!(!tasks.contains_key("tool_stale"));
+        drop(tasks);
+        drop(sessions_guard);
+
+        // A single broadcast carrying the post-purge snapshot.
+        let event = events_rx
+            .try_recv()
+            .expect("expected broadcast after purge");
+        match event {
+            ChatEvent::ActiveTasksUpdate { tasks } => {
+                assert_eq!(tasks.len(), 1);
+                assert_eq!(tasks[0].id, "tool_alive");
+            }
+            other => panic!("expected ActiveTasksUpdate, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_tick_purge_marks_idle_entries_as_pending_removal() {
+        let Some((session, _)) = try_create_dummy_session(false, "", vec![]) else {
+            eprintln!("Skipping test: Claude CLI not installed");
+            return;
+        };
+        let mut events_rx = session.events_tx.subscribe();
+        let events_tx = session.events_tx.clone();
+
+        // Pre-seed: one ALIVE entry (last_seen_at = now), one IDLE
+        // entry (last_seen_at well past the death threshold).
+        let now = chrono::Utc::now();
+        let stale_seen =
+            now - chrono::Duration::seconds((BACKGROUND_TASK_IDLE_DEATH_SECS + 60) as i64);
+        {
+            let mut tasks = session.active_background_tasks.lock().await;
+            tasks.insert(
+                "tool_alive".into(),
+                BackgroundTaskInfo {
+                    id: "tool_alive".into(),
+                    kind: BackgroundTaskKind::Monitor,
+                    description: "live".into(),
+                    started_at: now,
+                    last_seen_at: now,
+                    pid: None,
+                    parent_tool_use_id: None,
+                    pending_removal_at: None,
+                },
+            );
+            tasks.insert(
+                "tool_idle".into(),
+                BackgroundTaskInfo {
+                    id: "tool_idle".into(),
+                    kind: BackgroundTaskKind::BashBackground,
+                    description: "silently dead".into(),
+                    started_at: stale_seen,
+                    last_seen_at: stale_seen,
+                    pid: None,
+                    parent_tool_use_id: None,
+                    pending_removal_at: None,
+                },
+            );
+        }
+
+        let map: Arc<RwLock<HashMap<String, ActiveSession>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        map.write().await.insert("s-idle".into(), session);
+
+        ChatManager::tick_purge_background_tasks(
+            "s-idle",
+            &map,
+            &events_tx,
+            &None,
+            Duration::from_secs(BACKGROUND_TASK_PURGE_GRACE_SECS),
+        )
+        .await;
+
+        // Idle entry must now have pending_removal_at set.
+        let sessions_guard = map.read().await;
+        let tasks = sessions_guard
+            .get("s-idle")
+            .unwrap()
+            .active_background_tasks
+            .lock()
+            .await;
+        assert_eq!(tasks.len(), 2, "first tick only marks, doesn't purge yet");
+        assert!(
+            tasks
+                .get("tool_alive")
+                .unwrap()
+                .pending_removal_at
+                .is_none(),
+            "alive entry must NOT be marked"
+        );
+        assert!(
+            tasks.get("tool_idle").unwrap().pending_removal_at.is_some(),
+            "idle entry MUST be marked"
+        );
+        drop(tasks);
+        drop(sessions_guard);
+
+        // Single broadcast carrying the marked-but-still-present snapshot.
+        let event = events_rx.try_recv().expect("expected broadcast");
+        match event {
+            ChatEvent::ActiveTasksUpdate { tasks } => assert_eq!(tasks.len(), 2),
+            other => panic!("expected ActiveTasksUpdate, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_tick_purge_within_grace_does_nothing() {
+        let Some((session, _)) = try_create_dummy_session(false, "", vec![]) else {
+            eprintln!("Skipping test: Claude CLI not installed");
+            return;
+        };
+        let mut events_rx = session.events_tx.subscribe();
+        let events_tx = session.events_tx.clone();
+
+        // Mark just now → still within grace.
+        let now = std::time::Instant::now();
+        session.active_background_tasks.lock().await.insert(
+            "tool_recent".into(),
+            BackgroundTaskInfo {
+                id: "tool_recent".into(),
+                kind: BackgroundTaskKind::Monitor,
+                description: "recent".into(),
+                started_at: chrono::Utc::now(),
+                last_seen_at: chrono::Utc::now(),
+                pid: None,
+                parent_tool_use_id: None,
+                pending_removal_at: Some(now),
+            },
+        );
+
+        let map: Arc<RwLock<HashMap<String, ActiveSession>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        map.write().await.insert("s-grace".into(), session);
+
+        ChatManager::tick_purge_background_tasks(
+            "s-grace",
+            &map,
+            &events_tx,
+            &None,
+            Duration::from_secs(BACKGROUND_TASK_PURGE_GRACE_SECS),
+        )
+        .await;
+
+        // Entry still present.
+        let sessions_guard = map.read().await;
+        let tasks = sessions_guard
+            .get("s-grace")
+            .unwrap()
+            .active_background_tasks
+            .lock()
+            .await;
+        assert_eq!(tasks.len(), 1);
+        drop(tasks);
+        drop(sessions_guard);
+
+        // No broadcast — purge was a no-op.
+        assert!(
+            events_rx.try_recv().is_err(),
+            "no broadcast expected when nothing was purged"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cancel_task_result_serde_round_trip() {
+        let r = CancelTaskResult {
+            task_id: "tool_abc".into(),
+            killed_pids: vec![],
+            capped: false,
+        };
+        let json = serde_json::to_string(&r).expect("serialize");
+        assert!(json.contains("\"task_id\":\"tool_abc\""));
+        assert!(json.contains("\"killed_pids\":[]"));
+        assert!(json.contains("\"capped\":false"));
+        let back: CancelTaskResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.task_id, "tool_abc");
+        assert!(back.killed_pids.is_empty());
+        assert!(!back.capped);
+    }
+
+    #[tokio::test]
+    async fn test_track_background_task_unknown_session_returns_false() {
+        let map: Arc<RwLock<HashMap<String, ActiveSession>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        let (events_tx, _) = broadcast::channel(8);
+
+        let inserted = ChatManager::track_background_task_start(
+            "ghost-session",
+            &map,
+            &events_tx,
+            &None,
+            "tool_X",
+            "Monitor",
+            &serde_json::json!({}),
+            None,
+        )
+        .await;
+        assert!(!inserted);
     }
 }

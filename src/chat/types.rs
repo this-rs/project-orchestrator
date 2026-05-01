@@ -222,6 +222,106 @@ pub struct ChatRequest {
     pub runner_context: Option<RunnerContext>,
 }
 
+/// Kind of background subprocess being tracked.
+///
+/// Currently we track tools that spawn long-living subprocesses surviving
+/// across multiple turns: `Monitor` (one stdout line = one event) and
+/// `BashBackground` (Bash with `run_in_background: true`).
+///
+/// This enum is open for extension (e.g. future SSE-based tools, watch
+/// commands) — add a new variant + extend `identify_subprocess_kind` in
+/// the recovery path (T13 of plan 754a1379).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackgroundTaskKind {
+    /// `Monitor` tool — emits one ChatEvent per stdout line, never completes
+    /// on its own (must be cancelled or timed out).
+    Monitor,
+    /// `Bash` tool invoked with `run_in_background: true` — emits BashOutput
+    /// events as stdout chunks land, terminates when the child process exits.
+    BashBackground,
+}
+
+/// Snapshot of a single background subprocess attached to a chat session.
+///
+/// Lives in `ActiveSession::active_background_tasks` (a `HashMap` keyed by
+/// `id`). Created by the OOB listener when a `Monitor` / `Bash` background
+/// `ToolUse` is detected (plan 754a1379, T3). Removed by the periodic death
+/// poller (PID disappears from `get_descendant_pids`) or by an explicit
+/// `cancel_task` call (T7).
+///
+/// ## Identity (audit note `2482f4e0-f1b1-4b92-883c-8704a85beb9e`)
+///
+/// `id` is the SDK Claude Code tool_use ID of the originating `Monitor` /
+/// `Bash` invocation — i.e. the same value that surfaces on
+/// `ChatEvent::BackgroundOutput::correlation_id` for every event emitted by
+/// this subprocess. Three names, one value:
+///
+/// - `parent_tool_use_id` (SDK `Message` payload)
+/// - `correlation_id` (ChatEvent::BackgroundOutput)
+/// - `id` (this struct, used as map key)
+///
+/// This intentional alias is what lets the frontend group `BackgroundOutput`
+/// events under their parent `MonitorCard` without any extra wiring.
+///
+/// ## Recovery (plan 754a1379, T13)
+///
+/// When a session resumes after a server restart, the OOB listener may not
+/// know the original `parent_tool_use_id` for surviving descendants. In that
+/// case `parent_tool_use_id` is `None` and `id` is set to a synthetic
+/// `recovered-{pid}` value so the entry can still be cancelled.
+///
+/// ## Removal grace period (plan 754a1379, T12)
+///
+/// Removal is two-phase: when `cancel_task` or the death poller decides to
+/// remove an entry, it sets `pending_removal_at` instead of deleting the
+/// entry immediately. The poller purges entries older than
+/// `GRACE_PERIOD = 5s`. This absorbs in-flight `BackgroundOutput` ticks that
+/// arrive between the SIGINT and the actual subprocess death — they still
+/// match an entry in the map and are routed correctly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackgroundTaskInfo {
+    /// SDK tool_use ID of the originating Monitor / Bash bg invocation.
+    /// Used as the map key in `active_background_tasks` and matches the
+    /// `correlation_id` on every `BackgroundOutput` produced by this
+    /// subprocess. For tasks rebuilt after a server restart (T13), this is
+    /// a synthetic `recovered-{pid}` string.
+    pub id: String,
+    /// What kind of subprocess this is.
+    pub kind: BackgroundTaskKind,
+    /// Human-readable description (typically the `description` argument
+    /// passed to the tool by the agent, e.g. "watch deploy.log for errors").
+    pub description: String,
+    /// When the OOB listener first observed this task starting. Approximate
+    /// for recovered tasks (set to recovery time, not original start).
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    /// PID of the root subprocess. `None` only in pathological cases where
+    /// the SDK didn't expose it; in that case `cancel_task` falls back to
+    /// killing all descendants of the CLI (degraded but safe).
+    pub pid: Option<u32>,
+    /// SDK `parent_tool_use_id` of the invoking turn — typically equal to
+    /// `id`, but kept distinct for the recovery case where `id` is synthetic
+    /// (`recovered-{pid}`) and the original tool_use is no longer known.
+    pub parent_tool_use_id: Option<String>,
+    /// Last time we observed activity for this task (the most recent
+    /// `BackgroundOutput` tick whose `correlation_id` matched, or
+    /// `started_at` if no tick has arrived yet). Used by the death
+    /// detector (T3, plan 754a1379): an entry whose `last_seen_at`
+    /// is older than `BACKGROUND_TASK_IDLE_DEATH_SECS` is marked for
+    /// removal — covers the case of a subprocess that died silently
+    /// without emitting a final tick. The default timeout is generous
+    /// (30 min) so legitimately quiet Monitors (e.g. `tail -F` on a
+    /// log that doesn't change for a long time) aren't mistakenly
+    /// reaped.
+    pub last_seen_at: chrono::DateTime<chrono::Utc>,
+    /// Two-phase removal marker. `None` while the task is alive; set to
+    /// `Some(now)` by `cancel_task` or the death poller; entries are
+    /// physically removed from the map by the poller after `GRACE_PERIOD`
+    /// has elapsed. Skipped on the wire — the frontend doesn't need it.
+    #[serde(skip)]
+    pub pending_removal_at: Option<std::time::Instant>,
+}
+
 /// Events emitted by the chat system (sent via WebSocket / broadcast)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -494,6 +594,38 @@ pub enum ChatEvent {
         /// ISO-8601 timestamp at which the error was detected.
         received_at: chrono::DateTime<chrono::Utc>,
     },
+    /// Snapshot of all background subprocesses currently attached to this
+    /// session. Emitted by the lifecycle hook (T3 of plan 754a1379) on every
+    /// mutation of `ActiveSession::active_background_tasks` — i.e.:
+    ///
+    /// - INSERT — a new `Monitor` / `Bash run_in_background` `ToolUse`
+    ///   was observed by the OOB listener.
+    /// - REMOVE — a `cancel_task` request fired, or the death poller
+    ///   detected that a tracked PID disappeared from
+    ///   `get_descendant_pids(child_pid)`, or the grace period expired
+    ///   and an entry marked `pending_removal_at` was purged (T12).
+    /// - RECOVERY — `create_session` / `resume_session` rebuilt the
+    ///   tracking map from `pgrep` after a server restart (T13), so the
+    ///   frontend can re-paint its toolbar indicator and any in-progress
+    ///   `MonitorCard`s without waiting for fresh ticks.
+    ///
+    /// The frontend uses this event to drive the toolbar indicator pill
+    /// (`👀 N Monitors • ⚙ M Bash`) and the per-card status badges. Each
+    /// emission carries the **full current snapshot** — never deltas —
+    /// so a client that misses one event simply gets the next refresh.
+    ///
+    /// Ephemeral: never persisted to Neo4j, never replayed in catch-up
+    /// snapshots (frontends use `GET /api/chat/sessions/:id/background-tasks`
+    /// at connection time instead, T6 of plan 754a1379). Returns `None`
+    /// from `fingerprint()` for the same reason — there is nothing to
+    /// dedup, every event is a fresh snapshot.
+    ActiveTasksUpdate {
+        /// Current snapshot of every tracked background task on the
+        /// session. Empty `Vec` is a legitimate value (means: no
+        /// background tasks active right now) and the frontend should
+        /// render the toolbar accordingly (no pill).
+        tasks: Vec<BackgroundTaskInfo>,
+    },
 }
 
 impl ChatEvent {
@@ -528,6 +660,7 @@ impl ChatEvent {
             ChatEvent::BackgroundOutput { .. } => "background_output",
             ChatEvent::SessionError { .. } => "session_error",
             ChatEvent::ToolsCancelled { .. } => "tools_cancelled",
+            ChatEvent::ActiveTasksUpdate { .. } => "active_tasks_update",
         }
     }
 
@@ -672,8 +805,13 @@ impl ChatEvent {
                 ))
             }
 
-            // StreamDelta and StreamingStatus are never in the snapshot
-            ChatEvent::StreamDelta { .. } | ChatEvent::StreamingStatus { .. } => None,
+            // StreamDelta and StreamingStatus are never in the snapshot.
+            // ActiveTasksUpdate is ephemeral — every emission is a fresh
+            // full snapshot, dedup is meaningless (and would actively hide
+            // useful state changes from the frontend). Plan 754a1379, T4.
+            ChatEvent::StreamDelta { .. }
+            | ChatEvent::StreamingStatus { .. }
+            | ChatEvent::ActiveTasksUpdate { .. } => None,
         }
     }
 }
@@ -1216,6 +1354,7 @@ impl SessionWorkLog {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
 
     #[test]
     fn test_chat_request_deserialize() {
@@ -2636,5 +2775,166 @@ mod tests {
         let msg = PendingMessage::background_output("monitor: epoch 100".into());
         assert_eq!(msg.kind, PendingMessageKind::BackgroundOutput);
         assert_eq!(msg.content, "monitor: epoch 100");
+    }
+
+    // ========================================================================
+    // T1 of plan 754a1379 — BackgroundTaskInfo / BackgroundTaskKind serde
+    // round-trip + property tests.
+    // ========================================================================
+
+    #[test]
+    fn test_background_task_kind_serde_round_trip() {
+        for (kind, expected_json) in [
+            (BackgroundTaskKind::Monitor, "\"monitor\""),
+            (BackgroundTaskKind::BashBackground, "\"bash_background\""),
+        ] {
+            let json = serde_json::to_string(&kind).unwrap();
+            assert_eq!(
+                json, expected_json,
+                "BackgroundTaskKind::{:?} must serialise as {}",
+                kind, expected_json
+            );
+            let back: BackgroundTaskKind = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, kind, "round-trip mismatch for {:?}", kind);
+        }
+    }
+
+    #[test]
+    fn test_background_task_info_serde_round_trip_full() {
+        let info = BackgroundTaskInfo {
+            id: "toolu_01ABC".to_string(),
+            kind: BackgroundTaskKind::Monitor,
+            description: "tail -F /tmp/build.log".to_string(),
+            started_at: chrono::Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+            last_seen_at: chrono::Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+            pid: Some(42_424),
+            parent_tool_use_id: Some("toolu_01ABC".to_string()),
+            pending_removal_at: None,
+        };
+        let json = serde_json::to_string(&info).expect("serialise");
+        let back: BackgroundTaskInfo = serde_json::from_str(&json).expect("deserialise");
+
+        assert_eq!(back.id, info.id);
+        assert_eq!(back.kind, info.kind);
+        assert_eq!(back.description, info.description);
+        assert_eq!(back.started_at, info.started_at);
+        assert_eq!(back.pid, info.pid);
+        assert_eq!(back.parent_tool_use_id, info.parent_tool_use_id);
+    }
+
+    #[test]
+    fn test_background_task_info_pending_removal_at_skipped_on_wire() {
+        // pending_removal_at is `Instant`, not serialisable, and explicitly
+        // marked `#[serde(skip)]`. It must NOT appear in the JSON.
+        let info = BackgroundTaskInfo {
+            id: "toolu_01XYZ".into(),
+            kind: BackgroundTaskKind::BashBackground,
+            description: "npm install".into(),
+            started_at: chrono::Utc::now(),
+            last_seen_at: chrono::Utc::now(),
+            pid: Some(12345),
+            parent_tool_use_id: Some("toolu_01XYZ".into()),
+            pending_removal_at: Some(std::time::Instant::now()),
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        assert!(
+            !json.contains("pending_removal_at"),
+            "pending_removal_at must be skipped from the wire format, got: {}",
+            json
+        );
+
+        // Round-trip drops the field (becomes None on deserialise).
+        let back: BackgroundTaskInfo = serde_json::from_str(&json).unwrap();
+        assert!(back.pending_removal_at.is_none());
+    }
+
+    #[test]
+    fn test_active_tasks_update_serde_round_trip() {
+        let event = ChatEvent::ActiveTasksUpdate {
+            tasks: vec![
+                BackgroundTaskInfo {
+                    id: "toolu_01ABC".into(),
+                    kind: BackgroundTaskKind::Monitor,
+                    description: "tail -F /tmp/build.log".into(),
+                    started_at: chrono::Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+                    last_seen_at: chrono::Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+                    pid: Some(42_424),
+                    parent_tool_use_id: Some("toolu_01ABC".into()),
+                    pending_removal_at: None,
+                },
+                BackgroundTaskInfo {
+                    id: "toolu_02XYZ".into(),
+                    kind: BackgroundTaskKind::BashBackground,
+                    description: "cargo build".into(),
+                    started_at: chrono::Utc.timestamp_opt(1_700_000_005, 0).unwrap(),
+                    last_seen_at: chrono::Utc.timestamp_opt(1_700_000_005, 0).unwrap(),
+                    pid: Some(42_425),
+                    parent_tool_use_id: Some("toolu_02XYZ".into()),
+                    pending_removal_at: None,
+                },
+            ],
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        // Discriminator field should be present.
+        assert!(json.contains("\"type\":\"active_tasks_update\""));
+        // Both task ids should be present.
+        assert!(json.contains("toolu_01ABC"));
+        assert!(json.contains("toolu_02XYZ"));
+
+        let back: ChatEvent = serde_json::from_str(&json).unwrap();
+        match back {
+            ChatEvent::ActiveTasksUpdate { tasks } => {
+                assert_eq!(tasks.len(), 2);
+                assert_eq!(tasks[0].id, "toolu_01ABC");
+                assert_eq!(tasks[0].kind, BackgroundTaskKind::Monitor);
+                assert_eq!(tasks[1].kind, BackgroundTaskKind::BashBackground);
+            }
+            _ => panic!("expected ActiveTasksUpdate, got {:?}", back),
+        }
+    }
+
+    #[test]
+    fn test_active_tasks_update_empty_snapshot_round_trip() {
+        // Empty snapshot is a legitimate value — meaning "no background
+        // tasks active". The frontend uses it to clear its toolbar pill.
+        let event = ChatEvent::ActiveTasksUpdate { tasks: vec![] };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"tasks\":[]"));
+
+        let back: ChatEvent = serde_json::from_str(&json).unwrap();
+        match back {
+            ChatEvent::ActiveTasksUpdate { tasks } => assert!(tasks.is_empty()),
+            _ => panic!("round-trip lost the variant"),
+        }
+    }
+
+    #[test]
+    fn test_active_tasks_update_event_type_and_fingerprint() {
+        let event = ChatEvent::ActiveTasksUpdate { tasks: vec![] };
+        // event_type should be the snake_case variant name.
+        assert_eq!(event.event_type(), "active_tasks_update");
+        // fingerprint must be None — every emission is a fresh full
+        // snapshot, dedup would actively hide useful state changes
+        // (cf the doc-comment on the variant).
+        assert!(event.fingerprint().is_none());
+    }
+
+    #[test]
+    fn test_background_task_info_recovered_synthetic_id() {
+        // Recovered tasks (T13) have a synthetic id and no parent_tool_use_id.
+        let info = BackgroundTaskInfo {
+            id: "recovered-42424".into(),
+            kind: BackgroundTaskKind::Monitor,
+            description: "[recovered after restart] PID 42424".into(),
+            started_at: chrono::Utc::now(),
+            last_seen_at: chrono::Utc::now(),
+            pid: Some(42_424),
+            parent_tool_use_id: None,
+            pending_removal_at: None,
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        let back: BackgroundTaskInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.id, "recovered-42424");
+        assert!(back.parent_tool_use_id.is_none());
     }
 }
