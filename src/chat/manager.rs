@@ -13,9 +13,9 @@ use super::config::ChatConfig;
 use super::post_tool_hook;
 use super::skill_hook;
 use super::types::{
-    classify_api_error, truncate_snippet, BackgroundTaskInfo, ChatEvent, ChatEventPage,
-    ChatRequest, CreateSessionResponse, MessageSearchHit, MessageSearchResult, PendingMessage,
-    SessionWorkLog,
+    classify_api_error, truncate_snippet, BackgroundTaskInfo, BackgroundTaskKind, ChatEvent,
+    ChatEventPage, ChatRequest, CreateSessionResponse, MessageSearchHit, MessageSearchResult,
+    PendingMessage, SessionWorkLog,
 };
 use crate::meilisearch::SearchStore;
 use crate::neo4j::models::ChatEventRecord;
@@ -2929,6 +2929,135 @@ impl ChatManager {
         })
     }
 
+    /// Track the start of a `Monitor` / `Bash run_in_background` invocation
+    /// in `ActiveSession::active_background_tasks`, then broadcast the
+    /// updated snapshot via `ChatEvent::ActiveTasksUpdate`.
+    ///
+    /// Plan 754a1379, T3 (INSERT side of lifecycle hooks). Called from
+    /// `stream_response` whenever a `ChatEvent::ToolUse` is observed, so
+    /// the entry materialises as soon as the SDK announces a tool call.
+    ///
+    /// ## Idempotence (two-pass call site)
+    ///
+    /// `stream_response` may call this helper twice for a single tool_use:
+    /// first when `ContentBlockStart` arrives with empty input, then when
+    /// `AssistantMessage` arrives with the full input. We use
+    /// `HashMap::entry(...).or_insert_with(...)` so the first call inserts
+    /// the placeholder entry and the second call only refreshes the
+    /// `description` field once it becomes available. Both passes also
+    /// emit a fresh `ActiveTasksUpdate` so the frontend reflects every
+    /// observable state change.
+    ///
+    /// ## Filtering
+    ///
+    /// - `tool_name == "Monitor"` → always tracked. Input is irrelevant
+    ///   to the kind decision.
+    /// - `tool_name == "Bash"` AND `input.run_in_background == true` →
+    ///   tracked as `BashBackground`. Synchronous Bash calls are ignored
+    ///   (their lifecycle is bounded by the turn).
+    /// - All other tools → ignored, returns `false` without touching
+    ///   the map or broadcasting.
+    ///
+    /// Note that Bash's `run_in_background` flag is only present on the
+    /// **second** pass (full input), so the first pass for a Bash call
+    /// returns `false` and the second pass performs the actual insert.
+    /// For Monitor, both passes succeed (the second one just updates
+    /// the description in place).
+    ///
+    /// ## Returns
+    ///
+    /// `true` if the tool is tracked (newly inserted or refreshed),
+    /// `false` if the tool isn't a tracked kind or the session is gone.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn track_background_task_start(
+        session_id: &str,
+        active_sessions: &Arc<RwLock<HashMap<String, ActiveSession>>>,
+        events_tx: &broadcast::Sender<ChatEvent>,
+        nats: &Option<Arc<crate::events::NatsEmitter>>,
+        tool_use_id: &str,
+        tool_name: &str,
+        input: &serde_json::Value,
+        parent_tool_use_id: Option<&str>,
+    ) -> bool {
+        // Decide whether the tool kind is something we track.
+        let kind = match tool_name {
+            "Monitor" => Some(BackgroundTaskKind::Monitor),
+            "Bash"
+                if input
+                    .get("run_in_background")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false) =>
+            {
+                Some(BackgroundTaskKind::BashBackground)
+            }
+            _ => None,
+        };
+        let Some(kind) = kind else {
+            return false;
+        };
+
+        // Best-effort description (input field, falls back to a placeholder
+        // before the second pass arrives with full input).
+        let description = input
+            .get("description")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("(no description)")
+            .to_string();
+
+        // Take the lock on `active_background_tasks`, upsert, and capture
+        // the fresh snapshot to broadcast outside the lock.
+        let snapshot = {
+            let sessions = active_sessions.read().await;
+            let Some(active) = sessions.get(session_id) else {
+                debug!(
+                    session_id = %session_id,
+                    "track_background_task_start: session not in active_sessions, dropping"
+                );
+                return false;
+            };
+            let mut tasks = active.active_background_tasks.lock().await;
+
+            let entry =
+                tasks
+                    .entry(tool_use_id.to_string())
+                    .or_insert_with(|| BackgroundTaskInfo {
+                        id: tool_use_id.to_string(),
+                        kind,
+                        description: description.clone(),
+                        started_at: chrono::Utc::now(),
+                        pid: None,
+                        parent_tool_use_id: parent_tool_use_id.map(String::from),
+                        pending_removal_at: None,
+                    });
+
+            // On the second pass (full input), refresh the description
+            // if we now have a real one.
+            if description != "(no description)" && !description.is_empty() {
+                entry.description = description;
+            }
+            // If the entry was previously marked for removal but the SDK
+            // surprises us with a fresh ToolUse on the same id, cancel
+            // the pending removal — the task is alive after all.
+            entry.pending_removal_at = None;
+
+            tasks.values().cloned().collect::<Vec<BackgroundTaskInfo>>()
+        };
+
+        let event = ChatEvent::ActiveTasksUpdate { tasks: snapshot };
+        let _ = events_tx.send(event.clone());
+        if let Some(ref nats) = nats {
+            nats.publish_chat_event(session_id, event);
+        }
+
+        info!(
+            session_id = %session_id,
+            tool_use_id = %tool_use_id,
+            kind = ?kind,
+            "Tracked background task start (plan 754a1379, T3)"
+        );
+        true
+    }
+
     /// Internal: send a message to the client and stream the response to broadcast
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn stream_response(
@@ -3596,11 +3725,32 @@ impl ChatManager {
                                     //    record and streaming_events with the full input.
                                     if let ChatEvent::ToolUse {
                                         ref id,
+                                        ref tool,
                                         ref input,
                                         ref parent_tool_use_id,
-                                        ..
                                     } = event
                                     {
+                                        // Plan 754a1379, T3 — INSERT side of the
+                                        // background-task lifecycle. Idempotent across
+                                        // both ContentBlockStart (empty input) and
+                                        // AssistantMessage (full input) passes; for
+                                        // Monitor the first call inserts and the second
+                                        // refreshes the description, for Bash with
+                                        // run_in_background=true only the second call
+                                        // succeeds (the flag isn't visible on the first
+                                        // pass).
+                                        let _ = Self::track_background_task_start(
+                                            &session_id,
+                                            &active_sessions,
+                                            &events_tx,
+                                            &nats,
+                                            id,
+                                            tool,
+                                            input,
+                                            parent_tool_use_id.as_deref(),
+                                        )
+                                        .await;
+
                                         if let Some(persist_idx) = emitted_tool_use_ids.get(id) {
                                             // Duplicate — update persisted record with full input
                                             let has_real_input = input.is_object()
@@ -10428,5 +10578,289 @@ mod tests {
         let json = serde_json::to_string(&result).expect("serialize");
         assert!(json.contains("\"capped\":true"));
         assert!(json.contains("\"killed_pids\":[]"));
+    }
+
+    // ========================================================================
+    // T3 of plan 754a1379 — track_background_task_start (INSERT lifecycle hook)
+    // ========================================================================
+
+    /// Helper: insert a dummy session under the given id and return the
+    /// active_sessions map ready for the helper. Returns None if Claude
+    /// CLI is not installed (skipping the test).
+    async fn build_sessions_map_for_track_test(
+        session_id: &str,
+    ) -> Option<(
+        Arc<RwLock<HashMap<String, ActiveSession>>>,
+        broadcast::Sender<ChatEvent>,
+        broadcast::Receiver<ChatEvent>,
+    )> {
+        let (session, _) = try_create_dummy_session(false, "", vec![])?;
+        let events_tx = session.events_tx.clone();
+        let events_rx = events_tx.subscribe();
+        let map = Arc::new(RwLock::new(HashMap::new()));
+        map.write().await.insert(session_id.to_string(), session);
+        Some((map, events_tx, events_rx))
+    }
+
+    #[tokio::test]
+    async fn test_track_background_task_inserts_monitor_on_first_pass() {
+        let Some((sessions, events_tx, mut events_rx)) =
+            build_sessions_map_for_track_test("s-mon").await
+        else {
+            eprintln!("Skipping test: Claude CLI not installed");
+            return;
+        };
+
+        // First pass: ContentBlockStart with empty input.
+        let inserted = ChatManager::track_background_task_start(
+            "s-mon",
+            &sessions,
+            &events_tx,
+            &None,
+            "tool_M1",
+            "Monitor",
+            &serde_json::json!({}),
+            None,
+        )
+        .await;
+        assert!(inserted, "Monitor should be tracked on first pass");
+
+        // Map should now have one entry.
+        let session_guard = sessions.read().await;
+        let session = session_guard.get("s-mon").unwrap();
+        let tasks = session.active_background_tasks.lock().await;
+        assert_eq!(tasks.len(), 1);
+        let entry = tasks.get("tool_M1").unwrap();
+        assert_eq!(entry.kind, BackgroundTaskKind::Monitor);
+        assert_eq!(entry.description, "(no description)");
+
+        // Should have broadcast an ActiveTasksUpdate.
+        let event = events_rx.try_recv().expect("expected one broadcast");
+        match event {
+            ChatEvent::ActiveTasksUpdate { tasks } => assert_eq!(tasks.len(), 1),
+            other => panic!("expected ActiveTasksUpdate, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_track_background_task_updates_description_on_second_pass() {
+        let Some((sessions, events_tx, mut events_rx)) =
+            build_sessions_map_for_track_test("s-mon2").await
+        else {
+            eprintln!("Skipping test: Claude CLI not installed");
+            return;
+        };
+
+        // First pass — empty input, placeholder description.
+        ChatManager::track_background_task_start(
+            "s-mon2",
+            &sessions,
+            &events_tx,
+            &None,
+            "tool_M2",
+            "Monitor",
+            &serde_json::json!({}),
+            None,
+        )
+        .await;
+        // Drain first broadcast.
+        let _ = events_rx.try_recv();
+
+        // Second pass — full input with description.
+        ChatManager::track_background_task_start(
+            "s-mon2",
+            &sessions,
+            &events_tx,
+            &None,
+            "tool_M2",
+            "Monitor",
+            &serde_json::json!({
+                "command": "tail -F /tmp/build.log",
+                "description": "watch build log",
+                "persistent": false,
+                "timeout_ms": 300000,
+            }),
+            None,
+        )
+        .await;
+
+        let session_guard = sessions.read().await;
+        let tasks = session_guard
+            .get("s-mon2")
+            .unwrap()
+            .active_background_tasks
+            .lock()
+            .await;
+        // Still one entry (idempotent), description refreshed.
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks.get("tool_M2").unwrap().description, "watch build log");
+
+        // Two broadcasts total (one per pass).
+        events_rx.try_recv().expect("second broadcast missing");
+    }
+
+    #[tokio::test]
+    async fn test_track_background_task_bash_run_in_background_first_pass_skipped() {
+        let Some((sessions, events_tx, mut events_rx)) =
+            build_sessions_map_for_track_test("s-bash").await
+        else {
+            eprintln!("Skipping test: Claude CLI not installed");
+            return;
+        };
+
+        // First pass: empty input, run_in_background flag absent → not tracked.
+        let inserted = ChatManager::track_background_task_start(
+            "s-bash",
+            &sessions,
+            &events_tx,
+            &None,
+            "tool_B1",
+            "Bash",
+            &serde_json::json!({}),
+            None,
+        )
+        .await;
+        assert!(!inserted, "Bash with empty input must not be tracked yet");
+
+        // Second pass: full input with run_in_background=true → tracked.
+        let inserted = ChatManager::track_background_task_start(
+            "s-bash",
+            &sessions,
+            &events_tx,
+            &None,
+            "tool_B1",
+            "Bash",
+            &serde_json::json!({
+                "command": "cargo watch -x test",
+                "description": "run tests on change",
+                "run_in_background": true,
+            }),
+            None,
+        )
+        .await;
+        assert!(inserted, "Bash with run_in_background=true must be tracked");
+
+        let session_guard = sessions.read().await;
+        let tasks = session_guard
+            .get("s-bash")
+            .unwrap()
+            .active_background_tasks
+            .lock()
+            .await;
+        assert_eq!(tasks.len(), 1);
+        let entry = tasks.get("tool_B1").unwrap();
+        assert_eq!(entry.kind, BackgroundTaskKind::BashBackground);
+        assert_eq!(entry.description, "run tests on change");
+
+        // Only ONE broadcast (the second pass) since the first returned false.
+        events_rx.try_recv().expect("expected the second broadcast");
+        assert!(events_rx.try_recv().is_err(), "no extra broadcast");
+    }
+
+    #[tokio::test]
+    async fn test_track_background_task_bash_synchronous_not_tracked() {
+        let Some((sessions, events_tx, mut events_rx)) =
+            build_sessions_map_for_track_test("s-bash-sync").await
+        else {
+            eprintln!("Skipping test: Claude CLI not installed");
+            return;
+        };
+
+        // Synchronous Bash (run_in_background absent or false) — never tracked.
+        let inserted_a = ChatManager::track_background_task_start(
+            "s-bash-sync",
+            &sessions,
+            &events_tx,
+            &None,
+            "tool_B2",
+            "Bash",
+            &serde_json::json!({ "command": "ls" }),
+            None,
+        )
+        .await;
+        let inserted_b = ChatManager::track_background_task_start(
+            "s-bash-sync",
+            &sessions,
+            &events_tx,
+            &None,
+            "tool_B3",
+            "Bash",
+            &serde_json::json!({ "command": "pwd", "run_in_background": false }),
+            None,
+        )
+        .await;
+        assert!(!inserted_a);
+        assert!(!inserted_b);
+
+        let tasks = sessions
+            .read()
+            .await
+            .get("s-bash-sync")
+            .unwrap()
+            .active_background_tasks
+            .lock()
+            .await
+            .len();
+        assert_eq!(tasks, 0, "no Bash should be tracked");
+        assert!(
+            events_rx.try_recv().is_err(),
+            "no broadcast expected for untracked tools"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_track_background_task_other_tools_ignored() {
+        let Some((sessions, events_tx, _events_rx)) =
+            build_sessions_map_for_track_test("s-other").await
+        else {
+            eprintln!("Skipping test: Claude CLI not installed");
+            return;
+        };
+
+        for tool in ["Read", "Write", "Edit", "Glob", "Task"] {
+            let inserted = ChatManager::track_background_task_start(
+                "s-other",
+                &sessions,
+                &events_tx,
+                &None,
+                "tool_X",
+                tool,
+                &serde_json::json!({"description": "should be ignored"}),
+                None,
+            )
+            .await;
+            assert!(!inserted, "{} must not be tracked", tool);
+        }
+
+        let count = sessions
+            .read()
+            .await
+            .get("s-other")
+            .unwrap()
+            .active_background_tasks
+            .lock()
+            .await
+            .len();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_track_background_task_unknown_session_returns_false() {
+        let map: Arc<RwLock<HashMap<String, ActiveSession>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        let (events_tx, _) = broadcast::channel(8);
+
+        let inserted = ChatManager::track_background_task_start(
+            "ghost-session",
+            &map,
+            &events_tx,
+            &None,
+            "tool_X",
+            "Monitor",
+            &serde_json::json!({}),
+            None,
+        )
+        .await;
+        assert!(!inserted);
     }
 }
