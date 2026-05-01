@@ -6162,31 +6162,31 @@ impl ChatManager {
 
     /// Cancel a single tracked background task (Monitor, Bash bg) by id.
     ///
-    /// Plan 754a1379 (T7). The granular companion to `cancel_running_tools`
-    /// — instead of killing every descendant of the CLI, this targets a
+    /// Plan 754a1379 (T7) — granular companion to `cancel_running_tools`.
+    /// Instead of killing every descendant of the CLI, this targets a
     /// single tracked task by its `tool_use_id` (= map key).
     ///
-    /// ## V1 semantics — map-side cancel only
+    /// ## V2 semantics — PID-targeted kill (plan fc35b25e, T4)
     ///
-    /// V1 marks the entry as `pending_removal_at = Some(now)` (the actual
-    /// physical purge happens after `GRACE_PERIOD` in T12) and broadcasts
-    /// a fresh `ChatEvent::ActiveTasksUpdate` so the frontend immediately
-    /// reflects the cancelled state. **It does NOT yet send SIGINT to
-    /// the subprocess** — PID-targeted kill requires a discovery
-    /// mechanism that maps `tool_use_id → root PID`, which is out of
-    /// scope for this commit (will land alongside T13 once
-    /// `identify_subprocess_kind` exists).
+    /// 1. Atomically extract the task's `pid` and mark
+    ///    `pending_removal_at = Some(now)` under a single tasks-lock op
+    ///    (the actual physical purge happens after `GRACE_PERIOD` in T12).
+    /// 2. If `pid.is_some()`: call `kill_subtree(pid)` — sends SIGINT to
+    ///    the root subprocess **and** all its descendants (`tail -F`,
+    ///    `find`, etc.) and returns the list of PIDs that received the
+    ///    signal. Populates `CancelTaskResult.killed_pids`.
+    /// 3. If `pid.is_none()` (claim race — `track_background_task_start`
+    ///    spawned the async claim but it hasn't fired yet, OR the
+    ///    subprocess crashed before pgrep saw it): logs a warning and
+    ///    falls back to V1 map-side-only cancel. `killed_pids` is empty
+    ///    in this edge case — the user can fall back to the global
+    ///    `cancel_running_tools` if needed.
+    /// 4. Broadcasts a fresh `ChatEvent::ActiveTasksUpdate` so the
+    ///    frontend immediately reflects the cancelled state.
     ///
-    /// **What this means in practice**: the user clicks Stop on a
-    /// specific Monitor → the toolbar pill disappears immediately, but
-    /// the underlying `tail -F` keeps emitting ticks for a short window.
-    /// Those orphan ticks are absorbed by the grace period (T12) and the
-    /// frontend's orphan-correlation_id buffer (F10).
-    ///
-    /// To actually kill the subprocess in V1, the user must use the
-    /// global `cancel_running_tools` (Stop button on the active turn) —
-    /// which kills every descendant. This is documented in the UX so
-    /// users with a single Monitor running get the same effect.
+    /// The 5 s grace period from T12 (plan 754a1379) is preserved — it
+    /// absorbs `BackgroundOutput` ticks that may be in flight between
+    /// the SIGINT and the subprocess actually exiting.
     ///
     /// ## Cap
     ///
@@ -6206,10 +6206,12 @@ impl ChatManager {
     ///
     /// ## Returns
     ///
-    /// - `CancelTaskResult { task_id, killed_pids: vec![], capped: false }`
-    ///   on success — `killed_pids` always empty in V1.
+    /// - `CancelTaskResult { task_id, killed_pids, capped: false }` on
+    ///   success — `killed_pids` is the list of PIDs (root + descendants)
+    ///   that received SIGINT in V2. Empty in the claim-race fallback
+    ///   path described above.
     /// - `capped: true` if the rate cap was hit (no broadcast, no map
-    ///   mutation).
+    ///   mutation, no kill).
     /// - Returns `Ok(...)` even if the session is unknown or the
     ///   task_id isn't in the map (idempotent — clicking Stop twice on
     ///   the same task is fine).
@@ -6264,25 +6266,60 @@ impl ChatManager {
             });
         }
 
-        // Mark for removal + capture snapshot for broadcast.
-        let snapshot = {
+        // V2 (plan fc35b25e, T4): atomically extract the task's pid AND
+        // mark for removal under a single tasks-lock op, then capture the
+        // snapshot for broadcast. Doing both in the same critical section
+        // ensures a concurrent claim-update from `async_pid_claim` cannot
+        // populate the pid AFTER we read it.
+        let (snapshot, task_pid) = {
             let mut tasks = tasks_arc.lock().await;
-            if let Some(entry) = tasks.get_mut(task_id) {
+            let pid = if let Some(entry) = tasks.get_mut(task_id) {
                 entry.pending_removal_at = Some(std::time::Instant::now());
+                let captured = entry.pid;
                 info!(
                     session_id = %session_id,
                     task_id = %task_id,
                     kind = ?entry.kind,
+                    pid = ?captured,
                     "cancel_task: marked for removal (grace period via T12)"
                 );
+                captured
             } else {
                 debug!(
                     session_id = %session_id,
                     task_id = %task_id,
                     "cancel_task: task_id unknown in map; idempotent no-op"
                 );
+                None
+            };
+            (
+                tasks.values().cloned().collect::<Vec<BackgroundTaskInfo>>(),
+                pid,
+            )
+        };
+
+        // V2: SIGINT the subtree if the async claim populated a pid;
+        // otherwise log a warning and fall back to map-side-only cancel.
+        let killed_pids = match task_pid {
+            Some(root_pid) => {
+                let killed = Self::kill_subtree(root_pid);
+                info!(
+                    session_id = %session_id,
+                    task_id = %task_id,
+                    root_pid = root_pid,
+                    killed_count = killed.len(),
+                    "cancel_task: SIGINT'd subtree (plan fc35b25e, T4)"
+                );
+                killed
             }
-            tasks.values().cloned().collect::<Vec<BackgroundTaskInfo>>()
+            None => {
+                warn!(
+                    session_id = %session_id,
+                    task_id = %task_id,
+                    "cancel_task: no PID stored (claim race or subprocess crashed before discovery), map-side only"
+                );
+                Vec::new()
+            }
         };
 
         let event = ChatEvent::ActiveTasksUpdate { tasks: snapshot };
@@ -6294,7 +6331,7 @@ impl ChatManager {
 
         Ok(CancelTaskResult {
             task_id: task_id.to_string(),
-            killed_pids: Vec::new(),
+            killed_pids,
             capped: false,
         })
     }
@@ -6648,7 +6685,6 @@ impl ChatManager {
     /// (it has no protected status), so we include it in the SIGINT batch.
     ///
     /// On non-unix platforms this is a no-op that returns an empty Vec.
-    #[allow(dead_code)] // wired by T4 of plan fc35b25e
     fn kill_subtree(root_pid: u32) -> Vec<u32> {
         #[cfg(unix)]
         {
@@ -11882,7 +11918,11 @@ mod tests {
 
         let result = manager.cancel_task("s-cancel", "tool_T1").await.unwrap();
         assert_eq!(result.task_id, "tool_T1");
-        assert!(result.killed_pids.is_empty(), "V1 returns no killed_pids");
+        // V2 (T4): entry has pid=None → fallback path, killed_pids empty.
+        assert!(
+            result.killed_pids.is_empty(),
+            "expected empty killed_pids for pid=None entry"
+        );
         assert!(!result.capped);
 
         // Entry should be marked for removal but still in the map (T12 grace).
@@ -11978,6 +12018,138 @@ mod tests {
         let r = manager.cancel_task("s-cap", "tool_W").await.unwrap();
         assert!(r.capped, "3rd call must be capped");
         assert!(r.killed_pids.is_empty());
+    }
+
+    // ========================================================================
+    // T4 of plan fc35b25e — cancel_task wires `kill_subtree` for V2 kill
+    // ========================================================================
+
+    /// When the task entry has `pid: None` (claim race or subprocess
+    /// crashed before discovery), `cancel_task` must:
+    /// - return `killed_pids: []` (no kill happened),
+    /// - still mark the entry for removal (V1 fallback preserved),
+    /// - still broadcast an `ActiveTasksUpdate` (frontend feedback).
+    #[tokio::test]
+    async fn test_cancel_task_without_pid_falls_back_to_v1() {
+        let Some((session, _)) = try_create_dummy_session(false, "", vec![]) else {
+            eprintln!("Skipping test: Claude CLI not installed");
+            return;
+        };
+        let mut events_rx = session.events_tx.subscribe();
+        // Pre-seed a task with pid=None to exercise the fallback branch.
+        session.active_background_tasks.lock().await.insert(
+            "tool_NoPid".into(),
+            BackgroundTaskInfo {
+                id: "tool_NoPid".into(),
+                kind: BackgroundTaskKind::Monitor,
+                description: "no pid yet".into(),
+                started_at: chrono::Utc::now(),
+                last_seen_at: chrono::Utc::now(),
+                pid: None,
+                parent_tool_use_id: Some("tool_NoPid".into()),
+                pending_removal_at: None,
+            },
+        );
+
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        manager
+            .active_sessions
+            .write()
+            .await
+            .insert("s-nopid".into(), session);
+
+        let result = manager.cancel_task("s-nopid", "tool_NoPid").await.unwrap();
+        assert_eq!(result.task_id, "tool_NoPid");
+        assert!(
+            result.killed_pids.is_empty(),
+            "fallback path must return empty killed_pids, got {:?}",
+            result.killed_pids
+        );
+        assert!(!result.capped);
+
+        // Mark for removal still applied (V1 fallback preserved).
+        let sessions = manager.active_sessions.read().await;
+        let tasks = sessions
+            .get("s-nopid")
+            .unwrap()
+            .active_background_tasks
+            .lock()
+            .await;
+        assert!(tasks
+            .get("tool_NoPid")
+            .unwrap()
+            .pending_removal_at
+            .is_some());
+
+        // Broadcast still happens.
+        let event = events_rx.try_recv().expect("expected broadcast");
+        assert!(matches!(event, ChatEvent::ActiveTasksUpdate { .. }));
+    }
+
+    /// Spawn a real `sleep 30`, seed a task entry with its PID, call
+    /// `cancel_task`, and verify:
+    /// - `killed_pids` contains the sleep's PID,
+    /// - the subprocess actually dies (exit status non-success).
+    ///
+    /// Marked `#[ignore]` because it touches real processes — run with
+    /// `cargo test -- --ignored`.
+    #[tokio::test]
+    #[ignore]
+    #[cfg(unix)]
+    async fn test_cancel_task_with_pid_calls_kill_subtree() {
+        let mut child = match std::process::Command::new("sleep").arg("30").spawn() {
+            Ok(c) => c,
+            Err(_) => {
+                eprintln!("Skipping test: sleep not available");
+                return;
+            }
+        };
+        let real_pid = child.id();
+
+        let Some((session, _)) = try_create_dummy_session(false, "", vec![]) else {
+            eprintln!("Skipping test: Claude CLI not installed");
+            let _ = child.kill();
+            let _ = child.wait();
+            return;
+        };
+        // Pre-seed a task entry pointing at the real subprocess.
+        session.active_background_tasks.lock().await.insert(
+            "tool_Real".into(),
+            BackgroundTaskInfo {
+                id: "tool_Real".into(),
+                kind: BackgroundTaskKind::Monitor,
+                description: "real sleep".into(),
+                started_at: chrono::Utc::now(),
+                last_seen_at: chrono::Utc::now(),
+                pid: Some(real_pid),
+                parent_tool_use_id: Some("tool_Real".into()),
+                pending_removal_at: None,
+            },
+        );
+
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        manager
+            .active_sessions
+            .write()
+            .await
+            .insert("s-real".into(), session);
+
+        let result = manager.cancel_task("s-real", "tool_Real").await.unwrap();
+        assert!(!result.capped);
+        assert!(
+            result.killed_pids.contains(&real_pid),
+            "expected real_pid {real_pid} in killed_pids, got {:?}",
+            result.killed_pids
+        );
+
+        // The subprocess should have received SIGINT and be dead now.
+        let exit = child.wait().expect("waitpid");
+        assert!(
+            !exit.success(),
+            "subprocess should have been signalled, not exited cleanly"
+        );
     }
 
     // ========================================================================
