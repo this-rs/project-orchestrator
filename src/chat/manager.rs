@@ -3075,9 +3075,10 @@ impl ChatManager {
             .unwrap_or("(no description)")
             .to_string();
 
-        // Take the lock on `active_background_tasks`, upsert, and capture
-        // the fresh snapshot to broadcast outside the lock.
-        let snapshot = {
+        // Extract the child_pid and the Arc<Mutex<HashMap>> for tasks under
+        // a brief read lock so we can release it before the (potentially
+        // slow) `get_descendant_pids` pgrep call below.
+        let (tasks_arc, child_pid_for_before) = {
             let sessions = active_sessions.read().await;
             let Some(active) = sessions.get(session_id) else {
                 debug!(
@@ -3086,7 +3087,26 @@ impl ChatManager {
                 );
                 return false;
             };
-            let mut tasks = active.active_background_tasks.lock().await;
+            (active.active_background_tasks.clone(), active.child_pid)
+        };
+
+        // Capture the descendant snapshot BEFORE the subprocess forks.
+        // This must run lock-free because `pgrep -P` may take 10-50 ms.
+        // Plan fc35b25e (T2): the async claim spawned below will compare
+        // this snapshot to one taken ~1 s later to discover the new PID.
+        let before_pids: Vec<u32> = child_pid_for_before
+            .map(Self::get_descendant_pids)
+            .unwrap_or_default();
+
+        // Now perform the upsert under the tasks lock and capture the
+        // fresh snapshot for the broadcast. We use `match entry` instead of
+        // `or_insert_with` so we can detect the first-insert case and gate
+        // the async PID claim on it (the helper is called twice per ToolUse
+        // — first with empty input, then with full input — and we only
+        // want to spawn one claim task per tool_use_id).
+        let (snapshot, was_vacant) = {
+            let mut tasks = tasks_arc.lock().await;
+            let was_vacant = !tasks.contains_key(tool_use_id);
 
             let entry = tasks.entry(tool_use_id.to_string()).or_insert_with(|| {
                 let now = chrono::Utc::now();
@@ -3112,7 +3132,8 @@ impl ChatManager {
             // the pending removal — the task is alive after all.
             entry.pending_removal_at = None;
 
-            tasks.values().cloned().collect::<Vec<BackgroundTaskInfo>>()
+            let snap = tasks.values().cloned().collect::<Vec<BackgroundTaskInfo>>();
+            (snap, was_vacant)
         };
 
         let event = ChatEvent::ActiveTasksUpdate { tasks: snapshot };
@@ -3127,7 +3148,131 @@ impl ChatManager {
             kind = ?kind,
             "Tracked background task start (plan 754a1379, T3)"
         );
+
+        // Plan fc35b25e (T2): spawn the async PID claim only on first
+        // insert. The second pass (description refresh) reuses whatever
+        // PID the first claim populated.
+        if was_vacant && child_pid_for_before.is_some() {
+            let session_id_owned = session_id.to_string();
+            let tool_use_id_owned = tool_use_id.to_string();
+            let active_sessions_clone = active_sessions.clone();
+            let events_tx_clone = events_tx.clone();
+            let nats_clone = nats.clone();
+            tokio::spawn(async move {
+                Self::async_pid_claim(
+                    session_id_owned,
+                    active_sessions_clone,
+                    events_tx_clone,
+                    nats_clone,
+                    tool_use_id_owned,
+                    before_pids,
+                )
+                .await;
+            });
+        }
+
         true
+    }
+
+    /// Resolve the current `child_pid` of a session. Returns `None` if the
+    /// session has been removed (e.g., dropped between callsite and the
+    /// async PID claim) or if the session has no CLI subprocess yet.
+    ///
+    /// Plan fc35b25e (T2): companion to `async_pid_claim`. Re-resolves the
+    /// PID at sleep wake-up so a `resume_session` that races with the
+    /// claim window doesn't silently associate the new tool with an
+    /// obsolete CLI.
+    async fn lookup_child_pid(
+        session_id: &str,
+        active_sessions: &Arc<RwLock<HashMap<String, ActiveSession>>>,
+    ) -> Option<u32> {
+        let sessions = active_sessions.read().await;
+        sessions.get(session_id).and_then(|s| s.child_pid)
+    }
+
+    /// Async PID claim for a freshly-tracked background task. Sleeps 1 s
+    /// to let the subprocess fork, then snapshots descendants again,
+    /// computes the diff against `before_pids`, and assigns the newest
+    /// new PID to the task entry. Broadcasts a fresh `ActiveTasksUpdate`
+    /// so the frontend can surface the PID (useful for debugging).
+    ///
+    /// Race-safety:
+    /// - No locks are held during the `tokio::time::sleep`.
+    /// - If the entry was removed during the sleep (rapid cancel) the
+    ///   claim no-ops silently.
+    /// - If `pid_discovery_diff` returns empty (subprocess crashed before
+    ///   the snapshot, or two ToolUses raced and the first claim won
+    ///   both candidates), we log a warning and leave `pid: None`. The
+    ///   `cancel_task` fallback (T4) handles this case.
+    ///
+    /// Plan fc35b25e (T2). Tested in `tests::test_pid_claim_*`.
+    async fn async_pid_claim(
+        session_id: String,
+        active_sessions: Arc<RwLock<HashMap<String, ActiveSession>>>,
+        events_tx: broadcast::Sender<ChatEvent>,
+        nats: Option<Arc<crate::events::NatsEmitter>>,
+        tool_use_id: String,
+        before_pids: Vec<u32>,
+    ) {
+        // Wait for the subprocess to fork and be visible via pgrep.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        // Re-resolve child_pid (a `resume_session` between the callsite
+        // and now would have replaced the CLI).
+        let Some(child_pid) = Self::lookup_child_pid(&session_id, &active_sessions).await else {
+            debug!(
+                session_id = %session_id,
+                tool_use_id = %tool_use_id,
+                "async_pid_claim: session gone, skipping"
+            );
+            return;
+        };
+
+        let after_pids = Self::get_descendant_pids(child_pid);
+        let candidates = Self::pid_discovery_diff(&before_pids, &after_pids);
+        let Some(claimed) = candidates.first().copied() else {
+            warn!(
+                session_id = %session_id,
+                tool_use_id = %tool_use_id,
+                before_count = before_pids.len(),
+                after_count = after_pids.len(),
+                "async_pid_claim: no new PID in diff (subprocess crashed or claim raced)"
+            );
+            return;
+        };
+
+        // Update the task's pid and capture a fresh snapshot.
+        let snapshot = {
+            let sessions = active_sessions.read().await;
+            let Some(active) = sessions.get(&session_id) else {
+                return;
+            };
+            let mut tasks = active.active_background_tasks.lock().await;
+            let Some(task) = tasks.get_mut(&tool_use_id) else {
+                // Entry was cancelled/removed during the sleep — no-op.
+                debug!(
+                    session_id = %session_id,
+                    tool_use_id = %tool_use_id,
+                    "async_pid_claim: task removed before claim, dropping"
+                );
+                return;
+            };
+            task.pid = Some(claimed);
+            tasks.values().cloned().collect::<Vec<BackgroundTaskInfo>>()
+        };
+
+        info!(
+            session_id = %session_id,
+            tool_use_id = %tool_use_id,
+            pid = claimed,
+            "async_pid_claim: claimed PID for background task (plan fc35b25e, T2)"
+        );
+
+        let event = ChatEvent::ActiveTasksUpdate { tasks: snapshot };
+        let _ = events_tx.send(event.clone());
+        if let Some(ref nats) = nats {
+            nats.publish_chat_event(&session_id, event);
+        }
     }
 
     /// Touch the activity timestamp on a tracked background task,
@@ -11522,6 +11667,183 @@ mod tests {
             .await
             .len();
         assert_eq!(count, 0);
+    }
+
+    // ========================================================================
+    // T2 of plan fc35b25e — async PID claim from track_background_task_start
+    // ========================================================================
+
+    /// Trigger `track_background_task_start` against a session whose
+    /// `child_pid` points at a real `bash` subprocess that periodically
+    /// forks new descendants. The async claim must:
+    /// 1. snapshot descendants at insert time (`before`),
+    /// 2. sleep 1 s,
+    /// 3. snapshot again (`after`) and diff,
+    /// 4. claim the newest new PID,
+    /// 5. update the entry's `pid` and broadcast a fresh `ActiveTasksUpdate`.
+    ///
+    /// Marked `#[ignore]` because it spawns real subprocesses and depends
+    /// on timing — run with `cargo test -- --ignored`.
+    #[tokio::test]
+    #[ignore]
+    #[cfg(unix)]
+    async fn test_pid_claim_async_updates_map_after_1s() {
+        use std::process::Stdio;
+
+        // Spawn a bash that chains short sleeps so its descendant set
+        // changes during the 1 s claim window. At t=0 the descendant is
+        // a 0.3 s sleep; at t=1.0 it's the long-lived 30 s sleep.
+        //
+        // The trailing `& wait` is critical: without it, bash would
+        // optimise the final command via exec(2) and **replace itself**
+        // with `sleep 30`, leaving no descendants for pgrep to find.
+        // Backgrounding with `&` and using `wait` forces bash to fork
+        // and stay alive as the PPID.
+        let mut bash = match std::process::Command::new("bash")
+            .arg("-c")
+            .arg("sleep 0.3; sleep 0.5; sleep 30 & wait")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(_) => {
+                eprintln!("Skipping test: bash not available");
+                return;
+            }
+        };
+        let bash_pid = bash.id();
+        // Give the OS a moment so pgrep can see the first descendant.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let Some((mut session, _)) = try_create_dummy_session(false, "", vec![]) else {
+            eprintln!("Skipping test: Claude CLI not installed");
+            let _ = bash.kill();
+            let _ = bash.wait();
+            return;
+        };
+        session.child_pid = Some(bash_pid);
+        let events_tx = session.events_tx.clone();
+        let mut events_rx = events_tx.subscribe();
+
+        let map: Arc<RwLock<HashMap<String, ActiveSession>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        map.write().await.insert("s-claim".into(), session);
+
+        let inserted = ChatManager::track_background_task_start(
+            "s-claim",
+            &map,
+            &events_tx,
+            &None,
+            "tu-claim",
+            "Monitor",
+            &serde_json::json!({}),
+            None,
+        )
+        .await;
+        assert!(inserted, "Monitor first-pass should insert");
+
+        // Drain the first broadcast (insert with pid=None).
+        match tokio::time::timeout(Duration::from_secs(1), events_rx.recv()).await {
+            Ok(Ok(ChatEvent::ActiveTasksUpdate { tasks })) => {
+                assert_eq!(tasks.len(), 1);
+                assert!(tasks[0].pid.is_none(), "first broadcast pid must be None");
+            }
+            other => {
+                let _ = bash.kill();
+                let _ = bash.wait();
+                panic!("expected ActiveTasksUpdate broadcast, got {other:?}");
+            }
+        }
+
+        // Wait past the 1 s sleep + a margin for the async claim to land.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+
+        // The entry should now carry pid=Some(...).
+        let claimed_pid = {
+            let sessions = map.read().await;
+            let active = sessions.get("s-claim").expect("session present");
+            let tasks = active.active_background_tasks.lock().await;
+            let entry = tasks.get("tu-claim").expect("entry present");
+            entry.pid
+        };
+
+        // Cleanup before assertions so a panic doesn't leak the bash.
+        let _ = bash.kill();
+        let _ = bash.wait();
+
+        assert!(
+            claimed_pid.is_some(),
+            "expected pid populated by async claim, got {claimed_pid:?}"
+        );
+    }
+
+    /// Cancel the entry between the synchronous track call and the 1 s
+    /// async wake-up. The claim must no-op without re-inserting the entry
+    /// or panicking.
+    #[tokio::test]
+    async fn test_pid_claim_noop_when_entry_removed_before_wakeup() {
+        let Some((mut session, _)) = try_create_dummy_session(false, "", vec![]) else {
+            eprintln!("Skipping test: Claude CLI not installed");
+            return;
+        };
+        // Set a non-None child_pid so the claim task is actually spawned
+        // (else it short-circuits in the synchronous track call). We use
+        // a guaranteed-nonexistent PID so `pgrep -P` returns instantly
+        // with no descendants → the diff is empty and the claim takes
+        // the warn-and-return path, which is what we want to exercise.
+        // (Avoid PID 1 — on macOS that's launchd whose subtree is the
+        // entire process table, making `get_descendant_pids` very slow.)
+        session.child_pid = Some(999_999);
+        let events_tx = session.events_tx.clone();
+        let _events_rx = events_tx.subscribe();
+
+        let map: Arc<RwLock<HashMap<String, ActiveSession>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        map.write().await.insert("s-race".into(), session);
+
+        let inserted = ChatManager::track_background_task_start(
+            "s-race",
+            &map,
+            &events_tx,
+            &None,
+            "tu-race",
+            "Monitor",
+            &serde_json::json!({}),
+            None,
+        )
+        .await;
+        assert!(inserted);
+
+        // Immediately remove the entry — simulates a rapid cancel that
+        // beats the async claim.
+        {
+            let sessions = map.read().await;
+            let active = sessions.get("s-race").expect("session present");
+            active
+                .active_background_tasks
+                .lock()
+                .await
+                .remove("tu-race");
+        }
+
+        // Wait past the 1 s sleep + a margin.
+        tokio::time::sleep(Duration::from_millis(1300)).await;
+
+        // The entry must NOT have been re-inserted by the claim, and the
+        // process must not have panicked (if it did, the test runtime
+        // would have aborted).
+        let count = map
+            .read()
+            .await
+            .get("s-race")
+            .unwrap()
+            .active_background_tasks
+            .lock()
+            .await
+            .len();
+        assert_eq!(count, 0, "claim must not re-insert removed entries");
     }
 
     // ========================================================================
