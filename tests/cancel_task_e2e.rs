@@ -27,7 +27,7 @@
 //!
 //! - INSERT on `ToolUse Monitor` → entry materialises in the map
 //!   (test_track_background_task_inserts_monitor_on_first_pass +
-//!    test_track_background_task_updates_description_on_second_pass).
+//!   test_track_background_task_updates_description_on_second_pass).
 //! - INSERT filter for Bash run_in_background=true (vs synchronous
 //!   Bash, vs other tools) — full truth table covered.
 //! - cancel_task marks `pending_removal_at` and broadcasts
@@ -42,7 +42,7 @@
 //!   (test_tick_purge_marks_idle_entries_as_pending_removal).
 //! - Lazy crash recovery from orphan correlation_id
 //!   (test_recovery_inserts_orphan_*, test_recovery_skips_*,
-//!    test_recovery_touches_last_seen_at_*).
+//!   test_recovery_touches_last_seen_at_*).
 //!
 //! What's left for E2E is the integration layer:
 //! - REST endpoint hits the right path and returns the expected JSON.
