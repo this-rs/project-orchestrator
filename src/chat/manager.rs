@@ -5491,6 +5491,22 @@ impl ChatManager {
             nats_cancel.clone(),
         );
 
+        // Spawn the per-session background-tasks poller (T12 of plan
+        // 754a1379). Mirror of `create_session` — without this spawn,
+        // resumed sessions never run the grace-period purge, so
+        // `pending_removal_at` set by `cancel_task` is never honoured
+        // and entries linger forever in `active_background_tasks`.
+        // (Bug discovered post-V2 cancel_task: a stuck "stopping…"
+        // entry in the frontend with PIDs already dead — the poller
+        // wasn't running for resumed sessions to physically purge.)
+        Self::spawn_background_tasks_poller(
+            session_id.to_string(),
+            self.active_sessions.clone(),
+            events_tx.clone(),
+            self.nats.clone(),
+            nats_cancel.clone(),
+        );
+
         // Spawn the permanent out-of-band SDK message listener (T4+T5 of
         // plan 9a1684b2). Same as `create_session` — the resumed session
         // needs its own listener bound to the new InteractiveClient. The
