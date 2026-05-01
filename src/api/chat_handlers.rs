@@ -533,13 +533,14 @@ pub async fn get_background_tasks(
 /// `tool_use_id` (= map key, ≡ `correlation_id` on the related
 /// BackgroundOutput events).
 ///
-/// V1 semantics: marks the entry for removal in the tracking map and
-/// broadcasts a fresh `ActiveTasksUpdate` so the frontend reflects
-/// the cancelled state. The underlying subprocess is **not yet
-/// killed in this version** — see the doc-comment on
-/// `ChatManager::cancel_task` for the rationale and the follow-up
-/// path. Users who need the subprocess actually terminated should
-/// use the global `cancel-tools` button (current Stop UX).
+/// V2 semantics (plan fc35b25e): marks the entry for removal in
+/// the tracking map, broadcasts a fresh `ActiveTasksUpdate`, **and**
+/// SIGINTs the subprocess subtree (root + descendants) when the
+/// async PID claim has populated `task.pid`. `killed_pids` lists the
+/// PIDs that received the signal. Falls back to V1 map-side-only
+/// cancel when the pid is still `None` (claim race or subprocess
+/// crashed before discovery) — see the doc-comment on
+/// `ChatManager::cancel_task` for the full state machine.
 ///
 /// ## Response codes
 ///

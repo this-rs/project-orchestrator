@@ -273,26 +273,29 @@ pub struct CancelToolsResult {
 
 /// Result of `ChatManager::cancel_task`. Surfaced to REST/WS callers
 /// so the UI can update the cancelled task's status and surface rate
-/// cap hits gracefully. Plan 754a1379 (T7).
+/// cap hits gracefully.
 ///
-/// In V1 `killed_pids` is always empty — the cancel path is a
-/// map-side cancel only (entry marked for removal + broadcast); the
-/// underlying subprocess keeps running until the global Stop is hit
-/// or the session ends. PID-targeted kill is a follow-up enhancement
-/// once `identify_subprocess_kind` (T13) provides PID discovery.
+/// Plan 754a1379 (T7) introduced this with V1 semantics (map-side
+/// cancel only, `killed_pids` always empty). Plan fc35b25e (T4)
+/// upgraded the implementation to actually SIGINT the subprocess
+/// subtree via `kill_subtree`; `killed_pids` now reports the PIDs
+/// that received the signal in the common path. Empty `killed_pids`
+/// is now an edge case (claim race or subprocess crashed before
+/// PID discovery — falls back to V1 map-side cancel).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CancelTaskResult {
     /// `tool_use_id` (≡ map key, ≡ `correlation_id`) of the task that
     /// was cancelled. Echoed back so the caller doesn't have to
     /// remember which click corresponded to which task on a busy UI.
     pub task_id: String,
-    /// PIDs that received `SIGINT`. Always empty in V1 (no precise
-    /// PID discovery yet). Reserved for the follow-up that adds
-    /// PID-targeted kill — keeping the field now avoids a wire-format
-    /// breaking change later.
+    /// PIDs (root + descendants) that received `SIGINT` from
+    /// `kill_subtree`. Non-empty in the common V2 path. Empty when
+    /// the task entry's `pid` was still `None` at cancel time
+    /// (claim race or subprocess crashed before discovery — V1
+    /// fallback engaged).
     pub killed_pids: Vec<u32>,
     /// `true` when the rate cap was hit and the request was refused
-    /// (no map mutation, no broadcast).
+    /// (no map mutation, no broadcast, no kill).
     pub capped: bool,
 }
 
@@ -3075,9 +3078,10 @@ impl ChatManager {
             .unwrap_or("(no description)")
             .to_string();
 
-        // Take the lock on `active_background_tasks`, upsert, and capture
-        // the fresh snapshot to broadcast outside the lock.
-        let snapshot = {
+        // Extract the child_pid and the Arc<Mutex<HashMap>> for tasks under
+        // a brief read lock so we can release it before the (potentially
+        // slow) `get_descendant_pids` pgrep call below.
+        let (tasks_arc, child_pid_for_before) = {
             let sessions = active_sessions.read().await;
             let Some(active) = sessions.get(session_id) else {
                 debug!(
@@ -3086,7 +3090,26 @@ impl ChatManager {
                 );
                 return false;
             };
-            let mut tasks = active.active_background_tasks.lock().await;
+            (active.active_background_tasks.clone(), active.child_pid)
+        };
+
+        // Capture the descendant snapshot BEFORE the subprocess forks.
+        // This must run lock-free because `pgrep -P` may take 10-50 ms.
+        // Plan fc35b25e (T2): the async claim spawned below will compare
+        // this snapshot to one taken ~1 s later to discover the new PID.
+        let before_pids: Vec<u32> = child_pid_for_before
+            .map(Self::get_descendant_pids)
+            .unwrap_or_default();
+
+        // Now perform the upsert under the tasks lock and capture the
+        // fresh snapshot for the broadcast. We use `match entry` instead of
+        // `or_insert_with` so we can detect the first-insert case and gate
+        // the async PID claim on it (the helper is called twice per ToolUse
+        // — first with empty input, then with full input — and we only
+        // want to spawn one claim task per tool_use_id).
+        let (snapshot, was_vacant) = {
+            let mut tasks = tasks_arc.lock().await;
+            let was_vacant = !tasks.contains_key(tool_use_id);
 
             let entry = tasks.entry(tool_use_id.to_string()).or_insert_with(|| {
                 let now = chrono::Utc::now();
@@ -3112,7 +3135,8 @@ impl ChatManager {
             // the pending removal — the task is alive after all.
             entry.pending_removal_at = None;
 
-            tasks.values().cloned().collect::<Vec<BackgroundTaskInfo>>()
+            let snap = tasks.values().cloned().collect::<Vec<BackgroundTaskInfo>>();
+            (snap, was_vacant)
         };
 
         let event = ChatEvent::ActiveTasksUpdate { tasks: snapshot };
@@ -3127,7 +3151,131 @@ impl ChatManager {
             kind = ?kind,
             "Tracked background task start (plan 754a1379, T3)"
         );
+
+        // Plan fc35b25e (T2): spawn the async PID claim only on first
+        // insert. The second pass (description refresh) reuses whatever
+        // PID the first claim populated.
+        if was_vacant && child_pid_for_before.is_some() {
+            let session_id_owned = session_id.to_string();
+            let tool_use_id_owned = tool_use_id.to_string();
+            let active_sessions_clone = active_sessions.clone();
+            let events_tx_clone = events_tx.clone();
+            let nats_clone = nats.clone();
+            tokio::spawn(async move {
+                Self::async_pid_claim(
+                    session_id_owned,
+                    active_sessions_clone,
+                    events_tx_clone,
+                    nats_clone,
+                    tool_use_id_owned,
+                    before_pids,
+                )
+                .await;
+            });
+        }
+
         true
+    }
+
+    /// Resolve the current `child_pid` of a session. Returns `None` if the
+    /// session has been removed (e.g., dropped between callsite and the
+    /// async PID claim) or if the session has no CLI subprocess yet.
+    ///
+    /// Plan fc35b25e (T2): companion to `async_pid_claim`. Re-resolves the
+    /// PID at sleep wake-up so a `resume_session` that races with the
+    /// claim window doesn't silently associate the new tool with an
+    /// obsolete CLI.
+    async fn lookup_child_pid(
+        session_id: &str,
+        active_sessions: &Arc<RwLock<HashMap<String, ActiveSession>>>,
+    ) -> Option<u32> {
+        let sessions = active_sessions.read().await;
+        sessions.get(session_id).and_then(|s| s.child_pid)
+    }
+
+    /// Async PID claim for a freshly-tracked background task. Sleeps 1 s
+    /// to let the subprocess fork, then snapshots descendants again,
+    /// computes the diff against `before_pids`, and assigns the newest
+    /// new PID to the task entry. Broadcasts a fresh `ActiveTasksUpdate`
+    /// so the frontend can surface the PID (useful for debugging).
+    ///
+    /// Race-safety:
+    /// - No locks are held during the `tokio::time::sleep`.
+    /// - If the entry was removed during the sleep (rapid cancel) the
+    ///   claim no-ops silently.
+    /// - If `pid_discovery_diff` returns empty (subprocess crashed before
+    ///   the snapshot, or two ToolUses raced and the first claim won
+    ///   both candidates), we log a warning and leave `pid: None`. The
+    ///   `cancel_task` fallback (T4) handles this case.
+    ///
+    /// Plan fc35b25e (T2). Tested in `tests::test_pid_claim_*`.
+    async fn async_pid_claim(
+        session_id: String,
+        active_sessions: Arc<RwLock<HashMap<String, ActiveSession>>>,
+        events_tx: broadcast::Sender<ChatEvent>,
+        nats: Option<Arc<crate::events::NatsEmitter>>,
+        tool_use_id: String,
+        before_pids: Vec<u32>,
+    ) {
+        // Wait for the subprocess to fork and be visible via pgrep.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        // Re-resolve child_pid (a `resume_session` between the callsite
+        // and now would have replaced the CLI).
+        let Some(child_pid) = Self::lookup_child_pid(&session_id, &active_sessions).await else {
+            debug!(
+                session_id = %session_id,
+                tool_use_id = %tool_use_id,
+                "async_pid_claim: session gone, skipping"
+            );
+            return;
+        };
+
+        let after_pids = Self::get_descendant_pids(child_pid);
+        let candidates = Self::pid_discovery_diff(&before_pids, &after_pids);
+        let Some(claimed) = candidates.first().copied() else {
+            warn!(
+                session_id = %session_id,
+                tool_use_id = %tool_use_id,
+                before_count = before_pids.len(),
+                after_count = after_pids.len(),
+                "async_pid_claim: no new PID in diff (subprocess crashed or claim raced)"
+            );
+            return;
+        };
+
+        // Update the task's pid and capture a fresh snapshot.
+        let snapshot = {
+            let sessions = active_sessions.read().await;
+            let Some(active) = sessions.get(&session_id) else {
+                return;
+            };
+            let mut tasks = active.active_background_tasks.lock().await;
+            let Some(task) = tasks.get_mut(&tool_use_id) else {
+                // Entry was cancelled/removed during the sleep — no-op.
+                debug!(
+                    session_id = %session_id,
+                    tool_use_id = %tool_use_id,
+                    "async_pid_claim: task removed before claim, dropping"
+                );
+                return;
+            };
+            task.pid = Some(claimed);
+            tasks.values().cloned().collect::<Vec<BackgroundTaskInfo>>()
+        };
+
+        info!(
+            session_id = %session_id,
+            tool_use_id = %tool_use_id,
+            pid = claimed,
+            "async_pid_claim: claimed PID for background task (plan fc35b25e, T2)"
+        );
+
+        let event = ChatEvent::ActiveTasksUpdate { tasks: snapshot };
+        let _ = events_tx.send(event.clone());
+        if let Some(ref nats) = nats {
+            nats.publish_chat_event(&session_id, event);
+        }
     }
 
     /// Touch the activity timestamp on a tracked background task,
@@ -6017,31 +6165,31 @@ impl ChatManager {
 
     /// Cancel a single tracked background task (Monitor, Bash bg) by id.
     ///
-    /// Plan 754a1379 (T7). The granular companion to `cancel_running_tools`
-    /// — instead of killing every descendant of the CLI, this targets a
+    /// Plan 754a1379 (T7) — granular companion to `cancel_running_tools`.
+    /// Instead of killing every descendant of the CLI, this targets a
     /// single tracked task by its `tool_use_id` (= map key).
     ///
-    /// ## V1 semantics — map-side cancel only
+    /// ## V2 semantics — PID-targeted kill (plan fc35b25e, T4)
     ///
-    /// V1 marks the entry as `pending_removal_at = Some(now)` (the actual
-    /// physical purge happens after `GRACE_PERIOD` in T12) and broadcasts
-    /// a fresh `ChatEvent::ActiveTasksUpdate` so the frontend immediately
-    /// reflects the cancelled state. **It does NOT yet send SIGINT to
-    /// the subprocess** — PID-targeted kill requires a discovery
-    /// mechanism that maps `tool_use_id → root PID`, which is out of
-    /// scope for this commit (will land alongside T13 once
-    /// `identify_subprocess_kind` exists).
+    /// 1. Atomically extract the task's `pid` and mark
+    ///    `pending_removal_at = Some(now)` under a single tasks-lock op
+    ///    (the actual physical purge happens after `GRACE_PERIOD` in T12).
+    /// 2. If `pid.is_some()`: call `kill_subtree(pid)` — sends SIGINT to
+    ///    the root subprocess **and** all its descendants (`tail -F`,
+    ///    `find`, etc.) and returns the list of PIDs that received the
+    ///    signal. Populates `CancelTaskResult.killed_pids`.
+    /// 3. If `pid.is_none()` (claim race — `track_background_task_start`
+    ///    spawned the async claim but it hasn't fired yet, OR the
+    ///    subprocess crashed before pgrep saw it): logs a warning and
+    ///    falls back to V1 map-side-only cancel. `killed_pids` is empty
+    ///    in this edge case — the user can fall back to the global
+    ///    `cancel_running_tools` if needed.
+    /// 4. Broadcasts a fresh `ChatEvent::ActiveTasksUpdate` so the
+    ///    frontend immediately reflects the cancelled state.
     ///
-    /// **What this means in practice**: the user clicks Stop on a
-    /// specific Monitor → the toolbar pill disappears immediately, but
-    /// the underlying `tail -F` keeps emitting ticks for a short window.
-    /// Those orphan ticks are absorbed by the grace period (T12) and the
-    /// frontend's orphan-correlation_id buffer (F10).
-    ///
-    /// To actually kill the subprocess in V1, the user must use the
-    /// global `cancel_running_tools` (Stop button on the active turn) —
-    /// which kills every descendant. This is documented in the UX so
-    /// users with a single Monitor running get the same effect.
+    /// The 5 s grace period from T12 (plan 754a1379) is preserved — it
+    /// absorbs `BackgroundOutput` ticks that may be in flight between
+    /// the SIGINT and the subprocess actually exiting.
     ///
     /// ## Cap
     ///
@@ -6061,10 +6209,12 @@ impl ChatManager {
     ///
     /// ## Returns
     ///
-    /// - `CancelTaskResult { task_id, killed_pids: vec![], capped: false }`
-    ///   on success — `killed_pids` always empty in V1.
+    /// - `CancelTaskResult { task_id, killed_pids, capped: false }` on
+    ///   success — `killed_pids` is the list of PIDs (root + descendants)
+    ///   that received SIGINT in V2. Empty in the claim-race fallback
+    ///   path described above.
     /// - `capped: true` if the rate cap was hit (no broadcast, no map
-    ///   mutation).
+    ///   mutation, no kill).
     /// - Returns `Ok(...)` even if the session is unknown or the
     ///   task_id isn't in the map (idempotent — clicking Stop twice on
     ///   the same task is fine).
@@ -6119,25 +6269,60 @@ impl ChatManager {
             });
         }
 
-        // Mark for removal + capture snapshot for broadcast.
-        let snapshot = {
+        // V2 (plan fc35b25e, T4): atomically extract the task's pid AND
+        // mark for removal under a single tasks-lock op, then capture the
+        // snapshot for broadcast. Doing both in the same critical section
+        // ensures a concurrent claim-update from `async_pid_claim` cannot
+        // populate the pid AFTER we read it.
+        let (snapshot, task_pid) = {
             let mut tasks = tasks_arc.lock().await;
-            if let Some(entry) = tasks.get_mut(task_id) {
+            let pid = if let Some(entry) = tasks.get_mut(task_id) {
                 entry.pending_removal_at = Some(std::time::Instant::now());
+                let captured = entry.pid;
                 info!(
                     session_id = %session_id,
                     task_id = %task_id,
                     kind = ?entry.kind,
+                    pid = ?captured,
                     "cancel_task: marked for removal (grace period via T12)"
                 );
+                captured
             } else {
                 debug!(
                     session_id = %session_id,
                     task_id = %task_id,
                     "cancel_task: task_id unknown in map; idempotent no-op"
                 );
+                None
+            };
+            (
+                tasks.values().cloned().collect::<Vec<BackgroundTaskInfo>>(),
+                pid,
+            )
+        };
+
+        // V2: SIGINT the subtree if the async claim populated a pid;
+        // otherwise log a warning and fall back to map-side-only cancel.
+        let killed_pids = match task_pid {
+            Some(root_pid) => {
+                let killed = Self::kill_subtree(root_pid);
+                info!(
+                    session_id = %session_id,
+                    task_id = %task_id,
+                    root_pid = root_pid,
+                    killed_count = killed.len(),
+                    "cancel_task: SIGINT'd subtree (plan fc35b25e, T4)"
+                );
+                killed
             }
-            tasks.values().cloned().collect::<Vec<BackgroundTaskInfo>>()
+            None => {
+                warn!(
+                    session_id = %session_id,
+                    task_id = %task_id,
+                    "cancel_task: no PID stored (claim race or subprocess crashed before discovery), map-side only"
+                );
+                Vec::new()
+            }
         };
 
         let event = ChatEvent::ActiveTasksUpdate { tasks: snapshot };
@@ -6149,7 +6334,7 @@ impl ChatManager {
 
         Ok(CancelTaskResult {
             task_id: task_id.to_string(),
-            killed_pids: Vec::new(),
+            killed_pids,
             capped: false,
         })
     }
@@ -6337,6 +6522,99 @@ impl ChatManager {
         result
     }
 
+    /// Parse the `[[dd-]hh:]mm:ss` format returned by `ps -o etime=` into a
+    /// total elapsed-seconds count. Plan fc35b25e (T1, V2 cancel_task).
+    ///
+    /// `ps -o etime=` is the only locale-independent process-age field that
+    /// works identically on Linux and macOS — `etimes` (with `s`) is
+    /// Linux-only, and `lstart` is locale-formatted. See audit observation
+    /// `7dbde66b` for the full cross-platform investigation.
+    ///
+    /// Format examples:
+    /// - `"00:01"`        → 1 second
+    /// - `"12:34"`        → 754 seconds (12 min 34 s)
+    /// - `"02:12:34"`     → 7954 seconds
+    /// - `"01-02:12:34"`  → 94354 seconds (1 day 2 h …)
+    ///
+    /// Returns `None` on any parse failure rather than panicking — callers
+    /// fall back to skipping the PID in the diff sort.
+    #[allow(dead_code)] // wired by T2 of plan fc35b25e
+    pub(crate) fn parse_etime(s: &str) -> Option<u64> {
+        let s = s.trim();
+        if s.is_empty() {
+            return None;
+        }
+        // Optional "DD-" days prefix.
+        let (days, rest) = match s.find('-') {
+            Some(idx) => (s[..idx].parse::<u64>().ok()?, &s[idx + 1..]),
+            None => (0u64, s),
+        };
+        let parts: Vec<&str> = rest.split(':').collect();
+        let (hours, minutes, seconds) = match parts.as_slice() {
+            [sec] => (0u64, 0u64, sec.parse::<u64>().ok()?),
+            [m, sec] => (0u64, m.parse::<u64>().ok()?, sec.parse::<u64>().ok()?),
+            [h, m, sec] => (
+                h.parse::<u64>().ok()?,
+                m.parse::<u64>().ok()?,
+                sec.parse::<u64>().ok()?,
+            ),
+            _ => return None,
+        };
+        Some(days * 86_400 + hours * 3_600 + minutes * 60 + seconds)
+    }
+
+    /// Return the elapsed seconds since `pid` started, or `None` if the
+    /// process is gone / `ps` failed / the format couldn't be parsed.
+    /// Plan fc35b25e (T1).
+    ///
+    /// Cross-platform via `ps -p <pid> -o etime=`. Single code path for
+    /// Linux + macOS — see audit observation `7dbde66b` for why we
+    /// abandoned the original `/proc/<pid>/stat` + boot_time approach.
+    #[cfg(unix)]
+    #[allow(dead_code)] // wired by T2 of plan fc35b25e
+    pub(crate) fn process_etime_seconds(pid: u32) -> Option<u64> {
+        let output = std::process::Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "etime="])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let raw = String::from_utf8(output.stdout).ok()?;
+        Self::parse_etime(&raw)
+    }
+
+    /// Compute `after \ before` (set difference, treating each `Vec` as a
+    /// set) and return the new PIDs sorted by elapsed time **ascending**
+    /// (smallest etime first → most recently spawned first). PIDs whose
+    /// etime can't be read are placed at the end.
+    ///
+    /// Plan fc35b25e (T1, T2). The first element of the returned Vec is
+    /// the heuristic "claim" candidate for a freshly-observed
+    /// `ToolUse(Monitor | Bash run_in_background)` event — the assumption
+    /// being that the most recently spawned descendant of the CLI is the
+    /// subprocess this ToolUse just created.
+    ///
+    /// ## Race-tolerance caveat
+    ///
+    /// When two ToolUses fire within the diff window (1s), this function
+    /// returns multiple new PIDs and the first-PID claim heuristic
+    /// becomes ambiguous. V2 accepts this as documented degraded
+    /// behaviour — see plan constraint `e1dfeaa5`.
+    #[allow(dead_code)] // wired by T2 of plan fc35b25e
+    pub(crate) fn pid_discovery_diff(before: &[u32], after: &[u32]) -> Vec<u32> {
+        let before_set: std::collections::HashSet<u32> = before.iter().copied().collect();
+        let mut new_pids: Vec<u32> = after
+            .iter()
+            .copied()
+            .filter(|p| !before_set.contains(p))
+            .collect();
+        // Sort by etime ascending (smallest = most recent). Unreadable
+        // etimes (process gone, ps failed) sort last via u64::MAX.
+        new_pids.sort_by_key(|pid| Self::process_etime_seconds(*pid).unwrap_or(u64::MAX));
+        new_pids
+    }
+
     /// Send `SIGINT` to every descendant of `cli_pid` **without** sending the
     /// SDK `interrupt` control_request and **without** touching the
     /// `interrupt_flag`/`interrupt_token`. Returns the PIDs that received the
@@ -6385,6 +6663,58 @@ impl ChatManager {
         #[cfg(not(unix))]
         {
             let _ = cli_pid;
+            Vec::new()
+        }
+    }
+
+    /// Send `SIGINT` to a single PID **and** all its descendants. Returns the
+    /// PIDs that received the signal (filters out ESRCH for already-dead
+    /// processes).
+    ///
+    /// Plan fc35b25e (T3, V2 cancel_task). Companion to `kill_descendants`
+    /// but with two key differences:
+    ///
+    /// | Aspect | `kill_descendants(cli_pid)` | `kill_subtree(root_pid)` |
+    /// |--------|------------------------------|---------------------------|
+    /// | Targets the root | **No** (preserves CLI) | **Yes** (root + descendants) |
+    /// | Use case | Global "Stop" — kill every running tool | Per-task cancel — kill one Monitor / Bash bg subtree |
+    /// | Caller | `cancel_running_tools` | `cancel_task` |
+    /// | Plan | `28e9afe3` (T2) | `fc35b25e` (T3) |
+    ///
+    /// The reason `kill_descendants` doesn't kill the root is that the root
+    /// is the Claude Code CLI subprocess — killing it would tear down the
+    /// whole session (cf decision `d2bf0e7b`). For `kill_subtree` the root
+    /// is a Monitor / Bash bg subprocess that we **do** want to terminate
+    /// (it has no protected status), so we include it in the SIGINT batch.
+    ///
+    /// On non-unix platforms this is a no-op that returns an empty Vec.
+    fn kill_subtree(root_pid: u32) -> Vec<u32> {
+        #[cfg(unix)]
+        {
+            let mut all_pids = vec![root_pid];
+            all_pids.extend(Self::get_descendant_pids(root_pid));
+
+            let mut killed = Vec::with_capacity(all_pids.len());
+            for &pid in &all_pids {
+                // SAFETY: libc::kill is FFI; SIGINT to a non-existent PID
+                // returns ESRCH which we silently ignore (idempotent —
+                // the subprocess may have finished naturally between
+                // pgrep snapshot and signal).
+                let rc = unsafe { libc::kill(pid as i32, libc::SIGINT) };
+                if rc == 0 {
+                    killed.push(pid);
+                } else {
+                    let errno = std::io::Error::last_os_error();
+                    if errno.raw_os_error() != Some(libc::ESRCH) {
+                        warn!(pid = pid, error = ?errno, "kill_subtree: SIGINT failed");
+                    }
+                }
+            }
+            killed
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = root_pid;
             Vec::new()
         }
     }
@@ -11032,6 +11362,57 @@ mod tests {
         assert!(killed.is_empty());
     }
 
+    // ========================================================================
+    // T3 of plan fc35b25e — kill_subtree(pid) helper
+    // ========================================================================
+
+    #[test]
+    #[cfg(unix)]
+    fn test_kill_subtree_nonexistent_pid_is_noop() {
+        // PID 999_999 is almost certainly not a live process — kill returns
+        // ESRCH which we silently filter, so killed list is empty and the
+        // call must not panic.
+        let killed = ChatManager::kill_subtree(999_999);
+        assert!(
+            killed.is_empty(),
+            "expected empty killed list, got {killed:?}"
+        );
+    }
+
+    /// Spawn a real `sleep 30`, call `kill_subtree`, verify the subprocess
+    /// is reaped within a reasonable timeout. Marked `#[ignore]` because it
+    /// touches real processes — run with `cargo test -- --ignored`.
+    #[test]
+    #[ignore]
+    #[cfg(unix)]
+    fn test_kill_subtree_kills_real_sleep_subprocess() {
+        let mut child = match std::process::Command::new("sleep").arg("30").spawn() {
+            Ok(c) => c,
+            Err(_) => {
+                eprintln!("Skipping test: sleep not available");
+                return;
+            }
+        };
+        let pid = child.id();
+
+        // Give the OS a moment to register the process.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let killed = ChatManager::kill_subtree(pid);
+        assert!(
+            killed.contains(&pid),
+            "expected {pid} in killed list, got {killed:?}"
+        );
+
+        // Reap the zombie and confirm the process actually died (sleep was
+        // 30s — if it's already dead now, kill_subtree did its job).
+        let exit = child.wait().expect("waitpid");
+        assert!(
+            !exit.success(),
+            "subprocess should have been signalled, not exited cleanly"
+        );
+    }
+
     #[test]
     fn test_cancel_tools_result_serde_roundtrip() {
         let result = CancelToolsResult {
@@ -11328,6 +11709,183 @@ mod tests {
     }
 
     // ========================================================================
+    // T2 of plan fc35b25e — async PID claim from track_background_task_start
+    // ========================================================================
+
+    /// Trigger `track_background_task_start` against a session whose
+    /// `child_pid` points at a real `bash` subprocess that periodically
+    /// forks new descendants. The async claim must:
+    /// 1. snapshot descendants at insert time (`before`),
+    /// 2. sleep 1 s,
+    /// 3. snapshot again (`after`) and diff,
+    /// 4. claim the newest new PID,
+    /// 5. update the entry's `pid` and broadcast a fresh `ActiveTasksUpdate`.
+    ///
+    /// Marked `#[ignore]` because it spawns real subprocesses and depends
+    /// on timing — run with `cargo test -- --ignored`.
+    #[tokio::test]
+    #[ignore]
+    #[cfg(unix)]
+    async fn test_pid_claim_async_updates_map_after_1s() {
+        use std::process::Stdio;
+
+        // Spawn a bash that chains short sleeps so its descendant set
+        // changes during the 1 s claim window. At t=0 the descendant is
+        // a 0.3 s sleep; at t=1.0 it's the long-lived 30 s sleep.
+        //
+        // The trailing `& wait` is critical: without it, bash would
+        // optimise the final command via exec(2) and **replace itself**
+        // with `sleep 30`, leaving no descendants for pgrep to find.
+        // Backgrounding with `&` and using `wait` forces bash to fork
+        // and stay alive as the PPID.
+        let mut bash = match std::process::Command::new("bash")
+            .arg("-c")
+            .arg("sleep 0.3; sleep 0.5; sleep 30 & wait")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(_) => {
+                eprintln!("Skipping test: bash not available");
+                return;
+            }
+        };
+        let bash_pid = bash.id();
+        // Give the OS a moment so pgrep can see the first descendant.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let Some((mut session, _)) = try_create_dummy_session(false, "", vec![]) else {
+            eprintln!("Skipping test: Claude CLI not installed");
+            let _ = bash.kill();
+            let _ = bash.wait();
+            return;
+        };
+        session.child_pid = Some(bash_pid);
+        let events_tx = session.events_tx.clone();
+        let mut events_rx = events_tx.subscribe();
+
+        let map: Arc<RwLock<HashMap<String, ActiveSession>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        map.write().await.insert("s-claim".into(), session);
+
+        let inserted = ChatManager::track_background_task_start(
+            "s-claim",
+            &map,
+            &events_tx,
+            &None,
+            "tu-claim",
+            "Monitor",
+            &serde_json::json!({}),
+            None,
+        )
+        .await;
+        assert!(inserted, "Monitor first-pass should insert");
+
+        // Drain the first broadcast (insert with pid=None).
+        match tokio::time::timeout(Duration::from_secs(1), events_rx.recv()).await {
+            Ok(Ok(ChatEvent::ActiveTasksUpdate { tasks })) => {
+                assert_eq!(tasks.len(), 1);
+                assert!(tasks[0].pid.is_none(), "first broadcast pid must be None");
+            }
+            other => {
+                let _ = bash.kill();
+                let _ = bash.wait();
+                panic!("expected ActiveTasksUpdate broadcast, got {other:?}");
+            }
+        }
+
+        // Wait past the 1 s sleep + a margin for the async claim to land.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+
+        // The entry should now carry pid=Some(...).
+        let claimed_pid = {
+            let sessions = map.read().await;
+            let active = sessions.get("s-claim").expect("session present");
+            let tasks = active.active_background_tasks.lock().await;
+            let entry = tasks.get("tu-claim").expect("entry present");
+            entry.pid
+        };
+
+        // Cleanup before assertions so a panic doesn't leak the bash.
+        let _ = bash.kill();
+        let _ = bash.wait();
+
+        assert!(
+            claimed_pid.is_some(),
+            "expected pid populated by async claim, got {claimed_pid:?}"
+        );
+    }
+
+    /// Cancel the entry between the synchronous track call and the 1 s
+    /// async wake-up. The claim must no-op without re-inserting the entry
+    /// or panicking.
+    #[tokio::test]
+    async fn test_pid_claim_noop_when_entry_removed_before_wakeup() {
+        let Some((mut session, _)) = try_create_dummy_session(false, "", vec![]) else {
+            eprintln!("Skipping test: Claude CLI not installed");
+            return;
+        };
+        // Set a non-None child_pid so the claim task is actually spawned
+        // (else it short-circuits in the synchronous track call). We use
+        // a guaranteed-nonexistent PID so `pgrep -P` returns instantly
+        // with no descendants → the diff is empty and the claim takes
+        // the warn-and-return path, which is what we want to exercise.
+        // (Avoid PID 1 — on macOS that's launchd whose subtree is the
+        // entire process table, making `get_descendant_pids` very slow.)
+        session.child_pid = Some(999_999);
+        let events_tx = session.events_tx.clone();
+        let _events_rx = events_tx.subscribe();
+
+        let map: Arc<RwLock<HashMap<String, ActiveSession>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        map.write().await.insert("s-race".into(), session);
+
+        let inserted = ChatManager::track_background_task_start(
+            "s-race",
+            &map,
+            &events_tx,
+            &None,
+            "tu-race",
+            "Monitor",
+            &serde_json::json!({}),
+            None,
+        )
+        .await;
+        assert!(inserted);
+
+        // Immediately remove the entry — simulates a rapid cancel that
+        // beats the async claim.
+        {
+            let sessions = map.read().await;
+            let active = sessions.get("s-race").expect("session present");
+            active
+                .active_background_tasks
+                .lock()
+                .await
+                .remove("tu-race");
+        }
+
+        // Wait past the 1 s sleep + a margin.
+        tokio::time::sleep(Duration::from_millis(1300)).await;
+
+        // The entry must NOT have been re-inserted by the claim, and the
+        // process must not have panicked (if it did, the test runtime
+        // would have aborted).
+        let count = map
+            .read()
+            .await
+            .get("s-race")
+            .unwrap()
+            .active_background_tasks
+            .lock()
+            .await
+            .len();
+        assert_eq!(count, 0, "claim must not re-insert removed entries");
+    }
+
+    // ========================================================================
     // T7 of plan 754a1379 — cancel_task (map-side cancel V1)
     // ========================================================================
 
@@ -11363,7 +11921,11 @@ mod tests {
 
         let result = manager.cancel_task("s-cancel", "tool_T1").await.unwrap();
         assert_eq!(result.task_id, "tool_T1");
-        assert!(result.killed_pids.is_empty(), "V1 returns no killed_pids");
+        // V2 (T4): entry has pid=None → fallback path, killed_pids empty.
+        assert!(
+            result.killed_pids.is_empty(),
+            "expected empty killed_pids for pid=None entry"
+        );
         assert!(!result.capped);
 
         // Entry should be marked for removal but still in the map (T12 grace).
@@ -11459,6 +12021,249 @@ mod tests {
         let r = manager.cancel_task("s-cap", "tool_W").await.unwrap();
         assert!(r.capped, "3rd call must be capped");
         assert!(r.killed_pids.is_empty());
+    }
+
+    // ========================================================================
+    // T4 of plan fc35b25e — cancel_task wires `kill_subtree` for V2 kill
+    // ========================================================================
+
+    /// When the task entry has `pid: None` (claim race or subprocess
+    /// crashed before discovery), `cancel_task` must:
+    /// - return `killed_pids: []` (no kill happened),
+    /// - still mark the entry for removal (V1 fallback preserved),
+    /// - still broadcast an `ActiveTasksUpdate` (frontend feedback).
+    #[tokio::test]
+    async fn test_cancel_task_without_pid_falls_back_to_v1() {
+        let Some((session, _)) = try_create_dummy_session(false, "", vec![]) else {
+            eprintln!("Skipping test: Claude CLI not installed");
+            return;
+        };
+        let mut events_rx = session.events_tx.subscribe();
+        // Pre-seed a task with pid=None to exercise the fallback branch.
+        session.active_background_tasks.lock().await.insert(
+            "tool_NoPid".into(),
+            BackgroundTaskInfo {
+                id: "tool_NoPid".into(),
+                kind: BackgroundTaskKind::Monitor,
+                description: "no pid yet".into(),
+                started_at: chrono::Utc::now(),
+                last_seen_at: chrono::Utc::now(),
+                pid: None,
+                parent_tool_use_id: Some("tool_NoPid".into()),
+                pending_removal_at: None,
+            },
+        );
+
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        manager
+            .active_sessions
+            .write()
+            .await
+            .insert("s-nopid".into(), session);
+
+        let result = manager.cancel_task("s-nopid", "tool_NoPid").await.unwrap();
+        assert_eq!(result.task_id, "tool_NoPid");
+        assert!(
+            result.killed_pids.is_empty(),
+            "fallback path must return empty killed_pids, got {:?}",
+            result.killed_pids
+        );
+        assert!(!result.capped);
+
+        // Mark for removal still applied (V1 fallback preserved).
+        let sessions = manager.active_sessions.read().await;
+        let tasks = sessions
+            .get("s-nopid")
+            .unwrap()
+            .active_background_tasks
+            .lock()
+            .await;
+        assert!(tasks
+            .get("tool_NoPid")
+            .unwrap()
+            .pending_removal_at
+            .is_some());
+
+        // Broadcast still happens.
+        let event = events_rx.try_recv().expect("expected broadcast");
+        assert!(matches!(event, ChatEvent::ActiveTasksUpdate { .. }));
+    }
+
+    /// Spawn a real `sleep 30`, seed a task entry with its PID, call
+    /// `cancel_task`, and verify:
+    /// - `killed_pids` contains the sleep's PID,
+    /// - the subprocess actually dies (exit status non-success).
+    ///
+    /// Marked `#[ignore]` because it touches real processes — run with
+    /// `cargo test -- --ignored`.
+    #[tokio::test]
+    #[ignore]
+    #[cfg(unix)]
+    async fn test_cancel_task_with_pid_calls_kill_subtree() {
+        let mut child = match std::process::Command::new("sleep").arg("30").spawn() {
+            Ok(c) => c,
+            Err(_) => {
+                eprintln!("Skipping test: sleep not available");
+                return;
+            }
+        };
+        let real_pid = child.id();
+
+        let Some((session, _)) = try_create_dummy_session(false, "", vec![]) else {
+            eprintln!("Skipping test: Claude CLI not installed");
+            let _ = child.kill();
+            let _ = child.wait();
+            return;
+        };
+        // Pre-seed a task entry pointing at the real subprocess.
+        session.active_background_tasks.lock().await.insert(
+            "tool_Real".into(),
+            BackgroundTaskInfo {
+                id: "tool_Real".into(),
+                kind: BackgroundTaskKind::Monitor,
+                description: "real sleep".into(),
+                started_at: chrono::Utc::now(),
+                last_seen_at: chrono::Utc::now(),
+                pid: Some(real_pid),
+                parent_tool_use_id: Some("tool_Real".into()),
+                pending_removal_at: None,
+            },
+        );
+
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        manager
+            .active_sessions
+            .write()
+            .await
+            .insert("s-real".into(), session);
+
+        let result = manager.cancel_task("s-real", "tool_Real").await.unwrap();
+        assert!(!result.capped);
+        assert!(
+            result.killed_pids.contains(&real_pid),
+            "expected real_pid {real_pid} in killed_pids, got {:?}",
+            result.killed_pids
+        );
+
+        // The subprocess should have received SIGINT and be dead now.
+        let exit = child.wait().expect("waitpid");
+        assert!(
+            !exit.success(),
+            "subprocess should have been signalled, not exited cleanly"
+        );
+    }
+
+    // ========================================================================
+    // T1 of plan fc35b25e — parse_etime + pid_discovery_diff helpers
+    // ========================================================================
+
+    #[test]
+    fn test_parse_etime_seconds_only() {
+        assert_eq!(ChatManager::parse_etime("00:01"), Some(1));
+        assert_eq!(ChatManager::parse_etime("00:42"), Some(42));
+        assert_eq!(ChatManager::parse_etime("00:00"), Some(0));
+    }
+
+    #[test]
+    fn test_parse_etime_minutes_seconds() {
+        assert_eq!(ChatManager::parse_etime("12:34"), Some(12 * 60 + 34));
+        assert_eq!(ChatManager::parse_etime("00:30"), Some(30));
+        assert_eq!(ChatManager::parse_etime("59:59"), Some(59 * 60 + 59));
+    }
+
+    #[test]
+    fn test_parse_etime_hours_minutes_seconds() {
+        assert_eq!(
+            ChatManager::parse_etime("02:12:34"),
+            Some(2 * 3600 + 12 * 60 + 34)
+        );
+        assert_eq!(ChatManager::parse_etime("01:00:00"), Some(3600));
+    }
+
+    #[test]
+    fn test_parse_etime_with_days() {
+        assert_eq!(
+            ChatManager::parse_etime("01-02:12:34"),
+            Some(86_400 + 2 * 3600 + 12 * 60 + 34)
+        );
+        assert_eq!(ChatManager::parse_etime("07-00:00:00"), Some(7 * 86_400));
+    }
+
+    #[test]
+    fn test_parse_etime_handles_whitespace() {
+        // `ps -o etime=` may pad with leading spaces.
+        assert_eq!(ChatManager::parse_etime("  00:42  "), Some(42));
+        assert_eq!(ChatManager::parse_etime("\n12:34\n"), Some(12 * 60 + 34));
+    }
+
+    #[test]
+    fn test_parse_etime_rejects_garbage() {
+        assert_eq!(ChatManager::parse_etime(""), None);
+        assert_eq!(ChatManager::parse_etime("hello"), None);
+        assert_eq!(ChatManager::parse_etime("1:2:3:4"), None); // too many parts
+        assert_eq!(ChatManager::parse_etime("aa:bb"), None);
+        assert_eq!(ChatManager::parse_etime("-1:00"), None);
+    }
+
+    #[test]
+    fn test_pid_discovery_diff_finds_new_pids() {
+        // before = [100, 200], after = [100, 200, 300] → new = [300]
+        let before = vec![100u32, 200];
+        let after = vec![100u32, 200, 300];
+        let diff = ChatManager::pid_discovery_diff(&before, &after);
+        // PID 300 doesn't exist in /proc, etime returns None → sorted last,
+        // but it's the only new entry so it's at index 0.
+        assert_eq!(diff, vec![300]);
+    }
+
+    #[test]
+    fn test_pid_discovery_diff_no_new_pids() {
+        let before = vec![100u32, 200, 300];
+        let after = vec![100u32, 200];
+        let diff = ChatManager::pid_discovery_diff(&before, &after);
+        // No PIDs in `after` that aren't in `before`.
+        assert!(diff.is_empty());
+    }
+
+    #[test]
+    fn test_pid_discovery_diff_empty_before() {
+        let before = Vec::<u32>::new();
+        let after = vec![1u32, 2, 3];
+        let diff = ChatManager::pid_discovery_diff(&before, &after);
+        assert_eq!(diff.len(), 3);
+        // Order is stable (etime returns None for fake PIDs → all u64::MAX,
+        // sort_by_key preserves insertion order on ties).
+    }
+
+    #[test]
+    fn test_pid_discovery_diff_with_real_subprocess() {
+        // Spawn a real `sleep 30` subprocess so we have a PID with a
+        // readable etime. Diff should put it before fake PIDs (which
+        // have unreadable etime → sorted last).
+        let mut child = match std::process::Command::new("sleep").arg("30").spawn() {
+            Ok(c) => c,
+            Err(_) => {
+                eprintln!("Skipping test: sleep not available");
+                return;
+            }
+        };
+        let real_pid = child.id();
+
+        // Give the OS a moment to register the process so `ps` sees it.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let before = Vec::<u32>::new();
+        let after = vec![999_999u32, real_pid, 999_998u32];
+        let diff = ChatManager::pid_discovery_diff(&before, &after);
+
+        // Real PID has etime ~0s (just spawned), fake PIDs have etime
+        // None → u64::MAX → sorted last. So real PID should be first.
+        assert_eq!(diff[0], real_pid, "real subprocess should sort first");
+
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     // ========================================================================

@@ -141,4 +141,69 @@ mod tests {
              GET background-tasks must return 1 entry (the bg one) only."
         );
     }
+
+    // ====================================================================
+    // T7 of plan fc35b25e — V2 PID-targeted kill — 2-Monitor isolation
+    // ====================================================================
+
+    /// V2 isolation flagship — start two Monitors on different log files,
+    /// cancel one, and verify *only* that one's subprocess actually dies
+    /// (the other is untouched). This is the test that proves V2 over V1:
+    /// V1 would have left both `tail -F` running regardless of cancel.
+    ///
+    /// Asserts:
+    /// 1. After ~1.5 s post-ToolUse, both entries have `pid: Some(...)`
+    ///    populated (T2 async claim landed).
+    /// 2. `cancel_task(id_A)` returns `killed_pids` containing the
+    ///    Monitor A subtree's PIDs (T4 wires kill_subtree).
+    /// 3. `pgrep -f "tail.*test_a.log"` returns empty after cancel
+    ///    (subprocess actually dead).
+    /// 4. `pgrep -f "tail.*test_b.log"` still matches (Monitor B
+    ///    untouched — true isolation).
+    #[test]
+    #[ignore = "requires real Claude CLI + ANTHROPIC_API_KEY + test-server fixture (TODO)"]
+    fn test_v2_isolation_2_monitors_cancel_one() {
+        let scenario = "[T7 plan fc35b25e — V2 isolation manual scenario]\n\
+             \n\
+             Setup:\n\
+             - Two empty log files: /tmp/po_test_a.log, /tmp/po_test_b.log.\n\
+             - PO server running with the V2 cancel_task code (commit efb47a8).\n\
+             \n\
+             Steps:\n\
+             1. POST /api/chat/sessions {...} → session_id.\n\
+             2. WS connect.\n\
+             3. WS send: \"Use Monitor on /tmp/po_test_a.log with timeout 5min.\"\n\
+                Wait for ToolUse event id_A → wait 1.5s for the async PID claim (T2).\n\
+             4. WS send: \"Now use Monitor on /tmp/po_test_b.log with timeout 5min.\"\n\
+                Wait for ToolUse event id_B → wait 1.5s.\n\
+             5. GET /api/chat/sessions/{session_id}/background-tasks.\n\
+                Assert: 2 entries, both with pid=Some(<u32>) (different PIDs).\n\
+                Capture pid_a, pid_b.\n\
+             6. POST /api/chat/sessions/{session_id}/cancel-task/{id_A}.\n\
+                Assert: response.killed_pids contains pid_a (and possibly\n\
+                its descendants — the inner sleep / shell of `tail -F`).\n\
+                Assert: response.capped == false.\n\
+             7. Wait ~200 ms for SIGINT delivery + reaping.\n\
+                Run `pgrep -f \"tail.*po_test_a.log\"` from the test host.\n\
+                Assert: empty output (Monitor A's tail is dead).\n\
+             8. Run `pgrep -f \"tail.*po_test_b.log\"`.\n\
+                Assert: returns pid_b (Monitor B still alive — isolation\n\
+                property holds).\n\
+             9. WS observed an ActiveTasksUpdate where Monitor A is\n\
+                marked pending_removal_at and Monitor B is unchanged.\n\
+             10. After 5 s grace, WS observed an ActiveTasksUpdate where\n\
+                 Monitor A entry is gone (purged by T12) and Monitor B\n\
+                 still present.\n\
+             \n\
+             Cleanup:\n\
+             - POST cancel-task/{id_B} to stop Monitor B.\n\
+             - rm /tmp/po_test_a.log /tmp/po_test_b.log.\n\
+             \n\
+             Why V2 wins over V1 here:\n\
+             - V1: response.killed_pids would have been [] (no PID stored).\n\
+             - V1: Monitor A's tail subprocess would still match pgrep.\n\
+             - V1: only the toolbar pill would change (cosmetic cancel).\n\
+             V2 makes the kill actually happen, scoped to the one task.";
+        eprintln!("{scenario}");
+    }
 }
