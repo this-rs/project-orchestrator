@@ -74,6 +74,21 @@ pub(crate) const CANCEL_TASK_CAP: u32 = 30;
 /// Rolling window for the cancel-task rate cap (300s = 5 minutes).
 pub(crate) const CANCEL_TASK_WINDOW_SECS: u64 = 300;
 
+/// Grace period applied between marking a `BackgroundTaskInfo` for removal
+/// (`pending_removal_at`) and physically purging it from the
+/// `active_background_tasks` map. 5 seconds absorbs in-flight
+/// `BackgroundOutput` ticks that arrive between the cancel SIGINT and
+/// the subprocess actually dying — they still match an entry in the map
+/// and are routed correctly to their (now greyed-out) MonitorCard,
+/// instead of becoming orphans on the frontend. Plan 754a1379 (T12).
+pub(crate) const BACKGROUND_TASK_PURGE_GRACE_SECS: u64 = 5;
+/// How often the background-tasks poller wakes up to apply the grace
+/// period purge (and, in a follow-up commit, run death detection
+/// against `get_descendant_pids`). 5s matches the grace period — i.e.
+/// a marked entry is purged on the next tick after it ages past the
+/// grace, with at most an extra tick of latency. Plan 754a1379 (T12).
+pub(crate) const BACKGROUND_TASKS_POLL_INTERVAL_SECS: u64 = 5;
+
 /// An active chat session with a live Claude CLI subprocess
 pub struct ActiveSession {
     /// Persistent broadcast sender — one per session lifetime, NOT replaced per message
@@ -2811,6 +2826,21 @@ impl ChatManager {
             nats_cancel.clone(),
         );
 
+        // Spawn the per-session background-tasks poller (T12 of plan
+        // 754a1379). Wakes up every BACKGROUND_TASKS_POLL_INTERVAL_SECS
+        // seconds and physically purges any entries whose
+        // `pending_removal_at` aged past the grace period — absorbs
+        // in-flight `BackgroundOutput` ticks that arrive between the
+        // cancel SIGINT and the subprocess actually dying. Tied to
+        // `nats_cancel` so it terminates cleanly with the session.
+        Self::spawn_background_tasks_poller(
+            session_id.to_string(),
+            self.active_sessions.clone(),
+            events_tx.clone(),
+            self.nats.clone(),
+            nats_cancel.clone(),
+        );
+
         // Spawn the permanent out-of-band SDK message listener (T4+T5 of
         // plan 9a1684b2). Captures Messages emitted by the CLI subprocess
         // between turns (background tool notifications, etc.) and
@@ -3081,6 +3111,111 @@ impl ChatManager {
             "Tracked background task start (plan 754a1379, T3)"
         );
         true
+    }
+
+    /// Spawn the per-session background-tasks poller. The poller wakes
+    /// up every `BACKGROUND_TASKS_POLL_INTERVAL_SECS` seconds and runs
+    /// `tick_purge_background_tasks`, which physically removes any
+    /// entries whose `pending_removal_at` aged past
+    /// `BACKGROUND_TASK_PURGE_GRACE_SECS`.
+    ///
+    /// Plan 754a1379 (T12 — race-safe purge). The grace period absorbs
+    /// in-flight `BackgroundOutput` ticks that arrive between the
+    /// cancel SIGINT and the subprocess actually dying.
+    ///
+    /// The poller terminates when `cancel_token` is fired — typically
+    /// `nats_cancel` of the owning `ActiveSession`, which is also the
+    /// cancel token for the OOB listener. Tying both to the same token
+    /// guarantees a clean teardown on session end (or `resume_session`,
+    /// which cancels the previous session's tokens before spawning new
+    /// ones).
+    pub(crate) fn spawn_background_tasks_poller(
+        session_id: String,
+        active_sessions: Arc<RwLock<HashMap<String, ActiveSession>>>,
+        events_tx: broadcast::Sender<ChatEvent>,
+        nats: Option<Arc<crate::events::NatsEmitter>>,
+        cancel_token: CancellationToken,
+    ) {
+        tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(Duration::from_secs(BACKGROUND_TASKS_POLL_INTERVAL_SECS));
+            // Skip the immediate first tick so we don't run a purge
+            // before any state has even been mutated.
+            interval.tick().await;
+            let grace = Duration::from_secs(BACKGROUND_TASK_PURGE_GRACE_SECS);
+
+            loop {
+                tokio::select! {
+                    _ = cancel_token.cancelled() => {
+                        debug!(
+                            session_id = %session_id,
+                            "background_tasks_poller: cancelled, exiting"
+                        );
+                        return;
+                    }
+                    _ = interval.tick() => {
+                        Self::tick_purge_background_tasks(
+                            &session_id,
+                            &active_sessions,
+                            &events_tx,
+                            &nats,
+                            grace,
+                        )
+                        .await;
+                    }
+                }
+            }
+        });
+    }
+
+    /// One purge pass. Public-crate so tests can drive it without
+    /// waiting for the real interval. Removes every entry whose
+    /// `pending_removal_at` is older than `grace` and broadcasts a
+    /// fresh `ActiveTasksUpdate` if anything was purged. No-op (and
+    /// no broadcast) when nothing is eligible — keeps the WebSocket
+    /// quiet on idle sessions.
+    pub(crate) async fn tick_purge_background_tasks(
+        session_id: &str,
+        active_sessions: &Arc<RwLock<HashMap<String, ActiveSession>>>,
+        events_tx: &broadcast::Sender<ChatEvent>,
+        nats: &Option<Arc<crate::events::NatsEmitter>>,
+        grace: Duration,
+    ) {
+        let tasks_arc = {
+            let sessions = active_sessions.read().await;
+            match sessions.get(session_id) {
+                Some(active) => active.active_background_tasks.clone(),
+                None => return,
+            }
+        };
+
+        let now = std::time::Instant::now();
+        let snapshot = {
+            let mut tasks = tasks_arc.lock().await;
+            let before = tasks.len();
+            tasks.retain(|_id, info| {
+                !matches!(
+                    info.pending_removal_at,
+                    Some(at) if now.saturating_duration_since(at) >= grace
+                )
+            });
+            if tasks.len() == before {
+                return;
+            }
+            info!(
+                session_id = %session_id,
+                purged = before - tasks.len(),
+                remaining = tasks.len(),
+                "background_tasks_poller: purged stale entries (T12 grace expired)"
+            );
+            tasks.values().cloned().collect::<Vec<BackgroundTaskInfo>>()
+        };
+
+        let event = ChatEvent::ActiveTasksUpdate { tasks: snapshot };
+        let _ = events_tx.send(event.clone());
+        if let Some(ref nats) = nats {
+            nats.publish_chat_event(session_id, event);
+        }
     }
 
     /// Internal: send a message to the client and stream the response to broadcast
@@ -11165,6 +11300,147 @@ mod tests {
         let r = manager.cancel_task("s-cap", "tool_W").await.unwrap();
         assert!(r.capped, "3rd call must be capped");
         assert!(r.killed_pids.is_empty());
+    }
+
+    // ========================================================================
+    // T12 of plan 754a1379 — tick_purge_background_tasks (grace period purge)
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_tick_purge_removes_stale_pending_entries_and_broadcasts() {
+        let Some((session, _)) = try_create_dummy_session(false, "", vec![]) else {
+            eprintln!("Skipping test: Claude CLI not installed");
+            return;
+        };
+        let mut events_rx = session.events_tx.subscribe();
+        let events_tx = session.events_tx.clone();
+
+        // Insert: one expired (pending_removal_at far in the past),
+        // one fresh (no pending_removal_at).
+        let now = std::time::Instant::now();
+        let stale_at = now.checked_sub(Duration::from_secs(10)).unwrap_or(now);
+        {
+            let mut tasks = session.active_background_tasks.lock().await;
+            tasks.insert(
+                "tool_stale".into(),
+                BackgroundTaskInfo {
+                    id: "tool_stale".into(),
+                    kind: BackgroundTaskKind::Monitor,
+                    description: "stale".into(),
+                    started_at: chrono::Utc::now(),
+                    pid: None,
+                    parent_tool_use_id: None,
+                    pending_removal_at: Some(stale_at),
+                },
+            );
+            tasks.insert(
+                "tool_alive".into(),
+                BackgroundTaskInfo {
+                    id: "tool_alive".into(),
+                    kind: BackgroundTaskKind::BashBackground,
+                    description: "alive".into(),
+                    started_at: chrono::Utc::now(),
+                    pid: None,
+                    parent_tool_use_id: None,
+                    pending_removal_at: None,
+                },
+            );
+        }
+
+        let map: Arc<RwLock<HashMap<String, ActiveSession>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        map.write().await.insert("s-purge".into(), session);
+
+        ChatManager::tick_purge_background_tasks(
+            "s-purge",
+            &map,
+            &events_tx,
+            &None,
+            Duration::from_secs(BACKGROUND_TASK_PURGE_GRACE_SECS),
+        )
+        .await;
+
+        // Stale entry purged, alive entry kept.
+        let sessions_guard = map.read().await;
+        let tasks = sessions_guard
+            .get("s-purge")
+            .unwrap()
+            .active_background_tasks
+            .lock()
+            .await;
+        assert_eq!(tasks.len(), 1);
+        assert!(tasks.contains_key("tool_alive"));
+        assert!(!tasks.contains_key("tool_stale"));
+        drop(tasks);
+        drop(sessions_guard);
+
+        // A single broadcast carrying the post-purge snapshot.
+        let event = events_rx
+            .try_recv()
+            .expect("expected broadcast after purge");
+        match event {
+            ChatEvent::ActiveTasksUpdate { tasks } => {
+                assert_eq!(tasks.len(), 1);
+                assert_eq!(tasks[0].id, "tool_alive");
+            }
+            other => panic!("expected ActiveTasksUpdate, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_tick_purge_within_grace_does_nothing() {
+        let Some((session, _)) = try_create_dummy_session(false, "", vec![]) else {
+            eprintln!("Skipping test: Claude CLI not installed");
+            return;
+        };
+        let mut events_rx = session.events_tx.subscribe();
+        let events_tx = session.events_tx.clone();
+
+        // Mark just now → still within grace.
+        let now = std::time::Instant::now();
+        session.active_background_tasks.lock().await.insert(
+            "tool_recent".into(),
+            BackgroundTaskInfo {
+                id: "tool_recent".into(),
+                kind: BackgroundTaskKind::Monitor,
+                description: "recent".into(),
+                started_at: chrono::Utc::now(),
+                pid: None,
+                parent_tool_use_id: None,
+                pending_removal_at: Some(now),
+            },
+        );
+
+        let map: Arc<RwLock<HashMap<String, ActiveSession>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        map.write().await.insert("s-grace".into(), session);
+
+        ChatManager::tick_purge_background_tasks(
+            "s-grace",
+            &map,
+            &events_tx,
+            &None,
+            Duration::from_secs(BACKGROUND_TASK_PURGE_GRACE_SECS),
+        )
+        .await;
+
+        // Entry still present.
+        let sessions_guard = map.read().await;
+        let tasks = sessions_guard
+            .get("s-grace")
+            .unwrap()
+            .active_background_tasks
+            .lock()
+            .await;
+        assert_eq!(tasks.len(), 1);
+        drop(tasks);
+        drop(sessions_guard);
+
+        // No broadcast — purge was a no-op.
+        assert!(
+            events_rx.try_recv().is_err(),
+            "no broadcast expected when nothing was purged"
+        );
     }
 
     #[tokio::test]
