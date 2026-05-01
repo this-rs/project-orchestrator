@@ -74,7 +74,7 @@ serde_yaml = { workspace = true }
 neo4rs = { workspace = true }
 
 # Meilisearch
-meilisearch-sdk = "0.30"
+meilisearch-sdk = { version = "0.33", default-features = false, features = ["reqwest", "tls", "jwt_rust_crypto"] }
 
 # Tree-sitter
 tree-sitter = "0.24"
@@ -130,7 +130,7 @@ async-trait = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 # Chat / Claude Code SDK
-nexus-claude = { git = "https://github.com/this-rs/nexus.git", rev = "fc00740", features = ["memory", "auto-download"] }
+nexus-claude = { git = "https://github.com/this-rs/nexus.git", rev = "3466b0af402f28d5e32336af4edf66a95af4cb9f", features = ["memory", "auto-download"] }
 tokio-stream = { workspace = true }
 
 # Auth
