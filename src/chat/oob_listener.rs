@@ -374,23 +374,31 @@ async fn maybe_trigger_stream(
         return;
     }
 
-    // Push the OOB content as a queue entry so drain_pending_messages
-    // (or the spawned stream_response below) can process it later.
-    {
-        let mut queue = pending_messages.lock().await;
-        queue.push_back(PendingMessage::background_output(oob_content.clone()));
-    }
-
-    // Claim the streaming flag atomically. Loser leaves the message in
-    // the queue — drain will pick it up after the active turn ends.
+    // T6 of plan 806c8f2c — Claim FIRST, push only on lost race.
+    //
+    // The previous logic was push-then-pop (push BG to queue, then if won
+    // race pop_front the queue to use as prompt). That was brittle: if
+    // *another* entry landed in the queue between our push and our pop
+    // (possible during the `finalize_streaming_status` window where
+    // is_streaming flips false but the queue is briefly inspected without
+    // a continuous lock), pop_front would return THAT entry — potentially
+    // a User message that should have gone through drain's
+    // priority-aware path. The bug was latent rather than active because
+    // the timing window is narrow, but eliminating the primitive removes
+    // the risk entirely. Cf companion fix in drain.rs (T2).
     let won_race = is_streaming
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_ok();
 
     if !won_race {
+        // Lost — leave the OOB content in the queue. drain_pending_messages
+        // will pick it up after the active turn ends, prioritised below
+        // any User/SystemHint that's also queued (cf drain.rs::pop_highest_priority).
+        let mut queue = pending_messages.lock().await;
+        queue.push_back(PendingMessage::background_output(oob_content));
         debug!(
             session_id = %session_id,
-            "OOB listener: lost is_streaming race — message queued for active stream's drain"
+            "OOB listener: lost is_streaming race — queued for drain"
         );
         return;
     }
@@ -404,18 +412,14 @@ async fn maybe_trigger_stream(
         session_id = %session_id,
         oob_trigger_count = trigger_count,
         oob_trigger_cap = oob_trigger_cap,
-        "OOB listener: idle session, spawning stream_response for queued OOB event"
+        "OOB listener: idle session, spawning stream_response for OOB event"
     );
 
-    // Pop the entry we just pushed (drain will see it via the queue).
-    // Actually we WANT drain to handle it — but stream_response needs an
-    // initial prompt. Give it the OOB content directly; the queue
-    // remains for any subsequent OOB events that may have stacked up
-    // between the push and the spawn.
-    let prompt = {
-        let mut queue = pending_messages.lock().await;
-        queue.pop_front().map(|m| m.content).unwrap_or(oob_content)
-    };
+    // Won the race — use the OOB content directly. The queue stays
+    // untouched; any subsequent OOB events that arrive between this
+    // point and the spawn (or during the spawn) push themselves to the
+    // queue via the lost-race branch above and drain handles them after.
+    let prompt = oob_content;
 
     // Spawn stream_response. Same call shape as in `spawn_nats_rpc_listener`.
     let session_id_for_spawn = session_id.to_string();
