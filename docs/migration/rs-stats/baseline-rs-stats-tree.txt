@@ -1,0 +1,75 @@
+rs-stats v2.0.3
+├── bincode v1.3.3
+│   └── serde v1.0.228
+│       ├── serde_core v1.0.228
+│       └── serde_derive v1.0.228 (proc-macro)
+│           ├── proc-macro2 v1.0.106
+│           │   └── unicode-ident v1.0.24
+│           ├── quote v1.0.45
+│           │   └── proc-macro2 v1.0.106 (*)
+│           └── syn v2.0.117
+│               ├── proc-macro2 v1.0.106 (*)
+│               ├── quote v1.0.45 (*)
+│               └── unicode-ident v1.0.24
+├── num v0.4.3
+│   ├── num-bigint v0.4.6
+│   │   ├── num-integer v0.1.46
+│   │   │   └── num-traits v0.2.19
+│   │   │       └── libm v0.2.16
+│   │   │       [build-dependencies]
+│   │   │       └── autocfg v1.5.0
+│   │   └── num-traits v0.2.19 (*)
+│   ├── num-complex v0.4.6
+│   │   ├── bytemuck v1.25.0
+│   │   │   └── bytemuck_derive v1.10.2 (proc-macro)
+│   │   │       ├── proc-macro2 v1.0.106 (*)
+│   │   │       ├── quote v1.0.45 (*)
+│   │   │       └── syn v2.0.117 (*)
+│   │   └── num-traits v0.2.19 (*)
+│   ├── num-integer v0.1.46 (*)
+│   ├── num-iter v0.1.45
+│   │   ├── num-integer v0.1.46 (*)
+│   │   └── num-traits v0.2.19 (*)
+│   │   [build-dependencies]
+│   │   └── autocfg v1.5.0
+│   ├── num-rational v0.4.2
+│   │   ├── num-bigint v0.4.6 (*)
+│   │   ├── num-integer v0.1.46 (*)
+│   │   └── num-traits v0.2.19 (*)
+│   └── num-traits v0.2.19 (*)
+├── num-traits v0.2.19 (*)
+├── rand v0.8.6
+│   ├── libc v0.2.183
+│   ├── rand_chacha v0.3.1
+│   │   ├── ppv-lite86 v0.2.21
+│   │   │   └── zerocopy v0.8.47
+│   │   │       └── zerocopy-derive v0.8.47 (proc-macro)
+│   │   │           ├── proc-macro2 v1.0.106 (*)
+│   │   │           ├── quote v1.0.45 (*)
+│   │   │           └── syn v2.0.117 (*)
+│   │   └── rand_core v0.6.4
+│   │       └── getrandom v0.2.17
+│   │           ├── cfg-if v1.0.4
+│   │           └── libc v0.2.183
+│   └── rand_core v0.6.4 (*)
+├── rand_chacha v0.3.1 (*)
+├── rayon v1.11.0
+│   ├── either v1.15.0
+│   │   └── serde v1.0.228 (*)
+│   └── rayon-core v1.13.0
+│       ├── crossbeam-deque v0.8.6
+│       │   ├── crossbeam-epoch v0.9.18
+│       │   │   └── crossbeam-utils v0.8.21
+│       │   └── crossbeam-utils v0.8.21
+│       └── crossbeam-utils v0.8.21
+├── serde v1.0.228 (*)
+├── serde_json v1.0.149
+│   ├── itoa v1.0.18
+│   ├── memchr v2.8.0
+│   ├── serde_core v1.0.228
+│   └── zmij v1.0.21
+└── thiserror v1.0.69
+    └── thiserror-impl v1.0.69 (proc-macro)
+        ├── proc-macro2 v1.0.106 (*)
+        ├── quote v1.0.45 (*)
+        └── syn v2.0.117 (*)

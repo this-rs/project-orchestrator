@@ -10,4 +10,5 @@
 
 pub mod distribution;
 pub mod hypothesis;
-// pub mod regression; // Phase 2: churn_score prediction via multiple linear regression
+pub mod stats; // First-party replacement for rs-stats — see plan 00f0ca9a
+               // pub mod regression; // Phase 2: churn_score prediction via multiple linear regression
