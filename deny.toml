@@ -14,7 +14,20 @@ version = 2
 yanked = "deny"
 # When a known advisory has no actionable fix yet, document the
 # exception with an explanatory comment + GHSA id below.
-ignore = []
+ignore = [
+    # RUSTSEC-2023-0071 — "Marvin Attack" timing sidechannel on the `rsa` crate.
+    # No upstream patch available (open since 2023-11-22); a constant-time
+    # rewrite is in progress at https://github.com/RustCrypto/RSA/issues/626.
+    #
+    # Pulled transitively via jsonwebtoken 10 + features = ["rust_crypto"]
+    # (chain: rsa ← jsonwebtoken ← meilisearch-sdk ← project-orchestrator).
+    #
+    # Justification: we use HS256 (HMAC) for JWT signing in `auth/jwt.rs`
+    # (`EncodingKey::from_secret`). RSA signing/verification is never invoked
+    # at runtime, so the timing sidechannel is unreachable in our code paths.
+    # We will revisit when RustCrypto/RSA ships a constant-time release.
+    { id = "RUSTSEC-2023-0071", reason = "Marvin Attack on rsa crate. We only use HS256 (HMAC) for JWT — RSA paths never executed." },
+]
 
 [bans]
 # Same crate at multiple versions in the lockfile bloats binary
@@ -42,6 +55,9 @@ allow = [
     "CDLA-Permissive-2.0",
     "BSL-1.0",
     "OpenSSL",
+    # University of Illinois/NCSA Open Source License — OSI approved, FSF Free.
+    # Pulled transitively via libfuzzer-sys ← rav1e ← ravif ← image ← fastembed.
+    "NCSA",
 ]
 confidence-threshold = 0.93
 
