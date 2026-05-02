@@ -7,7 +7,7 @@
 #
 # In both cases, the output is /app/frontend/dist/ with the built assets.
 # =============================================================================
-FROM node:22-slim AS frontend-builder
+FROM node:25-slim AS frontend-builder
 
 WORKDIR /app/frontend
 
