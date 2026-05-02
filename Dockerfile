@@ -7,7 +7,7 @@
 #
 # In both cases, the output is /app/frontend/dist/ with the built assets.
 # =============================================================================
-FROM node:22-slim AS frontend-builder
+FROM node:25-slim AS frontend-builder
 
 WORKDIR /app/frontend
 
@@ -43,7 +43,7 @@ RUN if [ -f "package.json" ] && grep -q '"build"' package.json; then \
 # Trixie (Debian 13) provides glibc 2.40, required because ort-sys prebuilt
 # ONNX Runtime binaries reference __isoc23_* symbols (glibc ≥ 2.38).
 # Bookworm (glibc 2.36) fails with "undefined symbol: __isoc23_strtoll".
-FROM rust:1.93-trixie AS builder
+FROM rust:1.95-trixie AS builder
 
 WORKDIR /app
 

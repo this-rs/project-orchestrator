@@ -114,51 +114,94 @@ impl IntentWeightMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard};
+
+    /// Serializes all tests in this module to prevent races on the
+    /// `ENRICHMENT_INTENT_WEIGHTS_JSON` env var.
+    ///
+    /// `env_override_parse_and_fallback` mutates the env var, while every
+    /// other test (which calls `IntentWeightMap::for_intent`) reads it via
+    /// `from_env_override`. Since cargo runs tests in parallel by default,
+    /// observing the env var in a partially-mutated state caused a flaky
+    /// failure on `debug_intent_boosts_gotcha` (got 2.0 from the override
+    /// instead of the expected 1.5 default).
+    ///
+    /// Holding this lock for the duration of every test in the module
+    /// effectively makes them sequential — at the cost of ~negligible
+    /// runtime since the suite is ~12 micro-tests.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Acquire the env lock, recovering from poisoning so a panicked
+    /// previous test doesn't cascade-fail the rest.
+    fn lock_env() -> MutexGuard<'static, ()> {
+        match ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        }
+    }
+
+    /// RAII guard that always clears the env var on drop, even on panic.
+    /// Prevents a failing `env_override` test from leaking the override
+    /// into subsequent runs.
+    struct EnvVarGuard;
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            std::env::remove_var("ENRICHMENT_INTENT_WEIGHTS_JSON");
+        }
+    }
 
     #[test]
     fn debug_intent_boosts_gotcha() {
+        let _guard = lock_env();
         let map = IntentWeightMap::for_intent("debug");
         assert!((map.get("gotcha") - 1.5).abs() < f64::EPSILON);
     }
 
     #[test]
     fn debug_intent_dampens_guideline() {
+        let _guard = lock_env();
         let map = IntentWeightMap::for_intent("debug");
         assert!((map.get("guideline") - 0.7).abs() < f64::EPSILON);
     }
 
     #[test]
     fn planning_intent_boosts_guideline() {
+        let _guard = lock_env();
         let map = IntentWeightMap::for_intent("planning");
         assert!((map.get("guideline") - 1.5).abs() < f64::EPSILON);
     }
 
     #[test]
     fn plan_alias_same_as_planning() {
+        let _guard = lock_env();
         let map = IntentWeightMap::for_intent("plan");
         assert!((map.get("guideline") - 1.5).abs() < f64::EPSILON);
     }
 
     #[test]
     fn code_intent_boosts_pattern() {
+        let _guard = lock_env();
         let map = IntentWeightMap::for_intent("code");
         assert!((map.get("pattern") - 1.5).abs() < f64::EPSILON);
     }
 
     #[test]
     fn review_intent_boosts_assertion() {
+        let _guard = lock_env();
         let map = IntentWeightMap::for_intent("review");
         assert!((map.get("assertion") - 1.5).abs() < f64::EPSILON);
     }
 
     #[test]
     fn explore_intent_boosts_context() {
+        let _guard = lock_env();
         let map = IntentWeightMap::for_intent("explore");
         assert!((map.get("context") - 1.3).abs() < f64::EPSILON);
     }
 
     #[test]
     fn general_intent_returns_uniform_weights() {
+        let _guard = lock_env();
         let map = IntentWeightMap::for_intent("general");
         assert!((map.get("gotcha") - 1.0).abs() < f64::EPSILON);
         assert!((map.get("guideline") - 1.0).abs() < f64::EPSILON);
@@ -167,18 +210,21 @@ mod tests {
 
     #[test]
     fn unknown_intent_returns_uniform_weights() {
+        let _guard = lock_env();
         let map = IntentWeightMap::for_intent("something_unexpected");
         assert!((map.get("gotcha") - 1.0).abs() < f64::EPSILON);
     }
 
     #[test]
     fn unknown_note_type_returns_one() {
+        let _guard = lock_env();
         let map = IntentWeightMap::for_intent("debug");
         assert!((map.get("nonexistent_type") - 1.0).abs() < f64::EPSILON);
     }
 
     #[test]
     fn case_insensitive_note_type() {
+        let _guard = lock_env();
         let map = IntentWeightMap::for_intent("debug");
         assert!((map.get("Gotcha") - 1.5).abs() < f64::EPSILON);
         assert!((map.get("GOTCHA") - 1.5).abs() < f64::EPSILON);
@@ -186,8 +232,10 @@ mod tests {
 
     #[test]
     fn env_override_parse_and_fallback() {
-        // Test env override by calling from_env_override directly to avoid
-        // parallel test races with for_intent (which also checks the env var).
+        let _guard = lock_env();
+        // Drop guard ensures cleanup even if an assertion panics below.
+        let _cleanup = EnvVarGuard;
+
         let json = r#"{"debug": {"gotcha": 2.0, "tip": 0.5}}"#;
         std::env::set_var("ENRICHMENT_INTENT_WEIGHTS_JSON", json);
 
@@ -203,9 +251,9 @@ mod tests {
             "Missing intent should return None"
         );
 
+        // Manual cleanup before final assertion (EnvVarGuard would also do
+        // this, but we want to assert post-removal behavior here).
         std::env::remove_var("ENRICHMENT_INTENT_WEIGHTS_JSON");
-
-        // Without env var, from_env_override returns None
         assert!(IntentWeightMap::from_env_override("debug").is_none());
     }
 }

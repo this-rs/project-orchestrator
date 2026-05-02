@@ -11,4 +11,4 @@ license = "Apache-2.0"
 tree-sitter-language = "0.1"
 
 [build-dependencies]
-cc = "1.0"
+cc = "1.2"

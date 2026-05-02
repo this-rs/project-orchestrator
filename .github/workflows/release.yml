@@ -65,7 +65,7 @@ jobs:
           grep -o '"0\.[0-9]\.[0-9]"' dist/assets/*.js | head -5 || true
 
       - name: Upload frontend dist
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: frontend-dist
           path: dist/
@@ -264,7 +264,7 @@ jobs:
           echo "ARCHIVE_LIGHT=${archiveName}.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Upload light artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ env.ARCHIVE_LIGHT }}
           path: staging/${{ env.ARCHIVE_LIGHT }}
@@ -333,7 +333,7 @@ jobs:
           echo "ARCHIVE_FULL=${archiveName}.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Upload full artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ env.ARCHIVE_FULL }}
           path: staging/${{ env.ARCHIVE_FULL }}
@@ -418,7 +418,7 @@ jobs:
           echo "DEB_NAME=${DEB_NAME}" >> "$GITHUB_ENV"
 
       - name: Upload .deb artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ env.DEB_NAME }}
           path: ${{ env.DEB_NAME }}
@@ -496,7 +496,7 @@ jobs:
           echo "RPM_NAME=${RPM_NAME}" >> "$GITHUB_ENV"
 
       - name: Upload .rpm artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ env.RPM_NAME }}
           path: ${{ env.RPM_NAME }}
@@ -1168,7 +1168,7 @@ jobs:
 
       - name: Upload Tauri artifacts (macOS)
         if: runner.os == 'macOS'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: tauri-${{ matrix.target }}
           path: |
@@ -1179,7 +1179,7 @@ jobs:
 
       - name: Upload Tauri artifacts (Linux)
         if: runner.os == 'Linux'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: tauri-${{ matrix.target }}
           path: |
@@ -1191,7 +1191,7 @@ jobs:
 
       - name: Upload Tauri artifacts (Windows)
         if: runner.os == 'Windows'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: tauri-${{ matrix.target }}
           path: |
@@ -1388,7 +1388,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ env.RELEASE_TAG }}
           generate_release_notes: true
@@ -1431,13 +1431,13 @@ jobs:
         run: mkdir -p frontend/dist
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Set up QEMU (for multi-arch)
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@v4
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
