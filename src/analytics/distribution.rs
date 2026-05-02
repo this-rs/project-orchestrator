@@ -102,10 +102,13 @@ pub fn analyze_distribution(values: &[f64]) -> Option<DistributionAnalysis> {
     let mut sorted = values.to_vec();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
-    // ── Basic statistics — delegate to rs-stats rather than reimplementing ────
-    let mean =
-        rs_stats::prob::average(values).unwrap_or_else(|_| values.iter().sum::<f64>() / n as f64);
-    let std_dev = rs_stats::prob::std_dev(values).unwrap_or(0.0);
+    // ── Basic statistics — first-party impl (replaces rs-stats GPL-3.0) ──────
+    // See `crate::analytics::stats::mean_std`. The `unwrap_or_else` fallback
+    // is kept for empty-input defensiveness (Option::None path), even though
+    // R6's `analyze_distribution` already guards `values.is_empty()`.
+    let mean = crate::analytics::stats::mean_std::mean(values)
+        .unwrap_or_else(|| values.iter().sum::<f64>() / n as f64);
+    let std_dev = crate::analytics::stats::mean_std::std_dev_population(values).unwrap_or(0.0);
 
     let skewness = if std_dev > 0.0 && n >= 3 {
         sorted
