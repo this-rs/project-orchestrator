@@ -46,7 +46,7 @@ ignore = [
     { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile unmaintained — transitive via tokio-rustls 0.24 in fastembed. Newer rustls 0.23 stack uses pki-types directly; will land when fastembed updates." },
     { id = "RUSTSEC-2025-0141", reason = "bincode 1.x unmaintained — bincode 2.x is the maintained version but is a breaking change; transitive via fastembed/ort. Out of scope for this PR." },
     { id = "RUSTSEC-2026-0097", reason = "rand unsound (custom logger via rand::rng()) — transitive in build deps. We don't call rand::rng() with a custom logger anywhere in our codebase." },
-    { id = "RUSTSEC-2026-0105", reason = "core2 unmaintained + all versions yanked. Will be removed from our lockfile when this PR's regenerated lockfile lands." },
+    { id = "RUSTSEC-2026-0105", reason = "core2 unmaintained + all versions yanked. Transitive via bitstream-io ← rav1e ← ravif ← image ← fastembed. Pinned by upstream image crate; no upgrade path available. Surfaced as `yanked = warn` in [advisories]." },
 ]
 
 [bans]
