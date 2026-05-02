@@ -6538,6 +6538,17 @@ impl ChatManager {
         result
     }
 
+    /// Windows stub for `get_descendant_pids` — descendant tracking relies
+    /// on `pgrep -P <pid>` (POSIX-specific). Windows would need a different
+    /// implementation (e.g. `wmic process` or the `Toolhelp32` API). The
+    /// runtime feature this powers (V2 cancel-tools subtree termination)
+    /// is currently Unix-only, so we no-op cleanly on Windows: callers
+    /// receive an empty Vec and skip the descendant-aware code paths.
+    #[cfg(windows)]
+    fn get_descendant_pids(_pid: u32) -> Vec<u32> {
+        Vec::new()
+    }
+
     /// Parse the `[[dd-]hh:]mm:ss` format returned by `ps -o etime=` into a
     /// total elapsed-seconds count. Plan fc35b25e (T1, V2 cancel_task).
     ///
@@ -6598,6 +6609,16 @@ impl ChatManager {
         }
         let raw = String::from_utf8(output.stdout).ok()?;
         Self::parse_etime(&raw)
+    }
+
+    /// Windows stub for `process_etime_seconds` — `ps -o etime=` doesn't
+    /// exist on Windows. Caller `pid_discovery_diff` uses this only as a
+    /// sort key and substitutes `u64::MAX` on `None`, so returning `None`
+    /// here keeps PIDs in their original (unsorted) order on Windows.
+    #[cfg(windows)]
+    #[allow(dead_code)]
+    pub(crate) fn process_etime_seconds(_pid: u32) -> Option<u64> {
+        None
     }
 
     /// Compute `after \ before` (set difference, treating each `Vec` as a
