@@ -24,4 +24,17 @@ ignore = [
     # at runtime, so the timing sidechannel is unreachable in our code paths.
     # We will revisit when RustCrypto/RSA ships a constant-time release.
     "RUSTSEC-2023-0071",
+
+    # ---------------------------------------------------------------------
+    # Unmaintained transitive dependencies (informational, not vulnerabilities).
+    # Mirrored from deny.toml — see that file for per-advisory justifications.
+    # ---------------------------------------------------------------------
+    "RUSTSEC-2024-0384", # instant unmaintained
+    "RUSTSEC-2024-0436", # paste unmaintained
+    "RUSTSEC-2025-0012", # backoff unmaintained
+    "RUSTSEC-2025-0119", # number_prefix unmaintained
+    "RUSTSEC-2025-0134", # rustls-pemfile unmaintained
+    "RUSTSEC-2025-0141", # bincode 1.x unmaintained
+    "RUSTSEC-2026-0097", # rand unsound (custom logger via rand::rng())
+    "RUSTSEC-2026-0105", # core2 unmaintained + yanked
 ]
