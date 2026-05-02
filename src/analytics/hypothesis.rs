@@ -1,7 +1,11 @@
 //! Hypothesis testing helpers for Orchestrator statistical analysis.
 //!
-//! Wraps `rs_stats` t-test and ANOVA modules with Orchestrator-specific
-//! convenience functions and serde-safe result types.
+//! Wraps the first-party `crate::analytics::stats` t-test and ANOVA
+//! primitives with Orchestrator-specific convenience functions and
+//! serde-safe result types.
+//!
+//! Migrated from `rs-stats` (GPL-3.0) to first-party impl + `statrs` (MIT)
+//! under plan `00f0ca9a` — see `docs/migration/rs-stats/`.
 //!
 //! ## Use cases
 //! - **Community fragility**: ANOVA to test whether Louvain communities have
@@ -13,11 +17,11 @@
 //! - **Synapse strength homogeneity**: test whether synapse weights within a
 //!   knowledge cluster are uniform (ANOVA across clusters)
 
-use rs_stats::hypothesis_tests::anova::one_way_anova;
 use serde::{Deserialize, Serialize};
 
-// First-party t-test impl (R4 of plan 00f0ca9a) — replaces rs-stats's t-tests.
-// ANOVA still goes through rs-stats; migrated in R5.
+// First-party stats impl (plan 00f0ca9a) — replaces rs-stats GPL-3.0:
+//   R4: t-tests, R5: one-way ANOVA.
+use crate::analytics::stats::anova::one_way_anova;
 use crate::analytics::stats::t_test::{one_sample_t_test, two_sample_t_test};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -121,10 +125,10 @@ pub fn test_community_homogeneity(groups: &[Vec<f64>]) -> Option<AnovaResult> {
         return None;
     }
 
-    // Convert to slices for rs-stats (expects &[&[T]])
+    // Convert to slices for the anova primitive (expects &[&[f64]])
     let group_slices: Vec<&[f64]> = valid_groups.iter().map(|g| g.as_slice()).collect();
 
-    one_way_anova(&group_slices).ok().map(|r| AnovaResult {
+    one_way_anova(&group_slices).map(|r| AnovaResult {
         f_statistic: r.f_statistic,
         df_between: r.df_between,
         df_within: r.df_within,
