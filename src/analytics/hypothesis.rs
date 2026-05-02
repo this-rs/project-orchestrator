@@ -13,11 +13,12 @@
 //! - **Synapse strength homogeneity**: test whether synapse weights within a
 //!   knowledge cluster are uniform (ANOVA across clusters)
 
-use rs_stats::hypothesis_tests::{
-    anova::one_way_anova,
-    t_test::{one_sample_t_test, two_sample_t_test},
-};
+use rs_stats::hypothesis_tests::anova::one_way_anova;
 use serde::{Deserialize, Serialize};
+
+// First-party t-test impl (R4 of plan 00f0ca9a) — replaces rs-stats's t-tests.
+// ANOVA still goes through rs-stats; migrated in R5.
+use crate::analytics::stats::t_test::{one_sample_t_test, two_sample_t_test};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Serde-safe result types (rs-stats structs don't implement Serialize)
@@ -157,16 +158,14 @@ pub fn compare_distributions(
     if a.len() < 2 || b.len() < 2 {
         return None;
     }
-    two_sample_t_test(a, b, assume_equal_variance)
-        .ok()
-        .map(|r| TTestResult {
-            t_statistic: r.t_statistic,
-            degrees_of_freedom: r.degrees_of_freedom,
-            p_value: r.p_value,
-            mean_values: r.mean_values,
-            std_devs: r.std_devs,
-            significance: SignificanceLevel::from_p_value(r.p_value),
-        })
+    two_sample_t_test(a, b, assume_equal_variance).map(|r| TTestResult {
+        t_statistic: r.t_statistic,
+        degrees_of_freedom: r.degrees_of_freedom,
+        p_value: r.p_value,
+        mean_values: r.mean_values,
+        std_devs: r.std_devs,
+        significance: SignificanceLevel::from_p_value(r.p_value),
+    })
 }
 
 /// Test whether a metric series shows a statistically significant deviation
@@ -184,16 +183,14 @@ pub fn test_stagnation(values: &[f64], reference_mean: f64) -> Option<TTestResul
     if values.len() < 2 {
         return None;
     }
-    one_sample_t_test(values, reference_mean)
-        .ok()
-        .map(|r| TTestResult {
-            t_statistic: r.t_statistic,
-            degrees_of_freedom: r.degrees_of_freedom,
-            p_value: r.p_value,
-            mean_values: r.mean_values,
-            std_devs: r.std_devs,
-            significance: SignificanceLevel::from_p_value(r.p_value),
-        })
+    one_sample_t_test(values, reference_mean).map(|r| TTestResult {
+        t_statistic: r.t_statistic,
+        degrees_of_freedom: r.degrees_of_freedom,
+        p_value: r.p_value,
+        mean_values: r.mean_values,
+        std_devs: r.std_devs,
+        significance: SignificanceLevel::from_p_value(r.p_value),
+    })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
