@@ -1,0 +1,3 @@
+rs-stats v2.0.3
+└── project-orchestrator v0.1.0 (/Users/triviere/.openclaw/workspace/skills/project-orchestrator)
+    └── project-orchestrator-desktop v0.1.0 (/Users/triviere/.openclaw/workspace/skills/project-orchestrator/desktop/src-tauri)

@@ -175,8 +175,13 @@ fastembed = "5.11"
 # Dimensionality reduction (UMAP projection for embedding visualization)
 rag-umap = "0.0"
 
-# Statistical analysis engine — distribution fitting, hypothesis testing, regression
-rs-stats = { version = "2.0.3", features = ["parallel"] }
+# Statistical primitives (distribution CDFs, MLE helpers) — MIT.
+# Used by `src/analytics/stats/` (first-party fitter + hypothesis tests).
+# Replaced rs-stats v2.0.3 (GPL-3.0) — see `docs/migration/rs-stats/` and
+# plan 00f0ca9a for the full migration audit.
+# default-features disabled: we only use univariate distributions
+# (StudentsT, FisherSnedecor, Normal, Gamma, …); nalgebra/rand are not needed.
+statrs = { version = "0.18", default-features = false }
 
 # openssl-sys is a transitive dep (via ort-sys build script → ureq → native-tls,
 # and neo4rs → native-tls). The "vendored" feature builds OpenSSL from source,

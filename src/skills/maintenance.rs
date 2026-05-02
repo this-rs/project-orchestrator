@@ -197,7 +197,7 @@ pub async fn run_daily_maintenance(
             crate::analytics::hypothesis::test_stagnation(&synapse_weights, 0.5)
         {
             use crate::analytics::hypothesis::SignificanceLevel;
-            let mean = rs_stats::prob::average(&synapse_weights).unwrap_or(0.0);
+            let mean = crate::analytics::stats::mean_std::mean(&synapse_weights).unwrap_or(0.0);
             if mean < 0.5
                 && matches!(
                     test_result.significance,

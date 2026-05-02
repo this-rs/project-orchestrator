@@ -1,0 +1,77 @@
+   Compiling project-orchestrator v0.1.0 (/Users/triviere/.openclaw/workspace/skills/project-orchestrator)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3m 43s
+     Running unittests src/lib.rs (target/debug/deps/project_orchestrator-4be490cbe1db9206)
+
+running 1 test
+test analytics::stats::golden_fixtures::capture::capture_rs_stats_outputs ... // === Captured from rs-stats v2.0.3 ===
+
+pub const EXPECTED_MEAN_SMALL_INTEGERS: f64 = 3.000000000000000000e0_f64;
+pub const EXPECTED_MEAN_MEDIUM_NORMAL: f64 = 9.975253331428302062e0_f64;
+pub const EXPECTED_MEAN_WITH_OUTLIERS: f64 = 2.200000000000000000e1_f64;
+pub const EXPECTED_MEAN_NEAR_ZERO_FLAT: f64 = 1.666666666666666774e-3_f64;
+pub const EXPECTED_MEAN_LOGNORMAL_SHAPE: f64 = 1.150209870525542799e0_f64;
+
+pub const EXPECTED_STD_DEV_SMALL_INTEGERS: f64 = 1.414213562373095145e0_f64;
+pub const EXPECTED_STD_DEV_MEDIUM_NORMAL: f64 = 1.784131496006474471e0_f64;
+pub const EXPECTED_STD_DEV_WITH_OUTLIERS: f64 = 3.901281840626231912e1_f64;
+pub const EXPECTED_STD_DEV_NEAR_ZERO_FLAT: f64 = 1.343709624716424994e-2_f64;
+pub const EXPECTED_STD_DEV_LOGNORMAL_SHAPE: f64 = 6.238892708910099838e-1_f64;
+
+pub const EXPECTED_TTEST1_SMALL_INTEGERS: TTestExpected = TTestExpected { t_stat: 4.242640687119284770e0_f64, df: 4.000000000000000000e0_f64, p_value: 1.000000000000000000e0_f64 };
+pub const EXPECTED_TTEST1_MEDIUM_NORMAL: TTestExpected = TTestExpected { t_stat: 3.010898204695107694e1_f64, df: 2.900000000000000000e1_f64, p_value: 1.000000000000000000e0_f64 };
+pub const EXPECTED_TTEST1_NEAR_ZERO_FLAT: TTestExpected = TTestExpected { t_stat: 2.773500981126145737e-1_f64, df: 5.000000000000000000e0_f64, p_value: 0.000000000000000000e0_f64 };
+
+pub const EXPECTED_TTEST2_WELCH_SHIFTED: TTestExpected = TTestExpected { t_stat: -1.000000000000000000e0_f64, df: 8.000000000000000000e0_f64, p_value: 1.000000000000000000e0_f64 };
+pub const EXPECTED_TTEST2_WELCH_IDENTICAL: TTestExpected = TTestExpected { t_stat: 0.000000000000000000e0_f64, df: 8.000000000000000000e0_f64, p_value: 0.000000000000000000e0_f64 };
+
+pub const EXPECTED_ANOVA_3_GROUPS: AnovaExpected = AnovaExpected {
+    f_stat: 2.136440366972473385e3_f64,
+    df_between: 2,
+    df_within: 12,
+    p_value: 9.999999999721721489e-1_f64,
+    ss_between: 1.552480000000000082e0_f64,
+    ss_within: 4.360000000000007099e-3_f64,
+    ms_between: 7.762400000000000411e-1_f64,
+    ms_within: 3.633333333333339430e-4_f64,
+};
+
+// fit_all(LOGNORMAL_SHAPE) — 9 fits ranked by AIC asc
+pub const EXPECTED_FIT_ALL_LOGNORMAL_SHAPE: &[FitExpected] = &[
+    FitExpected { name: "Gamma", aic: 8.652257753988506295e1_f64, bic: 9.034662355074135576e1_f64, ks_p_value: 9.780769081697978651e-1_f64 },
+    FitExpected { name: "LogNormal", aic: 8.732478621067313895e1_f64, bic: 9.114883222152943176e1_f64, ks_p_value: 7.705644546619278001e-1_f64 },
+    FitExpected { name: "Weibull", aic: 8.920656664541205316e1_f64, bic: 9.303061265626834597e1_f64, ks_p_value: 8.717507017756929155e-1_f64 },
+    FitExpected { name: "F", aic: 8.975613679703987202e1_f64, bic: 9.358018280789616483e1_f64, ks_p_value: 7.489654257771853896e-1_f64 },
+    FitExpected { name: "Normal", aic: 9.871561563505848369e1_f64, bic: 1.025396616459147765e2_f64, ks_p_value: 4.509144806111594073e-1_f64 },
+    FitExpected { name: "StudentT", aic: 1.001060202488694983e2_f64, bic: 1.058420892651539305e2_f64, ks_p_value: 4.165393865930515638e-1_f64 },
+    FitExpected { name: "Uniform", aic: 1.146166432298891920e2_f64, bic: 1.184406892407454848e2_f64, ks_p_value: 5.760497257947763431e-7_f64 },
+    FitExpected { name: "Exponential", aic: 1.159944421833937298e2_f64, bic: 1.179064651888218691e2_f64, ks_p_value: 1.608606591459847950e-3_f64 },
+    FitExpected { name: "ChiSquared", aic: 1.428221529010404254e2_f64, bic: 1.447341759064685789e2_f64, ks_p_value: 7.235708072786238937e-7_f64 },
+];
+// fit_all(MEDIUM_NORMAL) — 9 fits ranked by AIC asc
+pub const EXPECTED_FIT_ALL_MEDIUM_NORMAL: &[FitExpected] = &[
+    FitExpected { name: "Uniform", aic: 1.213197140948095125e2_f64, bic: 1.241221088581338279e2_f64, ks_p_value: 7.226570087051474855e-1_f64 },
+    FitExpected { name: "Normal", aic: 1.238722163901975222e2_f64, bic: 1.266746111535218375e2_f64, ks_p_value: 9.207119476101386368e-1_f64 },
+    FitExpected { name: "Gamma", aic: 1.240108329979821633e2_f64, bic: 1.268132277613064787e2_f64, ks_p_value: 9.711902110932811860e-1_f64 },
+    FitExpected { name: "LogNormal", aic: 1.244758212537962976e2_f64, bic: 1.272782160171206129e2_f64, ks_p_value: 9.460078514176815112e-1_f64 },
+    FitExpected { name: "Weibull", aic: 1.246879793225404711e2_f64, bic: 1.274903740858647865e2_f64, ks_p_value: 5.777477299729707472e-1_f64 },
+    FitExpected { name: "StudentT", aic: 1.262518930905680463e2_f64, bic: 1.304554852355545052e2_f64, ks_p_value: 9.222123997488645974e-1_f64 },
+    FitExpected { name: "ChiSquared", aic: 1.518870437863737664e2_f64, bic: 1.532882411680359098e2_f64, ks_p_value: 2.693876727165624846e-2_f64 },
+    FitExpected { name: "Exponential", aic: 2.000064415452712012e2_f64, bic: 2.014076389269333447e2_f64, ks_p_value: 9.957176834003386191e-7_f64 },
+    FitExpected { name: "F", aic: 2.937069675720478585e2_f64, bic: 2.965093623353721455e2_f64, ks_p_value: 9.130902848384875403e-22_f64 },
+];
+// fit_all(SMALL_INTEGERS) — 9 fits ranked by AIC asc
+pub const EXPECTED_FIT_ALL_SMALL_INTEGERS: &[FitExpected] = &[
+    FitExpected { name: "Uniform", aic: 1.786294361119890794e1_f64, bic: 1.708181943606710718e1_f64, ks_p_value: 9.747892465409951912e-1_f64 },
+    FitExpected { name: "Weibull", aic: 2.134351563830021448e1_f64, bic: 2.056239146316841371e1_f64, ks_p_value: 9.969629519444076493e-1_f64 },
+    FitExpected { name: "ChiSquared", aic: 2.140189358926468088e1_f64, bic: 2.101133150169878050e1_f64, ks_p_value: 9.253829608296609832e-1_f64 },
+    FitExpected { name: "Normal", aic: 2.165512123484645457e1_f64, bic: 2.087399705971465380e1_f64, ks_p_value: 9.983903404822666028e-1_f64 },
+    FitExpected { name: "Gamma", aic: 2.166861375031595216e1_f64, bic: 2.088748957518415139e1_f64, ks_p_value: 9.948950008978878490e-1_f64 },
+    FitExpected { name: "LogNormal", aic: 2.211536770113599459e1_f64, bic: 2.133424352600419382e1_f64, ks_p_value: 9.771100979579145918e-1_f64 },
+    FitExpected { name: "Exponential", aic: 2.298612288668109471e1_f64, bic: 2.259556079911519433e1_f64, ks_p_value: 7.289550986668227317e-1_f64 },
+    FitExpected { name: "StudentT", aic: 2.376464418809259982e1_f64, bic: 2.259295792539489867e1_f64, ks_p_value: 9.987748914743455053e-1_f64 },
+    FitExpected { name: "F", aic: 3.011177912872494034e1_f64, bic: 2.933065495359313957e1_f64, ks_p_value: 7.268046250963082489e-2_f64 },
+];
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5806 filtered out; finished in 0.01s
+

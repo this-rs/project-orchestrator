@@ -1,0 +1,40 @@
+# cargo-audit configuration — supply chain advisory exceptions.
+# https://docs.rs/cargo-audit/latest/cargo_audit/config/struct.AuditConfig.html
+#
+# Run locally: `cargo audit`
+# Run in CI:   .github/workflows/security.yml (rustsec/audit-check@v2)
+#
+# Plan e81fb4de — Dependabot security audit (T7). Mirrors the
+# `[advisories.ignore]` block in `deny.toml` since cargo-audit and
+# cargo-deny consume separate config files.
+
+[advisories]
+# When a known advisory has no actionable fix yet, document the
+# exception with an explanatory comment + RUSTSEC id below.
+ignore = [
+    # RUSTSEC-2023-0071 — "Marvin Attack" timing sidechannel on the `rsa` crate.
+    # No upstream patch available (open since 2023-11-22); a constant-time
+    # rewrite is in progress at https://github.com/RustCrypto/RSA/issues/626.
+    #
+    # Pulled transitively via jsonwebtoken 10 + features = ["rust_crypto"]
+    # (chain: rsa ← jsonwebtoken ← meilisearch-sdk ← project-orchestrator).
+    #
+    # Justification: we use HS256 (HMAC) for JWT signing in `auth/jwt.rs`
+    # (`EncodingKey::from_secret`). RSA signing/verification is never invoked
+    # at runtime, so the timing sidechannel is unreachable in our code paths.
+    # We will revisit when RustCrypto/RSA ships a constant-time release.
+    "RUSTSEC-2023-0071",
+
+    # ---------------------------------------------------------------------
+    # Unmaintained transitive dependencies (informational, not vulnerabilities).
+    # Mirrored from deny.toml — see that file for per-advisory justifications.
+    # ---------------------------------------------------------------------
+    "RUSTSEC-2024-0384", # instant unmaintained
+    "RUSTSEC-2024-0436", # paste unmaintained
+    "RUSTSEC-2025-0012", # backoff unmaintained
+    "RUSTSEC-2025-0119", # number_prefix unmaintained
+    "RUSTSEC-2025-0134", # rustls-pemfile unmaintained
+    "RUSTSEC-2025-0141", # bincode 1.x unmaintained
+    "RUSTSEC-2026-0097", # rand unsound (custom logger via rand::rng())
+    "RUSTSEC-2026-0105", # core2 unmaintained + yanked
+]

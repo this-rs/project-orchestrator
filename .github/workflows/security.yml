@@ -1,0 +1,48 @@
+# Supply chain security — runs cargo-deny + cargo-audit on every
+# PR and on every push to main. Fails the build if a known advisory,
+# yanked version, license violation, or untrusted source slips in.
+#
+# Plan e81fb4de — Dependabot security audit (T7).
+
+name: Security
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  schedule:
+    # Daily at 06:30 UTC — catches advisories published between
+    # PR runs.
+    - cron: "30 6 * * *"
+
+permissions:
+  contents: read
+  # Required by rustsec/audit-check@v2 to post audit results as a
+  # check run on the PR.
+  checks: write
+  issues: write
+
+jobs:
+  cargo-deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run cargo-deny (advisories, bans, licenses, sources)
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories bans licenses sources
+          # Optional fast-fail short-circuit; leave default behaviour.
+
+  cargo-audit:
+    name: cargo-audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run cargo-audit
+        uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

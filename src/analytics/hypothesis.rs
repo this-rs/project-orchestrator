@@ -1,7 +1,11 @@
 //! Hypothesis testing helpers for Orchestrator statistical analysis.
 //!
-//! Wraps `rs_stats` t-test and ANOVA modules with Orchestrator-specific
-//! convenience functions and serde-safe result types.
+//! Wraps the first-party `crate::analytics::stats` t-test and ANOVA
+//! primitives with Orchestrator-specific convenience functions and
+//! serde-safe result types.
+//!
+//! Migrated from `rs-stats` (GPL-3.0) to first-party impl + `statrs` (MIT)
+//! under plan `00f0ca9a` — see `docs/migration/rs-stats/`.
 //!
 //! ## Use cases
 //! - **Community fragility**: ANOVA to test whether Louvain communities have
@@ -13,11 +17,12 @@
 //! - **Synapse strength homogeneity**: test whether synapse weights within a
 //!   knowledge cluster are uniform (ANOVA across clusters)
 
-use rs_stats::hypothesis_tests::{
-    anova::one_way_anova,
-    t_test::{one_sample_t_test, two_sample_t_test},
-};
 use serde::{Deserialize, Serialize};
+
+// First-party stats impl (plan 00f0ca9a) — replaces rs-stats GPL-3.0:
+//   R4: t-tests, R5: one-way ANOVA.
+use crate::analytics::stats::anova::one_way_anova;
+use crate::analytics::stats::t_test::{one_sample_t_test, two_sample_t_test};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Serde-safe result types (rs-stats structs don't implement Serialize)
@@ -120,10 +125,10 @@ pub fn test_community_homogeneity(groups: &[Vec<f64>]) -> Option<AnovaResult> {
         return None;
     }
 
-    // Convert to slices for rs-stats (expects &[&[T]])
+    // Convert to slices for the anova primitive (expects &[&[f64]])
     let group_slices: Vec<&[f64]> = valid_groups.iter().map(|g| g.as_slice()).collect();
 
-    one_way_anova(&group_slices).ok().map(|r| AnovaResult {
+    one_way_anova(&group_slices).map(|r| AnovaResult {
         f_statistic: r.f_statistic,
         df_between: r.df_between,
         df_within: r.df_within,
@@ -157,16 +162,14 @@ pub fn compare_distributions(
     if a.len() < 2 || b.len() < 2 {
         return None;
     }
-    two_sample_t_test(a, b, assume_equal_variance)
-        .ok()
-        .map(|r| TTestResult {
-            t_statistic: r.t_statistic,
-            degrees_of_freedom: r.degrees_of_freedom,
-            p_value: r.p_value,
-            mean_values: r.mean_values,
-            std_devs: r.std_devs,
-            significance: SignificanceLevel::from_p_value(r.p_value),
-        })
+    two_sample_t_test(a, b, assume_equal_variance).map(|r| TTestResult {
+        t_statistic: r.t_statistic,
+        degrees_of_freedom: r.degrees_of_freedom,
+        p_value: r.p_value,
+        mean_values: r.mean_values,
+        std_devs: r.std_devs,
+        significance: SignificanceLevel::from_p_value(r.p_value),
+    })
 }
 
 /// Test whether a metric series shows a statistically significant deviation
@@ -184,16 +187,14 @@ pub fn test_stagnation(values: &[f64], reference_mean: f64) -> Option<TTestResul
     if values.len() < 2 {
         return None;
     }
-    one_sample_t_test(values, reference_mean)
-        .ok()
-        .map(|r| TTestResult {
-            t_statistic: r.t_statistic,
-            degrees_of_freedom: r.degrees_of_freedom,
-            p_value: r.p_value,
-            mean_values: r.mean_values,
-            std_devs: r.std_devs,
-            significance: SignificanceLevel::from_p_value(r.p_value),
-        })
+    one_sample_t_test(values, reference_mean).map(|r| TTestResult {
+        t_statistic: r.t_statistic,
+        degrees_of_freedom: r.degrees_of_freedom,
+        p_value: r.p_value,
+        mean_values: r.mean_values,
+        std_devs: r.std_devs,
+        significance: SignificanceLevel::from_p_value(r.p_value),
+    })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

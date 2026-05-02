@@ -1,7 +1,11 @@
 //! Distribution analysis helpers for Orchestrator graph metrics.
 //!
-//! Wraps `rs_stats` fitting API to produce rich distribution reports from raw
-//! metric slices (PageRank vectors, risk scores, coupling coefficients, etc.).
+//! Wraps the first-party `crate::analytics::stats::fitting` API to produce
+//! rich distribution reports from raw metric slices (PageRank vectors,
+//! risk scores, coupling coefficients, etc.).
+//!
+//! Migrated from `rs-stats` (GPL-3.0) to first-party impl + `statrs` (MIT)
+//! under plan `00f0ca9a` — see `docs/migration/rs-stats/`.
 //!
 //! ## Usage
 //! ```rust,ignore
@@ -12,7 +16,7 @@
 //! let p95_threshold = adaptive_threshold(&pageranks, 0.95);
 //! ```
 
-use rs_stats::distributions::fitting::FitResult;
+use crate::analytics::stats::fitting::FitResult;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
@@ -91,7 +95,7 @@ pub struct DistributionAnalysis {
 /// Analyse the full distribution of `values`, fitting all applicable distributions.
 ///
 /// Returns `None` if `values` is empty.
-/// All rs-stats errors are caught and logged; the percentile fields still
+/// All fit errors are caught and logged; the percentile fields still
 /// reflect the empirical distribution even if model fitting fails.
 pub fn analyze_distribution(values: &[f64]) -> Option<DistributionAnalysis> {
     if values.is_empty() {
@@ -102,10 +106,13 @@ pub fn analyze_distribution(values: &[f64]) -> Option<DistributionAnalysis> {
     let mut sorted = values.to_vec();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
-    // ── Basic statistics — delegate to rs-stats rather than reimplementing ────
-    let mean =
-        rs_stats::prob::average(values).unwrap_or_else(|_| values.iter().sum::<f64>() / n as f64);
-    let std_dev = rs_stats::prob::std_dev(values).unwrap_or(0.0);
+    // ── Basic statistics — first-party impl (replaces rs-stats GPL-3.0) ──────
+    // See `crate::analytics::stats::mean_std`. The `unwrap_or_else` fallback
+    // is kept for empty-input defensiveness (Option::None path), even though
+    // R6's `analyze_distribution` already guards `values.is_empty()`.
+    let mean = crate::analytics::stats::mean_std::mean(values)
+        .unwrap_or_else(|| values.iter().sum::<f64>() / n as f64);
+    let std_dev = crate::analytics::stats::mean_std::std_dev_population(values).unwrap_or(0.0);
 
     let skewness = if std_dev > 0.0 && n >= 3 {
         sorted
@@ -129,14 +136,15 @@ pub fn analyze_distribution(values: &[f64]) -> Option<DistributionAnalysis> {
         sorted[lo] * (1.0 - frac) + sorted[hi] * frac
     };
 
-    // ── Distribution fitting via rs-stats ─────────────────────────────────────
-    let fit_results: Vec<FitResult> = rs_stats::fit_all(values).unwrap_or_else(|e| {
-        warn!(
-            "rs-stats fit_all failed (n={}): {} — using empty fit list",
-            n, e
-        );
-        vec![]
-    });
+    // ── Distribution fitting via first-party impl (R6 of plan 00f0ca9a) ───────
+    let fit_results: Vec<FitResult> = crate::analytics::stats::fitting::fit_all(values)
+        .unwrap_or_else(|e| {
+            warn!(
+                "stats::fitting::fit_all failed (n={}): {} — using empty fit list",
+                n, e
+            );
+            vec![]
+        });
 
     let all_fits: Vec<DistributionFit> = fit_results
         .iter()

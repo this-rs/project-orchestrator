@@ -1,44 +1,103 @@
-# cargo-deny configuration
+# cargo-deny configuration — supply chain guardrail.
 # https://embarkstudios.github.io/cargo-deny/
+#
+# Run locally: `cargo deny check`
+# Run in CI:   .github/workflows/security.yml
+#
+# Plan e81fb4de — Dependabot security audit (T7). Migrated from
+# v1 schema (`vulnerability = "deny"`, `unlicensed = "deny"`, etc.,
+# deprecated in cargo-deny ≥0.14) to the v2 schema.
 
 [advisories]
-# Fail on vulnerabilities with severity >= medium
-vulnerability = "deny"
-unmaintained = "warn"
+version = 2
+# Yanked crates are surfaced as warnings rather than build-breakers. Some
+# transitive deps (notably core2 via bitstream-io ← rav1e ← image) have ALL
+# versions yanked, with no upgrade path until the upstream image crate
+# replaces rav1e — fixing this is out of scope for the security PR. Real
+# vulnerabilities continue to error out via the RustSec advisory database.
 yanked = "warn"
-notice = "warn"
+# When a known advisory has no actionable fix yet, document the
+# exception with an explanatory comment + GHSA id below.
+ignore = [
+    # RUSTSEC-2023-0071 — "Marvin Attack" timing sidechannel on the `rsa` crate.
+    # No upstream patch available (open since 2023-11-22); a constant-time
+    # rewrite is in progress at https://github.com/RustCrypto/RSA/issues/626.
+    #
+    # Pulled transitively via jsonwebtoken 10 + features = ["rust_crypto"]
+    # (chain: rsa ← jsonwebtoken ← meilisearch-sdk ← project-orchestrator).
+    #
+    # Justification: we use HS256 (HMAC) for JWT signing in `auth/jwt.rs`
+    # (`EncodingKey::from_secret`). RSA signing/verification is never invoked
+    # at runtime, so the timing sidechannel is unreachable in our code paths.
+    # We will revisit when RustCrypto/RSA ships a constant-time release.
+    { id = "RUSTSEC-2023-0071", reason = "Marvin Attack on rsa crate. We only use HS256 (HMAC) for JWT — RSA paths never executed." },
+
+    # ---------------------------------------------------------------------
+    # Unmaintained transitive dependencies (informational, not vulnerabilities).
+    # Each is pulled by an upstream crate we can't easily replace without
+    # major churn; the unmaintained signal is a reminder to revisit, not a
+    # critical issue. We track them as ignores so the security gate stays
+    # actionable on real vulns.
+    # ---------------------------------------------------------------------
+    { id = "RUSTSEC-2024-0384", reason = "instant unmaintained — transitive via parking_lot/tracing ecosystem. Migration to std::time::Instant is upstream's responsibility." },
+    { id = "RUSTSEC-2024-0436", reason = "paste unmaintained — proc-macro pulled by hf-hub/fastembed. No drop-in replacement; fastembed migration is out of scope." },
+    { id = "RUSTSEC-2025-0012", reason = "backoff unmaintained — pulled by hf-hub. Stable for our retry use case; will follow hf-hub upstream when they migrate." },
+    { id = "RUSTSEC-2025-0119", reason = "number_prefix unmaintained — pulled by indicatif progress bars. Trivial functionality, no security impact." },
+    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile unmaintained — transitive via tokio-rustls 0.24 in fastembed. Newer rustls 0.23 stack uses pki-types directly; will land when fastembed updates." },
+    { id = "RUSTSEC-2025-0141", reason = "bincode 1.x unmaintained — bincode 2.x is the maintained version but is a breaking change; transitive via fastembed/ort. Out of scope for this PR." },
+    { id = "RUSTSEC-2026-0097", reason = "rand unsound (custom logger via rand::rng()) — transitive in build deps. We don't call rand::rng() with a custom logger anywhere in our codebase." },
+    { id = "RUSTSEC-2026-0105", reason = "core2 unmaintained + all versions yanked. Transitive via bitstream-io ← rav1e ← ravif ← image ← fastembed. Pinned by upstream image crate; no upgrade path available. Surfaced as `yanked = warn` in [advisories]." },
+]
+
+[bans]
+# Same crate at multiple versions in the lockfile bloats binary
+# size and complicates security scanning. Warn (don't deny — many
+# version splits come from upstream we can't control).
+multiple-versions = "warn"
+# Wildcard version reqs (`= "*"`) defeat semver constraints.
+wildcards = "warn"
 
 [licenses]
-# Allow common permissive licenses
-unlicensed = "deny"
+version = 2
+# Permissive licenses we accept. Audit before adding new ones.
 allow = [
     "MIT",
     "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
     "BSD-2-Clause",
     "BSD-3-Clause",
     "ISC",
-    "Unicode-3.0",
     "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "MPL-2.0",
     "Zlib",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
     "BSL-1.0",
     "OpenSSL",
-    "CC0-1.0",
-    "MPL-2.0",
+    # University of Illinois/NCSA Open Source License — OSI approved, FSF Free.
+    # Pulled transitively via libfuzzer-sys ← rav1e ← ravif ← image ← fastembed.
+    "NCSA",
+    # Business Source License 1.1 — used by our own neural-routing-* crates
+    # (neural-routing-{core,nn,gnn,policy,runtime}) under "MIT AND BUSL-1.1".
+    # We authorize ourselves; the BUSL parts are first-party code.
+    "BUSL-1.1",
 ]
-copyleft = "warn"
-confidence-threshold = 0.8
+confidence-threshold = 0.93
 
+# `ring` is dual-licensed but doesn't always declare it cleanly in
+# its crate metadata; clarify so the licenses check passes.
 [[licenses.clarify]]
 name = "ring"
 expression = "MIT AND ISC AND OpenSSL"
 license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
 
-[bans]
-multiple-versions = "warn"
-wildcards = "allow"
-
 [sources]
-unknown-registry = "warn"
+# Refuse arbitrary alternative crates registries.
+unknown-registry = "deny"
+# Allow a small set of trusted git sources.
 unknown-git = "warn"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-allow-git = []
+allow-git = [
+    "https://github.com/this-rs/nexus.git",
+]
