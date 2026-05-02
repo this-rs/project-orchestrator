@@ -176,7 +176,16 @@ fastembed = "5.11"
 rag-umap = "0.0"
 
 # Statistical analysis engine — distribution fitting, hypothesis testing, regression
+# rs-stats is being phased out: GPL-3.0 is incompatible with our MIT AND BUSL-1.1
+# license (cargo-deny flags this). Migration in progress under plan 00f0ca9a:
+# replaced by first-party impl in `src/analytics/stats/` + `statrs` for CDF primitives.
 rs-stats = { version = "2.0.3", features = ["parallel"] }
+
+# Statistical primitives (distribution CDFs, MLE helpers) — MIT.
+# Used by `src/analytics/stats/` as the rs-stats GPL-3.0 replacement.
+# default-features disabled: we only use univariate distributions
+# (StudentsT, FisherSnedecor, Normal, Gamma, …); nalgebra/rand are not needed.
+statrs = { version = "0.18", default-features = false }
 
 # openssl-sys is a transitive dep (via ort-sys build script → ureq → native-tls,
 # and neo4rs → native-tls). The "vendored" feature builds OpenSSL from source,
