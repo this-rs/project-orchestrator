@@ -111,6 +111,135 @@ fn try_parse_at(bytes: &[u8]) -> Option<(String, usize)> {
 }
 
 // ============================================================================
+// High-level lookup: branch → Task
+// ============================================================================
+
+use crate::neo4j::models::TaskNode;
+use crate::neo4j::traits::GraphStore;
+use std::sync::Arc;
+use uuid::Uuid;
+
+/// A task located via its external_id (parsed from a branch).
+#[derive(Debug, Clone)]
+pub struct ResolvedTask {
+    pub external_id: String,
+    /// Present when a task matching `external_id` was found in the project's plans.
+    /// `None` means the id was extracted from the branch but no Task carries it
+    /// (e.g. branch was created proactively, plan/task not yet authored).
+    pub task: Option<TaskNode>,
+}
+
+/// Boundary chars that may follow the external_id inside a task title.
+/// Keeps `T210` distinct from `T2100` and `T210.5`.
+const ID_BOUNDARY_CHARS: &[char] = &[' ', '\t', ':', '—', '-', '|', '/', '(', '[', ',', '.'];
+
+/// Resolve a Task by parsing a git branch name and matching the extracted
+/// external_id against task titles within a project.
+///
+/// **Lookup strategy** (no dedicated `external_id` column yet — operates on
+/// the existing graph): scan in-progress + recent plans for the project and
+/// pick the first task whose title starts with the parsed id followed by a
+/// non-id boundary character. This is O(plans × tasks) but bounded in
+/// practice and short-circuits on the first hit.
+///
+/// Returns `None` if:
+/// - The branch doesn't contain a recognizable id.
+///
+/// Returns `Some` with `task: None` when the id was parsed but no matching
+/// task was found — useful for downstream UIs to show "Working on T210
+/// (task not registered)".
+pub async fn resolve_task_from_branch(
+    graph: &Arc<dyn GraphStore>,
+    project_id: Uuid,
+    branch: &str,
+) -> Option<ResolvedTask> {
+    let external_id = parse_branch_to_external_id(branch)?;
+    let task = find_task_by_external_id(graph, project_id, &external_id).await;
+    Some(ResolvedTask { external_id, task })
+}
+
+/// Check whether a title carries the given external_id as a prefix-token.
+///
+/// Visible for testing.
+pub fn title_matches_external_id(title: &str, external_id: &str) -> bool {
+    // Match case-insensitively but anchor at the very start.
+    let lower_title = title.trim_start().to_ascii_lowercase();
+    let lower_id = external_id.to_ascii_lowercase();
+    if !lower_title.starts_with(&lower_id) {
+        return false;
+    }
+    // Boundary check: the char immediately after the id must be a separator,
+    // or the title must end exactly at the id.
+    match lower_title[lower_id.len()..].chars().next() {
+        None => true,
+        Some(c) if ID_BOUNDARY_CHARS.contains(&c) => {
+            // Reject `T210.5` when looking for `T210` — `.` is a boundary in
+            // ID_BOUNDARY_CHARS but introduces a sub-id continuation. The id
+            // continues only if a digit follows the dot.
+            if c == '.' {
+                let after = lower_title[lower_id.len() + 1..].chars().next();
+                !matches!(after, Some(d) if d.is_ascii_digit())
+            } else {
+                true
+            }
+        }
+        Some(_) => false,
+    }
+}
+
+async fn find_task_by_external_id(
+    graph: &Arc<dyn GraphStore>,
+    project_id: Uuid,
+    external_id: &str,
+) -> Option<TaskNode> {
+    // Active first, then everything else — recent work usually matches the branch.
+    let active_filter = Some(vec![
+        "in_progress".to_string(),
+        "approved".to_string(),
+        "draft".to_string(),
+    ]);
+    let (active_plans, _) = graph
+        .list_plans_for_project(project_id, active_filter, 50, 0)
+        .await
+        .ok()?;
+
+    for plan in &active_plans {
+        if let Ok(tasks) = graph.get_plan_tasks(plan.id).await {
+            for t in tasks {
+                if let Some(ref title) = t.title {
+                    if title_matches_external_id(title, external_id) {
+                        return Some(t);
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback sweep: any plan status (completed plans often carry the task too)
+    let (all_plans, _) = graph
+        .list_plans_for_project(project_id, None, 100, 0)
+        .await
+        .ok()?;
+    for plan in &all_plans {
+        // Skip plans we already scanned above
+        if active_plans.iter().any(|p| p.id == plan.id) {
+            continue;
+        }
+        if let Ok(tasks) = graph.get_plan_tasks(plan.id).await {
+            for t in tasks {
+                if let Some(ref title) = t.title {
+                    if title_matches_external_id(title, external_id) {
+                        return Some(t);
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -211,5 +340,52 @@ mod tests {
     #[test]
     fn handles_empty_branch() {
         assert_eq!(parse_branch_to_external_id(""), None);
+    }
+
+    // ====================================================================
+    // title_matches_external_id
+    // ====================================================================
+
+    #[test]
+    fn title_matches_with_em_dash() {
+        assert!(title_matches_external_id("T210 — Mamba2 plan A", "T210"));
+    }
+
+    #[test]
+    fn title_matches_with_colon() {
+        assert!(title_matches_external_id("T246.7: Lookahead decoding", "T246.7"));
+    }
+
+    #[test]
+    fn title_matches_with_space() {
+        assert!(title_matches_external_id("T300 fix the regression", "T300"));
+    }
+
+    #[test]
+    fn title_matches_exact_equals_id() {
+        assert!(title_matches_external_id("T42", "T42"));
+    }
+
+    #[test]
+    fn title_matches_is_case_insensitive() {
+        assert!(title_matches_external_id("t210 — Mamba2", "T210"));
+        assert!(title_matches_external_id("T210 — Mamba2", "t210"));
+    }
+
+    #[test]
+    fn title_matches_rejects_longer_id() {
+        // Looking for T210 should NOT match T2100
+        assert!(!title_matches_external_id("T2100 — Other task", "T210"));
+    }
+
+    #[test]
+    fn title_matches_rejects_sub_id() {
+        // Looking for T246 should NOT match T246.5 (sub-id continuation)
+        assert!(!title_matches_external_id("T246.5 — Decode push", "T246"));
+    }
+
+    #[test]
+    fn title_matches_rejects_mid_word() {
+        assert!(!title_matches_external_id("Fix HTTP T210 backport", "T210"));
     }
 }
