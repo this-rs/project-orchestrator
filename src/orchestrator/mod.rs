@@ -1,5 +1,6 @@
 //! Orchestrator module for coordinating agents
 
+pub mod branch_parser;
 pub mod context;
 pub mod planner;
 pub mod runner;
