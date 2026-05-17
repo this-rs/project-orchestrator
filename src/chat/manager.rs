@@ -2513,10 +2513,45 @@ impl ChatManager {
             )
             .await;
 
+        // Infer project_slug from cwd when the caller didn't pass one.
+        // Without this, sessions created from cwd-only contexts (Claude Code via MCP
+        // is the common case) end up with an empty `project_slug` property and
+        // become invisible to `list_chat_sessions(project_slug=X)` — which in turn
+        // breaks downstream session-continuity flows (`SessionResume`, etc.).
+        let resolved_project_slug = match request.project_slug.clone() {
+            Some(slug) if !slug.is_empty() => Some(slug),
+            _ => {
+                if request.cwd.is_empty() {
+                    None
+                } else {
+                    match crate::skills::project_resolver::infer_project_slug_from_cwd(
+                        self.graph.as_ref(),
+                        &request.cwd,
+                    )
+                    .await
+                    {
+                        Ok(Some(slug)) => {
+                            debug!(
+                                cwd = %request.cwd,
+                                inferred_slug = %slug,
+                                "Inferred project_slug from cwd for new chat session"
+                            );
+                            Some(slug)
+                        }
+                        Ok(None) => None,
+                        Err(e) => {
+                            warn!("Failed to infer project_slug from cwd: {}", e);
+                            None
+                        }
+                    }
+                }
+            }
+        };
+
         let session_node = ChatSessionNode {
             id: session_id,
             cli_session_id: None,
-            project_slug: request.project_slug.clone(),
+            project_slug: resolved_project_slug,
             workspace_slug: request.workspace_slug.clone(),
             cwd: request.cwd.clone(),
             title: None,

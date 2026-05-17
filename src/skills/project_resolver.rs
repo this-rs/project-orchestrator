@@ -198,6 +198,31 @@ pub async fn resolve_project_from_context(
     Ok(None)
 }
 
+/// Infer a project slug from a working directory via longest-prefix match
+/// against registered `root_path`s.
+///
+/// Mirrors [`resolve_project_from_context`] but operates purely on a cwd
+/// (no tool-call context) and returns the slug — which is the form needed
+/// by `ChatSession.project_slug`, `list_chat_sessions(project_slug=...)`,
+/// and the broader REST API.
+///
+/// Returns `None` when:
+/// - `cwd` is empty
+/// - No project's `root_path` is a prefix of the (tilde-expanded) cwd
+///
+/// Results benefit from the same 5-minute cache as `resolve_project_from_context`.
+pub async fn infer_project_slug_from_cwd(
+    graph_store: &dyn GraphStore,
+    cwd: &str,
+) -> anyhow::Result<Option<String>> {
+    if cwd.is_empty() {
+        return Ok(None);
+    }
+    let entries = load_project_entries(graph_store).await?;
+    let normalized = crate::expand_tilde(cwd);
+    Ok(find_longest_prefix_match(&entries, &normalized).map(|m| m.slug))
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -397,5 +422,44 @@ mod tests {
         // Neither file_path nor cwd match any project
         let result = find_longest_prefix_match(&entries, "/completely/different/path");
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_infer_slug_returns_slug_for_matching_cwd() {
+        // `infer_project_slug_from_cwd` is a thin async wrapper around
+        // `find_longest_prefix_match`. Test the underlying pipeline here:
+        // the slug projection from a longest-prefix match.
+        let entries = vec![
+            make_entry(
+                "00000000-0000-0000-0000-000000000001",
+                "rustorch",
+                "/Users/triviere/projects/rustorch",
+            ),
+            make_entry(
+                "00000000-0000-0000-0000-000000000002",
+                "rustorch-frontend",
+                "/Users/triviere/projects/rustorch-frontend",
+            ),
+        ];
+
+        // Inner cwd resolves to the outer project (rustorch).
+        let cwd = "/Users/triviere/projects/rustorch/pytorch";
+        let matched = find_longest_prefix_match(&entries, cwd).expect("should match");
+        assert_eq!(matched.slug, "rustorch");
+
+        // No false-positive on the sibling project that shares a prefix.
+        assert_ne!(matched.slug, "rustorch-frontend");
+    }
+
+    #[test]
+    fn test_infer_slug_no_match_when_cwd_outside_any_project() {
+        let entries = vec![make_entry(
+            "00000000-0000-0000-0000-000000000001",
+            "rustorch",
+            "/Users/triviere/projects/rustorch",
+        )];
+
+        let cwd = "/tmp/sandbox/whatever";
+        assert!(find_longest_prefix_match(&entries, cwd).is_none());
     }
 }
