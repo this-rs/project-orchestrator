@@ -535,12 +535,41 @@ pub struct ActiveAgent {
     pub task_title: String,
     /// Chat session ID for this agent (set after spawning)
     pub session_id: Option<Uuid>,
+    /// OS process id of the Claude Code subprocess for this agent.
+    /// Set by [`ActiveAgent::set_pid`] once the subprocess is spawned. `None`
+    /// means the agent is either still spawning or has already exited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
     /// When this agent started working
     pub started_at: DateTime<Utc>,
     /// Accumulated cost in USD for this agent
     pub cost_usd: f64,
     /// Current status of the task
     pub status: TaskRunStatus,
+}
+
+// ============================================================================
+// ActiveAgentResources — runtime metrics scraped via sysinfo
+// ============================================================================
+
+/// Live resource usage for an agent's subprocess.
+///
+/// Populated by [`ActiveAgent::snapshot_with_resources`] when a `pid` is set
+/// and the process is still alive. Designed to feed debug/observability UIs
+/// (top-like view of "what each agent is doing").
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ActiveAgentResources {
+    /// OS process id (echoed for convenience).
+    pub pid: u32,
+    /// Resident set size in megabytes (RAM physically held).
+    pub rss_mb: f64,
+    /// CPU usage percentage averaged over the last sysinfo refresh interval.
+    /// `0.0` until at least two refreshes have happened on the same process.
+    pub cpu_pct: f32,
+    /// Process status as reported by the OS (e.g. "Run", "Sleep", "Zombie").
+    pub status: String,
+    /// Number of OS threads owned by the process.
+    pub threads: u32,
 }
 
 // ============================================================================
@@ -555,9 +584,16 @@ pub struct ActiveAgentSnapshot {
     pub task_id: Uuid,
     pub task_title: String,
     pub session_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
     pub elapsed_secs: f64,
     pub cost_usd: f64,
     pub status: TaskRunStatus,
+    /// Live OS-level metrics for the underlying subprocess. `None` when the
+    /// agent has no `pid` set, when the process has exited, or when the caller
+    /// chose the cheap [`ActiveAgent::snapshot`] path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resources: Option<ActiveAgentResources>,
 }
 
 impl ActiveAgent {
@@ -567,23 +603,110 @@ impl ActiveAgent {
             task_id,
             task_title,
             session_id: None,
+            pid: None,
             started_at: Utc::now(),
             cost_usd: 0.0,
             status: TaskRunStatus::Spawning,
         }
     }
 
+    /// Record the OS pid of the spawned Claude Code subprocess.
+    ///
+    /// Intended call-site: ChatManager, immediately after the subprocess has
+    /// been spawned and its pid is known. Idempotent — calling it twice
+    /// overwrites the previous value (useful if the subprocess is respawned
+    /// during a retry).
+    pub fn set_pid(&mut self, pid: u32) {
+        self.pid = Some(pid);
+    }
+
     /// Create a snapshot of this agent at the current point in time.
+    ///
+    /// Cheap path — does NOT touch the OS process table. Use
+    /// [`Self::snapshot_with_resources`] when you also need live RAM/CPU.
     pub fn snapshot(&self) -> ActiveAgentSnapshot {
         let elapsed_secs = (Utc::now() - self.started_at).num_milliseconds() as f64 / 1000.0;
         ActiveAgentSnapshot {
             task_id: self.task_id,
             task_title: self.task_title.clone(),
             session_id: self.session_id,
+            pid: self.pid,
             elapsed_secs,
             cost_usd: self.cost_usd,
             status: self.status,
+            resources: None,
         }
+    }
+
+    /// Create a snapshot enriched with live resource metrics.
+    ///
+    /// `sys` must have been refreshed for the target process (e.g. via
+    /// [`sysinfo::System::refresh_processes`]) before this call. When the
+    /// agent has no `pid`, or when the OS doesn't know that pid (process has
+    /// exited), the returned snapshot has `resources: None`.
+    pub fn snapshot_with_resources(&self, sys: &sysinfo::System) -> ActiveAgentSnapshot {
+        let mut snap = self.snapshot();
+        if let Some(pid) = self.pid {
+            if let Some(proc_info) = sys.process(sysinfo::Pid::from_u32(pid)) {
+                snap.resources = Some(ActiveAgentResources {
+                    pid,
+                    // sysinfo returns memory in bytes since 0.30
+                    rss_mb: proc_info.memory() as f64 / (1024.0 * 1024.0),
+                    cpu_pct: proc_info.cpu_usage(),
+                    status: format!("{:?}", proc_info.status()),
+                    threads: proc_info.tasks().map(|t| t.len() as u32).unwrap_or(1),
+                });
+            }
+        }
+        snap
+    }
+}
+
+#[cfg(test)]
+mod active_agent_tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_carries_pid_when_set() {
+        let mut a = ActiveAgent::new(Uuid::new_v4(), "T1 — demo".into());
+        assert_eq!(a.snapshot().pid, None);
+        a.set_pid(4242);
+        assert_eq!(a.snapshot().pid, Some(4242));
+    }
+
+    #[test]
+    fn snapshot_without_pid_has_no_resources() {
+        let a = ActiveAgent::new(Uuid::new_v4(), "T1 — demo".into());
+        let sys = sysinfo::System::new();
+        assert!(a.snapshot_with_resources(&sys).resources.is_none());
+    }
+
+    #[test]
+    fn snapshot_with_resources_reads_live_process() {
+        // Use the current test process as the target — guaranteed to exist.
+        let mut a = ActiveAgent::new(Uuid::new_v4(), "T1 — self-introspection".into());
+        a.set_pid(std::process::id());
+
+        let mut sys = sysinfo::System::new();
+        let target = sysinfo::Pid::from_u32(std::process::id());
+        sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[target]), true);
+
+        let snap = a.snapshot_with_resources(&sys);
+        let res = snap.resources.expect("current process must exist in sysinfo");
+        assert_eq!(res.pid, std::process::id());
+        assert!(res.rss_mb > 0.0, "RSS should be > 0 MB for a running test");
+        assert!(res.threads >= 1, "process has at least one thread");
+        // status string is something like "Run" / "Sleep" — non-empty.
+        assert!(!res.status.is_empty());
+    }
+
+    #[test]
+    fn snapshot_with_unknown_pid_returns_none_resources() {
+        let mut a = ActiveAgent::new(Uuid::new_v4(), "T1 — ghost".into());
+        // u32::MAX is virtually guaranteed to NOT be a live process.
+        a.set_pid(u32::MAX);
+        let sys = sysinfo::System::new();
+        assert!(a.snapshot_with_resources(&sys).resources.is_none());
     }
 }
 

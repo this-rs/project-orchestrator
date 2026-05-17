@@ -175,6 +175,9 @@ fastembed = "5.11"
 # Dimensionality reduction (UMAP projection for embedding visualization)
 rag-umap = "0.0"
 
+# OS process introspection (runner active-agent resource snapshot)
+sysinfo = { workspace = true }
+
 # Statistical primitives (distribution CDFs, MLE helpers) — MIT.
 # Used by `src/analytics/stats/` (first-party fitter + hypothesis tests).
 # Replaced rs-stats v2.0.3 (GPL-3.0) — see `docs/migration/rs-stats/` and
