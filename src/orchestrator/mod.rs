@@ -3,6 +3,7 @@
 pub mod branch_parser;
 pub mod context;
 pub mod planner;
+pub mod resume_context;
 pub mod runner;
 pub mod topology_hook;
 pub mod watcher;
