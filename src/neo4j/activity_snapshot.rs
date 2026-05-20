@@ -159,7 +159,10 @@ impl Neo4jClient {
 // Map projection helpers (BoltType -> typed DTO)
 // ============================================================================
 
-fn bolt_string(map: &std::collections::HashMap<String, neo4rs::BoltType>, key: &str) -> Option<String> {
+fn bolt_string(
+    map: &std::collections::HashMap<String, neo4rs::BoltType>,
+    key: &str,
+) -> Option<String> {
     match map.get(key)? {
         neo4rs::BoltType::String(s) => Some(s.value.clone()),
         _ => None,
@@ -333,8 +336,8 @@ mod tests {
     // via the GraphStore trait method.
     // ------------------------------------------------------------------
 
-    use crate::neo4j::GraphStore as _;
     use crate::neo4j::mock::MockGraphStore;
+    use crate::neo4j::GraphStore as _;
     use crate::runner::{PlanRunStatus, RunnerState, TriggerSource};
 
     fn ts_offset_seconds(offset: i64) -> chrono::DateTime<chrono::Utc> {
