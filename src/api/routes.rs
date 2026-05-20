@@ -3,6 +3,7 @@
 //! Routes are split into public (no auth) and protected (require valid JWT).
 //! The `require_auth` middleware is applied only to protected routes.
 
+use super::activity_handlers;
 use super::auth_handlers;
 use super::chat_handlers;
 use super::code_handlers;
@@ -422,6 +423,11 @@ fn protected_routes() -> Router<OrchestratorState> {
         .route(
             "/api/plans/{plan_id}/run/auto-pr",
             post(handlers::create_auto_pr),
+        )
+        // Live Activity Hub — REST snapshot (paired with /ws/activity)
+        .route(
+            "/api/activity/snapshot",
+            get(activity_handlers::get_activity_snapshot),
         )
         // Plan Runs
         .route("/api/runs", get(handlers::list_all_plan_runs))

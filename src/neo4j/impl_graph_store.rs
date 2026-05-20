@@ -3620,6 +3620,16 @@ impl GraphStore for Neo4jClient {
         self.list_plan_runs_impl(plan_id, limit).await
     }
 
+    async fn fetch_activity_snapshot(
+        &self,
+        project_id: Uuid,
+        project_slug: Option<&str>,
+        chat_session_limit: i64,
+    ) -> anyhow::Result<crate::neo4j::activity_snapshot::ActivitySnapshotData> {
+        self.fetch_activity_snapshot(project_id, project_slug, chat_session_limit)
+            .await
+    }
+
     // ── Triggers ──────────────────────────────────────────────────────────
 
     async fn create_trigger(

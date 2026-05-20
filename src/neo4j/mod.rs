@@ -1,5 +1,6 @@
 //! Neo4j client and models for the knowledge graph
 
+pub(crate) mod activity_snapshot;
 pub(crate) mod agent_execution;
 mod alert;
 mod analytics;

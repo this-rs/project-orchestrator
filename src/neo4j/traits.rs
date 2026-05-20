@@ -3037,6 +3037,22 @@ pub trait GraphStore: Send + Sync {
         limit: i64,
     ) -> Result<Vec<crate::runner::RunnerState>>;
 
+    /// Fetch the Live Activity Hub snapshot for a project in **one round-trip**:
+    /// running `PlanRun`s, running `ProtocolRun`s and recently-active
+    /// `ChatSession`s, already projected to the lightweight DTOs used by the
+    /// REST endpoint.
+    ///
+    /// `project_slug` is optional and only required to retrieve `ChatSession`
+    /// rows (sessions are tagged by `project_slug`, not `project_id`).
+    /// `chat_session_limit` caps the chat session list — pass `0` to skip them
+    /// entirely.
+    async fn fetch_activity_snapshot(
+        &self,
+        project_id: Uuid,
+        project_slug: Option<&str>,
+        chat_session_limit: i64,
+    ) -> Result<crate::neo4j::activity_snapshot::ActivitySnapshotData>;
+
     // ── Triggers ──────────────────────────────────────────────────────────
 
     /// Create a trigger node linked to a plan via (:Trigger)-[:TRIGGERS]->(:Plan).

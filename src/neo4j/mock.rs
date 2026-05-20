@@ -10369,6 +10369,137 @@ impl GraphStore for MockGraphStore {
         Ok(result)
     }
 
+    async fn fetch_activity_snapshot(
+        &self,
+        project_id: Uuid,
+        project_slug: Option<&str>,
+        chat_session_limit: i64,
+    ) -> anyhow::Result<crate::neo4j::activity_snapshot::ActivitySnapshotData> {
+        use crate::api::models::activity::{
+            ChatSessionSummary, PlanRunSummary, ProtocolRunSummary, SnapshotPlanRunStatus,
+            SnapshotProtocolRunStatus,
+        };
+
+        // ─── PlanRuns ────────────────────────────────────────────────────
+        // Mirror the Cypher: include runs whose `project_id` matches OR whose
+        // `plan.project_id` matches. We need the Plan node to pull the title.
+        let runs = self.plan_runs.read().await;
+        let plans = self.plans.read().await;
+        let mut plan_runs: Vec<PlanRunSummary> = runs
+            .values()
+            .filter(|s| s.status == crate::runner::PlanRunStatus::Running)
+            .filter(|s| {
+                let runner_match = s.project_id == Some(project_id);
+                let plan_match = plans
+                    .get(&s.plan_id)
+                    .and_then(|p| p.project_id)
+                    .map(|pid| pid == project_id)
+                    .unwrap_or(false);
+                runner_match || plan_match
+            })
+            .map(|s| PlanRunSummary {
+                run_id: s.run_id,
+                plan_id: s.plan_id,
+                plan_title: plans
+                    .get(&s.plan_id)
+                    .map(|p| p.title.clone())
+                    .unwrap_or_default(),
+                total_tasks: s.total_tasks,
+                current_wave: s.current_wave,
+                completed_tasks: s.completed_tasks.len(),
+                failed_tasks: s.failed_tasks.len(),
+                status: SnapshotPlanRunStatus::Running,
+                cost_usd: s.cost_usd,
+                started_at: s.started_at,
+                current_task_id: s.current_task_id,
+                current_task_title: s.current_task_title.clone(),
+                git_branch: if s.git_branch.is_empty() {
+                    None
+                } else {
+                    Some(s.git_branch.clone())
+                },
+            })
+            .collect();
+        plan_runs.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+        drop(plans);
+        drop(runs);
+
+        // ─── ProtocolRuns ────────────────────────────────────────────────
+        let protocols = self.protocols.read().await;
+        let protocol_runs_store = self.protocol_runs.read().await;
+        let protocol_states = self.protocol_states.read().await;
+        let mut protocol_runs: Vec<ProtocolRunSummary> = protocol_runs_store
+            .values()
+            .filter(|r| r.status == crate::protocol::RunStatus::Running)
+            .filter(|r| {
+                protocols
+                    .get(&r.protocol_id)
+                    .map(|p| p.project_id == project_id)
+                    .unwrap_or(false)
+            })
+            .map(|r| ProtocolRunSummary {
+                id: r.id,
+                protocol_id: r.protocol_id,
+                protocol_name: protocols
+                    .get(&r.protocol_id)
+                    .map(|p| p.name.clone())
+                    .unwrap_or_default(),
+                current_state: r.current_state,
+                state_name: protocol_states
+                    .get(&r.current_state)
+                    .map(|s| s.name.clone())
+                    .unwrap_or_default(),
+                status: SnapshotProtocolRunStatus::Running,
+                states_visited: r.states_visited.len(),
+                started_at: r.started_at,
+                plan_id: r.plan_id,
+                task_id: r.task_id,
+                depth: r.depth,
+            })
+            .collect();
+        protocol_runs.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+        drop(protocols);
+        drop(protocol_runs_store);
+        drop(protocol_states);
+
+        // ─── ChatSessions ────────────────────────────────────────────────
+        let chat_sessions_store = self.chat_sessions.read().await;
+        let mut chat_sessions: Vec<ChatSessionSummary> = chat_sessions_store
+            .values()
+            .filter(|s| {
+                project_slug
+                    .map(|slug| s.project_slug.as_deref() == Some(slug))
+                    .unwrap_or(false)
+            })
+            .filter(|s| {
+                s.spawned_by
+                    .as_deref()
+                    .map(|v| v.is_empty())
+                    .unwrap_or(true)
+            })
+            .map(|s| ChatSessionSummary {
+                id: s.id,
+                title: s.title.clone(),
+                model: s.model.clone(),
+                message_count: s.message_count,
+                updated_at: s.updated_at,
+                total_cost_usd: s.total_cost_usd,
+                preview: s.preview.clone(),
+                project_slug: s.project_slug.clone(),
+            })
+            .collect();
+        chat_sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        if chat_session_limit >= 0 {
+            chat_sessions.truncate(chat_session_limit as usize);
+        }
+
+        Ok(crate::neo4j::activity_snapshot::ActivitySnapshotData {
+            plan_runs,
+            protocol_runs,
+            chat_sessions,
+        })
+    }
+
     // ── Triggers ──────────────────────────────────────────────────────────
 
     async fn create_trigger(

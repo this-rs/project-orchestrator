@@ -1,5 +1,6 @@
 //! HTTP API for the orchestrator
 
+pub mod activity_handlers;
 pub mod auth_handlers;
 pub mod chat_handlers;
 pub mod code_handlers;
@@ -9,6 +10,7 @@ pub mod graph_types;
 pub mod handlers;
 pub mod hook_handlers;
 pub mod mcp_federation_handlers;
+pub mod models;
 pub mod neural_routing_handlers;
 pub mod note_handlers;
 pub mod persona_handlers;
