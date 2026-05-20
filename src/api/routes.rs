@@ -25,6 +25,7 @@ use super::skill_handlers;
 use super::trajectory_handlers;
 use super::trigger_handlers;
 use super::workspace_handlers;
+use super::ws_activity_handler;
 use super::ws_chat_handler;
 use super::ws_handlers;
 use super::ws_run_handler;
@@ -180,6 +181,7 @@ fn public_routes() -> Router<OrchestratorState> {
         .route("/ws/events", get(ws_handlers::ws_events))
         .route("/ws/chat/{session_id}", get(ws_chat_handler::ws_chat))
         .route("/ws/run/{run_id}", get(ws_run_handler::ws_run))
+        .route("/ws/activity", get(ws_activity_handler::ws_activity))
         // ================================================================
         // Webhooks & Internal
         // ================================================================

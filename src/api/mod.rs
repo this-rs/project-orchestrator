@@ -25,6 +25,7 @@ pub mod skill_handlers;
 pub mod trajectory_handlers;
 pub mod trigger_handlers;
 pub mod workspace_handlers;
+pub mod ws_activity_handler;
 pub mod ws_auth;
 pub mod ws_chat_handler;
 pub mod ws_handlers;
