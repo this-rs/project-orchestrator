@@ -68,6 +68,7 @@
 //! | BatchCreated      | Code       | project sync completion (bulk IMPORTS/CALLS)          |
 //! | ScoresUpdated     | Fabric     | update_fabric_scores, bootstrap_knowledge_fabric     |
 
+pub mod activity;
 pub mod builtin_triggers;
 mod bus;
 pub mod graph;
@@ -80,6 +81,10 @@ pub mod trigger;
 pub mod trigger_routing;
 mod types;
 
+pub use activity::{
+    is_chat_event_relevant, is_crud_entity_relevant, ActivityEvent, ProtocolProgress,
+    ProtocolProgressSnapshot,
+};
 pub use bus::EventBus;
 pub use graph::{ActivationTarget, GraphEvent, GraphEventType, GraphLayer};
 pub use hybrid::HybridEmitter;
