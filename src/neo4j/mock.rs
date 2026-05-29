@@ -6790,6 +6790,15 @@ impl GraphStore for MockGraphStore {
         Ok(())
     }
 
+    async fn update_chat_session_model(&self, id: Uuid, model: &str) -> Result<()> {
+        let mut sessions = self.chat_sessions.write().await;
+        if let Some(session) = sessions.get_mut(&id) {
+            session.model = model.to_string();
+            session.updated_at = Utc::now();
+        }
+        Ok(())
+    }
+
     async fn set_session_auto_continue(&self, id: Uuid, enabled: bool) -> Result<()> {
         let mut auto_continue = self.session_auto_continue.write().await;
         auto_continue.insert(id, enabled);

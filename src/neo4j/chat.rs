@@ -282,6 +282,22 @@ impl Neo4jClient {
         Ok(())
     }
 
+    /// Update the model field on a chat session node.
+    ///
+    /// The model is otherwise written only at create time, so a mid-session model
+    /// switch would be lost the moment the session went dormant and was resumed
+    /// (resume reads `s.model` back from Neo4j). Persisting here makes the chosen
+    /// model survive idle-cleanup and respawn.
+    pub async fn update_chat_session_model(&self, id: Uuid, model: &str) -> Result<()> {
+        let cypher =
+            "MATCH (s:ChatSession {id: $id}) SET s.model = $model, s.updated_at = datetime()";
+        let q = query(cypher)
+            .param("id", id.to_string())
+            .param("model", model.to_string());
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
     /// Set the auto_continue flag on a chat session node.
     pub async fn set_session_auto_continue(&self, id: Uuid, enabled: bool) -> Result<()> {
         let cypher = "MATCH (s:ChatSession {id: $id}) SET s.auto_continue = $enabled, s.updated_at = datetime()";

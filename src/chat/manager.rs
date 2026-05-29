@@ -5060,54 +5060,94 @@ impl ChatManager {
     /// `stream_response` holds the client lock for the entire duration of streaming.
     /// If we tried to lock the client here, the WS event loop would deadlock.
     pub async fn set_session_model(&self, session_id: &str, model: &str) -> Result<()> {
-        // Get session state and stdin_tx — do NOT extract client (avoids Mutex deadlock)
-        let (stdin_tx, old_model, events_tx) = {
+        // Capture the live session's stdin_tx + events_tx IF the CLI subprocess is still
+        // attached. A dormant session (idle-cleaned) won't be present in `active_sessions`
+        // — that is NOT an error: we still persist the chosen model to Neo4j below so the
+        // next resume/spawn launches with it. Do NOT extract `client` (avoids Mutex deadlock).
+        let live = {
             let mut sessions = self.active_sessions.write().await;
-            let session = sessions
-                .get_mut(session_id)
-                .ok_or_else(|| anyhow!("Session {} not found or inactive", session_id))?;
-            session.last_activity = Instant::now();
-            let old_model = session.model.clone();
-            session.model = Some(model.to_string());
-            let tx = session.stdin_tx.clone().ok_or_else(|| {
-                anyhow!(
-                    "No stdin sender for session {} (CLI may not be connected)",
-                    session_id
-                )
-            })?;
-            (tx, old_model, session.events_tx.clone())
+            match sessions.get_mut(session_id) {
+                Some(session) => {
+                    session.last_activity = Instant::now();
+                    let old_model = session.model.clone();
+                    session.model = Some(model.to_string());
+                    Some((
+                        session.stdin_tx.clone(),
+                        old_model,
+                        session.events_tx.clone(),
+                    ))
+                }
+                None => None,
+            }
         };
 
-        // Build the control_request JSON — same format as InteractiveClient::set_model
-        let control_request = serde_json::json!({
-            "type": "control_request",
-            "request_id": Uuid::new_v4().to_string(),
-            "request": {
-                "subtype": "set_model",
-                "model": model
+        // Persist to Neo4j ALWAYS. This is the core fix: previously the model was updated
+        // in-memory only, so it was silently lost on idle-cleanup → resume respawned on the
+        // create-time model. `resume_session` reads `s.model` back from Neo4j (manager line
+        // ~5271 → build_options.model), so persisting here makes the switch durable.
+        if let Ok(uuid) = Uuid::parse_str(session_id) {
+            if let Err(e) = self.graph.update_chat_session_model(uuid, model).await {
+                warn!(
+                    session_id = %session_id,
+                    error = %e,
+                    "Failed to persist model change to Neo4j (non-fatal)"
+                );
             }
-        });
+        }
 
-        let json = serde_json::to_string(&control_request)
-            .map_err(|e| anyhow!("Failed to serialize set_model request: {}", e))?;
+        match live {
+            // Active session with a live CLI: switch the running model mid-conversation.
+            Some((Some(stdin_tx), old_model, events_tx)) => {
+                // Build the control_request JSON — same format as InteractiveClient::set_model
+                let control_request = serde_json::json!({
+                    "type": "control_request",
+                    "request_id": Uuid::new_v4().to_string(),
+                    "request": {
+                        "subtype": "set_model",
+                        "model": model
+                    }
+                });
 
-        // Send via stdin_tx (lock-free — bypasses the client Mutex entirely)
-        stdin_tx
-            .send(json)
-            .await
-            .map_err(|e| anyhow!("Failed to send set_model to CLI: {}", e))?;
+                let json = serde_json::to_string(&control_request)
+                    .map_err(|e| anyhow!("Failed to serialize set_model request: {}", e))?;
 
-        info!(
-            session_id = %session_id,
-            old_model = ?old_model,
-            new_model = %model,
-            "Model changed for session (via stdin_tx, lock-free)"
-        );
+                // Send via stdin_tx (lock-free — bypasses the client Mutex entirely)
+                stdin_tx
+                    .send(json)
+                    .await
+                    .map_err(|e| anyhow!("Failed to send set_model to CLI: {}", e))?;
 
-        // Broadcast event to WebSocket clients
-        let _ = events_tx.send(ChatEvent::ModelChanged {
-            model: model.to_string(),
-        });
+                info!(
+                    session_id = %session_id,
+                    old_model = ?old_model,
+                    new_model = %model,
+                    "Model changed for active session (via stdin_tx, lock-free)"
+                );
+
+                let _ = events_tx.send(ChatEvent::ModelChanged {
+                    model: model.to_string(),
+                });
+            }
+            // Session present but CLI not connected yet — persisted; applies on next spawn.
+            Some((None, _, events_tx)) => {
+                info!(
+                    session_id = %session_id,
+                    new_model = %model,
+                    "Model persisted (no live CLI stdin); applies on next spawn"
+                );
+                let _ = events_tx.send(ChatEvent::ModelChanged {
+                    model: model.to_string(),
+                });
+            }
+            // Dormant session (idle-cleaned) — persisted to Neo4j only; applies on resume.
+            None => {
+                info!(
+                    session_id = %session_id,
+                    new_model = %model,
+                    "Model persisted for dormant session; applies on resume"
+                );
+            }
+        }
 
         Ok(())
     }
@@ -10441,11 +10481,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_set_session_model_fails_without_stdin() {
+    async fn test_set_session_model_without_stdin_persists_and_broadcasts() {
         let state = mock_app_state();
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
         let (session, _handle) = mock_active_session(false);
-        // stdin_tx is None by default
+        // stdin_tx is None — no live CLI to receive a control_request. This must NOT error:
+        // the model is updated in-memory + persisted so it applies on the next spawn.
+
+        let mut events_rx = session.events_tx.subscribe();
 
         let session_id = "test-model-no-stdin";
         manager
@@ -10454,30 +10497,45 @@ mod tests {
             .await
             .insert(session_id.to_string(), session);
 
-        let result = manager
+        manager
             .set_session_model(session_id, "claude-opus-4-20250514")
-            .await;
+            .await
+            .expect("model change without live stdin should succeed (persist + broadcast)");
 
-        assert!(result.is_err());
-        assert!(
-            result.unwrap_err().to_string().contains("No stdin sender"),
-            "Error should mention missing stdin sender"
-        );
+        // In-memory model is updated so a respawn from this session uses the new model.
+        {
+            let sessions = manager.active_sessions.read().await;
+            assert_eq!(
+                sessions.get(session_id).unwrap().model.as_deref(),
+                Some("claude-opus-4-20250514")
+            );
+        }
+
+        // ModelChanged is still broadcast so the frontend reflects the choice.
+        let event = tokio::time::timeout(Duration::from_millis(100), events_rx.recv())
+            .await
+            .expect("should receive event within timeout")
+            .expect("channel should be open");
+        assert_eq!(event.event_type(), "model_changed");
     }
 
     #[tokio::test]
-    async fn test_set_session_model_fails_for_unknown_session() {
+    async fn test_set_session_model_dormant_session_persists() {
         let state = mock_app_state();
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
 
+        // A session absent from active_sessions is dormant (idle-cleaned). set_model must
+        // still succeed by persisting to Neo4j so the next resume launches with the new
+        // model — rather than rejecting the change and respawning on the create-time model.
+        let session_id = uuid::Uuid::new_v4().to_string();
         let result = manager
-            .set_session_model("nonexistent-session", "claude-opus-4-20250514")
+            .set_session_model(&session_id, "claude-opus-4-20250514")
             .await;
 
-        assert!(result.is_err());
         assert!(
-            result.unwrap_err().to_string().contains("not found"),
-            "Error should mention session not found"
+            result.is_ok(),
+            "dormant session model change should persist without error, got {:?}",
+            result
         );
     }
 
