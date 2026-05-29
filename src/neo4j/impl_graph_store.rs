@@ -2229,6 +2229,10 @@ impl GraphStore for Neo4jClient {
         self.update_chat_session_permission_mode(id, mode).await
     }
 
+    async fn update_chat_session_model(&self, id: Uuid, model: &str) -> anyhow::Result<()> {
+        self.update_chat_session_model(id, model).await
+    }
+
     async fn set_session_auto_continue(&self, id: Uuid, enabled: bool) -> anyhow::Result<()> {
         self.set_session_auto_continue(id, enabled).await
     }

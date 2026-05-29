@@ -978,31 +978,29 @@ async fn handle_ws_chat_loop(
 
                                     WsChatClientMessage::SetModel { model } => {
                                         info!(session_id = %session_id, model = %model, "WS: Received set_model");
-                                        if chat_manager.is_session_active(&session_id).await {
-                                            match chat_manager.set_session_model(&session_id, &model).await {
-                                                Ok(()) => {
-                                                    // Send confirmation back to frontend
-                                                    let confirmation = serde_json::json!({
-                                                        "type": "model_changed",
-                                                        "model": model,
-                                                    });
-                                                    let _ = ws_sender.send(Message::Text(confirmation.to_string().into())).await;
-                                                }
-                                                Err(e) => {
-                                                    warn!(session_id = %session_id, error = %e, "Failed to set model");
-                                                    let err = serde_json::json!({
-                                                        "type": "error",
-                                                        "message": format!("Failed to set model: {}", e),
-                                                    });
-                                                    let _ = ws_sender.send(Message::Text(err.to_string().into())).await;
-                                                }
+                                        // set_model works whether the session is active or dormant:
+                                        // - Active: sends a live control_request to switch mid-conversation.
+                                        // - Dormant (idle-cleaned): persists to Neo4j so the next resume/spawn
+                                        //   launches with the chosen model.
+                                        // Previously this was gated on is_session_active, so selecting a model
+                                        // on an idle session was silently rejected and the respawn used the
+                                        // create-time model. set_session_model now handles both cases.
+                                        match chat_manager.set_session_model(&session_id, &model).await {
+                                            Ok(()) => {
+                                                let confirmation = serde_json::json!({
+                                                    "type": "model_changed",
+                                                    "model": model,
+                                                });
+                                                let _ = ws_sender.send(Message::Text(confirmation.to_string().into())).await;
                                             }
-                                        } else {
-                                            let err = serde_json::json!({
-                                                "type": "error",
-                                                "message": "Session not active on this instance",
-                                            });
-                                            let _ = ws_sender.send(Message::Text(err.to_string().into())).await;
+                                            Err(e) => {
+                                                warn!(session_id = %session_id, error = %e, "Failed to set model");
+                                                let err = serde_json::json!({
+                                                    "type": "error",
+                                                    "message": format!("Failed to set model: {}", e),
+                                                });
+                                                let _ = ws_sender.send(Message::Text(err.to_string().into())).await;
+                                            }
                                         }
                                     }
 
