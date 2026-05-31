@@ -503,6 +503,21 @@ pub enum ChatEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         permission_mode: Option<String>,
     },
+    /// Claude Code Dynamic Workflow lifecycle event (intra-task sub-agent fan-out).
+    ///
+    /// Emitted when the session's agent runs the `Workflow` tool, which spawns
+    /// background sub-agents. Carries the workflow lifecycle `subtype`
+    /// (`task_started` / `task_progress` / `task_updated` / `task_notification`)
+    /// and the full payload preserved from the CLI system message — task_id,
+    /// workflow_name, `workflow_progress[]` (per-agent fan-out state), usage,
+    /// status, output_file, patch. Passed through verbatim so the frontend can
+    /// render live fan-out progress without the backend pinning a schema.
+    Workflow {
+        /// Workflow lifecycle subtype, e.g. "task_started", "task_progress".
+        subtype: String,
+        /// Full event payload as emitted by the CLI (passed through verbatim).
+        data: serde_json::Value,
+    },
     /// Backend auto-continue: emitted when the backend detects error_max_turns
     /// and auto_continue is enabled. Signals that a "Continue" will be sent
     /// automatically after the delay.
@@ -654,6 +669,7 @@ impl ChatEvent {
             ChatEvent::CompactionRecovery { .. } => "compaction_recovery",
             ChatEvent::CompactBoundary { .. } => "compact_boundary",
             ChatEvent::SystemInit { .. } => "system_init",
+            ChatEvent::Workflow { .. } => "workflow",
             ChatEvent::AutoContinue { .. } => "auto_continue",
             ChatEvent::AutoContinueStateChanged { .. } => "auto_continue_state_changed",
             ChatEvent::Retrying { .. } => "retrying",
@@ -684,6 +700,19 @@ impl ChatEvent {
             ChatEvent::PermissionDecision { id, .. } => Some(format!("permission_decision:{}", id)),
             ChatEvent::SystemInit { cli_session_id, .. } => {
                 Some(format!("system_init:{}", cli_session_id))
+            }
+            ChatEvent::Workflow { subtype, data } => {
+                // Each CLI workflow event carries a unique `uuid`; dedup on it so
+                // a replay never collapses distinct task_progress ticks. Fall back
+                // to subtype + content hash if no uuid is present.
+                if let Some(uuid) = data.get("uuid").and_then(|v| v.as_str()) {
+                    Some(format!("workflow:{}", uuid))
+                } else {
+                    use std::hash::{Hash, Hasher};
+                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                    data.to_string().hash(&mut hasher);
+                    Some(format!("workflow:{}:{}", subtype, hasher.finish()))
+                }
             }
 
             // Events without unique IDs — use type + content hash
@@ -1382,6 +1411,43 @@ mod tests {
         assert!(json.contains("Hello!"));
         // parent_tool_use_id: None should NOT appear in JSON
         assert!(!json.contains("parent_tool_use_id"));
+    }
+
+    #[test]
+    fn test_workflow_event_serialize_and_dedup() {
+        let event = ChatEvent::Workflow {
+            subtype: "task_progress".into(),
+            data: serde_json::json!({
+                "task_id": "wbk63ch2d",
+                "uuid": "ed4e206c-974c-4883-93d3-de4c892e12a9",
+                "workflow_progress": [{ "index": 1, "state": "start" }],
+                "usage": { "total_tokens": 7681 }
+            }),
+        };
+
+        // Serde tag + subtype + nested payload survive serialization.
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"type\":\"workflow\""));
+        assert!(json.contains("\"subtype\":\"task_progress\""));
+        assert!(json.contains("wbk63ch2d"));
+        assert!(json.contains("workflow_progress"));
+
+        assert_eq!(event.event_type(), "workflow");
+
+        // Fingerprint keys on the unique per-event uuid, so distinct progress ticks
+        // are never collapsed on replay.
+        assert_eq!(
+            event.fingerprint().as_deref(),
+            Some("workflow:ed4e206c-974c-4883-93d3-de4c892e12a9")
+        );
+
+        // Without a uuid, fingerprint falls back to subtype + content hash (still Some).
+        let no_uuid = ChatEvent::Workflow {
+            subtype: "task_started".into(),
+            data: serde_json::json!({ "task_id": "x" }),
+        };
+        let key = no_uuid.fingerprint().unwrap();
+        assert!(key.starts_with("workflow:task_started:"));
     }
 
     #[test]
