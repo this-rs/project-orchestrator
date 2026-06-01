@@ -11,3 +11,4 @@ pub mod homeostasis;
 pub mod maintenance;
 pub mod staleness;
 pub mod synapse_decay;
+pub mod synapse_replenish;

@@ -1421,6 +1421,7 @@ pub async fn start_server(mut config: Config) -> Result<()> {
             consolidation::ConsolidationCheck, convention_guard::ConventionGuardCheck,
             git_drift::GitDriftCheck, homeostasis::HomeostasisCheck, maintenance::MaintenanceCheck,
             staleness::StalenessCheck, synapse_decay::SynapseDecayCheck,
+            synapse_replenish::SynapseReplenishCheck,
         };
         use heartbeat::engine::HeartbeatEngine;
 
@@ -1433,6 +1434,7 @@ pub async fn start_server(mut config: Config) -> Result<()> {
             Box::new(GitDriftCheck),
             Box::new(StalenessCheck),
             Box::new(SynapseDecayCheck),
+            Box::new(SynapseReplenishCheck),
             Box::new(ConventionGuardCheck),
             Box::new(MaintenanceCheck),
             Box::new(ConsolidationCheck),
