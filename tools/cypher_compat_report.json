@@ -1,0 +1,1261 @@
+{
+  "summary": {
+    "total_queries": 1156,
+    "total_files": 41,
+    "compatibility": {
+      "ok": 920,
+      "adapt": 21,
+      "unknown": 213,
+      "risk": 2
+    },
+    "dynamic_queries": 190,
+    "pct_compatible": 79.6,
+    "pct_needs_adapt": 1.8
+  },
+  "feature_usage": {
+    "MATCH": 858,
+    "PARAM": 797,
+    "RETURN": 581,
+    "WHERE": 303,
+    "CREATE": 248,
+    "SET": 214,
+    "ORDER_BY": 213,
+    "WITH": 210,
+    "MERGE": 164,
+    "LIMIT": 162,
+    "AGG_count": 153,
+    "DELETE": 122,
+    "FN_datetime": 118,
+    "OPTIONAL_MATCH": 111,
+    "UNWIND": 104,
+    "DISTINCT": 98,
+    "INDEX_CREATE": 86,
+    "FN_coalesce": 82,
+    "AGG_collect": 81,
+    "MAP_PROJECTION": 72,
+    "CASE_WHEN": 61,
+    "CONSTRAINT": 38,
+    "EXISTS_SUBQUERY": 36,
+    "VAR_LENGTH_REL": 32,
+    "SKIP": 31,
+    "FN_size": 29,
+    "LIST_COMPREHENSION": 24,
+    "FN_toFloat": 17,
+    "PATH_VARIABLE": 16,
+    "AGG_avg": 15,
+    "CALL_SUBQUERY": 15,
+    "AGG_sum": 13,
+    "FN_labels": 13,
+    "AGG_max": 12,
+    "FN_length": 12,
+    "VECTOR_QUERY": 11,
+    "REMOVE": 11,
+    "FN_toString": 9,
+    "FN_nodes": 8,
+    "FN_type": 8,
+    "FN_relationships": 8,
+    "UNION": 7,
+    "FN_range": 6,
+    "AGG_reduce": 6,
+    "VECTOR_INDEX": 6,
+    "FOREACH": 4,
+    "FN_duration": 4,
+    "FN_left": 4,
+    "VECTOR_SET": 4,
+    "AGG_min": 4,
+    "FN_head": 3,
+    "FN_toInteger": 2,
+    "APOC": 2,
+    "FN_startNode": 2,
+    "FN_last": 2,
+    "FN_keys": 2,
+    "FN_abs": 2,
+    "FN_endNode": 1,
+    "FN_tail": 1,
+    "FN_substring": 1,
+    "FN_properties": 1
+  },
+  "needs_adaptation": [
+    {
+      "file": "/Users/triviere/.openclaw/workspace/skills/project-orchestrator/src/neo4j/analytics.rs",
+      "line": 786,
+      "method": "get_project_percentiles",
+      "compat": "risk",
+      "notes": [
+        "[APOC] APOC is Neo4j-specific, not available in Obrain"
+      ],
+      "query_preview": "MATCH (p:Project {id: $pid})-[:CONTAINS]->(n) WHERE (n:File OR n:Function) AND n.pagerank IS NOT NULL WITH collect(toFlo..."
+    },
+    {
+      "file": "/Users/triviere/.openclaw/workspace/skills/project-orchestrator/src/neo4j/client.rs",
+      "line": 386,
+      "method": "init_schema",
+      "compat": "adapt",
+      "notes": [
+        "[VECTOR_INDEX] Obrain vector indexes created via API, not CREATE VECTOR INDEX Cypher"
+      ],
+      "query_preview": "CREATE VECTOR INDEX note_embeddings IF NOT EXISTS FOR (n:Note) ON (n.embedding) OPTIONS {indexConfig: { `vector.dimensio..."
+    },
+    {
+      "file": "/Users/triviere/.openclaw/workspace/skills/project-orchestrator/src/neo4j/client.rs",
+      "line": 393,
+      "method": "init_schema",
+      "compat": "adapt",
+      "notes": [
+        "[VECTOR_INDEX] Obrain vector indexes created via API, not CREATE VECTOR INDEX Cypher"
+      ],
+      "query_preview": "CREATE VECTOR INDEX file_embedding_index IF NOT EXISTS FOR (f:File) ON (f.embedding) OPTIONS {indexConfig: { `vector.dim..."
+    },
+    {
+      "file": "/Users/triviere/.openclaw/workspace/skills/project-orchestrator/src/neo4j/client.rs",
+      "line": 400,
+      "method": "init_schema",
+      "compat": "adapt",
+      "notes": [
+        "[VECTOR_INDEX] Obrain vector indexes created via API, not CREATE VECTOR INDEX Cypher"
+      ],
+      "query_preview": "CREATE VECTOR INDEX function_embedding_index IF NOT EXISTS FOR (fn:Function) ON (fn.embedding) OPTIONS {indexConfig: { `..."
+    },
+    {
+      "file": "/Users/triviere/.openclaw/workspace/skills/project-orchestrator/src/neo4j/client.rs",
+      "line": 407,
+      "method": "init_schema",
+      "compat": "adapt",
+      "notes": [
+        "[VECTOR_INDEX] Obrain vector indexes created via API, not CREATE VECTOR INDEX Cypher",
+        "[DYNAMIC] Query built with format!/concat \u2014 verify generated Cypher at runtime"
+      ],
+      "query_preview": "CREATE VECTOR INDEX decision_embedding IF NOT EXISTS FOR (d:Decision) ON (d.embedding) OPTIONS {indexConfig: { `vector.d..."
+    },
+    {
+      "file": "/Users/triviere/.openclaw/workspace/skills/project-orchestrator/src/neo4j/decision.rs",
+      "line": 265,
+      "method": "set_decision_embedding",
+      "compat": "adapt",
+      "notes": [
+        "[VECTOR_SET] Obrain uses API/procedure for vector properties, not db.create.setNodeVectorProperty()"
+      ],
+      "query_preview": "MATCH (d:Decision {id: $id}) CALL db.create.setNodeVectorProperty(d, 'embedding', $embedding) SET d.embedding_model = $m..."
+    },
+    {
+      "file": "/Users/triviere/.openclaw/workspace/skills/project-orchestrator/src/neo4j/decision.rs",
+      "line": 377,
+      "method": "search_decisions_by_vector",
+      "compat": "adapt",
+      "notes": [
+        "[VECTOR_QUERY] Obrain uses hybrid_search() procedure instead of db.index.vector.queryNodes()"
+      ],
+      "query_preview": "CALL db.index.vector.queryNodes('decision_embedding', $fetch_limit, $embedding) YIELD node AS d, score // Filter by proj..."
+    },
+    {
+      "file": "/Users/triviere/.openclaw/workspace/skills/project-orchestrator/src/neo4j/decision.rs",
+      "line": 388,
+      "method": "search_decisions_by_vector",
+      "compat": "adapt",
+      "notes": [
+        "[VECTOR_QUERY] Obrain uses hybrid_search() procedure instead of db.index.vector.queryNodes()"
+      ],
+      "query_preview": "CALL db.index.vector.queryNodes('decision_embedding', $fetch_limit, $embedding) YIELD node AS d, score RETURN d, score O..."
+    },
+    {
+      "file": "/Users/triviere/.openclaw/workspace/skills/project-orchestrator/src/neo4j/note.rs",
+      "line": 619,
+      "method": "propagate_semantic_links",
+      "compat": "adapt",
+      "notes": [
+        "[VECTOR_QUERY] Obrain uses hybrid_search() procedure instead of db.index.vector.queryNodes()"
+      ],
+      "query_preview": "CALL db.index.vector.queryNodes('note_embeddings', $k, $embedding) YIELD node AS n, score WHERE score > $min_similarity ..."
+    },
+    {
+      "file": "/Users/triviere/.openclaw/workspace/skills/project-orchestrator/src/neo4j/note.rs",
+      "line": 1165,
+      "method": "get_pairwise_coupling",
+      "compat": "risk",
+      "notes": [
+        "[APOC] APOC is Neo4j-specific, not available in Obrain"
+      ],
+      "query_preview": "MATCH (na:Note {project_id: $a}) WHERE na.tags IS NOT NULL WITH collect(na.tags) AS a_tags_raw WITH reduce(s = [], t IN ..."
+    },
+    {
+      "file": "/Users/triviere/.openclaw/workspace/skills/project-orchestrator/src/neo4j/note.rs",
+      "line": 1833,
+      "method": "set_note_embedding",
+      "compat": "adapt",
+      "notes": [
+        "[VECTOR_SET] Obrain uses API/procedure for vector properties, not db.create.setNodeVectorProperty()",
+        "[DYNAMIC] Query built with format!/concat \u2014 verify generated Cypher at runtime"
+      ],
+      "query_preview": "MATCH (n:Note {id: $id}) CALL db.create.setNodeVectorProperty(n, 'embedding', $embedding) SET n.embedding_model = $model..."
+    },
+    {
+      "file": "/Users/triviere/.openclaw/workspace/skills/project-orchestrator/src/neo4j/note.rs",
+      "line": 1967,
+      "method": "vector_search_notes",
+      "compat": "adapt",
+      "notes": [
+        "[VECTOR_QUERY] Obrain uses hybrid_search() procedure instead of db.index.vector.queryNodes()"
+      ],
+      "query_preview": "CALL db.index.vector.queryNodes('note_embeddings', $query_limit, $embedding) YIELD node AS n, score WHERE n.status IN ['..."
+    },
+    {
+      "file": "/Users/triviere/.openclaw/workspace/skills/project-orchestrator/src/neo4j/note.rs",
+      "line": 1981,
+      "method": "vector_search_notes",
+      "compat": "adapt",
+      "notes": [
+        "[VECTOR_QUERY] Obrain uses hybrid_search() procedure instead of db.index.vector.queryNodes()",
+        "[DYNAMIC] Query built with format!/concat \u2014 verify generated Cypher at runtime"
+      ],
+      "query_preview": "CALL db.index.vector.queryNodes('note_embeddings', $query_limit, $embedding) YIELD node AS n, score WHERE n.status IN ['..."
+    },
+    {
+      "file": "/Users/triviere/.openclaw/workspace/skills/project-orchestrator/src/neo4j/note.rs",
+      "line": 1998,
+      "method": "vector_search_notes",
+      "compat": "adapt",
+      "notes": [
+        "[VECTOR_QUERY] Obrain uses hybrid_search() procedure instead of db.index.vector.queryNodes()"
+      ],
+      "query_preview": "CALL db.index.vector.queryNodes('note_embeddings', $query_limit, $embedding) YIELD node AS n, score WHERE n.status IN ['..."
+    },
+    {
+      "file": "/Users/triviere/.openclaw/workspace/skills/project-orchestrator/src/neo4j/note.rs",
+      "line": 2105,
+      "method": "set_file_embedding",
+      "compat": "adapt",
+      "notes": [
+        "[VECTOR_SET] Obrain uses API/procedure for vector properties, not db.create.setNodeVectorProperty()",
+        "[DYNAMIC] Query built with format!/concat \u2014 verify generated Cypher at runtime"
+      ],
+      "query_preview": "MATCH (f:File {path: $path}) CALL db.create.setNodeVectorProperty(f, 'embedding', $embedding) SET f.embedding_model = $m..."
+    },
+    {
+      "file": "/Users/triviere/.openclaw/workspace/skills/project-orchestrator/src/neo4j/note.rs",
+      "line": 2135,
+      "method": "set_function_embedding",
+      "compat": "adapt",
+      "notes": [
+        "[VECTOR_SET] Obrain uses API/procedure for vector properties, not db.create.setNodeVectorProperty()"
+      ],
+      "query_preview": "MATCH (fn:Function)<-[:CONTAINS]-(f:File {path: $file_path}) WHERE fn.name = $name WITH fn LIMIT 1 CALL db.create.setNod..."
+    },
+    {
+      "file": "/Users/triviere/.openclaw/workspace/skills/project-orchestrator/src/neo4j/note.rs",
+      "line": 2168,
+      "method": "vector_search_files",
+      "compat": "adapt",
+      "notes": [
+        "[EXISTS_SUBQUERY] EXISTS subquery support depends on Obrain version \u2014 verify",
+        "[VECTOR_QUERY] Obrain uses hybrid_search() procedure instead of db.index.vector.queryNodes()"
+      ],
+      "query_preview": "CALL db.index.vector.queryNodes('file_embedding_index', $query_limit, $embedding) YIELD node AS f, score WHERE EXISTS { ..."
+    },
+    {
+      "file": "/Users/triviere/.openclaw/workspace/skills/project-orchestrator/src/neo4j/note.rs",
+      "line": 2177,
+      "method": "vector_search_files",
+      "compat": "adapt",
+      "notes": [
+        "[VECTOR_QUERY] Obrain uses hybrid_search() procedure instead of db.index.vector.queryNodes()"
+      ],
+      "query_preview": "CALL db.index.vector.queryNodes('file_embedding_index', $query_limit, $embedding) YIELD node AS f, score RETURN f.path A..."
+    },
+    {
+      "file": "/Users/triviere/.openclaw/workspace/skills/project-orchestrator/src/neo4j/note.rs",
+      "line": 2218,
+      "method": "vector_search_functions",
+      "compat": "adapt",
+      "notes": [
+        "[EXISTS_SUBQUERY] EXISTS subquery support depends on Obrain version \u2014 verify",
+        "[VECTOR_QUERY] Obrain uses hybrid_search() procedure instead of db.index.vector.queryNodes()"
+      ],
+      "query_preview": "CALL db.index.vector.queryNodes('function_embedding_index', $query_limit, $embedding) YIELD node AS fn, score MATCH (fn)..."
+    },
+    {
+      "file": "/Users/triviere/.openclaw/workspace/skills/project-orchestrator/src/neo4j/note.rs",
+      "line": 2228,
+      "method": "vector_search_functions",
+      "compat": "adapt",
+      "notes": [
+        "[VECTOR_QUERY] Obrain uses hybrid_search() procedure instead of db.index.vector.queryNodes()"
+      ],
+      "query_preview": "CALL db.index.vector.queryNodes('function_embedding_index', $query_limit, $embedding) YIELD node AS fn, score MATCH (fn)..."
+    },
+    {
+      "file": "/Users/triviere/.openclaw/workspace/skills/project-orchestrator/crates/neural-routing-core/src/store.rs",
+      "line": 42,
+      "method": "ensure_indexes",
+      "compat": "adapt",
+      "notes": [
+        "[VECTOR_INDEX] Obrain vector indexes created via API, not CREATE VECTOR INDEX Cypher"
+      ],
+      "query_preview": "CREATE VECTOR INDEX trajectory_query_embedding_idx IF NOT EXISTS FOR (t:Trajectory) ON (t.query_embedding) OPTIONS {inde..."
+    },
+    {
+      "file": "/Users/triviere/.openclaw/workspace/skills/project-orchestrator/crates/neural-routing-core/src/store.rs",
+      "line": 45,
+      "method": "ensure_indexes",
+      "compat": "adapt",
+      "notes": [
+        "[VECTOR_INDEX] Obrain vector indexes created via API, not CREATE VECTOR INDEX Cypher"
+      ],
+      "query_preview": "CREATE VECTOR INDEX tnode_context_embedding_idx IF NOT EXISTS FOR (tn:TrajectoryNode) ON (tn.context_embedding) OPTIONS ..."
+    },
+    {
+      "file": "/Users/triviere/.openclaw/workspace/skills/project-orchestrator/crates/neural-routing-core/src/store.rs",
+      "line": 536,
+      "method": "search_similar",
+      "compat": "adapt",
+      "notes": [
+        "[VECTOR_QUERY] Obrain uses hybrid_search() procedure instead of db.index.vector.queryNodes()"
+      ],
+      "query_preview": "CALL db.index.vector.queryNodes('trajectory_query_embedding_idx', $top_k, $embedding) YIELD node AS t, score WHERE score..."
+    }
+  ],
+  "file_reports": [
+    {
+      "path": "/Users/triviere/.openclaw/workspace/skills/project-orchestrator/src/neo4j/code.rs",
+      "query_count": 199,
+      "features": {
+        "MATCH": 149,
+        "RETURN": 97,
+        "PARAM": 113,
+        "OPTIONAL_MATCH": 32,
+        "DELETE": 14,
+        "WHERE": 57,
+        "AGG_count": 23,
+        "AGG_collect": 14,
+        "DISTINCT": 30,
+        "FN_type": 3,
+        "MERGE": 49,
+        "SET": 31,
+        "FN_datetime": 5,
+        "UNWIND": 42,
+        "MAP_PROJECTION": 30,
+        "ORDER_BY": 19,
+        "LIMIT": 41,
+        "CASE_WHEN": 7,
+        "WITH": 62,
+        "FN_coalesce": 14,
+        "CREATE": 23,
+        "CALL_SUBQUERY": 11,
+        "EXISTS_SUBQUERY": 15,
+        "VAR_LENGTH_REL": 15,
+        "FN_length": 4,
+        "PATH_VARIABLE": 3,
+        "FN_labels": 2,
+        "AGG_max": 2,
+        "FN_toFloat": 2,
+        "LIST_COMPREHENSION": 1,
+        "AGG_avg": 1,
+        "FN_size": 1,
+        "FN_last": 1,
+        "FN_relationships": 4,
+        "FN_nodes": 2
+      }
+    },
+    {
+      "path": "/Users/triviere/.openclaw/workspace/skills/project-orchestrator/src/neo4j/client.rs",
+      "query_count": 127,
+      "features": {
+        "CREATE": 123,
+        "VECTOR_INDEX": 4,
+        "MATCH": 2,
+        "SET": 3,
+        "WHERE": 1,
+        "MERGE": 2,
+        "DELETE": 1,
+        "WITH": 1,
+        "LIMIT": 1,
+        "PARAM": 1,
+        "CONSTRAINT": 38,
+        "INDEX_CREATE": 81,
+        "RETURN": 1,
+        "AGG_collect": 1
+      }
+    },
+    {
+      "path": "/Users/triviere/.openclaw/workspace/skills/project-orchestrator/src/neo4j/note.rs",
+      "query_count": 86,
+      "features": {
+        "CREATE": 16,
+        "FN_datetime": 24,
+        "PARAM": 72,
+        "MATCH": 77,
+        "MERGE": 16,
+        "RETURN": 63,
+        "SET": 38,
+        "DELETE": 5,
+        "AGG_count": 32,
+        "ORDER_BY": 21,
+        "SKIP": 4,
+        "LIMIT": 15,
+        "WITH": 13,
+        "WHERE": 45,
+        "VECTOR_QUERY": 8,
+        "DISTINCT": 6,
+        "UNION": 1,
+        "CASE_WHEN": 13,
+        "AGG_collect": 1,
+        "AGG_reduce": 2,
+        "FN_toFloat": 2,
+        "FN_size": 2,
+        "APOC": 1,
+        "LIST_COMPREHENSION": 2,
+        "FN_coalesce": 12,
+        "FN_type": 1,
+        "FN_tail": 1,
+        "FN_nodes": 1,
+        "FN_relationships": 1,
+        "FN_length": 1,
+        "PATH_VARIABLE": 1,
+        "FN_abs": 2,
+        "FN_labels": 1,
+        "VECTOR_SET": 3,
+        "FN_left": 1,
+        "EXISTS_SUBQUERY": 2,
+        "UNWIND": 6,
+        "MAP_PROJECTION": 4,
+        "OPTIONAL_MATCH": 1,
+        "FN_toString": 1
+      }
+    },
+    {
+      "path": "/Users/triviere/.openclaw/workspace/skills/project-orchestrator/src/neo4j/persona.rs",
+      "query_count": 78,
+      "features": {
+        "MATCH": 69,
+        "OPTIONAL_MATCH": 9,
+        "CREATE": 11,
+        "SET": 23,
+        "WITH": 21,
+        "FOREACH": 1,
+        "CASE_WHEN": 13,
+        "PARAM": 67,
+        "DELETE": 15,
+        "RETURN": 43,
+        "AGG_count": 18,
+        "MERGE": 18,
+        "FN_datetime": 5,
+        "ORDER_BY": 21,
+        "LIMIT": 7,
+        "WHERE": 30,
+        "FN_length": 2,
+        "VAR_LENGTH_REL": 1,
+        "PATH_VARIABLE": 1,
+        "DISTINCT": 9,
+        "CALL_SUBQUERY": 2,
+        "UNION": 3,
+        "AGG_max": 2,
+        "AGG_collect": 7,
+        "AGG_sum": 2,
+        "FN_coalesce": 6,
+        "UNWIND": 4,
+        "FN_toString": 1,
+        "FN_head": 1,
+        "FN_duration": 2,
+        "FN_toFloat": 3,
+        "MAP_PROJECTION": 1,
+        "AGG_avg": 3,
+        "FN_size": 1,
+        "LIST_COMPREHENSION": 1,
+        "SKIP": 2
+      }
+    },
+    {
+      "path": "/Users/triviere/.openclaw/workspace/skills/project-orchestrator/src/neo4j/analytics.rs",
+      "query_count": 71,
+      "features": {
+        "MATCH": 71,
+        "WITH": 24,
+        "RETURN": 57,
+        "ORDER_BY": 16,
+        "WHERE": 49,
+        "AGG_count": 26,
+        "AGG_collect": 8,
+        "FN_size": 6,
+        "LIST_COMPREHENSION": 4,
+        "PARAM": 69,
+        "DISTINCT": 15,
+        "LIMIT": 14,
+        "OPTIONAL_MATCH": 14,
+        "EXISTS_SUBQUERY": 6,
+        "AGG_avg": 9,
+        "AGG_max": 2,
+        "UNWIND": 13,
+        "AGG_sum": 6,
+        "FN_range": 1,
+        "CASE_WHEN": 8,
+        "FN_coalesce": 14,
+        "FN_toFloat": 8,
+        "FN_datetime": 11,
+        "FN_duration": 2,
+        "FN_nodes": 1,
+        "VAR_LENGTH_REL": 1,
+        "PATH_VARIABLE": 1,
+        "AGG_reduce": 2,
+        "FN_toInteger": 2,
+        "APOC": 1,
+        "SET": 11,
+        "MAP_PROJECTION": 10,
+        "DELETE": 1,
+        "MERGE": 1,
+        "FN_left": 3,
+        "CALL_SUBQUERY": 1,
+        "FN_type": 1,
+        "FN_toString": 1
+      }
+    },
+    {
+      "path": "/Users/triviere/.openclaw/workspace/skills/project-orchestrator/src/neo4j/workspace.rs",
+      "query_count": 68,
+      "features": {
+        "CREATE": 6,
+        "FN_datetime": 4,
+        "PARAM": 51,
+        "MATCH": 51,
+        "RETURN": 25,
+        "ORDER_BY": 9,
+        "LIMIT": 5,
+        "WHERE": 8,
+        "SET": 5,
+        "DELETE": 18,
+        "MERGE": 9,
+        "SKIP": 2,
+        "OPTIONAL_MATCH": 5,
+        "WITH": 11,
+        "AGG_collect": 6,
+        "FN_size": 3,
+        "LIST_COMPREHENSION": 5,
+        "DISTINCT": 5,
+        "UNWIND": 3,
+        "FN_coalesce": 1,
+        "AGG_count": 2,
+        "EXISTS_SUBQUERY": 1,
+        "VAR_LENGTH_REL": 1,
+        "REMOVE": 3
+      }
+    },
+    {
+      "path": "/Users/triviere/.openclaw/workspace/skills/project-orchestrator/src/neo4j/protocol.rs",
+      "query_count": 46,
+      "features": {
+        "MATCH": 43,
+        "RETURN": 29,
+        "LIMIT": 8,
+        "PARAM": 43,
+        "CREATE": 5,
+        "MERGE": 9,
+        "SET": 6,
+        "AGG_count": 6,
+        "ORDER_BY": 13,
+        "SKIP": 4,
+        "OPTIONAL_MATCH": 3,
+        "DELETE": 9,
+        "WHERE": 4,
+        "EXISTS_SUBQUERY": 1,
+        "FN_coalesce": 2,
+        "WITH": 2,
+        "UNWIND": 2,
+        "AGG_collect": 2,
+        "VAR_LENGTH_REL": 1,
+        "PATH_VARIABLE": 1,
+        "DISTINCT": 2,
+        "FN_datetime": 1,
+        "CASE_WHEN": 1,
+        "AGG_sum": 1,
+        "MAP_PROJECTION": 1
+      }
+    },
+    {
+      "path": "/Users/triviere/.openclaw/workspace/skills/project-orchestrator/src/neo4j/chat.rs",
+      "query_count": 44,
+      "features": {
+        "MATCH": 42,
+        "OPTIONAL_MATCH": 8,
+        "CREATE": 8,
+        "WITH": 14,
+        "FOREACH": 1,
+        "CASE_WHEN": 6,
+        "FN_datetime": 9,
+        "PARAM": 41,
+        "RETURN": 34,
+        "ORDER_BY": 19,
+        "SKIP": 5,
+        "LIMIT": 11,
+        "WHERE": 22,
+        "MAP_PROJECTION": 9,
+        "AGG_collect": 9,
+        "AGG_count": 7,
+        "SET": 7,
+        "FN_size": 3,
+        "FN_relationships": 1,
+        "FN_length": 2,
+        "FN_startNode": 1,
+        "FN_endNode": 1,
+        "VAR_LENGTH_REL": 2,
+        "PATH_VARIABLE": 2,
+        "MERGE": 3,
+        "UNWIND": 7,
+        "EXISTS_SUBQUERY": 1,
+        "FN_toString": 4,
+        "AGG_max": 2,
+        "DISTINCT": 5,
+        "FN_coalesce": 5,
+        "LIST_COMPREHENSION": 2,
+        "DELETE": 2,
+        "FN_labels": 1
+      }
+    },
+    {
+      "path": "/Users/triviere/.openclaw/workspace/skills/project-orchestrator/src/neo4j/mock.rs",
+      "query_count": 35,
+      "features": {
+        "MATCH": 6,
+        "DELETE": 4,
+        "REMOVE": 2,
+        "RETURN": 15,
+        "AGG_count": 5,
+        "AGG_collect": 7,
+        "FN_keys": 2,
+        "MAP_PROJECTION": 6,
+        "CREATE": 5,
+        "WITH": 4,
+        "SKIP": 1,
+        "SET": 5,
+        "LIMIT": 6,
+        "FN_last": 1,
+        "AGG_sum": 1,
+        "AGG_min": 2,
+        "PATH_VARIABLE": 2
+      }
+    },
+    {
+      "path": "/Users/triviere/.openclaw/workspace/skills/project-orchestrator/src/neo4j/task.rs",
+      "query_count": 33,
+      "features": {
+        "MATCH": 32,
+        "CREATE": 1,
+        "FN_datetime": 5,
+        "PARAM": 28,
+        "RETURN": 16,
+        "ORDER_BY": 6,
+        "FN_coalesce": 10,
+        "OPTIONAL_MATCH": 2,
+        "AGG_collect": 3,
+        "DISTINCT": 2,
+        "VAR_LENGTH_REL": 1,
+        "WHERE": 3,
+        "SET": 8,
+        "CASE_WHEN": 3,
+        "MERGE": 3,
+        "DELETE": 4,
+        "LIMIT": 5,
+        "EXISTS_SUBQUERY": 1,
+        "SKIP": 1
+      }
+    },
+    {
+      "path": "/Users/triviere/.openclaw/workspace/skills/project-orchestrator/src/neo4j/feature_graph.rs",
+      "query_count": 32,
+      "features": {
+        "MATCH": 32,
+        "RETURN": 21,
+        "WHERE": 13,
+        "PARAM": 31,
+        "WITH": 8,
+        "UNWIND": 5,
+        "ORDER_BY": 4,
+        "LIMIT": 2,
+        "AGG_collect": 6,
+        "FN_coalesce": 4,
+        "DISTINCT": 9,
+        "OPTIONAL_MATCH": 8,
+        "EXISTS_SUBQUERY": 3,
+        "VAR_LENGTH_REL": 2,
+        "FN_labels": 5,
+        "AGG_count": 6,
+        "CREATE": 1,
+        "FN_type": 2,
+        "DELETE": 3,
+        "MERGE": 9,
+        "SET": 2,
+        "FN_startNode": 1
+      }
+    },
+    {
+      "path": "/Users/triviere/.openclaw/workspace/skills/project-orchestrator/src/neo4j/plan.rs",
+      "query_count": 29,
+      "features": {
+        "CREATE": 1,
+        "FN_datetime": 1,
+        "PARAM": 24,
+        "MATCH": 26,
+        "MERGE": 2,
+        "RETURN": 16,
+        "ORDER_BY": 8,
+        "WHERE": 8,
+        "AGG_count": 5,
+        "SKIP": 2,
+        "LIMIT": 4,
+        "SET": 4,
+        "DELETE": 6,
+        "WITH": 3,
+        "UNWIND": 5,
+        "EXISTS_SUBQUERY": 1,
+        "FN_nodes": 1,
+        "FN_length": 1,
+        "VAR_LENGTH_REL": 1,
+        "PATH_VARIABLE": 1,
+        "DISTINCT": 3,
+        "OPTIONAL_MATCH": 2,
+        "CASE_WHEN": 1,
+        "MAP_PROJECTION": 2,
+        "FN_coalesce": 3,
+        "AGG_sum": 1,
+        "UNION": 2,
+        "FN_substring": 1
+      }
+    },
+    {
+      "path": "/Users/triviere/.openclaw/workspace/skills/project-orchestrator/src/neo4j/project.rs",
+      "query_count": 29,
+      "features": {
+        "CREATE": 1,
+        "FN_datetime": 6,
+        "PARAM": 26,
+        "MATCH": 28,
+        "RETURN": 8,
+        "ORDER_BY": 3,
+        "SET": 9,
+        "OPTIONAL_MATCH": 4,
+        "DELETE": 11,
+        "REMOVE": 4,
+        "WHERE": 2,
+        "EXISTS_SUBQUERY": 2,
+        "VAR_LENGTH_REL": 2,
+        "CASE_WHEN": 1,
+        "AGG_count": 2,
+        "AGG_sum": 1,
+        "FN_coalesce": 1,
+        "SKIP": 1,
+        "LIMIT": 1
+      }
+    },
+    {
+      "path": "/Users/triviere/.openclaw/workspace/skills/project-orchestrator/crates/neural-routing-core/src/store.rs",
+      "query_count": 27,
+      "features": {
+        "CREATE": 13,
+        "INDEX_CREATE": 5,
+        "VECTOR_INDEX": 2,
+        "MATCH": 16,
+        "MERGE": 5,
+        "SET": 4,
+        "PARAM": 17,
+        "RETURN": 8,
+        "FN_datetime": 2,
+        "WITH": 5,
+        "UNWIND": 5,
+        "ORDER_BY": 5,
+        "AGG_collect": 3,
+        "FN_size": 4,
+        "FN_range": 4,
+        "MAP_PROJECTION": 2,
+        "OPTIONAL_MATCH": 2,
+        "SKIP": 1,
+        "LIMIT": 1,
+        "WHERE": 4,
+        "VECTOR_QUERY": 1,
+        "AGG_count": 2,
+        "AGG_avg": 1,
+        "AGG_min": 1,
+        "AGG_max": 1,
+        "DELETE": 1,
+        "EXISTS_SUBQUERY": 1
+      }
+    },
+    {
+      "path": "/Users/triviere/.openclaw/workspace/skills/project-orchestrator/src/neo4j/decision.rs",
+      "query_count": 25,
+      "features": {
+        "MATCH": 23,
+        "CREATE": 2,
+        "FN_datetime": 5,
+        "PARAM": 22,
+        "RETURN": 13,
+        "DELETE": 3,
+        "OPTIONAL_MATCH": 4,
+        "MERGE": 4,
+        "WITH": 7,
+        "UNWIND": 1,
+        "ORDER_BY": 8,
+        "LIMIT": 3,
+        "WHERE": 10,
+        "AGG_collect": 1,
+        "LIST_COMPREHENSION": 2,
+        "DISTINCT": 1,
+        "SET": 5,
+        "VECTOR_SET": 1,
+        "VECTOR_QUERY": 2,
+        "MAP_PROJECTION": 1,
+        "FN_coalesce": 1,
+        "FN_labels": 1,
+        "FN_nodes": 1,
+        "VAR_LENGTH_REL": 1,
+        "PATH_VARIABLE": 1
+      }
+    },
+    {
+      "path": "/Users/triviere/.openclaw/workspace/skills/project-orchestrator/src/neo4j/skill.rs",
+      "query_count": 25,
+      "features": {
+        "MATCH": 22,
+        "CREATE": 2,
+        "RETURN": 20,
+        "CASE_WHEN": 6,
+        "FN_datetime": 9,
+        "PARAM": 22,
+        "SET": 8,
+        "OPTIONAL_MATCH": 5,
+        "DELETE": 4,
+        "WITH": 7,
+        "WHERE": 10,
+        "AGG_count": 1,
+        "ORDER_BY": 7,
+        "SKIP": 1,
+        "LIMIT": 9,
+        "AGG_collect": 2,
+        "FN_coalesce": 1,
+        "DISTINCT": 1,
+        "MERGE": 2,
+        "FN_size": 5,
+        "FOREACH": 1,
+        "REMOVE": 2
+      }
+    },
+    {
+      "path": "/Users/triviere/.openclaw/workspace/skills/project-orchestrator/src/neo4j/commit.rs",
+      "query_count": 20,
+      "features": {
+        "MERGE": 7,
+        "SET": 6,
+        "FN_datetime": 5,
+        "PARAM": 20,
+        "MATCH": 19,
+        "RETURN": 13,
+        "ORDER_BY": 8,
+        "WITH": 5,
+        "UNWIND": 3,
+        "WHERE": 10,
+        "MAP_PROJECTION": 2,
+        "LIMIT": 4,
+        "AGG_count": 4,
+        "AGG_collect": 3,
+        "FN_coalesce": 1,
+        "FN_size": 1,
+        "FN_range": 1,
+        "DELETE": 3,
+        "SKIP": 1,
+        "AGG_max": 3,
+        "EXISTS_SUBQUERY": 2,
+        "AGG_reduce": 2,
+        "FN_toFloat": 2,
+        "FN_head": 2,
+        "FN_nodes": 2,
+        "FN_relationships": 2,
+        "VAR_LENGTH_REL": 2,
+        "LIST_COMPREHENSION": 2,
+        "FN_toString": 2,
+        "DISTINCT": 1
+      }
+    },
+    {
+      "path": "/Users/triviere/.openclaw/workspace/skills/project-orchestrator/src/neo4j/mcp_federation.rs",
+      "query_count": 17,
+      "features": {
+        "CREATE": 2,
+        "FN_datetime": 8,
+        "PARAM": 14,
+        "MATCH": 15,
+        "MERGE": 7,
+        "RETURN": 6,
+        "ORDER_BY": 4,
+        "OPTIONAL_MATCH": 2,
+        "DELETE": 3,
+        "SET": 6,
+        "WITH": 2,
+        "UNWIND": 1,
+        "WHERE": 2,
+        "AGG_count": 2,
+        "AGG_collect": 1,
+        "FN_size": 1,
+        "DISTINCT": 1,
+        "AGG_avg": 1
+      }
+    },
+    {
+      "path": "/Users/triviere/.openclaw/workspace/skills/project-orchestrator/src/neo4j/milestone.rs",
+      "query_count": 16,
+      "features": {
+        "MATCH": 15,
+        "CREATE": 2,
+        "RETURN": 10,
+        "FN_datetime": 1,
+        "PARAM": 15,
+        "ORDER_BY": 5,
+        "MERGE": 2,
+        "DELETE": 2,
+        "OPTIONAL_MATCH": 5,
+        "WITH": 5,
+        "WHERE": 5,
+        "AGG_collect": 5,
+        "LIST_COMPREHENSION": 5,
+        "DISTINCT": 5,
+        "FN_size": 1,
+        "UNWIND": 3,
+        "FN_coalesce": 2,
+        "SKIP": 1,
+        "LIMIT": 1,
+        "SET": 1,
+        "AGG_count": 1
+      }
+    },
+    {
+      "path": "/Users/triviere/.openclaw/workspace/skills/project-orchestrator/src/neo4j/profile.rs",
+      "query_count": 13,
+      "features": {
+        "MATCH": 9,
+        "MERGE": 4,
+        "SET": 5,
+        "PARAM": 10,
+        "RETURN": 6,
+        "ORDER_BY": 3,
+        "WHERE": 2,
+        "DELETE": 2,
+        "CREATE": 3
+      }
+    },
+    {
+      "path": "/Users/triviere/.openclaw/workspace/skills/project-orchestrator/src/neo4j/release.rs",
+      "query_count": 12,
+      "features": {
+        "MATCH": 12,
+        "CREATE": 1,
+        "FN_datetime": 1,
+        "PARAM": 12,
+        "RETURN": 6,
+        "ORDER_BY": 3,
+        "MERGE": 2,
+        "DELETE": 2,
+        "OPTIONAL_MATCH": 1,
+        "AGG_collect": 1,
+        "DISTINCT": 1,
+        "FN_coalesce": 1,
+        "SKIP": 1,
+        "LIMIT": 1,
+        "SET": 1,
+        "AGG_count": 1
+      }
+    },
+    {
+      "path": "/Users/triviere/.openclaw/workspace/skills/project-orchestrator/src/neo4j/user.rs",
+      "query_count": 11,
+      "features": {
+        "MATCH": 10,
+        "CREATE": 3,
+        "MERGE": 2,
+        "SET": 4,
+        "RETURN": 10,
+        "FN_datetime": 2,
+        "PARAM": 10,
+        "ORDER_BY": 1,
+        "AGG_count": 1
+      }
+    },
+    {
+      "path": "/Users/triviere/.openclaw/workspace/skills/project-orchestrator/src/neo4j/alert.rs",
+      "query_count": 10,
+      "features": {
+        "MATCH": 9,
+        "OPTIONAL_MATCH": 1,
+        "CREATE": 2,
+        "WITH": 1,
+        "FOREACH": 1,
+        "CASE_WHEN": 1,
+        "PARAM": 9,
+        "RETURN": 7,
+        "ORDER_BY": 4,
+        "LIMIT": 4,
+        "WHERE": 4,
+        "SET": 1,
+        "SKIP": 2,
+        "AGG_count": 2
+      }
+    },
+    {
+      "path": "/Users/triviere/.openclaw/workspace/skills/project-orchestrator/src/neo4j/sharing.rs",
+      "query_count": 10,
+      "features": {
+        "MATCH": 7,
+        "RETURN": 5,
+        "PARAM": 8,
+        "SET": 3,
+        "CREATE": 2,
+        "FN_datetime": 2,
+        "ORDER_BY": 1,
+        "SKIP": 1,
+        "LIMIT": 1,
+        "MERGE": 1,
+        "AGG_count": 1
+      }
+    },
+    {
+      "path": "/Users/triviere/.openclaw/workspace/skills/project-orchestrator/src/neo4j/trigger.rs",
+      "query_count": 10,
+      "features": {
+        "MATCH": 10,
+        "CREATE": 3,
+        "RETURN": 7,
+        "FN_datetime": 2,
+        "PARAM": 7,
+        "ORDER_BY": 4,
+        "OPTIONAL_MATCH": 1,
+        "DELETE": 1,
+        "SET": 2,
+        "WITH": 1,
+        "LIMIT": 1,
+        "WHERE": 1
+      }
+    },
+    {
+      "path": "/Users/triviere/.openclaw/workspace/skills/project-orchestrator/src/neo4j/lifecycle_hook.rs",
+      "query_count": 9,
+      "features": {
+        "CREATE": 1,
+        "FN_datetime": 1,
+        "PARAM": 7,
+        "MATCH": 7,
+        "RETURN": 5,
+        "ORDER_BY": 4,
+        "WHERE": 3,
+        "DELETE": 2,
+        "SET": 1
+      }
+    },
+    {
+      "path": "/Users/triviere/.openclaw/workspace/skills/project-orchestrator/src/neo4j/step.rs",
+      "query_count": 9,
+      "features": {
+        "MATCH": 9,
+        "CREATE": 1,
+        "FN_datetime": 4,
+        "PARAM": 9,
+        "RETURN": 4,
+        "ORDER_BY": 1,
+        "SET": 4,
+        "CASE_WHEN": 1,
+        "AGG_count": 2,
+        "AGG_sum": 1,
+        "WHERE": 1,
+        "DELETE": 1
+      }
+    },
+    {
+      "path": "/Users/triviere/.openclaw/workspace/skills/project-orchestrator/src/neo4j/topology.rs",
+      "query_count": 8,
+      "features": {
+        "CREATE": 1,
+        "PARAM": 8,
+        "MATCH": 7,
+        "RETURN": 6,
+        "ORDER_BY": 4,
+        "DELETE": 1,
+        "LIMIT": 5,
+        "WHERE": 5,
+        "WITH": 3,
+        "FN_size": 1,
+        "AGG_min": 1,
+        "FN_length": 2,
+        "VAR_LENGTH_REL": 2,
+        "PATH_VARIABLE": 1,
+        "DISTINCT": 1
+      }
+    },
+    {
+      "path": "/Users/triviere/.openclaw/workspace/skills/project-orchestrator/src/neo4j/event_trigger.rs",
+      "query_count": 7,
+      "features": {
+        "CREATE": 1,
+        "PARAM": 6,
+        "MATCH": 6,
+        "RETURN": 4,
+        "DELETE": 1,
+        "MERGE": 1,
+        "ORDER_BY": 1,
+        "SET": 1
+      }
+    },
+    {
+      "path": "/Users/triviere/.openclaw/workspace/skills/project-orchestrator/src/neo4j/plan_run.rs",
+      "query_count": 7,
+      "features": {
+        "MATCH": 6,
+        "CREATE": 1,
+        "FN_datetime": 1,
+        "PARAM": 5,
+        "SET": 1,
+        "RETURN": 4,
+        "ORDER_BY": 2,
+        "LIMIT": 2
+      }
+    },
+    {
+      "path": "/Users/triviere/.openclaw/workspace/skills/project-orchestrator/src/neo4j/reasoning.rs",
+      "query_count": 7,
+      "features": {
+        "CREATE": 2,
+        "MERGE": 2,
+        "SET": 1,
+        "RETURN": 5,
+        "FN_datetime": 1,
+        "PARAM": 6,
+        "MATCH": 5,
+        "ORDER_BY": 3,
+        "LIMIT": 3,
+        "OPTIONAL_MATCH": 2,
+        "WHERE": 1,
+        "FN_labels": 2
+      }
+    },
+    {
+      "path": "/Users/triviere/.openclaw/workspace/skills/project-orchestrator/crates/neural-routing-core/src/mcts.rs",
+      "query_count": 6,
+      "features": {
+        "WITH": 4,
+        "CREATE": 2
+      }
+    },
+    {
+      "path": "/Users/triviere/.openclaw/workspace/skills/project-orchestrator/src/neo4j/constraint.rs",
+      "query_count": 6,
+      "features": {
+        "MATCH": 6,
+        "CREATE": 1,
+        "PARAM": 6,
+        "RETURN": 3,
+        "DELETE": 1,
+        "SET": 1
+      }
+    },
+    {
+      "path": "/Users/triviere/.openclaw/workspace/skills/project-orchestrator/src/neo4j/batch.rs",
+      "query_count": 5,
+      "features": {
+        "MERGE": 2,
+        "SET": 2,
+        "UNWIND": 3,
+        "MAP_PROJECTION": 2,
+        "PARAM": 4,
+        "MATCH": 2,
+        "DELETE": 2,
+        "WITH": 2,
+        "RETURN": 2,
+        "LIMIT": 2,
+        "AGG_count": 2
+      }
+    },
+    {
+      "path": "/Users/triviere/.openclaw/workspace/skills/project-orchestrator/src/neo4j/registry.rs",
+      "query_count": 5,
+      "features": {
+        "MERGE": 1,
+        "SET": 2,
+        "FN_datetime": 1,
+        "PARAM": 4,
+        "MATCH": 4,
+        "RETURN": 3,
+        "AGG_count": 1,
+        "ORDER_BY": 1,
+        "SKIP": 1,
+        "LIMIT": 1,
+        "FN_coalesce": 1
+      }
+    },
+    {
+      "path": "/Users/triviere/.openclaw/workspace/skills/project-orchestrator/crates/neural-routing-gnn/src/sampler.rs",
+      "query_count": 4,
+      "features": {
+        "MATCH": 4,
+        "WITH": 4,
+        "RETURN": 4,
+        "LIMIT": 3,
+        "WHERE": 2,
+        "CALL_SUBQUERY": 1,
+        "UNION": 1,
+        "FN_labels": 1,
+        "FN_properties": 1,
+        "PATH_VARIABLE": 1,
+        "PARAM": 3,
+        "DISTINCT": 1,
+        "UNWIND": 1,
+        "FN_coalesce": 3,
+        "FN_type": 1,
+        "ORDER_BY": 2,
+        "MAP_PROJECTION": 2
+      }
+    },
+    {
+      "path": "/Users/triviere/.openclaw/workspace/skills/project-orchestrator/src/neo4j/agent_execution.rs",
+      "query_count": 4,
+      "features": {
+        "MATCH": 4,
+        "CREATE": 1,
+        "FN_datetime": 2,
+        "PARAM": 4,
+        "SET": 2,
+        "RETURN": 1,
+        "ORDER_BY": 1,
+        "MERGE": 1
+      }
+    },
+    {
+      "path": "/Users/triviere/.openclaw/workspace/skills/project-orchestrator/crates/neural-routing-core/src/migration.rs",
+      "query_count": 3,
+      "features": {
+        "MATCH": 3,
+        "RETURN": 3,
+        "ORDER_BY": 2,
+        "LIMIT": 1,
+        "PARAM": 3,
+        "WHERE": 1,
+        "AGG_count": 1
+      }
+    },
+    {
+      "path": "/Users/triviere/.openclaw/workspace/skills/project-orchestrator/crates/neural-routing-gnn/src/benchmark/mod.rs",
+      "query_count": 1,
+      "features": {
+        "WITH": 1,
+        "RETURN": 1,
+        "AGG_collect": 1,
+        "PATH_VARIABLE": 1
+      }
+    },
+    {
+      "path": "/Users/triviere/.openclaw/workspace/skills/project-orchestrator/crates/neural-routing-gnn/src/training.rs",
+      "query_count": 1,
+      "features": {
+        "CREATE": 1
+      }
+    },
+    {
+      "path": "/Users/triviere/.openclaw/workspace/skills/project-orchestrator/src/neo4j/models.rs",
+      "query_count": 1,
+      "features": {
+        "SET": 1
+      }
+    }
+  ]
+}
