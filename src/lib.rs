@@ -1434,11 +1434,16 @@ pub async fn start_server(mut config: Config) -> Result<()> {
             Box::new(GitDriftCheck),
             Box::new(StalenessCheck),
             Box::new(SynapseDecayCheck),
-            Box::new(SynapseReplenishCheck),
             Box::new(ConventionGuardCheck),
             Box::new(MaintenanceCheck),
             Box::new(ConsolidationCheck),
             Box::new(HomeostasisCheck::new()),
+            // MUST run LAST: the engine executes checks in vec order within a tick
+            // (engine.rs:88). SynapseDecayCheck and MaintenanceCheck (deep_maintenance
+            // applies an aggressive 3x decay + prune) both delete synapses; replenish
+            // has to rebuild AFTER them, otherwise at startup — when every check is due —
+            // a fresh rebuild would be wiped by the maintenance prune in the same tick.
+            Box::new(SynapseReplenishCheck),
         ];
 
         let engine = HeartbeatEngine::new(graph, search, emitter, checks);
