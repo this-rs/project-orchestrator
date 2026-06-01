@@ -47,6 +47,29 @@ ignore = [
     { id = "RUSTSEC-2025-0141", reason = "bincode 1.x unmaintained — bincode 2.x is the maintained version but is a breaking change; transitive via fastembed/ort. Out of scope for this PR." },
     { id = "RUSTSEC-2026-0097", reason = "rand unsound (custom logger via rand::rng()) — transitive in build deps. We don't call rand::rng() with a custom logger anywhere in our codebase." },
     { id = "RUSTSEC-2026-0105", reason = "core2 unmaintained + all versions yanked. Transitive via bitstream-io ← rav1e ← ravif ← image ← fastembed. Pinned by upstream image crate; no upgrade path available. Surfaced as `yanked = warn` in [advisories]." },
+    # ── gtk-rs GTK3 bindings unmaintained — transitive via Tauri's Linux desktop
+    #    stack (tauri → gtk/gdk/atk → *-sys). No fix until Tauri's GTK4 migration
+    #    lands upstream; the bindings are not in any security-sensitive code path.
+    { id = "RUSTSEC-2024-0411", reason = "gtk-rs GTK3 unmaintained — transitive via Tauri Linux desktop stack. Awaiting upstream Tauri GTK4 migration." },
+    { id = "RUSTSEC-2024-0412", reason = "gtk-rs GTK3 unmaintained — transitive via Tauri Linux desktop stack. Awaiting upstream Tauri GTK4 migration." },
+    { id = "RUSTSEC-2024-0413", reason = "gtk-rs GTK3 unmaintained — transitive via Tauri Linux desktop stack. Awaiting upstream Tauri GTK4 migration." },
+    { id = "RUSTSEC-2024-0414", reason = "gtk-rs GTK3 unmaintained — transitive via Tauri Linux desktop stack. Awaiting upstream Tauri GTK4 migration." },
+    { id = "RUSTSEC-2024-0415", reason = "gtk-rs GTK3 unmaintained — transitive via Tauri Linux desktop stack. Awaiting upstream Tauri GTK4 migration." },
+    { id = "RUSTSEC-2024-0416", reason = "gtk-rs GTK3 unmaintained — transitive via Tauri Linux desktop stack. Awaiting upstream Tauri GTK4 migration." },
+    { id = "RUSTSEC-2024-0417", reason = "gtk-rs GTK3 unmaintained — transitive via Tauri Linux desktop stack. Awaiting upstream Tauri GTK4 migration." },
+    { id = "RUSTSEC-2024-0418", reason = "gtk-rs GTK3 unmaintained — transitive via Tauri Linux desktop stack. Awaiting upstream Tauri GTK4 migration." },
+    { id = "RUSTSEC-2024-0419", reason = "gtk-rs GTK3 unmaintained — transitive via Tauri Linux desktop stack. Awaiting upstream Tauri GTK4 migration." },
+    { id = "RUSTSEC-2024-0420", reason = "gtk-rs GTK3 unmaintained — transitive via Tauri Linux desktop stack. Awaiting upstream Tauri GTK4 migration." },
+    { id = "RUSTSEC-2024-0429", reason = "glib VariantStrIter Iterator unsoundness — transitive via the same Tauri/GTK3 stack. The affected iterator is never constructed in our code paths." },
+    # ── unic-* unmaintained text crates — transitive (idna/url parsing chain).
+    { id = "RUSTSEC-2025-0075", reason = "unic-char-range unmaintained — transitive text-processing dep. Informational; no security impact." },
+    { id = "RUSTSEC-2025-0080", reason = "unic-common unmaintained — transitive text-processing dep. Informational; no security impact." },
+    { id = "RUSTSEC-2025-0081", reason = "unic-char-property unmaintained — transitive text-processing dep. Informational; no security impact." },
+    { id = "RUSTSEC-2025-0098", reason = "unic-ucd-version unmaintained — transitive text-processing dep. Informational; no security impact." },
+    { id = "RUSTSEC-2025-0100", reason = "unic-ucd-ident unmaintained — transitive text-processing dep. Informational; no security impact." },
+    # ── other unmaintained transitive deps.
+    { id = "RUSTSEC-2024-0370", reason = "proc-macro-error unmaintained — transitive build-time proc-macro dep. No runtime/security impact." },
+    { id = "RUSTSEC-2025-0057", reason = "fxhash unmaintained — transitive non-cryptographic hasher. No security impact." },
 ]
 
 [bans]
