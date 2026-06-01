@@ -2406,6 +2406,17 @@ impl ChatManager {
                             pre_tokens,
                         }]
                     }
+                    // Claude Code Dynamic Workflow lifecycle events (intra-task
+                    // sub-agent fan-out via the `Workflow` tool). These arrive as
+                    // flat system messages; forward subtype + full payload so the
+                    // frontend can render live fan-out progress. (Requires the SDK
+                    // to preserve the flat payload — nexus PR #31.)
+                    "task_started" | "task_progress" | "task_updated" | "task_notification" => {
+                        vec![ChatEvent::Workflow {
+                            subtype: subtype.clone(),
+                            data: data.clone(),
+                        }]
+                    }
                     _ => {
                         debug!("Unhandled system message: {} — {:?}", subtype, data);
                         vec![]
