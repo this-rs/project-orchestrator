@@ -50,6 +50,14 @@ pub struct RunnerConfig {
     /// Maximum number of auto-continue cycles before giving up. Default: 5.
     /// Prevents infinite loops when the agent keeps hitting error_max_turns.
     pub max_auto_continues: u32,
+    /// Maximum number of tasks executed concurrently within a single wave. Default: 4.
+    /// A wave can contain many independent tasks; without a cap the runner would spawn
+    /// one Claude Code session per task simultaneously (unbounded fan-out → cost spikes,
+    /// API rate limits, host saturation). Tasks beyond the cap queue on a semaphore and
+    /// start as permits free up. Set to `0` for unlimited (legacy behaviour, not advised).
+    /// This is also the prerequisite for safely hosting intra-task Dynamic Workflows,
+    /// which themselves fan out up to 16 sub-agents per session.
+    pub max_parallel_tasks: usize,
 }
 
 /// CWD validation mode for the runner.
@@ -78,6 +86,7 @@ impl Default for RunnerConfig {
             completion_loop_threshold: 5,
             completion_max_chars: 200,
             max_auto_continues: 5,
+            max_parallel_tasks: 4,
         }
     }
 }
@@ -692,7 +701,9 @@ mod active_agent_tests {
         sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[target]), true);
 
         let snap = a.snapshot_with_resources(&sys);
-        let res = snap.resources.expect("current process must exist in sysinfo");
+        let res = snap
+            .resources
+            .expect("current process must exist in sysinfo");
         assert_eq!(res.pid, std::process::id());
         assert!(res.rss_mb > 0.0, "RSS should be > 0 MB for a running test");
         assert!(res.threads >= 1, "process has at least one thread");

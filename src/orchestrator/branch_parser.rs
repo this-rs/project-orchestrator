@@ -297,10 +297,7 @@ mod tests {
 
     #[test]
     fn parses_bare_id_branch() {
-        assert_eq!(
-            parse_branch_to_external_id("t42"),
-            Some("T42".to_string())
-        );
+        assert_eq!(parse_branch_to_external_id("t42"), Some("T42".to_string()));
     }
 
     #[test]
@@ -353,7 +350,10 @@ mod tests {
 
     #[test]
     fn title_matches_with_colon() {
-        assert!(title_matches_external_id("T246.7: Lookahead decoding", "T246.7"));
+        assert!(title_matches_external_id(
+            "T246.7: Lookahead decoding",
+            "T246.7"
+        ));
     }
 
     #[test]

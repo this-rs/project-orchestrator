@@ -438,6 +438,10 @@ Your ONLY job is to **write code, test it, and commit it**. You are NOT in a con
 8. If tests are mentioned in steps, run them. If `cargo check` or tests fail, fix the errors and retry — do not give up.
 9. When done with ALL steps, make a final commit summarizing the work.
 
+## Parallel sub-agents (optional — Dynamic Workflows)
+
+For a task with **independent, parallelizable sub-parts** (e.g. the same mechanical change across several unrelated files/modules), you MAY use the **`Workflow` tool** to fan out sub-agents instead of working sequentially. Use it ONLY when the sub-parts are genuinely independent AND the task is large enough to justify the overhead — for small or tightly-coupled work, just edit directly. The PlanRunner already parallelizes ACROSS tasks, so never use a workflow for work that should be its own task. Keep the fan-out modest; the runner caps concurrency for a reason.
+
 ## Execution Flow
 
 1. Read the task description and steps provided in the user message

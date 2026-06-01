@@ -289,7 +289,8 @@ impl Neo4jClient {
     /// (resume reads `s.model` back from Neo4j). Persisting here makes the chosen
     /// model survive idle-cleanup and respawn.
     pub async fn update_chat_session_model(&self, id: Uuid, model: &str) -> Result<()> {
-        let cypher = "MATCH (s:ChatSession {id: $id}) SET s.model = $model, s.updated_at = datetime()";
+        let cypher =
+            "MATCH (s:ChatSession {id: $id}) SET s.model = $model, s.updated_at = datetime()";
         let q = query(cypher)
             .param("id", id.to_string())
             .param("model", model.to_string());

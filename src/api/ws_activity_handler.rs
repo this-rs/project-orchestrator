@@ -36,9 +36,7 @@
 use super::handlers::OrchestratorState;
 use super::ws_auth::CookieAuthResult;
 use crate::auth::jwt::Claims;
-use crate::events::{
-    ActivityEvent, CrudEvent, EntityType, EventBus, is_crud_entity_relevant,
-};
+use crate::events::{is_crud_entity_relevant, ActivityEvent, CrudEvent, EntityType, EventBus};
 use crate::runner::models::RunnerEvent;
 use axum::{
     extract::{
@@ -180,9 +178,7 @@ async fn get_or_init_activity_hub(state: &OrchestratorState) -> Arc<ActivityHub>
 fn transform_crud(bus: &EventBus, crud: CrudEvent) -> Option<ActivityEvent> {
     if crud.entity_type == EntityType::Runner {
         // Try to deserialize the payload as a RunnerEvent.
-        if let Ok(runner_event) =
-            serde_json::from_value::<RunnerEvent>(crud.payload.clone())
-        {
+        if let Ok(runner_event) = serde_json::from_value::<RunnerEvent>(crud.payload.clone()) {
             let seq = bus.next_sequence();
             return Some(ActivityEvent::from_runner(seq, runner_event));
         }
@@ -784,8 +780,11 @@ mod tests {
         let hub = ActivityHub::new();
         // Push 3 events with seq 0,1,2
         for seq in 0..3 {
-            hub.push(ActivityEvent::from_runner(seq, sample_task_started(run_id())))
-                .await;
+            hub.push(ActivityEvent::from_runner(
+                seq,
+                sample_task_started(run_id()),
+            ))
+            .await;
         }
         let replay = hub.replay_since(0).await;
         // Should return events with seq > 0 → seq 1 and 2
@@ -799,8 +798,11 @@ mod tests {
         let hub = ActivityHub::new();
         // Push more than capacity
         for seq in 0..(RING_BUFFER_CAPACITY as u64 + 50) {
-            hub.push(ActivityEvent::from_runner(seq, sample_task_started(run_id())))
-                .await;
+            hub.push(ActivityEvent::from_runner(
+                seq,
+                sample_task_started(run_id()),
+            ))
+            .await;
         }
         let all = hub.replay_since(0).await;
         // Cap is RING_BUFFER_CAPACITY; oldest events were dropped.
@@ -818,8 +820,11 @@ mod tests {
     async fn hub_replay_since_filters_strictly_greater() {
         let hub = ActivityHub::new();
         for seq in 0..5 {
-            hub.push(ActivityEvent::from_runner(seq, sample_task_started(run_id())))
-                .await;
+            hub.push(ActivityEvent::from_runner(
+                seq,
+                sample_task_started(run_id()),
+            ))
+            .await;
         }
         // last_seq=3 → return seq 4 only
         let replay = hub.replay_since(3).await;
@@ -842,8 +847,11 @@ mod tests {
         // still records events so future reconnects can replay.
         let hub = ActivityHub::new();
         for seq in 0..10 {
-            hub.push(ActivityEvent::from_runner(seq, sample_task_started(run_id())))
-                .await;
+            hub.push(ActivityEvent::from_runner(
+                seq,
+                sample_task_started(run_id()),
+            ))
+            .await;
         }
         let replay = hub.replay_since(0).await;
         assert_eq!(replay.len(), 9);

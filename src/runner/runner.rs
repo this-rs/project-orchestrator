@@ -1420,6 +1420,24 @@ impl PlanRunner {
 
         let mut join_set: JoinSet<(Uuid, String, Result<TaskExecutionResult>)> = JoinSet::new();
 
+        // Concurrency cap: throttle how many tasks in this wave run their agent
+        // session simultaneously. All eligible tasks are still spawned immediately,
+        // but each one acquires a permit before doing real work, so at most
+        // `max_parallel_tasks` sessions are live at once. `0` = unlimited (legacy).
+        let task_semaphore = match self.config.max_parallel_tasks {
+            0 => None,
+            n => {
+                if eligible_tasks.len() > n {
+                    info!(
+                        "Wave has {} eligible tasks; throttling to {} concurrent (max_parallel_tasks)",
+                        eligible_tasks.len(),
+                        n
+                    );
+                }
+                Some(std::sync::Arc::new(tokio::sync::Semaphore::new(n)))
+            }
+        };
+
         for wave_task in &eligible_tasks {
             let task_id = wave_task.id;
             let task_title = wave_task
@@ -1481,8 +1499,15 @@ impl PlanRunner {
             let project_slug = project_slug.map(|s| s.to_string());
             let title_clone = task_title.clone();
             let continuity = continuity_context.to_string();
+            let task_semaphore = task_semaphore.clone();
 
             join_set.spawn(async move {
+                // Acquire a concurrency permit (held for the whole task) when a cap
+                // is configured. Tasks beyond the cap park here until a permit frees.
+                let _permit = match task_semaphore {
+                    Some(sem) => sem.acquire_owned().await.ok(),
+                    None => None,
+                };
                 let result = runner
                     .execute_task(
                         run_id,
@@ -4319,6 +4344,66 @@ mod tests {
             *global = None;
         }
         RUNNER_CANCEL.store(false, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn test_default_max_parallel_tasks_is_bounded() {
+        // The runner must NOT default to unbounded wave fan-out. A finite cap is the
+        // prerequisite for coordinated multi-scale execution and for safely hosting
+        // intra-task Dynamic Workflows (which themselves fan out up to 16 sub-agents).
+        let cfg = RunnerConfig::default();
+        assert_eq!(cfg.max_parallel_tasks, 4);
+        assert_ne!(
+            cfg.max_parallel_tasks, 0,
+            "0 means unlimited; must not be the default"
+        );
+    }
+
+    /// Pins the throttle invariant used by `execute_wave`: with a semaphore of N
+    /// permits, no more than N spawned tasks run their critical section concurrently,
+    /// while all of them still eventually complete. This mirrors the exact
+    /// `Arc<Semaphore>` + `acquire_owned()` pattern guarding agent-session spawns.
+    #[tokio::test]
+    async fn test_wave_semaphore_caps_concurrency() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AOrd};
+        use tokio::task::JoinSet;
+
+        const CAP: usize = 4;
+        const TASKS: usize = 20;
+
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(CAP));
+        let live = std::sync::Arc::new(AtomicUsize::new(0));
+        let peak = std::sync::Arc::new(AtomicUsize::new(0));
+        let done = std::sync::Arc::new(AtomicUsize::new(0));
+
+        let mut join_set: JoinSet<()> = JoinSet::new();
+        for _ in 0..TASKS {
+            let sem = sem.clone();
+            let live = live.clone();
+            let peak = peak.clone();
+            let done = done.clone();
+            join_set.spawn(async move {
+                let _permit = sem.acquire_owned().await.ok();
+                let now = live.fetch_add(1, AOrd::SeqCst) + 1;
+                peak.fetch_max(now, AOrd::SeqCst);
+                // Hold the permit across an await point, like a real task session.
+                tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+                live.fetch_sub(1, AOrd::SeqCst);
+                done.fetch_add(1, AOrd::SeqCst);
+            });
+        }
+        while join_set.join_next().await.is_some() {}
+
+        assert_eq!(done.load(AOrd::SeqCst), TASKS, "every task must complete");
+        assert!(
+            peak.load(AOrd::SeqCst) <= CAP,
+            "peak concurrency {} exceeded cap {CAP}",
+            peak.load(AOrd::SeqCst)
+        );
+        assert!(
+            peak.load(AOrd::SeqCst) >= 2,
+            "with {TASKS} tasks and cap {CAP}, some real parallelism should occur"
+        );
     }
 
     #[tokio::test]
