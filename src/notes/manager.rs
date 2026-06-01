@@ -534,9 +534,16 @@ impl NoteManager {
             if content_changed {
                 self.embed_note(id, &note.content).await;
 
-                // Content changed → delete old synapses and re-connect
-                // delete_synapses is best-effort (non-critical for the update)
-                if self.synapse_config.enabled {
+                // Content changed → delete old synapses and re-connect.
+                // CRITICAL: only delete when we can actually RECREATE — i.e. when
+                // an embedding provider is present. `spawn_auto_connect_synapses`
+                // silently returns if `embedding_provider` is None, so without this
+                // guard a content update on a provider-less server would DELETE the
+                // note's synapses and recreate nothing — every edit bleeds the
+                // synapse graph toward zero (breaking skill detection). Better to
+                // keep slightly-stale synapses than to wipe them irrecoverably;
+                // the SynapseReplenishCheck refreshes them from stored embeddings.
+                if self.synapse_config.enabled && self.embedding_provider.is_some() {
                     if let Err(e) = self.neo4j.delete_synapses(id).await {
                         tracing::warn!(
                             note_id = %id,
