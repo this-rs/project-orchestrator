@@ -5,7 +5,7 @@
 //! - Generate a config.yaml from wizard input
 //! - Detect if Claude Code CLI is installed
 
-use rand::Rng;
+use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -330,10 +330,10 @@ fn dirs_next_config_dir() -> Option<PathBuf> {
 
 /// Generate a random alphanumeric string of the given length.
 fn random_secret(len: usize) -> String {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     (0..len)
         .map(|_| {
-            let idx = rng.gen_range(0..62);
+            let idx = rng.random_range(0..62);
             match idx {
                 0..=9 => (b'0' + idx) as char,
                 10..=35 => (b'a' + idx - 10) as char,
