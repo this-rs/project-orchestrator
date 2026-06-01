@@ -7,7 +7,7 @@ resolver = "2"
 # =============================================================================
 [workspace.dependencies]
 # Async runtime
-tokio = { version = "1.49", features = ["full"] }
+tokio = { version = "1.52", features = ["full"] }
 tokio-util = "0.7"
 tokio-stream = "0.1"
 
