@@ -42,7 +42,7 @@ safetensors = "0.7"
 moka = { version = "0.12", features = ["future"] }
 
 # CPU monitoring
-sysinfo = "0.33"
+sysinfo = "0.39"
 
 # =============================================================================
 # Main crate
