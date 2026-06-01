@@ -1606,10 +1606,6 @@ impl NoteManager {
                 break;
             }
 
-            // Track how many notes in this batch couldn't be connected —
-            // if ALL of them fail, we've exhausted the connectable notes.
-            let mut batch_connected = 0usize;
-
             for note in &batch {
                 // Check cancellation per-note for responsiveness
                 if let Some(flag) = cancel {
@@ -1693,7 +1689,6 @@ impl NoteManager {
                 match self.neo4j.create_synapses(note.id, &synapse_targets).await {
                     Ok(created) => {
                         synapses_created += created;
-                        batch_connected += 1;
                         // Note now has synapses → will NOT appear in next
                         // query at the same offset. Don't increment skip_offset.
                     }
@@ -1716,12 +1711,14 @@ impl NoteManager {
                 "Synapse backfill: {processed}/{total} notes processed, {synapses_created} synapses created ({errors} errors, {skip_offset} skipped)"
             );
 
-            // If no note in this batch could be connected, all remaining
-            // notes are un-connectable — stop to avoid spinning forever.
-            if batch_connected == 0 {
-                tracing::info!("Synapse backfill: no more connectable notes found, stopping");
-                break;
-            }
+            // NOTE: we deliberately do NOT stop when a whole batch failed to
+            // connect. Un-connectable notes (isolated, or whose only neighbours
+            // are filtered out) are skipped via `skip_offset` and the loop
+            // terminates naturally once the offset exhausts the candidate list
+            // (`batch.is_empty()` above). The old `if batch_connected == 0 break`
+            // stranded connectable notes whenever un-connectable ones clustered
+            // at the front of the (created_at-ordered) list — which is why a
+            // corpus dominated by isolated notes produced ZERO synapses.
         }
 
         let skipped = total.saturating_sub(processed + errors);
@@ -1795,8 +1792,6 @@ impl NoteManager {
             if batch.is_empty() || remaining == 0 {
                 break;
             }
-
-            let mut batch_connected = 0usize;
 
             for decision in &batch {
                 if let Some(flag) = cancel {
@@ -1897,7 +1892,6 @@ impl NoteManager {
                 {
                     Ok(created) => {
                         synapses_created += created;
-                        batch_connected += 1;
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -1918,12 +1912,9 @@ impl NoteManager {
                 "Synapse backfill (decisions): {processed}/{total} processed, {synapses_created} cross-entity synapses ({errors} errors)"
             );
 
-            if batch_connected == 0 {
-                tracing::info!(
-                    "Synapse backfill (decisions): no more connectable decisions, stopping"
-                );
-                break;
-            }
+            // See the note-synapse loop above: do not early-stop on an
+            // all-un-connectable batch; rely on skip_offset/offset exhaustion so
+            // connectable entities after a cluster of isolated ones are reached.
         }
 
         Ok((synapses_created, processed, errors))
