@@ -3967,9 +3967,9 @@ dependencies = [
 
 [[package]]
 name = "libc"
-version = "0.2.183"
+version = "0.2.186"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b5b646652bf6661599e1da8901b3b9522896f01e736bad5f723fe7a3a27f899d"
+checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
 name = "libdbus-sys"
@@ -4068,6 +4068,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0fae87c125b03c1d2c0150c90365d7d6bcc53fb73a9acaef207d2d065860f062"
 dependencies = [
  "imgref",
+]
+
+[[package]]
+name = "lru"
+version = "0.16.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f66e8d5d03f609abc3a39e6f08e4164ebf1447a732906d39eb9b99b7919ef39"
+dependencies = [
+ "hashbrown 0.16.1",
 ]
 
 [[package]]
@@ -4589,7 +4598,7 @@ dependencies = [
  "candle-core",
  "candle-nn",
  "chrono",
- "lru",
+ "lru 0.18.0",
  "moka",
  "neo4rs",
  "neural-routing-core",
@@ -5992,7 +6001,7 @@ dependencies = [
  "hmac",
  "jsonwebtoken",
  "libc",
- "lru",
+ "lru 0.16.4",
  "meilisearch-sdk",
  "mime_guess",
  "multibase",
