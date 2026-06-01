@@ -3099,6 +3099,7 @@ impl Neo4jClient {
             r#"
             MATCH (n:Note)
             WHERE n.embedding IS NOT NULL AND NOT (n)-[:SYNAPSE]->()
+              AND n.status IN ['active', 'needs_review']
             RETURN count(n) AS total
             "#,
         );
@@ -3118,6 +3119,7 @@ impl Neo4jClient {
             r#"
             MATCH (n:Note)
             WHERE n.embedding IS NOT NULL AND NOT (n)-[:SYNAPSE]->()
+              AND n.status IN ['active', 'needs_review']
             RETURN n
             ORDER BY n.created_at
             SKIP $offset LIMIT $limit
