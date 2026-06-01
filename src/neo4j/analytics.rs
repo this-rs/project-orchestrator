@@ -1465,13 +1465,16 @@ impl Neo4jClient {
             MATCH (p:Project {id: $project_id})-[:CONTAINS]->(f:File)
             OPTIONAL MATCH (n:Note)-[:LINKED_TO]->(f)
             WITH count(DISTINCT n) AS total_notes
-            OPTIONAL MATCH (n1:Note)-[s:SYNAPSE]->(n2:Note) WHERE s.weight >= 0.1
+            OPTIONAL MATCH (n1:Note)-[s:SYNAPSE]->(n2:Note)
+              WHERE n1.project_id = $project_id AND n2.project_id = $project_id AND s.weight >= 0.1
             WITH total_notes, count(s) AS active_synapses, avg(s.weight) AS avg_weight,
                  sum(CASE WHEN s.weight < $weak_threshold THEN 1 ELSE 0 END) AS weak_synapses
-            OPTIONAL MATCH (n:Note) WHERE n.energy IS NOT NULL AND n.energy < 0.05
+            OPTIONAL MATCH (n:Note)
+              WHERE n.project_id = $project_id AND n.energy IS NOT NULL AND n.energy < 0.05
             WITH total_notes, active_synapses, coalesce(avg_weight, 0) AS avg_weight,
                  coalesce(weak_synapses, 0) AS weak_synapses, count(n) AS dead_notes
-            OPTIONAL MATCH (rn:Note) WHERE rn.reactivation_count IS NOT NULL AND rn.reactivation_count > 0
+            OPTIONAL MATCH (rn:Note)
+              WHERE rn.project_id = $project_id AND rn.reactivation_count IS NOT NULL AND rn.reactivation_count > 0
             WITH total_notes, active_synapses, avg_weight, weak_synapses, dead_notes,
                  avg(coalesce(rn.reactivation_count, 0)) AS avg_reactivation
             RETURN active_synapses, avg_weight AS avg_energy,
