@@ -13,6 +13,15 @@ use tracing::{debug, info, warn};
 use crate::heartbeat::{HeartbeatCheck, HeartbeatContext};
 use crate::skills::maintenance::SkillMaintenanceConfig;
 
+/// Per-run timeout for deep maintenance.
+///
+/// `deep_maintenance` runs Louvain community detection + skill-evolution
+/// analysis + persistence across ALL projects, which cannot complete within
+/// the engine's 5s default. Without this override the run is cancelled every
+/// tick and `last_run` is never updated (see engine.rs), so it retries-and-
+/// times-out forever — meaning periodic skill detection/evolution never lands.
+const MAINTENANCE_TIMEOUT: Duration = Duration::from_secs(5 * 60); // 5 minutes
+
 /// Run deep maintenance on all projects (every 24 hours).
 pub struct MaintenanceCheck;
 
@@ -24,6 +33,10 @@ impl HeartbeatCheck for MaintenanceCheck {
 
     fn interval(&self) -> Duration {
         Duration::from_secs(24 * 60 * 60) // 24 hours
+    }
+
+    fn timeout_override(&self) -> Option<Duration> {
+        Some(MAINTENANCE_TIMEOUT)
     }
 
     async fn run(&self, ctx: &HeartbeatContext) -> Result<()> {
@@ -115,5 +128,18 @@ mod tests {
     fn test_maintenance_check_interval() {
         let check = MaintenanceCheck;
         assert_eq!(check.interval(), Duration::from_secs(24 * 3600));
+    }
+
+    #[test]
+    fn test_maintenance_check_timeout_override() {
+        // Must override the engine's 5s default, otherwise deep_maintenance
+        // (Louvain + evolution across all projects) is cancelled every tick and
+        // last_run is never updated → periodic skill creation never lands.
+        let check = MaintenanceCheck;
+        assert_eq!(check.timeout_override(), Some(Duration::from_secs(300)));
+        assert!(
+            check.timeout_override().unwrap() > Duration::from_secs(5),
+            "must exceed the engine default timeout"
+        );
     }
 }
