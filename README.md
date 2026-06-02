@@ -71,9 +71,8 @@ Download the desktop app for your platform:
 | **Windows** (64-bit) | [Download .exe](https://github.com/this-rs/project-orchestrator/releases/latest/download/Project.Orchestrator_0.0.14_x64-setup.exe) | Installer |
 | **Windows** (64-bit MSI) | [Download .msi](https://github.com/this-rs/project-orchestrator/releases/latest/download/Project.Orchestrator_0.0.14_x64_en-US.msi) | MSI |
 | **Linux** (x86_64 AppImage) | [Download .AppImage](https://github.com/this-rs/project-orchestrator/releases/latest/download/Project.Orchestrator_0.0.14_amd64.AppImage) | Intel/AMD |
-| **Linux** (arm64 AppImage) | [Download .AppImage](https://github.com/this-rs/project-orchestrator/releases/latest/download/Project.Orchestrator_0.0.14_aarch64.AppImage) | ARM64 (DGX Spark, Ampere, RPi…) |
 | **Linux** (Debian/Ubuntu x86_64) | [Download .deb](https://github.com/this-rs/project-orchestrator/releases/latest/download/Project.Orchestrator_0.0.14_amd64.deb) | apt/dpkg |
-| **Linux** (Debian/Ubuntu arm64) | [Download .deb](https://github.com/this-rs/project-orchestrator/releases/latest/download/Project.Orchestrator_0.0.14_arm64.deb) | apt/dpkg |
+| **Linux** (Debian/Ubuntu **arm64**) | [Download .deb](https://github.com/this-rs/project-orchestrator/releases/latest/download/Project.Orchestrator_0.0.14_arm64.deb) | apt/dpkg — ARM64 (DGX Spark, Ampere, RPi…) |
 | **Linux** (Fedora/RHEL x86_64) | [Download .rpm](https://github.com/this-rs/project-orchestrator/releases/latest/download/project-orchestrator-0.0.14-1.x86_64.rpm) | dnf/rpm |
 | **Linux** (Fedora/RHEL arm64) | [Download .rpm](https://github.com/this-rs/project-orchestrator/releases/latest/download/project-orchestrator-0.0.14-1.aarch64.rpm) | dnf/rpm |
 
