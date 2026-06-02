@@ -638,7 +638,10 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev
+          # xdg-utils (provides /usr/bin/xdg-open) + desktop-file-utils are preinstalled on
+          # the x86_64 ubuntu-latest image but NOT on ubuntu-24.04-arm — the Tauri AppImage
+          # bundler hard-fails without xdg-open ("xdg-open binary not found"). Install explicitly.
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev xdg-utils desktop-file-utils
 
       - name: Install Tauri CLI
         run: cargo install tauri-cli --version "^2"
