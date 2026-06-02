@@ -535,6 +535,17 @@ jobs:
             artifact_os: linux
             artifact_arch: x86_64
 
+          # Linux arm64 desktop bundle (AppImage + .deb). Built natively on a
+          # GitHub-hosted ARM runner — produces Project.Orchestrator_*_aarch64.AppImage
+          # and the arm64 .deb so ARM Linux machines (e.g. DGX Spark / aarch64)
+          # get a runnable desktop app instead of the x86_64 AppImage they can't
+          # execute (GNOME falls back to "mount as disk image" → nothing happens).
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            tauri_target: aarch64-unknown-linux-gnu
+            artifact_os: linux
+            artifact_arch: arm64
+
           - target: x86_64-pc-windows-msvc
             runner: windows-latest
             tauri_target: x86_64-pc-windows-msvc
