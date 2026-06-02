@@ -118,6 +118,19 @@ fn webview_log(level: String, message: String) {
 }
 
 fn main() {
+    // Linux launch fix (2026-06-02) — webkitgtk ≥ 2.42 ships a DMABUF renderer
+    // that crashes or shows a blank window at startup on many Linux setups
+    // (Wayland, NVIDIA proprietary, several recent Intel/Mesa stacks). This is
+    // the most common cause of "the Linux desktop app doesn't launch". Disable
+    // it BEFORE the webview initializes. No-op on macOS/Windows; respects an
+    // explicit user override if already set in the environment.
+    #[cfg(target_os = "linux")]
+    {
+        if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
+            std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+        }
+    }
+
     // Initialize tracing
     tracing_subscriber::registry()
         .with(
