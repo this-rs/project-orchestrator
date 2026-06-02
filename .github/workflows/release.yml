@@ -812,6 +812,11 @@ jobs:
       - name: Build Tauri bundle
         working-directory: desktop/src-tauri
         env:
+          # linuxdeploy + appimagetool are themselves AppImages and need FUSE to
+          # self-mount. Minimal CI runners (notably ubuntu-24.04-arm) ship no
+          # FUSE → "failed to run linuxdeploy". Extract-and-run avoids FUSE
+          # entirely. No-op on macOS/Windows.
+          APPIMAGE_EXTRACT_AND_RUN: "1"
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           # macOS — identity only, certificate is in our persistent keychain
