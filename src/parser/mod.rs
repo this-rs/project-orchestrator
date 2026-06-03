@@ -377,24 +377,68 @@ mod tests {
     #[test]
     fn test_parse_file_all_languages_smoke() {
         let cases: &[(&str, &str, &str)] = &[
-            ("a.rs", "pub fn foo() -> i32 { 1 }\nstruct S { x: i32 }\nenum E { A, B }\n", "rust"),
-            ("a.ts", "export function foo(): number { return 1; }\nclass C { m() {} }\n", "typescript"),
-            ("a.tsx", "export const C = () => <div/>;\nfunction g(){return 1;}\n", "typescript"),
-            ("a.js", "function foo(){ return 1; }\nclass C {}\n", "typescript"),
-            ("a.py", "def foo():\n    return 1\nclass C:\n    def m(self):\n        pass\n", "python"),
-            ("a.go", "package m\nimport \"fmt\"\nfunc Foo() int { return 1 }\n", "go"),
-            ("a.java", "package p;\nclass C { int foo() { return 1; } }\n", "java"),
+            (
+                "a.rs",
+                "pub fn foo() -> i32 { 1 }\nstruct S { x: i32 }\nenum E { A, B }\n",
+                "rust",
+            ),
+            (
+                "a.ts",
+                "export function foo(): number { return 1; }\nclass C { m() {} }\n",
+                "typescript",
+            ),
+            (
+                "a.tsx",
+                "export const C = () => <div/>;\nfunction g(){return 1;}\n",
+                "typescript",
+            ),
+            (
+                "a.js",
+                "function foo(){ return 1; }\nclass C {}\n",
+                "typescript",
+            ),
+            (
+                "a.py",
+                "def foo():\n    return 1\nclass C:\n    def m(self):\n        pass\n",
+                "python",
+            ),
+            (
+                "a.go",
+                "package m\nimport \"fmt\"\nfunc Foo() int { return 1 }\n",
+                "go",
+            ),
+            (
+                "a.java",
+                "package p;\nclass C { int foo() { return 1; } }\n",
+                "java",
+            ),
             ("a.c", "#include <stdio.h>\nint foo() { return 1; }\n", "c"),
-            ("a.cpp", "class C { public: int foo() { return 1; } };\n", "cpp"),
+            (
+                "a.cpp",
+                "class C { public: int foo() { return 1; } };\n",
+                "cpp",
+            ),
             ("a.rb", "def foo\n  1\nend\nclass C\nend\n", "ruby"),
-            ("a.php", "<?php\nfunction foo() { return 1; }\nclass C {}\n", "php"),
+            (
+                "a.php",
+                "<?php\nfunction foo() { return 1; }\nclass C {}\n",
+                "php",
+            ),
             ("a.kt", "fun foo(): Int { return 1 }\nclass C\n", "kotlin"),
-            ("a.swift", "func foo() -> Int { return 1 }\nclass C {}\n", "swift"),
+            (
+                "a.swift",
+                "func foo() -> Int { return 1 }\nclass C {}\n",
+                "swift",
+            ),
             ("a.sh", "foo() {\n  echo 1\n}\n", "bash"),
             ("a.cs", "class C { int Foo() { return 1; } }\n", "csharp"),
             ("a.scala", "object O { def foo(): Int = 1 }\n", "scala"),
             ("a.zig", "fn foo() i32 { return 1; }\n", "zig"),
-            ("a.tf", "resource \"aws_s3_bucket\" \"b\" {\n  bucket = \"x\"\n}\n", "hcl"),
+            (
+                "a.tf",
+                "resource \"aws_s3_bucket\" \"b\" {\n  bucket = \"x\"\n}\n",
+                "hcl",
+            ),
             ("a.dart", "int foo() { return 1; }\nclass C {}\n", "dart"),
         ];
         let mut parser = CodeParser::new().unwrap();
@@ -441,9 +485,15 @@ mod tests {
     #[test]
     fn test_parse_file_hash_is_content_addressed() {
         let mut parser = CodeParser::new().unwrap();
-        let a = parser.parse_file(&PathBuf::from("a.rs"), "fn x() {}\n").unwrap();
-        let b = parser.parse_file(&PathBuf::from("b.rs"), "fn x() {}\n").unwrap();
-        let c = parser.parse_file(&PathBuf::from("c.rs"), "fn y() {}\n").unwrap();
+        let a = parser
+            .parse_file(&PathBuf::from("a.rs"), "fn x() {}\n")
+            .unwrap();
+        let b = parser
+            .parse_file(&PathBuf::from("b.rs"), "fn x() {}\n")
+            .unwrap();
+        let c = parser
+            .parse_file(&PathBuf::from("c.rs"), "fn y() {}\n")
+            .unwrap();
         assert_eq!(a.hash, b.hash, "same content must hash equally");
         assert_ne!(a.hash, c.hash, "different content must hash differently");
     }
@@ -464,9 +514,18 @@ mod tests {
     /// from_extension is case-insensitive and rejects the empty/unknown case.
     #[test]
     fn test_from_extension_case_insensitive_and_unknown() {
-        assert_eq!(SupportedLanguage::from_extension("RS"), Some(SupportedLanguage::Rust));
-        assert_eq!(SupportedLanguage::from_extension("Py"), Some(SupportedLanguage::Python));
-        assert_eq!(SupportedLanguage::from_extension("DART"), Some(SupportedLanguage::Dart));
+        assert_eq!(
+            SupportedLanguage::from_extension("RS"),
+            Some(SupportedLanguage::Rust)
+        );
+        assert_eq!(
+            SupportedLanguage::from_extension("Py"),
+            Some(SupportedLanguage::Python)
+        );
+        assert_eq!(
+            SupportedLanguage::from_extension("DART"),
+            Some(SupportedLanguage::Dart)
+        );
         assert_eq!(SupportedLanguage::from_extension(""), None);
         assert_eq!(SupportedLanguage::from_extension("xyz"), None);
     }

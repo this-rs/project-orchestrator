@@ -341,8 +341,14 @@ mod tests {
     fn test_visibility_from_name_conventions() {
         assert!(matches!(visibility_from_name("Foo"), Visibility::Public));
         assert!(matches!(visibility_from_name("foo"), Visibility::Public));
-        assert!(matches!(visibility_from_name("_private"), Visibility::Private));
-        assert!(matches!(visibility_from_name("__dunder"), Visibility::Private));
+        assert!(matches!(
+            visibility_from_name("_private"),
+            Visibility::Private
+        ));
+        assert!(matches!(
+            visibility_from_name("__dunder"),
+            Visibility::Private
+        ));
         assert!(matches!(visibility_from_name(""), Visibility::Public));
     }
 

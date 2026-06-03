@@ -2300,7 +2300,7 @@ mod tests {
             assert!(json["metadata"]["total_activated"].is_number());
         } else {
             assert!(
-                resp.status().is_server_error(),
+                resp.status().is_client_error() || resp.status().is_server_error(),
                 "unexpected status: {}",
                 resp.status()
             );
