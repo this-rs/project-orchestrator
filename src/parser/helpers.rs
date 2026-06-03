@@ -326,3 +326,52 @@ pub fn extract_type_parameters(node: &tree_sitter::Node, source: &str) -> Vec<St
 
     generics
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_rust(src: &str) -> tree_sitter::Tree {
+        let mut p = tree_sitter::Parser::new();
+        p.set_language(&tree_sitter_rust::LANGUAGE.into()).unwrap();
+        p.parse(src, None).unwrap()
+    }
+
+    #[test]
+    fn test_visibility_from_name_conventions() {
+        assert!(matches!(visibility_from_name("Foo"), Visibility::Public));
+        assert!(matches!(visibility_from_name("foo"), Visibility::Public));
+        assert!(matches!(visibility_from_name("_private"), Visibility::Private));
+        assert!(matches!(visibility_from_name("__dunder"), Visibility::Private));
+        assert!(matches!(visibility_from_name(""), Visibility::Public));
+    }
+
+    #[test]
+    fn test_get_text_and_child_lookup() {
+        let src = "fn alpha() {}\nstruct S;\n";
+        let tree = parse_rust(src);
+        let root = tree.root_node();
+        let text = get_text(&root, src).expect("root text");
+        assert!(text.contains("alpha"));
+        assert!(has_child_kind(&root, "function_item"));
+        assert!(find_child_by_kind(&root, "struct_item").is_some());
+        assert!(!has_child_kind(&root, "this_kind_does_not_exist"));
+        assert!(find_child_by_kind(&root, "this_kind_does_not_exist").is_none());
+    }
+
+    #[test]
+    fn test_calculate_complexity_grows_with_branches() {
+        let simple = parse_rust("fn f() { let x = 1; let _ = x; }");
+        let branchy = parse_rust(
+            "fn f(a: i32) -> i32 { if a > 0 { return 1; } else { } \
+             while a > 0 { } match a { 0 => {}, _ => {} } a }",
+        );
+        let c_simple = calculate_complexity(&simple.root_node());
+        let c_branchy = calculate_complexity(&branchy.root_node());
+        assert!(c_simple >= 1);
+        assert!(
+            c_branchy > c_simple,
+            "branchy complexity {c_branchy} should exceed simple {c_simple}"
+        );
+    }
+}
