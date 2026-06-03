@@ -367,6 +367,111 @@ mod tests {
     use std::path::PathBuf;
 
     // =========================================================================
+    // Coverage batch 1 — exercise every language extractor + metadata helpers.
+    // The smoke test below runs parse_file for all 18 supported languages,
+    // covering the per-language extraction code in src/parser/languages/*.
+    // =========================================================================
+
+    /// One representative snippet per language: parse must succeed, report the
+    /// right language tag, produce a content hash, and not panic.
+    #[test]
+    fn test_parse_file_all_languages_smoke() {
+        let cases: &[(&str, &str, &str)] = &[
+            ("a.rs", "pub fn foo() -> i32 { 1 }\nstruct S { x: i32 }\nenum E { A, B }\n", "rust"),
+            ("a.ts", "export function foo(): number { return 1; }\nclass C { m() {} }\n", "typescript"),
+            ("a.tsx", "export const C = () => <div/>;\nfunction g(){return 1;}\n", "typescript"),
+            ("a.js", "function foo(){ return 1; }\nclass C {}\n", "typescript"),
+            ("a.py", "def foo():\n    return 1\nclass C:\n    def m(self):\n        pass\n", "python"),
+            ("a.go", "package m\nimport \"fmt\"\nfunc Foo() int { return 1 }\n", "go"),
+            ("a.java", "package p;\nclass C { int foo() { return 1; } }\n", "java"),
+            ("a.c", "#include <stdio.h>\nint foo() { return 1; }\n", "c"),
+            ("a.cpp", "class C { public: int foo() { return 1; } };\n", "cpp"),
+            ("a.rb", "def foo\n  1\nend\nclass C\nend\n", "ruby"),
+            ("a.php", "<?php\nfunction foo() { return 1; }\nclass C {}\n", "php"),
+            ("a.kt", "fun foo(): Int { return 1 }\nclass C\n", "kotlin"),
+            ("a.swift", "func foo() -> Int { return 1 }\nclass C {}\n", "swift"),
+            ("a.sh", "foo() {\n  echo 1\n}\n", "bash"),
+            ("a.cs", "class C { int Foo() { return 1; } }\n", "csharp"),
+            ("a.scala", "object O { def foo(): Int = 1 }\n", "scala"),
+            ("a.zig", "fn foo() i32 { return 1; }\n", "zig"),
+            ("a.tf", "resource \"aws_s3_bucket\" \"b\" {\n  bucket = \"x\"\n}\n", "hcl"),
+            ("a.dart", "int foo() { return 1; }\nclass C {}\n", "dart"),
+        ];
+        let mut parser = CodeParser::new().unwrap();
+        for (fname, src, lang) in cases {
+            let parsed = parser
+                .parse_file(&PathBuf::from(fname), src)
+                .unwrap_or_else(|e| panic!("parse_file failed for {fname}: {e}"));
+            assert_eq!(&parsed.language, lang, "language mismatch for {fname}");
+            assert!(!parsed.hash.is_empty(), "empty hash for {fname}");
+            assert_eq!(parsed.path, *fname);
+        }
+    }
+
+    /// Major languages should extract at least one function symbol — exercises
+    /// the function-extraction branch of each extractor.
+    #[test]
+    fn test_parse_file_extracts_functions_major_langs() {
+        let cases: &[(&str, &str)] = &[
+            ("a.rs", "fn alpha() {}\nfn beta() {}\n"),
+            ("a.py", "def alpha():\n    pass\ndef beta():\n    pass\n"),
+            ("a.go", "package m\nfunc Alpha() {}\nfunc Beta() {}\n"),
+            ("a.ts", "function alpha(){}\nfunction beta(){}\n"),
+            ("a.java", "class C { void alpha(){} void beta(){} }\n"),
+        ];
+        let mut parser = CodeParser::new().unwrap();
+        for (fname, src) in cases {
+            let parsed = parser.parse_file(&PathBuf::from(fname), src).unwrap();
+            assert!(
+                !parsed.functions.is_empty() || !parsed.symbols.is_empty(),
+                "no functions/symbols extracted for {fname}"
+            );
+        }
+    }
+
+    /// Unknown extension → parse_file errors (Unsupported file extension path).
+    #[test]
+    fn test_parse_file_unsupported_extension_errors() {
+        let mut parser = CodeParser::new().unwrap();
+        let res = parser.parse_file(&PathBuf::from("a.unknownext"), "whatever");
+        assert!(res.is_err(), "expected error for unsupported extension");
+    }
+
+    /// Same content → same hash; different content → different hash.
+    #[test]
+    fn test_parse_file_hash_is_content_addressed() {
+        let mut parser = CodeParser::new().unwrap();
+        let a = parser.parse_file(&PathBuf::from("a.rs"), "fn x() {}\n").unwrap();
+        let b = parser.parse_file(&PathBuf::from("b.rs"), "fn x() {}\n").unwrap();
+        let c = parser.parse_file(&PathBuf::from("c.rs"), "fn y() {}\n").unwrap();
+        assert_eq!(a.hash, b.hash, "same content must hash equally");
+        assert_ne!(a.hash, c.hash, "different content must hash differently");
+    }
+
+    /// SupportedLanguage::all() and as_str() round-trip + are non-empty/unique.
+    #[test]
+    fn test_supported_language_all_and_as_str() {
+        let all = SupportedLanguage::all();
+        assert!(all.len() >= 17, "expected all supported languages");
+        let mut names: Vec<&str> = all.iter().map(|l| l.as_str()).collect();
+        let n = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), n, "as_str() names must be unique");
+        assert!(names.iter().all(|s| !s.is_empty()));
+    }
+
+    /// from_extension is case-insensitive and rejects the empty/unknown case.
+    #[test]
+    fn test_from_extension_case_insensitive_and_unknown() {
+        assert_eq!(SupportedLanguage::from_extension("RS"), Some(SupportedLanguage::Rust));
+        assert_eq!(SupportedLanguage::from_extension("Py"), Some(SupportedLanguage::Python));
+        assert_eq!(SupportedLanguage::from_extension("DART"), Some(SupportedLanguage::Dart));
+        assert_eq!(SupportedLanguage::from_extension(""), None);
+        assert_eq!(SupportedLanguage::from_extension("xyz"), None);
+    }
+
+    // =========================================================================
     // SupportedLanguage Tests
     // =========================================================================
 
