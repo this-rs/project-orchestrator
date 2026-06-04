@@ -455,3 +455,244 @@ async fn test_neo4j_stale_file_cleanup() {
         .await
         .unwrap();
 }
+
+// ============================================================================
+// GraphStore task operations (coverage batch — exercises src/neo4j/task.rs)
+// ============================================================================
+
+fn make_task(title: &str, status: TaskStatus) -> TaskNode {
+    TaskNode {
+        id: Uuid::new_v4(),
+        title: Some(title.to_string()),
+        description: format!("description for {title}"),
+        status,
+        assigned_to: None,
+        priority: Some(5),
+        tags: vec!["test".to_string()],
+        acceptance_criteria: vec![],
+        affected_files: vec![],
+        estimated_complexity: Some(3),
+        actual_complexity: None,
+        created_at: chrono::Utc::now(),
+        updated_at: None,
+        started_at: None,
+        completed_at: None,
+        frustration_score: 0.0,
+        execution_context: None,
+        persona: None,
+        prompt_cache: None,
+    }
+}
+
+fn make_step(order: u32, desc: &str) -> StepNode {
+    StepNode {
+        id: Uuid::new_v4(),
+        order,
+        description: desc.to_string(),
+        status: StepStatus::Pending,
+        verification: None,
+        created_at: chrono::Utc::now(),
+        updated_at: None,
+        completed_at: None,
+        execution_context: None,
+        persona: None,
+    }
+}
+
+async fn setup_plan(state: &AppState) -> Uuid {
+    let plan = PlanNode::new(
+        format!("Plan {}", Uuid::new_v4()),
+        "task-test plan".to_string(),
+        "test-agent".to_string(),
+        5,
+    );
+    state.neo4j.create_plan(&plan).await.unwrap();
+    plan.id
+}
+
+#[tokio::test]
+async fn test_neo4j_task_create_get_list() {
+    if !backends_available().await {
+        return;
+    }
+    let state = AppState::new(test_config()).await.unwrap();
+    let plan_id = setup_plan(&state).await;
+    let task = make_task("alpha", TaskStatus::Pending);
+    state.neo4j.create_task(plan_id, &task).await.unwrap();
+
+    let got = state.neo4j.get_task(task.id).await.unwrap();
+    assert!(got.is_some());
+    assert_eq!(got.unwrap().title.as_deref(), Some("alpha"));
+
+    let tasks = state.neo4j.get_plan_tasks(plan_id).await.unwrap();
+    assert!(tasks.iter().any(|t| t.id == task.id));
+
+    state.neo4j.delete_task(task.id).await.ok();
+    state.neo4j.delete_plan(plan_id).await.ok();
+}
+
+#[tokio::test]
+async fn test_neo4j_task_get_not_found() {
+    if !backends_available().await {
+        return;
+    }
+    let state = AppState::new(test_config()).await.unwrap();
+    let got = state.neo4j.get_task(Uuid::new_v4()).await.unwrap();
+    assert!(got.is_none());
+}
+
+#[tokio::test]
+async fn test_neo4j_task_update_status_and_assign() {
+    if !backends_available().await {
+        return;
+    }
+    let state = AppState::new(test_config()).await.unwrap();
+    let plan_id = setup_plan(&state).await;
+    let task = make_task("beta", TaskStatus::Pending);
+    state.neo4j.create_task(plan_id, &task).await.unwrap();
+
+    state
+        .neo4j
+        .update_task_status(task.id, TaskStatus::Completed)
+        .await
+        .unwrap();
+    // assign_task exercises the assignment write path (relationship-based, not
+    // necessarily reflected in the TaskNode.assigned_to scalar) — assert it
+    // succeeds rather than asserting the scalar round-trips.
+    state.neo4j.assign_task(task.id, "agent-7").await.unwrap();
+
+    let got = state.neo4j.get_task(task.id).await.unwrap().unwrap();
+    assert_eq!(got.status, TaskStatus::Completed);
+
+    state.neo4j.delete_task(task.id).await.ok();
+    state.neo4j.delete_plan(plan_id).await.ok();
+}
+
+#[tokio::test]
+async fn test_neo4j_task_dependency_blockers() {
+    if !backends_available().await {
+        return;
+    }
+    let state = AppState::new(test_config()).await.unwrap();
+    let plan_id = setup_plan(&state).await;
+    let t1 = make_task("dep-base", TaskStatus::Pending);
+    let t2 = make_task("dep-dependent", TaskStatus::Pending);
+    state.neo4j.create_task(plan_id, &t1).await.unwrap();
+    state.neo4j.create_task(plan_id, &t2).await.unwrap();
+
+    state.neo4j.add_task_dependency(t2.id, t1.id).await.unwrap();
+    let deps = state.neo4j.get_task_dependencies(t2.id).await.unwrap();
+    assert!(deps.iter().any(|t| t.id == t1.id));
+    let blocked_by = state.neo4j.get_tasks_blocked_by(t1.id).await.unwrap();
+    assert!(blocked_by.iter().any(|t| t.id == t2.id));
+
+    state
+        .neo4j
+        .remove_task_dependency(t2.id, t1.id)
+        .await
+        .unwrap();
+    let deps_after = state.neo4j.get_task_dependencies(t2.id).await.unwrap();
+    assert!(deps_after.iter().all(|t| t.id != t1.id));
+
+    state.neo4j.delete_task(t1.id).await.ok();
+    state.neo4j.delete_task(t2.id).await.ok();
+    state.neo4j.delete_plan(plan_id).await.ok();
+}
+
+#[tokio::test]
+async fn test_neo4j_task_update_fields() {
+    if !backends_available().await {
+        return;
+    }
+    let state = AppState::new(test_config()).await.unwrap();
+    let plan_id = setup_plan(&state).await;
+    let task = make_task("gamma", TaskStatus::Pending);
+    state.neo4j.create_task(plan_id, &task).await.unwrap();
+
+    let updates = project_orchestrator::plan::models::UpdateTaskRequest {
+        title: Some("gamma-renamed".to_string()),
+        priority: Some(9),
+        ..Default::default()
+    };
+    state.neo4j.update_task(task.id, &updates).await.unwrap();
+
+    let got = state.neo4j.get_task(task.id).await.unwrap().unwrap();
+    assert_eq!(got.title.as_deref(), Some("gamma-renamed"));
+    assert_eq!(got.priority, Some(9));
+
+    state.neo4j.delete_task(task.id).await.ok();
+    state.neo4j.delete_plan(plan_id).await.ok();
+}
+
+#[tokio::test]
+async fn test_neo4j_task_delete() {
+    if !backends_available().await {
+        return;
+    }
+    let state = AppState::new(test_config()).await.unwrap();
+    let plan_id = setup_plan(&state).await;
+    let task = make_task("to-delete", TaskStatus::Pending);
+    state.neo4j.create_task(plan_id, &task).await.unwrap();
+    state.neo4j.delete_task(task.id).await.unwrap();
+    assert!(state.neo4j.get_task(task.id).await.unwrap().is_none());
+    state.neo4j.delete_plan(plan_id).await.ok();
+}
+
+#[tokio::test]
+async fn test_neo4j_task_steps_and_progress() {
+    if !backends_available().await {
+        return;
+    }
+    let state = AppState::new(test_config()).await.unwrap();
+    let plan_id = setup_plan(&state).await;
+    let task = make_task("with-steps", TaskStatus::Pending);
+    state.neo4j.create_task(plan_id, &task).await.unwrap();
+
+    state
+        .neo4j
+        .create_step(task.id, &make_step(1, "first"))
+        .await
+        .unwrap();
+    state
+        .neo4j
+        .create_step(task.id, &make_step(2, "second"))
+        .await
+        .unwrap();
+
+    let steps = state.neo4j.get_task_steps(task.id).await.unwrap();
+    assert_eq!(steps.len(), 2);
+    let (done, total) = state.neo4j.get_task_step_progress(task.id).await.unwrap();
+    assert_eq!((done, total), (0, 2));
+
+    let completed = state
+        .neo4j
+        .complete_pending_steps_for_task(task.id)
+        .await
+        .unwrap();
+    assert_eq!(completed, 2);
+    let (done2, total2) = state.neo4j.get_task_step_progress(task.id).await.unwrap();
+    assert_eq!((done2, total2), (2, 2));
+
+    state.neo4j.delete_task(task.id).await.ok();
+    state.neo4j.delete_plan(plan_id).await.ok();
+}
+
+#[tokio::test]
+async fn test_neo4j_task_plan_and_next_available() {
+    if !backends_available().await {
+        return;
+    }
+    let state = AppState::new(test_config()).await.unwrap();
+    let plan_id = setup_plan(&state).await;
+    let task = make_task("ready", TaskStatus::Pending);
+    state.neo4j.create_task(plan_id, &task).await.unwrap();
+
+    let resolved_plan = state.neo4j.get_plan_id_for_task(task.id).await.unwrap();
+    assert_eq!(resolved_plan, Some(plan_id));
+
+    let next = state.neo4j.get_next_available_task(plan_id).await.unwrap();
+    assert!(next.is_some());
+
+    state.neo4j.delete_task(task.id).await.ok();
+    state.neo4j.delete_plan(plan_id).await.ok();
+}
