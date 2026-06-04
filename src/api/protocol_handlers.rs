@@ -2391,4 +2391,127 @@ mod tests {
         assert!(response.success);
         assert_eq!(response.current_state_name, "work");
     }
+
+    // ----------------------------------------------------------------
+    // Handler coverage batch — CRUD handlers via direct calls against the
+    // mock GraphStore (no DB). Each test gets its own isolated state.
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_handler_list_protocols_ok() {
+        let (state, project_id, _) = make_state_with_protocol().await;
+        let q = ProtocolsListQuery {
+            pagination: PaginationParams::default(),
+            project_id,
+            category: None,
+        };
+        let res = list_protocols(State(state), axum::extract::Query(q)).await;
+        assert!(res.is_ok(), "list_protocols failed: {:?}", res.err());
+    }
+
+    #[tokio::test]
+    async fn test_handler_get_protocol_ok_and_not_found() {
+        let (state, _project_id, proto_id) = make_state_with_protocol().await;
+        assert!(get_protocol(State(state.clone()), Path(proto_id))
+            .await
+            .is_ok());
+        let missing = get_protocol(State(state), Path(Uuid::new_v4())).await;
+        assert!(matches!(missing, Err(AppError::NotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn test_handler_list_states_returns_seeded_three() {
+        let (state, _project_id, proto_id) = make_state_with_protocol().await;
+        let states = list_states(State(state), Path(proto_id)).await.unwrap().0;
+        assert_eq!(states.len(), 3);
+        assert!(states.iter().any(|s| s.name == "start"));
+        assert!(states.iter().any(|s| s.name == "done"));
+    }
+
+    #[tokio::test]
+    async fn test_handler_list_transitions_ok_empty() {
+        let (state, _project_id, proto_id) = make_state_with_protocol().await;
+        let transitions = list_transitions(State(state), Path(proto_id))
+            .await
+            .unwrap()
+            .0;
+        assert!(transitions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_handler_add_state_then_listed() {
+        let (state, _project_id, proto_id) = make_state_with_protocol().await;
+        let body = AddStateBody {
+            name: "review".to_string(),
+            description: Some("review step".to_string()),
+            state_type: Some("intermediate".to_string()),
+            action: None,
+            prompt_fragment: None,
+            available_tools: None,
+            forbidden_actions: None,
+        };
+        let added = add_state(State(state.clone()), Path(proto_id), Json(body)).await;
+        assert!(added.is_ok(), "add_state failed: {:?}", added.err());
+        let states = list_states(State(state), Path(proto_id)).await.unwrap().0;
+        assert_eq!(states.len(), 4);
+        assert!(states.iter().any(|s| s.name == "review"));
+    }
+
+    #[tokio::test]
+    async fn test_handler_delete_state_ok() {
+        let (state, _project_id, proto_id) = make_state_with_protocol().await;
+        let states = list_states(State(state.clone()), Path(proto_id))
+            .await
+            .unwrap()
+            .0;
+        let target = states.iter().find(|s| s.name == "work").unwrap().id;
+        let res = delete_state(State(state.clone()), Path((proto_id, target))).await;
+        assert!(res.is_ok(), "delete_state failed: {:?}", res.err());
+        let after = list_states(State(state), Path(proto_id)).await.unwrap().0;
+        assert_eq!(after.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_handler_update_protocol_ok() {
+        let (state, _project_id, proto_id) = make_state_with_protocol().await;
+        let body = UpdateProtocolBody {
+            name: Some("renamed-proto".to_string()),
+            description: Some("updated".to_string()),
+            protocol_category: None,
+            trigger_mode: None,
+            trigger_config: None,
+            relevance_vector: None,
+        };
+        let res = update_protocol(State(state), Path(proto_id), Json(body)).await;
+        assert!(res.is_ok(), "update_protocol failed: {:?}", res.err());
+        assert_eq!(res.unwrap().0.name, "renamed-proto");
+    }
+
+    #[tokio::test]
+    async fn test_handler_delete_protocol_ok() {
+        let (state, _project_id, proto_id) = make_state_with_protocol().await;
+        let res = delete_protocol(State(state.clone()), Path(proto_id)).await;
+        assert!(res.is_ok(), "delete_protocol failed: {:?}", res.err());
+        // After deletion the protocol is gone.
+        let gone = get_protocol(State(state), Path(proto_id)).await;
+        assert!(matches!(gone, Err(AppError::NotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn test_handler_get_run_not_found() {
+        let (state, _project_id, _proto_id) = make_state_with_protocol().await;
+        let res = get_run(State(state), Path(Uuid::new_v4())).await;
+        assert!(matches!(res, Err(AppError::NotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn test_handler_list_runs_ok_empty() {
+        let (state, _project_id, proto_id) = make_state_with_protocol().await;
+        let q = RunsListQuery {
+            pagination: PaginationParams::default(),
+            status: None,
+        };
+        let res = list_runs(State(state), Path(proto_id), axum::extract::Query(q)).await;
+        assert!(res.is_ok(), "list_runs failed: {:?}", res.err());
+    }
 }
