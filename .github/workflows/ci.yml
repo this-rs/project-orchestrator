@@ -304,6 +304,33 @@ jobs:
     name: Code Coverage
     runs-on: ubuntu-latest
     needs: [build]
+    services:
+      neo4j:
+        image: neo4j:5
+        env:
+          NEO4J_AUTH: neo4j/testpassword
+          NEO4J_PLUGINS: '["apoc"]'
+        ports:
+          - 7687:7687
+          - 7474:7474
+        options: >-
+          --health-cmd "cypher-shell -u neo4j -p testpassword 'RETURN 1' || exit 1"
+          --health-interval 10s
+          --health-timeout 10s
+          --health-retries 10
+          --health-start-period 30s
+      meilisearch:
+        image: getmeili/meilisearch:v1.34
+        env:
+          MEILI_MASTER_KEY: test-master-key
+          MEILI_NO_ANALYTICS: true
+        ports:
+          - 7700:7700
+        options: >-
+          --health-cmd "curl -sf http://localhost:7700/health || exit 1"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v6
 
@@ -321,12 +348,24 @@ jobs:
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
 
-      # Coverage includes all #[cfg(test)] modules: mock-based tests (MockGraphStore,
-      # MockSearchStore), MCP handler tests, PlanManager tests, NoteManager tests,
-      # and parser tests. Integration/API tests are excluded because they require
-      # Neo4j and Meilisearch services (covered in separate CI jobs).
-      - name: Generate coverage report (unit + mock tests)
-        run: cargo llvm-cov --lib --test parser_tests --lcov --output-path lcov.info
+      - name: Wait for services to be ready
+        run: |
+          timeout 90 bash -c 'until curl -sf http://localhost:7474 > /dev/null 2>&1; do sleep 2; done'
+          timeout 60 bash -c 'until curl -sf http://localhost:7700/health > /dev/null 2>&1; do sleep 2; done'
+          echo "Neo4j + Meilisearch ready"
+
+      # Coverage spans unit/mock tests (MockGraphStore, MCP/Plan/Note managers,
+      # parser) AND the Neo4j integration tests. Neo4j + Meilisearch services are
+      # provisioned above so the neo4j GraphStore implementations are exercised
+      # and counted toward coverage instead of being excluded.
+      - name: Generate coverage report (unit + integration)
+        env:
+          NEO4J_URI: bolt://localhost:7687
+          NEO4J_USER: neo4j
+          NEO4J_PASSWORD: testpassword
+          MEILISEARCH_URL: http://localhost:7700
+          MEILISEARCH_KEY: test-master-key
+        run: cargo llvm-cov --lib --test parser_tests --test integration_tests --lcov --output-path lcov.info
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v6
