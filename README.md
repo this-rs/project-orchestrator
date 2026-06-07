@@ -37,6 +37,101 @@ Project Orchestrator gives your AI agents a shared brain. Instead of each agent 
 
 ---
 
+## ⚠️ Important Notice — Anthropic Billing Change (June 15, 2026)
+
+> **Read this before connecting Project Orchestrator to a Claude subscription.**
+
+Starting **June 15, 2026**, Anthropic is splitting how Claude usage is metered.
+**Programmatic / agent-based Claude usage no longer draws from your standard subscription usage limits.** It now consumes a **separate, capped monthly Agent SDK credit, billed at standard API list rates.**
+
+Because Project Orchestrator orchestrates Claude through the **Claude Agent SDK**, the `claude -p` non-interactive mode, the GitHub Actions integration, and third-party agent authentication, **all PO-driven Claude calls fall under this new metered pool — not under your interactive Pro/Max chat quota.**
+
+### What is affected
+
+The following PO features route through the Agent SDK billing pool starting June 15, 2026:
+
+- Autonomous plan execution (`plan(action: "run")`, wave dispatch, delegated tasks)
+- Chat sessions launched from PO (the WebSocket chat manager)
+- Any sub-agent spawned by PO (personas, protocol runs, RFC reviews, code-review skills)
+- The `claude -p` / Claude Code GitHub Actions paths invoked by PO automations
+- MCP tool calls Claude makes back into PO during an agent run
+
+Interactive use of `claude` in your terminal, the Claude.ai web/desktop/mobile apps, and Claude Cowork are **not** affected — those keep their normal subscription limits.
+
+### Monthly Agent SDK credit (per Anthropic's published policy)
+
+| Plan | Monthly Agent SDK Credit |
+|------|--------------------------|
+| Pro | **$20** |
+| Max 5x | **$100** |
+| Max 20x | **$200** |
+| Team — Standard seat | $20 / seat |
+| Team — Premium seat | $100 / seat |
+| Enterprise — usage-based | $20 |
+| Enterprise — Premium seat | $200 |
+| Enterprise — Standard seat | **Not eligible** |
+
+Key rules:
+
+- **Credit is consumed at standard Anthropic API list rates** — not at "all-you-can-eat" subscription rates.
+- **Credits do not roll over.** Unused balance is lost at the end of the billing cycle.
+- **Credits are per-user, non-pooled, non-transferable.** Teams cannot share a credit pool.
+- **One-time opt-in is required.** If you do not claim it before June 15, you forfeit the credit allowance for that cycle.
+- **When the credit runs out:**
+  - With **"usage credits" overflow enabled** → additional calls continue at standard API rates (you pay).
+  - With overflow **disabled** → calls hard-stop until the next billing cycle. Your PO automations will halt.
+
+### 🚨 What this means for Project Orchestrator users
+
+PO is designed to fan out work across many parallel sub-agents (waves, personas, protocol runs, RFC reviews, completeness critics, adversarial verifiers). **Under the new model, these patterns can burn through a Pro ($20) or even a Max 20x ($200) monthly credit much faster than under the old flat-rate model** — anywhere from ~12× to 150×+ more expensive depending on workload, according to multiple third-party analyses.
+
+A single deep PO run (a multi-wave plan, a comprehensive review, or a long autonomous loop) can consume a significant share of a monthly credit. **Plan and budget accordingly.**
+
+### Recommended actions before June 15, 2026
+
+1. **Claim your Agent SDK credit** via the Anthropic email / Help Center flow. No claim = no credit.
+2. **Audit your current PO Claude usage at API list rates** — compare against your tier's credit cap.
+3. **Decide deliberately about overflow billing:**
+   - Enable it if you need PO to keep working past the cap (you accept paying API rates).
+   - Disable it if you want a hard cap and accept that PO automations will stop mid-month.
+4. **Right-size your plan or your workflow.** If your typical PO usage exceeds the credit, either upgrade your plan, reduce the depth/breadth of your workflows (smaller waves, shorter loops, smaller models per `model` opt in `agent()` calls), or move to a direct API key + usage-based billing.
+5. **Configure budgets per plan.** PO exposes a `budget.total` mechanism inside workflows — use it. Bound your `while (budget.remaining() > N)` loops. Do not run uncapped autonomous loops against a metered credit.
+6. **Watch your CI agents.** GitHub Actions-driven PO runs on every PR can drain a monthly credit in days on busy repos.
+7. **Notify your team.** Anyone who can trigger a PO autonomous plan, scheduled trigger, or webhook can spend the credit.
+
+### ⚖️ Disclaimer of Responsibility
+
+**The Project Orchestrator maintainers are not responsible for any usage, cost, billing, overage, or service interruption you may incur with Anthropic (or any other LLM provider) as a result of using Project Orchestrator.**
+
+This includes, without limitation:
+
+- Exhaustion of your monthly Agent SDK credit.
+- Charges accrued via overflow billing at standard API rates.
+- Unexpected costs from autonomous loops, scheduled triggers, webhook-driven runs, recurring routines, or background workflows you configured.
+- Costs from sub-agents, parallel waves, personas, or protocol runs spawned by your plans.
+- Interruption of your PO-driven automations when the credit is exhausted.
+- Any change in Anthropic's (or any other provider's) pricing, quotas, eligibility, or terms.
+
+Project Orchestrator is provided **as-is, under the MIT license, with no warranty**. By using PO with any paid LLM provider, **you accept full responsibility for monitoring your own usage, configuring your own caps, and paying your own bills.**
+
+### 🧭 User Responsibility — On What You Build
+
+Project Orchestrator is a powerful agent harness. It can spawn many sub-agents, take autonomous actions on your codebase, commit code, open PRs, run scheduled triggers, and operate at considerable speed and scale.
+
+**You are responsible for what you build with it.** This includes:
+
+- **Reviewing the code, plans, decisions, and notes** that agents produce before trusting them. PO does not replace human judgment.
+- **Setting appropriate permission, sandboxing, and approval boundaries** for autonomous and scheduled work. PO will do what you tell it to do.
+- **Respecting the law, third-party terms of service, intellectual property, privacy, and security** in the workflows, skills, personas, and protocols you create and share.
+- **Auditing exported / imported skills and personas** before publishing them via the registry or importing them into your projects. Federation is opt-in and your responsibility.
+- **The integrity of any production system** PO interacts with. Autonomous tooling and production systems should be combined with care.
+
+If your use of Project Orchestrator causes harm, cost, data loss, or any other consequence — to yourself, your team, your users, or third parties — **that responsibility is yours, not the maintainers'.**
+
+For Anthropic's official statement of the change, see the [Claude Agent SDK plan article](https://support.claude.com/en/articles/15036540-use-the-claude-agent-sdk-with-your-claude-plan).
+
+---
+
 ## Features
 
 - **Shared Knowledge Base** — Code structure stored in Neo4j graph database, accessible to all agents
