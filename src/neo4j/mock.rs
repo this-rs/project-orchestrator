@@ -5726,6 +5726,21 @@ impl GraphStore for MockGraphStore {
         }
     }
 
+    async fn record_notes_served(&self, note_ids: &[Uuid]) -> Result<usize> {
+        let mut notes = self.notes.write().await;
+        let mut updated = 0;
+        for id in note_ids {
+            if let Some(n) = notes.get_mut(id) {
+                n.last_activated = Some(chrono::Utc::now());
+                n.reactivation_count += 1;
+                // Serving is weaker evidence than confirm (+0.3) → +0.05.
+                n.energy = (n.energy + 0.05).min(1.0);
+                updated += 1;
+            }
+        }
+        Ok(updated)
+    }
+
     async fn get_notes_needing_review(&self, project_id: Option<Uuid>) -> Result<Vec<Note>> {
         let notes = self.notes.read().await;
         Ok(notes

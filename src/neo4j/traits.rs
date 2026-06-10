@@ -1480,6 +1480,12 @@ pub trait GraphStore: Send + Sync {
     /// Confirm a note is still valid
     async fn confirm_note(&self, note_id: Uuid, confirmed_by: &str) -> Result<Option<Note>>;
 
+    /// Record that notes were served into a context (search/get_context).
+    /// The activation sensor: bumps last_activated + reactivation_count and
+    /// gives a small energy boost, so energy decay measures real disuse
+    /// instead of killing frequently-served notes (R* review 2026-06-10).
+    async fn record_notes_served(&self, note_ids: &[Uuid]) -> Result<usize>;
+
     /// Get notes that need review (stale or needs_review status)
     async fn get_notes_needing_review(&self, project_id: Option<Uuid>) -> Result<Vec<Note>>;
 

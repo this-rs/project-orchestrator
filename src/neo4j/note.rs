@@ -1674,6 +1674,44 @@ impl Neo4jClient {
         }
     }
 
+    /// Record that notes were SERVED into a context (search hit, get_context,
+    /// semantic search). R* review 2026-06-10 — the activation sensor.
+    ///
+    /// Before this, the energy lifecycle was open-loop on the read side:
+    /// `update_energy_scores` decayed on `days_idle` (from last_activated) but
+    /// no serving path ever wrote `last_activated`, so every note decayed to
+    /// death regardless of how often it was actually used (observed: 100/100
+    /// dead notes on an actively-read project). Serving is weaker evidence
+    /// than an explicit confirm (+0.3), so the boost is +0.05, capped at 1.0.
+    pub async fn record_notes_served(&self, note_ids: &[Uuid]) -> Result<usize> {
+        if note_ids.is_empty() {
+            return Ok(0);
+        }
+        let ids: Vec<String> = note_ids.iter().map(|id| id.to_string()).collect();
+        let q = query(
+            r#"
+            UNWIND $ids AS nid
+            MATCH (n:Note {id: nid})
+            SET n.last_activated = datetime(),
+                n.reactivation_count = coalesce(n.reactivation_count, 0) + 1,
+                n.energy = CASE
+                    WHEN coalesce(n.energy, 0.5) + 0.05 > 1.0 THEN 1.0
+                    ELSE coalesce(n.energy, 0.5) + 0.05
+                END
+            RETURN count(n) AS updated
+            "#,
+        )
+        .param("ids", ids);
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let updated: i64 = row.get("updated").unwrap_or(0);
+            Ok(updated as usize)
+        } else {
+            Ok(0)
+        }
+    }
+
     /// Get notes that need review (stale or needs_review status)
     pub async fn get_notes_needing_review(&self, project_id: Option<Uuid>) -> Result<Vec<Note>> {
         let project_filter = project_id

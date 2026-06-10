@@ -1887,6 +1887,10 @@ impl GraphStore for Neo4jClient {
         self.confirm_note(note_id, confirmed_by).await
     }
 
+    async fn record_notes_served(&self, note_ids: &[Uuid]) -> anyhow::Result<usize> {
+        self.record_notes_served(note_ids).await
+    }
+
     async fn get_notes_needing_review(
         &self,
         project_id: Option<Uuid>,

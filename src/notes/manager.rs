@@ -881,6 +881,24 @@ impl NoteManager {
     // ========================================================================
 
     /// Search notes using semantic search
+    /// Fire-and-forget activation credit for notes that were just served into
+    /// a context (search hit, semantic hit, get_context). R* review
+    /// 2026-06-10 — the activation sensor: without it, energy decay measured
+    /// pure age instead of disuse, and every note died at energy 0 no matter
+    /// how often it was read (observed: 100/100 dead notes). Non-fatal and
+    /// off the hot path.
+    fn credit_served(&self, note_ids: Vec<Uuid>) {
+        if note_ids.is_empty() {
+            return;
+        }
+        let neo4j = self.neo4j.clone();
+        tokio::spawn(async move {
+            if let Err(e) = neo4j.record_notes_served(&note_ids).await {
+                tracing::debug!("record_notes_served failed (non-fatal): {e}");
+            }
+        });
+    }
+
     pub async fn search_notes(
         &self,
         query: &str,
@@ -929,6 +947,9 @@ impl NoteManager {
                 });
             }
         }
+
+        // Activation sensor: a search hit is a serve.
+        self.credit_served(results.iter().map(|h| h.note.id).collect());
 
         Ok(results)
     }
@@ -1017,6 +1038,10 @@ impl NoteManager {
                 .partial_cmp(&a.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
+
+        // Activation sensor: a semantic hit is a serve.
+        self.credit_served(hits.iter().map(|h| h.note.id).collect());
+
         Ok(hits)
     }
 
@@ -1132,6 +1157,16 @@ impl NoteManager {
         });
 
         let total_count = direct_notes.len() + propagated_notes.len();
+
+        // Activation sensor: being assembled into an entity context is the
+        // strongest "serve" signal — both direct and propagated notes count.
+        self.credit_served(
+            direct_notes
+                .iter()
+                .map(|n| n.id)
+                .chain(propagated_notes.iter().map(|p| p.note.id))
+                .collect(),
+        );
 
         Ok(NoteContextResponse {
             direct_notes,
