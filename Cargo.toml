@@ -36,7 +36,7 @@ futures = "0.3"
 # ML — candle (always compiled, runtime-controlled)
 candle-core = "0.8"
 candle-nn = "0.8"
-safetensors = "0.7"
+safetensors = "0.8"
 
 # Cache
 moka = { version = "0.12", features = ["future"] }
