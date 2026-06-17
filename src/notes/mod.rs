@@ -10,8 +10,10 @@ pub mod hashing;
 pub mod lifecycle;
 pub mod manager;
 pub mod models;
+pub mod witness;
 
 pub use hashing::*;
 pub use lifecycle::*;
 pub use manager::{BackfillProgress, NoteManager, SynapseBackfillProgress, SynapseConfig};
 pub use models::*;
+pub use witness::{CodeRef, ExternalRef, Witness, WitnessKind, WitnessValidationError};
