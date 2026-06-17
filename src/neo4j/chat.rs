@@ -810,8 +810,15 @@ impl Neo4jClient {
         offset: i64,
         limit: i64,
     ) -> Result<Vec<ChatEventRecord>> {
+        // Match events by the session_id property (backed by the composite
+        // (session_id, seq) index) rather than expanding the HAS_EVENT
+        // relationship. With the composite index the planner seeks to the
+        // session and walks seq in order, returning after LIMIT — instead of
+        // gathering every event of the conversation and sorting in memory.
+        // Equivalent result: every ChatEvent is created with session_id set to
+        // its owning session (see store_chat_events).
         let q = query(
-            "MATCH (s:ChatSession {id: $session_id})-[:HAS_EVENT]->(e:ChatEvent)
+            "MATCH (e:ChatEvent {session_id: $session_id})
              RETURN e
              ORDER BY e.seq ASC
              SKIP $offset
@@ -834,8 +841,10 @@ impl Neo4jClient {
 
     /// Count total chat events for a session.
     pub async fn count_chat_events(&self, session_id: Uuid) -> Result<i64> {
+        // Count via the session_id property (index-backed) instead of expanding
+        // the HAS_EVENT relationship — same result, no relationship walk.
         let q = query(
-            "MATCH (s:ChatSession {id: $session_id})-[:HAS_EVENT]->(e:ChatEvent)
+            "MATCH (e:ChatEvent {session_id: $session_id})
              RETURN count(e) AS cnt",
         )
         .param("session_id", session_id.to_string());

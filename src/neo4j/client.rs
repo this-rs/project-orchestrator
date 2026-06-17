@@ -309,6 +309,12 @@ impl Neo4jClient {
             "CREATE INDEX chat_event_session IF NOT EXISTS FOR (e:ChatEvent) ON (e.session_id)",
             "CREATE INDEX chat_event_type IF NOT EXISTS FOR (e:ChatEvent) ON (e.event_type)",
             "CREATE INDEX chat_event_seq IF NOT EXISTS FOR (e:ChatEvent) ON (e.seq)",
+            // Composite (session_id, seq) — opening a conversation pages events
+            // with `WHERE e.session_id = $sid RETURN e ORDER BY e.seq ASC SKIP/LIMIT`.
+            // This composite lets the planner seek to the session and walk seq in
+            // order (index-backed ORDER BY + LIMIT), instead of gathering every
+            // event of the conversation via HAS_EVENT and sorting in memory.
+            "CREATE INDEX chat_event_session_seq IF NOT EXISTS FOR (e:ChatEvent) ON (e.session_id, e.seq)",
             // ChatSession indexes — queried by project_slug, workspace_slug, cli_session_id
             "CREATE INDEX chat_session_project IF NOT EXISTS FOR (s:ChatSession) ON (s.project_slug)",
             "CREATE INDEX chat_session_workspace IF NOT EXISTS FOR (s:ChatSession) ON (s.workspace_slug)",
