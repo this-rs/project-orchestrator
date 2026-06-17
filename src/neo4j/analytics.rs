@@ -265,6 +265,34 @@ impl Neo4jClient {
         })
     }
 
+    /// Count orphan files for a project (lightweight — no full health report).
+    ///
+    /// Same orphan definition as [`Self::get_code_health_report`]: a File with
+    /// no IMPORTS in either direction and no contained Function. Unlike the
+    /// health report (which LIMITs the orphan list to 20 for display), this
+    /// returns the TRUE total count. Used by the real-time project overview to
+    /// avoid running the full health report — including its expensive PageRank
+    /// and risk-score distribution fitting — just to read one number.
+    pub async fn count_orphan_files(&self, project_id: Uuid) -> Result<i64> {
+        let q = query(
+            r#"
+            MATCH (p:Project {id: $pid})-[:CONTAINS]->(f:File)
+            WHERE NOT EXISTS { (f)-[:IMPORTS]->() }
+              AND NOT EXISTS { ()-[:IMPORTS]->(f) }
+              AND NOT EXISTS { (f)-[:CONTAINS]->(:Function) }
+            RETURN count(f) AS cnt
+            "#,
+        )
+        .param("pid", project_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            Ok(row.get::<i64>("cnt")?)
+        } else {
+            Ok(0)
+        }
+    }
+
     /// WorldModel prediction accuracy (biomimicry T7):
     /// For each of the last N sessions, compute what files the agent discussed,
     /// then check if those files were predictable from the CO_CHANGED graph

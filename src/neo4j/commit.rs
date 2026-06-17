@@ -581,6 +581,33 @@ impl Neo4jClient {
         Ok(pairs)
     }
 
+    /// Count CO_CHANGED pairs for a project (lightweight — no row transfer).
+    ///
+    /// Same dedup semantics as [`Self::get_co_change_graph`] (`f1.path < f2.path`
+    /// collapses the bidirectional relationship to one pair). Used by the
+    /// real-time project overview, which previously pulled up to 100k pairs only
+    /// to call `.len()` on them.
+    pub async fn count_co_change_pairs(&self, project_id: Uuid, min_count: i64) -> Result<i64> {
+        let q = query(
+            r#"
+            MATCH (f1:File)-[r:CO_CHANGED]-(f2:File)
+            WHERE r.project_id = $project_id
+              AND r.count >= $min_count
+              AND f1.path < f2.path
+            RETURN count(*) AS cnt
+            "#,
+        )
+        .param("project_id", project_id.to_string())
+        .param("min_count", min_count);
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            Ok(row.get::<i64>("cnt")?)
+        } else {
+            Ok(0)
+        }
+    }
+
     /// Get files that co-change with a given file (bidirectional).
     pub async fn get_file_co_changers(
         &self,

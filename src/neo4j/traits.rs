@@ -348,6 +348,17 @@ pub trait GraphStore: Send + Sync {
     /// Count files for a project (lightweight, no data transfer)
     async fn count_project_files(&self, project_id: Uuid) -> Result<i64>;
 
+    /// Count orphan files for a project (lightweight — avoids the full health
+    /// report and its distribution fitting). Used by the real-time overview.
+    async fn count_orphan_files(&self, project_id: Uuid) -> Result<i64>;
+
+    /// Count CO_CHANGED pairs for a project (lightweight — no row transfer).
+    async fn count_co_change_pairs(&self, project_id: Uuid, min_count: i64) -> Result<i64>;
+
+    /// Count total protocol states and transitions across a project's protocols
+    /// in a single query (replaces the per-protocol N+1 in the overview).
+    async fn count_protocol_states_transitions(&self, project_id: Uuid) -> Result<(i64, i64)>;
+
     /// Invalidate pre-computed GraIL properties on changed files and their neighbors.
     ///
     /// Sets `*_version = -1` on:

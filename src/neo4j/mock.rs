@@ -1422,6 +1422,18 @@ impl GraphStore for MockGraphStore {
         Ok(pf.get(&project_id).map(|p| p.len() as i64).unwrap_or(0))
     }
 
+    async fn count_orphan_files(&self, _project_id: Uuid) -> Result<i64> {
+        Ok(0)
+    }
+
+    async fn count_co_change_pairs(&self, _project_id: Uuid, _min_count: i64) -> Result<i64> {
+        Ok(0)
+    }
+
+    async fn count_protocol_states_transitions(&self, _project_id: Uuid) -> Result<(i64, i64)> {
+        Ok((0, 0))
+    }
+
     async fn invalidate_computed_properties(
         &self,
         _project_id: Uuid,
