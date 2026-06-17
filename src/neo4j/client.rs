@@ -315,6 +315,18 @@ impl Neo4jClient {
             "CREATE INDEX chat_session_cli IF NOT EXISTS FOR (s:ChatSession) ON (s.cli_session_id)",
             // ChatSession composite index for DISCUSSED relation queries
             "CREATE INDEX chat_session_project_id IF NOT EXISTS FOR (s:ChatSession) ON (s.project_slug, s.id)",
+            // ChatSession ordering indexes — the conversation list does
+            // `ORDER BY s.updated_at DESC SKIP/LIMIT`. Without a range index on
+            // updated_at, Neo4j scans and sorts EVERY ChatSession on each list
+            // load (cost grows with total conversation count, not page size).
+            // A range index lets the planner walk the index in reverse and stop
+            // after LIMIT rows. The composite (project_slug, updated_at) covers
+            // the project-filtered list in a single index seek + ordered scan.
+            "CREATE INDEX chat_session_updated IF NOT EXISTS FOR (s:ChatSession) ON (s.updated_at)",
+            "CREATE INDEX chat_session_project_updated IF NOT EXISTS FOR (s:ChatSession) ON (s.project_slug, s.updated_at)",
+            // ChatSession conversation_id index — search_messages resolves
+            // Meilisearch hits back to sessions by conversation_id.
+            "CREATE INDEX chat_session_conversation IF NOT EXISTS FOR (s:ChatSession) ON (s.conversation_id)",
             // ProtocolRun indexes
             "CREATE INDEX protocol_run_protocol IF NOT EXISTS FOR (r:ProtocolRun) ON (r.protocol_id)",
             "CREATE INDEX protocol_run_status IF NOT EXISTS FOR (r:ProtocolRun) ON (r.status)",
