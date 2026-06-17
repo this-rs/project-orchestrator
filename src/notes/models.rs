@@ -331,6 +331,62 @@ impl FromStr for EntityType {
     }
 }
 
+impl EntityType {
+    /// Returns the PascalCase label this entity type uses as a node label in
+    /// Neo4j. The MCP and REST surfaces use the snake_case `Display` form
+    /// (`"file"`, `"workspace_milestone"`), while Neo4j labels are PascalCase
+    /// (`:File`, `:WorkspaceMilestone`). Use this method whenever you build a
+    /// Cypher query against an entity whose label was supplied as user input,
+    /// otherwise you build a query against a label that does not exist and the
+    /// MATCH silently produces zero rows.
+    pub fn neo4j_label(&self) -> &'static str {
+        match self {
+            Self::Project => "Project",
+            Self::File => "File",
+            Self::Module => "Module",
+            Self::Function => "Function",
+            Self::Struct => "Struct",
+            Self::Trait => "Trait",
+            Self::Enum => "Enum",
+            Self::Impl => "Impl",
+            Self::Task => "Task",
+            Self::Plan => "Plan",
+            Self::Step => "Step",
+            Self::Commit => "Commit",
+            Self::Decision => "Decision",
+            Self::Constraint => "Constraint",
+            Self::Milestone => "Milestone",
+            Self::Release => "Release",
+            Self::Workspace => "Workspace",
+            Self::WorkspaceMilestone => "WorkspaceMilestone",
+            Self::Resource => "Resource",
+            Self::Component => "Component",
+            Self::FeatureGraph => "FeatureGraph",
+            Self::Protocol => "Protocol",
+            Self::ProtocolState => "ProtocolState",
+            Self::ProtocolRun => "ProtocolRun",
+            Self::PlanRun => "PlanRun",
+            Self::Skill => "Skill",
+            Self::Note => "Note",
+            Self::ChatSession => "ChatSession",
+            Self::Process => "Process",
+        }
+    }
+
+    /// Returns the Cypher property used to look up nodes of this type by their
+    /// external identifier. Most entities are matched by `id` (UUID), but:
+    ///
+    /// - `File` is matched by `path`
+    /// - `Commit` is matched by `hash`
+    pub fn match_property(&self) -> &'static str {
+        match self {
+            Self::File => "path",
+            Self::Commit => "hash",
+            _ => "id",
+        }
+    }
+}
+
 // ============================================================================
 // Scope
 // ============================================================================
@@ -1344,6 +1400,89 @@ mod tests {
             let deserialized: EntityType = serde_json::from_str(&json).unwrap();
             assert_eq!(&deserialized, variant);
         }
+    }
+
+    #[test]
+    fn test_entity_type_neo4j_label_is_pascal_case_for_every_variant() {
+        // The MCP/REST surface speaks lowercase snake_case (Display).
+        // The Neo4j label is the PascalCase variant name. The two MUST agree
+        // across every variant or we silently no-op Cypher queries.
+        let pairs = vec![
+            (EntityType::Project, "Project"),
+            (EntityType::File, "File"),
+            (EntityType::Module, "Module"),
+            (EntityType::Function, "Function"),
+            (EntityType::Struct, "Struct"),
+            (EntityType::Trait, "Trait"),
+            (EntityType::Enum, "Enum"),
+            (EntityType::Impl, "Impl"),
+            (EntityType::Task, "Task"),
+            (EntityType::Plan, "Plan"),
+            (EntityType::Step, "Step"),
+            (EntityType::Commit, "Commit"),
+            (EntityType::Decision, "Decision"),
+            (EntityType::Constraint, "Constraint"),
+            (EntityType::Milestone, "Milestone"),
+            (EntityType::Release, "Release"),
+            (EntityType::Workspace, "Workspace"),
+            (EntityType::WorkspaceMilestone, "WorkspaceMilestone"),
+            (EntityType::Resource, "Resource"),
+            (EntityType::Component, "Component"),
+            (EntityType::FeatureGraph, "FeatureGraph"),
+            (EntityType::Protocol, "Protocol"),
+            (EntityType::ProtocolState, "ProtocolState"),
+            (EntityType::ProtocolRun, "ProtocolRun"),
+            (EntityType::PlanRun, "PlanRun"),
+            (EntityType::Skill, "Skill"),
+            (EntityType::Note, "Note"),
+            (EntityType::ChatSession, "ChatSession"),
+            (EntityType::Process, "Process"),
+        ];
+        for (variant, label) in pairs {
+            assert_eq!(
+                variant.neo4j_label(),
+                label,
+                "variant {variant:?} mapped to the wrong Neo4j label"
+            );
+        }
+    }
+
+    #[test]
+    fn test_entity_type_match_property_specializations() {
+        // File and Commit have non-default match properties; everything else
+        // is keyed by `id`.
+        assert_eq!(EntityType::File.match_property(), "path");
+        assert_eq!(EntityType::Commit.match_property(), "hash");
+        for et in [
+            EntityType::Project,
+            EntityType::Function,
+            EntityType::Task,
+            EntityType::Plan,
+            EntityType::Decision,
+            EntityType::Note,
+            EntityType::ChatSession,
+            EntityType::Process,
+        ] {
+            assert_eq!(et.match_property(), "id", "{et:?} should match by id");
+        }
+    }
+
+    #[test]
+    fn test_entity_type_from_str_accepts_both_cases() {
+        // The MCP layer documents snake_case ("file") but older docs and
+        // human callers may pass PascalCase ("File"). Both must parse — this
+        // is the regression captured by gotcha e3f9a882.
+        assert_eq!(EntityType::from_str("file").unwrap(), EntityType::File);
+        assert_eq!(EntityType::from_str("File").unwrap(), EntityType::File);
+        assert_eq!(
+            EntityType::from_str("workspace_milestone").unwrap(),
+            EntityType::WorkspaceMilestone
+        );
+        assert_eq!(
+            EntityType::from_str("WorkspaceMilestone").unwrap(),
+            EntityType::WorkspaceMilestone
+        );
+        assert!(EntityType::from_str("not_a_real_type").is_err());
     }
 
     #[test]

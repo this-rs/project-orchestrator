@@ -16,6 +16,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use chrono::Utc;
 use std::collections::HashMap;
+use std::str::FromStr;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
@@ -4388,8 +4389,17 @@ impl GraphStore for MockGraphStore {
         entity_id: &str,
         impact_description: Option<&str>,
     ) -> Result<()> {
+        // Mirror the real implementation's validation: reject unknown
+        // entity_types up front. The mock has no graph to MATCH against, so it
+        // cannot reproduce the "entity not found" error — but it CAN catch the
+        // case-mismatch / typo class of bug (gotcha e3f9a882), which is the
+        // regression this method previously hid by accepting anything.
+        let etype = crate::notes::models::EntityType::from_str(entity_type)
+            .map_err(|e| anyhow::anyhow!("add_decision_affects: invalid entity_type: {e}"))?;
         let relation = AffectsRelation {
-            entity_type: entity_type.to_string(),
+            // Normalize to the canonical snake_case form so stored relations are
+            // consistent regardless of input casing.
+            entity_type: etype.to_string(),
             entity_id: entity_id.to_string(),
             entity_name: None,
             impact_description: impact_description.map(|s| s.to_string()),
@@ -4406,9 +4416,12 @@ impl GraphStore for MockGraphStore {
     async fn remove_decision_affects(
         &self,
         decision_id: Uuid,
-        _entity_type: &str,
+        entity_type: &str,
         entity_id: &str,
     ) -> Result<()> {
+        // Validate entity_type for symmetry with add_decision_affects.
+        crate::notes::models::EntityType::from_str(entity_type)
+            .map_err(|e| anyhow::anyhow!("remove_decision_affects: invalid entity_type: {e}"))?;
         if let Some(affects) = self.decision_affects.write().await.get_mut(&decision_id) {
             affects.retain(|a| a.entity_id != entity_id);
         }
