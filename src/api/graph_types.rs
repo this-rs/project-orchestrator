@@ -1034,13 +1034,14 @@ pub async fn build_intelligence_summary(
         lang_stats_res,
         communities_res,
         hotspots_res,
-        health_res,
+        orphan_count_res,
         notes_res,
         stale_res,
-        co_change_res,
+        co_change_count_res,
         neural_res,
         skills_all_res,
         protocols_res,
+        protocol_st_res,
         pm_graph_res,
         chat_graph_res,
     ) = tokio::join!(
@@ -1048,13 +1049,18 @@ pub async fn build_intelligence_summary(
         neo4j.get_language_stats_for_project(pid),
         neo4j.get_project_communities(pid),
         neo4j.get_top_hotspots(pid, 5),
-        neo4j.get_code_health_report(pid, 200),
+        // Lightweight orphan count — avoids the full health report (and its
+        // PageRank/risk distribution fitting) just to read one number.
+        neo4j.count_orphan_files(pid),
         neo4j.list_notes(Some(pid), None, &note_filters),
         neo4j.get_notes_needing_review(Some(pid)),
-        neo4j.get_co_change_graph(pid, 1, 100_000),
+        // Count co-change pairs instead of pulling up to 100k rows to .len().
+        neo4j.count_co_change_pairs(pid, 1),
         neo4j.get_neural_metrics(pid),
         neo4j.list_skills(pid, None, 1000, 0),
         neo4j.list_protocols(pid, None, 10_000, 0),
+        // Single aggregate replaces the per-protocol states/transitions N+1.
+        neo4j.count_protocol_states_transitions(pid),
         neo4j.get_pm_graph_data(pid, 10_000),
         neo4j.get_chat_graph_data(pid, 100),
     );
@@ -1065,7 +1071,9 @@ pub async fn build_intelligence_summary(
     let function_count: usize = lang_stats.iter().map(|l| l.file_count).sum();
     let communities_list = communities_res.unwrap_or_default();
     let hotspots = hotspots_res.unwrap_or_default();
-    let health = health_res.ok();
+    // True orphan count (the previous full-health path capped the displayed
+    // list at 20; this is the real total).
+    let orphan_count = orphan_count_res.unwrap_or(0) as usize;
 
     let code = CodeLayerSummary {
         files: file_count,
@@ -1078,7 +1086,7 @@ pub async fn build_intelligence_summary(
                 churn_score: h.churn_score,
             })
             .collect(),
-        orphans: health.as_ref().map(|h| h.orphan_files.len()).unwrap_or(0),
+        orphans: orphan_count,
     };
 
     // === Knowledge layer ===
@@ -1100,10 +1108,8 @@ pub async fn build_intelligence_summary(
     };
 
     // === Fabric layer ===
-    let co_changes = co_change_res.unwrap_or_default();
-
     let fabric = FabricLayerSummary {
-        co_changed_pairs: co_changes.len(),
+        co_changed_pairs: co_change_count_res.unwrap_or(0) as usize,
     };
 
     // === Neural layer ===
@@ -1153,17 +1159,11 @@ pub async fn build_intelligence_summary(
     // === Behavioral layer (Protocol Federation) ===
     let (all_protocols, _protocols_total) = protocols_res.unwrap_or((vec![], 0));
 
-    // Count states and transitions across all protocols (fire in parallel)
-    let mut total_states = 0usize;
-    let mut total_transitions = 0usize;
-    for proto in &all_protocols {
-        let (states_res, transitions_res) = tokio::join!(
-            neo4j.get_protocol_states(proto.id),
-            neo4j.get_protocol_transitions(proto.id),
-        );
-        total_states += states_res.map(|s| s.len()).unwrap_or(0);
-        total_transitions += transitions_res.map(|t| t.len()).unwrap_or(0);
-    }
+    // States/transitions totals come from a single aggregate query (fired in the
+    // parallel join above), replacing the previous per-protocol N+1.
+    let (total_states, total_transitions) = protocol_st_res
+        .map(|(s, t)| (s as usize, t as usize))
+        .unwrap_or((0, 0));
 
     let system_count = all_protocols
         .iter()

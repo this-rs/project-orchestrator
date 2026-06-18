@@ -2,8 +2,10 @@
 
 use super::client::Neo4jClient;
 use super::models::*;
+use crate::notes::models::EntityType;
 use anyhow::Result;
 use neo4rs::query;
+use std::str::FromStr;
 use uuid::Uuid;
 
 impl Neo4jClient {
@@ -493,8 +495,22 @@ impl Neo4jClient {
 
     /// Create an AFFECTS relation from a Decision to any entity in the graph.
     ///
-    /// The entity is matched by a generic `{id: $entity_id}` or `{path: $entity_id}`
-    /// (for File nodes). The `impact_description` is optional free-text.
+    /// `entity_type` is parsed via [`EntityType::from_str`] so callers may pass
+    /// the snake_case MCP convention (`"file"`, `"workspace_milestone"`) or the
+    /// PascalCase Neo4j label form (`"File"`, `"WorkspaceMilestone"`) —
+    /// internally we always use the canonical [`EntityType::neo4j_label`] to
+    /// build the Cypher.
+    ///
+    /// The entity is matched by [`EntityType::match_property`] (`path` for
+    /// `File`, `hash` for `Commit`, `id` for everything else). For `File`
+    /// targets, a relative `entity_id` (not starting with `/`) is matched via
+    /// `ENDS WITH` against the stored absolute path, preserving the previous
+    /// behaviour for convenience.
+    ///
+    /// Returns `Err` if `entity_type` is not a recognized variant, or if the
+    /// Decision and entity could not both be matched in the graph (previously
+    /// this case was a silent no-op which made the AFFECTS edge an
+    /// unverifiable claim — see the R\* RFC `19b89465`).
     pub async fn add_decision_affects(
         &self,
         decision_id: Uuid,
@@ -502,29 +518,33 @@ impl Neo4jClient {
         entity_id: &str,
         impact_description: Option<&str>,
     ) -> Result<()> {
-        let cypher = if entity_type == "File" && !entity_id.starts_with('/') {
-            // Relative path: use ENDS WITH to match against full absolute paths
+        let etype = EntityType::from_str(entity_type)
+            .map_err(|e| anyhow::anyhow!("add_decision_affects: invalid entity_type: {e}"))?;
+        let label = etype.neo4j_label();
+        let match_field = etype.match_property();
+
+        let cypher = if matches!(etype, EntityType::File) && !entity_id.starts_with('/') {
+            // Relative path: match against full absolute paths via ENDS WITH.
             format!(
                 r#"
                 MATCH (d:Decision {{id: $did}})
-                MATCH (e:{} ) WHERE e.path ENDS WITH $eid
+                MATCH (e:{label}) WHERE e.path ENDS WITH $eid
                 MERGE (d)-[r:AFFECTS]->(e)
                 SET r.impact_description = $desc,
                     r.created_at = datetime()
+                RETURN d.id AS did, e.path AS matched
                 "#,
-                entity_type
             )
         } else {
-            let match_field = if entity_type == "File" { "path" } else { "id" };
             format!(
                 r#"
                 MATCH (d:Decision {{id: $did}})
-                MATCH (e:{} {{{}: $eid}})
+                MATCH (e:{label} {{{match_field}: $eid}})
                 MERGE (d)-[r:AFFECTS]->(e)
                 SET r.impact_description = $desc,
                     r.created_at = datetime()
+                RETURN d.id AS did, e.{match_field} AS matched
                 "#,
-                entity_type, match_field
             )
         };
 
@@ -533,33 +553,51 @@ impl Neo4jClient {
             .param("eid", entity_id.to_string())
             .param("desc", impact_description.unwrap_or("").to_string());
 
-        self.graph.run(q).await?;
+        let mut result = self.graph.execute(q).await?;
+        if result.next().await?.is_none() {
+            anyhow::bail!(
+                "add_decision_affects: no matching {} found for {} (the decision {} or the target entity does not exist in the graph)",
+                label,
+                entity_id,
+                decision_id,
+            );
+        }
         Ok(())
     }
 
     /// Remove an AFFECTS relation from a Decision to an entity.
+    ///
+    /// Symmetric to [`Self::add_decision_affects`]: `entity_type` accepts both
+    /// MCP snake_case and Neo4j PascalCase forms, and the function returns
+    /// `Err` if `entity_type` is unknown or if no matching AFFECTS edge exists
+    /// (so callers can distinguish "nothing to remove" from "successfully
+    /// removed").
     pub async fn remove_decision_affects(
         &self,
         decision_id: Uuid,
         entity_type: &str,
         entity_id: &str,
     ) -> Result<()> {
-        let cypher = if entity_type == "File" && !entity_id.starts_with('/') {
+        let etype = EntityType::from_str(entity_type)
+            .map_err(|e| anyhow::anyhow!("remove_decision_affects: invalid entity_type: {e}"))?;
+        let label = etype.neo4j_label();
+        let match_field = etype.match_property();
+
+        let cypher = if matches!(etype, EntityType::File) && !entity_id.starts_with('/') {
             format!(
                 r#"
-                MATCH (d:Decision {{id: $did}})-[r:AFFECTS]->(e:{}) WHERE e.path ENDS WITH $eid
+                MATCH (d:Decision {{id: $did}})-[r:AFFECTS]->(e:{label}) WHERE e.path ENDS WITH $eid
                 DELETE r
+                RETURN count(r) AS removed
                 "#,
-                entity_type
             )
         } else {
-            let match_field = if entity_type == "File" { "path" } else { "id" };
             format!(
                 r#"
-                MATCH (d:Decision {{id: $did}})-[r:AFFECTS]->(e:{} {{{}: $eid}})
+                MATCH (d:Decision {{id: $did}})-[r:AFFECTS]->(e:{label} {{{match_field}: $eid}})
                 DELETE r
+                RETURN count(r) AS removed
                 "#,
-                entity_type, match_field
             )
         };
 
@@ -567,8 +605,27 @@ impl Neo4jClient {
             .param("did", decision_id.to_string())
             .param("eid", entity_id.to_string());
 
-        self.graph.run(q).await?;
-        Ok(())
+        let mut result = self.graph.execute(q).await?;
+        match result.next().await? {
+            Some(row) => {
+                let removed: i64 = row.get("removed").unwrap_or(0);
+                if removed == 0 {
+                    anyhow::bail!(
+                        "remove_decision_affects: no AFFECTS edge from decision {} to {} {}",
+                        decision_id,
+                        label,
+                        entity_id,
+                    );
+                }
+                Ok(())
+            }
+            None => anyhow::bail!(
+                "remove_decision_affects: query returned no rows (decision {} or {} {} likely missing)",
+                decision_id,
+                label,
+                entity_id,
+            ),
+        }
     }
 
     /// List all entities affected by a Decision.

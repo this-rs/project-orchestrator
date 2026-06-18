@@ -503,6 +503,36 @@ impl Neo4jClient {
         Ok(states)
     }
 
+    /// Count total ProtocolState and ProtocolTransition nodes across all
+    /// protocols of a project, in a single query.
+    ///
+    /// Replaces the previous per-protocol N+1 in the project overview, which
+    /// looped over every protocol and fired two queries each. States and
+    /// transitions are matched by their `protocol_id` property (the same access
+    /// pattern as [`Self::get_protocol_states`]).
+    pub async fn count_protocol_states_transitions(&self, project_id: Uuid) -> Result<(i64, i64)> {
+        let q = query(
+            r#"
+            MATCH (proto:Protocol {project_id: $project_id})
+            WITH collect(proto.id) AS pids
+            OPTIONAL MATCH (s:ProtocolState) WHERE s.protocol_id IN pids
+            WITH pids, count(s) AS states
+            OPTIONAL MATCH (t:ProtocolTransition) WHERE t.protocol_id IN pids
+            RETURN states, count(t) AS transitions
+            "#,
+        )
+        .param("project_id", project_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let states: i64 = row.get("states").unwrap_or(0);
+            let transitions: i64 = row.get("transitions").unwrap_or(0);
+            Ok((states, transitions))
+        } else {
+            Ok((0, 0))
+        }
+    }
+
     /// Delete a protocol state and its relationships.
     pub async fn delete_protocol_state(&self, state_id: Uuid) -> Result<bool> {
         let check_q = query(

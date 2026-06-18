@@ -440,6 +440,21 @@ impl GraphStore for Neo4jClient {
         self.count_project_files(project_id).await
     }
 
+    async fn count_orphan_files(&self, project_id: Uuid) -> anyhow::Result<i64> {
+        self.count_orphan_files(project_id).await
+    }
+
+    async fn count_co_change_pairs(&self, project_id: Uuid, min_count: i64) -> anyhow::Result<i64> {
+        self.count_co_change_pairs(project_id, min_count).await
+    }
+
+    async fn count_protocol_states_transitions(
+        &self,
+        project_id: Uuid,
+    ) -> anyhow::Result<(i64, i64)> {
+        self.count_protocol_states_transitions(project_id).await
+    }
+
     async fn invalidate_computed_properties(
         &self,
         project_id: Uuid,

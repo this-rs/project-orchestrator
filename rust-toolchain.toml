@@ -1,0 +1,9 @@
+# Pin the toolchain so the Homebrew cargo (rustc 1.93) shadowing rustup can't
+# silently drive dependency resolution. Observed 2026-06-10: the 1.93 MSRV-aware
+# resolver DOWNGRADED Cargo.lock (async-nats 0.49→0.47, …) because sysinfo@0.39.3
+# requires rustc ≥1.95 — builds stopped being reproducible across shells.
+# With this file, rustup-shimmed cargo always selects 1.95.0; the Homebrew cargo
+# ignores it, so prefer `~/.cargo/bin/cargo` first in PATH.
+[toolchain]
+channel = "1.95.0"
+components = ["rustfmt", "clippy"]
