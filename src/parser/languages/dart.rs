@@ -44,7 +44,8 @@ fn extract_toplevel(
     let mut i = 0;
 
     while i < child_count {
-        let child = root.child(i).unwrap();
+        // tree-sitter 0.26 changed Node::child() to take u32 (was usize).
+        let child = root.child(i as u32).unwrap();
 
         match child.kind() {
             "class_declaration" => {
@@ -95,7 +96,8 @@ fn extract_toplevel(
             "function_signature" => {
                 // Look ahead for function_body
                 let body_node = if i + 1 < child_count {
-                    root.child(i + 1).filter(|n| n.kind() == "function_body")
+                    root.child((i + 1) as u32)
+                        .filter(|n| n.kind() == "function_body")
                 } else {
                     None
                 };

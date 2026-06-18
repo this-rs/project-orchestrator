@@ -78,7 +78,7 @@ fn compute_cache_key(request: &str, project_id: Option<Uuid>) -> String {
     if let Some(pid) = project_id {
         hasher.update(pid.as_bytes());
     }
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 // ============================================================================
