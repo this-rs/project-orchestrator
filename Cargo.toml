@@ -36,7 +36,7 @@ futures = "0.3"
 # ML — candle (always compiled, runtime-controlled)
 candle-core = "0.8"
 candle-nn = "0.8"
-safetensors = "0.7"
+safetensors = "0.8"
 
 # Cache
 moka = { version = "0.12", features = ["future"] }
@@ -77,7 +77,7 @@ neo4rs = { workspace = true }
 meilisearch-sdk = { version = "0.33", default-features = false, features = ["reqwest", "tls", "jwt_rust_crypto"] }
 
 # Tree-sitter
-tree-sitter = "0.24"
+tree-sitter = "0.26"
 tree-sitter-rust = "0.23"
 tree-sitter-typescript = "0.23"
 tree-sitter-python = "0.23"
@@ -108,8 +108,8 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 
 # Graph analytics
-petgraph = "0.7"
-rustworkx-core = "0.16"
+petgraph = "0.8"
+rustworkx-core = "0.17"
 
 # LRU cache (for resolver)
 lru = "0.16"
@@ -119,8 +119,8 @@ uuid = { workspace = true }
 chrono = { workspace = true }
 walkdir = "2.5"
 glob = "0.3"
-sha2 = "0.10"
-hmac = "0.12"
+sha2 = "0.11"
+hmac = "0.13"
 hex = "0.4"
 rayon = "1.10"
 futures = { workspace = true }

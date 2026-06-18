@@ -54,7 +54,7 @@ impl TriggerProvider for WebhookProvider {
 ///
 /// The expected format is `sha256=<hex_signature>`.
 pub fn validate_github_signature(secret: &str, body: &[u8], signature_header: &str) -> bool {
-    use hmac::{Hmac, Mac};
+    use hmac::{digest::KeyInit, Hmac, Mac};
     use sha2::Sha256;
 
     let Some(hex_sig) = signature_header.strip_prefix("sha256=") else {
@@ -83,7 +83,7 @@ mod tests {
 
     #[test]
     fn test_validate_github_signature_valid() {
-        use hmac::{Hmac, Mac};
+        use hmac::{digest::KeyInit, Hmac, Mac};
         use sha2::Sha256;
 
         let secret = "my_webhook_secret";
