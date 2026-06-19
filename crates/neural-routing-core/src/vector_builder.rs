@@ -682,6 +682,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "wall-clock perf benchmark — non-deterministic on shared CI runners; run with `cargo test -- --ignored`"]
     fn bench_build_latency_under_5ms() {
         let builder = DecisionVectorBuilder::new();
         let ctx = make_context();

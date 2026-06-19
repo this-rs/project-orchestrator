@@ -561,6 +561,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "wall-clock perf benchmark — non-deterministic on shared CI runners; run with `cargo test -- --ignored`"]
     fn test_infer_latency_reasonable() {
         // With a random model and small max_steps, inference should be fast
         let mut engine = InferenceEngine::new(InferenceEngineConfig {
