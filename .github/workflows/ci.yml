@@ -112,7 +112,13 @@ jobs:
         run: cargo fmt --all --check
 
       - name: Run clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        # --workspace so EVERY member crate is linted (neural-routing-*,
+        # tree-sitter-*), not just the root package. Without it, member crates
+        # only compile as path-dependencies and their own targets/tests are
+        # never linted. project-orchestrator-desktop is excluded until its
+        # bollard 0.21 migration lands (tracked) — it doesn't compile on main
+        # and needs Tauri system deps + the frontend dist to build on CI.
+        run: cargo clippy --workspace --exclude project-orchestrator-desktop --all-targets --all-features -- -D warnings
 
   # ==========================================================================
   # Unit Tests - Library and parser tests without external services
@@ -134,7 +140,11 @@ jobs:
           save-if: false
 
       - name: Run unit tests (lib)
-        run: cargo test --lib
+        # --workspace so member crates' unit tests actually run in CI (the
+        # neural-routing-* crates carry their own #[cfg(test)] suites that the
+        # root-only `cargo test --lib` never executed). Desktop excluded — see
+        # the clippy step.
+        run: cargo test --workspace --exclude project-orchestrator-desktop --lib
 
       - name: Run parser tests
         run: cargo test --test parser_tests
