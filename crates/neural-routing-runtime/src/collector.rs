@@ -1731,7 +1731,7 @@ mod tests {
         };
 
         // The extraction logic: buffer.decisions.iter().find_map(|d| d.protocol_run_id)
-        let decisions = vec![d1, d2];
+        let decisions = [d1, d2];
         let extracted = decisions.iter().find_map(|d| d.protocol_run_id);
         assert_eq!(extracted, Some(run_id));
     }
@@ -1754,7 +1754,7 @@ mod tests {
             protocol_run_id: None,
             protocol_state: None,
         };
-        let decisions = vec![d1];
+        let decisions = [d1];
         let extracted: Option<uuid::Uuid> = decisions.iter().find_map(|d| d.protocol_run_id);
         assert_eq!(extracted, None);
     }

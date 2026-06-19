@@ -1305,7 +1305,7 @@ mod tests {
         // Zero: log(1+exp(0)) = log(2) ≈ 0.693
         let zero = Tensor::new(&[0.0f32], &device)?;
         let result = log1p_exp(&zero)?.to_vec1::<f32>()?;
-        assert!((result[0] - 0.6931).abs() < 0.01);
+        assert!((result[0] - std::f32::consts::LN_2).abs() < 0.01);
 
         Ok(())
     }
