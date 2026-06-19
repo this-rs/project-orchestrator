@@ -769,6 +769,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "wall-clock perf benchmark — non-deterministic on shared CI runners; run with `cargo test -- --ignored`"]
     fn test_encode_500_nodes_performance() -> Result<(), GnnError> {
         let config = CandleGnnEncoderConfig {
             encoder_config: GraphEncoderConfig {

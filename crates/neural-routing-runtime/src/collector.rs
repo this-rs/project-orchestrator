@@ -906,6 +906,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "wall-clock perf benchmark — non-deterministic on shared CI runners; run with `cargo test -- --ignored`"]
     fn bench_record_decision_latency_under_1ms() {
         // Benchmark: record_decision must complete in <1ms (fire-and-forget via try_send).
         // We measure 1000 iterations and assert p99 < 1ms.
@@ -946,6 +947,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "wall-clock perf benchmark — non-deterministic on shared CI runners; run with `cargo test -- --ignored`"]
     fn bench_record_decision_disabled_latency() {
         // When collection is disabled, record_decision should be near-zero (just an atomic load).
         let (tx, _rx) = mpsc::channel::<CollectorEvent>(10);

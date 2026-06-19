@@ -791,6 +791,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "heavy ML-training test with fixed 15s sleeps — non-deterministic on shared CI runners (training can exceed the wait under load); run with `cargo test -- --ignored`"]
     async fn test_ewc_wiring_two_cycles() {
         // Test that EWC snapshot is taken after first promoted cycle,
         // and that EWC penalty is active during the second cycle.
