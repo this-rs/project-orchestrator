@@ -3,12 +3,16 @@
 //! Uses bollard to manage Neo4j and MeiliSearch containers directly
 //! from the Tauri app, without requiring docker-compose.
 
-use bollard::container::{
-    Config as ContainerConfig, CreateContainerOptions, ListContainersOptions, LogsOptions,
-    StopContainerOptions,
+// bollard 0.21 reorganized its API: the container-creation body moved to
+// `models::ContainerCreateBody` (was `container::Config`) and every operation's
+// options became a builder under `query_parameters` (was a plain struct under
+// `container`/`image`). We alias ContainerCreateBody back to ContainerConfig so
+// the struct-literal config blocks below stay unchanged.
+use bollard::models::{ContainerCreateBody as ContainerConfig, HostConfig, PortBinding};
+use bollard::query_parameters::{
+    CreateContainerOptionsBuilder, CreateImageOptionsBuilder, ListContainersOptionsBuilder,
+    LogsOptionsBuilder, StartContainerOptions, StopContainerOptionsBuilder,
 };
-use bollard::image::CreateImageOptions;
-use bollard::models::{HostConfig, PortBinding};
 use bollard::Docker;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -230,10 +234,9 @@ impl DockerManager {
         }
 
         tracing::info!("Pulling image {}...", image);
-        let opts = CreateImageOptions {
-            from_image: image,
-            ..Default::default()
-        };
+        let opts = CreateImageOptionsBuilder::default()
+            .from_image(image)
+            .build();
 
         let mut stream = docker.create_image(Some(opts), None, None);
         while let Some(result) = stream.next().await {
@@ -254,14 +257,13 @@ impl DockerManager {
     /// Check if a container exists (running or stopped).
     async fn container_exists(&self, name: &str) -> Result<bool, String> {
         let docker = self.docker()?;
-        let mut filters = HashMap::new();
-        filters.insert("name", vec![name]);
+        let mut filters: HashMap<String, Vec<String>> = HashMap::new();
+        filters.insert("name".to_string(), vec![name.to_string()]);
 
-        let opts = ListContainersOptions {
-            all: true,
-            filters,
-            ..Default::default()
-        };
+        let opts = ListContainersOptionsBuilder::default()
+            .all(true)
+            .filters(&filters)
+            .build();
 
         let containers = docker
             .list_containers(Some(opts))
@@ -342,10 +344,11 @@ impl DockerManager {
 
             docker
                 .create_container(
-                    Some(CreateContainerOptions {
-                        name: NEO4J_CONTAINER,
-                        ..Default::default()
-                    }),
+                    Some(
+                        CreateContainerOptionsBuilder::default()
+                            .name(NEO4J_CONTAINER)
+                            .build(),
+                    ),
                     container_config,
                 )
                 .await
@@ -392,10 +395,11 @@ impl DockerManager {
 
             docker
                 .create_container(
-                    Some(CreateContainerOptions {
-                        name: MEILISEARCH_CONTAINER,
-                        ..Default::default()
-                    }),
+                    Some(
+                        CreateContainerOptionsBuilder::default()
+                            .name(MEILISEARCH_CONTAINER)
+                            .build(),
+                    ),
                     container_config,
                 )
                 .await
@@ -405,7 +409,7 @@ impl DockerManager {
         if !self.container_running(MEILISEARCH_CONTAINER).await? {
             tracing::info!("Starting MeiliSearch...");
             docker
-                .start_container::<String>(MEILISEARCH_CONTAINER, None)
+                .start_container(MEILISEARCH_CONTAINER, None::<StartContainerOptions>)
                 .await
                 .map_err(|e| format!("Failed to start MeiliSearch: {}", e))?;
         }
@@ -440,10 +444,11 @@ impl DockerManager {
 
                 docker
                     .create_container(
-                        Some(CreateContainerOptions {
-                            name: NATS_CONTAINER,
-                            ..Default::default()
-                        }),
+                        Some(
+                            CreateContainerOptionsBuilder::default()
+                                .name(NATS_CONTAINER)
+                                .build(),
+                        ),
                         container_config,
                     )
                     .await
@@ -453,7 +458,7 @@ impl DockerManager {
             if !self.container_running(NATS_CONTAINER).await? {
                 tracing::info!("Starting NATS...");
                 docker
-                    .start_container::<String>(NATS_CONTAINER, None)
+                    .start_container(NATS_CONTAINER, None::<StartContainerOptions>)
                     .await
                     .map_err(|e| format!("Failed to start NATS: {}", e))?;
             }
@@ -535,7 +540,7 @@ impl DockerManager {
         for name in [NEO4J_CONTAINER, MEILISEARCH_CONTAINER, NATS_CONTAINER] {
             if self.container_running(name).await.unwrap_or(false) {
                 tracing::info!("Stopping {}...", name);
-                let opts = StopContainerOptions { t: 10 };
+                let opts = StopContainerOptionsBuilder::default().t(10).build();
                 if let Err(e) = docker.stop_container(name, Some(opts)).await {
                     tracing::warn!("Failed to stop {}: {}", name, e);
                 }
@@ -557,12 +562,11 @@ impl DockerManager {
             _ => return Err(format!("Unknown service: {}", service)),
         };
 
-        let opts = LogsOptions::<String> {
-            stdout: true,
-            stderr: true,
-            tail: tail.to_string(),
-            ..Default::default()
-        };
+        let opts = LogsOptionsBuilder::default()
+            .stdout(true)
+            .stderr(true)
+            .tail(tail.to_string())
+            .build();
 
         let mut stream = docker.logs(name, Some(opts));
         let mut lines = Vec::new();
