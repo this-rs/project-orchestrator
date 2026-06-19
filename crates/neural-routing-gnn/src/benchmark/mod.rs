@@ -1124,8 +1124,8 @@ mod tests {
         // Both should produce valid AUC-ROC
         let gnn_auc = gnn_metrics.auc_roc.unwrap();
         let voyage_auc = voyage_metrics.auc_roc.unwrap();
-        assert!(gnn_auc >= 0.0 && gnn_auc <= 1.0);
-        assert!(voyage_auc >= 0.0 && voyage_auc <= 1.0);
+        assert!((0.0..=1.0).contains(&gnn_auc));
+        assert!((0.0..=1.0).contains(&voyage_auc));
 
         info!(
             "Co-change AUC: GNN={:.3}, Voyage={:.3}",

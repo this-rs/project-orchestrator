@@ -528,7 +528,11 @@ mod tests {
     fn test_splitmix_uniform_range() {
         for seed in 0..1000u64 {
             let u = splitmix_uniform(seed);
-            assert!(u >= 0.0 && u < 1.0, "Uniform sample out of range: {}", u);
+            assert!(
+                (0.0..1.0).contains(&u),
+                "Uniform sample out of range: {}",
+                u
+            );
         }
     }
 
@@ -617,7 +621,7 @@ mod tests {
     fn test_sort_by_total_cmp_handles_nan() {
         // Regression: sort_by(partial_cmp().unwrap()) panics on NaN.
         // total_cmp handles NaN deterministically (NaN sorts after all values).
-        let mut values = vec![0.5, f64::NAN, 0.3, 0.7, f64::NAN, 0.1];
+        let mut values = [0.5, f64::NAN, 0.3, 0.7, f64::NAN, 0.1];
         values.sort_by(|a, b| a.total_cmp(b));
         // Should not panic; NaN sorts to the end
         assert_eq!(values[0], 0.1);

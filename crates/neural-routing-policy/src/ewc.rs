@@ -261,7 +261,7 @@ mod tests {
 
         // Fisher = all ones
         let grad = Tensor::ones((4,), DType::F32, &device).unwrap();
-        ewc.snapshot_from_gradients(&varmap, &vec![("param".to_string(), vec![grad])])
+        ewc.snapshot_from_gradients(&varmap, &[("param".to_string(), vec![grad])])
             .unwrap();
 
         // Now mutate the parameter via the Var stored in VarMap
