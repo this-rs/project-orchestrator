@@ -160,6 +160,22 @@ pub async fn create_project(
     // Auto-registration on the file watcher is handled by the ProjectWatcherBridge
     // which listens to CrudEvent::Created events emitted by the orchestrator.
 
+    // Seed the default behavioural protocols (the session-lifecycle navigation
+    // ritual: warm-up -> reason -> act -> feedback) so EVERY project — including
+    // fresh installs — gets it without any external seed script. Idempotent,
+    // best-effort, non-blocking.
+    {
+        let neo4j = state.orchestrator.neo4j_arc();
+        let pid = project.id;
+        tokio::spawn(async move {
+            if let Err(e) =
+                crate::protocol::seed_runner::ensure_default_protocols(neo4j.as_ref(), pid).await
+            {
+                tracing::warn!(project_id = %pid, error = %e, "Failed to seed default protocols for new project");
+            }
+        });
+    }
+
     Ok(Json(ProjectResponse {
         id: project.id.to_string(),
         name: project.name,

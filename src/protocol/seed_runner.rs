@@ -211,6 +211,151 @@ pub async fn seed_runner_protocols(
 // Protocol definitions
 // ============================================================================
 
+/// Idempotently ensure the default *behavioural* protocols exist for a project
+/// and carry their seeded prompt fragments. Currently seeds `session-lifecycle`
+/// (the warm-up → reason → act → feedback navigation ritual) so a FRESH install
+/// gets it without depending on any external seed script. Safe to call repeatedly.
+pub async fn ensure_default_protocols(graph: &dyn GraphStore, project_id: Uuid) -> Result<()> {
+    let defs = vec![build_session_lifecycle_def()];
+    for def in &defs {
+        if graph
+            .get_protocol_by_name_and_project(def.name, project_id)
+            .await
+            .with_context(|| format!("check existence of protocol '{}'", def.name))?
+            .is_some()
+        {
+            continue; // idempotent — already present
+        }
+        create_protocol_from_def(graph, project_id, def).await?;
+    }
+    // Attach/refresh prompt fragments — seed.rs is the single source of truth, so
+    // installs that already have the protocol (external seed) also converge.
+    if let Err(e) = super::seed::seed_prompt_fragments(graph, project_id).await {
+        tracing::warn!(%project_id, error = %e, "ensure_default_protocols: fragment seeding failed (non-fatal)");
+    }
+    Ok(())
+}
+
+/// Build the session-lifecycle FSM from the seed.rs fragment definitions (single
+/// source of truth) plus state types and transitions.
+fn build_session_lifecycle_def() -> RunnerProtocolDef {
+    let seed = super::seed::seed_session_lifecycle();
+    let states = seed
+        .states
+        .into_iter()
+        .map(|sf| RunnerStateDef {
+            name: sf.state_name,
+            state_type: match sf.state_name {
+                "warm_up" => StateType::Start,
+                "closed" => StateType::Terminal,
+                _ => StateType::Intermediate,
+            },
+            prompt_fragment: sf.prompt_fragment,
+            available_tools: sf.available_tools,
+            forbidden_actions: sf.forbidden_actions,
+            action: None,
+        })
+        .collect();
+    RunnerProtocolDef {
+        name: "session-lifecycle",
+        description: "Per-session cognitive ritual: warm-up (reason-first) -> working (descend the hierarchy) -> checkpoint -> closing (close the reason_feedback learning loop).",
+        relevance_vector: RelevanceVector {
+            phase: 0.0,
+            structure: 0.5,
+            domain: 0.5,
+            resource: 0.5,
+            lifecycle: 0.0,
+        },
+        states,
+        transitions: vec![
+            RunnerTransitionDef { from: "warm_up", to: "working", trigger: "warmed_up", guard: None },
+            RunnerTransitionDef { from: "working", to: "checkpoint", trigger: "checkpoint_due", guard: None },
+            RunnerTransitionDef { from: "checkpoint", to: "working", trigger: "resume", guard: None },
+            RunnerTransitionDef { from: "working", to: "closing", trigger: "wrap_up", guard: None },
+            RunnerTransitionDef { from: "closing", to: "closed", trigger: "session_closed", guard: None },
+        ],
+    }
+}
+
+/// Create one protocol (states + transitions) from a def. Mirrors the per-def body
+/// of `seed_runner_protocols`; assumes the protocol does not yet exist.
+async fn create_protocol_from_def(
+    graph: &dyn GraphStore,
+    project_id: Uuid,
+    def: &RunnerProtocolDef,
+) -> Result<()> {
+    let mut name_to_id: HashMap<&str, Uuid> = HashMap::new();
+    let mut state_objects: Vec<ProtocolState> = Vec::new();
+
+    let placeholder_entry = Uuid::new_v4();
+    let mut proto = Protocol::new(project_id, def.name, placeholder_entry);
+    proto.description = def.description.to_string();
+    proto.protocol_category = crate::protocol::ProtocolCategory::Business;
+    proto.relevance_vector = Some(def.relevance_vector.clone());
+
+    for s in &def.states {
+        let mut ps = ProtocolState::new(proto.id, s.name);
+        ps.state_type = s.state_type;
+        ps.prompt_fragment = Some(s.prompt_fragment.to_string());
+        ps.available_tools = s
+            .available_tools
+            .as_ref()
+            .map(|v| v.iter().map(|t| t.to_string()).collect());
+        ps.forbidden_actions = s
+            .forbidden_actions
+            .as_ref()
+            .map(|v| v.iter().map(|a| a.to_string()).collect());
+        ps.action = s.action.map(|a| a.to_string());
+        name_to_id.insert(s.name, ps.id);
+        state_objects.push(ps);
+    }
+    if let Some(start) = state_objects
+        .iter()
+        .find(|s| s.state_type == StateType::Start)
+    {
+        proto.entry_state = start.id;
+    }
+    proto.terminal_states = state_objects
+        .iter()
+        .filter(|s| s.state_type == StateType::Terminal)
+        .map(|s| s.id)
+        .collect();
+
+    graph
+        .upsert_protocol(&proto)
+        .await
+        .with_context(|| format!("upsert protocol '{}'", def.name))?;
+    for ps in &state_objects {
+        graph
+            .upsert_protocol_state(ps)
+            .await
+            .with_context(|| format!("upsert state '{}/{}'", def.name, ps.name))?;
+    }
+    for t in &def.transitions {
+        let from_id = name_to_id
+            .get(t.from)
+            .ok_or_else(|| anyhow::anyhow!("from '{}' missing in '{}'", t.from, def.name))?;
+        let to_id = name_to_id
+            .get(t.to)
+            .ok_or_else(|| anyhow::anyhow!("to '{}' missing in '{}'", t.to, def.name))?;
+        let mut pt = ProtocolTransition::new(proto.id, *from_id, *to_id, t.trigger);
+        pt.guard = t.guard.map(|g| g.to_string());
+        graph
+            .upsert_protocol_transition(&pt)
+            .await
+            .with_context(|| {
+                format!("upsert transition '{}->{}' in '{}'", t.from, t.to, def.name)
+            })?;
+    }
+    info!(
+        protocol = def.name,
+        states = state_objects.len(),
+        transitions = def.transitions.len(),
+        "Ensured default protocol"
+    );
+    Ok(())
+}
+
 fn build_runner_protocol_defs() -> Vec<RunnerProtocolDef> {
     vec![
         build_plan_runner_full(),

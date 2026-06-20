@@ -154,7 +154,7 @@ fn build_protocol_seeds() -> Vec<ProtocolSeed> {
 // 1. session-lifecycle
 // ============================================================================
 
-fn seed_session_lifecycle() -> ProtocolSeed {
+pub(crate) fn seed_session_lifecycle() -> ProtocolSeed {
     ProtocolSeed {
         protocol_name: "session-lifecycle",
         states: vec![
