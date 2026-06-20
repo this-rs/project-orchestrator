@@ -161,14 +161,21 @@ fn seed_session_lifecycle() -> ProtocolSeed {
             StateFragment {
                 state_name: "warm_up",
                 prompt_fragment: "\
-You are in the WARM-UP phase. Your sole objective is to load relevant context \
-before any work begins. Execute at least 3 of these 5 actions: \
-(1) note(search_semantic) for the user's topic, \
-(2) note(get_context) on relevant files, \
-(3) decision(search_semantic) for past architectural choices, \
-(4) note(get_propagated) for files likely to be touched, \
-(5) note(search) with exact keywords. \
-Summarize what you found before proceeding. Do NOT start modifying code yet.",
+You are in the WARM-UP phase. Your objective is to build a GRAPH-GROUNDED model of \
+the request before any work begins — route the request THROUGH the graph's own \
+intelligence instead of hand-rolling blind searches. \
+ANCHOR STEP FIRST: call reasoning(reason) on the user's request to get a plan of which \
+entities and paths matter. Then DESCEND the hierarchy (community → persona → skill → note), \
+executing at least 4 of: \
+(1) reasoning(reason) on the request — the anchor, \
+(2) persona(find_for_file) / persona(activate) for the code region in scope, \
+(3) code(get_communities) / code(get_context_card) to locate the module, \
+(4) note(get_propagated) + note(search_semantic) for likely-touched files and the topic, \
+(5) decision(search_semantic) for past architectural choices, \
+(6) note(get_context) on the specific files. \
+Summarize the resulting map before proceeding. If a count or metric looks suspiciously \
+invariant, distrust the abstraction and verify it before relying on it. \
+Do NOT start modifying code yet.",
                 available_tools: Some(vec!["note", "decision", "code", "project", "task", "plan"]),
                 forbidden_actions: Some(vec![
                     "Do NOT edit or write any file during warm-up",
@@ -179,11 +186,15 @@ Summarize what you found before proceeding. Do NOT start modifying code yet.",
             StateFragment {
                 state_name: "working",
                 prompt_fragment: "\
-You are in the WORKING phase. Apply the impact-first protocol before each file \
-modification: check node importance, load propagated notes, verify topology rules. \
-After each significant change, capture knowledge: create notes for gotchas, patterns, \
-and conventions discovered. Update task/step statuses in real time. \
-Track every file you read or modify for the closing phase.",
+You are in the WORKING phase. NAVIGATE by descending community → persona → skill → note, \
+using each layer to prune the next — do not flat-search. When a need is fuzzy, route it \
+through reasoning(reason) rather than guessing queries. Apply the impact-first protocol \
+before each file modification: check node importance, load propagated notes, verify \
+topology rules. If a tool result looks suspiciously invariant or capped, verify it against \
+the substrate before trusting it. After each significant change, capture knowledge: create \
+notes for gotchas, patterns, and conventions discovered, and ALWAYS anchor them \
+(link_to_entity) so they never become orphans. Update task/step statuses in real time. \
+Track every file you read or modify, and the reasoning trees you followed, for closing.",
                 available_tools: None, // all tools allowed
                 forbidden_actions: Some(vec![
                     "Do NOT modify files without running analyze_impact first",
@@ -214,6 +225,10 @@ notes created, open questions. \
 (2) Call chat(add_discussed) with ALL files significantly touched. \
 (3) Verify every task/step status is current (no stale in_progress). \
 (4) If work is incomplete, document the exact resumption point. \
+(5) CLOSE THE LEARNING LOOP: for each reasoning tree you followed, call \
+reasoning(reason_feedback) marking the nodes/paths that led to the outcome \
+(success/partial/failure). Your trajectory trains the router — it is an asset, not \
+disposable; discarding it means the next agent re-derives everything from scratch. \
 This is your last chance to persist what you learned.",
                 available_tools: Some(vec!["note", "chat", "task", "step", "commit", "decision"]),
                 forbidden_actions: Some(vec![
