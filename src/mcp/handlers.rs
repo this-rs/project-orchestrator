@@ -625,6 +625,8 @@ impl ToolHandler {
             ("admin", "backfill_synapses") => "backfill_synapses",
             ("admin", "reindex_decisions") => "reindex_decisions",
             ("admin", "backfill_decision_embeddings") => "backfill_decision_embeddings",
+            ("admin", "backfill_note_embeddings") => "backfill_note_embeddings",
+            ("admin", "backfill_note_embeddings_status") => "backfill_note_embeddings_status",
             ("admin", "backfill_touches") => "backfill_touches",
             ("admin", "backfill_discussed") => "backfill_discussed",
             ("admin", "update_fabric_scores") => "update_fabric_scores",
@@ -2799,6 +2801,22 @@ impl ToolHandler {
                 let result = http
                     .post("/api/admin/backfill-decision-embeddings", &json!({}))
                     .await?;
+                Ok(Some(result))
+            }
+
+            "backfill_note_embeddings" => {
+                let mut body = serde_json::Map::new();
+                if let Some(bs) = args.get("batch_size").and_then(|v| v.as_u64()) {
+                    body.insert("batch_size".to_string(), json!(bs));
+                }
+                let result = http
+                    .post("/api/admin/backfill-embeddings", &Value::Object(body))
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "backfill_note_embeddings_status" => {
+                let result = http.get("/api/admin/backfill-embeddings/status").await?;
                 Ok(Some(result))
             }
 
