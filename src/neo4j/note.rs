@@ -716,6 +716,46 @@ impl Neo4jClient {
         Ok(created)
     }
 
+    /// Final-pass drainer: link every still-orphan note of a project to its
+    /// Project node via LINKED_TO. Notes that match no file by content or
+    /// embedding (health reports, RFCs, project-level observations) would
+    /// otherwise stay orphans forever; anchoring them to the Project gives them
+    /// an owner without inventing a spurious file link. Idempotent (MERGE).
+    /// Returns the number of fallback links created.
+    pub async fn anchor_orphan_notes_to_project(&self, project_id: Uuid) -> Result<usize> {
+        let q = query(
+            r#"
+            MATCH (p:Project {id: $pid})
+            MATCH (n:Note {project_id: $pid})
+            WHERE NOT (n)-[:LINKED_TO]->()
+            MERGE (n)-[r:LINKED_TO]->(p)
+            ON CREATE SET
+                r.propagated = true,
+                r.propagation_source = 'project_fallback',
+                r.last_verified = datetime()
+            RETURN count(r) AS cnt
+            "#,
+        )
+        .param("pid", project_id.to_string());
+
+        let mut created = 0usize;
+        if let Ok(mut result) = self.graph.execute(q).await {
+            if let Ok(Some(row)) = result.next().await {
+                created = row.get::<i64>("cnt").unwrap_or(0) as usize;
+            }
+        }
+
+        if created > 0 {
+            tracing::info!(
+                %project_id,
+                links_created = created,
+                "Anchored orphan notes to Project node (final fallback)"
+            );
+        }
+
+        Ok(created)
+    }
+
     // ================================================================
     // High-Level Entity Propagation (FeatureGraph, Skill, Protocol)
     // ================================================================

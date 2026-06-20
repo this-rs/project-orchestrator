@@ -2467,17 +2467,54 @@ impl Neo4jClient {
             }
         }
 
-        let total_gaps = orphan_notes.len()
-            + decisions_without_affects.len()
-            + commits_without_touches.len()
-            + skills_without_members.len();
+        // True totals (not capped by the sample LIMITs above). The sample vecs
+        // are for preview; these counts drive the dashboard so a large backlog
+        // is no longer hidden behind the LIMIT 100 ceiling.
+        let count_one = |cypher: &'static str| {
+            let q = query(cypher).param("pid", pid.clone());
+            async move {
+                let mut n = 0usize;
+                if let Ok(mut rows) = self.graph.execute(q).await {
+                    if let Ok(Some(row)) = rows.next().await {
+                        n = row.get::<i64>("cnt").unwrap_or(0) as usize;
+                    }
+                }
+                n
+            }
+        };
+
+        let orphan_notes_total = count_one(
+            "MATCH (n:Note {project_id: $pid}) WHERE NOT (n)-[:LINKED_TO]->() RETURN count(n) AS cnt",
+        )
+        .await;
+        let decisions_without_affects_total = count_one(
+            "MATCH (d:Decision) WHERE d.project_id = $pid AND NOT (d)-[:AFFECTS]->() RETURN count(d) AS cnt",
+        )
+        .await;
+        let commits_without_touches_total = count_one(
+            "MATCH (c:Commit {project_id: $pid}) WHERE NOT (c)-[:TOUCHES]->() RETURN count(c) AS cnt",
+        )
+        .await;
+        let skills_without_members_total = count_one(
+            "MATCH (s:Skill {project_id: $pid}) WHERE NOT (s)-[:HAS_MEMBER]->() RETURN count(s) AS cnt",
+        )
+        .await;
+
+        let total_gaps = orphan_notes_total
+            + decisions_without_affects_total
+            + commits_without_touches_total
+            + skills_without_members_total;
 
         Ok(AuditGapsReport {
             total_gaps,
             orphan_notes,
+            orphan_notes_total,
             decisions_without_affects,
+            decisions_without_affects_total,
             commits_without_touches,
+            commits_without_touches_total,
             skills_without_members,
+            skills_without_members_total,
             relationship_type_counts,
         })
     }

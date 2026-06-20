@@ -1455,6 +1455,10 @@ pub trait GraphStore: Send + Sync {
         min_similarity: f64,
     ) -> Result<usize>;
 
+    /// Final-pass drainer: link every still-orphan note of a project to its
+    /// Project node via LINKED_TO. Returns the number of fallback links created.
+    async fn anchor_orphan_notes_to_project(&self, project_id: Uuid) -> Result<usize>;
+
     /// Unlink a note from an entity
     async fn unlink_note_from_entity(
         &self,

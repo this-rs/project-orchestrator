@@ -1861,6 +1861,10 @@ impl GraphStore for Neo4jClient {
             .await
     }
 
+    async fn anchor_orphan_notes_to_project(&self, project_id: Uuid) -> anyhow::Result<usize> {
+        self.anchor_orphan_notes_to_project(project_id).await
+    }
+
     async fn get_notes_for_entity(
         &self,
         entity_type: &EntityType,

@@ -1755,10 +1755,10 @@ pub async fn get_health_dashboard(
 
     let audit_gaps = audit_res.ok().map(|report| AuditGapsSummary {
         total_gaps: report.total_gaps as i64,
-        orphan_notes_count: report.orphan_notes.len() as i64,
-        skills_without_members_count: report.skills_without_members.len() as i64,
-        commits_without_touches_count: report.commits_without_touches.len() as i64,
-        decisions_without_affects_count: report.decisions_without_affects.len() as i64,
+        orphan_notes_count: report.orphan_notes_total as i64,
+        skills_without_members_count: report.skills_without_members_total as i64,
+        commits_without_touches_count: report.commits_without_touches_total as i64,
+        decisions_without_affects_count: report.decisions_without_affects_total as i64,
     });
 
     let risk_top10 = risk_res.ok().map(|scores| {

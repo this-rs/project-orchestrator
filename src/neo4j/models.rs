@@ -1344,16 +1344,28 @@ pub struct CouplingMetrics {
 /// Knowledge graph audit report — gaps found in entity relations.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditGapsReport {
-    /// Total gaps found across all categories
+    /// Total gaps found across all categories (uses true counts, not capped samples)
     pub total_gaps: usize,
-    /// Notes without any LINKED_TO relations to code entities
+    /// Notes without any LINKED_TO relations to code entities (sample, capped at 100)
     pub orphan_notes: Vec<String>,
-    /// Decisions without AFFECTS relations
+    /// True total count of orphan notes (not capped by the sample limit)
+    #[serde(default)]
+    pub orphan_notes_total: usize,
+    /// Decisions without AFFECTS relations (sample, capped at 100)
     pub decisions_without_affects: Vec<String>,
-    /// Commits without TOUCHES relations to files
+    /// True total count of decisions without AFFECTS
+    #[serde(default)]
+    pub decisions_without_affects_total: usize,
+    /// Commits without TOUCHES relations to files (sample, capped at 100)
     pub commits_without_touches: Vec<String>,
-    /// Skills without HAS_MEMBER relations
+    /// True total count of commits without TOUCHES
+    #[serde(default)]
+    pub commits_without_touches_total: usize,
+    /// Skills without HAS_MEMBER relations (sample, capped at 50)
     pub skills_without_members: Vec<String>,
+    /// True total count of skills without members
+    #[serde(default)]
+    pub skills_without_members_total: usize,
     /// Relationship types in the graph with their counts
     pub relationship_type_counts: Vec<RelTypeCount>,
 }

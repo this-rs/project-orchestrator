@@ -5662,6 +5662,10 @@ impl GraphStore for MockGraphStore {
         Ok(0)
     }
 
+    async fn anchor_orphan_notes_to_project(&self, _project_id: Uuid) -> Result<usize> {
+        Ok(0)
+    }
+
     async fn get_notes_for_entity(
         &self,
         entity_type: &EntityType,
@@ -10203,9 +10207,13 @@ impl GraphStore for MockGraphStore {
         Ok(crate::neo4j::models::AuditGapsReport {
             total_gaps: 0,
             orphan_notes: vec![],
+            orphan_notes_total: 0,
             decisions_without_affects: vec![],
+            decisions_without_affects_total: 0,
             commits_without_touches: vec![],
+            commits_without_touches_total: 0,
             skills_without_members: vec![],
+            skills_without_members_total: 0,
             relationship_type_counts: vec![],
         })
     }
