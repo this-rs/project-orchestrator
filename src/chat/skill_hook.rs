@@ -262,7 +262,11 @@ impl SkillActivationHook {
         let id = Uuid::parse_str(entity_id).ok()?;
         let note = self.graph_store.get_note(id).await.ok().flatten()?;
         // Collapse whitespace/newlines into a single line.
-        let mut text: String = note.content.split_whitespace().collect::<Vec<_>>().join(" ");
+        let mut text: String = note
+            .content
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
         if text.chars().count() > MAX_CHARS {
             text = text.chars().take(MAX_CHARS).collect::<String>();
             text.push('…');
@@ -352,8 +356,9 @@ impl SkillActivationHook {
                         self.graph_store.get_persona_subgraph(*linked_id).await
                     {
                         for note_rel in linked_subgraph.notes.iter().take(3) {
-                            if let Some(line) =
-                                self.note_snippet(&note_rel.entity_id, note_rel.weight).await
+                            if let Some(line) = self
+                                .note_snippet(&note_rel.entity_id, note_rel.weight)
+                                .await
                             {
                                 ctx.push_str("  ");
                                 ctx.push_str(&line);
