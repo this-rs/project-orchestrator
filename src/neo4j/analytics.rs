@@ -2425,11 +2425,14 @@ impl Neo4jClient {
             commits_without_touches.push(format!("{} — {}", &hash[..8.min(hash.len())], msg));
         }
 
-        // 4. Skills without HAS_MEMBER relations
+        // 4. Skills with no members. Membership is modelled as INCOMING edges
+        //    (:Note)-[:MEMBER_OF]->(:Skill) and (:Decision)-[:MEMBER_OF_SKILL]->(:Skill),
+        //    NOT an outgoing (s)-[:HAS_MEMBER]->() edge (which never existed) — the
+        //    old query falsely flagged ~1100 populated skills as empty.
         let skills_q = query(
             r#"
             MATCH (s:Skill {project_id: $pid})
-            WHERE NOT (s)-[:HAS_MEMBER]->()
+            WHERE NOT (:Note)-[:MEMBER_OF]->(s) AND NOT (:Decision)-[:MEMBER_OF_SKILL]->(s)
             RETURN s.id AS id, s.name AS name
             LIMIT 50
             "#,
@@ -2496,7 +2499,7 @@ impl Neo4jClient {
         )
         .await;
         let skills_without_members_total = count_one(
-            "MATCH (s:Skill {project_id: $pid}) WHERE NOT (s)-[:HAS_MEMBER]->() RETURN count(s) AS cnt",
+            "MATCH (s:Skill {project_id: $pid}) WHERE NOT (:Note)-[:MEMBER_OF]->(s) AND NOT (:Decision)-[:MEMBER_OF_SKILL]->(s) RETURN count(s) AS cnt",
         )
         .await;
 
