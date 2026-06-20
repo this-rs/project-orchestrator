@@ -1445,6 +1445,16 @@ pub trait GraphStore: Send + Sync {
         min_similarity: f64,
     ) -> Result<usize>;
 
+    /// Semantically anchor a single note to its most similar project files
+    /// (creation-time fallback for notes with no file paths in their content).
+    /// Returns the number of LINKED_TO relations created.
+    async fn semantic_anchor_note(
+        &self,
+        note_id: Uuid,
+        project_id: Uuid,
+        min_similarity: f64,
+    ) -> Result<usize>;
+
     /// Unlink a note from an entity
     async fn unlink_note_from_entity(
         &self,

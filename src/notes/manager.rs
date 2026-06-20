@@ -282,6 +282,27 @@ impl NoteManager {
                             anchors = count,
                             "Auto-anchor: created file anchors from content"
                         );
+                    } else if let Some(pid) = note_clone.project_id {
+                        // Content mentioned no file paths → fall back to semantic
+                        // anchoring against the note's embedding so "concept" notes
+                        // don't become graph orphans. The embedding was awaited
+                        // before this task was spawned, so it is available here.
+                        match neo4j.semantic_anchor_note(note_clone.id, pid, 0.7).await {
+                            Ok(n) if n > 0 => tracing::debug!(
+                                note_id = %note_clone.id,
+                                anchors = n,
+                                "Auto-anchor: created semantic anchors (content had no file paths)"
+                            ),
+                            Ok(_) => tracing::debug!(
+                                note_id = %note_clone.id,
+                                "Auto-anchor: no content or semantic anchor found"
+                            ),
+                            Err(e) => tracing::warn!(
+                                note_id = %note_clone.id,
+                                error = %e,
+                                "Auto-anchor: semantic fallback failed"
+                            ),
+                        }
                     }
                 }
                 Err(e) => {

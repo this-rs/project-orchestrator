@@ -5653,6 +5653,15 @@ impl GraphStore for MockGraphStore {
         Ok(0)
     }
 
+    async fn semantic_anchor_note(
+        &self,
+        _note_id: Uuid,
+        _project_id: Uuid,
+        _min_similarity: f64,
+    ) -> Result<usize> {
+        Ok(0)
+    }
+
     async fn get_notes_for_entity(
         &self,
         entity_type: &EntityType,

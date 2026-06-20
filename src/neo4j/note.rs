@@ -659,6 +659,63 @@ impl Neo4jClient {
         Ok(total)
     }
 
+    /// Semantically anchor a SINGLE note to the most similar files in its
+    /// project, using the note's own embedding against the `file_embedding_index`
+    /// vector index. Used as a creation-time fallback when content-based
+    /// anchoring found no file paths in the note text — this is what keeps
+    /// "concept" notes (e.g. "always validate input") from becoming orphans.
+    ///
+    /// Creates LINKED_TO with `propagation_source = 'semantic_creation'` for the
+    /// top-K matches above `min_similarity`. Idempotent (skips existing links).
+    /// Returns the number of links created. No-op if the note has no embedding.
+    pub async fn semantic_anchor_note(
+        &self,
+        note_id: Uuid,
+        project_id: Uuid,
+        min_similarity: f64,
+    ) -> Result<usize> {
+        let q = query(
+            r#"
+            MATCH (n:Note {id: $note_id})
+            WHERE n.embedding IS NOT NULL
+            CALL db.index.vector.queryNodes('file_embedding_index', $k, n.embedding)
+            YIELD node AS f, score
+            WHERE score > $min_similarity
+              AND f.project_id = $project_id
+              AND NOT (n)-[:LINKED_TO]->(f)
+            MERGE (n)-[r:LINKED_TO]->(f)
+            ON CREATE SET
+                r.propagated = true,
+                r.propagation_source = 'semantic_creation',
+                r.similarity_score = score,
+                r.last_verified = datetime()
+            RETURN count(r) AS cnt
+            "#,
+        )
+        .param("note_id", note_id.to_string())
+        .param("k", 3i64)
+        .param("min_similarity", min_similarity)
+        .param("project_id", project_id.to_string());
+
+        let mut created = 0usize;
+        if let Ok(mut result) = self.graph.execute(q).await {
+            if let Ok(Some(row)) = result.next().await {
+                created = row.get::<i64>("cnt").unwrap_or(0) as usize;
+            }
+        }
+
+        if created > 0 {
+            tracing::debug!(
+                %note_id,
+                %project_id,
+                links_created = created,
+                "Semantic-anchored note to similar files (creation fallback)"
+            );
+        }
+
+        Ok(created)
+    }
+
     // ================================================================
     // High-Level Entity Propagation (FeatureGraph, Skill, Protocol)
     // ================================================================

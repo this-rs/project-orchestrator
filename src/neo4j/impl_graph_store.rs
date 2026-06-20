@@ -1851,6 +1851,16 @@ impl GraphStore for Neo4jClient {
             .await
     }
 
+    async fn semantic_anchor_note(
+        &self,
+        note_id: Uuid,
+        project_id: Uuid,
+        min_similarity: f64,
+    ) -> anyhow::Result<usize> {
+        self.semantic_anchor_note(note_id, project_id, min_similarity)
+            .await
+    }
+
     async fn get_notes_for_entity(
         &self,
         entity_type: &EntityType,
