@@ -1304,6 +1304,12 @@ pub struct DeepMaintenanceReport {
     pub stale_notes_flagged: usize,
     /// Number of stuck tasks identified (in_progress > 48h)
     pub stuck_tasks_found: usize,
+    /// Number of note→entity LINKED_TO relations (re)created by knowledge reconstruction
+    #[serde(default)]
+    pub notes_relinked: usize,
+    /// Number of decision→entity AFFECTS relations (re)created by knowledge reconstruction
+    #[serde(default)]
+    pub affects_created: usize,
     /// Recommendations generated
     pub recommendations: Vec<String>,
 }

@@ -1332,6 +1332,9 @@ impl Neo4jClient {
         //   5. Scar penalty: (1 - scar_intensity * 0.5)
         //      Notes with high scar_intensity (from past invalidations) are de-prioritized.
         //      Max penalty = 50% score reduction at scar_intensity=1.0.
+        //   6. Energy factor: (0.4 + energy * 0.6)
+        //      Low-energy ("dead") notes are de-prioritized but never zeroed, so a
+        //      stale-but-relevant note still surfaces below a fresh equivalent.
         //
         // Relation weights (defined in Cypher CASE):
         //   CONTAINS=1.0, IMPORTS=1.0, CALLS=0.9, IMPLEMENTS_TRAIT=0.85,
@@ -1377,7 +1380,8 @@ impl Neo4jClient {
                  END AS path_rel_weight
             WITH n, source, distance, path_names, rel_types, avg_path_pagerank, path_rel_weight, hop_weights,
                  (1.0 / (distance + 1)) * importance_weight * (1.0 + avg_path_pagerank * 5.0) * path_rel_weight
-                 * (1.0 - COALESCE(n.scar_intensity, 0.0) * 0.5) AS score
+                 * (1.0 - COALESCE(n.scar_intensity, 0.0) * 0.5)
+                 * (0.4 + COALESCE(n.energy, 0.5) * 0.6) AS score
             WHERE score >= $min_score
             RETURN DISTINCT n, score, coalesce(source.name, source.path, source.id) AS source_entity,
                    path_names, distance, avg_path_pagerank,
