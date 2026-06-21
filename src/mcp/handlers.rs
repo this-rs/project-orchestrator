@@ -7840,6 +7840,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_http_backfill_note_embeddings() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("backfill_note_embeddings", Some(json!({})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert_eq!(result["path"], "/api/admin/backfill-embeddings");
+    }
+
+    #[tokio::test]
+    async fn test_http_backfill_note_embeddings_status() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("backfill_note_embeddings_status", Some(json!({})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert_eq!(result["path"], "/api/admin/backfill-embeddings/status");
+    }
+
+    #[tokio::test]
     async fn test_http_backfill_decision_embeddings() {
         let (handler, _) = make_http_handler().await;
         let result = handler

@@ -1412,6 +1412,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_ensure_default_protocols_creates_session_lifecycle() {
+        let mock = MockGraphStore::new();
+        let project_id = Uuid::new_v4();
+
+        ensure_default_protocols(&mock, project_id).await.unwrap();
+
+        let proto = mock
+            .get_protocol_by_name_and_project("session-lifecycle", project_id)
+            .await
+            .unwrap();
+        assert!(proto.is_some(), "session-lifecycle should be created");
+
+        // Idempotent: a second call must not error or create a duplicate.
+        ensure_default_protocols(&mock, project_id).await.unwrap();
+        let protocols = mock.protocols.read().await;
+        let count = protocols
+            .values()
+            .filter(|p| p.name == "session-lifecycle")
+            .count();
+        assert_eq!(
+            count, 1,
+            "no duplicate session-lifecycle after double ensure"
+        );
+    }
+
+    #[test]
+    fn test_build_session_lifecycle_def_shape() {
+        use crate::protocol::StateType;
+        let def = build_session_lifecycle_def();
+        assert_eq!(def.name, "session-lifecycle");
+        assert_eq!(
+            def.states.len(),
+            5,
+            "warm_up/working/checkpoint/closing/closed"
+        );
+        assert_eq!(
+            def.states
+                .iter()
+                .filter(|s| s.state_type == StateType::Start)
+                .count(),
+            1,
+            "exactly one start state"
+        );
+        assert_eq!(
+            def.states
+                .iter()
+                .filter(|s| s.state_type == StateType::Terminal)
+                .count(),
+            1,
+            "exactly one terminal state"
+        );
+        assert!(def
+            .states
+            .iter()
+            .any(|s| s.name == "warm_up" && s.state_type == StateType::Start));
+        assert!(def
+            .states
+            .iter()
+            .any(|s| s.name == "closed" && s.state_type == StateType::Terminal));
+        // Every transition references a declared state (no dangling triggers).
+        let names: Vec<&str> = def.states.iter().map(|s| s.name).collect();
+        assert!(!def.transitions.is_empty());
+        for t in &def.transitions {
+            assert!(names.contains(&t.from), "from '{}' declared", t.from);
+            assert!(names.contains(&t.to), "to '{}' declared", t.to);
+        }
+    }
+
+    #[tokio::test]
     async fn test_seed_runner_protocols_states_have_fragments() {
         let mock = MockGraphStore::new();
         let project_id = Uuid::new_v4();
