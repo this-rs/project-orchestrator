@@ -358,7 +358,7 @@ impl DockerManager {
         if !self.container_running(NEO4J_CONTAINER).await? {
             tracing::info!("Starting Neo4j...");
             docker
-                .start_container::<String>(NEO4J_CONTAINER, None)
+                .start_container(NEO4J_CONTAINER, None::<StartContainerOptions>)
                 .await
                 .map_err(|e| format!("Failed to start Neo4j: {}", e))?;
         }
@@ -565,7 +565,7 @@ impl DockerManager {
         let opts = LogsOptionsBuilder::default()
             .stdout(true)
             .stderr(true)
-            .tail(tail.to_string())
+            .tail(&tail.to_string())
             .build();
 
         let mut stream = docker.logs(name, Some(opts));

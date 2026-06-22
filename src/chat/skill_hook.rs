@@ -251,6 +251,29 @@ impl SkillActivationHook {
         dir_index
     }
 
+    /// Fetch a note by its UUID string and render a one-line, weight-prefixed
+    /// content snippet. Returns None if the id is invalid or the note is missing.
+    ///
+    /// This is what makes the injected context *usable*: the agent receives the
+    /// actual knowledge ("Always validate the workspace before...") instead of a
+    /// bare `[note:uuid]` it would have to resolve with another tool call.
+    async fn note_snippet(&self, entity_id: &str, weight: f64) -> Option<String> {
+        const MAX_CHARS: usize = 160;
+        let id = Uuid::parse_str(entity_id).ok()?;
+        let note = self.graph_store.get_note(id).await.ok().flatten()?;
+        // Collapse whitespace/newlines into a single line.
+        let mut text: String = note
+            .content
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        if text.chars().count() > MAX_CHARS {
+            text = text.chars().take(MAX_CHARS).collect::<String>();
+            text.push('…');
+        }
+        Some(format!("- (w:{:.2}) {}\n", weight, text))
+    }
+
     /// Build persona context string for injection into additionalContext.
     async fn build_persona_context(
         &self,
@@ -270,22 +293,43 @@ impl SkillActivationHook {
             }
         };
 
+        // Real energy comes from the Persona node, not the subgraph stats. The
+        // previous placeholder (stats.freshness) is why hooks always reported
+        // "energy: 0.00". Fetch it so we can both display it and gate on it.
+        let energy = self
+            .graph_store
+            .get_persona(persona_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|p| p.energy)
+            .unwrap_or(0.0);
+
+        // Skip personas that are effectively dead AND barely relevant to the
+        // current files — injecting them only adds low-signal noise. A persona
+        // that is either energetic OR strongly weighted to the scope is kept.
+        if energy < 0.01 && weight < 0.10 {
+            debug!(
+                persona_id = %persona_id,
+                energy,
+                weight,
+                "Skipping dead/low-relevance persona in hook injection"
+            );
+            return None;
+        }
+
         let mut ctx = format!(
             "## 🎭 Persona: {} (energy: {:.2}, weight: {:.2})\n",
-            persona_name,
-            // We don't have energy in subgraph, use a placeholder from stats
-            subgraph.stats.freshness,
-            weight
+            persona_name, energy, weight
         );
 
-        // Top notes (by weight, max 5)
+        // Top notes (by weight, max 5) — inject CONTENT, not bare ids.
         if !subgraph.notes.is_empty() {
             ctx.push_str("**Knowledge notes:**\n");
             for rel in subgraph.notes.iter().take(5) {
-                ctx.push_str(&format!(
-                    "- [note:{}] (w:{:.2})\n",
-                    rel.entity_id, rel.weight
-                ));
+                if let Some(line) = self.note_snippet(&rel.entity_id, rel.weight).await {
+                    ctx.push_str(&line);
+                }
             }
         }
 
@@ -307,15 +351,18 @@ impl SkillActivationHook {
                 ctx.push_str("\n**Related personas (via SYNAPSE links):**\n");
                 for (linked_id, linked_name, syn_weight) in linked.iter().take(2) {
                     ctx.push_str(&format!("- {} (synapse: {:.2})\n", linked_name, syn_weight));
-                    // Load top 3 notes from linked persona
+                    // Load top 3 notes from linked persona — content, not ids.
                     if let Ok(linked_subgraph) =
                         self.graph_store.get_persona_subgraph(*linked_id).await
                     {
                         for note_rel in linked_subgraph.notes.iter().take(3) {
-                            ctx.push_str(&format!(
-                                "  - [note:{}] (w:{:.2})\n",
-                                note_rel.entity_id, note_rel.weight
-                            ));
+                            if let Some(line) = self
+                                .note_snippet(&note_rel.entity_id, note_rel.weight)
+                                .await
+                            {
+                                ctx.push_str("  ");
+                                ctx.push_str(&line);
+                            }
                         }
                     }
                 }
@@ -323,10 +370,10 @@ impl SkillActivationHook {
             _ => {}
         }
 
-        // Truncate to ~2000 chars for additionalContext budget
-        if ctx.len() > 2000 {
-            ctx.truncate(1996);
-            ctx.push_str("...\n");
+        // Truncate to ~2000 chars for additionalContext budget (char-safe).
+        if ctx.chars().count() > 2000 {
+            ctx = ctx.chars().take(1996).collect::<String>();
+            ctx.push_str("…\n");
         }
 
         Some(ctx)

@@ -1500,16 +1500,34 @@ pub async fn auto_anchor_all_notes_to_project(
         }
     };
 
-    // Load ALL notes (None for project_id = all notes across all projects)
-    let filters = NoteFilters::default();
-    let (all_notes, _total) = graph_store.list_notes(None, None, &filters).await?;
-
-    let notes_count = all_notes.len();
+    // Load ALL notes (None for project_id = all notes across all projects),
+    // PAGINATED. Previously this used NoteFilters::default() which caps at 50,
+    // so only the first 50 notes were ever anchored and a large backlog could
+    // never drain. Page through every note instead.
+    const PAGE: i64 = 500;
+    let mut notes_count = 0usize;
     let mut total_anchors = 0;
-
-    for note in &all_notes {
-        let anchored = auto_anchor_note(graph_store, note, root_path.as_deref()).await?;
-        total_anchors += anchored;
+    let mut offset = 0i64;
+    loop {
+        let filters = NoteFilters {
+            limit: Some(PAGE),
+            offset: Some(offset),
+            ..Default::default()
+        };
+        let (batch, _total) = graph_store.list_notes(None, None, &filters).await?;
+        if batch.is_empty() {
+            break;
+        }
+        let batch_len = batch.len();
+        for note in &batch {
+            let anchored = auto_anchor_note(graph_store, note, root_path.as_deref()).await?;
+            total_anchors += anchored;
+        }
+        notes_count += batch_len;
+        if (batch_len as i64) < PAGE {
+            break;
+        }
+        offset += PAGE;
     }
 
     tracing::info!(
@@ -1539,6 +1557,9 @@ pub struct ReconstructReport {
     pub affects_created: usize,
     pub structural_propagated: usize,
     pub semantic_linked: usize,
+    /// Orphan notes linked to the Project node as a final fallback (drainer).
+    #[serde(default)]
+    pub project_fallback_linked: usize,
     pub elapsed_ms: u64,
 }
 
@@ -1588,6 +1609,17 @@ pub async fn reconstruct_knowledge_links(
             0
         });
 
+    // 6. Final fallback: any note still orphaned after content/semantic/structural
+    //    anchoring (typically project-level meta notes that map to no file) is
+    //    linked to the Project node so it has an owner and stops counting as an orphan.
+    let project_fallback_linked = graph_store
+        .anchor_orphan_notes_to_project(project_id)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(%project_id, error = %e, "Project-fallback anchoring failed (non-fatal)");
+            0
+        });
+
     let elapsed = start.elapsed();
 
     let report = ReconstructReport {
@@ -1597,6 +1629,7 @@ pub async fn reconstruct_knowledge_links(
         affects_created,
         structural_propagated: structural_propagated + high_level_propagated,
         semantic_linked,
+        project_fallback_linked,
         elapsed_ms: elapsed.as_millis() as u64,
     };
 
@@ -4364,6 +4397,7 @@ mod tests {
             affects_created: 2,
             structural_propagated: 1,
             semantic_linked: 0,
+            project_fallback_linked: 0,
             elapsed_ms: 42,
         };
         let json = serde_json::to_value(&report).unwrap();

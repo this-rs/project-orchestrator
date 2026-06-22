@@ -160,6 +160,22 @@ pub async fn create_project(
     // Auto-registration on the file watcher is handled by the ProjectWatcherBridge
     // which listens to CrudEvent::Created events emitted by the orchestrator.
 
+    // Seed the default behavioural protocols (the session-lifecycle navigation
+    // ritual: warm-up -> reason -> act -> feedback) so EVERY project — including
+    // fresh installs — gets it without any external seed script. Idempotent,
+    // best-effort, non-blocking.
+    {
+        let neo4j = state.orchestrator.neo4j_arc();
+        let pid = project.id;
+        tokio::spawn(async move {
+            if let Err(e) =
+                crate::protocol::seed_runner::ensure_default_protocols(neo4j.as_ref(), pid).await
+            {
+                tracing::warn!(project_id = %pid, error = %e, "Failed to seed default protocols for new project");
+            }
+        });
+    }
+
     Ok(Json(ProjectResponse {
         id: project.id.to_string(),
         name: project.name,
@@ -1755,10 +1771,10 @@ pub async fn get_health_dashboard(
 
     let audit_gaps = audit_res.ok().map(|report| AuditGapsSummary {
         total_gaps: report.total_gaps as i64,
-        orphan_notes_count: report.orphan_notes.len() as i64,
-        skills_without_members_count: report.skills_without_members.len() as i64,
-        commits_without_touches_count: report.commits_without_touches.len() as i64,
-        decisions_without_affects_count: report.decisions_without_affects.len() as i64,
+        orphan_notes_count: report.orphan_notes_total as i64,
+        skills_without_members_count: report.skills_without_members_total as i64,
+        commits_without_touches_count: report.commits_without_touches_total as i64,
+        decisions_without_affects_count: report.decisions_without_affects_total as i64,
     });
 
     let risk_top10 = risk_res.ok().map(|scores| {

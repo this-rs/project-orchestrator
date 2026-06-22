@@ -661,8 +661,38 @@ pub async fn deep_maintenance(
     // 4. Identify stuck tasks (in_progress for too long)
     let stuck_tasks_found = count_stuck_tasks(graph_store, project_id).await;
 
+    // 4b. Reconstruct knowledge links — re-anchor orphan notes/decisions to code
+    // entities. This is the healing step that prevents orphans from persisting
+    // across maintenance cycles (notes/decisions linked back to files via
+    // LINKED_TO / AFFECTS, plus structural + semantic propagation). Non-fatal.
+    let (notes_relinked, affects_created) =
+        match crate::skills::activation::reconstruct_knowledge_links(graph_store, project_id).await
+        {
+            Ok(report) => {
+                info!(
+                    project_id = %project_id,
+                    notes_linked = report.notes_linked,
+                    affects_created = report.affects_created,
+                    structural = report.structural_propagated,
+                    semantic = report.semantic_linked,
+                    "Knowledge reconstruction during deep maintenance complete"
+                );
+                (report.notes_linked, report.affects_created)
+            }
+            Err(e) => {
+                warn!(error = %e, "Knowledge reconstruction failed during deep maintenance");
+                (0, 0)
+            }
+        };
+
     // 5. Build recommendations
     let mut recommendations = stagnation.recommendations.clone();
+    if notes_relinked > 0 || affects_created > 0 {
+        recommendations.push(format!(
+            "Knowledge reconstruction re-anchored {} note link(s) and {} decision AFFECTS link(s).",
+            notes_relinked, affects_created
+        ));
+    }
     if stale_notes_flagged > 0 {
         recommendations.push(format!(
             "{} notes have high staleness — review with note(action: \"get_needing_review\").",
@@ -690,6 +720,8 @@ pub async fn deep_maintenance(
         maintenance: maintenance_json,
         stale_notes_flagged,
         stuck_tasks_found,
+        notes_relinked,
+        affects_created,
         recommendations,
     })
 }

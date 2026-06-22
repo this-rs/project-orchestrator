@@ -3848,6 +3848,8 @@ pub async fn reconstruct_knowledge(
             "notes_linked": report.notes_linked,
             "decisions_processed": report.decisions_processed,
             "affects_created": report.affects_created,
+            "semantic_linked": report.semantic_linked,
+            "project_fallback_linked": report.project_fallback_linked,
             "elapsed_ms": elapsed_ms,
         })))
     } else {
