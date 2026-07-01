@@ -2482,6 +2482,34 @@ impl GraphStore for Neo4jClient {
         self.revoke_all_user_tokens(user_id).await
     }
 
+    // MCP Tokens
+    async fn create_mcp_token(
+        &self,
+        user_id: Uuid,
+        jti: &str,
+        label: &str,
+        scope: &str,
+        expires_at: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<()> {
+        self.create_mcp_token(user_id, jti, label, scope, expires_at)
+            .await
+    }
+
+    async fn is_mcp_token_active(&self, jti: &str) -> anyhow::Result<bool> {
+        self.is_mcp_token_active(jti).await
+    }
+
+    async fn revoke_mcp_token(&self, user_id: Uuid, jti: &str) -> anyhow::Result<bool> {
+        self.revoke_mcp_token(user_id, jti).await
+    }
+
+    async fn list_mcp_tokens(
+        &self,
+        user_id: Uuid,
+    ) -> anyhow::Result<Vec<crate::neo4j::models::McpTokenNode>> {
+        self.list_mcp_tokens(user_id).await
+    }
+
     // Feature Graphs
     async fn create_feature_graph(&self, graph: &FeatureGraphNode) -> anyhow::Result<()> {
         self.create_feature_graph(graph).await

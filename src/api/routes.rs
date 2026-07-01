@@ -215,6 +215,17 @@ fn protected_routes() -> Router<OrchestratorState> {
         // ================================================================
         .route("/auth/me", get(auth_handlers::get_me))
         // ================================================================
+        // MCP tokens (issue/list/revoke — auth for the remote MCP transport)
+        // ================================================================
+        .route(
+            "/auth/mcp-tokens",
+            get(auth_handlers::list_mcp_tokens).post(auth_handlers::create_mcp_token),
+        )
+        .route(
+            "/auth/mcp-tokens/{jti}",
+            axum::routing::delete(auth_handlers::revoke_mcp_token),
+        )
+        // ================================================================
         // MCP Streamable HTTP transport (remote Claude clients)
         // POST = JSON-RPC messages, GET = 405 (no server-push stream yet),
         // DELETE = session termination. See src/mcp/http_transport.rs.

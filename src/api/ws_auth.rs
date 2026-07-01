@@ -238,6 +238,9 @@ async fn try_cookie_auth(
         name: name.clone(),
         iat: now,
         exp: now + config.access_token_expiry_secs as i64,
+        token_type: None,
+        scope: None,
+        jti: None,
     };
 
     debug!(email = %email, "WS auth: authenticated via refresh_token cookie");
@@ -679,6 +682,9 @@ mod tests {
             name: "Alice".to_string(),
             iat: 0,
             exp: i64::MAX,
+            token_type: None,
+            scope: None,
+            jti: None,
         };
         let ticket = store.create_ticket(claims).await;
 
@@ -787,6 +793,9 @@ mod tests {
             name: "Ticket".to_string(),
             iat: 0,
             exp: i64::MAX,
+            token_type: None,
+            scope: None,
+            jti: None,
         };
         let ticket = store.create_ticket(ticket_claims).await;
 

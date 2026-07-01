@@ -13,6 +13,9 @@ use uuid::Uuid;
 /// Generated from Uuid::nil() — always `00000000-0000-0000-0000-000000000000`.
 pub const ANONYMOUS_USER_ID: Uuid = Uuid::nil();
 
+/// Marker value for `Claims::token_type` identifying MCP access tokens.
+pub const TOKEN_TYPE_MCP: &str = "mcp";
+
 /// JWT claims payload
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Claims {
@@ -26,6 +29,18 @@ pub struct Claims {
     pub iat: i64,
     /// Expiration (Unix timestamp)
     pub exp: i64,
+    /// Token type discriminator. `None` (absent) = regular access JWT;
+    /// `Some("mcp")` = long-lived revocable MCP token (the middleware then
+    /// checks `jti` against the McpToken revocation store on every request).
+    /// Optional + skipped when absent so existing tokens stay valid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_type: Option<String>,
+    /// Space-separated OAuth-style scopes (MCP tokens: "mcp:read mcp:write").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    /// JWT ID — revocation lookup key for MCP tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jti: Option<String>,
 }
 
 impl Claims {
@@ -41,6 +56,9 @@ impl Claims {
             name: "Anonymous".to_string(),
             iat: now,
             exp: now + 86400 * 365 * 100, // effectively never expires
+            token_type: None,
+            scope: None,
+            jti: None,
         }
     }
 
@@ -57,7 +75,16 @@ impl Claims {
             name: "Service Account".to_string(),
             iat: now,
             exp: now + 86400, // 24 h
+            token_type: None,
+            scope: None,
+            jti: None,
         }
+    }
+
+    /// True when these claims describe a long-lived MCP token (which must be
+    /// revocation-checked against the McpToken store).
+    pub fn is_mcp_token(&self) -> bool {
+        self.token_type.as_deref() == Some(TOKEN_TYPE_MCP)
     }
 }
 
@@ -78,6 +105,9 @@ pub fn encode_jwt(
         name: name.to_string(),
         iat: now,
         exp: now + expiry_secs as i64,
+        token_type: None,
+        scope: None,
+        jti: None,
     };
 
     encode(
@@ -104,6 +134,9 @@ pub fn generate_session_token(claims: &Claims, secret: &str, expiry_secs: u64) -
         name: claims.name.clone(),
         iat: now,
         exp: now + expiry_secs as i64,
+        token_type: None,
+        scope: None,
+        jti: None,
     };
 
     encode(
@@ -112,6 +145,42 @@ pub fn generate_session_token(claims: &Claims, secret: &str, expiry_secs: u64) -
         &EncodingKey::from_secret(secret.as_bytes()),
     )
     .context("Failed to encode session token")
+}
+
+/// Encode a long-lived, revocable, scoped MCP access token.
+///
+/// Returns `(token, jti)` — the caller must persist the `jti` in the
+/// McpToken store (Neo4j) so the middleware can revocation-check it.
+/// Signed with the same HS256 secret as regular JWTs; distinguished by
+/// `token_type = "mcp"`.
+pub fn encode_mcp_token(
+    user_id: Uuid,
+    email: &str,
+    name: &str,
+    scope: &str,
+    secret: &str,
+    expiry_secs: u64,
+) -> Result<(String, String)> {
+    let now = chrono::Utc::now().timestamp();
+    let jti = Uuid::new_v4().to_string();
+    let claims = Claims {
+        sub: user_id.to_string(),
+        email: email.to_string(),
+        name: name.to_string(),
+        iat: now,
+        exp: now + expiry_secs as i64,
+        token_type: Some(TOKEN_TYPE_MCP.to_string()),
+        scope: Some(scope.to_string()),
+        jti: Some(jti.clone()),
+    };
+
+    let token = encode(
+        &Header::default(),
+        &claims,
+        &EncodingKey::from_secret(secret.as_bytes()),
+    )
+    .context("Failed to encode MCP token")?;
+    Ok((token, jti))
 }
 
 /// Decode and validate a JWT token.
@@ -162,7 +231,10 @@ mod tests {
             email: "bob@ffs.holdings".to_string(),
             name: "Bob".to_string(),
             iat: now - 7200, // issued 2h ago
-            exp: now - 3600, // expired 1h ago
+            exp: now - 3600, // expired 1h ago,
+            token_type: None,
+            scope: None,
+            jti: None,
         };
 
         let token = jsonwebtoken::encode(
@@ -211,7 +283,10 @@ mod tests {
             email: "alice@ffs.holdings".to_string(),
             name: "Alice".to_string(),
             iat: chrono::Utc::now().timestamp(),
-            exp: chrono::Utc::now().timestamp() + 900, // original 15min token
+            exp: chrono::Utc::now().timestamp() + 900, // original 15min token,
+            token_type: None,
+            scope: None,
+            jti: None,
         };
 
         let token = generate_session_token(&original, TEST_SECRET, 86400).expect("should succeed");
@@ -232,6 +307,9 @@ mod tests {
             name: "Bob".to_string(),
             iat: chrono::Utc::now().timestamp(),
             exp: chrono::Utc::now().timestamp() + 900,
+            token_type: None,
+            scope: None,
+            jti: None,
         };
 
         let token = generate_session_token(&claims, TEST_SECRET, 3600).expect("should succeed");

@@ -2066,6 +2066,33 @@ pub trait GraphStore: Send + Sync {
     async fn revoke_all_user_tokens(&self, user_id: Uuid) -> Result<u64>;
 
     // ================================================================
+    // MCP Tokens (long-lived, revocable, scoped — remote MCP transport)
+    // ================================================================
+
+    /// Record a newly issued MCP token (keyed by its JWT `jti` claim).
+    async fn create_mcp_token(
+        &self,
+        user_id: Uuid,
+        jti: &str,
+        label: &str,
+        scope: &str,
+        expires_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()>;
+
+    /// Check whether an MCP token (by `jti`) exists, is not revoked, and is
+    /// not expired.
+    async fn is_mcp_token_active(&self, jti: &str) -> Result<bool>;
+
+    /// Revoke a single MCP token by `jti` (scoped to its owning user).
+    async fn revoke_mcp_token(&self, user_id: Uuid, jti: &str) -> Result<bool>;
+
+    /// List all MCP tokens for a user (inventory; includes revoked/expired).
+    async fn list_mcp_tokens(
+        &self,
+        user_id: Uuid,
+    ) -> Result<Vec<crate::neo4j::models::McpTokenNode>>;
+
+    // ================================================================
     // Feature Graphs
     // ================================================================
 

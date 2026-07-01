@@ -337,6 +337,112 @@ impl Neo4jClient {
         Ok(result.next().await?.is_some())
     }
 
+    // ================================================================
+    // MCP Tokens (long-lived, revocable, scoped — see McpTokenNode)
+    // ================================================================
+
+    /// Record a newly issued MCP token (keyed by its JWT `jti` claim).
+    pub async fn create_mcp_token(
+        &self,
+        user_id: Uuid,
+        jti: &str,
+        label: &str,
+        scope: &str,
+        expires_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()> {
+        let q = query(
+            "CREATE (mt:McpToken {
+                jti: $jti,
+                user_id: $user_id,
+                label: $label,
+                scope: $scope,
+                expires_at: $expires_at,
+                created_at: $created_at,
+                revoked: false
+            })",
+        )
+        .param("jti", jti.to_string())
+        .param("user_id", user_id.to_string())
+        .param("label", label.to_string())
+        .param("scope", scope.to_string())
+        .param("expires_at", expires_at.to_rfc3339())
+        .param("created_at", chrono::Utc::now().to_rfc3339());
+
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
+    /// Check whether an MCP token (by `jti`) is still active: it must exist,
+    /// not be revoked, and not be expired. Called by the auth middleware on
+    /// every request bearing a `token_type=mcp` JWT.
+    pub async fn is_mcp_token_active(&self, jti: &str) -> Result<bool> {
+        let q = query("MATCH (mt:McpToken {jti: $jti}) RETURN mt.revoked AS revoked, mt.expires_at AS expires_at")
+            .param("jti", jti.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        match result.next().await? {
+            Some(row) => {
+                let revoked: bool = row.get("revoked").unwrap_or(true);
+                let expires_at: chrono::DateTime<chrono::Utc> = row
+                    .get::<String>("expires_at")?
+                    .parse()
+                    .unwrap_or_else(|_| chrono::Utc::now());
+                Ok(!revoked && expires_at > chrono::Utc::now())
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// Revoke a single MCP token by `jti`. Returns false when no such token
+    /// exists or it doesn't belong to the given user.
+    pub async fn revoke_mcp_token(&self, user_id: Uuid, jti: &str) -> Result<bool> {
+        let q = query(
+            "MATCH (mt:McpToken {jti: $jti, user_id: $user_id})
+             SET mt.revoked = true
+             RETURN mt",
+        )
+        .param("jti", jti.to_string())
+        .param("user_id", user_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        Ok(result.next().await?.is_some())
+    }
+
+    /// List all MCP tokens for a user (including revoked/expired, for
+    /// inventory UIs).
+    pub async fn list_mcp_tokens(
+        &self,
+        user_id: Uuid,
+    ) -> Result<Vec<crate::neo4j::models::McpTokenNode>> {
+        let q = query(
+            "MATCH (mt:McpToken {user_id: $user_id})
+             RETURN mt ORDER BY mt.created_at DESC",
+        )
+        .param("user_id", user_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut tokens = Vec::new();
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("mt")?;
+            tokens.push(crate::neo4j::models::McpTokenNode {
+                jti: node.get("jti")?,
+                user_id: node.get::<String>("user_id")?.parse()?,
+                label: node.get("label").unwrap_or_default(),
+                scope: node.get("scope").unwrap_or_default(),
+                expires_at: node
+                    .get::<String>("expires_at")?
+                    .parse()
+                    .unwrap_or_else(|_| chrono::Utc::now()),
+                created_at: node
+                    .get::<String>("created_at")?
+                    .parse()
+                    .unwrap_or_else(|_| chrono::Utc::now()),
+                revoked: node.get("revoked").unwrap_or(false),
+            });
+        }
+        Ok(tokens)
+    }
+
     /// Revoke all refresh tokens for a given user.
     pub async fn revoke_all_user_tokens(&self, user_id: Uuid) -> Result<u64> {
         let q = query(
