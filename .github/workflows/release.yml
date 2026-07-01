@@ -124,7 +124,7 @@ jobs:
             use_cross: false
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Get version from tag
         id: version
@@ -362,7 +362,7 @@ jobs:
             artifact_arch: arm64
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -447,7 +447,7 @@ jobs:
             artifact_arch: arm64
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -558,7 +558,7 @@ jobs:
             artifact_arch: x86_64
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Get version from tag
         id: version
@@ -1246,7 +1246,7 @@ jobs:
     # but we still want to publish everything that built successfully.
     if: always()
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Download release artifacts (native builds)
         uses: actions/download-artifact@v8
@@ -1441,7 +1441,7 @@ jobs:
             suffix: "-api"
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Download frontend dist
         if: matrix.include_frontend == 'true'
@@ -1519,7 +1519,7 @@ jobs:
     # Skip pre-releases (e.g. v0.0.1-beta). Works for both tag push and workflow_dispatch.
     if: ${{ !contains(inputs.tag || github.ref_name, '-') }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Get version from tag
         id: version
