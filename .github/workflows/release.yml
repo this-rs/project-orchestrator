@@ -38,7 +38,7 @@ jobs:
           echo "Msg:    $(git log -1 --format='%s')"
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: 22
           cache: npm
@@ -624,7 +624,7 @@ jobs:
           ls desktop/dist/assets/*.js 2>/dev/null || echo "(none)"
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: 22
 
