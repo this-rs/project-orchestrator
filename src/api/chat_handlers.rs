@@ -808,6 +808,19 @@ pub async fn get_chat_config(
     }))
 }
 
+/// GET /api/chat/models — Live Claude model catalog for the model selector.
+///
+/// Backed by a stale-while-revalidate cache (see `chat::model_catalog`):
+/// returns instantly from cache, refreshing in the background at most every
+/// 12h when an Anthropic API key is configured. Falls back to a small
+/// static list when no key is configured or the live fetch fails — this
+/// endpoint never errors on the caller.
+pub async fn get_model_catalog(
+    State(state): State<OrchestratorState>,
+) -> Json<Vec<crate::chat::model_catalog::ModelDefinition>> {
+    Json(state.model_catalog.get_models().await)
+}
+
 /// Request body for PATCH /api/chat/config
 #[derive(Debug, Deserialize)]
 pub struct UpdateChatConfigRequest {
@@ -1181,6 +1194,7 @@ mod tests {
             reactor_counters: std::sync::OnceLock::new(),
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
+            model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
         })
     }
 
@@ -1227,6 +1241,7 @@ mod tests {
             reactor_counters: std::sync::OnceLock::new(),
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
+            model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
         });
         create_router(state)
     }
@@ -1657,6 +1672,7 @@ mod tests {
             reactor_counters: std::sync::OnceLock::new(),
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
+            model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
         })
     }
 

@@ -1694,6 +1694,8 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/chat/config",
             get(chat_handlers::get_chat_config).patch(chat_handlers::update_chat_config),
         )
+        // Live Claude model catalog (Anthropic Models API + local curation, cached)
+        .route("/api/chat/models", get(chat_handlers::get_model_catalog))
         // Detect user PATH from login shell
         .route("/api/chat/detect-path", get(chat_handlers::detect_path))
         // CLI version management (check + install/upgrade)
@@ -1777,6 +1779,7 @@ mod tests {
             reactor_counters: std::sync::OnceLock::new(),
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
+            model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
         });
         create_router(state)
     }
@@ -1811,6 +1814,7 @@ mod tests {
             reactor_counters: std::sync::OnceLock::new(),
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
+            model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
         });
         create_router(state)
     }

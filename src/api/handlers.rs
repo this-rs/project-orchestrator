@@ -84,6 +84,10 @@ pub struct ServerState {
     /// MCP Federation registry — external MCP server connections.
     /// Always initialized (empty registry). Servers are added/removed dynamically via API.
     pub mcp_registry: crate::mcp_federation::registry::SharedRegistry,
+    /// Live Claude model catalog (Anthropic Models API + local curation,
+    /// stale-while-revalidate cache). Always initialized; falls back to a
+    /// static list when no Anthropic API key is configured.
+    pub model_catalog: Arc<crate::chat::model_catalog::ModelCatalogCache>,
 }
 
 /// Shared orchestrator state
@@ -6346,6 +6350,7 @@ mod tests {
             reactor_counters: std::sync::OnceLock::new(),
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
+            model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
         });
         (create_router(state), milestone.id, task1.id, task2.id)
     }
@@ -6559,6 +6564,7 @@ mod tests {
             reactor_counters: std::sync::OnceLock::new(),
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
+            model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
         }
     }
 
@@ -6719,6 +6725,7 @@ mod tests {
             reactor_counters: std::sync::OnceLock::new(),
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
+            model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
         });
         create_router(state)
     }
@@ -7513,6 +7520,7 @@ mod tests {
             reactor_counters: std::sync::OnceLock::new(),
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
+            model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
         });
         (create_router(state), plan.id, task1.id, task2.id)
     }
@@ -7622,6 +7630,7 @@ mod tests {
             reactor_counters: std::sync::OnceLock::new(),
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
+            model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
         });
         let app = create_router(state);
 
@@ -7798,6 +7807,7 @@ mod tests {
             reactor_counters,
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
+            model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
         });
         let app = create_router(state);
 
@@ -7848,6 +7858,7 @@ mod tests {
             reactor_counters,
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
+            model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
         });
         let app = create_router(state);
 
@@ -7937,6 +7948,7 @@ mod tests {
             reactor_counters: std::sync::OnceLock::new(),
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
+            model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
         })
     }
 
@@ -8114,6 +8126,7 @@ mod tests {
                 crate::graph::confidence::ConfidenceTracker::default(),
             ),
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
+            model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
         });
         (state, project, graph)
     }
