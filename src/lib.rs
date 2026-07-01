@@ -97,6 +97,9 @@ pub struct YamlConfig {
     /// Skill registry section (optional — enables cross-instance skill sharing)
     #[serde(default)]
     pub registry: RegistryYamlConfig,
+    /// Anthropic API section (optional — enables live model catalog discovery)
+    #[serde(default)]
+    pub anthropic: AnthropicYamlConfig,
     /// Runner section (optional — configures autonomous plan execution)
     #[serde(default)]
     pub runner: runner::RunnerConfig,
@@ -155,6 +158,21 @@ pub struct RegistryYamlConfig {
     /// URL of a remote PO instance to use as a skill registry
     /// (e.g. "https://po-central.example.com")
     pub remote_url: Option<String>,
+}
+
+/// Anthropic API configuration section (optional).
+///
+/// When an API key is present, the backend queries Anthropic's Models API
+/// (`GET /v1/models`) to keep the chat model selector's catalog up to date
+/// automatically, instead of requiring a manual code change + release every
+/// time a model is added or renamed. See `chat::model_catalog`.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct AnthropicYamlConfig {
+    /// Anthropic API key, used only for `GET /v1/models` (live model
+    /// discovery) — never for chat itself, which goes through the Claude
+    /// Code CLI subprocess and its own auth.
+    pub api_key: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -600,6 +618,13 @@ pub struct Config {
     /// Priority: env var (EMBEDDING_DIMENSIONS) > YAML (embeddings.dimensions) > None.
     pub embedding_dimensions: Option<usize>,
 
+    // ── Anthropic API config ─────────────────────────────────────────────
+    /// Anthropic API key, used only for live model catalog discovery
+    /// (`GET /v1/models`) — chat itself goes through the Claude Code CLI.
+    /// Priority: env var (ANTHROPIC_API_KEY) > YAML (anthropic.api_key) > None.
+    /// When absent, the model selector falls back to a small static list.
+    pub anthropic_api_key: Option<String>,
+
     // ── Skill Registry config ────────────────────────────────────────────
     /// URL of a remote PO instance to use as a skill registry.
     /// When set, registry search merges local + remote results.
@@ -694,6 +719,10 @@ impl Config {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .or(yaml.embeddings.dimensions),
+            // Anthropic API config (env var > YAML > None)
+            anthropic_api_key: std::env::var("ANTHROPIC_API_KEY")
+                .ok()
+                .or(yaml.anthropic.api_key),
             // Registry config (env var > YAML > None)
             registry_remote_url: std::env::var("REGISTRY_REMOTE_URL")
                 .ok()
@@ -1514,6 +1543,9 @@ pub async fn start_server(mut config: Config) -> Result<()> {
         reactor_counters: std::sync::OnceLock::new(),
         confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
         mcp_registry: mcp_registry.clone(),
+        model_catalog: chat::model_catalog::ModelCatalogCache::new(
+            config.anthropic_api_key.clone(),
+        ),
     });
 
     // ── EventReactor: build, register built-in reactions, and spawn ──

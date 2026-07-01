@@ -15,6 +15,7 @@ pub mod enrichment;
 pub mod entity_extractor;
 pub mod feedback;
 pub mod manager;
+pub mod model_catalog;
 pub mod observation_detector;
 pub(crate) mod oob_listener;
 pub mod path_detect;
