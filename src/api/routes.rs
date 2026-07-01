@@ -215,6 +215,17 @@ fn protected_routes() -> Router<OrchestratorState> {
         // ================================================================
         .route("/auth/me", get(auth_handlers::get_me))
         // ================================================================
+        // MCP Streamable HTTP transport (remote Claude clients)
+        // POST = JSON-RPC messages, GET = 405 (no server-push stream yet),
+        // DELETE = session termination. See src/mcp/http_transport.rs.
+        // ================================================================
+        .route(
+            "/mcp",
+            post(crate::mcp::http_transport::mcp_post)
+                .get(crate::mcp::http_transport::mcp_get)
+                .delete(crate::mcp::http_transport::mcp_delete),
+        )
+        // ================================================================
         // Projects (multi-project support)
         // ================================================================
         .route(
