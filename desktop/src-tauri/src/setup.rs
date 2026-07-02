@@ -1237,6 +1237,9 @@ pub fn read_config() -> Result<ReadConfigResponse, String> {
         has_oidc_secret,
         has_neo4j_password,
         has_meilisearch_key,
+        // Remote MCP: false when the section is absent (serde default), so a
+        // pre-remote-MCP config.yaml pre-fills the wizard as "disabled".
+        remote_mcp_enabled: yaml.remote_mcp.enabled,
     })
 }
 
@@ -1258,6 +1261,8 @@ pub struct ReadConfigResponse {
     pub serve_frontend: bool,
     /// Public URL for reverse-proxy setups (empty if not configured).
     pub public_url: String,
+    /// Whether remote MCP is enabled (false when the section is absent).
+    pub remote_mcp_enabled: bool,
     pub auth_mode: String,
     pub root_email: String,
     pub root_password: String,
@@ -2125,6 +2130,31 @@ mod remote_mcp_tests {
             .filter(|o| *o == "https://claude.ai")
             .count();
         assert_eq!(claude_count, 1, "no duplicate claude.ai origin");
+    }
+
+    /// A legacy config.yaml with no remote_mcp section deserializes into the
+    /// backend YamlConfig with remote MCP disabled — this is exactly the value
+    /// read_config surfaces (yaml.remote_mcp.enabled), so upgrades pre-fill the
+    /// wizard as "disabled" with no parse error and no config loss.
+    #[test]
+    fn legacy_config_without_section_reads_as_disabled() {
+        let legacy = r#"
+setup_completed: true
+server:
+  port: 6600
+neo4j:
+  uri: "bolt://localhost:7687"
+  user: "neo4j"
+  password: "secret-kept"
+meilisearch:
+  url: "http://localhost:7700"
+  key: "meili-kept"
+"#;
+        let yaml: project_orchestrator::YamlConfig = serde_yaml::from_str(legacy).unwrap();
+        assert!(!yaml.remote_mcp.enabled);
+        // Pre-existing secrets are untouched by the (absent) remote MCP section.
+        assert_eq!(yaml.neo4j.password, "secret-kept");
+        assert_eq!(yaml.meilisearch.key, "meili-kept");
     }
 
     #[test]
