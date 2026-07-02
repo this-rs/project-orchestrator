@@ -28,6 +28,13 @@ pub struct SetupConfig {
     #[serde(default)]
     pub public_url: String,
 
+    // Remote MCP (Streamable HTTP + OAuth 2.1 AS for Claude.ai connectors)
+    /// Opt-in toggle for the remote MCP transport. Default false — the wizard
+    /// never exposes /mcp without an explicit choice. When true, `public_url`
+    /// MUST be an https:// domain (validated in generate_config).
+    #[serde(default)]
+    pub remote_mcp_enabled: bool,
+
     // Auth
     pub auth_mode: String,
     pub root_email: String,
@@ -171,6 +178,94 @@ struct YamlOutput {
     embeddings: Option<EmbeddingsSection>,
     #[serde(skip_serializing_if = "Option::is_none")]
     auth: Option<AuthSection>,
+    /// Remote MCP section — always emitted (additive). Its `enabled` flag gates
+    /// the /mcp + OAuth 2.1 AS routes; keys mirror the backend RemoteMcpConfig.
+    remote_mcp: RemoteMcpSection,
+}
+
+/// Remote MCP config block — mirrors `project_orchestrator::RemoteMcpConfig`.
+///
+/// The public issuer/domain is NOT here — it reuses `server.public_url`. No
+/// secret is stored: DCR client_ids and MCP tokens are stateless JWTs signed
+/// with `auth.jwt_secret`.
+#[derive(Debug, Serialize)]
+struct RemoteMcpSection {
+    /// Opt-in master switch. False ⇒ /mcp + OAuth routes are not mounted.
+    enabled: bool,
+    /// Loopback/tailnet bind interface. Never 0.0.0.0 from the wizard.
+    bind_addr: String,
+    session_ttl_secs: u64,
+    rate_limit: RemoteMcpRateLimitSection,
+    /// Browser connector origins (auto-seeded with claude.ai/claude.com).
+    origin_allowlist: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct RemoteMcpRateLimitSection {
+    window_secs: u64,
+    max_requests: u32,
+}
+
+/// Validate the remote MCP opt-in invariant: when enabled, `public_url` must be
+/// a non-empty https:// domain. The OAuth issuer, `.well-known` metadata and the
+/// `/mcp` resource URL all derive from `server.public_url`, so claude.ai
+/// connectors cannot work without it.
+fn validate_remote_mcp_exposure(enabled: bool, public_url: &str) -> Result<(), String> {
+    if enabled {
+        let pu = public_url.trim();
+        if pu.is_empty() || !pu.starts_with("https://") {
+            return Err(
+                "Remote MCP requires a public HTTPS domain (server.public_url must start \
+                 with https://). Set a public URL or disable remote MCP."
+                    .to_string(),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Anthropic Claude connector browser origins, seeded into the remote MCP
+/// origin allowlist so the "Add connector" browser flow passes the
+/// DNS-rebinding Origin check. Server-side fetchers send no Origin and are
+/// gated by the bearer token instead.
+const CLAUDE_CONNECTOR_ORIGINS: [&str; 2] = ["https://claude.ai", "https://claude.com"];
+
+/// Build the remote MCP section from the wizard flag, preserving any
+/// operator-customized values found in an existing config (additive reconfigure)
+/// and always ensuring the Claude connector origins are present.
+fn build_remote_mcp_section(
+    enabled: bool,
+    existing: Option<&project_orchestrator::RemoteMcpConfig>,
+) -> RemoteMcpSection {
+    // Start from existing values (reconfigure) or the safe defaults.
+    let bind_addr = existing
+        .map(|e| e.bind_addr.clone())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+    let session_ttl_secs = existing.map(|e| e.session_ttl_secs).unwrap_or(3600);
+    let (window_secs, max_requests) = existing
+        .map(|e| (e.rate_limit.window_secs, e.rate_limit.max_requests))
+        .unwrap_or((60, 120));
+
+    // Union existing origins with the seeded Claude connector origins.
+    let mut origin_allowlist: Vec<String> =
+        existing.map(|e| e.origin_allowlist.clone()).unwrap_or_default();
+    for o in CLAUDE_CONNECTOR_ORIGINS {
+        if !origin_allowlist.iter().any(|x| x == o) {
+            origin_allowlist.push(o.to_string());
+        }
+    }
+
+    RemoteMcpSection {
+        enabled,
+        bind_addr,
+        session_ttl_secs,
+        rate_limit: RemoteMcpRateLimitSection {
+            window_secs,
+            max_requests,
+        },
+        origin_allowlist,
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -483,6 +578,10 @@ pub fn generate_config(config: SetupConfig) -> Result<String, String> {
     let path = config_path();
     tracing::info!("Generating config at: {}", path.display());
 
+    // Remote MCP is opt-in and requires a public HTTPS domain (defense-in-depth;
+    // the wizard UI blocks it too).
+    validate_remote_mcp_exposure(config.remote_mcp_enabled, &config.public_url)?;
+
     // ── Read existing config for secret preservation (reconfigure mode) ──
     let existing: Option<project_orchestrator::YamlConfig> = std::fs::read_to_string(&path)
         .ok()
@@ -767,6 +866,10 @@ pub fn generate_config(config: SetupConfig) -> Result<String, String> {
             })
         },
         auth,
+        remote_mcp: build_remote_mcp_section(
+            config.remote_mcp_enabled,
+            existing.as_ref().map(|e| &e.remote_mcp),
+        ),
     };
 
     // Serialize
@@ -1230,6 +1333,8 @@ pub fn generate_default_config() -> Result<PathBuf, String> {
         chat: None,
         embeddings: None,
         auth: None, // no-auth mode — wizard can load freely
+        // Remote MCP disabled on first boot (opt-in via the wizard).
+        remote_mcp: build_remote_mcp_section(false, None),
     };
 
     let yaml_str = serde_yaml::to_string(&yaml).map_err(|e| format!("YAML error: {}", e))?;
@@ -1948,4 +2053,89 @@ fn chrono_now() -> String {
     // Basic formatting: days since epoch → approximate date
     // For a proper date we'd need chrono, but this is good enough for a comment
     format!("unix:{}", secs)
+}
+
+#[cfg(test)]
+mod remote_mcp_tests {
+    use super::*;
+
+    /// Serializing the wizard's RemoteMcpSection must deserialize cleanly into
+    /// the backend RemoteMcpConfig — proves the emitted keys align with the
+    /// struct that gates the routes.
+    fn roundtrip(section: &RemoteMcpSection) -> project_orchestrator::RemoteMcpConfig {
+        let yaml = serde_yaml::to_string(section).unwrap();
+        serde_yaml::from_str(&yaml).unwrap()
+    }
+
+    #[test]
+    fn enabled_section_seeds_claude_origins_and_loopback() {
+        let section = build_remote_mcp_section(true, None);
+        assert!(section.enabled);
+        assert_eq!(section.bind_addr, "127.0.0.1");
+        assert!(section
+            .origin_allowlist
+            .contains(&"https://claude.ai".to_string()));
+        assert!(section
+            .origin_allowlist
+            .contains(&"https://claude.com".to_string()));
+
+        let cfg = roundtrip(&section);
+        assert!(cfg.enabled);
+        assert_eq!(cfg.bind_addr, "127.0.0.1");
+        assert!(cfg.origin_allowlist.contains(&"https://claude.ai".to_string()));
+        assert!(cfg.origin_allowlist.contains(&"https://claude.com".to_string()));
+    }
+
+    #[test]
+    fn disabled_by_default() {
+        let section = build_remote_mcp_section(false, None);
+        assert!(!section.enabled);
+        // Origins are still seeded (harmless while disabled) and bind stays loopback.
+        assert_eq!(section.bind_addr, "127.0.0.1");
+        assert!(!roundtrip(&section).enabled);
+    }
+
+    #[test]
+    fn reconfigure_preserves_existing_and_unions_origins() {
+        let existing = project_orchestrator::RemoteMcpConfig {
+            enabled: true,
+            bind_addr: "100.64.0.1".to_string(), // tailnet interface set by operator
+            session_ttl_secs: 1800,
+            rate_limit: project_orchestrator::RemoteMcpRateLimit {
+                window_secs: 30,
+                max_requests: 42,
+            },
+            origin_allowlist: vec!["https://custom.example".to_string()],
+        };
+        let section = build_remote_mcp_section(true, Some(&existing));
+        // Operator values preserved.
+        assert_eq!(section.bind_addr, "100.64.0.1");
+        assert_eq!(section.session_ttl_secs, 1800);
+        assert_eq!(section.rate_limit.max_requests, 42);
+        // Custom origin kept AND Claude origins added (union, no dup).
+        assert!(section
+            .origin_allowlist
+            .contains(&"https://custom.example".to_string()));
+        assert!(section
+            .origin_allowlist
+            .contains(&"https://claude.ai".to_string()));
+        let claude_count = section
+            .origin_allowlist
+            .iter()
+            .filter(|o| *o == "https://claude.ai")
+            .count();
+        assert_eq!(claude_count, 1, "no duplicate claude.ai origin");
+    }
+
+    #[test]
+    fn exposure_requires_https_public_url_when_enabled() {
+        // Disabled: any public_url is fine.
+        assert!(validate_remote_mcp_exposure(false, "").is_ok());
+        // Enabled + valid https: ok.
+        assert!(validate_remote_mcp_exposure(true, "https://po.example.com").is_ok());
+        // Enabled + empty or non-https: rejected.
+        assert!(validate_remote_mcp_exposure(true, "").is_err());
+        assert!(validate_remote_mcp_exposure(true, "http://po.example.com").is_err());
+        assert!(validate_remote_mcp_exposure(true, "po.example.com").is_err());
+    }
 }
