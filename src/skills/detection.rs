@@ -272,6 +272,30 @@ pub enum DeduplicationOutcome {
     },
 }
 
+/// Collapse near-duplicate candidates against **each other** (inter-candidate
+/// dedup), before comparing against existing skills.
+///
+/// Louvain can emit multiple candidates covering almost the same member set
+/// (constat 5: duplicate skills). Greedy pass in input order: a candidate is
+/// dropped if its Jaccard against an already-kept candidate exceeds
+/// `overlap_threshold`. Guarantees no surviving candidate pair with
+/// Jaccard > `overlap_threshold`.
+pub fn dedupe_inter_candidates(
+    candidates: Vec<SkillCandidate>,
+    overlap_threshold: f64,
+) -> Vec<SkillCandidate> {
+    let mut kept: Vec<SkillCandidate> = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        let is_dup = kept.iter().any(|k| {
+            jaccard_similarity(&candidate.member_note_ids, &k.member_note_ids) > overlap_threshold
+        });
+        if !is_dup {
+            kept.push(candidate);
+        }
+    }
+    kept
+}
+
 /// Deduplicate candidates against existing skills.
 ///
 /// For each candidate, compute the Jaccard similarity of its member_note_ids
@@ -685,17 +709,22 @@ pub async fn detect_skills_pipeline(
     let existing_skills = graph_store.get_skills_for_project(project_id).await?;
     let mut existing_members: Vec<(Uuid, Vec<String>)> = Vec::new();
     for skill in &existing_skills {
-        let (notes, _decisions) = graph_store.get_skill_members(skill.id).await?;
-        let member_ids: Vec<String> = notes.iter().map(|n| n.id.to_string()).collect();
+        let (notes, decisions) = graph_store.get_skill_members(skill.id).await?;
+        // Include decision members (MEMBER_OF_SKILL) alongside notes so dedup
+        // accounts for decision-backed skills and does not split them (constat 5).
+        let member_ids: Vec<String> = notes
+            .iter()
+            .map(|n| n.id.to_string())
+            .chain(decisions.iter().map(|d| d.id.to_string()))
+            .collect();
         existing_members.push((skill.id, member_ids));
     }
 
-    // Step 4: Deduplicate
-    let outcomes = deduplicate_candidates(
-        detection.candidates,
-        &existing_members,
-        config.overlap_threshold,
-    );
+    // Step 4a: Inter-candidate dedup (collapse near-identical Louvain candidates)
+    let candidates = dedupe_inter_candidates(detection.candidates, config.overlap_threshold);
+
+    // Step 4b: Deduplicate against existing skills
+    let outcomes = deduplicate_candidates(candidates, &existing_members, config.overlap_threshold);
 
     let skills_created = outcomes
         .iter()
@@ -1131,6 +1160,38 @@ mod tests {
         let a: Vec<String> = vec![];
         let b: Vec<String> = vec![];
         assert_eq!(jaccard_similarity(&a, &b), 0.0);
+    }
+
+    // ================================================================
+    // dedupe_inter_candidates tests
+    // ================================================================
+
+    #[test]
+    fn test_dedupe_inter_candidates_collapses_near_duplicates() {
+        let mk = |cid: u32, members: &[&str]| SkillCandidate {
+            community_id: cid,
+            member_note_ids: members.iter().map(|s| s.to_string()).collect(),
+            cohesion: 0.8,
+            size: members.len(),
+            label: format!("c{cid}"),
+        };
+        let candidates = vec![
+            mk(0, &["a", "b", "c", "d"]),
+            mk(1, &["a", "b", "c", "d", "e"]), // Jaccard 4/5=0.8 > 0.7 → dropped
+            mk(2, &["x", "y", "z"]),           // disjoint → kept
+        ];
+        let kept = dedupe_inter_candidates(candidates, 0.7);
+        assert_eq!(kept.len(), 2);
+        assert_eq!(kept[0].community_id, 0);
+        assert_eq!(kept[1].community_id, 2);
+        // No surviving pair exceeds the threshold.
+        for i in 0..kept.len() {
+            for j in (i + 1)..kept.len() {
+                assert!(
+                    jaccard_similarity(&kept[i].member_note_ids, &kept[j].member_note_ids) <= 0.7
+                );
+            }
+        }
     }
 
     // ================================================================

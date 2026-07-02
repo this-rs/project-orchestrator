@@ -3,7 +3,25 @@
 //! Uses statistical analysis of note tags to compose human-readable skill names.
 //! No LLM needed — purely deterministic heuristic.
 
+use regex::Regex;
 use std::collections::{HashMap, HashSet};
+use std::sync::LazyLock;
+
+/// Matches a canonical UUID (skill/plan/task identifiers leaking into tags).
+static UUID_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$").unwrap()
+});
+
+/// Matches short identifier tokens: `T12`, `t7`, `plan-abcd`, `task-3`, bare hex blobs.
+static ID_TOKEN_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)^(t\d+|(plan|task|step|milestone)-\S+|[0-9a-f]{7,})$").unwrap());
+
+/// True if a tag is an identifier rather than a meaningful label — such tags
+/// must never become part of a skill name (constat 5: ID-named skills).
+fn is_id_shaped(tag: &str) -> bool {
+    let t = tag.trim();
+    UUID_RE.is_match(t) || ID_TOKEN_RE.is_match(t)
+}
 
 /// Generate a skill name from the tags of its member notes.
 ///
@@ -22,6 +40,11 @@ pub fn generate_skill_name(
     let mut freq: HashMap<&str, usize> = HashMap::new();
     for tags in tags_per_note {
         for tag in tags {
+            // Skip identifier-shaped tags (UUIDs, T123, plan-XXXX): they would
+            // produce meaningless ID-named skills.
+            if is_id_shaped(tag) {
+                continue;
+            }
             *freq.entry(tag.as_str()).or_insert(0) += 1;
         }
     }
@@ -141,6 +164,44 @@ mod tests {
             "Expected '-5' suffix in '{}'",
             deduped
         );
+    }
+
+    #[test]
+    fn test_is_id_shaped() {
+        assert!(is_id_shaped("550e8400-e29b-41d4-a716-446655440000")); // UUID
+        assert!(is_id_shaped("T12"));
+        assert!(is_id_shaped("t7"));
+        assert!(is_id_shaped("plan-2da9fc43"));
+        assert!(is_id_shaped("task-3"));
+        assert!(is_id_shaped("deadbeef")); // bare hex blob
+        assert!(!is_id_shaped("auth"));
+        assert!(!is_id_shaped("neo4j"));
+        assert!(!is_id_shaped("api")); // 3 chars, not a hex blob
+    }
+
+    #[test]
+    fn test_generate_skill_name_strips_id_tags() {
+        // A cluster whose only non-ID tags are "auth"/"neo4j" must be named from
+        // those, never from the leaked UUID/T-id tags.
+        let tags = vec![
+            vec![
+                "550e8400-e29b-41d4-a716-446655440000".to_string(),
+                "auth".to_string(),
+                "T42".to_string(),
+            ],
+            vec!["auth".to_string(), "plan-abcd".to_string()],
+        ];
+        let name = generate_skill_name(&tags, 0, None);
+        assert_eq!(name, "Auth");
+        assert!(!name.contains("550e8400"));
+        assert!(!name.contains("T42"));
+    }
+
+    #[test]
+    fn test_generate_skill_name_all_id_tags_falls_back() {
+        let tags = vec![vec!["T1".to_string(), "plan-x".to_string()]];
+        let name = generate_skill_name(&tags, 9, None);
+        assert_eq!(name, "Cluster-9");
     }
 
     #[test]
