@@ -70,6 +70,9 @@ ignore = [
     # ── other unmaintained transitive deps.
     { id = "RUSTSEC-2024-0370", reason = "proc-macro-error unmaintained — transitive build-time proc-macro dep. No runtime/security impact." },
     { id = "RUSTSEC-2025-0057", reason = "fxhash unmaintained — transitive non-cryptographic hasher. No security impact." },
+    # ── quick-xml DoS advisories — no upgrade path (fix requires quick-xml >= 0.40).
+    { id = "RUSTSEC-2026-0194", reason = "quick-xml quadratic duplicate-attribute check DoS. Transitive via plist 1.9.0 ← tauri; latest plist still pins quick-xml 0.39. Only used to read trusted macOS Info.plist bundle metadata — never untrusted XML. Revisit when plist bumps quick-xml >= 0.40." },
+    { id = "RUSTSEC-2026-0195", reason = "quick-xml parsing-cost DoS (same family as RUSTSEC-2026-0194). Same transitive chain and justification: plist ← tauri, trusted local Info.plist input only." },
 ]
 
 [bans]
