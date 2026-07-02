@@ -70,6 +70,12 @@ const CURATED_ORDER: &[(&str, &str, &str, &str)] = &[
         "Most capable — demanding reasoning & long-horizon agentic work",
     ),
     (
+        "claude-fable-5",
+        "Fable 5",
+        "bg-rose-400",
+        "Previous generation — superseded by Sonnet 5",
+    ),
+    (
         "claude-opus-4-8",
         "Opus 4.8",
         "bg-violet-500",
@@ -335,14 +341,25 @@ impl ModelCatalogCache {
         // Curated models first (in our preferred order), then anything the
         // live API knows about that we haven't curated yet, newest-looking
         // (API order) last.
+        //
+        // Curated entries are ALWAYS included, even when absent from the
+        // Models API response. Chat goes through the Claude Code CLI (its own
+        // auth/routing), which can serve models the first-party Models API
+        // doesn't list — e.g. `claude-fable-5` works via the CLI while being
+        // absent from the API. Gating curation on API presence silently
+        // dropped such models from the selector. Deactivating a model is now
+        // an explicit act (remove its CURATED_ORDER entry) rather than an
+        // implicit side effect of an API listing change.
         let mut seen = std::collections::HashSet::new();
         let mut models: Vec<ModelDefinition> = Vec::new();
 
         for (id, ..) in CURATED_ORDER {
-            if let Some(entry) = entries.iter().find(|e| e.id == *id) {
-                models.push(resolve_model(&entry.id, entry.display_name.as_deref()));
-                seen.insert(entry.id.clone());
-            }
+            let api_entry = entries.iter().find(|e| e.id == *id);
+            models.push(resolve_model(
+                id,
+                api_entry.and_then(|e| e.display_name.as_deref()),
+            ));
+            seen.insert(id.to_string());
         }
         for entry in &entries {
             if seen.contains(&entry.id) {
@@ -380,10 +397,13 @@ mod tests {
     }
 
     #[test]
-    fn test_curated_lookup_no_fable() {
-        // The whole point of this module's introduction: Fable 5 was renamed
-        // to Sonnet 5 — it must not resurface via curation.
-        assert!(curated_lookup("claude-fable-5").is_none());
+    fn test_curated_lookup_fable_and_sonnet_both_resolve() {
+        // Fable 5 was briefly renamed away when Sonnet 5 launched, then
+        // reintroduced as its own selectable entry alongside Sonnet 5 —
+        // both IDs must resolve independently via curation.
+        let fable = curated_lookup("claude-fable-5");
+        assert!(fable.is_some());
+        assert_eq!(fable.unwrap().short_label, "Fable 5");
         assert!(curated_lookup("claude-sonnet-5").is_some());
     }
 
@@ -392,7 +412,7 @@ mod tests {
         let models = static_fallback_models();
         assert!(!models.is_empty());
         assert_eq!(models[0].id, "claude-sonnet-5");
-        assert!(models.iter().all(|m| m.id != "claude-fable-5"));
+        assert_eq!(models[1].id, "claude-fable-5");
     }
 
     #[test]
