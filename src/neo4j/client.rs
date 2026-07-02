@@ -1,7 +1,7 @@
 //! Neo4j client for interacting with the knowledge graph
 
 use anyhow::{Context, Result};
-use neo4rs::{query, Graph, Query};
+use neo4rs::{query, ConfigBuilder, Graph, Query};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
@@ -156,8 +156,41 @@ impl WhereBuilder {
 
 impl Neo4jClient {
     /// Create a new Neo4j client
+    ///
+    /// Pool sizing is configurable via env vars, falling back to defaults well
+    /// above neo4rs' built-ins (16 connections / fetch_size 200), which starve
+    /// under concurrent fan-out — e.g. the workspace intelligence summary fires
+    /// ~14 queries per project in parallel, multiplied by the number of tabs:
+    /// - `NEO4J_MAX_CONNECTIONS` (default 50)
+    /// - `NEO4J_FETCH_SIZE` (default 500)
     pub async fn new(uri: &str, user: &str, password: &str) -> Result<Self> {
-        let graph = Graph::new(uri, user, password)
+        let max_connections = std::env::var("NEO4J_MAX_CONNECTIONS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(50);
+        let fetch_size = std::env::var("NEO4J_FETCH_SIZE")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(500);
+
+        let config = ConfigBuilder::new()
+            .uri(uri)
+            .user(user)
+            .password(password)
+            .max_connections(max_connections)
+            .fetch_size(fetch_size)
+            .build()
+            .context("Failed to build Neo4j config")?;
+
+        tracing::info!(
+            max_connections,
+            fetch_size,
+            "Connecting to Neo4j with configured pool"
+        );
+
+        let graph = Graph::connect(config)
             .await
             .context("Failed to connect to Neo4j")?;
 

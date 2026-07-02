@@ -63,7 +63,7 @@ tokio-util = { workspace = true }
 # Web framework for webhook listener
 axum = { version = "0.8", features = ["macros", "ws"] }
 tower = "0.5"
-tower-http = { version = "0.7", features = ["cors", "trace", "fs", "set-header"] }
+tower-http = { version = "0.7", features = ["cors", "trace", "fs", "set-header", "timeout"] }
 
 # Serialization
 serde = { workspace = true }

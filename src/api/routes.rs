@@ -54,7 +54,24 @@ pub fn create_router(state: OrchestratorState) -> Router {
     let cors = build_cors(&state);
 
     let public = public_routes();
-    let protected = protected_routes().layer(from_fn_with_state(state.clone(), require_auth));
+
+    // Request timeout on protected REST routes only. Hung requests (e.g. a
+    // handler blocked waiting for a saturated Neo4j pool) return 408 instead of
+    // freezing the tab forever. WS routes live in `public_routes` and are NOT
+    // wrapped — a blanket timeout would kill long-lived sockets.
+    // Heavy admin/sync ops spawn background work and return fast, so the
+    // generous default (60s) does not clip them. Tune via env if needed.
+    let timeout_secs = std::env::var("HTTP_REQUEST_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(60);
+    let protected = protected_routes()
+        .layer(from_fn_with_state(state.clone(), require_auth))
+        .layer(tower_http::timeout::TimeoutLayer::with_status_code(
+            axum::http::StatusCode::REQUEST_TIMEOUT,
+            std::time::Duration::from_secs(timeout_secs),
+        ));
 
     let router = public
         .merge(protected)
