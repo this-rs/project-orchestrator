@@ -157,6 +157,29 @@ fn public_routes() -> Router<OrchestratorState> {
         .route("/auth/providers", get(auth_handlers::get_auth_providers))
         .route("/auth/login", post(auth_handlers::password_login))
         .route("/auth/register", post(auth_handlers::register))
+        // ================================================================
+        // OAuth 2.1 Authorization Server (Claude.ai remote MCP connectors)
+        // Public per spec: discovery metadata, DCR, authorize (user auth
+        // happens via the refresh cookie inside), token exchange (PKCE).
+        // See src/auth/oauth_server.rs.
+        // ================================================================
+        .route(
+            "/.well-known/oauth-authorization-server",
+            get(crate::auth::oauth_server::authorization_server_metadata),
+        )
+        .route(
+            "/.well-known/oauth-protected-resource",
+            get(crate::auth::oauth_server::protected_resource_metadata),
+        )
+        .route(
+            "/oauth/register",
+            post(crate::auth::oauth_server::register_client),
+        )
+        .route(
+            "/oauth/authorize",
+            get(crate::auth::oauth_server::authorize),
+        )
+        .route("/oauth/token", post(crate::auth::oauth_server::token))
         // OIDC generic routes
         .route("/auth/oidc", get(auth_handlers::oidc_login))
         .route("/auth/oidc/callback", post(auth_handlers::oidc_callback))

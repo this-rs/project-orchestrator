@@ -11,5 +11,6 @@ pub mod extractor;
 pub mod google;
 pub mod jwt;
 pub mod middleware;
+pub mod oauth_server;
 pub mod oidc;
 pub mod refresh;
