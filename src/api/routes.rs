@@ -53,7 +53,15 @@ use tower_http::trace::TraceLayer;
 pub fn create_router(state: OrchestratorState) -> Router {
     let cors = build_cors(&state);
 
-    let public = public_routes();
+    // Remote MCP is opt-in: the /mcp transport and OAuth 2.1 AS routes are only
+    // mounted when explicitly enabled in config. When disabled, requests to /mcp
+    // and /oauth/* fall through to the 404/SPA fallback — no exposure by default.
+    let remote_mcp_enabled = state.remote_mcp.enabled;
+
+    let mut public = public_routes();
+    if remote_mcp_enabled {
+        public = public.merge(remote_mcp_public_routes());
+    }
 
     // Request timeout on protected REST routes only. Hung requests (e.g. a
     // handler blocked waiting for a saturated Neo4j pool) return 408 instead of
@@ -66,7 +74,12 @@ pub fn create_router(state: OrchestratorState) -> Router {
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|&n| n > 0)
         .unwrap_or(60);
-    let protected = protected_routes()
+    let mut protected = protected_routes();
+    if remote_mcp_enabled {
+        // Merge BEFORE the require_auth layer so /mcp stays authenticated.
+        protected = protected.merge(remote_mcp_protected_routes());
+    }
+    let protected = protected
         .layer(from_fn_with_state(state.clone(), require_auth))
         .layer(tower_http::timeout::TimeoutLayer::with_status_code(
             axum::http::StatusCode::REQUEST_TIMEOUT,
@@ -162,24 +175,14 @@ fn build_cors(state: &OrchestratorState) -> CorsLayer {
 /// Routes accessible without authentication.
 ///
 /// Includes: health check, OAuth login/callback, webhook endpoints, internal events.
-fn public_routes() -> Router<OrchestratorState> {
+/// Remote MCP public routes — OAuth 2.1 Authorization Server + discovery.
+///
+/// Mounted only when `remote_mcp.enabled` is true (see `create_router`). Public
+/// per the OAuth/MCP spec: discovery metadata, Dynamic Client Registration,
+/// authorize (user auth happens via the refresh cookie inside), token exchange
+/// (PKCE). See src/auth/oauth_server.rs.
+fn remote_mcp_public_routes() -> Router<OrchestratorState> {
     Router::new()
-        // Health check, version & setup status
-        .route("/health", get(handlers::health))
-        .route("/api/version", get(handlers::get_version))
-        .route("/api/setup-status", get(handlers::setup_status))
-        // ================================================================
-        // Auth (public — login flow + discovery)
-        // ================================================================
-        .route("/auth/providers", get(auth_handlers::get_auth_providers))
-        .route("/auth/login", post(auth_handlers::password_login))
-        .route("/auth/register", post(auth_handlers::register))
-        // ================================================================
-        // OAuth 2.1 Authorization Server (Claude.ai remote MCP connectors)
-        // Public per spec: discovery metadata, DCR, authorize (user auth
-        // happens via the refresh cookie inside), token exchange (PKCE).
-        // See src/auth/oauth_server.rs.
-        // ================================================================
         .route(
             "/.well-known/oauth-authorization-server",
             get(crate::auth::oauth_server::authorization_server_metadata),
@@ -192,11 +195,39 @@ fn public_routes() -> Router<OrchestratorState> {
             "/oauth/register",
             post(crate::auth::oauth_server::register_client),
         )
-        .route(
-            "/oauth/authorize",
-            get(crate::auth::oauth_server::authorize),
-        )
+        .route("/oauth/authorize", get(crate::auth::oauth_server::authorize))
         .route("/oauth/token", post(crate::auth::oauth_server::token))
+}
+
+/// Remote MCP protected routes — the Streamable HTTP transport itself.
+///
+/// Mounted only when `remote_mcp.enabled` is true (see `create_router`) and kept
+/// UNDER the `require_auth` layer. POST = JSON-RPC messages, GET = SSE stream,
+/// DELETE = session termination. See src/mcp/http_transport.rs.
+fn remote_mcp_protected_routes() -> Router<OrchestratorState> {
+    Router::new().route(
+        "/mcp",
+        post(crate::mcp::http_transport::mcp_post)
+            .get(crate::mcp::http_transport::mcp_get)
+            .delete(crate::mcp::http_transport::mcp_delete),
+    )
+}
+
+fn public_routes() -> Router<OrchestratorState> {
+    Router::new()
+        // Health check, version & setup status
+        .route("/health", get(handlers::health))
+        .route("/api/version", get(handlers::get_version))
+        .route("/api/setup-status", get(handlers::setup_status))
+        // ================================================================
+        // Auth (public — login flow + discovery)
+        // ================================================================
+        .route("/auth/providers", get(auth_handlers::get_auth_providers))
+        .route("/auth/login", post(auth_handlers::password_login))
+        .route("/auth/register", post(auth_handlers::register))
+        // NOTE: the OAuth 2.1 Authorization Server routes (discovery metadata,
+        // DCR, authorize, token) are gated behind remote_mcp.enabled and mounted
+        // separately in `create_router` via `remote_mcp_public_routes()`.
         // OIDC generic routes
         .route("/auth/oidc", get(auth_handlers::oidc_login))
         .route("/auth/oidc/callback", post(auth_handlers::oidc_callback))
@@ -265,17 +296,9 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/auth/mcp-tokens/{jti}",
             axum::routing::delete(auth_handlers::revoke_mcp_token),
         )
-        // ================================================================
-        // MCP Streamable HTTP transport (remote Claude clients)
-        // POST = JSON-RPC messages, GET = 405 (no server-push stream yet),
-        // DELETE = session termination. See src/mcp/http_transport.rs.
-        // ================================================================
-        .route(
-            "/mcp",
-            post(crate::mcp::http_transport::mcp_post)
-                .get(crate::mcp::http_transport::mcp_get)
-                .delete(crate::mcp::http_transport::mcp_delete),
-        )
+        // NOTE: the `/mcp` Streamable HTTP transport route is gated behind
+        // remote_mcp.enabled and mounted separately in `create_router` via
+        // `remote_mcp_protected_routes()` (still under `require_auth`).
         // ================================================================
         // Projects (multi-project support)
         // ================================================================
@@ -1830,6 +1853,7 @@ mod tests {
             setup_completed: true,
             server_port: 6600,
             public_url: None,
+            remote_mcp: crate::RemoteMcpConfig::default(),
             ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
             registry_remote_url: None,
             oidc_client: None,
@@ -1844,6 +1868,114 @@ mod tests {
             model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
         });
         create_router(state)
+    }
+
+    /// Build a test router with a specific remote MCP config and no frontend, so
+    /// unmounted routes resolve to a clean 404 (not the SPA fallback).
+    async fn test_app_remote_mcp(remote_mcp: crate::RemoteMcpConfig) -> Router {
+        let app_state = mock_app_state();
+        let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
+        let watcher = Arc::new(RwLock::new(FileWatcher::new(orchestrator.clone())));
+        let state = Arc::new(handlers::ServerState {
+            orchestrator,
+            watcher,
+            chat_manager: None,
+            event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(
+                EventBus::default(),
+            ))),
+            nats_emitter: None,
+            auth_config: Some(test_auth_config()),
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+            setup_completed: true,
+            server_port: 6600,
+            public_url: None,
+            remote_mcp,
+            ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
+            registry_remote_url: None,
+            oidc_client: None,
+            neural_router: crate::test_helpers::mock_neural_router(),
+            trajectory_collector: std::sync::RwLock::new(None),
+            trajectory_store_neo4j: None,
+            trajectory_store: None,
+            identity: None,
+            reactor_counters: std::sync::OnceLock::new(),
+            confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
+            mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
+            model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
+        });
+        create_router(state)
+    }
+
+    /// remote MCP DISABLED (default): the OAuth AS discovery routes are NOT
+    /// mounted. The authoritative signal is the *public* metadata route: when
+    /// mounted it returns 200 JSON; when absent the request falls through to the
+    /// require_auth-guarded fallback → 401 (never the 200 metadata document).
+    /// (`/mcp` itself is auth-guarded and returns 401 whether or not it is
+    /// mounted, so it can't discriminate at unit level — see the E2E task.)
+    #[tokio::test]
+    async fn test_remote_mcp_disabled_routes_absent() {
+        let app = test_app_remote_mcp(crate::RemoteMcpConfig::default()).await;
+
+        let meta = app
+            .oneshot(
+                Request::get("/.well-known/oauth-authorization-server")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            meta.status(),
+            StatusCode::OK,
+            "OAuth AS metadata must NOT be served when remote MCP is disabled"
+        );
+    }
+
+    /// remote MCP ENABLED: OAuth AS metadata is public (200); /mcp is mounted but
+    /// stays behind require_auth (401 without a token — crucially NOT 404).
+    #[tokio::test]
+    async fn test_remote_mcp_enabled_routes_present() {
+        let cfg = crate::RemoteMcpConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let app = test_app_remote_mcp(cfg).await;
+
+        let meta = app
+            .clone()
+            .oneshot(
+                Request::get("/.well-known/oauth-authorization-server")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            meta.status(),
+            StatusCode::OK,
+            "OAuth AS metadata must be served when remote MCP is enabled"
+        );
+
+        let mcp = app
+            .oneshot(
+                Request::post("/mcp")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            mcp.status(),
+            StatusCode::NOT_FOUND,
+            "/mcp must be mounted when remote MCP is enabled"
+        );
+        assert_eq!(
+            mcp.status(),
+            StatusCode::UNAUTHORIZED,
+            "/mcp must remain behind require_auth (401 without a token)"
+        );
     }
 
     /// Build a test router with serve_frontend disabled
@@ -1865,6 +1997,7 @@ mod tests {
             setup_completed: true,
             server_port: 6600,
             public_url: None,
+            remote_mcp: crate::RemoteMcpConfig::default(),
             ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
             registry_remote_url: None,
             oidc_client: None,

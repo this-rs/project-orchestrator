@@ -51,6 +51,10 @@ pub struct ServerState {
     /// Public URL for reverse-proxy setups (e.g. https://ffs.dev).
     /// Used for CORS and OAuth origin whitelist when both desktop + web access is needed.
     pub public_url: Option<String>,
+    /// Remote MCP transport config (disabled by default). Its `enabled` flag
+    /// gates the `/mcp` + OAuth AS routes; its `origin_allowlist` is union'd into
+    /// `allowed_origins()` (e.g. the Claude connector origins).
+    pub remote_mcp: crate::RemoteMcpConfig,
     /// In-memory store for ephemeral WebSocket auth tickets.
     /// Used as a fallback when cookies are not sent on WS upgrades (WKWebView).
     pub ws_ticket_store: Arc<super::ws_auth::WsTicketStore>,
@@ -134,6 +138,15 @@ impl ServerState {
             }
             // additional_origins from auth config (e.g. dev frontend on a different port)
             for origin in &auth_config.additional_origins {
+                add(origin);
+            }
+        }
+
+        // Remote MCP origin allowlist (e.g. https://claude.ai, https://claude.com
+        // for the browser connector flow). Only relevant when remote MCP is
+        // enabled; harmless to include when the routes are unmounted.
+        if self.remote_mcp.enabled {
+            for origin in &self.remote_mcp.origin_allowlist {
                 add(origin);
             }
         }
@@ -6339,6 +6352,7 @@ mod tests {
             setup_completed: true,
             server_port: 6600,
             public_url: None,
+            remote_mcp: crate::RemoteMcpConfig::default(),
             ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
             registry_remote_url: None,
             oidc_client: None,
@@ -6553,6 +6567,7 @@ mod tests {
             setup_completed: true,
             server_port,
             public_url: public_url.map(|s| s.to_string()),
+            remote_mcp: crate::RemoteMcpConfig::default(),
             ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
             registry_remote_url: None,
             oidc_client: None,
@@ -6714,6 +6729,7 @@ mod tests {
             setup_completed: true,
             server_port: 6600,
             public_url: None,
+            remote_mcp: crate::RemoteMcpConfig::default(),
             ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
             registry_remote_url: None,
             oidc_client: None,
@@ -7509,6 +7525,7 @@ mod tests {
             setup_completed: true,
             server_port: 6600,
             public_url: None,
+            remote_mcp: crate::RemoteMcpConfig::default(),
             ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
             registry_remote_url: None,
             oidc_client: None,
@@ -7619,6 +7636,7 @@ mod tests {
             setup_completed: true,
             server_port: 6600,
             public_url: None,
+            remote_mcp: crate::RemoteMcpConfig::default(),
             ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
             registry_remote_url: None,
             oidc_client: None,
@@ -7796,6 +7814,7 @@ mod tests {
             setup_completed: true,
             server_port: 6600,
             public_url: None,
+            remote_mcp: crate::RemoteMcpConfig::default(),
             ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
             registry_remote_url: None,
             oidc_client: None,
@@ -7847,6 +7866,7 @@ mod tests {
             setup_completed: true,
             server_port: 6600,
             public_url: None,
+            remote_mcp: crate::RemoteMcpConfig::default(),
             ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
             registry_remote_url: None,
             oidc_client: None,
@@ -7937,6 +7957,7 @@ mod tests {
             setup_completed: true,
             server_port: 0,
             public_url: None,
+            remote_mcp: crate::RemoteMcpConfig::default(),
             ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
             registry_remote_url: None,
             oidc_client: None,
@@ -8113,6 +8134,7 @@ mod tests {
             setup_completed: true,
             server_port: 0,
             public_url: None,
+            remote_mcp: crate::RemoteMcpConfig::default(),
             ws_ticket_store: std::sync::Arc::new(crate::api::ws_auth::WsTicketStore::new()),
             registry_remote_url: None,
             oidc_client: None,

@@ -109,6 +109,10 @@ pub struct YamlConfig {
     /// MCP Federation section (optional — connect to external MCP servers)
     #[serde(default)]
     pub mcp_federation: McpFederationConfig,
+    /// Remote MCP section (optional — exposes the /mcp Streamable HTTP transport
+    /// + OAuth 2.1 AS). Disabled by default: absent section ⇒ remote MCP off.
+    #[serde(default)]
+    pub remote_mcp: RemoteMcpConfig,
 }
 
 /// MCP Federation configuration section.
@@ -130,6 +134,109 @@ pub struct McpFederationConfig {
     /// Maximum reconnection attempts for failed servers (default: 3).
     #[serde(default = "default_reconnect_retries")]
     pub reconnect_max_retries: u32,
+}
+
+/// Remote MCP (Streamable HTTP) configuration section.
+///
+/// Gates the `/mcp` Streamable HTTP transport and the OAuth 2.1 Authorization
+/// Server / discovery routes. **Disabled by default** — those routes are only
+/// mounted when `enabled = true`, so a `config.yaml` without this section (the
+/// common case for existing installs) never exposes remote MCP. Opt-in is the
+/// consent gate for public exposure.
+///
+/// The public issuer/domain is NOT configured here — it reuses `server.public_url`
+/// (single source of truth for the OAuth issuer, `.well-known` metadata and the
+/// resource URL). No remote-MCP-specific secret is stored: Dynamic Client
+/// Registration client_ids and MCP access tokens are stateless JWTs signed with
+/// the existing `auth.jwt_secret`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct RemoteMcpConfig {
+    /// Master switch. When false, `/mcp`, `/oauth/*` and the OAuth discovery
+    /// metadata routes are NOT mounted. Default: false (opt-in).
+    pub enabled: bool,
+    /// Advertised bind interface for the transport. The `/mcp` route shares the
+    /// main Axum listener, so this is the loopback/tailnet interface the operator
+    /// intends to expose behind a TLS proxy. Default `127.0.0.1`; never `0.0.0.0`
+    /// by default. Validated as an IP address at startup when enabled.
+    pub bind_addr: String,
+    /// Idle session TTL (seconds) for the `Mcp-Session-Id` registry. Default 3600.
+    /// Consumed by the multi-session management task.
+    pub session_ttl_secs: u64,
+    /// Per-token rate limit. Default 120 requests / 60s. Consumed by the
+    /// rate-limiting task.
+    pub rate_limit: RemoteMcpRateLimit,
+    /// Extra browser origins allowed to call `/mcp` (union'd with the server's
+    /// standard origins in `allowed_origins()`). Auto-seeded by the desktop
+    /// wizard with the Claude connector origins (`https://claude.ai`,
+    /// `https://claude.com`). Non-browser clients (CLI, Anthropic server-side
+    /// fetchers) send no `Origin` and are gated by the bearer token instead.
+    pub origin_allowlist: Vec<String>,
+}
+
+impl Default for RemoteMcpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind_addr: "127.0.0.1".into(),
+            session_ttl_secs: 3600,
+            rate_limit: RemoteMcpRateLimit::default(),
+            origin_allowlist: Vec::new(),
+        }
+    }
+}
+
+impl RemoteMcpConfig {
+    /// Fail-fast validation, called at startup. A no-op when disabled (an
+    /// unconfigured remote MCP block must never block boot). When enabled,
+    /// rejects nonsensical values with a clear message so a misconfigured
+    /// exposure surfaces immediately instead of at first request.
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.bind_addr.parse::<std::net::IpAddr>().is_err() {
+            return Err(format!(
+                "remote_mcp.bind_addr '{}' is not a valid IP address",
+                self.bind_addr
+            ));
+        }
+        if self.session_ttl_secs == 0 {
+            return Err("remote_mcp.session_ttl_secs must be > 0".into());
+        }
+        if self.rate_limit.window_secs == 0 || self.rate_limit.max_requests == 0 {
+            return Err(
+                "remote_mcp.rate_limit.window_secs and max_requests must both be > 0".into(),
+            );
+        }
+        for o in &self.origin_allowlist {
+            if !(o.starts_with("http://") || o.starts_with("https://")) {
+                return Err(format!(
+                    "remote_mcp.origin_allowlist entry '{o}' must be an http(s) origin"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Per-token rate limit for the remote MCP transport.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct RemoteMcpRateLimit {
+    /// Sliding window length in seconds. Default 60.
+    pub window_secs: u64,
+    /// Max requests per token within the window. Default 120.
+    pub max_requests: u32,
+}
+
+impl Default for RemoteMcpRateLimit {
+    fn default() -> Self {
+        Self {
+            window_secs: 60,
+            max_requests: 120,
+        }
+    }
 }
 
 /// A pre-configured MCP server to connect to on startup.
@@ -570,6 +677,10 @@ pub struct Config {
     /// Public URL for reverse-proxy setups (e.g. https://ffs.dev).
     /// Used for CORS and OAuth origin whitelist.
     pub public_url: Option<String>,
+    /// Remote MCP transport config (disabled by default). Gates the `/mcp`
+    /// Streamable HTTP + OAuth 2.1 AS routes and carries the exposure settings
+    /// (bind, session TTL, rate limit, origin allowlist).
+    pub remote_mcp: RemoteMcpConfig,
     /// Chat permission config from YAML (if present).
     /// Priority: YAML > env vars > defaults.
     pub chat_permissions: Option<chat::config::PermissionConfig>,
@@ -679,6 +790,16 @@ impl Config {
                 .unwrap_or(yaml.server.serve_frontend),
             frontend_path: std::env::var("FRONTEND_PATH").unwrap_or(yaml.server.frontend_path),
             public_url: std::env::var("PUBLIC_URL").ok().or(yaml.server.public_url),
+            // Remote MCP: YAML section, with a single env override for the master
+            // switch (REMOTE_MCP_ENABLED=true|1) so ops can toggle exposure without
+            // editing the file. Other fields stay YAML-only.
+            remote_mcp: {
+                let mut rm = yaml.remote_mcp;
+                if let Ok(v) = std::env::var("REMOTE_MCP_ENABLED") {
+                    rm.enabled = v == "true" || v == "1";
+                }
+                rm
+            },
             chat_permissions: yaml.chat.permissions,
             chat_default_model: yaml.chat.default_model,
             chat_max_sessions: yaml.chat.max_sessions,
@@ -965,6 +1086,22 @@ pub async fn start_server(mut config: Config) -> Result<()> {
     // Hash root account password at startup (if plaintext)
     if let Some(ref mut auth) = config.auth_config {
         auth.ensure_root_password_hashed()?;
+    }
+
+    // Fail-fast: reject an invalid remote MCP config before any expensive init.
+    // No-op when disabled, so unconfigured installs boot normally.
+    config
+        .remote_mcp
+        .validate()
+        .map_err(|e| anyhow::anyhow!("Invalid remote_mcp config: {e}"))?;
+    if config.remote_mcp.enabled {
+        tracing::info!(
+            bind_addr = %config.remote_mcp.bind_addr,
+            origins = config.remote_mcp.origin_allowlist.len(),
+            "Remote MCP transport ENABLED — /mcp and OAuth 2.1 AS routes will be mounted"
+        );
+    } else {
+        tracing::info!("Remote MCP transport disabled (opt-in) — /mcp routes not mounted");
     }
 
     // Initialize application state
@@ -1519,6 +1656,7 @@ pub async fn start_server(mut config: Config) -> Result<()> {
         setup_completed: config.setup_completed,
         server_port: config.server_port,
         public_url: config.public_url.clone(),
+        remote_mcp: config.remote_mcp.clone(),
         ws_ticket_store,
         registry_remote_url: config.registry_remote_url.clone(),
         neural_router: neural_router.clone(),
@@ -1916,6 +2054,94 @@ auth:
         let oidc = auth.effective_oidc().expect("should have effective OIDC");
         assert_eq!(oidc.client_id, "123.apps.googleusercontent.com");
         assert_eq!(oidc.provider_name, "Google");
+    }
+
+    /// Remote MCP is absent from most config.yaml files → defaults to disabled.
+    /// This is the additive-migration guarantee for existing installs.
+    #[test]
+    fn test_remote_mcp_defaults_disabled_when_absent() {
+        let yaml = r#"
+server:
+  port: 8080
+neo4j:
+  uri: bolt://localhost:7687
+"#;
+        let config: YamlConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(!config.remote_mcp.enabled);
+        assert_eq!(config.remote_mcp.bind_addr, "127.0.0.1");
+        assert_eq!(config.remote_mcp.session_ttl_secs, 3600);
+        assert_eq!(config.remote_mcp.rate_limit.window_secs, 60);
+        assert_eq!(config.remote_mcp.rate_limit.max_requests, 120);
+        assert!(config.remote_mcp.origin_allowlist.is_empty());
+        assert!(config.remote_mcp.validate().is_ok());
+    }
+
+    /// A fully-specified remote_mcp block parses, and validate() accepts it.
+    #[test]
+    fn test_remote_mcp_enabled_parses_and_validates() {
+        let yaml = r#"
+server:
+  port: 8080
+neo4j:
+  uri: bolt://localhost:7687
+remote_mcp:
+  enabled: true
+  bind_addr: "127.0.0.1"
+  session_ttl_secs: 1800
+  rate_limit:
+    window_secs: 30
+    max_requests: 60
+  origin_allowlist:
+    - "https://claude.ai"
+    - "https://claude.com"
+"#;
+        let config: YamlConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.remote_mcp.enabled);
+        assert_eq!(config.remote_mcp.session_ttl_secs, 1800);
+        assert_eq!(
+            config.remote_mcp.origin_allowlist,
+            vec![
+                "https://claude.ai".to_string(),
+                "https://claude.com".to_string()
+            ]
+        );
+        assert!(config.remote_mcp.validate().is_ok());
+    }
+
+    /// validate() fail-fasts on nonsensical values only when enabled.
+    #[test]
+    fn test_remote_mcp_validate_rejects_bad_config() {
+        let bad_bind = RemoteMcpConfig {
+            enabled: true,
+            bind_addr: "not-an-ip".into(),
+            ..Default::default()
+        };
+        assert!(bad_bind.validate().is_err());
+
+        let bad_origin = RemoteMcpConfig {
+            enabled: true,
+            origin_allowlist: vec!["claude.ai".into()],
+            ..Default::default()
+        };
+        assert!(bad_origin.validate().is_err());
+
+        let bad_rl = RemoteMcpConfig {
+            enabled: true,
+            rate_limit: RemoteMcpRateLimit {
+                window_secs: 0,
+                max_requests: 0,
+            },
+            ..Default::default()
+        };
+        assert!(bad_rl.validate().is_err());
+
+        // The SAME bad values are ignored when disabled (no-op validation).
+        let disabled = RemoteMcpConfig {
+            enabled: false,
+            bind_addr: "not-an-ip".into(),
+            ..Default::default()
+        };
+        assert!(disabled.validate().is_ok());
     }
 
     #[test]

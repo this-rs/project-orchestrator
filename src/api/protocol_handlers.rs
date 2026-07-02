@@ -2124,6 +2124,7 @@ mod tests {
             frontend_path: String::new(),
             server_port: 0,
             public_url: None,
+            remote_mcp: crate::RemoteMcpConfig::default(),
             ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
             registry_remote_url: None,
             identity: None,
