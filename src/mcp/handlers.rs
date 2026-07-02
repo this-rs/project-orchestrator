@@ -3827,7 +3827,8 @@ impl ToolHandler {
             }
 
             "chat_send_message" => {
-                // REST POST /api/chat/sessions creates a session + sends the first message
+                // REST POST /api/chat/sessions creates a session + sends the first message,
+                // or resumes an existing session when session_id is provided
                 let mut body = serde_json::Map::new();
                 body.insert(
                     "message".to_string(),
