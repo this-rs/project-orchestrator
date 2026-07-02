@@ -227,6 +227,8 @@ const STOP_WORDS: &[&str] = &[
     "me", "my", "if", "then", "else", "when", "where", "how", "what", "which", "who", "whom",
     "all", "each", "every", "any", "some", "no", "more", "most", "other", "such", "only", "very",
     "just", "also", "than", "too", "here", "there", "now",
+    // Audit T1: low-signal terms observed generating false-positive triggers
+    "stay", "extra", "negligible", "even", "need", "symptom",
     // --- French articles, prepositions, pronouns, conjunctions, common verbs ---
     "le", "la", "les", "un", "une", "des", "du", "au", "aux", "de", "dans", "pour", "par", "sur",
     "en", "avec", "sans", "vers", "chez", "entre", "je", "tu", "il", "elle", "nous", "vous", "ils",
@@ -235,6 +237,8 @@ const STOP_WORDS: &[&str] = &[
     "si", "comme", "quand", "lorsque", "est", "sont", "ont", "fait", "peut", "doit", "faut", "va",
     "vont", "ne", "pas", "plus", "aussi", "bien", "tout", "toute", "tous", "toutes", "même",
     "encore", "déjà", "toujours", "jamais", "très", "trop",
+    // Audit T1: additional French low-signal terms
+    "laquelle", "tourner", "typiquement",
     // --- Common technical stop words (language-agnostic programming terms) ---
     "use", "used", "using", "new", "get", "set", "add", "update", "delete", "create", "file",
     "function", "method", "class", "type", "value", "data", "note", "notes",
@@ -793,6 +797,10 @@ pub fn generate_all_triggers(
     for trigger in &mut file_globs {
         trigger.quality_score = evaluate_trigger_quality(trigger, skill_notes, all_project_notes);
     }
+    // Genesis reliability gate: drop unreliable triggers (quality < 0.3) at generation
+    // time so they are never stored. This relocates the is_reliable filter off the
+    // activation hot-path; counts below reflect what is actually persisted.
+    file_globs.retain(|t| t.is_reliable());
     let file_glob_count = file_globs.len();
     all_triggers.extend(file_globs);
 
@@ -801,6 +809,8 @@ pub fn generate_all_triggers(
     for trigger in &mut regex_triggers {
         trigger.quality_score = evaluate_trigger_quality(trigger, skill_notes, all_project_notes);
     }
+    // Genesis reliability gate (see FileGlob above).
+    regex_triggers.retain(|t| t.is_reliable());
     let regex_count = regex_triggers.len();
     all_triggers.extend(regex_triggers);
 
@@ -1364,6 +1374,23 @@ mod tests {
         assert!(tokens.contains(&"quick".to_string()));
         assert!(tokens.contains(&"brown".to_string()));
         assert!(tokens.contains(&"fox".to_string()));
+    }
+
+    #[test]
+    fn test_tokenize_filters_audit_t1_stop_words() {
+        // Audit T1: low-signal EN + FR terms that were generating false-positive triggers
+        // must be filtered out, while a discriminative term in the same sentence survives.
+        let en = tokenize("stay extra negligible even need symptom substrate");
+        for w in ["stay", "extra", "negligible", "even", "need", "symptom"] {
+            assert!(!en.contains(&w.to_string()), "EN stopword '{w}' should be filtered");
+        }
+        assert!(en.contains(&"substrate".to_string()));
+
+        let fr = tokenize("laquelle tourner typiquement neo4j");
+        for w in ["laquelle", "tourner", "typiquement"] {
+            assert!(!fr.contains(&w.to_string()), "FR stopword '{w}' should be filtered");
+        }
+        assert!(fr.contains(&"neo4j".to_string()));
     }
 
     #[test]
