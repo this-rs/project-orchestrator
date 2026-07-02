@@ -32,6 +32,44 @@ const BULK_SYNC_THRESHOLD: usize = 50;
 /// to complete before we start syncing.
 const SYNC_DEBOUNCE_SECS: u64 = 3;
 
+/// Minimum interval between two post-sync `reconstruct_knowledge_links`
+/// runs for the SAME project.
+///
+/// Reconstruction is expensive: the cross-project anchoring pass loads EVERY
+/// note in the graph (thousands) and issues one MATCH/MERGE per extracted
+/// file path. Without a cooldown, every watcher flush (each save, build
+/// artifact, git operation…) spawned a fresh full pass — with two backend
+/// instances watching the same projects this stacked into a sustained
+/// 400-800% CPU storm on Neo4j. The heartbeat's deep_maintenance (24h) and
+/// explicit admin actions still force a run at any time; this cooldown only
+/// throttles the automatic watcher-driven trigger.
+const RECONSTRUCT_COOLDOWN: Duration = Duration::from_secs(10 * 60);
+
+/// Per-project last-run registry for the reconstruction cooldown.
+/// Shared across both watcher hooks (post-sync and post-delete).
+static RECONSTRUCT_LAST_RUN: std::sync::OnceLock<
+    std::sync::Mutex<HashMap<Uuid, std::time::Instant>>,
+> = std::sync::OnceLock::new();
+
+/// Returns true (and records the run) when the project is outside its
+/// reconstruction cooldown window. Recording BEFORE the run also acts as a
+/// single-flight guard for the duration of the window.
+fn reconstruct_cooldown_elapsed(pid: Uuid) -> bool {
+    let map = RECONSTRUCT_LAST_RUN.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let mut guard = match map.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let now = std::time::Instant::now();
+    match guard.get(&pid) {
+        Some(last) if now.duration_since(*last) < RECONSTRUCT_COOLDOWN => false,
+        _ => {
+            guard.insert(pid, now);
+            true
+        }
+    }
+}
+
 use super::Orchestrator;
 use crate::events::{CrudAction, CrudEvent, EntityType as EventEntityType};
 
@@ -644,28 +682,35 @@ async fn flush_pending_files(
         orchestrator.analytics_debouncer().trigger(pid);
 
         // Spawn knowledge link reconstruction in background: link notes + decisions
-        // to newly synced files (cross-project notes + decision AFFECTS)
-        let neo4j = orchestrator.neo4j_arc();
-        tokio::spawn(async move {
-            match crate::skills::activation::reconstruct_knowledge_links(neo4j.as_ref(), pid).await
-            {
-                Ok(r) if r.notes_linked > 0 || r.affects_created > 0 => {
-                    tracing::info!(
-                        %pid,
-                        notes_linked = r.notes_linked,
-                        affects_created = r.affects_created,
-                        elapsed_ms = r.elapsed_ms,
-                        "Watcher post-sync knowledge reconstruction: {} note links, {} decision affects",
-                        r.notes_linked,
-                        r.affects_created
-                    );
+        // to newly synced files (cross-project notes + decision AFFECTS).
+        // Cooldown-gated: at most one run per project per RECONSTRUCT_COOLDOWN —
+        // rapid successive flushes (builds, git ops) must not stack full passes.
+        if reconstruct_cooldown_elapsed(pid) {
+            let neo4j = orchestrator.neo4j_arc();
+            tokio::spawn(async move {
+                match crate::skills::activation::reconstruct_knowledge_links(neo4j.as_ref(), pid)
+                    .await
+                {
+                    Ok(r) if r.notes_linked > 0 || r.affects_created > 0 => {
+                        tracing::info!(
+                            %pid,
+                            notes_linked = r.notes_linked,
+                            affects_created = r.affects_created,
+                            elapsed_ms = r.elapsed_ms,
+                            "Watcher post-sync knowledge reconstruction: {} note links, {} decision affects",
+                            r.notes_linked,
+                            r.affects_created
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!(%pid, "Watcher post-sync knowledge reconstruction failed: {}", e);
+                    }
                 }
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::warn!(%pid, "Watcher post-sync knowledge reconstruction failed: {}", e);
-                }
-            }
-        });
+            });
+        } else {
+            tracing::debug!(%pid, "Watcher post-sync knowledge reconstruction skipped (cooldown)");
+        }
     }
 
     // ── Handle deleted files ─────────────────────────────────────────
@@ -742,26 +787,32 @@ async fn flush_pending_files(
         // Spawn knowledge link reconstruction in background after deletions too:
         // notes/decisions referencing deleted files won't match, but those
         // referencing remaining files may now need re-anchoring.
-        let neo4j = orchestrator.neo4j_arc();
-        tokio::spawn(async move {
-            match crate::skills::activation::reconstruct_knowledge_links(neo4j.as_ref(), pid).await
-            {
-                Ok(r) if r.notes_linked > 0 || r.affects_created > 0 => {
-                    tracing::info!(
-                        %pid,
-                        notes_linked = r.notes_linked,
-                        affects_created = r.affects_created,
-                        "Watcher post-delete knowledge reconstruction: {} note links, {} decision affects",
-                        r.notes_linked,
-                        r.affects_created
-                    );
+        // Cooldown-gated like the post-sync hook (shared registry).
+        if reconstruct_cooldown_elapsed(pid) {
+            let neo4j = orchestrator.neo4j_arc();
+            tokio::spawn(async move {
+                match crate::skills::activation::reconstruct_knowledge_links(neo4j.as_ref(), pid)
+                    .await
+                {
+                    Ok(r) if r.notes_linked > 0 || r.affects_created > 0 => {
+                        tracing::info!(
+                            %pid,
+                            notes_linked = r.notes_linked,
+                            affects_created = r.affects_created,
+                            "Watcher post-delete knowledge reconstruction: {} note links, {} decision affects",
+                            r.notes_linked,
+                            r.affects_created
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!(%pid, "Watcher post-delete knowledge reconstruction failed: {}", e);
+                    }
                 }
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::warn!(%pid, "Watcher post-delete knowledge reconstruction failed: {}", e);
-                }
-            }
-        });
+            });
+        } else {
+            tracing::debug!(%pid, "Watcher post-delete knowledge reconstruction skipped (cooldown)");
+        }
     }
 
     // Sync orphan files (no project association) individually

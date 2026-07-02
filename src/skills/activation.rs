@@ -1320,7 +1320,14 @@ pub async fn auto_anchor_notes_for_project(
     // File nodes in Neo4j use absolute paths, but extract_file_paths_from_content
     // returns relative paths — we need root_path to bridge the gap.
     let root_path = match graph_store.get_project(project_id).await? {
-        Some(proj) => Some(proj.root_path),
+        // Expand `~` so resolved paths are ABSOLUTE. This is critical for
+        // performance: `link_note_to_entity`/`add_decision_affects` use an
+        // index-backed exact MATCH on File.path (unique constraint) for
+        // absolute paths, but fall back to a full-label-scan `ENDS WITH`
+        // for anything else. A stored root_path like `~/projects/app`
+        // produced `/~/...` paths that never matched AND scanned all File
+        // nodes on every call — one CPU-bound scan per note×path.
+        Some(proj) => Some(crate::expand_tilde(&proj.root_path)),
         None => {
             tracing::warn!(%project_id, "Auto-anchor: project not found, using relative paths");
             None
@@ -1436,7 +1443,8 @@ pub async fn auto_anchor_decisions_for_project(
 ) -> anyhow::Result<(usize, usize)> {
     // Resolve project root_path for absolute file path matching.
     let root_path = match graph_store.get_project(project_id).await? {
-        Some(proj) => Some(proj.root_path),
+        // Expand `~` — see comment in auto_anchor_notes_for_project.
+        Some(proj) => Some(crate::expand_tilde(&proj.root_path)),
         None => {
             tracing::warn!(%project_id, "Auto-anchor decisions: project not found");
             None
@@ -1489,7 +1497,8 @@ pub async fn auto_anchor_all_notes_to_project(
     use crate::notes::models::NoteFilters;
 
     let root_path = match graph_store.get_project(project_id).await? {
-        Some(proj) => Some(proj.root_path),
+        // Expand `~` — see comment in auto_anchor_notes_for_project.
+        Some(proj) => Some(crate::expand_tilde(&proj.root_path)),
         None => {
             tracing::warn!(%project_id, "Cross-project auto-anchor: project not found");
             return Ok(AutoAnchorResult {
