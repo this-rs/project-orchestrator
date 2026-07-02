@@ -133,6 +133,32 @@ enum SessionCheck {
 }
 
 // ============================================================================
+// Origin validation (DNS-rebinding protection — MCP transport security spec)
+// ============================================================================
+
+/// Browser-originated requests must come from an allowlisted origin
+/// (`allowed_origins()`: localhost:{port}, public_url, frontend_url,
+/// additional_origins). Non-browser clients (Claude Code CLI, claude.ai's
+/// server-side fetchers) send no `Origin` header and pass through — the
+/// bearer token remains their auth gate. This closes the DNS-rebinding
+/// vector where a malicious page scripts requests at a local MCP server.
+fn origin_allowed(state: &OrchestratorState, headers: &HeaderMap) -> bool {
+    match headers
+        .get(axum::http::header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+    {
+        None => true, // non-browser client
+        Some(origin) => {
+            let origin = origin.trim_end_matches('/');
+            state
+                .allowed_origins()
+                .iter()
+                .any(|allowed| allowed.trim_end_matches('/') == origin)
+        }
+    }
+}
+
+// ============================================================================
 // Handlers
 // ============================================================================
 
@@ -143,6 +169,11 @@ pub async fn mcp_post(
     headers: HeaderMap,
     body: String,
 ) -> Response {
+    if !origin_allowed(&state, &headers) {
+        warn!("MCP HTTP request rejected: non-allowlisted Origin");
+        return StatusCode::FORBIDDEN.into_response();
+    }
+
     // Parse the JSON-RPC envelope. Batches are not supported (Claude clients
     // send single messages); reject arrays explicitly rather than silently
     // processing only the first entry.
@@ -244,9 +275,14 @@ pub async fn mcp_get() -> Response {
 
 /// `DELETE /mcp` — explicit session termination.
 pub async fn mcp_delete(
+    State(state): State<OrchestratorState>,
     auth_user: crate::auth::extractor::AuthUser,
     headers: HeaderMap,
 ) -> Response {
+    if !origin_allowed(&state, &headers) {
+        warn!("MCP HTTP DELETE rejected: non-allowlisted Origin");
+        return StatusCode::FORBIDDEN.into_response();
+    }
     let Some(session_id) = headers
         .get(MCP_SESSION_HEADER)
         .and_then(|v| v.to_str().ok())
