@@ -88,10 +88,10 @@ tree-sitter-cpp = "0.23"
 tree-sitter-ruby = "0.23"
 tree-sitter-php = "0.23"
 tree-sitter-kotlin-ng = "1.1"
-tree-sitter-swift = "0.6"
-tree-sitter-bash = "0.23"
+tree-sitter-swift = "0.7"
+tree-sitter-bash = "0.25"
 tree-sitter-c-sharp = "0.23"
-tree-sitter-scala = "0.24"
+tree-sitter-scala = "0.26"
 tree-sitter-zig = "1.1"
 tree-sitter-hcl = { path = "crates/tree-sitter-hcl" }
 tree-sitter-dart = { path = "crates/tree-sitter-dart" }
@@ -109,10 +109,10 @@ thiserror = { workspace = true }
 
 # Graph analytics
 petgraph = "0.8"
-rustworkx-core = "0.17"
+rustworkx-core = "0.18"
 
 # LRU cache (for resolver)
-lru = "0.16"
+lru = "0.18"
 
 # Utilities
 uuid = { workspace = true }
@@ -135,7 +135,7 @@ tokio-stream = { workspace = true }
 
 # Auth
 jsonwebtoken = { version = "10", features = ["rust_crypto"] }
-bcrypt = "0.16"
+bcrypt = "0.19"
 
 # P2P Identity (M4)
 ed25519-dalek = { version = "2.1", features = ["serde", "rand_core"] }
