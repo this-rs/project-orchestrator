@@ -37,4 +37,17 @@ ignore = [
     "RUSTSEC-2025-0141", # bincode 1.x unmaintained
     "RUSTSEC-2026-0097", # rand unsound (custom logger via rand::rng())
     "RUSTSEC-2026-0105", # core2 unmaintained + yanked
+
+    # RUSTSEC-2026-0194 / RUSTSEC-2026-0195 — quick-xml DoS on untrusted XML
+    # (quadratic duplicate-attribute check and related parsing cost).
+    # Patched only in quick-xml >= 0.40; we are pinned to 0.39.4 transitively
+    # via plist 1.9.0 ← tauri (latest plist still requires quick-xml 0.39,
+    # so no `cargo update` path exists).
+    #
+    # Justification: plist/quick-xml is only used by the Tauri desktop stack
+    # to read macOS Info.plist bundle metadata — trusted, locally-generated
+    # input. We never parse untrusted XML through this chain. Revisit when
+    # plist releases with quick-xml >= 0.40.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
 ]
