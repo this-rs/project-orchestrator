@@ -940,6 +940,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_weekly_maintenance_self_heals_and_reports_repaired_synapses() {
+        let store = std::sync::Arc::new(MockGraphStore::new());
+        let meili = std::sync::Arc::new(crate::meilisearch::mock::MockSearchStore::new());
+        let project_id = Uuid::new_v4();
+        let mut p = crate::test_helpers::test_project();
+        p.id = project_id;
+        store.create_project(&p).await.unwrap();
+
+        // Seed notes with near-identical embeddings so the bounded,
+        // project-scoped self-heal (backfill_synapses) can actually create
+        // SYNAPSE edges from a collapsed graph — see
+        // detection::ensure_synapse_graph_health.
+        for i in 0..20 {
+            let note = Note::new(
+                Some(project_id),
+                NoteType::Observation,
+                format!("note {i}"),
+                "test".into(),
+            );
+            store.create_note(&note).await.unwrap();
+            let embedding: Vec<f32> = vec![1.0, 0.0, 0.0, (i as f32) * 0.001];
+            store
+                .set_note_embedding(note.id, &embedding, "test-model")
+                .await
+                .unwrap();
+        }
+
+        let nm = NoteManager::new(store.clone() as std::sync::Arc<dyn GraphStore>, meili);
+        let config = SkillMaintenanceConfig::default();
+
+        let result = run_weekly_maintenance(store.as_ref(), Some(&nm), project_id, &config)
+            .await
+            .unwrap();
+
+        assert_eq!(result.level, "weekly");
+        assert!(
+            result.synapses_repaired.unwrap_or(0) > 0,
+            "self-heal should have repaired synapses and reported the count"
+        );
+    }
+
+    #[tokio::test]
     async fn test_full_maintenance_delegates_to_weekly() {
         let (store, project_id) = setup_store_with_project().await;
         let config = SkillMaintenanceConfig::default();

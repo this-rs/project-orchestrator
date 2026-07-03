@@ -157,4 +157,33 @@ mod tests {
             "must exceed the engine default timeout"
         );
     }
+
+    #[tokio::test]
+    async fn test_maintenance_check_run_without_search_warns_but_completes() {
+        // No search store available — the self-heal NoteManager cannot be
+        // built, so the run must still complete (warning only, non-fatal).
+        let ctx = HeartbeatContext {
+            graph: std::sync::Arc::new(crate::neo4j::mock::MockGraphStore::new()),
+            search: None,
+            emitter: None,
+        };
+        let check = MaintenanceCheck;
+        assert!(check.run(&ctx).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_maintenance_check_run_with_search_builds_note_manager() {
+        // A search store is available — the self-heal NoteManager should be
+        // built (no projects exist, so deep_maintenance itself is never
+        // invoked, but the construction path must not error).
+        let ctx = HeartbeatContext {
+            graph: std::sync::Arc::new(crate::neo4j::mock::MockGraphStore::new()),
+            search: Some(std::sync::Arc::new(
+                crate::meilisearch::mock::MockSearchStore::new(),
+            )),
+            emitter: None,
+        };
+        let check = MaintenanceCheck;
+        assert!(check.run(&ctx).await.is_ok());
+    }
 }

@@ -1628,6 +1628,151 @@ mod tests {
     }
 
     // ================================================================
+    // ensure_synapse_graph_health / self-heal tests
+    // ================================================================
+
+    /// Seed `count` notes in `project_id`, each with a near-identical
+    /// embedding (cosine similarity ~1.0), so `backfill_synapses`'s vector
+    /// search finds neighbours comfortably above the auto-calibrated
+    /// min_similarity floor (0.75 fallback on a synapse-free graph).
+    async fn seed_notes_with_similar_embeddings(
+        store: &crate::neo4j::mock::MockGraphStore,
+        project_id: Uuid,
+        count: usize,
+    ) {
+        use crate::neo4j::traits::GraphStore;
+
+        for i in 0..count {
+            let note = crate::notes::Note::new(
+                Some(project_id),
+                crate::notes::NoteType::Observation,
+                format!("note {i}"),
+                "test".to_string(),
+            );
+            store.create_note(&note).await.unwrap();
+            let embedding: Vec<f32> = vec![1.0, 0.0, 0.0, (i as f32) * 0.001];
+            store
+                .set_note_embedding(note.id, &embedding, "test-model")
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ensure_synapse_graph_health_skips_without_note_manager() {
+        use crate::neo4j::mock::MockGraphStore;
+        use crate::neo4j::traits::GraphStore;
+
+        let store = MockGraphStore::new();
+        let project = crate::test_helpers::test_project();
+        let project_id = project.id;
+        store.create_project(&project).await.unwrap();
+
+        let config = SkillDetectionConfig::default();
+
+        // No NoteManager supplied — self-heal must be skipped entirely, even
+        // though the graph (0 notes) is under min_notes_for_detection.
+        let (edges, repaired) = ensure_synapse_graph_health(&store, None, project_id, &config)
+            .await
+            .unwrap();
+
+        assert!(edges.is_empty());
+        assert_eq!(repaired, 0, "no self-heal should run without a NoteManager");
+    }
+
+    #[tokio::test]
+    async fn test_ensure_synapse_graph_health_no_op_when_nothing_needs_synapses() {
+        use crate::neo4j::mock::MockGraphStore;
+        use crate::neo4j::traits::GraphStore;
+
+        let store = std::sync::Arc::new(MockGraphStore::new());
+        let meili = std::sync::Arc::new(crate::meilisearch::mock::MockSearchStore::new());
+        let project = crate::test_helpers::test_project();
+        let project_id = project.id;
+        store.create_project(&project).await.unwrap();
+
+        // No notes exist at all — backfill_synapses has nothing to do.
+        let nm = NoteManager::new(store.clone() as std::sync::Arc<dyn GraphStore>, meili);
+        let config = SkillDetectionConfig::default();
+
+        let (edges, repaired) =
+            ensure_synapse_graph_health(store.as_ref(), Some(&nm), project_id, &config)
+                .await
+                .unwrap();
+
+        assert!(edges.is_empty());
+        assert_eq!(repaired, 0);
+    }
+
+    #[tokio::test]
+    async fn test_ensure_synapse_graph_health_repairs_decayed_graph() {
+        use crate::neo4j::mock::MockGraphStore;
+        use crate::neo4j::traits::GraphStore;
+
+        let store = std::sync::Arc::new(MockGraphStore::new());
+        let meili = std::sync::Arc::new(crate::meilisearch::mock::MockSearchStore::new());
+        let project = crate::test_helpers::test_project();
+        let project_id = project.id;
+        store.create_project(&project).await.unwrap();
+
+        seed_notes_with_similar_embeddings(&store, project_id, 20).await;
+
+        let nm = NoteManager::new(store.clone() as std::sync::Arc<dyn GraphStore>, meili);
+        let config = SkillDetectionConfig::default(); // min_notes_for_detection: 15
+
+        let (_edges, repaired) =
+            ensure_synapse_graph_health(store.as_ref(), Some(&nm), project_id, &config)
+                .await
+                .unwrap();
+
+        // NOTE: MockGraphStore::get_synapse_graph always returns an empty Vec
+        // regardless of synapses actually created (a pre-existing mock
+        // simplification, unrelated to this fix) — so we assert on
+        // `repaired` (sourced from backfill_synapses' own progress return)
+        // rather than on the re-fetched `edges`.
+        assert!(
+            repaired > 0,
+            "self-heal should have created synapses from similar embeddings"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_reports_repair_when_still_insufficient_after_self_heal() {
+        use crate::neo4j::mock::MockGraphStore;
+        use crate::neo4j::traits::GraphStore;
+
+        let store = std::sync::Arc::new(MockGraphStore::new());
+        let meili = std::sync::Arc::new(crate::meilisearch::mock::MockSearchStore::new());
+        let project = crate::test_helpers::test_project();
+        let project_id = project.id;
+        store.create_project(&project).await.unwrap();
+
+        seed_notes_with_similar_embeddings(&store, project_id, 20).await;
+
+        let nm = NoteManager::new(store.clone() as std::sync::Arc<dyn GraphStore>, meili);
+        let config = SkillDetectionConfig::default();
+
+        let result = detect_skills_pipeline(store.as_ref(), Some(&nm), project_id, &config)
+            .await
+            .unwrap();
+
+        // MockGraphStore::get_synapse_graph always returns empty, so even
+        // after a successful repair the pipeline still sees an empty graph
+        // on re-fetch and reports InsufficientData — but it must surface
+        // that a repair happened.
+        assert_eq!(result.status, ClusterDetectionStatus::InsufficientData);
+        assert!(
+            result.synapses_repaired > 0,
+            "self-heal should have run and created synapses"
+        );
+        assert!(
+            result.message.contains("self-heal repaired"),
+            "message should mention the repair: {}",
+            result.message
+        );
+    }
+
+    // ================================================================
     // persist_detected_skills tests
     // ================================================================
 
