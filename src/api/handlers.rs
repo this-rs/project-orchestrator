@@ -3675,10 +3675,14 @@ pub async fn detect_skills(
     let config = crate::skills::SkillDetectionConfig::default();
     let start = std::time::Instant::now();
 
-    let result =
-        crate::skills::detect_skills_pipeline(state.orchestrator.neo4j(), project_id, &config)
-            .await
-            .map_err(AppError::Internal)?;
+    let result = crate::skills::detect_skills_pipeline(
+        state.orchestrator.neo4j(),
+        Some(state.orchestrator.note_manager().as_ref()),
+        project_id,
+        &config,
+    )
+    .await
+    .map_err(AppError::Internal)?;
 
     let elapsed_ms = start.elapsed().as_millis() as u64;
 
@@ -3964,6 +3968,7 @@ pub async fn skill_maintenance(
 
     let (result, report) = crate::skills::maintenance::run_maintenance_with_tracking(
         state.orchestrator.neo4j(),
+        Some(state.orchestrator.note_manager().as_ref()),
         project_id,
         level,
         &config,
@@ -4042,6 +4047,7 @@ pub async fn run_deep_maintenance(
 
     let report = crate::skills::maintenance::deep_maintenance(
         state.orchestrator.neo4j(),
+        Some(state.orchestrator.note_manager().as_ref()),
         project_id,
         &config,
     )

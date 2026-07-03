@@ -315,7 +315,13 @@ pub async fn execute_actions(
                     // - min_similarity=0.0: auto-calibrate from existing weights
                     // - max_neighbors: scaled by synapse_health (sparse → more, dense → less)
                     match note_manager
-                        .backfill_synapses(params.batch_size, 0.0, params.max_neighbors, None)
+                        .backfill_synapses(
+                            params.batch_size,
+                            0.0,
+                            params.max_neighbors,
+                            /* cancel */ None,
+                            /* project_id */ None,
+                        )
                         .await
                     {
                         Ok(progress) => {

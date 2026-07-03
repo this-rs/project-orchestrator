@@ -14,7 +14,8 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::neo4j::traits::GraphStore;
-use crate::skills::detection::SkillDetectionConfig;
+use crate::notes::NoteManager;
+use crate::skills::detection::{ensure_synapse_graph_health, SkillDetectionConfig};
 use crate::skills::evolution::{analyze_evolution, execute_evolution, EvolutionResult};
 use crate::skills::lifecycle::{update_skill_lifecycle, MetricsUpdateResult, SkillLifecycleConfig};
 
@@ -37,6 +38,12 @@ pub struct MaintenanceResult {
     pub evolution: Option<EvolutionResult>,
     /// Skills detected (weekly)
     pub skills_detected: Option<usize>,
+    /// Synapses (re)created by the bounded self-heal pass that runs before
+    /// Louvain re-detection when the SYNAPSE graph is under
+    /// `min_notes_for_detection` (weekly only; `None` when not applicable or
+    /// no `NoteManager` was supplied). See `detection::ensure_synapse_graph_health`.
+    #[serde(default)]
+    pub synapses_repaired: Option<usize>,
     /// Any errors encountered (non-fatal)
     pub warnings: Vec<String>,
 }
@@ -260,8 +267,17 @@ pub async fn run_daily_maintenance(
 ///
 /// This is the most expensive operation and includes re-running Louvain
 /// community detection to catch new clusters and evolve existing skills.
+///
+/// `note_manager`: when `Some`, enables the same bounded, project-scoped
+/// self-heal used by `detect_skills_pipeline` (see
+/// `detection::ensure_synapse_graph_health`) before reading the SYNAPSE graph
+/// for Louvain re-detection — otherwise a decayed graph makes this step
+/// silently evolve zero skills even during `deep_maintenance`. Pass `None`
+/// only where no `NoteManager` is available (e.g. unit tests), which
+/// preserves the prior behavior.
 pub async fn run_weekly_maintenance(
     graph_store: &dyn GraphStore,
+    note_manager: Option<&NoteManager>,
     project_id: Uuid,
     config: &SkillMaintenanceConfig,
 ) -> anyhow::Result<MaintenanceResult> {
@@ -283,11 +299,20 @@ pub async fn run_weekly_maintenance(
     // Step 3: Run Louvain detection once — detect candidates for evolution analysis
     // (We use detect_skill_candidates directly instead of detect_skills_pipeline
     // to avoid persisting skills twice. Evolution will handle persistence.)
-    let detection_candidates = match graph_store
-        .get_synapse_graph(project_id, config.detection.min_synapse_weight)
-        .await
+    // Self-heals a decayed SYNAPSE graph first (bounded, project-scoped) so
+    // evolution/merge can still re-level existing skills after a collapse.
+    let detection_candidates = match ensure_synapse_graph_health(
+        graph_store,
+        note_manager,
+        project_id,
+        &config.detection,
+    )
+    .await
     {
-        Ok(edges) => {
+        Ok((edges, repaired)) => {
+            if repaired > 0 {
+                result.synapses_repaired = Some(repaired);
+            }
             let detection = crate::skills::detection::detect_skill_candidates(
                 &edges,
                 &project_id.to_string(),
@@ -374,8 +399,12 @@ pub async fn run_weekly_maintenance(
 // ============================================================================
 
 /// Run all maintenance levels sequentially: hourly + daily + weekly.
+///
+/// `note_manager`: forwarded to `run_weekly_maintenance`'s self-heal — see
+/// its doc comment.
 pub async fn run_full_maintenance(
     graph_store: &dyn GraphStore,
+    note_manager: Option<&NoteManager>,
     project_id: Uuid,
     config: &SkillMaintenanceConfig,
 ) -> anyhow::Result<MaintenanceResult> {
@@ -392,7 +421,7 @@ pub async fn run_full_maintenance(
         _ => {}
     }
 
-    let mut result = run_weekly_maintenance(graph_store, project_id, config).await?;
+    let mut result = run_weekly_maintenance(graph_store, note_manager, project_id, config).await?;
     result.level = "full".to_string();
     Ok(result)
 }
@@ -518,6 +547,7 @@ async fn store_maintenance_report(
 /// 5. Return both the MaintenanceResult and the MaintenanceReport
 pub async fn run_maintenance_with_tracking(
     graph_store: &dyn GraphStore,
+    note_manager: Option<&NoteManager>,
     project_id: Uuid,
     level: &str,
     config: &SkillMaintenanceConfig,
@@ -550,8 +580,8 @@ pub async fn run_maintenance_with_tracking(
     let result = match level {
         "hourly" => run_hourly_maintenance(graph_store, project_id, config).await?,
         "daily" => run_daily_maintenance(graph_store, project_id, config).await?,
-        "weekly" => run_weekly_maintenance(graph_store, project_id, config).await?,
-        "full" => run_full_maintenance(graph_store, project_id, config).await?,
+        "weekly" => run_weekly_maintenance(graph_store, note_manager, project_id, config).await?,
+        "full" => run_full_maintenance(graph_store, note_manager, project_id, config).await?,
         _ => {
             warn!(
                 level = level,
@@ -625,8 +655,14 @@ pub async fn run_maintenance_with_tracking(
 /// 3. Flag stale notes for review
 /// 4. Identify stuck tasks
 /// 5. Generate recommendations
+///
+/// `note_manager`: forwarded to `run_full_maintenance` → `run_weekly_maintenance`'s
+/// self-heal — see its doc comment. Without it, deep_maintenance can decay
+/// synapses (step 2, 3x normal amount) without ever repairing them, so
+/// skill evolution silently stops re-leveling once the graph collapses.
 pub async fn deep_maintenance(
     graph_store: &dyn GraphStore,
+    note_manager: Option<&NoteManager>,
     project_id: Uuid,
     config: &SkillMaintenanceConfig,
 ) -> anyhow::Result<crate::neo4j::models::DeepMaintenanceReport> {
@@ -641,7 +677,8 @@ pub async fn deep_maintenance(
     aggressive_config.synapse_prune_threshold *= 1.5;
 
     let maintenance_json =
-        match run_full_maintenance(graph_store, project_id, &aggressive_config).await {
+        match run_full_maintenance(graph_store, note_manager, project_id, &aggressive_config).await
+        {
             Ok(result) => serde_json::to_value(&result).ok(),
             Err(e) => {
                 warn!(error = %e, "Full maintenance failed during deep maintenance");
@@ -896,7 +933,7 @@ mod tests {
         let (store, project_id) = setup_store_with_project().await;
         let config = SkillMaintenanceConfig::default();
 
-        let result = run_weekly_maintenance(&store, project_id, &config)
+        let result = run_weekly_maintenance(&store, None, project_id, &config)
             .await
             .unwrap();
 
@@ -911,7 +948,7 @@ mod tests {
         let (store, project_id) = setup_store_with_project().await;
         let config = SkillMaintenanceConfig::default();
 
-        let result = run_full_maintenance(&store, project_id, &config)
+        let result = run_full_maintenance(&store, None, project_id, &config)
             .await
             .unwrap();
 
@@ -934,6 +971,7 @@ mod tests {
             synapses_pruned: Some(2),
             evolution: None,
             skills_detected: None,
+            synapses_repaired: None,
             warnings: vec!["test warning".to_string()],
         };
         let json = serde_json::to_string(&result).unwrap();
@@ -1125,7 +1163,7 @@ mod tests {
 
         // Deep maintenance
         let config = SkillMaintenanceConfig::default();
-        let deep = deep_maintenance(&store, project_id, &config).await.unwrap();
+        let deep = deep_maintenance(&store, None, project_id, &config).await.unwrap();
         assert!(deep.stagnation.is_stagnating);
         assert!(
             deep.stuck_tasks_found >= 3,
@@ -1164,7 +1202,7 @@ mod tests {
 
         // Run tracked maintenance
         let config = SkillMaintenanceConfig::default();
-        let (result, report) = run_maintenance_with_tracking(&store, project_id, "hourly", &config)
+        let (result, report) = run_maintenance_with_tracking(&store, None, project_id, "hourly", &config)
             .await
             .unwrap();
 
@@ -1333,6 +1371,7 @@ mod tests {
                 unchanged: 0,
             }),
             skills_detected: Some(7),
+            synapses_repaired: Some(3),
             warnings: vec!["warn1".to_string(), "warn2".to_string()],
         };
         let json = serde_json::to_string(&result).unwrap();
@@ -1464,7 +1503,7 @@ mod tests {
         }
 
         let config = SkillMaintenanceConfig::default();
-        let (result, report) = run_maintenance_with_tracking(&store, project_id, "daily", &config)
+        let (result, report) = run_maintenance_with_tracking(&store, None, project_id, "daily", &config)
             .await
             .unwrap();
 
@@ -1480,7 +1519,7 @@ mod tests {
         let (project_id, _, _) = setup_project_with_tasks(&store, 1, 0, 0).await;
 
         let config = SkillMaintenanceConfig::default();
-        let (result, report) = run_maintenance_with_tracking(&store, project_id, "weekly", &config)
+        let (result, report) = run_maintenance_with_tracking(&store, None, project_id, "weekly", &config)
             .await
             .unwrap();
 
@@ -1494,7 +1533,7 @@ mod tests {
         let (project_id, _, _) = setup_project_with_tasks(&store, 1, 0, 0).await;
 
         let config = SkillMaintenanceConfig::default();
-        let (result, report) = run_maintenance_with_tracking(&store, project_id, "full", &config)
+        let (result, report) = run_maintenance_with_tracking(&store, None, project_id, "full", &config)
             .await
             .unwrap();
 
@@ -1509,7 +1548,7 @@ mod tests {
 
         let config = SkillMaintenanceConfig::default();
         let (result, report) =
-            run_maintenance_with_tracking(&store, project_id, "bogus_level", &config)
+            run_maintenance_with_tracking(&store, None, project_id, "bogus_level", &config)
                 .await
                 .unwrap();
 
@@ -1544,7 +1583,7 @@ mod tests {
         let original_decay = config.synapse_decay_amount;
 
         // Run tracked maintenance - should adapt config
-        let (result, report) = run_maintenance_with_tracking(&store, project_id, "hourly", &config)
+        let (result, report) = run_maintenance_with_tracking(&store, None, project_id, "hourly", &config)
             .await
             .unwrap();
 
@@ -1563,7 +1602,7 @@ mod tests {
 
         let config = SkillMaintenanceConfig::default();
         let (_result, _report) =
-            run_maintenance_with_tracking(&store, project_id, "hourly", &config)
+            run_maintenance_with_tracking(&store, None, project_id, "hourly", &config)
                 .await
                 .unwrap();
 
@@ -1607,7 +1646,7 @@ mod tests {
 
         let config = SkillMaintenanceConfig::default();
         let (_result, report) =
-            run_maintenance_with_tracking(&store, project_id, "hourly", &config)
+            run_maintenance_with_tracking(&store, None, project_id, "hourly", &config)
                 .await
                 .unwrap();
 
@@ -1644,7 +1683,7 @@ mod tests {
         }
 
         let config = SkillMaintenanceConfig::default();
-        let report = deep_maintenance(&store, project_id, &config).await.unwrap();
+        let report = deep_maintenance(&store, None, project_id, &config).await.unwrap();
 
         // Not stagnating
         assert!(
@@ -1673,7 +1712,7 @@ mod tests {
         }
 
         let config = SkillMaintenanceConfig::default();
-        let report = deep_maintenance(&store, project_id, &config).await.unwrap();
+        let report = deep_maintenance(&store, None, project_id, &config).await.unwrap();
 
         // Should have stuck_tasks recommendations since we have 3 in_progress tasks
         assert!(
@@ -1706,7 +1745,7 @@ mod tests {
         };
 
         // Should not panic with aggressive config
-        let report = deep_maintenance(&store, project_id, &config).await.unwrap();
+        let report = deep_maintenance(&store, None, project_id, &config).await.unwrap();
         assert!(report.maintenance.is_some() || report.maintenance.is_none());
     }
 
@@ -1840,7 +1879,7 @@ mod tests {
             .unwrap();
 
         let config = SkillMaintenanceConfig::default();
-        let result = run_weekly_maintenance(&store, project_id, &config)
+        let result = run_weekly_maintenance(&store, None, project_id, &config)
             .await
             .unwrap();
 
@@ -1869,7 +1908,7 @@ mod tests {
         store.create_skill(&skill).await.unwrap();
 
         let config = SkillMaintenanceConfig::default();
-        let result = run_full_maintenance(&store, pid, &config).await.unwrap();
+        let result = run_full_maintenance(&store, None, pid, &config).await.unwrap();
         assert_eq!(result.level, "full");
 
         // Verify the trigger was cleaned up

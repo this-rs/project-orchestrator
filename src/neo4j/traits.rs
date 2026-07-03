@@ -1769,10 +1769,17 @@ pub trait GraphStore: Send + Sync {
 
     /// List notes that have an embedding but no outgoing SYNAPSE.
     /// Used for synapse backfill. Returns (notes, total_count).
+    ///
+    /// `project_id`: when `Some`, restricts the scan to that project's notes
+    /// (via `HAS_NOTE`) — used by on-demand, bounded self-heal callers (skill
+    /// detection/maintenance) so a single call cannot balloon into a full
+    /// multi-tenant rebuild. `None` preserves the original global sweep
+    /// behavior used by the periodic heartbeat/homeostasis/admin backfill.
     async fn list_notes_needing_synapses(
         &self,
         limit: usize,
         offset: usize,
+        project_id: Option<Uuid>,
     ) -> Result<(Vec<crate::notes::Note>, usize)>;
 
     // ========================================================================

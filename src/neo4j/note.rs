@@ -3194,16 +3194,29 @@ impl Neo4jClient {
         &self,
         limit: usize,
         offset: usize,
+        project_id: Option<uuid::Uuid>,
     ) -> Result<(Vec<Note>, usize)> {
         // Count total
-        let count_q = query(
-            r#"
-            MATCH (n:Note)
-            WHERE n.embedding IS NOT NULL AND NOT (n)-[:SYNAPSE]->()
-              AND n.status IN ['active', 'needs_review']
-            RETURN count(n) AS total
-            "#,
-        );
+        let count_q = if let Some(pid) = project_id {
+            query(
+                r#"
+                MATCH (p:Project {id: $project_id})-[:HAS_NOTE]->(n:Note)
+                WHERE n.embedding IS NOT NULL AND NOT (n)-[:SYNAPSE]->()
+                  AND n.status IN ['active', 'needs_review']
+                RETURN count(n) AS total
+                "#,
+            )
+            .param("project_id", pid.to_string())
+        } else {
+            query(
+                r#"
+                MATCH (n:Note)
+                WHERE n.embedding IS NOT NULL AND NOT (n)-[:SYNAPSE]->()
+                  AND n.status IN ['active', 'needs_review']
+                RETURN count(n) AS total
+                "#,
+            )
+        };
         let mut result = self.graph.execute(count_q).await?;
         let total = if let Some(row) = result.next().await? {
             row.get::<i64>("total").unwrap_or(0) as usize
@@ -3216,18 +3229,34 @@ impl Neo4jClient {
         }
 
         // Fetch batch
-        let fetch_q = query(
-            r#"
-            MATCH (n:Note)
-            WHERE n.embedding IS NOT NULL AND NOT (n)-[:SYNAPSE]->()
-              AND n.status IN ['active', 'needs_review']
-            RETURN n
-            ORDER BY n.created_at
-            SKIP $offset LIMIT $limit
-            "#,
-        )
-        .param("offset", offset as i64)
-        .param("limit", limit as i64);
+        let fetch_q = if let Some(pid) = project_id {
+            query(
+                r#"
+                MATCH (p:Project {id: $project_id})-[:HAS_NOTE]->(n:Note)
+                WHERE n.embedding IS NOT NULL AND NOT (n)-[:SYNAPSE]->()
+                  AND n.status IN ['active', 'needs_review']
+                RETURN n
+                ORDER BY n.created_at
+                SKIP $offset LIMIT $limit
+                "#,
+            )
+            .param("project_id", pid.to_string())
+            .param("offset", offset as i64)
+            .param("limit", limit as i64)
+        } else {
+            query(
+                r#"
+                MATCH (n:Note)
+                WHERE n.embedding IS NOT NULL AND NOT (n)-[:SYNAPSE]->()
+                  AND n.status IN ['active', 'needs_review']
+                RETURN n
+                ORDER BY n.created_at
+                SKIP $offset LIMIT $limit
+                "#,
+            )
+            .param("offset", offset as i64)
+            .param("limit", limit as i64)
+        };
 
         let mut result = self.graph.execute(fetch_q).await?;
         let mut notes = Vec::new();

@@ -66,8 +66,17 @@ impl HeartbeatCheck for SynapseReplenishCheck {
         // `min_similarity = 0.0` auto-calibrates the threshold from the existing
         // weight distribution (falls back to 0.75 when the graph is empty).
         let nm = NoteManager::new(ctx.graph.clone(), search);
+        // project_id: None — this check intentionally sweeps ALL projects
+        // globally (unlike the bounded, project-scoped self-heal now embedded
+        // in detect_skills_pipeline / run_weekly_maintenance).
         let progress = nm
-            .backfill_synapses(REPLENISH_BATCH_SIZE, 0.0, REPLENISH_MAX_NEIGHBORS, None)
+            .backfill_synapses(
+                REPLENISH_BATCH_SIZE,
+                0.0,
+                REPLENISH_MAX_NEIGHBORS,
+                /* cancel */ None,
+                /* project_id */ None,
+            )
             .await?;
 
         if progress.synapses_created > 0 || progress.energy_initialized > 0 {

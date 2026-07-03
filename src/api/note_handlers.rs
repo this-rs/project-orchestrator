@@ -1204,6 +1204,7 @@ pub async fn start_backfill_synapses(
                 min_similarity,
                 max_neighbors,
                 Some(&cancel_flag),
+                /* project_id */ None,
             )
             .await;
 
