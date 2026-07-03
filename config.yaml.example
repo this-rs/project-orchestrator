@@ -58,6 +58,39 @@ meilisearch:
 #   url: "nats://localhost:4222"     # NATS_URL env override
 
 # -----------------------------------------------------------------------------
+# Remote MCP — Streamable HTTP transport + OAuth 2.1 Authorization Server
+# -----------------------------------------------------------------------------
+# Exposes the PO MCP server to remote Claude clients (Claude Code CLI over a
+# tailnet, and Claude.ai / Desktop connectors over public HTTPS).
+#
+# OPT-IN AND OFF BY DEFAULT. When this section is absent (or enabled: false),
+# the /mcp route and the /oauth/* + /.well-known/oauth-* discovery routes are
+# NOT mounted — no remote exposure. An existing config.yaml without this block
+# upgrades cleanly to "disabled" (additive migration, no rewrite needed).
+#
+# The public issuer/domain is NOT set here — it reuses server.public_url (the
+# single source of truth for the OAuth issuer, .well-known metadata and the
+# /mcp resource URL). No remote-MCP secret is stored: DCR client_ids and MCP
+# access tokens are stateless JWTs signed with auth.jwt_secret.
+#
+# Enable env override: REMOTE_MCP_ENABLED=true
+#
+# SECURITY: /mcp must sit behind TLS (reverse proxy / tunnel). For public
+# exposure, restrict at the network layer to Anthropic egress ranges
+# (IPv4 160.79.104.0/21, IPv6 2607:6bc0::/48). Never bind 0.0.0.0 without a proxy.
+#
+# remote_mcp:
+#   enabled: false                     # master switch (default: false)
+#   bind_addr: "127.0.0.1"             # loopback/tailnet interface (never 0.0.0.0 by default)
+#   session_ttl_secs: 3600             # idle TTL for Mcp-Session-Id sessions
+#   rate_limit:
+#     window_secs: 60                  # per-token sliding window
+#     max_requests: 120                # max requests per token per window
+#   origin_allowlist:                  # browser connector origins (DNS-rebinding guard)
+#     - "https://claude.ai"
+#     - "https://claude.com"
+
+# -----------------------------------------------------------------------------
 # Embeddings — Vector embedding provider for semantic search
 # -----------------------------------------------------------------------------
 # Two providers available:

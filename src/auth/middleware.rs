@@ -62,6 +62,27 @@ pub async fn require_auth(
         ));
     }
 
+    // 4b. MCP tokens are long-lived but revocable: signature + expiry alone
+    //     are not enough — the jti must still be active in the McpToken
+    //     store. Fail closed on a missing jti or a store error.
+    if claims.is_mcp_token() {
+        let jti = claims
+            .jti
+            .as_deref()
+            .ok_or_else(|| AppError::Unauthorized("MCP token missing jti".to_string()))?;
+        let active = state
+            .orchestrator
+            .neo4j()
+            .is_mcp_token_active(jti)
+            .await
+            .map_err(|e| AppError::Unauthorized(format!("MCP token check failed: {e}")))?;
+        if !active {
+            return Err(AppError::Unauthorized(
+                "MCP token revoked, expired or unknown".to_string(),
+            ));
+        }
+    }
+
     // 5. Inject claims into request extensions
     req.extensions_mut().insert(claims);
 
@@ -133,6 +154,7 @@ mod tests {
             setup_completed: true,
             server_port: 6600,
             public_url: None,
+            remote_mcp: crate::RemoteMcpConfig::default(),
             ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
             registry_remote_url: None,
             oidc_client: None,
@@ -264,6 +286,9 @@ mod tests {
             name: "Test".to_string(),
             iat: now - 7200,
             exp: now - 3600,
+            token_type: None,
+            scope: None,
+            jti: None,
         };
         let token = jsonwebtoken::encode(
             &jsonwebtoken::Header::default(),

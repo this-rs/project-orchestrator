@@ -316,6 +316,7 @@ mod tests {
             setup_completed: true,
             server_port: 0,
             public_url: None,
+            remote_mcp: crate::RemoteMcpConfig::default(),
             ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
             registry_remote_url: None,
             oidc_client: None,

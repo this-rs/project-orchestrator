@@ -115,6 +115,8 @@ pub struct MockGraphStore {
     pub users: RwLock<HashMap<Uuid, UserNode>>,
     /// Refresh tokens keyed by token_hash
     pub refresh_tokens: RwLock<HashMap<String, crate::neo4j::models::RefreshTokenNode>>,
+    /// MCP tokens keyed by jti
+    pub mcp_tokens: RwLock<HashMap<String, crate::neo4j::models::McpTokenNode>>,
     pub feature_graphs: RwLock<HashMap<Uuid, FeatureGraphNode>>,
     /// feature_graph_id -> Vec<(entity_type, entity_id, role)>
     #[allow(clippy::type_complexity)]
@@ -277,6 +279,7 @@ impl MockGraphStore {
             note_supersedes: RwLock::new(HashMap::new()),
             users: RwLock::new(HashMap::new()),
             refresh_tokens: RwLock::new(HashMap::new()),
+            mcp_tokens: RwLock::new(HashMap::new()),
             feature_graphs: RwLock::new(HashMap::new()),
             feature_graph_entities: RwLock::new(HashMap::new()),
             file_analytics: RwLock::new(HashMap::new()),
@@ -7197,6 +7200,58 @@ impl GraphStore for MockGraphStore {
             }
         }
         Ok(count)
+    }
+
+    // MCP Tokens
+    async fn create_mcp_token(
+        &self,
+        user_id: Uuid,
+        jti: &str,
+        label: &str,
+        scope: &str,
+        expires_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()> {
+        let token = crate::neo4j::models::McpTokenNode {
+            jti: jti.to_string(),
+            user_id,
+            label: label.to_string(),
+            scope: scope.to_string(),
+            expires_at,
+            created_at: chrono::Utc::now(),
+            revoked: false,
+        };
+        self.mcp_tokens.write().await.insert(jti.to_string(), token);
+        Ok(())
+    }
+
+    async fn is_mcp_token_active(&self, jti: &str) -> Result<bool> {
+        let tokens = self.mcp_tokens.read().await;
+        Ok(tokens
+            .get(jti)
+            .is_some_and(|t| !t.revoked && t.expires_at > chrono::Utc::now()))
+    }
+
+    async fn revoke_mcp_token(&self, user_id: Uuid, jti: &str) -> Result<bool> {
+        let mut tokens = self.mcp_tokens.write().await;
+        match tokens.get_mut(jti) {
+            Some(token) if token.user_id == user_id => {
+                token.revoked = true;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    async fn list_mcp_tokens(
+        &self,
+        user_id: Uuid,
+    ) -> Result<Vec<crate::neo4j::models::McpTokenNode>> {
+        let tokens = self.mcp_tokens.read().await;
+        Ok(tokens
+            .values()
+            .filter(|t| t.user_id == user_id)
+            .cloned()
+            .collect())
     }
 
     // Feature Graphs

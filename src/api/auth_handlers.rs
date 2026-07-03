@@ -925,6 +925,9 @@ async fn try_ws_ticket_via_cookie(
         name,
         iat: now,
         exp: now + auth_config.access_token_expiry_secs as i64,
+        token_type: None,
+        scope: None,
+        jti: None,
     })
 }
 
@@ -941,6 +944,127 @@ fn try_ws_ticket_via_bearer(
     let token = auth_header.strip_prefix("Bearer ")?;
 
     crate::auth::jwt::decode_jwt(token, &auth_config.jwt_secret).ok()
+}
+
+// ============================================================================
+// MCP tokens (long-lived, revocable, scoped — remote MCP transport auth)
+// ============================================================================
+
+/// Default lifetime for issued MCP tokens (90 days).
+const MCP_TOKEN_DEFAULT_EXPIRY_DAYS: u32 = 90;
+/// Hard ceiling on requested MCP token lifetime (1 year).
+const MCP_TOKEN_MAX_EXPIRY_DAYS: u32 = 365;
+/// Default scope granted when none is requested.
+const MCP_TOKEN_DEFAULT_SCOPE: &str = "mcp:read mcp:write";
+
+#[derive(Debug, Deserialize)]
+pub struct CreateMcpTokenRequest {
+    /// Human label for inventory ("claude-code laptop", "claude.ai", ...)
+    pub label: String,
+    /// Requested lifetime in days (default 90, capped at 365).
+    #[serde(default)]
+    pub expiry_days: Option<u32>,
+    /// Requested scope (default "mcp:read mcp:write").
+    #[serde(default)]
+    pub scope: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CreateMcpTokenResponse {
+    /// The bearer token — returned ONCE, never stored server-side.
+    pub token: String,
+    pub jti: String,
+    pub label: String,
+    pub scope: String,
+    pub expires_at: chrono::DateTime<Utc>,
+}
+
+/// POST /auth/mcp-tokens — issue a long-lived scoped MCP token.
+///
+/// Requires a regular authenticated session. The raw token is returned once;
+/// only its `jti` is persisted (for revocation + inventory).
+pub async fn create_mcp_token(
+    State(state): State<OrchestratorState>,
+    user: AuthUser,
+    Json(req): Json<CreateMcpTokenRequest>,
+) -> Result<Json<CreateMcpTokenResponse>, AppError> {
+    let auth_config = state
+        .auth_config
+        .as_ref()
+        .ok_or_else(|| AppError::Forbidden("Authentication not configured".to_string()))?;
+
+    if req.label.trim().is_empty() {
+        return Err(AppError::BadRequest("label is required".to_string()));
+    }
+    let days = req
+        .expiry_days
+        .unwrap_or(MCP_TOKEN_DEFAULT_EXPIRY_DAYS)
+        .clamp(1, MCP_TOKEN_MAX_EXPIRY_DAYS);
+    let scope = req
+        .scope
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or(MCP_TOKEN_DEFAULT_SCOPE)
+        .to_string();
+    let expiry_secs = u64::from(days) * 86_400;
+
+    let (token, jti) = crate::auth::jwt::encode_mcp_token(
+        user.user_id,
+        &user.email,
+        &user.name,
+        &scope,
+        &auth_config.jwt_secret,
+        expiry_secs,
+    )
+    .map_err(AppError::Internal)?;
+
+    let expires_at = Utc::now() + chrono::Duration::seconds(expiry_secs as i64);
+    state
+        .orchestrator
+        .neo4j()
+        .create_mcp_token(user.user_id, &jti, req.label.trim(), &scope, expires_at)
+        .await?;
+
+    tracing::info!(user = %user.email, jti = %jti, label = %req.label, "MCP token issued");
+    Ok(Json(CreateMcpTokenResponse {
+        token,
+        jti,
+        label: req.label.trim().to_string(),
+        scope,
+        expires_at,
+    }))
+}
+
+/// GET /auth/mcp-tokens — inventory of the caller's MCP tokens (no secrets).
+pub async fn list_mcp_tokens(
+    State(state): State<OrchestratorState>,
+    user: AuthUser,
+) -> Result<Json<Vec<crate::neo4j::models::McpTokenNode>>, AppError> {
+    let tokens = state
+        .orchestrator
+        .neo4j()
+        .list_mcp_tokens(user.user_id)
+        .await?;
+    Ok(Json(tokens))
+}
+
+/// DELETE /auth/mcp-tokens/{jti} — revoke one of the caller's MCP tokens.
+pub async fn revoke_mcp_token(
+    State(state): State<OrchestratorState>,
+    user: AuthUser,
+    axum::extract::Path(jti): axum::extract::Path<String>,
+) -> Result<axum::http::StatusCode, AppError> {
+    let revoked = state
+        .orchestrator
+        .neo4j()
+        .revoke_mcp_token(user.user_id, &jti)
+        .await?;
+    if revoked {
+        tracing::info!(user = %user.email, jti = %jti, "MCP token revoked");
+        Ok(axum::http::StatusCode::NO_CONTENT)
+    } else {
+        Err(AppError::NotFound("No such MCP token".to_string()))
+    }
 }
 
 // ============================================================================
@@ -1009,6 +1133,7 @@ mod tests {
             setup_completed: true,
             server_port: 6600,
             public_url: None,
+            remote_mcp: crate::RemoteMcpConfig::default(),
             ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
             registry_remote_url: None,
             oidc_client: None,

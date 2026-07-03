@@ -27,6 +27,7 @@ fn test_config() -> Config {
         serve_frontend: false,
         frontend_path: "./dist".to_string(),
         public_url: None,
+        remote_mcp: project_orchestrator::RemoteMcpConfig::default(),
         chat_permissions: None,
         chat_default_model: None,
         chat_max_sessions: None,

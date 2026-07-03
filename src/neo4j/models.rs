@@ -1888,6 +1888,30 @@ pub struct RefreshTokenNode {
     pub revoked: bool,
 }
 
+/// A long-lived, revocable, scoped MCP access token record.
+///
+/// Unlike refresh tokens, the MCP token itself is a JWT (validated by
+/// signature + expiry in the middleware); this node exists solely for
+/// **revocation** and **inventory** — the JWT's `jti` claim is looked up
+/// here on every authenticated MCP-token request. The JWT is never stored.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpTokenNode {
+    /// JWT ID claim (`jti`) — primary lookup key for revocation
+    pub jti: String,
+    /// User who owns this token
+    pub user_id: Uuid,
+    /// Human label ("claude-code laptop", "claude.ai connector", ...)
+    pub label: String,
+    /// Space-separated OAuth-style scopes (e.g. "mcp:read mcp:write")
+    pub scope: String,
+    /// When this token expires (mirrors the JWT exp claim)
+    pub expires_at: DateTime<Utc>,
+    /// When this token was created
+    pub created_at: DateTime<Utc>,
+    /// Whether this token has been revoked
+    pub revoked: bool,
+}
+
 // ============================================================================
 // Analytics: Churn, Knowledge Density, Risk Score (T5.5, T5.6, T5.7)
 // ============================================================================

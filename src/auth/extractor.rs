@@ -86,6 +86,9 @@ mod tests {
             name: "Alice".to_string(),
             iat: 0,
             exp: 0,
+            token_type: None,
+            scope: None,
+            jti: None,
         };
 
         let user = AuthUser::from_claims(&claims).unwrap();
@@ -102,6 +105,9 @@ mod tests {
             name: "Alice".to_string(),
             iat: 0,
             exp: 0,
+            token_type: None,
+            scope: None,
+            jti: None,
         };
 
         let result = AuthUser::from_claims(&claims);
