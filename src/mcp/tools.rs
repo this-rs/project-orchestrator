@@ -796,7 +796,7 @@ fn chat_tool() -> ToolDefinition {
                     "enum": ["list_sessions", "get_session", "get_children", "delete_session", "send_message", "list_messages", "add_discussed", "get_session_entities", "get_session_tree", "get_run_sessions", "associate_with"],
                     "description": "Operation to perform"
                 },
-                "session_id": {"type": "string", "description": "Session UUID"},
+                "session_id": {"type": "string", "description": "Session UUID. For send_message: resume this existing session instead of creating a new one (omit to start a new conversation)"},
                 "message": {"type": "string", "description": "Message to send (send_message)"},
                 "cwd": {"type": "string", "description": "Working directory (send_message)"},
                 "project_slug": {"type": "string", "description": "Project filter (list_sessions/send_message)"},

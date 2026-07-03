@@ -39,7 +39,7 @@ serde_yaml = "0.9"
 rand = "0.10"
 
 # Platform directories (config path)
-dirs = "5"
+dirs = "6"
 
 # Docker management
 bollard = "0.21"

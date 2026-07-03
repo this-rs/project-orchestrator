@@ -18,7 +18,18 @@ use uuid::Uuid;
 // Create session + send first message
 // ============================================================================
 
-/// POST /api/chat/sessions — Create a new chat session and send the first message
+/// POST /api/chat/sessions — Create a new chat session and send the first
+/// message, OR resume an existing session when `session_id` is provided.
+///
+/// The resume path mirrors the WS handler's 3-branch routing:
+/// 1. session active locally → `send_message`
+/// 2. session owned by another instance → `try_remote_send` (NATS RPC)
+/// 3. no instance owns it → `resume_session` (respawns the CLI)
+///
+/// This is the path used by REST/MCP callers (`chat` tool, `send_message`
+/// action) which previously could only START conversations: `ChatRequest`
+/// documented `session_id` as "Session ID to resume" but `create_session`
+/// ignored it and always generated a fresh UUID.
 pub async fn create_session(
     State(state): State<OrchestratorState>,
     claims: Option<axum::Extension<crate::auth::jwt::Claims>>,
@@ -35,6 +46,56 @@ pub async fn create_session(
         .as_ref()
         .ok_or_else(|| AppError::Internal(anyhow::anyhow!("Chat manager not initialized")))?;
 
+    // ── Resume path ────────────────────────────────────────────────────────
+    if let Some(sid) = request.session_id.clone() {
+        Uuid::parse_str(&sid)
+            .map_err(|_| AppError::BadRequest("Invalid session_id UUID".to_string()))?;
+
+        if chat_manager.is_session_active(&sid).await {
+            // 1. Session is local — send directly into the running CLI
+            chat_manager
+                .send_message(&sid, &request.message)
+                .await
+                .map_err(AppError::Internal)?;
+        } else if chat_manager
+            .try_remote_send(&sid, &request.message, "user_message")
+            .await
+            .unwrap_or(false)
+        {
+            // 2. Message proxied to the owning instance via NATS RPC
+        } else {
+            // 3. No instance owns the session — resume locally (spawns CLI).
+            //    Surfaces a 404 when the session doesn't exist in Neo4j.
+            chat_manager
+                .resume_session(&sid, &request.message, request.user_claims.as_ref())
+                .await
+                .map_err(|e| {
+                    if e.to_string().contains("not found") {
+                        AppError::NotFound(format!("Session {} not found", sid))
+                    } else {
+                        AppError::Internal(e)
+                    }
+                })?;
+        }
+
+        // Same side-effects as the WS path: entity extraction + live refresh
+        super::ws_chat_handler::spawn_entity_extraction(&state, &sid, &request.message);
+        state.event_bus.emit(
+            CrudEvent::new(EntityType::ChatSession, CrudAction::Updated, &sid).with_payload(
+                serde_json::json!({
+                    "project_slug": request.project_slug,
+                    "resumed": true,
+                }),
+            ),
+        );
+
+        return Ok(Json(CreateSessionResponse {
+            session_id: sid.clone(),
+            stream_url: format!("/ws/chat/{}", sid),
+        }));
+    }
+
+    // ── Create path (no session_id) ────────────────────────────────────────
     let response = chat_manager
         .create_session(&request)
         .await
