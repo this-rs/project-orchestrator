@@ -110,8 +110,11 @@ impl Neo4jClient {
         // Storage-layer reliability gate (relocated from the activation hot-path):
         // unreliable triggers (quality < 0.3) are never persisted, so the matching
         // path never has to filter them per-message. See skills/models.rs is_reliable.
-        let reliable_triggers: Vec<&SkillTrigger> =
-            skill.trigger_patterns.iter().filter(|t| t.is_reliable()).collect();
+        let reliable_triggers: Vec<&SkillTrigger> = skill
+            .trigger_patterns
+            .iter()
+            .filter(|t| t.is_reliable())
+            .collect();
         let trigger_json = serde_json::to_string(&reliable_triggers)?;
 
         let q = query(
@@ -235,8 +238,11 @@ impl Neo4jClient {
     pub async fn update_skill(&self, skill: &SkillNode) -> Result<()> {
         // Storage-layer reliability gate (relocated from the activation hot-path):
         // unreliable triggers (quality < 0.3) are never persisted. See create_skill.
-        let reliable_triggers: Vec<&SkillTrigger> =
-            skill.trigger_patterns.iter().filter(|t| t.is_reliable()).collect();
+        let reliable_triggers: Vec<&SkillTrigger> = skill
+            .trigger_patterns
+            .iter()
+            .filter(|t| t.is_reliable())
+            .collect();
         let trigger_json = serde_json::to_string(&reliable_triggers)?;
 
         let q = query(

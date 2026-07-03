@@ -13,8 +13,9 @@ static UUID_RE: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 /// Matches short identifier tokens: `T12`, `t7`, `plan-abcd`, `task-3`, bare hex blobs.
-static ID_TOKEN_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)^(t\d+|(plan|task|step|milestone)-\S+|[0-9a-f]{7,})$").unwrap());
+static ID_TOKEN_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)^(t\d+|(plan|task|step|milestone)-\S+|[0-9a-f]{7,})$").unwrap()
+});
 
 /// True if a tag is an identifier rather than a meaningful label — such tags
 /// must never become part of a skill name (constat 5: ID-named skills).

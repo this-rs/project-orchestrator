@@ -248,8 +248,9 @@ fn build_remote_mcp_section(
         .unwrap_or((60, 120));
 
     // Union existing origins with the seeded Claude connector origins.
-    let mut origin_allowlist: Vec<String> =
-        existing.map(|e| e.origin_allowlist.clone()).unwrap_or_default();
+    let mut origin_allowlist: Vec<String> = existing
+        .map(|e| e.origin_allowlist.clone())
+        .unwrap_or_default();
     for o in CLAUDE_CONNECTOR_ORIGINS {
         if !origin_allowlist.iter().any(|x| x == o) {
             origin_allowlist.push(o.to_string());
@@ -2087,8 +2088,12 @@ mod remote_mcp_tests {
         let cfg = roundtrip(&section);
         assert!(cfg.enabled);
         assert_eq!(cfg.bind_addr, "127.0.0.1");
-        assert!(cfg.origin_allowlist.contains(&"https://claude.ai".to_string()));
-        assert!(cfg.origin_allowlist.contains(&"https://claude.com".to_string()));
+        assert!(cfg
+            .origin_allowlist
+            .contains(&"https://claude.ai".to_string()));
+        assert!(cfg
+            .origin_allowlist
+            .contains(&"https://claude.com".to_string()));
     }
 
     #[test]

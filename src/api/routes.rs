@@ -195,7 +195,10 @@ fn remote_mcp_public_routes() -> Router<OrchestratorState> {
             "/oauth/register",
             post(crate::auth::oauth_server::register_client),
         )
-        .route("/oauth/authorize", get(crate::auth::oauth_server::authorize))
+        .route(
+            "/oauth/authorize",
+            get(crate::auth::oauth_server::authorize),
+        )
         .route("/oauth/token", post(crate::auth::oauth_server::token))
 }
 
@@ -1961,7 +1964,9 @@ mod tests {
             .oneshot(
                 Request::post("/mcp")
                     .header("content-type", "application/json")
-                    .body(Body::from(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#))
+                    .body(Body::from(
+                        r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+                    ))
                     .unwrap(),
             )
             .await
