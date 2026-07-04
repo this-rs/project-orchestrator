@@ -145,6 +145,17 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # Belt-and-braces: when the runner image's preinstalled stable lags the
+      # channel, `rustup toolchain install stable --target <t>` takes the
+      # UPDATE path and silently drops the extra target — rust-std for <t> is
+      # never installed and cross-target builds die with E0463 "can't find
+      # crate for core". Deterministic, not a flake (observed on v0.0.15:
+      # macos-14 image had 1.96.0, channel had 1.96.1 → x86_64-apple-darwin
+      # std lost). `rustup target add` is idempotent and guarantees the std.
+      - name: Ensure ${{ matrix.target }} stdlib is installed
+        shell: bash
+        run: rustup target add ${{ matrix.target }}
+
       - name: Cache cargo registry
         uses: Swatinem/rust-cache@v2
         with:
@@ -369,6 +380,17 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # Belt-and-braces: when the runner image's preinstalled stable lags the
+      # channel, `rustup toolchain install stable --target <t>` takes the
+      # UPDATE path and silently drops the extra target — rust-std for <t> is
+      # never installed and cross-target builds die with E0463 "can't find
+      # crate for core". Deterministic, not a flake (observed on v0.0.15:
+      # macos-14 image had 1.96.0, channel had 1.96.1 → x86_64-apple-darwin
+      # std lost). `rustup target add` is idempotent and guarantees the std.
+      - name: Ensure ${{ matrix.target }} stdlib is installed
+        shell: bash
+        run: rustup target add ${{ matrix.target }}
+
       - name: Install cargo-deb
         run: cargo install cargo-deb
 
@@ -453,6 +475,17 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
+      # Belt-and-braces: when the runner image's preinstalled stable lags the
+      # channel, `rustup toolchain install stable --target <t>` takes the
+      # UPDATE path and silently drops the extra target — rust-std for <t> is
+      # never installed and cross-target builds die with E0463 "can't find
+      # crate for core". Deterministic, not a flake (observed on v0.0.15:
+      # macos-14 image had 1.96.0, channel had 1.96.1 → x86_64-apple-darwin
+      # std lost). `rustup target add` is idempotent and guarantees the std.
+      - name: Ensure ${{ matrix.target }} stdlib is installed
+        shell: bash
+        run: rustup target add ${{ matrix.target }}
 
       - name: Install cargo-generate-rpm
         run: cargo install cargo-generate-rpm
@@ -632,6 +665,17 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
+      # Belt-and-braces: when the runner image's preinstalled stable lags the
+      # channel, `rustup toolchain install stable --target <t>` takes the
+      # UPDATE path and silently drops the extra target — rust-std for <t> is
+      # never installed and cross-target builds die with E0463 "can't find
+      # crate for core". Deterministic, not a flake (observed on v0.0.15:
+      # macos-14 image had 1.96.0, channel had 1.96.1 → x86_64-apple-darwin
+      # std lost). `rustup target add` is idempotent and guarantees the std.
+      - name: Ensure ${{ matrix.target }} stdlib is installed
+        shell: bash
+        run: rustup target add ${{ matrix.target }}
 
       - name: Cache cargo registry
         uses: Swatinem/rust-cache@v2
