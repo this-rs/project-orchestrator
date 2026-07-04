@@ -1538,12 +1538,20 @@ impl NoteManager {
     ///
     /// Also calls `init_note_energy()` first to ensure all notes have an
     /// energy value.
+    ///
+    /// `project_id`: when `Some`, scopes both note selection and the adaptive
+    /// `min_similarity` calibration to that project — used by bounded,
+    /// on-demand self-heal callers (skill detection/maintenance) so a single
+    /// call cannot balloon into a full multi-tenant rebuild. `None` preserves
+    /// the original global sweep (heartbeat replenish, homeostasis, admin
+    /// endpoint).
     pub async fn backfill_synapses(
         &self,
         batch_size: usize,
         min_similarity: f64,
         max_neighbors: usize,
         cancel: Option<&std::sync::atomic::AtomicBool>,
+        project_id: Option<Uuid>,
     ) -> Result<SynapseBackfillProgress> {
         let batch_size = if batch_size == 0 { 50 } else { batch_size };
         let max_neighbors = if max_neighbors == 0 {
@@ -1563,7 +1571,7 @@ impl NoteManager {
         let min_similarity = if min_similarity > 0.0 {
             min_similarity
         } else {
-            match self.neo4j.get_all_synapse_weights(None).await {
+            match self.neo4j.get_all_synapse_weights(project_id).await {
                 Ok(weights) if weights.len() >= 4 => {
                     let calibrated =
                         crate::analytics::distribution::adaptive_threshold(&weights, 0.70, 0.75);
@@ -1585,7 +1593,10 @@ impl NoteManager {
         }
 
         // Phase 2: get total count of notes needing synapses
-        let (_, total) = self.neo4j.list_notes_needing_synapses(0, 0).await?;
+        let (_, total) = self
+            .neo4j
+            .list_notes_needing_synapses(0, 0, project_id)
+            .await?;
         if total == 0 {
             tracing::info!("Synapse backfill: all notes with embeddings already have synapses");
             return Ok(SynapseBackfillProgress {
@@ -1621,7 +1632,7 @@ impl NoteManager {
             // neighbours stay, so we skip past them with `skip_offset`.
             let (batch, remaining) = self
                 .neo4j
-                .list_notes_needing_synapses(batch_size, skip_offset)
+                .list_notes_needing_synapses(batch_size, skip_offset, project_id)
                 .await?;
             if batch.is_empty() || remaining == 0 {
                 break;

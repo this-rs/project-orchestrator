@@ -6499,6 +6499,7 @@ impl GraphStore for MockGraphStore {
         &self,
         limit: usize,
         _offset: usize,
+        project_id: Option<Uuid>,
     ) -> Result<(Vec<crate::notes::Note>, usize)> {
         let notes = self.notes.read().await;
         let embeddings = self.note_embeddings.read().await;
@@ -6507,6 +6508,7 @@ impl GraphStore for MockGraphStore {
         let needing: Vec<crate::notes::Note> = notes
             .values()
             .filter(|n| embeddings.contains_key(&n.id) && !synapses.contains_key(&n.id))
+            .filter(|n| project_id.is_none_or(|pid| n.project_id == Some(pid)))
             .cloned()
             .collect();
 
@@ -11136,6 +11138,62 @@ mod tests {
             data: data.to_string(),
             created_at: Utc::now(),
         }
+    }
+
+    #[tokio::test]
+    async fn test_list_notes_needing_synapses_project_scoped() {
+        // Regression test for the synapse-collapse self-heal fix: on-demand
+        // callers (detect_skills_pipeline / run_weekly_maintenance) must be
+        // able to scope the backfill to a single project so a bounded,
+        // on-demand call cannot balloon into a full multi-tenant rebuild.
+        let store = MockGraphStore::new();
+        let project_a = Uuid::new_v4();
+        let project_b = Uuid::new_v4();
+
+        let note_a = Note::new(
+            Some(project_a),
+            crate::notes::NoteType::Observation,
+            "note in project A".to_string(),
+            "test".to_string(),
+        );
+        let note_b = Note::new(
+            Some(project_b),
+            crate::notes::NoteType::Observation,
+            "note in project B".to_string(),
+            "test".to_string(),
+        );
+
+        store.create_note(&note_a).await.unwrap();
+        store.create_note(&note_b).await.unwrap();
+
+        // Both notes have embeddings but no synapses yet — both are
+        // "needing synapses" candidates.
+        store
+            .set_note_embedding(note_a.id, &[0.1, 0.2, 0.3], "test-model")
+            .await
+            .unwrap();
+        store
+            .set_note_embedding(note_b.id, &[0.4, 0.5, 0.6], "test-model")
+            .await
+            .unwrap();
+
+        // Scoped to project A: only note_a should be returned.
+        let (notes, total) = store
+            .list_notes_needing_synapses(10, 0, Some(project_a))
+            .await
+            .unwrap();
+        assert_eq!(total, 1, "only project A's note should count");
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].id, note_a.id);
+
+        // Unscoped (None): both notes across both projects should be returned,
+        // preserving the original global-sweep behavior used by the heartbeat.
+        let (notes_all, total_all) = store
+            .list_notes_needing_synapses(10, 0, None)
+            .await
+            .unwrap();
+        assert_eq!(total_all, 2, "unscoped call should see both projects");
+        assert_eq!(notes_all.len(), 2);
     }
 
     #[tokio::test]

@@ -2131,8 +2131,10 @@ impl GraphStore for Neo4jClient {
         &self,
         limit: usize,
         offset: usize,
+        project_id: Option<Uuid>,
     ) -> anyhow::Result<(Vec<crate::notes::Note>, usize)> {
-        self.list_notes_needing_synapses(limit, offset).await
+        self.list_notes_needing_synapses(limit, offset, project_id)
+            .await
     }
 
     async fn create_cross_entity_synapses(

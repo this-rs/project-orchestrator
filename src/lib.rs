@@ -1318,8 +1318,13 @@ pub async fn start_server(mut config: Config) -> Result<()> {
                                 };
 
                             if let Some(is_bootstrap) = needs_run {
-                                match detect_skills_pipeline(orch_skills.neo4j(), *pid, &config)
-                                    .await
+                                match detect_skills_pipeline(
+                                    orch_skills.neo4j(),
+                                    Some(orch_skills.note_manager().as_ref()),
+                                    *pid,
+                                    &config,
+                                )
+                                .await
                                 {
                                     Ok(result) => {
                                         tracing::info!(

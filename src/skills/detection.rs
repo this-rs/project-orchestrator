@@ -6,9 +6,20 @@
 
 use crate::graph::algorithms::{compute_cohesion, louvain_communities};
 use crate::graph::{AnalyticsConfig, CodeEdge, CodeEdgeType, CodeGraph, CodeNode, CodeNodeType};
+use crate::notes::NoteManager;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
+
+/// Notes processed per self-heal backfill batch when the SYNAPSE graph is
+/// found to be under `min_notes_for_detection`. Kept small and single-batch
+/// (unlike `SynapseReplenishCheck`'s global 12h sweep) so an on-demand
+/// `detect_skills`/maintenance call stays fast and project-scoped instead of
+/// risking a multi-minute multi-tenant rebuild.
+const SELF_HEAL_BATCH_SIZE: usize = 200;
+/// Max neighbours linked per note during self-heal (mirrors the heartbeat's
+/// default so calibrated similarity thresholds behave consistently).
+const SELF_HEAL_MAX_NEIGHBORS: usize = 10;
 
 // ============================================================================
 // Configuration
@@ -595,6 +606,82 @@ pub fn detect_skill_candidates(
     }
 }
 
+/// Self-heals a decayed SYNAPSE graph before it is read for
+/// detection/evolution, and returns the (possibly repaired) edge list.
+///
+/// `SynapseDecayCheck` erodes SYNAPSE weights unconditionally every 6h, while
+/// creation is otherwise event-driven (note create/update) or the periodic
+/// `SynapseReplenishCheck` heartbeat (every 12h). Between two heartbeat ticks
+/// — or if the heartbeat is disabled/lagging — the graph can fall below
+/// `min_notes_for_detection`, and both `detect_skills_pipeline` and
+/// `run_weekly_maintenance` would otherwise silently no-op forever (see
+/// `heartbeat/checks/synapse_replenish.rs` for the original diagnosis).
+///
+/// This bridges that gap for on-demand/scheduled callers: when the fetched
+/// edge list is under threshold and a `NoteManager` is available, it runs one
+/// bounded, project-scoped `backfill_synapses` pass (stored embeddings +
+/// vector search, no external embedding calls needed) and re-fetches the
+/// edges once. Returns `(edges, synapses_repaired)` — `synapses_repaired` is
+/// 0 when the graph was already healthy or no `NoteManager` was supplied.
+pub async fn ensure_synapse_graph_health(
+    graph_store: &dyn crate::neo4j::traits::GraphStore,
+    note_manager: Option<&NoteManager>,
+    project_id: Uuid,
+    config: &SkillDetectionConfig,
+) -> anyhow::Result<(Vec<(String, String, f64)>, usize)> {
+    let edges = graph_store
+        .get_synapse_graph(project_id, config.min_synapse_weight)
+        .await?;
+
+    let mut unique_notes = std::collections::HashSet::new();
+    for (from, to, _) in &edges {
+        unique_notes.insert(from.as_str());
+        unique_notes.insert(to.as_str());
+    }
+
+    if unique_notes.len() >= config.min_notes_for_detection {
+        return Ok((edges, 0));
+    }
+
+    let Some(nm) = note_manager else {
+        return Ok((edges, 0));
+    };
+
+    tracing::info!(
+        %project_id,
+        unique_notes = unique_notes.len(),
+        threshold = config.min_notes_for_detection,
+        "detect_skills: synapse graph under threshold, running bounded self-heal"
+    );
+
+    let progress = nm
+        .backfill_synapses(
+            SELF_HEAL_BATCH_SIZE,
+            0.0,
+            SELF_HEAL_MAX_NEIGHBORS,
+            None,
+            Some(project_id),
+        )
+        .await?;
+
+    if progress.synapses_created == 0 {
+        return Ok((edges, 0));
+    }
+
+    let repaired_edges = graph_store
+        .get_synapse_graph(project_id, config.min_synapse_weight)
+        .await?;
+
+    tracing::info!(
+        %project_id,
+        synapses_created = progress.synapses_created,
+        "detect_skills: self-heal repaired {} synapses",
+        progress.synapses_created
+    );
+
+    Ok((repaired_edges, progress.synapses_created))
+}
+
 // ============================================================================
 // Full Pipeline Orchestrator
 // ============================================================================
@@ -624,6 +711,12 @@ pub struct DetectSkillsPipelineResult {
     /// This ensures all notes have fresh LINKED_TO relations before clustering.
     #[serde(default)]
     pub anchors_created: usize,
+    /// Number of SYNAPSE edges (re)created by the bounded, project-scoped
+    /// self-heal pass triggered when the graph was under
+    /// `min_notes_for_detection`. Zero when the graph was already healthy or
+    /// no `NoteManager` was supplied. See `ensure_synapse_graph_health`.
+    #[serde(default)]
+    pub synapses_repaired: usize,
 }
 
 /// Run the full skill detection pipeline:
@@ -636,8 +729,14 @@ pub struct DetectSkillsPipelineResult {
 ///
 /// This function is idempotent — re-running updates existing skills
 /// rather than creating duplicates.
+///
+/// `note_manager`: when `Some`, enables the bounded self-heal described in
+/// [`ensure_synapse_graph_health`] — pass `None` only in contexts without a
+/// `NoteManager` (e.g. unit tests), which preserves the prior no-op-on-empty
+/// behavior.
 pub async fn detect_skills_pipeline(
     graph_store: &dyn crate::neo4j::traits::GraphStore,
+    note_manager: Option<&NoteManager>,
     project_id: Uuid,
     config: &SkillDetectionConfig,
 ) -> anyhow::Result<DetectSkillsPipelineResult> {
@@ -680,15 +779,24 @@ pub async fn detect_skills_pipeline(
             }
         };
 
-    // Step 1: Fetch SYNAPSE edges
-    let edges = graph_store
-        .get_synapse_graph(project_id, config.min_synapse_weight)
-        .await?;
+    // Step 1: Fetch SYNAPSE edges, self-healing a decayed graph first when
+    // possible (see `ensure_synapse_graph_health` — bridges the gap between
+    // heartbeat replenish ticks for on-demand callers).
+    let (edges, synapses_repaired) =
+        ensure_synapse_graph_health(graph_store, note_manager, project_id, config).await?;
 
     // Step 2: Run Louvain detection
     let detection = detect_skill_candidates(&edges, &project_id_str, config);
 
     if detection.status == ClusterDetectionStatus::InsufficientData {
+        let mut message = detection.message;
+        if synapses_repaired > 0 {
+            message = format!(
+                "{} (self-heal repaired {} synapses but the graph is still below threshold — \
+                 continue creating notes or re-run detect_skills shortly.)",
+                message, synapses_repaired
+            );
+        }
         return Ok(DetectSkillsPipelineResult {
             status: ClusterDetectionStatus::InsufficientData,
             skills_detected: 0,
@@ -697,9 +805,10 @@ pub async fn detect_skills_pipeline(
             total_notes: detection.total_notes,
             total_synapses: detection.total_synapses,
             modularity: 0.0,
-            message: detection.message,
+            message,
             skill_ids: Vec::new(),
             anchors_created,
+            synapses_repaired,
         });
     }
 
@@ -833,6 +942,7 @@ pub async fn detect_skills_pipeline(
         message,
         skill_ids,
         anchors_created,
+        synapses_repaired,
     })
 }
 
@@ -1372,7 +1482,7 @@ mod tests {
             min_notes_for_detection: 100, // force InsufficientData
             ..Default::default()
         };
-        let result = detect_skills_pipeline(&store, project_id, &config)
+        let result = detect_skills_pipeline(&store, None, project_id, &config)
             .await
             .unwrap();
 
@@ -1509,12 +1619,157 @@ mod tests {
 
         // No project exists — pipeline should handle gracefully
         let config = SkillDetectionConfig::default();
-        let result = detect_skills_pipeline(&store, fake_project_id, &config)
+        let result = detect_skills_pipeline(&store, None, fake_project_id, &config)
             .await
             .unwrap();
 
         assert_eq!(result.anchors_created, 0);
         assert_eq!(result.status, ClusterDetectionStatus::InsufficientData);
+    }
+
+    // ================================================================
+    // ensure_synapse_graph_health / self-heal tests
+    // ================================================================
+
+    /// Seed `count` notes in `project_id`, each with a near-identical
+    /// embedding (cosine similarity ~1.0), so `backfill_synapses`'s vector
+    /// search finds neighbours comfortably above the auto-calibrated
+    /// min_similarity floor (0.75 fallback on a synapse-free graph).
+    async fn seed_notes_with_similar_embeddings(
+        store: &crate::neo4j::mock::MockGraphStore,
+        project_id: Uuid,
+        count: usize,
+    ) {
+        use crate::neo4j::traits::GraphStore;
+
+        for i in 0..count {
+            let note = crate::notes::Note::new(
+                Some(project_id),
+                crate::notes::NoteType::Observation,
+                format!("note {i}"),
+                "test".to_string(),
+            );
+            store.create_note(&note).await.unwrap();
+            let embedding: Vec<f32> = vec![1.0, 0.0, 0.0, (i as f32) * 0.001];
+            store
+                .set_note_embedding(note.id, &embedding, "test-model")
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ensure_synapse_graph_health_skips_without_note_manager() {
+        use crate::neo4j::mock::MockGraphStore;
+        use crate::neo4j::traits::GraphStore;
+
+        let store = MockGraphStore::new();
+        let project = crate::test_helpers::test_project();
+        let project_id = project.id;
+        store.create_project(&project).await.unwrap();
+
+        let config = SkillDetectionConfig::default();
+
+        // No NoteManager supplied — self-heal must be skipped entirely, even
+        // though the graph (0 notes) is under min_notes_for_detection.
+        let (edges, repaired) = ensure_synapse_graph_health(&store, None, project_id, &config)
+            .await
+            .unwrap();
+
+        assert!(edges.is_empty());
+        assert_eq!(repaired, 0, "no self-heal should run without a NoteManager");
+    }
+
+    #[tokio::test]
+    async fn test_ensure_synapse_graph_health_no_op_when_nothing_needs_synapses() {
+        use crate::neo4j::mock::MockGraphStore;
+        use crate::neo4j::traits::GraphStore;
+
+        let store = std::sync::Arc::new(MockGraphStore::new());
+        let meili = std::sync::Arc::new(crate::meilisearch::mock::MockSearchStore::new());
+        let project = crate::test_helpers::test_project();
+        let project_id = project.id;
+        store.create_project(&project).await.unwrap();
+
+        // No notes exist at all — backfill_synapses has nothing to do.
+        let nm = NoteManager::new(store.clone() as std::sync::Arc<dyn GraphStore>, meili);
+        let config = SkillDetectionConfig::default();
+
+        let (edges, repaired) =
+            ensure_synapse_graph_health(store.as_ref(), Some(&nm), project_id, &config)
+                .await
+                .unwrap();
+
+        assert!(edges.is_empty());
+        assert_eq!(repaired, 0);
+    }
+
+    #[tokio::test]
+    async fn test_ensure_synapse_graph_health_repairs_decayed_graph() {
+        use crate::neo4j::mock::MockGraphStore;
+        use crate::neo4j::traits::GraphStore;
+
+        let store = std::sync::Arc::new(MockGraphStore::new());
+        let meili = std::sync::Arc::new(crate::meilisearch::mock::MockSearchStore::new());
+        let project = crate::test_helpers::test_project();
+        let project_id = project.id;
+        store.create_project(&project).await.unwrap();
+
+        seed_notes_with_similar_embeddings(&store, project_id, 20).await;
+
+        let nm = NoteManager::new(store.clone() as std::sync::Arc<dyn GraphStore>, meili);
+        let config = SkillDetectionConfig::default(); // min_notes_for_detection: 15
+
+        let (_edges, repaired) =
+            ensure_synapse_graph_health(store.as_ref(), Some(&nm), project_id, &config)
+                .await
+                .unwrap();
+
+        // NOTE: MockGraphStore::get_synapse_graph always returns an empty Vec
+        // regardless of synapses actually created (a pre-existing mock
+        // simplification, unrelated to this fix) — so we assert on
+        // `repaired` (sourced from backfill_synapses' own progress return)
+        // rather than on the re-fetched `edges`.
+        assert!(
+            repaired > 0,
+            "self-heal should have created synapses from similar embeddings"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_reports_repair_when_still_insufficient_after_self_heal() {
+        use crate::neo4j::mock::MockGraphStore;
+        use crate::neo4j::traits::GraphStore;
+
+        let store = std::sync::Arc::new(MockGraphStore::new());
+        let meili = std::sync::Arc::new(crate::meilisearch::mock::MockSearchStore::new());
+        let project = crate::test_helpers::test_project();
+        let project_id = project.id;
+        store.create_project(&project).await.unwrap();
+
+        seed_notes_with_similar_embeddings(&store, project_id, 20).await;
+
+        let nm = NoteManager::new(store.clone() as std::sync::Arc<dyn GraphStore>, meili);
+        let config = SkillDetectionConfig::default();
+
+        let result = detect_skills_pipeline(store.as_ref(), Some(&nm), project_id, &config)
+            .await
+            .unwrap();
+
+        // MockGraphStore::get_synapse_graph always returns empty, so even
+        // after a successful repair the pipeline still sees an empty graph
+        // on re-fetch and reports InsufficientData — but it must surface
+        // that a repair happened.
+        assert_eq!(result.status, ClusterDetectionStatus::InsufficientData);
+        assert!(
+            result.synapses_repaired > 0,
+            "self-heal should have run and created synapses"
+        );
+        assert!(
+            result.message.contains("self-heal repaired"),
+            "message should mention the repair: {}",
+            result.message
+        );
     }
 
     // ================================================================
@@ -1719,6 +1974,7 @@ mod tests {
             message: "test".into(),
             skill_ids: vec![Uuid::new_v4()],
             anchors_created: 5,
+            synapses_repaired: 0,
         };
         let json = serde_json::to_string(&result).unwrap();
         let back: DetectSkillsPipelineResult = serde_json::from_str(&json).unwrap();

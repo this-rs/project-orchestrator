@@ -117,7 +117,9 @@ async fn execute_admin_action(
                 .first()
                 .and_then(|a| a.parse::<usize>().ok())
                 .unwrap_or(50);
-            let (notes, total) = store.list_notes_needing_synapses(batch_size, 0).await?;
+            let (notes, total) = store
+                .list_notes_needing_synapses(batch_size, 0, None)
+                .await?;
             Ok(format!(
                 "Found {total} notes needing synapses (batch: {})",
                 notes.len()

@@ -11,6 +11,7 @@ use async_trait::async_trait;
 use tracing::{debug, info, warn};
 
 use crate::heartbeat::{HeartbeatCheck, HeartbeatContext};
+use crate::notes::NoteManager;
 use crate::skills::maintenance::SkillMaintenanceConfig;
 
 /// Per-run timeout for deep maintenance.
@@ -43,6 +44,19 @@ impl HeartbeatCheck for MaintenanceCheck {
         let projects = ctx.graph.list_projects().await?;
         let config = SkillMaintenanceConfig::default();
 
+        // Built once and reused across projects, mirroring SynapseReplenishCheck.
+        // Enables deep_maintenance's weekly step to self-heal a decayed SYNAPSE
+        // graph (bounded, project-scoped) before Louvain re-detection, instead
+        // of decaying synapses 3x and never repairing them — see
+        // `skills::detection::ensure_synapse_graph_health`.
+        let note_manager = ctx
+            .search
+            .clone()
+            .map(|search| NoteManager::new(ctx.graph.clone(), search));
+        if note_manager.is_none() {
+            warn!("MaintenanceCheck: no search store available, skill self-heal disabled for this run");
+        }
+
         for project in &projects {
             info!(
                 "MaintenanceCheck: running deep maintenance for '{}'",
@@ -51,6 +65,7 @@ impl HeartbeatCheck for MaintenanceCheck {
 
             match crate::skills::maintenance::deep_maintenance(
                 ctx.graph.as_ref(),
+                note_manager.as_ref(),
                 project.id,
                 &config,
             )
@@ -141,5 +156,34 @@ mod tests {
             check.timeout_override().unwrap() > Duration::from_secs(5),
             "must exceed the engine default timeout"
         );
+    }
+
+    #[tokio::test]
+    async fn test_maintenance_check_run_without_search_warns_but_completes() {
+        // No search store available — the self-heal NoteManager cannot be
+        // built, so the run must still complete (warning only, non-fatal).
+        let ctx = HeartbeatContext {
+            graph: std::sync::Arc::new(crate::neo4j::mock::MockGraphStore::new()),
+            search: None,
+            emitter: None,
+        };
+        let check = MaintenanceCheck;
+        assert!(check.run(&ctx).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_maintenance_check_run_with_search_builds_note_manager() {
+        // A search store is available — the self-heal NoteManager should be
+        // built (no projects exist, so deep_maintenance itself is never
+        // invoked, but the construction path must not error).
+        let ctx = HeartbeatContext {
+            graph: std::sync::Arc::new(crate::neo4j::mock::MockGraphStore::new()),
+            search: Some(std::sync::Arc::new(
+                crate::meilisearch::mock::MockSearchStore::new(),
+            )),
+            emitter: None,
+        };
+        let check = MaintenanceCheck;
+        assert!(check.run(&ctx).await.is_ok());
     }
 }
