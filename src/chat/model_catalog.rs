@@ -64,6 +64,12 @@ pub struct ModelDefinition {
 /// abbreviation, or description until someone adds an entry here.
 const CURATED_ORDER: &[(&str, &str, &str, &str)] = &[
     (
+        "claude-opus-5",
+        "Opus 5",
+        "bg-violet-500",
+        "Latest flagship — most advanced reasoning & agentic work",
+    ),
+    (
         "claude-sonnet-5",
         "Sonnet 5",
         "bg-rose-500",
@@ -411,8 +417,9 @@ mod tests {
     fn test_static_fallback_models_nonempty_and_ordered() {
         let models = static_fallback_models();
         assert!(!models.is_empty());
-        assert_eq!(models[0].id, "claude-sonnet-5");
-        assert_eq!(models[1].id, "claude-fable-5");
+        assert_eq!(models[0].id, "claude-opus-5");
+        assert_eq!(models[1].id, "claude-sonnet-5");
+        assert_eq!(models[2].id, "claude-fable-5");
     }
 
     #[test]
