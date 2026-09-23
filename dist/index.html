@@ -6,10 +6,18 @@
     <link rel="icon" type="image/png" sizes="32x32" href="/logo-32.png" />
     <link rel="icon" type="image/png" sizes="192x192" href="/logo-192.png" />
     <link rel="apple-touch-icon" sizes="512x512" href="/logo-512.png" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <!--
+      viewport-fit=cover: expose env(safe-area-inset-*) on notched devices.
+      interactive-widget=resizes-content: make Android Chrome shrink the
+      LAYOUT viewport when the on-screen keyboard opens (default only
+      shrinks the visual viewport, leaving fixed containers full-height
+      behind the keyboard). iOS ignores this hint — handled in JS via
+      window.visualViewport (see useVisualViewportHeight).
+    -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover, interactive-widget=resizes-content" />
     <title>Project Orchestrator</title>
-    <script type="module" crossorigin src="/assets/index-DBZJP3DP.js"></script>
-    <link rel="stylesheet" crossorigin href="/assets/index-MN2CgW5Q.css">
+    <script type="module" crossorigin src="/assets/index-2Haesaiq.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/index-BALLO_cS.css">
   </head>
   <body style="background:#0f1117">
     <div id="root"></div>
