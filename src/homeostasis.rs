@@ -254,7 +254,8 @@ pub struct ExecuteContext<'a> {
 /// Execute a list of corrective actions against the graph store.
 ///
 /// Each action maps to a specific GraphStore method:
-/// - `DecaySynapses` → `graph.decay_synapses(amount, prune_threshold)`
+/// - `DecaySynapses` → `graph.decay_project_synapses` for `ctx.project_id`
+///   (global `decay_synapses` only without a project)
 /// - `BackfillSynapses` → `NoteManager::backfill_synapses` (paginated via cursor)
 /// - `ReduceInitialEnergy` → logged only (informational, caller adjusts defaults)
 ///
@@ -285,7 +286,18 @@ pub async fn execute_actions(
                     amount,
                     prune_threshold, "homeostasis: executing DecaySynapses"
                 );
-                match graph.decay_synapses(*amount, *prune_threshold).await {
+                // Scoped to the project being corrected: the global decay here
+                // decayed every synapse of the graph to fix one project (m4:
+                // 13,422 synapses for a 9-note project, once per project).
+                let decayed = match ctx.project_id {
+                    Some(pid) => {
+                        graph
+                            .decay_project_synapses(pid, *amount, *prune_threshold)
+                            .await
+                    }
+                    None => graph.decay_synapses(*amount, *prune_threshold).await,
+                };
+                match decayed {
                     Ok((decayed, pruned)) => {
                         debug!(decayed, pruned, "homeostasis: DecaySynapses completed");
                         executed += 1;

@@ -2806,6 +2806,40 @@ impl Neo4jClient {
         Ok(pair_count * 2)
     }
 
+    /// Weaken the synapses of ONE node (note or decision) by `amount` and
+    /// delete those that fall below `prune_threshold`. Returns how many were
+    /// weakened. The counterpart of reinforcing a node's synapses: negative
+    /// feedback on one piece of knowledge must not decay the whole graph.
+    pub async fn weaken_node_synapses(
+        &self,
+        node_id: Uuid,
+        amount: f64,
+        prune_threshold: f64,
+    ) -> Result<usize> {
+        let mut result = self
+            .graph
+            .execute(
+                query(
+                    r#"
+                    MATCH (n {id: $id})-[s:SYNAPSE]-()
+                    SET s.weight = s.weight - $amount
+                    WITH collect(s) AS all_syn
+                    WITH all_syn, [x IN all_syn WHERE x.weight < $threshold] AS weak
+                    FOREACH (x IN weak | DELETE x)
+                    RETURN size(all_syn) AS weakened
+                    "#,
+                )
+                .param("id", node_id.to_string())
+                .param("amount", amount)
+                .param("threshold", prune_threshold),
+            )
+            .await?;
+        Ok(match result.next().await? {
+            Some(row) => row.get::<i64>("weakened").unwrap_or(0) as usize,
+            None => 0,
+        })
+    }
+
     /// Ids of dormant projects: no human activity — code sync (`last_synced`,
     /// updated by the watcher and commits) nor chat session — for
     /// [`crate::notes::PROJECT_DORMANT_AFTER_DAYS`] days.

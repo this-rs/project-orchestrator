@@ -39,7 +39,9 @@ const DORMANCY_THRESHOLD: f64 = 0.1;
 
 /// Timeout override for homeostasis check.
 /// Backfill + decay can take longer than the default 5s engine timeout.
-const HOMEOSTASIS_TIMEOUT: Duration = Duration::from_secs(30);
+// 30s was too tight for 40+ projects on m4 (24s when it completed, timed
+// out on other passes); it runs every 2 hours.
+const HOMEOSTASIS_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// Run homeostasis evaluation and correction on all projects (every 2 hours).
 ///
@@ -289,7 +291,7 @@ mod tests {
     #[test]
     fn test_homeostasis_check_timeout_override() {
         let check = HomeostasisCheck::new();
-        assert_eq!(check.timeout_override(), Some(Duration::from_secs(30)));
+        assert_eq!(check.timeout_override(), Some(Duration::from_secs(90)));
     }
 
     #[test]

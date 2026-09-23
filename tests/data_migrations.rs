@@ -683,6 +683,77 @@ async fn test_data_migrations_repair_an_upgraded_install() {
         );
     }
 
+    // Negative feedback weakens only the target's synapses, and homeostasis
+    // decays only the project it corrects (both decayed the whole graph).
+    {
+        let x = Uuid::new_v4();
+        let h = Uuid::new_v4();
+        let o = Uuid::new_v4();
+        raw.run(
+            query(
+                "CREATE (:Note {id: $x, project_id: $h})-[:SYNAPSE {weight: 0.5, source: 'coactivation'}]->(:Note {id: randomUUID(), project_id: $h})
+                 CREATE (:Note {id: randomUUID(), project_id: $o})-[:SYNAPSE {weight: 0.5, source: 'coactivation'}]->(:Note {id: randomUUID(), project_id: $o})
+                 CREATE (:Project {id: $h, slug: 'h-' + $h, name: 'h', root_path: '/tmp/h', last_synced: datetime()})
+                 CREATE (:Project {id: $o, slug: 'o-' + $o, name: 'o', root_path: '/tmp/o', last_synced: datetime()})",
+            )
+            .param("x", x.to_string())
+            .param("h", h.to_string())
+            .param("o", o.to_string()),
+        )
+        .await
+        .unwrap();
+        let weight_in = |p: Uuid| {
+            let raw = &raw;
+            async move {
+                let mut r = raw
+                    .execute(
+                        query(
+                            "MATCH (a:Note {project_id: $p})-[s:SYNAPSE]->() RETURN s.weight AS w",
+                        )
+                        .param("p", p.to_string()),
+                    )
+                    .await
+                    .unwrap();
+                r.next()
+                    .await
+                    .unwrap()
+                    .map(|row| row.get::<f64>("w").unwrap())
+            }
+        };
+        assert_eq!(client.weaken_node_synapses(x, 0.1, 0.05).await.unwrap(), 1);
+        assert!((weight_in(h).await.unwrap() - 0.4).abs() < 1e-9);
+        assert_eq!(weight_in(o).await, Some(0.5), "other nodes untouched");
+
+        use project_orchestrator::homeostasis::{
+            execute_actions, ExecuteContext, HomeostasisAction,
+        };
+        use project_orchestrator::neo4j::traits::GraphStore;
+        let uri = std::env::var("NEO4J_URI").unwrap_or_else(|_| "bolt://localhost:7687".into());
+        let user = std::env::var("NEO4J_USER").unwrap_or_else(|_| "neo4j".into());
+        let password = std::env::var("NEO4J_PASSWORD").unwrap_or_else(|_| "testpassword".into());
+        let store: std::sync::Arc<dyn GraphStore> =
+            std::sync::Arc::new(Neo4jClient::new(&uri, &user, &password).await.unwrap());
+        execute_actions(
+            &store,
+            None,
+            &[HomeostasisAction::DecaySynapses {
+                amount: 0.1,
+                prune_threshold: 0.05,
+            }],
+            ExecuteContext {
+                project_id: Some(h),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            (weight_in(h).await.unwrap() - 0.3).abs() < 1e-9,
+            "corrected project decayed"
+        );
+        assert_eq!(weight_in(o).await, Some(0.5), "other projects untouched");
+    }
+
     // Deep maintenance times are persisted per project (a restart must not
     // re-run a full pass over every project).
     {

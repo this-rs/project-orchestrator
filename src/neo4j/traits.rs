@@ -2446,6 +2446,17 @@ pub trait GraphStore: Send + Sync {
         self.decay_synapses(decay_amount, prune_threshold).await
     }
 
+    /// Weaken one node's synapses (see the Neo4j implementation). Defaults to
+    /// a no-op for stores without synapse storage.
+    async fn weaken_node_synapses(
+        &self,
+        _node_id: Uuid,
+        _amount: f64,
+        _prune_threshold: f64,
+    ) -> Result<usize> {
+        Ok(0)
+    }
+
     /// When each project last got a deep maintenance pass (persisted, so a
     /// restart does not re-run a full pass over every project).
     async fn get_deep_maintenance_times(
