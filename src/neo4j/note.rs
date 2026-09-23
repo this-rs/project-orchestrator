@@ -2633,27 +2633,40 @@ impl Neo4jClient {
 
     /// Apply exponential energy decay to all active notes.
     ///
-    /// Formula: `energy = energy × exp(-days_idle / half_life)`
-    /// where `days_idle = (now - last_activated).days()`.
+    /// Formula: `energy = energy × exp(-days_since_last_update / half_life)`,
+    /// then `energy_updated_at = now`.
     ///
-    /// **Temporally idempotent**: the result depends only on the absolute elapsed
-    /// time since `last_activated`, NOT on how often this function is called.
-    /// Calling it once after 30 days ≡ calling it daily for 30 days.
+    /// **Temporally idempotent**: each call applies only the decay of the time
+    /// elapsed since the previous update, so calling it once after 30 days ≡
+    /// calling it daily for 30 days, and calling it twice in a row changes
+    /// nothing.
     ///
-    /// Notes decaying below 0.05 are floored to 0.0 ("dead neuron").
+    /// The previous formula multiplied the CURRENT (already decayed) energy by
+    /// `exp(-days_since_last_activated / half_life)` on every call, so the decay
+    /// compounded with each call — and deep maintenance called it once per
+    /// project. Energy of every idle note collapsed to 0 and consolidation
+    /// archived ~4,000 notes (3,051 of them consolidated) as `low_energy_60d`.
+    /// Data migration `2026-09-restore-energy-decay-victims` repairs that.
+    ///
+    /// A note without `energy_updated_at` is only stamped on its first pass
+    /// (its energy is current as of now). Notes decaying below 0.05 are
+    /// floored to 0.0 ("dead neuron").
     pub async fn update_energy_scores(&self, half_life_days: f64) -> Result<usize> {
         let q = query(
             r#"
             MATCH (n:Note)
             WHERE n.status = 'active'
               AND n.energy > 0.0
-              AND n.last_activated IS NOT NULL
             WITH n,
-                 duration.between(datetime(n.last_activated), datetime()).days AS days_idle
+                 CASE WHEN n.energy_updated_at IS NULL THEN 0.0
+                      ELSE toFloat(duration.inSeconds(datetime(n.energy_updated_at), datetime()).seconds) / 86400.0
+                 END AS days_elapsed
             WITH n,
-                 n.energy * exp(-1.0 * toFloat(days_idle) / $half_life) AS new_energy
+                 n.energy * exp(-1.0 * days_elapsed / $half_life) AS new_energy
             WITH n,
                  CASE WHEN new_energy < 0.05 THEN 0.0 ELSE new_energy END AS clamped_energy
+            SET n.energy_updated_at = datetime()
+            WITH n, clamped_energy
             WHERE abs(n.energy - clamped_energy) > 0.001
             SET n.energy = clamped_energy
             RETURN count(n) AS updated
@@ -2675,13 +2688,12 @@ impl Neo4jClient {
         let q = query(
             r#"
             MATCH (n:Note {id: $id})
-            WITH n,
-                 CASE WHEN n.last_activated IS NOT NULL
-                      THEN n.energy * (0.5 ^ (duration.between(n.last_activated, datetime()).days / 90.0))
-                      ELSE coalesce(n.energy, 1.0)
-                 END AS current_e
+            // `energy` is kept current by update_energy_scores: decaying it
+            // again here from last_activated double-counted the idle time.
+            WITH n, coalesce(n.energy, 1.0) AS current_e
             SET n.energy = CASE WHEN current_e + $amount > 1.0 THEN 1.0 ELSE current_e + $amount END,
-                n.last_activated = datetime()
+                n.last_activated = datetime(),
+                n.energy_updated_at = datetime()
             "#,
         )
         .param("id", note_id.to_string())
@@ -2780,6 +2792,66 @@ impl Neo4jClient {
 
         // Each pair creates/updates 2 synapses (bidirectional)
         Ok(pair_count * 2)
+    }
+
+    /// Decay and prune the synapses of ONE project's notes.
+    ///
+    /// Per-project skill maintenance used to call the global
+    /// [`Self::decay_synapses`], so one maintenance pass over N projects decayed
+    /// every synapse N times (×3 in deep maintenance): the whole SYNAPSE layer
+    /// was wiped, and skill detection — which clusters notes by synapses —
+    /// found nothing and archived live skills as orphans. Same differentiated
+    /// rates as the global decay.
+    pub async fn decay_project_synapses(
+        &self,
+        project_id: Uuid,
+        decay_amount: f64,
+        prune_threshold: f64,
+    ) -> Result<(usize, usize)> {
+        let mut result = self
+            .graph
+            .execute(
+                query(
+                    r#"
+                    MATCH (a:Note {project_id: $project_id})-[s:SYNAPSE]->()
+                    SET s.weight = s.weight - CASE
+                        WHEN s.source = 'coactivation' THEN $decay_amount
+                        ELSE $decay_amount_cosine
+                    END
+                    RETURN count(s) AS decayed
+                    "#,
+                )
+                .param("project_id", project_id.to_string())
+                .param("decay_amount", decay_amount)
+                .param("decay_amount_cosine", decay_amount * 2.0),
+            )
+            .await?;
+        let decayed = match result.next().await? {
+            Some(row) => row.get::<i64>("decayed").unwrap_or(0) as usize,
+            None => 0,
+        };
+
+        let mut result = self
+            .graph
+            .execute(
+                query(
+                    r#"
+                    MATCH (a:Note {project_id: $project_id})-[s:SYNAPSE]->()
+                    WHERE s.weight < $threshold
+                    WITH collect(s) AS weak
+                    FOREACH (x IN weak | DELETE x)
+                    RETURN size(weak) AS pruned
+                    "#,
+                )
+                .param("project_id", project_id.to_string())
+                .param("threshold", prune_threshold),
+            )
+            .await?;
+        let pruned = match result.next().await? {
+            Some(row) => row.get::<i64>("pruned").unwrap_or(0) as usize,
+            None => 0,
+        };
+        Ok((decayed, pruned))
     }
 
     /// Decay all synapses and prune weak ones.
@@ -3028,12 +3100,16 @@ impl Neo4jClient {
             let node = row.get::<neo4rs::Node>("n")?;
             let note = self.node_to_note(&node)?;
             let synapse_count = row.get::<i64>("synapse_count").unwrap_or(0);
-            // Use the stored activation_count, falling back to synapse_count for legacy notes
-            let activation_count = if note.activation_count > 0 {
-                note.activation_count
-            } else {
-                synapse_count
-            };
+            // Usage signal. `activation_count` is never incremented anywhere
+            // (0 on every note), so the "never activated for 90 days" rule
+            // relied on the synapse-count fallback alone — and once the
+            // SYNAPSE layer was wiped, every note older than 90 days would be
+            // archived as dead. `reactivation_count` is the counter the
+            // activation path actually maintains.
+            let activation_count = note
+                .activation_count
+                .max(note.reactivation_count)
+                .max(synapse_count);
 
             // Check auto-archival (new threshold-based rules)
             if lifecycle.should_auto_archive(&note, activation_count, now) {

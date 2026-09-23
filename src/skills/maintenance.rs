@@ -172,8 +172,15 @@ pub async fn run_daily_maintenance(
         threshold
     };
 
+    // Project-scoped: this runs once per project, and the global decay here
+    // decayed every synapse N times per pass (×3 in deep maintenance) — it
+    // wiped the whole SYNAPSE layer.
     match graph_store
-        .decay_synapses(config.synapse_decay_amount, adaptive_prune_threshold)
+        .decay_project_synapses(
+            project_id,
+            config.synapse_decay_amount,
+            adaptive_prune_threshold,
+        )
         .await
     {
         Ok((decayed, pruned)) => {
