@@ -3292,6 +3292,16 @@ impl GraphStore for Neo4jClient {
         self.get_skills_for_project(project_id).await
     }
 
+    async fn get_deep_maintenance_times(
+        &self,
+    ) -> anyhow::Result<Vec<(uuid::Uuid, chrono::DateTime<chrono::Utc>)>> {
+        self.get_deep_maintenance_times().await
+    }
+
+    async fn mark_deep_maintenance(&self, project_id: uuid::Uuid) -> anyhow::Result<()> {
+        self.mark_deep_maintenance(project_id).await
+    }
+
     async fn decay_project_synapses(
         &self,
         project_id: uuid::Uuid,

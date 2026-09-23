@@ -735,14 +735,19 @@ pub async fn deep_maintenance(
     // 1. Detect stagnation
     let stagnation = graph_store.detect_global_stagnation(project_id).await?;
 
-    // 2. Run full maintenance with aggressive decay (3x normal)
-    let mut aggressive_config = config.clone();
-    aggressive_config.synapse_decay_amount *= 3.0;
-    aggressive_config.synapse_prune_threshold *= 1.5;
+    // 2. Run full maintenance — with aggressive decay (3x) only as the
+    // response to detected stagnation, as the name says. Applied on every
+    // daily pass, it pruned most of the synapses the self-heal had just
+    // rebuilt (e.g. 5,600 of 8,018 in one project), reshuffling Louvain
+    // clusters and orphaning live skills each day.
+    let mut pass_config = config.clone();
+    if stagnation.is_stagnating {
+        pass_config.synapse_decay_amount *= 3.0;
+        pass_config.synapse_prune_threshold *= 1.5;
+    }
 
     let maintenance_json =
-        match run_full_maintenance(graph_store, note_manager, project_id, &aggressive_config).await
-        {
+        match run_full_maintenance(graph_store, note_manager, project_id, &pass_config).await {
             Ok(result) => serde_json::to_value(&result).ok(),
             Err(e) => {
                 warn!(error = %e, "Full maintenance failed during deep maintenance");

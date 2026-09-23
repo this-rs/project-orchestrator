@@ -552,4 +552,40 @@ impl Neo4jClient {
 
         Ok((projects, total as usize))
     }
+
+    /// When each project last got a deep maintenance pass.
+    pub async fn get_deep_maintenance_times(
+        &self,
+    ) -> Result<Vec<(Uuid, chrono::DateTime<chrono::Utc>)>> {
+        let mut result = self
+            .graph
+            .execute(query(
+                "MATCH (p:Project) WHERE p.last_deep_maintenance_at IS NOT NULL
+                 RETURN p.id AS id, toString(p.last_deep_maintenance_at) AS at",
+            ))
+            .await?;
+        let mut times = Vec::new();
+        while let Some(row) = result.next().await? {
+            let id: String = row.get("id")?;
+            let at: String = row.get("at")?;
+            if let (Ok(id), Ok(at)) = (
+                Uuid::parse_str(&id),
+                chrono::DateTime::parse_from_rfc3339(&at),
+            ) {
+                times.push((id, at.with_timezone(&chrono::Utc)));
+            }
+        }
+        Ok(times)
+    }
+
+    /// Record that a project's deep maintenance pass started now.
+    pub async fn mark_deep_maintenance(&self, project_id: Uuid) -> Result<()> {
+        self.graph
+            .run(
+                query("MATCH (p:Project {id: $id}) SET p.last_deep_maintenance_at = datetime()")
+                    .param("id", project_id.to_string()),
+            )
+            .await?;
+        Ok(())
+    }
 }
