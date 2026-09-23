@@ -622,6 +622,21 @@ pub fn parse_spawned_by(json_str: &str) -> Option<SpawnedByContext> {
     })
 }
 
+/// Project id handed to every enrichment stage, resolved once from the
+/// session's slug. Stages that read only `project_id` (reflex) were skipped
+/// for every chat message when it was left `None`.
+async fn enrichment_project_id(
+    graph: &dyn crate::neo4j::traits::GraphStore,
+    project_slug: Option<&str>,
+) -> Option<Uuid> {
+    graph
+        .get_project_by_slug(project_slug?)
+        .await
+        .ok()
+        .flatten()
+        .map(|p| p.id)
+}
+
 impl ChatManager {
     /// Build the standard enrichment pipeline with optional reasoning engine and trajectory collector.
     ///
@@ -3690,11 +3705,16 @@ impl ChatManager {
                                 .await
                             }
                         };
+                        // Resolve the project id once for every stage: stages
+                        // that only read `project_id` (reflex) were skipped
+                        // for every chat message.
+                        let project_id =
+                            enrichment_project_id(graph.as_ref(), project_slug.as_deref()).await;
                         Some(super::enrichment::EnrichmentInput {
                             message: prompt.clone(),
                             session_id: uuid,
                             project_slug,
-                            project_id: None, // Resolved from slug inside stages
+                            project_id,
                             cwd: Some(node.cwd),
                             protocol_run_id: proto_run_id,
                             protocol_state: proto_state,
@@ -7047,6 +7067,19 @@ fn parse_permission_control_msg(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn test_enrichment_project_id_resolves_the_session_slug() {
+        let store = crate::neo4j::mock::MockGraphStore::new();
+        let project = crate::test_helpers::test_project_named("Enriched");
+        store.create_project(&project).await.unwrap();
+        assert_eq!(
+            enrichment_project_id(&store, Some(&project.slug)).await,
+            Some(project.id)
+        );
+        assert_eq!(enrichment_project_id(&store, Some("unknown")).await, None);
+        assert_eq!(enrichment_project_id(&store, None).await, None);
+    }
     use crate::neo4j::models::ChatSessionNode;
     use crate::test_helpers::{mock_app_state, test_chat_session, test_project};
     use nexus_claude::{

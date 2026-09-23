@@ -261,6 +261,10 @@ impl SkillActivationHook {
         const MAX_CHARS: usize = 160;
         let id = Uuid::parse_str(entity_id).ok()?;
         let note = self.graph_store.get_note(id).await.ok().flatten()?;
+        // Never inject knowledge that no longer applies.
+        if !crate::notes::is_current_knowledge(&note) {
+            return None;
+        }
         // Collapse whitespace/newlines into a single line.
         let mut text: String = note
             .content

@@ -293,6 +293,11 @@ impl ReasoningTreeEngine {
         // Process decision results
         if let Ok(decisions) = decision_results {
             for (decision, score) in decisions {
+                // Decisions no longer in force must not seed the reasoning
+                // shown to the agent (newer knowledge wins).
+                if !is_decision_in_force(&decision) {
+                    continue;
+                }
                 let label = truncate_content(&decision.description, 100);
                 seeds.push(SeedNode {
                     entity_type: EntitySource::Decision,
@@ -412,7 +417,7 @@ impl ReasoningTreeEngine {
                     // Resolve neighbor and compute score
                     let (label, energy, entity_type) = if entity_type_str == "Decision" {
                         match self.graph_store.get_decision(neighbor_id).await {
-                            Ok(Some(d)) => (
+                            Ok(Some(d)) if is_decision_in_force(&d) => (
                                 truncate_content(&d.description, 80),
                                 1.0,
                                 EntitySource::Decision,
@@ -424,6 +429,11 @@ impl ReasoningTreeEngine {
                             Ok(Some(n)) => {
                                 if n.computed_energy() < 0.05 {
                                     continue; // Dead neuron
+                                }
+                                // Synapses survive archival/supersession: never
+                                // walk into knowledge that no longer applies.
+                                if !crate::notes::is_current_knowledge(&n) {
+                                    continue;
                                 }
                                 (
                                     truncate_content(&n.content, 80),
@@ -806,6 +816,15 @@ fn format_seed_reasoning(seed: &SeedNode) -> String {
 /// Truncate content to a maximum length, adding "..." if truncated.
 ///
 /// Handles UTF-8 correctly by finding a valid char boundary before slicing.
+/// Proposed or accepted: a decision still in force.
+fn is_decision_in_force(decision: &crate::neo4j::models::DecisionNode) -> bool {
+    matches!(
+        decision.status,
+        crate::neo4j::models::DecisionStatus::Proposed
+            | crate::neo4j::models::DecisionStatus::Accepted
+    )
+}
+
 fn truncate_content(content: &str, max_len: usize) -> String {
     if content.len() <= max_len {
         content.to_string()

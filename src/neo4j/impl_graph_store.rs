@@ -3292,6 +3292,16 @@ impl GraphStore for Neo4jClient {
         self.get_skills_for_project(project_id).await
     }
 
+    async fn decay_project_synapses(
+        &self,
+        project_id: uuid::Uuid,
+        decay_amount: f64,
+        prune_threshold: f64,
+    ) -> anyhow::Result<(usize, usize)> {
+        self.decay_project_synapses(project_id, decay_amount, prune_threshold)
+            .await
+    }
+
     async fn purge_archived_empty_skills(
         &self,
         project_id: uuid::Uuid,

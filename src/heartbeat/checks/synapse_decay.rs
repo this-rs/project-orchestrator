@@ -17,7 +17,7 @@ const DEFAULT_DECAY_AMOUNT: f64 = 0.02;
 /// Default prune threshold — synapses below this weight are deleted.
 const DEFAULT_PRUNE_THRESHOLD: f64 = 0.05;
 /// Default energy half-life in days.
-const DEFAULT_HALF_LIFE_DAYS: f64 = 14.0;
+const DEFAULT_HALF_LIFE_DAYS: f64 = crate::notes::ENERGY_HALF_LIFE_DAYS;
 
 /// Decay synapses and update energy scores (every 6 hours).
 pub struct SynapseDecayCheck;
@@ -74,6 +74,6 @@ mod tests {
     fn test_default_constants() {
         assert!((DEFAULT_DECAY_AMOUNT - 0.02).abs() < f64::EPSILON);
         assert!((DEFAULT_PRUNE_THRESHOLD - 0.05).abs() < f64::EPSILON);
-        assert!((DEFAULT_HALF_LIFE_DAYS - 14.0).abs() < f64::EPSILON);
+        assert!((DEFAULT_HALF_LIFE_DAYS - 90.0).abs() < f64::EPSILON);
     }
 }

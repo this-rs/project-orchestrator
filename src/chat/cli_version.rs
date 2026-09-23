@@ -387,12 +387,10 @@ mod tests {
         let v2 = SemVer::parse("2.6.0").expect("Should parse '2.6.0'");
         assert_eq!(v2.to_string(), "2.6.0");
 
-        // Test that Nexus SemVer::parse alone FAILS with the suffix (the bug we're fixing)
-        let buggy = SemVer::parse(raw);
-        assert!(
-            buggy.is_none() || buggy.unwrap().to_string() == "2.1.0",
-            "Nexus SemVer::parse on raw '2.1.50 (Claude Code)' should either fail or produce 2.1.0"
-        );
+        // Nexus SemVer::parse now handles the raw CLI output itself
+        // (this-rs/nexus#40); it used to yield 2.1.0.
+        let raw_parsed = SemVer::parse(raw).expect("Should parse the raw CLI output");
+        assert_eq!(raw_parsed.to_string(), "2.1.50");
     }
 
     #[test]

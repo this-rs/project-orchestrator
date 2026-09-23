@@ -775,6 +775,11 @@ impl Neo4jClient {
                 r#"
                 MATCH (n:Note)-[:MEMBER_OF]->(s:Skill {id: $skill_id})
                 WHERE n.energy IS NOT NULL
+                  // The threshold is derived from CURRENT members only: an
+                  // archived/superseded member with high energy used to raise
+                  // it above the note that replaced it, evicting the newer
+                  // knowledge from the skill's context.
+                  AND n.status IN ['active', 'needs_review'] AND n.superseded_by IS NULL
                 RETURN n.energy AS energy
                 "#,
             )
@@ -803,7 +808,12 @@ impl Neo4jClient {
         let notes_q = query(
             r#"
             MATCH (n:Note)-[:MEMBER_OF]->(s:Skill {id: $skill_id})
-            WHERE n.energy > $energy_threshold
+            // >= : the threshold is the p5 of member energies; with a strict
+            // comparison, members sharing one energy (e.g. all fresh at 1.0)
+            // were ALL excluded and the skill injected an empty context.
+            WHERE n.energy >= $energy_threshold
+              // Current knowledge only (never archived/obsolete/superseded).
+              AND n.status IN ['active', 'needs_review'] AND n.superseded_by IS NULL
             RETURN n
             ORDER BY n.energy DESC
             LIMIT 500
@@ -830,6 +840,7 @@ impl Neo4jClient {
         let decisions_q = query(
             r#"
             MATCH (d:Decision)-[:MEMBER_OF_SKILL]->(s:Skill {id: $skill_id})
+            WHERE coalesce(d.status, 'accepted') IN ['proposed', 'accepted']
             RETURN d
             ORDER BY d.decided_at DESC
             LIMIT 200

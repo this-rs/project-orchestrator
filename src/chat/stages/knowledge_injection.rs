@@ -181,6 +181,95 @@ pub struct KnowledgeInjectionStage {
     collector: Option<Arc<neural_routing_runtime::TrajectoryCollector>>,
 }
 
+/// Time constant (days) of the recency factor: at equal relevance, fresher
+/// knowledge ranks first.
+const RECENCY_TIME_CONSTANT_DAYS: f64 = 180.0;
+
+/// Relevance multiplier in [0.85, 1.0] from how recently a piece of knowledge
+/// was written or confirmed. Gentle on purpose: relevance decides, recency
+/// breaks near-ties in favour of the newer instruction.
+fn recency_factor(freshest: chrono::DateTime<chrono::Utc>) -> f64 {
+    let age_days = (chrono::Utc::now() - freshest).num_seconds().max(0) as f64 / 86_400.0;
+    0.85 + 0.15 * (-age_days / RECENCY_TIME_CONSTANT_DAYS).exp()
+}
+
+/// Final currency check of candidate notes against Neo4j, the source of
+/// truth. Search indexes can lag (Meilisearch keeps `active` for notes
+/// archived by consolidation), so every candidate is re-read:
+/// - archived / obsolete / stale / superseded notes are dropped — newer
+///   knowledge wins and an old instruction must not come back;
+/// - a note the user referenced by id is kept but labelled as no longer
+///   applying (pointing to its replacement when there is one);
+/// - scores get the recency factor.
+async fn keep_current_notes(
+    graph: &dyn crate::neo4j::traits::GraphStore,
+    notes: Vec<ScoredNote>,
+) -> Vec<ScoredNote> {
+    let lookups = notes.iter().map(|n| async move {
+        match Uuid::parse_str(&n.id) {
+            Ok(id) => graph.get_note(id).await.ok().flatten(),
+            Err(_) => None,
+        }
+    });
+    let current = futures::future::join_all(lookups).await;
+    notes
+        .into_iter()
+        .zip(current)
+        .filter_map(|(mut scored, note)| {
+            let note = note?; // deleted since indexing
+            if !crate::notes::is_current_knowledge(&note) {
+                if scored.source != "uuid_reference" {
+                    return None;
+                }
+                let replacement = note
+                    .superseded_by
+                    .map(|id| format!(", superseded by note {id}"))
+                    .unwrap_or_default();
+                scored.content = format!(
+                    "[NO LONGER APPLIES — status {}{}] {}",
+                    note.status, replacement, scored.content
+                );
+            }
+            let freshest = note
+                .last_confirmed_at
+                .map_or(note.created_at, |c| c.max(note.created_at));
+            scored.score *= recency_factor(freshest);
+            Some(scored)
+        })
+        .collect()
+}
+
+/// Same check for decisions: only proposed/accepted decisions are injected
+/// (superseded and deprecated ones are dropped), with the recency factor.
+async fn keep_current_decisions(
+    graph: &dyn crate::neo4j::traits::GraphStore,
+    decisions: Vec<ScoredDecision>,
+) -> Vec<ScoredDecision> {
+    use crate::neo4j::models::DecisionStatus;
+    let lookups = decisions.iter().map(|d| async move {
+        match Uuid::parse_str(&d.id) {
+            Ok(id) => graph.get_decision(id).await.ok().flatten(),
+            Err(_) => None,
+        }
+    });
+    let current = futures::future::join_all(lookups).await;
+    decisions
+        .into_iter()
+        .zip(current)
+        .filter_map(|(mut scored, decision)| {
+            let decision = decision?;
+            if !matches!(
+                decision.status,
+                DecisionStatus::Proposed | DecisionStatus::Accepted
+            ) {
+                return None;
+            }
+            scored.score *= recency_factor(decision.decided_at);
+            Some(scored)
+        })
+        .collect()
+}
+
 impl KnowledgeInjectionStage {
     /// Create a new knowledge injection stage with default configuration.
     pub fn new(graph: Arc<dyn GraphStore>, search: Arc<dyn SearchStore>) -> Self {
@@ -704,8 +793,10 @@ impl KnowledgeInjectionStage {
             debug!("[knowledge_injection] UUID lookup timed out");
         }
 
-        // Collect and sort notes by score descending
-        let mut notes: Vec<ScoredNote> = note_map.into_values().collect();
+        // Collect and sort notes by score descending — after the currency
+        // check against Neo4j (see keep_current_notes).
+        let notes: Vec<ScoredNote> = note_map.into_values().collect();
+        let mut notes = keep_current_notes(self.graph.as_ref(), notes).await;
         notes.sort_by(|a, b| {
             b.score
                 .partial_cmp(&a.score)
@@ -736,7 +827,8 @@ impl KnowledgeInjectionStage {
             debug!("[knowledge_injection] Decisions BM25 search timed out");
         }
 
-        let mut decisions: Vec<ScoredDecision> = decision_map.into_values().collect();
+        let decisions: Vec<ScoredDecision> = decision_map.into_values().collect();
+        let mut decisions = keep_current_decisions(self.graph.as_ref(), decisions).await;
         decisions.sort_by(|a, b| {
             b.score
                 .partial_cmp(&a.score)
@@ -1113,6 +1205,100 @@ impl ParallelEnrichmentStage for KnowledgeInjectionStage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── currency check: newer knowledge wins ────────────────────────────
+
+    fn scored(id: Uuid, source: &'static str) -> ScoredNote {
+        ScoredNote {
+            id: id.to_string(),
+            note_type: "Gotcha".into(),
+            importance: "High".into(),
+            content: "instruction".into(),
+            score: 1.0,
+            source,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_old_or_replaced_knowledge_never_reaches_the_agent() {
+        use crate::notes::{Note, NoteStatus, NoteType};
+        let store = crate::neo4j::mock::MockGraphStore::new();
+        let project = Some(Uuid::new_v4());
+        let mk = |status: NoteStatus, age_days: i64| {
+            let mut n = Note::new(project, NoteType::Gotcha, "instruction".into(), "t".into());
+            n.status = status;
+            n.created_at = chrono::Utc::now() - chrono::Duration::days(age_days);
+            // Never re-confirmed since it was written.
+            n.last_confirmed_at = Some(n.created_at);
+            n
+        };
+        let fresh = mk(NoteStatus::Active, 1);
+        let old = mk(NoteStatus::Active, 400);
+        // Archived in Neo4j, still "active" in the search index.
+        let archived = mk(NoteStatus::Archived, 30);
+        let mut replaced = mk(NoteStatus::Archived, 30);
+        replaced.superseded_by = Some(fresh.id);
+        for n in [&fresh, &old, &archived, &replaced] {
+            store.create_note(n).await.unwrap();
+        }
+
+        let kept = keep_current_notes(
+            &store,
+            vec![
+                scored(old.id, "bm25_search"),
+                scored(archived.id, "bm25_search"),
+                scored(fresh.id, "bm25_search"),
+                scored(replaced.id, "uuid_reference"),
+            ],
+        )
+        .await;
+        let ids: Vec<&str> = kept.iter().map(|n| n.id.as_str()).collect();
+        assert!(
+            !ids.contains(&archived.id.to_string().as_str()),
+            "stale index hit dropped"
+        );
+        // Explicitly referenced: kept, but clearly labelled with its replacement.
+        let r = kept
+            .iter()
+            .find(|n| n.id == replaced.id.to_string())
+            .unwrap();
+        assert!(r.content.starts_with("[NO LONGER APPLIES"), "{}", r.content);
+        assert!(r.content.contains(&fresh.id.to_string()));
+        // Equal relevance: the fresher instruction ranks above the old one.
+        let score = |id: Uuid| kept.iter().find(|n| n.id == id.to_string()).unwrap().score;
+        assert!(score(fresh.id) > score(old.id));
+    }
+
+    #[tokio::test]
+    async fn test_superseded_and_deprecated_decisions_are_not_injected() {
+        use crate::neo4j::models::DecisionStatus;
+        let store = crate::neo4j::mock::MockGraphStore::new();
+        let task = Uuid::new_v4();
+        let mut accepted = crate::test_helpers::test_decision("use A", "because");
+        accepted.status = DecisionStatus::Accepted;
+        let mut superseded = crate::test_helpers::test_decision("use B", "old");
+        superseded.status = DecisionStatus::Superseded;
+        let mut deprecated = crate::test_helpers::test_decision("use C", "old");
+        deprecated.status = DecisionStatus::Deprecated;
+        for d in [&accepted, &superseded, &deprecated] {
+            store.create_decision(task, d).await.unwrap();
+        }
+        let sd = |id: Uuid| ScoredDecision {
+            id: id.to_string(),
+            description: String::new(),
+            rationale: String::new(),
+            score: 1.0,
+        };
+        let kept = keep_current_decisions(
+            &store,
+            vec![sd(accepted.id), sd(superseded.id), sd(deprecated.id)],
+        )
+        .await;
+        assert_eq!(
+            kept.iter().map(|d| d.id.clone()).collect::<Vec<_>>(),
+            vec![accepted.id.to_string()]
+        );
+    }
 
     // ── truncate_content tests ──────────────────────────────────────────
 

@@ -12,6 +12,25 @@ pub mod manager;
 pub mod models;
 pub mod witness;
 
+/// Time constant (days) of note energy decay — the single value used by the
+/// heartbeat, skill maintenance and data migrations (it used to be 14 days
+/// in one place and 90 in others).
+pub const ENERGY_HALF_LIFE_DAYS: f64 = 90.0;
+
+/// Days without human activity (code sync, chat) after which a project is
+/// dormant: its notes' energy and synapses stop decaying until it is active
+/// again, so knowledge survives months without work on the project.
+pub const PROJECT_DORMANT_AFTER_DAYS: i64 = 14;
+
+/// Whether a note is knowledge the agent may still be given: active or
+/// awaiting review, and not replaced by a newer note. Archived, obsolete
+/// (invalidated), stale and superseded notes must never reach its context —
+/// newer knowledge wins.
+pub fn is_current_knowledge(note: &Note) -> bool {
+    matches!(note.status, NoteStatus::Active | NoteStatus::NeedsReview)
+        && note.superseded_by.is_none()
+}
+
 pub use hashing::*;
 pub use lifecycle::*;
 pub use manager::{BackfillProgress, NoteManager, SynapseBackfillProgress, SynapseConfig};

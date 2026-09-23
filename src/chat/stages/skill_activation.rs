@@ -285,7 +285,11 @@ impl ParallelEnrichmentStage for SkillActivationStage {
                         );
                     }
                     // Boost energy of member notes
-                    match graph.get_skill_members(skill_id).await {
+                    // Only current members: boosting archived/superseded
+                    // notes kept old knowledge ranked high.
+                    match crate::skills::activation::current_skill_members(graph.as_ref(), skill_id)
+                        .await
+                    {
                         Ok((notes, _decisions)) => {
                             let note_ids: Vec<Uuid> = notes.iter().map(|n| n.id).collect();
                             for note_id in &note_ids {

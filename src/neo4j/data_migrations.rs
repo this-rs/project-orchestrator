@@ -156,6 +156,53 @@ RETURN size(doomed) AS processed
     )
 }
 
+/// Restore notes archived by the compounding energy-decay bug.
+///
+/// `update_energy_scores` re-applied the whole decay since `last_activated`
+/// to the already-decayed energy on every call, and deep maintenance called it
+/// once per project: energy of idle notes collapsed, and consolidation
+/// archived them as `low_energy_60d` — ~4,000 notes on m4, 3,051 of them
+/// consolidated gotchas/patterns/guidelines. Their energy is reset to the
+/// value the intended decay gives (90-day time constant from the last
+/// activation, as the maintenance and `boost_energy` used), floored at 0.1 so
+/// they are not re-archived immediately. `restored_from_energy_bug` makes
+/// each note eligible once: a later, legitimate archival sticks. A note that
+/// was superseded is never restored — newer knowledge wins — and invalidated
+/// notes (status `obsolete`) are not candidates.
+const RESTORE_ENERGY_DECAY_VICTIMS: &str = r#"
+MATCH (n:Note {status: 'archived'})
+WHERE ($scope IS NULL OR n.project_id = $scope)
+  AND n.changes_json CONTAINS 'low_energy_60d'
+  AND n.restored_from_energy_bug IS NULL
+  // Newer knowledge wins: never bring back a note that was replaced.
+  AND n.superseded_by IS NULL
+  AND NOT ()-[:SUPERSEDES]->(n)
+WITH n LIMIT $batch
+WITH n, toFloat(duration.inSeconds(datetime(coalesce(n.last_activated, n.created_at)), datetime()).seconds) / 86400.0 AS idle_days
+WITH n, exp(-idle_days / 90.0) AS intended
+SET n.status = 'active',
+    n.energy = CASE WHEN intended > 0.1 THEN intended ELSE 0.1 END,
+    n.energy_updated_at = datetime(),
+    n.restored_from_energy_bug = datetime()
+RETURN count(n) AS processed
+"#;
+
+/// Raise the energy of active notes the same bug over-decayed, to the value
+/// the intended decay gives — never lowering it. Stamps `energy_updated_at`
+/// so the fixed incremental decay starts from now.
+const REBASE_ACTIVE_NOTE_ENERGY: &str = r#"
+MATCH (n:Note {status: 'active'})
+WHERE ($scope IS NULL OR n.project_id = $scope)
+  AND n.energy_rebased_at IS NULL
+WITH n LIMIT $batch
+WITH n, toFloat(duration.inSeconds(datetime(coalesce(n.last_activated, n.created_at)), datetime()).seconds) / 86400.0 AS idle_days
+WITH n, exp(-idle_days / 90.0) AS intended
+SET n.energy = CASE WHEN intended > coalesce(n.energy, 0.0) THEN intended ELSE n.energy END,
+    n.energy_updated_at = datetime(),
+    n.energy_rebased_at = datetime()
+RETURN count(n) AS processed
+"#;
+
 /// Outcome of one migration on this start.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct MigrationOutcome {
@@ -182,6 +229,18 @@ impl Neo4jClient {
                 id: "2026-09-archive-duplicate-skills",
                 description: "Archive duplicate skills created by the truncated evolution snapshot",
                 batch: archive_duplicate_skills_query(),
+                finalize: None,
+            },
+            DataMigration {
+                id: "2026-09-restore-energy-decay-victims",
+                description: "Restore notes archived by the compounding energy-decay bug",
+                batch: RESTORE_ENERGY_DECAY_VICTIMS.to_string(),
+                finalize: None,
+            },
+            DataMigration {
+                id: "2026-09-rebase-active-note-energy",
+                description: "Raise over-decayed energy of active notes to the intended value",
+                batch: REBASE_ACTIVE_NOTE_ENERGY.to_string(),
                 finalize: None,
             },
             DataMigration {
@@ -402,6 +461,8 @@ mod tests {
             vec![
                 "2026-09-fold-legacy-alerts",
                 "2026-09-archive-duplicate-skills",
+                "2026-09-restore-energy-decay-victims",
+                "2026-09-rebase-active-note-energy",
                 "2026-09-purge-empty-archived-skills",
             ]
         );

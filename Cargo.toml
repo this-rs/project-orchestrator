@@ -130,7 +130,7 @@ async-trait = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 # Chat / Claude Code SDK
-nexus-claude = { git = "https://github.com/this-rs/nexus.git", rev = "7c8e9abc3769371381be870a38d2f8f4381427be", features = ["memory", "auto-download"] }
+nexus-claude = { git = "https://github.com/this-rs/nexus.git", rev = "6d8fdceb2359c01c7e4afe7f7ceee47e2c1c1e59", features = ["memory", "auto-download"] }
 tokio-stream = { workspace = true }
 
 # Auth

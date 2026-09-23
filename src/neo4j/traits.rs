@@ -2433,6 +2433,19 @@ pub trait GraphStore: Send + Sync {
         Vec::new()
     }
 
+    /// Decay and prune the synapses of one project's notes (see the Neo4j
+    /// implementation). Per-project maintenance MUST use this rather than the
+    /// global `decay_synapses`. Defaults to the global decay for stores
+    /// without a project-scoped variant (test mocks).
+    async fn decay_project_synapses(
+        &self,
+        _project_id: Uuid,
+        decay_amount: f64,
+        prune_threshold: f64,
+    ) -> Result<(usize, usize)> {
+        self.decay_synapses(decay_amount, prune_threshold).await
+    }
+
     /// Every non-archived skill of a project, uncapped.
     ///
     /// Skill evolution MUST compare new clusters against this set: the
