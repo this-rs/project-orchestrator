@@ -2448,15 +2448,16 @@ impl Neo4jClient {
         }
 
         // 5. Dynamic relationship type inventory with actual counts
+        // (2026-08-12) UN SEUL scan au lieu d'un par type : la forme
+        // CALL db.relationshipTypes() + sous-requête était décomposée par le
+        // pont neo4j→obrain en ~32 scans complets PARALLÈLES des arêtes —
+        // mesuré en production : file de verrous de 28 à 40 s sur la base
+        // po à chaque audit (94 des 105 vrais locks d'une heure entière).
+        // group-by sur type(r) : même résultat, un seul passage.
         let rel_types_q = query(
             r#"
-            CALL db.relationshipTypes() YIELD relationshipType AS rel_type
-            CALL {
-                WITH rel_type
-                MATCH ()-[r]->() WHERE type(r) = rel_type
-                RETURN count(r) AS cnt
-            }
-            RETURN rel_type, cnt
+            MATCH ()-[r]->()
+            RETURN type(r) AS rel_type, count(r) AS cnt
             ORDER BY rel_type
             "#,
         );
