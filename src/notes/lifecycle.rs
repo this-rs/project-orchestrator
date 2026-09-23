@@ -843,6 +843,13 @@ impl NoteLifecycleManager {
         if note.status != NoteStatus::Active {
             return false;
         }
+        // Consolidated notes are permanent knowledge — "never auto-archived"
+        // (MemoryHorizon::Consolidated). This rule used to ignore that, and
+        // archived 3,051 consolidated gotchas/patterns whose energy a bug
+        // had crushed.
+        if note.memory_horizon == crate::notes::MemoryHorizon::Consolidated {
+            return false;
+        }
         let age_days = now.signed_duration_since(note.created_at).num_days();
 
         // Dead note: never activated and older than 90 days
@@ -895,6 +902,25 @@ pub struct AssertionVerificationResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_consolidated_notes_are_never_auto_archived() {
+        let lifecycle = NoteLifecycleManager::new();
+        let now = Utc::now();
+        let mut note = Note::new(
+            Some(Uuid::new_v4()),
+            NoteType::Gotcha,
+            "battle-tested gotcha".into(),
+            "test".into(),
+        );
+        note.created_at = now - chrono::Duration::days(400);
+        note.energy = 0.0;
+        note.memory_horizon = crate::notes::MemoryHorizon::Consolidated;
+        assert!(!lifecycle.should_auto_archive(&note, 0, now));
+        // The same note, not consolidated, is still subject to the rules.
+        note.memory_horizon = crate::notes::MemoryHorizon::Operational;
+        assert!(lifecycle.should_auto_archive(&note, 0, now));
+    }
 
     fn create_test_note(anchors: Vec<NoteAnchor>) -> Note {
         let mut note = Note::new(

@@ -2652,13 +2652,18 @@ impl Neo4jClient {
     /// (its energy is current as of now). Notes decaying below 0.05 are
     /// floored to 0.0 ("dead neuron").
     pub async fn update_energy_scores(&self, half_life_days: f64) -> Result<usize> {
+        // Notes of dormant projects are only stamped: their energy is frozen
+        // while nobody works on the project, and decay resumes from the
+        // moment it is active again (see dormant_project_ids).
+        let dormant = self.dormant_project_ids().await?;
         let q = query(
             r#"
             MATCH (n:Note)
             WHERE n.status = 'active'
               AND n.energy > 0.0
             WITH n,
-                 CASE WHEN n.energy_updated_at IS NULL THEN 0.0
+                 CASE WHEN n.energy_updated_at IS NULL
+                        OR (n.project_id IS NOT NULL AND n.project_id IN $dormant) THEN 0.0
                       ELSE toFloat(duration.inSeconds(datetime(n.energy_updated_at), datetime()).seconds) / 86400.0
                  END AS days_elapsed
             WITH n,
@@ -2672,7 +2677,8 @@ impl Neo4jClient {
             RETURN count(n) AS updated
             "#,
         )
-        .param("half_life", half_life_days);
+        .param("half_life", half_life_days)
+        .param("dormant", dormant);
 
         let mut result = self.graph.execute(q).await?;
         if let Some(row) = result.next().await? {
@@ -2794,6 +2800,41 @@ impl Neo4jClient {
         Ok(pair_count * 2)
     }
 
+    /// Ids of dormant projects: no human activity — code sync (`last_synced`,
+    /// updated by the watcher and commits) nor chat session — for
+    /// [`crate::notes::PROJECT_DORMANT_AFTER_DAYS`] days.
+    ///
+    /// Knowledge of a dormant project is frozen: its notes' energy and its
+    /// synapses do not decay. Coming back to a project months later must find
+    /// it as it was left, not forgotten because nobody touched it.
+    pub async fn dormant_project_ids(&self) -> Result<Vec<String>> {
+        let mut result = self
+            .graph
+            .execute(
+                query(
+                    r#"
+                    MATCH (p:Project)
+                    OPTIONAL MATCH (s:ChatSession {project_slug: p.slug})
+                    WITH p, max(s.updated_at) AS chat_at
+                    WITH p, CASE
+                        WHEN chat_at IS NULL THEN p.last_synced
+                        WHEN p.last_synced IS NULL OR chat_at > p.last_synced THEN chat_at
+                        ELSE p.last_synced
+                    END AS active_at
+                    WHERE active_at IS NULL
+                       OR datetime(active_at) < datetime() - duration({days: $days})
+                    RETURN collect(p.id) AS dormant
+                    "#,
+                )
+                .param("days", crate::notes::PROJECT_DORMANT_AFTER_DAYS),
+            )
+            .await?;
+        Ok(match result.next().await? {
+            Some(row) => row.get::<Vec<String>>("dormant").unwrap_or_default(),
+            None => Vec::new(),
+        })
+    }
+
     /// Decay and prune the synapses of ONE project's notes.
     ///
     /// Per-project skill maintenance used to call the global
@@ -2808,6 +2849,13 @@ impl Neo4jClient {
         decay_amount: f64,
         prune_threshold: f64,
     ) -> Result<(usize, usize)> {
+        if self
+            .dormant_project_ids()
+            .await?
+            .contains(&project_id.to_string())
+        {
+            return Ok((0, 0));
+        }
         let mut result = self
             .graph
             .execute(
@@ -2867,9 +2915,12 @@ impl Neo4jClient {
     ) -> Result<(usize, usize)> {
         // Step 1: Decay all synapses with differentiated rates
         // Coactivation synapses (validated by usage) decay slower
+        // Synapses of dormant projects are frozen (see dormant_project_ids).
+        let dormant = self.dormant_project_ids().await?;
         let decay_q = query(
             r#"
-            MATCH ()-[s:SYNAPSE]->()
+            MATCH (a)-[s:SYNAPSE]->()
+            WHERE a.project_id IS NULL OR NOT a.project_id IN $dormant
             SET s.weight = s.weight - CASE
                 WHEN s.source = 'coactivation' THEN $decay_amount
                 ELSE $decay_amount_cosine
@@ -2877,6 +2928,7 @@ impl Neo4jClient {
             RETURN count(s) AS decayed
             "#,
         )
+        .param("dormant", dormant.clone())
         .param("decay_amount", decay_amount)
         .param("decay_amount_cosine", decay_amount * 2.0);
 
@@ -2892,11 +2944,13 @@ impl Neo4jClient {
         // so we must count before deleting.
         let count_q = query(
             r#"
-            MATCH ()-[s:SYNAPSE]->()
+            MATCH (a)-[s:SYNAPSE]->()
             WHERE s.weight < $threshold
+              AND (a.project_id IS NULL OR NOT a.project_id IN $dormant)
             RETURN count(s) AS pruned
             "#,
         )
+        .param("dormant", dormant.clone())
         .param("threshold", prune_threshold);
 
         let mut result = self.graph.execute(count_q).await?;
@@ -2909,11 +2963,13 @@ impl Neo4jClient {
         if pruned > 0 {
             let delete_q = query(
                 r#"
-                MATCH ()-[s:SYNAPSE]->()
+                MATCH (a)-[s:SYNAPSE]->()
                 WHERE s.weight < $threshold
+                  AND (a.project_id IS NULL OR NOT a.project_id IN $dormant)
                 DELETE s
                 "#,
             )
+            .param("dormant", dormant.clone())
             .param("threshold", prune_threshold);
             self.graph.run(delete_q).await?;
         }

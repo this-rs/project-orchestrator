@@ -346,6 +346,20 @@ async fn test_data_migrations_repair_an_upgraded_install() {
         r#"[{"details":{"reason":"ephemeral_expired"}}]"#,
     )
     .await;
+    let replaced = note(
+        "archived",
+        0.0,
+        30,
+        r#"[{"details":{"reason":"low_energy_60d"}}]"#,
+    )
+    .await;
+    raw.run(
+        query("MATCH (old:Note {id: $id}) CREATE (:Note {id: randomUUID(), project_id: $p, status: 'active', note_type: 'gotcha', content: 'newer', created_by: 'test', created_at: datetime()})-[:SUPERSEDES]->(old)")
+            .param("id", replaced.clone())
+            .param("p", rs.clone()),
+    )
+    .await
+    .unwrap();
     let crushed = note("active", 0.01, 30, "[]").await;
     let healthy = note("active", 0.95, 30, "[]").await;
 
@@ -384,6 +398,11 @@ async fn test_data_migrations_repair_an_upgraded_install() {
         "archived",
         "legitimate archival stays"
     );
+    assert_eq!(
+        energy_of(replaced.clone()).await.0,
+        "archived",
+        "a superseded note is never restored: newer knowledge wins"
+    );
     // Restored once: re-archiving it later must stick.
     raw.run(
         query("MATCH (n:Note {id: $id}) SET n.status = 'archived'").param("id", victim.clone()),
@@ -400,7 +419,10 @@ async fn test_data_migrations_repair_an_upgraded_install() {
         .run_data_migration_scoped("2026-09-rebase-active-note-energy", r)
         .await
         .unwrap();
-    assert_eq!(out.processed, 2);
+    assert_eq!(
+        out.processed, 3,
+        "crushed, healthy and the superseding note"
+    );
     assert!(
         (energy_of(crushed.clone()).await.1 - intended).abs() < 0.01,
         "raised"
@@ -485,6 +507,75 @@ async fn test_data_migrations_repair_an_upgraded_install() {
         w.next().await.unwrap().unwrap().get::<f64>("w").unwrap(),
         0.5
     );
+
+    // ------------------------------------------------------------------
+    // 5b. Dormant project (no sync nor chat for weeks): its knowledge is
+    //     frozen — coming back months later must find it intact.
+    // ------------------------------------------------------------------
+    let d = Uuid::new_v4();
+    let ds = d.to_string();
+    let frozen = Uuid::new_v4().to_string();
+    let permanent = Uuid::new_v4().to_string();
+    raw.run(
+        query(
+            "CREATE (:Project {id: $d, slug: 'dormant-' + $d, name: 'dormant', root_path: '/tmp/dormant',
+                     last_synced: datetime() - duration({days: 120})})
+             CREATE (f:Note {id: $frozen, project_id: $d, status: 'active', energy: 0.8,
+                     note_type: 'pattern', content: 'frozen', created_by: 'test',
+                     created_at: datetime() - duration({days: 200}),
+                     last_activated: datetime() - duration({days: 120}),
+                     energy_updated_at: datetime() - duration({days: 30})})
+             CREATE (f)-[:SYNAPSE {weight: 0.5, source: 'coactivation'}]->(:Note {id: randomUUID(), project_id: $d})
+             CREATE (:Note {id: $permanent, project_id: $d, status: 'active', energy: 0.0,
+                     note_type: 'gotcha', content: 'permanent', created_by: 'test',
+                     memory_horizon: 'consolidated', activation_count: 0, reactivation_count: 0,
+                     created_at: datetime() - duration({days: 400}),
+                     last_activated: datetime() - duration({days: 300})})",
+        )
+        .param("d", ds.clone())
+        .param("frozen", frozen.clone())
+        .param("permanent", permanent.clone()),
+    )
+    .await
+    .unwrap();
+    assert!(client.dormant_project_ids().await.unwrap().contains(&ds));
+
+    client.update_energy_scores(90.0).await.unwrap();
+    assert!(
+        (energy_of(frozen.clone()).await.1 - 0.8).abs() < 1e-9,
+        "dormant project: energy frozen"
+    );
+    client.decay_synapses(0.1, 0.05).await.unwrap();
+    assert_eq!(
+        client.decay_project_synapses(d, 0.1, 0.05).await.unwrap(),
+        (0, 0)
+    );
+    let mut w = raw
+        .execute(
+            query("MATCH (a:Note {id: $id})-[s:SYNAPSE]->() RETURN s.weight AS w")
+                .param("id", frozen.clone()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        w.next().await.unwrap().unwrap().get::<f64>("w").unwrap(),
+        0.5,
+        "dormant project: synapses frozen"
+    );
+    client.consolidate_memory().await.unwrap();
+    assert_eq!(
+        energy_of(permanent.clone()).await.0,
+        "active",
+        "consolidated knowledge is never auto-archived"
+    );
+
+    // Activity resumes (a code sync): decay applies again, from now on.
+    raw.run(
+        query("MATCH (p:Project {id: $d}) SET p.last_synced = datetime()").param("d", ds.clone()),
+    )
+    .await
+    .unwrap();
+    assert!(!client.dormant_project_ids().await.unwrap().contains(&ds));
 
     // ------------------------------------------------------------------
     // 6. The startup runner completes every migration once, then skips.

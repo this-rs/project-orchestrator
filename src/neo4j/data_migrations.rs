@@ -166,12 +166,17 @@ RETURN size(doomed) AS processed
 /// value the intended decay gives (90-day time constant from the last
 /// activation, as the maintenance and `boost_energy` used), floored at 0.1 so
 /// they are not re-archived immediately. `restored_from_energy_bug` makes
-/// each note eligible once: a later, legitimate archival sticks.
+/// each note eligible once: a later, legitimate archival sticks. A note that
+/// was superseded is never restored — newer knowledge wins — and invalidated
+/// notes (status `obsolete`) are not candidates.
 const RESTORE_ENERGY_DECAY_VICTIMS: &str = r#"
 MATCH (n:Note {status: 'archived'})
 WHERE ($scope IS NULL OR n.project_id = $scope)
   AND n.changes_json CONTAINS 'low_energy_60d'
   AND n.restored_from_energy_bug IS NULL
+  // Newer knowledge wins: never bring back a note that was replaced.
+  AND n.superseded_by IS NULL
+  AND NOT ()-[:SUPERSEDES]->(n)
 WITH n LIMIT $batch
 WITH n, toFloat(duration.inSeconds(datetime(coalesce(n.last_activated, n.created_at)), datetime()).seconds) / 86400.0 AS idle_days
 WITH n, exp(-idle_days / 90.0) AS intended

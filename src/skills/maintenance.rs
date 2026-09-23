@@ -194,7 +194,10 @@ pub async fn run_daily_maintenance(
     }
 
     // Step 2: Update energy scores (half-life decay for note energies, global).
-    if let Err(e) = graph_store.update_energy_scores(90.0).await {
+    if let Err(e) = graph_store
+        .update_energy_scores(crate::notes::ENERGY_HALF_LIFE_DAYS)
+        .await
+    {
         warn!(error = %e, "Failed to update energy scores");
         result.warnings.push(format!("Energy update failed: {}", e));
     }
