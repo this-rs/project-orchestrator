@@ -86,7 +86,7 @@ tree-sitter-java = "0.23"
 tree-sitter-c = "0.24"
 tree-sitter-cpp = "0.23"
 tree-sitter-ruby = "0.23"
-tree-sitter-php = "0.23"
+tree-sitter-php = "0.24"
 tree-sitter-kotlin-ng = "1.1"
 tree-sitter-swift = "0.7"
 tree-sitter-bash = "0.25"
@@ -130,7 +130,7 @@ async-trait = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 # Chat / Claude Code SDK
-nexus-claude = { git = "https://github.com/this-rs/nexus.git", rev = "8b907031debc784f2e7192d26be5ee988d20b2ab", features = ["memory", "auto-download"] }
+nexus-claude = { git = "https://github.com/this-rs/nexus.git", rev = "7c8e9abc3769371381be870a38d2f8f4381427be", features = ["memory", "auto-download"] }
 tokio-stream = { workspace = true }
 
 # Auth
@@ -146,7 +146,7 @@ multibase = "0.9"
 # Self-update (archive extraction)
 flate2 = "1"
 tar = "0.4"
-zip = { version = "4", default-features = false, features = ["deflate"] }
+zip = { version = "8", default-features = false, features = ["deflate"] }
 
 # Home directory detection
 dirs = "6"

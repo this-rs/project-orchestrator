@@ -42,7 +42,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # rustsec/audit-check builds cargo-audit WITHOUT --locked, under this
+      # repo's rust-toolchain.toml (1.95). Its freshly resolved dependency tree
+      # now needs rustc >= 1.96 (kstring 2.0.5), so the job died compiling the
+      # tool and never audited anything. Install exactly like ci.yml's
+      # security-audit job, which works; ignores come from .cargo/audit.toml.
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
       - name: Run cargo-audit
-        uses: rustsec/audit-check@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+        run: cargo audit
