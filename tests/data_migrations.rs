@@ -578,6 +578,112 @@ async fn test_data_migrations_repair_an_upgraded_install() {
     assert!(!client.dormant_project_ids().await.unwrap().contains(&ds));
 
     // ------------------------------------------------------------------
+    // 5c. Newer knowledge wins: replaced / archived knowledge never comes
+    //     back through personas, skills, or a later confirmation.
+    // ------------------------------------------------------------------
+    {
+        use project_orchestrator::neo4j::models::{PersonaNode, PersonaOrigin, PersonaStatus};
+        use project_orchestrator::neo4j::traits::GraphStore;
+        let store: &dyn GraphStore = &client;
+        let k = Uuid::new_v4();
+        let ks = k.to_string();
+        let current = Uuid::new_v4();
+        let old = Uuid::new_v4();
+        raw.run(
+            query(
+                "CREATE (:Note {id: $cur, project_id: $k, status: 'active', energy: 0.9,
+                         note_type: 'guideline', content: 'use the NEW way', created_by: 'test',
+                         created_at: datetime()})
+                 CREATE (:Note {id: $old, project_id: $k, status: 'archived', energy: 1.0,
+                         note_type: 'guideline', content: 'use the OLD way', created_by: 'test',
+                         superseded_by: $cur, created_at: datetime() - duration({days: 30})})
+                 WITH 1 AS _
+                 MATCH (n:Note {id: $cur}), (o:Note {id: $old})
+                 CREATE (n)-[:SUPERSEDES]->(o)",
+            )
+            .param("cur", current.to_string())
+            .param("old", old.to_string())
+            .param("k", ks.clone()),
+        )
+        .await
+        .unwrap();
+
+        // A later confirmation of the old note must not resurrect it.
+        client.confirm_note(old, "test").await.unwrap();
+        assert_eq!(energy_of(old.to_string()).await.0, "archived");
+
+        // Persona: only current knowledge in its subgraph (hook context).
+        let persona = PersonaNode {
+            id: Uuid::new_v4(),
+            project_id: Some(k),
+            name: "freshness".into(),
+            description: "test".into(),
+            status: PersonaStatus::Active,
+            complexity_default: None,
+            timeout_secs: None,
+            max_cost_usd: None,
+            model_preference: None,
+            system_prompt_override: None,
+            energy: 0.9,
+            cohesion: 0.0,
+            activation_count: 0,
+            success_rate: 0.0,
+            avg_duration_secs: 0.0,
+            last_activated: None,
+            energy_boost_accumulated: 0.0,
+            energy_history: vec![],
+            origin: PersonaOrigin::Manual,
+            created_at: chrono::Utc::now(),
+            updated_at: None,
+        };
+        store.create_persona(&persona).await.unwrap();
+        store
+            .add_persona_note(persona.id, current, 0.5)
+            .await
+            .unwrap();
+        store.add_persona_note(persona.id, old, 1.0).await.unwrap();
+        let sub = store.get_persona_subgraph(persona.id).await.unwrap();
+        let ids: Vec<String> = sub.notes.iter().map(|n| n.entity_id.clone()).collect();
+        assert_eq!(
+            ids,
+            vec![current.to_string()],
+            "persona injects only current knowledge"
+        );
+
+        // Skill: activation returns only current members.
+        let sk = skill(&raw, &ks, "Freshness", "active", 0).await;
+        raw.run(
+            query(
+                "MATCH (s:Skill {id: $s}), (a:Note {id: $cur}), (b:Note {id: $old})
+                 CREATE (a)-[:MEMBER_OF]->(s), (b)-[:MEMBER_OF]->(s)",
+            )
+            .param("s", sk.clone())
+            .param("cur", current.to_string())
+            .param("old", old.to_string())
+            .param("k", ks.clone()),
+        )
+        .await
+        .unwrap();
+        let activated = store
+            .activate_skill(Uuid::parse_str(&sk).unwrap(), "which way?")
+            .await
+            .unwrap();
+        let ids: Vec<String> = activated
+            .activated_notes
+            .iter()
+            .map(|n| n.note.id.to_string())
+            .collect();
+        assert!(
+            ids.contains(&current.to_string()),
+            "the newer knowledge is in the skill context"
+        );
+        assert!(
+            !ids.contains(&old.to_string()),
+            "the replaced knowledge is not"
+        );
+    }
+
+    // ------------------------------------------------------------------
     // 6. The startup runner completes every migration once, then skips.
     // ------------------------------------------------------------------
     let first = {

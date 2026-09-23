@@ -22,6 +22,15 @@ pub const ENERGY_HALF_LIFE_DAYS: f64 = 90.0;
 /// again, so knowledge survives months without work on the project.
 pub const PROJECT_DORMANT_AFTER_DAYS: i64 = 14;
 
+/// Whether a note is knowledge the agent may still be given: active or
+/// awaiting review, and not replaced by a newer note. Archived, obsolete
+/// (invalidated), stale and superseded notes must never reach its context —
+/// newer knowledge wins.
+pub fn is_current_knowledge(note: &Note) -> bool {
+    matches!(note.status, NoteStatus::Active | NoteStatus::NeedsReview)
+        && note.superseded_by.is_none()
+}
+
 pub use hashing::*;
 pub use lifecycle::*;
 pub use manager::{BackfillProgress, NoteManager, SynapseBackfillProgress, SynapseConfig};

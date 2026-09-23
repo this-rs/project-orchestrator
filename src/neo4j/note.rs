@@ -1754,8 +1754,14 @@ impl Neo4jClient {
             SET n.last_confirmed_at = datetime(),
                 n.last_confirmed_by = $confirmed_by,
                 n.staleness_score = 0.0,
-                n.status = 'active',
+                // Confirming a superseded note must not resurrect it: the
+                // newer note that replaced it wins.
+                n.status = CASE
+                    WHEN n.superseded_by IS NOT NULL OR EXISTS { (n)<-[:SUPERSEDES]-() } THEN n.status
+                    ELSE 'active'
+                END,
                 n.energy = CASE
+                    WHEN n.superseded_by IS NOT NULL OR EXISTS { (n)<-[:SUPERSEDES]-() } THEN n.energy
                     WHEN coalesce(n.energy, 1.0) + 0.3 > 1.0 THEN 1.0
                     ELSE coalesce(n.energy, 1.0) + 0.3
                 END,

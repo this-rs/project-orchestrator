@@ -94,6 +94,37 @@ pub struct HookActivationOutcome {
 ///
 /// Target: < 150ms total. The bottleneck is the DB call to load skills
 /// and their members. Trigger matching is done locally in <1ms.
+/// A skill's members that may still be given to the agent: current notes
+/// (see [`crate::notes::is_current_knowledge`]) and decisions in force
+/// (proposed/accepted). Archived, obsolete, superseded or deprecated members
+/// stay attached to the skill but must never reach its context — newer
+/// knowledge wins.
+pub async fn current_skill_members(
+    graph_store: &dyn GraphStore,
+    skill_id: Uuid,
+) -> anyhow::Result<(
+    Vec<crate::notes::Note>,
+    Vec<crate::neo4j::models::DecisionNode>,
+)> {
+    let (notes, decisions) = graph_store.get_skill_members(skill_id).await?;
+    Ok((
+        notes
+            .into_iter()
+            .filter(crate::notes::is_current_knowledge)
+            .collect(),
+        decisions
+            .into_iter()
+            .filter(|d| {
+                matches!(
+                    d.status,
+                    crate::neo4j::models::DecisionStatus::Proposed
+                        | crate::neo4j::models::DecisionStatus::Accepted
+                )
+            })
+            .collect(),
+    ))
+}
+
 pub async fn activate_for_hook(
     graph_store: &dyn GraphStore,
     project_id: Uuid,
@@ -144,8 +175,8 @@ pub async fn activate_for_hook(
         let (skill2, _conf2) = matches.remove(0);
 
         let ((notes1, decisions1), (notes2, decisions2)) = tokio::try_join!(
-            graph_store.get_skill_members(skill1.id),
-            graph_store.get_skill_members(skill2.id),
+            current_skill_members(graph_store, skill1.id),
+            current_skill_members(graph_store, skill2.id),
         )?;
 
         // Merge notes, dedup by id
@@ -225,7 +256,7 @@ pub async fn activate_for_hook(
     } else {
         // Single top skill
         let (skill, confidence) = matches.remove(0);
-        let (notes, decisions) = graph_store.get_skill_members(skill.id).await?;
+        let (notes, decisions) = current_skill_members(graph_store, skill.id).await?;
 
         let mut active_notes: Vec<_> = notes
             .into_iter()
@@ -381,8 +412,8 @@ pub async fn activate_for_hook_cached(
         let (skill2, _conf2) = matches.remove(0);
 
         let ((notes1, decisions1), (notes2, decisions2)) = tokio::try_join!(
-            graph_store.get_skill_members(skill1.id),
-            graph_store.get_skill_members(skill2.id),
+            current_skill_members(graph_store, skill1.id),
+            current_skill_members(graph_store, skill2.id),
         )?;
 
         let mut all_notes = notes1;
@@ -458,7 +489,7 @@ pub async fn activate_for_hook_cached(
         }))
     } else {
         let (skill, confidence) = matches.remove(0);
-        let (notes, decisions) = graph_store.get_skill_members(skill.id).await?;
+        let (notes, decisions) = current_skill_members(graph_store, skill.id).await?;
 
         let mut active_notes: Vec<_> = notes
             .into_iter()

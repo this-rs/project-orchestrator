@@ -741,6 +741,10 @@ impl Neo4jClient {
             let q = query(
                 r#"
                 MATCH (p:Persona {id: $pid})-[r:USES]->(n:Note)
+                // Current knowledge only: archived / obsolete / superseded
+                // notes keep their USES weight, and the hook injected them on
+                // every file access — old instructions kept coming back.
+                WHERE n.status IN ['active', 'needs_review'] AND n.superseded_by IS NULL
                 RETURN n.id AS entity_id, r.weight AS weight
                 ORDER BY r.weight DESC
                 "#,
@@ -754,6 +758,7 @@ impl Neo4jClient {
             let q = query(
                 r#"
                 MATCH (p:Persona {id: $pid})-[r:USES]->(d:Decision)
+                WHERE coalesce(d.status, 'accepted') IN ['proposed', 'accepted']
                 RETURN d.id AS entity_id, r.weight AS weight
                 ORDER BY r.weight DESC
                 "#,
