@@ -222,6 +222,14 @@ fn public_routes() -> Router<OrchestratorState> {
         .route("/health", get(handlers::health))
         .route("/api/version", get(handlers::get_version))
         .route("/api/setup-status", get(handlers::setup_status))
+        // Live Claude model catalog (Anthropic Models API + local curation, cached).
+        // PUBLIC on purpose: the setup wizard at /setup runs before login and
+        // needs the real list — while it was authenticated, that screen could
+        // only ever render the frontend's hardcoded fallback. The payload is
+        // the public Claude catalog plus UI labels: no user data, no API key,
+        // and the 12h server-side cache means an anonymous caller cannot
+        // amplify traffic to Anthropic.
+        .route("/api/chat/models", get(chat_handlers::get_model_catalog))
         // ================================================================
         // Auth (public — login flow + discovery)
         // ================================================================
@@ -1782,8 +1790,6 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/chat/config",
             get(chat_handlers::get_chat_config).patch(chat_handlers::update_chat_config),
         )
-        // Live Claude model catalog (Anthropic Models API + local curation, cached)
-        .route("/api/chat/models", get(chat_handlers::get_model_catalog))
         // Detect user PATH from login shell
         .route("/api/chat/detect-path", get(chat_handlers::detect_path))
         // CLI version management (check + install/upgrade)

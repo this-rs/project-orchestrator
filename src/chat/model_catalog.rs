@@ -38,161 +38,216 @@ const ANTHROPIC_VERSION: &str = "2023-06-01";
 const MAX_PAGES: u8 = 5;
 
 /// A single model entry, shaped for direct consumption by the frontend's
-/// model selector (mirrors `ModelDefinition` in `frontend/src/constants/models.ts`).
+/// model selector.
+///
+/// Deliberately carries **semantic** tokens (`family`, `version`, `tier`)
+/// rather than presentation values. An earlier revision shipped a raw
+/// Tailwind class (`dot_color`) over the wire; that only ever worked because
+/// the frontend happened to hardcode the same strings in a scanned source
+/// file. Tailwind v4 runs with no config and no safelist here, so a class
+/// that exists *only* in this Rust file is purged from the production bundle
+/// — silently, with no build error and no failing test. Colors are now the
+/// frontend's business; this module never names one.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelDefinition {
     /// Official Anthropic API model ID (e.g. "claude-sonnet-4-6")
     pub id: String,
+    /// Model family, lowercase: "opus" | "sonnet" | "haiku" | "fable" | "other"
+    pub family: String,
+    /// Version as displayed, e.g. "5.5", "4.6". Empty when undeterminable.
+    pub version: String,
+    /// "current" (in the active lineup) | "legacy" (still served, superseded)
+    pub tier: String,
     /// Short display label for compact UI (e.g. "Sonnet 4.6")
     pub short_label: String,
     /// Full marketing name (e.g. "Claude Sonnet 4.6")
     pub full_label: String,
-    /// Tailwind dot color class (e.g. "bg-blue-400")
-    pub dot_color: String,
     /// One-line description for selection cards
     pub description: String,
 }
 
-/// Manual curation for known model families, in the preferred display order.
-/// `(id, short_label, dot_color, description)`. `full_label` is always
-/// derived as `"Claude {short_label}"` — every known model follows that
-/// pattern, so it isn't worth a fifth tuple field.
+pub const TIER_CURRENT: &str = "current";
+pub const TIER_LEGACY: &str = "legacy";
+
+/// Known families, longest-match-first is irrelevant here (no overlap).
+const KNOWN_FAMILIES: &[&str] = &["opus", "sonnet", "haiku", "fable", "mythos"];
+
+/// Manual curation, in preferred display order.
+/// `(id, family, version, tier, description)`.
 ///
-/// Models not listed here (including brand-new ones the live API returns)
-/// still show up — see `derive_fallback` — just without a curated color,
-/// abbreviation, or description until someone adds an entry here.
-const CURATED_ORDER: &[(&str, &str, &str, &str)] = &[
+/// `short_label` is derived as `"{Family} {version}"` and `full_label` as
+/// `"Claude {short_label}"` — every model follows that pattern, so neither
+/// is worth a tuple field. Adding a model is one line, and it carries no
+/// presentation decision.
+///
+/// Models absent from this table (including brand-new ones the live API
+/// returns) still show up — see `resolve_model` — with a derived label and
+/// no description, until someone curates them.
+const CURATED_ORDER: &[(&str, &str, &str, &str, &str)] = &[
     (
-        "claude-opus-5",
-        "Opus 5",
-        "bg-violet-500",
-        "Latest flagship — most advanced reasoning & agentic work",
+        "claude-opus-5-5",
+        "opus",
+        "5.5",
+        TIER_CURRENT,
+        "Recommended default — long-running agentic coding & knowledge work",
     ),
     (
-        "claude-sonnet-5",
-        "Sonnet 5",
-        "bg-rose-500",
+        "claude-fable-5-1",
+        "fable",
+        "5.1",
+        TIER_CURRENT,
         "Most capable — demanding reasoning & long-horizon agentic work",
     ),
     (
-        "claude-fable-5",
-        "Fable 5",
-        "bg-rose-400",
-        "Previous generation — superseded by Sonnet 5",
-    ),
-    (
-        "claude-opus-4-8",
-        "Opus 4.8",
-        "bg-violet-500",
-        "Most intelligent — complex reasoning",
-    ),
-    (
-        "claude-opus-4-7",
-        "Opus 4.7",
-        "bg-violet-400",
-        "Previous Opus — complex reasoning",
-    ),
-    (
-        "claude-opus-4-6",
-        "Opus 4.6",
-        "bg-violet-300",
-        "Older Opus — complex reasoning",
-    ),
-    (
-        "claude-sonnet-4-6",
-        "Sonnet 4.6",
-        "bg-blue-400",
-        "Fast & capable — best for most tasks",
+        "claude-sonnet-5",
+        "sonnet",
+        "5",
+        TIER_CURRENT,
+        "Best balance of speed and intelligence",
     ),
     (
         "claude-haiku-4-5",
-        "Haiku 4.5",
-        "bg-emerald-400",
-        "Fastest — lightweight tasks",
+        "haiku",
+        "4.5",
+        TIER_CURRENT,
+        "Fastest — near-frontier intelligence",
+    ),
+    (
+        "claude-opus-5",
+        "opus",
+        "5",
+        TIER_LEGACY,
+        "Legacy — superseded by Opus 5.5",
+    ),
+    (
+        "claude-fable-5",
+        "fable",
+        "5",
+        TIER_LEGACY,
+        "Legacy — superseded by Fable 5.1",
+    ),
+    (
+        "claude-opus-4-8",
+        "opus",
+        "4.8",
+        TIER_LEGACY,
+        "Legacy Opus — complex reasoning",
+    ),
+    (
+        "claude-opus-4-7",
+        "opus",
+        "4.7",
+        TIER_LEGACY,
+        "Legacy Opus — complex reasoning",
+    ),
+    (
+        "claude-opus-4-6",
+        "opus",
+        "4.6",
+        TIER_LEGACY,
+        "Legacy Opus — complex reasoning",
+    ),
+    (
+        "claude-sonnet-4-6",
+        "sonnet",
+        "4.6",
+        TIER_LEGACY,
+        "Legacy Sonnet — fast & capable",
     ),
 ];
 
-fn curated_lookup(id: &str) -> Option<ModelDefinition> {
-    CURATED_ORDER.iter().find(|(cid, ..)| *cid == id).map(
-        |(id, short_label, dot_color, description)| ModelDefinition {
-            id: id.to_string(),
-            short_label: short_label.to_string(),
-            full_label: format!("Claude {short_label}"),
-            dot_color: dot_color.to_string(),
-            description: description.to_string(),
-        },
-    )
+/// Capitalize a family slug for display: "opus" -> "Opus".
+fn family_label(family: &str) -> String {
+    let mut chars = family.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
 }
 
-/// Derive a readable short label from an unknown model ID.
+/// `("opus", "5.5")` -> `"Opus 5.5"`. Falls back to the family alone when
+/// no version could be determined.
+fn compose_short_label(family: &str, version: &str) -> String {
+    let fam = family_label(family);
+    if version.is_empty() {
+        fam
+    } else {
+        format!("{fam} {version}")
+    }
+}
+
+fn build_definition(
+    id: &str,
+    family: &str,
+    version: &str,
+    tier: &str,
+    description: &str,
+    full_label_override: Option<&str>,
+) -> ModelDefinition {
+    let short_label = compose_short_label(family, version);
+    ModelDefinition {
+        id: id.to_string(),
+        family: family.to_string(),
+        version: version.to_string(),
+        tier: tier.to_string(),
+        full_label: full_label_override
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("Claude {short_label}")),
+        short_label,
+        description: description.to_string(),
+    }
+}
+
+fn curated_lookup(id: &str) -> Option<ModelDefinition> {
+    CURATED_ORDER
+        .iter()
+        .find(|(cid, ..)| *cid == id)
+        .map(|(id, family, version, tier, description)| {
+            build_definition(id, family, version, tier, description, None)
+        })
+}
+
+/// Split an unknown model ID into `(family, version)`.
 ///
-/// `"claude-foo-bar-7"` → `"Foo Bar 7"`; trailing numeric segments are
-/// grouped with dots (`"claude-sonnet-4-5"` → `"Sonnet 4.5"`). Mirrors the
-/// frontend's `getModelShortLabel` fallback so an unrecognized ID from the
-/// live API never renders as a raw slug.
-fn derive_short_label(id: &str) -> String {
+/// `"claude-opus-4-9"` -> `("opus", "4.9")`; `"claude-foo-bar-7"` ->
+/// `("other", "7")`. Trailing numeric segments are joined with dots.
+fn derive_family_version(id: &str) -> (String, String) {
     let without_prefix = id.strip_prefix("claude-").unwrap_or(id);
     let parts: Vec<&str> = without_prefix.split('-').collect();
 
-    let mut text_parts: Vec<String> = Vec::new();
     let mut num_parts: Vec<&str> = Vec::new();
-
-    for part in parts {
+    for part in parts.iter().rev() {
         if !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()) {
             num_parts.push(part);
         } else {
-            if !num_parts.is_empty() {
-                text_parts.push(num_parts.join("."));
-                num_parts.clear();
-            }
-            let mut chars = part.chars();
-            let capitalized = match chars.next() {
-                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-                None => String::new(),
-            };
-            text_parts.push(capitalized);
+            break;
         }
     }
-    if !num_parts.is_empty() {
-        text_parts.push(num_parts.join("."));
-    }
+    num_parts.reverse();
+    let version = num_parts.join(".");
 
-    if text_parts.is_empty() {
-        id.to_string()
-    } else {
-        text_parts.join(" ")
-    }
-}
+    let family = KNOWN_FAMILIES
+        .iter()
+        .find(|f| parts.iter().any(|p| p.eq_ignore_ascii_case(f)))
+        .map(|f| f.to_string())
+        .unwrap_or_else(|| "other".to_string());
 
-/// Family-based color fallback for an unrecognized model ID (mirrors the
-/// frontend's `getModelDotColor` fallback).
-fn derive_dot_color(id: &str) -> String {
-    if id.contains("opus") {
-        "bg-violet-400".to_string()
-    } else if id.contains("haiku") {
-        "bg-emerald-400".to_string()
-    } else {
-        "bg-blue-400".to_string() // sonnet / default
-    }
+    (family, version)
 }
 
 /// Build a full `ModelDefinition` for a model ID the live API returned,
 /// preferring curated data and falling back to derived heuristics.
+///
+/// An uncurated model is assumed `current`: the live Models API only lists
+/// models that are actually available, and anything we have not curated yet
+/// is far more likely to be newly released than retired.
 fn resolve_model(id: &str, api_display_name: Option<&str>) -> ModelDefinition {
     if let Some(curated) = curated_lookup(id) {
         return curated;
     }
-    let short_label = derive_short_label(id);
-    ModelDefinition {
-        id: id.to_string(),
-        full_label: api_display_name
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| format!("Claude {short_label}")),
-        dot_color: derive_dot_color(id),
-        short_label,
-        description: String::new(),
-    }
+    let (family, version) = derive_family_version(id);
+    build_definition(id, &family, &version, TIER_CURRENT, "", api_display_name)
 }
 
 /// The static list used when no API key is configured, or the live fetch
@@ -384,22 +439,74 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_derive_short_label_known_pattern() {
-        assert_eq!(derive_short_label("claude-sonnet-4-5"), "Sonnet 4.5");
-        assert_eq!(derive_short_label("claude-opus-4-8"), "Opus 4.8");
-        assert_eq!(derive_short_label("claude-haiku-4-5"), "Haiku 4.5");
+    fn test_derive_family_version_known_families() {
+        assert_eq!(
+            derive_family_version("claude-opus-4-9"),
+            ("opus".into(), "4.9".into())
+        );
+        assert_eq!(
+            derive_family_version("claude-haiku-5"),
+            ("haiku".into(), "5".into())
+        );
+        assert_eq!(
+            derive_family_version("claude-fable-5-1"),
+            ("fable".into(), "5.1".into())
+        );
     }
 
     #[test]
-    fn test_derive_short_label_unknown_family() {
-        assert_eq!(derive_short_label("claude-foo-bar-7"), "Foo Bar 7");
+    fn test_derive_family_version_unknown_family() {
+        assert_eq!(
+            derive_family_version("claude-foo-bar-7"),
+            ("other".into(), "7".into())
+        );
     }
 
     #[test]
-    fn test_derive_dot_color_families() {
-        assert_eq!(derive_dot_color("claude-opus-4-9"), "bg-violet-400");
-        assert_eq!(derive_dot_color("claude-haiku-5"), "bg-emerald-400");
-        assert_eq!(derive_dot_color("claude-sonnet-5"), "bg-blue-400");
+    fn test_derive_family_version_no_trailing_digits() {
+        // No version segment at all — must not panic, and must not swallow
+        // an interior number as if it were the version.
+        assert_eq!(
+            derive_family_version("claude-opus-next"),
+            ("opus".into(), "".into())
+        );
+    }
+
+    #[test]
+    fn test_compose_short_label() {
+        assert_eq!(compose_short_label("opus", "5.5"), "Opus 5.5");
+        assert_eq!(compose_short_label("sonnet", "4.6"), "Sonnet 4.6");
+        // Versionless model degrades to the family alone rather than
+        // rendering a trailing space.
+        assert_eq!(compose_short_label("opus", ""), "Opus");
+    }
+
+    #[test]
+    fn test_definitions_carry_no_presentation_values() {
+        // Guards the Tailwind purge trap: a color class shipped from here
+        // would be absent from every file Tailwind scans, and would be
+        // stripped from the production bundle with no error anywhere.
+        let json = serde_json::to_string(&static_fallback_models()).unwrap();
+        assert!(!json.contains("bg-"), "presentation class leaked into the API payload");
+    }
+
+    #[test]
+    fn test_every_curated_entry_is_self_consistent() {
+        for (id, family, version, tier, _) in CURATED_ORDER {
+            assert!(
+                KNOWN_FAMILIES.contains(family),
+                "{id}: unknown family {family}"
+            );
+            assert!(
+                *tier == TIER_CURRENT || *tier == TIER_LEGACY,
+                "{id}: bad tier {tier}"
+            );
+            // The curated family/version must agree with what the ID itself
+            // says, so a typo in the table cannot silently mislabel a model.
+            let (derived_family, derived_version) = derive_family_version(id);
+            assert_eq!(derived_family, *family, "{id}: family disagrees with ID");
+            assert_eq!(derived_version, *version, "{id}: version disagrees with ID");
+        }
     }
 
     #[test]
@@ -417,9 +524,9 @@ mod tests {
     fn test_static_fallback_models_nonempty_and_ordered() {
         let models = static_fallback_models();
         assert!(!models.is_empty());
-        assert_eq!(models[0].id, "claude-opus-5");
-        assert_eq!(models[1].id, "claude-sonnet-5");
-        assert_eq!(models[2].id, "claude-fable-5");
+        assert_eq!(models[0].id, "claude-opus-5-5");
+        assert_eq!(models[1].id, "claude-fable-5-1");
+        assert_eq!(models[2].id, "claude-sonnet-5");
     }
 
     #[test]
@@ -433,8 +540,9 @@ mod tests {
     fn test_resolve_model_falls_back_for_unknown_id() {
         let m = resolve_model("claude-new-hotness-9", Some("Claude New Hotness 9"));
         assert_eq!(m.full_label, "Claude New Hotness 9");
-        assert_eq!(m.short_label, "New Hotness 9");
-        assert_eq!(m.dot_color, "bg-blue-400");
+        assert_eq!(m.family, "other");
+        assert_eq!(m.version, "9");
+        assert_eq!(m.tier, TIER_CURRENT);
         assert_eq!(m.description, "");
     }
 
