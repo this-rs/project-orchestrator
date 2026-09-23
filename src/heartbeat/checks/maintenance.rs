@@ -1,10 +1,21 @@
-//! MaintenanceCheck — runs deep_maintenance for all projects periodically.
+//! MaintenanceCheck — runs deep_maintenance for every project once a day.
 //!
-//! Wraps `skills::maintenance::deep_maintenance` as a heartbeat check.
-//! Runs every 24 hours to perform aggressive cleanup: decay, energy update,
-//! staleness scoring, stuck task detection, and recommendations.
+//! Wraps `skills::maintenance::deep_maintenance` as a heartbeat check:
+//! aggressive cleanup (decay, energy update, staleness scoring, stuck task
+//! detection, Louvain skill evolution) for each project, at most once per
+//! [`PROJECT_MIN_GAP`].
+//!
+//! The work is split into bounded slices. A pass over all projects takes
+//! ~12s per project, so a single pass over 40+ projects cannot fit in one
+//! heartbeat timeout: it used to be cancelled every time, restart from the
+//! first project on the next tick, and loop forever (see engine.rs
+//! `TIMEOUT_RETRY_BACKOFF`). Each run now handles the projects that are due,
+//! least-recently-maintained first, until [`SLICE_BUDGET`] is spent; the
+//! next run resumes with the rest.
 
-use std::time::Duration;
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -13,6 +24,7 @@ use tracing::{debug, info, warn};
 use crate::heartbeat::{HeartbeatCheck, HeartbeatContext};
 use crate::notes::NoteManager;
 use crate::skills::maintenance::SkillMaintenanceConfig;
+use uuid::Uuid;
 
 /// Per-run timeout for deep maintenance.
 ///
@@ -23,8 +35,53 @@ use crate::skills::maintenance::SkillMaintenanceConfig;
 /// times-out forever — meaning periodic skill detection/evolution never lands.
 const MAINTENANCE_TIMEOUT: Duration = Duration::from_secs(5 * 60); // 5 minutes
 
-/// Run deep maintenance on all projects (every 24 hours).
-pub struct MaintenanceCheck;
+/// Time spent starting new projects in one run. Checked before each project,
+/// so it must leave room under [`MAINTENANCE_TIMEOUT`] for the last one.
+const SLICE_BUDGET: Duration = Duration::from_secs(3 * 60);
+
+/// How often a slice runs. With [`SLICE_BUDGET`] this covers ~12 projects
+/// per slice, i.e. every project within a couple of hours of becoming due.
+const SLICE_INTERVAL: Duration = Duration::from_secs(15 * 60);
+
+/// Minimum time between two deep maintenances of the same project.
+const PROJECT_MIN_GAP: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Run deep maintenance on each project once per [`PROJECT_MIN_GAP`], in
+/// bounded slices.
+#[derive(Default)]
+pub struct MaintenanceCheck {
+    /// Last attempt per project, recorded BEFORE running it, so a project
+    /// that times out goes to the back of the queue instead of pinning it.
+    /// In-memory: after a restart every project is due again once.
+    attempts: Mutex<HashMap<Uuid, Instant>>,
+}
+
+impl MaintenanceCheck {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+/// Projects due for maintenance at `now`, never-attempted first (in input
+/// order), then least recently attempted first.
+fn due_projects(
+    project_ids: &[Uuid],
+    attempts: &HashMap<Uuid, Instant>,
+    now: Instant,
+    min_gap: Duration,
+) -> Vec<Uuid> {
+    let mut due: Vec<(Option<Instant>, usize, Uuid)> = project_ids
+        .iter()
+        .enumerate()
+        .filter_map(|(i, id)| match attempts.get(id) {
+            Some(last) if now.duration_since(*last) < min_gap => None,
+            last => Some((last.copied(), i, *id)),
+        })
+        .collect();
+    // None < Some(_): never-attempted projects come first.
+    due.sort_by_key(|(last, i, _)| (*last, *i));
+    due.into_iter().map(|(_, _, id)| id).collect()
+}
 
 #[async_trait]
 impl HeartbeatCheck for MaintenanceCheck {
@@ -33,7 +90,7 @@ impl HeartbeatCheck for MaintenanceCheck {
     }
 
     fn interval(&self) -> Duration {
-        Duration::from_secs(24 * 60 * 60) // 24 hours
+        SLICE_INTERVAL
     }
 
     fn timeout_override(&self) -> Option<Duration> {
@@ -57,7 +114,31 @@ impl HeartbeatCheck for MaintenanceCheck {
             warn!("MaintenanceCheck: no search store available, skill self-heal disabled for this run");
         }
 
-        for project in &projects {
+        let started = Instant::now();
+        let due = {
+            let attempts = self.attempts.lock().unwrap_or_else(|e| e.into_inner());
+            let ids: Vec<Uuid> = projects.iter().map(|p| p.id).collect();
+            due_projects(&ids, &attempts, started, PROJECT_MIN_GAP)
+        };
+        if due.is_empty() {
+            debug!("MaintenanceCheck: no project due");
+            return Ok(());
+        }
+        let by_id: HashMap<Uuid, _> = projects.iter().map(|p| (p.id, p)).collect();
+
+        for project_id in due {
+            if started.elapsed() >= SLICE_BUDGET {
+                debug!("MaintenanceCheck: slice budget spent, resuming next run");
+                break;
+            }
+            let Some(project) = by_id.get(&project_id) else {
+                continue;
+            };
+            self.attempts
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(project.id, Instant::now());
+
             info!(
                 "MaintenanceCheck: running deep maintenance for '{}'",
                 project.name
@@ -136,14 +217,48 @@ mod tests {
 
     #[test]
     fn test_maintenance_check_name() {
-        let check = MaintenanceCheck;
+        let check = MaintenanceCheck::new();
         assert_eq!(check.name(), "deep_maintenance");
     }
 
     #[test]
     fn test_maintenance_check_interval() {
-        let check = MaintenanceCheck;
-        assert_eq!(check.interval(), Duration::from_secs(24 * 3600));
+        let check = MaintenanceCheck::new();
+        // Slices run every 15 min; each project is still maintained at most
+        // once per PROJECT_MIN_GAP (see test_due_projects_*).
+        assert_eq!(check.interval(), Duration::from_secs(15 * 60));
+        assert!(SLICE_BUDGET < MAINTENANCE_TIMEOUT);
+    }
+
+    #[test]
+    fn test_due_projects_orders_never_attempted_then_oldest() {
+        let now = Instant::now();
+        let (a, b, c, d) = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        let mut attempts = HashMap::new();
+        attempts.insert(a, now - Duration::from_secs(30 * 3600)); // due, older
+        attempts.insert(b, now - Duration::from_secs(25 * 3600)); // due, newer
+        attempts.insert(c, now - Duration::from_secs(3600)); // done recently
+        let due = due_projects(&[a, b, c, d], &attempts, now, PROJECT_MIN_GAP);
+        assert_eq!(due, vec![d, a, b]);
+    }
+
+    #[test]
+    fn test_due_projects_resumes_where_the_last_slice_stopped() {
+        // Regression: a pass that cannot finish must not restart from the
+        // first project forever. Projects attempted in the previous slice
+        // are not due again; the rest are.
+        let now = Instant::now();
+        let ids: Vec<Uuid> = (0..5).map(|_| Uuid::new_v4()).collect();
+        let mut attempts = HashMap::new();
+        attempts.insert(ids[0], now);
+        attempts.insert(ids[1], now);
+        let due = due_projects(&ids, &attempts, now, PROJECT_MIN_GAP);
+        assert_eq!(due, ids[2..].to_vec());
     }
 
     #[test]
@@ -151,7 +266,7 @@ mod tests {
         // Must override the engine's 5s default, otherwise deep_maintenance
         // (Louvain + evolution across all projects) is cancelled every tick and
         // last_run is never updated → periodic skill creation never lands.
-        let check = MaintenanceCheck;
+        let check = MaintenanceCheck::new();
         assert_eq!(check.timeout_override(), Some(Duration::from_secs(300)));
         assert!(
             check.timeout_override().unwrap() > Duration::from_secs(5),
@@ -168,7 +283,7 @@ mod tests {
             search: None,
             emitter: None,
         };
-        let check = MaintenanceCheck;
+        let check = MaintenanceCheck::new();
         assert!(check.run(&ctx).await.is_ok());
     }
 
@@ -184,7 +299,7 @@ mod tests {
             )),
             emitter: None,
         };
-        let check = MaintenanceCheck;
+        let check = MaintenanceCheck::new();
         assert!(check.run(&ctx).await.is_ok());
     }
 }

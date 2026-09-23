@@ -287,8 +287,12 @@ pub async fn run_weekly_maintenance(
     let mut result = run_daily_maintenance(graph_store, project_id, config).await?;
     result.level = "weekly".to_string();
 
-    // Step 2: Snapshot existing skills BEFORE detection (for evolution comparison)
-    let existing_skills = graph_store.get_skills_for_project(project_id).await?;
+    // Step 2: Snapshot existing skills BEFORE detection (for evolution comparison).
+    // Live (non-archived) skills only, uncapped: archived skills are not
+    // candidates for Stable/Grow, and a capped energy-ordered snapshot let
+    // them crowd out live skills — every cluster was then re-created as New
+    // on each pass (tens of thousands of duplicate skills in prod).
+    let existing_skills = graph_store.get_live_skills_for_project(project_id).await?;
     let mut existing_members: Vec<(Uuid, Vec<String>)> = Vec::new();
     for skill in &existing_skills {
         let (notes, _) = graph_store.get_skill_members(skill.id).await?;
@@ -1936,6 +1940,32 @@ mod tests {
 
         assert_eq!(result.level, "weekly");
         assert!(result.lifecycle.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_evolution_snapshot_excludes_archived_skills() {
+        // Regression: the evolution snapshot used the capped (LIMIT 1000),
+        // energy-ordered skill listing, archived skills included. Archived
+        // skills (energy > 0) crowded out emerging ones (energy 0), so live
+        // skills were missing from the snapshot and every Louvain cluster was
+        // re-created as a New skill on each pass.
+        let (store, project_id) = setup_store_with_project().await;
+        for i in 0..3 {
+            let mut archived = SkillNode::new(project_id, format!("Archived {i}"));
+            archived.status = SkillStatus::Archived;
+            archived.energy = 0.5;
+            store.create_skill(&archived).await.unwrap();
+        }
+        let mut live = SkillNode::new(project_id, "Live");
+        live.status = SkillStatus::Emerging;
+        live.energy = 0.0;
+        store.create_skill(&live).await.unwrap();
+
+        let snapshot = store.get_live_skills_for_project(project_id).await.unwrap();
+        assert_eq!(
+            snapshot.iter().map(|s| s.id).collect::<Vec<_>>(),
+            vec![live.id]
+        );
     }
 
     // ========================================================================

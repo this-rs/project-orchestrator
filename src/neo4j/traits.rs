@@ -2416,6 +2416,21 @@ pub trait GraphStore: Send + Sync {
     /// Get all skills belonging to a project (convenience for list without pagination).
     async fn get_skills_for_project(&self, project_id: Uuid) -> Result<Vec<SkillNode>>;
 
+    /// Every non-archived skill of a project, uncapped.
+    ///
+    /// Skill evolution MUST compare new clusters against this set: the
+    /// capped, energy-ordered `get_skills_for_project` lets archived skills
+    /// crowd live ones out of the snapshot on large projects, and every
+    /// cluster then gets re-created as a New skill on each pass.
+    async fn get_live_skills_for_project(&self, project_id: Uuid) -> Result<Vec<SkillNode>> {
+        Ok(self
+            .get_skills_for_project(project_id)
+            .await?
+            .into_iter()
+            .filter(|s| s.status != crate::skills::SkillStatus::Archived)
+            .collect())
+    }
+
     /// Activate a skill: collect member notes (above min energy) and relevant
     /// decisions, assemble context text. Returns the full activation payload.
     async fn activate_skill(&self, skill_id: Uuid, query: &str) -> Result<ActivatedSkillContext>;

@@ -1606,7 +1606,7 @@ pub async fn start_server(mut config: Config) -> Result<()> {
             Box::new(StalenessCheck),
             Box::new(SynapseDecayCheck),
             Box::new(ConventionGuardCheck),
-            Box::new(MaintenanceCheck),
+            Box::new(MaintenanceCheck::new()),
             Box::new(ConsolidationCheck),
             Box::new(HomeostasisCheck::new()),
             // MUST run LAST: the engine executes checks in vec order within a tick
