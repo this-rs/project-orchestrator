@@ -8,6 +8,14 @@
 //! - `GET /api/hooks/resolve-project` REST endpoint
 //!
 //! Results are cached for 5 minutes to avoid repeated Neo4j lookups.
+//!
+//! Paths are compared in BOTH their given and canonical (symlink-resolved)
+//! forms. Sync stores `File.path` canonicalized while `Project.root_path` is
+//! stored as typed — e.g. the backend is registered through a symlink
+//! (`~/projects/project-orchestrator/backend` → `~/.openclaw/.../project-
+//! orchestrator`) while the CLI reports the real path as cwd. Plain string
+//! prefix matching then never matched ("no project matched" for every tool
+//! call in that project).
 
 use crate::neo4j::traits::GraphStore;
 use crate::skills::hook_extractor::extract_file_context;
@@ -92,6 +100,87 @@ pub(crate) fn find_longest_prefix_match(
     })
 }
 
+/// `path` with `~` expanded, relative paths joined onto `base` (when given),
+/// plus its canonical form when it exists on disk and differs.
+pub(crate) fn path_forms(path: &str, base: Option<&str>) -> Vec<String> {
+    let expanded = crate::expand_tilde(path);
+    let absolute = match base {
+        Some(base) if !expanded.starts_with('/') && !expanded.is_empty() => {
+            let base = crate::expand_tilde(base);
+            format!("{}/{}", base.trim_end_matches('/'), expanded)
+        }
+        _ => expanded,
+    };
+    let mut forms = vec![absolute.clone()];
+    if let Ok(canonical) = std::fs::canonicalize(&absolute) {
+        let canonical = canonical.display().to_string();
+        if canonical != absolute {
+            forms.push(canonical);
+        }
+    }
+    forms
+}
+
+/// Longest-prefix match over every form of `path` (see [`path_forms`]).
+pub(crate) fn find_match_any_form(
+    entries: &[ResolvedProject],
+    forms: &[String],
+) -> Option<MatchedProject> {
+    forms
+        .iter()
+        .filter_map(|form| find_longest_prefix_match(entries, form))
+        .max_by_key(|m| m.root_path.len())
+}
+
+/// Resolver entries for `projects`: one per root_path form (as stored, and
+/// canonical when it differs), each ending with `/`.
+pub(crate) fn entries_for_projects(
+    projects: &[crate::neo4j::models::ProjectNode],
+) -> Vec<ResolvedProject> {
+    let mut entries = Vec::new();
+    for p in projects {
+        if p.root_path.is_empty() {
+            continue;
+        }
+        for form in path_forms(&p.root_path, None) {
+            let root_path = if form.ends_with('/') {
+                form
+            } else {
+                format!("{}/", form)
+            };
+            entries.push(ResolvedProject {
+                project_id: p.id,
+                slug: p.slug.clone(),
+                root_path,
+            });
+        }
+    }
+    entries
+}
+
+/// Project owning `cwd`, for sessions created without a project_slug
+/// (workspace / all-projects mode). Returns `None` when no project matches,
+/// or when the best match is ambiguous (several projects registered on the
+/// same root) — attaching a session to the wrong project is worse than none.
+pub(crate) fn infer_project_slug(entries: &[ResolvedProject], cwd: &str) -> Option<String> {
+    let best = find_match_any_form(entries, &path_forms(cwd, None))?;
+    let tied: std::collections::HashSet<&str> = entries
+        .iter()
+        .filter(|e| e.root_path == best.root_path)
+        .map(|e| e.slug.as_str())
+        .collect();
+    (tied.len() == 1).then_some(best.slug)
+}
+
+/// Async wrapper of [`infer_project_slug`] over the cached project list.
+pub async fn infer_project_slug_for_cwd(graph_store: &dyn GraphStore, cwd: &str) -> Option<String> {
+    if cwd.is_empty() {
+        return None;
+    }
+    let entries = load_project_entries(graph_store).await.ok()?;
+    infer_project_slug(&entries, cwd)
+}
+
 /// Load project entries from Neo4j (or cache), expanding root_paths.
 ///
 /// Returns the cached entries if still valid, otherwise fetches from graph_store
@@ -121,23 +210,7 @@ pub(crate) async fn load_project_entries(
     let projects = graph_store.list_projects().await?;
 
     let now = Instant::now();
-    let entries: Vec<ResolvedProject> = projects
-        .iter()
-        .map(|p| {
-            let expanded = crate::expand_tilde(&p.root_path);
-            // Ensure root_path ends with / for correct prefix matching
-            let normalized = if expanded.ends_with('/') {
-                expanded
-            } else {
-                format!("{}/", expanded)
-            };
-            ResolvedProject {
-                project_id: p.id,
-                slug: p.slug.clone(),
-                root_path: normalized,
-            }
-        })
-        .collect();
+    let entries = entries_for_projects(&projects);
 
     // Update cache
     {
@@ -182,16 +255,16 @@ pub async fn resolve_project_from_context(
     let entries = load_project_entries(graph_store).await?;
 
     // Try file path from tool_input first
+    // Relative tool paths (Bash `cat src/a.rs`) are resolved against cwd.
     if let Some(file_path) = extract_file_context(tool_name, tool_input) {
-        let normalized = crate::expand_tilde(&file_path);
-        if let Some(matched) = find_longest_prefix_match(&entries, &normalized) {
+        let forms = path_forms(&file_path, Some(cwd));
+        if let Some(matched) = find_match_any_form(&entries, &forms) {
             return Ok(Some(matched.project_id));
         }
     }
 
     // Fallback: try cwd
-    let normalized_cwd = crate::expand_tilde(cwd);
-    if let Some(matched) = find_longest_prefix_match(&entries, &normalized_cwd) {
+    if let Some(matched) = find_match_any_form(&entries, &path_forms(cwd, None)) {
         return Ok(Some(matched.project_id));
     }
 
@@ -383,6 +456,82 @@ mod tests {
         assert_eq!(
             result.unwrap().project_id,
             Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap()
+        );
+    }
+
+    /// A project registered through a symlink, like the prod backend.
+    fn symlinked_project() -> (tempfile::TempDir, String, String) {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real-project");
+        std::fs::create_dir_all(real.join("src")).unwrap();
+        std::fs::write(real.join("src/main.rs"), "").unwrap();
+        let link = tmp.path().join("link-project");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let real = std::fs::canonicalize(&real).unwrap().display().to_string();
+        (tmp, link.display().to_string(), real)
+    }
+
+    fn project_node(slug: &str, root: &str) -> crate::neo4j::models::ProjectNode {
+        let mut project = crate::test_helpers::test_project_named(slug);
+        project.slug = slug.to_string();
+        project.root_path = root.to_string();
+        project
+    }
+
+    #[test]
+    fn test_symlinked_root_matches_the_real_path() {
+        // Regression: File.path and the CLI cwd are canonical, root_path is
+        // the symlink — "no project matched" for every tool call.
+        let (_tmp, link, real) = symlinked_project();
+        let entries = entries_for_projects(&[project_node("backend", &link)]);
+
+        let file = format!("{real}/src/main.rs");
+        let matched = find_match_any_form(&entries, &path_forms(&file, None));
+        assert_eq!(matched.map(|m| m.slug), Some("backend".to_string()));
+        // And the symlinked form still matches too.
+        let via_link = format!("{link}/src/main.rs");
+        assert!(find_match_any_form(&entries, &path_forms(&via_link, None)).is_some());
+    }
+
+    #[test]
+    fn test_relative_tool_path_is_resolved_against_cwd() {
+        let (_tmp, link, real) = symlinked_project();
+        let entries = entries_for_projects(&[project_node("backend", &link)]);
+        let forms = path_forms("src/main.rs", Some(&real));
+        assert_eq!(forms[0], format!("{real}/src/main.rs"));
+        assert!(find_match_any_form(&entries, &forms).is_some());
+    }
+
+    #[test]
+    fn test_infer_project_slug_from_cwd() {
+        // Sessions created in all-projects mode carry no project_slug; the
+        // cwd (the selected project's root) identifies the project.
+        let (_tmp, link, real) = symlinked_project();
+        let entries = entries_for_projects(&[project_node("backend", &link)]);
+        assert_eq!(
+            infer_project_slug(&entries, &real),
+            Some("backend".to_string())
+        );
+        assert_eq!(
+            infer_project_slug(&entries, &link),
+            Some("backend".to_string())
+        );
+        assert_eq!(infer_project_slug(&entries, "/somewhere/else"), None);
+    }
+
+    #[test]
+    fn test_infer_project_slug_refuses_ambiguous_roots() {
+        // Two projects registered on the same root (happens in prod: obrain
+        // and grafeo) — attaching the session to either would be a guess.
+        let entries = entries_for_projects(&[
+            project_node("obrain", "/Users/dev/lab/grafeo"),
+            project_node("grafeo", "/Users/dev/lab/grafeo"),
+            project_node("other", "/Users/dev/lab/other"),
+        ]);
+        assert_eq!(infer_project_slug(&entries, "/Users/dev/lab/grafeo"), None);
+        assert_eq!(
+            infer_project_slug(&entries, "/Users/dev/lab/other/src"),
+            Some("other".to_string())
         );
     }
 
