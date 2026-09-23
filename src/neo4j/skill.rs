@@ -1056,10 +1056,19 @@ impl Neo4jClient {
         min_weight: f64,
     ) -> Result<Vec<(String, String, f64)>> {
         let q = query(
+            // Skills are clustered from CURRENT knowledge only: archived,
+            // obsolete or superseded notes must not shape skills, nor the
+            // audit-trail notes skill evolution writes about itself — those
+            // clustered into "Auto Generated Skill Evolution" skills that were
+            // then orphaned, writing more trace notes (14,670 on m4).
             "MATCH (n1:Note)-[s:SYNAPSE]->(n2:Note)
              WHERE n1.project_id = $project_id
                AND n2.project_id = $project_id
                AND s.weight > $min_weight
+               AND n1.status IN ['active', 'needs_review'] AND n1.superseded_by IS NULL
+               AND n2.status IN ['active', 'needs_review'] AND n2.superseded_by IS NULL
+               AND NOT n1.created_by = 'skill-evolution'
+               AND NOT n2.created_by = 'skill-evolution'
              RETURN n1.id AS from_id, n2.id AS to_id, s.weight AS weight
              LIMIT 10000",
         )

@@ -754,6 +754,32 @@ async fn test_data_migrations_repair_an_upgraded_install() {
         assert_eq!(weight_in(o).await, Some(0.5), "other projects untouched");
     }
 
+    // Skill detection clusters current knowledge only: no archived note,
+    // no skill-evolution audit trail.
+    {
+        use project_orchestrator::neo4j::traits::GraphStore;
+        let store: &dyn GraphStore = &client;
+        let g = Uuid::new_v4();
+        let gs = g.to_string();
+        raw.run(
+            query(
+                "CREATE (a:Note {id: 'g-a-' + $g, project_id: $g, status: 'active', created_by: 'user'})
+                 CREATE (b:Note {id: 'g-b-' + $g, project_id: $g, status: 'active', created_by: 'user'})
+                 CREATE (arch:Note {id: 'g-arch-' + $g, project_id: $g, status: 'archived', created_by: 'user'})
+                 CREATE (tr:Note {id: 'g-trace-' + $g, project_id: $g, status: 'active', created_by: 'skill-evolution'})
+                 CREATE (a)-[:SYNAPSE {weight: 0.8}]->(b)
+                 CREATE (a)-[:SYNAPSE {weight: 0.8}]->(arch)
+                 CREATE (a)-[:SYNAPSE {weight: 0.8}]->(tr)",
+            )
+            .param("g", gs.clone()),
+        )
+        .await
+        .unwrap();
+        let edges = store.get_synapse_graph(g, 0.1).await.unwrap();
+        assert_eq!(edges.len(), 1, "{edges:?}");
+        assert_eq!(edges[0].1, format!("g-b-{gs}"));
+    }
+
     // Deep maintenance times are persisted per project (a restart must not
     // re-run a full pass over every project).
     {
