@@ -656,6 +656,10 @@ pub async fn run_maintenance_with_tracking(
 /// 4. Identify stuck tasks
 /// 5. Generate recommendations
 ///
+/// Days an unreferenced archived skill is kept before deep maintenance
+/// deletes it (see `GraphStore::purge_archived_empty_skills`).
+pub const ARCHIVED_SKILL_RETENTION_DAYS: i64 = 7;
+
 /// `note_manager`: forwarded to `run_full_maintenance` → `run_weekly_maintenance`'s
 /// self-heal — see its doc comment. Without it, deep_maintenance can decay
 /// synapses (step 2, 3x normal amount) without ever repairing them, so
@@ -685,6 +689,20 @@ pub async fn deep_maintenance(
                 None
             }
         };
+
+    // 2b. Delete skills evolution archived (orphans, duplicates) that nothing
+    // references anymore, once they have been archived for a week — archived
+    // skills otherwise pile up forever (tens of thousands in prod).
+    let archived_before =
+        chrono::Utc::now() - chrono::Duration::days(ARCHIVED_SKILL_RETENTION_DAYS);
+    match graph_store
+        .purge_archived_empty_skills(project_id, archived_before)
+        .await
+    {
+        Ok(0) => {}
+        Ok(n) => info!(project_id = %project_id, purged = n, "Purged unreferenced archived skills"),
+        Err(e) => warn!(error = %e, "Failed to purge archived skills"),
+    }
 
     // 3. Update staleness scores and flag stale notes
     let stale_notes_flagged = match graph_store.update_staleness_scores().await {

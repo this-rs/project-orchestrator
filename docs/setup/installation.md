@@ -548,6 +548,30 @@ orchestrator update
 
 This checks GitHub Releases for a newer version, downloads it, verifies the checksum, and replaces the binary atomically.
 
+### Automatic data repair after an update
+
+You don't have to run anything by hand. When the server starts, it runs any pending **data migrations** in the background. These repair data left behind by bugs fixed in earlier versions. Each migration:
+
+- runs in small batches, so the server keeps serving requests;
+- is safe to interrupt, and resumes on the next start;
+- runs once, then records a `(:DataMigration {id})` marker so later starts skip it.
+
+The background checks (the heartbeat) start once the migrations are done.
+
+| Migration | What it does |
+|-----------|--------------|
+| `2026-09-fold-legacy-alerts` | Old versions appended a new alert node on every check, so the same condition could have thousands of nodes. This merges them into one node per condition. The merged node keeps the oldest first-seen date, the newest last-seen date and message, and the highest severity. It stays acknowledged if any of the merged alerts was. |
+| `2026-09-archive-duplicate-skills` | Skill evolution used to recreate the same skill on every maintenance pass. For each project and skill name, this keeps the skill with the most members, plus any skill a persona, protocol or execution refers to. It archives the other copies and detaches their members. |
+| `2026-09-purge-empty-archived-skills` | Deletes archived skills that have no members and that nothing refers to. |
+
+To follow the migrations, search the server log for `Data migration`. To check what has already run:
+
+```cypher
+MATCH (m:DataMigration) RETURN m.id, m.completed_at, m.processed ORDER BY m.id
+```
+
+After that, deep maintenance handles the ongoing cleanup. It deletes an archived skill that nothing refers to once it has been archived for 7 days, and it maintains each project at most once a day.
+
 ---
 
 ## Uninstalling

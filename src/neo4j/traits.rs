@@ -2416,6 +2416,23 @@ pub trait GraphStore: Send + Sync {
     /// Get all skills belonging to a project (convenience for list without pagination).
     async fn get_skills_for_project(&self, project_id: Uuid) -> Result<Vec<SkillNode>>;
 
+    /// Delete a project's archived skills that nothing references anymore
+    /// (no member, persona, protocol, execution…) and that were archived
+    /// before `archived_before`. Returns how many were deleted.
+    async fn purge_archived_empty_skills(
+        &self,
+        _project_id: Uuid,
+        _archived_before: chrono::DateTime<chrono::Utc>,
+    ) -> Result<i64> {
+        Ok(0)
+    }
+
+    /// Run the pending one-time data migrations (see
+    /// `neo4j::data_migrations`). Backends without migrations do nothing.
+    async fn run_data_migrations(&self) -> Vec<crate::neo4j::data_migrations::MigrationOutcome> {
+        Vec::new()
+    }
+
     /// Every non-archived skill of a project, uncapped.
     ///
     /// Skill evolution MUST compare new clusters against this set: the

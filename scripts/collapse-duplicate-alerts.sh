@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # Collapse the append-only Alert backlog onto one node per condition.
 #
+# NOTE: the server now does this itself at startup — data migration
+# `2026-09-fold-legacy-alerts` (src/neo4j/data_migrations.rs) — so upgraded
+# installs need no manual step. This script remains for manual repairs and
+# for DRY_RUN inspection.
+#
 # Context: create_alert_node used CREATE, so every heartbeat tick appended a
 # node. Measured 2026-08-30: 1,445,290 Alert nodes = 40.5% of the whole graph;
 # git_drift alone held 1,355,752 nodes for 1,591 distinct messages (852x), one

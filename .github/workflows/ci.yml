@@ -212,7 +212,7 @@ jobs:
           NEO4J_PASSWORD: testpassword
           MEILISEARCH_URL: http://localhost:7700
           MEILISEARCH_KEY: test-master-key
-        run: cargo test --test integration_tests
+        run: cargo test --test integration_tests --test data_migrations
 
   # ==========================================================================
   # API Tests - Downloads pre-built binary, requires Neo4j and Meilisearch

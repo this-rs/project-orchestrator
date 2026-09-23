@@ -3292,6 +3292,19 @@ impl GraphStore for Neo4jClient {
         self.get_skills_for_project(project_id).await
     }
 
+    async fn purge_archived_empty_skills(
+        &self,
+        project_id: uuid::Uuid,
+        archived_before: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<i64> {
+        self.purge_archived_empty_skills(project_id, archived_before)
+            .await
+    }
+
+    async fn run_data_migrations(&self) -> Vec<crate::neo4j::data_migrations::MigrationOutcome> {
+        self.run_data_migrations().await
+    }
+
     async fn get_live_skills_for_project(
         &self,
         project_id: uuid::Uuid,

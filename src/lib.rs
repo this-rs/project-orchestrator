@@ -1617,11 +1617,28 @@ pub async fn start_server(mut config: Config) -> Result<()> {
             Box::new(SynapseReplenishCheck),
         ];
 
-        let engine = HeartbeatEngine::new(graph, search, emitter, checks);
-        let handle = engine.start_owned();
-        // Keep handle alive for the lifetime of the process
-        std::mem::forget(handle);
-        tracing::info!("HeartbeatEngine started (7 checks)");
+        let engine = HeartbeatEngine::new(graph.clone(), search, emitter, checks);
+        // One-time data migrations (legacy alert backlog, duplicate and empty
+        // skills — see neo4j::data_migrations) run in the background so an
+        // upgraded install repairs its data without blocking startup. The
+        // heartbeat only starts once they are done: deep maintenance evolves
+        // the same skills the migrations archive and purge.
+        tokio::spawn(async move {
+            let outcomes = graph.run_data_migrations().await;
+            for o in outcomes.iter().filter(|o| !o.skipped) {
+                tracing::info!(
+                    id = %o.id,
+                    processed = o.processed,
+                    completed = o.completed,
+                    error = ?o.error,
+                    "Data migration result"
+                );
+            }
+            let handle = engine.start_owned();
+            // Keep handle alive for the lifetime of the process
+            std::mem::forget(handle);
+            tracing::info!("HeartbeatEngine started (8 checks)");
+        });
     }
 
     // Pre-build OIDC client once (avoids fetching discovery document on every request)
