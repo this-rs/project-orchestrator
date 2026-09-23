@@ -12,58 +12,71 @@ impl Neo4jClient {
     // Alert operations
     // ========================================================================
 
-    /// Create a new alert node, optionally linked to a project.
+    /// Upsert an alert, collapsing repeat observations of the same condition.
+    ///
+    /// Keyed on `dedup_key`, NOT on a fresh uuid. A condition seen again
+    /// increments `occurrence_count`, refreshes `last_seen` and `message`
+    /// (latest wording wins) and recomputes `priority`. `acknowledged` is
+    /// deliberately preserved on re-observation so acknowledging a known,
+    /// ongoing condition stays acknowledged instead of resurfacing every tick.
+    ///
+    /// This replaces an append-only `CREATE`, which had produced 1,355,752
+    /// `git_drift` nodes for 1,591 distinct messages — 40% of all nodes in the
+    /// graph — because the commit count was embedded in the message.
     pub async fn create_alert_node(&self, alert: &AlertNode) -> Result<()> {
-        let q = if alert.project_id.is_some() {
-            query(
-                r#"
-                CREATE (a:Alert {
-                    id: $id,
-                    alert_type: $alert_type,
-                    severity: $severity,
-                    message: $message,
-                    project_id: $project_id,
-                    acknowledged: false,
-                    created_at: $created_at
-                })
-                WITH a
-                OPTIONAL MATCH (p:Project {id: $project_id})
-                FOREACH (_ IN CASE WHEN p IS NOT NULL THEN [1] ELSE [] END |
-                    CREATE (p)-[:HAS_ALERT]->(a)
-                )
-                "#,
-            )
-            .param("id", alert.id.to_string())
-            .param("alert_type", alert.alert_type.clone())
-            .param("severity", alert.severity.to_string())
-            .param("message", alert.message.clone())
-            .param(
-                "project_id",
-                alert
-                    .project_id
-                    .map(|id| id.to_string())
-                    .unwrap_or_default(),
-            )
-            .param("created_at", alert.created_at.to_rfc3339())
+        let now = Utc::now();
+        let dedup_key = if alert.dedup_key.is_empty() {
+            AlertNode::make_dedup_key(&alert.alert_type, alert.project_id, &alert.message)
         } else {
-            query(
-                r#"
-                CREATE (a:Alert {
-                    id: $id,
-                    alert_type: $alert_type,
-                    severity: $severity,
-                    message: $message,
-                    acknowledged: false,
-                    created_at: $created_at
-                })
-                "#,
-            )
-            .param("id", alert.id.to_string())
-            .param("alert_type", alert.alert_type.clone())
-            .param("severity", alert.severity.to_string())
-            .param("message", alert.message.clone())
-            .param("created_at", alert.created_at.to_rfc3339())
+            alert.dedup_key.clone()
         };
+
+        let q = query(
+            r#"
+            MERGE (a:Alert {dedup_key: $dedup_key})
+            ON CREATE SET
+                a.id = $id,
+                a.alert_type = $alert_type,
+                a.severity = $severity,
+                a.message = $message,
+                a.project_id = $project_id,
+                a.acknowledged = false,
+                a.created_at = $now,
+                a.first_seen = $now,
+                a.occurrence_count = 0
+            SET a.severity   = $severity,
+                a.message    = $message,
+                a.last_seen  = $now,
+                a.occurrence_count = coalesce(a.occurrence_count, 0) + 1
+            WITH a
+            SET a.priority = CASE
+                    WHEN coalesce(a.acknowledged, false) THEN 0.0
+                    ELSE $sev_weight * (1.0 + (
+                        CASE WHEN log(toFloat(a.occurrence_count)) / 10.0 > 0.5
+                             THEN 0.5
+                             ELSE log(toFloat(a.occurrence_count)) / 10.0 END))
+                END
+            WITH a
+            OPTIONAL MATCH (p:Project {id: $project_id})
+            FOREACH (_ IN CASE WHEN p IS NOT NULL THEN [1] ELSE [] END |
+                MERGE (p)-[:HAS_ALERT]->(a)
+            )
+            "#,
+        )
+        .param("dedup_key", dedup_key)
+        .param("id", alert.id.to_string())
+        .param("alert_type", alert.alert_type.clone())
+        .param("severity", alert.severity.to_string())
+        .param("message", alert.message.clone())
+        .param(
+            "project_id",
+            alert
+                .project_id
+                .map(|id| id.to_string())
+                .unwrap_or_default(),
+        )
+        .param("now", now.to_rfc3339())
+        .param("sev_weight", alert.severity.weight());
 
         self.graph.run(q).await?;
         Ok(())
@@ -80,7 +93,7 @@ impl Neo4jClient {
             MATCH (a:Alert)
             WHERE a.acknowledged = false AND a.project_id = $project_id
             RETURN a
-            ORDER BY a.created_at DESC
+            ORDER BY coalesce(a.priority, 0.0) DESC, coalesce(a.last_seen, a.created_at) DESC
             LIMIT $limit
             "#
         } else {
@@ -88,7 +101,7 @@ impl Neo4jClient {
             MATCH (a:Alert)
             WHERE a.acknowledged = false
             RETURN a
-            ORDER BY a.created_at DESC
+            ORDER BY coalesce(a.priority, 0.0) DESC, coalesce(a.last_seen, a.created_at) DESC
             LIMIT $limit
             "#
         };
@@ -183,14 +196,14 @@ impl Neo4jClient {
             MATCH (a:Alert)
             WHERE a.project_id = $project_id
             RETURN a
-            ORDER BY a.created_at DESC
+            ORDER BY coalesce(a.priority, 0.0) DESC, coalesce(a.last_seen, a.created_at) DESC
             SKIP $offset LIMIT $limit
             "#
         } else {
             r#"
             MATCH (a:Alert)
             RETURN a
-            ORDER BY a.created_at DESC
+            ORDER BY coalesce(a.priority, 0.0) DESC, coalesce(a.last_seen, a.created_at) DESC
             SKIP $offset LIMIT $limit
             "#
         };
@@ -250,6 +263,27 @@ impl Neo4jClient {
             .map(|dt| dt.with_timezone(&chrono::Utc))
             .unwrap_or_else(chrono::Utc::now);
 
+        let parse_ts = |k: &str| -> Option<chrono::DateTime<chrono::Utc>> {
+            node.get::<String>(k)
+                .ok()
+                .filter(|s| !s.is_empty())
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+        };
+        let first_seen = parse_ts("first_seen").or(Some(created_at));
+        let last_seen = parse_ts("last_seen").or(Some(created_at));
+        let occurrence_count = node.get::<i64>("occurrence_count").unwrap_or(1).max(1) as u64;
+        let dedup_key = node.get::<String>("dedup_key").unwrap_or_default();
+        let priority = node.get::<f64>("priority").unwrap_or_else(|_| {
+            AlertNode::compute_priority(
+                severity,
+                occurrence_count,
+                last_seen.unwrap_or(created_at),
+                acknowledged,
+                chrono::Utc::now(),
+            )
+        });
+
         Ok(AlertNode {
             id: node.get::<String>("id")?.parse()?,
             alert_type: node.get("alert_type")?,
@@ -260,6 +294,11 @@ impl Neo4jClient {
             acknowledged_by,
             acknowledged_at,
             created_at,
+            dedup_key,
+            occurrence_count,
+            first_seen,
+            last_seen,
+            priority,
         })
     }
 }

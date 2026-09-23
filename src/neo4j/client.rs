@@ -429,6 +429,13 @@ impl Neo4jClient {
             "CREATE INDEX protocol_category IF NOT EXISTS FOR (p:Protocol) ON (p.protocol_category)",
             "CREATE INDEX protocol_state_protocol IF NOT EXISTS FOR (ps:ProtocolState) ON (ps.protocol_id)",
             "CREATE INDEX protocol_transition_protocol IF NOT EXISTS FOR (pt:ProtocolTransition) ON (pt.protocol_id)",
+            // Alert deduplication: dedup_key is the identity of a *condition*.
+            // The unique constraint is what makes the MERGE in create_alert_node
+            // collapse repeat observations instead of appending a node per tick.
+            "CREATE CONSTRAINT alert_dedup_key IF NOT EXISTS FOR (a:Alert) REQUIRE a.dedup_key IS UNIQUE",
+            "CREATE INDEX alert_priority IF NOT EXISTS FOR (a:Alert) ON (a.priority)",
+            "CREATE INDEX alert_type_idx IF NOT EXISTS FOR (a:Alert) ON (a.alert_type)",
+            "CREATE INDEX alert_project IF NOT EXISTS FOR (a:Alert) ON (a.project_id)",
         ];
 
         // Vector indexes (require Neo4j 5.13+ — gracefully skip if not supported)

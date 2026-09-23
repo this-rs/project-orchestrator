@@ -244,17 +244,15 @@ async fn execute_emit_alert(
         _ => AlertSeverity::Info,
     };
 
-    let alert = AlertNode {
-        id: uuid::Uuid::new_v4(),
-        alert_type: "lifecycle_hook".to_string(),
+    // Subject is the hook, not the rendered message: a hook that keeps firing
+    // is one condition observed N times, not N conditions.
+    let alert = AlertNode::new_for_subject(
+        "lifecycle_hook".to_string(),
         severity,
         message,
-        project_id: hook.project_id,
-        acknowledged: false,
-        acknowledged_by: None,
-        acknowledged_at: None,
-        created_at: chrono::Utc::now(),
-    };
+        hook.project_id,
+        &hook.name,
+    );
 
     state.orchestrator.neo4j().create_alert(&alert).await?;
 

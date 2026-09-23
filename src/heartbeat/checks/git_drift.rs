@@ -64,7 +64,12 @@ impl HeartbeatCheck for GitDriftCheck {
                         );
 
                         // Create alert
-                        let alert = crate::neo4j::models::AlertNode::new(
+                        // Subject is the *condition* ("this project has drifted"),
+                        // deliberately excluding commit_count: the count changes on
+                        // every commit, and embedding it in the identity is what
+                        // produced 1.36M near-duplicate nodes. The live count still
+                        // rides in the message, which the upsert refreshes.
+                        let alert = crate::neo4j::models::AlertNode::new_for_subject(
                             "git_drift".to_string(),
                             crate::neo4j::models::AlertSeverity::Warning,
                             format!(
@@ -72,6 +77,7 @@ impl HeartbeatCheck for GitDriftCheck {
                                 project.name, commit_count
                             ),
                             Some(project.id),
+                            "behind-origin",
                         );
 
                         if let Err(e) = ctx.graph.create_alert(&alert).await {
