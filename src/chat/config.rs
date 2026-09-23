@@ -192,7 +192,7 @@ impl ChatConfig {
         Self {
             mcp_server_path,
             default_model: std::env::var("CHAT_DEFAULT_MODEL")
-                .unwrap_or_else(|_| "claude-sonnet-4-6".into()),
+                .unwrap_or_else(|_| "claude-sonnet-5".into()),
             max_sessions: std::env::var("CHAT_MAX_SESSIONS")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -373,7 +373,8 @@ mod tests {
         std::env::remove_var("CHAT_AUTO_UPDATE_CLI");
 
         let config = ChatConfig::from_env();
-        assert_eq!(config.default_model, "claude-sonnet-4-6");
+        // Tracks the `default_model` literal in `from_env`; bump both together.
+        assert_eq!(config.default_model, "claude-sonnet-5");
         assert_eq!(config.max_sessions, 10);
         assert_eq!(config.session_timeout.as_secs(), 1800);
         // Permission defaults — MCP tools are pre-approved out of the box

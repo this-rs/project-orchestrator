@@ -19,9 +19,18 @@
 //!   minutes) — a new model appearing a few hours late is fine.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
+
+use crate::events::{EntityType, EventEmitter};
+use crate::neo4j::models::{AlertNode, AlertSeverity};
+use crate::neo4j::GraphStore;
+
+/// `alert_type` under which a newly released model is recorded. Doubles as
+/// the durable "already announced" marker — see `announce_new_models`.
+pub const MODEL_ADDED_ALERT: &str = "model_added";
 
 /// How long a cached catalog is considered fresh before a background refresh
 /// is triggered.
@@ -38,161 +47,215 @@ const ANTHROPIC_VERSION: &str = "2023-06-01";
 const MAX_PAGES: u8 = 5;
 
 /// A single model entry, shaped for direct consumption by the frontend's
-/// model selector (mirrors `ModelDefinition` in `frontend/src/constants/models.ts`).
+/// model selector.
+///
+/// Deliberately carries **semantic** tokens (`family`, `version`, `tier`)
+/// rather than presentation values. An earlier revision shipped a raw
+/// Tailwind class (`dot_color`) over the wire; that only ever worked because
+/// the frontend happened to hardcode the same strings in a scanned source
+/// file. Tailwind v4 runs with no config and no safelist here, so a class
+/// that exists *only* in this Rust file is purged from the production bundle
+/// — silently, with no build error and no failing test. Colors are now the
+/// frontend's business; this module never names one.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelDefinition {
     /// Official Anthropic API model ID (e.g. "claude-sonnet-4-6")
     pub id: String,
+    /// Model family, lowercase: "opus" | "sonnet" | "haiku" | "fable" | "other"
+    pub family: String,
+    /// Version as displayed, e.g. "5.5", "4.6". Empty when undeterminable.
+    pub version: String,
+    /// "current" (in the active lineup) | "legacy" (still served, superseded)
+    pub tier: String,
     /// Short display label for compact UI (e.g. "Sonnet 4.6")
     pub short_label: String,
     /// Full marketing name (e.g. "Claude Sonnet 4.6")
     pub full_label: String,
-    /// Tailwind dot color class (e.g. "bg-blue-400")
-    pub dot_color: String,
     /// One-line description for selection cards
     pub description: String,
 }
 
-/// Manual curation for known model families, in the preferred display order.
-/// `(id, short_label, dot_color, description)`. `full_label` is always
-/// derived as `"Claude {short_label}"` — every known model follows that
-/// pattern, so it isn't worth a fifth tuple field.
+pub const TIER_CURRENT: &str = "current";
+pub const TIER_LEGACY: &str = "legacy";
+
+/// Known families, longest-match-first is irrelevant here (no overlap).
+const KNOWN_FAMILIES: &[&str] = &["opus", "sonnet", "haiku", "fable", "mythos"];
+
+/// Manual curation, in preferred display order.
+/// `(id, family, version, tier, description)`.
 ///
-/// Models not listed here (including brand-new ones the live API returns)
-/// still show up — see `derive_fallback` — just without a curated color,
-/// abbreviation, or description until someone adds an entry here.
-const CURATED_ORDER: &[(&str, &str, &str, &str)] = &[
+/// `short_label` is derived as `"{Family} {version}"` and `full_label` as
+/// `"Claude {short_label}"` — every model follows that pattern, so neither
+/// is worth a tuple field. Adding a model is one line, and it carries no
+/// presentation decision.
+///
+/// Models absent from this table (including brand-new ones the live API
+/// returns) still show up — see `resolve_model` — with a derived label and
+/// no description, until someone curates them.
+const CURATED_ORDER: &[(&str, &str, &str, &str, &str)] = &[
     (
-        "claude-opus-5",
-        "Opus 5",
-        "bg-violet-500",
-        "Latest flagship — most advanced reasoning & agentic work",
+        "claude-opus-5-5",
+        "opus",
+        "5.5",
+        TIER_CURRENT,
+        "Recommended default — long-running agentic coding & knowledge work",
     ),
     (
-        "claude-sonnet-5",
-        "Sonnet 5",
-        "bg-rose-500",
+        "claude-fable-5-1",
+        "fable",
+        "5.1",
+        TIER_CURRENT,
         "Most capable — demanding reasoning & long-horizon agentic work",
     ),
     (
-        "claude-fable-5",
-        "Fable 5",
-        "bg-rose-400",
-        "Previous generation — superseded by Sonnet 5",
-    ),
-    (
-        "claude-opus-4-8",
-        "Opus 4.8",
-        "bg-violet-500",
-        "Most intelligent — complex reasoning",
-    ),
-    (
-        "claude-opus-4-7",
-        "Opus 4.7",
-        "bg-violet-400",
-        "Previous Opus — complex reasoning",
-    ),
-    (
-        "claude-opus-4-6",
-        "Opus 4.6",
-        "bg-violet-300",
-        "Older Opus — complex reasoning",
-    ),
-    (
-        "claude-sonnet-4-6",
-        "Sonnet 4.6",
-        "bg-blue-400",
-        "Fast & capable — best for most tasks",
+        "claude-sonnet-5",
+        "sonnet",
+        "5",
+        TIER_CURRENT,
+        "Best balance of speed and intelligence",
     ),
     (
         "claude-haiku-4-5",
-        "Haiku 4.5",
-        "bg-emerald-400",
-        "Fastest — lightweight tasks",
+        "haiku",
+        "4.5",
+        TIER_CURRENT,
+        "Fastest — near-frontier intelligence",
+    ),
+    (
+        "claude-opus-5",
+        "opus",
+        "5",
+        TIER_LEGACY,
+        "Legacy — superseded by Opus 5.5",
+    ),
+    (
+        "claude-fable-5",
+        "fable",
+        "5",
+        TIER_LEGACY,
+        "Legacy — superseded by Fable 5.1",
+    ),
+    (
+        "claude-opus-4-8",
+        "opus",
+        "4.8",
+        TIER_LEGACY,
+        "Legacy Opus — complex reasoning",
+    ),
+    (
+        "claude-opus-4-7",
+        "opus",
+        "4.7",
+        TIER_LEGACY,
+        "Legacy Opus — complex reasoning",
+    ),
+    (
+        "claude-opus-4-6",
+        "opus",
+        "4.6",
+        TIER_LEGACY,
+        "Legacy Opus — complex reasoning",
+    ),
+    (
+        "claude-sonnet-4-6",
+        "sonnet",
+        "4.6",
+        TIER_LEGACY,
+        "Legacy Sonnet — fast & capable",
     ),
 ];
 
+/// Capitalize a family slug for display: "opus" -> "Opus".
+fn family_label(family: &str) -> String {
+    let mut chars = family.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
+/// `("opus", "5.5")` -> `"Opus 5.5"`. Falls back to the family alone when
+/// no version could be determined.
+fn compose_short_label(family: &str, version: &str) -> String {
+    let fam = family_label(family);
+    if version.is_empty() {
+        fam
+    } else {
+        format!("{fam} {version}")
+    }
+}
+
+fn build_definition(
+    id: &str,
+    family: &str,
+    version: &str,
+    tier: &str,
+    description: &str,
+    full_label_override: Option<&str>,
+) -> ModelDefinition {
+    let short_label = compose_short_label(family, version);
+    ModelDefinition {
+        id: id.to_string(),
+        family: family.to_string(),
+        version: version.to_string(),
+        tier: tier.to_string(),
+        full_label: full_label_override
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("Claude {short_label}")),
+        short_label,
+        description: description.to_string(),
+    }
+}
+
 fn curated_lookup(id: &str) -> Option<ModelDefinition> {
     CURATED_ORDER.iter().find(|(cid, ..)| *cid == id).map(
-        |(id, short_label, dot_color, description)| ModelDefinition {
-            id: id.to_string(),
-            short_label: short_label.to_string(),
-            full_label: format!("Claude {short_label}"),
-            dot_color: dot_color.to_string(),
-            description: description.to_string(),
+        |(id, family, version, tier, description)| {
+            build_definition(id, family, version, tier, description, None)
         },
     )
 }
 
-/// Derive a readable short label from an unknown model ID.
+/// Split an unknown model ID into `(family, version)`.
 ///
-/// `"claude-foo-bar-7"` → `"Foo Bar 7"`; trailing numeric segments are
-/// grouped with dots (`"claude-sonnet-4-5"` → `"Sonnet 4.5"`). Mirrors the
-/// frontend's `getModelShortLabel` fallback so an unrecognized ID from the
-/// live API never renders as a raw slug.
-fn derive_short_label(id: &str) -> String {
+/// `"claude-opus-4-9"` -> `("opus", "4.9")`; `"claude-foo-bar-7"` ->
+/// `("other", "7")`. Trailing numeric segments are joined with dots.
+fn derive_family_version(id: &str) -> (String, String) {
     let without_prefix = id.strip_prefix("claude-").unwrap_or(id);
     let parts: Vec<&str> = without_prefix.split('-').collect();
 
-    let mut text_parts: Vec<String> = Vec::new();
     let mut num_parts: Vec<&str> = Vec::new();
-
-    for part in parts {
+    for part in parts.iter().rev() {
         if !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()) {
             num_parts.push(part);
         } else {
-            if !num_parts.is_empty() {
-                text_parts.push(num_parts.join("."));
-                num_parts.clear();
-            }
-            let mut chars = part.chars();
-            let capitalized = match chars.next() {
-                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-                None => String::new(),
-            };
-            text_parts.push(capitalized);
+            break;
         }
     }
-    if !num_parts.is_empty() {
-        text_parts.push(num_parts.join("."));
-    }
+    num_parts.reverse();
+    let version = num_parts.join(".");
 
-    if text_parts.is_empty() {
-        id.to_string()
-    } else {
-        text_parts.join(" ")
-    }
-}
+    let family = KNOWN_FAMILIES
+        .iter()
+        .find(|f| parts.iter().any(|p| p.eq_ignore_ascii_case(f)))
+        .map(|f| f.to_string())
+        .unwrap_or_else(|| "other".to_string());
 
-/// Family-based color fallback for an unrecognized model ID (mirrors the
-/// frontend's `getModelDotColor` fallback).
-fn derive_dot_color(id: &str) -> String {
-    if id.contains("opus") {
-        "bg-violet-400".to_string()
-    } else if id.contains("haiku") {
-        "bg-emerald-400".to_string()
-    } else {
-        "bg-blue-400".to_string() // sonnet / default
-    }
+    (family, version)
 }
 
 /// Build a full `ModelDefinition` for a model ID the live API returned,
 /// preferring curated data and falling back to derived heuristics.
+///
+/// An uncurated model is assumed `current`: the live Models API only lists
+/// models that are actually available, and anything we have not curated yet
+/// is far more likely to be newly released than retired.
 fn resolve_model(id: &str, api_display_name: Option<&str>) -> ModelDefinition {
     if let Some(curated) = curated_lookup(id) {
         return curated;
     }
-    let short_label = derive_short_label(id);
-    ModelDefinition {
-        id: id.to_string(),
-        full_label: api_display_name
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| format!("Claude {short_label}")),
-        dot_color: derive_dot_color(id),
-        short_label,
-        description: String::new(),
-    }
+    let (family, version) = derive_family_version(id);
+    build_definition(id, &family, &version, TIER_CURRENT, "", api_display_name)
 }
 
 /// The static list used when no API key is configured, or the live fetch
@@ -225,11 +288,19 @@ struct CacheState {
     refreshing: bool,
 }
 
+/// Handles needed to announce a newly released model. Optional so the cache
+/// stays constructible in tests and in any context without a graph.
+struct Notifier {
+    emitter: Arc<dyn EventEmitter>,
+    graph: Arc<dyn GraphStore>,
+}
+
 /// Shared, lazily-refreshed cache of the Claude model catalog.
 pub struct ModelCatalogCache {
     inner: RwLock<CacheState>,
     http: reqwest::Client,
     api_key: Option<String>,
+    notifier: Option<Notifier>,
 }
 
 impl ModelCatalogCache {
@@ -250,7 +321,21 @@ impl ModelCatalogCache {
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
             api_key,
+            notifier: None,
         })
+    }
+
+    /// Same as `new`, plus the handles required to announce a model that
+    /// appears in the live catalog for the first time.
+    pub fn new_with_notifier(
+        api_key: Option<String>,
+        emitter: Arc<dyn EventEmitter>,
+        graph: Arc<dyn GraphStore>,
+    ) -> Arc<Self> {
+        let mut cache = Arc::try_unwrap(Self::new(api_key))
+            .unwrap_or_else(|_| unreachable!("freshly created Arc is unique"));
+        cache.notifier = Some(Notifier { emitter, graph });
+        Arc::new(cache)
     }
 
     /// Return the current catalog, triggering a background refresh if the
@@ -285,6 +370,9 @@ impl ModelCatalogCache {
     async fn refresh(self: &Arc<Self>) {
         let result = self.fetch_live_catalog().await;
 
+        // Announcing touches Neo4j, so it happens after the write lock is
+        // released — holding it across that I/O would stall every reader.
+        let mut announce: Option<Vec<ModelDefinition>> = None;
         let mut state = self.inner.write().await;
         match result {
             Ok(models) if !models.is_empty() => {
@@ -292,6 +380,7 @@ impl ModelCatalogCache {
                     count = models.len(),
                     "Refreshed Claude model catalog from Anthropic Models API"
                 );
+                announce = Some(models.clone());
                 state.models = models;
                 state.fetched_at = Instant::now();
             }
@@ -311,6 +400,111 @@ impl ModelCatalogCache {
             }
         }
         state.refreshing = false;
+        drop(state);
+
+        if let Some(models) = announce {
+            self.announce_new_models(&models).await;
+        }
+    }
+
+    /// Record and broadcast models seen in the live catalog for the first time.
+    ///
+    /// The durable "already announced" marker is an `Alert` node keyed by
+    /// `dedup_key`, one per model, for the life of the graph. That is what
+    /// makes this restart-safe: the in-memory cache is seeded from the static
+    /// fallback on every boot, so diffing against it would re-announce every
+    /// uncurated model each time the process restarts.
+    ///
+    /// The very first run establishes a baseline silently — with nothing
+    /// recorded yet, every model would otherwise look new and the user would
+    /// be buried in toasts for models that have existed for months.
+    async fn announce_new_models(self: &Arc<Self>, models: &[ModelDefinition]) {
+        let Some(notifier) = self.notifier.as_ref() else {
+            return;
+        };
+
+        let known = match Self::known_model_keys(&notifier.graph).await {
+            Ok(k) => k,
+            Err(e) => {
+                tracing::warn!(error = %e, "Could not read announced-model markers; skipping announcements");
+                return;
+            }
+        };
+        let baseline = known.is_empty();
+
+        for model in models {
+            let key = AlertNode::make_dedup_key(MODEL_ADDED_ALERT, None, &model.id);
+            if known.contains(&key) {
+                continue;
+            }
+
+            let alert = AlertNode::new_for_subject(
+                MODEL_ADDED_ALERT.to_string(),
+                AlertSeverity::Info,
+                format!("{} is now available", model.full_label),
+                None,
+                &model.id,
+            );
+
+            if let Err(e) = notifier.graph.create_alert(&alert).await {
+                tracing::warn!(model = %model.id, error = %e, "Failed to record new-model alert");
+                continue;
+            }
+
+            if baseline {
+                continue;
+            }
+
+            tracing::info!(model = %model.id, "New Claude model available");
+            // `project_id: None` is what makes this app-wide: the WS filter
+            // lets project-less events through whatever project a client
+            // subscribed to.
+            notifier.emitter.emit_created(
+                EntityType::Alert,
+                &alert.id.to_string(),
+                serde_json::json!({
+                    "alert_type": MODEL_ADDED_ALERT,
+                    "model_id": model.id,
+                    "full_label": model.full_label,
+                    "family": model.family,
+                    "version": model.version,
+                }),
+                None,
+            );
+        }
+
+        if baseline {
+            tracing::info!(
+                count = models.len(),
+                "Recorded model-catalog baseline; future additions will be announced"
+            );
+        }
+    }
+
+    /// Every `dedup_key` already recorded for an announced model.
+    ///
+    /// Paged rather than fetched in one shot: the alert store is shared with
+    /// the heartbeat checks, so its size is not ours to assume. Capped so a
+    /// pathological store cannot turn a background refresh into a long scan.
+    async fn known_model_keys(graph: &Arc<dyn GraphStore>) -> anyhow::Result<HashSet<String>> {
+        const PAGE: usize = 500;
+        const MAX_PAGES: usize = 20;
+
+        let mut keys = HashSet::new();
+        for page in 0..MAX_PAGES {
+            let (alerts, _total) = graph.list_alerts(None, PAGE, page * PAGE).await?;
+            let fetched = alerts.len();
+            keys.extend(
+                alerts
+                    .into_iter()
+                    .filter(|a| a.alert_type == MODEL_ADDED_ALERT)
+                    .map(|a| a.dedup_key),
+            );
+            if fetched < PAGE {
+                break;
+            }
+        }
+        Ok(keys)
     }
 
     async fn fetch_live_catalog(&self) -> anyhow::Result<Vec<ModelDefinition>> {
@@ -384,22 +578,77 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_derive_short_label_known_pattern() {
-        assert_eq!(derive_short_label("claude-sonnet-4-5"), "Sonnet 4.5");
-        assert_eq!(derive_short_label("claude-opus-4-8"), "Opus 4.8");
-        assert_eq!(derive_short_label("claude-haiku-4-5"), "Haiku 4.5");
+    fn test_derive_family_version_known_families() {
+        assert_eq!(
+            derive_family_version("claude-opus-4-9"),
+            ("opus".into(), "4.9".into())
+        );
+        assert_eq!(
+            derive_family_version("claude-haiku-5"),
+            ("haiku".into(), "5".into())
+        );
+        assert_eq!(
+            derive_family_version("claude-fable-5-1"),
+            ("fable".into(), "5.1".into())
+        );
     }
 
     #[test]
-    fn test_derive_short_label_unknown_family() {
-        assert_eq!(derive_short_label("claude-foo-bar-7"), "Foo Bar 7");
+    fn test_derive_family_version_unknown_family() {
+        assert_eq!(
+            derive_family_version("claude-foo-bar-7"),
+            ("other".into(), "7".into())
+        );
     }
 
     #[test]
-    fn test_derive_dot_color_families() {
-        assert_eq!(derive_dot_color("claude-opus-4-9"), "bg-violet-400");
-        assert_eq!(derive_dot_color("claude-haiku-5"), "bg-emerald-400");
-        assert_eq!(derive_dot_color("claude-sonnet-5"), "bg-blue-400");
+    fn test_derive_family_version_no_trailing_digits() {
+        // No version segment at all — must not panic, and must not swallow
+        // an interior number as if it were the version.
+        assert_eq!(
+            derive_family_version("claude-opus-next"),
+            ("opus".into(), "".into())
+        );
+    }
+
+    #[test]
+    fn test_compose_short_label() {
+        assert_eq!(compose_short_label("opus", "5.5"), "Opus 5.5");
+        assert_eq!(compose_short_label("sonnet", "4.6"), "Sonnet 4.6");
+        // Versionless model degrades to the family alone rather than
+        // rendering a trailing space.
+        assert_eq!(compose_short_label("opus", ""), "Opus");
+    }
+
+    #[test]
+    fn test_definitions_carry_no_presentation_values() {
+        // Guards the Tailwind purge trap: a color class shipped from here
+        // would be absent from every file Tailwind scans, and would be
+        // stripped from the production bundle with no error anywhere.
+        let json = serde_json::to_string(&static_fallback_models()).unwrap();
+        assert!(
+            !json.contains("bg-"),
+            "presentation class leaked into the API payload"
+        );
+    }
+
+    #[test]
+    fn test_every_curated_entry_is_self_consistent() {
+        for (id, family, version, tier, _) in CURATED_ORDER {
+            assert!(
+                KNOWN_FAMILIES.contains(family),
+                "{id}: unknown family {family}"
+            );
+            assert!(
+                *tier == TIER_CURRENT || *tier == TIER_LEGACY,
+                "{id}: bad tier {tier}"
+            );
+            // The curated family/version must agree with what the ID itself
+            // says, so a typo in the table cannot silently mislabel a model.
+            let (derived_family, derived_version) = derive_family_version(id);
+            assert_eq!(derived_family, *family, "{id}: family disagrees with ID");
+            assert_eq!(derived_version, *version, "{id}: version disagrees with ID");
+        }
     }
 
     #[test]
@@ -417,9 +666,9 @@ mod tests {
     fn test_static_fallback_models_nonempty_and_ordered() {
         let models = static_fallback_models();
         assert!(!models.is_empty());
-        assert_eq!(models[0].id, "claude-opus-5");
-        assert_eq!(models[1].id, "claude-sonnet-5");
-        assert_eq!(models[2].id, "claude-fable-5");
+        assert_eq!(models[0].id, "claude-opus-5-5");
+        assert_eq!(models[1].id, "claude-fable-5-1");
+        assert_eq!(models[2].id, "claude-sonnet-5");
     }
 
     #[test]
@@ -433,9 +682,152 @@ mod tests {
     fn test_resolve_model_falls_back_for_unknown_id() {
         let m = resolve_model("claude-new-hotness-9", Some("Claude New Hotness 9"));
         assert_eq!(m.full_label, "Claude New Hotness 9");
-        assert_eq!(m.short_label, "New Hotness 9");
-        assert_eq!(m.dot_color, "bg-blue-400");
+        assert_eq!(m.family, "other");
+        assert_eq!(m.version, "9");
+        assert_eq!(m.tier, TIER_CURRENT);
         assert_eq!(m.description, "");
+    }
+
+    /// Records every CrudEvent it is handed, so a test can assert on what
+    /// actually reached the bus.
+    #[derive(Default)]
+    struct RecordingEmitter {
+        events: std::sync::Mutex<Vec<crate::events::CrudEvent>>,
+    }
+
+    impl crate::events::EventEmitter for RecordingEmitter {
+        fn emit(&self, event: crate::events::CrudEvent) {
+            self.events.lock().unwrap().push(event);
+        }
+    }
+
+    impl RecordingEmitter {
+        fn model_ids(&self) -> Vec<String> {
+            self.events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|e| {
+                    e.payload.get("alert_type").and_then(|v| v.as_str()) == Some(MODEL_ADDED_ALERT)
+                })
+                .filter_map(|e| {
+                    e.payload
+                        .get("model_id")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                })
+                .collect()
+        }
+    }
+
+    fn model(id: &str) -> ModelDefinition {
+        resolve_model(id, None)
+    }
+
+    async fn cache_with(
+        graph: Arc<dyn GraphStore>,
+        emitter: Arc<RecordingEmitter>,
+    ) -> Arc<ModelCatalogCache> {
+        ModelCatalogCache::new_with_notifier(None, emitter, graph)
+    }
+
+    #[tokio::test]
+    async fn test_first_run_records_baseline_without_announcing() {
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let emitter = Arc::new(RecordingEmitter::default());
+        let cache = cache_with(graph.clone(), emitter.clone()).await;
+
+        cache
+            .announce_new_models(&[model("claude-opus-5-5"), model("claude-sonnet-5")])
+            .await;
+
+        // Nothing announced: with no markers recorded, every model would look
+        // new and the user would be buried in toasts for old models.
+        assert!(
+            emitter.model_ids().is_empty(),
+            "baseline run must not announce anything"
+        );
+        // But the markers ARE persisted, so the next run has a reference point.
+        let (alerts, _) = graph.list_alerts(None, 100, 0).await.unwrap();
+        assert_eq!(alerts.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_only_genuinely_new_models_are_announced() {
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let emitter = Arc::new(RecordingEmitter::default());
+        let cache = cache_with(graph.clone(), emitter.clone()).await;
+
+        // Establish the baseline.
+        cache
+            .announce_new_models(&[model("claude-opus-5-5"), model("claude-sonnet-5")])
+            .await;
+        assert!(emitter.model_ids().is_empty());
+
+        // A later refresh turns up one extra model.
+        cache
+            .announce_new_models(&[
+                model("claude-opus-5-5"),
+                model("claude-sonnet-5"),
+                model("claude-opus-6"),
+            ])
+            .await;
+
+        assert_eq!(emitter.model_ids(), vec!["claude-opus-6".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_restart_does_not_reannounce() {
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let catalog = vec![model("claude-opus-5-5"), model("claude-sonnet-5")];
+
+        // First process: baseline.
+        let e1 = Arc::new(RecordingEmitter::default());
+        cache_with(graph.clone(), e1.clone())
+            .await
+            .announce_new_models(&catalog)
+            .await;
+
+        // Second process: fresh cache, same graph. The in-memory cache is
+        // reseeded from the static fallback on every boot, so this is exactly
+        // the case that would spam on every restart if the markers were not
+        // durable.
+        let e2 = Arc::new(RecordingEmitter::default());
+        cache_with(graph.clone(), e2.clone())
+            .await
+            .announce_new_models(&catalog)
+            .await;
+
+        assert!(
+            e2.model_ids().is_empty(),
+            "a restart must not re-announce known models"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_announcement_is_app_wide() {
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let emitter = Arc::new(RecordingEmitter::default());
+        let cache = cache_with(graph.clone(), emitter.clone()).await;
+
+        cache.announce_new_models(&[model("claude-opus-5-5")]).await;
+        cache
+            .announce_new_models(&[model("claude-opus-5-5"), model("claude-opus-6")])
+            .await;
+
+        let events = emitter.events.lock().unwrap();
+        let announced = events
+            .iter()
+            .find(|e| {
+                e.payload.get("alert_type").and_then(|v| v.as_str()) == Some(MODEL_ADDED_ALERT)
+            })
+            .expect("one announcement expected");
+        // project_id: None is what makes the WS filter deliver this to every
+        // client regardless of which project they subscribed to.
+        assert!(
+            announced.project_id.is_none(),
+            "a model announcement must not be scoped to a project"
+        );
     }
 
     #[tokio::test]

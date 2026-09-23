@@ -1887,4 +1887,68 @@ mod tests {
         assert_eq!(allowed[0], "mcp__project-orchestrator__*");
         assert_eq!(json["disallowed_tools"].as_array().unwrap().len(), 0);
     }
+    /// The model catalog must be reachable WITHOUT credentials.
+    ///
+    /// The setup wizard (`/setup`) runs before login, so while this route sat
+    /// behind `require_auth` the wizard's fetch 401'd and the selector could
+    /// only ever render a hardcoded fallback list. Now that the frontend keeps
+    /// no such list, an authenticated route here would leave that screen with
+    /// no models at all.
+    #[tokio::test]
+    async fn test_model_catalog_is_publicly_reachable() {
+        let app = test_app().await;
+        let anonymous = Request::builder()
+            .uri("/api/chat/models")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(anonymous).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "/api/chat/models must not require auth"
+        );
+    }
+
+    /// The payload must stay free of presentation values.
+    ///
+    /// A Tailwind class shipped from the backend is purged from the production
+    /// bundle (Tailwind v4 here runs with no config and no safelist, and never
+    /// scans .rs files), so the dots would silently lose their color in prod
+    /// only. Colors belong to the frontend; the API sends `family` instead.
+    #[tokio::test]
+    async fn test_model_catalog_payload_is_semantic_not_presentational() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/chat/models")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let raw = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            !raw.contains("bg-"),
+            "no Tailwind class may cross the wire: {raw}"
+        );
+
+        let models: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let first = &models.as_array().expect("array")[0];
+        for field in ["id", "family", "version", "tier", "shortLabel", "fullLabel"] {
+            assert!(first.get(field).is_some(), "missing field {field}: {first}");
+        }
+        assert_eq!(first["id"], "claude-opus-5-5");
+        assert_eq!(first["family"], "opus");
+        assert_eq!(first["version"], "5.5");
+        assert_eq!(first["tier"], "current");
+        assert_eq!(first["shortLabel"], "Opus 5.5");
+        assert_eq!(first["fullLabel"], "Claude Opus 5.5");
+    }
 }
