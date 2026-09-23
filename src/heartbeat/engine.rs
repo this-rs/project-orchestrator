@@ -300,9 +300,18 @@ mod tests {
         );
         engine.tick_interval = Duration::from_millis(10);
         let handle = engine.start_owned();
+        // Wait for the first run (bounded: slow CI / coverage builds), then
+        // let ~20 more ticks elapse.
+        for _ in 0..500 {
+            if count.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         tokio::time::sleep(Duration::from_millis(200)).await;
         handle.shutdown();
-        // ~20 ticks elapsed; the timed-out check must have run exactly once.
+        // The timed-out check must have run exactly once: its retry waits
+        // for the backoff instead of the next tick.
         assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 

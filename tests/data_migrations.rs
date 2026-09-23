@@ -228,6 +228,24 @@ async fn test_data_migrations_repair_an_upgraded_install() {
         "the kept skill keeps its members"
     );
 
+    // The uncapped live listing (used by evolution, lifecycle, the hook…)
+    // sees exactly the non-archived skills, through the GraphStore trait.
+    {
+        use project_orchestrator::neo4j::traits::GraphStore;
+        let store: &dyn GraphStore = &client;
+        let mut live: Vec<String> = store
+            .get_live_skills_for_project(q)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|s| s.id.to_string())
+            .collect();
+        live.sort();
+        let mut expected = vec![rich.clone(), protocol_ref.clone(), solo.clone()];
+        expected.sort();
+        assert_eq!(live, expected);
+    }
+
     // ------------------------------------------------------------------
     // 3. Purge archived skills nothing references; keep referenced ones.
     // ------------------------------------------------------------------
@@ -270,10 +288,15 @@ async fn test_data_migrations_repair_an_upgraded_install() {
     // ------------------------------------------------------------------
     let recent = skill(&raw, &qs, "Recently Archived", "archived", 1).await;
     let old = skill(&raw, &qs, "Long Archived", "archived", 30).await;
-    let purged = client
-        .purge_archived_empty_skills(q, chrono::Utc::now() - chrono::Duration::days(7))
-        .await
-        .unwrap();
+    // Through the trait, as deep maintenance calls it.
+    let purged = {
+        use project_orchestrator::neo4j::traits::GraphStore;
+        let store: &dyn GraphStore = &client;
+        store
+            .purge_archived_empty_skills(q, chrono::Utc::now() - chrono::Duration::days(7))
+            .await
+            .unwrap()
+    };
     assert_eq!(purged, 1);
     assert_eq!(status_of(&raw, &recent).await.as_deref(), Some("archived"));
     assert_eq!(status_of(&raw, &old).await, None);
@@ -281,7 +304,11 @@ async fn test_data_migrations_repair_an_upgraded_install() {
     // ------------------------------------------------------------------
     // 5. The startup runner completes every migration once, then skips.
     // ------------------------------------------------------------------
-    let first = client.run_data_migrations().await;
+    let first = {
+        use project_orchestrator::neo4j::traits::GraphStore;
+        let store: &dyn GraphStore = &client;
+        store.run_data_migrations().await
+    };
     assert_eq!(first.len(), 3);
     assert!(
         first.iter().all(|o| o.completed && o.error.is_none()),
