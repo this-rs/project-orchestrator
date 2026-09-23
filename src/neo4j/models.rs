@@ -2300,18 +2300,105 @@ pub struct AlertNode {
     /// When the alert was acknowledged.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub acknowledged_at: Option<DateTime<Utc>>,
-    /// When the alert was created.
+    /// When the alert was created (first occurrence).
     pub created_at: DateTime<Utc>,
+    /// Stable identity of the *condition* this alert reports, independent of
+    /// how the message is worded on any given run. Alerts sharing a dedup_key
+    /// collapse onto a single node whose `occurrence_count` is incremented.
+    ///
+    /// Built as `{alert_type}:{project|global}:{subject}`. When no explicit
+    /// subject is supplied it falls back to the message, which restores the
+    /// old one-node-per-distinct-message behaviour rather than exploding.
+    #[serde(default)]
+    pub dedup_key: String,
+    /// How many times this condition has been observed.
+    #[serde(default = "default_occurrence_count")]
+    pub occurrence_count: u64,
+    /// First time this condition was seen.
+    #[serde(default)]
+    pub first_seen: Option<DateTime<Utc>>,
+    /// Most recent time this condition was seen.
+    #[serde(default)]
+    pub last_seen: Option<DateTime<Utc>>,
+    /// Triage score in [0,1]; see `AlertNode::compute_priority`.
+    #[serde(default)]
+    pub priority: f64,
+}
+
+fn default_occurrence_count() -> u64 {
+    1
+}
+
+impl AlertSeverity {
+    /// Base weight used by the triage score.
+    pub fn weight(&self) -> f64 {
+        match self {
+            Self::Info => 0.2,
+            Self::Warning => 0.5,
+            Self::Critical => 1.0,
+        }
+    }
 }
 
 impl AlertNode {
-    /// Create a new pending (unacknowledged) alert.
+    /// Build the dedup key for a condition.
+    ///
+    /// `subject` must identify *what* the alert is about (a project, a file, a
+    /// node id) and must NOT embed volatile values such as counts or
+    /// timestamps — that is precisely what caused 1.36M near-duplicate
+    /// `git_drift` nodes, where the commit count lived in the message.
+    pub fn make_dedup_key(alert_type: &str, project_id: Option<Uuid>, subject: &str) -> String {
+        let scope = project_id
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "global".to_string());
+        format!("{alert_type}:{scope}:{subject}")
+    }
+
+    /// Triage score in [0,1], ordering what a human should look at first.
+    ///
+    /// Severity dominates. Chronicity raises a recurring condition, but only
+    /// logarithmically, so 100k repeats cannot outrank a fresh critical.
+    /// Staleness decays a condition nothing has re-observed. Acknowledged
+    /// alerts score 0 and drop out of triage entirely.
+    pub fn compute_priority(
+        severity: AlertSeverity,
+        occurrence_count: u64,
+        last_seen: DateTime<Utc>,
+        acknowledged: bool,
+        now: DateTime<Utc>,
+    ) -> f64 {
+        if acknowledged {
+            return 0.0;
+        }
+        let base = severity.weight();
+        let chronicity = 1.0 + ((occurrence_count.max(1) as f64).ln() / 10.0).min(0.5);
+        let age_days = (now - last_seen).num_seconds().max(0) as f64 / 86_400.0;
+        let recency = 1.0 / (1.0 + age_days / 7.0);
+        (base * chronicity * recency).clamp(0.0, 1.0)
+    }
+
+    /// Create a pending alert whose identity is the message (legacy behaviour).
     pub fn new(
         alert_type: String,
         severity: AlertSeverity,
         message: String,
         project_id: Option<Uuid>,
     ) -> Self {
+        let subject = message.clone();
+        Self::new_for_subject(alert_type, severity, message, project_id, &subject)
+    }
+
+    /// Create a pending alert with an explicit, stable subject. Prefer this:
+    /// it is what makes deduplication actually collapse.
+    pub fn new_for_subject(
+        alert_type: String,
+        severity: AlertSeverity,
+        message: String,
+        project_id: Option<Uuid>,
+        subject: &str,
+    ) -> Self {
+        let now = Utc::now();
+        let dedup_key = Self::make_dedup_key(&alert_type, project_id, subject);
         Self {
             id: Uuid::new_v4(),
             alert_type,
@@ -2321,7 +2408,12 @@ impl AlertNode {
             acknowledged: false,
             acknowledged_by: None,
             acknowledged_at: None,
-            created_at: Utc::now(),
+            created_at: now,
+            dedup_key,
+            occurrence_count: 1,
+            first_seen: Some(now),
+            last_seen: Some(now),
+            priority: Self::compute_priority(severity, 1, now, false, now),
         }
     }
 }

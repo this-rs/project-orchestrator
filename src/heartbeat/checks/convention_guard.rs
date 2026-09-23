@@ -77,7 +77,7 @@ impl HeartbeatCheck for ConventionGuardCheck {
 
             if guideline_count == 0 && drifted_count > 0 {
                 // Create alert: drifted files with no guidelines
-                let alert = crate::neo4j::models::AlertNode::new(
+                let alert = crate::neo4j::models::AlertNode::new_for_subject(
                     "convention_gap".to_string(),
                     crate::neo4j::models::AlertSeverity::Info,
                     format!(
@@ -86,6 +86,7 @@ impl HeartbeatCheck for ConventionGuardCheck {
                         project.name, drifted_count
                     ),
                     Some(project.id),
+                    "guidelines-missing",
                 );
 
                 if let Err(e) = ctx.graph.create_alert(&alert).await {

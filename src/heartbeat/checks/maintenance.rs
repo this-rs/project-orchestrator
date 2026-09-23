@@ -83,7 +83,7 @@ impl HeartbeatCheck for MaintenanceCheck {
 
                     // Create alert if stagnation was detected
                     if report.stagnation.is_stagnating {
-                        let alert = crate::neo4j::models::AlertNode::new(
+                        let alert = crate::neo4j::models::AlertNode::new_for_subject(
                             "stagnation".to_string(),
                             crate::neo4j::models::AlertSeverity::Warning,
                             format!(
@@ -94,6 +94,7 @@ impl HeartbeatCheck for MaintenanceCheck {
                                 report.recommendations.first().cloned().unwrap_or_default(),
                             ),
                             Some(project.id),
+                            "project-stagnating",
                         );
 
                         if let Err(e) = ctx.graph.create_alert(&alert).await {
