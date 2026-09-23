@@ -86,7 +86,7 @@ tree-sitter-java = "0.23"
 tree-sitter-c = "0.24"
 tree-sitter-cpp = "0.23"
 tree-sitter-ruby = "0.23"
-tree-sitter-php = "0.23"
+tree-sitter-php = "0.24"
 tree-sitter-kotlin-ng = "1.1"
 tree-sitter-swift = "0.7"
 tree-sitter-bash = "0.25"
@@ -146,7 +146,7 @@ multibase = "0.9"
 # Self-update (archive extraction)
 flate2 = "1"
 tar = "0.4"
-zip = { version = "4", default-features = false, features = ["deflate"] }
+zip = { version = "8", default-features = false, features = ["deflate"] }
 
 # Home directory detection
 dirs = "6"
