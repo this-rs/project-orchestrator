@@ -683,6 +683,17 @@ async fn test_data_migrations_repair_an_upgraded_install() {
         );
     }
 
+    // Deep maintenance times are persisted per project (a restart must not
+    // re-run a full pass over every project).
+    {
+        use project_orchestrator::neo4j::traits::GraphStore;
+        let store: &dyn GraphStore = &client;
+        store.mark_deep_maintenance(d).await.unwrap();
+        let times = store.get_deep_maintenance_times().await.unwrap();
+        let (_, at) = times.iter().find(|(id, _)| *id == d).expect("persisted");
+        assert!((chrono::Utc::now() - *at).num_seconds().abs() < 60);
+    }
+
     // ------------------------------------------------------------------
     // 6. The startup runner completes every migration once, then skips.
     // ------------------------------------------------------------------

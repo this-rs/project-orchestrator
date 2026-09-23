@@ -1,7 +1,8 @@
 //! Skill Auto-Activation Stage for the Chat Enrichment Pipeline.
 //!
 //! Matches the user message against skill trigger patterns (Regex, FileGlob)
-//! and injects activated skills' context_templates into the enrichment context.
+//! and injects the context of each activated skill, built from its current
+//! members (never the static `context_template` snapshot).
 //!
 //! This stage reuses the core trigger evaluation logic from `skills::activation`
 //! but adapts it for the chat enrichment pipeline (free-text message input
@@ -12,7 +13,8 @@
 //! 1. Load all matchable skills (Active/Emerging) for the project
 //! 2. Evaluate each skill's trigger patterns against the user message
 //! 3. Filter by confidence threshold, sort descending, take top N
-//! 4. Inject context_template for each activated skill
+//! 4. Inject each activated skill's context, assembled from its current
+//!    members (notes/decisions still in force), like the PreToolUse hook
 //! 5. Async boost energy of activated skills (Hebbian reinforcement)
 
 use anyhow::Result;
@@ -157,6 +159,49 @@ impl SkillActivationStage {
     }
 }
 
+/// Characters of context injected per activated skill.
+const SKILL_CONTEXT_BUDGET: usize = 1500;
+
+impl SkillActivationStage {
+    /// Context of an activated skill, built from its CURRENT members — the
+    /// same assembly the PreToolUse hook uses.
+    ///
+    /// This used to inject `skill.context_template` verbatim: a snapshot
+    /// written when the skill's triggers were generated, with its
+    /// `{{activated_notes}}` / `{{relevant_decisions}}` placeholders never
+    /// filled in, and summaries of notes that may since have been
+    /// superseded — old instructions kept coming back. Without current
+    /// members, only the skill's name and description are given.
+    async fn render_skill_context(&self, skill: &SkillNode, confidence: f64) -> String {
+        match crate::skills::activation::current_skill_members(self.graph.as_ref(), skill.id).await
+        {
+            Ok((notes, decisions)) if !notes.is_empty() || !decisions.is_empty() => {
+                crate::skills::activation::assemble_context_with_confidence(
+                    &skill.name,
+                    &notes,
+                    &decisions,
+                    SKILL_CONTEXT_BUDGET,
+                    Some(confidence),
+                    false,
+                )
+                .0
+            }
+            _ => {
+                let mut section = format!(
+                    "### {} (confidence: {:.0}%)\n",
+                    skill.name,
+                    confidence * 100.0
+                );
+                if !skill.description.is_empty() {
+                    section.push_str(&skill.description);
+                    section.push('\n');
+                }
+                section
+            }
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl ParallelEnrichmentStage for SkillActivationStage {
     async fn execute(&self, input: &EnrichmentInput) -> Result<StageOutput> {
@@ -193,26 +238,7 @@ impl ParallelEnrichmentStage for SkillActivationStage {
         let mut skill_ids_to_boost: Vec<Uuid> = Vec::new();
 
         for (skill, confidence) in &matches {
-            let mut section = format!(
-                "### {} (confidence: {:.0}%)\n",
-                skill.name,
-                confidence * 100.0
-            );
-
-            // Add context_template if available
-            if let Some(ref template) = skill.context_template {
-                if !template.is_empty() {
-                    section.push_str(template);
-                    section.push('\n');
-                }
-            } else {
-                // Fallback: add skill description
-                if !skill.description.is_empty() {
-                    section.push_str(&skill.description);
-                    section.push('\n');
-                }
-            }
-
+            let section = self.render_skill_context(skill, *confidence).await;
             content_parts.push(section);
             skill_ids_to_boost.push(skill.id);
         }
@@ -403,6 +429,66 @@ fn detect_intent_from_message(message: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn test_skill_context_is_live_never_the_raw_template() {
+        // Regression: the stage injected `context_template` verbatim — its
+        // {{activated_notes}} / {{relevant_decisions}} placeholders unfilled,
+        // plus summaries of notes since replaced.
+        use crate::notes::{Note, NoteStatus, NoteType};
+        let store = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let project = crate::test_helpers::test_project_named("Live");
+        store.create_project(&project).await.unwrap();
+        let mut skill = SkillNode::new(project.id, "Live Skill");
+        skill.context_template = Some(
+            "# Live Skill\n## Gotchas\n- use the OLD way\n## Activated Notes\n\n{{activated_notes}}\n## Relevant Decisions\n\n{{relevant_decisions}}".into(),
+        );
+        store.create_skill(&skill).await.unwrap();
+        let current = Note::new(
+            Some(project.id),
+            NoteType::Gotcha,
+            "use the NEW way".into(),
+            "t".into(),
+        );
+        let mut old = Note::new(
+            Some(project.id),
+            NoteType::Gotcha,
+            "use the OLD way".into(),
+            "t".into(),
+        );
+        old.status = NoteStatus::Archived;
+        old.superseded_by = Some(current.id);
+        for n in [&current, &old] {
+            store.create_note(n).await.unwrap();
+            store
+                .add_skill_member(skill.id, "note", n.id)
+                .await
+                .unwrap();
+        }
+
+        let stage = SkillActivationStage::new(store.clone());
+        let ctx = stage.render_skill_context(&skill, 0.8).await;
+        assert!(!ctx.contains("{{"), "no unfilled placeholder: {ctx}");
+        assert!(
+            ctx.contains("use the NEW way"),
+            "current knowledge injected: {ctx}"
+        );
+        assert!(
+            !ctx.contains("OLD way"),
+            "replaced knowledge never injected: {ctx}"
+        );
+
+        // Without current members: name + description, still no template.
+        let mut bare = SkillNode::new(project.id, "Bare");
+        bare.description = "what it covers".into();
+        bare.context_template = Some("{{activated_notes}}".into());
+        store.create_skill(&bare).await.unwrap();
+        let ctx = stage.render_skill_context(&bare, 0.6).await;
+        assert!(
+            ctx.contains("what it covers") && !ctx.contains("{{"),
+            "{ctx}"
+        );
+    }
     use crate::chat::enrichment::EnrichmentContext;
 
     #[test]

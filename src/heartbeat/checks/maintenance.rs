@@ -52,8 +52,18 @@ const PROJECT_MIN_GAP: Duration = Duration::from_secs(24 * 60 * 60);
 pub struct MaintenanceCheck {
     /// Last attempt per project, recorded BEFORE running it, so a project
     /// that times out goes to the back of the queue instead of pinning it.
-    /// In-memory: after a restart every project is due again once.
+    /// Seeded from the graph on the first run (`last_deep_maintenance_at`),
+    /// so a restart does not re-run a full pass over every project.
     attempts: Mutex<HashMap<Uuid, Instant>>,
+    /// Whether `attempts` was seeded from the graph yet.
+    seeded: std::sync::atomic::AtomicBool,
+}
+
+/// Convert a persisted wall-clock time into the monotonic clock used for
+/// scheduling (clamped to "now" if it lies in the future).
+fn instant_from(at: chrono::DateTime<chrono::Utc>, now: Instant) -> Instant {
+    let age = (chrono::Utc::now() - at).to_std().unwrap_or_default();
+    now.checked_sub(age).unwrap_or(now)
 }
 
 impl MaintenanceCheck {
@@ -114,6 +124,19 @@ impl HeartbeatCheck for MaintenanceCheck {
             warn!("MaintenanceCheck: no search store available, skill self-heal disabled for this run");
         }
 
+        if !self.seeded.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            match ctx.graph.get_deep_maintenance_times().await {
+                Ok(times) => {
+                    let now = Instant::now();
+                    let mut attempts = self.attempts.lock().unwrap_or_else(|e| e.into_inner());
+                    for (id, at) in times {
+                        attempts.entry(id).or_insert_with(|| instant_from(at, now));
+                    }
+                }
+                Err(e) => warn!("MaintenanceCheck: could not load last maintenance times: {e}"),
+            }
+        }
+
         let started = Instant::now();
         let due = {
             let attempts = self.attempts.lock().unwrap_or_else(|e| e.into_inner());
@@ -138,6 +161,9 @@ impl HeartbeatCheck for MaintenanceCheck {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(project.id, Instant::now());
+            if let Err(e) = ctx.graph.mark_deep_maintenance(project.id).await {
+                debug!("MaintenanceCheck: could not persist maintenance time: {e}");
+            }
 
             info!(
                 "MaintenanceCheck: running deep maintenance for '{}'",
@@ -245,6 +271,46 @@ mod tests {
         attempts.insert(c, now - Duration::from_secs(3600)); // done recently
         let due = due_projects(&[a, b, c, d], &attempts, now, PROJECT_MIN_GAP);
         assert_eq!(due, vec![d, a, b]);
+    }
+
+    #[test]
+    fn test_instant_from_persisted_time() {
+        let now = Instant::now();
+        let two_hours_ago = chrono::Utc::now() - chrono::Duration::hours(2);
+        let i = instant_from(two_hours_ago, now);
+        let age = now.duration_since(i);
+        assert!(age >= Duration::from_secs(7190) && age <= Duration::from_secs(7210));
+        // A future timestamp (clock skew) counts as "just now".
+        assert_eq!(
+            instant_from(chrono::Utc::now() + chrono::Duration::hours(1), now),
+            now
+        );
+    }
+
+    #[test]
+    fn test_restart_does_not_rerun_recently_maintained_projects() {
+        // Regression: attempts lived only in memory, so every restart ran a
+        // full deep pass over every project again.
+        // The graph read/write is covered by tests/data_migrations.rs.
+        let project = crate::test_helpers::test_project_named("Recent");
+        let check = MaintenanceCheck::new();
+        // Seed as the graph would: maintained one hour ago.
+        {
+            let now = Instant::now();
+            check.attempts.lock().unwrap().insert(
+                project.id,
+                instant_from(chrono::Utc::now() - chrono::Duration::hours(1), now),
+            );
+            check
+                .seeded
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        let attempts = check.attempts.lock().unwrap().clone();
+        let due = due_projects(&[project.id], &attempts, Instant::now(), PROJECT_MIN_GAP);
+        assert!(
+            due.is_empty(),
+            "maintained an hour ago: not due after a restart"
+        );
     }
 
     #[test]

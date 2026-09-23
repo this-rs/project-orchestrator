@@ -2446,6 +2446,19 @@ pub trait GraphStore: Send + Sync {
         self.decay_synapses(decay_amount, prune_threshold).await
     }
 
+    /// When each project last got a deep maintenance pass (persisted, so a
+    /// restart does not re-run a full pass over every project).
+    async fn get_deep_maintenance_times(
+        &self,
+    ) -> Result<Vec<(Uuid, chrono::DateTime<chrono::Utc>)>> {
+        Ok(Vec::new())
+    }
+
+    /// Record that a project's deep maintenance pass started now.
+    async fn mark_deep_maintenance(&self, _project_id: Uuid) -> Result<()> {
+        Ok(())
+    }
+
     /// Every non-archived skill of a project, uncapped.
     ///
     /// Skill evolution MUST compare new clusters against this set: the
