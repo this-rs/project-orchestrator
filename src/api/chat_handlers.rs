@@ -1951,5 +1951,4 @@ mod tests {
         assert_eq!(first["shortLabel"], "Opus 5.5");
         assert_eq!(first["fullLabel"], "Claude Opus 5.5");
     }
-
 }

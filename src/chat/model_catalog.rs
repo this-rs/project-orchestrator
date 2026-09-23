@@ -25,8 +25,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
 use crate::events::{EntityType, EventEmitter};
-use crate::neo4j::GraphStore;
 use crate::neo4j::models::{AlertNode, AlertSeverity};
+use crate::neo4j::GraphStore;
 
 /// `alert_type` under which a newly released model is recorded. Doubles as
 /// the durable "already announced" marker — see `announce_new_models`.
@@ -209,12 +209,11 @@ fn build_definition(
 }
 
 fn curated_lookup(id: &str) -> Option<ModelDefinition> {
-    CURATED_ORDER
-        .iter()
-        .find(|(cid, ..)| *cid == id)
-        .map(|(id, family, version, tier, description)| {
+    CURATED_ORDER.iter().find(|(cid, ..)| *cid == id).map(
+        |(id, family, version, tier, description)| {
             build_definition(id, family, version, tier, description, None)
-        })
+        },
+    )
 }
 
 /// Split an unknown model ID into `(family, version)`.
@@ -627,7 +626,10 @@ mod tests {
         // would be absent from every file Tailwind scans, and would be
         // stripped from the production bundle with no error anywhere.
         let json = serde_json::to_string(&static_fallback_models()).unwrap();
-        assert!(!json.contains("bg-"), "presentation class leaked into the API payload");
+        assert!(
+            !json.contains("bg-"),
+            "presentation class leaked into the API payload"
+        );
     }
 
     #[test]
@@ -705,7 +707,9 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .filter(|e| e.payload.get("alert_type").and_then(|v| v.as_str()) == Some(MODEL_ADDED_ALERT))
+                .filter(|e| {
+                    e.payload.get("alert_type").and_then(|v| v.as_str()) == Some(MODEL_ADDED_ALERT)
+                })
                 .filter_map(|e| {
                     e.payload
                         .get("model_id")
@@ -814,7 +818,9 @@ mod tests {
         let events = emitter.events.lock().unwrap();
         let announced = events
             .iter()
-            .find(|e| e.payload.get("alert_type").and_then(|v| v.as_str()) == Some(MODEL_ADDED_ALERT))
+            .find(|e| {
+                e.payload.get("alert_type").and_then(|v| v.as_str()) == Some(MODEL_ADDED_ALERT)
+            })
             .expect("one announcement expected");
         // project_id: None is what makes the WS filter deliver this to every
         // client regardless of which project they subscribed to.
