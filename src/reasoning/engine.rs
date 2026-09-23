@@ -306,7 +306,7 @@ impl ReasoningTreeEngine {
 
         // Step 3: Fast-path skill matching (if project scoped)
         if let Some(pid) = project_id {
-            if let Ok(skills) = self.graph_store.get_skills_for_project(pid).await {
+            if let Ok(skills) = self.graph_store.get_live_skills_for_project(pid).await {
                 for skill in &skills {
                     if let Some(seed) = check_skill_fast_path(skill, request) {
                         seeds.push(seed);

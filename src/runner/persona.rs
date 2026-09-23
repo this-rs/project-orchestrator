@@ -615,7 +615,7 @@ pub async fn activate_skills_for_task(
     let file_context = task.affected_files.first().map(|f| f.as_str());
 
     // Load matchable skills for this project
-    let skills = match graph.get_skills_for_project(project_id).await {
+    let skills = match graph.get_live_skills_for_project(project_id).await {
         Ok(s) => s,
         Err(e) => {
             warn!("Failed to load skills for project {}: {}", project_id, e);

@@ -547,7 +547,7 @@ pub async fn update_skill_lifecycle(
     let mut result = MetricsUpdateResult::default();
 
     // Fetch all skills for the project
-    let skills = graph_store.get_skills_for_project(project_id).await?;
+    let skills = graph_store.get_live_skills_for_project(project_id).await?;
 
     for skill in &skills {
         // Wrap per-skill processing — one corrupted skill should not abort the batch

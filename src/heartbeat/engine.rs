@@ -14,6 +14,40 @@ use crate::neo4j::traits::GraphStore;
 
 use super::{HeartbeatCheck, HeartbeatContext};
 
+/// Upper bound on how long a timed-out check waits before its next attempt.
+///
+/// A timed-out check used to keep its old `last_run` and was retried on the
+/// very next tick. For a check that cannot finish within its timeout that is
+/// an endless loop: deep_maintenance ran back-to-back ~every 12s in prod
+/// (165 timeouts for 1 completion over two days), re-running Louvain skill
+/// evolution thousands of times a day and starving every other check, since
+/// the engine runs checks sequentially.
+const TIMEOUT_RETRY_BACKOFF: Duration = Duration::from_secs(10 * 60);
+
+/// Delay before retrying a check that timed out: its own interval, capped at
+/// [`TIMEOUT_RETRY_BACKOFF`] so a daily check still retries the same day.
+fn timeout_retry_delay(check_interval: Duration) -> Duration {
+    check_interval.min(TIMEOUT_RETRY_BACKOFF)
+}
+
+/// Whether a check is due at `now`.
+///
+/// `retry_at` (set after a timeout) takes precedence over the interval.
+fn is_due(
+    last_run: Option<Instant>,
+    retry_at: Option<Instant>,
+    interval: Duration,
+    now: Instant,
+) -> bool {
+    if let Some(retry_at) = retry_at {
+        return now >= retry_at;
+    }
+    match last_run {
+        None => true,
+        Some(last) => now.duration_since(last) >= interval,
+    }
+}
+
 /// Background engine that periodically evaluates all registered heartbeat checks.
 ///
 /// Each check has its own interval. The engine ticks every `tick_interval` (default 30s)
@@ -73,7 +107,12 @@ impl HeartbeatEngine {
 
             // Track last-run time per check
             let mut last_run: Vec<Option<Instant>> = vec![None; checks.len()];
+            // Earliest retry for a check that timed out (see TIMEOUT_RETRY_BACKOFF).
+            let mut retry_at: Vec<Option<Instant>> = vec![None; checks.len()];
             let mut interval = tokio::time::interval(tick_interval);
+            // A tick can take minutes (checks run sequentially). Burst mode
+            // would then fire the missed ticks back-to-back; delay instead.
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
             info!(
                 "HeartbeatEngine started ({} checks, tick interval: {:?})",
@@ -86,12 +125,7 @@ impl HeartbeatEngine {
                         let now = Instant::now();
 
                         for (i, check) in checks.iter().enumerate() {
-                            let should_run = match last_run[i] {
-                                None => true,
-                                Some(last) => now.duration_since(last) >= check.interval(),
-                            };
-
-                            if !should_run {
+                            if !is_due(last_run[i], retry_at[i], check.interval(), now) {
                                 continue;
                             }
 
@@ -107,6 +141,7 @@ impl HeartbeatEngine {
                                 Ok(Ok(())) => {
                                     debug!("HeartbeatEngine: check '{}' completed OK", check.name());
                                     last_run[i] = Some(Instant::now());
+                                    retry_at[i] = None;
                                 }
                                 Ok(Err(e)) => {
                                     warn!(
@@ -115,14 +150,19 @@ impl HeartbeatEngine {
                                         e
                                     );
                                     last_run[i] = Some(Instant::now());
+                                    retry_at[i] = None;
                                 }
                                 Err(_) => {
+                                    let delay = timeout_retry_delay(check.interval());
                                     warn!(
-                                        "HeartbeatEngine: check '{}' timed out (>{:?}), skipping",
+                                        "HeartbeatEngine: check '{}' timed out (>{:?}), retrying in {:?}",
                                         check.name(),
-                                        check_timeout
+                                        check_timeout,
+                                        delay
                                     );
-                                    // Don't update last_run — retry next tick
+                                    // last_run stays untouched (the interval
+                                    // did not complete), but the retry waits.
+                                    retry_at[i] = Some(Instant::now() + delay);
                                 }
                             }
                         }
@@ -178,6 +218,101 @@ mod tests {
             self.count.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
+    }
+
+    #[test]
+    fn test_timeout_retry_delay_is_capped() {
+        assert_eq!(
+            timeout_retry_delay(Duration::from_secs(24 * 3600)),
+            TIMEOUT_RETRY_BACKOFF
+        );
+        assert_eq!(
+            timeout_retry_delay(Duration::from_secs(60)),
+            Duration::from_secs(60)
+        );
+    }
+
+    #[test]
+    fn test_is_due_waits_for_retry_after_timeout() {
+        let now = Instant::now();
+        let day = Duration::from_secs(24 * 3600);
+        // Never ran, no timeout: due immediately.
+        assert!(is_due(None, None, day, now));
+        // Never completed, but timed out: NOT due until the backoff elapses —
+        // this is the regression (it used to be retried on the next tick).
+        let retry = now + Duration::from_secs(600);
+        assert!(!is_due(None, Some(retry), day, now));
+        assert!(!is_due(
+            None,
+            Some(retry),
+            day,
+            now + Duration::from_secs(599)
+        ));
+        assert!(is_due(
+            None,
+            Some(retry),
+            day,
+            now + Duration::from_secs(600)
+        ));
+        // Completed recently: not due until the interval elapses.
+        assert!(!is_due(
+            Some(now),
+            None,
+            day,
+            now + Duration::from_secs(3600)
+        ));
+        assert!(is_due(Some(now), None, day, now + day));
+    }
+
+    struct NeverFinishingCheck {
+        count: Arc<AtomicU32>,
+    }
+
+    #[async_trait]
+    impl HeartbeatCheck for NeverFinishingCheck {
+        fn name(&self) -> &str {
+            "slow_check"
+        }
+        fn interval(&self) -> Duration {
+            Duration::from_secs(3600)
+        }
+        fn timeout_override(&self) -> Option<Duration> {
+            Some(Duration::from_millis(5))
+        }
+        async fn run(&self, _ctx: &HeartbeatContext) -> Result<()> {
+            self.count.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_engine_does_not_hot_loop_a_timed_out_check() {
+        let count = Arc::new(AtomicU32::new(0));
+        let graph = Arc::new(MockGraphStore::new());
+        let mut engine = HeartbeatEngine::new(
+            graph,
+            None,
+            None,
+            vec![Box::new(NeverFinishingCheck {
+                count: count.clone(),
+            })],
+        );
+        engine.tick_interval = Duration::from_millis(10);
+        let handle = engine.start_owned();
+        // Wait for the first run (bounded: slow CI / coverage builds), then
+        // let ~20 more ticks elapse.
+        for _ in 0..500 {
+            if count.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        handle.shutdown();
+        // The timed-out check must have run exactly once: its retry waits
+        // for the backoff instead of the next tick.
+        assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 
     struct FailingCheck;

@@ -405,7 +405,7 @@ pub async fn detect_skill_fission(
     }
 
     // Step 2: Get existing skills with their members
-    let existing_skills = graph_store.get_skills_for_project(project_id).await?;
+    let existing_skills = graph_store.get_live_skills_for_project(project_id).await?;
     let mut candidates = Vec::new();
 
     for skill in &existing_skills {
@@ -466,7 +466,7 @@ pub async fn detect_skill_fusion(
     project_id: Uuid,
     overlap_threshold: f64,
 ) -> anyhow::Result<Vec<FusionCandidate>> {
-    let existing_skills = graph_store.get_skills_for_project(project_id).await?;
+    let existing_skills = graph_store.get_live_skills_for_project(project_id).await?;
     let mut candidates = Vec::new();
 
     // Collect active skills with their members

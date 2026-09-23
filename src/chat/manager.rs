@@ -2483,6 +2483,26 @@ impl ChatManager {
                 .and_then(|ctx| ctx.scaffolding_level)
         });
 
+        // Sessions created in all-projects (workspace) mode carry no
+        // project_slug, and every graph stage (system prompt, skills,
+        // personas, knowledge injection, status) is keyed on it — so from
+        // mid-July 2026 no chat session got ANY graph context. The cwd is the
+        // selected project's root: infer the project from it.
+        let project_slug = match request.project_slug.clone() {
+            Some(slug) => Some(slug),
+            None => {
+                let inferred = crate::skills::project_resolver::infer_project_slug_for_cwd(
+                    self.graph.as_ref(),
+                    &request.cwd,
+                )
+                .await;
+                if let Some(ref slug) = inferred {
+                    info!(session_id = %session_id, slug = %slug, cwd = %request.cwd, "Inferred session project from cwd");
+                }
+                inferred
+            }
+        };
+
         // Build system prompt — runner-spawned agents get a dedicated autonomous
         // execution prompt; conversational sessions get the generic PO prompt.
         let (system_prompt, _included_note_ids) =
@@ -2504,7 +2524,7 @@ impl ChatManager {
                     &request.message
                 };
                 self.build_system_prompt(
-                    request.project_slug.as_deref(),
+                    project_slug.as_deref(),
                     routing_message,
                     Some(&model),
                     Some(&session_id.to_string()),
@@ -2527,7 +2547,7 @@ impl ChatManager {
         let session_node = ChatSessionNode {
             id: session_id,
             cli_session_id: None,
-            project_slug: request.project_slug.clone(),
+            project_slug: project_slug.clone(),
             workspace_slug: request.workspace_slug.clone(),
             cwd: request.cwd.clone(),
             title: None,
@@ -2593,7 +2613,7 @@ impl ChatManager {
                 Some(ctx) if ctx.task_id.is_some() => {
                     CompactionContextSource::Task(ctx.task_id.unwrap())
                 }
-                _ => match request.project_slug.as_deref() {
+                _ => match project_slug.as_deref() {
                     Some(slug) => CompactionContextSource::Session(slug.to_string()),
                     None => CompactionContextSource::None,
                 },
@@ -3658,10 +3678,22 @@ impl ChatManager {
                                 })
                                 .unwrap_or((None, None, None))
                         };
+                        // Sessions persisted without a slug (all-projects mode,
+                        // before cwd inference existed) still get graph context.
+                        let project_slug = match node.project_slug {
+                            Some(slug) => Some(slug),
+                            None => {
+                                crate::skills::project_resolver::infer_project_slug_for_cwd(
+                                    graph.as_ref(),
+                                    &node.cwd,
+                                )
+                                .await
+                            }
+                        };
                         Some(super::enrichment::EnrichmentInput {
                             message: prompt.clone(),
                             session_id: uuid,
-                            project_slug: node.project_slug,
+                            project_slug,
                             project_id: None, // Resolved from slug inside stages
                             cwd: Some(node.cwd),
                             protocol_run_id: proto_run_id,
@@ -5261,12 +5293,22 @@ impl ChatManager {
         let uuid = Uuid::parse_str(session_id).context("Invalid session ID")?;
 
         // Load session from Neo4j
-        let session_node = self
+        let mut session_node = self
             .graph
             .get_chat_session(uuid)
             .await
             .context("Failed to fetch session from Neo4j")?
             .ok_or_else(|| anyhow!("Session {} not found in database", session_id))?;
+        // Sessions stored without a slug (all-projects mode) resume with the
+        // project inferred from their cwd, like create_session does.
+        if session_node.project_slug.is_none() {
+            session_node.project_slug =
+                crate::skills::project_resolver::infer_project_slug_for_cwd(
+                    self.graph.as_ref(),
+                    &session_node.cwd,
+                )
+                .await;
+        }
 
         let cli_session_id = session_node.cli_session_id.as_deref();
 

@@ -212,7 +212,7 @@ jobs:
           NEO4J_PASSWORD: testpassword
           MEILISEARCH_URL: http://localhost:7700
           MEILISEARCH_KEY: test-master-key
-        run: cargo test --test integration_tests
+        run: cargo test --test integration_tests --test data_migrations
 
   # ==========================================================================
   # API Tests - Downloads pre-built binary, requires Neo4j and Meilisearch
@@ -375,7 +375,7 @@ jobs:
           NEO4J_PASSWORD: testpassword
           MEILISEARCH_URL: http://localhost:7700
           MEILISEARCH_KEY: test-master-key
-        run: cargo llvm-cov --lib --test parser_tests --test integration_tests --lcov --output-path lcov.info
+        run: cargo llvm-cov --lib --test parser_tests --test integration_tests --test data_migrations --lcov --output-path lcov.info
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v7

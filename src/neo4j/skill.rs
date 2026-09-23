@@ -724,6 +724,27 @@ impl Neo4jClient {
         Ok(skills)
     }
 
+    /// Every non-archived skill of a project, uncapped (see the GraphStore
+    /// trait doc: the evolution snapshot must not be truncated).
+    pub async fn get_live_skills_for_project(&self, project_id: Uuid) -> Result<Vec<SkillNode>> {
+        let q = query(
+            r#"
+            MATCH (s:Skill {project_id: $project_id})
+            WHERE s.status <> 'archived'
+            RETURN s
+            "#,
+        )
+        .param("project_id", project_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut skills = Vec::new();
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("s")?;
+            skills.push(Self::node_to_skill(&node)?);
+        }
+        Ok(skills)
+    }
+
     // ========================================================================
     // Activation
     // ========================================================================

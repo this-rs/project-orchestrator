@@ -9,6 +9,7 @@ pub mod client;
 mod code;
 mod commit;
 mod constraint;
+pub mod data_migrations;
 mod decision;
 mod event_trigger;
 mod feature_graph;

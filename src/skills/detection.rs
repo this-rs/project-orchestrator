@@ -815,7 +815,7 @@ pub async fn detect_skills_pipeline(
     let skills_detected = detection.candidates.len();
 
     // Step 3: Fetch existing skills for deduplication
-    let existing_skills = graph_store.get_skills_for_project(project_id).await?;
+    let existing_skills = graph_store.get_live_skills_for_project(project_id).await?;
     let mut existing_members: Vec<(Uuid, Vec<String>)> = Vec::new();
     for skill in &existing_skills {
         let (notes, decisions) = graph_store.get_skill_members(skill.id).await?;
@@ -873,53 +873,7 @@ pub async fn detect_skills_pipeline(
     .await?;
 
     // Step 7: Generate triggers and templates for each skill
-    // Fetch all project notes for quality evaluation
-    let all_project_notes = {
-        let max_notes = 5000;
-        let filters = crate::notes::NoteFilters {
-            limit: Some(max_notes),
-            ..Default::default()
-        };
-        let (notes, _) = graph_store
-            .list_notes(Some(project_id), None, &filters)
-            .await?;
-        if notes.len() >= max_notes as usize {
-            tracing::warn!(
-                project_id = %project_id,
-                count = notes.len(),
-                "Project has ≥{} notes — trigger quality evaluation may be incomplete",
-                max_notes
-            );
-        }
-        notes
-    };
-
-    for skill_id in &skill_ids {
-        if let Ok(Some(mut skill)) = graph_store.get_skill(*skill_id).await {
-            // Get member notes for this skill
-            let (member_notes, _) = graph_store.get_skill_members(*skill_id).await?;
-
-            // Generate triggers (no embeddings for now)
-            let embeddings = HashMap::new();
-            let trigger_result = crate::skills::triggers::generate_all_triggers(
-                &member_notes,
-                &all_project_notes,
-                &embeddings,
-                root_path.as_deref(),
-            );
-            skill.trigger_patterns = trigger_result.triggers;
-
-            // Generate context template
-            skill.context_template = Some(crate::skills::templates::generate_context_template(
-                &skill.name,
-                &skill.description,
-                &member_notes,
-            ));
-
-            skill.updated_at = chrono::Utc::now();
-            graph_store.update_skill(&skill).await?;
-        }
-    }
+    generate_triggers_for_skills(graph_store, project_id, root_path.as_deref(), &skill_ids).await?;
 
     let message = format!(
         "Detected {} candidates from {} notes/{} synapses (modularity: {:.3}). Created {} new, updated {} existing skills.",
@@ -944,6 +898,74 @@ pub async fn detect_skills_pipeline(
         anchors_created,
         synapses_repaired,
     })
+}
+
+/// Generate trigger patterns and the context template of `skill_ids` from
+/// their member notes. Trigger quality is evaluated against the project's
+/// notes, and file globs are made relative to `root_path`.
+///
+/// Used right after detection persists skills, and by maintenance to backfill
+/// skills that never got triggers — skill evolution creates its New skills
+/// without any, and a skill without triggers can never be activated.
+pub async fn generate_triggers_for_skills(
+    graph_store: &dyn crate::neo4j::traits::GraphStore,
+    project_id: Uuid,
+    root_path: Option<&str>,
+    skill_ids: &[Uuid],
+) -> anyhow::Result<usize> {
+    if skill_ids.is_empty() {
+        return Ok(0);
+    }
+    let mut updated = 0;
+    // Fetch all project notes for quality evaluation
+    let all_project_notes = {
+        let max_notes = 5000;
+        let filters = crate::notes::NoteFilters {
+            limit: Some(max_notes),
+            ..Default::default()
+        };
+        let (notes, _) = graph_store
+            .list_notes(Some(project_id), None, &filters)
+            .await?;
+        if notes.len() >= max_notes as usize {
+            tracing::warn!(
+                project_id = %project_id,
+                count = notes.len(),
+                "Project has ≥{} notes — trigger quality evaluation may be incomplete",
+                max_notes
+            );
+        }
+        notes
+    };
+
+    for skill_id in skill_ids {
+        if let Ok(Some(mut skill)) = graph_store.get_skill(*skill_id).await {
+            // Get member notes for this skill
+            let (member_notes, _) = graph_store.get_skill_members(*skill_id).await?;
+
+            // Generate triggers (no embeddings for now)
+            let embeddings = HashMap::new();
+            let trigger_result = crate::skills::triggers::generate_all_triggers(
+                &member_notes,
+                &all_project_notes,
+                &embeddings,
+                root_path,
+            );
+            skill.trigger_patterns = trigger_result.triggers;
+
+            // Generate context template
+            skill.context_template = Some(crate::skills::templates::generate_context_template(
+                &skill.name,
+                &skill.description,
+                &member_notes,
+            ));
+
+            skill.updated_at = chrono::Utc::now();
+            graph_store.update_skill(&skill).await?;
+            updated += 1;
+        }
+    }
+    Ok(updated)
 }
 
 // ============================================================================
