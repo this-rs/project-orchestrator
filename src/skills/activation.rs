@@ -111,7 +111,7 @@ pub async fn activate_for_hook(
     }
 
     // 2. Load matchable skills for this project
-    let skills = graph_store.get_skills_for_project(project_id).await?;
+    let skills = graph_store.get_live_skills_for_project(project_id).await?;
     let matchable: Vec<_> = skills.into_iter().filter(|s| s.is_matchable()).collect();
 
     if matchable.is_empty() {
@@ -320,7 +320,7 @@ pub async fn activate_for_hook_cached(
         Some(skills) => skills,
         None => {
             // Cache miss — load from DB and populate cache
-            let skills = graph_store.get_skills_for_project(project_id).await?;
+            let skills = graph_store.get_live_skills_for_project(project_id).await?;
             cache.insert(project_id, skills).await;
             // Get from cache (just inserted, no TOCTOU since insert is write-locked)
             cache.get(&project_id).await.unwrap_or_default()
@@ -331,10 +331,35 @@ pub async fn activate_for_hook_cached(
         return Ok(None);
     }
 
-    // 3. Evaluate using pre-compiled triggers (no Regex::new per request)
+    // 3. Evaluate using pre-compiled triggers (no Regex::new per request).
+    //
+    // File-glob triggers are relative to the project root (`src/neo4j/**`)
+    // while tools pass absolute paths — often canonical, under a root that
+    // may be registered through a symlink. Matching the raw absolute path
+    // never hit a root-relative glob: offer every form (root-relative
+    // first, then absolute for legacy absolute triggers) and keep the best.
+    let file_candidates = match file_context.as_deref() {
+        Some(file) => {
+            crate::skills::project_resolver::hook_file_candidates(
+                graph_store,
+                project_id,
+                file,
+                None,
+            )
+            .await
+        }
+        None => Vec::new(),
+    };
     let mut matches: Vec<(SkillNode, f64)> = Vec::new();
     for cached in &cached_skills {
-        let confidence = evaluate_cached_skill(cached, pattern.as_deref(), file_context.as_deref());
+        let confidence = if file_candidates.is_empty() {
+            evaluate_cached_skill(cached, pattern.as_deref(), None)
+        } else {
+            file_candidates
+                .iter()
+                .map(|file| evaluate_cached_skill(cached, pattern.as_deref(), Some(file)))
+                .fold(0.0_f64, f64::max)
+        };
         if confidence >= config.confidence_threshold {
             matches.push((cached.skill.clone(), confidence));
         }
@@ -2861,6 +2886,42 @@ mod tests {
         }
 
         store
+    }
+
+    #[tokio::test]
+    async fn test_hook_cached_matches_root_relative_glob_on_absolute_read() {
+        // Regression: file-glob triggers are root-relative (`src/neo4j/**`)
+        // but Read passes an absolute path; the raw path never matched, so
+        // no Read/Edit/Write ever activated a skill through its file globs.
+        let project_id = Uuid::new_v4();
+        let note = make_test_note(
+            Uuid::new_v4(),
+            "Always batch UNWIND writes in neo4j/client.rs",
+            NoteType::Gotcha,
+            NoteImportance::High,
+            0.8,
+        );
+        let store = setup_mcp_skill_store(
+            project_id,
+            "Neo4j Client",
+            vec![SkillTrigger::file_glob("src/neo4j/**", 0.9)],
+            vec![note],
+        )
+        .await;
+
+        let result = activate_for_hook_cached(
+            &store,
+            project_id,
+            "Read",
+            &serde_json::json!({"file_path": "/tmp/test-project/src/neo4j/client.rs"}),
+            &HookActivationConfig::default(),
+            &crate::skills::cache::SkillCache::new(),
+        )
+        .await
+        .unwrap();
+
+        let outcome = result.expect("root-relative glob must match the absolute Read path");
+        assert_eq!(outcome.response.skill_name, "Neo4j Client");
     }
 
     #[tokio::test]

@@ -230,7 +230,7 @@ pub async fn run_daily_maintenance(
 
     // Step 3: Lifecycle evaluation (promotions/demotions).
     // Use adaptive lifecycle thresholds derived from the current skill distribution.
-    let adaptive_lifecycle = match graph_store.get_skills_for_project(project_id).await {
+    let adaptive_lifecycle = match graph_store.get_live_skills_for_project(project_id).await {
         Ok(skills) if !skills.is_empty() => {
             crate::skills::lifecycle::compute_adaptive_lifecycle_config(&skills)
         }
@@ -382,6 +382,20 @@ pub async fn run_weekly_maintenance(
         }
     }
 
+    // Step 5: Backfill triggers. Evolution creates its New skills without
+    // trigger patterns, and a skill without triggers can never be activated
+    // (36,852 of 37,233 live skills in prod had none). Bounded per run.
+    match backfill_missing_triggers(graph_store, project_id).await {
+        Ok(0) => {}
+        Ok(n) => info!(project_id = %project_id, skills = n, "Backfilled skill triggers"),
+        Err(e) => {
+            warn!(error = %e, "Trigger backfill failed");
+            result
+                .warnings
+                .push(format!("Trigger backfill failed: {}", e));
+        }
+    }
+
     info!(
         project_id = %project_id,
         skills_detected = result.skills_detected.unwrap_or(0),
@@ -392,6 +406,42 @@ pub async fn run_weekly_maintenance(
     );
 
     Ok(result)
+}
+
+/// Skills given triggers per maintenance run (each generation lists the
+/// project's notes and every member of the skill).
+pub const TRIGGER_BACKFILL_PER_RUN: usize = 200;
+
+/// Generate triggers for live skills that have none, at most
+/// [`TRIGGER_BACKFILL_PER_RUN`] per call. Returns how many were updated.
+pub async fn backfill_missing_triggers(
+    graph_store: &dyn GraphStore,
+    project_id: Uuid,
+) -> anyhow::Result<usize> {
+    let missing: Vec<Uuid> = graph_store
+        .get_live_skills_for_project(project_id)
+        .await?
+        .into_iter()
+        .filter(|s| s.trigger_patterns.is_empty())
+        .map(|s| s.id)
+        .take(TRIGGER_BACKFILL_PER_RUN)
+        .collect();
+    if missing.is_empty() {
+        return Ok(0);
+    }
+    let root_path = graph_store
+        .get_project(project_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|p| p.root_path);
+    crate::skills::detection::generate_triggers_for_skills(
+        graph_store,
+        project_id,
+        root_path.as_deref(),
+        &missing,
+    )
+    .await
 }
 
 // ============================================================================
@@ -452,7 +502,7 @@ pub async fn cleanup_absolute_triggers(
         return Ok(0);
     }
 
-    let skills = graph_store.get_skills_for_project(project_id).await?;
+    let skills = graph_store.get_live_skills_for_project(project_id).await?;
     let mut total_fixed = 0;
 
     for mut skill in skills {
@@ -1958,6 +2008,46 @@ mod tests {
 
         assert_eq!(result.level, "weekly");
         assert!(result.lifecycle.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_backfill_gives_triggers_to_skills_created_without_any() {
+        // Regression: evolution creates New skills with no trigger patterns,
+        // so they could never be activated by the hook.
+        let (store, project_id) = setup_store_with_project().await;
+        let mut skill = SkillNode::new(project_id, "Evolved Without Triggers");
+        skill.status = SkillStatus::Emerging;
+        assert!(skill.trigger_patterns.is_empty());
+        let skill_id = skill.id;
+        store.create_skill(&skill).await.unwrap();
+        for i in 0..3 {
+            let mut note = Note::new(
+                Some(project_id),
+                NoteType::Gotcha,
+                format!("neo4j UNWIND batching gotcha {i}: always batch cypher writes"),
+                "test".into(),
+            );
+            note.tags = vec!["neo4j".into(), "cypher".into()];
+            store.create_note(&note).await.unwrap();
+            store
+                .add_skill_member(skill_id, "note", note.id)
+                .await
+                .unwrap();
+        }
+
+        let updated = backfill_missing_triggers(&store, project_id).await.unwrap();
+        assert_eq!(updated, 1);
+        let skill = store.get_skill(skill_id).await.unwrap().unwrap();
+        assert!(
+            !skill.trigger_patterns.is_empty(),
+            "backfill must generate triggers from member notes"
+        );
+        assert!(skill.context_template.is_some());
+        // Nothing left to backfill.
+        assert_eq!(
+            backfill_missing_triggers(&store, project_id).await.unwrap(),
+            0
+        );
     }
 
     #[tokio::test]

@@ -108,7 +108,7 @@ impl SkillActivationStage {
     /// - `file_context`: extracted file paths concatenated (for file_glob matching)
     async fn match_skills(&self, message: &str, project_id: Uuid) -> Result<Vec<(SkillNode, f64)>> {
         // Load matchable skills
-        let skills = self.graph.get_skills_for_project(project_id).await?;
+        let skills = self.graph.get_live_skills_for_project(project_id).await?;
         let matchable: Vec<_> = skills.into_iter().filter(|s| s.is_matchable()).collect();
 
         if matchable.is_empty() {

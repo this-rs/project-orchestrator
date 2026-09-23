@@ -51,6 +51,21 @@ pub fn relativize(path: &str, root_path: &str) -> String {
         return rest.to_string();
     }
 
+    // `root_path` may be a symlink while stored paths are canonical: sync
+    // canonicalizes File.path, so notes anchored on the symlinked backend
+    // produced absolute (never-matching) file-glob triggers. Retry against
+    // the canonical root.
+    if let Ok(canonical) = std::fs::canonicalize(root) {
+        let canonical = canonical.display().to_string();
+        if canonical != root {
+            if let Some(rest) = path.strip_prefix(canonical.as_str()) {
+                if rest.is_empty() || rest.starts_with('/') {
+                    return rest.trim_start_matches('/').to_string();
+                }
+            }
+        }
+    }
+
     // Path is outside the root — return unchanged
     path.to_string()
 }
@@ -119,6 +134,33 @@ pub fn is_relative(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_relativize_through_symlinked_root() {
+        // Regression: project root registered as a symlink, File.path
+        // canonical — relativize returned the absolute path unchanged.
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir_all(real.join("src")).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let real = std::fs::canonicalize(&real).unwrap().display().to_string();
+        let link = link.display().to_string();
+
+        assert_eq!(
+            relativize(&format!("{real}/src/main.rs"), &link),
+            "src/main.rs"
+        );
+        assert_eq!(
+            relativize(&format!("{link}/src/main.rs"), &link),
+            "src/main.rs"
+        );
+        // A sibling sharing the prefix is not inside the root.
+        assert_eq!(
+            relativize(&format!("{real}-other/src/main.rs"), &link),
+            format!("{real}-other/src/main.rs")
+        );
+    }
 
     // ── relativize ──────────────────────────────────────────────────────
 

@@ -121,6 +121,16 @@ pub(crate) fn path_forms(path: &str, base: Option<&str>) -> Vec<String> {
     forms
 }
 
+/// The form of `path` stored in the graph: `File.path` is canonical (sync
+/// canonicalizes), so persona KNOWS lookups must use the canonical form.
+/// Relative paths are joined onto `base`; falls back to the absolute form
+/// when the file does not exist.
+pub fn graph_file_path(path: &str, base: Option<&str>) -> String {
+    path_forms(path, base)
+        .pop()
+        .unwrap_or_else(|| path.to_string())
+}
+
 /// Longest-prefix match over every form of `path` (see [`path_forms`]).
 pub(crate) fn find_match_any_form(
     entries: &[ResolvedProject],
@@ -179,6 +189,57 @@ pub async fn infer_project_slug_for_cwd(graph_store: &dyn GraphStore, cwd: &str)
     }
     let entries = load_project_entries(graph_store).await.ok()?;
     infer_project_slug(&entries, cwd)
+}
+
+/// The forms of a tool's file path to match against a project's skill
+/// triggers: relative to each of the project's roots first (file-glob
+/// triggers are root-relative, e.g. `src/neo4j/**`), then the absolute
+/// forms (legacy absolute triggers). Deduplicated, in that order.
+pub(crate) fn file_candidates(
+    entries: &[ResolvedProject],
+    project_id: Uuid,
+    forms: &[String],
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let roots = entries.iter().filter(|e| e.project_id == project_id);
+    for root in roots {
+        for form in forms {
+            if let Some(rel) = form.strip_prefix(root.root_path.as_str()) {
+                if !rel.is_empty() && !out.iter().any(|o| o == rel) {
+                    out.push(rel.to_string());
+                }
+            }
+        }
+    }
+    for form in forms {
+        if !out.iter().any(|o| o == form) {
+            out.push(form.clone());
+        }
+    }
+    out
+}
+
+/// Async wrapper of [`file_candidates`] over the cached project list.
+/// `cwd` resolves relative tool paths.
+pub async fn hook_file_candidates(
+    graph_store: &dyn GraphStore,
+    project_id: Uuid,
+    file: &str,
+    cwd: Option<&str>,
+) -> Vec<String> {
+    let forms = path_forms(file, cwd);
+    let mut entries = match load_project_entries(graph_store).await {
+        Ok(entries) => entries,
+        Err(_) => return forms,
+    };
+    // The cached list can predate this project (5 min TTL): reload rather
+    // than silently match without its root.
+    if !entries.iter().any(|e| e.project_id == project_id) {
+        if let Ok(projects) = graph_store.list_projects().await {
+            entries = entries_for_projects(&projects);
+        }
+    }
+    file_candidates(&entries, project_id, &forms)
 }
 
 /// Load project entries from Neo4j (or cache), expanding root_paths.
@@ -533,6 +594,41 @@ mod tests {
             infer_project_slug(&entries, "/Users/dev/lab/other/src"),
             Some("other".to_string())
         );
+    }
+
+    #[test]
+    fn test_graph_file_path_is_canonical() {
+        let (_tmp, link, real) = symlinked_project();
+        assert_eq!(
+            graph_file_path(&format!("{link}/src/main.rs"), None),
+            format!("{real}/src/main.rs")
+        );
+        assert_eq!(
+            graph_file_path("src/main.rs", Some(&link)),
+            format!("{real}/src/main.rs")
+        );
+        // Missing files keep their absolute form.
+        assert_eq!(graph_file_path("/nope/x.rs", None), "/nope/x.rs");
+    }
+
+    #[test]
+    fn test_file_candidates_are_root_relative_first() {
+        // File-glob triggers are root-relative (`src/**`): a Read of an
+        // absolute path — canonical, under a symlinked root — must be offered
+        // to them as `src/main.rs`.
+        let (_tmp, link, real) = symlinked_project();
+        let project = project_node("backend", &link);
+        let entries = entries_for_projects(std::slice::from_ref(&project));
+        let file = format!("{real}/src/main.rs");
+        let candidates = file_candidates(&entries, project.id, &path_forms(&file, None));
+        assert_eq!(candidates[0], "src/main.rs");
+        assert!(
+            candidates.contains(&file),
+            "absolute form kept for legacy triggers"
+        );
+        // Another project's roots are not used.
+        let other = file_candidates(&entries, Uuid::new_v4(), &path_forms(&file, None));
+        assert!(!other.contains(&"src/main.rs".to_string()));
     }
 
     #[test]

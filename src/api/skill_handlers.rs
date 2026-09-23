@@ -745,7 +745,7 @@ pub async fn get_skill_health(
     // Enrich with project-level percentile context.
     // Loads all skills for the project so we can rank this skill among its peers.
     // Falls back gracefully (percentiles stay None) on any error.
-    if let Ok(peers) = neo4j.get_skills_for_project(skill.project_id).await {
+    if let Ok(peers) = neo4j.get_live_skills_for_project(skill.project_id).await {
         crate::skills::validation::enrich_with_project_context(&mut health, &peers);
     }
 

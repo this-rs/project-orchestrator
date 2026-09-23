@@ -435,7 +435,11 @@ impl nexus_claude::HookCallback for SkillActivationHook {
         .await;
 
         // 3b. Persona matching: on Read/Edit/Write, match file against persona KNOWS
-        let file_path = extract_file_context(&pre_tool.tool_name, &pre_tool.tool_input);
+        // KNOWS targets File.path, which sync stores canonicalized: look up
+        // (and auto-grow) with the canonical form, relative paths resolved
+        // against the session cwd.
+        let file_path = extract_file_context(&pre_tool.tool_name, &pre_tool.tool_input)
+            .map(|fp| crate::skills::project_resolver::graph_file_path(&fp, Some(&pre_tool.cwd)));
         let persona_context = if let Some(ref fp) = file_path {
             match self.match_persona_for_file(project_id, fp).await {
                 Some((pid, pname, weight)) => {
