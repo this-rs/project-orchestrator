@@ -666,6 +666,41 @@ fn is_symbol_like(pattern: &str) -> bool {
     has_camel || has_snake || has_path
 }
 
+/// The pattern of a Bash command that searches the codebase, if it is one.
+///
+/// A code search is a `rg …` or a recursive `grep -r …` that **starts** a
+/// command (after `&&`, `;` or `||`), not one that receives piped input. A
+/// non-recursive grep names its files explicitly — the agent already knows
+/// where to look, and a graph query would not know better.
+pub fn bash_code_search_pattern(command: &str) -> Option<String> {
+    command
+        .split("&&")
+        .flat_map(|s| s.split("||"))
+        .flat_map(|s| s.split(';'))
+        .find_map(|segment| {
+            // Only the first stage of a pipeline reads from the filesystem.
+            let stage = segment.split('|').next()?.trim();
+            let mut words = stage.split_whitespace();
+            match words.next()? {
+                "rg" => extract_rg_grep_pattern(stage, "rg", RG_FLAGS_WITH_VALUES),
+                "grep" | "egrep" => {
+                    let recursive = stage.split_whitespace().any(|w| {
+                        w == "--recursive"
+                            || (w.starts_with('-')
+                                && !w.starts_with("--")
+                                && (w.contains('r') || w.contains('R')))
+                    });
+                    if recursive {
+                        extract_rg_grep_pattern(stage, "grep", GREP_FLAGS_WITH_VALUES)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            }
+        })
+}
+
 /// Generate a redirect suggestion when a raw tool (Grep/Bash) is used for something
 /// that an MCP code tool can handle better.
 ///
@@ -674,7 +709,18 @@ pub fn generate_redirect_suggestion(
     tool_name: &str,
     tool_input: &serde_json::Value,
 ) -> Option<RedirectSuggestion> {
-    let pattern = extract_pattern(tool_name, tool_input)?;
+    // Bash is only a candidate when it actually *searches the codebase*. The
+    // generic `extract_pattern` also returns `find -name`, `cargo test` and
+    // grep-in-a-pipe patterns, and redirecting those is noise: `cmd | grep -c
+    // warning` filters a command's output, it does not look for code, and
+    // "use semantic search for `warning`" is simply wrong advice.
+    let pattern = match tool_name {
+        "Bash" => {
+            let command = tool_input.get("command").and_then(|v| v.as_str())?;
+            bash_code_search_pattern(command)?
+        }
+        _ => extract_pattern(tool_name, tool_input)?,
+    };
 
     match tool_name {
         "Grep" | "Bash" => {
@@ -1543,6 +1589,47 @@ mod tests {
         assert!(!is_symbol_like("[a-z]+"));
         assert!(!is_symbol_like("foo|bar"));
         assert!(!is_symbol_like("./relative"));
+    }
+
+    // --- bash_code_search_pattern ---
+
+    #[test]
+    fn test_bash_search_rg_is_a_code_search() {
+        assert_eq!(
+            bash_code_search_pattern("rg -n HookLedger src/").as_deref(),
+            Some("HookLedger")
+        );
+    }
+
+    #[test]
+    fn test_bash_search_recursive_grep_after_cd() {
+        assert_eq!(
+            bash_code_search_pattern("cd /repo && grep -rn find_adjacent_personas src").as_deref(),
+            Some("find_adjacent_personas")
+        );
+    }
+
+    #[test]
+    fn test_bash_search_piped_grep_is_not_a_code_search() {
+        // Filtering a command's output — the case that produced
+        // "use semantic search for `warning`".
+        assert!(bash_code_search_pattern("npx eslint src/a.ts 2>&1 | grep -c warning").is_none());
+    }
+
+    #[test]
+    fn test_bash_search_non_recursive_grep_on_named_file() {
+        assert!(bash_code_search_pattern("grep -n fn src/chat/skill_hook.rs").is_none());
+    }
+
+    #[test]
+    fn test_bash_search_cargo_test_is_not_a_code_search() {
+        assert!(bash_code_search_pattern("cargo test hook_ledger").is_none());
+    }
+
+    #[test]
+    fn test_redirect_bash_piped_grep_no_redirect() {
+        let input = serde_json::json!({"command": "cargo clippy 2>&1 | grep warning"});
+        assert!(generate_redirect_suggestion("Bash", &input).is_none());
     }
 
     // --- generate_redirect_suggestion ---

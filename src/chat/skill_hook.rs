@@ -16,6 +16,7 @@
 //! Skills are a nice-to-have context injection, not a gating mechanism.
 
 use crate::api::hook_handlers::skill_cache;
+use crate::chat::hook_ledger::{cap_chars, HookLedger, InjectionKey, MAX_HOOK_CONTEXT_CHARS};
 use crate::neo4j::traits::GraphStore;
 use crate::neurons::AutoReinforcementConfig;
 use crate::skills::activation::{
@@ -57,6 +58,18 @@ pub(crate) struct PersonaFileIndex {
 /// TTL for persona file index cache (2 minutes).
 const PERSONA_INDEX_TTL: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// Minimum raw KNOWS weight that counts as evidence a persona knows a file.
+///
+/// Measured distribution (2026-09-24): hand-built / learned KNOWS sit at
+/// 0.6–1.0, while `auto-grow` edges are 0.3 and `co-change` edges 0.1–0.3.
+/// Those two are *hypotheses* the system made about adjacency, not knowledge:
+/// every persona matched on `src/chat/*` came from auto-grow alone, and the
+/// injected blocks (Meilisearch notes on the hook file, P2P auth notes on the
+/// extractor) were unrelated to the file. They stay in the graph — they may be
+/// confirmed later — but they are not enough to put a persona in front of the
+/// agent.
+pub(crate) const MIN_KNOWS_EVIDENCE: f64 = 0.5;
+
 /// In-process hook callback that activates Neural Skills on every PreToolUse event.
 ///
 /// Registered in `create_session()` and `resume_session()` alongside `CompactionNotifier`.
@@ -67,13 +80,26 @@ pub(crate) struct SkillActivationHook {
     graph_store: Arc<dyn GraphStore>,
     /// Per-project persona file index cache: project_id → PersonaFileIndex.
     persona_index: RwLock<HashMap<Uuid, PersonaFileIndex>>,
+    /// What this session has already been shown — see `hook_ledger`.
+    ledger: Arc<HookLedger>,
 }
 
 impl SkillActivationHook {
+    /// Standalone hook with its own ledger. Production registers through
+    /// `ChatManager::register_skill_hook`, which shares the ledger with the
+    /// PreCompact reset; this is for tests.
+    #[cfg(test)]
     pub fn new(graph_store: Arc<dyn GraphStore>) -> Self {
+        Self::with_ledger(graph_store, Arc::new(HookLedger::new()))
+    }
+
+    /// Share the ledger with a `HookLedgerReset` registered on PreCompact, so a
+    /// compaction makes previously injected knowledge eligible again.
+    pub fn with_ledger(graph_store: Arc<dyn GraphStore>, ledger: Arc<HookLedger>) -> Self {
         Self {
             graph_store,
             persona_index: RwLock::new(HashMap::new()),
+            ledger,
         }
     }
 
@@ -155,6 +181,10 @@ impl SkillActivationHook {
                 let mut entries: HashMap<String, Vec<(Uuid, String, f64, PersonaMatchSource)>> =
                     HashMap::new();
                 for (persona, path, weight) in &all_knows {
+                    // Hypotheses (auto-grow, co-change) are not evidence.
+                    if *weight < MIN_KNOWS_EVIDENCE {
+                        continue;
+                    }
                     // Weight persona activation by success_rate (floor 0.5 for new personas)
                     let effective_weight =
                         *weight * (0.5 + 0.5 * persona.success_rate.clamp(0.0, 1.0));
@@ -327,14 +357,25 @@ impl SkillActivationHook {
             persona_name, energy, weight
         );
 
-        // Top notes (by weight, max 5) — inject CONTENT, not bare ids.
-        if !subgraph.notes.is_empty() {
-            ctx.push_str("**Knowledge notes:**\n");
-            for rel in subgraph.notes.iter().take(5) {
-                if let Some(line) = self.note_snippet(&rel.entity_id, rel.weight).await {
-                    ctx.push_str(&line);
-                }
+        // Top notes (by weight, max 5) — inject CONTENT, not bare ids, and
+        // only notes this session has not already been shown (by this persona,
+        // another one, or a skill).
+        let mut note_lines = String::new();
+        for rel in subgraph.notes.iter().take(5) {
+            let Ok(note_id) = Uuid::parse_str(&rel.entity_id) else {
+                continue;
+            };
+            if !self.ledger.is_fresh(&InjectionKey::Note(note_id)) {
+                continue;
             }
+            if let Some(line) = self.note_snippet(&rel.entity_id, rel.weight).await {
+                note_lines.push_str(&line);
+                self.ledger.record(InjectionKey::Note(note_id));
+            }
+        }
+        if !note_lines.is_empty() {
+            ctx.push_str("**Knowledge notes:**\n");
+            ctx.push_str(&note_lines);
         }
 
         // Top files (by weight, max 5)
@@ -345,34 +386,12 @@ impl SkillActivationHook {
             }
         }
 
-        // Pre-warm: load related persona context via SYNAPSE links
-        match self
-            .graph_store
-            .find_synapse_linked_personas(persona_id)
-            .await
-        {
-            Ok(linked) if !linked.is_empty() => {
-                ctx.push_str("\n**Related personas (via SYNAPSE links):**\n");
-                for (linked_id, linked_name, syn_weight) in linked.iter().take(2) {
-                    ctx.push_str(&format!("- {} (synapse: {:.2})\n", linked_name, syn_weight));
-                    // Load top 3 notes from linked persona — content, not ids.
-                    if let Ok(linked_subgraph) =
-                        self.graph_store.get_persona_subgraph(*linked_id).await
-                    {
-                        for note_rel in linked_subgraph.notes.iter().take(3) {
-                            if let Some(line) = self
-                                .note_snippet(&note_rel.entity_id, note_rel.weight)
-                                .await
-                            {
-                                ctx.push_str("  ");
-                                ctx.push_str(&line);
-                            }
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
+        // No second-order context. This used to append the top notes of up to
+        // two SYNAPSE-linked personas; measured in practice it is where
+        // relevance drifts furthest — the Meilisearch persona brought frontend
+        // notes, the P2P security persona brought this-rs framework notes —
+        // for ~600 chars on every call. A linked persona that is relevant to a
+        // file gets injected on its own evidence when that file is touched.
 
         // Truncate to ~2000 chars for additionalContext budget (char-safe).
         if ctx.chars().count() > 2000 {
@@ -382,6 +401,15 @@ impl SkillActivationHook {
 
         Some(ctx)
     }
+}
+
+/// Does an assembled skill context carry anything beyond its header line?
+pub(crate) fn skill_has_body(context: &str) -> bool {
+    context
+        .lines()
+        .skip_while(|l| l.trim().is_empty())
+        .skip(1) // the "## 🧠 Skill …" header
+        .any(|l| !l.trim().is_empty())
 }
 
 #[async_trait::async_trait]
@@ -397,6 +425,7 @@ impl nexus_claude::HookCallback for SkillActivationHook {
             nexus_claude::HookInput::PreToolUse(pre) => pre,
             _ => return Ok(Self::passthrough()),
         };
+        self.ledger.begin_call();
 
         // 2. Resolve project from tool context (file path → project, or cwd → project)
         let project_id = match resolve_project_from_context(
@@ -446,6 +475,10 @@ impl nexus_claude::HookCallback for SkillActivationHook {
             .map(|fp| crate::skills::project_resolver::graph_file_path(&fp, Some(&pre_tool.cwd)));
         let persona_context = if let Some(ref fp) = file_path {
             match self.match_persona_for_file(project_id, fp).await {
+                Some((pid, _, _)) if !self.ledger.is_fresh(&InjectionKey::Persona(pid)) => {
+                    // Already in context — see `hook_ledger`.
+                    None
+                }
                 Some((pid, pname, weight)) => {
                     info!(
                         persona_name = %pname,
@@ -467,7 +500,11 @@ impl nexus_claude::HookCallback for SkillActivationHook {
                             );
                         }
                     });
-                    self.build_persona_context(pid, &pname, weight).await
+                    let ctx = self.build_persona_context(pid, &pname, weight).await;
+                    if ctx.is_some() {
+                        self.ledger.record(InjectionKey::Persona(pid));
+                    }
+                    ctx
                 }
                 None => {
                     // Auto-grow: file not in KNOWS, check if adjacent to a persona's scope
@@ -553,10 +590,22 @@ impl nexus_claude::HookCallback for SkillActivationHook {
         }
 
         // 5. Build combined context: skill context + persona context + redirect suggestion
-        let mut combined_context = outcome
-            .as_ref()
-            .map(|o| o.response.context.clone())
-            .unwrap_or_default();
+        //
+        // The skill block is shown once per session window, and never when it
+        // carries no knowledge: a header alone ("## 🧠 Skill X (90%)" followed
+        // by nothing, when every note fell under the energy floor) costs tokens
+        // and tells the agent nothing.
+        let mut combined_context = String::new();
+        if let Some(ref o) = outcome {
+            let key = InjectionKey::Skill(o.response.skill_id);
+            if skill_has_body(&o.response.context) && self.ledger.is_fresh(&key) {
+                combined_context.push_str(&o.response.context);
+                self.ledger.record(key);
+                for id in &o.activated_note_ids {
+                    self.ledger.record(InjectionKey::Note(*id));
+                }
+            }
+        }
 
         // 5a. Inject persona context (after skill context)
         if let Some(ref pc) = persona_context {
@@ -567,9 +616,16 @@ impl nexus_claude::HookCallback for SkillActivationHook {
         }
 
         // 5b. Generate redirect suggestion for Grep/Bash tools
+        // Once per recommended tool per session window: the advice does not
+        // improve by repetition.
         if let Some(suggestion) =
-            generate_redirect_suggestion(&pre_tool.tool_name, &pre_tool.tool_input)
+            generate_redirect_suggestion(&pre_tool.tool_name, &pre_tool.tool_input).filter(|s| {
+                self.ledger
+                    .is_fresh(&InjectionKey::Redirect(s.mcp_tool.clone()))
+            })
         {
+            self.ledger
+                .record(InjectionKey::Redirect(suggestion.mcp_tool.clone()));
             // Try to enrich with ContextCard (best-effort, don't block on failure)
             let redirect_fp = extract_file_context(&pre_tool.tool_name, &pre_tool.tool_input);
             let enriched = if let Some(ref fp) = redirect_fp {
@@ -589,7 +645,9 @@ impl nexus_claude::HookCallback for SkillActivationHook {
             };
 
             // Append redirect suggestion to context (never overwrite skill context)
-            combined_context.push_str("\n\n");
+            if !combined_context.is_empty() {
+                combined_context.push_str("\n\n");
+            }
             combined_context.push_str(&enriched.to_string());
 
             debug!(
@@ -598,6 +656,12 @@ impl nexus_claude::HookCallback for SkillActivationHook {
                 "Redirect suggestion injected"
             );
         }
+
+        // Everything this call had to say was already in context.
+        if combined_context.trim().is_empty() {
+            return Ok(Self::passthrough());
+        }
+        cap_chars(&mut combined_context, MAX_HOOK_CONTEXT_CHARS);
 
         let skill_name = outcome
             .as_ref()
@@ -1130,6 +1194,69 @@ mod tests {
         assert_eq!(pname, "neo4j-expert");
         // effective_weight = 0.85 * (0.5 + 0.5 * 0.0) = 0.425 (success_rate=0.0)
         assert!((weight - 0.425).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn test_weak_knows_is_not_evidence_for_injection() {
+        // An auto-grow edge (0.3) — or two in the same directory — must not
+        // put a persona in front of the agent. This is the exact shape of the
+        // Meilisearch persona injected on src/chat/skill_hook.rs.
+        let mock_store = Arc::new(MockGraphStore::new());
+        let project_id = Uuid::new_v4();
+        let persona = test_persona(project_id, "semantic-search-specialist");
+        mock_store.create_persona(&persona).await.unwrap();
+        for f in [
+            "src/chat/skill_hook.rs",
+            "src/chat/manager.rs",
+            "src/chat/mod.rs",
+        ] {
+            mock_store
+                .add_persona_file(persona.id, f, 0.3)
+                .await
+                .unwrap();
+        }
+
+        let hook = SkillActivationHook::new(mock_store);
+        assert!(hook
+            .match_persona_for_file(project_id, "src/chat/skill_hook.rs")
+            .await
+            .is_none());
+        // Nor via the directory-prefix fallback.
+        assert!(hook
+            .match_persona_for_file(project_id, "src/chat/prompt.rs")
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn test_evidence_threshold_boundary() {
+        let mock_store = Arc::new(MockGraphStore::new());
+        let project_id = Uuid::new_v4();
+        let persona = test_persona(project_id, "neo4j-expert");
+        mock_store.create_persona(&persona).await.unwrap();
+        mock_store
+            .add_persona_file(persona.id, "src/neo4j/client.rs", MIN_KNOWS_EVIDENCE)
+            .await
+            .unwrap();
+        let hook = SkillActivationHook::new(mock_store);
+        assert!(hook
+            .match_persona_for_file(project_id, "src/neo4j/client.rs")
+            .await
+            .is_some());
+    }
+
+    #[test]
+    fn test_skill_has_body() {
+        assert!(!skill_has_body(
+            "## \u{1f9e0} Skill \"Architecture\" (confidence 90%)\n"
+        ));
+        assert!(!skill_has_body(
+            "## \u{1f9e0} Skill \"X\" (confidence 60%)\n\n  \n"
+        ));
+        assert!(skill_has_body(
+            "## \u{1f9e0} Skill \"X\" (confidence 60%)\n- \u{26a0}\u{fe0f} use run() for writes\n"
+        ));
+        assert!(!skill_has_body(""));
     }
 
     #[tokio::test]
