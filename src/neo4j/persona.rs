@@ -13,6 +13,16 @@ use neo4rs::query;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// Minimum KNOWS weight that counts as evidence for adjacency. Same value and
+/// rationale as `MIN_KNOWS_EVIDENCE` in the PreToolUse hook: below it are the
+/// system's own hypotheses (auto-grow 0.3, co-change 0.1–0.3), not knowledge.
+const MIN_ADJACENCY_EVIDENCE: f64 = 0.5;
+
+/// Files with more import neighbours than this are hubs; import adjacency is
+/// not computed for them. 20 ≈ the 99th percentile measured on PO (p50 = 2,
+/// p90 = 6, max = 41 for `lib.rs`).
+const MAX_ADJACENCY_DEGREE: i64 = 20;
+
 impl Neo4jClient {
     // ========================================================================
     // Conversion helpers
@@ -1616,8 +1626,21 @@ impl Neo4jClient {
     /// Check if a file is adjacent to a persona's KNOWS scope.
     ///
     /// Adjacent means:
-    /// 1. Same directory as a file the persona KNOWS, OR
+    /// 1. Same **immediate** directory as a file the persona KNOWS, OR
     /// 2. 1 hop via IMPORTS from a file the persona KNOWS
+    ///
+    /// In both cases the evidence must be a KNOWS of at least
+    /// `MIN_ADJACENCY_EVIDENCE` — real knowledge, not an `auto-grow` (0.3) or
+    /// weak `co-change` (0.1–0.3) edge. Import adjacency is not used for hub
+    /// files (more than `MAX_ADJACENCY_DEGREE` import neighbours): everything
+    /// is adjacent to `lib.rs`, so adjacency to it means nothing.
+    ///
+    /// Three bugs made this promiscuous before (2026-09-24): `STARTS WITH $dir`
+    /// also matched every subdirectory, so a file at the root of `src/` was
+    /// "adjacent" to any persona knowing anything under `src/`; auto-grow edges
+    /// counted as evidence for the next auto-grow, so one wrong guess seeded
+    /// the next; and hubs linked every persona to every file they touch.
+    /// `events/nats.rs` ended up "known" by four unrelated personas.
     ///
     /// Returns the list of personas (id, name) that are adjacent to this file.
     /// File paths are ABSOLUTE (matching File node convention).
@@ -1639,12 +1662,18 @@ impl Neo4jClient {
         let q = query(
             r#"
             // Strategy 1: Same directory — persona KNOWS a file in the same directory
-            OPTIONAL MATCH (p1:Persona {project_id: $project_id, status: "active"})-[:KNOWS]->(f1:File)
-            WHERE f1.path STARTS WITH $dir AND f1.path <> $file_path
+            OPTIONAL MATCH (p1:Persona {project_id: $project_id, status: "active"})-[k1:KNOWS]->(f1:File)
+            WHERE f1.path STARTS WITH $dir
+              AND NOT substring(f1.path, size($dir)) CONTAINS '/'
+              AND f1.path <> $file_path
+              AND coalesce(k1.weight, 1.0) >= $min_evidence
             WITH collect(DISTINCT p1) AS dir_personas
 
             // Strategy 2: 1-hop IMPORTS — file imports or is imported by a KNOWS file
-            OPTIONAL MATCH (target:File {path: $file_path})-[:IMPORTS|IMPORTED_BY]-(neighbor:File)<-[:KNOWS]-(p2:Persona {project_id: $project_id, status: "active"})
+            OPTIONAL MATCH (target:File {path: $file_path})
+            WHERE size([(target)-[:IMPORTS|IMPORTED_BY]-(x:File) | x]) <= $max_degree
+            OPTIONAL MATCH (target)-[:IMPORTS|IMPORTED_BY]-(neighbor:File)<-[k2:KNOWS]-(p2:Persona {project_id: $project_id, status: "active"})
+            WHERE coalesce(k2.weight, 1.0) >= $min_evidence
             WITH dir_personas, collect(DISTINCT p2) AS import_personas
 
             // Union both sets
@@ -1657,7 +1686,9 @@ impl Neo4jClient {
         )
         .param("file_path", file_path)
         .param("dir", dir)
-        .param("project_id", project_id.to_string());
+        .param("project_id", project_id.to_string())
+        .param("min_evidence", MIN_ADJACENCY_EVIDENCE)
+        .param("max_degree", MAX_ADJACENCY_DEGREE);
 
         let mut result = self
             .graph

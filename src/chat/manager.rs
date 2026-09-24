@@ -2654,14 +2654,7 @@ impl ChatManager {
             // full task context via the prompt.
             if request.runner_context.is_none() {
                 // PreToolUse → SkillActivationHook injects skill context as additionalContext
-                let skill_hook = skill_hook::SkillActivationHook::new(self.graph.clone());
-                hooks.insert(
-                    "PreToolUse".to_string(),
-                    vec![nexus_claude::HookMatcher {
-                        matcher: None, // Match all tools — filtering is done inside the hook
-                        hooks: vec![std::sync::Arc::new(skill_hook)],
-                    }],
-                );
+                Self::register_skill_hook(&mut hooks, self.graph.clone());
 
                 // PostToolUse → PostToolUseRedirectHook suggests MCP alternatives after noisy Grep
                 let post_hook = post_tool_hook::PostToolUseRedirectHook::new(self.graph.clone());
@@ -5304,6 +5297,31 @@ impl ChatManager {
     ///
     /// If the session has a `cli_session_id`, resumes with `--resume`.
     /// If not (first message or previous spawn failed), starts fresh without `--resume`.
+    /// Register the PreToolUse knowledge hook, plus a PreCompact companion that
+    /// resets its injection ledger — after a compaction, knowledge injected
+    /// earlier is no longer in context and may be shown again.
+    fn register_skill_hook(
+        hooks: &mut HashMap<String, Vec<nexus_claude::HookMatcher>>,
+        graph: Arc<dyn GraphStore>,
+    ) {
+        let ledger = Arc::new(super::hook_ledger::HookLedger::new());
+        let skill_hook = skill_hook::SkillActivationHook::with_ledger(graph, ledger.clone());
+        hooks.insert(
+            "PreToolUse".to_string(),
+            vec![nexus_claude::HookMatcher {
+                matcher: None, // Match all tools — filtering is done inside the hook
+                hooks: vec![Arc::new(skill_hook)],
+            }],
+        );
+        hooks
+            .entry("PreCompact".to_string())
+            .or_default()
+            .push(nexus_claude::HookMatcher {
+                matcher: None,
+                hooks: vec![Arc::new(super::hook_ledger::HookLedgerReset::new(ledger))],
+            });
+    }
+
     pub async fn resume_session(
         &self,
         session_id: &str,
@@ -5383,15 +5401,13 @@ impl ChatManager {
                 }],
             );
 
-            // PreToolUse → SkillActivationHook injects skill context as additionalContext
-            let skill_hook = skill_hook::SkillActivationHook::new(self.graph.clone());
-            hooks.insert(
-                "PreToolUse".to_string(),
-                vec![nexus_claude::HookMatcher {
-                    matcher: None,
-                    hooks: vec![std::sync::Arc::new(skill_hook)],
-                }],
-            );
+            // PreToolUse → SkillActivationHook injects skill context as additionalContext.
+            // Same runner exclusion as create_session: resuming a runner session
+            // used to re-enable the per-tool-call injection that creation
+            // deliberately skips.
+            if !is_runner_spawned(session_node.spawned_by.as_deref()) {
+                Self::register_skill_hook(&mut hooks, self.graph.clone());
+            }
 
             // PostToolUse → PostToolUseRedirectHook suggests MCP alternatives after noisy Grep
             let post_hook = post_tool_hook::PostToolUseRedirectHook::new(self.graph.clone());
@@ -7062,6 +7078,42 @@ fn parse_permission_control_msg(
         input,
         parent_tool_use_id: current_parent,
     })
+}
+
+/// Whether a session's `spawned_by` marks it as a PlanRunner session
+/// (`{"type":"runner",…}`). Parsed, not substring-matched, so a user session
+/// whose metadata merely mentions "runner" is not mistaken for one.
+pub(crate) fn is_runner_spawned(spawned_by: Option<&str>) -> bool {
+    spawned_by
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+        .and_then(|v| {
+            v.get("type")
+                .and_then(|t| t.as_str())
+                .map(|t| t == "runner")
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod runner_spawn_tests {
+    use super::is_runner_spawned;
+
+    #[test]
+    fn detects_runner_sessions() {
+        assert!(is_runner_spawned(Some(
+            r#"{"type":"runner","run_id":"x","plan_id":"y"}"#
+        )));
+    }
+
+    #[test]
+    fn user_and_malformed_sessions_are_not_runners() {
+        assert!(!is_runner_spawned(None));
+        assert!(!is_runner_spawned(Some("")));
+        assert!(!is_runner_spawned(Some(
+            r#"{"type":"user","note":"runner"}"#
+        )));
+        assert!(!is_runner_spawned(Some("runner")));
+    }
 }
 
 #[cfg(test)]

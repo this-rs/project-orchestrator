@@ -14,6 +14,7 @@ pub(crate) mod drain;
 pub mod enrichment;
 pub mod entity_extractor;
 pub mod feedback;
+pub(crate) mod hook_ledger;
 pub mod manager;
 pub mod model_catalog;
 pub mod observation_detector;
