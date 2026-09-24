@@ -46,6 +46,17 @@ ignore = [
     { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile unmaintained — transitive via tokio-rustls 0.24 in fastembed. Newer rustls 0.23 stack uses pki-types directly; will land when fastembed updates." },
     { id = "RUSTSEC-2025-0141", reason = "bincode 1.x unmaintained — bincode 2.x is the maintained version but is a breaking change; transitive via fastembed/ort. Out of scope for this PR." },
     { id = "RUSTSEC-2026-0097", reason = "rand unsound (custom logger via rand::rng()) — transitive in build deps. We don't call rand::rng() with a custom logger anywhere in our codebase." },
+    # ttf-parser unmaintained — author declared it so; the advisory names `skrifa`
+    # as the successor, and pdf_oxide already pulls skrifa alongside it, so the
+    # migration is underway upstream. Transitive via pdf_oxide, which is behind
+    # the OPT-IN `pdf` feature: the default build does not compile it at all.
+    #
+    # Stated plainly rather than waved through: font parsing runs on bytes from
+    # an uploaded PDF, so this is untrusted input, and an unmaintained parser
+    # there is not nothing. What makes it acceptable is the opt-in gate, not the
+    # absence of risk. Revisit when pdf_oxide finishes moving to skrifa — and
+    # reconsider the whole `pdf` feature if it does not.
+    { id = "RUSTSEC-2026-0192", reason = "ttf-parser unmaintained; transitive via pdf_oxide behind the opt-in `pdf` feature. Upstream is migrating to skrifa, already present in the same tree." },
     { id = "RUSTSEC-2026-0105", reason = "core2 unmaintained + all versions yanked. Transitive via bitstream-io ← rav1e ← ravif ← image ← fastembed. Pinned by upstream image crate; no upgrade path available. Surfaced as `yanked = warn` in [advisories]." },
     # ── gtk-rs GTK3 bindings unmaintained — transitive via Tauri's Linux desktop
     #    stack (tauri → gtk/gdk/atk → *-sys). No fix until Tauri's GTK4 migration
