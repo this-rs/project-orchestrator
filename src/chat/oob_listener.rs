@@ -51,7 +51,7 @@
 //!      `drain_pending_messages` after that turn ends — no event is
 //!      dropped.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -147,6 +147,13 @@ pub(crate) fn spawn_oob_listener(
 
         info!(session_id = %session_id, "OOB listener started");
 
+        // Tool-use ids of sub-agent launches (`Agent` / `Task`). Everything a
+        // sub-agent does is streamed with `parent_tool_use_id` = that id, and
+        // none of it is an external event the main agent must react to.
+        // Filled from every message, including in-stream ones: the launch is
+        // almost always seen while the parent turn is still streaming.
+        let mut subagent_parents: HashSet<String> = HashSet::new();
+
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => {
@@ -156,6 +163,7 @@ pub(crate) fn spawn_oob_listener(
                 next = stream.next() => {
                     match next {
                         Some(Ok(message)) => {
+                            remember_subagent_launches(&message, &mut subagent_parents);
                             // If a stream_response is currently running, that path
                             // already consumes the same broadcast. Skip silently.
                             if is_streaming.load(Ordering::Relaxed) {
@@ -174,6 +182,7 @@ pub(crate) fn spawn_oob_listener(
                                 &client,
                                 &deps,
                                 &message,
+                                should_trigger_turn(&message, &subagent_parents),
                             )
                             .await;
                         }
@@ -207,6 +216,7 @@ async fn handle_oob_message(
     _client: &Arc<Mutex<InteractiveClient>>,
     deps: &OobListenerDeps,
     message: &Message,
+    trigger_turn: bool,
 ) {
     let payload = extract_payload(message);
     let Some((source, content, correlation_id)) = payload else {
@@ -304,8 +314,18 @@ async fn handle_oob_message(
     }
 
     // 3 & 4. Push to pending_messages and try to claim streaming, then
-    //         maybe trigger a new stream_response.
-    maybe_trigger_stream(session_id, content, is_streaming, deps).await;
+    //         maybe trigger a new stream_response — only for events the agent
+    //         must react to (see `should_trigger_turn`). The event itself was
+    //         persisted and broadcast above either way.
+    if trigger_turn {
+        maybe_trigger_stream(session_id, content, is_streaming, deps).await;
+    } else {
+        debug!(
+            session_id = %session_id,
+            source = %source,
+            "OOB listener: not a turn trigger (own output, system status or sub-agent traffic)"
+        );
+    }
 }
 
 /// Push the OOB content as a `PendingMessage::BackgroundOutput` and, if
@@ -588,6 +608,60 @@ async fn check_and_record_trigger_cap(
     capped_warned.store(false, Ordering::SeqCst);
     hist.push_back(now);
     false
+}
+
+/// Upper bound on remembered sub-agent launches. A session launches a handful;
+/// the cap only guards a pathological one against unbounded growth.
+const MAX_REMEMBERED_SUBAGENTS: usize = 1024;
+
+/// Record the ids of `Agent` / `Task` tool calls, at any depth: a sub-agent
+/// may launch its own sub-agent, whose traffic is parented to that launch.
+fn remember_subagent_launches(message: &Message, parents: &mut HashSet<String>) {
+    let Message::Assistant { message: m, .. } = message else {
+        return;
+    };
+    for block in &m.content {
+        if let ContentBlock::ToolUse(t) = block {
+            if t.name == "Agent" || t.name == "Task" {
+                if parents.len() >= MAX_REMEMBERED_SUBAGENTS {
+                    parents.clear();
+                }
+                parents.insert(t.id.clone());
+            }
+        }
+    }
+}
+
+/// Should an idle-time message start a new agent turn?
+///
+/// Only a genuine external event the agent has to react to: a background
+/// tool's output (a `Monitor` match, a `Bash run_in_background` result)
+/// arriving as a User + tool_result.
+///
+/// Everything else used to trigger a turn too, and each one fed the agent a
+/// phantom "user" message — observed in production as bursts of messages
+/// reading only `[tool_use: Bash]`, `[thinking]` or a JSON status blob while
+/// background sub-agents were working:
+///
+/// - **Assistant messages** are the agent's own output (or a sub-agent's).
+///   Handing the model its own words back as a new prompt is never right.
+/// - **System messages** are status traffic (`task_progress`, `status`, …).
+///   Completion notifications are injected by the CLI itself, which starts
+///   its own turn for them.
+/// - **Anything parented to a sub-agent launch** is that sub-agent's
+///   internal traffic, tool results included.
+pub(crate) fn should_trigger_turn(message: &Message, subagent_parents: &HashSet<String>) -> bool {
+    match message {
+        Message::User {
+            parent_tool_use_id, ..
+        } => !parent_tool_use_id
+            .as_ref()
+            .is_some_and(|p| subagent_parents.contains(p)),
+        Message::Assistant { .. }
+        | Message::System { .. }
+        | Message::Result { .. }
+        | Message::StreamEvent { .. } => false,
+    }
 }
 
 /// Map a `nexus_claude::Message` variant to `(source, content, correlation_id)`
@@ -1149,6 +1223,97 @@ mod tests {
         }
 
         cancel.cancel();
+    }
+
+    // ── Phantom turns: which idle-time messages may start a turn ────────
+
+    fn assistant_with(parent: Option<&str>, blocks: Vec<ContentBlock>) -> Message {
+        Message::Assistant {
+            message: AssistantMessage { content: blocks },
+            parent_tool_use_id: parent.map(str::to_string),
+        }
+    }
+
+    fn tool_use(id: &str, name: &str) -> ContentBlock {
+        ContentBlock::ToolUse(nexus_claude::ToolUseContent {
+            id: id.to_string(),
+            name: name.to_string(),
+            input: json!({}),
+        })
+    }
+
+    #[test]
+    fn test_background_tool_output_triggers_a_turn() {
+        // The legitimate case the listener exists for.
+        let none = HashSet::new();
+        assert!(should_trigger_turn(
+            &monitor_match_message("monitor-1", "epoch 50"),
+            &none
+        ));
+        assert!(should_trigger_turn(
+            &bash_output_message("bash-bg-1", "done"),
+            &none
+        ));
+    }
+
+    #[test]
+    fn test_assistant_output_never_triggers_a_turn() {
+        // Exactly what surfaced as "[tool_use: Bash]" / "[thinking]" user
+        // messages while sub-agents ran in the background.
+        let none = HashSet::new();
+        let own = assistant_with(None, vec![tool_use("t1", "Bash")]);
+        let sub = assistant_with(Some("agent-1"), vec![tool_use("t2", "Bash")]);
+        assert!(!should_trigger_turn(&own, &none));
+        assert!(!should_trigger_turn(&sub, &none));
+    }
+
+    #[test]
+    fn test_system_status_never_triggers_a_turn() {
+        let status = Message::System {
+            subtype: "status".to_string(),
+            data: json!({"estimated_tokens": 50, "estimated_tokens_delta": 50}),
+        };
+        assert!(!should_trigger_turn(&status, &HashSet::new()));
+    }
+
+    #[test]
+    fn test_subagent_tool_results_do_not_trigger_a_turn() {
+        let mut parents = HashSet::new();
+        remember_subagent_launches(
+            &assistant_with(None, vec![tool_use("agent-7", "Agent")]),
+            &mut parents,
+        );
+        // A tool result inside the sub-agent: same shape as a Monitor match.
+        let inner = bash_output_message("agent-7", "grep output of the sub-agent");
+        assert!(!should_trigger_turn(&inner, &parents));
+        // A genuine background Bash of the main agent still triggers.
+        assert!(should_trigger_turn(
+            &bash_output_message("bash-bg-9", "x"),
+            &parents
+        ));
+    }
+
+    #[test]
+    fn test_agent_launches_are_remembered_at_any_depth() {
+        let mut parents = HashSet::new();
+        remember_subagent_launches(
+            &assistant_with(None, vec![tool_use("b1", "Bash"), tool_use("t1", "Task")]),
+            &mut parents,
+        );
+        // A sub-agent launching its own sub-agent: that one's traffic is
+        // parented to "nested" and must not trigger turns either.
+        remember_subagent_launches(
+            &assistant_with(Some("t1"), vec![tool_use("nested", "Agent")]),
+            &mut parents,
+        );
+        assert_eq!(
+            parents,
+            HashSet::from(["t1".to_string(), "nested".to_string()])
+        );
+        assert!(!should_trigger_turn(
+            &bash_output_message("nested", "deep result"),
+            &parents
+        ));
     }
 
     // ── T9: subprocess death detection ──────────────────────────────────
