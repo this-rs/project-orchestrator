@@ -11,6 +11,7 @@ mod commit;
 mod constraint;
 pub mod data_migrations;
 mod decision;
+pub mod document;
 mod event_trigger;
 mod feature_graph;
 mod impl_graph_store;
@@ -40,6 +41,7 @@ mod workspace;
 
 pub use agent_execution::{AgentExecutionNode, AgentExecutionStatus};
 pub use client::Neo4jClient;
+pub use document::{Document, DocumentChunk, DocumentChunkHit};
 pub use models::*;
 pub use traits::GraphStore;
 

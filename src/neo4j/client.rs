@@ -264,6 +264,11 @@ impl Neo4jClient {
             "CREATE CONSTRAINT agent_id IF NOT EXISTS FOR (a:Agent) REQUIRE a.id IS UNIQUE",
             // Knowledge Note constraints
             "CREATE CONSTRAINT note_id IF NOT EXISTS FOR (n:Note) REQUIRE n.id IS UNIQUE",
+            // Document constraints — a Document is a first-class knowledge node,
+            // so it gets the same id guarantee every other citizen of the graph has.
+            // Its chunks too: MERGE on DocumentChunk.id is the ingestion hot path.
+            "CREATE CONSTRAINT document_id IF NOT EXISTS FOR (d:Document) REQUIRE d.id IS UNIQUE",
+            "CREATE CONSTRAINT document_chunk_id IF NOT EXISTS FOR (c:DocumentChunk) REQUIRE c.id IS UNIQUE",
             // Workspace constraints
             "CREATE CONSTRAINT workspace_id IF NOT EXISTS FOR (w:Workspace) REQUIRE w.id IS UNIQUE",
             "CREATE CONSTRAINT workspace_slug IF NOT EXISTS FOR (w:Workspace) REQUIRE w.slug IS UNIQUE",
@@ -329,6 +334,15 @@ impl Neo4jClient {
             "CREATE INDEX note_type IF NOT EXISTS FOR (n:Note) ON (n.note_type)",
             "CREATE INDEX note_importance IF NOT EXISTS FOR (n:Note) ON (n.importance)",
             "CREATE INDEX note_staleness IF NOT EXISTS FOR (n:Note) ON (n.staleness_score)",
+            // Document indexes — sha256 is the identity of the *content*, looked
+            // up on every upload to reuse an existing ingestion instead of
+            // re-chunking and re-embedding. Deliberately NOT unique: the same
+            // bytes may legitimately be attached to two projects.
+            "CREATE INDEX document_sha256 IF NOT EXISTS FOR (d:Document) ON (d.sha256)",
+            "CREATE INDEX document_project IF NOT EXISTS FOR (d:Document) ON (d.project_id)",
+            "CREATE INDEX document_session IF NOT EXISTS FOR (d:Document) ON (d.session_id)",
+            // DocumentChunk.ordinal — every chunk read is ORDER BY ordinal.
+            "CREATE INDEX document_chunk_ordinal IF NOT EXISTS FOR (c:DocumentChunk) ON (c.ordinal)",
             // Workspace indexes
             "CREATE INDEX workspace_name IF NOT EXISTS FOR (w:Workspace) ON (w.name)",
             "CREATE INDEX ws_milestone_workspace IF NOT EXISTS FOR (wm:WorkspaceMilestone) ON (wm.workspace_id)",
@@ -461,6 +475,14 @@ impl Neo4jClient {
                    `vector.dimensions`: 768,
                    `vector.similarity_function`: 'cosine'
                }}"#,
+            // HNSW vector index for cosine similarity search on DocumentChunk
+            // embeddings — chunks are searched exactly the way notes are.
+            r#"CREATE VECTOR INDEX document_chunk_embeddings IF NOT EXISTS
+               FOR (c:DocumentChunk) ON (c.embedding)
+               OPTIONS {indexConfig: {
+                   `vector.dimensions`: 768,
+                   `vector.similarity_function`: 'cosine'
+               }}"#,
             // HNSW vector index for cosine similarity search on Decision embeddings
             r#"CREATE VECTOR INDEX decision_embedding IF NOT EXISTS
                FOR (d:Decision) ON (d.embedding)
@@ -581,6 +603,8 @@ impl Neo4jClient {
             "constraint_id",
             "agent_id",
             "note_id",
+            "document_id",
+            "document_chunk_id",
             "workspace_id",
             "workspace_slug",
             "workspace_milestone_id",

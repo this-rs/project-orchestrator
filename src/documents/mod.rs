@@ -4,10 +4,12 @@
 //! text into chunks that can still point back at exactly where they came from,
 //! and it can tell whether a claim about a document still holds.
 //!
-//! Deliberately **not** in this module: upload handling, storage, format
-//! decoding, and how a chunk reaches an agent's context. Those depend on
-//! product decisions (which formats, stored where, injected or searched or
-//! exposed as a tool) that this layer does not need to know about.
+//! Deliberately **not** in this module: upload handling, format decoding, and
+//! how a chunk reaches an agent's context. Those depend on product decisions
+//! (which formats, injected or searched or exposed as a tool) that this layer
+//! does not need to know about. [`store`] is the one exception that has since
+//! been settled: the original bytes are kept on local disk, addressed by their
+//! SHA-256.
 //!
 //! ## Why provenance is the hard part
 //!
@@ -25,12 +27,14 @@
 pub mod align;
 pub mod chunk;
 pub mod extract;
+pub mod store;
 
 pub use align::{locate, Alignment, AlignmentStatus};
 pub use chunk::{chunk_text, ChunkConfig, TextChunk};
 pub use extract::{
     DocumentFormat, ExtractError, ExtractedText, ExtractorRegistry, FormatProbe, TextExtractor,
 };
+pub use store::{DocumentStore, StoreError, MAX_BLOB_BYTES};
 
 use serde::{Deserialize, Serialize};
 

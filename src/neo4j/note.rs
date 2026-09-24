@@ -360,6 +360,7 @@ impl Neo4jClient {
             EntityType::Note => "Note",
             EntityType::ChatSession => "ChatSession",
             EntityType::Process => "Process",
+            EntityType::Document => "Document",
         };
 
         // Determine the match field based on entity type.
@@ -451,6 +452,7 @@ impl Neo4jClient {
             EntityType::Note => "Note",
             EntityType::ChatSession => "ChatSession",
             EntityType::Process => "Process",
+            EntityType::Document => "Document",
         };
 
         let (match_field, match_value, use_suffix_match) = match entity_type {
@@ -1093,6 +1095,7 @@ impl Neo4jClient {
             EntityType::Note => "Note",
             EntityType::ChatSession => "ChatSession",
             EntityType::Process => "Process",
+            EntityType::Document => "Document",
         };
 
         let (match_field, match_value, use_suffix_match) = match entity_type {
@@ -1365,6 +1368,7 @@ impl Neo4jClient {
             EntityType::Note => "Note",
             EntityType::ChatSession => "ChatSession",
             EntityType::Process => "Process",
+            EntityType::Document => "Document",
         };
 
         let (match_field, match_value, use_suffix_match) = match entity_type {

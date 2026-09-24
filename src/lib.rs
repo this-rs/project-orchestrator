@@ -114,6 +114,20 @@ pub struct YamlConfig {
     /// + OAuth 2.1 AS). Disabled by default: absent section ⇒ remote MCP off.
     #[serde(default)]
     pub remote_mcp: RemoteMcpConfig,
+    /// Document storage section (optional — where uploaded blobs live)
+    #[serde(default)]
+    pub documents: DocumentsYamlConfig,
+}
+
+/// Document storage configuration section.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct DocumentsYamlConfig {
+    /// Root directory for content-addressed document blobs.
+    /// Default: `documents::store::default_storage_dir()`, i.e. a `documents/`
+    /// subdirectory of the same per-platform application directory that already
+    /// holds `config.yaml` and `identity.key`.
+    pub storage_dir: Option<String>,
 }
 
 /// MCP Federation configuration section.
@@ -748,6 +762,13 @@ pub struct Config {
     /// Runtime-controlled — always compiled, enabled/disabled via settings.
     pub neural_routing: neural_routing_runtime::NeuralRoutingConfig,
 
+    // ── Document storage config ──────────────────────────────────────────
+    /// Root directory for content-addressed document blobs.
+    /// Priority: env var (DOCUMENTS_STORAGE_DIR) > YAML (documents.storage_dir) >
+    /// None, in which case `documents::store::default_storage_dir()` applies.
+    /// Stored unexpanded; `DocumentStore::from_config` applies `expand_tilde`.
+    pub documents_storage_dir: Option<String>,
+
     /// Resolved path to the config.yaml file that was loaded (if any).
     /// Used for persisting runtime changes back to disk.
     pub config_yaml_path: Option<std::path::PathBuf>,
@@ -849,6 +870,10 @@ impl Config {
             registry_remote_url: std::env::var("REGISTRY_REMOTE_URL")
                 .ok()
                 .or(yaml.registry.remote_url),
+            // Document storage config (env var > YAML > None ⇒ platform default)
+            documents_storage_dir: std::env::var("DOCUMENTS_STORAGE_DIR")
+                .ok()
+                .or(yaml.documents.storage_dir),
             // Neural routing config (env var overrides > YAML > defaults)
             neural_routing: {
                 let mut nr = yaml.neural_routing;
