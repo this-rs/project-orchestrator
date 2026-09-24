@@ -551,7 +551,7 @@ async fn trace_evolution_note(graph_store: &dyn GraphStore, project_id: Uuid, co
         tags: vec!["skill-evolution".to_string(), "auto-generated".to_string()],
         anchors: vec![],
         created_at: Utc::now(),
-        created_by: "skill-evolution".to_string(),
+        created_by: crate::notes::SKILL_EVOLUTION_AUTHOR.to_string(),
         last_confirmed_at: None,
         last_confirmed_by: None,
         staleness_score: 0.0,

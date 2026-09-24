@@ -152,16 +152,11 @@ pub async fn run_daily_maintenance(
         .await
         .unwrap_or_default();
 
-    // Derive adaptive prune threshold from p5 of the weight distribution
-    // (fallback = configured default when fewer than 4 synapses exist).
+    // Prune threshold: see `prune_threshold`.
     let adaptive_prune_threshold = if synapse_weights.is_empty() {
         config.synapse_prune_threshold
     } else {
-        let threshold = crate::analytics::distribution::adaptive_threshold(
-            &synapse_weights,
-            0.05,
-            config.synapse_prune_threshold,
-        );
+        let threshold = prune_threshold(&synapse_weights, config.synapse_prune_threshold);
         info!(
             project_id = %project_id,
             adaptive_prune_threshold = threshold,
@@ -416,6 +411,19 @@ pub async fn run_weekly_maintenance(
     );
 
     Ok(result)
+}
+
+/// Synapse prune threshold for one project: the p5 of its weight
+/// distribution, CAPPED at the configured absolute threshold.
+///
+/// The p5 alone is relative: on a healthy project whose synapses all weigh
+/// 0.94–0.96 it is ~0.94, and after the daily decay nearly every synapse
+/// fell below it — m4 pruned 1,457 of 2,163 strong synapses in one pass,
+/// which the self-heal then rebuilt, round after round. The distribution may
+/// only LOWER the threshold (sparse, weak graphs), never raise it: pruning
+/// is for genuinely weak synapses.
+pub fn prune_threshold(weights: &[f64], configured: f64) -> f64 {
+    crate::analytics::distribution::adaptive_threshold(weights, 0.05, configured).min(configured)
 }
 
 /// Skills given triggers per maintenance run (each generation lists the
@@ -2023,6 +2031,22 @@ mod tests {
 
         assert_eq!(result.level, "weekly");
         assert!(result.lifecycle.is_some());
+    }
+
+    #[test]
+    fn test_prune_threshold_never_prunes_strong_synapses() {
+        // Regression: tight, strong distribution — the relative p5 (~0.94)
+        // pruned nearly every synapse after the daily decay.
+        let strong: Vec<f64> = (0..200).map(|i| 0.94 + (i as f64) * 0.0001).collect();
+        let t = prune_threshold(&strong, 0.1);
+        assert!(t <= 0.1, "threshold {t} would prune strong synapses");
+        assert!(
+            strong.iter().all(|w| w - 0.02 > t),
+            "none pruned after one decay"
+        );
+        // Weak graph: the distribution may lower the threshold.
+        let weak: Vec<f64> = (0..200).map(|i| 0.01 + (i as f64) * 0.0005).collect();
+        assert!(prune_threshold(&weak, 0.1) < 0.1);
     }
 
     #[tokio::test]

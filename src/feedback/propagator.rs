@@ -156,16 +156,18 @@ async fn propagate_negative(
                 }
             }
 
-            // Decay synapses globally (light touch — proportional to negative score)
+            // Weaken the TARGET's synapses only (light touch — proportional
+            // to the negative score). This used to decay every synapse of the
+            // graph on each negative feedback about a single node.
             let decay_amount = NEGATIVE_SYNAPSE_DECAY * score.abs();
             match graph
-                .decay_synapses(decay_amount, SYNAPSE_PRUNE_THRESHOLD)
+                .weaken_node_synapses(target_id, decay_amount, SYNAPSE_PRUNE_THRESHOLD)
                 .await
             {
-                Ok((decayed, pruned)) => {
+                Ok(weakened) => {
                     debug!(
-                        "[propagator] Decayed {} synapses, pruned {} for negative feedback on {}",
-                        decayed, pruned, target_id
+                        "[propagator] Weakened {} synapses of {} for negative feedback",
+                        weakened, target_id
                     );
                 }
                 Err(e) => {

@@ -3292,6 +3292,16 @@ impl GraphStore for Neo4jClient {
         self.get_skills_for_project(project_id).await
     }
 
+    async fn weaken_node_synapses(
+        &self,
+        node_id: uuid::Uuid,
+        amount: f64,
+        prune_threshold: f64,
+    ) -> anyhow::Result<usize> {
+        self.weaken_node_synapses(node_id, amount, prune_threshold)
+            .await
+    }
+
     async fn get_deep_maintenance_times(
         &self,
     ) -> anyhow::Result<Vec<(uuid::Uuid, chrono::DateTime<chrono::Utc>)>> {
