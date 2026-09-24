@@ -1516,28 +1516,45 @@ fn contains_word(text: &str, keyword: &str) -> bool {
     if keyword.contains(' ') {
         return text.contains(keyword);
     }
-    // Single-word: require word boundaries
-    let kw_bytes = keyword.as_bytes();
-    let text_bytes = text.as_bytes();
-    let kw_len = kw_bytes.len();
-    if kw_len > text_bytes.len() {
+    let kw_len = keyword.len();
+    if kw_len == 0 || kw_len > text.len() {
         return false;
     }
-    for i in 0..=(text_bytes.len() - kw_len) {
-        if &text_bytes[i..i + kw_len] == kw_bytes {
-            let before_ok = i == 0 || !text_bytes[i - 1].is_ascii_alphanumeric();
-            let after_ok =
-                i + kw_len == text_bytes.len() || !text_bytes[i + kw_len].is_ascii_alphanumeric();
-            if before_ok && after_ok {
-                return true;
-            }
+    let mut start = 0usize;
+    while let Some(off) = text[start..].find(keyword) {
+        let i = start + off;
+
+        // Boundary check is Unicode-aware: `is_ascii_alphanumeric` treats the
+        // leading byte of an accented char as a boundary, so "partage" matched
+        // inside "partagée" and "note" inside "noté". `char::is_alphanumeric`
+        // does not.
+        let before_ok = text[..i]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !c.is_alphanumeric());
+
+        let mut after = text[i + kw_len..].chars();
+        let after_ok = match after.next() {
+            None => true,
+            Some(c) if !c.is_alphanumeric() => true,
+            // Tolerate a single plural marker: "sessions" matches "session",
+            // "compétences" matches "compétence". "findings" still does not
+            // match "find" (the next char is 'i', not a boundary).
+            Some('s') | Some('S') => after.next().is_none_or(|c| !c.is_alphanumeric()),
+            Some(_) => false,
+        };
+
+        if before_ok && after_ok {
+            return true;
         }
+        start = i + kw_len;
     }
     false
 }
 
 /// Intent keywords that trigger specific tool groups.
 const CODE_KEYWORDS: &[&str] = &[
+    // EN
     "code",
     "function",
     "file",
@@ -1550,14 +1567,33 @@ const CODE_KEYWORDS: &[&str] = &[
     "impact",
     "call graph",
     "dependency",
+    "dependencies",
     "trait",
     "struct",
     "class",
+    "method",
+    "refactor",
+    "signature",
+    "codebase",
+    // FR
     "cherche",
+    "chercher",
     "fonction",
     "fichier",
+    "recherche",
+    "référence",
+    "symbole",
+    "graphe d'appels",
+    "dépendance",
+    "classe",
+    "méthode",
+    "refactorisation",
+    "arborescence",
+    "appelant",
+    "appelé",
 ];
 const STRUCTURAL_KEYWORDS: &[&str] = &[
+    // EN
     "admin",
     "sync",
     "maintenance",
@@ -1569,8 +1605,23 @@ const STRUCTURAL_KEYWORDS: &[&str] = &[
     "energy",
     "staleness",
     "hotspot",
+    "technical debt",
+    "risk score",
+    // FR
+    "synchronisation",
+    "synchroniser",
+    "santé",
+    "neurone",
+    "énergie",
+    "obsolescence",
+    "point chaud",
+    "points chauds",
+    "dette technique",
+    "score de risque",
+    "maintenance profonde",
 ];
 const BEHAVIORAL_KEYWORDS: &[&str] = &[
+    // EN
     "protocol",
     "skill",
     "persona",
@@ -1578,25 +1629,60 @@ const BEHAVIORAL_KEYWORDS: &[&str] = &[
     "fsm",
     "state machine",
     "transition",
+    "lifecycle",
+    "hook",
+    // FR
     "protocole",
     "compétence",
+    "épisode",
+    "machine à états",
+    "machine a etats",
+    "cycle de vie",
+    "état de la machine",
 ];
 const WORKSPACE_KEYWORDS: &[&str] = &[
+    // EN
     "workspace",
     "component",
     "resource",
     "multi-project",
     "topology",
     "cross-project",
+    "monorepo",
+    // FR
+    "espace de travail",
+    "composant",
+    "ressource",
+    "multi-projet",
+    "topologie",
+    "inter-projet",
+    "inter-projets",
+    "transverse",
 ];
 const COLLAB_KEYWORDS: &[&str] = &[
+    // EN
     "chat",
-    "session",
+    "conversation",
+    "discussion",
     "feature graph",
     "sharing",
+    "share",
     "reasoning",
-    "reason",
-    "conversation",
+    "trajectory",
+    "neural routing",
+    // FR
+    "partage",
+    "partager",
+    "raisonnement",
+    "arbre de raisonnement",
+    "trajectoire",
+    "routage neuronal",
+    "graphe de fonctionnalités",
+    // NOTE: "session", "reason" and "raison" were REMOVED. Measured by
+    // tests/routing_metamorphic.rs: the filler sentence "On en reparle à la
+    // prochaine session." injected the whole Collaboration group (~1223 tokens)
+    // into 20/20 unrelated messages. A bare generic noun that names the medium
+    // rather than the intent must not be a sole trigger.
 ];
 
 /// Select which tool reference groups to include in the prompt.
@@ -2308,6 +2394,40 @@ mod tests {
         // "findings" should not trigger "find"
         let msg2 = "review the findings report";
         assert!(!CODE_KEYWORDS.iter().any(|kw| contains_word(msg2, kw)));
+    }
+
+    #[test]
+    fn test_contains_word_accented_boundary() {
+        // `is_ascii_alphanumeric` treated the leading byte of an accented char as a
+        // boundary, so "partage" matched inside "partagée" and pulled the whole
+        // Collaboration group into a Workspace question. Caught by
+        // tests/routing_metamorphic.rs (invariant `lang`).
+        assert!(!contains_word(
+            "on a besoin d'une ressource partagée",
+            "partage"
+        ));
+        assert!(contains_word("partage ce résultat", "partage"));
+        assert!(!contains_word("il est noté absent", "note"));
+        assert!(!contains_word("une clé étrangère", "cle"));
+    }
+
+    #[test]
+    fn test_contains_word_plural_tolerance() {
+        // A single trailing plural marker is tolerated...
+        assert!(contains_word("list the open sessions", "session"));
+        assert!(contains_word("quelles compétences", "compétence"));
+        assert!(contains_word("read the files", "file"));
+        // ...but ONLY for single-word keywords. A multi-word keyword is a plain
+        // substring match, so "point chaud" does not match "points chauds" —
+        // STRUCTURAL_KEYWORDS carries both forms for exactly this reason.
+        assert!(!contains_word("les points chauds", "point chaud"));
+        assert!(STRUCTURAL_KEYWORDS
+            .iter()
+            .any(|kw| contains_word("les points chauds du projet", kw)));
+        // ...but it must not reopen the substring hole.
+        assert!(!contains_word("review the findings report", "find"));
+        assert!(!contains_word("check the user profile settings", "file"));
+        assert!(!contains_word("the classifier output", "class"));
     }
 
     #[test]
