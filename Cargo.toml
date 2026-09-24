@@ -61,7 +61,7 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 
 # Web framework for webhook listener
-axum = { version = "0.8", features = ["macros", "ws"] }
+axum = { version = "0.8", features = ["macros", "multipart", "ws"] }
 tower = "0.5"
 tower-http = { version = "0.7", features = ["cors", "trace", "fs", "set-header", "timeout"] }
 
