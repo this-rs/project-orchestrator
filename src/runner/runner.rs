@@ -1165,7 +1165,7 @@ impl PlanRunner {
 
             // Execute all tasks in this wave in parallel via JoinSet
             let continuity_context = run_memory.to_markdown();
-            let wave_result = self
+            let mut wave_result = self
                 .execute_wave(
                     run_id,
                     plan_id,
@@ -1252,6 +1252,7 @@ impl PlanRunner {
             // only once (on the last task) since they verify the whole project.
             // The base_commit check runs on the last task to detect ghost completions.
             if !wave_result.tasks_completed.is_empty() {
+                let mut verification_failures: Vec<(Uuid, String)> = Vec::new();
                 for (idx, &task_id) in wave_result.tasks_completed.iter().enumerate() {
                     let is_last = idx == wave_result.tasks_completed.len() - 1;
                     // Use with_base_commit on the LAST task to verify the wave
@@ -1275,9 +1276,19 @@ impl PlanRunner {
                         let reason =
                             format!("Post-wave verification failed:\n- {}", reasons.join("\n- "));
                         warn!("Task {} verification failed: {}", task_id, reason);
-                        self.on_task_failed(run_id, plan_id, task_id, &reason, 0.0, 0.0)
+                        // Definitive: the wave's retry loop has already run, so
+                        // routing this through on_task_failed() would only flip
+                        // the task back to Pending and strand it there (while
+                        // still counted as completed in RunnerState).
+                        self.fail_task_definitively(run_id, task_id, &reason, 0)
                             .await?;
+                        verification_failures.push((task_id, reason));
                     }
+                }
+                // Keep RunMemory truthful for the next waves.
+                for (task_id, reason) in verification_failures {
+                    wave_result.tasks_completed.retain(|t| *t != task_id);
+                    wave_result.tasks_failed.push((task_id, reason));
                 }
             }
 
@@ -3334,7 +3345,31 @@ impl PlanRunner {
         }
 
         // No retries left — mark as definitively Failed
+        self.fail_task_definitively(run_id, task_id, reason, retry_count)
+            .await?;
 
+        error!(
+            "Task {} failed (final): {} (duration: {:.1}s, cost: ${:.4})",
+            task_id, reason, duration_secs, cost_usd
+        );
+
+        Ok(false)
+    }
+
+    /// Mark a task as definitively Failed (no further retry in this run):
+    /// Neo4j status + RunnerState bookkeeping (persisted), close the agent's
+    /// chat session if one is still registered, and emit `TaskFailed`.
+    ///
+    /// Used by `on_task_failed` once retries are exhausted, by the retry loop
+    /// when a retry fails, and by post-wave verification (which runs after the
+    /// retry loop, so a verification failure can no longer be retried).
+    async fn fail_task_definitively(
+        &self,
+        run_id: Uuid,
+        task_id: Uuid,
+        reason: &str,
+        attempts: u32,
+    ) -> Result<()> {
         // Extract session_id BEFORE mark_task_failed removes the agent
         let agent_session_id = {
             let global = RUNNER_STATE.read().await;
@@ -3347,7 +3382,6 @@ impl PlanRunner {
         self.update_task_status_with_event(task_id, TaskStatus::Failed)
             .await?;
 
-        // Update global state
         {
             let mut global = RUNNER_STATE.write().await;
             if let Some(ref mut s) = *global {
@@ -3356,23 +3390,8 @@ impl PlanRunner {
             }
         }
 
-        // Close the agent's chat session (fire-and-forget, definitive failure only)
         if let Some(sid) = agent_session_id {
-            let chat_manager = self.chat_manager.clone();
-            tokio::spawn(async move {
-                let sid_str = sid.to_string();
-                if let Err(e) = chat_manager.close_session(&sid_str).await {
-                    warn!(
-                        "Failed to close agent session {} after task failure: {}",
-                        sid_str, e
-                    );
-                } else {
-                    debug!(
-                        "Closed agent session {} after task {} failed (final)",
-                        sid_str, task_id
-                    );
-                }
-            });
+            self.close_session_in_background(sid, task_id, "task failure");
         }
 
         self.emit_event(RunnerEvent::TaskFailed {
@@ -3380,15 +3399,23 @@ impl PlanRunner {
             task_id,
             task_title: String::new(),
             reason: reason.to_string(),
-            attempts: retry_count,
+            attempts,
         });
+        Ok(())
+    }
 
-        error!(
-            "Task {} failed (final): {} (duration: {:.1}s, cost: ${:.4})",
-            task_id, reason, duration_secs, cost_usd
-        );
-
-        Ok(false)
+    /// Close an agent chat session without blocking the caller. Closing kills
+    /// the Claude Code process group (CLI + its tool subprocesses).
+    fn close_session_in_background(&self, sid: Uuid, task_id: Uuid, why: &'static str) {
+        let chat_manager = self.chat_manager.clone();
+        tokio::spawn(async move {
+            let sid_str = sid.to_string();
+            if let Err(e) = chat_manager.close_session(&sid_str).await {
+                warn!("Failed to close agent session {} after {}: {}", sid_str, why, e);
+            } else {
+                debug!("Closed agent session {} after {} (task {})", sid_str, why, task_id);
+            }
+        });
     }
 
     /// Create a gotcha note when a task fails definitively after all retries.
