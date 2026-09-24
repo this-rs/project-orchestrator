@@ -148,6 +148,12 @@ flate2 = "1"
 tar = "0.4"
 zip = { version = "8", default-features = false, features = ["deflate"] }
 
+# DOCX text extraction (feature `docx`). A .docx is a ZIP of XML parts, so the
+# container is handled by `zip` above and the parsing by quick-xml. 0.39 is
+# already in Cargo.lock as a transitive dependency — pinning the same minor
+# reuses that resolution instead of vendoring a second copy of the crate.
+quick-xml = { version = "0.39", optional = true }
+
 # Home directory detection
 dirs = "6"
 regex = "1.12.3"
@@ -189,14 +195,31 @@ statrs = { version = "0.18", default-features = false }
 # Only activated for cross-compiled builds (e.g. aarch64-unknown-linux-gnu).
 openssl-sys = { version = "0.9", optional = true, features = ["vendored"] }
 
+# PDF text extraction (optional — feature `pdf`).
+# MIT OR Apache-2.0. default-features = false drops `icc` (colour profiles) and
+# `legacy-crypto` (RC4/MD5 for pre-AES encrypted PDFs); we only read text.
+pdf_oxide = { version = "0.3.78", default-features = false, optional = true }
+
+# Not used directly — an upper bound on a transitive dependency of pdf_oxide.
+# pdf_oxide 0.3.78 requires office_oxide "0.1.9", but office_oxide 0.1.12
+# (released after it) added a field to `DocumentIR`, so pdf_oxide no longer
+# compiles against it: `missing field `defined_names` in initializer`. A
+# semver-compatible break, which means cargo picks the broken version by
+# default and `cargo update` would re-break a lockfile pin. Stating the bound
+# here makes it a constraint rather than an accident. Remove once pdf_oxide
+# ships a release that builds against office_oxide 0.1.12.
+office_oxide = { version = ">=0.1.9, <0.1.12", default-features = false, optional = true }
+
 # Unix process signaling (SIGINT to process group for interrupt)
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [features]
 default = []
+docx = ["dep:quick-xml"]
 embedded-frontend = ["dep:rust-embed", "dep:mime_guess"]
 vendored-openssl = ["dep:openssl-sys"]
+pdf = ["dep:pdf_oxide", "dep:office_oxide"]
 
 [dev-dependencies]
 tokio-test = "0.4"

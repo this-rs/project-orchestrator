@@ -24,9 +24,13 @@
 
 pub mod align;
 pub mod chunk;
+pub mod extract;
 
 pub use align::{locate, Alignment, AlignmentStatus};
 pub use chunk::{chunk_text, ChunkConfig, TextChunk};
+pub use extract::{
+    DocumentFormat, ExtractError, ExtractedText, ExtractorRegistry, FormatProbe, TextExtractor,
+};
 
 use serde::{Deserialize, Serialize};
 
