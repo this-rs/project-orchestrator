@@ -661,7 +661,7 @@ Plans can be executed autonomously and triggered automatically:
 - `plan(action: "enrich", plan_id)` — auto-enrich plan with affected files and dependencies
 "#;
 
-/// Exhaustive reference of all 28 MCP mega-tools with every action and parameter.
+/// Exhaustive reference of all 29 MCP mega-tools with every action and parameter.
 /// Injected as the final section of the system prompt by `build_system_prompt()`.
 pub const TOOL_REFERENCE: &str = r#"# MCP Mega-Tools Reference
 
@@ -1297,6 +1297,21 @@ Manage lifecycle hooks — automatic actions triggered on entity status changes.
 | get | `hook_id` (req) | Get hook by UUID |
 | update | `hook_id` (req), `name`, `description`, `action_config`, `priority`, `enabled` | Update hook fields |
 | delete | `hook_id` (req) | Delete a hook |
+
+## mcp_federation
+Manage external MCP server connections (federation). Actions: connect, disconnect, list, status, tools, probe, reconnect, backfill_relations, backfill_sequences
+
+| Action | Key Parameters | Description |
+|--------|---------------|-------------|
+| connect | `server_id` (req), `transport` (req: stdio/sse/streamable_http), `command`, `args` (array), `env` (object) for stdio, `url`, `headers` (object) for sse/streamable_http, `display_name`, `auto_probe` (default true) | Connect an external MCP server |
+| disconnect | `server_id` (req) | Disconnect a server |
+| list | | List connected external MCP servers |
+| status | `server_id` (req) | Get connection status of a server |
+| tools | `server_id` (req) | List the tools exposed by a server |
+| probe | `server_id` (req) | Probe a server's read-only tools |
+| reconnect | `server_id` (req) | Reconnect a server |
+| backfill_relations | | Backfill CO_ACTIVATED_WITH relations between external tools used in the same session |
+| backfill_sequences | | Backfill OFTEN_FOLLOWS relations between consecutively used external tools |
 "#;
 
 use anyhow::Result;

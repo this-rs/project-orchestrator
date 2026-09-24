@@ -6,10 +6,94 @@
 //! Uses Platt scaling (logistic regression on raw logits) fitted on a validation set.
 
 use serde::{Deserialize, Serialize};
+use std::sync::Once;
 
 // ---------------------------------------------------------------------------
 // Platt scaling
 // ---------------------------------------------------------------------------
+
+/// Largest slope magnitude `|a|` a Platt calibrator is allowed to publish with.
+///
+/// `a` is Platt's inverse-temperature: it is the total logit swing the sigmoid
+/// applies across the whole raw-confidence range `[0, 1]`. The larger `|a|`, the
+/// closer the calibrator is to a step function, and the more a difference in raw
+/// confidence that the validation set could not possibly have resolved gets turned
+/// into a difference in published probability.
+///
+/// Concrete toxic fit, produced by `fit()` itself: 12 samples whose raw confidences
+/// all sit in `[0.490, 0.512]`, perfectly separable at the midpoint. Newton converges
+/// to `a = 272.99`, `b = -136.77` — an optimum of the likelihood, and mathematically
+/// nothing is wrong. Applied as-is it publishes:
+///
+/// ```text
+///   raw 0.49 -> 0.047        raw 0.51 -> 0.921
+/// ```
+///
+/// A 0.02 swing in raw confidence — the entire width of the data the fit ever saw,
+/// i.e. noise — flips a caller gating at 0.7 from "reject" to "accept". At `|a| = 273`
+/// the band where the published probability travels from 0.12 to 0.88 is 0.015 raw
+/// confidence wide; the calibrator is a step function wearing a sigmoid's clothes.
+///
+/// 50.0 is the ceiling because:
+/// * every healthy fit this crate's own fixtures produce lands well below it —
+///   `|a| = 4.5` on noisy data, `18.5` on cleanly separated data at n=100, `25.9` at
+///   n=200. The cap leaves roughly 2x headroom over the steepest legitimate fit, so
+///   like `MIN_CLI_VERSION` it is a safety ceiling, not a validation: it does not
+///   bite configurations that are merely aggressive;
+/// * at `|a| = 50` the 0.12..0.88 band is still 0.08 raw confidence wide — steep, but
+///   a gradation rather than a threshold.
+///
+/// When the ceiling bites, `a` and `b` are rescaled *jointly* by `MAX / |a|`. That is
+/// exactly a temperature floor: it caps the sharpening while leaving the decision
+/// midpoint `-b/a` — the only part of a degenerate fit that carries real information —
+/// untouched. The fit above becomes `a = 50.0`, `b = -25.05`, same midpoint 0.501,
+/// and publishes `raw 0.49 -> 0.366`, `raw 0.51 -> 0.611`: still ordered, no longer
+/// pretending to a certainty it never measured.
+///
+/// This is deliberately NOT a hard error. A calibrator that trips the ceiling still
+/// produces monotone, usable output; what changes is that a warning tells the operator
+/// the confidences involved must be treated as uncalibrated.
+pub const PLATT_MAX_ABS_SLOPE: f64 = 50.0;
+
+/// Emitted once per process, not once per `calibrate()` call.
+static PLATT_BOUND_WARNED: Once = Once::new();
+
+fn warn_platt_bounded(a: f64, b: f64, reason: &str) {
+    PLATT_BOUND_WARNED.call_once(|| {
+        tracing::warn!(
+            fitted_a = a,
+            fitted_b = b,
+            max_abs_slope = PLATT_MAX_ABS_SLOPE,
+            "Platt calibration {reason}; parameters bounded before publication. \
+             Treat the confidence of the affected entries as UNCALIBRATED — the fit \
+             resolves differences in raw confidence that the validation set cannot \
+             support. This warning is emitted once per process."
+        );
+    });
+}
+
+/// Bound `(a, b)` before they are ever used to publish a probability.
+///
+/// Returns the parameters untouched — bit-for-bit, no arithmetic applied — whenever
+/// they are finite and within `PLATT_MAX_ABS_SLOPE`, so a healthy fit is strictly
+/// unaffected by this guard.
+fn bounded_params(a: f64, b: f64) -> (f64, f64) {
+    if !a.is_finite() || !b.is_finite() {
+        // A NaN/inf calibrator (corrupt persisted model, division by a singular
+        // Hessian upstream) would publish NaN. Fall back to the default parameters.
+        warn_platt_bounded(a, b, "parameters are not finite");
+        return (-1.0, 0.0);
+    }
+
+    let abs_a = a.abs();
+    if abs_a > PLATT_MAX_ABS_SLOPE {
+        let scale = PLATT_MAX_ABS_SLOPE / abs_a;
+        warn_platt_bounded(a, b, "slope exceeds the safety ceiling");
+        return (a * scale, b * scale);
+    }
+
+    (a, b)
+}
 
 /// Platt scaling parameters: P(y=1|x) = 1 / (1 + exp(A*x + B))
 ///
@@ -36,14 +120,28 @@ impl Default for PlattCalibrator {
 }
 
 impl PlattCalibrator {
+    /// The parameters actually used to publish a probability.
+    ///
+    /// Equal to `(self.a, self.b)` for any healthy calibrator; see
+    /// [`PLATT_MAX_ABS_SLOPE`] for when and why they differ.
+    pub fn effective_params(&self) -> (f64, f64) {
+        bounded_params(self.a, self.b)
+    }
+
     /// Calibrate a raw confidence score.
     pub fn calibrate(&self, raw_confidence: f32) -> f32 {
         let x = raw_confidence as f64;
+        // The safety ceiling is applied to (a, b) *here*, before the sigmoid is
+        // evaluated — never to the probability afterwards. A guard that fires after
+        // publication does not protect anything. Applying it on this path (and not
+        // only in `fit()`) also covers calibrators that never went through `fit()`:
+        // hand-built literals and deserialized persisted models.
+        let (a, b) = self.effective_params();
         // Platt's sigmoid: P(y=1|x) = 1/(1 + exp(Ax + B))
         // With A < 0 for well-calibrated output (higher x → higher P).
         // The fit() uses sigmoid(f) = 1/(1+exp(-f)) where f = ax+b,
         // so calibrate must also use sigmoid(ax+b) = 1/(1+exp(-(ax+b))).
-        let p = 1.0 / (1.0 + (-(self.a * x + self.b)).exp());
+        let p = 1.0 / (1.0 + (-(a * x + b)).exp());
         p as f32
     }
 
@@ -152,6 +250,11 @@ impl PlattCalibrator {
                 break;
             }
         }
+
+        // Bound the fit before it is stored, so a persisted calibrator is already
+        // sane and the operator sees the warning when the model is built rather than
+        // on the first request it answers. `calibrate()` re-checks anyway.
+        let (a, b) = bounded_params(a, b);
 
         Self { a, b, n_samples: n }
     }
@@ -423,6 +526,288 @@ mod tests {
                 i,
                 calibrated[i],
                 calibrated[i - 1]
+            );
+        }
+    }
+
+    // ── Safety-ceiling on the fitted slope (Laya-style guard) ────────────
+
+    /// The unguarded formula, exactly as `calibrate()` computed it before the
+    /// safety ceiling existed. Non-regression tests compare against this.
+    fn unguarded_calibrate(a: f64, b: f64, raw: f32) -> f32 {
+        let x = raw as f64;
+        (1.0 / (1.0 + (-(a * x + b)).exp())) as f32
+    }
+
+    /// The three fixtures already exercised by the tests above, plus a noisy one.
+    fn healthy_fixtures() -> Vec<(&'static str, Vec<(f32, bool)>)> {
+        vec![
+            (
+                "separable_at_0.5_n100",
+                (0..100)
+                    .map(|i| {
+                        let c = i as f32 / 100.0;
+                        (c, c > 0.5)
+                    })
+                    .collect(),
+            ),
+            (
+                "noisy_n200",
+                (0..200)
+                    .map(|i| {
+                        let c = i as f32 / 200.0;
+                        (c, c + 0.1 * ((i as f32 * 0.7).sin()) > 0.5)
+                    })
+                    .collect(),
+            ),
+            (
+                "separable_at_0.45_n200",
+                (0..200)
+                    .map(|i| {
+                        let c = i as f32 / 200.0;
+                        (c, c > 0.45)
+                    })
+                    .collect(),
+            ),
+            (
+                "realistic_noisy_n200",
+                (0..200)
+                    .map(|i| {
+                        let c = 0.2 + 0.7 * (i as f32 / 200.0);
+                        (c, (((i * 7919) % 100) as f32 / 100.0) < c)
+                    })
+                    .collect(),
+            ),
+        ]
+    }
+
+    #[test]
+    fn test_platt_default_is_strictly_unchanged_by_guard() {
+        let cal = PlattCalibrator::default(); // a = -1, b = 0
+        let (a, b) = cal.effective_params();
+
+        // Bit-for-bit: the guard must not touch the default parameters at all.
+        assert_eq!(
+            a, -1.0,
+            "default slope must pass through the guard untouched"
+        );
+        assert_eq!(
+            b, 0.0,
+            "default intercept must pass through the guard untouched"
+        );
+
+        for i in 0..=20 {
+            let raw = i as f32 / 20.0;
+            assert_eq!(
+                cal.calibrate(raw),
+                unguarded_calibrate(-1.0, 0.0, raw),
+                "default calibration changed at raw={raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_platt_healthy_fit_is_bitwise_unchanged_by_guard() {
+        // Non-regression: for every healthy fixture, the guard is a strict no-op —
+        // same (a, b) bits, and calibrate() returns exactly what the pre-guard
+        // formula returns. Demonstrated, not asserted in prose.
+        for (name, data) in healthy_fixtures() {
+            let cal = PlattCalibrator::fit(&data);
+
+            assert!(
+                cal.a.abs() < PLATT_MAX_ABS_SLOPE,
+                "fixture {name} produced |a| = {:.4}, at or above the ceiling {} — \
+                 it is no longer a healthy-fit fixture",
+                cal.a.abs(),
+                PLATT_MAX_ABS_SLOPE
+            );
+
+            let (a, b) = cal.effective_params();
+            assert_eq!(
+                a, cal.a,
+                "guard altered the slope of healthy fixture {name}"
+            );
+            assert_eq!(
+                b, cal.b,
+                "guard altered the intercept of healthy fixture {name}"
+            );
+
+            for i in 0..=100 {
+                let raw = i as f32 / 100.0;
+                assert_eq!(
+                    cal.calibrate(raw),
+                    unguarded_calibrate(cal.a, cal.b, raw),
+                    "fixture {name}: calibrate({raw}) changed"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_platt_healthy_fit_matches_pre_guard_golden_values() {
+        // Golden values captured from the implementation BEFORE the safety ceiling
+        // was introduced. Any drift in fit() or calibrate() breaks this.
+        struct Golden {
+            name: &'static str,
+            data: Vec<(f32, bool)>,
+            a: f64,
+            b: f64,
+            p: [(f32, f64); 3],
+        }
+
+        let goldens = vec![
+            Golden {
+                name: "separable_at_0.5_n100",
+                data: (0..100)
+                    .map(|i| {
+                        let c = i as f32 / 100.0;
+                        (c, c > 0.5)
+                    })
+                    .collect(),
+                a: 1.849_395_597_403_027_5e1,
+                b: -9.339_209_806_439_31,
+                p: [
+                    (0.1, 0.000_558_435),
+                    (0.5, 0.476_958_377),
+                    (0.9, 0.999_328_517),
+                ],
+            },
+            Golden {
+                name: "separable_at_0.45_n200",
+                data: (0..200)
+                    .map(|i| {
+                        let c = i as f32 / 200.0;
+                        (c, c > 0.45)
+                    })
+                    .collect(),
+                a: 2.591_085_318_809_990_7e1,
+                b: -1.172_510_601_853_088_7e1,
+                p: [
+                    (0.1, 0.000_107_919),
+                    (0.5, 0.773_874_678),
+                    (0.9, 0.999_990_785),
+                ],
+            },
+        ];
+
+        for g in goldens {
+            let cal = PlattCalibrator::fit(&g.data);
+            assert!(
+                (cal.a - g.a).abs() / g.a.abs() < 1e-12,
+                "{}: slope drifted, expected {} got {}",
+                g.name,
+                g.a,
+                cal.a
+            );
+            assert!(
+                (cal.b - g.b).abs() / g.b.abs() < 1e-12,
+                "{}: intercept drifted, expected {} got {}",
+                g.name,
+                g.b,
+                cal.b
+            );
+            for (raw, expected) in g.p {
+                let got = cal.calibrate(raw) as f64;
+                assert!(
+                    (got - expected).abs() < 1e-6,
+                    "{}: calibrate({raw}) expected {expected}, got {got}",
+                    g.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_platt_degenerate_handbuilt_fit_is_bounded_not_applied() {
+        // The toxic fit documented on PLATT_MAX_ABS_SLOPE, built by hand the way a
+        // deserialized persisted model would arrive: it never goes through fit().
+        let cal = PlattCalibrator {
+            a: 272.994_801_540_981_54,
+            b: -136.770_398_053_008_08,
+            n_samples: 12,
+        };
+
+        let (a, b) = cal.effective_params();
+        assert!(
+            a.abs() <= PLATT_MAX_ABS_SLOPE + 1e-9,
+            "slope was not bounded: {a}"
+        );
+
+        // The decision midpoint -b/a is preserved by the joint rescale.
+        assert!(
+            ((-b / a) - (-cal.b / cal.a)).abs() < 1e-9,
+            "rescale moved the decision midpoint: {} -> {}",
+            -cal.b / cal.a,
+            -b / a
+        );
+
+        // Applied as-is, 0.49/0.51 would publish 0.047/0.921. The guard must NOT
+        // publish those.
+        let p_low = cal.calibrate(0.49);
+        let p_high = cal.calibrate(0.51);
+
+        assert!(
+            p_low > 0.2,
+            "raw 0.49 still published as a near-certainty of failure: {p_low}"
+        );
+        assert!(
+            p_high < 0.8,
+            "raw 0.51 still published as a near-certainty: {p_high}"
+        );
+        // Ordering — the one thing the degenerate fit did know — is kept.
+        assert!(p_high > p_low, "bounding must not invert the ordering");
+
+        // And it is a ceiling, not a rejection: the output is still a live sigmoid.
+        assert!(cal.calibrate(0.0) < cal.calibrate(1.0));
+    }
+
+    #[test]
+    fn test_platt_fit_on_tight_cluster_is_bounded() {
+        // 12 samples spanning 0.490..0.512, perfectly separable. Newton converges to
+        // |a| ≈ 273 — an honest likelihood optimum over data that resolves nothing.
+        let data: Vec<(f32, bool)> = (0..12).map(|i| (0.49 + 0.002 * i as f32, i >= 6)).collect();
+
+        let cal = PlattCalibrator::fit(&data);
+
+        assert_eq!(cal.n_samples, 12, "the fit itself must still happen");
+        assert!(
+            cal.a.abs() <= PLATT_MAX_ABS_SLOPE + 1e-9,
+            "fit() stored an unbounded slope: {}",
+            cal.a
+        );
+
+        // The published band over the data's own width is a gradation, not a step.
+        let p_low = cal.calibrate(0.49);
+        let p_high = cal.calibrate(0.51);
+        assert!(
+            p_high - p_low < 0.7,
+            "0.02 of raw confidence still moves the published probability by {:.3} \
+             ({p_low:.3} -> {p_high:.3})",
+            p_high - p_low
+        );
+    }
+
+    #[test]
+    fn test_platt_non_finite_params_fall_back_to_default() {
+        for (a, b) in [
+            (f64::NAN, 0.0),
+            (f64::INFINITY, 0.0),
+            (1.0, f64::NEG_INFINITY),
+        ] {
+            let cal = PlattCalibrator {
+                a,
+                b,
+                n_samples: 50,
+            };
+            assert_eq!(
+                cal.effective_params(),
+                (-1.0, 0.0),
+                "non-finite ({a}, {b}) must fall back to the default parameters"
+            );
+            let p = cal.calibrate(0.8);
+            assert!(
+                p.is_finite() && p > 0.0 && p < 1.0,
+                "non-finite parameters published {p}"
             );
         }
     }
