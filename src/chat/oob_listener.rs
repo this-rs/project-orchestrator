@@ -153,6 +153,13 @@ pub(crate) fn spawn_oob_listener(
         // Filled from every message, including in-stream ones: the launch is
         // almost always seen while the parent turn is still streaming.
         let mut subagent_parents: HashSet<String> = HashSet::new();
+        // Background traffic IS activity: without this, a session whose turn
+        // ended while sub-agents / background tasks kept working looked idle
+        // and was closed by the idle cleanup, killing that work. Throttled so
+        // a chatty stream does not take the sessions write lock per message.
+        let mut last_activity_touch = Instant::now()
+            .checked_sub(ACTIVITY_TOUCH_INTERVAL)
+            .unwrap_or_else(Instant::now);
 
         loop {
             tokio::select! {
@@ -164,6 +171,14 @@ pub(crate) fn spawn_oob_listener(
                     match next {
                         Some(Ok(message)) => {
                             remember_subagent_launches(&message, &mut subagent_parents);
+                            if last_activity_touch.elapsed() >= ACTIVITY_TOUCH_INTERVAL {
+                                last_activity_touch = Instant::now();
+                                if let Some(active) =
+                                    deps.active_sessions.write().await.get_mut(&session_id)
+                                {
+                                    active.last_activity = Instant::now();
+                                }
+                            }
                             // If a stream_response is currently running, that path
                             // already consumes the same broadcast. Skip silently.
                             if is_streaming.load(Ordering::Relaxed) {
@@ -609,6 +624,10 @@ async fn check_and_record_trigger_cap(
     hist.push_back(now);
     false
 }
+
+/// Minimum interval between two `last_activity` refreshes from background
+/// traffic — far below the idle timeout (minutes), far above message rate.
+const ACTIVITY_TOUCH_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Upper bound on remembered sub-agent launches. A session launches a handful;
 /// the cap only guards a pathological one against unbounded growth.
