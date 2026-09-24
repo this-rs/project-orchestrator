@@ -14,6 +14,7 @@ pub mod analytics;
 pub mod api;
 pub mod auth;
 pub mod chat;
+pub mod documents;
 pub mod embeddings;
 pub mod episodes;
 pub mod events;
