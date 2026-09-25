@@ -595,6 +595,24 @@ impl Orchestrator {
         self.state.neo4j.clone()
     }
 
+    /// The resolved runtime configuration.
+    ///
+    /// Exposed so HTTP handlers can build config-derived services (the document
+    /// blob store, for one) without a second, divergent copy of the config
+    /// resolution rules.
+    pub fn config(&self) -> &Arc<crate::Config> {
+        &self.state.config
+    }
+
+    /// The embedding provider, when one is configured.
+    ///
+    /// `None` is a supported state, not a failure: with embeddings disabled the
+    /// system still works, it just cannot answer semantic queries. Callers must
+    /// degrade rather than error.
+    pub fn embedding_provider(&self) -> Option<&Arc<dyn EmbeddingProvider>> {
+        self.embedding_provider.as_ref()
+    }
+
     /// Get the runner config.
     ///
     /// TODO: propagate RunnerConfig from YamlConfig to Config for YAML-based customization.

@@ -254,6 +254,8 @@ pub enum EntityType {
     Note,
     ChatSession,
     Process,
+    /// An ingested document (uploaded attachment) living in the knowledge graph.
+    Document,
 }
 
 impl fmt::Display for EntityType {
@@ -288,6 +290,7 @@ impl fmt::Display for EntityType {
             Self::Note => write!(f, "note"),
             Self::ChatSession => write!(f, "chat_session"),
             Self::Process => write!(f, "process"),
+            Self::Document => write!(f, "document"),
         }
     }
 }
@@ -326,6 +329,7 @@ impl FromStr for EntityType {
             "note" => Ok(Self::Note),
             "chatsession" => Ok(Self::ChatSession),
             "process" => Ok(Self::Process),
+            "document" => Ok(Self::Document),
             _ => Err(format!("Unknown entity type: {}", s)),
         }
     }
@@ -370,6 +374,7 @@ impl EntityType {
             Self::Note => "Note",
             Self::ChatSession => "ChatSession",
             Self::Process => "Process",
+            Self::Document => "Document",
         }
     }
 

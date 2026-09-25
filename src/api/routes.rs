@@ -6,6 +6,7 @@
 use super::auth_handlers;
 use super::chat_handlers;
 use super::code_handlers;
+use super::document_handlers;
 use super::episode_handlers;
 use super::feedback_handlers;
 use super::handlers::{self, OrchestratorState};
@@ -29,6 +30,7 @@ use super::ws_chat_handler;
 use super::ws_handlers;
 use super::ws_run_handler;
 use crate::auth::middleware::require_auth;
+use axum::extract::DefaultBodyLimit;
 use axum::http::{header, Method};
 use axum::{
     middleware::from_fn_with_state,
@@ -1035,6 +1037,33 @@ fn protected_routes() -> Router<OrchestratorState> {
         .route(
             "/api/feedback/stats",
             get(feedback_handlers::get_feedback_stats),
+        )
+        // ================================================================
+        // Documents (attachments)
+        // ================================================================
+        // The upload route carries its own body limit. axum's default is 2 MiB,
+        // which an ordinary PDF exceeds; the rejection that follows says nothing
+        // about size, so the failure reads as a mystery rather than as "too
+        // big". The limit is derived from the blob store's cap so the two
+        // cannot drift apart — see `document_handlers::upload_body_limit`.
+        .route(
+            "/api/documents",
+            get(document_handlers::list_documents).merge(
+                post(document_handlers::upload_document)
+                    .layer(DefaultBodyLimit::max(document_handlers::upload_body_limit())),
+            ),
+        )
+        .route(
+            "/api/documents/{document_id}",
+            get(document_handlers::get_document).delete(document_handlers::delete_document),
+        )
+        .route(
+            "/api/documents/{document_id}/chunks",
+            get(document_handlers::get_document_chunks),
+        )
+        .route(
+            "/api/documents/{document_id}/raw",
+            get(document_handlers::get_document_raw),
         )
         // ================================================================
         // Knowledge Notes

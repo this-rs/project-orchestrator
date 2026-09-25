@@ -45,6 +45,7 @@ fn test_config() -> Config {
         embedding_dimensions: None,
         anthropic_api_key: None,
         registry_remote_url: None,
+        documents_storage_dir: None,
         neural_routing: Default::default(),
         config_yaml_path: None,
     }

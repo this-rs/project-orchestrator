@@ -3,6 +3,7 @@
 pub mod auth_handlers;
 pub mod chat_handlers;
 pub mod code_handlers;
+pub mod document_handlers;
 pub mod episode_handlers;
 pub mod feedback_handlers;
 pub mod graph_types;

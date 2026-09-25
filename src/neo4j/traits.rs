@@ -10,6 +10,7 @@ use crate::graph::models::{
     TopologyRule, TopologyViolation,
 };
 use crate::lifecycle::{LifecycleHook, LifecycleScope, UpdateLifecycleHookRequest};
+use crate::neo4j::document::{Document, DocumentChunk, DocumentChunkHit};
 use crate::neo4j::models::*;
 use crate::notes::{
     EntityType, Note, NoteAnchor, NoteFilters, NoteImportance, NoteStatus, PropagatedNote,
@@ -1371,6 +1372,84 @@ pub trait GraphStore: Send + Sync {
         sort_by: Option<&str>,
         sort_order: &str,
     ) -> Result<(Vec<ProjectNode>, usize)>;
+
+    // ========================================================================
+    // Document operations
+    // ========================================================================
+
+    /// Create a document and all of its chunks (batched, one UNWIND per 10K).
+    async fn create_document(&self, document: &Document, chunks: &[DocumentChunk]) -> Result<()>;
+
+    /// Get a document by ID
+    async fn get_document(&self, id: Uuid) -> Result<Option<Document>>;
+
+    /// Find an already-ingested document by content hash, optionally scoped to
+    /// a project. Used to reuse an ingestion instead of paying for it twice.
+    async fn find_document_by_sha256(
+        &self,
+        sha256: &str,
+        project_id: Option<Uuid>,
+    ) -> Result<Option<Document>>;
+
+    /// List the documents of a project, most recent first
+    async fn list_project_documents(&self, project_id: Uuid) -> Result<Vec<Document>>;
+
+    /// Get the chunks of a document, ordered by `ordinal`
+    async fn get_document_chunks(&self, document_id: Uuid) -> Result<Vec<DocumentChunk>>;
+
+    /// Write (or rewrite) the chunks of a document. Returns the number written.
+    async fn upsert_document_chunks(
+        &self,
+        document_id: Uuid,
+        chunks: &[DocumentChunk],
+    ) -> Result<usize>;
+
+    /// Store embeddings on chunks, in bulk. Returns the number written.
+    async fn set_document_chunk_embeddings(
+        &self,
+        embeddings: &[(Uuid, Vec<f32>)],
+        model: &str,
+    ) -> Result<usize>;
+
+    /// Search chunks by vector similarity (same mechanism as `vector_search_notes`)
+    async fn vector_search_document_chunks(
+        &self,
+        embedding: &[f32],
+        limit: usize,
+        project_id: Option<Uuid>,
+        min_similarity: Option<f64>,
+    ) -> Result<Vec<DocumentChunkHit>>;
+
+    /// Delete a document and, in cascade, every chunk hanging off it
+    async fn delete_document(&self, id: Uuid) -> Result<bool>;
+
+    /// Link a document to any knowledge entity via `LINKED_TO` — the same
+    /// relation `link_note_to_entity` writes, so documents live *in* the
+    /// knowledge graph rather than beside it.
+    async fn link_document_to_entity(
+        &self,
+        document_id: Uuid,
+        entity_type: &EntityType,
+        entity_id: &str,
+    ) -> Result<()>;
+
+    /// Remove the `LINKED_TO` edge between a document and an entity
+    async fn unlink_document_from_entity(
+        &self,
+        document_id: Uuid,
+        entity_type: &EntityType,
+        entity_id: &str,
+    ) -> Result<()>;
+
+    /// Documents attached to an entity, whichever side wrote the edge
+    async fn get_documents_for_entity(
+        &self,
+        entity_type: &EntityType,
+        entity_id: &str,
+    ) -> Result<Vec<Document>>;
+
+    /// Link a note to a document: `(:Note)-[:LINKED_TO]->(:Document)`
+    async fn link_note_to_document(&self, note_id: Uuid, document_id: Uuid) -> Result<()>;
 
     // ========================================================================
     // Knowledge Note operations

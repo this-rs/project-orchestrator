@@ -6,6 +6,7 @@
 
 use crate::events::trigger::EventTrigger;
 use crate::lifecycle::{LifecycleHook, LifecycleScope, UpdateLifecycleHookRequest};
+use crate::neo4j::document::{Document, DocumentChunk, DocumentChunkHit};
 use crate::neo4j::models::*;
 use crate::neo4j::traits::GraphStore;
 use crate::notes::{
@@ -68,6 +69,13 @@ pub struct MockGraphStore {
     pub impls_map: RwLock<HashMap<String, ImplNode>>,
     pub imports: RwLock<HashMap<String, ImportNode>>,
     pub notes: RwLock<HashMap<Uuid, Note>>,
+    /// Documents keyed by id
+    pub documents: RwLock<HashMap<Uuid, Document>>,
+    /// Chunks keyed by their document's id (cascade deletion mirrors HAS_CHUNK)
+    pub document_chunks: RwLock<HashMap<Uuid, Vec<DocumentChunk>>>,
+    /// LINKED_TO edges between a document and knowledge entities, stored
+    /// undirected the way the Cypher reads them
+    pub document_links: RwLock<HashMap<Uuid, Vec<(EntityType, String)>>>,
     pub chat_sessions: RwLock<HashMap<Uuid, ChatSessionNode>>,
     pub chat_events: RwLock<HashMap<Uuid, Vec<ChatEventRecord>>>,
     /// Per-session auto_continue flag (stored separately from ChatSessionNode)
@@ -240,6 +248,9 @@ impl MockGraphStore {
             impls_map: RwLock::new(HashMap::new()),
             imports: RwLock::new(HashMap::new()),
             notes: RwLock::new(HashMap::new()),
+            documents: RwLock::new(HashMap::new()),
+            document_chunks: RwLock::new(HashMap::new()),
+            document_links: RwLock::new(HashMap::new()),
             chat_sessions: RwLock::new(HashMap::new()),
             chat_events: RwLock::new(HashMap::new()),
             session_auto_continue: RwLock::new(HashMap::new()),
@@ -5455,6 +5466,204 @@ impl GraphStore for MockGraphStore {
             .collect();
         let total = filtered.len();
         Ok((paginate(&filtered, limit, offset), total))
+    }
+
+    // ========================================================================
+    // Document operations
+    // ========================================================================
+
+    async fn create_document(&self, document: &Document, chunks: &[DocumentChunk]) -> Result<()> {
+        self.documents
+            .write()
+            .await
+            .insert(document.id, document.clone());
+        self.document_chunks
+            .write()
+            .await
+            .insert(document.id, Vec::new());
+        self.upsert_document_chunks(document.id, chunks).await?;
+        Ok(())
+    }
+
+    async fn get_document(&self, id: Uuid) -> Result<Option<Document>> {
+        Ok(self.documents.read().await.get(&id).cloned())
+    }
+
+    async fn find_document_by_sha256(
+        &self,
+        sha256: &str,
+        project_id: Option<Uuid>,
+    ) -> Result<Option<Document>> {
+        let documents = self.documents.read().await;
+        let mut matches: Vec<&Document> = documents
+            .values()
+            .filter(|d| d.sha256 == sha256)
+            .filter(|d| project_id.is_none() || d.project_id == project_id)
+            .collect();
+        matches.sort_by_key(|d| d.created_at);
+        Ok(matches.first().map(|d| (*d).clone()))
+    }
+
+    async fn list_project_documents(&self, project_id: Uuid) -> Result<Vec<Document>> {
+        let documents = self.documents.read().await;
+        let mut out: Vec<Document> = documents
+            .values()
+            .filter(|d| d.project_id == Some(project_id))
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        Ok(out)
+    }
+
+    async fn get_document_chunks(&self, document_id: Uuid) -> Result<Vec<DocumentChunk>> {
+        let chunks = self.document_chunks.read().await;
+        let mut out = chunks.get(&document_id).cloned().unwrap_or_default();
+        out.sort_by_key(|c| c.ordinal);
+        Ok(out)
+    }
+
+    async fn upsert_document_chunks(
+        &self,
+        document_id: Uuid,
+        chunks: &[DocumentChunk],
+    ) -> Result<usize> {
+        let mut store = self.document_chunks.write().await;
+        let existing = store.entry(document_id).or_default();
+        for chunk in chunks {
+            // MERGE on id: a re-ingestion converges instead of duplicating.
+            match existing.iter_mut().find(|c| c.id == chunk.id) {
+                Some(slot) => *slot = chunk.clone(),
+                None => existing.push(chunk.clone()),
+            }
+        }
+        Ok(chunks.len())
+    }
+
+    async fn set_document_chunk_embeddings(
+        &self,
+        embeddings: &[(Uuid, Vec<f32>)],
+        _model: &str,
+    ) -> Result<usize> {
+        let mut store = self.document_chunks.write().await;
+        let mut written = 0;
+        for (chunk_id, vector) in embeddings {
+            for chunks in store.values_mut() {
+                if let Some(chunk) = chunks.iter_mut().find(|c| c.id == *chunk_id) {
+                    chunk.embedding = Some(vector.clone());
+                    written += 1;
+                    break;
+                }
+            }
+        }
+        Ok(written)
+    }
+
+    async fn vector_search_document_chunks(
+        &self,
+        embedding: &[f32],
+        limit: usize,
+        project_id: Option<Uuid>,
+        min_similarity: Option<f64>,
+    ) -> Result<Vec<DocumentChunkHit>> {
+        let documents = self.documents.read().await;
+        let chunks = self.document_chunks.read().await;
+
+        let mut hits: Vec<DocumentChunkHit> = Vec::new();
+        for (document_id, document_chunks) in chunks.iter() {
+            let Some(document) = documents.get(document_id) else {
+                continue;
+            };
+            if project_id.is_some() && document.project_id != project_id {
+                continue;
+            }
+            for chunk in document_chunks {
+                let Some(vector) = chunk.embedding.as_ref() else {
+                    continue;
+                };
+                let score = cosine_similarity(embedding, vector);
+                if let Some(floor) = min_similarity {
+                    if score < floor {
+                        continue;
+                    }
+                }
+                hits.push(DocumentChunkHit {
+                    document_id: *document_id,
+                    filename: document.filename.clone(),
+                    chunk: chunk.clone(),
+                    score,
+                });
+            }
+        }
+
+        hits.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        hits.truncate(limit);
+        Ok(hits)
+    }
+
+    async fn delete_document(&self, id: Uuid) -> Result<bool> {
+        let removed = self.documents.write().await.remove(&id).is_some();
+        // Chunks and links go with the document, as DETACH DELETE does.
+        self.document_chunks.write().await.remove(&id);
+        self.document_links.write().await.remove(&id);
+        Ok(removed)
+    }
+
+    async fn link_document_to_entity(
+        &self,
+        document_id: Uuid,
+        entity_type: &EntityType,
+        entity_id: &str,
+    ) -> Result<()> {
+        let mut links = self.document_links.write().await;
+        let edges = links.entry(document_id).or_default();
+        let edge = (entity_type.clone(), entity_id.to_string());
+        if !edges.contains(&edge) {
+            edges.push(edge);
+        }
+        Ok(())
+    }
+
+    async fn unlink_document_from_entity(
+        &self,
+        document_id: Uuid,
+        entity_type: &EntityType,
+        entity_id: &str,
+    ) -> Result<()> {
+        if let Some(edges) = self.document_links.write().await.get_mut(&document_id) {
+            edges.retain(|(t, id)| !(t == entity_type && id == entity_id));
+        }
+        Ok(())
+    }
+
+    async fn get_documents_for_entity(
+        &self,
+        entity_type: &EntityType,
+        entity_id: &str,
+    ) -> Result<Vec<Document>> {
+        let links = self.document_links.read().await;
+        let documents = self.documents.read().await;
+        let mut out: Vec<Document> = links
+            .iter()
+            .filter(|(_, edges)| {
+                edges
+                    .iter()
+                    .any(|(t, id)| t == entity_type && id == entity_id)
+            })
+            .filter_map(|(document_id, _)| documents.get(document_id).cloned())
+            .collect();
+        out.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        Ok(out)
+    }
+
+    async fn link_note_to_document(&self, note_id: Uuid, document_id: Uuid) -> Result<()> {
+        // The Cypher writes (:Note)-[:LINKED_TO]->(:Document); reads are
+        // undirected, so the mock records the same edge once.
+        self.link_document_to_entity(document_id, &EntityType::Note, &note_id.to_string())
+            .await
     }
 
     // ========================================================================

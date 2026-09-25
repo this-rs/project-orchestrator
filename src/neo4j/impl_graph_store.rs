@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use uuid::Uuid;
 
 use super::client::Neo4jClient;
+use super::document::{Document, DocumentChunk, DocumentChunkHit};
 use super::models::*;
 use super::traits::GraphStore;
 use crate::lifecycle::{LifecycleHook, LifecycleScope, UpdateLifecycleHookRequest};
@@ -1747,6 +1748,101 @@ impl GraphStore for Neo4jClient {
     ) -> anyhow::Result<(Vec<ProjectNode>, usize)> {
         self.list_projects_filtered(search, limit, offset, sort_by, sort_order)
             .await
+    }
+
+    // ========================================================================
+    // Document operations
+    // ========================================================================
+
+    async fn create_document(
+        &self,
+        document: &Document,
+        chunks: &[DocumentChunk],
+    ) -> anyhow::Result<()> {
+        self.create_document(document, chunks).await
+    }
+
+    async fn get_document(&self, id: Uuid) -> anyhow::Result<Option<Document>> {
+        self.get_document(id).await
+    }
+
+    async fn find_document_by_sha256(
+        &self,
+        sha256: &str,
+        project_id: Option<Uuid>,
+    ) -> anyhow::Result<Option<Document>> {
+        self.find_document_by_sha256(sha256, project_id).await
+    }
+
+    async fn list_project_documents(&self, project_id: Uuid) -> anyhow::Result<Vec<Document>> {
+        self.list_project_documents(project_id).await
+    }
+
+    async fn get_document_chunks(&self, document_id: Uuid) -> anyhow::Result<Vec<DocumentChunk>> {
+        self.get_document_chunks(document_id).await
+    }
+
+    async fn upsert_document_chunks(
+        &self,
+        document_id: Uuid,
+        chunks: &[DocumentChunk],
+    ) -> anyhow::Result<usize> {
+        self.upsert_document_chunks(document_id, chunks).await
+    }
+
+    async fn set_document_chunk_embeddings(
+        &self,
+        embeddings: &[(Uuid, Vec<f32>)],
+        model: &str,
+    ) -> anyhow::Result<usize> {
+        self.set_document_chunk_embeddings(embeddings, model).await
+    }
+
+    async fn vector_search_document_chunks(
+        &self,
+        embedding: &[f32],
+        limit: usize,
+        project_id: Option<Uuid>,
+        min_similarity: Option<f64>,
+    ) -> anyhow::Result<Vec<DocumentChunkHit>> {
+        self.vector_search_document_chunks(embedding, limit, project_id, min_similarity)
+            .await
+    }
+
+    async fn delete_document(&self, id: Uuid) -> anyhow::Result<bool> {
+        self.delete_document(id).await
+    }
+
+    async fn link_document_to_entity(
+        &self,
+        document_id: Uuid,
+        entity_type: &EntityType,
+        entity_id: &str,
+    ) -> anyhow::Result<()> {
+        self.link_document_to_entity(document_id, entity_type, entity_id)
+            .await
+    }
+
+    async fn unlink_document_from_entity(
+        &self,
+        document_id: Uuid,
+        entity_type: &EntityType,
+        entity_id: &str,
+    ) -> anyhow::Result<()> {
+        self.unlink_document_from_entity(document_id, entity_type, entity_id)
+            .await
+    }
+
+    async fn get_documents_for_entity(
+        &self,
+        entity_type: &EntityType,
+        entity_id: &str,
+    ) -> anyhow::Result<Vec<Document>> {
+        self.get_documents_for_entity(entity_type, entity_id).await
+    }
+
+    async fn link_note_to_document(&self, note_id: Uuid, document_id: Uuid) -> anyhow::Result<()> {
+        self.link_note_to_document(note_id, document_id).await
     }
 
     // ========================================================================
