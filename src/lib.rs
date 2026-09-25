@@ -1106,6 +1106,32 @@ pub async fn start_server(mut config: Config) -> Result<()> {
     // ────────────────────────────────────────────────────────────────────
     // Normal (fully configured) server
     // ────────────────────────────────────────────────────────────────────
+
+    // Bind the port FIRST, before any initialization that has side effects.
+    //
+    // This used to be the very last step, after ~850 lines of startup that
+    // connect to Neo4j, start the file watchers and the protocol scheduler,
+    // recover "interrupted" plan runs and boot the schedule/event triggers. A
+    // duplicate instance — launchd's KeepAlive relaunching
+    // `land.ffs.orchestrator` while a hand-started server already held the
+    // port — ran all of that, THEN died on `Address already in use`, and was
+    // relaunched: 443 times in one night, a full boot every ~77s, each one
+    // free to resume plan runs the live instance owned. Binding first turns a
+    // duplicate into an immediate, side-effect-free failure whose message says
+    // what happened.
+    //
+    // Connections arriving during the rest of startup now wait in the listen
+    // backlog and are served once `axum::serve` starts, instead of being
+    // refused.
+    let addr = SocketAddr::from(([0, 0, 0, 0], config.server_port));
+    let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| {
+        anyhow::anyhow!(
+            "cannot bind {addr}: {e} — another orchestrator instance is probably \
+             already serving this port (check `lsof -nP -iTCP:{} -sTCP:LISTEN`)",
+            config.server_port
+        )
+    })?;
+
     use api::handlers::ServerState;
     use tokio::sync::RwLock;
 
@@ -1948,11 +1974,8 @@ pub async fn start_server(mut config: Config) -> Result<()> {
         tracing::info!("Frontend serving disabled (API-only mode)");
     }
 
-    // Start server
-    let addr = SocketAddr::from(([0, 0, 0, 0], config.server_port));
+    // Start serving. The port was bound at the top of `start_server`.
     tracing::info!("Server listening on {}", addr);
-
-    let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
 
     Ok(())
@@ -2858,5 +2881,43 @@ chat:
         std::env::remove_var("CHAT_PROCESS_PATH");
         std::env::remove_var("CLAUDE_CLI_PATH");
         std::env::remove_var("CHAT_AUTO_UPDATE_CLI");
+    }
+
+    /// A duplicate instance must die on the port BEFORE any initialization.
+    ///
+    /// Regression for the night launchd's KeepAlive relaunched the service 443
+    /// times against a port a hand-started server already held: each attempt
+    /// connected to Neo4j, started watchers and schedulers and recovered plan
+    /// runs, and only then failed to bind. Neo4j points at an unreachable
+    /// address here on purpose — if the bind ever moves back behind
+    /// initialization, this test fails on the timeout or on a Neo4j error
+    /// instead of silently booting a full server against a real database.
+    #[tokio::test]
+    async fn start_server_fails_on_a_taken_port_before_any_initialization() {
+        // Hold a port the way the live instance did.
+        let holder = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+        let port = holder.local_addr().unwrap().port();
+
+        let mut config =
+            Config::from_yaml_and_env(Some(Path::new("/nonexistent/po-bind-first.yaml"))).unwrap();
+        // Set explicitly rather than through YAML/env: other tests in this
+        // module mutate the environment concurrently.
+        config.setup_completed = true;
+        config.server_port = port;
+        config.neo4j_uri = "bolt://127.0.0.1:1".to_string();
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), start_server(config))
+            .await
+            .expect("a taken port must fail fast, not wait on initialization");
+        let err = outcome
+            .expect_err("a taken port must be an error")
+            .to_string();
+
+        assert!(err.contains("cannot bind"), "unexpected error: {err}");
+        assert!(
+            err.contains(&port.to_string()),
+            "error should name the port: {err}"
+        );
+        drop(holder);
     }
 }
