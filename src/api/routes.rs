@@ -1790,6 +1790,14 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/chat/sessions/{id}/associate",
             post(chat_handlers::associate_session),
         )
+        // End the current turn (REST fallback for the WS `interrupt`
+        // frame). Transport-independent on purpose: Stop must still
+        // work when the chat WebSocket is down — which is precisely
+        // when the user reaches for it. See the handler doc-comment.
+        .route(
+            "/api/chat/sessions/{id}/interrupt",
+            post(chat_handlers::interrupt_session),
+        )
         // Cancel running tools (T3 of plan 28e9afe3) — kill the
         // currently-running tool subprocess(es) WITHOUT ending the
         // LLM turn. See chat_handlers::cancel_tools doc-comment.
@@ -2015,6 +2023,80 @@ mod tests {
             mcp.status(),
             StatusCode::UNAUTHORIZED,
             "/mcp must remain behind require_auth (401 without a token)"
+        );
+    }
+
+    /// The interrupt route must be **mounted**.
+    ///
+    /// This is not a hypothetical: `chatApi.interruptSession()` had been
+    /// POSTing to `/api/chat/sessions/{id}/interrupt` from four places in
+    /// the frontend while no such route existed, and every caller swallowed
+    /// the 404 in an empty `catch`. Stop buttons did nothing, silently, and
+    /// nothing in either codebase noticed.
+    ///
+    /// The assertion is relative rather than absolute, because an
+    /// unauthenticated request cannot see past `require_auth`: the route is
+    /// required to answer exactly like its mounted sibling `cancel-tools`,
+    /// and differently from a path that really is absent. The third request
+    /// keeps the test honest — if an absent path answered like a mounted
+    /// one, this test would fail instead of quietly proving nothing.
+    #[tokio::test]
+    async fn test_chat_interrupt_route_is_mounted() {
+        let app = test_app_no_frontend().await;
+        let sid = "11111111-2222-3333-4444-555555555555";
+
+        // Authenticated, otherwise every path — mounted or not — answers 401
+        // from the auth fallback and the comparison proves nothing.
+        let token = crate::test_helpers::test_bearer_token();
+        // The status alone cannot discriminate: this router is built with
+        // `chat_manager: None`, so a mounted chat route answers 404 from its
+        // own handler — the same status an absent path gets. The body is what
+        // separates "the handler ran and said chat is not configured" from
+        // "nothing answered", so compare both.
+        let answer_of = |app: Router, path: String, token: String| async move {
+            let res = app
+                .oneshot(
+                    Request::post(path)
+                        .header("content-type", "application/json")
+                        .header("authorization", token)
+                        .body(Body::from(r#"{}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = res.status();
+            let bytes = axum::body::to_bytes(res.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            (status, String::from_utf8_lossy(&bytes).to_string())
+        };
+
+        let interrupt = answer_of(
+            app.clone(),
+            format!("/api/chat/sessions/{sid}/interrupt"),
+            token.clone(),
+        )
+        .await;
+        let sibling = answer_of(
+            app.clone(),
+            format!("/api/chat/sessions/{sid}/cancel-tools"),
+            token.clone(),
+        )
+        .await;
+        let absent = answer_of(
+            app.clone(),
+            format!("/api/chat/sessions/{sid}/no-such-endpoint"),
+            token,
+        )
+        .await;
+
+        assert_ne!(
+            sibling, absent,
+            "the test cannot conclude: a mounted route and an absent one answer alike"
+        );
+        assert_eq!(
+            interrupt, sibling,
+            "/interrupt must be mounted, like its sibling /cancel-tools (got {interrupt:?}, sibling {sibling:?})"
         );
     }
 
