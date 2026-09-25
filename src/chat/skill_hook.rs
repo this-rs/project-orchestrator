@@ -740,6 +740,9 @@ mod tests {
         let hook = SkillActivationHook::new(mock_store);
 
         let input = HookInput::PreToolUse(nexus_claude::PreToolUseHookInput {
+            // Main thread, not a sub-agent — the CLI omits both fields there.
+            agent_id: None,
+            agent_type: None,
             session_id: "test".to_string(),
             transcript_path: "/tmp/transcript".to_string(),
             cwd: "/completely/unknown/path".to_string(),

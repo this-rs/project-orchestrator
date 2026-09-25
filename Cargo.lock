@@ -4621,7 +4621,7 @@ checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
 [[package]]
 name = "nexus-claude"
 version = "0.5.0"
-source = "git+https://github.com/this-rs/nexus.git?rev=6d8fdceb2359c01c7e4afe7f7ceee47e2c1c1e59#6d8fdceb2359c01c7e4afe7f7ceee47e2c1c1e59"
+source = "git+https://github.com/this-rs/nexus.git?rev=c68f046fe11e031060db32380385468a5b611a85#c68f046fe11e031060db32380385468a5b611a85"
 dependencies = [
  "async-stream",
  "async-trait",
