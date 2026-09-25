@@ -10750,6 +10750,9 @@ mod tests {
         let notifier = CompactionNotifier::new(tx, None, "test-session".to_string());
 
         let input = HookInput::PreToolUse(PreToolUseHookInput {
+            // Main thread, not a sub-agent — the CLI omits both fields there.
+            agent_id: None,
+            agent_type: None,
             session_id: "s".into(),
             transcript_path: "/t".into(),
             cwd: "/c".into(),

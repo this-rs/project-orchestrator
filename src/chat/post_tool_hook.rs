@@ -288,6 +288,9 @@ mod tests {
         let hook = PostToolUseRedirectHook::new(mock_store);
 
         let input = nexus_claude::HookInput::PreToolUse(nexus_claude::PreToolUseHookInput {
+            // Main thread, not a sub-agent — the CLI omits both fields there.
+            agent_id: None,
+            agent_type: None,
             session_id: "test".to_string(),
             transcript_path: "/tmp/t".to_string(),
             cwd: "/tmp".to_string(),
