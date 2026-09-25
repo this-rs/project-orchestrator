@@ -578,11 +578,25 @@ jobs:
             tauri_target: aarch64-unknown-linux-gnu
             artifact_os: linux
             artifact_arch: arm64
-            # AppImage bundling is broken on the ubuntu-24.04-arm runner
-            # (linuxdeploy/appimagetool fail to run even with FUSE workarounds).
-            # .deb + .rpm build fine and are the cleaner install path on ARM,
-            # so restrict the arm64 desktop bundle to those.
-            bundles: deb,rpm
+            # AppImage was disabled here on 2026-06-02 (#329) because
+            # linuxdeploy/appimagetool would not run on this runner even with
+            # APPIMAGE_EXTRACT_AND_RUN (#328). Upstream has since fixed the
+            # aarch64 builds, so the restriction is lifted.
+            #
+            # Re-verified 2026-09-24 on a DGX Spark (aarch64, Ubuntu 24.04.4,
+            # libfuse2 NOT installed — the package no longer exists on 24.04,
+            # it was renamed libfuse2t64 in the time_t transition, which is
+            # probably why the earlier FUSE workaround never took effect):
+            #   appimagetool-aarch64  build 295 (2025-12-04) -> runs
+            #   linuxdeploy-aarch64   build 368 (2026-09-01) -> runs
+            # and packaging a real AppDir succeeded, producing a valid
+            # static-pie aarch64 ELF. Both tools now ship a static runtime and
+            # need no FUSE at all. Note the working linuxdeploy build postdates
+            # the failure by three months.
+            #
+            # APPIMAGE_EXTRACT_AND_RUN=1 is kept set below: harmless when
+            # unneeded, and still the no-FUSE escape hatch if a future build
+            # regresses.
 
           - target: x86_64-pc-windows-msvc
             runner: windows-latest
