@@ -271,6 +271,28 @@ pub struct CancelToolsResult {
     pub capped: bool,
 }
 
+/// Outcome of [`ChatManager::interrupt_scoped`]. Surfaced to REST callers
+/// so a client can tell a real interrupt from a silent no-op: before this,
+/// `interrupt()` returned `Ok(())` whether it had stopped a live turn or
+/// found nothing at all, and the UI had no way to tell the two apart —
+/// it just span on "Stopping…" forever.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct InterruptOutcome {
+    /// `true` when the session was found in `active_sessions` and the
+    /// interrupt was actually applied (flag + token + control_request).
+    /// `false` means nothing local was stopped — the session may live on
+    /// another instance (see `routed`), or not be running at all.
+    pub delivered: bool,
+    /// Where the interrupt went: `"local"`, `"nats"` (not local, published
+    /// for whichever instance owns the session) or `"none"` (nowhere).
+    pub routed: String,
+    /// PID of the Claude Code CLI subprocess, when known.
+    pub cli_pid: Option<u32>,
+    /// Descendant PIDs that received `SIGINT`. Always empty when the call
+    /// was made with `kill_tools = false`.
+    pub killed_pids: Vec<u32>,
+}
+
 /// Result of `ChatManager::cancel_task`. Surfaced to REST/WS callers
 /// so the UI can update the cancelled task's status and surface rate
 /// cap hits gracefully.
@@ -6097,7 +6119,52 @@ impl ChatManager {
     /// Sets the interrupt flag, which causes the stream loop to break and release the
     /// client lock. The stream loop then sends the actual interrupt signal to the CLI.
     /// This is instantaneous — no waiting for the Mutex.
+    /// Interrupt the current turn of a session: end the LLM turn **and**
+    /// SIGINT every descendant of the CLI (the tools it is running).
+    ///
+    /// Thin wrapper over [`Self::interrupt_scoped`], kept for the many
+    /// callers that need neither the outcome nor a narrower scope. It
+    /// preserves the historical `Result<()>` contract — including the
+    /// "succeeds silently when the session is not local" semantics the
+    /// tests assert.
     pub async fn interrupt(&self, session_id: &str) -> Result<()> {
+        self.interrupt_scoped(session_id, true).await.map(|_| ())
+    }
+
+    /// Interrupt the current turn of a session, choosing whether the
+    /// running tool subprocesses go down with it.
+    ///
+    /// ## Scope
+    ///
+    /// - `kill_tools = true` — historical behaviour. The turn ends and
+    ///   every descendant of the CLI receives `SIGINT` (find, cargo,
+    ///   sleep…). This is what the composer's Stop button wants: stop
+    ///   everything, now.
+    /// - `kill_tools = false` — the turn ends but no descendant is
+    ///   signalled. The flag, the token and the SDK `control_request`
+    ///   still go out, so the CLI stops generating; a `Bash` or
+    ///   `Monitor` subprocess started in the background survives.
+    ///
+    /// ## What `kill_tools = false` does NOT preserve
+    ///
+    /// In-process `Task` sub-agents are **not** subprocesses: they live
+    /// inside the CLI and are torn down by the same
+    /// `control_request: interrupt` that ends the turn (it aborts the
+    /// shared `QueryEngine.abortController`). There is therefore no way,
+    /// at this layer, to end a turn while letting its in-process
+    /// sub-agents run on — only detached *subprocesses* can be spared.
+    ///
+    /// ## Outcome
+    ///
+    /// Unlike [`Self::interrupt`], this reports what actually happened.
+    /// `delivered: false` means the session was not in `active_sessions`
+    /// and nothing local was interrupted — the caller can surface that
+    /// instead of spinning on "Stopping…" forever.
+    pub async fn interrupt_scoped(
+        &self,
+        session_id: &str,
+        kill_tools: bool,
+    ) -> Result<InterruptOutcome> {
         let (interrupt_flag, interrupt_token, stdin_tx, child_pid) = {
             let sessions = self.active_sessions.read().await;
             match sessions.get(session_id) {
@@ -6109,6 +6176,13 @@ impl ChatManager {
                 ),
                 None => (None, None, None, None),
             }
+        };
+
+        let mut outcome = InterruptOutcome {
+            delivered: false,
+            routed: "none".to_string(),
+            cli_pid: child_pid,
+            killed_pids: Vec::new(),
         };
 
         if let Some(flag) = interrupt_flag {
@@ -6139,26 +6213,37 @@ impl ChatManager {
             // the SIGINT primitive but interrupt() additionally sets the
             // flag/token + sends the control_request to end the turn,
             // whereas cancel_running_tools deliberately does NEITHER).
-            let killed = Self::kill_descendants(child_pid);
-            if !killed.is_empty() {
-                info!(
-                    session_id = %session_id,
-                    cli_pid = ?child_pid,
-                    descendant_count = killed.len(),
-                    descendant_pids = ?killed,
-                    "Sent SIGINT to CLI descendant processes (not the CLI itself)"
-                );
-            } else if let Some(pid) = child_pid {
-                debug!(
-                    session_id = %session_id,
-                    cli_pid = pid,
-                    "No descendant processes found to kill"
-                );
+            //
+            // Skipped entirely when `kill_tools` is false: the turn still
+            // ends, but background subprocesses are left running.
+            if kill_tools {
+                let killed = Self::kill_descendants(child_pid);
+                if !killed.is_empty() {
+                    info!(
+                        session_id = %session_id,
+                        cli_pid = ?child_pid,
+                        descendant_count = killed.len(),
+                        descendant_pids = ?killed,
+                        "Sent SIGINT to CLI descendant processes (not the CLI itself)"
+                    );
+                } else if let Some(pid) = child_pid {
+                    debug!(
+                        session_id = %session_id,
+                        cli_pid = pid,
+                        "No descendant processes found to kill"
+                    );
+                }
+                outcome.killed_pids = killed;
             }
+
+            outcome.delivered = true;
+            outcome.routed = "local".to_string();
 
             info!(
                 session_id = %session_id,
-                "Interrupt: flag set, token cancelled, control_request sent, descendants killed"
+                kill_tools,
+                descendants_killed = outcome.killed_pids.len(),
+                "Interrupt: flag set, token cancelled, control_request sent"
             );
         } else {
             debug!(
@@ -6171,13 +6256,16 @@ impl ChatManager {
         // This is fire-and-forget — no-op if NATS is not configured.
         if let Some(ref nats) = self.nats {
             nats.publish_interrupt(session_id);
+            if !outcome.delivered {
+                outcome.routed = "nats".to_string();
+            }
             debug!(
                 session_id = %session_id,
                 "Interrupt published to NATS"
             );
         }
 
-        Ok(())
+        Ok(outcome)
     }
 
     /// Cancel the currently-running tool subprocess(es) of a session
@@ -9623,6 +9711,128 @@ mod tests {
             result.is_ok(),
             "interrupt should not error when session is not local"
         );
+    }
+
+    /// `interrupt()` returning `Ok(())` for a session it never found is the
+    /// reason a lost Stop was invisible: the UI could not tell "turn ended"
+    /// from "nothing happened". `interrupt_scoped` says which it was.
+    #[tokio::test]
+    async fn test_interrupt_scoped_reports_a_no_op_as_undelivered() {
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+
+        let outcome = manager
+            .interrupt_scoped("nonexistent-session", true)
+            .await
+            .expect("interrupt_scoped must not error on an unknown session");
+
+        assert!(
+            !outcome.delivered,
+            "nothing was interrupted — delivered must be false"
+        );
+        assert_eq!(
+            outcome.routed, "none",
+            "no local session and no NATS means the interrupt went nowhere"
+        );
+        assert!(outcome.killed_pids.is_empty());
+    }
+
+    /// The narrow scope still ends the turn: flag set, token cancelled.
+    #[tokio::test]
+    async fn test_interrupt_scoped_still_ends_the_turn_without_tools() {
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let (session, _handle) = mock_active_session(true);
+        let flag = session.interrupt_flag.clone();
+        let token = session.interrupt_token.clone();
+
+        let session_id = "test-session-scoped-turn";
+        manager
+            .active_sessions
+            .write()
+            .await
+            .insert(session_id.to_string(), session);
+
+        let outcome = manager.interrupt_scoped(session_id, false).await.unwrap();
+
+        assert!(outcome.delivered, "a local session was interrupted");
+        assert_eq!(outcome.routed, "local");
+        assert!(
+            flag.load(Ordering::SeqCst),
+            "the turn must still be interrupted with kill_tools = false"
+        );
+        assert!(
+            token.is_cancelled(),
+            "the stream token must still be cancelled"
+        );
+        assert!(outcome.killed_pids.is_empty());
+    }
+
+    /// The point of the narrow scope, proved on real processes rather than
+    /// on an empty `killed_pids`: a subprocess the agent launched survives
+    /// an interrupt scoped to the turn, and dies under the wide one.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_interrupt_scoped_spares_then_reaps_a_running_tool() {
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let (mut session, _handle) = mock_active_session(true);
+
+        // Stand-in for a tool the agent is running: a shell that stays alive
+        // as the parent of a long sleep, so the sleep is a *descendant* of
+        // the pretend-CLI, exactly like a real Bash tool child. The trailing
+        // `:` stops `sh` from exec'ing sleep in its own process.
+        let mut shell = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("sleep 30; :")
+            .spawn()
+            .expect("failed to spawn the stand-in tool");
+        session.child_pid = Some(shell.id());
+
+        // Wait for the grandchild to actually exist — without it the test
+        // would pass for the wrong reason.
+        let mut descendants = Vec::new();
+        for _ in 0..40 {
+            descendants = ChatManager::get_descendant_pids(shell.id());
+            if !descendants.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            !descendants.is_empty(),
+            "no descendant ever appeared under the stand-in tool — the test cannot conclude"
+        );
+
+        let session_id = "test-session-scoped-tools";
+        manager
+            .active_sessions
+            .write()
+            .await
+            .insert(session_id.to_string(), session);
+
+        // Narrow scope: the turn ends, the tool keeps running.
+        let outcome = manager.interrupt_scoped(session_id, false).await.unwrap();
+        assert!(outcome.delivered);
+        assert!(
+            outcome.killed_pids.is_empty(),
+            "kill_tools = false must signal nobody"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !ChatManager::get_descendant_pids(shell.id()).is_empty(),
+            "the tool subprocess must survive an interrupt scoped to the turn"
+        );
+
+        // Wide scope: same session, the tool is reaped.
+        let outcome = manager.interrupt_scoped(session_id, true).await.unwrap();
+        assert!(
+            !outcome.killed_pids.is_empty(),
+            "kill_tools = true must SIGINT the descendant"
+        );
+
+        let _ = shell.kill();
+        let _ = shell.wait();
     }
 
     #[tokio::test]

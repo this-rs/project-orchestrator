@@ -551,6 +551,79 @@ pub async fn cancel_tools(
 }
 
 // ============================================================================
+// Interrupt (REST fallback for the WebSocket `interrupt` frame)
+// ============================================================================
+
+/// Body of `POST /api/chat/sessions/{id}/interrupt`. Entirely optional —
+/// an absent body, or `{}`, means "stop everything".
+#[derive(Debug, Deserialize, Default)]
+pub struct InterruptRequest {
+    /// `"turn_and_tools"` (default) ends the turn and SIGINTs every
+    /// descendant of the CLI. `"turn"` ends the turn only, leaving
+    /// background subprocesses (`Bash`/`Monitor`) alive.
+    #[serde(default)]
+    pub scope: Option<String>,
+}
+
+/// POST /api/chat/sessions/{id}/interrupt — End the current turn of a
+/// session.
+///
+/// ## Why this exists
+///
+/// Interrupting used to be reachable **only** through the WebSocket frame
+/// `{"type":"interrupt"}` (`ws_chat_handler.rs`). That made Stop depend on
+/// a healthy socket, which is exactly the condition that fails: when the
+/// chat WS drops on a route change, `ChatWebSocket.send()` returns `false`,
+/// the frontend dropped the return value, and the interrupt vanished with
+/// no error anywhere. Meanwhile the frontend had *already* been calling
+/// this very path (`chatApi.interruptSession`) for detached runs and child
+/// sessions — into a 404, swallowed by four empty `catch` blocks.
+///
+/// So this endpoint is both the missing route those callers expected and
+/// the transport-independent fallback the composer's Stop button needs.
+///
+/// ## Response
+///
+/// Always **200** with an `InterruptOutcome`. Read `delivered`:
+/// - `true` — a live local turn was interrupted.
+/// - `false` with `routed: "nats"` — not local; published for whichever
+///   instance owns the session.
+/// - `false` with `routed: "none"` — nothing was stopped anywhere. The UI
+///   should clear its "Stopping…" state rather than spin forever.
+///
+/// **400** — unknown `scope`. **404** — `chat_manager` not configured.
+pub async fn interrupt_session(
+    State(state): State<OrchestratorState>,
+    Path(session_id): Path<Uuid>,
+    body: Option<Json<InterruptRequest>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let chat_manager = state.chat_manager.as_ref().ok_or_else(|| {
+        AppError::NotFound("chat_manager not configured on this server".to_string())
+    })?;
+
+    let scope = body
+        .and_then(|Json(b)| b.scope)
+        .unwrap_or_else(|| "turn_and_tools".to_string());
+
+    let kill_tools = match scope.as_str() {
+        "turn_and_tools" => true,
+        "turn" => false,
+        other => {
+            return Err(AppError::BadRequest(format!(
+                "unknown interrupt scope '{other}' (expected 'turn' or 'turn_and_tools')"
+            )))
+        }
+    };
+
+    let outcome = chat_manager
+        .interrupt_scoped(&session_id.to_string(), kill_tools)
+        .await
+        .map_err(AppError::Internal)?;
+
+    Ok(Json(serde_json::to_value(&outcome).unwrap_or_default()))
+}
+
+// ============================================================================
 // Background tasks (T6 + T8 of plan 754a1379)
 // ============================================================================
 
