@@ -7053,14 +7053,41 @@ impl ChatManager {
             loop {
                 ticker.tick().await;
 
-                let expired: Vec<String> = {
+                // Candidates by idle time first, under the read lock; the
+                // busy checks below take other (async) locks, so they run
+                // after it is released.
+                let candidates: Vec<_> = {
                     let sessions = manager.active_sessions.read().await;
                     sessions
                         .iter()
                         .filter(|(_, s)| s.last_activity.elapsed() > timeout)
-                        .map(|(id, _)| id.clone())
+                        .map(|(id, s)| {
+                            (
+                                id.clone(),
+                                s.last_activity.elapsed(),
+                                s.is_streaming.clone(),
+                                s.active_background_tasks.clone(),
+                            )
+                        })
                         .collect()
                 };
+
+                let mut expired = Vec::new();
+                for (id, idle, streaming, background) in candidates {
+                    let is_streaming = streaming.load(Ordering::Relaxed);
+                    let background_tasks = background.lock().await.len();
+                    if session_is_expired(idle, timeout, is_streaming, background_tasks) {
+                        expired.push(id);
+                    } else {
+                        debug!(
+                            session_id = %id,
+                            idle_secs = idle.as_secs(),
+                            is_streaming,
+                            background_tasks,
+                            "Idle session kept alive: work still in progress"
+                        );
+                    }
+                }
 
                 for id in expired {
                     info!("Cleaning up timed-out session {}", id);
@@ -7075,6 +7102,69 @@ impl ChatManager {
     /// Get the number of currently active sessions
     pub async fn active_session_count(&self) -> usize {
         self.active_sessions.read().await.len()
+    }
+}
+
+/// Multiple of the idle timeout after which a session is closed even if it
+/// still looks busy — a background task that never reports completion must not
+/// pin a CLI subprocess forever.
+const IDLE_HARD_CAP_FACTOR: u32 = 8;
+
+/// Should an idle session be closed?
+///
+/// Idle time alone used to decide, and "activity" was only refreshed during
+/// turns. A session whose agent had finished its turn but still had
+/// background work running (sub-agents, background Bash, Monitor) looked idle
+/// and was closed after `session_timeout` — killing the CLI subprocess, the
+/// background work with it, and the completion notification that would have
+/// woken the agent to report back. Busy sessions are now kept, up to a hard
+/// cap.
+pub(crate) fn session_is_expired(
+    idle: Duration,
+    timeout: Duration,
+    is_streaming: bool,
+    background_tasks: usize,
+) -> bool {
+    if idle <= timeout {
+        return false;
+    }
+    if idle > timeout * IDLE_HARD_CAP_FACTOR {
+        return true;
+    }
+    !is_streaming && background_tasks == 0
+}
+
+#[cfg(test)]
+mod idle_expiry_tests {
+    use super::session_is_expired;
+    use std::time::Duration;
+
+    const T: Duration = Duration::from_secs(1800);
+
+    #[test]
+    fn active_session_is_kept() {
+        assert!(!session_is_expired(Duration::from_secs(60), T, false, 0));
+    }
+
+    #[test]
+    fn idle_session_without_work_expires() {
+        assert!(session_is_expired(T + Duration::from_secs(1), T, false, 0));
+    }
+
+    #[test]
+    fn idle_session_with_background_work_is_kept() {
+        // The failure mode: agent's turn over, sub-agents still running.
+        assert!(!session_is_expired(T * 2, T, false, 3));
+    }
+
+    #[test]
+    fn streaming_session_is_kept() {
+        assert!(!session_is_expired(T * 2, T, true, 0));
+    }
+
+    #[test]
+    fn stuck_background_work_is_bounded_by_the_hard_cap() {
+        assert!(session_is_expired(T * 9, T, true, 1));
     }
 }
 
