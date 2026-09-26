@@ -2754,18 +2754,28 @@ impl ChatManager {
             None
         };
 
-        // Take the SDK control receiver ONCE at session creation.
-        // This channel receives `can_use_tool` permission requests from the CLI subprocess.
-        // It must be taken before wrapping the client in Arc<Mutex<>> so it can be
-        // reused across all stream_response invocations for this session.
-        let sdk_control_rx = client.take_sdk_control_receiver().await;
-        let sdk_control_rx = Arc::new(tokio::sync::Mutex::new(sdk_control_rx));
-
         // Clone the stdin sender BEFORE wrapping client in Arc<Mutex<>>.
         // This allows send_permission_response to write control responses
         // directly to the CLI subprocess without taking the client lock
         // (which is held by stream_response during streaming → deadlock).
         let stdin_tx = client.clone_stdin_sender().await;
+
+        // Take the SDK control receiver ONCE at session creation and hand it to
+        // the session-lifetime control pump. Hook callbacks are answered there
+        // for as long as the session lives — background subagents outlive the
+        // turn that spawned them — and everything else (`can_use_tool`
+        // permission requests…) is forwarded to the receiver `stream_response`
+        // reads. It must be taken before wrapping the client in Arc<Mutex<>>.
+        // See `control_pump.rs` for the incident behind this.
+        let sdk_control_rx = client.take_sdk_control_receiver().await.map(|raw_rx| {
+            super::control_pump::spawn(
+                session_id.to_string(),
+                raw_rx,
+                client.hook_callbacks(),
+                stdin_tx.clone(),
+            )
+        });
+        let sdk_control_rx = Arc::new(tokio::sync::Mutex::new(sdk_control_rx));
 
         // Capture the CLI subprocess PID so descendant-PID SIGINT
         // cascade in `interrupt()` and `cancel_running_tools()` works.
@@ -3986,7 +3996,9 @@ impl ChatManager {
                                 control_msg = rx.recv() => {
                                     match control_msg {
                                         Some(msg) => {
-                                            // Hook callbacks: dispatch via lock-free registry, send response via stdin_tx
+                                            // Hook callbacks are answered by the session-lifetime control
+                                            // pump (`control_pump.rs`) before they reach this channel. This
+                                            // branch only remains as a defensive fallback.
                                             if is_hook_callback(&msg) {
                                                 let request_id = msg.get("request_id")
                                                     .or_else(|| msg.get("request").and_then(|r| r.get("request_id")))
@@ -5479,12 +5491,20 @@ impl ChatManager {
             );
         }
 
-        // Take the SDK control receiver ONCE at session resume.
-        let sdk_control_rx = client.take_sdk_control_receiver().await;
-        let sdk_control_rx = Arc::new(tokio::sync::Mutex::new(sdk_control_rx));
-
         // Clone stdin sender for lock-free permission responses (see create_session).
         let stdin_tx = client.clone_stdin_sender().await;
+
+        // Take the SDK control receiver ONCE at session resume and hand it to the
+        // session-lifetime control pump (see create_session and `control_pump.rs`).
+        let sdk_control_rx = client.take_sdk_control_receiver().await.map(|raw_rx| {
+            super::control_pump::spawn(
+                session_id.to_string(),
+                raw_rx,
+                client.hook_callbacks(),
+                stdin_tx.clone(),
+            )
+        });
+        let sdk_control_rx = Arc::new(tokio::sync::Mutex::new(sdk_control_rx));
 
         // CLI subprocess PID for descendant SIGINT cascade (T1+T2 of
         // plan 28e9afe3). Same as create_session.
