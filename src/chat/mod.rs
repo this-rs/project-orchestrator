@@ -9,6 +9,7 @@ pub mod compaction_context;
 pub mod composer;
 pub mod config;
 pub mod continuity;
+pub mod control_pump;
 pub(crate) mod drain;
 
 pub mod enrichment;
