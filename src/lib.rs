@@ -1228,7 +1228,15 @@ pub async fn start_server(mut config: Config) -> Result<()> {
                         skipped += 1;
                         continue;
                     }
-                    let expanded = expand_tilde(&project.root_path);
+                    let Some(expanded) = project.expanded_root_path() else {
+                        tracing::debug!(
+                            "Auto-watch: skipping project '{}' — no root_path (profile={})",
+                            project.slug,
+                            project.profile.as_str(),
+                        );
+                        skipped += 1;
+                        continue;
+                    };
                     let path = std::path::Path::new(&expanded);
                     if !path.exists() {
                         tracing::warn!(
@@ -1271,8 +1279,8 @@ pub async fn start_server(mut config: Config) -> Result<()> {
                     let project_ids: Vec<_> = projects
                         .iter()
                         .filter(|p| {
-                            let expanded = expand_tilde(&p.root_path);
-                            std::path::Path::new(&expanded).exists()
+                            p.expanded_root_path()
+                                .is_some_and(|e| std::path::Path::new(&e).exists())
                         })
                         .map(|p| (p.id, p.slug.clone()))
                         .collect();
@@ -1316,8 +1324,8 @@ pub async fn start_server(mut config: Config) -> Result<()> {
                     let skill_project_ids: Vec<_> = projects
                         .iter()
                         .filter(|p| {
-                            let expanded = expand_tilde(&p.root_path);
-                            std::path::Path::new(&expanded).exists()
+                            p.expanded_root_path()
+                                .is_some_and(|e| std::path::Path::new(&e).exists())
                         })
                         .map(|p| (p.id, p.slug.clone()))
                         .collect();

@@ -673,9 +673,9 @@ Manage projects. Actions: list, create, get, update, delete, sync, get_roadmap, 
 | Action | Key Parameters | Description |
 |--------|---------------|-------------|
 | list | `search`, `limit`, `offset`, `sort_by`, `sort_order` | List all projects |
-| create | `name` (req), `description`, `root_path` | Create a project |
+| create | `name` (req), `description`, `root_path` (optional), `profile` (`software`\|`work`) | Create a project. `work` projects (documents, plans, tasks, notes) have no `root_path` and are never synced or watched |
 | get | `slug` (req) | Get project by slug |
-| update | `slug` (req), `name`, `description`, `root_path` | Update project fields |
+| update | `slug` (req), `name`, `description`, `root_path` (empty string clears), `profile` | Update project fields |
 | delete | `slug` (req) | Delete a project |
 | sync | `slug` (req) | Sync project from filesystem |
 | get_roadmap | `slug` (req) | Get project roadmap |
@@ -2146,7 +2146,13 @@ pub fn context_to_markdown(ctx: &ProjectContext, user_message: Option<&str>) -> 
 
     if let Some(ref p) = ctx.project {
         md.push_str(&format!("## Active Project: {} ({})\n", p.name, p.slug));
-        md.push_str(&format!("Root: {}\n", p.root_path));
+        match p.root_path_opt() {
+            Some(root) => md.push_str(&format!("Root: {}\n", root)),
+            None => md.push_str(&format!(
+                "Profile: {} (no root path: nothing to sync)\n",
+                p.profile.as_str()
+            )),
+        }
         if let Some(ref desc) = p.description {
             md.push_str(&format!("Description: {}\n", desc));
         }
@@ -2639,6 +2645,7 @@ mod tests {
                 scaffolding_override: None,
                 sharing_policy: None,
                 watch_enabled: true,
+                profile: Default::default(),
             }),
             ..Default::default()
         };
@@ -2665,6 +2672,7 @@ mod tests {
                 scaffolding_override: None,
                 sharing_policy: None,
                 watch_enabled: true,
+                profile: Default::default(),
             }),
             language_stats: vec![LanguageStatsNode {
                 language: "Rust".into(),
@@ -2820,6 +2828,7 @@ mod tests {
                 scaffolding_override: None,
                 sharing_policy: None,
                 watch_enabled: true,
+                profile: Default::default(),
             }),
             workspace: Some(WorkspaceNode {
                 id: uuid::Uuid::new_v4(),
@@ -2845,6 +2854,7 @@ mod tests {
                     scaffolding_override: None,
                     sharing_policy: None,
                     watch_enabled: true,
+                    profile: Default::default(),
                 },
                 ProjectNode {
                     id: uuid::Uuid::new_v4(),
@@ -2860,6 +2870,7 @@ mod tests {
                     scaffolding_override: None,
                     sharing_policy: None,
                     watch_enabled: true,
+                    profile: Default::default(),
                 },
             ],
             ..Default::default()
@@ -2941,6 +2952,7 @@ mod tests {
                 scaffolding_override: None,
                 sharing_policy: None,
                 watch_enabled: true,
+                profile: Default::default(),
             }),
             global_guidelines: vec![{
                 let mut n = crate::notes::Note::new(
@@ -3022,6 +3034,26 @@ mod tests {
                 name
             );
         }
+    }
+
+    #[test]
+    fn test_project_tool_docs_cover_profile_and_optional_root_path() {
+        // The prompt reference and the MCP schema must both tell the model
+        // that `root_path` is optional and that `profile` exists.
+        assert!(TOOL_REFERENCE.contains("`profile` (`software`\\|`work`)"));
+        assert!(TOOL_REFERENCE.contains("`root_path` (optional)"));
+
+        let mcp = crate::mcp::tools::all_tools();
+        let project = mcp.iter().find(|t| t.name == "project").unwrap();
+        let props = project.input_schema.properties.as_ref().unwrap();
+        assert_eq!(
+            props["profile"]["enum"],
+            serde_json::json!(["software", "work"])
+        );
+        assert!(props["root_path"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("Optional"));
     }
 
     #[test]
@@ -3233,6 +3265,7 @@ mod tests {
                 scaffolding_override: None,
                 sharing_policy: None,
                 watch_enabled: true,
+                profile: Default::default(),
             }),
             ..Default::default()
         };
@@ -3276,6 +3309,7 @@ mod tests {
                 scaffolding_override: None,
                 sharing_policy: None,
                 watch_enabled: true,
+                profile: Default::default(),
             }),
             feature_graphs: make_feature_graphs(3),
             ..Default::default()
@@ -3308,6 +3342,7 @@ mod tests {
                 scaffolding_override: None,
                 sharing_policy: None,
                 watch_enabled: true,
+                profile: Default::default(),
             }),
             ..Default::default()
         };
@@ -3348,6 +3383,7 @@ mod tests {
                 scaffolding_override: None,
                 sharing_policy: None,
                 watch_enabled: true,
+                profile: Default::default(),
             }),
             feature_graphs: fgs,
             ..Default::default()

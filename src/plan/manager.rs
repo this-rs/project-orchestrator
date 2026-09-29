@@ -381,7 +381,7 @@ impl PlanManager {
     ) {
         let neo4j = self.neo4j.clone();
         let decision_clone = decision.clone();
-        let root_path = project.map(|p| p.root_path.clone());
+        let root_path = project.and_then(|p| p.root_path_opt().map(str::to_string));
 
         tokio::spawn(async move {
             match crate::skills::activation::auto_anchor_decision(

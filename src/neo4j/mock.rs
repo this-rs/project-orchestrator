@@ -527,6 +527,7 @@ impl GraphStore for MockGraphStore {
         name: Option<String>,
         description: Option<Option<String>>,
         root_path: Option<String>,
+        profile: Option<ProjectProfile>,
     ) -> Result<()> {
         if let Some(p) = self.projects.write().await.get_mut(&id) {
             if let Some(n) = name {
@@ -537,6 +538,9 @@ impl GraphStore for MockGraphStore {
             }
             if let Some(r) = root_path {
                 p.root_path = r;
+            }
+            if let Some(pr) = profile {
+                p.profile = pr;
             }
         }
         Ok(())

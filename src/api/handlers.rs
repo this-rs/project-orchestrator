@@ -2564,7 +2564,8 @@ pub async fn create_commit(
     };
     let project_root = project_info
         .as_ref()
-        .map(|p| std::path::PathBuf::from(crate::expand_tilde(&p.root_path)));
+        .and_then(|p| p.expanded_root_path())
+        .map(std::path::PathBuf::from);
     let project_slug = project_info.as_ref().map(|p| p.slug.clone());
 
     // Resolve relative paths to absolute using project root_path
@@ -2881,7 +2882,13 @@ pub async fn backfill_commit_touches(
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Project not found: {}", project_slug)))?;
 
-    let root_path = std::path::PathBuf::from(crate::expand_tilde(&project.root_path));
+    let root_path = project.expanded_root_path().ok_or_else(|| {
+        AppError::BadRequest(format!(
+            "Project '{}' has no root_path: there is no git history to backfill",
+            project_slug
+        ))
+    })?;
+    let root_path = std::path::PathBuf::from(root_path);
     let result = state
         .orchestrator
         .backfill_commit_touches(project.id, &root_path)

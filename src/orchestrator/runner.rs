@@ -4310,7 +4310,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
                 CrudAction::Created,
                 project.id.to_string(),
             )
-            .with_payload(serde_json::json!({"name": &project.name, "slug": &project.slug, "root_path": &project.root_path})),
+            .with_payload(serde_json::json!({"name": &project.name, "slug": &project.slug, "root_path": &project.root_path, "profile": project.profile.as_str()})),
         );
         Ok(())
     }
@@ -4322,9 +4322,10 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         name: Option<String>,
         description: Option<Option<String>>,
         root_path: Option<String>,
+        profile: Option<ProjectProfile>,
     ) -> Result<()> {
         self.neo4j()
-            .update_project(id, name.clone(), description, root_path.clone())
+            .update_project(id, name.clone(), description, root_path.clone(), profile)
             .await?;
         let mut payload = serde_json::Map::new();
         if let Some(ref n) = name {
@@ -4332,6 +4333,9 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         }
         if let Some(ref rp) = root_path {
             payload.insert("root_path".into(), serde_json::json!(rp));
+        }
+        if let Some(pr) = profile {
+            payload.insert("profile".into(), serde_json::json!(pr.as_str()));
         }
         self.emit(
             CrudEvent::new(
@@ -5640,7 +5644,7 @@ mod tests {
         let (orch, mut rx) = orch_with_bus().await;
         let project = test_project();
         orch.neo4j().create_project(&project).await.unwrap();
-        orch.update_project(project.id, Some("new-name".into()), None, None)
+        orch.update_project(project.id, Some("new-name".into()), None, None, None)
             .await
             .unwrap();
         let ev = rx.try_recv().unwrap();

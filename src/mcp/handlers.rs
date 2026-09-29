@@ -978,6 +978,9 @@ impl ToolHandler {
                 if let Some(v) = args.get("root_path") {
                     body.insert("root_path".to_string(), v.clone());
                 }
+                if let Some(v) = args.get("profile") {
+                    body.insert("profile".to_string(), v.clone());
+                }
                 let result = http
                     .patch(&format!("/api/projects/{}", slug), &Value::Object(body))
                     .await?;
@@ -6420,6 +6423,35 @@ mod tests {
         assert_eq!(result["method"], "POST");
         assert_eq!(result["path"], "/api/projects");
         assert_eq!(result["body"]["name"], "My Project");
+    }
+
+    #[tokio::test]
+    async fn test_http_create_work_project_without_root_path() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "create_project",
+                Some(json!({"name": "Hiring", "profile": "work"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert_eq!(result["body"]["profile"], "work");
+        assert!(result["body"].get("root_path").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_http_update_project_forwards_profile() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "update_project",
+                Some(json!({"slug": "p", "profile": "work", "root_path": ""})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["body"]["profile"], "work");
+        assert_eq!(result["body"]["root_path"], "");
     }
 
     #[tokio::test]

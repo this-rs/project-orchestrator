@@ -54,6 +54,7 @@ pub trait GraphStore: Send + Sync {
         name: Option<String>,
         description: Option<Option<String>>,
         root_path: Option<String>,
+        profile: Option<ProjectProfile>,
     ) -> Result<()>;
 
     /// Update project last_synced timestamp

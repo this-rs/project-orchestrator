@@ -4680,6 +4680,7 @@ mod tests {
             scaffolding_override: None,
             sharing_policy: None,
             watch_enabled: true,
+            profile: Default::default(),
         };
         app_state.neo4j.create_project(&project).await.unwrap();
         app_state
@@ -4842,6 +4843,7 @@ mod tests {
             scaffolding_override: None,
             sharing_policy: None,
             watch_enabled: true,
+            profile: Default::default(),
         };
         graph.create_project(&project).await.unwrap();
 
@@ -5039,6 +5041,7 @@ mod tests {
             scaffolding_override: None,
             sharing_policy: None,
             watch_enabled: true,
+            profile: Default::default(),
         };
         graph.create_project(&project).await.unwrap();
 
@@ -5253,6 +5256,7 @@ mod tests {
             scaffolding_override: None,
             sharing_policy: None,
             watch_enabled: true,
+            profile: Default::default(),
         };
         graph.create_project(&project).await.unwrap();
 
@@ -5407,6 +5411,7 @@ mod tests {
             scaffolding_override: None,
             sharing_policy: None,
             watch_enabled: true,
+            profile: Default::default(),
         };
         graph.create_project(&project).await.unwrap();
 

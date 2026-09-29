@@ -43,8 +43,10 @@ impl GraphStore for Neo4jClient {
         name: Option<String>,
         description: Option<Option<String>>,
         root_path: Option<String>,
+        profile: Option<ProjectProfile>,
     ) -> anyhow::Result<()> {
-        self.update_project(id, name, description, root_path).await
+        self.update_project(id, name, description, root_path, profile)
+            .await
     }
 
     async fn update_project_synced(&self, id: Uuid) -> anyhow::Result<()> {

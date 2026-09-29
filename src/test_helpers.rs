@@ -358,6 +358,7 @@ pub fn test_project() -> ProjectNode {
         scaffolding_override: None,
         sharing_policy: None,
         watch_enabled: true,
+        profile: Default::default(),
     }
 }
 
@@ -377,6 +378,7 @@ pub fn test_project_named(name: &str) -> ProjectNode {
         scaffolding_override: None,
         watch_enabled: true,
         sharing_policy: None,
+        profile: Default::default(),
     }
 }
 

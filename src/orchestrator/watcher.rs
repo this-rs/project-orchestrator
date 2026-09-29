@@ -969,7 +969,17 @@ async fn handle_project_created(
     event: &CrudEvent,
 ) {
     let root_path = match event.payload.get("root_path").and_then(|v| v.as_str()) {
+        // A project without a codebase (`work` profile) is created with a null
+        // or empty root_path: nothing to watch, nothing to sync.
+        Some(rp) if rp.trim().is_empty() => {
+            tracing::debug!(
+                "Watcher bridge: project {} has no root_path, not watching",
+                event.entity_id
+            );
+            return;
+        }
         Some(rp) => rp.to_string(),
+        None if event.payload.get("root_path").is_some_and(|v| v.is_null()) => return,
         None => {
             tracing::warn!(
                 "Watcher bridge: Project::Created event missing root_path in payload (id={})",

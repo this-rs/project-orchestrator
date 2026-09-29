@@ -261,7 +261,7 @@ impl NoteManager {
             // returns relative — we need root_path to bridge the gap.
             let root_path = if let Some(pid) = note_clone.project_id {
                 match neo4j.get_project(pid).await {
-                    Ok(Some(proj)) => Some(proj.root_path),
+                    Ok(Some(proj)) => proj.root_path_opt().map(str::to_string),
                     _ => None,
                 }
             } else {

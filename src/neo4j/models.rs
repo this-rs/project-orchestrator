@@ -8,12 +8,77 @@ use uuid::Uuid;
 // Project Node (multi-project support)
 // ============================================================================
 
+/// What kind of work a project holds.
+///
+/// Drives which parts of the product are relevant, not what is possible: a
+/// `work` project (a marketing plan, a budget, a hiring pipeline) has plans,
+/// tasks, notes and attachments like any other, but no source tree to index.
+/// Stored on the node as a lowercase string; a node with no `profile` property
+/// predates the field and is `software`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectProfile {
+    /// A codebase: has a root path, is synced, parsed and watched.
+    #[default]
+    Software,
+    /// Knowledge work around documents and tasks; no code to analyse.
+    Work,
+}
+
+impl ProjectProfile {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Software => "software",
+            Self::Work => "work",
+        }
+    }
+}
+
+impl std::str::FromStr for ProjectProfile {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "software" => Ok(Self::Software),
+            "work" => Ok(Self::Work),
+            other => Err(format!(
+                "unknown project profile {other:?} (expected \"software\" or \"work\")"
+            )),
+        }
+    }
+}
+
+/// Serialize an absent path as `null` rather than `""`.
+fn serialize_root_path<S: serde::Serializer>(value: &str, s: S) -> Result<S::Ok, S::Error> {
+    if value.is_empty() {
+        s.serialize_none()
+    } else {
+        s.serialize_str(value)
+    }
+}
+
+/// Accept `null` (and a missing key) as "no path".
+fn deserialize_root_path<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    Ok(Option::<String>::deserialize(d)?.unwrap_or_default())
+}
+
 /// A project/codebase being tracked
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectNode {
     pub id: Uuid,
     pub name: String,
     pub slug: String, // URL-safe identifier
+    /// Directory of the codebase. **Empty means the project has none** — a
+    /// `work` project, or a software project not yet bound to a checkout. It is
+    /// a `String` rather than an `Option` because the value is threaded through
+    /// path arithmetic in a few dozen places that already treat `""` as "no
+    /// root"; use [`ProjectNode::root_path_opt`] where absence must be handled
+    /// explicitly. Serialized as `null` when empty.
+    #[serde(
+        default,
+        serialize_with = "serialize_root_path",
+        deserialize_with = "deserialize_root_path"
+    )]
     pub root_path: String,
     pub description: Option<String>,
     pub created_at: DateTime<Utc>,
@@ -41,6 +106,22 @@ pub struct ProjectNode {
     /// Defaults to true for backward compatibility with existing projects.
     #[serde(default = "default_watch_enabled")]
     pub watch_enabled: bool,
+    /// `software` (default, and what nodes without the property are) or `work`.
+    #[serde(default)]
+    pub profile: ProjectProfile,
+}
+
+impl ProjectNode {
+    /// The root path, or `None` when the project has none.
+    pub fn root_path_opt(&self) -> Option<&str> {
+        let trimmed = self.root_path.trim();
+        (!trimmed.is_empty()).then_some(self.root_path.as_str())
+    }
+
+    /// The root path with `~` expanded, or `None` when the project has none.
+    pub fn expanded_root_path(&self) -> Option<String> {
+        self.root_path_opt().map(crate::expand_tilde)
+    }
 }
 
 fn default_watch_enabled() -> bool {

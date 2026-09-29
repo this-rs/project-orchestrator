@@ -58,9 +58,9 @@ Manage projects (codebases tracked by the orchestrator).
 | Action | Description | Key Parameters |
 |--------|-------------|----------------|
 | `list` | List all projects | `search`, `limit`, `offset`, `sort_by`, `sort_order` |
-| `create` | Register a new project | `name`, `root_path`, `description` |
+| `create` | Register a new project | `name`, `root_path` (optional), `profile` (`software`/`work`), `description` |
 | `get` | Get project by slug | `slug` |
-| `update` | Update project details | `slug`, `name`, `description`, `root_path` |
+| `update` | Update project details | `slug`, `name`, `description`, `root_path`, `profile` |
 | `delete` | Delete project and all data | `slug` |
 | `sync` | Parse and index codebase | `slug` |
 | `get_roadmap` | Aggregated roadmap view | `slug` |

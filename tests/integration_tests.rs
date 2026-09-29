@@ -388,6 +388,7 @@ async fn test_neo4j_stale_file_cleanup() {
         scaffolding_override: None,
         sharing_policy: None,
         watch_enabled: true,
+        profile: Default::default(),
     };
     state.neo4j.create_project(&project).await.unwrap();
 

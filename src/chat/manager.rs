@@ -2096,7 +2096,8 @@ impl ChatManager {
                         let expanded_cwd = expand_tilde(cwd);
                         return projects
                             .into_iter()
-                            .map(|p| expand_tilde(&p.root_path))
+                            // Projects without a codebase contribute no directory.
+                            .filter_map(|p| p.expanded_root_path())
                             .filter(|path| *path != expanded_cwd)
                             .collect();
                     }
