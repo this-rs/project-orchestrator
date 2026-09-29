@@ -134,7 +134,7 @@ nexus-claude = { git = "https://github.com/this-rs/nexus.git", rev = "c68f046fe1
 tokio-stream = { workspace = true }
 
 # Auth
-jsonwebtoken = { version = "10", features = ["rust_crypto"] }
+jsonwebtoken = { version = "11", features = ["rust_crypto"] }
 bcrypt = "0.19"
 
 # P2P Identity (M4)
@@ -187,7 +187,7 @@ rag-umap = "0.0"
 # plan 00f0ca9a for the full migration audit.
 # default-features disabled: we only use univariate distributions
 # (StudentsT, FisherSnedecor, Normal, Gamma, …); nalgebra/rand are not needed.
-statrs = { version = "0.18", default-features = false }
+statrs = { version = "0.19", default-features = false }
 
 # openssl-sys is a transitive dep (via ort-sys build script → ureq → native-tls,
 # and neo4rs → native-tls). The "vendored" feature builds OpenSSL from source,
