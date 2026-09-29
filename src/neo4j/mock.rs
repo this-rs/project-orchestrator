@@ -57,6 +57,8 @@ pub struct MockGraphStore {
     pub constraints: RwLock<HashMap<Uuid, ConstraintNode>>,
     pub commits: RwLock<HashMap<String, CommitNode>>,
     pub releases: RwLock<HashMap<Uuid, ReleaseNode>>,
+    pub environments: RwLock<HashMap<Uuid, EnvironmentNode>>,
+    pub deployments: RwLock<HashMap<Uuid, DeploymentNode>>,
     pub milestones: RwLock<HashMap<Uuid, MilestoneNode>>,
     pub workspace_milestones: RwLock<HashMap<Uuid, WorkspaceMilestoneNode>>,
     pub resources: RwLock<HashMap<Uuid, ResourceNode>>,
@@ -236,6 +238,8 @@ impl MockGraphStore {
             constraints: RwLock::new(HashMap::new()),
             commits: RwLock::new(HashMap::new()),
             releases: RwLock::new(HashMap::new()),
+            environments: RwLock::new(HashMap::new()),
+            deployments: RwLock::new(HashMap::new()),
             milestones: RwLock::new(HashMap::new()),
             workspace_milestones: RwLock::new(HashMap::new()),
             resources: RwLock::new(HashMap::new()),
@@ -570,6 +574,18 @@ impl GraphStore for MockGraphStore {
         }
         self.project_releases.write().await.remove(&id);
         self.project_milestones.write().await.remove(&id);
+        // Cascade: remove environments and their deployments
+        let env_ids: Vec<Uuid> = self
+            .environments
+            .read()
+            .await
+            .values()
+            .filter(|e| e.project_id == id)
+            .map(|e| e.id)
+            .collect();
+        for env_id in env_ids {
+            self.delete_environment(env_id).await?;
+        }
         Ok(())
     }
 
@@ -4921,6 +4937,176 @@ impl GraphStore for MockGraphStore {
         self.release_tasks.write().await.remove(&release_id);
         self.release_commits.write().await.remove(&release_id);
         Ok(())
+    }
+
+    // ========================================================================
+    // Environment & deployment operations
+    // ========================================================================
+
+    async fn create_environment(&self, env: &EnvironmentNode) -> Result<()> {
+        let mut envs = self.environments.write().await;
+        if envs
+            .values()
+            .any(|e| e.project_id == env.project_id && e.name == env.name)
+        {
+            anyhow::bail!(
+                "Cannot create environment '{}': project not found or name already used",
+                env.name
+            );
+        }
+        envs.insert(env.id, env.clone());
+        Ok(())
+    }
+
+    async fn get_environment(&self, id: Uuid) -> Result<Option<EnvironmentNode>> {
+        Ok(self.environments.read().await.get(&id).cloned())
+    }
+
+    async fn list_project_environments(&self, project_id: Uuid) -> Result<Vec<EnvironmentNode>> {
+        let mut envs: Vec<EnvironmentNode> = self
+            .environments
+            .read()
+            .await
+            .values()
+            .filter(|e| e.project_id == project_id)
+            .cloned()
+            .collect();
+        envs.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.name.cmp(&b.name))
+        });
+        Ok(envs)
+    }
+
+    async fn update_environment(
+        &self,
+        id: Uuid,
+        name: Option<String>,
+        kind: Option<EnvironmentKind>,
+        url: Option<String>,
+        description: Option<String>,
+        config: Option<String>,
+    ) -> Result<()> {
+        // Empty string clears an optional field (mirrors the Neo4j store)
+        fn opt(v: String) -> Option<String> {
+            if v.is_empty() {
+                None
+            } else {
+                Some(v)
+            }
+        }
+        if let Some(e) = self.environments.write().await.get_mut(&id) {
+            if let Some(n) = name {
+                e.name = n;
+            }
+            if let Some(k) = kind {
+                e.kind = k;
+            }
+            if let Some(u) = url {
+                e.url = opt(u);
+            }
+            if let Some(d) = description {
+                e.description = opt(d);
+            }
+            if let Some(c) = config {
+                e.config = opt(c);
+            }
+        }
+        Ok(())
+    }
+
+    async fn delete_environment(&self, id: Uuid) -> Result<()> {
+        self.environments.write().await.remove(&id);
+        self.deployments
+            .write()
+            .await
+            .retain(|_, d| d.environment_id != id);
+        Ok(())
+    }
+
+    async fn create_deployment(&self, deployment: &DeploymentNode) -> Result<()> {
+        if !self
+            .environments
+            .read()
+            .await
+            .contains_key(&deployment.environment_id)
+        {
+            anyhow::bail!(
+                "Cannot create deployment: environment {} not found",
+                deployment.environment_id
+            );
+        }
+        self.deployments
+            .write()
+            .await
+            .insert(deployment.id, deployment.clone());
+        Ok(())
+    }
+
+    async fn get_deployment(&self, id: Uuid) -> Result<Option<DeploymentNode>> {
+        Ok(self.deployments.read().await.get(&id).cloned())
+    }
+
+    async fn list_environment_deployments(
+        &self,
+        environment_id: Uuid,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<DeploymentNode>, usize)> {
+        let mut all: Vec<DeploymentNode> = self
+            .deployments
+            .read()
+            .await
+            .values()
+            .filter(|d| d.environment_id == environment_id)
+            .cloned()
+            .collect();
+        // Newest first (same ordering as the Neo4j store)
+        all.sort_by(|a, b| {
+            b.started_at
+                .cmp(&a.started_at)
+                .then_with(|| b.id.cmp(&a.id))
+        });
+        let total = all.len();
+        Ok((all.into_iter().skip(offset).take(limit).collect(), total))
+    }
+
+    async fn update_deployment(
+        &self,
+        id: Uuid,
+        status: Option<DeploymentStatus>,
+        finished_at: Option<chrono::DateTime<chrono::Utc>>,
+        notes: Option<String>,
+    ) -> Result<()> {
+        if let Some(d) = self.deployments.write().await.get_mut(&id) {
+            if let Some(s) = status {
+                d.status = s;
+            }
+            if let Some(f) = finished_at {
+                d.finished_at = Some(f);
+            }
+            if let Some(n) = notes {
+                d.notes = if n.is_empty() { None } else { Some(n) };
+            }
+        }
+        Ok(())
+    }
+
+    async fn get_deployment_matrix(&self, project_id: Uuid) -> Result<Vec<DeploymentMatrixEntry>> {
+        // The mock may loop (the Neo4j store does this in one aggregate query)
+        let mut matrix = Vec::new();
+        for environment in self.list_project_environments(project_id).await? {
+            let (recent, _) = self
+                .list_environment_deployments(environment.id, DEPLOYMENT_MATRIX_RECENT, 0)
+                .await?;
+            matrix.push(DeploymentMatrixEntry {
+                environment,
+                recent_statuses: recent.iter().map(|d| d.status).collect(),
+                latest_deployment: recent.into_iter().next(),
+            });
+        }
+        Ok(matrix)
     }
 
     // ========================================================================

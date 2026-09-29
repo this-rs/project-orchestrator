@@ -1536,6 +1536,77 @@ impl GraphStore for Neo4jClient {
     }
 
     // ========================================================================
+    // Environment & deployment operations
+    // ========================================================================
+
+    async fn create_environment(&self, env: &EnvironmentNode) -> anyhow::Result<()> {
+        self.create_environment(env).await
+    }
+
+    async fn get_environment(&self, id: Uuid) -> anyhow::Result<Option<EnvironmentNode>> {
+        self.get_environment(id).await
+    }
+
+    async fn list_project_environments(
+        &self,
+        project_id: Uuid,
+    ) -> anyhow::Result<Vec<EnvironmentNode>> {
+        self.list_project_environments(project_id).await
+    }
+
+    async fn update_environment(
+        &self,
+        id: Uuid,
+        name: Option<String>,
+        kind: Option<EnvironmentKind>,
+        url: Option<String>,
+        description: Option<String>,
+        config: Option<String>,
+    ) -> anyhow::Result<()> {
+        self.update_environment(id, name, kind, url, description, config)
+            .await
+    }
+
+    async fn delete_environment(&self, id: Uuid) -> anyhow::Result<()> {
+        self.delete_environment(id).await
+    }
+
+    async fn create_deployment(&self, deployment: &DeploymentNode) -> anyhow::Result<()> {
+        self.create_deployment(deployment).await
+    }
+
+    async fn get_deployment(&self, id: Uuid) -> anyhow::Result<Option<DeploymentNode>> {
+        self.get_deployment(id).await
+    }
+
+    async fn list_environment_deployments(
+        &self,
+        environment_id: Uuid,
+        limit: usize,
+        offset: usize,
+    ) -> anyhow::Result<(Vec<DeploymentNode>, usize)> {
+        self.list_environment_deployments(environment_id, limit, offset)
+            .await
+    }
+
+    async fn update_deployment(
+        &self,
+        id: Uuid,
+        status: Option<DeploymentStatus>,
+        finished_at: Option<chrono::DateTime<chrono::Utc>>,
+        notes: Option<String>,
+    ) -> anyhow::Result<()> {
+        self.update_deployment(id, status, finished_at, notes).await
+    }
+
+    async fn get_deployment_matrix(
+        &self,
+        project_id: Uuid,
+    ) -> anyhow::Result<Vec<DeploymentMatrixEntry>> {
+        self.get_deployment_matrix(project_id).await
+    }
+
+    // ========================================================================
     // Milestone operations
     // ========================================================================
 

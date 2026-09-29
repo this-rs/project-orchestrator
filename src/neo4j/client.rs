@@ -281,6 +281,9 @@ impl Neo4jClient {
             // Milestone & Release constraints
             "CREATE CONSTRAINT milestone_id IF NOT EXISTS FOR (m:Milestone) REQUIRE m.id IS UNIQUE",
             "CREATE CONSTRAINT release_id IF NOT EXISTS FOR (r:Release) REQUIRE r.id IS UNIQUE",
+            // Environment & Deployment constraints
+            "CREATE CONSTRAINT environment_id IF NOT EXISTS FOR (e:Environment) REQUIRE e.id IS UNIQUE",
+            "CREATE CONSTRAINT deployment_id IF NOT EXISTS FOR (d:Deployment) REQUIRE d.id IS UNIQUE",
             // FeatureGraph constraint
             "CREATE CONSTRAINT feature_graph_id IF NOT EXISTS FOR (fg:FeatureGraph) REQUIRE fg.id IS UNIQUE",
             // Skill constraint
@@ -396,6 +399,9 @@ impl Neo4jClient {
             // Release indexes
             "CREATE INDEX release_project IF NOT EXISTS FOR (r:Release) ON (r.project_id)",
             "CREATE INDEX release_version IF NOT EXISTS FOR (r:Release) ON (r.version)",
+            // Environment & Deployment indexes
+            "CREATE INDEX environment_project IF NOT EXISTS FOR (e:Environment) ON (e.project_id)",
+            "CREATE INDEX deployment_environment IF NOT EXISTS FOR (d:Deployment) ON (d.environment_id)",
             // Knowledge Fabric — TOUCHES relationship indexes (Commit→File)
             "CREATE INDEX touches_file_path IF NOT EXISTS FOR ()-[r:TOUCHES]-() ON (r.file_path)",
             // Knowledge Fabric — CO_CHANGED relationship indexes (File↔File)
@@ -614,6 +620,8 @@ impl Neo4jClient {
             "chat_event_id",
             "milestone_id",
             "release_id",
+            "environment_id",
+            "deployment_id",
             "feature_graph_id",
             "user_id",
             "refresh_token_hash",

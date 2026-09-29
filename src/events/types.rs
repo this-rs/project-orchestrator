@@ -1,7 +1,7 @@
 //! CRUD event types for WebSocket notifications.
 //!
 //! Defines the core types used by the event system:
-//! - [`EntityType`] — all entity kinds that can emit events (27 variants)
+//! - [`EntityType`] — all entity kinds that can emit events (30 variants)
 //! - [`CrudAction`] — the mutation action performed (8 variants)
 //! - [`CrudEvent`] — the event payload sent over WebSocket/NATS
 //! - [`EventEmitter`] — trait with convenience methods for emitting events
@@ -34,6 +34,10 @@ pub enum EntityType {
     Release,
     /// Progress marker — emitters: handlers.rs (Created, Updated, Deleted, StatusChanged, Linked)
     Milestone,
+    /// Place where a project runs (dev/staging/production) — emitters: environment_handlers.rs (Created, Updated, Deleted)
+    Environment,
+    /// Deployment of a version to an environment — emitters: environment_handlers.rs (Created, Updated, StatusChanged)
+    Deployment,
     /// Multi-project container
     Workspace,
     /// Cross-project milestone
@@ -353,6 +357,8 @@ mod tests {
             EntityType::Commit,
             EntityType::Release,
             EntityType::Milestone,
+            EntityType::Environment,
+            EntityType::Deployment,
             EntityType::Workspace,
             EntityType::WorkspaceMilestone,
             EntityType::Resource,
@@ -480,9 +486,9 @@ mod tests {
     }
 
     #[test]
-    fn test_entity_type_has_26_variants() {
+    fn test_entity_type_has_30_variants() {
         // Ensure we don't accidentally add/remove variants
-        let all: [EntityType; 28] = [
+        let all: [EntityType; 30] = [
             EntityType::Project,
             EntityType::Plan,
             EntityType::Task,
@@ -492,6 +498,8 @@ mod tests {
             EntityType::Commit,
             EntityType::Release,
             EntityType::Milestone,
+            EntityType::Environment,
+            EntityType::Deployment,
             EntityType::Workspace,
             EntityType::WorkspaceMilestone,
             EntityType::Resource,
@@ -512,7 +520,7 @@ mod tests {
             EntityType::LifecycleHook,
             EntityType::Learning,
         ];
-        assert_eq!(all.len(), 28);
+        assert_eq!(all.len(), 30);
     }
 
     // ================================================================

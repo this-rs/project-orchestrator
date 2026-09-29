@@ -7,6 +7,7 @@ use super::auth_handlers;
 use super::chat_handlers;
 use super::code_handlers;
 use super::document_handlers;
+use super::environment_handlers;
 use super::episode_handlers;
 use super::feedback_handlers;
 use super::handlers::{self, OrchestratorState};
@@ -455,6 +456,31 @@ fn protected_routes() -> Router<OrchestratorState> {
         .route(
             "/api/projects/{project_id}/releases",
             get(handlers::list_releases).post(handlers::create_release),
+        )
+        // Environments & deployments
+        .route(
+            "/api/projects/{project_id}/environments",
+            get(environment_handlers::list_environments)
+                .post(environment_handlers::create_environment),
+        )
+        .route(
+            "/api/projects/{project_id}/deployment-matrix",
+            get(environment_handlers::get_deployment_matrix),
+        )
+        .route(
+            "/api/environments/{id}",
+            get(environment_handlers::get_environment)
+                .patch(environment_handlers::update_environment)
+                .delete(environment_handlers::delete_environment),
+        )
+        .route(
+            "/api/environments/{id}/deployments",
+            get(environment_handlers::list_deployments)
+                .post(environment_handlers::create_deployment),
+        )
+        .route(
+            "/api/deployments/{id}",
+            axum::routing::patch(environment_handlers::update_deployment),
         )
         // Milestones (by project_id)
         .route(

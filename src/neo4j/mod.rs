@@ -12,6 +12,7 @@ mod constraint;
 pub mod data_migrations;
 mod decision;
 pub mod document;
+mod environment;
 mod event_trigger;
 mod feature_graph;
 mod impl_graph_store;

@@ -33,6 +33,8 @@
 //! | Commit            | ✅      | —       | —       | ✅     | —        | —      | —             | handlers.rs                   |
 //! | Release           | ✅      | ✅      | ✅      | ✅     | —        | —      | ✅            | handlers.rs                   |
 //! | Milestone         | ✅      | ✅      | ✅      | ✅     | —        | —      | ✅            | handlers.rs                   |
+//! | Environment       | ✅      | ✅      | ✅      | —      | —        | —      | —             | environment_handlers.rs       |
+//! | Deployment        | ✅      | ✅      | —       | —      | —        | —      | ✅            | environment_handlers.rs       |
 //! | Workspace         | —       | —       | —       | —      | —        | —      | —             | (not yet wired)               |
 //! | WorkspaceMilestone| —       | —       | —       | —      | —        | —      | —             | (not yet wired)               |
 //! | Resource          | —       | —       | —       | —      | —        | —      | —             | (not yet wired)               |

@@ -548,6 +548,28 @@ curl -H "Authorization: Bearer <JWT>" \
 
 ---
 
+## Environments & Deployments
+
+Describe where a project runs and what was deployed where. All routes are Protected.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/projects/{project_id}/environments` | List environments |
+| POST | `/api/projects/{project_id}/environments` | Create (`name` unique per project -> 409 on duplicate) |
+| GET / PATCH / DELETE | `/api/environments/{id}` | Read, update, delete (delete also removes its deployments) |
+| GET | `/api/environments/{id}/deployments` | Paginated, newest first (`limit`, `offset`) |
+| POST | `/api/environments/{id}/deployments` | Record a deployment |
+| PATCH | `/api/deployments/{id}` | Update `status`, `notes`, `finished_at` |
+| GET | `/api/projects/{project_id}/deployment-matrix` | Environments x latest deployment |
+
+Environment: `{id, project_id, name, kind, url?, description?, config?, created_at}` where `kind` is `dev | staging | production | other` and `config` is a free JSON string.
+
+Deployment: `{id, environment_id, version?, commit_sha?, status, notes?, created_by, started_at, finished_at?}` where `status` is `pending | running | succeeded | failed | rolled_back`. Moving to `succeeded`, `failed` or `rolled_back` stamps `finished_at` unless one is given. When a Commit with `commit_sha` exists, a `(Deployment)-[:DEPLOYS]->(Commit)` relation is created; otherwise the deployment is still recorded.
+
+Invalid `kind` / `status` return 400. Matrix rows: `{environment, latest_deployment, recent_statuses}` with the last 5 statuses, newest first.
+
+---
+
 ## Workspaces
 
 Workspaces group related projects together for cross-project coordination.

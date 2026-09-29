@@ -328,6 +328,17 @@ impl Neo4jClient {
         .param("id", id.to_string());
         self.graph.run(q).await?;
 
+        // Delete environments and their deployments
+        let q = query(
+            r#"
+            MATCH (p:Project {id: $id})-[:HAS_ENVIRONMENT]->(e:Environment)
+            OPTIONAL MATCH (e)-[:HAS_DEPLOYMENT]->(d:Deployment)
+            DETACH DELETE d, e
+            "#,
+        )
+        .param("id", id.to_string());
+        self.graph.run(q).await?;
+
         // Delete feature graphs
         let q = query(
             r#"

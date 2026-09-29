@@ -661,7 +661,7 @@ Plans can be executed autonomously and triggered automatically:
 - `plan(action: "enrich", plan_id)` — auto-enrich plan with affected files and dependencies
 "#;
 
-/// Exhaustive reference of all 29 MCP mega-tools with every action and parameter.
+/// Exhaustive reference of all 30 MCP mega-tools with every action and parameter.
 /// Injected as the final section of the system prompt by `build_system_prompt()`.
 pub const TOOL_REFERENCE: &str = r#"# MCP Mega-Tools Reference
 
@@ -794,6 +794,21 @@ Manage releases. Actions: list, create, get, update, delete, add_task, add_commi
 | add_task | `release_id` (req), `task_id` (req) | Add task to release |
 | add_commit | `release_id` (req), `commit_sha` (req) | Add commit to release |
 | remove_commit | `release_id` (req), `commit_sha` (req) | Remove commit from release |
+
+## environment
+Manage project environments (dev/staging/production) and what was deployed where. Actions: list, create, get, update, delete, deploy, update_deployment, list_deployments, get_matrix
+
+| Action | Key Parameters | Description |
+|--------|---------------|-------------|
+| list | `project_id` (req) | List environments of a project |
+| create | `project_id` (req), `name` (req, unique per project), `kind` (dev/staging/production/other), `url`, `description`, `config` (free JSON) | Create environment |
+| get | `environment_id` (req) | Get environment by UUID |
+| update | `environment_id` (req), `name`, `kind`, `url`, `description`, `config` | Update environment |
+| delete | `environment_id` (req) | Delete environment and its deployments |
+| deploy | `environment_id` (req), `version`, `commit_sha`, `status` (pending/running/succeeded/failed/rolled_back), `notes`, `created_by` | Record a deployment |
+| update_deployment | `deployment_id` (req), `status`, `notes`, `finished_at` | Update deployment (terminal status sets finished_at) |
+| list_deployments | `environment_id` (req), `limit`, `offset` | Deployments of an environment, newest first |
+| get_matrix | `project_id` (req) | Environments x latest deployment + last 5 statuses |
 
 ## milestone
 Manage project milestones. Actions: list, create, get, update, delete, get_progress, add_task, link_plan, unlink_plan
@@ -1493,7 +1508,7 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
     ToolGroup {
         name: "releases_milestones",
         description: "Deliverable versions and milestones",
-        keywords: &["release", "milestone", "version", "deliverable", "livrable", "jalon", "delivery", "livraison"],
+        keywords: &["release", "milestone", "version", "deliverable", "livrable", "jalon", "delivery", "livraison", "environment", "deploy", "deployment", "staging", "production"],
         tools: &[
             ToolRef {
                 name: "release",
@@ -1502,6 +1517,10 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
             ToolRef {
                 name: "milestone",
                 description: "Manage milestones (list/create/get/update/delete/get_progress/add_task/link_plan/unlink_plan)",
+            },
+            ToolRef {
+                name: "environment",
+                description: "Manage environments and deployments (list/create/get/update/delete/deploy/update_deployment/list_deployments/get_matrix)",
             },
         ],
     },
@@ -1658,7 +1677,7 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
 ];
 
 /// Total number of unique tools across all groups.
-/// Must match the MCP tools.rs count (currently 29 mega-tools).
+/// Must match the MCP tools.rs count (currently 30 mega-tools).
 pub fn tool_catalog_tool_count() -> usize {
     let mut names: Vec<&str> = TOOL_GROUPS
         .iter()
@@ -2956,8 +2975,8 @@ mod tests {
     fn test_tool_groups_cover_all_29_mega_tools() {
         let count = tool_catalog_tool_count();
         assert_eq!(
-            count, 29,
-            "TOOL_GROUPS must cover exactly 29 unique mega-tools (got {}). \
+            count, 30,
+            "TOOL_GROUPS must cover exactly 30 unique mega-tools (got {}). \
              Update the catalog when adding/removing MCP tools.",
             count
         );
