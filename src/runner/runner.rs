@@ -318,7 +318,10 @@ impl RunMemory {
             task_id,
             title,
             wave_number,
-            status: format!("failed: {}", &reason[..reason.len().min(200)]),
+            status: format!(
+                "failed: {}",
+                &reason[..crate::utils::floor_char_boundary(reason, 200)]
+            ),
             commits: vec![],
             files_modified: vec![],
         });
@@ -2540,7 +2543,11 @@ impl PlanRunner {
                     for note in notes.iter().take(3) {
                         // Truncate content to ~200 chars
                         let excerpt = if note.content.len() > 200 {
-                            format!("{}…", &note.content[..200])
+                            format!(
+                                "{}…",
+                                &note.content
+                                    [..crate::utils::floor_char_boundary(&note.content, 200)]
+                            )
                         } else {
                             note.content.clone()
                         };
@@ -2558,7 +2565,11 @@ impl PlanRunner {
                 {
                     for dec in decisions.iter().take(2) {
                         let rationale_excerpt = if dec.rationale.len() > 150 {
-                            format!("{}…", &dec.rationale[..150])
+                            format!(
+                                "{}…",
+                                &dec.rationale
+                                    [..crate::utils::floor_char_boundary(&dec.rationale, 150)]
+                            )
                         } else {
                             dec.rationale.clone()
                         };
@@ -3411,9 +3422,15 @@ impl PlanRunner {
         tokio::spawn(async move {
             let sid_str = sid.to_string();
             if let Err(e) = chat_manager.close_session(&sid_str).await {
-                warn!("Failed to close agent session {} after {}: {}", sid_str, why, e);
+                warn!(
+                    "Failed to close agent session {} after {}: {}",
+                    sid_str, why, e
+                );
             } else {
-                debug!("Closed agent session {} after {} (task {})", sid_str, why, task_id);
+                debug!(
+                    "Closed agent session {} after {} (task {})",
+                    sid_str, why, task_id
+                );
             }
         });
     }
@@ -4248,7 +4265,13 @@ impl PlanRunner {
                                 .unwrap_or_else(|| result.to_string());
                             // Keep last 500 chars to avoid bloat
                             metrics.last_error = Some(if err_text.len() > 500 {
-                                err_text[err_text.len() - 500..].to_string()
+                                // Keep the tail, cut on a char boundary (notes/errors are often
+                                // non-ASCII — byte slicing panicked the task).
+                                let cut = err_text.len() - 500;
+                                let cut = (cut..=err_text.len())
+                                    .find(|&i| err_text.is_char_boundary(i))
+                                    .unwrap_or(err_text.len());
+                                err_text[cut..].to_string()
                             } else {
                                 err_text
                             });
@@ -7694,5 +7717,45 @@ mod tests {
             let mut global = RUNNER_STATE.write().await;
             *global = None;
         }
+    }
+
+    // ---------------------------------------------------------------
+    // Runner hardening regression tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_run_memory_record_failed_multibyte_reason_does_not_panic() {
+        // 199 ASCII bytes followed by a 2-byte char straddling the 200-byte cut.
+        let reason = format!("{}é suite", "a".repeat(199));
+        let mut mem = RunMemory::default();
+        mem.record_failed(Uuid::new_v4(), "T".into(), 1, &reason);
+        assert!(mem.summaries[0].status.starts_with("failed: "));
+    }
+
+    #[tokio::test]
+    async fn test_listen_for_result_multibyte_error_truncation_does_not_panic() {
+        let runner = test_plan_runner();
+        let (tx, rx) = broadcast::channel::<ChatEvent>(16);
+        // 601 bytes: the "last 500 bytes" cut (byte 101) lands inside a 2-byte 'é'.
+        let long_error = format!("{}x", "é".repeat(300));
+        tx.send(ChatEvent::ToolResult {
+            id: "tr1".into(),
+            result: serde_json::json!(long_error),
+            is_error: true,
+            parent_tool_use_id: None,
+        })
+        .unwrap();
+        tx.send(ChatEvent::Result {
+            session_id: "s1".into(),
+            duration_ms: 1,
+            cost_usd: None,
+            subtype: "success".into(),
+            is_error: false,
+            num_turns: None,
+            result_text: None,
+        })
+        .unwrap();
+        let (_r, metrics) = runner.listen_for_result(rx, Uuid::new_v4(), None).await;
+        assert!(metrics.last_error.unwrap().len() <= 500);
     }
 }
