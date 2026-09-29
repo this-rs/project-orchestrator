@@ -9,8 +9,8 @@
 
 use super::client::Neo4jClient;
 use crate::graph::neighborhood::{
-    all_labels, entity_kind, kind_for_labels, layer_of, next_frontier, rel_types_for, NodeProps,
-    NeighborhoodParams, RawEdge, RawNeighborhood, RawNode, EDGE_WEIGHT_CYPHER,
+    all_labels, entity_kind, kind_for_labels, layer_of, next_frontier, rel_types_for,
+    NeighborhoodParams, NodeProps, RawEdge, RawNeighborhood, RawNode, EDGE_WEIGHT_CYPHER,
 };
 use anyhow::{anyhow, Result};
 use neo4rs::query;

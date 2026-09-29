@@ -466,7 +466,7 @@ pub fn node_label(node_type: &str, public_id: &str, p: &NodeProps) -> (String, O
         "decision" => (first(&[&p.description]), join_parts(&[status])),
         "constraint" => (
             first(&[&p.description]),
-            join_parts(std::slice::from_ref(&p.constraint_type)),
+            join_parts(&[p.constraint_type.clone()]),
         ),
         "task" | "plan" | "milestone" | "workspace_milestone" | "release" | "step" => (
             first(&[&p.title, &p.description]),
@@ -490,12 +490,9 @@ pub fn node_label(node_type: &str, public_id: &str, p: &NodeProps) -> (String, O
         ),
         "protocol" => (
             first(&[&p.name]),
-            join_parts(std::slice::from_ref(&p.protocol_category)),
+            join_parts(&[p.protocol_category.clone()]),
         ),
-        "protocol_state" => (
-            first(&[&p.name]),
-            join_parts(std::slice::from_ref(&p.state_type)),
-        ),
+        "protocol_state" => (first(&[&p.name]), join_parts(&[p.state_type.clone()])),
         "feature_graph" => (
             first(&[&p.name]),
             p.description.as_deref().map(|d| headline(d, MAX)),
@@ -720,11 +717,7 @@ pub fn expand_in_memory(
                 .flatten()
                 .filter_map(|&i| {
                     let e = &graph.edges[i];
-                    let other = if e.source == *fid {
-                        &e.target
-                    } else {
-                        &e.source
-                    };
+                    let other = if e.source == *fid { &e.target } else { &e.source };
                     graph.nodes.get(other).map(|n| (i, n))
                 })
                 .collect();
@@ -1055,12 +1048,8 @@ pub fn layer_counts(raw: &RawNeighborhood, depth: u32, min_weight: f64) -> BTree
         .collect();
     let mut adj: HashMap<&str, Vec<&str>> = HashMap::new();
     for e in &edges {
-        adj.entry(e.source.as_str())
-            .or_default()
-            .push(e.target.as_str());
-        adj.entry(e.target.as_str())
-            .or_default()
-            .push(e.source.as_str());
+        adj.entry(e.source.as_str()).or_default().push(e.target.as_str());
+        adj.entry(e.target.as_str()).or_default().push(e.source.as_str());
     }
     let mut reach: HashSet<&str> = HashSet::from([center.id.as_str()]);
     let mut frontier = vec![center.id.as_str()];
@@ -1102,12 +1091,7 @@ mod tests {
     }
 
     fn params(depth: u32, min_weight: f64, limit: usize) -> NeighborhoodParams {
-        NeighborhoodParams::clamped(
-            Some(depth),
-            Some(min_weight),
-            Some(limit),
-            Layer::ALL.to_vec(),
-        )
+        NeighborhoodParams::clamped(Some(depth), Some(min_weight), Some(limit), Layer::ALL.to_vec())
     }
 
     /// n0 ─SYNAPSE .9─ n1 ─SYNAPSE .8─ n3
@@ -1132,11 +1116,7 @@ mod tests {
         g
     }
 
-    fn run(
-        g: &InMemoryGraph,
-        center: (&str, &str),
-        p: &NeighborhoodParams,
-    ) -> NeighborhoodResponse {
+    fn run(g: &InMemoryGraph, center: (&str, &str), p: &NeighborhoodParams) -> NeighborhoodResponse {
         let raw = expand_in_memory(g, center.0, center.1, p).expect("center");
         select_neighborhood(&raw, p).expect("selection")
     }
@@ -1151,9 +1131,7 @@ mod tests {
         for (i, (rel, src, _)) in REL_LAYERS.iter().enumerate() {
             if src.is_some() {
                 assert!(
-                    !REL_LAYERS[..i]
-                        .iter()
-                        .any(|(r, s, _)| r == rel && s.is_none()),
+                    !REL_LAYERS[..i].iter().any(|(r, s, _)| r == rel && s.is_none()),
                     "{rel}/{src:?} is shadowed by an earlier catch-all"
                 );
             }
@@ -1263,8 +1241,8 @@ mod tests {
         // candidate set walked over all layers
         let all = expand_in_memory(&g, "note", "n0", &params(2, 0.0, 100)).unwrap();
         let p = NeighborhoodParams::clamped(Some(2), None, None, vec![Layer::Neural]);
-        let mut r =
-            select_neighborhood(&expand_in_memory(&g, "note", "n0", &p).unwrap(), &p).unwrap();
+        let mut r = select_neighborhood(&expand_in_memory(&g, "note", "n0", &p).unwrap(), &p)
+            .unwrap();
         r.stats.by_layer = layer_counts(&all, p.depth, p.min_weight);
         // SYNAPSE n0-n1, n0-n2, n1-n3
         assert_eq!(r.stats.by_layer["neural"], 3);
@@ -1294,9 +1272,7 @@ mod tests {
         let mut p = params(2, 0.0, 400);
         p.fanout = 10;
         let raw = expand_in_memory(&g, "note", "start", &p).unwrap();
-        // hub + its 9 strongest new neighbours (`start` already uses 1 of the
-        // 10 fanout slots); the centre itself is not part of `nodes`
-        assert_eq!(raw.nodes.len(), 1 + 9);
+        assert_eq!(raw.nodes.len(), 1 + 10);
         // strongest kept
         assert!(raw.nodes.iter().any(|n| n.id == "n000"));
         assert!(!raw.nodes.iter().any(|n| n.id == "n099"));

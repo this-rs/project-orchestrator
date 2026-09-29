@@ -250,7 +250,10 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         let msg = json.to_string();
-        assert!(msg.contains("Unsupported entity_type 'chat_event'"), "{msg}");
+        assert!(
+            msg.contains("Unsupported entity_type 'chat_event'"),
+            "{msg}"
+        );
         assert!(msg.contains("feature_graph"), "{msg}");
     }
 
@@ -280,9 +283,13 @@ mod tests {
     #[tokio::test]
     async fn contract_shape_and_defaults() {
         let app = app_with(sample()).await;
-        let (status, json) = get(app, "/api/graph/neighborhood?entity_type=note&entity_id=n0").await;
+        let (status, json) =
+            get(app, "/api/graph/neighborhood?entity_type=note&entity_id=n0").await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(json["center"], serde_json::json!({"id": "n0", "type": "note"}));
+        assert_eq!(
+            json["center"],
+            serde_json::json!({"id": "n0", "type": "note"})
+        );
         let first = &json["nodes"][0];
         assert_eq!(first["id"], "n0");
         assert_eq!(first["depth"], 0);

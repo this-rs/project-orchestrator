@@ -700,3 +700,149 @@ async fn test_neo4j_task_plan_and_next_available() {
     state.neo4j.delete_task(task.id).await.ok();
     state.neo4j.delete_plan(plan_id).await.ok();
 }
+
+/// Real-Neo4j check of the entity neighbourhood fetch: a note linked to a
+/// file (LINKED_TO), a second note tied to the first by a SYNAPSE, and a
+/// project container that must not be expanded past the first hop.
+#[tokio::test]
+async fn test_neo4j_entity_neighborhood() {
+    use project_orchestrator::graph::neighborhood::{
+        select_neighborhood, Layer, NeighborhoodParams,
+    };
+    use project_orchestrator::neo4j::client::Neo4jClient;
+
+    let config = test_config();
+    let client = match Neo4jClient::new(
+        &config.neo4j_uri,
+        &config.neo4j_user,
+        &config.neo4j_password,
+    )
+    .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Skipping test: Neo4j not available: {e}");
+            return;
+        }
+    };
+    let raw_graph = neo4rs::Graph::new(
+        &config.neo4j_uri,
+        &config.neo4j_user,
+        &config.neo4j_password,
+    )
+    .await
+    .unwrap();
+
+    let tag = Uuid::new_v4().to_string();
+    let (n1, n2, n3) = (
+        format!("{tag}-n1"),
+        format!("{tag}-n2"),
+        format!("{tag}-n3"),
+    );
+    let file = format!("/test/neighborhood_{tag}.rs");
+    let project = format!("{tag}-p");
+    let other_file = format!("/test/neighborhood_other_{tag}.rs");
+
+    raw_graph
+        .run(
+            neo4rs::query(
+                "CREATE (a:Note {id: $n1, content: 'first note'}), \
+                        (b:Note {id: $n2, content: 'second note'}), \
+                        (c:Note {id: $n3, content: 'third note'}), \
+                        (f:File {path: $file}), \
+                        (o:File {path: $other}), \
+                        (p:Project {id: $p, name: 'neighborhood-test'}), \
+                        (a)-[:LINKED_TO]->(f), \
+                        (a)-[:SYNAPSE {weight: 0.8}]->(b), \
+                        (p)-[:CONTAINS]->(f), \
+                        (p)-[:CONTAINS]->(o), \
+                        (c)-[:LINKED_TO]->(o)",
+            )
+            .param("n1", n1.clone())
+            .param("n2", n2.clone())
+            .param("n3", n3.clone())
+            .param("file", file.clone())
+            .param("other", other_file.clone())
+            .param("p", project.clone()),
+        )
+        .await
+        .unwrap();
+
+    let all = NeighborhoodParams::clamped(Some(2), None, None, Layer::ALL.to_vec());
+
+    // Unknown centre
+    let missing = client
+        .get_entity_neighborhood("note", &format!("{tag}-missing"), &all)
+        .await
+        .unwrap();
+    assert!(missing.is_none());
+
+    // Depth 1 from n1: the file and the second note, not the project
+    let d1 = NeighborhoodParams::clamped(Some(1), None, None, Layer::ALL.to_vec());
+    let raw = client
+        .get_entity_neighborhood("note", &n1, &d1)
+        .await
+        .unwrap()
+        .expect("centre exists");
+    let res = select_neighborhood(&raw, &d1).unwrap();
+    let ids: Vec<&str> = res.nodes.iter().map(|n| n.id.as_str()).collect();
+    assert!(ids.contains(&n1.as_str()), "centre included: {ids:?}");
+    assert!(ids.contains(&n2.as_str()), "synapse neighbour: {ids:?}");
+    assert!(ids.contains(&file.as_str()), "linked file: {ids:?}");
+    assert!(!ids.contains(&project.as_str()), "project is 2 hops away");
+
+    // Depth 2 reaches the project through the file, but the project is a
+    // container: it must not open onto its other files or their notes.
+    let raw = client
+        .get_entity_neighborhood("note", &n1, &all)
+        .await
+        .unwrap()
+        .expect("centre exists");
+    let res = select_neighborhood(&raw, &all).unwrap();
+    let ids: Vec<&str> = res.nodes.iter().map(|n| n.id.as_str()).collect();
+    assert!(ids.contains(&project.as_str()), "project at hop 2: {ids:?}");
+    assert!(
+        !ids.contains(&other_file.as_str()),
+        "container not expanded"
+    );
+    assert!(!ids.contains(&n3.as_str()), "container not expanded");
+
+    // Layer filter: neural only keeps the synapse
+    let neural = NeighborhoodParams::clamped(Some(2), None, None, vec![Layer::Neural]);
+    let raw = client
+        .get_entity_neighborhood("note", &n1, &neural)
+        .await
+        .unwrap()
+        .expect("centre exists");
+    let res = select_neighborhood(&raw, &neural).unwrap();
+    let ids: Vec<&str> = res.nodes.iter().map(|n| n.id.as_str()).collect();
+    assert!(ids.contains(&n2.as_str()));
+    assert!(!ids.contains(&file.as_str()));
+
+    // Centre may be a container: the project expands to its files
+    let raw = client
+        .get_entity_neighborhood("project", &project, &d1)
+        .await
+        .unwrap()
+        .expect("project exists");
+    let res = select_neighborhood(&raw, &d1).unwrap();
+    let ids: Vec<&str> = res.nodes.iter().map(|n| n.id.as_str()).collect();
+    assert!(ids.contains(&file.as_str()) && ids.contains(&other_file.as_str()));
+
+    // Cleanup
+    raw_graph
+        .run(
+            neo4rs::query(
+                "MATCH (x) WHERE x.id IN [$n1, $n2, $n3, $p] OR x.path IN [$file, $other] \
+                 DETACH DELETE x",
+            )
+            .param("n1", n1)
+            .param("n2", n2)
+            .param("n3", n3)
+            .param("p", project)
+            .param("file", file)
+            .param("other", other_file),
+        )
+        .await
+        .unwrap();
+}
