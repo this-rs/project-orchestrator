@@ -3512,4 +3512,18 @@ pub trait GraphStore: Send + Sync {
 
     /// Backfill OFTEN_FOLLOWS relations from consecutive tool use events
     async fn backfill_often_follows(&self) -> Result<usize>;
+
+    // ========================================================================
+    // Entity neighbourhood (ego-graph)
+    // ========================================================================
+
+    /// Bounded candidate neighbourhood around an entity, walked hop by hop
+    /// over the relationship types of `params.layers` (see
+    /// `crate::graph::neighborhood`). `Ok(None)` when the centre is unknown.
+    async fn get_entity_neighborhood(
+        &self,
+        center_type: &str,
+        center_id: &str,
+        params: &crate::graph::neighborhood::NeighborhoodParams,
+    ) -> Result<Option<crate::graph::neighborhood::RawNeighborhood>>;
 }

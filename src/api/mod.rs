@@ -5,6 +5,7 @@ pub mod chat_handlers;
 pub mod code_handlers;
 pub mod episode_handlers;
 pub mod feedback_handlers;
+pub mod graph_handlers;
 pub mod graph_types;
 pub mod handlers;
 pub mod hook_handlers;

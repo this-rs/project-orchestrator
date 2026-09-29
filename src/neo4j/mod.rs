@@ -18,6 +18,7 @@ mod lifecycle_hook;
 mod mcp_federation;
 mod milestone;
 pub mod models;
+mod neighborhood;
 mod note;
 mod persona;
 pub mod plan;

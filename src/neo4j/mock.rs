@@ -212,6 +212,8 @@ pub struct MockGraphStore {
     pub mock_has_context_cards: std::sync::atomic::AtomicBool,
     /// When true, `set_watch_enabled()` returns an error (default: false)
     pub mock_fail_set_watch_enabled: std::sync::atomic::AtomicBool,
+    /// Generic graph served by `get_entity_neighborhood` (seeded by tests).
+    pub neighborhood_graph: RwLock<crate::graph::neighborhood::InMemoryGraph>,
 }
 
 #[allow(dead_code)]
@@ -322,6 +324,7 @@ impl MockGraphStore {
             mcp_often_follows: RwLock::new(HashMap::new()),
             mock_has_context_cards: std::sync::atomic::AtomicBool::new(false),
             mock_fail_set_watch_enabled: std::sync::atomic::AtomicBool::new(false),
+            neighborhood_graph: RwLock::new(Default::default()),
         }
     }
 
@@ -11119,6 +11122,21 @@ impl GraphStore for MockGraphStore {
     async fn backfill_often_follows(&self) -> Result<usize> {
         // Mock: no chat event records to scan, return 0
         Ok(0)
+    }
+
+    async fn get_entity_neighborhood(
+        &self,
+        center_type: &str,
+        center_id: &str,
+        params: &crate::graph::neighborhood::NeighborhoodParams,
+    ) -> Result<Option<crate::graph::neighborhood::RawNeighborhood>> {
+        let graph = self.neighborhood_graph.read().await;
+        Ok(crate::graph::neighborhood::expand_in_memory(
+            &graph,
+            center_type,
+            center_id,
+            params,
+        ))
     }
 }
 

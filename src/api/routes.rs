@@ -8,6 +8,7 @@ use super::chat_handlers;
 use super::code_handlers;
 use super::episode_handlers;
 use super::feedback_handlers;
+use super::graph_handlers;
 use super::handlers::{self, OrchestratorState};
 use super::hook_handlers;
 use super::mcp_federation_handlers;
@@ -1151,6 +1152,11 @@ fn protected_routes() -> Router<OrchestratorState> {
         .route(
             "/api/entities/{entity_type}/{entity_id}/notes",
             get(note_handlers::get_entity_notes),
+        )
+        // Ego-graph around any entity (entity pages, agents)
+        .route(
+            "/api/graph/neighborhood",
+            get(graph_handlers::get_neighborhood),
         )
         // ================================================================
         // Analysis Profiles

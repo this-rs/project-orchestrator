@@ -4148,4 +4148,14 @@ impl GraphStore for Neo4jClient {
     async fn backfill_often_follows(&self) -> anyhow::Result<usize> {
         self.backfill_often_follows().await
     }
+
+    async fn get_entity_neighborhood(
+        &self,
+        center_type: &str,
+        center_id: &str,
+        params: &crate::graph::neighborhood::NeighborhoodParams,
+    ) -> anyhow::Result<Option<crate::graph::neighborhood::RawNeighborhood>> {
+        self.get_entity_neighborhood(center_type, center_id, params)
+            .await
+    }
 }
