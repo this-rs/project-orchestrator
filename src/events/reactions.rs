@@ -1421,6 +1421,13 @@ pub fn register_builtin_reactions(
 
 #[cfg(test)]
 mod tests {
+    /// Serializes the tests that reset and read the process-global
+    /// `LAST_FEEDBACK_ANALYSIS_TS`. Run in parallel, one test's `store(0)`
+    /// re-opens the cooldown in the middle of another's two calls, which then
+    /// sees the timestamp move (seen flaking under llvm-cov, where the slower
+    /// instrumented build widens the window).
+    static FEEDBACK_COOLDOWN_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     use super::*;
     use crate::api::handlers::ServerState;
     use crate::events::{EventBus, HybridEmitter};
@@ -2318,6 +2325,7 @@ mod tests {
     async fn on_plan_run_completed_skips_missing_plan_id() {
         let state = mock_server_state().await;
         // Reset cooldown for this test
+        let _cooldown_guard = FEEDBACK_COOLDOWN_TEST_LOCK.lock().await;
         LAST_FEEDBACK_ANALYSIS_TS.store(0, std::sync::atomic::Ordering::Relaxed);
         let event = make_event(
             EntityType::Runner,
@@ -2334,6 +2342,7 @@ mod tests {
         let plan_id = Uuid::new_v4();
 
         // Reset cooldown
+        let _cooldown_guard = FEEDBACK_COOLDOWN_TEST_LOCK.lock().await;
         LAST_FEEDBACK_ANALYSIS_TS.store(0, std::sync::atomic::Ordering::Relaxed);
 
         // First call: should proceed (plan not found, but past cooldown)
@@ -2375,6 +2384,7 @@ mod tests {
         let neo4j = state.orchestrator.neo4j();
 
         // Reset cooldown
+        let _cooldown_guard = FEEDBACK_COOLDOWN_TEST_LOCK.lock().await;
         LAST_FEEDBACK_ANALYSIS_TS.store(0, std::sync::atomic::Ordering::Relaxed);
 
         // Create a project + plan
@@ -2409,6 +2419,7 @@ mod tests {
         let neo4j = state.orchestrator.neo4j();
 
         // Reset cooldown
+        let _cooldown_guard = FEEDBACK_COOLDOWN_TEST_LOCK.lock().await;
         LAST_FEEDBACK_ANALYSIS_TS.store(0, std::sync::atomic::Ordering::Relaxed);
 
         // Create a project + plan
@@ -2483,6 +2494,7 @@ mod tests {
         let neo4j = state.orchestrator.neo4j();
 
         // Reset cooldown
+        let _cooldown_guard = FEEDBACK_COOLDOWN_TEST_LOCK.lock().await;
         LAST_FEEDBACK_ANALYSIS_TS.store(0, std::sync::atomic::Ordering::Relaxed);
 
         // Create a project + plan
