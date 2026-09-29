@@ -1635,6 +1635,14 @@ impl GraphStore for Neo4jClient {
         self.get_project_progress(project_id).await
     }
 
+    async fn get_progress_batch(
+        &self,
+        kind: ProgressKind,
+        ids: &[Uuid],
+    ) -> anyhow::Result<std::collections::HashMap<Uuid, TaskCounts>> {
+        self.get_progress_batch(kind, ids).await
+    }
+
     async fn get_project_task_dependencies(
         &self,
         project_id: Uuid,

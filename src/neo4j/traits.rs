@@ -1293,6 +1293,28 @@ pub trait GraphStore: Send + Sync {
     /// Get project progress stats
     async fn get_project_progress(&self, project_id: Uuid) -> Result<(u32, u32, u32, u32)>;
 
+    /// Task counters for many entities at once (one round trip for list cards).
+    ///
+    /// The default implementation loops over the per-entity task getters so
+    /// every store (including mocks) supports it; `Neo4jClient` overrides it
+    /// with a single aggregated query.
+    async fn get_progress_batch(
+        &self,
+        kind: ProgressKind,
+        ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, TaskCounts>> {
+        let mut out = std::collections::HashMap::with_capacity(ids.len());
+        for id in ids {
+            let tasks = match kind {
+                ProgressKind::Plan => self.get_plan_tasks(*id).await?,
+                ProgressKind::Project => self.get_project_tasks(*id).await?,
+                ProgressKind::Milestone => self.get_milestone_tasks(*id).await?,
+            };
+            out.insert(*id, TaskCounts::from_tasks(&tasks));
+        }
+        Ok(out)
+    }
+
     /// Get all task dependencies for a project (across all plans)
     async fn get_project_task_dependencies(&self, project_id: Uuid) -> Result<Vec<(Uuid, Uuid)>>;
 

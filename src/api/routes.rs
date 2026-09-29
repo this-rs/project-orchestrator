@@ -745,6 +745,7 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/milestones/{milestone_id}/plans/{plan_id}",
             delete(handlers::unlink_plan_from_milestone),
         )
+        .route("/api/progress", get(handlers::get_progress_batch))
         .route(
             "/api/milestones/{milestone_id}/progress",
             get(handlers::get_milestone_progress),

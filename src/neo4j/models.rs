@@ -494,6 +494,49 @@ pub enum TaskStatus {
     Failed,
 }
 
+/// Task counters for one entity (plan, project or milestone).
+///
+/// Returned in batch by `GET /api/progress` so list cards can show a progress
+/// bar without one request per row.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskCounts {
+    pub total: u32,
+    pub completed: u32,
+    pub in_progress: u32,
+    pub blocked: u32,
+    pub pending: u32,
+    pub failed: u32,
+}
+
+impl TaskCounts {
+    /// Count tasks by status.
+    pub fn from_tasks(tasks: &[TaskNode]) -> Self {
+        let mut c = Self {
+            total: tasks.len() as u32,
+            ..Self::default()
+        };
+        for t in tasks {
+            match t.status {
+                TaskStatus::Completed => c.completed += 1,
+                TaskStatus::InProgress => c.in_progress += 1,
+                TaskStatus::Blocked => c.blocked += 1,
+                TaskStatus::Pending => c.pending += 1,
+                TaskStatus::Failed => c.failed += 1,
+            }
+        }
+        c
+    }
+}
+
+/// Entity kind a batch progress request is computed for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgressKind {
+    Plan,
+    Project,
+    Milestone,
+}
+
 /// A task with its parent plan information (for global task queries)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskWithPlan {

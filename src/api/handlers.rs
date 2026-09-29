@@ -4785,6 +4785,63 @@ pub struct MilestoneProgressResponse {
     pub percentage: f64,
 }
 
+/// Query parameters for GET /api/progress
+#[derive(Debug, Deserialize)]
+pub struct ProgressBatchQuery {
+    /// Entity kind: plan | project | milestone
+    pub kind: crate::neo4j::ProgressKind,
+    /// Comma-separated entity UUIDs (max 200)
+    pub ids: String,
+}
+
+/// One entry of the batch progress response
+#[derive(Debug, Serialize)]
+pub struct ProgressEntry {
+    #[serde(flatten)]
+    pub counts: crate::neo4j::TaskCounts,
+    /// Completed / total, 0..100 (0 when there is no task)
+    pub percentage: f64,
+}
+
+/// Batch task counters for list cards: `GET /api/progress?kind=plan&ids=a,b,c`
+///
+/// Returns `{ "<id>": { total, completed, in_progress, blocked, pending, failed, percentage } }`.
+pub async fn get_progress_batch(
+    State(state): State<OrchestratorState>,
+    Query(query): Query<ProgressBatchQuery>,
+) -> Result<Json<std::collections::HashMap<Uuid, ProgressEntry>>, AppError> {
+    let ids = query
+        .ids
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| Uuid::parse_str(s).map_err(|_| AppError::BadRequest(format!("Invalid UUID: {s}"))))
+        .collect::<Result<Vec<_>, _>>()?;
+    if ids.len() > 200 {
+        return Err(AppError::BadRequest("At most 200 ids per request".into()));
+    }
+
+    let counts = state
+        .orchestrator
+        .neo4j()
+        .get_progress_batch(query.kind, &ids)
+        .await?;
+
+    Ok(Json(
+        counts
+            .into_iter()
+            .map(|(id, counts)| {
+                let percentage = if counts.total > 0 {
+                    counts.completed as f64 / counts.total as f64 * 100.0
+                } else {
+                    0.0
+                };
+                (id, ProgressEntry { counts, percentage })
+            })
+            .collect(),
+    ))
+}
+
 /// Get milestone progress
 pub async fn get_milestone_progress(
     State(state): State<OrchestratorState>,
@@ -6482,6 +6539,45 @@ mod tests {
 
         assert_eq!(json["total"], 0);
         assert_eq!(json["percentage"], 0.0);
+    }
+
+    #[tokio::test]
+    async fn test_progress_batch_milestone_and_unknown_ids() {
+        let (app, milestone_id, _, _) = test_app_with_project_milestone().await;
+        let unknown = uuid::Uuid::new_v4();
+        let uri = format!(
+            "/api/progress?kind=milestone&ids={},{}",
+            milestone_id, unknown
+        );
+        let resp = app.oneshot(auth_get(&uri)).await.unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json[milestone_id.to_string()]["total"], 2);
+        assert_eq!(json[milestone_id.to_string()]["pending"], 2);
+        assert_eq!(json[milestone_id.to_string()]["percentage"], 0.0);
+        // Unknown ids are present with zeros, never omitted
+        assert_eq!(json[unknown.to_string()]["total"], 0);
+    }
+
+    #[tokio::test]
+    async fn test_progress_batch_rejects_bad_input() {
+        let (app, _, _, _) = test_app_with_project_milestone().await;
+        let resp = app
+            .clone()
+            .oneshot(auth_get("/api/progress?kind=plan&ids=not-a-uuid"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::BAD_REQUEST);
+
+        let resp = app
+            .oneshot(auth_get("/api/progress?kind=nope&ids="))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::BAD_REQUEST);
     }
 
     #[test]
