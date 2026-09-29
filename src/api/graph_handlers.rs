@@ -54,7 +54,7 @@ pub struct NeighborhoodQuery {
 }
 
 /// Validate the query, fetch the bounded candidate set and select the view.
-/// Shared by the REST handler and the MCP tool.
+/// Used by the REST handler; reusable by an MCP tool.
 pub async fn compute_neighborhood(
     store: &dyn GraphStore,
     q: &NeighborhoodQuery,
