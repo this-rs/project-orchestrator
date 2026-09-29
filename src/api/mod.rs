@@ -7,6 +7,7 @@ pub mod document_handlers;
 pub mod environment_handlers;
 pub mod episode_handlers;
 pub mod feedback_handlers;
+pub mod graph_handlers;
 pub mod graph_types;
 pub mod handlers;
 pub mod hook_handlers;
