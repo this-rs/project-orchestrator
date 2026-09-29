@@ -337,7 +337,10 @@ impl TaskVerifier {
             let stderr = String::from_utf8_lossy(&output.stderr);
             // Truncate stderr to avoid huge error messages
             let truncated = if stderr.len() > 2000 {
-                format!("{}...(truncated)", &stderr[..2000])
+                format!(
+                    "{}...(truncated)",
+                    &stderr[..crate::utils::floor_char_boundary(&stderr, 2000)]
+                )
             } else {
                 stderr.to_string()
             };
@@ -491,7 +494,10 @@ impl TaskVerifier {
             let stdout = String::from_utf8_lossy(&output.stdout);
             let combined = format!("{}\n{}", stdout, stderr);
             let truncated = if combined.len() > 2000 {
-                format!("{}...(truncated)", &combined[..2000])
+                format!(
+                    "{}...(truncated)",
+                    &combined[..crate::utils::floor_char_boundary(&combined, 2000)]
+                )
             } else {
                 combined
             };

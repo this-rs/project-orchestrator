@@ -912,4 +912,88 @@ branch refs/heads/feature
         assert_eq!(r.total_merged, 0);
         assert_eq!(r.total_conflicts, 0);
     }
+
+    /// `cleanup_worktrees` runs at the end of every plan run. It must only
+    /// touch disposable agent worktrees: a user's own `.claude/worktrees/<name>`
+    /// (e.g. an interactive session working in the same repo) and agent
+    /// worktrees holding commits that were NOT recovered onto the run branch
+    /// must survive — `worktree remove --force` + `branch -D` would destroy
+    /// that work.
+    #[tokio::test]
+    async fn test_cleanup_worktrees_preserves_user_and_unrecovered_worktrees() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |cwd: &std::path::Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(["-c", "user.email=t@t", "-c", "user.name=t"])
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {:?}: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(root, &["init", "-q", "-b", "main"]);
+        git(root, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        // A user worktree (not an agent one) and an agent worktree with an
+        // unrecovered commit, plus a stale agent worktree with no new commit.
+        git(
+            root,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feat",
+                ".claude/worktrees/my-feature",
+            ],
+        );
+        git(
+            root,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "agent-a",
+                ".claude/worktrees/agent-a",
+            ],
+        );
+        git(
+            &root.join(".claude/worktrees/agent-a"),
+            &["commit", "-q", "--allow-empty", "-m", "agent work"],
+        );
+        git(
+            root,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "agent-b",
+                ".claude/worktrees/agent-b",
+            ],
+        );
+
+        let cwd = root.to_string_lossy().to_string();
+        let cleaned = WorktreeCollector::cleanup_worktrees(&cwd).await.unwrap();
+
+        assert!(
+            root.join(".claude/worktrees/my-feature").exists(),
+            "user worktree removed"
+        );
+        assert!(
+            root.join(".claude/worktrees/agent-a").exists(),
+            "unrecovered agent work removed"
+        );
+        assert!(
+            !root.join(".claude/worktrees/agent-b").exists(),
+            "stale agent worktree kept"
+        );
+        assert_eq!(cleaned, 1);
+    }
 }
