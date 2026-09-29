@@ -1891,7 +1891,37 @@ pub struct WatchRequest {
 #[derive(Serialize)]
 pub struct WatchStatusResponse {
     pub running: bool,
+    /// Canonicalized paths under watch (symlinks resolved).
     pub watched_paths: Vec<String>,
+    /// Projects under watch, keyed by id. Clients must match on `project_id`,
+    /// not on `root_path`: the watcher canonicalizes paths, so a project whose
+    /// `root_path` goes through a symlink never string-matches `watched_paths`.
+    pub watched_projects: Vec<WatchedProject>,
+}
+
+/// A project registered with the file watcher.
+#[derive(Serialize)]
+pub struct WatchedProject {
+    pub project_id: String,
+    pub slug: String,
+    pub path: String,
+}
+
+async fn watched_projects_of(
+    watcher: &crate::orchestrator::watcher::FileWatcher,
+) -> Vec<WatchedProject> {
+    let mut v: Vec<WatchedProject> = watcher
+        .registered_projects()
+        .await
+        .into_iter()
+        .map(|(id, slug, path)| WatchedProject {
+            project_id: id.to_string(),
+            slug,
+            path: path.to_string_lossy().to_string(),
+        })
+        .collect();
+    v.sort_by(|a, b| a.path.cmp(&b.path));
+    v
 }
 
 /// Start watching a directory
@@ -1936,6 +1966,7 @@ pub async fn start_watch(
             .iter()
             .map(|p| p.to_string_lossy().to_string())
             .collect(),
+        watched_projects: watched_projects_of(&watcher).await,
     }))
 }
 
@@ -1974,6 +2005,7 @@ pub async fn stop_watch(
                 .iter()
                 .map(|p| p.to_string_lossy().to_string())
                 .collect(),
+            watched_projects: watched_projects_of(&watcher).await,
         }))
     } else {
         // Stop all: persist watch_enabled=false for all registered projects,
@@ -1993,6 +2025,7 @@ pub async fn stop_watch(
         Ok(Json(WatchStatusResponse {
             running: false,
             watched_paths: vec![],
+            watched_projects: vec![],
         }))
     }
 }
@@ -2010,6 +2043,7 @@ pub async fn watch_status(
             .iter()
             .map(|p| p.to_string_lossy().to_string())
             .collect(),
+        watched_projects: watched_projects_of(&watcher).await,
     }))
 }
 
@@ -8204,6 +8238,60 @@ mod tests {
             .await
             .unwrap();
         (state, project)
+    }
+
+    /// Regression: a project whose `root_path` goes through a symlink is watched
+    /// under its canonical path, so `watched_paths` never string-matches its
+    /// `root_path`. The status must expose the project by id instead.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_handler_watch_status_exposes_project_behind_symlink() {
+        let real = tempfile::tempdir().unwrap();
+        let links = tempfile::tempdir().unwrap();
+        let link = links.path().join("linked-root");
+        std::os::unix::fs::symlink(real.path(), &link).unwrap();
+
+        let (state, project) = mock_server_state_with_project().await;
+        let app = watch_router(state);
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/watch")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "path": link.to_string_lossy().to_string(),
+                    "project_id": project.id.to_string(),
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let resp = oneshot_req(app.clone(), req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let req = axum::http::Request::builder()
+            .method("GET")
+            .uri("/api/watch")
+            .body(Body::empty())
+            .unwrap();
+        let resp = oneshot_req(app, req).await;
+        let json = resp_json(resp).await;
+
+        let link_str = link.to_string_lossy().to_string();
+        let paths: Vec<&str> = json["watched_paths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p.as_str().unwrap())
+            .collect();
+        assert!(
+            !paths.contains(&link_str.as_str()),
+            "the watcher reports canonical paths, not the symlink"
+        );
+        let projects = json["watched_projects"].as_array().unwrap();
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0]["project_id"], project.id.to_string());
+        assert_eq!(projects[0]["slug"], project.slug);
     }
 
     /// Build a mock state with a project AND a failing `set_watch_enabled` mock.
