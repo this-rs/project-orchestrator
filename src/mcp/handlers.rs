@@ -173,6 +173,7 @@ impl ToolHandler {
             "decision",
             "constraint",
             "release",
+            "environment",
             "milestone",
             "commit",
             "note",
@@ -319,6 +320,17 @@ impl ToolHandler {
             ("release", "add_task") => "add_task_to_release",
             ("release", "add_commit") => "add_commit_to_release",
             ("release", "remove_commit") => "remove_commit_from_release",
+
+            // Environment / Deployment
+            ("environment", "list") => "list_environments",
+            ("environment", "create") => "create_environment",
+            ("environment", "get") => "get_environment",
+            ("environment", "update") => "update_environment",
+            ("environment", "delete") => "delete_environment",
+            ("environment", "deploy") => "create_deployment",
+            ("environment", "update_deployment") => "update_deployment",
+            ("environment", "list_deployments") => "list_deployments",
+            ("environment", "get_matrix") => "get_deployment_matrix",
 
             // Milestone
             ("milestone", "list") => "list_milestones",
@@ -2074,6 +2086,110 @@ impl ToolHandler {
                 } else {
                     result
                 }))
+            }
+
+            // ── Environments & deployments ─────────────────────────────
+            "list_environments" => {
+                let project_id = extract_id(args, "project_id")?;
+                let result = http
+                    .get(&format!("/api/projects/{}/environments", project_id))
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "create_environment" => {
+                let project_id = extract_id(args, "project_id")?;
+                let result = http
+                    .post(&format!("/api/projects/{}/environments", project_id), args)
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "get_environment" => {
+                let id = extract_id(args, "environment_id")?;
+                let result = http.get(&format!("/api/environments/{}", id)).await?;
+                Ok(Some(result))
+            }
+
+            "update_environment" => {
+                let id = extract_id(args, "environment_id")?;
+                let mut body = serde_json::Map::new();
+                for key in ["name", "kind", "url", "description", "config"] {
+                    if let Some(v) = args.get(key) {
+                        body.insert(key.to_string(), v.clone());
+                    }
+                }
+                let result = http
+                    .patch(&format!("/api/environments/{}", id), &Value::Object(body))
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "delete_environment" => {
+                let id = extract_id(args, "environment_id")?;
+                let result = http.delete(&format!("/api/environments/{}", id)).await?;
+                Ok(Some(if result.is_null() {
+                    json!({"deleted": true})
+                } else {
+                    result
+                }))
+            }
+
+            "create_deployment" => {
+                let id = extract_id(args, "environment_id")?;
+                let mut body = serde_json::Map::new();
+                for key in ["version", "commit_sha", "status", "notes", "created_by"] {
+                    if let Some(v) = args.get(key) {
+                        body.insert(key.to_string(), v.clone());
+                    }
+                }
+                let result = http
+                    .post(
+                        &format!("/api/environments/{}/deployments", id),
+                        &Value::Object(body),
+                    )
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "update_deployment" => {
+                let id = extract_id(args, "deployment_id")?;
+                let mut body = serde_json::Map::new();
+                for key in ["status", "finished_at", "notes"] {
+                    if let Some(v) = args.get(key) {
+                        body.insert(key.to_string(), v.clone());
+                    }
+                }
+                let result = http
+                    .patch(&format!("/api/deployments/{}", id), &Value::Object(body))
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "list_deployments" => {
+                let id = extract_id(args, "environment_id")?;
+                let mut query = Vec::new();
+                if let Some(l) = args.get("limit").and_then(|v| v.as_u64()) {
+                    query.push(("limit".to_string(), l.to_string()));
+                }
+                if let Some(o) = args.get("offset").and_then(|v| v.as_u64()) {
+                    query.push(("offset".to_string(), o.to_string()));
+                }
+                let path = format!("/api/environments/{}/deployments", id);
+                let result = if query.is_empty() {
+                    http.get(&path).await?
+                } else {
+                    http.get_with_query(&path, &query).await?
+                };
+                Ok(Some(result))
+            }
+
+            "get_deployment_matrix" => {
+                let project_id = extract_id(args, "project_id")?;
+                let result = http
+                    .get(&format!("/api/projects/{}/deployment-matrix", project_id))
+                    .await?;
+                Ok(Some(result))
             }
 
             // ── P5: Releases (8 tools) ─────────────────────────────────
@@ -6163,6 +6279,7 @@ mod tests {
             ("step", "list"),
             ("constraint", "list"),
             ("release", "list"),
+            ("environment", "list"),
             ("milestone", "list"),
             ("commit", "create"),
             ("code", "search"),
@@ -7319,6 +7436,91 @@ mod tests {
             .unwrap();
         assert_eq!(result["method"], "DELETE");
         assert!(result["path"].as_str().unwrap().contains("/plans/"));
+    }
+
+    // -- Environments & deployments -----------------------------------------
+
+    #[tokio::test]
+    async fn test_http_environment_actions() {
+        let (handler, _) = make_http_handler().await;
+        let cases: Vec<(&str, Value, &str, &str)> = vec![
+            (
+                "list_environments",
+                json!({"project_id": UUID1}),
+                "GET",
+                "/environments",
+            ),
+            (
+                "create_environment",
+                json!({"project_id": UUID1, "name": "prod", "kind": "production"}),
+                "POST",
+                "/environments",
+            ),
+            (
+                "get_environment",
+                json!({"environment_id": UUID1}),
+                "GET",
+                "/api/environments/",
+            ),
+            (
+                "update_environment",
+                json!({"environment_id": UUID1, "url": "https://x"}),
+                "PATCH",
+                "/api/environments/",
+            ),
+            (
+                "delete_environment",
+                json!({"environment_id": UUID1}),
+                "DELETE",
+                "/api/environments/",
+            ),
+            (
+                "create_deployment",
+                json!({"environment_id": UUID1, "version": "1.0.0", "status": "running"}),
+                "POST",
+                "/deployments",
+            ),
+            (
+                "update_deployment",
+                json!({"deployment_id": UUID2, "status": "succeeded"}),
+                "PATCH",
+                "/api/deployments/",
+            ),
+            (
+                "list_deployments",
+                json!({"environment_id": UUID1, "limit": 5}),
+                "GET",
+                "/deployments",
+            ),
+            (
+                "get_deployment_matrix",
+                json!({"project_id": UUID1}),
+                "GET",
+                "/deployment-matrix",
+            ),
+        ];
+        for (tool, args, method, path_part) in cases {
+            let result = handler.handle(tool, Some(args)).await.unwrap();
+            assert_eq!(result["method"], method, "{tool}");
+            assert!(
+                result["path"].as_str().unwrap().contains(path_part),
+                "{tool}: {}",
+                result["path"]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_http_environment_requires_ids() {
+        let (handler, _) = make_http_handler().await;
+        assert!(handler
+            .handle("get_environment", Some(json!({})))
+            .await
+            .is_err());
+        assert!(handler
+            .handle("update_deployment", Some(json!({})))
+            .await
+            .is_err());
     }
 
     // -- Releases -----------------------------------------------------------
@@ -9924,6 +10126,26 @@ mod tests {
         ] {
             let args = json!({"action": action});
             let (name, _) = handler.resolve_mega_tool("release", &args).unwrap();
+            assert_eq!(name, expected);
+        }
+    }
+
+    #[test]
+    fn test_resolve_mega_tool_environment_actions() {
+        let handler = make_handler();
+        for (action, expected) in [
+            ("list", "list_environments"),
+            ("create", "create_environment"),
+            ("get", "get_environment"),
+            ("update", "update_environment"),
+            ("delete", "delete_environment"),
+            ("deploy", "create_deployment"),
+            ("update_deployment", "update_deployment"),
+            ("list_deployments", "list_deployments"),
+            ("get_matrix", "get_deployment_matrix"),
+        ] {
+            let args = json!({"action": action});
+            let (name, _) = handler.resolve_mega_tool("environment", &args).unwrap();
             assert_eq!(name, expected);
         }
     }

@@ -32,6 +32,7 @@ Each mega-tool uses an **`action` parameter** to select the operation. This cons
 | [`decision`](#decision) | 12 | Decisions, semantic search, affects tracking |
 | [`constraint`](#constraint) | 5 | Plan constraints |
 | [`release`](#release) | 8 | Release management |
+| [`environment`](#environment) | 9 | Environments and deployments |
 | [`milestone`](#milestone) | 9 | Milestones with progress |
 | [`commit`](#commit) | 7 | Git commit tracking, file history |
 | [`note`](#note) | 20 | Knowledge notes, semantic search, propagation |
@@ -154,6 +155,24 @@ Manage plan constraints.
 | `get` | Get constraint by ID | `constraint_id` |
 | `update` | Update constraint | `constraint_id`, `description`, `constraint_type`, `enforced_by` |
 | `delete` | Delete constraint | `constraint_id` |
+
+---
+
+## environment
+
+Manage project environments and their deployments.
+
+| Action | Description | Key Parameters |
+|--------|-------------|----------------|
+| `list` | List project environments | `project_id` |
+| `create` | Create environment | `project_id`, `name`, `kind` (dev/staging/production/other), `url`, `description`, `config` |
+| `get` | Get environment | `environment_id` |
+| `update` | Update environment | `environment_id`, `name`, `kind`, `url`, `description`, `config` |
+| `delete` | Delete environment and its deployments | `environment_id` |
+| `deploy` | Record a deployment | `environment_id`, `version`, `commit_sha`, `status`, `notes`, `created_by` |
+| `update_deployment` | Update a deployment | `deployment_id`, `status`, `notes`, `finished_at` |
+| `list_deployments` | Deployments of an environment | `environment_id`, `limit`, `offset` |
+| `get_matrix` | Environments x latest deployment | `project_id` |
 
 ---
 

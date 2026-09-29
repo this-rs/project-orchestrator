@@ -1,6 +1,6 @@
 //! MCP Tool definitions — Mega-tools architecture
 //!
-//! Instead of 160 individual tools, we expose 28 mega-tools with an `action` parameter.
+//! Instead of 160 individual tools, we expose 30 mega-tools with an `action` parameter.
 //! Each mega-tool groups all operations for a domain (e.g., project, plan, task).
 //! The `action` parameter selects the specific operation; additional parameters vary by action.
 //!
@@ -19,6 +19,7 @@ pub fn all_tools() -> Vec<ToolDefinition> {
         decision_tool(),
         constraint_tool(),
         release_tool(),
+        environment_tool(),
         milestone_tool(),
         commit_tool(),
         note_tool(),
@@ -570,6 +571,40 @@ fn release_tool() -> ToolDefinition {
                 "target_date": {"type": "string", "description": "Target date ISO (create/update)"},
                 "task_id": {"type": "string", "description": "Task UUID (add_task)"},
                 "commit_sha": {"type": "string", "description": "Commit SHA (add_commit/remove_commit)"}
+            })),
+            required: Some(vec!["action".to_string()]),
+        },
+    }
+}
+
+fn environment_tool() -> ToolDefinition {
+    ToolDefinition {
+        name: "environment".to_string(),
+        description: "Manage project environments (dev/staging/production) and their deployments. Actions: list, create, get, update, delete, deploy, update_deployment, list_deployments, get_matrix".to_string(),
+        input_schema: InputSchema {
+            schema_type: "object".to_string(),
+            properties: Some(json!({
+                "action": {
+                    "type": "string",
+                    "enum": ["list", "create", "get", "update", "delete", "deploy", "update_deployment", "list_deployments", "get_matrix"],
+                    "description": "Operation to perform"
+                },
+                "environment_id": {"type": "string", "description": "Environment UUID (get/update/delete/deploy/list_deployments)"},
+                "project_id": {"type": "string", "description": "Project UUID (list/create/get_matrix)"},
+                "name": {"type": "string", "description": "Environment name, unique per project (create/update)"},
+                "kind": {"type": "string", "description": "Kind (create/update): dev, staging, production, other"},
+                "url": {"type": "string", "description": "Environment URL (create/update)"},
+                "description": {"type": "string", "description": "Description (create/update)"},
+                "config": {"description": "Free-form JSON config: host, region, runtime... (create/update)"},
+                "version": {"type": "string", "description": "Deployed version (deploy)"},
+                "commit_sha": {"type": "string", "description": "Deployed commit SHA (deploy); linked to the Commit node when it exists"},
+                "status": {"type": "string", "description": "Deployment status (deploy/update_deployment): pending, running, succeeded, failed, rolled_back"},
+                "notes": {"type": "string", "description": "Deployment notes (deploy/update_deployment)"},
+                "created_by": {"type": "string", "description": "Who triggered the deployment (deploy)"},
+                "deployment_id": {"type": "string", "description": "Deployment UUID (update_deployment)"},
+                "finished_at": {"type": "string", "description": "Finish time ISO (update_deployment); auto-set on terminal status"},
+                "limit": {"type": "integer", "description": "Max results (list_deployments)"},
+                "offset": {"type": "integer", "description": "Offset (list_deployments)"}
             })),
             required: Some(vec!["action".to_string()]),
         },
@@ -1435,8 +1470,8 @@ mod tests {
         let tools = all_tools();
         assert_eq!(
             tools.len(),
-            29,
-            "Expected 29 mega-tools, got {}",
+            30,
+            "Expected 30 mega-tools, got {}",
             tools.len()
         );
     }

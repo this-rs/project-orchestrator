@@ -1448,6 +1448,7 @@ impl ToolRefGroupId {
                 "step",
                 "constraint",
                 "release",
+                "environment",
                 "milestone",
             ],
             Self::Knowledge => &["note", "decision", "commit"],
@@ -2050,10 +2051,10 @@ mod tests {
             .collect();
         all_tools.sort();
         all_tools.dedup();
-        // Must cover all 29 mega-tools (28 existing + mcp_federation)
+        // Must cover all 30 mega-tools (29 existing + environment)
         assert!(
-            all_tools.len() >= 29,
-            "Groups should cover at least 29 tools, got {}",
+            all_tools.len() >= 30,
+            "Groups should cover at least 30 tools, got {}",
             all_tools.len()
         );
     }
