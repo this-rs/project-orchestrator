@@ -863,6 +863,154 @@ pub enum ReleaseStatus {
     Cancelled,
 }
 
+// ============================================================================
+// Environments & deployments
+// ============================================================================
+
+/// A place where a project runs (dev, staging, production, ...).
+///
+/// `(Project)-[:HAS_ENVIRONMENT]->(Environment)`. The name is unique per project.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EnvironmentNode {
+    pub id: Uuid,
+    pub project_id: Uuid,
+    pub name: String,
+    pub kind: EnvironmentKind,
+    pub url: Option<String>,
+    pub description: Option<String>,
+    /// Free-form JSON string (host, region, runtime, ...)
+    pub config: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Kind of environment
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EnvironmentKind {
+    Dev,
+    Staging,
+    Production,
+    Other,
+}
+
+impl EnvironmentKind {
+    /// Canonical snake_case name (also the value persisted in Neo4j)
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Dev => "dev",
+            Self::Staging => "staging",
+            Self::Production => "production",
+            Self::Other => "other",
+        }
+    }
+}
+
+impl std::fmt::Display for EnvironmentKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for EnvironmentKind {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_lowercase().as_str() {
+            "dev" => Ok(Self::Dev),
+            "staging" => Ok(Self::Staging),
+            "production" => Ok(Self::Production),
+            "other" => Ok(Self::Other),
+            _ => Err(format!(
+                "Invalid environment kind '{}': expected dev, staging, production or other",
+                s
+            )),
+        }
+    }
+}
+
+/// One deployment of a project version/commit to an environment.
+///
+/// `(Environment)-[:HAS_DEPLOYMENT]->(Deployment)`, and optionally
+/// `(Deployment)-[:DEPLOYS]->(Commit)` when a commit node with that sha exists.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DeploymentNode {
+    pub id: Uuid,
+    pub environment_id: Uuid,
+    pub version: Option<String>,
+    pub commit_sha: Option<String>,
+    pub status: DeploymentStatus,
+    pub notes: Option<String>,
+    pub created_by: String,
+    pub started_at: DateTime<Utc>,
+    pub finished_at: Option<DateTime<Utc>>,
+}
+
+/// Status of a deployment
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DeploymentStatus {
+    Pending,
+    Running,
+    Succeeded,
+    Failed,
+    RolledBack,
+}
+
+impl DeploymentStatus {
+    /// Canonical snake_case name (also the value persisted in Neo4j)
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::RolledBack => "rolled_back",
+        }
+    }
+
+    /// True once the deployment can no longer change on its own
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, Self::Succeeded | Self::Failed | Self::RolledBack)
+    }
+}
+
+impl std::fmt::Display for DeploymentStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for DeploymentStatus {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_lowercase().as_str() {
+            "pending" => Ok(Self::Pending),
+            "running" => Ok(Self::Running),
+            "succeeded" => Ok(Self::Succeeded),
+            "failed" => Ok(Self::Failed),
+            "rolled_back" => Ok(Self::RolledBack),
+            _ => Err(format!(
+                "Invalid deployment status '{}': expected pending, running, succeeded, failed or rolled_back",
+                s
+            )),
+        }
+    }
+}
+
+/// Number of recent statuses reported per environment in the deployment matrix
+pub const DEPLOYMENT_MATRIX_RECENT: usize = 5;
+
+/// One row of the deployment matrix: an environment and what was deployed there.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DeploymentMatrixEntry {
+    pub environment: EnvironmentNode,
+    pub latest_deployment: Option<DeploymentNode>,
+    /// Statuses of the last deployments, newest first (at most
+    /// [`DEPLOYMENT_MATRIX_RECENT`])
+    pub recent_statuses: Vec<DeploymentStatus>,
+}
+
 /// A milestone in the roadmap
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MilestoneNode {

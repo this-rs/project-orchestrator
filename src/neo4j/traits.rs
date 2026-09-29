@@ -1226,6 +1226,61 @@ pub trait GraphStore: Send + Sync {
     async fn delete_release(&self, release_id: Uuid) -> Result<()>;
 
     // ========================================================================
+    // Environment & deployment operations
+    // ========================================================================
+
+    /// Create an environment. Errors when the project does not exist or when the
+    /// name is already used by another environment of the project.
+    async fn create_environment(&self, env: &EnvironmentNode) -> Result<()>;
+
+    /// Get an environment by ID
+    async fn get_environment(&self, id: Uuid) -> Result<Option<EnvironmentNode>>;
+
+    /// List the environments of a project (oldest first)
+    async fn list_project_environments(&self, project_id: Uuid) -> Result<Vec<EnvironmentNode>>;
+
+    /// Update an environment (empty string clears url/description/config)
+    async fn update_environment(
+        &self,
+        id: Uuid,
+        name: Option<String>,
+        kind: Option<EnvironmentKind>,
+        url: Option<String>,
+        description: Option<String>,
+        config: Option<String>,
+    ) -> Result<()>;
+
+    /// Delete an environment and its deployments
+    async fn delete_environment(&self, id: Uuid) -> Result<()>;
+
+    /// Record a deployment (linked to the Commit node with the same sha, if any)
+    async fn create_deployment(&self, deployment: &DeploymentNode) -> Result<()>;
+
+    /// Get a deployment by ID
+    async fn get_deployment(&self, id: Uuid) -> Result<Option<DeploymentNode>>;
+
+    /// List deployments of an environment, newest first, with the total count
+    async fn list_environment_deployments(
+        &self,
+        environment_id: Uuid,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<DeploymentNode>, usize)>;
+
+    /// Update a deployment (status, finished_at, notes)
+    async fn update_deployment(
+        &self,
+        id: Uuid,
+        status: Option<DeploymentStatus>,
+        finished_at: Option<chrono::DateTime<chrono::Utc>>,
+        notes: Option<String>,
+    ) -> Result<()>;
+
+    /// Deployment matrix of a project: every environment with its latest
+    /// deployment and the statuses of its last 5 deployments (newest first)
+    async fn get_deployment_matrix(&self, project_id: Uuid) -> Result<Vec<DeploymentMatrixEntry>>;
+
+    // ========================================================================
     // Milestone operations
     // ========================================================================
 
