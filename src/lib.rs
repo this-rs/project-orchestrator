@@ -1982,6 +1982,14 @@ pub async fn start_server(mut config: Config) -> Result<()> {
         tracing::info!("Frontend serving disabled (API-only mode)");
     }
 
+    // Release checker (startup + every ~6h, never blocks or fails startup).
+    // Self-install of the binary is OPT-IN: only an explicit
+    // `chat.auto_update_app: true` / CHAT_AUTO_UPDATE_APP=true enables it (the
+    // chat default of `true` is about the desktop updater), and even then it
+    // only stages the new binary on disk for standalone deployments — the
+    // running process is never restarted automatically.
+    let _ = update::service::start_global(config.chat_auto_update_app == Some(true));
+
     // Start serving. The port was bound at the top of `start_server`.
     tracing::info!("Server listening on {}", addr);
     axum::serve(listener, app).await?;

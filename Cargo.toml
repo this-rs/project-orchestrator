@@ -122,6 +122,8 @@ glob = "0.3"
 sha2 = "0.11"
 hmac = "0.13"
 hex = "0.4"
+# Release version comparison (self-update checker)
+semver = "1"
 rayon = "1.10"
 futures = { workspace = true }
 async-trait = { workspace = true }
@@ -231,6 +233,8 @@ pdf = ["dep:pdf_oxide", "dep:office_oxide"]
 
 [dev-dependencies]
 tokio-test = "0.4"
+# Paused clock for the periodic update-check test
+tokio = { workspace = true, features = ["test-util"] }
 tempfile = "3.14"
 wiremock = "0.6.5"
 

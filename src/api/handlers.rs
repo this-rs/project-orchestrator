@@ -305,6 +305,9 @@ pub struct VersionResponse {
     pub version: &'static str,
     pub features: VersionFeatures,
     pub build: VersionBuild,
+    /// Release-check snapshot (absent when the update service is not running).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub update: Option<crate::update::UpdateStatus>,
 }
 
 /// GET /api/version — public endpoint returning server version and build info.
@@ -323,6 +326,7 @@ pub async fn get_version(State(state): State<OrchestratorState>) -> Json<Version
                 "release"
             },
         },
+        update: crate::update::global().map(|svc| svc.status()),
     })
 }
 
