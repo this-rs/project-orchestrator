@@ -154,6 +154,12 @@ zip = { version = "8", default-features = false, features = ["deflate"] }
 # reuses that resolution instead of vendoring a second copy of the crate.
 quick-xml = { version = "0.39", optional = true }
 
+# XLSX text extraction (feature `xlsx`). Spreadsheets are cell grids with shared
+# strings, typed values and several storage formats, so unlike DOCX/PPTX this is
+# not worth hand-rolling on top of `zip`. Default features are off: `dates` and
+# `picture` are not needed to read cell text.
+calamine = { version = "0.36", default-features = false, optional = true }
+
 # Home directory detection
 dirs = "6"
 regex = "1.12.3"
@@ -217,6 +223,8 @@ libc = "0.2"
 [features]
 default = []
 docx = ["dep:quick-xml"]
+pptx = ["dep:quick-xml"]
+xlsx = ["dep:calamine"]
 embedded-frontend = ["dep:rust-embed", "dep:mime_guess"]
 vendored-openssl = ["dep:openssl-sys"]
 pdf = ["dep:pdf_oxide", "dep:office_oxide"]

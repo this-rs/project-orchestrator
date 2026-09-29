@@ -26,6 +26,12 @@ pub mod text;
 pub mod docx;
 #[cfg(feature = "pdf")]
 pub mod pdf;
+#[cfg(feature = "pptx")]
+pub mod pptx;
+#[cfg(feature = "xlsx")]
+pub mod xlsx;
+#[cfg(any(feature = "docx", feature = "pptx"))]
+mod xml;
 
 use serde::{Deserialize, Serialize};
 
@@ -42,6 +48,14 @@ pub enum DocumentFormat {
     Docx,
     /// Portable Document Format.
     Pdf,
+    /// Office Open XML spreadsheet (`.xlsx`).
+    Xlsx,
+    /// Office Open XML presentation (`.pptx`).
+    Pptx,
+    /// Anything else, stored as an opaque attachment: no extractor read it, so
+    /// there is no text and no chunks. Never produced by an extractor — only by
+    /// the upload pipeline when nothing recognised the bytes.
+    Binary,
 }
 
 impl DocumentFormat {
@@ -50,6 +64,9 @@ impl DocumentFormat {
             Self::PlainText => "plain_text",
             Self::Docx => "docx",
             Self::Pdf => "pdf",
+            Self::Xlsx => "xlsx",
+            Self::Pptx => "pptx",
+            Self::Binary => "binary",
         }
     }
 }
@@ -187,6 +204,10 @@ impl ExtractorRegistry {
         reg.register(Box::new(pdf::PdfExtractor));
         #[cfg(feature = "docx")]
         reg.register(Box::new(docx::DocxExtractor));
+        #[cfg(feature = "xlsx")]
+        reg.register(Box::new(xlsx::XlsxExtractor));
+        #[cfg(feature = "pptx")]
+        reg.register(Box::new(pptx::PptxExtractor));
 
         // Catch-all last.
         reg.register(Box::new(text::PlainTextExtractor));
