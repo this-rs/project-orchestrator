@@ -237,11 +237,11 @@ async fn run_update(check_only: bool) -> Result<()> {
 
     println!();
     match update::perform_update(&info).await? {
-        update::UpdateStatus::Updated { from, to } => {
+        update::UpdateOutcome::Updated { from, to } => {
             println!("  Successfully updated from v{} to v{}!", from, to);
             println!("  Please restart orchestrator to use the new version.");
         }
-        update::UpdateStatus::AlreadyUpToDate => {
+        update::UpdateOutcome::AlreadyUpToDate => {
             println!("  Already up to date.");
         }
     }
