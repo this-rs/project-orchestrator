@@ -242,7 +242,7 @@ pub struct ChatEventRecord {
     /// Monotonically increasing sequence number (per session)
     pub seq: i64,
     /// Event type: "user_message", "assistant_text", "thinking", "tool_use",
-    /// "tool_result", "permission_request", "input_request", "result", "error"
+    /// "tool_result", "permission_request", "ask_user_question", "result", "error"
     pub event_type: String,
     /// JSON-serialized event payload
     pub data: String,

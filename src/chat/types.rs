@@ -405,14 +405,6 @@ pub enum ChatEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         parent_tool_use_id: Option<String>,
     },
-    /// Claude is waiting for user input
-    InputRequest {
-        prompt: String,
-        #[serde(default)]
-        options: Option<Vec<String>>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        parent_tool_use_id: Option<String>,
-    },
     /// Conversation turn completed
     Result {
         session_id: String,
@@ -672,7 +664,6 @@ impl ChatEvent {
             ChatEvent::ToolCancelled { .. } => "tool_cancelled",
             ChatEvent::PermissionRequest { .. } => "permission_request",
             ChatEvent::AskUserQuestion { .. } => "ask_user_question",
-            ChatEvent::InputRequest { .. } => "input_request",
             ChatEvent::Result { .. } => "result",
             ChatEvent::StreamDelta { .. } => "stream_delta",
             ChatEvent::StreamingStatus { .. } => "streaming_status",
@@ -764,7 +755,6 @@ impl ChatEvent {
                 Some(format!("error:{}", hasher.finish()))
             }
             ChatEvent::Result { session_id, .. } => Some(format!("result:{}", session_id)),
-            ChatEvent::InputRequest { prompt, .. } => Some(format!("input_request:{}", prompt)),
             ChatEvent::PermissionModeChanged { mode } => {
                 Some(format!("permission_mode_changed:{}", mode))
             }
@@ -1599,16 +1589,6 @@ mod tests {
                 input: serde_json::json!({"command": "rm -rf /"}),
                 parent_tool_use_id: None,
             },
-            ChatEvent::InputRequest {
-                prompt: "Which option?".into(),
-                options: Some(vec!["A".into(), "B".into()]),
-                parent_tool_use_id: None,
-            },
-            ChatEvent::InputRequest {
-                prompt: "Enter value:".into(),
-                options: None,
-                parent_tool_use_id: Some("toolu_parent_2".into()),
-            },
             ChatEvent::Result {
                 session_id: "cli-123".into(),
                 duration_ms: 5000,
@@ -1787,9 +1767,10 @@ mod tests {
         let event: ChatEvent = serde_json::from_str(json).unwrap();
         assert!(matches!(event, ChatEvent::PermissionRequest { .. }));
 
+        // couac2: `input_request` was never emitted in production (only built in
+        // tests) and was removed; user questions go through AskUserQuestion.
         let json = r#"{"type":"input_request","prompt":"Choose:","options":["A","B"]}"#;
-        let event: ChatEvent = serde_json::from_str(json).unwrap();
-        assert!(matches!(event, ChatEvent::InputRequest { ref options, .. } if options.is_some()));
+        assert!(serde_json::from_str::<ChatEvent>(json).is_err());
 
         // CompactionStarted with auto trigger
         let json = r#"{"type":"compaction_started","trigger":"auto"}"#;
@@ -1990,11 +1971,6 @@ mod tests {
                 tool: "bash".into(),
                 input: serde_json::json!({}),
                 parent_tool_use_id: Some("p5".into()),
-            },
-            ChatEvent::InputRequest {
-                prompt: "?".into(),
-                options: None,
-                parent_tool_use_id: Some("p6".into()),
             },
             ChatEvent::ToolUseInputResolved {
                 id: "tu1".into(),

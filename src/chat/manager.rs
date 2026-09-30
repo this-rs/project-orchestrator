@@ -9498,11 +9498,6 @@ mod tests {
                 input: serde_json::json!({"command": "ls"}),
                 parent_tool_use_id: None,
             },
-            ChatEvent::InputRequest {
-                prompt: "Choose:".into(),
-                options: Some(vec!["A".into(), "B".into()]),
-                parent_tool_use_id: None,
-            },
             ChatEvent::Error {
                 message: "Something went wrong".into(),
                 parent_tool_use_id: None,
