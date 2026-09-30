@@ -21,13 +21,13 @@ use crate::skills::models::HookActivateRequest;
 use crate::skills::project_resolver::{find_longest_prefix_match, load_project_entries};
 use crate::skills::SkillStatus;
 use axum::{
-    extract::{Query, State},
-    http::{HeaderMap, StatusCode},
+    extract::{ConnectInfo, Query, State},
+    http::StatusCode,
     Json,
 };
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -130,11 +130,11 @@ pub fn skill_cache() -> &'static SkillCache {
 /// - 429 Too Many Requests if rate limited
 pub async fn activate_hook(
     State(state): State<OrchestratorState>,
-    headers: HeaderMap,
+    connect_info: Option<axum::Extension<ConnectInfo<SocketAddr>>>,
     Json(req): Json<HookActivateRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
     // --- Rate limiting ---
-    let client_ip = extract_client_ip(&headers);
+    let client_ip = extract_client_ip(connect_info.as_ref().map(|c| c.0 .0));
     if !HOOK_RATE_LIMITER.check(client_ip) {
         return Ok((
             StatusCode::TOO_MANY_REQUESTS,
@@ -528,21 +528,17 @@ fn truncate_str(s: &str, max_len: usize) -> String {
     }
 }
 
-/// Extract client IP from request headers.
+/// Determine the client IP used for rate limiting.
 ///
-/// **Security**: Does NOT trust X-Forwarded-For or X-Real-IP headers
-/// because PO runs as a localhost service without a reverse proxy.
-/// These headers can be trivially spoofed by any client to bypass
-/// the rate limiter. Always returns localhost for consistent rate limiting.
-///
-/// If PO is ever deployed behind a trusted reverse proxy, this function
-/// should be updated to read the IP from the proxy's header, but only
-/// after configuring the trusted proxy IP list.
-fn extract_client_ip(_headers: &HeaderMap) -> IpAddr {
-    // PO is a localhost service — the "client" is always local.
-    // Trusting X-Forwarded-For without a known reverse proxy
-    // allows trivial rate limiter bypass via header spoofing.
-    IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+/// Uses the real TCP peer address (axum `ConnectInfo`). `X-Forwarded-For` /
+/// `X-Real-IP` are deliberately NOT honored: PO is served directly (no trusted
+/// reverse proxy configured), so those headers are client-controlled and would
+/// let any caller dodge the limiter by rotating a fake value. If the peer
+/// address is unavailable (e.g. router driven without `ConnectInfo`), fall back
+/// to localhost so the limiter still applies globally.
+fn extract_client_ip(peer: Option<SocketAddr>) -> IpAddr {
+    peer.map(|a| a.ip())
+        .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
 }
 
 // ============================================================================
@@ -627,32 +623,17 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_client_ip_always_localhost() {
-        // Security: PO is a localhost service, so we never trust proxy headers.
-        // This prevents rate limiter bypass via X-Forwarded-For spoofing.
-        let headers = HeaderMap::new();
-        let ip = extract_client_ip(&headers);
-        assert_eq!(ip, IpAddr::V4(Ipv4Addr::LOCALHOST));
+    fn test_extract_client_ip_uses_peer_address() {
+        let peer: SocketAddr = "203.0.113.7:5555".parse().unwrap();
+        assert_eq!(
+            extract_client_ip(Some(peer)),
+            "203.0.113.7".parse::<IpAddr>().unwrap()
+        );
     }
 
     #[test]
-    fn test_extract_client_ip_ignores_xff() {
-        // X-Forwarded-For headers should be ignored (security: spoofable)
-        let mut headers = HeaderMap::new();
-        headers.insert("x-forwarded-for", "1.2.3.4, 5.6.7.8".parse().unwrap());
-
-        let ip = extract_client_ip(&headers);
-        assert_eq!(ip, IpAddr::V4(Ipv4Addr::LOCALHOST)); // Always localhost
-    }
-
-    #[test]
-    fn test_extract_client_ip_ignores_xri() {
-        // X-Real-IP headers should be ignored (security: spoofable)
-        let mut headers = HeaderMap::new();
-        headers.insert("x-real-ip", "10.0.0.5".parse().unwrap());
-
-        let ip = extract_client_ip(&headers);
-        assert_eq!(ip, IpAddr::V4(Ipv4Addr::LOCALHOST)); // Always localhost
+    fn test_extract_client_ip_falls_back_to_localhost() {
+        assert_eq!(extract_client_ip(None), IpAddr::V4(Ipv4Addr::LOCALHOST));
     }
 
     // ================================================================

@@ -37,7 +37,9 @@ pub struct ServerState {
     /// NATS emitter for inter-process chat events and interrupts.
     /// None when NATS is not configured (local-only mode).
     pub nats_emitter: Option<Arc<NatsEmitter>>,
-    /// Auth config — None means deny-by-default
+    /// Auth config. `None` means **anonymous/open access**: `require_auth`
+    /// injects anonymous claims and lets every request through (no JWT needed).
+    /// Only intended for local single-user use; a WARN is logged at startup.
     pub auth_config: Option<AuthConfig>,
     /// Whether the app has been fully configured (setup wizard completed).
     /// When false, the frontend should show the setup wizard.
@@ -6111,10 +6113,20 @@ pub enum AppError {
     Conflict(String),
 }
 
+/// Generic message returned to clients for `AppError::Internal`.
+pub(crate) const INTERNAL_ERROR_MESSAGE: &str = "Internal server error";
+
 impl IntoResponse for AppError {
     fn into_response(self) -> axum::response::Response {
         let (status, message) = match self {
-            AppError::Internal(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+            AppError::Internal(e) => {
+                // Never leak internal details (DB errors, paths, queries) to the client.
+                tracing::error!(error = ?e, "internal server error");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    INTERNAL_ERROR_MESSAGE.to_string(),
+                )
+            }
             AppError::NotFound(msg) => (StatusCode::NOT_FOUND, msg),
             AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
             AppError::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, msg),
@@ -6139,6 +6151,17 @@ impl From<anyhow::Error> for AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn test_internal_error_does_not_leak_detail() {
+        let resp =
+            AppError::Internal(anyhow::anyhow!("bolt://secret-host:7687 refused")).into_response();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(!body.contains("secret-host"));
+        assert!(body.contains(INTERNAL_ERROR_MESSAGE));
+    }
 
     #[test]
     fn test_update_decision_request_all_fields() {

@@ -75,7 +75,10 @@ pub async fn require_auth(
             .neo4j()
             .is_mcp_token_active(jti)
             .await
-            .map_err(|e| AppError::Unauthorized(format!("MCP token check failed: {e}")))?;
+            .map_err(|e| {
+                tracing::error!(error = %e, "MCP token revocation check failed");
+                AppError::Unauthorized("MCP token check failed".to_string())
+            })?;
         if !active {
             return Err(AppError::Unauthorized(
                 "MCP token revoked, expired or unknown".to_string(),

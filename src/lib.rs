@@ -93,7 +93,7 @@ pub struct YamlConfig {
     pub nats: NatsYamlConfig,
     pub chat: ChatYamlConfig,
     pub embeddings: EmbeddingsYamlConfig,
-    /// Auth section — if absent, auth_config will be None (deny-by-default)
+    /// Auth section — if absent, auth_config will be None (anonymous/open access)
     pub auth: Option<AuthConfig>,
     /// Skill registry section (optional — enables cross-instance skill sharing)
     #[serde(default)]
@@ -1967,6 +1967,17 @@ pub async fn start_server(mut config: Config) -> Result<()> {
     // Create router
     let app = api::create_router(server_state);
 
+    if config.auth_config.is_none() {
+        // The listener is always bound on 0.0.0.0 (see top of start_server), so
+        // anonymous mode is reachable from the network, not just loopback.
+        tracing::warn!(
+            "AUTH DISABLED: no `auth` section configured — every API request is served \
+             anonymously. The server listens on {addr} (all interfaces), so anyone who can \
+             reach this port has full access. Configure `auth` (root_account or oidc) \
+             before exposing this host beyond a trusted machine."
+        );
+    }
+
     // Log frontend serving mode
     if config.serve_frontend {
         tracing::info!("Frontend serving enabled — path: {}", config.frontend_path);
@@ -1976,7 +1987,11 @@ pub async fn start_server(mut config: Config) -> Result<()> {
 
     // Start serving. The port was bound at the top of `start_server`.
     tracing::info!("Server listening on {}", addr);
-    axum::serve(listener, app).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
 
     Ok(())
 }
