@@ -891,17 +891,24 @@ pub async fn update_workspace_milestone(
         .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
         .map(|dt| dt.with_timezone(&chrono::Utc));
 
-    state
+    let found = state
         .orchestrator
         .update_workspace_milestone(id, req.title, req.description, status, target_date)
         .await?;
+    if !found {
+        return Err(AppError::NotFound(format!(
+            "Workspace milestone {} not found",
+            id
+        )));
+    }
 
+    // Re-read; may race with a concurrent delete, so no unwrap here.
     let updated = state
         .orchestrator
         .neo4j()
         .get_workspace_milestone(id)
         .await?
-        .unwrap();
+        .ok_or_else(|| AppError::NotFound(format!("Workspace milestone {} not found", id)))?;
 
     Ok(Json(WorkspaceMilestoneResponse::from(updated)))
 }
@@ -1236,7 +1243,7 @@ pub async fn update_resource(
         .parse()
         .map_err(|_| AppError::BadRequest("Invalid resource ID".to_string()))?;
 
-    state
+    let found = state
         .orchestrator
         .update_resource(
             id,
@@ -1247,6 +1254,9 @@ pub async fn update_resource(
             req.description,
         )
         .await?;
+    if !found {
+        return Err(AppError::NotFound(format!("Resource {} not found", id)));
+    }
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1433,7 +1443,7 @@ pub async fn update_component(
         })
         .transpose()?;
 
-    state
+    let found = state
         .orchestrator
         .update_component(
             id,
@@ -1447,6 +1457,9 @@ pub async fn update_component(
             },
         )
         .await?;
+    if !found {
+        return Err(AppError::NotFound(format!("Component {} not found", id)));
+    }
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -3284,5 +3297,165 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), HttpStatus::OK);
+    }
+
+    // ================================================================
+    // couac2: PATCH on an unknown id must answer 404, not a silent 204
+    // ================================================================
+
+    fn auth_patch_json(uri: &str, body: serde_json::Value) -> Request<Body> {
+        Request::builder()
+            .method("PATCH")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header("authorization", test_bearer_token())
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap()
+    }
+
+    /// Create a workspace through the API and return its slug.
+    async fn create_ws_via_api(app: &axum::Router) -> String {
+        let resp = app
+            .clone()
+            .oneshot(auth_post_json(
+                "/api/workspaces",
+                serde_json::json!({"name": "Couac2 WS"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::CREATED);
+        body_json(resp).await["slug"].as_str().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn test_patch_component_unknown_id_returns_404() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_patch_json(
+                &format!("/api/components/{}", Uuid::new_v4()),
+                serde_json::json!({"name": "ghost"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_patch_component_unknown_id_empty_body_returns_404() {
+        // No field to set used to early-return Ok -> 204 without even
+        // checking that the component exists.
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_patch_json(
+                &format!("/api/components/{}", Uuid::new_v4()),
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_patch_component_existing_returns_204_and_writes() {
+        let app = test_app().await;
+        let slug = create_ws_via_api(&app).await;
+        let resp = app
+            .clone()
+            .oneshot(auth_post_json(
+                &format!("/api/workspaces/{}/components", slug),
+                serde_json::json!({"name": "api", "component_type": "service"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::CREATED);
+        let id = body_json(resp).await["id"].as_str().unwrap().to_string();
+
+        let resp = app
+            .clone()
+            .oneshot(auth_patch_json(
+                &format!("/api/components/{}", id),
+                serde_json::json!({"name": "api-v2"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::NO_CONTENT);
+
+        let resp = app
+            .oneshot(auth_get(&format!("/api/components/{}", id)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        assert_eq!(body_json(resp).await["name"], "api-v2");
+    }
+
+    #[tokio::test]
+    async fn test_patch_resource_unknown_id_returns_404() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_patch_json(
+                &format!("/api/resources/{}", Uuid::new_v4()),
+                serde_json::json!({"name": "ghost"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_patch_resource_existing_returns_204() {
+        let app = test_app().await;
+        let slug = create_ws_via_api(&app).await;
+        let resp = app
+            .clone()
+            .oneshot(auth_post_json(
+                &format!("/api/workspaces/{}/resources", slug),
+                serde_json::json!({
+                    "name": "spec",
+                    "resource_type": "api_contract",
+                    "file_path": "api.yaml"
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::CREATED);
+        let id = body_json(resp).await["id"].as_str().unwrap().to_string();
+
+        let resp = app
+            .oneshot(auth_patch_json(
+                &format!("/api/resources/{}", id),
+                serde_json::json!({"version": "2.0"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn test_patch_workspace_milestone_unknown_id_returns_404_not_panic() {
+        // Before couac2 the handler did get_workspace_milestone(id).unwrap()
+        // after the silent update: an unknown id panicked the request task.
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_patch_json(
+                &format!("/api/workspace-milestones/{}", Uuid::new_v4()),
+                serde_json::json!({"title": "ghost"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_patch_workspace_milestone_existing_returns_200() {
+        let (app, milestone_id, _, _) = test_app_with_milestone_tasks().await;
+        let resp = app
+            .oneshot(auth_patch_json(
+                &format!("/api/workspace-milestones/{}", milestone_id),
+                serde_json::json!({"title": "renamed"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        assert_eq!(body_json(resp).await["title"], "renamed");
     }
 }

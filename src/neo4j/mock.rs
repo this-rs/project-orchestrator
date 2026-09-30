@@ -865,22 +865,24 @@ impl GraphStore for MockGraphStore {
         description: Option<String>,
         status: Option<MilestoneStatus>,
         target_date: Option<chrono::DateTime<chrono::Utc>>,
-    ) -> Result<()> {
-        if let Some(m) = self.workspace_milestones.write().await.get_mut(&id) {
-            if let Some(t) = title {
-                m.title = t;
-            }
-            if let Some(d) = description {
-                m.description = Some(d);
-            }
-            if let Some(s) = status {
-                m.status = s;
-            }
-            if let Some(td) = target_date {
-                m.target_date = Some(td);
-            }
+    ) -> Result<bool> {
+        let mut milestones = self.workspace_milestones.write().await;
+        let Some(m) = milestones.get_mut(&id) else {
+            return Ok(false);
+        };
+        if let Some(t) = title {
+            m.title = t;
         }
-        Ok(())
+        if let Some(d) = description {
+            m.description = Some(d);
+        }
+        if let Some(s) = status {
+            m.status = s;
+        }
+        if let Some(td) = target_date {
+            m.target_date = Some(td);
+        }
+        Ok(true)
     }
 
     async fn delete_workspace_milestone(&self, id: Uuid) -> Result<()> {
@@ -1091,26 +1093,28 @@ impl GraphStore for MockGraphStore {
         url: Option<String>,
         version: Option<String>,
         description: Option<String>,
-    ) -> Result<()> {
-        if let Some(r) = self.resources.write().await.get_mut(&id) {
-            if let Some(n) = name {
-                r.name = n;
-            }
-            if let Some(fp) = file_path {
-                r.file_path = fp;
-            }
-            if let Some(u) = url {
-                r.url = Some(u);
-            }
-            if let Some(v) = version {
-                r.version = Some(v);
-            }
-            if let Some(d) = description {
-                r.description = Some(d);
-            }
-            r.updated_at = Some(Utc::now());
+    ) -> Result<bool> {
+        let mut resources = self.resources.write().await;
+        let Some(r) = resources.get_mut(&id) else {
+            return Ok(false);
+        };
+        if let Some(n) = name {
+            r.name = n;
         }
-        Ok(())
+        if let Some(fp) = file_path {
+            r.file_path = fp;
+        }
+        if let Some(u) = url {
+            r.url = Some(u);
+        }
+        if let Some(v) = version {
+            r.version = Some(v);
+        }
+        if let Some(d) = description {
+            r.description = Some(d);
+        }
+        r.updated_at = Some(Utc::now());
+        Ok(true)
     }
 
     async fn delete_resource(&self, id: Uuid) -> Result<()> {
@@ -1201,7 +1205,7 @@ impl GraphStore for MockGraphStore {
             .collect())
     }
 
-    async fn update_component(&self, id: Uuid, patch: ComponentUpdate) -> Result<()> {
+    async fn update_component(&self, id: Uuid, patch: ComponentUpdate) -> Result<bool> {
         let ComponentUpdate {
             name,
             component_type,
@@ -1210,27 +1214,30 @@ impl GraphStore for MockGraphStore {
             config,
             tags,
         } = patch;
-        if let Some(c) = self.components.write().await.get_mut(&id) {
-            if let Some(n) = name {
-                c.name = n;
-            }
-            if let Some(t) = component_type {
-                c.component_type = t;
-            }
-            if let Some(d) = description {
-                c.description = Some(d);
-            }
-            if let Some(r) = runtime {
-                c.runtime = Some(r);
-            }
-            if let Some(cfg) = config {
-                c.config = cfg;
-            }
-            if let Some(t) = tags {
-                c.tags = t;
-            }
+        let mut components = self.components.write().await;
+        // Same contract as the store: an unknown id writes nothing and says so.
+        let Some(c) = components.get_mut(&id) else {
+            return Ok(false);
+        };
+        if let Some(n) = name {
+            c.name = n;
         }
-        Ok(())
+        if let Some(t) = component_type {
+            c.component_type = t;
+        }
+        if let Some(d) = description {
+            c.description = Some(d);
+        }
+        if let Some(r) = runtime {
+            c.runtime = Some(r);
+        }
+        if let Some(cfg) = config {
+            c.config = cfg;
+        }
+        if let Some(t) = tags {
+            c.tags = t;
+        }
+        Ok(true)
     }
 
     async fn upsert_derived_component(&self, write: DerivedComponentWrite) -> Result<Uuid> {

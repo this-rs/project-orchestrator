@@ -37,7 +37,30 @@ pub fn validate_workspace_slug(slug: &str) -> Result<()> {
     Ok(())
 }
 
+/// Build the ` SET a, b` suffix of a partial-update query ("" when nothing
+/// to set: the query then only checks that the node exists).
+fn set_suffix<S: AsRef<str>>(clauses: &[S]) -> String {
+    if clauses.is_empty() {
+        String::new()
+    } else {
+        let joined: Vec<&str> = clauses.iter().map(|c| c.as_ref()).collect();
+        format!(" SET {}", joined.join(", "))
+    }
+}
+
 impl Neo4jClient {
+    /// Run a `MATCH … [SET …] RETURN count(x) AS matched` query and report
+    /// whether the node existed. Partial updates must not answer "ok" for an
+    /// id that matched nothing (couac2: silent 204 on unknown ids).
+    async fn run_matched(&self, q: neo4rs::Query) -> Result<bool> {
+        let mut result = self.graph.execute(q).await?;
+        let matched = match result.next().await? {
+            Some(row) => row.get::<i64>("matched")? > 0,
+            None => false,
+        };
+        Ok(matched)
+    }
+
     // ========================================================================
     // Workspace operations
     // ========================================================================
@@ -610,7 +633,7 @@ impl Neo4jClient {
         description: Option<String>,
         status: Option<MilestoneStatus>,
         target_date: Option<chrono::DateTime<chrono::Utc>>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let mut set_clauses = Vec::new();
 
         if title.is_some() {
@@ -626,16 +649,9 @@ impl Neo4jClient {
             set_clauses.push("wm.target_date = $target_date".to_string());
         }
 
-        if set_clauses.is_empty() {
-            return Ok(());
-        }
-
         let cypher = format!(
-            r#"
-            MATCH (wm:WorkspaceMilestone {{id: $id}})
-            SET {}
-            "#,
-            set_clauses.join(", ")
+            "MATCH (wm:WorkspaceMilestone {{id: $id}}){} RETURN count(wm) AS matched",
+            set_suffix(&set_clauses)
         );
 
         let mut q = query(&cypher).param("id", id.to_string());
@@ -660,8 +676,7 @@ impl Neo4jClient {
             q = q.param("target_date", td.to_rfc3339());
         }
 
-        self.graph.run(q).await?;
-        Ok(())
+        self.run_matched(q).await
     }
 
     /// Delete a workspace milestone
@@ -1067,7 +1082,7 @@ impl Neo4jClient {
         url: Option<String>,
         version: Option<String>,
         description: Option<String>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let mut set_clauses = vec![];
         if name.is_some() {
             set_clauses.push("r.name = $name");
@@ -1085,13 +1100,9 @@ impl Neo4jClient {
             set_clauses.push("r.description = $description");
         }
 
-        if set_clauses.is_empty() {
-            return Ok(());
-        }
-
         let cypher = format!(
-            "MATCH (r:Resource {{id: $id}}) SET {}",
-            set_clauses.join(", ")
+            "MATCH (r:Resource {{id: $id}}){} RETURN count(r) AS matched",
+            set_suffix(&set_clauses)
         );
 
         let mut q = query(&cypher).param("id", id.to_string());
@@ -1111,8 +1122,7 @@ impl Neo4jClient {
             q = q.param("description", description);
         }
 
-        self.graph.run(q).await?;
-        Ok(())
+        self.run_matched(q).await
     }
 
     /// Delete a resource
@@ -1409,7 +1419,8 @@ impl Neo4jClient {
     }
 
     /// Update a component
-    pub async fn update_component(&self, id: Uuid, patch: ComponentUpdate) -> Result<()> {
+    /// Returns `false` when no component has this id (nothing was written).
+    pub async fn update_component(&self, id: Uuid, patch: ComponentUpdate) -> Result<bool> {
         let ComponentUpdate {
             name,
             component_type,
@@ -1439,16 +1450,11 @@ impl Neo4jClient {
             set_clauses.push("c.tags = $tags");
         }
 
-        if set_clauses.is_empty() {
-            return Ok(());
-        }
-
-        // NOTE: a non-existent id matches nothing and still reports success —
-        // the caller gets 204 No Content. Fixing that means returning a match count
-        // up through GraphStore, which is a separate change.
+        // No early return when nothing is set: the query still checks that the
+        // component exists, so an unknown id is reported (404), not "ok".
         let cypher = format!(
-            "MATCH (c:Component {{id: $id}}) SET {}",
-            set_clauses.join(", ")
+            "MATCH (c:Component {{id: $id}}){} RETURN count(c) AS matched",
+            set_suffix(&set_clauses)
         );
 
         let mut q = query(&cypher).param("id", id.to_string());
@@ -1473,8 +1479,7 @@ impl Neo4jClient {
             q = q.param("tags", tags);
         }
 
-        self.graph.run(q).await?;
-        Ok(())
+        self.run_matched(q).await
     }
 
     /// Delete a component

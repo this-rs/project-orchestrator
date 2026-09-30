@@ -164,6 +164,8 @@ pub trait GraphStore: Send + Sync {
     ) -> Result<usize>;
 
     /// Update a workspace milestone
+    ///
+    /// Returns `false` when no milestone has this id (nothing was written).
     async fn update_workspace_milestone(
         &self,
         id: Uuid,
@@ -171,7 +173,7 @@ pub trait GraphStore: Send + Sync {
         description: Option<String>,
         status: Option<MilestoneStatus>,
         target_date: Option<chrono::DateTime<chrono::Utc>>,
-    ) -> Result<()>;
+    ) -> Result<bool>;
 
     /// Delete a workspace milestone
     async fn delete_workspace_milestone(&self, id: Uuid) -> Result<()>;
@@ -233,6 +235,8 @@ pub trait GraphStore: Send + Sync {
     async fn list_workspace_resources(&self, workspace_id: Uuid) -> Result<Vec<ResourceNode>>;
 
     /// Update a resource
+    ///
+    /// Returns `false` when no resource has this id (nothing was written).
     async fn update_resource(
         &self,
         id: Uuid,
@@ -241,7 +245,7 @@ pub trait GraphStore: Send + Sync {
         url: Option<String>,
         version: Option<String>,
         description: Option<String>,
-    ) -> Result<()>;
+    ) -> Result<bool>;
 
     /// Delete a resource
     async fn delete_resource(&self, id: Uuid) -> Result<()>;
@@ -276,7 +280,9 @@ pub trait GraphStore: Send + Sync {
     async fn list_components(&self, workspace_id: Uuid) -> Result<Vec<ComponentNode>>;
 
     /// Update a component
-    async fn update_component(&self, id: Uuid, patch: ComponentUpdate) -> Result<()>;
+    ///
+    /// Returns `false` when no component has this id (nothing was written).
+    async fn update_component(&self, id: Uuid, patch: ComponentUpdate) -> Result<bool>;
 
     /// Create the component if absent, refresh it if present, and return its id.
     /// Identity is (workspace, name). Used by architecture derivation, which runs

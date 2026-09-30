@@ -4878,16 +4878,20 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         description: Option<String>,
         status: Option<MilestoneStatus>,
         target_date: Option<chrono::DateTime<chrono::Utc>>,
-    ) -> Result<()> {
-        self.neo4j()
+    ) -> Result<bool> {
+        let found = self
+            .neo4j()
             .update_workspace_milestone(id, title, description, status, target_date)
             .await?;
-        self.emit(CrudEvent::new(
-            EventEntityType::WorkspaceMilestone,
-            CrudAction::Updated,
-            id.to_string(),
-        ));
-        Ok(())
+        // No phantom "Updated" event for an id that matched nothing.
+        if found {
+            self.emit(CrudEvent::new(
+                EventEntityType::WorkspaceMilestone,
+                CrudAction::Updated,
+                id.to_string(),
+            ));
+        }
+        Ok(found)
     }
 
     /// Delete a workspace milestone and emit event
@@ -4986,16 +4990,20 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         url: Option<String>,
         version: Option<String>,
         description: Option<String>,
-    ) -> Result<()> {
-        self.neo4j()
+    ) -> Result<bool> {
+        let found = self
+            .neo4j()
             .update_resource(id, name, file_path, url, version, description)
             .await?;
-        self.emit(CrudEvent::new(
-            EventEntityType::Resource,
-            CrudAction::Updated,
-            id.to_string(),
-        ));
-        Ok(())
+        // No phantom "Updated" event for an id that matched nothing.
+        if found {
+            self.emit(CrudEvent::new(
+                EventEntityType::Resource,
+                CrudAction::Updated,
+                id.to_string(),
+            ));
+        }
+        Ok(found)
     }
 
     /// Delete a resource and emit event
@@ -5064,14 +5072,18 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
     }
 
     /// Update a component and emit event
-    pub async fn update_component(&self, id: Uuid, patch: ComponentUpdate) -> Result<()> {
-        self.neo4j().update_component(id, patch).await?;
-        self.emit(CrudEvent::new(
-            EventEntityType::Component,
-            CrudAction::Updated,
-            id.to_string(),
-        ));
-        Ok(())
+    /// Returns `false` when no component has this id.
+    pub async fn update_component(&self, id: Uuid, patch: ComponentUpdate) -> Result<bool> {
+        let found = self.neo4j().update_component(id, patch).await?;
+        // No phantom "Updated" event for an id that matched nothing.
+        if found {
+            self.emit(CrudEvent::new(
+                EventEntityType::Component,
+                CrudAction::Updated,
+                id.to_string(),
+            ));
+        }
+        Ok(found)
     }
 
     /// Delete a component and emit event
@@ -6133,11 +6145,37 @@ mod tests {
     #[tokio::test]
     async fn test_update_workspace_milestone_emits_event() {
         let (orch, mut rx) = orch_with_bus().await;
-        orch.update_workspace_milestone(Uuid::new_v4(), Some("t".into()), None, None, None)
+        let ms = WorkspaceMilestoneNode {
+            id: Uuid::new_v4(),
+            workspace_id: Uuid::new_v4(),
+            title: "m".into(),
+            description: None,
+            status: MilestoneStatus::Open,
+            target_date: None,
+            closed_at: None,
+            created_at: chrono::Utc::now(),
+            tags: vec![],
+        };
+        orch.create_workspace_milestone(&ms).await.unwrap();
+        let _created = rx.try_recv().unwrap();
+        let found = orch
+            .update_workspace_milestone(ms.id, Some("t".into()), None, None, None)
             .await
             .unwrap();
+        assert!(found);
         let ev = rx.try_recv().unwrap();
         assert_eq!(ev.action, CrudAction::Updated);
+    }
+
+    #[tokio::test]
+    async fn test_update_workspace_milestone_unknown_id_no_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        let found = orch
+            .update_workspace_milestone(Uuid::new_v4(), Some("t".into()), None, None, None)
+            .await
+            .unwrap();
+        assert!(!found, "unknown id must be reported, not silently accepted");
+        assert!(rx.try_recv().is_err(), "no phantom Updated event");
     }
 
     #[tokio::test]
@@ -6211,11 +6249,41 @@ mod tests {
     #[tokio::test]
     async fn test_update_resource_emits_event() {
         let (orch, mut rx) = orch_with_bus().await;
-        orch.update_resource(Uuid::new_v4(), Some("n".into()), None, None, None, None)
+        let res = ResourceNode {
+            id: Uuid::new_v4(),
+            workspace_id: Some(Uuid::new_v4()),
+            project_id: None,
+            name: "API spec".into(),
+            resource_type: ResourceType::ApiContract,
+            file_path: "api.yaml".into(),
+            url: None,
+            format: None,
+            version: None,
+            description: None,
+            created_at: chrono::Utc::now(),
+            updated_at: None,
+            metadata: serde_json::json!({}),
+        };
+        orch.create_resource(&res).await.unwrap();
+        let _created = rx.try_recv().unwrap();
+        let found = orch
+            .update_resource(res.id, Some("n".into()), None, None, None, None)
             .await
             .unwrap();
+        assert!(found);
         let ev = rx.try_recv().unwrap();
         assert_eq!(ev.action, CrudAction::Updated);
+    }
+
+    #[tokio::test]
+    async fn test_update_resource_unknown_id_no_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        let found = orch
+            .update_resource(Uuid::new_v4(), Some("n".into()), None, None, None, None)
+            .await
+            .unwrap();
+        assert!(!found, "unknown id must be reported, not silently accepted");
+        assert!(rx.try_recv().is_err(), "no phantom Updated event");
     }
 
     #[tokio::test]
@@ -6272,8 +6340,22 @@ mod tests {
     #[tokio::test]
     async fn test_update_component_emits_event() {
         let (orch, mut rx) = orch_with_bus().await;
+        // The component must exist: an unknown id emits nothing (see below).
+        let comp = ComponentNode {
+            id: Uuid::new_v4(),
+            workspace_id: Uuid::new_v4(),
+            name: "c".into(),
+            component_type: ComponentType::Service,
+            description: None,
+            runtime: None,
+            config: serde_json::json!({}),
+            created_at: chrono::Utc::now(),
+            tags: vec![],
+        };
+        orch.create_component(&comp).await.unwrap();
+        while rx.try_recv().is_ok() {} // drain the Created event
         orch.update_component(
-            Uuid::new_v4(),
+            comp.id,
             ComponentUpdate {
                 name: Some("n".into()),
                 ..Default::default()
@@ -6321,6 +6403,23 @@ mod tests {
             ComponentType::Frontend,
             "component_type must be writable — a frontend stuck as Service never reaches tier 0 in the architecture view"
         );
+    }
+
+    #[tokio::test]
+    async fn test_update_component_unknown_id_no_event() {
+        let (orch, mut rx) = orch_with_bus().await;
+        let found = orch
+            .update_component(
+                Uuid::new_v4(),
+                ComponentUpdate {
+                    name: Some("n".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(!found, "unknown id must be reported, not silently accepted");
+        assert!(rx.try_recv().is_err(), "no phantom Updated event");
     }
 
     #[tokio::test]

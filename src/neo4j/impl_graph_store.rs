@@ -199,7 +199,7 @@ impl GraphStore for Neo4jClient {
         description: Option<String>,
         status: Option<MilestoneStatus>,
         target_date: Option<chrono::DateTime<chrono::Utc>>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
         self.update_workspace_milestone(id, title, description, status, target_date)
             .await
     }
@@ -292,7 +292,7 @@ impl GraphStore for Neo4jClient {
         url: Option<String>,
         version: Option<String>,
         description: Option<String>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
         self.update_resource(id, name, file_path, url, version, description)
             .await
     }
@@ -346,7 +346,7 @@ impl GraphStore for Neo4jClient {
         self.list_components(workspace_id).await
     }
 
-    async fn update_component(&self, id: Uuid, patch: ComponentUpdate) -> anyhow::Result<()> {
+    async fn update_component(&self, id: Uuid, patch: ComponentUpdate) -> anyhow::Result<bool> {
         self.update_component(id, patch).await
     }
 
