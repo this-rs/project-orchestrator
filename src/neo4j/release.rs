@@ -349,7 +349,11 @@ impl Neo4jClient {
             where_clause
         );
         let count_result = self
-            .execute_with_params(query(&count_cypher).param("project_id", project_id.to_string()))
+            .execute_with_params(
+                where_builder
+                    .bind(query(&count_cypher))
+                    .param("project_id", project_id.to_string()),
+            )
             .await?;
         let total: i64 = count_result
             .first()
@@ -371,7 +375,11 @@ impl Neo4jClient {
 
         let mut result = self
             .graph
-            .execute(query(&cypher).param("project_id", project_id.to_string()))
+            .execute(
+                where_builder
+                    .bind(query(&cypher))
+                    .param("project_id", project_id.to_string()),
+            )
             .await?;
         let mut releases = Vec::new();
         while let Some(row) = result.next().await? {

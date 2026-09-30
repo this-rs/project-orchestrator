@@ -1108,16 +1108,10 @@ impl Neo4jClient {
         };
         let order_dir = if sort_order == "asc" { "ASC" } else { "DESC" };
 
-        let match_clause = if let Some(pid) = project_id {
-            format!(
-                "MATCH (proj:Project {{id: '{}'}})-[:HAS_PLAN]->(p:Plan)",
-                pid
-            )
-        } else if let Some(ws) = workspace_slug {
-            format!(
-                "MATCH (w:Workspace {{slug: '{}'}})<-[:BELONGS_TO_WORKSPACE]-(proj:Project)-[:HAS_PLAN]->(p:Plan)",
-                ws
-            )
+        let match_clause = if project_id.is_some() {
+            "MATCH (proj:Project {id: $scope_project_id})-[:HAS_PLAN]->(p:Plan)".to_string()
+        } else if workspace_slug.is_some() {
+            "MATCH (w:Workspace {slug: $scope_workspace_slug})<-[:BELONGS_TO_WORKSPACE]-(proj:Project)-[:HAS_PLAN]->(p:Plan)".to_string()
         } else {
             "MATCH (p:Plan)".to_string()
         };
@@ -1127,7 +1121,20 @@ impl Neo4jClient {
             "{} {} RETURN count(DISTINCT p) AS total",
             match_clause, where_clause
         );
-        let count_result = self.execute(&count_cypher).await?;
+        let scope = |q: neo4rs::Query| {
+            let q = where_builder.bind(q);
+            let q = match project_id {
+                Some(pid) => q.param("scope_project_id", pid.to_string()),
+                None => q,
+            };
+            match (project_id, workspace_slug) {
+                (None, Some(ws)) => q.param("scope_workspace_slug", ws.to_string()),
+                _ => q,
+            }
+        };
+        let count_result = self
+            .execute_with_params(scope(query(&count_cypher)))
+            .await?;
         let total: i64 = count_result
             .first()
             .and_then(|r| r.get("total").ok())
@@ -1146,7 +1153,7 @@ impl Neo4jClient {
             match_clause, where_clause, order_field, order_dir, offset, limit
         );
 
-        let mut result = self.graph.execute(query(&cypher)).await?;
+        let mut result = self.graph.execute(scope(query(&cypher))).await?;
         let mut plans = Vec::new();
         while let Some(row) = result.next().await? {
             let node: neo4rs::Node = row.get("p")?;

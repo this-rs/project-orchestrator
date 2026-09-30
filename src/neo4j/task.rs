@@ -752,18 +752,12 @@ impl Neo4jClient {
             .add_assigned_to_filter("t", assigned_to);
 
         // Build plan filter if specified
-        let plan_match = if let Some(pid) = plan_id {
-            format!("MATCH (p:Plan {{id: '{}'}})-[:HAS_TASK]->(t:Task)", pid)
-        } else if let Some(pid) = project_id {
-            format!(
-                "MATCH (proj:Project {{id: '{}'}})-[:HAS_PLAN]->(p:Plan)-[:HAS_TASK]->(t:Task)",
-                pid
-            )
-        } else if let Some(ws) = workspace_slug {
-            format!(
-                "MATCH (w:Workspace {{slug: '{}'}})<-[:BELONGS_TO_WORKSPACE]-(proj:Project)-[:HAS_PLAN]->(p:Plan)-[:HAS_TASK]->(t:Task)",
-                ws
-            )
+        let plan_match = if plan_id.is_some() {
+            "MATCH (p:Plan {id: $scope_plan_id})-[:HAS_TASK]->(t:Task)".to_string()
+        } else if project_id.is_some() {
+            "MATCH (proj:Project {id: $scope_project_id})-[:HAS_PLAN]->(p:Plan)-[:HAS_TASK]->(t:Task)".to_string()
+        } else if workspace_slug.is_some() {
+            "MATCH (w:Workspace {slug: $scope_workspace_slug})<-[:BELONGS_TO_WORKSPACE]-(proj:Project)-[:HAS_PLAN]->(p:Plan)-[:HAS_TASK]->(t:Task)".to_string()
         } else {
             "MATCH (p:Plan)-[:HAS_TASK]->(t:Task)".to_string()
         };
@@ -787,7 +781,21 @@ impl Neo4jClient {
 
         // Count query
         let count_cypher = format!("{} {} RETURN count(t) AS total", plan_match, where_clause);
-        let count_result = self.execute(&count_cypher).await?;
+        let scope = |q: neo4rs::Query| {
+            let q = where_builder.bind(q);
+            if let Some(pid) = plan_id {
+                q.param("scope_plan_id", pid.to_string())
+            } else if let Some(pid) = project_id {
+                q.param("scope_project_id", pid.to_string())
+            } else if let Some(ws) = workspace_slug {
+                q.param("scope_workspace_slug", ws.to_string())
+            } else {
+                q
+            }
+        };
+        let count_result = self
+            .execute_with_params(scope(query(&count_cypher)))
+            .await?;
         let total: i64 = count_result
             .first()
             .and_then(|r| r.get("total").ok())
@@ -807,7 +815,7 @@ impl Neo4jClient {
             plan_match, where_clause, order_field, order_dir, offset, limit
         );
 
-        let mut result = self.graph.execute(query(&cypher)).await?;
+        let mut result = self.graph.execute(scope(query(&cypher))).await?;
         let mut tasks = Vec::new();
         while let Some(row) = result.next().await? {
             let node: neo4rs::Node = row.get("t")?;

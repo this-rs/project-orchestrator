@@ -524,7 +524,9 @@ impl Neo4jClient {
             "MATCH (p:Project) {} RETURN count(p) AS total",
             where_clause
         );
-        let count_result = self.execute(&count_cypher).await?;
+        let count_result = self
+            .execute_with_params(where_builder.bind(query(&count_cypher)))
+            .await?;
         let total: i64 = count_result
             .first()
             .and_then(|r| r.get("total").ok())
@@ -543,7 +545,10 @@ impl Neo4jClient {
             where_clause, order_field, order_dir, offset, limit
         );
 
-        let mut result = self.graph.execute(query(&cypher)).await?;
+        let mut result = self
+            .graph
+            .execute(where_builder.bind(query(&cypher)))
+            .await?;
         let mut projects = Vec::new();
         while let Some(row) = result.next().await? {
             let node: neo4rs::Node = row.get("p")?;
