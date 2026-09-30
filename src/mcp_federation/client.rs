@@ -299,6 +299,39 @@ pub struct StdioMcpClient {
     stdout: Mutex<BufReader<tokio::process::ChildStdout>>,
 }
 
+/// Directories where user-installed tools (`npx`, `uvx`, `node`…) usually live.
+/// A service started by launchd/systemd only gets a minimal `PATH`
+/// (`/usr/bin:/bin:…`), so `npx` is not found and every stdio server fails to spawn.
+const EXTRA_PATH_DIRS: &[&str] = &["/opt/homebrew/bin", "/opt/homebrew/sbin", "/usr/local/bin"];
+const EXTRA_HOME_DIRS: &[&str] = &[
+    ".local/bin",
+    ".cargo/bin",
+    ".volta/bin",
+    ".bun/bin",
+    ".deno/bin",
+];
+
+/// `base` PATH followed by the well-known tool directories that are missing from it.
+/// The base order is kept first so an explicit configuration always wins.
+pub(crate) fn augmented_path(base: Option<&str>, home: Option<&str>) -> String {
+    let mut dirs: Vec<String> = base
+        .unwrap_or("")
+        .split(':')
+        .filter(|d| !d.is_empty())
+        .map(str::to_string)
+        .collect();
+    let extras = EXTRA_PATH_DIRS.iter().map(|d| d.to_string()).chain(
+        home.into_iter()
+            .flat_map(|h| EXTRA_HOME_DIRS.iter().map(move |d| format!("{h}/{d}"))),
+    );
+    for d in extras {
+        if !dirs.contains(&d) {
+            dirs.push(d);
+        }
+    }
+    dirs.join(":")
+}
+
 impl StdioMcpClient {
     /// Spawn the child process.
     pub async fn spawn(
@@ -308,9 +341,18 @@ impl StdioMcpClient {
     ) -> Result<Self> {
         debug!(command, ?args, "Spawning MCP server (stdio)");
 
+        // The child's PATH: the one configured for this server, else ours, widened with
+        // the usual tool directories (see `augmented_path`).
+        let base_path = env
+            .get("PATH")
+            .cloned()
+            .or_else(|| std::env::var("PATH").ok());
+        let path = augmented_path(base_path.as_deref(), std::env::var("HOME").ok().as_deref());
+
         let mut cmd = Command::new(command);
         cmd.args(args)
             .envs(env)
+            .env("PATH", &path)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
@@ -879,6 +921,42 @@ impl McpClient for SseMcpClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_augmented_path_adds_homebrew_to_minimal_launchd_path() {
+        let p = augmented_path(Some("/usr/bin:/bin:/usr/sbin:/sbin"), Some("/Users/x"));
+        let dirs: Vec<&str> = p.split(':').collect();
+        assert_eq!(&dirs[..4], ["/usr/bin", "/bin", "/usr/sbin", "/sbin"]);
+        assert!(dirs.contains(&"/opt/homebrew/bin"));
+        assert!(dirs.contains(&"/Users/x/.local/bin"));
+    }
+
+    #[test]
+    fn test_augmented_path_keeps_configured_order_and_does_not_duplicate() {
+        let p = augmented_path(Some("/opt/homebrew/bin:/custom"), None);
+        let dirs: Vec<&str> = p.split(':').collect();
+        assert_eq!(dirs[0], "/opt/homebrew/bin");
+        assert_eq!(
+            dirs.iter().filter(|d| **d == "/opt/homebrew/bin").count(),
+            1
+        );
+        assert!(!dirs.iter().any(|d| d.contains(".local")));
+    }
+
+    #[test]
+    fn test_augmented_path_without_base() {
+        let p = augmented_path(None, None);
+        assert!(p.starts_with("/opt/homebrew/bin"));
+        assert!(!p.starts_with(':'));
+    }
+
+    #[tokio::test]
+    async fn test_spawn_finds_command_outside_the_parent_path() {
+        // `sh` lives in /bin; the child PATH is widened, never narrowed.
+        let ok =
+            StdioMcpClient::spawn("sh", &["-c".into(), "exit 0".into()], &HashMap::new()).await;
+        assert!(ok.is_ok());
+    }
 
     #[test]
     fn test_make_request() {

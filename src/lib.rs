@@ -1922,12 +1922,23 @@ pub async fn start_server(mut config: Config) -> Result<()> {
                             transport,
                         };
 
-                        match tokio::time::timeout(
-                            std::time::Duration::from_secs(30),
-                            registry.write().await.connect(config),
-                        )
-                        .await
-                        {
+                        // A few attempts with a growing pause: at boot the network, the
+                        // package runner or the PATH may not be ready on the first try.
+                        let mut attempt = 0u32;
+                        let outcome = loop {
+                            let res = tokio::time::timeout(
+                                std::time::Duration::from_secs(30),
+                                registry.write().await.connect(config.clone()),
+                            )
+                            .await;
+                            if matches!(res, Ok(Ok(_))) || attempt >= 2 {
+                                break res;
+                            }
+                            attempt += 1;
+                            tokio::time::sleep(std::time::Duration::from_secs(10 * attempt as u64))
+                                .await;
+                        };
+                        match outcome {
                             Ok(Ok(_summary)) => {
                                 tracing::info!("MCP federation: restored '{}'", server.server_id);
                                 connected += 1;
