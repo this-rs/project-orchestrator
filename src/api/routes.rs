@@ -574,6 +574,10 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/plans/{plan_id}/run/auto-pr",
             post(handlers::create_auto_pr),
         )
+        .route(
+            "/api/plans/{plan_id}/run/tasks/{task_id}/retry",
+            post(handlers::retry_plan_task),
+        )
         // Plan Runs
         .route("/api/runs", get(handlers::list_all_plan_runs))
         .route("/api/plans/{plan_id}/runs", get(handlers::list_plan_runs))

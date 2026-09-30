@@ -5248,6 +5248,40 @@ pub async fn run_plan(
     axum::Extension(caller_claims): axum::Extension<crate::auth::jwt::Claims>,
     Json(req): Json<RunPlanRequest>,
 ) -> Result<(StatusCode, Json<RunPlanResponse>), AppError> {
+    // Parse trigger source from request (default: Manual)
+    let trigger_source = match req.triggered_by.as_deref() {
+        Some("chat") => crate::runner::TriggerSource::Chat { session_id: None },
+        Some("schedule") => crate::runner::TriggerSource::Schedule {
+            trigger_id: uuid::Uuid::nil(),
+        },
+        _ => crate::runner::TriggerSource::Manual,
+    };
+
+    let response = start_plan_run(
+        &state,
+        plan_id,
+        caller_claims,
+        req.cwd,
+        req.project_slug,
+        req.max_cost_usd,
+        trigger_source,
+    )
+    .await?;
+    Ok((StatusCode::ACCEPTED, Json(response)))
+}
+
+/// Build a `PlanRunner` wired to the server (chat manager, event bus, caller
+/// claims) and start a run of `plan_id`. Shared by `run_plan` and
+/// `retry_plan_task`.
+async fn start_plan_run(
+    state: &OrchestratorState,
+    plan_id: Uuid,
+    caller_claims: crate::auth::jwt::Claims,
+    cwd: String,
+    project_slug: Option<String>,
+    max_cost_usd: Option<f64>,
+    trigger_source: crate::runner::TriggerSource,
+) -> Result<RunPlanResponse, AppError> {
     let chat_manager = state
         .chat_manager
         .as_ref()
@@ -5257,7 +5291,7 @@ pub async fn run_plan(
     let context_builder = state.orchestrator.context_builder().clone();
     let mut config = state.orchestrator.runner_config();
     // Override budget if the caller specified one
-    if let Some(budget) = req.max_cost_usd {
+    if let Some(budget) = max_cost_usd {
         config.max_cost_usd = budget;
     }
 
@@ -5281,17 +5315,8 @@ pub async fn run_plan(
 
     let runner = Arc::new(runner);
 
-    // Parse trigger source from request (default: Manual)
-    let trigger_source = match req.triggered_by.as_deref() {
-        Some("chat") => crate::runner::TriggerSource::Chat { session_id: None },
-        Some("schedule") => crate::runner::TriggerSource::Schedule {
-            trigger_id: uuid::Uuid::nil(),
-        },
-        _ => crate::runner::TriggerSource::Manual,
-    };
-
     let start_result = runner
-        .start(plan_id, trigger_source, req.cwd, req.project_slug)
+        .start(plan_id, trigger_source, cwd, project_slug)
         .await
         .map_err(|e| {
             if e.to_string().contains("already has an active run") {
@@ -5301,15 +5326,94 @@ pub async fn run_plan(
             }
         })?;
 
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(RunPlanResponse {
-            run_id: start_result.run_id,
-            plan_id: start_result.plan_id,
-            total_waves: start_result.total_waves,
-            total_tasks: start_result.total_tasks,
-        }),
-    ))
+    Ok(RunPlanResponse {
+        run_id: start_result.run_id,
+        plan_id: start_result.plan_id,
+        total_waves: start_result.total_waves,
+        total_tasks: start_result.total_tasks,
+    })
+}
+
+/// Validate a per-task retry and put the task back to `pending`.
+///
+/// - 404 if the task does not belong to the plan;
+/// - 409 if the task is not `failed` (only failed tasks can be retried);
+/// - 409 if the plan already has an active run: the runner keeps a single
+///   global run state and cannot take a task into a run that is in progress.
+///
+/// Nothing is written unless every check passes.
+pub(crate) async fn prepare_task_retry(
+    graph: &dyn crate::neo4j::GraphStore,
+    plan_id: Uuid,
+    task_id: Uuid,
+) -> Result<(), AppError> {
+    let task = graph
+        .get_plan_tasks(plan_id)
+        .await
+        .map_err(AppError::Internal)?
+        .into_iter()
+        .find(|t| t.id == task_id)
+        .ok_or_else(|| AppError::NotFound(format!("Task {task_id} not found in plan {plan_id}")))?;
+
+    if task.status != crate::neo4j::models::TaskStatus::Failed {
+        return Err(AppError::Conflict(format!(
+            "Task {task_id} is {:?}, only failed tasks can be retried",
+            task.status
+        )));
+    }
+
+    let active_runs = graph
+        .list_active_plan_runs()
+        .await
+        .map_err(AppError::Internal)?;
+    if let Some(run) = active_runs.iter().find(|r| r.plan_id == plan_id) {
+        return Err(AppError::Conflict(format!(
+            "Plan {plan_id} has an active run ({}); wait for it to finish or cancel it before retrying a task",
+            run.run_id
+        )));
+    }
+
+    graph
+        .update_task_status(task_id, crate::neo4j::models::TaskStatus::Pending)
+        .await
+        .map_err(AppError::Internal)?;
+    Ok(())
+}
+
+/// POST /api/plans/:plan_id/run/tasks/:task_id/retry — Retry one failed task.
+///
+/// Puts the failed task back to `pending` and starts a new run of the plan
+/// (cwd `.` → project root_path, default budget), exactly like "Retry run".
+/// A run re-executes every task that is not `completed`/`blocked`, so other
+/// failed/pending tasks of the plan are resumed too.
+///
+/// Returns 202 with the new run, 404 if the task is not in the plan, 409 if
+/// the task is not failed or a run is already active.
+pub async fn retry_plan_task(
+    State(state): State<OrchestratorState>,
+    Path((plan_id, task_id)): Path<(Uuid, Uuid)>,
+    axum::Extension(caller_claims): axum::Extension<crate::auth::jwt::Claims>,
+) -> Result<(StatusCode, Json<RunPlanResponse>), AppError> {
+    // Refuse before touching the task if no run can be started at all.
+    if state.chat_manager.is_none() {
+        return Err(AppError::Internal(anyhow::anyhow!(
+            "Chat manager not initialized"
+        )));
+    }
+
+    prepare_task_retry(state.orchestrator.neo4j(), plan_id, task_id).await?;
+
+    let response = start_plan_run(
+        &state,
+        plan_id,
+        caller_claims,
+        ".".to_string(),
+        None,
+        None,
+        crate::runner::TriggerSource::Manual,
+    )
+    .await?;
+    Ok((StatusCode::ACCEPTED, Json(response)))
 }
 
 /// GET /api/plans/:id/run/status — Get current runner status.
@@ -8621,5 +8725,144 @@ mod tests {
         let resp = oneshot_req(app, req).await;
         let json = resp_json(resp).await;
         assert_eq!(json["running"], false);
+    }
+}
+
+#[cfg(test)]
+mod retry_plan_task_tests {
+    use super::*;
+    use crate::neo4j::models::TaskStatus;
+    use crate::neo4j::GraphStore;
+    use crate::orchestrator::{FileWatcher, Orchestrator};
+    use crate::test_helpers::{mock_app_state, test_auth_config, test_bearer_token, test_task};
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    async fn seed(status: TaskStatus) -> (Arc<dyn GraphStore>, Uuid, Uuid) {
+        let app_state = mock_app_state();
+        let graph = app_state.neo4j.clone();
+        let plan_id = Uuid::new_v4();
+        let mut task = test_task();
+        task.status = status;
+        graph.create_task(plan_id, &task).await.unwrap();
+        (graph, plan_id, task.id)
+    }
+
+    async fn status_of(graph: &dyn GraphStore, task_id: Uuid) -> TaskStatus {
+        graph.get_task(task_id).await.unwrap().unwrap().status
+    }
+
+    #[tokio::test]
+    async fn retry_failed_task_resets_it_to_pending() {
+        let (graph, plan_id, task_id) = seed(TaskStatus::Failed).await;
+        prepare_task_retry(graph.as_ref(), plan_id, task_id)
+            .await
+            .expect("a failed task with no active run can be retried");
+        assert_eq!(
+            status_of(graph.as_ref(), task_id).await,
+            TaskStatus::Pending
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_task_outside_plan_is_404() {
+        let (graph, _plan_id, task_id) = seed(TaskStatus::Failed).await;
+        let err = prepare_task_retry(graph.as_ref(), Uuid::new_v4(), task_id)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::NotFound(_)), "got {err:?}");
+        assert_eq!(status_of(graph.as_ref(), task_id).await, TaskStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn retry_non_failed_task_is_409() {
+        for status in [
+            TaskStatus::Pending,
+            TaskStatus::InProgress,
+            TaskStatus::Completed,
+        ] {
+            let (graph, plan_id, task_id) = seed(status.clone()).await;
+            let err = prepare_task_retry(graph.as_ref(), plan_id, task_id)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, AppError::Conflict(_)),
+                "{status:?}: got {err:?}"
+            );
+            assert_eq!(status_of(graph.as_ref(), task_id).await, status);
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_task_while_plan_run_active_is_409_and_untouched() {
+        let (graph, plan_id, task_id) = seed(TaskStatus::Failed).await;
+        let run = crate::runner::RunnerState::new(
+            Uuid::new_v4(),
+            plan_id,
+            1,
+            crate::runner::TriggerSource::Manual,
+        );
+        graph.create_plan_run(&run).await.unwrap();
+        let err = prepare_task_retry(graph.as_ref(), plan_id, task_id)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Conflict(_)), "got {err:?}");
+        assert_eq!(status_of(graph.as_ref(), task_id).await, TaskStatus::Failed);
+    }
+
+    /// The route is wired in the router (an unknown route would be a 404) and
+    /// refuses before touching the task when no runner can be started.
+    #[tokio::test]
+    async fn retry_route_is_wired_and_does_not_mutate_without_runner() {
+        let app_state = mock_app_state();
+        let graph = app_state.neo4j.clone();
+        let plan_id = Uuid::new_v4();
+        let mut task = test_task();
+        task.status = TaskStatus::Failed;
+        graph.create_task(plan_id, &task).await.unwrap();
+
+        let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
+        let watcher = Arc::new(RwLock::new(FileWatcher::new(orchestrator.clone())));
+        let state = Arc::new(ServerState {
+            orchestrator,
+            watcher,
+            chat_manager: None,
+            event_bus: Arc::new(HybridEmitter::new(Arc::new(
+                crate::events::EventBus::default(),
+            ))),
+            nats_emitter: None,
+            auth_config: Some(test_auth_config()),
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+            setup_completed: true,
+            server_port: 0,
+            public_url: None,
+            remote_mcp: crate::RemoteMcpConfig::default(),
+            ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
+            registry_remote_url: None,
+            oidc_client: None,
+            neural_router: crate::test_helpers::mock_neural_router(),
+            trajectory_collector: std::sync::RwLock::new(None),
+            trajectory_store_neo4j: None,
+            trajectory_store: None,
+            identity: None,
+            reactor_counters: std::sync::OnceLock::new(),
+            confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
+            mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
+            model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
+            vault: crate::vault::VaultService::ephemeral(),
+        });
+        let app = crate::api::routes::create_router(state);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/api/plans/{plan_id}/run/tasks/{}/retry", task.id))
+            .header("authorization", test_bearer_token())
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(status_of(graph.as_ref(), task.id).await, TaskStatus::Failed);
     }
 }
