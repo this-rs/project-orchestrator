@@ -116,7 +116,7 @@ Business processes: `code(action: "list_processes")`, `code(action: "get_process
   - `code(action: "find_trait_implementations", trait_name)` — trait implementations
   - `code(action: "find_type_traits", type_name)` — traits implemented by a type
   - `code(action: "get_impl_blocks", type_name)` — impl blocks for a type
-  - `code(action: "find_similar_code", code_snippet)` — similar code
+  - `code(action: "find_similar", snippet)` — similar code
 
 ## 4. Git Workflow
 
@@ -851,8 +851,8 @@ Manage knowledge notes. Actions: list, create, get, update, delete, search, sear
 | search | `query` (req) | Full-text search notes (BM25) |
 | search_semantic | `query` (req), `project_id` | Semantic vector search notes |
 | confirm | `note_id` (req) | Confirm note validity |
-| invalidate | `note_id` (req) | Mark note as invalid |
-| supersede | `note_id` (req), `superseded_by_id` (req) | Supersede with newer note |
+| invalidate | `note_id` (req), `reason` (req) | Mark note as invalid |
+| supersede | `old_note_id` (req), `note_type` (req), `content` (req), `project_id` | Create a new note that supersedes `old_note_id` |
 | link_to_entity | `note_id` (req), `entity_type` (req), `entity_id` (req) | Link note to entity |
 | unlink_from_entity | `note_id` (req), `entity_type` (req), `entity_id` (req) | Unlink note from entity |
 | get_context | `entity_type` (req), `entity_id` (req) | Get contextual notes |
@@ -878,7 +878,7 @@ Manage workspaces. Actions: list, create, get, update, delete, get_overview, lis
 | delete | `slug` (req) | Delete workspace |
 | get_overview | `slug` (req) | Get workspace overview |
 | list_projects | `slug` (req) | List projects in workspace |
-| add_project | `slug` (req), `project_id` (req), `role` | Add project to workspace |
+| add_project | `slug` (req), `project_id` (req) | Add project to workspace |
 | remove_project | `slug` (req), `project_id` (req) | Remove project from workspace |
 | get_topology | `slug` (req) | Get component topology |
 
@@ -908,7 +908,7 @@ Manage workspace resources (API contracts, schemas). Actions: list, create, get,
 | get | `id` (req) | Get resource by UUID |
 | update | `id` (req), `name`, `description`, `file_path`, `url`, `version` | Update resource |
 | delete | `id` (req) | Delete resource |
-| link_to_project | `resource_id` (req), `project_id` (req) | Link resource to project |
+| link_to_project | `id` (req), `project_id` (req), `relation` (req: implements/uses) | Link resource to project |
 
 ## component
 Manage workspace components (services, modules). Actions: list, create, get, update, delete, add_dependency, remove_dependency, map_to_project
@@ -920,8 +920,8 @@ Manage workspace components (services, modules). Actions: list, create, get, upd
 | get | `id` (req) | Get component by UUID |
 | update | `id` (req), `name`, `description`, `runtime`, `config`, `tags` | Update component |
 | delete | `id` (req) | Delete component |
-| add_dependency | `from_id` (req), `to_id` (req), `dependency_type` | Add dependency between components |
-| remove_dependency | `from_id` (req), `to_id` (req) | Remove dependency |
+| add_dependency | `id` (req), `depends_on_id` (req), `protocol`, `required` | `id` depends on `depends_on_id` |
+| remove_dependency | `id` (req), `dep_id` (req) | Remove dependency |
 | map_to_project | `component_id` (req), `project_id` (req) | Map component to project |
 
 ## chat
@@ -969,7 +969,7 @@ Explore and analyze code. Actions: search, search_project, search_workspace, get
 | get_call_graph | `function` (req), `limit` (depth) | Get call graph for function |
 | analyze_impact | `target` (req) | Analyze impact of changes |
 | get_architecture | `project_slug` | Get project architecture overview |
-| find_similar | `code_snippet` (req) | Find similar code |
+| find_similar | `snippet` (req), `limit` | Find similar code |
 | find_trait_implementations | `trait_name` (req) | Find trait implementations |
 | find_type_traits | `type_name` (req) | Find traits for type |
 | get_impl_blocks | `type_name` (req) | Get impl blocks for type |
@@ -1314,19 +1314,17 @@ Manage lifecycle hooks — automatic actions triggered on entity status changes.
 | delete | `hook_id` (req) | Delete a hook |
 
 ## mcp_federation
-Manage external MCP server connections (federation). Actions: connect, disconnect, list, status, tools, probe, reconnect, backfill_relations, backfill_sequences
+Manage external MCP server connections (federation). Actions: connect, disconnect, list, status, tools, probe, reconnect
 
 | Action | Key Parameters | Description |
 |--------|---------------|-------------|
-| connect | `server_id` (req), `transport` (req: stdio/sse/streamable_http), `command`, `args` (array), `env` (object) for stdio, `url`, `headers` (object) for sse/streamable_http, `display_name`, `auto_probe` (default true) | Connect an external MCP server |
+| connect | `server_id` (req), `transport` (req: stdio/sse/streamable_http), `command`, `args` (array), `env` (object) for stdio, `url`, `headers` (object) for sse/streamable_http, `display_name` | Connect an external MCP server |
 | disconnect | `server_id` (req) | Disconnect a server |
 | list | | List connected external MCP servers |
 | status | `server_id` (req) | Get connection status of a server |
 | tools | `server_id` (req) | List the tools exposed by a server |
 | probe | `server_id` (req) | Probe a server's read-only tools |
 | reconnect | `server_id` (req) | Reconnect a server |
-| backfill_relations | | Backfill CO_ACTIVATED_WITH relations between external tools used in the same session |
-| backfill_sequences | | Backfill OFTEN_FOLLOWS relations between consecutively used external tools |
 "#;
 
 use anyhow::Result;
@@ -1683,7 +1681,7 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
             },
             ToolRef {
                 name: "mcp_federation",
-                description: "Manage external MCP server connections (connect/disconnect/list/status/tools/probe/reconnect/backfill_relations/backfill_sequences) — federation layer for consuming external MCP servers",
+                description: "Manage external MCP server connections (connect/disconnect/list/status/tools/probe/reconnect) — federation layer for consuming external MCP servers",
             },
         ],
     },
