@@ -2712,6 +2712,10 @@ pub struct McpServerNode {
     pub transport_command: Option<String>,
     /// Transport args (for Stdio, JSON array as string).
     pub transport_args: Option<String>,
+    /// Stdio env vars / HTTP headers needed to reconnect after a restart, as JSON
+    /// `{"env":{..},"headers":{..}}`. May hold secrets: never serialised to API output.
+    #[serde(default, skip_serializing)]
+    pub transport_secrets: Option<String>,
     /// Current connection status: "connected", "disconnected", "error".
     pub status: String,
     /// MCP protocol version reported by the server.
@@ -3362,6 +3366,7 @@ mod tests {
             transport_url: Some("http://localhost:8080/sse".to_string()),
             transport_command: None,
             transport_args: None,
+            transport_secrets: None,
             status: "connected".to_string(),
             protocol_version: Some("2025-03-26".to_string()),
             server_name: Some("Grafeo".to_string()),
@@ -3404,6 +3409,7 @@ mod tests {
             transport_url: None,
             transport_command: Some("npx".to_string()),
             transport_args: Some(r#"["-y","@modelcontextprotocol/server-github"]"#.to_string()),
+            transport_secrets: None,
             status: "connected".to_string(),
             protocol_version: Some("2024-11-05".to_string()),
             server_name: None,

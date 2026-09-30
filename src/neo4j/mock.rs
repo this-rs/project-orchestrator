@@ -15128,6 +15128,7 @@ mod tests {
             transport_url: None,
             transport_command: Some("echo".to_string()),
             transport_args: None,
+            transport_secrets: None,
             status: "connected".to_string(),
             protocol_version: Some("2024-11-05".to_string()),
             server_name: Some("TestMCP".to_string()),

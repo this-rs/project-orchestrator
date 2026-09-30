@@ -146,6 +146,25 @@ pub(crate) fn extract_transport_fields(
     }
 }
 
+/// JSON of what a reconnect needs beyond command/url: stdio env and HTTP headers.
+/// `None` when there is nothing to keep.
+pub(crate) fn extract_transport_secrets(transport: &McpTransport) -> Option<String> {
+    let (env, headers) = match transport {
+        McpTransport::Stdio { env, .. } => (env.clone(), Default::default()),
+        McpTransport::Sse { headers, .. } | McpTransport::StreamableHttp { headers, .. } => {
+            (Default::default(), headers.clone())
+        }
+    };
+    let (env, headers): (
+        std::collections::HashMap<String, String>,
+        std::collections::HashMap<String, String>,
+    ) = (env, headers);
+    if env.is_empty() && headers.is_empty() {
+        return None;
+    }
+    serde_json::to_string(&serde_json::json!({ "env": env, "headers": headers })).ok()
+}
+
 /// Build an `McpServerNode` from a connect request + server summary.
 pub(crate) fn build_server_node(
     server_id: &str,
@@ -168,6 +187,7 @@ pub(crate) fn build_server_node(
         transport_url,
         transport_command,
         transport_args,
+        transport_secrets: extract_transport_secrets(transport),
         status: "connected".to_string(),
         protocol_version: server_name.map(|s| s.to_string()),
         server_name: server_name.map(|s| s.to_string()),
@@ -1333,6 +1353,46 @@ mod tests {
     // ========================================================================
     // 29. Round-trip: build_server_node → reconstruct transport from stored fields
     // ========================================================================
+
+    #[test]
+    fn test_server_node_keeps_env_and_headers_for_reconnect_but_never_serialises_them() {
+        let mut env = HashMap::new();
+        env.insert("DISCORD_TOKEN".to_string(), "s3cret".to_string());
+        let stdio = McpTransport::Stdio {
+            command: "npx".to_string(),
+            args: vec![],
+            env,
+        };
+        let node = build_server_node("discord", None, &stdio, None, 0);
+        let saved: serde_json::Value =
+            serde_json::from_str(node.transport_secrets.as_deref().unwrap()).unwrap();
+        assert_eq!(saved["env"]["DISCORD_TOKEN"], "s3cret");
+        // A secret must never leak through API output.
+        assert!(!serde_json::to_string(&node).unwrap().contains("s3cret"));
+
+        let mut headers = HashMap::new();
+        headers.insert("Authorization".to_string(), "Bearer x".to_string());
+        let http = McpTransport::StreamableHttp {
+            url: "http://h/mcp".to_string(),
+            headers,
+        };
+        let node = build_server_node("h", None, &http, None, 0);
+        let saved: serde_json::Value =
+            serde_json::from_str(node.transport_secrets.as_deref().unwrap()).unwrap();
+        assert_eq!(saved["headers"]["Authorization"], "Bearer x");
+    }
+
+    #[test]
+    fn test_server_node_without_env_stores_no_secrets() {
+        let t = McpTransport::Stdio {
+            command: "node".to_string(),
+            args: vec![],
+            env: HashMap::new(),
+        };
+        assert!(build_server_node("s", None, &t, None, 0)
+            .transport_secrets
+            .is_none());
+    }
 
     #[test]
     fn test_server_node_roundtrip_stdio() {
