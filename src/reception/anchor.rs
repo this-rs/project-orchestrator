@@ -38,8 +38,8 @@ pub struct SignedTombstone {
 /// Tombstone registry for revoked content hashes.
 ///
 /// Stores [`SignedTombstone`] entries keyed by content hash.
-/// Backward-compatible: the legacy `apply_tombstone` / `is_revoked` API
-/// still works by creating unsigned placeholder tombstones internally.
+/// The legacy `apply_tombstone` API (local use only) creates unsigned entries;
+/// tombstones coming from peers MUST go through `apply_signed_tombstone`.
 #[derive(Debug, Clone, Default)]
 pub struct TombstoneRegistry {
     /// Map of content hashes to their signed tombstone records.
@@ -72,14 +72,23 @@ impl TombstoneRegistry {
         true
     }
 
-    /// Apply a signed tombstone. Returns `true` if it was newly inserted.
-    pub fn apply_signed_tombstone(&mut self, tombstone: SignedTombstone) -> bool {
+    /// Apply a signed tombstone after verifying its Ed25519 signature (fail-closed).
+    ///
+    /// Returns `Err` if the signature does not verify, `Ok(true)` if newly
+    /// inserted, `Ok(false)` if already present.
+    pub fn apply_signed_tombstone(&mut self, tombstone: SignedTombstone) -> Result<bool, String> {
+        if !crate::sharing::tombstone::verify_tombstone_ed25519(&tombstone) {
+            return Err(format!(
+                "tombstone signature verification failed for {}",
+                tombstone.content_hash
+            ));
+        }
         if self.revoked.contains_key(&tombstone.content_hash) {
-            return false;
+            return Ok(false);
         }
         self.revoked
             .insert(tombstone.content_hash.clone(), tombstone);
-        true
+        Ok(true)
     }
 
     /// Check if a content hash has been tombstoned.
@@ -211,16 +220,43 @@ mod tests {
     #[test]
     fn test_signed_tombstone_apply() {
         let mut registry = TombstoneRegistry::new();
-        let tombstone = SignedTombstone {
-            content_hash: "hash_signed".to_string(),
-            issuer_did: "did:key:zIssuer".to_string(),
-            signature_hex: "abcd1234".to_string(),
-            issued_at: chrono::Utc::now(),
-            reason: Some("GDPR request".to_string()),
-        };
-        assert!(registry.apply_signed_tombstone(tombstone.clone()));
-        assert!(!registry.apply_signed_tombstone(tombstone)); // duplicate
+        let id = crate::identity::InstanceIdentity::generate();
+        let tombstone = crate::sharing::tombstone::sign_tombstone(
+            &id,
+            "hash_signed".to_string(),
+            chrono::Utc::now(),
+            Some("GDPR request".to_string()),
+        );
+        assert_eq!(registry.apply_signed_tombstone(tombstone.clone()), Ok(true));
+        assert_eq!(registry.apply_signed_tombstone(tombstone), Ok(false)); // duplicate
         assert!(registry.is_revoked("hash_signed"));
+    }
+
+    #[test]
+    fn test_forged_tombstone_rejected() {
+        let mut registry = TombstoneRegistry::new();
+        let forged = SignedTombstone {
+            content_hash: "hash_forged".to_string(),
+            issuer_did: "did:key:zIssuer".to_string(),
+            signature_hex: "0".repeat(128),
+            issued_at: chrono::Utc::now(),
+            reason: None,
+        };
+        assert!(registry.apply_signed_tombstone(forged).is_err());
+        assert!(!registry.is_revoked("hash_forged"));
+
+        // Valid signature by key A, claimed by issuer B
+        let a = crate::identity::InstanceIdentity::generate();
+        let b = crate::identity::InstanceIdentity::generate();
+        let mut t = crate::sharing::tombstone::sign_tombstone(
+            &a,
+            "hash_forged2".to_string(),
+            chrono::Utc::now(),
+            None,
+        );
+        t.issuer_did = b.did_key().to_string();
+        assert!(registry.apply_signed_tombstone(t).is_err());
+        assert!(!registry.is_revoked("hash_forged2"));
     }
 
     #[test]
@@ -228,18 +264,19 @@ mod tests {
         let mut registry = TombstoneRegistry::new();
         assert!(registry.get_tombstone("missing").is_none());
 
-        let tombstone = SignedTombstone {
-            content_hash: "hash_get".to_string(),
-            issuer_did: "did:key:zAlice".to_string(),
-            signature_hex: "beef".to_string(),
-            issued_at: chrono::Utc::now(),
-            reason: None,
-        };
-        registry.apply_signed_tombstone(tombstone);
+        let id = crate::identity::InstanceIdentity::generate();
+        let tombstone = crate::sharing::tombstone::sign_tombstone(
+            &id,
+            "hash_get".to_string(),
+            chrono::Utc::now(),
+            None,
+        );
+        let sig = tombstone.signature_hex.clone();
+        registry.apply_signed_tombstone(tombstone).unwrap();
 
         let retrieved = registry.get_tombstone("hash_get").unwrap();
-        assert_eq!(retrieved.issuer_did, "did:key:zAlice");
-        assert_eq!(retrieved.signature_hex, "beef");
+        assert_eq!(retrieved.issuer_did, id.did_key());
+        assert_eq!(retrieved.signature_hex, sig);
         assert!(retrieved.reason.is_none());
     }
 
@@ -249,13 +286,15 @@ mod tests {
         assert!(registry.list_tombstones().is_empty());
 
         registry.apply_tombstone("hash_a");
-        registry.apply_signed_tombstone(SignedTombstone {
-            content_hash: "hash_b".to_string(),
-            issuer_did: "did:key:zBob".to_string(),
-            signature_hex: "cafe".to_string(),
-            issued_at: chrono::Utc::now(),
-            reason: Some("test".to_string()),
-        });
+        let id = crate::identity::InstanceIdentity::generate();
+        registry
+            .apply_signed_tombstone(crate::sharing::tombstone::sign_tombstone(
+                &id,
+                "hash_b".to_string(),
+                chrono::Utc::now(),
+                Some("test".to_string()),
+            ))
+            .unwrap();
 
         assert_eq!(registry.list_tombstones().len(), 2);
     }

@@ -388,18 +388,19 @@ pub async fn retract_sharing(
         ));
     };
 
-    // Build and persist tombstone
-    let tombstone = SignedTombstone {
-        content_hash: content_hash.clone(),
-        issuer_did: state
-            .identity
-            .as_ref()
-            .map(|id| id.did_key().to_string())
-            .unwrap_or_else(|| "did:local:unknown".to_string()),
-        signature_hex: "0".repeat(128), // placeholder — real signing requires InstanceIdentity
-        issued_at: Utc::now(),
-        reason: body.reason.clone(),
-    };
+    // Build and persist a really signed tombstone. Without an instance
+    // identity we cannot sign: refuse instead of persisting a fake signature.
+    let identity = state.identity.as_ref().ok_or_else(|| {
+        AppError::NotImplemented(
+            "tombstone signing requires an instance identity (none configured)".into(),
+        )
+    })?;
+    let tombstone = crate::sharing::tombstone::sign_tombstone(
+        identity,
+        content_hash.clone(),
+        Utc::now(),
+        body.reason.clone(),
+    );
 
     state
         .orchestrator

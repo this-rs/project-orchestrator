@@ -6109,6 +6109,7 @@ pub enum AppError {
     Unauthorized(String),
     Forbidden(String),
     Conflict(String),
+    NotImplemented(String),
 }
 
 impl IntoResponse for AppError {
@@ -6120,6 +6121,7 @@ impl IntoResponse for AppError {
             AppError::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, msg),
             AppError::Forbidden(msg) => (StatusCode::FORBIDDEN, msg),
             AppError::Conflict(msg) => (StatusCode::CONFLICT, msg),
+            AppError::NotImplemented(msg) => (StatusCode::NOT_IMPLEMENTED, msg),
         };
 
         let body = Json(serde_json::json!({

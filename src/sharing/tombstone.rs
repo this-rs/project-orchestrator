@@ -1,44 +1,58 @@
-//! Tombstone verification utilities (Privacy MVP-B T2).
+//! Tombstone signing and verification (Privacy MVP-B T2).
 //!
-//! Provides signature verification for signed tombstones received
-//! from peers over the P2P transport layer.
+//! Ed25519 signatures over `content_hash|issuer_did|issued_at`, with the
+//! verifying key recovered from the issuer's did:key.
 
+use crate::identity::did::from_did_key;
+use crate::identity::InstanceIdentity;
 use crate::reception::anchor::SignedTombstone;
+use chrono::{DateTime, Utc};
+use ed25519_dalek::{Signature, Verifier};
 
-/// Verify a tombstone's structural integrity.
+/// Verify a tombstone's Ed25519 signature (fail-closed).
 ///
-/// Checks that all required fields are present and the signature
-/// has a valid hex format with minimum length (64 hex chars = 32 bytes).
-///
-/// For full Ed25519 verification, use [`verify_tombstone_ed25519`] when
-/// `ed25519-dalek` is available.
-pub fn verify_tombstone(tombstone: &SignedTombstone, issuer_public_key: &[u8]) -> bool {
-    // Must have a non-empty public key
-    if issuer_public_key.is_empty() {
+/// The issuer's verifying key is recovered from `issuer_did` (did:key), and
+/// the signature must be valid over [`build_signing_payload`]. Any malformed
+/// field (empty hash, non-did:key issuer, bad hex, wrong length) returns `false`.
+pub fn verify_tombstone_ed25519(tombstone: &SignedTombstone) -> bool {
+    if tombstone.content_hash.is_empty() || tombstone.issuer_did.is_empty() {
         return false;
     }
-
-    // Content hash must be non-empty
-    if tombstone.content_hash.is_empty() {
+    let Ok(key) = from_did_key(&tombstone.issuer_did) else {
         return false;
-    }
-
-    // Issuer DID must be non-empty
-    if tombstone.issuer_did.is_empty() {
+    };
+    let Ok(sig_bytes) = hex::decode(&tombstone.signature_hex) else {
         return false;
-    }
-
-    // Signature must be at least 64 hex characters (32 bytes)
-    if tombstone.signature_hex.len() < 64 {
+    };
+    let Ok(signature) = Signature::from_slice(&sig_bytes) else {
         return false;
-    }
+    };
+    key.verify(&build_signing_payload(tombstone), &signature)
+        .is_ok()
+}
 
-    // Signature must be valid hex
-    if hex::decode(&tombstone.signature_hex).is_err() {
-        return false;
-    }
+/// Alias of [`verify_tombstone_ed25519`].
+pub fn verify_tombstone(tombstone: &SignedTombstone) -> bool {
+    verify_tombstone_ed25519(tombstone)
+}
 
-    true
+/// Create a tombstone signed by this instance's identity.
+pub fn sign_tombstone(
+    identity: &InstanceIdentity,
+    content_hash: String,
+    issued_at: DateTime<Utc>,
+    reason: Option<String>,
+) -> SignedTombstone {
+    let mut tombstone = SignedTombstone {
+        content_hash,
+        issuer_did: identity.did_key().to_string(),
+        signature_hex: String::new(),
+        issued_at,
+        reason,
+    };
+    let sig = identity.sign(&build_signing_payload(&tombstone));
+    tombstone.signature_hex = hex::encode(sig.to_bytes());
+    tombstone
 }
 
 /// Build the signing payload for a tombstone (for verification or creation).
@@ -61,81 +75,59 @@ pub fn build_signing_payload(tombstone: &SignedTombstone) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
 
-    fn make_tombstone(sig: &str) -> SignedTombstone {
-        SignedTombstone {
-            content_hash: "abc123def456".to_string(),
-            issuer_did: "did:key:z6MkTest".to_string(),
-            signature_hex: sig.to_string(),
-            issued_at: Utc::now(),
-            reason: Some("test revocation".to_string()),
-        }
+    fn signed() -> SignedTombstone {
+        let id = InstanceIdentity::generate();
+        sign_tombstone(&id, "abc123".into(), Utc::now(), Some("r".into()))
     }
 
     #[test]
-    fn test_valid_tombstone() {
-        // 64 hex chars = 32 bytes
-        let sig = "a".repeat(64);
-        let ts = make_tombstone(&sig);
-        assert!(verify_tombstone(&ts, b"some_public_key"));
+    fn test_valid_signature_accepted() {
+        assert!(verify_tombstone(&signed()));
     }
 
     #[test]
-    fn test_long_valid_signature() {
-        // 128 hex chars (Ed25519 signature = 64 bytes)
-        let sig = "ab".repeat(64);
-        let ts = make_tombstone(&sig);
-        assert!(verify_tombstone(&ts, b"key"));
+    fn test_placeholder_zero_signature_rejected() {
+        let mut ts = signed();
+        ts.signature_hex = "0".repeat(128);
+        assert!(!verify_tombstone(&ts));
     }
 
     #[test]
-    fn test_empty_signature_rejected() {
-        let ts = make_tombstone("");
-        assert!(!verify_tombstone(&ts, b"key"));
+    fn test_forged_other_key_rejected() {
+        let mut ts = signed();
+        let other = InstanceIdentity::generate();
+        ts.issuer_did = other.did_key().to_string();
+        assert!(!verify_tombstone(&ts));
     }
 
     #[test]
-    fn test_short_signature_rejected() {
-        let ts = make_tombstone("abcd1234");
-        assert!(!verify_tombstone(&ts, b"key"));
+    fn test_tampered_content_rejected() {
+        let mut ts = signed();
+        ts.content_hash = "other".into();
+        assert!(!verify_tombstone(&ts));
     }
 
     #[test]
-    fn test_invalid_hex_rejected() {
-        let sig = "g".repeat(64); // 'g' is not valid hex
-        let ts = make_tombstone(&sig);
-        assert!(!verify_tombstone(&ts, b"key"));
-    }
-
-    #[test]
-    fn test_empty_public_key_rejected() {
-        let sig = "a".repeat(64);
-        let ts = make_tombstone(&sig);
-        assert!(!verify_tombstone(&ts, b""));
-    }
-
-    #[test]
-    fn test_empty_content_hash_rejected() {
-        let sig = "a".repeat(64);
-        let mut ts = make_tombstone(&sig);
+    fn test_malformed_rejected() {
+        let mut ts = signed();
+        ts.signature_hex = "g".repeat(128);
+        assert!(!verify_tombstone(&ts));
+        let mut ts = signed();
+        ts.signature_hex = String::new();
+        assert!(!verify_tombstone(&ts));
+        let mut ts = signed();
+        ts.issuer_did = "did:local:unknown".into();
+        assert!(!verify_tombstone(&ts));
+        let mut ts = signed();
         ts.content_hash = String::new();
-        assert!(!verify_tombstone(&ts, b"key"));
-    }
-
-    #[test]
-    fn test_empty_issuer_did_rejected() {
-        let sig = "a".repeat(64);
-        let mut ts = make_tombstone(&sig);
-        ts.issuer_did = String::new();
-        assert!(!verify_tombstone(&ts, b"key"));
+        assert!(!verify_tombstone(&ts));
     }
 
     #[test]
     fn test_signing_payload_format() {
-        let ts = make_tombstone("aa");
-        let payload = build_signing_payload(&ts);
-        let payload_str = String::from_utf8(payload).unwrap();
-        assert!(payload_str.starts_with("abc123def456|did:key:z6MkTest|"));
+        let ts = signed();
+        let payload = String::from_utf8(build_signing_payload(&ts)).unwrap();
+        assert!(payload.starts_with("abc123|did:key:"));
     }
 }

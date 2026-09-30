@@ -93,6 +93,9 @@ pub fn build_broadcast_messages(
 
 /// Process an incoming tombstone message.
 ///
+/// The tombstone's Ed25519 signature is verified first; an invalid or forged
+/// tombstone is dropped (fail-closed): no ack, no re-broadcast.
+///
 /// Returns:
 /// - An optional ack (if the sender requested acknowledgement)
 /// - An optional re-broadcast request (if hop_count > 0)
@@ -101,6 +104,23 @@ pub fn handle_incoming_tombstone(
     local_did: &str,
     content_found_locally: bool,
 ) -> (Option<RevocationAck>, Option<RevocationRequest>) {
+    let t = &request.tombstone;
+    let signed = crate::reception::anchor::SignedTombstone {
+        content_hash: t.content_hash.clone(),
+        issuer_did: t.issuer_did.clone(),
+        signature_hex: t.signature_hex.clone(),
+        issued_at: t.issued_at,
+        reason: t.reason.clone(),
+    };
+    if !crate::sharing::tombstone::verify_tombstone_ed25519(&signed) {
+        tracing::warn!(
+            content_hash = %t.content_hash,
+            issuer = %t.issuer_did,
+            "rejecting incoming tombstone: invalid signature"
+        );
+        return (None, None);
+    }
+
     // Build ack if requested
     let ack = if request.ack_requested {
         Some(RevocationAck {
@@ -141,14 +161,31 @@ mod tests {
     use super::*;
 
     fn make_tombstone_payload() -> TombstonePayload {
+        let id = crate::identity::InstanceIdentity::generate();
+        let t = crate::sharing::tombstone::sign_tombstone(
+            &id,
+            "hash123".to_string(),
+            Utc::now(),
+            Some("test".to_string()),
+        );
         TombstonePayload {
-            content_hash: "hash123".to_string(),
-            issuer_did: "did:key:alice".to_string(),
-            signature_hex: "deadbeef".to_string(),
-            issued_at: Utc::now(),
-            reason: Some("test".to_string()),
+            content_hash: t.content_hash,
+            issuer_did: t.issuer_did,
+            signature_hex: t.signature_hex,
+            issued_at: t.issued_at,
+            reason: t.reason,
             ack_requested: true,
         }
+    }
+
+    #[test]
+    fn test_forged_incoming_tombstone_rejected() {
+        let mut p = make_tombstone_payload();
+        p.signature_hex = "0".repeat(128);
+        let req = build_revocation_request(p, false);
+        let (ack, rebroadcast) = handle_incoming_tombstone(&req, "did:key:bob", true);
+        assert!(ack.is_none());
+        assert!(rebroadcast.is_none());
     }
 
     #[test]
