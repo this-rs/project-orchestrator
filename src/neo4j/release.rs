@@ -6,6 +6,14 @@ use anyhow::Result;
 use neo4rs::query;
 use uuid::Uuid;
 
+/// Canonical (snake_case) storage encoding of a release status.
+fn release_status_str(s: &ReleaseStatus) -> String {
+    serde_json::to_value(s)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_default()
+}
+
 impl Neo4jClient {
     // ========================================================================
     // Release operations
@@ -37,7 +45,7 @@ impl Neo4jClient {
             "description",
             release.description.clone().unwrap_or_default(),
         )
-        .param("status", format!("{:?}", release.status))
+        .param("status", release_status_str(&release.status))
         .param("project_id", release.project_id.to_string())
         .param(
             "target_date",
@@ -173,7 +181,7 @@ impl Neo4jClient {
         let mut q = query(&cypher).param("id", id.to_string());
 
         if let Some(ref s) = status {
-            q = q.param("status", format!("{:?}", s));
+            q = q.param("status", release_status_str(s));
         }
         if let Some(d) = target_date {
             q = q.param("target_date", d.to_rfc3339());
@@ -331,7 +339,7 @@ impl Neo4jClient {
         sort_order: &str,
     ) -> Result<(Vec<ReleaseNode>, usize)> {
         let mut where_builder = WhereBuilder::new();
-        where_builder.add_status_filter("r", statuses);
+        where_builder.add_status_filter_any_case("r", statuses);
 
         let where_clause = where_builder.build_and();
         let order_field = match sort_by {

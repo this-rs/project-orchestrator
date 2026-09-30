@@ -34,6 +34,27 @@ pub(crate) fn pascal_to_snake_case(s: &str) -> String {
     result
 }
 
+/// Both on-disk spellings of a status, snake_case first (canonical) then
+/// PascalCase (legacy rows written with `{:?}`). Characters other than
+/// `[A-Za-z0-9_]` are dropped so the result is safe to embed in Cypher text.
+///
+/// Canonical encoding: Release, Milestone and WorkspaceMilestone store
+/// snake_case (`in_progress`); Plan, Task and Step still store PascalCase
+/// (`InProgress`). Reads must accept both (see `pascal_to_snake_case`).
+pub(crate) fn status_variants(s: &str) -> Vec<String> {
+    let clean: String = s
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    let snake = pascal_to_snake_case(&clean);
+    let pascal = snake_to_pascal_case(&snake);
+    if snake == pascal {
+        vec![snake]
+    } else {
+        vec![snake, pascal]
+    }
+}
+
 /// Convert snake_case to PascalCase (e.g., "in_progress" -> "InProgress")
 pub(crate) fn snake_to_pascal_case(s: &str) -> String {
     s.split('_')
@@ -101,6 +122,23 @@ impl WhereBuilder {
                 let pascal_statuses: Vec<String> =
                     statuses.iter().map(|s| snake_to_pascal_case(s)).collect();
                 let p = self.push_param(WhereParam::StrList(pascal_statuses));
+                self.conditions.push(format!("{}.status IN {}", alias, p));
+            }
+        }
+        self
+    }
+
+    /// Status filter matching both snake_case (canonical) and legacy PascalCase
+    /// rows. Use for entities migrated to snake_case (Release, Milestone).
+    pub fn add_status_filter_any_case(
+        &mut self,
+        alias: &str,
+        statuses: Option<Vec<String>>,
+    ) -> &mut Self {
+        if let Some(statuses) = statuses {
+            if !statuses.is_empty() {
+                let all: Vec<String> = statuses.iter().flat_map(|s| status_variants(s)).collect();
+                let p = self.push_param(WhereParam::StrList(all));
                 self.conditions.push(format!("{}.status IN {}", alias, p));
             }
         }
@@ -724,6 +762,35 @@ mod where_builder_tests {
         assert_eq!(
             wb.params(),
             &[("wb_0".to_string(), WhereParam::Str(EVIL.to_lowercase()))]
+        );
+    }
+
+    #[test]
+    fn status_variants_cover_both_encodings() {
+        assert_eq!(
+            status_variants("in_progress"),
+            vec!["in_progress", "InProgress"]
+        );
+        assert_eq!(
+            status_variants("InProgress"),
+            vec!["in_progress", "InProgress"]
+        );
+        assert_eq!(status_variants("planned"), vec!["planned", "Planned"]);
+        for v in status_variants("x'] OR true //") {
+            assert!(
+                v.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
+                "{v}"
+            );
+        }
+    }
+
+    #[test]
+    fn any_case_filter_matches_milestone_snake_case() {
+        let mut wb = WhereBuilder::new();
+        wb.add_status_filter_any_case("m", Some(vec!["in_progress".into()]));
+        assert_eq!(
+            wb.params()[0].1,
+            WhereParam::StrList(vec!["in_progress".into(), "InProgress".into()])
         );
     }
 

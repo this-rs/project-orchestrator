@@ -1,6 +1,15 @@
 //! Neo4j Workspace operations
 
-use super::client::{pascal_to_snake_case, snake_to_pascal_case, Neo4jClient};
+use super::client::{pascal_to_snake_case, status_variants, Neo4jClient};
+
+/// Cypher list literal of both status spellings (sanitized by `status_variants`).
+fn status_in_list(s: &str) -> String {
+    let items: Vec<String> = status_variants(s)
+        .iter()
+        .map(|v| format!("'{}'", v))
+        .collect();
+    format!("[{}]", items.join(", "))
+}
 use super::models::*;
 use anyhow::Result;
 use neo4rs::query;
@@ -476,7 +485,7 @@ impl Neo4jClient {
         offset: usize,
     ) -> Result<(Vec<WorkspaceMilestoneNode>, usize)> {
         let status_filter = if let Some(s) = status {
-            format!("WHERE toLower(wm.status) = toLower('{}')", s)
+            format!("WHERE wm.status IN {}", status_in_list(s))
         } else {
             String::new()
         };
@@ -535,8 +544,7 @@ impl Neo4jClient {
             conditions.push(format!("w.id = '{}'", wid));
         }
         if let Some(s) = status {
-            let pascal = snake_to_pascal_case(s);
-            conditions.push(format!("wm.status = '{}'", pascal));
+            conditions.push(format!("wm.status IN {}", status_in_list(s)));
         }
         let where_clause = if conditions.is_empty() {
             String::new()
@@ -580,8 +588,7 @@ impl Neo4jClient {
             conditions.push(format!("w.id = '{}'", wid));
         }
         if let Some(s) = status {
-            let pascal = snake_to_pascal_case(s);
-            conditions.push(format!("wm.status = '{}'", pascal));
+            conditions.push(format!("wm.status IN {}", status_in_list(s)));
         }
         let where_clause = if conditions.is_empty() {
             String::new()
@@ -903,10 +910,12 @@ impl Neo4jClient {
 
     /// Helper to convert Neo4j node to WorkspaceMilestoneNode
     fn node_to_workspace_milestone(&self, node: &neo4rs::Node) -> Result<WorkspaceMilestoneNode> {
-        let status_str: String = node.get("status").unwrap_or_else(|_| "Open".to_string());
-        let status =
-            serde_json::from_str::<MilestoneStatus>(&format!("\"{}\"", status_str.to_lowercase()))
-                .unwrap_or(MilestoneStatus::Open);
+        let status_str: String = node.get("status").unwrap_or_else(|_| "open".to_string());
+        let status = serde_json::from_str::<MilestoneStatus>(&format!(
+            "\"{}\"",
+            pascal_to_snake_case(&status_str)
+        ))
+        .unwrap_or(MilestoneStatus::Open);
 
         let tags: Vec<String> = node.get("tags").unwrap_or_else(|_| vec![]);
 

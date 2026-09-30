@@ -218,7 +218,7 @@ impl SearchPipeline {
 
                 // Signal 2: Recency — exponential decay over days
                 let age_days = (now - note.created_at).num_seconds().max(0) as f64 / 86400.0;
-                let recency_score = (-age_days / 30.0).exp(); // half-life ~30 days
+                let recency_score = (-age_days / 30.0).exp(); // time constant 30 days (half-life ~20.8 days)
 
                 // Signal 3: Energy — already [0, 1]
                 let energy_score = note.computed_energy().clamp(0.0, 1.0);

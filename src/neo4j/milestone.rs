@@ -511,7 +511,7 @@ impl Neo4jClient {
         sort_order: &str,
     ) -> Result<(Vec<MilestoneNode>, usize)> {
         let mut where_builder = WhereBuilder::new();
-        where_builder.add_status_filter("m", statuses);
+        where_builder.add_status_filter_any_case("m", statuses);
 
         let where_clause = where_builder.build_and();
         let order_field = match sort_by {

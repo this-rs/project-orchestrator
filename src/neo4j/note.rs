@@ -1815,9 +1815,14 @@ impl Neo4jClient {
 
     /// Update staleness scores for all active notes.
     ///
+    /// The per-type `base_decay_days` CASE below MUST mirror
+    /// `Note::base_decay_days()` (parity test `staleness_cypher_matches_rust`).
+    /// Assertions are excluded by the WHERE clause (Rust: `f64::MAX`, never stale).
+    ///
     /// The formula incorporates `freshness_pinged_at`: if a linked file was
     /// recently touched by a commit, the note receives a freshness discount
-    /// that decays over 30 days (half-life). This means actively-maintained
+    /// that decays as `exp(-days_since_ping / 30)` (time constant 30 days, i.e.
+    /// a half-life of ~20.8 days). This means actively-maintained
     /// code keeps its linked notes fresher.
     pub async fn update_staleness_scores(&self) -> Result<usize> {
         // This updates staleness based on time since last confirmation,
@@ -1838,6 +1843,7 @@ impl Neo4jClient {
                      WHEN 'gotcha' THEN 180.0
                      WHEN 'guideline' THEN 365.0
                      WHEN 'pattern' THEN 365.0
+                     WHEN 'rfc' THEN 365.0
                      ELSE 90.0
                  END AS base_decay_days,
                  CASE n.importance
@@ -2643,7 +2649,12 @@ impl Neo4jClient {
 
     /// Apply exponential energy decay to all active notes.
     ///
-    /// Formula: `energy = energy × exp(-days_since_last_update / half_life)`,
+    /// Formula: `energy = energy × exp(-days_since_last_update / tau)`, where the
+    /// `half_life` parameter is really a TIME CONSTANT tau (default 90 days,
+    /// `ENERGY_HALF_LIFE_DAYS`): energy halves every `tau·ln2 ≈ 62.4` days.
+    /// NOTE: `Note::computed_energy()` (read-time, used for ranking) uses a true
+    /// half-life `0.5^(t/90)` (halves every 90 days). The two are intentionally
+    /// left as-is: unifying would shift prod ranking and archival thresholds.
     /// then `energy_updated_at = now`.
     ///
     /// **Temporally idempotent**: each call applies only the decay of the time
@@ -3637,5 +3648,45 @@ impl Neo4jClient {
             }
         }
         Ok(synapses)
+    }
+}
+
+#[cfg(test)]
+mod staleness_parity_tests {
+    use crate::notes::models::{Note, NoteType};
+
+    /// Every note type's `WHEN 'x' THEN N` in the staleness Cypher must equal
+    /// `Note::base_decay_days()`; assertions are excluded from the query.
+    #[test]
+    fn staleness_cypher_matches_rust() {
+        let src = include_str!("note.rs");
+        let start = src.find("CASE n.note_type").expect("case");
+        let block = &src[start..start + src[start..].find("END AS base_decay_days").unwrap()];
+        for t in [
+            NoteType::Context,
+            NoteType::Tip,
+            NoteType::Observation,
+            NoteType::Gotcha,
+            NoteType::Guideline,
+            NoteType::Pattern,
+            NoteType::Rfc,
+        ] {
+            let note = Note::new(None, t.clone(), "x".into(), "t".into());
+            let name = t.to_string();
+            let cypher = block
+                .lines()
+                .find_map(|l| {
+                    let l = l.trim();
+                    l.strip_prefix(&format!("WHEN '{}' THEN ", name))
+                        .map(|v| v.parse::<f64>().unwrap())
+                })
+                .unwrap_or(90.0); // ELSE branch
+            assert_eq!(cypher, note.base_decay_days(), "{name}");
+        }
+        assert_eq!(
+            Note::new(None, NoteType::Assertion, "x".into(), "t".into()).base_decay_days(),
+            f64::MAX
+        );
+        assert!(src.contains("n.note_type <> 'assertion'"));
     }
 }
