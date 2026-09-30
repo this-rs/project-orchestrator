@@ -1916,7 +1916,7 @@ pub enum FeatureRole {
 }
 
 /// An entity included in a feature graph (file, function, struct, trait).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FeatureGraphEntity {
     pub entity_type: String,
     pub entity_id: String,
@@ -1929,6 +1929,104 @@ pub struct FeatureGraphEntity {
     /// Allows visualizing the most important nodes in the feature graph.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub importance_score: Option<f64>,
+    /// Source file: the path itself for files, the containing file for
+    /// functions/structs/traits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_path: Option<String>,
+    /// Doc comment of the entity (trimmed, capped at ~400 chars).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub docstring: Option<String>,
+    /// Rust-like signature, e.g. `pub async fn foo(a: T) -> R`, `struct Foo`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+    /// First line of the definition in its file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line_start: Option<u32>,
+    /// Normalized visibility (`public`, `private`, `crate`, `super`, `restricted`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visibility: Option<String>,
+}
+
+/// Maximum number of characters kept from a docstring in feature graph entities.
+pub const FEATURE_GRAPH_DOCSTRING_MAX_CHARS: usize = 400;
+
+/// Trim a docstring and cap it at [`FEATURE_GRAPH_DOCSTRING_MAX_CHARS`] chars
+/// (adding an ellipsis when truncated). Returns `None` for empty/blank input.
+pub fn clean_entity_docstring(raw: &str) -> Option<String> {
+    let t = raw.trim();
+    if t.is_empty() {
+        return None;
+    }
+    if t.chars().count() <= FEATURE_GRAPH_DOCSTRING_MAX_CHARS {
+        return Some(t.to_string());
+    }
+    let cut: String = t.chars().take(FEATURE_GRAPH_DOCSTRING_MAX_CHARS).collect();
+    Some(format!("{}…", cut.trim_end()))
+}
+
+/// Normalize a visibility as stored in Neo4j (`format!("{:?}", Visibility)`,
+/// e.g. `Public`, `InPath("crate::x")`) to a lowercase label.
+pub fn normalize_visibility(raw: &str) -> Option<String> {
+    let t = raw.trim();
+    if t.is_empty() {
+        return None;
+    }
+    Some(if t.starts_with("InPath") {
+        "restricted".to_string()
+    } else {
+        t.to_lowercase()
+    })
+}
+
+fn visibility_prefix(vis: Option<&str>) -> &'static str {
+    match vis {
+        Some("public") => "pub ",
+        Some("crate") => "pub(crate) ",
+        Some("super") => "pub(super) ",
+        Some("restricted") => "pub(in ..) ",
+        _ => "",
+    }
+}
+
+/// Build a function signature from stored node properties.
+/// `params_json` is the JSON array stored in `Function.params`
+/// (`[{"name":..,"type_name":..}]`); invalid/empty JSON yields no params.
+pub fn build_function_signature(
+    name: &str,
+    visibility: Option<&str>,
+    is_async: bool,
+    is_unsafe: bool,
+    params_json: Option<&str>,
+    return_type: Option<&str>,
+) -> String {
+    let params: Vec<Parameter> = params_json
+        .and_then(|j| serde_json::from_str(j).ok())
+        .unwrap_or_default();
+    let params = params
+        .iter()
+        .map(|p| match p.type_name.as_deref().map(str::trim) {
+            Some(t) if !t.is_empty() => format!("{}: {}", p.name, t),
+            _ => p.name.clone(),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut sig = String::from(visibility_prefix(visibility));
+    if is_async {
+        sig.push_str("async ");
+    }
+    if is_unsafe {
+        sig.push_str("unsafe ");
+    }
+    sig.push_str(&format!("fn {}({})", name, params));
+    if let Some(r) = return_type.map(str::trim).filter(|r| !r.is_empty()) {
+        sig.push_str(&format!(" -> {}", r));
+    }
+    sig
+}
+
+/// Build `pub struct Name` / `trait Name` style signatures.
+pub fn build_type_signature(keyword: &str, name: &str, visibility: Option<&str>) -> String {
+    format!("{}{} {}", visibility_prefix(visibility), keyword, name)
 }
 
 /// A relationship between two entities inside a feature graph.
@@ -2750,6 +2848,108 @@ pub struct McpToolNode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── FeatureGraphEntity enrichment ──
+
+    #[test]
+    fn test_signature_pub_async_with_params_and_return() {
+        let sig = build_function_signature(
+            "run",
+            Some("public"),
+            true,
+            false,
+            Some(r#"[{"name":"a","type_name":"T"},{"name":"b","type_name":"U"}]"#),
+            Some("R"),
+        );
+        assert_eq!(sig, "pub async fn run(a: T, b: U) -> R");
+    }
+
+    #[test]
+    fn test_signature_no_params_private() {
+        assert_eq!(
+            build_function_signature("go", Some("private"), false, false, Some("[]"), None),
+            "fn go()"
+        );
+        assert_eq!(
+            build_function_signature("go", None, false, false, Some("not json"), Some("")),
+            "fn go()"
+        );
+    }
+
+    #[test]
+    fn test_signature_untyped_param_and_unsafe_crate() {
+        let sig = build_function_signature(
+            "f",
+            Some("crate"),
+            false,
+            true,
+            Some(r#"[{"name":"self","type_name":null}]"#),
+            None,
+        );
+        assert_eq!(sig, "pub(crate) unsafe fn f(self)");
+    }
+
+    #[test]
+    fn test_signature_struct_and_trait() {
+        assert_eq!(
+            build_type_signature("struct", "Foo", Some("public")),
+            "pub struct Foo"
+        );
+        assert_eq!(build_type_signature("trait", "Bar", None), "trait Bar");
+    }
+
+    #[test]
+    fn test_normalize_visibility_and_docstring() {
+        assert_eq!(normalize_visibility("Public").as_deref(), Some("public"));
+        assert_eq!(
+            normalize_visibility("InPath(\"crate::x\")").as_deref(),
+            Some("restricted")
+        );
+        assert_eq!(normalize_visibility(" "), None);
+        assert_eq!(clean_entity_docstring("  \n "), None);
+        assert_eq!(clean_entity_docstring(" hi \n").as_deref(), Some("hi"));
+        let long = "x".repeat(1000);
+        let c = clean_entity_docstring(&long).unwrap();
+        assert_eq!(c.chars().count(), FEATURE_GRAPH_DOCSTRING_MAX_CHARS + 1);
+        assert!(c.ends_with('…'));
+    }
+
+    #[test]
+    fn test_feature_graph_entity_new_fields_serialization() {
+        let bare = FeatureGraphEntity {
+            entity_type: "function".into(),
+            entity_id: "f".into(),
+            ..Default::default()
+        };
+        let v = serde_json::to_value(&bare).unwrap();
+        for k in [
+            "file_path",
+            "docstring",
+            "signature",
+            "line_start",
+            "visibility",
+        ] {
+            assert!(v.get(k).is_none(), "{k} should be absent");
+        }
+        let full = FeatureGraphEntity {
+            file_path: Some("src/a.rs".into()),
+            docstring: Some("doc".into()),
+            signature: Some("fn f()".into()),
+            line_start: Some(3),
+            visibility: Some("public".into()),
+            ..bare
+        };
+        let v = serde_json::to_value(&full).unwrap();
+        assert_eq!(v["file_path"], "src/a.rs");
+        assert_eq!(v["docstring"], "doc");
+        assert_eq!(v["signature"], "fn f()");
+        assert_eq!(v["line_start"], 3);
+        assert_eq!(v["visibility"], "public");
+        // Old payloads without the new fields still deserialize.
+        let old: FeatureGraphEntity =
+            serde_json::from_str(r#"{"entity_type":"file","entity_id":"a","name":null}"#).unwrap();
+        assert!(old.signature.is_none());
+    }
 
     #[test]
     fn test_workspace_node_serialization() {

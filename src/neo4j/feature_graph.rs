@@ -73,7 +73,15 @@ impl Neo4jClient {
                     COALESCE(e.path, e.name, e.id) AS entity_id,
                     COALESCE(e.name, e.path) AS name,
                     r.role AS role,
-                    e.pagerank AS pagerank",
+                    e.pagerank AS pagerank,
+                    COALESCE(e.file_path, e.path) AS file_path,
+                    left(COALESCE(e.docstring, ''), 2000) AS docstring,
+                    e.visibility AS visibility,
+                    e.line_start AS line_start,
+                    e.params AS params,
+                    e.return_type AS return_type,
+                    COALESCE(e.is_async, false) AS is_async,
+                    COALESCE(e.is_unsafe, false) AS is_unsafe",
         )
         .param("id", id.to_string());
 
@@ -94,12 +102,48 @@ impl Neo4jClient {
                 } else {
                     None
                 };
+                let entity_type = row.get::<String>("entity_type").unwrap_or_default();
+                let name = row.get::<String>("name").ok();
+                let non_empty =
+                    |k: &str| row.get::<String>(k).ok().filter(|v| !v.trim().is_empty());
+                let visibility = non_empty("visibility").and_then(|v| normalize_visibility(&v));
+                let signature = match (entity_type.as_str(), name.as_deref()) {
+                    ("Function", Some(n)) => Some(build_function_signature(
+                        n,
+                        visibility.as_deref(),
+                        row.get::<bool>("is_async").unwrap_or(false),
+                        row.get::<bool>("is_unsafe").unwrap_or(false),
+                        non_empty("params").as_deref(),
+                        non_empty("return_type").as_deref(),
+                    )),
+                    ("Struct", Some(n)) => {
+                        Some(build_type_signature("struct", n, visibility.as_deref()))
+                    }
+                    ("Trait", Some(n)) => {
+                        Some(build_type_signature("trait", n, visibility.as_deref()))
+                    }
+                    ("Enum", Some(n)) => {
+                        Some(build_type_signature("enum", n, visibility.as_deref()))
+                    }
+                    _ => None,
+                };
                 FeatureGraphEntity {
-                    entity_type: row.get::<String>("entity_type").unwrap_or_default(),
+                    entity_type,
                     entity_id: row.get::<String>("entity_id").unwrap_or_default(),
-                    name: row.get::<String>("name").ok(),
+                    name,
                     role: row.get::<String>("role").ok(),
                     importance_score,
+                    file_path: non_empty("file_path"),
+                    docstring: row
+                        .get::<String>("docstring")
+                        .ok()
+                        .and_then(|d| clean_entity_docstring(&d)),
+                    signature,
+                    line_start: row
+                        .get::<i64>("line_start")
+                        .ok()
+                        .and_then(|l| u32::try_from(l).ok()),
+                    visibility,
                 }
             })
             .collect();
@@ -821,6 +865,7 @@ impl Neo4jClient {
                 name: Some(func_name.clone()),
                 role: Some(role.to_string()),
                 importance_score: None,
+                ..Default::default()
             });
         }
 
@@ -841,6 +886,7 @@ impl Neo4jClient {
                 name: Some(file_path.clone()),
                 role: Some("support".to_string()),
                 importance_score: None,
+                ..Default::default()
             });
         }
 
@@ -861,6 +907,7 @@ impl Neo4jClient {
                 name: Some(struct_name.clone()),
                 role: Some("data_model".to_string()),
                 importance_score: None,
+                ..Default::default()
             });
         }
 
@@ -881,10 +928,15 @@ impl Neo4jClient {
                 name: Some(trait_name.clone()),
                 role: Some("trait_contract".to_string()),
                 importance_score: None,
+                ..Default::default()
             });
         }
 
-        // Relations will be populated when fetching via get_feature_graph_detail
+        // Re-read through the enriched detail query (docstring, signature, ...);
+        // fall back to the bare in-memory entities if the re-read fails.
+        if let Ok(Some(detail)) = self.get_feature_graph_detail(fg.id).await {
+            return Ok(detail);
+        }
         Ok(FeatureGraphDetail {
             graph: fg,
             entities,
@@ -1077,6 +1129,7 @@ impl Neo4jClient {
                 name: Some(func_name.clone()),
                 role: Some(role.to_string()),
                 importance_score: None,
+                ..Default::default()
             });
         }
 
@@ -1096,6 +1149,7 @@ impl Neo4jClient {
                 name: Some(file_path.clone()),
                 role: Some("support".to_string()),
                 importance_score: None,
+                ..Default::default()
             });
         }
 
@@ -1115,6 +1169,7 @@ impl Neo4jClient {
                 name: Some(struct_name.clone()),
                 role: Some("data_model".to_string()),
                 importance_score: None,
+                ..Default::default()
             });
         }
 
@@ -1134,6 +1189,7 @@ impl Neo4jClient {
                 name: Some(trait_name.clone()),
                 role: Some("trait_contract".to_string()),
                 importance_score: None,
+                ..Default::default()
             });
         }
 

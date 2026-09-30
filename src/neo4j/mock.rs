@@ -7678,16 +7678,75 @@ impl GraphStore for MockGraphStore {
         };
 
         let fg_entities = self.feature_graph_entities.read().await;
+        let funcs = self.functions.read().await;
+        let structs = self.structs_map.read().await;
+        let traits = self.traits_map.read().await;
         let entities = fg_entities
             .get(&id)
             .map(|ents| {
                 ents.iter()
-                    .map(|(et, eid, role)| FeatureGraphEntity {
-                        entity_type: et.clone(),
-                        entity_id: eid.clone(),
-                        name: Some(eid.clone()),
-                        role: role.clone(),
-                        importance_score: None,
+                    .map(|(et, eid, role)| {
+                        let mut ent = FeatureGraphEntity {
+                            entity_type: et.clone(),
+                            entity_id: eid.clone(),
+                            name: Some(eid.clone()),
+                            role: role.clone(),
+                            ..Default::default()
+                        };
+                        match et.to_lowercase().as_str() {
+                            "file" => ent.file_path = Some(eid.clone()),
+                            "function" => {
+                                if let Some(f) = funcs.values().find(|f| &f.name == eid) {
+                                    let vis = normalize_visibility(&format!("{:?}", f.visibility));
+                                    let params = serde_json::to_string(&f.params).ok();
+                                    ent.file_path = Some(f.file_path.clone());
+                                    ent.docstring =
+                                        f.docstring.as_deref().and_then(clean_entity_docstring);
+                                    ent.signature = Some(build_function_signature(
+                                        &f.name,
+                                        vis.as_deref(),
+                                        f.is_async,
+                                        f.is_unsafe,
+                                        params.as_deref(),
+                                        f.return_type.as_deref(),
+                                    ));
+                                    ent.line_start = Some(f.line_start);
+                                    ent.visibility = vis;
+                                }
+                            }
+                            "struct" => {
+                                if let Some(x) = structs.values().find(|x| &x.name == eid) {
+                                    let vis = normalize_visibility(&format!("{:?}", x.visibility));
+                                    ent.file_path = Some(x.file_path.clone());
+                                    ent.docstring =
+                                        x.docstring.as_deref().and_then(clean_entity_docstring);
+                                    ent.signature = Some(build_type_signature(
+                                        "struct",
+                                        &x.name,
+                                        vis.as_deref(),
+                                    ));
+                                    ent.line_start = Some(x.line_start);
+                                    ent.visibility = vis;
+                                }
+                            }
+                            "trait" => {
+                                if let Some(x) = traits.values().find(|x| &x.name == eid) {
+                                    let vis = normalize_visibility(&format!("{:?}", x.visibility));
+                                    ent.file_path = Some(x.file_path.clone());
+                                    ent.docstring =
+                                        x.docstring.as_deref().and_then(clean_entity_docstring);
+                                    ent.signature = Some(build_type_signature(
+                                        "trait",
+                                        &x.name,
+                                        vis.as_deref(),
+                                    ));
+                                    ent.line_start = Some(x.line_start);
+                                    ent.visibility = vis;
+                                }
+                            }
+                            _ => {}
+                        }
+                        ent
                     })
                     .collect()
             })
@@ -8058,6 +8117,7 @@ impl GraphStore for MockGraphStore {
                 name: Some(func_name.clone()),
                 role: Some(role.to_string()),
                 importance_score: None,
+                ..Default::default()
             });
         }
         for file_path in &files {
@@ -8076,6 +8136,7 @@ impl GraphStore for MockGraphStore {
                 name: Some(file_path.clone()),
                 role: Some("support".to_string()),
                 importance_score: None,
+                ..Default::default()
             });
         }
 
@@ -8096,6 +8157,7 @@ impl GraphStore for MockGraphStore {
                 name: Some(struct_name.clone()),
                 role: Some("data_model".to_string()),
                 importance_score: None,
+                ..Default::default()
             });
         }
 
@@ -8116,6 +8178,7 @@ impl GraphStore for MockGraphStore {
                 name: Some(trait_name.clone()),
                 role: Some("trait_contract".to_string()),
                 importance_score: None,
+                ..Default::default()
             });
         }
 
@@ -8297,6 +8360,7 @@ impl GraphStore for MockGraphStore {
                 name: Some(func_name.clone()),
                 role: Some(role.to_string()),
                 importance_score: None,
+                ..Default::default()
             });
         }
         for file_path in &files {
@@ -8315,6 +8379,7 @@ impl GraphStore for MockGraphStore {
                 name: Some(file_path.clone()),
                 role: Some("support".to_string()),
                 importance_score: None,
+                ..Default::default()
             });
         }
         for struct_name in &discovered_structs {
@@ -8333,6 +8398,7 @@ impl GraphStore for MockGraphStore {
                 name: Some(struct_name.clone()),
                 role: Some("data_model".to_string()),
                 importance_score: None,
+                ..Default::default()
             });
         }
         for trait_name in &discovered_traits {
@@ -8351,6 +8417,7 @@ impl GraphStore for MockGraphStore {
                 name: Some(trait_name.clone()),
                 role: Some("trait_contract".to_string()),
                 importance_score: None,
+                ..Default::default()
             });
         }
 
@@ -12859,6 +12926,60 @@ mod tests {
             docstring: None,
             is_external: false,
             source: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_feature_graph_detail_entity_enrichment_round_trip() {
+        let project = test_project();
+        let pid = project.id;
+        let store = MockGraphStore::new();
+        store.create_project(&project).await.unwrap();
+
+        let mut func = make_function("build_system_prompt", "src/prompt.rs", 42);
+        func.is_async = true;
+        func.return_type = Some("String".to_string());
+        func.params = vec![Parameter {
+            name: "ctx".to_string(),
+            type_name: Some("&Ctx".to_string()),
+        }];
+        func.docstring = Some("  Builds the prompt.  ".to_string());
+        store.upsert_function(&func).await.unwrap();
+        store
+            .project_files
+            .write()
+            .await
+            .entry(pid)
+            .or_default()
+            .push("src/prompt.rs".to_string());
+
+        let built = store
+            .auto_build_feature_graph("fg", None, pid, "build_system_prompt", 1, None, None)
+            .await
+            .unwrap();
+        let detail = store
+            .get_feature_graph_detail(built.graph.id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let f = detail
+            .entities
+            .iter()
+            .find(|e| e.entity_type == "function")
+            .expect("function entity");
+        assert_eq!(
+            f.signature.as_deref(),
+            Some("pub async fn build_system_prompt(ctx: &Ctx) -> String")
+        );
+        assert_eq!(f.docstring.as_deref(), Some("Builds the prompt."));
+        assert_eq!(f.file_path.as_deref(), Some("src/prompt.rs"));
+        assert_eq!(f.line_start, Some(42));
+        assert_eq!(f.visibility.as_deref(), Some("public"));
+
+        if let Some(file) = detail.entities.iter().find(|e| e.entity_type == "file") {
+            assert_eq!(file.file_path.as_deref(), Some(file.entity_id.as_str()));
+            assert!(file.signature.is_none());
         }
     }
 
