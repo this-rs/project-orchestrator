@@ -107,7 +107,9 @@ pub struct Wave {
 pub struct WaveTask {
     pub id: Uuid,
     pub title: Option<String>,
-    pub status: String,
+    /// Serialized through serde (`snake_case`, e.g. `in_progress`) like every
+    /// other task status in the API — never through `Debug` (`InProgress`).
+    pub status: TaskStatus,
     pub priority: Option<i32>,
     pub affected_files: Vec<String>,
     pub depends_on: Vec<Uuid>,
@@ -877,7 +879,7 @@ impl Neo4jClient {
                     wave_tasks.push(WaveTask {
                         id: task.id,
                         title: task.title.clone(),
-                        status: format!("{:?}", task.status),
+                        status: task.status.clone(),
                         priority: task.priority,
                         affected_files: task.affected_files.clone(),
                         depends_on: deps_of

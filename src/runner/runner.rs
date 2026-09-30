@@ -1114,7 +1114,7 @@ impl PlanRunner {
             let wave_number = wave_idx + 1;
 
             // Skip waves where all tasks are already completed (resume optimization)
-            let has_pending_tasks = wave.tasks.iter().any(|t| t.status != "completed");
+            let has_pending_tasks = wave.tasks.iter().any(|t| t.status != TaskStatus::Completed);
             if !has_pending_tasks {
                 info!(
                     "Skipping wave {} — all {} tasks already completed",
@@ -1402,10 +1402,10 @@ impl PlanRunner {
             .tasks
             .iter()
             .filter(|t| {
-                if t.status.eq_ignore_ascii_case("completed") {
+                if t.status == TaskStatus::Completed {
                     return false;
                 }
-                if t.status.eq_ignore_ascii_case("blocked") {
+                if t.status == TaskStatus::Blocked {
                     warn!(
                         "Skipping blocked task {}: {}",
                         t.id,

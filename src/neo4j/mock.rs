@@ -3857,7 +3857,7 @@ impl GraphStore for MockGraphStore {
                     wave_tasks.push(WaveTask {
                         id: task.id,
                         title: task.title.clone(),
-                        status: format!("{:?}", task.status),
+                        status: task.status.clone(),
                         priority: task.priority,
                         affected_files: task.affected_files.clone(),
                         depends_on: deps_of
@@ -15638,5 +15638,40 @@ mod tests {
         // Should not error, just no-op
         let result = store.set_watch_enabled(Uuid::new_v4(), false).await;
         assert!(result.is_ok());
+    }
+
+    /// Regression (couac 3): wave task statuses reached the UI as `Debug`
+    /// strings (`"Failed"`, `"InProgress"`), so the runner dashboard's
+    /// lowercase comparisons fell through and showed failed tasks as
+    /// completed. They must serialize like every other `TaskStatus`.
+    #[tokio::test]
+    async fn test_compute_waves_serializes_task_status_as_snake_case() {
+        use crate::test_helpers::{test_plan, test_task_titled};
+
+        let store = MockGraphStore::new();
+        let plan = test_plan();
+        store.create_plan(&plan).await.unwrap();
+
+        let mut done = test_task_titled("done");
+        done.status = TaskStatus::Completed;
+        let mut failed = test_task_titled("failed");
+        failed.status = TaskStatus::Failed;
+        let mut running = test_task_titled("running");
+        running.status = TaskStatus::InProgress;
+        for t in [&done, &failed, &running] {
+            store.create_task(plan.id, t).await.unwrap();
+        }
+
+        let result = store.compute_waves(plan.id).await.unwrap();
+        let json = serde_json::to_value(&result).unwrap();
+        let mut statuses: Vec<String> = json["waves"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|w| w["tasks"].as_array().unwrap().clone())
+            .map(|t| t["status"].as_str().unwrap().to_string())
+            .collect();
+        statuses.sort();
+        assert_eq!(statuses, vec!["completed", "failed", "in_progress"]);
     }
 }

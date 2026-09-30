@@ -11,7 +11,7 @@ use crate::identity::InstanceIdentity;
 use crate::neo4j::models::{
     AffectsRelation, CommitNode, ConstraintNode, DecisionNode, DecisionStatus,
     DecisionTimelineEntry, MilestoneNode, MilestoneStatus, PlanNode, PlanStatus, ReleaseNode,
-    ReleaseStatus, StepNode, TaskNode, TaskWithPlan,
+    ReleaseStatus, StepNode, TaskNode, TaskStatus, TaskWithPlan,
 };
 use crate::neo4j::plan::{compute_file_conflicts, WaveComputationResult};
 use crate::orchestrator::{FileWatcher, Orchestrator};
@@ -5020,7 +5020,8 @@ pub struct DependencyGraphNode {
     pub id: Uuid,
     pub title: Option<String>,
     pub description: String,
-    pub status: String,
+    /// serde `snake_case` (`in_progress`), matching `TaskStatus` everywhere else.
+    pub status: TaskStatus,
     pub priority: Option<i32>,
     #[serde(default)]
     pub tags: Vec<String>,
@@ -5098,7 +5099,7 @@ pub async fn get_plan_dependency_graph(
                 id: t.id,
                 title: t.title,
                 description: t.description,
-                status: format!("{:?}", t.status),
+                status: t.status,
                 priority: t.priority,
                 tags: t.tags,
                 affected_files: t.affected_files,
@@ -6113,7 +6114,7 @@ pub async fn get_project_roadmap(
             id: t.id,
             title: t.title,
             description: t.description,
-            status: format!("{:?}", t.status),
+            status: t.status,
             priority: t.priority,
             tags: t.tags,
             affected_files: t.affected_files,
@@ -7565,7 +7566,7 @@ mod tests {
             id: uuid::Uuid::new_v4(),
             title: Some("Implement API".to_string()),
             description: "Build the REST endpoint".to_string(),
-            status: "Pending".to_string(),
+            status: TaskStatus::InProgress,
             priority: Some(80),
             tags: vec!["api".to_string(), "backend".to_string()],
             affected_files: vec!["src/api.rs".to_string()],
@@ -7604,6 +7605,9 @@ mod tests {
         assert_eq!(json["affected_files"].as_array().unwrap().len(), 1);
         assert_eq!(json["assigned_to"], "agent-1");
         assert_eq!(json["acceptance_criteria"].as_array().unwrap().len(), 1);
+        // Regression: status used to go through `format!("{:?}")` and reach
+        // the UI as "InProgress", which no frontend comparison matched.
+        assert_eq!(json["status"], "in_progress");
     }
 
     #[test]
