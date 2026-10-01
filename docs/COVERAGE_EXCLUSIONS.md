@@ -23,20 +23,14 @@ apparaît un, il s'inscrit dans le tableau ci-dessous comme les autres.
 
 Les 9 exclusions retirées sont `src/neo4j/{client,traits,workspace,milestone,constraint,release,commit,decision,user}.rs`.
 
-**Provenance des chiffres.** Les pourcentages des tableaux ci-dessous viennent
-de la mesure de la tâche 0.3 (`origin/main` @ 962e2119, voir COVERAGE.md) : ce
-sont les chiffres d'AVANT cette PR, c'est-à-dire ce que l'exclusion masquait.
-Les chiffres d'APRÈS sont produits par le premier run du job `coverage` sur
-cette branche — la machine de développement était à une charge moyenne de ~350
-(une vingtaine de sessions parallèles) et un run instrumenté complet y a été
-tué par le système, donc ils ne sont pas recopiés ici de mémoire. Ce qui est
-vérifié en local, lui, l'est pour de bon : les 7 suites de
-`tests/neo4j_store_tests.rs` passent contre un Neo4j réel (conteneur jetable sur
-le port 37687, jamais l'instance de développement sur 7687), en 1,4 s, et
-chacune appelle les méthodes des 9 fichiers dés-exclus.
-Elles le sont dans la **même PR** que les tests qui les couvrent
-(`tests/neo4j_store_tests.rs`, et `tests/workspace_tests.rs` désormais inclus
-dans la commande de couverture de la CI).
+**Provenance des chiffres.** Les pourcentages du tableau « Exclusions
+restantes » viennent de la mesure de la tâche 0.3 (`origin/main` @ 962e2119,
+voir COVERAGE.md) : ce sont les chiffres d'AVANT, c'est-à-dire ce que
+l'exclusion masquait. Les chiffres d'APRÈS, pour les 9 fichiers dés-exclus, sont
+ceux du run CI 36893434053 (section suivante) — mesurés, pas estimés. Les 7
+suites de `tests/neo4j_store_tests.rs` passent aussi contre un Neo4j réel en
+local (conteneur jetable sur le port 37687, jamais l'instance de développement
+sur 7687) et en CI (`Integration Tests` vert).
 
 ## Pourquoi `src/neo4j/*` n'était pas intestable
 
@@ -62,6 +56,50 @@ Ce qui a changé dans cette PR :
    `None`) téléverserait un rapport à 0 % qui ressemblerait à « ce code n'est
    pas testable ». Les suites elles-mêmes paniquent désormais quand `CI` est
    défini et que Neo4j ne répond pas.
+
+## Mesure APRÈS, par fichier dés-exclu (CI, run 36893434053)
+
+Produite par le job `coverage` de la PR #477 (les 9 checks verts, garde-fou
+`assert_lcov_covers.py` compris). Ce sont les chiffres du lcov FUSIONNÉ, donc
+ce que Codecov voit.
+
+| Fichier | avant (baseline 0.3) | après | lignes |
+|---|---|---|---|
+| `src/neo4j/release.rs` | 0 % | **75,2 %** | 209/278 |
+| `src/neo4j/constraint.rs` | 0 % | **73,2 %** | 115/157 |
+| `src/neo4j/client.rs` | 69,8 % | 71,2 % | 302/424 |
+| `src/neo4j/traits.rs` | 68,4 % | 68,4 % | 13/19 |
+| `src/neo4j/workspace.rs` | 0 % | **63,0 %** | 851/1351 |
+| `src/neo4j/milestone.rs` | 0 % | **49,5 %** | 202/408 |
+| `src/neo4j/user.rs` | 0 % | **30,5 %** | 101/331 |
+| `src/neo4j/decision.rs` | 0 % | **23,1 %** | 117/507 |
+| `src/neo4j/commit.rs` | 0 % | **16,2 %** | 74/456 |
+
+**À lire honnêtement : « exclusion retirée » ne veut PAS dire « bien testé ».**
+Sept de ces fichiers partaient de 0 % ; aucun n'atteint 100 %. Trois restent
+faibles et demandent une suite de leur côté :
+
+- `commit.rs` (16,2 %) — les tests couvrent le CRUD et les liens, pas du tout
+  l'analyse de co-changement (`compute_co_changed`, `compute_co_changed_transitive`,
+  `get_co_change_graph`, `get_file_transitive_co_changers`), qui fait l'essentiel
+  du fichier et demande un historique de commits construit.
+- `decision.rs` (23,1 %) — manquent la recherche vectorielle
+  (`search_decisions_by_vector`, `set_decision_embedding`), les relations
+  AFFECTS et la frise (`get_decision_timeline`). La partie vectorielle demande
+  un index HNSW et des embeddings.
+- `user.rs` (30,5 %) — manquent les jetons : `create_refresh_token`,
+  `validate_refresh_token`, `revoke_refresh_token`, les jetons MCP et
+  `revoke_all_user_tokens`. C'est de la surface d'authentification : à couvrir
+  en coordination avec le lot 2.E, pas à l'aveugle.
+
+La tâche 3.1 disait « retirer les exclusions au fur et à mesure que chacun passe
+le seuil ». Ces trois-là ne passent aucun seuil. Ils sont néanmoins **dés-exclus**,
+et c'est délibéré : la contrainte du plan est que le nombre d'exclusions ne peut
+que baisser et qu'on ne gonfle jamais le chiffre en retirant du code du
+dénominateur. Un fichier à 16 % compté honnêtement vaut mieux qu'un fichier à
+16 % caché. Le plancher de chaque fichier est la valeur mesurée ci-dessus : le
+cliquet de la tâche 4.1 (`coverage-floor.json`) doit partir de là, et ces trois
+lignes sont la liste de travail.
 
 ## Exclusions restantes
 
