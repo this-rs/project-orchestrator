@@ -1072,6 +1072,40 @@ pub async fn list_mcp_tokens(
     Ok(Json(tokens))
 }
 
+#[derive(Debug, Serialize)]
+pub struct PurgeMcpTokensResponse {
+    /// How many dead token records were removed.
+    pub purged: u64,
+}
+
+/// DELETE /auth/mcp-tokens — permanently remove the caller's dead MCP token
+/// records: those already revoked, and those past their expiry.
+///
+/// Revocation (`DELETE /auth/mcp-tokens/{jti}`) is what stops a token from
+/// working; it deliberately KEEPS the record, so the inventory still shows
+/// that the token existed and was revoked. This endpoint is the janitor for
+/// that inventory, and it is strictly narrower than it looks:
+///
+/// - it never removes a token that still works — an active record is left
+///   alone, so this cannot be used to disable anything;
+/// - it is scoped to the caller's own `user_id`, so one user cannot purge
+///   another's records;
+/// - removing a dead record cannot bring the token back: the middleware's
+///   `is_mcp_token_active` answers `false` for an unknown `jti`.
+pub async fn purge_mcp_tokens(
+    State(state): State<OrchestratorState>,
+    user: AuthUser,
+) -> Result<Json<PurgeMcpTokensResponse>, AppError> {
+    let purged = state
+        .orchestrator
+        .neo4j()
+        .purge_mcp_tokens(user.user_id)
+        .await?;
+
+    tracing::info!(user = %user.email, purged, "MCP token records purged");
+    Ok(Json(PurgeMcpTokensResponse { purged }))
+}
+
 /// DELETE /auth/mcp-tokens/{jti} — revoke one of the caller's MCP tokens.
 pub async fn revoke_mcp_token(
     State(state): State<OrchestratorState>,
@@ -2337,5 +2371,257 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
+    }
+
+    // ========================================================================
+    // MCP tokens — purge (DELETE /auth/mcp-tokens)
+    //
+    // These are the first tests of the MCP-token endpoints at all. They run
+    // against the in-memory store. NOTE: the Cypher in `neo4j/user.rs` is a
+    // SECOND implementation of the same predicate and is NOT covered here (it
+    // needs a live Neo4j). The two predicates are kept textually parallel on
+    // purpose — "owned by this user AND (revoked OR expired)" — so a reader
+    // can diff them by eye. A drift between them would not be caught by these
+    // tests, which is a real gap, not an oversight.
+    // ========================================================================
+
+    /// Router exposing the four MCP-token routes behind `require_auth`.
+    async fn test_mcp_tokens_app(auth_config: Option<AuthConfig>) -> (Router, OrchestratorState) {
+        let state = make_server_state(auth_config).await;
+        let app = Router::new()
+            .route(
+                "/auth/mcp-tokens",
+                get(list_mcp_tokens)
+                    .post(create_mcp_token)
+                    .delete(purge_mcp_tokens),
+            )
+            .route(
+                "/auth/mcp-tokens/{jti}",
+                axum::routing::delete(revoke_mcp_token),
+            )
+            .layer(from_fn_with_state(state.clone(), require_auth))
+            .with_state(state.clone());
+        (app, state)
+    }
+
+    fn session_for(user_id: uuid::Uuid) -> String {
+        encode_jwt(user_id, "alice@example.com", "Alice", TEST_SECRET, 900).unwrap()
+    }
+
+    /// A purge removes the revoked record and leaves the working one alone.
+    /// This is the property that makes the endpoint safe to expose: it is a
+    /// janitor, never a kill switch.
+    #[tokio::test]
+    async fn a_purge_removes_revoked_records_and_keeps_active_ones() {
+        let (app, state) = test_mcp_tokens_app(Some(test_auth_config())).await;
+        let user = uuid::Uuid::new_v4();
+        let token = session_for(user);
+        let store = state.orchestrator.neo4j();
+        let later = Utc::now() + chrono::Duration::days(30);
+
+        store
+            .create_mcp_token(user, "jti-dead", "revoked one", "mcp:read", later)
+            .await
+            .unwrap();
+        store
+            .create_mcp_token(user, "jti-live", "working one", "mcp:read", later)
+            .await
+            .unwrap();
+        assert!(store.revoke_mcp_token(user, "jti-dead").await.unwrap());
+
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method("DELETE")
+                    .uri("/auth/mcp-tokens")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["purged"], 1, "exactly the revoked record goes");
+
+        let left = store.list_mcp_tokens(user).await.unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].jti, "jti-live", "the working token must survive");
+        assert!(
+            store.is_mcp_token_active("jti-live").await.unwrap(),
+            "purging must not disable a token that still works"
+        );
+    }
+
+    /// THE safety property. Revocation stops a token; a purge erases its
+    /// record. If `is_mcp_token_active` answered `true` for an unknown `jti`,
+    /// purging would RESURRECT every revoked token — the endpoint would be a
+    /// privilege-escalation primitive. It answers `false`, and this test is
+    /// what keeps that true.
+    #[tokio::test]
+    async fn a_purged_record_leaves_its_token_rejected_not_resurrected() {
+        let (_app, state) = test_mcp_tokens_app(Some(test_auth_config())).await;
+        let user = uuid::Uuid::new_v4();
+        let store = state.orchestrator.neo4j();
+
+        store
+            .create_mcp_token(
+                user,
+                "jti-gone",
+                "revoked then purged",
+                "mcp:read",
+                Utc::now() + chrono::Duration::days(30),
+            )
+            .await
+            .unwrap();
+        store.revoke_mcp_token(user, "jti-gone").await.unwrap();
+        assert!(!store.is_mcp_token_active("jti-gone").await.unwrap());
+
+        assert_eq!(store.purge_mcp_tokens(user).await.unwrap(), 1);
+        assert!(
+            store.list_mcp_tokens(user).await.unwrap().is_empty(),
+            "the record is really gone"
+        );
+        assert!(
+            !store.is_mcp_token_active("jti-gone").await.unwrap(),
+            "an unknown jti must stay rejected — this is the fail-closed arm"
+        );
+    }
+
+    /// An expired-but-never-revoked record is dead weight too, and goes.
+    #[tokio::test]
+    async fn a_purge_also_removes_expired_records_that_were_never_revoked() {
+        let (_app, state) = test_mcp_tokens_app(Some(test_auth_config())).await;
+        let user = uuid::Uuid::new_v4();
+        let store = state.orchestrator.neo4j();
+
+        store
+            .create_mcp_token(
+                user,
+                "jti-expired",
+                "lapsed",
+                "mcp:read",
+                Utc::now() - chrono::Duration::days(1),
+            )
+            .await
+            .unwrap();
+        assert!(!store.is_mcp_token_active("jti-expired").await.unwrap());
+
+        assert_eq!(store.purge_mcp_tokens(user).await.unwrap(), 1);
+        assert!(store.list_mcp_tokens(user).await.unwrap().is_empty());
+    }
+
+    /// One user cannot purge another user's records, even dead ones.
+    #[tokio::test]
+    async fn a_purge_never_touches_another_users_records() {
+        let (app, state) = test_mcp_tokens_app(Some(test_auth_config())).await;
+        let mine = uuid::Uuid::new_v4();
+        let theirs = uuid::Uuid::new_v4();
+        let store = state.orchestrator.neo4j();
+        let later = Utc::now() + chrono::Duration::days(30);
+
+        store
+            .create_mcp_token(theirs, "jti-theirs", "not mine", "mcp:read", later)
+            .await
+            .unwrap();
+        store.revoke_mcp_token(theirs, "jti-theirs").await.unwrap();
+
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method("DELETE")
+                    .uri("/auth/mcp-tokens")
+                    .header("authorization", format!("Bearer {}", session_for(mine)))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["purged"], 0, "nothing of mine to purge");
+        assert_eq!(
+            store.list_mcp_tokens(theirs).await.unwrap().len(),
+            1,
+            "the other user's record is untouched"
+        );
+    }
+
+    /// Purging an empty inventory is a no-op, not an error.
+    #[tokio::test]
+    async fn a_purge_with_nothing_to_do_returns_zero() {
+        let (_app, state) = test_mcp_tokens_app(Some(test_auth_config())).await;
+        let user = uuid::Uuid::new_v4();
+        assert_eq!(
+            state
+                .orchestrator
+                .neo4j()
+                .purge_mcp_tokens(user)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    /// The route is behind `require_auth`: no token, no purge.
+    #[tokio::test]
+    async fn a_purge_without_a_token_is_rejected() {
+        let (app, _state) = test_mcp_tokens_app(Some(test_auth_config())).await;
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method("DELETE")
+                    .uri("/auth/mcp-tokens")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// Revoking ONE token must keep its record — otherwise the inventory
+    /// would silently lose the audit trail and `purge` would have no reason
+    /// to exist. Pins the division of labour between the two endpoints.
+    #[tokio::test]
+    async fn revoking_one_token_keeps_its_record_for_the_inventory() {
+        let (app, state) = test_mcp_tokens_app(Some(test_auth_config())).await;
+        let user = uuid::Uuid::new_v4();
+        let store = state.orchestrator.neo4j();
+
+        store
+            .create_mcp_token(
+                user,
+                "jti-audit",
+                "kept for audit",
+                "mcp:read",
+                Utc::now() + chrono::Duration::days(30),
+            )
+            .await
+            .unwrap();
+
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method("DELETE")
+                    .uri("/auth/mcp-tokens/jti-audit")
+                    .header("authorization", format!("Bearer {}", session_for(user)))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        let inventory = store.list_mcp_tokens(user).await.unwrap();
+        assert_eq!(inventory.len(), 1, "revoke keeps the record");
+        assert!(inventory[0].revoked, "and marks it revoked");
     }
 }
