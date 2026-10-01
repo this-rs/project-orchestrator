@@ -65,6 +65,10 @@ pub struct ReasonFeedbackRequest {
     /// Optional task ID to increment frustration on failure (biomimicry).
     #[serde(default)]
     pub task_id: Option<Uuid>,
+    /// Optional ProtocolRun ID. On success the persisted tree is linked to
+    /// this run via `REASONING_FOR`, so the run's episode can reference it.
+    #[serde(default)]
+    pub run_id: Option<Uuid>,
 }
 
 /// Feedback outcome.
@@ -286,7 +290,7 @@ pub async fn reason_feedback(
                 match state
                     .orchestrator
                     .neo4j()
-                    .persist_reasoning_tree(&tree, None, None)
+                    .persist_reasoning_tree(&tree, body.run_id.map(|_| "ProtocolRun"), body.run_id)
                     .await
                 {
                     Ok(persisted_id) => {
@@ -505,5 +509,85 @@ mod tests {
         assert!(is_zero_usize(&0));
         assert!(!is_zero_usize(&1));
         assert!(!is_zero_usize(&100));
+    }
+
+    /// Success feedback with a `run_id` must link the persisted tree to the
+    /// ProtocolRun, so `get_run_reasoning_tree_id` finds it.
+    #[tokio::test]
+    async fn test_feedback_success_links_tree_to_run() {
+        use crate::events::{EventBus, HybridEmitter};
+        use crate::neo4j::mock::MockGraphStore;
+        use crate::neo4j::traits::GraphStore;
+        use crate::orchestrator::watcher::FileWatcher;
+        use crate::orchestrator::Orchestrator;
+        use std::sync::Arc;
+
+        let graph = Arc::new(MockGraphStore::new());
+        let mut state = crate::test_helpers::mock_app_state_with_graph(graph.clone());
+        let mut cfg = (*state.config).clone();
+        cfg.embedding_provider = Some("http".to_string());
+        cfg.embedding_url = Some("http://127.0.0.1:1/v1/embeddings".to_string());
+        state.config = Arc::new(cfg);
+
+        let event_bus = Arc::new(HybridEmitter::new(Arc::new(EventBus::default())));
+        let orchestrator = Arc::new(
+            Orchestrator::with_event_bus(state, event_bus.clone())
+                .await
+                .unwrap(),
+        );
+        let watcher = FileWatcher::new(orchestrator.clone());
+        let server = Arc::new(crate::api::handlers::ServerState {
+            orchestrator: orchestrator.clone(),
+            watcher: Arc::new(tokio::sync::RwLock::new(watcher)),
+            chat_manager: None,
+            event_bus,
+            nats_emitter: None,
+            auth_config: None,
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+            setup_completed: true,
+            server_port: 6600,
+            public_url: None,
+            remote_mcp: crate::RemoteMcpConfig::default(),
+            ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
+            registry_remote_url: None,
+            oidc_client: None,
+            neural_router: crate::test_helpers::mock_neural_router(),
+            trajectory_collector: std::sync::RwLock::new(None),
+            trajectory_store_neo4j: None,
+            trajectory_store: None,
+            identity: None,
+            reactor_counters: std::sync::OnceLock::new(),
+            confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
+            mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
+            model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
+            vault: crate::vault::VaultService::ephemeral(),
+        });
+
+        let tree = crate::reasoning::ReasoningTree::new("how to link runs", None);
+        let tree_id = tree.id;
+        orchestrator
+            .reasoning_engine()
+            .expect("reasoning engine")
+            .cache()
+            .insert(tree)
+            .await;
+
+        let run_id = Uuid::new_v4();
+        let body: ReasonFeedbackRequest = serde_json::from_value(json!({
+            "followed_nodes": [Uuid::new_v4()],
+            "outcome": "success",
+            "run_id": run_id
+        }))
+        .unwrap();
+
+        let resp = reason_feedback(State(server), Path(tree_id), Json(body))
+            .await
+            .unwrap();
+        assert!(resp.0.tree_persisted);
+        assert_eq!(
+            graph.get_run_reasoning_tree_id(run_id).await.unwrap(),
+            Some(tree_id)
+        );
     }
 }
