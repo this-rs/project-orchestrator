@@ -633,7 +633,7 @@ fn environment_tool() -> ToolDefinition {
 fn vault_tool() -> ToolDefinition {
     ToolDefinition {
         name: "vault".to_string(),
-        description: "Use the user's secrets vault without ever seeing a value. Actions: list_available (names + whether this session may read each; never values), request_secret (ask the user for a secret: a secure input card appears in the chat — then END YOUR TURN and wait; you are told when it is available). To USE a granted secret, run it in the shell so the value never enters your context: `orchestrator secret exec -e VAR=NAME -- cmd args` (preferred), or `orchestrator secret get NAME | cmd --password-stdin`. Never echo or print a secret.".to_string(),
+        description: "Use the user's secrets vault without ever seeing a value. Actions: list_available, request_secret. list_available returns names and whether this session may read each, never values. request_secret asks the user for a secret through a secure input card in the chat: END YOUR TURN after calling it and wait, you are told when it is available. To USE a granted secret, run it in the shell so the value never enters your context: `orchestrator secret exec -e VAR=NAME -- cmd args` (preferred), or `orchestrator secret get NAME | cmd --password-stdin`. Never echo or print a secret.".to_string(),
         input_schema: InputSchema {
             schema_type: "object".to_string(),
             properties: Some(json!({
