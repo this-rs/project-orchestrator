@@ -791,7 +791,7 @@ impl Config {
     /// exist, falls back to pure env var / defaults (backward compatible).
     pub fn from_yaml_and_env(yaml_path: Option<&Path>) -> Result<Self> {
         // 1. Load YAML config (or defaults if file not found)
-        let (yaml, resolved_path) = Self::load_yaml_with_path(yaml_path);
+        let (yaml, resolved_path) = Self::load_yaml_with_path(yaml_path)?;
 
         // 2. Build Config with env var overrides
         Ok(Self {
@@ -919,10 +919,12 @@ impl Config {
     /// Load and parse a YAML config file, returning both the config and the
     /// resolved file path (if found). The path is `None` when no config file
     /// was found on disk.
-    fn load_yaml_with_path(yaml_path: Option<&Path>) -> (YamlConfig, Option<std::path::PathBuf>) {
+    fn load_yaml_with_path(
+        yaml_path: Option<&Path>,
+    ) -> Result<(YamlConfig, Option<std::path::PathBuf>)> {
         // If an explicit path was given, use it directly.
         if let Some(path) = yaml_path {
-            return (Self::try_load_yaml(path), Some(path.to_path_buf()));
+            return Ok((Self::try_load_yaml(path)?, Some(path.to_path_buf())));
         }
 
         // Otherwise, try multiple search paths in priority order.
@@ -946,10 +948,10 @@ impl Config {
 
         for path in &candidates {
             if path.exists() {
-                let result = Self::try_load_yaml(path);
-                // try_load_yaml logs on success — return if we got a non-default config
-                // (we always return the first file found, even if it has parse errors)
-                return (result, Some(path.clone()));
+                // We always use the first file found; a parse error is
+                // propagated rather than silently falling back to defaults.
+                let result = Self::try_load_yaml(path)?;
+                return Ok((result, Some(path.clone())));
             }
         }
 
@@ -957,25 +959,30 @@ impl Config {
             "No config file found in search paths ({:?}), using env vars / defaults",
             candidates
         );
-        (YamlConfig::default(), None)
+        Ok((YamlConfig::default(), None))
     }
 
     /// Attempt to load and parse a single YAML config file.
-    fn try_load_yaml(path: &Path) -> YamlConfig {
+    ///
+    /// An unreadable/missing file yields defaults, but a file that exists and
+    /// cannot be parsed is an error: falling back to defaults would look like
+    /// a fresh install (`setup_completed: false`).
+    fn try_load_yaml(path: &Path) -> Result<YamlConfig> {
         match std::fs::read_to_string(path) {
             Ok(contents) => match serde_yaml::from_str(&contents) {
                 Ok(config) => {
                     tracing::info!("Loaded config from {}", path.display());
-                    config
+                    Ok(config)
                 }
-                Err(e) => {
-                    tracing::warn!("Failed to parse {}: {}. Using defaults.", path.display(), e);
-                    YamlConfig::default()
-                }
+                Err(e) => Err(anyhow::anyhow!(
+                    "Failed to parse config file {}: {}",
+                    path.display(),
+                    e
+                )),
             },
             Err(e) => {
                 tracing::debug!("Could not read {}: {}", path.display(), e);
-                YamlConfig::default()
+                Ok(YamlConfig::default())
             }
         }
     }
@@ -2983,5 +2990,22 @@ chat:
             "error should name the port: {err}"
         );
         drop(holder);
+    }
+
+    /// A config file that exists but cannot be parsed must be reported, not
+    /// silently replaced by defaults (which would look like a first run).
+    #[test]
+    fn from_yaml_and_env_errors_on_malformed_yaml() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("config.yaml");
+        std::fs::write(&file_path, "setup_completed: [oops\n").unwrap();
+
+        let err = Config::from_yaml_and_env(Some(&file_path))
+            .expect_err("a malformed config file must be an error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(&file_path.display().to_string()),
+            "error should name the file: {msg}"
+        );
     }
 }
