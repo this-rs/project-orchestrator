@@ -548,6 +548,11 @@ mod tests {
 
     /// Build an app with a pre-seeded project so sharing endpoints find it.
     async fn test_app_with_project() -> (axum::Router, String) {
+        test_app_with_project_identity(true).await
+    }
+
+    /// `with_identity = false` models an instance that cannot sign tombstones.
+    async fn test_app_with_project_identity(with_identity: bool) -> (axum::Router, String) {
         let app_state = mock_app_state();
         let project = test_project();
         let slug = project.slug.clone();
@@ -578,7 +583,8 @@ mod tests {
             trajectory_collector: std::sync::RwLock::new(None),
             trajectory_store_neo4j: None,
             trajectory_store: None,
-            identity: None,
+            identity: with_identity
+                .then(|| Arc::new(crate::identity::InstanceIdentity::generate())),
             reactor_counters: std::sync::OnceLock::new(),
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
@@ -963,6 +969,15 @@ mod tests {
         assert_eq!(json["content_hash"], "sha256:deadbeef");
         assert_eq!(json["tombstone_persisted"], true);
         assert_eq!(json["event_recorded"], true);
+    }
+
+    #[tokio::test]
+    async fn test_retract_without_identity_is_refused_not_faked() {
+        let (app, slug) = test_app_with_project_identity(false).await;
+        let uri = format!("/api/projects/{}/sharing/retract", slug);
+        let body = serde_json::json!({ "content_hash": "sha256:deadbeef" });
+        let resp = app.oneshot(auth_post(&uri, body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
     }
 
     #[tokio::test]
