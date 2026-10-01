@@ -662,6 +662,25 @@ async fn enrichment_project_id(
         .map(|p| p.id)
 }
 
+/// Server secrets an agent must not inherit, among those present.
+///
+/// Not listed on purpose: `ANTHROPIC_API_KEY` and `CLAUDE_CODE_OAUTH_TOKEN` —
+/// the CLI itself needs them to authenticate.
+pub(crate) const SERVER_ONLY_SECRETS: &[&str] = &[
+    "NEO4J_PASSWORD",
+    "MEILISEARCH_KEY",
+    "EMBEDDING_API_KEY",
+    "PO_JWT_SECRET",
+];
+
+pub(crate) fn server_secrets_to_hide(present: impl Fn(&str) -> bool) -> Vec<&'static str> {
+    SERVER_ONLY_SECRETS
+        .iter()
+        .copied()
+        .filter(|k| present(k))
+        .collect()
+}
+
 impl ChatManager {
     /// Build the standard enrichment pipeline with optional reasoning engine and trajectory collector.
     ///
@@ -2320,6 +2339,15 @@ impl ChatManager {
                 "PO_SERVER_URL",
                 format!("http://127.0.0.1:{}", self.config.server_port),
             );
+        }
+
+        // The CLI inherits the server's whole environment, and so does every
+        // shell the agent opens. When the server was configured through env
+        // vars (Docker, .env), its own secrets would sit in the agent's `env`.
+        // Override them with an empty value in the CHILD only — mutating the
+        // server's environment at runtime would race with other threads.
+        for name in server_secrets_to_hide(|k| std::env::var_os(k).is_some()) {
+            builder = builder.env(name, "");
         }
 
         builder.build()
@@ -13429,5 +13457,47 @@ mod tests {
         )
         .await;
         assert!(!inserted);
+    }
+}
+
+#[cfg(test)]
+mod agent_env_tests {
+    use super::server_secrets_to_hide;
+
+    #[test]
+    fn only_the_server_secrets_that_exist_are_hidden() {
+        let present = |k: &str| k == "NEO4J_PASSWORD" || k == "PO_JWT_SECRET";
+        assert_eq!(
+            server_secrets_to_hide(present),
+            vec!["NEO4J_PASSWORD", "PO_JWT_SECRET"]
+        );
+        assert!(server_secrets_to_hide(|_| false).is_empty());
+    }
+
+    #[test]
+    fn the_cli_keeps_the_credentials_it_needs_to_authenticate() {
+        let hidden = server_secrets_to_hide(|_| true);
+        for needed in [
+            "ANTHROPIC_API_KEY",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "PATH",
+            "HOME",
+        ] {
+            assert!(
+                !hidden.contains(&needed),
+                "{needed} must stay visible to the CLI"
+            );
+        }
+        for secret in [
+            "NEO4J_PASSWORD",
+            "MEILISEARCH_KEY",
+            "EMBEDDING_API_KEY",
+            "PO_JWT_SECRET",
+        ] {
+            assert!(
+                hidden.contains(&secret),
+                "{secret} must be hidden from agents"
+            );
+        }
     }
 }
