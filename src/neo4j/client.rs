@@ -844,4 +844,99 @@ mod where_builder_tests {
         // binding must not panic
         let _ = wb.bind(query("RETURN 1"));
     }
+
+    /// `$wb_N` placeholders referenced by a Cypher fragment, sorted and deduped.
+    fn referenced(cypher: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let b = cypher.as_bytes();
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] == b'$' {
+                let start = i + 1;
+                let mut j = start;
+                while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+                    j += 1;
+                }
+                out.push(cypher[start..j].to_string());
+                i = j;
+            } else {
+                i += 1;
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// Clause <-> params coherence: every placeholder the clause references is
+    /// carried by `params()` (which `bind` sets one-to-one), and no parameter
+    /// is bound without being referenced. No Neo4j needed.
+    fn assert_coherent(wb: &WhereBuilder, label: &str) {
+        let clause = wb.build();
+        let mut bound: Vec<String> = wb.params().iter().map(|(n, _)| n.clone()).collect();
+        bound.sort();
+        assert_eq!(referenced(&clause), bound, "{label}: {clause}");
+        assert_eq!(referenced(&wb.build_and()), bound, "{label} (and)");
+        // binding must succeed for the same set
+        let _ = wb.bind(query("RETURN 1"));
+    }
+
+    #[test]
+    fn every_builder_method_binds_exactly_what_its_clause_references() {
+        let mut wb = WhereBuilder::new();
+        assert_coherent(&wb, "empty");
+
+        wb.add_status_filter("t", Some(vec!["in_progress".into(), EVIL.into()]));
+        assert_coherent(&wb, "status");
+        wb.add_status_filter_any_case("m", Some(vec!["planned".into(), EVIL.into()]));
+        assert_coherent(&wb, "any_case");
+        wb.add_priority_filter("t", Some(1), Some(5));
+        assert_coherent(&wb, "priority");
+        wb.add_tags_filter("t", Some(vec!["a".into(), EVIL.into(), "c".into()]));
+        assert_coherent(&wb, "tags");
+        wb.add_assigned_to_filter("t", Some(EVIL));
+        assert_coherent(&wb, "assigned");
+        wb.add_search_filter("t", Some(EVIL));
+        assert_coherent(&wb, "search");
+        wb.add_bound("x.k = {}", WhereParam::Str(EVIL.into()));
+        wb.add_static("x.flag IS NULL");
+        assert_coherent(&wb, "bound+static");
+        // status 1 + any_case 1 + tags 3 + assigned 1 + search 1 + bound 1
+        assert_eq!(wb.params().len(), 8);
+    }
+
+    #[test]
+    fn note_where_binds_exactly_what_its_clause_references() {
+        use crate::notes::{NoteFilters, NoteImportance, NoteStatus, NoteType};
+        let full = NoteFilters {
+            status: Some(vec![NoteStatus::Active, NoteStatus::Stale]),
+            note_type: Some(vec![NoteType::Guideline]),
+            importance: Some(vec![NoteImportance::High]),
+            tags: Some(vec![EVIL.into(), "b".into()]),
+            search: Some(EVIL.into()),
+            min_staleness: Some(0.1),
+            max_staleness: Some(0.9),
+            ..Default::default()
+        };
+        let pid = Some(uuid::Uuid::new_v4());
+        for (label, p, ws, f) in [
+            ("none", None, None, NoteFilters::default()),
+            ("project", pid, None, full.clone()),
+            ("workspace", None, Some(EVIL), full.clone()),
+            ("project wins", pid, Some(EVIL), full.clone()),
+            (
+                "global",
+                None,
+                Some(EVIL),
+                NoteFilters {
+                    global_only: Some(true),
+                    ..full.clone()
+                },
+            ),
+        ] {
+            let wb = crate::neo4j::note::build_note_where(p, ws, &f);
+            assert_coherent(&wb, label);
+            assert!(!wb.build().contains("OR 1=1"), "{label}");
+        }
+    }
 }
