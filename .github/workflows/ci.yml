@@ -258,7 +258,9 @@ jobs:
           NEO4J_PASSWORD: testpassword
           MEILISEARCH_URL: http://localhost:7700
           MEILISEARCH_KEY: test-master-key
-        run: cargo test --test integration_tests --test data_migrations --test workspace_tests
+        run: |
+          cargo test --test integration_tests --test data_migrations \
+            --test workspace_tests --test neo4j_store_tests
 
   # ==========================================================================
   # API Tests - Downloads pre-built binary, requires Neo4j and Meilisearch
@@ -410,18 +412,67 @@ jobs:
           timeout 60 bash -c 'until curl -sf http://localhost:7700/health > /dev/null 2>&1; do sleep 2; done'
           echo "Neo4j + Meilisearch ready"
 
-      # Coverage spans unit/mock tests (MockGraphStore, MCP/Plan/Note managers,
-      # parser) AND the Neo4j integration tests. Neo4j + Meilisearch services are
-      # provisioned above so the neo4j GraphStore implementations are exercised
-      # and counted toward coverage instead of being excluded.
-      - name: Generate coverage report (unit + integration)
+      # Coverage is collected in SEVERAL runs whose profraw data is then MERGED
+      # into a single lcov (`--no-report` accumulates, `llvm-cov report` merges).
+      # One run cannot do it: the unit tests span the whole workspace while the
+      # Neo4j/Meilisearch suites are per-test-target, and a single invocation
+      # would hide one behind the other.
+      #
+      # `clean --workspace` first, so stale profraw from the cargo cache cannot
+      # inflate the numbers.
+      - name: Reset coverage profile data
+        run: cargo llvm-cov clean --workspace
+
+      # (1) Unit tests, whole workspace (member crates carry their own suites).
+      # `test_large_index_performance` is a wall-clock assertion that does not
+      # hold under llvm-cov instrumentation — skipped here, still run by the
+      # Unit Tests job. See docs/COVERAGE.md.
+      - name: Collect coverage — unit tests (workspace)
+        run: |
+          cargo llvm-cov --no-report --no-fail-fast \
+            --workspace --exclude project-orchestrator-desktop --lib \
+            -- --skip test_large_index_performance
+
+      # (2) Parser tests — no service needed.
+      - name: Collect coverage — parser tests
+        run: cargo llvm-cov --no-report --no-fail-fast --test parser_tests
+
+      # (3) The suites that talk to the REAL Neo4j provisioned above. This is
+      # what makes src/neo4j/* measurable instead of excluded: every GraphStore
+      # method here runs against Neo4j, so its lines count.
+      - name: Collect coverage — Neo4j integration suites
         env:
           NEO4J_URI: bolt://localhost:7687
           NEO4J_USER: neo4j
           NEO4J_PASSWORD: testpassword
           MEILISEARCH_URL: http://localhost:7700
           MEILISEARCH_KEY: test-master-key
-        run: cargo llvm-cov --lib --test parser_tests --test integration_tests --test data_migrations --lcov --output-path lcov.info
+        run: |
+          cargo llvm-cov --no-report --no-fail-fast \
+            --test integration_tests \
+            --test data_migrations \
+            --test workspace_tests \
+            --test neo4j_store_tests
+
+      # (4) Merge every run above into one lcov.
+      - name: Merge coverage runs into a single lcov
+        run: cargo llvm-cov report --lcov --output-path lcov.info
+
+      # Guard: the merged report must actually contain the Neo4j lines. Without
+      # it, a silently skipped integration suite (backends_available() returning
+      # false) would upload a report that looks fine while covering nothing.
+      - name: Assert the merged lcov covers src/neo4j
+        run: |
+          python3 scripts/assert_lcov_covers.py lcov.info \
+            src/neo4j/workspace.rs \
+            src/neo4j/milestone.rs \
+            src/neo4j/constraint.rs \
+            src/neo4j/release.rs \
+            src/neo4j/commit.rs \
+            src/neo4j/decision.rs \
+            src/neo4j/user.rs \
+            src/neo4j/traits.rs \
+            src/neo4j/client.rs
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v7

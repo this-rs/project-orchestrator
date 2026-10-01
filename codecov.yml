@@ -26,37 +26,31 @@ ignore:
   - "src/api/ws_chat_handler.rs"
   - "src/api/chat_handlers.rs"
   - "src/chat/**"
-  # Neo4j client — all methods require a running Neo4j instance.
-  # Tested by integration tests (ci.yml: integration-tests, api-tests jobs).
-  # Unit tests use MockGraphStore (mock.rs) which is fully covered.
-  # Note: client.rs was decomposed into domain files — all need live Neo4j.
-  - "src/neo4j/client.rs"
-  - "src/neo4j/impl_graph_store.rs"
-  - "src/neo4j/analytics.rs"
-  - "src/neo4j/chat.rs"
-  - "src/neo4j/code.rs"
-  - "src/neo4j/commit.rs"
-  - "src/neo4j/constraint.rs"
-  - "src/neo4j/decision.rs"
-  - "src/neo4j/feature_graph.rs"
-  - "src/neo4j/milestone.rs"
-  - "src/neo4j/note.rs"
-  - "src/neo4j/plan.rs"
-  - "src/neo4j/project.rs"
-  - "src/neo4j/release.rs"
-  - "src/neo4j/step.rs"
-  - "src/neo4j/task.rs"
-  - "src/neo4j/user.rs"
-  - "src/neo4j/workspace.rs"
-  - "src/neo4j/persona.rs"
-  - "src/neo4j/event_trigger.rs"
-  - "src/neo4j/plan_run.rs"
+  # Neo4j layer — NOT excluded because it needs a live Neo4j: the CI provisions
+  # one (integration-tests, api-tests, coverage jobs), so these files are
+  # measurable. What is left below is untested code with an owner, tracked one
+  # by one in docs/COVERAGE_EXCLUSIONS.md. The count may only go down.
+  #
+  # Removed 2026-10-01 together with the tests that cover them
+  # (tests/neo4j_store_tests.rs + tests/workspace_tests.rs, now part of the
+  # coverage job's merged lcov): client, traits, workspace, milestone,
+  # constraint, release, commit, decision, user.
+  - "src/neo4j/analytics.rs"       # needs the GDS plugin, absent from CI (APOC only)
+  - "src/neo4j/chat.rs"            # needs the fake CLI of task 3.2
+  - "src/neo4j/code.rs"            # code-intelligence suite, task 2.B
+  - "src/neo4j/event_trigger.rs"   # task 2.C
+  - "src/neo4j/feature_graph.rs"   # task 2.B
+  - "src/neo4j/impl_graph_store.rs" # rises as the per-domain suites land
+  - "src/neo4j/note.rs"            # task 2.D
+  - "src/neo4j/persona.rs"         # task 2.D
+  - "src/neo4j/plan.rs"            # task 2.C
+  - "src/neo4j/plan_run.rs"        # task 2.C
+  - "src/neo4j/project.rs"         # task 2.B
+  - "src/neo4j/step.rs"            # task 2.C
+  - "src/neo4j/task.rs"            # task 2.C
   # Route registration — pure infrastructure (just .route() wiring).
   # No business logic to unit-test; covered by integration/API tests.
   - "src/api/routes.rs"
-  # GraphStore trait definition — only trait signatures + async_trait.
-  # No logic to test; implementations are tested via MockGraphStore and integration tests.
-  - "src/neo4j/traits.rs"
   # Server bootstrap — start_server / start_setup_server bind Axum servers,
   # read env vars, and configure middleware. Pure infrastructure, not unit-testable.
   # Covered by integration/API tests (ci.yml jobs).
