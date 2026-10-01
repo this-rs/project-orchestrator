@@ -11,7 +11,12 @@
 //      propre docs/diagrams/INDEX.yml pour les diagrammes dont le .mmd vit chez lui ; toute
 //      collision entre cet index local et celui-ci est une erreur, et les fichiers qu'il
 //      possede ne sont pas comptes comme orphelins ici ;
-//   6. liste les fichiers source sans diagramme proprietaire (orphelins) et tient a jour
+//   6. SEULE une entree `verified` possede : une entree `planned` ne designe aucun fichier
+//      ecrit, donc elle ne retire rien du compte des orphelins. Compter ses globs ferait
+//      baisser le plafond d'orphelins sans qu'un seul diagramme soit ecrit : l'index
+//      acheterait du credit sur des intentions. Les `covers` d'une entree `planned` servent
+//      uniquement a reserver un perimetre (regle du proprietaire unique, point 2) ;
+//   7. liste les fichiers source sans diagramme proprietaire (orphelins) et tient a jour
 //      le registre publie docs/diagrams/ORPHANS.md.
 //
 // Usage : node scripts/diagrams/check-index.mjs [options]
@@ -122,7 +127,7 @@ export function sharedOwnership(owners) {
 }
 
 // --- registre publie des orphelins : texte deterministe, sans sha ni date (verifiable hors reseau).
-export function renderOrphans(orphans, totalSources, localIndexes = []) {
+export function renderOrphans(orphans, totalSources, localIndexes = [], reserved = 0) {
   const byRepo = {};
   for (const o of orphans) { const [repo, path] = [o.slice(0, o.indexOf(':')), o.slice(o.indexOf(':') + 1)]; (byRepo[repo] ??= []).push(path); }
   const pct = totalSources ? ((orphans.length / totalSources) * 100).toFixed(1) : '0.0';
@@ -136,6 +141,12 @@ export function renderOrphans(orphans, totalSources, localIndexes = []) {
     'sur ce que la cartographie couvre reellement — on ne reduit pas le denominateur, on la reduit elle.',
     '',
     `**${orphans.length} orphelins sur ${totalSources} fichiers source (${pct} %).**`,
+    '',
+    'SEULE une entree `verified` possede un fichier. Une entree `planned` annonce un perimetre',
+    'sans qu\'un diagramme existe : compter ses globs ferait baisser ce nombre sans qu\'une ligne',
+    'soit ecrite, et l\'index acheterait du credit sur des intentions.',
+    `Sur les ${orphans.length} orphelins, **${reserved} sont deja reserves** par une entree \`planned\` :`,
+    'leur proprietaire est designe, son diagramme reste a ecrire.',
     '',
     'Regeneration (hors reseau) :',
     '',
@@ -177,6 +188,8 @@ export function localIndexOwners(indexes, files) {
   const owned = new Map();
   for (const { repo, entries } of indexes) {
     for (const e of entries) {
+      // Meme regle que pour notre index : une entree `planned` ne possede rien.
+      if (e.status !== 'verified') continue;
       for (const g of e.covers) {
         const m = g.match(/^([a-z]+):(.+)$/);
         // Un index local ne possede que des chemins de SON depot : un glob qui en designe un
@@ -240,7 +253,8 @@ function main() {
   const localIndexes = readLocalIndexes(files);
   const elsewhere = localIndexOwners(localIndexes, files);
 
-  const owners = new Map();
+  const owners = new Map();        // intention : qui a RESERVE le fichier (toutes entrees)
+  const ownedByVerified = new Map(); // possession : qui en REPOND vraiment (entrees verified)
   const problems = [];
   const names = new Set();
   const superseded = [];
@@ -265,7 +279,11 @@ function main() {
       const re = globToRegExp(pat);
       const hits = files[repo].filter((f) => re.test(f));
       if (!hits.length) problems.push(`${e.name} : le glob ne matche aucun fichier : ${g}`);
-      for (const h of hits) { const k = `${repo}:${h}`; owners.set(k, [...(owners.get(k) ?? []), e.name]); }
+      for (const h of hits) {
+        const k = `${repo}:${h}`;
+        owners.set(k, [...(owners.get(k) ?? []), e.name]);
+        if (e.status === 'verified') ownedByVerified.set(k, e.name);
+      }
     }
   }
 
@@ -296,14 +314,19 @@ function main() {
     for (const f of list) {
       if (!SOURCE[repo].some((r) => r.test(f)) || NOT_SOURCE.some((r) => r.test(f))) continue;
       const key = `${repo}:${f}`;
-      if (!owners.has(key) && !elsewhere.has(key)) orphans.push(key);
+      if (!ownedByVerified.has(key) && !elsewhere.has(key)) orphans.push(key);
     }
   }
   orphans.sort();
 
   const totalSources = Object.entries(files).reduce((n, [repo, list]) => n + list.filter((f) => SOURCE[repo].some((r) => r.test(f)) && !NOT_SOURCE.some((r) => r.test(f))).length, 0);
   const nVerified = entries.filter((e) => e.status === 'verified').length;
-  console.log(`${entries.length} diagrammes indexes (${nVerified} verified, ${entries.length - nVerified} planned) ; ${totalSources} fichiers source ; ${orphans.length} orphelins (sans diagramme proprietaire)`);
+  // Sous-ensemble STRICT des orphelins : un fichier dont une entree `planned` annonce le
+  // perimetre. Compter toutes les cles de `owners` gonflerait le chiffre avec des fichiers qui
+  // ne sont pas du code source (Cargo.toml, workflows, docs) et qui ne sont donc pas orphelins.
+  const reserved = orphans.filter((o) => owners.has(o)).length;
+  console.log(`${entries.length} diagrammes indexes (${nVerified} verified, ${entries.length - nVerified} planned) ; ${totalSources} fichiers source ; ${orphans.length} orphelins (aucun diagramme VERIFIE ne les couvre)`);
+  console.log(`  dont ${reserved} reserves par une entree planned : perimetre annonce, diagramme pas ecrit — ne compte pas comme couvert`);
   for (const { repo, entries: le } of localIndexes) {
     const n = [...elsewhere.keys()].filter((k) => k.startsWith(`${repo}:`)).length;
     console.log(`  index local '${repo}' : ${le.length} diagrammes, ${n} fichiers possedes ailleurs (non comptes ici)`);
@@ -320,7 +343,7 @@ function main() {
     repo,
     diagrams: le.length,
     owned: [...elsewhere.keys()].filter((k) => k.startsWith(`${repo}:`)).length,
-  })));
+  })), reserved);
   if (args.includes('--write-orphans')) {
     writeFileSync(orphansPath, rendered);
     console.log(`${ORPHANS_DOC} regenere (${orphans.length} orphelins)`);

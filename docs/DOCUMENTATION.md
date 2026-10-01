@@ -70,12 +70,34 @@ scanne et synchronise le code (`scan_files`, `init_embedding_provider`) et appar
 pas au runner de plans ; `src/events/reactions.rs` est le jeu de reactions de `EventReactor` et va
 a `po-autonomic`, pas au cycle des plans.
 
+### Seule une entree `verified` possede un fichier
+
+Une entree `planned` **ne possede rien**. Elle annonce un perimetre ; aucun diagramme n'existe,
+personne n'a relu son contenu contre le code. Compter ses `covers` comme de la propriete ferait
+baisser le plafond d'orphelins et taire le gate de derive **sans qu'une seule ligne de diagramme
+soit ecrite** : l'index acheterait du credit sur des intentions. Les `covers` d'une entree
+`planned` servent uniquement a reserver un perimetre, ce qui suffit a faire jouer la regle du
+proprietaire unique.
+
+Cette regle vient du verificateur de nexus (`claude-code-api/tests/diagram_index.rs`,
+`owning_globs`), qui l'appliquait avant cet index. Elle est reprise ici parce qu'elle est juste,
+et elle a change le chiffre affiche dans le mauvais sens — c'est-a-dire le bon.
+
 ### Les orphelins sont publies, pas caches
 
-Un fichier source que nul `covers` ne matche est **orphelin**. La liste complete est generee dans
-`docs/diagrams/ORPHANS.md` et versionnee : **734 orphelins sur 1204 fichiers source (61 %)** a
-l'amorcage. On ne retire pas des fichiers du denominateur pour embellir le chiffre ; on reduit le
-chiffre en ecrivant des diagrammes. Le fichier est deterministe (ni sha ni date) pour servir de
+Un fichier source qu'aucun diagramme **verifie** ne couvre est **orphelin**. La liste complete
+est generee dans `docs/diagrams/ORPHANS.md` et versionnee. Deux chiffres, toujours les deux :
+
+| | |
+|---|---|
+| Fichiers source | 1204 |
+| **Orphelins** (aucun diagramme verifie) | **1201 (99,8 %)** |
+| dont deja **reserves** par une entree `planned` | 470 |
+| Possedes par un diagramme verifie | 3 (via l'index de nexus) |
+
+Les 470 sont un sous-ensemble strict des orphelins : un proprietaire est designe, son diagramme
+reste a ecrire. On ne retire pas des fichiers du denominateur pour embellir le chiffre ; on reduit
+le chiffre en ecrivant des diagrammes. Le fichier est deterministe (ni sha ni date) pour servir de
 gate hors reseau, et il ne s'edite pas a la main.
 
 ### Un depot peut tenir son propre index (et la regle vaut ENTRE les index)
@@ -160,6 +182,7 @@ node --test scripts/diagrams/check-index.test.mjs
 
 Regles verifiees : chaque glob `covers` matche au moins un fichier existant ; **aucun fichier n'est
 couvert par deux diagrammes**, ni ici ni entre cet index et l'index local d'un depot voisin ;
+seule une entree `verified` compte comme proprietaire pour le calcul des orphelins ;
 l'index porte une seule carte `role: index` et elle couvre
 `INDEX.yml` ; toute carte declaree dans `supersedes` a bien disparu de l'index ; chaque entree
 `verified` a son `.mmd` avec les en-tetes `%% name`, `%% covers` (identique a l'index) et
@@ -175,8 +198,11 @@ Les depots voisins sont resolus par `DIAGRAM_ROOT_BACKEND|FRONTEND|NEXUS|WEBSITE
 - 27 diagrammes prevus dans l'index, tous `planned` : **aucun `.mmd` n'existe encore**. Un index de
   27 entrees n'est pas 27 diagrammes ; c'est la liste des proprietaires, et c'est deja ce qui manquait
   au gate de derive.
-- 1204 fichiers source, **731 orphelins (60,7 %)**, listes dans `docs/diagrams/ORPHANS.md`.
-- Zero recouvrement : chaque fichier couvert a exactement un diagramme proprietaire, ici comme
-  entre cet index et celui de nexus (3 diagrammes verifies, 24 fichiers possedes la-bas).
+- 1204 fichiers source, **1201 orphelins (99,8 %)**, dont 470 deja reserves par une entree
+  `planned`. Le seul code reellement couvert par un diagramme verifie l'est par l'index de nexus
+  (3 diagrammes, 24 fichiers possedes la-bas). C'est l'etat honnete : la cartographie n'a pas
+  encore produit un seul diagramme dans ce depot.
+- Zero recouvrement : chaque fichier reserve ou possede l'est par exactement un diagramme, ici
+  comme entre cet index et celui de nexus.
 - Les `covers` ne couvrent que ce que la cartographie a reellement lu ; le reste est orphelin, c'est
   voulu : on ne gonfle pas la couverture.

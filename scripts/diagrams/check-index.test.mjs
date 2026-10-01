@@ -95,18 +95,18 @@ test('localIndexOwners: un index local possede les fichiers de son depot', () =>
 
 test('localIndexOwners: un index local ne peut pas revendiquer un AUTRE depot', () => {
   // Sinon nexus pourrait s'attribuer du code du frontend sans que personne la-bas le sache.
-  const greedy = [{ repo: 'nexus', entries: parseIndex('diagrams:\n  - name: nexus-x\n    covers:\n      - "frontend:src/App.tsx"\n      - "nexus:claude-code-api/src/main.rs"\n') }];
+  const greedy = [{ repo: 'nexus', entries: parseIndex('diagrams:\n  - name: nexus-x\n    status: verified\n    covers:\n      - "frontend:src/App.tsx"\n      - "nexus:claude-code-api/src/main.rs"\n') }];
   const owned = localIndexOwners(greedy, nexusFiles);
   assert.deepEqual([...owned.keys()], ['nexus:claude-code-api/src/main.rs']);
 });
 
 test('localIndexOwners: globs et accolades resolus comme dans l index principal', () => {
-  const idx = [{ repo: 'nexus', entries: parseIndex('diagrams:\n  - name: nexus-y\n    covers:\n      - "nexus:claude-code-api/src/**"\n') }];
+  const idx = [{ repo: 'nexus', entries: parseIndex('diagrams:\n  - name: nexus-y\n    status: verified\n    covers:\n      - "nexus:claude-code-api/src/**"\n') }];
   assert.equal(localIndexOwners(idx, nexusFiles).size, 2);
 });
 
 test('localIndexOwners: entrees sans covers, ou depot absent, ne cassent rien', () => {
-  assert.equal(localIndexOwners([{ repo: 'nexus', entries: [{ name: 'x', covers: [] }] }], nexusFiles).size, 0);
+  assert.equal(localIndexOwners([{ repo: 'nexus', entries: [{ name: 'x', status: 'verified', covers: [] }] }], nexusFiles).size, 0);
   assert.equal(localIndexOwners(nexusIndex, {}).size, 0);
   assert.equal(localIndexOwners([], nexusFiles).size, 0);
 });
@@ -142,8 +142,9 @@ function fixture({ mainCovers, localCovers }) {
     `diagrams:\n  - name: po-carte\n    owner: t\n    status: planned\n    role: index\n    covers:\n      - "backend:docs/diagrams/INDEX.yml"\n  - name: po-x\n    owner: t\n    status: planned\n    covers:\n${mainCovers.map((c) => `      - "${c}"\n`).join('')}`);
   if (localCovers) {
     mkdirSync(join(nx, 'docs/diagrams'), { recursive: true });
+    // verified : seule une entree verified possede un fichier (cf. la regle du plafond d'orphelins)
     writeFileSync(join(nx, 'docs/diagrams/INDEX.yml'),
-      `diagrams:\n  - name: nexus-model-catalogue\n    owner: t\n    status: planned\n    covers:\n${localCovers.map((c) => `      - "${c}"\n`).join('')}`);
+      `diagrams:\n  - name: nexus-model-catalogue\n    owner: t\n    status: verified\n    covers:\n${localCovers.map((c) => `      - "${c}"\n`).join('')}`);
   }
   return { root, be, nx };
 }
@@ -184,7 +185,9 @@ test('gate: sans collision il passe, et le fichier de l index local n est pas or
     const { code, out } = run(be, nx, ['--write-orphans']);
     assert.equal(code, 0, out);
     assert.match(out, /index local 'nexus' : 1 diagrammes, 1 fichiers possedes ailleurs/);
-    assert.match(out, /0 orphelins/);
+    // po-x est `planned` : son perimetre reste orphelin, seul le fichier de nexus est possede.
+    assert.match(out, /1 orphelins/);
+    assert.match(out, /dont 1 reserves par une entree planned/);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -197,8 +200,42 @@ test('gate: sans index local, le fichier du depot voisin est bien orphelin', () 
   try {
     const { code, out } = run(be, nx, ['--write-orphans']);
     assert.equal(code, 0, out);
-    assert.match(out, /1 orphelins/);
+    // sans index local : le fichier de nexus redevient orphelin, et po-x etant `planned`,
+    // src/own.rs l'est aussi -> 2.
+    assert.match(out, /2 orphelins/);
     assert.doesNotMatch(out, /index local/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('localIndexOwners: une entree planned ne possede rien', () => {
+  // La regle vient du verificateur de nexus : compter les globs d'une entree planned
+  // ferait baisser le plafond d'orphelins sans qu'un diagramme soit ecrit.
+  const planned = [{ repo: 'nexus', entries: parseIndex('diagrams:\n  - name: nexus-z\n    status: planned\n    covers:\n      - "nexus:claude-code-api/src/main.rs"\n') }];
+  assert.equal(localIndexOwners(planned, nexusFiles).size, 0);
+  const verified = [{ repo: 'nexus', entries: parseIndex('diagrams:\n  - name: nexus-z\n    status: verified\n    covers:\n      - "nexus:claude-code-api/src/main.rs"\n') }];
+  assert.equal(localIndexOwners(verified, nexusFiles).size, 1);
+});
+
+test('renderOrphans: le registre distingue orphelins et perimetres reserves', () => {
+  const md = renderOrphans(['backend:src/a.rs', 'backend:src/b.rs'], 4, [], 1);
+  assert.match(md, /\*\*2 orphelins sur 4 fichiers source \(50\.0 %\)\.\*\*/);
+  assert.match(md, /SEULE une entree `verified` possede/);
+  assert.match(md, /\*\*1 sont deja reserves\*\* par une entree `planned`/);
+  assert.match(md, /acheterait du credit sur des intentions/);
+});
+
+test('gate: une entree planned ne retire PAS son perimetre des orphelins', () => {
+  // Le coeur de l'honnetete du chiffre : l'index principal n'a que des entrees planned,
+  // donc il ne doit rien couvrir. Sans cette regle, 550 fichiers disparaitraient du compte.
+  const { root, be, nx } = fixture({ mainCovers: ['backend:src/own.rs'], localCovers: null });
+  try {
+    const { code, out } = run(be, nx, ['--write-orphans']);
+    assert.equal(code, 0, out);
+    // src/own.rs est couvert par po-x, mais po-x est `planned` : il reste orphelin.
+    assert.match(out, /2 orphelins/);
+    assert.match(out, /dont 1 reserves par une entree planned/);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
