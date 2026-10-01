@@ -1,0 +1,124 @@
+{
+  "generated_at": "2026-10-01T08:00:00Z",
+  "lanes": [
+    {
+      "id": "455c1fdc-1014-5080-bbc7-3fe935113d29",
+      "slug": "project-orchestrator",
+      "name": "Project Orchestrator"
+    }
+  ],
+  "threads": [
+    {
+      "id": "159467cf-2ff5-568d-bc55-ad703c80f9fc",
+      "title": "Reprise apres echec",
+      "workspace": "project-orchestrator",
+      "band": "running",
+      "stuck_reason": null,
+      "plan": {
+        "id": "5745ee3b-b7b8-5fb1-9b4f-7368f9994388",
+        "title": "Reprise apres echec"
+      },
+      "run": {
+        "id": "c13e9a7a-1962-5431-9721-4f484824f883",
+        "status": "running",
+        "started_at": "2026-10-01T07:40:00Z",
+        "duration_secs": 1200,
+        "cost_usd": 0.9
+      },
+      "session_ids": [
+        "15ebea2b-a139-5155-9522-0c598dcce611",
+        "d3d064f9-51e9-58d1-a3e6-d3c509004758",
+        "0d7be4ab-5225-5fce-81b7-7bc2b81cd6db"
+      ],
+      "sessions": [
+        {
+          "id": "15ebea2b-a139-5155-9522-0c598dcce611",
+          "title": "Tache 1 (ancien run)",
+          "state": "dead",
+          "links": [
+            {
+              "via": "runner_run",
+              "run_id": "4619d1a6-3e12-5faf-a483-b3456ea89d9d",
+              "task_id": null,
+              "plan_id": "5745ee3b-b7b8-5fb1-9b4f-7368f9994388"
+            },
+            {
+              "via": "spawned_by_json",
+              "run_id": "4619d1a6-3e12-5faf-a483-b3456ea89d9d",
+              "task_id": null,
+              "plan_id": "5745ee3b-b7b8-5fb1-9b4f-7368f9994388"
+            }
+          ]
+        },
+        {
+          "id": "d3d064f9-51e9-58d1-a3e6-d3c509004758",
+          "title": "Tache 2 (ancien run, echouee)",
+          "state": "dead",
+          "links": [
+            {
+              "via": "runner_run",
+              "run_id": "4619d1a6-3e12-5faf-a483-b3456ea89d9d",
+              "task_id": null,
+              "plan_id": "5745ee3b-b7b8-5fb1-9b4f-7368f9994388"
+            }
+          ]
+        },
+        {
+          "id": "0d7be4ab-5225-5fce-81b7-7bc2b81cd6db",
+          "title": "Tache 2 (reprise)",
+          "state": "live",
+          "links": [
+            {
+              "via": "runner_run",
+              "run_id": "c13e9a7a-1962-5431-9721-4f484824f883",
+              "task_id": null,
+              "plan_id": "5745ee3b-b7b8-5fb1-9b4f-7368f9994388"
+            },
+            {
+              "via": "spawned_by_json",
+              "run_id": "c13e9a7a-1962-5431-9721-4f484824f883",
+              "task_id": null,
+              "plan_id": "5745ee3b-b7b8-5fb1-9b4f-7368f9994388"
+            }
+          ]
+        }
+      ],
+      "since": "2026-10-01T07:40:00Z",
+      "age_secs": 1200,
+      "waves": [
+        {
+          "wave_number": 1,
+          "points": [
+            {
+              "task_id": "4f29d8db-fb20-5d4a-ba6f-1456661d5730",
+              "status": "done"
+            }
+          ]
+        },
+        {
+          "wave_number": 2,
+          "points": [
+            {
+              "task_id": "8c5e4c57-e06b-56f2-a19f-dc2c7638e8ed",
+              "status": "running"
+            },
+            {
+              "task_id": "df15b918-9e58-5ca5-9f52-ab9e5cccce3e",
+              "status": "pending"
+            }
+          ]
+        }
+      ],
+      "blocked_tasks": [],
+      "resume": null
+    }
+  ],
+  "waiting": [],
+  "orphans": [],
+  "runner": {
+    "status": "free",
+    "busy_with": null
+  },
+  "thinking": [],
+  "unattached": []
+}

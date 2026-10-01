@@ -109,6 +109,34 @@ pub enum ThinkingKind {
     Alert,
 }
 
+/// Which mechanism attaches a chat session to a thread. A session may be
+/// attached by several mechanisms at once (one link per mechanism); a session
+/// with none is reported in `unattached`, never dropped nor filed at random.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LinkVia {
+    /// `(:ChatSession)-[:SPAWNED_BY {type, run_id, task_id}]->(parent)`,
+    /// read by `get_run_sessions`. Carries `run_id` (and `task_id` if known).
+    RunnerRun,
+    /// `ChatSession.spawned_by` JSON written by the runner
+    /// (`{"type":"runner","run_id","plan_id"}`).
+    SpawnedByJson,
+    /// Explicit session -> task association. Carries `task_id`.
+    TaskAssociation,
+    /// Explicit session -> plan association. Carries `plan_id`.
+    PlanAssociation,
+}
+
+/// Liveness of a chat session's CLI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionState {
+    /// The CLI is running.
+    Live,
+    /// The CLI is stopped (a pending request is then an orphan).
+    Dead,
+}
+
 /// One dot of a wave.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -165,6 +193,32 @@ pub struct ResumePreview {
     pub rerun_count: u32,
 }
 
+/// One link between a session and a thread, with its provenance kept.
+///
+/// `run_id` / `task_id` / `plan_id` are those of the mechanism (always
+/// emitted, `null` when the mechanism does not carry them). For a resumed
+/// run, an old session keeps the OLD `run_id` while the thread shows the new
+/// run: the thread stays the one of the same plan.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct SessionLink {
+    pub via: LinkVia,
+    pub run_id: Option<Uuid>,
+    pub task_id: Option<Uuid>,
+    pub plan_id: Option<Uuid>,
+}
+
+/// A chat session of a thread, with every link that attaches it. `links` is
+/// de-duplicated (one entry per distinct link) and never empty.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct ThreadSession {
+    pub id: Uuid,
+    pub title: String,
+    pub state: SessionState,
+    pub links: Vec<SessionLink>,
+}
+
 /// The unit of the cockpit: a thread of work (plan + run + sessions).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -178,8 +232,10 @@ pub struct Thread {
     pub stuck_reason: Option<StuckReason>,
     pub plan: Option<PlanRef>,
     pub run: Option<RunRef>,
-    /// Chat sessions linked to the thread.
+    /// Chat sessions linked to the thread (same order as `sessions`).
     pub session_ids: Vec<Uuid>,
+    /// The same sessions, each with the links (provenance) that attach it.
+    pub sessions: Vec<ThreadSession>,
     /// Since when the thread has been in its band.
     pub since: DateTime<Utc>,
     /// Waiting age in seconds at `generated_at`.
@@ -189,6 +245,19 @@ pub struct Thread {
     pub blocked_tasks: Vec<TaskRef>,
     /// Set when the thread can be resumed.
     pub resume: Option<ResumePreview>,
+}
+
+impl Thread {
+    /// Canonical form of the sessions: links sorted (mechanism order, then
+    /// ids) and de-duplicated, `session_ids` kept in step with `sessions`.
+    /// The order of the sessions themselves is the aggregator's (creation).
+    pub fn sort_sessions(&mut self) {
+        for s in &mut self.sessions {
+            s.links.sort();
+            s.links.dedup();
+        }
+        self.session_ids = self.sessions.iter().map(|s| s.id).collect();
+    }
 }
 
 /// An option offered by a question.
@@ -280,6 +349,26 @@ pub struct ThinkingItem {
     pub age_secs: u64,
 }
 
+/// A chat session with NO link to any thread (free conversation). It is never
+/// ignored: it comes out in its workspace lane with its pending requests, so
+/// a question or permission it is waiting on cannot get lost. Its pending
+/// requests are listed here only (not repeated in `waiting` / `orphans`);
+/// `state` tells whether the CLI is alive (answer) or dead (resume).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct UnattachedSession {
+    pub id: Uuid,
+    /// Slug of the lane (matches `lanes[].slug`).
+    pub workspace_slug: String,
+    pub title: String,
+    pub state: SessionState,
+    /// Pending requests (`thread_id` is always `null`); empty when none.
+    pub pending: Vec<WaitingRequest>,
+    /// Since when the session waits (oldest pending request, else last activity).
+    pub since: DateTime<Utc>,
+    pub age_secs: u64,
+}
+
 /// Full response of `GET /api/attention`: everything the page displays,
 /// without a second call.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -295,6 +384,8 @@ pub struct AttentionResponse {
     pub orphans: Vec<OrphanRequest>,
     pub runner: RunnerState,
     pub thinking: Vec<ThinkingItem>,
+    /// Sessions without any link, grouped by lane — never dropped.
+    pub unattached: Vec<UnattachedSession>,
 }
 
 impl AttentionResponse {
@@ -317,6 +408,25 @@ impl AttentionResponse {
         });
         self.thinking
             .sort_by(|a, b| b.age_secs.cmp(&a.age_secs).then_with(|| a.id.cmp(&b.id)));
+        for t in &mut self.threads {
+            t.sort_sessions();
+        }
+        // Unattached: grouped by lane (lane order = sorted by name), then
+        // oldest first, ties broken by id. Unknown lane slug sorts last.
+        let lane_ix = |slug: &str| {
+            self.lanes
+                .iter()
+                .position(|l| l.slug == slug)
+                .unwrap_or(usize::MAX)
+        };
+        let mut un = std::mem::take(&mut self.unattached);
+        un.sort_by(|a, b| {
+            lane_ix(&a.workspace_slug)
+                .cmp(&lane_ix(&b.workspace_slug))
+                .then(b.age_secs.cmp(&a.age_secs))
+                .then(a.id.cmp(&b.id))
+        });
+        self.unattached = un;
     }
 }
 
@@ -331,8 +441,9 @@ mod tests {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/attention")
     }
 
-    /// The 7 mandatory data sets (file stems).
-    const DATASETS: [&str; 7] = [
+    /// The data sets (file stems): the 7 original ones, then the 3 of the
+    /// session-link amendment.
+    const DATASETS: [&str; 10] = [
         "empty",
         "one_band",
         "four_bands",
@@ -340,6 +451,9 @@ mod tests {
         "orphan",
         "blocked_task",
         "forty_threads",
+        "multi_link",
+        "unattached_waiting",
+        "resumed_run",
     ];
 
     fn ser<T: Serialize>(v: T) -> Value {
@@ -411,6 +525,28 @@ mod tests {
     }
 
     #[test]
+    fn link_via_serializes_snake_case() {
+        use LinkVia::*;
+        assert_eq!(
+            ser([RunnerRun, SpawnedByJson, TaskAssociation, PlanAssociation]),
+            json!([
+                "runner_run",
+                "spawned_by_json",
+                "task_association",
+                "plan_association"
+            ])
+        );
+    }
+
+    #[test]
+    fn session_state_serializes_snake_case() {
+        assert_eq!(
+            ser([SessionState::Live, SessionState::Dead]),
+            json!(["live", "dead"])
+        );
+    }
+
+    #[test]
     fn runner_status_serializes_snake_case() {
         assert_eq!(
             ser([RunnerStatus::Free, RunnerStatus::Busy]),
@@ -443,6 +579,8 @@ mod tests {
             "request_kind": ser([RequestKind::Permission, RequestKind::Question]),
             "runner_status": ser([RunnerStatus::Free, RunnerStatus::Busy]),
             "thinking_kind": ser([ThinkingKind::Rfc, ThinkingKind::Decision, ThinkingKind::NoteReview, ThinkingKind::Alert]),
+            "link_via": ser([LinkVia::RunnerRun, LinkVia::SpawnedByJson, LinkVia::TaskAssociation, LinkVia::PlanAssociation]),
+            "session_state": ser([SessionState::Live, SessionState::Dead]),
         });
         assert_eq!(shared, expected, "enums.json diverges from the Rust enums");
     }
@@ -462,6 +600,7 @@ mod tests {
             orphans: vec![],
             runner: r,
             thinking: vec![],
+            unattached: vec![],
         };
         let v = ser(&resp);
         for key in v.as_object().unwrap().keys() {
@@ -477,6 +616,26 @@ mod tests {
     fn unknown_field_is_rejected() {
         let bad = json!({"status": "free", "busy_with": null, "extra": 1});
         assert!(serde_json::from_value::<RunnerState>(bad).is_err());
+    }
+
+    #[test]
+    fn link_fields_are_always_emitted_and_unknown_ones_rejected() {
+        let l = SessionLink {
+            via: LinkVia::TaskAssociation,
+            run_id: None,
+            task_id: Some(Uuid::nil()),
+            plan_id: None,
+        };
+        assert_eq!(
+            ser(&l),
+            json!({"via": "task_association", "run_id": null,
+                   "task_id": "00000000-0000-0000-0000-000000000000", "plan_id": null})
+        );
+        let bad = json!({"via": "runner_run", "run_id": null, "task_id": null,
+                         "plan_id": null, "extra": 1});
+        assert!(serde_json::from_value::<SessionLink>(bad).is_err());
+        assert!(serde_json::from_value::<LinkVia>(json!("RunnerRun")).is_err());
+        assert!(serde_json::from_value::<SessionState>(json!("Live")).is_err());
     }
 
     #[test]
@@ -551,6 +710,36 @@ mod tests {
 
         let (_, forty) = load("forty_threads");
         assert_eq!(forty.threads.len(), 40);
+
+        // amendment: session links / unattached sessions
+        let (_, multi) = load("multi_link");
+        let counts: Vec<usize> = multi.threads[0]
+            .sessions
+            .iter()
+            .map(|s| s.links.len())
+            .collect();
+        assert!(counts.iter().any(|&n| n >= 2), "a session linked twice");
+        let (_, un) = load("unattached_waiting");
+        assert!(un
+            .unattached
+            .iter()
+            .any(|s| s.state == SessionState::Live && !s.pending.is_empty()));
+        assert!(un.unattached.iter().any(|s| s.state == SessionState::Dead));
+        let (_, res) = load("resumed_run");
+        let t = &res.threads[0];
+        let new_run = t.run.as_ref().unwrap().id;
+        let run_ids: std::collections::HashSet<_> = t
+            .sessions
+            .iter()
+            .flat_map(|s| s.links.iter().filter_map(|l| l.run_id))
+            .collect();
+        assert!(run_ids.contains(&new_run) && run_ids.len() == 2);
+        let plan_ids: std::collections::HashSet<_> = t
+            .sessions
+            .iter()
+            .flat_map(|s| s.links.iter().filter_map(|l| l.plan_id))
+            .collect();
+        assert_eq!(plan_ids.len(), 1, "same plan before and after the resume");
     }
 
     #[test]
@@ -576,6 +765,92 @@ mod tests {
                 "{name}: busy_with iff busy"
             );
         }
+    }
+
+    /// Session-link rules (note 07909b4a): every session of a thread carries
+    /// at least one link, de-duplicated, with the id its mechanism needs; a
+    /// session without link is in `unattached` only, with its own requests.
+    #[test]
+    fn session_links_are_consistent() {
+        for name in DATASETS {
+            let (_, r) = load(name);
+            let mut attached = std::collections::HashSet::new();
+            for t in &r.threads {
+                let ids: Vec<Uuid> = t.sessions.iter().map(|s| s.id).collect();
+                assert_eq!(ids, t.session_ids, "{name}: session_ids == sessions[].id");
+                for s in &t.sessions {
+                    assert!(attached.insert(s.id), "{name}: session in two threads");
+                    assert!(!s.links.is_empty(), "{name}: attached session without link");
+                    let uniq: std::collections::HashSet<_> = s.links.iter().collect();
+                    assert_eq!(uniq.len(), s.links.len(), "{name}: duplicated link");
+                    for l in &s.links {
+                        let ok = match l.via {
+                            LinkVia::RunnerRun => l.run_id.is_some(),
+                            LinkVia::SpawnedByJson => l.run_id.is_some() || l.plan_id.is_some(),
+                            LinkVia::TaskAssociation => l.task_id.is_some(),
+                            LinkVia::PlanAssociation => l.plan_id.is_some(),
+                        };
+                        assert!(ok, "{name}: link {:?} lacks its id", l.via);
+                    }
+                }
+            }
+            let slugs: Vec<&str> = r.lanes.iter().map(|l| l.slug.as_str()).collect();
+            for u in &r.unattached {
+                assert!(!attached.contains(&u.id), "{name}: unattached AND attached");
+                assert!(slugs.contains(&u.workspace_slug.as_str()), "{name}: lane");
+                for p in &u.pending {
+                    assert_eq!(p.session_id, u.id, "{name}: pending of another session");
+                    assert_eq!(p.thread_id, None, "{name}: unattached request has a thread");
+                    assert_eq!(p.workspace, u.workspace_slug);
+                }
+            }
+            // a request attached to a thread points at one of its sessions
+            for w in &r.waiting {
+                if let Some(tid) = w.thread_id {
+                    let t = r.threads.iter().find(|t| t.id == tid).expect("thread");
+                    assert!(
+                        t.session_ids.contains(&w.session_id),
+                        "{name}: {}",
+                        w.request_id
+                    );
+                }
+            }
+            for w in &r.orphans {
+                if let Some(tid) = w.thread_id {
+                    let t = r.threads.iter().find(|t| t.id == tid).expect("thread");
+                    assert!(
+                        t.session_ids.contains(&w.session_id),
+                        "{name}: {}",
+                        w.request_id
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sort_by_age_dedups_links_and_groups_unattached_by_lane() {
+        let (_, mut r) = load("multi_link");
+        let s = &mut r.threads[0].sessions[0];
+        let dup = s.links[0].clone();
+        s.links.push(dup);
+        s.links.reverse();
+        r.sort_by_age();
+        assert_eq!(r.threads[0].sessions[0].links.len(), 3);
+        assert_eq!(r.threads[0].sessions[0].links[0].via, LinkVia::RunnerRun);
+
+        let (_, mut u) = load("unattached_waiting");
+        u.unattached.reverse();
+        u.sort_by_age();
+        let lanes: Vec<&str> = u
+            .unattached
+            .iter()
+            .map(|x| x.workspace_slug.as_str())
+            .collect();
+        assert_eq!(
+            lanes,
+            ["acme-freelance", "project-orchestrator", "studio-site"]
+        );
     }
 
     // ---- byte-identity of the two copies of the fixtures ----

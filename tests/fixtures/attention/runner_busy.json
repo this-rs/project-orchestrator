@@ -33,6 +33,21 @@
       "session_ids": [
         "8788695d-0fc2-5cb0-8fe4-3ba6fba87b84"
       ],
+      "sessions": [
+        {
+          "id": "8788695d-0fc2-5cb0-8fe4-3ba6fba87b84",
+          "title": "Session 1 - Refonte du site",
+          "state": "dead",
+          "links": [
+            {
+              "via": "runner_run",
+              "run_id": "d76b87ef-8917-556c-8a4f-934c21c5428a",
+              "task_id": null,
+              "plan_id": "64e804ae-586b-520e-bb8e-40c34cc3aeb0"
+            }
+          ]
+        }
+      ],
       "since": "2026-10-01T06:00:00Z",
       "age_secs": 7200,
       "waves": [
@@ -91,6 +106,21 @@
       "session_ids": [
         "b4407e64-b4e4-500f-9d54-2d9ae9164241"
       ],
+      "sessions": [
+        {
+          "id": "b4407e64-b4e4-500f-9d54-2d9ae9164241",
+          "title": "Session 1 - Today cockpit",
+          "state": "live",
+          "links": [
+            {
+              "via": "runner_run",
+              "run_id": "ef982668-23d1-521a-831b-85a576827e01",
+              "task_id": null,
+              "plan_id": "030191f0-3710-56aa-81a6-09c27389179c"
+            }
+          ]
+        }
+      ],
       "since": "2026-10-01T07:00:00Z",
       "age_secs": 3600,
       "waves": [
@@ -129,5 +159,6 @@
       "since": "2026-10-01T07:00:00Z"
     }
   },
-  "thinking": []
+  "thinking": [],
+  "unattached": []
 }

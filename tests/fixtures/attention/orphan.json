@@ -28,6 +28,21 @@
       "session_ids": [
         "2b124ec9-df9c-57ba-82a0-c6a2c25d1a31"
       ],
+      "sessions": [
+        {
+          "id": "2b124ec9-df9c-57ba-82a0-c6a2c25d1a31",
+          "title": "Session 1 - Attention backend",
+          "state": "dead",
+          "links": [
+            {
+              "via": "runner_run",
+              "run_id": "cd2f7bfc-6251-5f0b-93aa-e9a2d63d9df9",
+              "task_id": null,
+              "plan_id": "fab52906-c964-5e65-8c69-5c73a1d17cac"
+            }
+          ]
+        }
+      ],
       "since": "2026-09-30T17:00:00Z",
       "age_secs": 54000,
       "waves": [
@@ -71,7 +86,7 @@
     {
       "request_id": "req_o1",
       "kind": "permission",
-      "session_id": "1419fa2d-4646-5ad2-b4e1-9f365f1a2395",
+      "session_id": "2b124ec9-df9c-57ba-82a0-c6a2c25d1a31",
       "thread_id": "d339381a-fc94-5c2f-98b2-38a8a989a33b",
       "workspace": "project-orchestrator",
       "tool_name": "Bash",
@@ -87,5 +102,6 @@
     "status": "free",
     "busy_with": null
   },
-  "thinking": []
+  "thinking": [],
+  "unattached": []
 }

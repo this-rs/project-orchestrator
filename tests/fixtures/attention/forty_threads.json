@@ -27,6 +27,7 @@
       "plan": null,
       "run": null,
       "session_ids": [],
+      "sessions": [],
       "since": "2026-09-30T21:01:57Z",
       "age_secs": 39483,
       "waves": [],
@@ -52,6 +53,21 @@
       },
       "session_ids": [
         "c3be0dbd-9194-5650-a104-616ae4342e34"
+      ],
+      "sessions": [
+        {
+          "id": "c3be0dbd-9194-5650-a104-616ae4342e34",
+          "title": "Session 1 - Fil de travail numero 39 avec un titre assez long pour eprouver le retour a la ligne",
+          "state": "dead",
+          "links": [
+            {
+              "via": "runner_run",
+              "run_id": "25baa3f6-a3ff-56d8-b221-a056fcd5172a",
+              "task_id": null,
+              "plan_id": "8dc6f7ab-4ccb-500e-8282-812f024745b6"
+            }
+          ]
+        }
       ],
       "since": "2026-09-30T21:18:34Z",
       "age_secs": 38486,
@@ -127,6 +143,21 @@
       "session_ids": [
         "183895f2-89de-57e4-92b6-e1330616962b"
       ],
+      "sessions": [
+        {
+          "id": "183895f2-89de-57e4-92b6-e1330616962b",
+          "title": "Session 1 - Fil de travail numero 38 avec un titre assez long pour eprouver le retour a la ligne",
+          "state": "live",
+          "links": [
+            {
+              "via": "runner_run",
+              "run_id": "5562bd2d-c208-5c67-9139-9382044073ee",
+              "task_id": null,
+              "plan_id": "dae27562-f547-529f-9162-6dbc054b893c"
+            }
+          ]
+        }
+      ],
       "since": "2026-09-30T21:35:11Z",
       "age_secs": 37489,
       "waves": [
@@ -189,6 +220,21 @@
       "session_ids": [
         "6f5c0916-9b9c-5598-a0dc-b86936234199"
       ],
+      "sessions": [
+        {
+          "id": "6f5c0916-9b9c-5598-a0dc-b86936234199",
+          "title": "Session 1 - Fil de travail numero 37 avec un titre assez long pour eprouver le retour a la ligne",
+          "state": "live",
+          "links": [
+            {
+              "via": "runner_run",
+              "run_id": "c6f93eb7-182b-5f25-81eb-a3efeb9efb21",
+              "task_id": null,
+              "plan_id": "0892cd61-7338-561e-9abe-22a1a12dc648"
+            }
+          ]
+        }
+      ],
       "since": "2026-09-30T21:51:48Z",
       "age_secs": 36492,
       "waves": [
@@ -237,6 +283,21 @@
       },
       "session_ids": [
         "1ddc07eb-a680-5c4c-97df-b99e7d6e6697"
+      ],
+      "sessions": [
+        {
+          "id": "1ddc07eb-a680-5c4c-97df-b99e7d6e6697",
+          "title": "Session 1 - Fil de travail numero 36 avec un titre assez long pour eprouver le retour a la ligne",
+          "state": "live",
+          "links": [
+            {
+              "via": "runner_run",
+              "run_id": "c9a04b6d-59d3-5c1d-b68d-c7f2eb199d40",
+              "task_id": null,
+              "plan_id": "d4023f1c-88ed-5fb5-93fa-6a79b0ab3307"
+            }
+          ]
+        }
       ],
       "since": "2026-09-30T22:08:25Z",
       "age_secs": 35495,
@@ -301,6 +362,7 @@
       "plan": null,
       "run": null,
       "session_ids": [],
+      "sessions": [],
       "since": "2026-09-30T22:25:02Z",
       "age_secs": 34498,
       "waves": [],
@@ -326,6 +388,21 @@
       },
       "session_ids": [
         "3c24b96c-15ee-5881-a849-148b833a33c8"
+      ],
+      "sessions": [
+        {
+          "id": "3c24b96c-15ee-5881-a849-148b833a33c8",
+          "title": "Session 1 - Fil de travail numero 34 avec un titre assez long pour eprouver le retour a la ligne",
+          "state": "dead",
+          "links": [
+            {
+              "via": "runner_run",
+              "run_id": "f5b9cd74-2fd4-5bfa-bfa3-299483c58806",
+              "task_id": null,
+              "plan_id": "c5fcd69d-1a5f-54ed-847f-a348f722f53a"
+            }
+          ]
+        }
       ],
       "since": "2026-09-30T22:41:39Z",
       "age_secs": 33501,
@@ -383,6 +460,21 @@
       },
       "session_ids": [
         "261b0c1a-1974-5a16-bec7-46abc2ea0bdc"
+      ],
+      "sessions": [
+        {
+          "id": "261b0c1a-1974-5a16-bec7-46abc2ea0bdc",
+          "title": "Session 1 - Fil de travail numero 33 avec un titre assez long pour eprouver le retour a la ligne",
+          "state": "live",
+          "links": [
+            {
+              "via": "runner_run",
+              "run_id": "f4ed3415-0829-5740-89d6-41de8f5580f4",
+              "task_id": null,
+              "plan_id": "58a35f16-cb00-5274-8859-8a3de28b08eb"
+            }
+          ]
+        }
       ],
       "since": "2026-09-30T22:58:16Z",
       "age_secs": 32504,
@@ -445,6 +537,21 @@
       },
       "session_ids": [
         "454be8f5-7f93-5ae6-9298-a6b91eb7546b"
+      ],
+      "sessions": [
+        {
+          "id": "454be8f5-7f93-5ae6-9298-a6b91eb7546b",
+          "title": "Session 1 - Fil de travail numero 32 avec un titre assez long pour eprouver le retour a la ligne",
+          "state": "live",
+          "links": [
+            {
+              "via": "runner_run",
+              "run_id": "feb21f76-b33f-570c-b697-359ad5f098fe",
+              "task_id": null,
+              "plan_id": "9425d043-f516-5bab-a238-44dd12c29f35"
+            }
+          ]
+        }
       ],
       "since": "2026-09-30T23:14:53Z",
       "age_secs": 31507,
@@ -516,6 +623,21 @@
       "session_ids": [
         "8b318276-a6ca-57b5-a24d-33170e46dc5b"
       ],
+      "sessions": [
+        {
+          "id": "8b318276-a6ca-57b5-a24d-33170e46dc5b",
+          "title": "Session 1 - Fil de travail numero 31 avec un titre assez long pour eprouver le retour a la ligne",
+          "state": "live",
+          "links": [
+            {
+              "via": "runner_run",
+              "run_id": "6ee5cd8d-e67c-5f8c-b77d-023660dc379e",
+              "task_id": null,
+              "plan_id": "5714ca22-93c7-5bd8-8d34-4028a6662c6f"
+            }
+          ]
+        }
+      ],
       "since": "2026-09-30T23:31:30Z",
       "age_secs": 30510,
       "waves": [
@@ -562,6 +684,7 @@
       "plan": null,
       "run": null,
       "session_ids": [],
+      "sessions": [],
       "since": "2026-09-30T23:48:07Z",
       "age_secs": 29513,
       "waves": [],
@@ -587,6 +710,21 @@
       },
       "session_ids": [
         "a3eebeec-cf83-5dd5-b826-080398f1ac09"
+      ],
+      "sessions": [
+        {
+          "id": "a3eebeec-cf83-5dd5-b826-080398f1ac09",
+          "title": "Session 1 - Fil de travail numero 29 avec un titre assez long pour eprouver le retour a la ligne",
+          "state": "dead",
+          "links": [
+            {
+              "via": "runner_run",
+              "run_id": "41a50d7c-8174-58d7-ad10-34a776b8d39c",
+              "task_id": null,
+              "plan_id": "c3c696b0-ce10-581f-bdd0-b7446cb418b6"
+            }
+          ]
+        }
       ],
       "since": "2026-10-01T00:04:44Z",
       "age_secs": 28516,
@@ -650,6 +788,21 @@
       "session_ids": [
         "4765eb0d-cd64-533b-8adc-a8554a3220c5"
       ],
+      "sessions": [
+        {
+          "id": "4765eb0d-cd64-533b-8adc-a8554a3220c5",
+          "title": "Session 1 - Fil de travail numero 28 avec un titre assez long pour eprouver le retour a la ligne",
+          "state": "live",
+          "links": [
+            {
+              "via": "runner_run",
+              "run_id": "a4258e36-c147-5aaf-b7f1-20c747859ce7",
+              "task_id": null,
+              "plan_id": "9b49d596-a6fb-5fd8-a251-52bd59150954"
+            }
+          ]
+        }
+      ],
       "since": "2026-10-01T00:21:21Z",
       "age_secs": 27519,
       "waves": [
@@ -710,6 +863,21 @@
       },
       "session_ids": [
         "c3058ab3-be4b-5b11-ba71-28fabfc269b5"
+      ],
+      "sessions": [
+        {
+          "id": "c3058ab3-be4b-5b11-ba71-28fabfc269b5",
+          "title": "Session 1 - Fil de travail numero 27 avec un titre assez long pour eprouver le retour a la ligne",
+          "state": "live",
+          "links": [
+            {
+              "via": "runner_run",
+              "run_id": "79fc923e-1744-556b-8b65-5ad4a1dd4e60",
+              "task_id": null,
+              "plan_id": "6484ba8b-d8c3-50f9-960b-cc3c6440b2e2"
+            }
+          ]
+        }
       ],
       "since": "2026-10-01T00:37:58Z",
       "age_secs": 26522,
@@ -781,6 +949,21 @@
       "session_ids": [
         "7ed00679-bfd5-5013-9a7a-41f7d9a62919"
       ],
+      "sessions": [
+        {
+          "id": "7ed00679-bfd5-5013-9a7a-41f7d9a62919",
+          "title": "Session 1 - Fil de travail numero 26 avec un titre assez long pour eprouver le retour a la ligne",
+          "state": "live",
+          "links": [
+            {
+              "via": "runner_run",
+              "run_id": "703c32ce-ca73-55a7-bfec-873616e6b48b",
+              "task_id": null,
+              "plan_id": "7f4c38d6-6c22-5524-b906-50fe250baed9"
+            }
+          ]
+        }
+      ],
       "since": "2026-10-01T00:54:35Z",
       "age_secs": 25525,
       "waves": [
@@ -832,6 +1015,7 @@
       "plan": null,
       "run": null,
       "session_ids": [],
+      "sessions": [],
       "since": "2026-10-01T01:11:12Z",
       "age_secs": 24528,
       "waves": [],
@@ -857,6 +1041,21 @@
       },
       "session_ids": [
         "202ec034-26b7-5368-9ee1-a46cac4a9a75"
+      ],
+      "sessions": [
+        {
+          "id": "202ec034-26b7-5368-9ee1-a46cac4a9a75",
+          "title": "Session 1 - Fil de travail numero 24 avec un titre assez long pour eprouver le retour a la ligne",
+          "state": "dead",
+          "links": [
+            {
+              "via": "runner_run",
+              "run_id": "c2592ae3-1688-5120-955b-9c31afed87ca",
+              "task_id": null,
+              "plan_id": "ce1f319d-e0be-5a5f-96a5-bcaa6b63cbdf"
+            }
+          ]
+        }
       ],
       "since": "2026-10-01T01:27:49Z",
       "age_secs": 23531,
@@ -936,6 +1135,21 @@
       "session_ids": [
         "e8c189cf-801a-5217-8a48-eec1b2715788"
       ],
+      "sessions": [
+        {
+          "id": "e8c189cf-801a-5217-8a48-eec1b2715788",
+          "title": "Session 1 - Fil de travail numero 23 avec un titre assez long pour eprouver le retour a la ligne",
+          "state": "live",
+          "links": [
+            {
+              "via": "runner_run",
+              "run_id": "505af9c9-f2da-587b-88ab-499801f85cad",
+              "task_id": null,
+              "plan_id": "7bf8d24e-7885-5530-ab5c-f0775cb3859d"
+            }
+          ]
+        }
+      ],
       "since": "2026-10-01T01:44:26Z",
       "age_secs": 22534,
       "waves": [
@@ -1002,6 +1216,21 @@
       "session_ids": [
         "a7cdfbec-ddde-5fb1-9782-c2083540eef9"
       ],
+      "sessions": [
+        {
+          "id": "a7cdfbec-ddde-5fb1-9782-c2083540eef9",
+          "title": "Session 1 - Fil de travail numero 22 avec un titre assez long pour eprouver le retour a la ligne",
+          "state": "live",
+          "links": [
+            {
+              "via": "runner_run",
+              "run_id": "59be7212-19bb-5f13-9364-19fb865ff063",
+              "task_id": null,
+              "plan_id": "fb843d97-6975-5647-85e9-3cb19be2b7c1"
+            }
+          ]
+        }
+      ],
       "since": "2026-10-01T02:01:03Z",
       "age_secs": 21537,
       "waves": [
@@ -1055,6 +1284,21 @@
       "session_ids": [
         "06d8a7bb-a2ff-5976-8168-663c9cc382cc"
       ],
+      "sessions": [
+        {
+          "id": "06d8a7bb-a2ff-5976-8168-663c9cc382cc",
+          "title": "Session 1 - Fil de travail numero 21 avec un titre assez long pour eprouver le retour a la ligne",
+          "state": "live",
+          "links": [
+            {
+              "via": "runner_run",
+              "run_id": "a174b668-f351-5be6-b2e4-6758c26db382",
+              "task_id": null,
+              "plan_id": "08ba90da-6b80-5fa6-9c5e-7f1766c485a5"
+            }
+          ]
+        }
+      ],
       "since": "2026-10-01T02:17:40Z",
       "age_secs": 20540,
       "waves": [
@@ -1106,6 +1350,7 @@
       "plan": null,
       "run": null,
       "session_ids": [],
+      "sessions": [],
       "since": "2026-10-01T02:34:17Z",
       "age_secs": 19543,
       "waves": [],
@@ -1131,6 +1376,21 @@
       },
       "session_ids": [
         "56ed62fe-c2a4-57a8-bdaa-094a3437f12e"
+      ],
+      "sessions": [
+        {
+          "id": "56ed62fe-c2a4-57a8-bdaa-094a3437f12e",
+          "title": "Session 1 - Fil de travail numero 19 avec un titre assez long pour eprouver le retour a la ligne",
+          "state": "dead",
+          "links": [
+            {
+              "via": "runner_run",
+              "run_id": "340bc228-f335-582f-be75-ca68899d7450",
+              "task_id": null,
+              "plan_id": "6d21cadc-4188-5ed7-9dbf-0ea25363cef1"
+            }
+          ]
+        }
       ],
       "since": "2026-10-01T02:50:54Z",
       "age_secs": 18546,
@@ -1192,6 +1452,21 @@
       },
       "session_ids": [
         "f69b378b-bbde-562b-93e3-27d923e50b90"
+      ],
+      "sessions": [
+        {
+          "id": "f69b378b-bbde-562b-93e3-27d923e50b90",
+          "title": "Session 1 - Fil de travail numero 18 avec un titre assez long pour eprouver le retour a la ligne",
+          "state": "live",
+          "links": [
+            {
+              "via": "runner_run",
+              "run_id": "2eef14bf-9f01-5d78-a761-2c30f440a6a7",
+              "task_id": null,
+              "plan_id": "88e87df9-b80a-59b7-892f-3635d41c29e8"
+            }
+          ]
+        }
       ],
       "since": "2026-10-01T03:07:31Z",
       "age_secs": 17549,
@@ -1259,6 +1534,21 @@
       "session_ids": [
         "83257581-226a-5b8b-b23c-00e56d29c589"
       ],
+      "sessions": [
+        {
+          "id": "83257581-226a-5b8b-b23c-00e56d29c589",
+          "title": "Session 1 - Fil de travail numero 17 avec un titre assez long pour eprouver le retour a la ligne",
+          "state": "live",
+          "links": [
+            {
+              "via": "runner_run",
+              "run_id": "933271a5-f830-5775-a230-467dc19bdf4d",
+              "task_id": null,
+              "plan_id": "7ba676e6-76c8-5055-9bae-d1ef2037f3aa"
+            }
+          ]
+        }
+      ],
       "since": "2026-10-01T03:24:08Z",
       "age_secs": 16552,
       "waves": [
@@ -1317,6 +1607,21 @@
       "session_ids": [
         "bcfd8804-bfa9-531f-91ad-89f5048ad1d7"
       ],
+      "sessions": [
+        {
+          "id": "bcfd8804-bfa9-531f-91ad-89f5048ad1d7",
+          "title": "Session 1 - Fil de travail numero 16 avec un titre assez long pour eprouver le retour a la ligne",
+          "state": "live",
+          "links": [
+            {
+              "via": "runner_run",
+              "run_id": "4cc1fc37-835f-5325-b09a-a91e4149d19e",
+              "task_id": null,
+              "plan_id": "973efff5-bac9-5cfd-9fca-dc70513ec5d3"
+            }
+          ]
+        }
+      ],
       "since": "2026-10-01T03:40:45Z",
       "age_secs": 15555,
       "waves": [
@@ -1367,6 +1672,7 @@
       "plan": null,
       "run": null,
       "session_ids": [],
+      "sessions": [],
       "since": "2026-10-01T03:57:22Z",
       "age_secs": 14558,
       "waves": [],
@@ -1392,6 +1698,21 @@
       },
       "session_ids": [
         "49f4246f-a510-5061-a11b-e26ba3dab6af"
+      ],
+      "sessions": [
+        {
+          "id": "49f4246f-a510-5061-a11b-e26ba3dab6af",
+          "title": "Session 1 - Fil de travail numero 14 avec un titre assez long pour eprouver le retour a la ligne",
+          "state": "dead",
+          "links": [
+            {
+              "via": "runner_run",
+              "run_id": "db7fe8d1-ec42-5b47-9964-faf5c9d14aba",
+              "task_id": null,
+              "plan_id": "c28fa845-2ca7-51a4-8218-e4277a5994a5"
+            }
+          ]
+        }
       ],
       "since": "2026-10-01T04:13:59Z",
       "age_secs": 13561,
@@ -1459,6 +1780,21 @@
       "session_ids": [
         "236e5021-1afe-59aa-a6b6-1db61fb2c440"
       ],
+      "sessions": [
+        {
+          "id": "236e5021-1afe-59aa-a6b6-1db61fb2c440",
+          "title": "Session 1 - Fil de travail numero 13 avec un titre assez long pour eprouver le retour a la ligne",
+          "state": "live",
+          "links": [
+            {
+              "via": "runner_run",
+              "run_id": "add551cd-3bf7-504f-863e-7e2b42e424bb",
+              "task_id": null,
+              "plan_id": "db029c13-cb45-55d8-b318-89913f2c6765"
+            }
+          ]
+        }
+      ],
       "since": "2026-10-01T04:30:36Z",
       "age_secs": 12564,
       "waves": [
@@ -1507,6 +1843,21 @@
       },
       "session_ids": [
         "6397edd8-bfcd-541f-8fd4-03cea72c53ee"
+      ],
+      "sessions": [
+        {
+          "id": "6397edd8-bfcd-541f-8fd4-03cea72c53ee",
+          "title": "Session 1 - Fil de travail numero 12 avec un titre assez long pour eprouver le retour a la ligne",
+          "state": "live",
+          "links": [
+            {
+              "via": "runner_run",
+              "run_id": "70b14e66-4032-58bd-8f9d-94f1196e68ba",
+              "task_id": null,
+              "plan_id": "fe1cbb57-c71d-52ed-8faa-6f3f3766d6da"
+            }
+          ]
+        }
       ],
       "since": "2026-10-01T04:47:13Z",
       "age_secs": 11567,
@@ -1582,6 +1933,21 @@
       "session_ids": [
         "e0a64465-af90-59d4-86b4-86c1e67ef2a8"
       ],
+      "sessions": [
+        {
+          "id": "e0a64465-af90-59d4-86b4-86c1e67ef2a8",
+          "title": "Session 1 - Fil de travail numero 11 avec un titre assez long pour eprouver le retour a la ligne",
+          "state": "live",
+          "links": [
+            {
+              "via": "runner_run",
+              "run_id": "e37df6b9-87f0-594c-8841-92284f3f9f2e",
+              "task_id": null,
+              "plan_id": "620a1ca9-6f62-5224-a4c1-399d16c32d86"
+            }
+          ]
+        }
+      ],
       "since": "2026-10-01T05:03:50Z",
       "age_secs": 10570,
       "waves": [
@@ -1637,6 +2003,7 @@
       "plan": null,
       "run": null,
       "session_ids": [],
+      "sessions": [],
       "since": "2026-10-01T05:20:27Z",
       "age_secs": 9573,
       "waves": [],
@@ -1662,6 +2029,21 @@
       },
       "session_ids": [
         "c77a8be8-e75b-5fab-a9ce-60d50f1a4bad"
+      ],
+      "sessions": [
+        {
+          "id": "c77a8be8-e75b-5fab-a9ce-60d50f1a4bad",
+          "title": "Session 1 - Fil de travail numero 9 avec un titre assez long pour eprouver le retour a la ligne",
+          "state": "dead",
+          "links": [
+            {
+              "via": "runner_run",
+              "run_id": "a472b1c7-e63a-590d-8c03-25fe5daf1b49",
+              "task_id": null,
+              "plan_id": "dbfb7719-7f2d-5158-8358-e46e11991867"
+            }
+          ]
+        }
       ],
       "since": "2026-10-01T05:37:04Z",
       "age_secs": 8576,
@@ -1728,6 +2110,21 @@
       },
       "session_ids": [
         "a0653db5-0fdf-5f90-9414-87d2c0977a1a"
+      ],
+      "sessions": [
+        {
+          "id": "a0653db5-0fdf-5f90-9414-87d2c0977a1a",
+          "title": "Session 1 - Fil de travail numero 8 avec un titre assez long pour eprouver le retour a la ligne",
+          "state": "live",
+          "links": [
+            {
+              "via": "runner_run",
+              "run_id": "4fbc0629-3250-5ed6-a0c7-337d80421d9b",
+              "task_id": null,
+              "plan_id": "3b49b891-71f5-50a5-90b8-d9b4d08f1905"
+            }
+          ]
+        }
       ],
       "since": "2026-10-01T05:53:41Z",
       "age_secs": 7579,
@@ -1799,6 +2196,21 @@
       "session_ids": [
         "dd4f1511-0a21-57dc-a6c5-1b3bd07c23b5"
       ],
+      "sessions": [
+        {
+          "id": "dd4f1511-0a21-57dc-a6c5-1b3bd07c23b5",
+          "title": "Session 1 - Fil de travail numero 7 avec un titre assez long pour eprouver le retour a la ligne",
+          "state": "live",
+          "links": [
+            {
+              "via": "runner_run",
+              "run_id": "e00d98b8-cd75-57fe-b60d-5b7dd93342ad",
+              "task_id": null,
+              "plan_id": "8f14d148-1a02-5ff0-972d-1a3138090e97"
+            }
+          ]
+        }
+      ],
       "since": "2026-10-01T06:10:18Z",
       "age_secs": 6582,
       "waves": [
@@ -1856,6 +2268,21 @@
       "session_ids": [
         "8ebfa018-ec5f-56fb-be63-b081abad3bab"
       ],
+      "sessions": [
+        {
+          "id": "8ebfa018-ec5f-56fb-be63-b081abad3bab",
+          "title": "Session 1 - Fil de travail numero 6 avec un titre assez long pour eprouver le retour a la ligne",
+          "state": "live",
+          "links": [
+            {
+              "via": "runner_run",
+              "run_id": "52bb698d-2685-51e8-a32a-d4ebcd7c0481",
+              "task_id": null,
+              "plan_id": "1bc6136f-a0c1-5781-963f-eb3b020f2a81"
+            }
+          ]
+        }
+      ],
       "since": "2026-10-01T06:26:55Z",
       "age_secs": 5585,
       "waves": [
@@ -1911,6 +2338,7 @@
       "plan": null,
       "run": null,
       "session_ids": [],
+      "sessions": [],
       "since": "2026-10-01T06:43:32Z",
       "age_secs": 4588,
       "waves": [],
@@ -1936,6 +2364,21 @@
       },
       "session_ids": [
         "055cd8aa-62ec-5a14-a715-284257922d80"
+      ],
+      "sessions": [
+        {
+          "id": "055cd8aa-62ec-5a14-a715-284257922d80",
+          "title": "Session 1 - Fil de travail numero 4 avec un titre assez long pour eprouver le retour a la ligne",
+          "state": "dead",
+          "links": [
+            {
+              "via": "runner_run",
+              "run_id": "47e784ae-e281-56f2-8523-190ed7e35537",
+              "task_id": null,
+              "plan_id": "51f956fc-c5ab-5a4a-9fa6-b23708e8b9e2"
+            }
+          ]
+        }
       ],
       "since": "2026-10-01T07:00:09Z",
       "age_secs": 3591,
@@ -2001,6 +2444,21 @@
       },
       "session_ids": [
         "7b66cc2e-b324-522f-8ce7-ea869298bcc4"
+      ],
+      "sessions": [
+        {
+          "id": "7b66cc2e-b324-522f-8ce7-ea869298bcc4",
+          "title": "Session 1 - Fil de travail numero 3 avec un titre assez long pour eprouver le retour a la ligne",
+          "state": "live",
+          "links": [
+            {
+              "via": "runner_run",
+              "run_id": "5e3a8ad1-9415-56eb-9b11-57f6f02e3258",
+              "task_id": null,
+              "plan_id": "108a81d2-5cac-541d-98ee-c0b1e3f101ce"
+            }
+          ]
+        }
       ],
       "since": "2026-10-01T07:16:46Z",
       "age_secs": 2594,
@@ -2072,6 +2530,21 @@
       "session_ids": [
         "48527235-6fdc-51f1-84ab-5b0d173a1d04"
       ],
+      "sessions": [
+        {
+          "id": "48527235-6fdc-51f1-84ab-5b0d173a1d04",
+          "title": "Session 1 - Fil de travail numero 2 avec un titre assez long pour eprouver le retour a la ligne",
+          "state": "live",
+          "links": [
+            {
+              "via": "runner_run",
+              "run_id": "b6de6e3d-da48-565e-810b-b7ba3197c434",
+              "task_id": null,
+              "plan_id": "7788fb5d-7fd3-504c-8a4d-b7355860b6b1"
+            }
+          ]
+        }
+      ],
       "since": "2026-10-01T07:33:23Z",
       "age_secs": 1597,
       "waves": [
@@ -2134,6 +2607,21 @@
       "session_ids": [
         "cea45151-a5e7-5ab4-8530-cde5d09ea07f"
       ],
+      "sessions": [
+        {
+          "id": "cea45151-a5e7-5ab4-8530-cde5d09ea07f",
+          "title": "Session 1 - Fil de travail numero 1 avec un titre assez long pour eprouver le retour a la ligne",
+          "state": "live",
+          "links": [
+            {
+              "via": "runner_run",
+              "run_id": "f99136fe-b591-5586-83bb-d5ead3d6fee6",
+              "task_id": null,
+              "plan_id": "4173834d-7970-564f-897c-47e56c9eaf74"
+            }
+          ]
+        }
+      ],
       "since": "2026-10-01T07:50:00Z",
       "age_secs": 600,
       "waves": [
@@ -2168,7 +2656,7 @@
     {
       "request_id": "req_f37",
       "kind": "permission",
-      "session_id": "199c7d0e-1cf7-5ed7-9115-f77320b3907a",
+      "session_id": "183895f2-89de-57e4-92b6-e1330616962b",
       "thread_id": "30cf288c-e2b1-5349-8423-d78275b42735",
       "workspace": "project-orchestrator",
       "tool_name": "Bash",
@@ -2181,7 +2669,7 @@
     {
       "request_id": "req_f32",
       "kind": "permission",
-      "session_id": "71bf6cb9-17c2-54ef-a42e-eabf9e647d3e",
+      "session_id": "261b0c1a-1974-5a16-bec7-46abc2ea0bdc",
       "thread_id": "ef0a2860-cc2f-5934-8275-76f7a22986e9",
       "workspace": "studio-site",
       "tool_name": "Bash",
@@ -2194,7 +2682,7 @@
     {
       "request_id": "req_f27",
       "kind": "permission",
-      "session_id": "93aef050-5062-56dc-a6ff-5016a07f04cb",
+      "session_id": "4765eb0d-cd64-533b-8adc-a8554a3220c5",
       "thread_id": "a76305fa-66b4-578b-935f-967f696c3c0c",
       "workspace": "acme-freelance",
       "tool_name": "Bash",
@@ -2207,7 +2695,7 @@
     {
       "request_id": "req_f22",
       "kind": "permission",
-      "session_id": "2c8abc38-47cf-59bc-8352-f1930270716c",
+      "session_id": "e8c189cf-801a-5217-8a48-eec1b2715788",
       "thread_id": "28ec5bf7-30c2-53fa-8576-9c6d56dfcd1a",
       "workspace": "project-orchestrator",
       "tool_name": "Bash",
@@ -2220,7 +2708,7 @@
     {
       "request_id": "req_f17",
       "kind": "permission",
-      "session_id": "fb5f3e21-b9e1-548e-986c-de10aafc7441",
+      "session_id": "f69b378b-bbde-562b-93e3-27d923e50b90",
       "thread_id": "5a316069-6747-5703-b9b6-818a4f2c59d4",
       "workspace": "studio-site",
       "tool_name": "Bash",
@@ -2233,7 +2721,7 @@
     {
       "request_id": "req_f12",
       "kind": "permission",
-      "session_id": "82e6564a-c125-5810-9f32-399ed5968366",
+      "session_id": "236e5021-1afe-59aa-a6b6-1db61fb2c440",
       "thread_id": "12702388-12d9-51a1-a37a-230579db2288",
       "workspace": "acme-freelance",
       "tool_name": "Bash",
@@ -2246,7 +2734,7 @@
     {
       "request_id": "req_f7",
       "kind": "permission",
-      "session_id": "3c1f87a9-9a22-5a7c-951a-a90133d84418",
+      "session_id": "a0653db5-0fdf-5f90-9414-87d2c0977a1a",
       "thread_id": "8bf9821f-364c-521c-bc45-627802255aa3",
       "workspace": "project-orchestrator",
       "tool_name": "Bash",
@@ -2259,7 +2747,7 @@
     {
       "request_id": "req_f2",
       "kind": "permission",
-      "session_id": "af6cf489-ddbb-5d9a-b10f-869a0c0754b6",
+      "session_id": "7b66cc2e-b324-522f-8ce7-ea869298bcc4",
       "thread_id": "af8610fe-a4b6-5693-ba5f-710942d81046",
       "workspace": "studio-site",
       "tool_name": "Bash",
@@ -2275,5 +2763,6 @@
     "status": "free",
     "busy_with": null
   },
-  "thinking": []
+  "thinking": [],
+  "unattached": []
 }

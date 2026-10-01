@@ -28,6 +28,21 @@
       "session_ids": [
         "d3f8df68-4a9b-5e5a-8eae-1cb87d925acb"
       ],
+      "sessions": [
+        {
+          "id": "d3f8df68-4a9b-5e5a-8eae-1cb87d925acb",
+          "title": "Session 1 - Facturation automatique",
+          "state": "dead",
+          "links": [
+            {
+              "via": "runner_run",
+              "run_id": "0e8b3aff-4213-5f11-a370-92e1ce315fcf",
+              "task_id": null,
+              "plan_id": "1c2c673f-032c-575a-b916-2a94bee1a2fd"
+            }
+          ]
+        }
+      ],
       "since": "2026-10-01T04:00:00Z",
       "age_secs": 14400,
       "waves": [
@@ -91,5 +106,6 @@
     "status": "free",
     "busy_with": null
   },
-  "thinking": []
+  "thinking": [],
+  "unattached": []
 }

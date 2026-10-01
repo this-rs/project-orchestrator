@@ -27,6 +27,7 @@
       "plan": null,
       "run": null,
       "session_ids": [],
+      "sessions": [],
       "since": "2026-09-29T08:00:00Z",
       "age_secs": 172800,
       "waves": [],
@@ -52,6 +53,21 @@
       },
       "session_ids": [
         "0645550a-a1c6-5c00-adaa-e99b27f602e1"
+      ],
+      "sessions": [
+        {
+          "id": "0645550a-a1c6-5c00-adaa-e99b27f602e1",
+          "title": "Session 1 - Migration du site",
+          "state": "dead",
+          "links": [
+            {
+              "via": "runner_run",
+              "run_id": "4e09be79-4ed3-5921-bc53-d915a72b9152",
+              "task_id": null,
+              "plan_id": "4c50a307-bf9e-5d7a-b37b-bb3157e98fb1"
+            }
+          ]
+        }
       ],
       "since": "2026-09-30T08:00:00Z",
       "age_secs": 86400,
@@ -111,6 +127,47 @@
         "06b118be-7138-5515-b6ff-9ec1662ff8da",
         "7f548042-dfc6-57e7-9e06-bf79c860c4f2",
         "65991ce8-dd5d-5326-905a-8b09bad04535"
+      ],
+      "sessions": [
+        {
+          "id": "06b118be-7138-5515-b6ff-9ec1662ff8da",
+          "title": "Session 1 - Today cockpit",
+          "state": "live",
+          "links": [
+            {
+              "via": "runner_run",
+              "run_id": "abc5b4d4-54ca-526f-bf00-d1709dd609c0",
+              "task_id": null,
+              "plan_id": "5d623b4a-fdfa-5bf9-b7ba-37f7a7704900"
+            }
+          ]
+        },
+        {
+          "id": "7f548042-dfc6-57e7-9e06-bf79c860c4f2",
+          "title": "Session 2 - Today cockpit",
+          "state": "live",
+          "links": [
+            {
+              "via": "runner_run",
+              "run_id": "abc5b4d4-54ca-526f-bf00-d1709dd609c0",
+              "task_id": null,
+              "plan_id": "5d623b4a-fdfa-5bf9-b7ba-37f7a7704900"
+            }
+          ]
+        },
+        {
+          "id": "65991ce8-dd5d-5326-905a-8b09bad04535",
+          "title": "Session 3 - Today cockpit",
+          "state": "live",
+          "links": [
+            {
+              "via": "runner_run",
+              "run_id": "abc5b4d4-54ca-526f-bf00-d1709dd609c0",
+              "task_id": null,
+              "plan_id": "5d623b4a-fdfa-5bf9-b7ba-37f7a7704900"
+            }
+          ]
+        }
       ],
       "since": "2026-10-01T07:20:00Z",
       "age_secs": 2400,
@@ -174,6 +231,21 @@
       "session_ids": [
         "b0cd5b12-a11c-5af7-9ff8-94fd195733a5"
       ],
+      "sessions": [
+        {
+          "id": "b0cd5b12-a11c-5af7-9ff8-94fd195733a5",
+          "title": "Session 1 - Auth hardening",
+          "state": "live",
+          "links": [
+            {
+              "via": "runner_run",
+              "run_id": "0ecf398d-ea74-5090-ae80-c4bb15675454",
+              "task_id": null,
+              "plan_id": "6eebac83-5ff0-56b3-8192-db0f9e59fbeb"
+            }
+          ]
+        }
+      ],
       "since": "2026-10-01T07:39:00Z",
       "age_secs": 1260,
       "waves": [
@@ -221,6 +293,21 @@
       "session_ids": [
         "8e147687-4b78-5296-911f-10917bb6b174"
       ],
+      "sessions": [
+        {
+          "id": "8e147687-4b78-5296-911f-10917bb6b174",
+          "title": "Session 1 - Facturation septembre",
+          "state": "live",
+          "links": [
+            {
+              "via": "plan_association",
+              "run_id": null,
+              "task_id": null,
+              "plan_id": "914ac330-e330-554a-82a4-1d27e98eb806"
+            }
+          ]
+        }
+      ],
       "since": "2026-10-01T07:55:00Z",
       "age_secs": 300,
       "waves": [
@@ -251,7 +338,7 @@
     {
       "request_id": "req_p1",
       "kind": "permission",
-      "session_id": "f796a46d-5304-50eb-8da7-6ddfd15b1166",
+      "session_id": "b0cd5b12-a11c-5af7-9ff8-94fd195733a5",
       "thread_id": "81c8f400-7990-5544-9961-1ae4de4f03c1",
       "workspace": "project-orchestrator",
       "tool_name": "Bash",
@@ -264,7 +351,7 @@
     {
       "request_id": "req_q1",
       "kind": "question",
-      "session_id": "5cb1a089-4a7b-5dad-a532-ba7ba7c2b2cb",
+      "session_id": "8e147687-4b78-5296-911f-10917bb6b174",
       "thread_id": "165ee8b4-32f4-5952-8bc0-ba487679e991",
       "workspace": "acme-freelance",
       "tool_name": null,
@@ -334,5 +421,6 @@
       "since": "2026-10-01T06:00:00Z",
       "age_secs": 7200
     }
-  ]
+  ],
+  "unattached": []
 }

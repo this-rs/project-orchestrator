@@ -40,5 +40,15 @@
     "decision",
     "note_review",
     "alert"
+  ],
+  "link_via": [
+    "runner_run",
+    "spawned_by_json",
+    "task_association",
+    "plan_association"
+  ],
+  "session_state": [
+    "live",
+    "dead"
   ]
 }

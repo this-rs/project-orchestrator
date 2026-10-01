@@ -29,6 +29,34 @@
         "1e9909d7-c627-5f26-83a4-8eb6a217fb46",
         "c97b00e4-3bb3-5e21-8b93-953aa13489ae"
       ],
+      "sessions": [
+        {
+          "id": "1e9909d7-c627-5f26-83a4-8eb6a217fb46",
+          "title": "Session 1 - Wave runner hardening",
+          "state": "live",
+          "links": [
+            {
+              "via": "runner_run",
+              "run_id": "cecac6a2-bc18-5e07-a6cf-76f2480f15b4",
+              "task_id": null,
+              "plan_id": "ab3b10f6-b592-5b50-9db2-dbd2b84adfd4"
+            }
+          ]
+        },
+        {
+          "id": "c97b00e4-3bb3-5e21-8b93-953aa13489ae",
+          "title": "Session 2 - Wave runner hardening",
+          "state": "live",
+          "links": [
+            {
+              "via": "runner_run",
+              "run_id": "cecac6a2-bc18-5e07-a6cf-76f2480f15b4",
+              "task_id": null,
+              "plan_id": "ab3b10f6-b592-5b50-9db2-dbd2b84adfd4"
+            }
+          ]
+        }
+      ],
       "since": "2026-10-01T06:30:00Z",
       "age_secs": 5400,
       "waves": [
@@ -80,6 +108,21 @@
       "session_ids": [
         "3303d320-03a7-56c5-809d-95cd088bd39a"
       ],
+      "sessions": [
+        {
+          "id": "3303d320-03a7-56c5-809d-95cd088bd39a",
+          "title": "Session 1 - Embed wave summary",
+          "state": "live",
+          "links": [
+            {
+              "via": "plan_association",
+              "run_id": null,
+              "task_id": null,
+              "plan_id": "2f562500-1e3b-5854-92aa-36e69d5ccdf9"
+            }
+          ]
+        }
+      ],
       "since": "2026-10-01T07:45:00Z",
       "age_secs": 900,
       "waves": [
@@ -120,5 +163,6 @@
     "status": "free",
     "busy_with": null
   },
-  "thinking": []
+  "thinking": [],
+  "unattached": []
 }
