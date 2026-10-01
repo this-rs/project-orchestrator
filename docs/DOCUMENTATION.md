@@ -3,6 +3,7 @@
 Les diagrammes d'architecture et de conception de Project Orchestrator vivent dans le depot, en Mermaid standard, rendus nativement par GitHub : un fichier `docs/diagrams/<nom>.mmd` par diagramme. Ils sont relus et modifies comme du code, dans la meme PR que le code qu'ils decrivent. Aucun service externe n'est necessaire pour les lire, les verifier ou les mettre a jour.
 
 - Index : `docs/diagrams/INDEX.yml`
+- Fichiers sans proprietaire : `docs/diagrams/ORPHANS.md` (genere)
 - Verification (hors reseau) : `scripts/diagrams/check-index.mjs`
 
 ## 1. Nomenclature
@@ -49,12 +50,47 @@ On cite `create_router`, `require_auth`, `Config::from_yaml_and_env`, pas `route
 
 ## 5. Statuts d'un diagramme dans l'index
 
-`INDEX.yml` : une entree par diagramme `{name, file, covers, owner, status}`.
+`INDEX.yml` : une entree par diagramme `{name, covers, owner, status}`, plus `file` quand il existe,
+`role: index` sur la carte d'index et `supersedes` sur une entree qui reprend une carte provisoire.
 
 - `status: planned` : le diagramme est prevu, sans fichier. C'est le cas de toutes les cartes d'architecture existantes tant que leur contenu n'a pas ete releve contre le code : on n'exporte pas un contenu non verifie.
 - `status: verified` : `docs/diagrams/<name>.mmd` existe, son en-tete est valide et son contenu a ete relu contre le code au sha `verified`. Le champ `file` n'apparait que dans ce cas.
 
 Passer de `planned` a `verified` se fait dans une PR qui ajoute le `.mmd`, ajoute `file:` et passe le statut.
+
+### Un fichier, un proprietaire
+
+Deux `covers` ne doivent jamais matcher le meme fichier : un fichier couvert par deux diagrammes
+n'a pas de proprietaire, il a deux moities de proprietaire, et personne ne repond de lui quand il
+change. Le script echoue sur tout recouvrement. Onze recouvrements existaient a l'amorcage ; chaque
+arbitrage est ecrit en commentaire au-dessus de l'entree concernee dans `INDEX.yml`. Exemples lus
+dans le code, pas devines : `src/api/ws_handlers.rs` multiplexe les flux CRUD et graphe
+(`ws_events`, `passes_filters`) et n'est donc pas du chat, il reste a `po-api` ; `src/orchestrator/runner.rs`
+scanne et synchronise le code (`scan_files`, `init_embedding_provider`) et appartient a `po-sync-parser`,
+pas au runner de plans ; `src/events/reactions.rs` est le jeu de reactions de `EventReactor` et va
+a `po-autonomic`, pas au cycle des plans.
+
+### Les orphelins sont publies, pas caches
+
+Un fichier source que nul `covers` ne matche est **orphelin**. La liste complete est generee dans
+`docs/diagrams/ORPHANS.md` et versionnee : **734 orphelins sur 1204 fichiers source (61 %)** a
+l'amorcage. On ne retire pas des fichiers du denominateur pour embellir le chiffre ; on reduit le
+chiffre en ecrivant des diagrammes. Le fichier est deterministe (ni sha ni date) pour servir de
+gate hors reseau, et il ne s'edite pas a la main.
+
+### Cartes provisoires reprises (`supersedes`)
+
+Deux cartes de la cartographie d'origine portaient un suffixe numerique et n'etaient rattachees a
+aucun index : leur perimetre est repris, sous un nom conforme, par une entree qui le declare.
+
+| Carte provisoire | Reprise par | Perimetre |
+|---|---|---|
+| `po-chat-transport-2` | `po-p2p-transport` | `src/transport/**`, `src/reception/**` |
+| `po-code-intelligence-2` | `po-architecture-derive` | `src/architecture/**` |
+
+Le script verifie qu'une carte declaree dans `supersedes` n'est plus une entree de l'index (sinon
+le perimetre serait compte deux fois) et que l'index porte exactement une carte `role: index`
+(`po-carte`), qui couvre `docs/diagrams/INDEX.yml` : c'est par la que toute entree est rattachee.
 
 ## 6. Reference de conception pour les taches
 
@@ -88,18 +124,33 @@ Le gate de derive de la tache 1.1 fonctionnera sur ces seuls fichiers, sans rese
 ## 10. Verification
 
 ```
-node scripts/diagrams/check-index.mjs              # exit 1 si une regle est violee
-node scripts/diagrams/check-index.mjs --list       # noms des fichiers orphelins
+node scripts/diagrams/check-index.mjs                  # exit 1 si une regle est violee
+node scripts/diagrams/check-index.mjs --list           # noms des fichiers orphelins
+node scripts/diagrams/check-index.mjs --write-orphans  # regenere docs/diagrams/ORPHANS.md
+node scripts/diagrams/check-index.mjs --check-orphans   # echoue si ORPHANS.md n'est pas a jour
+node scripts/diagrams/check-index.mjs --fail-on-orphans # cible finale : plus aucun orphelin
 node scripts/diagrams/check-index.mjs --json out.json
-node scripts/diagrams/check-index.mjs --strict     # echoue aussi si un depot voisin est absent
+node scripts/diagrams/check-index.mjs --strict         # echoue aussi si un depot voisin est absent
 node --test scripts/diagrams/check-index.test.mjs
 ```
 
-Regles verifiees : chaque glob `covers` matche au moins un fichier existant ; chaque entree `verified` a son `.mmd` avec les en-tetes `%% name`, `%% covers` (identique a l'index) et `%% verified` (sha court) ; aucune entree `planned` n'a de fichier ; tout `.mmd` du dossier est dans l'index. Il liste enfin les **orphelins** : fichiers source (Rust et TS/TSX sous `src/`, hors tests) sans diagramme proprietaire.
+Regles verifiees : chaque glob `covers` matche au moins un fichier existant ; **aucun fichier n'est
+couvert par deux diagrammes** ; l'index porte une seule carte `role: index` et elle couvre
+`INDEX.yml` ; toute carte declaree dans `supersedes` a bien disparu de l'index ; chaque entree
+`verified` a son `.mmd` avec les en-tetes `%% name`, `%% covers` (identique a l'index) et
+`%% verified` (sha court) ; aucune entree `planned` n'a de fichier ; tout `.mmd` du dossier est dans
+l'index ; `docs/diagrams/ORPHANS.md` est a jour (avertissement par defaut, erreur avec
+`--check-orphans`). Les **orphelins** sont les fichiers source (Rust et TS/TSX sous `src/`, hors
+tests) sans diagramme proprietaire.
 
 Les depots voisins sont resolus par `DIAGRAM_ROOT_BACKEND|FRONTEND|NEXUS|WEBSITE` (defaut : `../frontend`, `../nexus`, `../website`) ; un depot absent est ignore avec un avertissement.
 
 ## 11. Etat
 
-- 27 diagrammes prevus dans l'index, tous `planned` : aucun n'est encore exporte.
-- Les `covers` ne couvrent que ce que la cartographie a reellement lu ; le reste est orphelin, c'est voulu : on ne gonfle pas la couverture.
+- 27 diagrammes prevus dans l'index, tous `planned` : **aucun `.mmd` n'existe encore**. Un index de
+  27 entrees n'est pas 27 diagrammes ; c'est la liste des proprietaires, et c'est deja ce qui manquait
+  au gate de derive.
+- 1204 fichiers source, 470 couverts, **734 orphelins (61 %)**, listes dans `docs/diagrams/ORPHANS.md`.
+- Zero recouvrement : chaque fichier couvert a exactement un diagramme proprietaire.
+- Les `covers` ne couvrent que ce que la cartographie a reellement lu ; le reste est orphelin, c'est
+  voulu : on ne gonfle pas la couverture.

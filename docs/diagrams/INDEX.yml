@@ -2,22 +2,32 @@
 # Sous-ensemble YAML strict : entrees "- name:", scalaires "cle: valeur", liste "covers:" de "- glob".
 # Globs prefixes par depot : backend: frontend: nexus: website:
 # status: planned = pas encore de fichier .mmd (contenu a verifier contre le code avant export) ; verified = docs/diagrams/<name>.mmd present et releve.
-# po-p2p-transport et po-architecture-derive reprennent le perimetre de deux cartes provisoires mal nommees (suffixe -2).
+# REGLE DU PROPRIETAIRE UNIQUE : deux `covers` ne doivent jamais matcher le meme fichier.
+#   Un fichier couvert par deux diagrammes n'a pas de proprietaire : personne ne repond de lui.
+#   Le script echoue sur tout recouvrement ; les arbitrages faits sont notes en commentaire ci-dessous.
+# po-carte (role: index) est la carte d'index : c'est a elle que se rattachent les entrees, y compris
+#   celles qui reprennent une carte provisoire mal nommee (champ `supersedes`).
+# Les fichiers sans proprietaire sont publies dans docs/diagrams/ORPHANS.md (--write-orphans).
 diagrams:
   - name: po-carte
     owner: theotime
     status: planned
+    role: index
     covers:
       - "backend:docs/diagrams/INDEX.yml"
+      - "backend:docs/DOCUMENTATION.md"
   - name: po-api
     owner: theotime
     status: planned
+    # Arbitrage : ws_auth.rs (authentification du socket, cookie/ticket) et ws_handlers.rs
+    # (multiplexage des flux CRUD et graphe) ne sont PAS du chat — ils restent ici.
     covers:
       - "backend:src/api/{mod,routes,handlers,query,ws_auth,ws_handlers,hook_handlers,auth_handlers}.rs"
       - "backend:src/auth/{mod,middleware,extractor}.rs"
   - name: po-autonomic
     owner: theotime
     status: planned
+    # Arbitrage : events/reactions.rs appartient au reacteur (EventReactor), pas au cycle des plans.
     covers:
       - "backend:src/heartbeat/**"
       - "backend:src/homeostasis.rs"
@@ -32,16 +42,19 @@ diagrams:
     owner: theotime
     status: planned
     covers:
-      - "backend:src/api/{ws_chat_handler,ws_auth,ws_handlers}.rs"
+      - "backend:src/api/ws_chat_handler.rs"
   - name: po-p2p-transport
     owner: theotime
     status: planned
+    supersedes: po-chat-transport-2
     covers:
       - "backend:src/transport/**"
       - "backend:src/reception/**"
   - name: po-code-intelligence
     owner: theotime
     status: planned
+    # Arbitrage : src/graph/** (extraction depuis le code, ecriture, debounce) est ici ;
+    # po-graph-store repond de la couche de persistance src/neo4j/* et des migrations.
     covers:
       - "backend:src/graph/{mod,engine,algorithms,models,process,debouncer,extraction,writer,enrichment,confidence}.rs"
       - "backend:src/analytics/{mod,hypothesis,distribution}.rs"
@@ -49,6 +62,7 @@ diagrams:
   - name: po-architecture-derive
     owner: theotime
     status: planned
+    supersedes: po-code-intelligence-2
     covers:
       - "backend:src/architecture/**"
   - name: po-crates-tests
@@ -74,9 +88,9 @@ diagrams:
   - name: po-entry-deploy
     owner: theotime
     status: planned
+    # Arbitrage : src/bin/mcp_server.rs est le binaire du serveur MCP ; po-mcp en repond.
     covers:
       - "backend:src/{main,cli,setup_claude,lib}.rs"
-      - "backend:src/bin/mcp_server.rs"
       - "backend:src/update/**"
       - "backend:Dockerfile"
       - "backend:docker-compose*.yml"
@@ -121,7 +135,6 @@ diagrams:
     covers:
       - "backend:src/neo4j/{mod,client,traits,impl_graph_store,data_migrations,batch,registry,analytics}.rs"
       - "backend:migrations/**"
-      - "backend:src/graph/{engine,writer,extraction,debouncer}.rs"
   - name: po-knowledge-notes
     owner: theotime
     status: planned
@@ -169,7 +182,7 @@ diagrams:
       - "backend:src/plan/**"
       - "backend:src/lifecycle/**"
       - "backend:src/neo4j/{lifecycle_hook,step,task,plan}.rs"
-      - "backend:src/events/{types,reactions}.rs"
+      - "backend:src/events/types.rs"
   - name: po-protocols
     owner: theotime
     status: planned
@@ -178,9 +191,10 @@ diagrams:
   - name: po-runner-orchestrator
     owner: theotime
     status: planned
+    # Arbitrage : src/orchestrator/{mod,runner}.rs scanne et synchronise le code
+    # (scan_files, init_embedding_provider, should_ignore_path) : po-sync-parser en repond.
     covers:
       - "backend:src/runner/{mod,runner,state,models,guard}.rs"
-      - "backend:src/orchestrator/{mod,runner}.rs"
   - name: po-skills-reasoning
     owner: theotime
     status: planned

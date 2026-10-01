@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { globToRegExp, parseIndex, parseHeader, checkDiagramFile } from './check-index.mjs';
+import { globToRegExp, parseIndex, parseHeader, checkDiagramFile, sharedOwnership, renderOrphans } from './check-index.mjs';
 
 test('glob: **, *, braces', () => {
   assert.ok(globToRegExp('src/heartbeat/**').test('src/heartbeat/checks/git_drift.rs'));
@@ -34,4 +34,46 @@ test('header: wrong name, covers drift and bad sha are reported', () => {
   assert.equal(checkDiagramFile(entry, good.replace('backend:src/a.rs', 'backend:src/c.rs')).length, 1);
   assert.equal(checkDiagramFile(entry, good.replace('94c04bce', 'HEAD')).length, 1);
   assert.equal(checkDiagramFile(entry, 'flowchart TD\n').length, 3);
+});
+
+test('sharedOwnership: un fichier a un seul proprietaire', () => {
+  const owners = new Map([
+    ['backend:src/a.rs', ['po-x']],
+    ['backend:src/b.rs', ['po-x', 'po-y']],
+    ['backend:src/c.rs', ['po-z', 'po-z']], // meme diagramme via deux globs : pas un conflit
+  ]);
+  assert.deepEqual(sharedOwnership(owners), [{ file: 'backend:src/b.rs', names: ['po-x', 'po-y'] }]);
+});
+
+test('sharedOwnership: trie par chemin et dedoublonne les noms', () => {
+  const owners = new Map([
+    ['backend:src/z.rs', ['po-b', 'po-a', 'po-a']],
+    ['backend:src/a.rs', ['po-c', 'po-d']],
+  ]);
+  assert.deepEqual(sharedOwnership(owners).map((s) => s.file), ['backend:src/a.rs', 'backend:src/z.rs']);
+  assert.deepEqual(sharedOwnership(owners)[1].names, ['po-b', 'po-a']);
+});
+
+test('renderOrphans: compte, pourcentage et regroupement par depot puis dossier', () => {
+  const md = renderOrphans(['frontend:src/x/b.ts', 'backend:src/a.rs', 'backend:src/x/c.rs'], 10);
+  assert.match(md, /\*\*3 orphelins sur 10 fichiers source \(30\.0 %\)\.\*\*/);
+  assert.match(md, /## backend \(2\)/);
+  assert.match(md, /## frontend \(1\)/);
+  assert.ok(md.indexOf('## backend') < md.indexOf('## frontend'), 'depots tries');
+  assert.match(md, /- `src\/x\/` \(1\) : `c\.rs`/);
+  assert.match(md, /- `src\/` \(1\) : `a\.rs`/);
+  // un fichier a la racine du depot tombe dans le groupe "."
+  assert.match(renderOrphans(['backend:build.rs'], 1), /- `\.\/` \(1\) : `build\.rs`/);
+  assert.match(md, /--write-orphans/);
+});
+
+test('renderOrphans: deterministe (aucun sha ni date), donc verifiable hors reseau', () => {
+  const a = renderOrphans(['backend:src/a.rs'], 2);
+  const b = renderOrphans(['backend:src/a.rs'], 2);
+  assert.equal(a, b);
+  assert.doesNotMatch(a, /\d{4}-\d{2}-\d{2}/);
+});
+
+test('renderOrphans: zero orphelin ne divise pas par zero', () => {
+  assert.match(renderOrphans([], 0), /\*\*0 orphelins sur 0 fichiers source \(0\.0 %\)\.\*\*/);
 });
