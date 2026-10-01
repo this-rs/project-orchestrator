@@ -297,6 +297,19 @@ impl AnalyticsEngine for GraphAnalyticsEngine {
         let file_analytics = self.analyze_file_graph(project_id).await?;
         let function_analytics = self.analyze_function_graph(project_id).await?;
 
+        // Keep the fabric_* scores in step with the code-only ones. A failure
+        // here must not discard the file/function results already persisted.
+        if let Err(e) = self
+            .analyze_fabric_graph(project_id, &FabricWeights::default())
+            .await
+        {
+            tracing::warn!(
+                project_id = %project_id,
+                error = %e,
+                "analyze_project: fabric analytics refresh failed"
+            );
+        }
+
         Ok(ProjectAnalytics {
             file_analytics,
             function_analytics,
@@ -347,6 +360,11 @@ impl AnalyticsEngine for GraphAnalyticsEngine {
 
         // 1. Extract function CALLS graph
         let graph = self.extractor.extract_function_graph(project_id).await?;
+
+        // Purge previously detected processes first: an empty graph or an empty
+        // detection result must not leave stale processes behind.
+        self.store.delete_project_processes(project_id).await?;
+
         if graph.node_count() == 0 {
             return Ok(Vec::new());
         }
@@ -362,15 +380,7 @@ impl AnalyticsEngine for GraphAnalyticsEngine {
             return Ok(processes);
         }
 
-        // 4. Persist: delete old processes, then upsert new ones
-        if let Err(e) = self.store.delete_project_processes(project_id).await {
-            tracing::warn!(
-                "Failed to delete old processes for project {}: {}",
-                project_id,
-                e
-            );
-        }
-
+        // 4. Persist: upsert the new processes (old ones were purged above)
         let process_nodes: Vec<ProcessNode> = processes
             .iter()
             .map(|p| ProcessNode {
@@ -632,6 +642,36 @@ mod tests {
         let func_a = store.function_analytics.read().await;
         assert_eq!(fa.len(), 10);
         assert_eq!(func_a.len(), 8);
+    }
+
+    #[tokio::test]
+    async fn test_analyze_project_refreshes_fabric_scores() {
+        let store = Arc::new(MockGraphStore::new());
+        let project = test_project();
+        store.create_project(&project).await.unwrap();
+
+        seed_two_cluster_file_graph(&store, project.id).await;
+        seed_functions(&store, project.id).await;
+
+        let engine = GraphAnalyticsEngine::new(store.clone(), AnalyticsConfig::default());
+        engine.analyze_project(project.id).await.unwrap();
+
+        let written = store.fabric_written_paths.read().await;
+        assert_eq!(written.len(), 10, "fabric scores must be written too");
+    }
+
+    #[tokio::test]
+    async fn test_detect_processes_empty_graph_purges_stale() {
+        let store = Arc::new(MockGraphStore::new());
+        let project = test_project();
+        store.create_project(&project).await.unwrap();
+
+        let engine = GraphAnalyticsEngine::new(store.clone(), AnalyticsConfig::default());
+        let result = engine.detect_processes(project.id).await.unwrap();
+        assert!(result.is_empty());
+
+        let purged = store.processes_purged_for.read().await;
+        assert_eq!(*purged, vec![project.id], "stale processes must be purged");
     }
 
     #[tokio::test]

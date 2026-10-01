@@ -129,6 +129,10 @@ pub struct MockGraphStore {
     pub resource_consumers: RwLock<HashMap<Uuid, Vec<Uuid>>>,
     pub import_relationships: RwLock<HashMap<String, Vec<String>>>,
     pub call_relationships: RwLock<HashMap<String, Vec<String>>>,
+    /// Paths written by `batch_update_fabric_file_analytics` (test observability)
+    pub fabric_written_paths: RwLock<Vec<String>>,
+    /// Project ids passed to `delete_project_processes` (test observability)
+    pub processes_purged_for: RwLock<Vec<Uuid>>,
     pub note_anchors: RwLock<HashMap<Uuid, Vec<NoteAnchor>>>,
     pub note_supersedes: RwLock<HashMap<Uuid, Uuid>>,
     pub users: RwLock<HashMap<Uuid, UserNode>>,
@@ -305,6 +309,8 @@ impl MockGraphStore {
             resource_consumers: RwLock::new(HashMap::new()),
             import_relationships: RwLock::new(HashMap::new()),
             call_relationships: RwLock::new(HashMap::new()),
+            fabric_written_paths: RwLock::new(Vec::new()),
+            processes_purged_for: RwLock::new(Vec::new()),
             note_anchors: RwLock::new(HashMap::new()),
             note_supersedes: RwLock::new(HashMap::new()),
             users: RwLock::new(HashMap::new()),
@@ -9306,9 +9312,13 @@ impl GraphStore for MockGraphStore {
 
     async fn batch_update_fabric_file_analytics(
         &self,
-        _updates: &[crate::graph::models::FabricFileAnalyticsUpdate],
+        updates: &[crate::graph::models::FabricFileAnalyticsUpdate],
     ) -> anyhow::Result<()> {
-        // Mock: fabric analytics are not stored separately in tests
+        // Mock: only record which paths were written
+        self.fabric_written_paths
+            .write()
+            .await
+            .extend(updates.iter().map(|u| u.path.clone()));
         Ok(())
     }
 
@@ -9460,7 +9470,8 @@ impl GraphStore for MockGraphStore {
         Ok(())
     }
 
-    async fn delete_project_processes(&self, _project_id: Uuid) -> anyhow::Result<u64> {
+    async fn delete_project_processes(&self, project_id: Uuid) -> anyhow::Result<u64> {
+        self.processes_purged_for.write().await.push(project_id);
         Ok(0)
     }
 
