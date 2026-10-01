@@ -136,6 +136,10 @@ function fixture({ mainCovers, localCovers }) {
   mkdirSync(join(be, 'docs/diagrams'), { recursive: true });
   mkdirSync(join(be, 'src'), { recursive: true });
   mkdirSync(join(nx, 'claude-code-api/src/core'), { recursive: true });
+  // frontend et website existent, vides : sans eux tout tourne en portee incomplete et le
+  // cliquet ne s'applique jamais — c'est le piege que ces fixtures doivent eviter.
+  mkdirSync(join(root, 'frontend/src'), { recursive: true });
+  mkdirSync(join(root, 'website/src'), { recursive: true });
   writeFileSync(join(be, 'src/own.rs'), '// backend\n');
   writeFileSync(join(nx, 'claude-code-api/src/core/model_registry.rs'), '// nexus\n');
   writeFileSync(join(be, 'docs/diagrams/INDEX.yml'),
@@ -146,7 +150,7 @@ function fixture({ mainCovers, localCovers }) {
     writeFileSync(join(nx, 'docs/diagrams/INDEX.yml'),
       `diagrams:\n  - name: nexus-model-catalogue\n    owner: t\n    status: verified\n    covers:\n${localCovers.map((c) => `      - "${c}"\n`).join('')}`);
   }
-  return { root, be, nx };
+  return { root, be, nx, fe: join(root, 'frontend'), web: join(root, 'website') };
 }
 
 function run(be, nx, args = []) {
@@ -154,7 +158,13 @@ function run(be, nx, args = []) {
   // et un test qui ne lit que stdout les manquerait.
   const r = spawnSync('node', [script, ...args], {
     encoding: 'utf8',
-    env: { ...process.env, DIAGRAM_ROOT_BACKEND: be, DIAGRAM_ROOT_NEXUS: nx, DIAGRAM_ROOT_FRONTEND: join(nx, 'absent'), DIAGRAM_ROOT_WEBSITE: join(nx, 'absent') },
+    env: {
+      ...process.env,
+      DIAGRAM_ROOT_BACKEND: be,
+      DIAGRAM_ROOT_NEXUS: nx,
+      DIAGRAM_ROOT_FRONTEND: join(be, '..', 'frontend'),
+      DIAGRAM_ROOT_WEBSITE: join(be, '..', 'website'),
+    },
   });
   return { code: r.status, out: `${r.stdout ?? ''}${r.stderr ?? ''}` };
 }
@@ -320,6 +330,58 @@ test('cliquet: supprimer le marqueur ne le desarme pas', () => {
     const { code, out } = run(be, nx);
     assert.equal(code, 1);
     assert.match(out, /ne porte pas de marqueur/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// --- portee incomplete : le cas de la CI d'un seul depot.
+// Le plafond publie compte quatre depots ; un checkout partiel en voit moins. Comparer les
+// deux chiffres serait un vert permanent qui ne verifie rien, et le regenerer detruirait le
+// plafond. Ces deux tests sont la parce que la premiere version faisait exactement ca.
+function partial(be, nx, args = []) {
+  const r = spawnSync('node', [script, ...args], {
+    encoding: 'utf8',
+    env: { ...process.env, DIAGRAM_ROOT_BACKEND: be, DIAGRAM_ROOT_NEXUS: join(nx, 'absent'), DIAGRAM_ROOT_FRONTEND: join(nx, 'absent'), DIAGRAM_ROOT_WEBSITE: join(nx, 'absent') },
+  });
+  return { code: r.status, out: `${r.stdout ?? ''}${r.stderr ?? ''}` };
+}
+
+test('portee incomplete: le cliquet n est ni applique ni compare', () => {
+  const { root, be, nx } = fixture({ mainCovers: ['backend:src/own.rs'], localCovers: null });
+  try {
+    withCeiling(be, 0); // un plafond que le compte partiel depasserait
+    const { code, out } = partial(be, nx);
+    assert.equal(code, 0, 'un index sain passe : le cliquet est hors sujet, pas viole');
+    assert.match(out, /portee incomplete/);
+    assert.match(out, /ne sont pas comparables au plafond/);
+    assert.doesNotMatch(out, /au-dessus du plafond/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('portee incomplete: --write-orphans est REFUSE, le plafond survit', () => {
+  const { root, be, nx } = fixture({ mainCovers: ['backend:src/own.rs'], localCovers: null });
+  try {
+    withCeiling(be, 1201); // plafond inter-depots
+    const { code, out } = partial(be, nx, ['--write-orphans']);
+    assert.equal(code, 1);
+    assert.match(out, /refuse en portee incomplete/);
+    assert.equal(orphanCeiling(readFileSync(join(be, 'docs/diagrams/ORPHANS.md'), 'utf8')), 1201, 'plafond intact');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('portee incomplete: un index casse echoue quand meme', () => {
+  // La portee partielle ne doit pas devenir une amnistie generale.
+  const { root, be, nx } = fixture({ mainCovers: ['backend:src/absent.rs'], localCovers: null });
+  try {
+    withCeiling(be, 1201);
+    const { code, out } = partial(be, nx);
+    assert.equal(code, 1);
+    assert.match(out, /ne matche aucun fichier/);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

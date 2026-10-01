@@ -120,6 +120,28 @@ jobs:
         # and needs Tauri system deps + the frontend dist to build on CI.
         run: cargo clippy --workspace --exclude project-orchestrator-desktop --all-targets --all-features -- -D warnings
 
+      # Index des diagrammes (docs/diagrams/INDEX.yml). Node est deja sur les
+      # runners ubuntu-latest : pas de setup-node, pas de package.json, pas de
+      # nouvelle chaine d'outils dans un depot Rust.
+      #
+      # CE QUI EST VERIFIE ICI, et c'est tout : la structure de l'index, les
+      # globs `backend:` qui ne matchent plus rien, un fichier revendique par
+      # deux diagrammes, une entree `verified` sans son `.mmd`, un en-tete
+      # invalide.
+      #
+      # CE QUI NE L'EST PAS : les depots voisins (frontend, nexus, website) ne
+      # sont pas dans ce checkout, donc leurs globs ne sont pas resolus, le
+      # cliquet d'orphelins NE TOURNE PAS et la fraicheur de ORPHANS.md n'est
+      # pas verifiee — le script le dit en avertissement plutot que de passer
+      # vert en silence. Ce vert ne prouve donc PAS l'absence de derive : c'est
+      # la tache 1.1 qui branchera le gate complet (checkout multi-depots ou
+      # artefact publie). Ne pas le citer comme preuve de non-derive.
+      - name: Check diagram index (partial — see comment)
+        run: node scripts/diagrams/check-index.mjs
+
+      - name: Test the diagram index checker
+        run: node --test scripts/diagrams/check-index.test.mjs
+
   # ==========================================================================
   # Unit Tests - Library and parser tests without external services
   # ==========================================================================

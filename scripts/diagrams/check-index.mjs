@@ -367,6 +367,25 @@ function main() {
   const raiseAt = args.indexOf('--raise-ceiling');
   const raiseReason = raiseAt >= 0 ? args[raiseAt + 1] : null;
   let ceiling = recordedCeiling ?? orphans.length;
+
+  // PORTEE INCOMPLETE : le plafond publie compte les quatre depots. Si un depot voisin manque
+  // (checkout d'un seul depot, CI du backend), `orphans` ne couvre que ce qui est la : comparer
+  // les deux, c'est comparer 456 a 1201 — le cliquet passerait toujours, et sans le dire. Pire,
+  // --write-orphans le ferait DESCENDRE a la valeur partielle et detruirait le vrai plafond.
+  // Donc : hors portee complete, on n'applique rien et on ne reecrit rien.
+  const partialScope = missingRepos.length > 0;
+  if (partialScope) {
+    console.warn(`AVERTISSEMENT portee incomplete (${missingRepos.join(', ')} absent) : le cliquet d'orphelins n'est ni applique ni mis a jour — ${orphans.length} orphelins ici ne sont pas comparables au plafond de ${recordedCeiling ?? 'non fixe'}`);
+    if (args.includes('--write-orphans')) {
+      console.error(`ERREUR --write-orphans refuse en portee incomplete : il abaisserait le plafond a ${orphans.length} et effacerait les orphelins des depots absents. Relancer la ou les quatre depots sont presents.`);
+      process.exit(1);
+    }
+    for (const p of problems) console.error(`ERREUR ${p}`);
+    if (strict) { console.error(`ERREUR depots absents en mode --strict : ${missingRepos.join(', ')}`); process.exit(1); }
+    if (problems.length) process.exit(1);
+    return;
+  }
+
   if (orphans.length > ceiling) {
     if (raiseReason && !raiseReason.startsWith('--')) {
       console.warn(`AVERTISSEMENT plafond d'orphelins releve ${ceiling} -> ${orphans.length} : ${raiseReason}`);

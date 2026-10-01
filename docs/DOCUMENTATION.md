@@ -143,6 +143,14 @@ Il descend seul des qu'un fichier gagne un proprietaire. Le marqueur est le meme
 gate de nexus (`claude-code-api/tests/diagram_index.rs`), pour que les deux depots se tiennent a
 la meme regle et qu'un lecteur n'ait qu'une forme a connaitre.
 
+**Le cliquet exige la portee complete.** Le plafond compte les quatre depots ; un checkout d'un
+seul depot en voit moins. Comparer un compte partiel au plafond complet (456 contre 1201) serait
+un vert permanent qui ne verifie rien, et `--write-orphans` ferait DESCENDRE le plafond a la
+valeur partielle, detruisant le vrai. Donc des qu'un depot voisin manque : le cliquet n'est ni
+applique ni mis a jour, le script le dit en avertissement, et `--write-orphans` est refuse. Les
+autres regles (structure, globs resolus, proprietaire unique, en-tetes) continuent de s'appliquer
+— une portee partielle n'est pas une amnistie.
+
 ### Cartes provisoires reprises (`supersedes`)
 
 Deux cartes de la cartographie d'origine portaient un suffixe numerique et n'etaient rattachees a
@@ -214,7 +222,22 @@ tests) sans diagramme proprietaire.
 
 Les depots voisins sont resolus par `DIAGRAM_ROOT_BACKEND|FRONTEND|NEXUS|WEBSITE` (defaut : `../frontend`, `../nexus`, `../website`) ; un depot absent est ignore avec un avertissement.
 
-## 11. Etat
+## 11. Ce que la CI verifie, et ce qu'elle ne verifie pas
+
+Le job `lint` de `.github/workflows/ci.yml` lance `check-index.mjs` et ses tests. Node est deja
+sur les runners `ubuntu-latest` : pas de `setup-node`, pas de `package.json`, aucune nouvelle
+chaine d'outils dans un depot Rust.
+
+Ce vert couvre : la structure de l'index, un glob `backend:` qui ne matche plus rien, un fichier
+revendique par deux diagrammes, une entree `verified` sans son `.mmd`, un en-tete invalide.
+
+Ce vert NE couvre PAS : les depots voisins, absents de ce checkout. Leurs globs ne sont pas
+resolus, le cliquet d'orphelins ne tourne pas, la fraicheur de `ORPHANS.md` n'est pas verifiee.
+**Ce vert ne prouve donc pas l'absence de derive** et ne doit pas etre cite comme tel ; c'est la
+tache 1.1 qui branchera le gate complet. Le script annonce lui-meme cette limite au lieu de
+passer vert en silence.
+
+## 12. Etat
 
 - 27 diagrammes prevus dans l'index, tous `planned` : **aucun `.mmd` n'existe encore**. Un index de
   27 entrees n'est pas 27 diagrammes ; c'est la liste des proprietaires, et c'est deja ce qui manquait
