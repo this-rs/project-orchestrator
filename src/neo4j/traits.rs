@@ -1844,7 +1844,10 @@ pub trait GraphStore: Send + Sync {
     /// Initialize energy for all notes that don't have it set.
     /// Sets energy = 1.0 and last_activated = coalesce(last_confirmed_at, created_at).
     /// Idempotent. Returns the number of notes initialized.
-    async fn init_note_energy(&self) -> Result<usize>;
+    ///
+    /// `project_id`: when `Some`, only notes of that project are touched;
+    /// `None` keeps the global sweep.
+    async fn init_note_energy(&self, project_id: Option<Uuid>) -> Result<usize>;
 
     /// List notes that have an embedding but no outgoing SYNAPSE.
     /// Used for synapse backfill. Returns (notes, total_count).

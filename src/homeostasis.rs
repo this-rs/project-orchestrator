@@ -919,6 +919,10 @@ mod tests {
                     format!("note {i}"),
                     "test".to_string(),
                 );
+                let mut n = n;
+                // Energy-less note: the mock initializes it only when asked to.
+                n.energy = 0.0;
+                n.last_activated = None;
                 mock.create_note(&n).await.unwrap();
                 mock.set_note_embedding(n.id, &[1.0, 0.0, 0.0], "m")
                     .await
@@ -950,6 +954,21 @@ mod tests {
         assert!(
             ids_b.iter().all(|id| !synapses.contains_key(id)),
             "project B notes must be untouched by a project-A correction"
+        );
+
+        assert_eq!(
+            *mock.init_note_energy_calls.read().await,
+            vec![Some(project_a)],
+            "init_note_energy must be called once, scoped to project A"
+        );
+        let notes = mock.notes.read().await;
+        assert!(
+            ids_a.iter().all(|id| notes[id].last_activated.is_some()),
+            "project A notes get their energy initialized"
+        );
+        assert!(
+            ids_b.iter().all(|id| notes[id].last_activated.is_none()),
+            "project B energy must not be initialized by a project-A correction"
         );
     }
 }

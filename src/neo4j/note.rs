@@ -3344,16 +3344,21 @@ impl Neo4jClient {
     }
 
     /// Initialize energy for notes that don't have it yet.
-    pub async fn init_note_energy(&self) -> Result<usize> {
+    ///
+    /// `project_id`: when `Some`, restricts the update to that project's notes
+    /// (`n.project_id`, the same property the vector search filters on).
+    pub async fn init_note_energy(&self, project_id: Option<uuid::Uuid>) -> Result<usize> {
         let q = query(
             r#"
             MATCH (n:Note)
             WHERE n.energy IS NULL
+              AND ($project_id IS NULL OR n.project_id = $project_id)
             SET n.energy = 1.0,
                 n.last_activated = coalesce(n.last_confirmed_at, n.created_at, datetime())
             RETURN count(n) AS updated
             "#,
-        );
+        )
+        .param("project_id", project_id.map(|p| p.to_string()));
 
         let mut result = self.graph.execute(q).await?;
         let updated = if let Some(row) = result.next().await? {

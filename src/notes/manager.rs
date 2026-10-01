@@ -1536,8 +1536,14 @@ impl NoteManager {
     /// only newly embedded notes or notes whose synapses were pruned are
     /// processed.
     ///
-    /// Also calls `init_note_energy()` first to ensure all notes have an
-    /// energy value.
+    /// Also calls `init_note_energy(project_id)` first to ensure the notes in
+    /// scope have an energy value.
+    ///
+    /// Neighbour search is bounded by each note's own `project_id`
+    /// (`vector_search_notes` filters `n.project_id = $pid` when `Some`), so a
+    /// project-scoped backfill never links across tenants. Notes with no
+    /// project (`None`) are only reached by the global sweep, where their
+    /// search is intentionally unfiltered.
     ///
     /// `project_id`: when `Some`, scopes both note selection and the adaptive
     /// `min_similarity` calibration to that project — used by bounded,
@@ -1587,7 +1593,7 @@ impl NoteManager {
         };
 
         // Phase 1: init energy on all notes that don't have it yet
-        let energy_init = self.neo4j.init_note_energy().await?;
+        let energy_init = self.neo4j.init_note_energy(project_id).await?;
         if energy_init > 0 {
             tracing::info!("Synapse backfill: initialized energy on {energy_init} notes");
         }
