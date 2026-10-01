@@ -5,7 +5,7 @@
 //! - **EpisodeRecall** — similar past episodes from episodic memory
 //! - **ScarWarning** — notes with high scar intensity on affected files
 //!
-//! The engine runs all three providers concurrently with a 300ms total budget.
+//! The engine runs all three providers concurrently with a 300ms budget each.
 //! On empty graphs or failures, each provider gracefully returns an empty vec.
 
 pub mod co_change;
@@ -140,7 +140,7 @@ use crate::neo4j::traits::GraphStore;
 /// Maximum number of suggestions returned by the engine.
 const MAX_SUGGESTIONS: usize = 5;
 
-/// Total time budget for all providers (ms).
+/// Time budget for each provider (ms); providers run concurrently.
 const REFLEX_TIMEOUT_MS: u64 = 300;
 
 /// The ReflexEngine runs co-change, episode recall, and scar warning providers
@@ -157,7 +157,7 @@ impl ReflexEngine {
 
     /// Generate suggestions for the given context.
     ///
-    /// Runs all three providers concurrently with a 300ms total budget.
+    /// Runs all three providers concurrently with a 300ms budget each.
     /// Returns at most `MAX_SUGGESTIONS` suggestions, sorted by priority
     /// (ScarWarning > EpisodeRecall > CoChangeReminder).
     pub async fn suggest(&self, ctx: &RefContext) -> Vec<Suggestion> {
@@ -171,32 +171,13 @@ impl ReflexEngine {
         let ctx_ep = ctx.clone();
         let ctx_sc = ctx.clone();
 
-        // Run all three providers concurrently under a shared timeout
-        let combined = timeout(deadline, async move {
-            let (co_changes, episodes, scars) = tokio::join!(
-                co_change::fetch_co_change_suggestions(graph_co.as_ref(), &ctx_co),
-                episode_recall::fetch_episode_suggestions(graph_ep.as_ref(), &ctx_ep),
-                scar_warning::fetch_scar_suggestions(graph_sc.as_ref(), &ctx_sc),
-            );
-            (co_changes, episodes, scars)
-        })
+        let mut suggestions = run_providers(
+            deadline,
+            co_change::fetch_co_change_suggestions(graph_co.as_ref(), &ctx_co),
+            episode_recall::fetch_episode_suggestions(graph_ep.as_ref(), &ctx_ep),
+            scar_warning::fetch_scar_suggestions(graph_sc.as_ref(), &ctx_sc),
+        )
         .await;
-
-        let mut suggestions = Vec::new();
-
-        match combined {
-            Ok((co_changes, episodes, scars)) => {
-                suggestions.extend(co_changes);
-                suggestions.extend(episodes);
-                suggestions.extend(scars);
-            }
-            Err(_) => {
-                warn!(
-                    "[reflex] Total timeout ({}ms) exceeded, returning partial results",
-                    REFLEX_TIMEOUT_MS
-                );
-            }
-        }
 
         // Sort by priority descending, then by score within each category
         suggestions.sort_by(|a, b| {
@@ -247,6 +228,43 @@ impl ReflexEngine {
     }
 }
 
+/// Run one provider under its own deadline: a slow provider yields an empty
+/// list instead of discarding the results of the others.
+async fn bounded<F>(name: &str, deadline: Duration, fut: F) -> Vec<Suggestion>
+where
+    F: std::future::Future<Output = Vec<Suggestion>>,
+{
+    match timeout(deadline, fut).await {
+        Ok(v) => v,
+        Err(_) => {
+            warn!(
+                "[reflex] Provider '{}' exceeded {}ms, dropping its results",
+                name,
+                deadline.as_millis()
+            );
+            Vec::new()
+        }
+    }
+}
+
+/// Run the three provider futures concurrently, each under its own deadline.
+async fn run_providers<A, B, C>(deadline: Duration, co: A, ep: B, sc: C) -> Vec<Suggestion>
+where
+    A: std::future::Future<Output = Vec<Suggestion>>,
+    B: std::future::Future<Output = Vec<Suggestion>>,
+    C: std::future::Future<Output = Vec<Suggestion>>,
+{
+    let (co_changes, episodes, scars) = tokio::join!(
+        bounded("co_change", deadline, co),
+        bounded("episode_recall", deadline, ep),
+        bounded("scar_warning", deadline, sc),
+    );
+    let mut suggestions = co_changes;
+    suggestions.extend(episodes);
+    suggestions.extend(scars);
+    suggestions
+}
+
 /// Extract the numeric score from a suggestion for secondary sorting.
 fn suggestion_score(s: &Suggestion) -> f64 {
     match s {
@@ -263,6 +281,30 @@ fn suggestion_score(s: &Suggestion) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scar() -> Suggestion {
+        Suggestion::ScarWarning {
+            note_id: Uuid::new_v4(),
+            content: "danger".into(),
+            scar_intensity: 0.9,
+            file_path: "a.rs".into(),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_slow_provider_does_not_discard_fast_providers() {
+        let out = run_providers(
+            Duration::from_millis(300),
+            async {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                Vec::new()
+            },
+            async { Vec::new() },
+            async { vec![scar()] },
+        )
+        .await;
+        assert_eq!(out.len(), 1, "scar must survive a slow co-change provider");
+    }
 
     #[test]
     fn test_suggestion_priority_ordering() {

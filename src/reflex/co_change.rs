@@ -35,9 +35,15 @@ pub async fn fetch_co_change_suggestions(
     let mut suggestions = Vec::new();
     let deadline = Duration::from_millis(CO_CHANGE_TIMEOUT_MS);
 
-    for source_file in &ctx.affected_files {
-        let result = timeout(deadline, graph.get_file_co_changers(source_file, 1, 10)).await;
+    // Query all files concurrently so latency does not add up per file.
+    let results =
+        futures::future::join_all(ctx.affected_files.iter().map(|source_file| async move {
+            let result = timeout(deadline, graph.get_file_co_changers(source_file, 1, 10)).await;
+            (source_file, result)
+        }))
+        .await;
 
+    for (source_file, result) in results {
         match result {
             Ok(Ok(co_changers)) => {
                 for cc in co_changers {
