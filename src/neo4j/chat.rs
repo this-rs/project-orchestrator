@@ -7,6 +7,40 @@ use neo4rs::query;
 use std::collections::HashMap;
 use uuid::Uuid;
 
+/// SET clauses of `update_chat_session`. Free-text fields are bound as
+/// `$cli_session_id`, `$title`, `$conversation_id`, `$preview` by the caller
+/// (the former inline escaping missed backslashes, so a trailing `\\` in a
+/// title broke out of the string literal).
+pub(crate) fn chat_session_update_clauses(
+    has_cli_session_id: bool,
+    has_title: bool,
+    message_count: Option<i64>,
+    total_cost_usd: Option<f64>,
+    has_conversation_id: bool,
+    has_preview: bool,
+) -> Vec<String> {
+    let mut c = vec!["s.updated_at = datetime()".to_string()];
+    if has_cli_session_id {
+        c.push("s.cli_session_id = $cli_session_id".to_string());
+    }
+    if has_title {
+        c.push("s.title = $title".to_string());
+    }
+    if let Some(v) = message_count {
+        c.push(format!("s.message_count = {}", v));
+    }
+    if let Some(v) = total_cost_usd.filter(|v| v.is_finite()) {
+        c.push(format!("s.total_cost_usd = {}", v));
+    }
+    if has_conversation_id {
+        c.push("s.conversation_id = $conversation_id".to_string());
+    }
+    if has_preview {
+        c.push("s.preview = $preview".to_string());
+    }
+    c
+}
+
 impl Neo4jClient {
     // ========================================================================
     // Chat Session operations
@@ -235,33 +269,33 @@ impl Neo4jClient {
         conversation_id: Option<String>,
         preview: Option<String>,
     ) -> Result<Option<ChatSessionNode>> {
-        let mut set_clauses = vec!["s.updated_at = datetime()".to_string()];
-
-        if let Some(ref v) = cli_session_id {
-            set_clauses.push(format!("s.cli_session_id = '{}'", v.replace('\'', "\\'")));
-        }
-        if let Some(ref v) = title {
-            set_clauses.push(format!("s.title = '{}'", v.replace('\'', "\\'")));
-        }
-        if let Some(v) = message_count {
-            set_clauses.push(format!("s.message_count = {}", v));
-        }
-        if let Some(v) = total_cost_usd {
-            set_clauses.push(format!("s.total_cost_usd = {}", v));
-        }
-        if let Some(ref v) = conversation_id {
-            set_clauses.push(format!("s.conversation_id = '{}'", v.replace('\'', "\\'")));
-        }
-        if let Some(ref v) = preview {
-            set_clauses.push(format!("s.preview = '{}'", v.replace('\'', "\\'")));
-        }
+        let set_clauses = chat_session_update_clauses(
+            cli_session_id.is_some(),
+            title.is_some(),
+            message_count,
+            total_cost_usd,
+            conversation_id.is_some(),
+            preview.is_some(),
+        );
 
         let cypher = format!(
             "MATCH (s:ChatSession {{id: $id}}) SET {} RETURN s",
             set_clauses.join(", ")
         );
 
-        let q = query(&cypher).param("id", id.to_string());
+        let mut q = query(&cypher).param("id", id.to_string());
+        if let Some(v) = cli_session_id {
+            q = q.param("cli_session_id", v);
+        }
+        if let Some(v) = title {
+            q = q.param("title", v);
+        }
+        if let Some(v) = conversation_id {
+            q = q.param("conversation_id", v);
+        }
+        if let Some(v) = preview {
+            q = q.param("preview", v);
+        }
         let mut result = self.graph.execute(q).await?;
 
         if let Some(row) = result.next().await? {
@@ -1776,5 +1810,21 @@ impl Neo4jClient {
         } else {
             Ok(None)
         }
+    }
+}
+
+#[cfg(test)]
+mod injection_tests {
+    use super::chat_session_update_clauses;
+
+    #[test]
+    fn chat_session_update_binds_free_text() {
+        let c = chat_session_update_clauses(true, true, Some(3), Some(0.25), true, true).join(", ");
+        for p in ["$cli_session_id", "$title", "$conversation_id", "$preview"] {
+            assert!(c.contains(p), "{c}");
+        }
+        assert!(!c.contains('\''), "no string literal expected: {c}");
+        let nan = chat_session_update_clauses(false, false, None, Some(f64::NAN), false, false);
+        assert_eq!(nan, vec!["s.updated_at = datetime()".to_string()]);
     }
 }
