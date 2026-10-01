@@ -11,6 +11,7 @@
 use super::handlers::{AppError, OrchestratorState};
 use super::ws_auth::CookieAuthResult;
 use crate::auth::jwt::Claims;
+use crate::chat::manager::{DeliveryRoute, MessageDeliveryError};
 use axum::{
     extract::{
         ws::{Message, WebSocket},
@@ -722,39 +723,42 @@ async fn handle_ws_chat_loop(
                                         // T4.3: Extract code entities and create DISCUSSED relations (non-blocking)
                                         spawn_entity_extraction(&state, &session_id, &content);
 
-                                        // 3-branch routing: local → remote (NATS RPC) → fallback resume
-                                        // Track which branch was used so the error handler knows
-                                        // whether a resume_session fallback makes sense.
-                                        let used_send_message;
-                                        let result = if chat_manager.is_session_active(&session_id).await {
-                                            // Session is local — send directly
-                                            used_send_message = true;
-                                            chat_manager.send_message(&session_id, &content).await
-                                        } else if chat_manager
-                                            .try_remote_send(&session_id, &content, "user_message")
-                                            .await
-                                            .unwrap_or(false)
-                                        {
-                                            // Message proxied to remote instance via NATS RPC.
-                                            // Ensure we have a NATS subscription to receive the stream.
-                                            used_send_message = false;
-                                            if nats_chat_sub.is_none() {
-                                                if let Some(ref nats) = state.nats_emitter {
-                                                    if let Ok(sub) = nats.subscribe_chat_events(&session_id).await {
-                                                        debug!(session_id = %session_id, "Subscribed to NATS chat events after remote send");
-                                                        nats_chat_sub = Some(sub);
+                                        // Same routing as POST /api/chat/sessions/{id}/messages:
+                                        // local → remote (NATS RPC) → resume_session.
+                                        let result = chat_manager
+                                            .route_user_message(&session_id, &content, Some(&claims))
+                                            .await;
+
+                                        // A message proxied to a remote instance: make sure we
+                                        // have a NATS subscription to receive the stream.
+                                        if matches!(result, Ok(DeliveryRoute::Remote)) && nats_chat_sub.is_none() {
+                                            if let Some(ref nats) = state.nats_emitter {
+                                                if let Ok(sub) = nats.subscribe_chat_events(&session_id).await {
+                                                    debug!(session_id = %session_id, "Subscribed to NATS chat events after remote send");
+                                                    nats_chat_sub = Some(sub);
+                                                }
+                                            }
+                                        }
+
+                                        match result {
+                                            Ok(DeliveryRoute::ResumedAfterSendFailure) => {
+                                                // Resume succeeded — subscribe to the new broadcast channel
+                                                // (the old one is dead since the CLI was replaced)
+                                                match chat_manager.subscribe(&session_id).await {
+                                                    Ok(rx) => {
+                                                        event_rx = Some(rx);
+                                                        if nats_chat_sub.is_some() {
+                                                            debug!(session_id = %session_id, "Dropping NATS chat sub — local broadcast now active (after resume fallback)");
+                                                            nats_chat_sub = None;
+                                                        }
+                                                        info!(session_id = %session_id, "Recovered via resume_session after send_message failure");
+                                                    }
+                                                    Err(sub_err) => {
+                                                        debug!(session_id = %session_id, error = %sub_err, "No local broadcast after resume fallback");
                                                     }
                                                 }
                                             }
-                                            Ok(())
-                                        } else {
-                                            // No instance owns the session — resume locally (spawns new CLI)
-                                            used_send_message = false;
-                                            chat_manager.resume_session(&session_id, &content, Some(&claims)).await
-                                        };
-
-                                        match result {
-                                            Ok(()) => {
+                                            Ok(_) => {
                                                 // If we did a local send/resume and don't have broadcast, subscribe now
                                                 if event_rx.is_none() {
                                                     match chat_manager.subscribe(&session_id).await {
@@ -775,51 +779,22 @@ async fn handle_ws_chat_loop(
                                                     }
                                                 }
                                             }
-                                            Err(e) if used_send_message => {
-                                                // send_message failed — likely dead CLI (ChannelSendError).
-                                                // Fall through to resume_session as a recovery mechanism.
-                                                warn!(
+                                            Err(MessageDeliveryError::SendAndResume { send, resume }) => {
+                                                // Both send_message and resume_session failed — show error
+                                                error!(
                                                     session_id = %session_id,
-                                                    error = %e,
-                                                    "send_message failed, attempting resume_session as fallback"
+                                                    send_error = %send,
+                                                    resume_error = %resume,
+                                                    "Both send_message and resume_session failed"
                                                 );
-                                                match chat_manager.resume_session(&session_id, &content, Some(&claims)).await {
-                                                    Ok(()) => {
-                                                        // Resume succeeded — subscribe to the new broadcast channel
-                                                        // (the old one is dead since the CLI was replaced)
-                                                        match chat_manager.subscribe(&session_id).await {
-                                                            Ok(rx) => {
-                                                                event_rx = Some(rx);
-                                                                if nats_chat_sub.is_some() {
-                                                                    debug!(session_id = %session_id, "Dropping NATS chat sub — local broadcast now active (after resume fallback)");
-                                                                    nats_chat_sub = None;
-                                                                }
-                                                                info!(session_id = %session_id, "Recovered via resume_session after send_message failure");
-                                                            }
-                                                            Err(sub_err) => {
-                                                                debug!(session_id = %session_id, error = %sub_err, "No local broadcast after resume fallback");
-                                                            }
-                                                        }
-                                                    }
-                                                    Err(resume_err) => {
-                                                        // Both send_message and resume_session failed — show error
-                                                        error!(
-                                                            session_id = %session_id,
-                                                            send_error = %e,
-                                                            resume_error = %resume_err,
-                                                            "Both send_message and resume_session failed"
-                                                        );
-                                                        let err = serde_json::json!({
-                                                            "type": "error",
-                                                            "message": format!("Failed to send message: {}", resume_err),
-                                                        });
-                                                        let _ = ws_sender.send(Message::Text(err.to_string().into())).await;
-                                                    }
-                                                }
+                                                let err = serde_json::json!({
+                                                    "type": "error",
+                                                    "message": format!("Failed to send message: {}", resume),
+                                                });
+                                                let _ = ws_sender.send(Message::Text(err.to_string().into())).await;
                                             }
-                                            Err(e) => {
-                                                // resume_session itself failed (branch 3) — don't retry it again.
-                                                // Show the error directly to the user.
+                                            Err(MessageDeliveryError::Resume(e)) => {
+                                                // resume_session itself failed — don't retry it again.
                                                 error!(
                                                     session_id = %session_id,
                                                     error = %e,
@@ -898,23 +873,10 @@ async fn handle_ws_chat_loop(
                                         // Unlike user messages, permission responses use the SDK
                                         // control protocol (JSON: {"allow": true/false}) and must
                                         // NOT be persisted or broadcast as user_message events.
-                                        let send_result = if is_local {
-                                            chat_manager.send_permission_response(&session_id, &request_id, allow).await
-                                        } else {
-                                            // For remote sessions, proxy the control response via NATS RPC.
-                                            // The message_type "control_response" signals the receiving
-                                            // instance to use send_permission_response instead of send_message.
-                                            let payload = serde_json::json!({ "allow": allow }).to_string();
-                                            if chat_manager
-                                                .try_remote_send(&session_id, &payload, "control_response")
-                                                .await
-                                                .unwrap_or(false)
-                                            {
-                                                Ok(())
-                                            } else {
-                                                Err(anyhow::anyhow!("Session not active on any instance"))
-                                            }
-                                        };
+                                        // Same routing as POST .../permissions/{request_id}.
+                                        let send_result = chat_manager
+                                            .route_permission_response(&session_id, &request_id, allow, false)
+                                            .await;
                                         if let Err(e) = send_result {
                                             warn!(
                                                 session_id = %session_id,

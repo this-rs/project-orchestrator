@@ -334,6 +334,7 @@ impl Neo4jClient {
             // Knowledge Note indexes
             "CREATE INDEX note_project IF NOT EXISTS FOR (n:Note) ON (n.project_id)",
             "CREATE INDEX note_status IF NOT EXISTS FOR (n:Note) ON (n.status)",
+            "CREATE INDEX decision_status IF NOT EXISTS FOR (d:Decision) ON (d.status)",
             "CREATE INDEX note_type IF NOT EXISTS FOR (n:Note) ON (n.note_type)",
             "CREATE INDEX note_importance IF NOT EXISTS FOR (n:Note) ON (n.importance)",
             "CREATE INDEX note_staleness IF NOT EXISTS FOR (n:Note) ON (n.staleness_score)",

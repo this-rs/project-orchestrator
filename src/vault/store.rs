@@ -445,11 +445,11 @@ mod tests {
     fn store_and_read_back_while_open() {
         let (_d, mut v) = temp_vault();
         init(&mut v);
-        v.put("mermaid", "the-mermaid-passphrase", None, t0())
+        v.put("design-tool", "the-design-tool-passphrase", None, t0())
             .unwrap();
         assert_eq!(
-            v.get("mermaid", t0()).unwrap().as_str(),
-            "the-mermaid-passphrase"
+            v.get("design-tool", t0()).unwrap().as_str(),
+            "the-design-tool-passphrase"
         );
     }
 
@@ -457,10 +457,10 @@ mod tests {
     fn it_locks_itself_at_the_deadline() {
         let (_d, mut v) = temp_vault();
         init(&mut v);
-        v.put("mermaid", "the-mermaid-passphrase", None, t0())
+        v.put("design-tool", "the-design-tool-passphrase", None, t0())
             .unwrap();
         let later = t0() + Duration::minutes(30);
-        assert_eq!(v.get("mermaid", later), Err(VaultError::Locked));
+        assert_eq!(v.get("design-tool", later), Err(VaultError::Locked));
         assert_eq!(v.status(later).unlocked_until, None);
     }
 
@@ -469,19 +469,19 @@ mod tests {
         // The server restarting must not reopen the vault by itself.
         let (d, mut v) = temp_vault();
         init(&mut v);
-        v.put("mermaid", "the-mermaid-passphrase", None, t0())
+        v.put("design-tool", "the-design-tool-passphrase", None, t0())
             .unwrap();
 
         let mut reloaded = Vault::load(d.path().join("vault.json")).unwrap();
-        assert_eq!(reloaded.get("mermaid", t0()), Err(VaultError::Locked));
+        assert_eq!(reloaded.get("design-tool", t0()), Err(VaultError::Locked));
         assert_eq!(
             reloaded.unlock("not the passphrase at all", Duration::minutes(5), t0()),
             Err(VaultError::WrongPassphrase)
         );
         reloaded.unlock(PASS, Duration::minutes(5), t0()).unwrap();
         assert_eq!(
-            reloaded.get("mermaid", t0()).unwrap().as_str(),
-            "the-mermaid-passphrase"
+            reloaded.get("design-tool", t0()).unwrap().as_str(),
+            "the-design-tool-passphrase"
         );
     }
 
@@ -489,13 +489,13 @@ mod tests {
     fn the_file_holds_no_plaintext_and_no_passphrase() {
         let (d, mut v) = temp_vault();
         init(&mut v);
-        v.put("mermaid", "the-mermaid-passphrase", None, t0())
+        v.put("design-tool", "the-design-tool-passphrase", None, t0())
             .unwrap();
         let raw = std::fs::read_to_string(d.path().join("vault.json")).unwrap();
-        assert!(!raw.contains("the-mermaid-passphrase"));
+        assert!(!raw.contains("the-design-tool-passphrase"));
         assert!(!raw.contains(PASS));
         assert!(
-            raw.contains("mermaid"),
+            raw.contains("design-tool"),
             "names are metadata, stored in clear"
         );
     }
@@ -573,27 +573,27 @@ mod tests {
         let (_d, mut v) = temp_vault();
         init(&mut v);
         v.put(
-            "mermaid",
-            "the-mermaid-passphrase",
-            Some("mermaid.ffs.dev default vault".into()),
+            "design-tool",
+            "the-design-tool-passphrase",
+            Some("local design tool default vault".into()),
             t0(),
         )
         .unwrap();
         v.lock();
         let listed = v.list();
         assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].name, "mermaid");
-        assert!(!format!("{listed:?}").contains("the-mermaid-passphrase"));
+        assert_eq!(listed[0].name, "design-tool");
+        assert!(!format!("{listed:?}").contains("the-design-tool-passphrase"));
     }
 
     #[test]
     fn debug_of_an_open_vault_shows_no_key_and_no_value() {
         let (_d, mut v) = temp_vault();
         init(&mut v);
-        v.put("mermaid", "the-mermaid-passphrase", None, t0())
+        v.put("design-tool", "the-design-tool-passphrase", None, t0())
             .unwrap();
         let debug = format!("{v:?}");
-        assert!(!debug.contains("the-mermaid-passphrase"));
+        assert!(!debug.contains("the-design-tool-passphrase"));
         assert!(debug.contains("<redacted>") || !debug.contains("key: SecretKey(["));
     }
 
@@ -601,14 +601,15 @@ mod tests {
     fn replacing_a_secret_keeps_its_creation_date() {
         let (_d, mut v) = temp_vault();
         init(&mut v);
-        v.put("mermaid", "first-value-000", None, t0()).unwrap();
+        v.put("design-tool", "first-value-000", None, t0()).unwrap();
         let later = t0() + Duration::minutes(3);
-        v.put("mermaid", "second-value-000", None, later).unwrap();
+        v.put("design-tool", "second-value-000", None, later)
+            .unwrap();
         let meta = &v.list()[0];
         assert_eq!(meta.created_at, t0());
         assert_eq!(meta.updated_at, later);
         assert_eq!(
-            v.get("mermaid", later).unwrap().as_str(),
+            v.get("design-tool", later).unwrap().as_str(),
             "second-value-000"
         );
     }

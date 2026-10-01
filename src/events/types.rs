@@ -76,6 +76,11 @@ pub enum EntityType {
     LifecycleHook,
     /// Learning system — emitters: reactions.rs (PatternsDetected after episode analysis)
     Learning,
+    /// A thread entered or left an attention band (waiting on the user, orphan,
+    /// plan/task failure...) — emitters: chat manager, runner. Payload is
+    /// minimal (ids + `workspace_slug` + `reasons`), NEVER the text of a command
+    /// or question: consumers refetch `/api/attention`.
+    AttentionChanged,
 }
 
 /// The CRUD action performed on an entity.
@@ -378,6 +383,7 @@ mod tests {
             EntityType::TopologyRule,
             EntityType::LifecycleHook,
             EntityType::Learning,
+            EntityType::AttentionChanged,
         ];
 
         for variant in &variants {
@@ -488,7 +494,7 @@ mod tests {
     #[test]
     fn test_entity_type_has_30_variants() {
         // Ensure we don't accidentally add/remove variants
-        let all: [EntityType; 30] = [
+        let all: [EntityType; 31] = [
             EntityType::Project,
             EntityType::Plan,
             EntityType::Task,
@@ -519,8 +525,9 @@ mod tests {
             EntityType::TopologyRule,
             EntityType::LifecycleHook,
             EntityType::Learning,
+            EntityType::AttentionChanged,
         ];
-        assert_eq!(all.len(), 30);
+        assert_eq!(all.len(), 31);
     }
 
     // ================================================================

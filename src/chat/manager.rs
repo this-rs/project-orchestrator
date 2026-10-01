@@ -17,6 +17,7 @@ use super::types::{
     ChatEventPage, ChatRequest, CreateSessionResponse, MessageSearchHit, MessageSearchResult,
     PendingMessage, SessionWorkLog,
 };
+use crate::events::attention::{notify_attention, AttentionReason, AttentionSubject};
 use crate::meilisearch::SearchStore;
 use crate::neo4j::models::ChatEventRecord;
 use crate::neo4j::models::ChatSessionNode;
@@ -104,6 +105,18 @@ pub(crate) const BACKGROUND_TASKS_POLL_INTERVAL_SECS: u64 = 5;
 /// still be cleaned up — just with a 30-min lag rather than instantly.
 /// Users who want immediate cleanup can `cancel_task` directly.
 pub(crate) const BACKGROUND_TASK_IDLE_DEATH_SECS: u64 = 1800;
+
+/// In-memory facts about the running CLIs (see
+/// [`ChatManager::live_session_snapshot`]).
+#[derive(Debug, Default, Clone)]
+pub struct LiveSessionSnapshot {
+    /// Sessions whose CLI is alive.
+    pub live: std::collections::HashSet<Uuid>,
+    /// Among them, those currently streaming a turn.
+    pub streaming: std::collections::HashSet<Uuid>,
+    /// Per live session, the `request_id`s of permissions still waiting.
+    pub pending_permissions: std::collections::HashMap<Uuid, std::collections::HashSet<String>>,
+}
 
 /// An active chat session with a live Claude CLI subprocess
 pub struct ActiveSession {
@@ -250,6 +263,55 @@ pub struct ActiveSession {
     pub cancel_task_cap: u32,
     /// Rolling window for the cancel_task rate cap. Defaults to 300s (5 min).
     pub cancel_task_window: Duration,
+}
+
+/// Where a message or permission answer ended up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryRoute {
+    /// Handed to the CLI running in this process.
+    Local,
+    /// Proxied to the instance that owns the session.
+    Remote,
+    /// Nobody held the session: the CLI was respawned (`resume_session`).
+    Resumed,
+    /// The local send failed (dead CLI) and the session was resumed instead.
+    ResumedAfterSendFailure,
+}
+
+/// Why a permission answer was not delivered.
+#[derive(Debug)]
+pub enum PermissionDeliveryError {
+    /// No instance holds the session: the CLI that asked is gone.
+    SessionDead(String),
+    /// The CLI is alive but the request is no longer waiting (already
+    /// answered, or never asked).
+    NotPending,
+    Failed(anyhow::Error),
+}
+
+impl std::fmt::Display for PermissionDeliveryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SessionDead(id) => write!(f, "Session {id} not found or inactive"),
+            Self::NotPending => write!(f, "Permission request is no longer pending"),
+            Self::Failed(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for PermissionDeliveryError {}
+
+/// Why a user message was not delivered.
+#[derive(Debug)]
+pub enum MessageDeliveryError {
+    /// Nobody held the session and `resume_session` failed.
+    Resume(anyhow::Error),
+    /// The local send failed and the resume fallback failed too.
+    SendAndResume {
+        send: anyhow::Error,
+        resume: anyhow::Error,
+    },
 }
 
 /// Result of `ChatManager::cancel_running_tools`. Surfaced to REST/WS
@@ -832,6 +894,16 @@ impl ChatManager {
             nn_router: None,
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
         }
+    }
+
+    /// Emit the light `attention_changed` signal for a session (no-op without
+    /// an emitter). Ids only: never the text of a command or question.
+    pub(crate) fn notify_attention(&self, session_id: &str, reason: AttentionReason) {
+        notify_attention(
+            &self.event_emitter,
+            AttentionSubject::Session(session_id.to_string()),
+            reason,
+        );
     }
 
     /// Set the event emitter for CRUD events (streaming status notifications)
@@ -1701,6 +1773,13 @@ impl ChatManager {
                             };
                             let _ = events_tx.send(user_msg_event.clone());
                             nats.publish_chat_event(&session_id, user_msg_event);
+                            crate::events::attention::notify_attention(
+                                &event_emitter,
+                                crate::events::attention::AttentionSubject::Session(
+                                    session_id.clone(),
+                                ),
+                                crate::events::attention::AttentionReason::UserMessage,
+                            );
 
                             // Spawn stream_response
                             let session_id_clone = session_id.clone();
@@ -2087,6 +2166,36 @@ impl ChatManager {
         }
 
         (prompt, included_note_ids)
+    }
+
+    /// Sessions whose CLI is alive, those currently streaming, and the
+    /// permission requests each live CLI still holds in memory. The sessions
+    /// map is read under ONE lock (the cockpit must not take it once per
+    /// session); the per-session permission maps are locked after it is
+    /// released.
+    pub async fn live_session_snapshot(&self) -> LiveSessionSnapshot {
+        let mut snap = LiveSessionSnapshot::default();
+        let mut inputs = Vec::new();
+        {
+            let sessions = self.active_sessions.read().await;
+            for (id, s) in sessions.iter() {
+                if let Ok(id) = id.parse::<Uuid>() {
+                    snap.live.insert(id);
+                    if s.is_streaming.load(Ordering::SeqCst) {
+                        snap.streaming.insert(id);
+                    }
+                    inputs.push((id, s.pending_permission_inputs.clone()));
+                }
+            }
+        }
+        for (id, pending) in inputs {
+            let ids: std::collections::HashSet<String> =
+                pending.lock().await.keys().cloned().collect();
+            if !ids.is_empty() {
+                snap.pending_permissions.insert(id, ids);
+            }
+        }
+        snap
     }
 
     /// Check if a session is currently active (subprocess alive)
@@ -2727,6 +2836,36 @@ impl ChatManager {
             None => (None, None),
         };
 
+        // A plan-runner session has no parent session, so the SPAWNED_BY
+        // relation above is never created for it. Link it to its PlanRun here,
+        // for EVERY caller (task, retry, wave, resumed run): the cockpit's
+        // session -> thread attachment reads this relation (chat::attachment).
+        if let Some(spawn) = request
+            .spawned_by
+            .as_deref()
+            .and_then(super::attachment::parse_plan_run_spawn)
+        {
+            if let Some(run_id) = spawn.run_id {
+                match self
+                    .graph
+                    .link_session_to_run(
+                        &session_id.to_string(),
+                        run_id,
+                        spawn.plan_id,
+                        spawn.task_id,
+                    )
+                    .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => warn!(
+                        session_id = %session_id, run_id = %run_id,
+                        "Runner session not linked to its run (PlanRun not found)"
+                    ),
+                    Err(e) => warn!("Failed to link runner session to its run: {e}"),
+                }
+            }
+        }
+
         // Create broadcast channel early so CompactionNotifier can use the sender
         let (events_tx, _) = broadcast::channel(BROADCAST_BUFFER);
 
@@ -2976,6 +3115,7 @@ impl ChatManager {
             );
             interrupt_flag
         };
+        self.notify_attention(&session_id.to_string(), AttentionReason::SessionActive);
 
         // Spawn NATS interrupt listener for cross-instance interrupt support
         self.spawn_nats_interrupt_listener(
@@ -3077,6 +3217,7 @@ impl ChatManager {
         if let Some(ref nats) = self.nats {
             nats.publish_chat_event(&session_id.to_string(), user_msg_event);
         }
+        self.notify_attention(&session_id.to_string(), AttentionReason::UserMessage);
 
         // Emit CRUD event so other instances (via NATS) know a session was created
         if let Some(ref emitter) = self.event_emitter {
@@ -3975,6 +4116,11 @@ impl ChatManager {
                                     session_id, err_str
                                 );
                                 active_sessions.write().await.remove(&session_id);
+                                notify_attention(
+                                    &event_emitter,
+                                    AttentionSubject::Session(session_id.to_string()),
+                                    AttentionReason::SessionInactive,
+                                );
                             }
 
                             emit_chat(
@@ -4057,6 +4203,8 @@ impl ChatManager {
 
                         // Broadcast to WebSocket clients
                         emit_chat(event.clone(), &events_tx, &nats, &session_id);
+                        // Light signal on /ws/events (ids only, never the command/question)
+                        notify_attention_for_chat_event(&event_emitter, &session_id, &event);
                         Some(event)
                     };
 
@@ -4914,6 +5062,7 @@ impl ChatManager {
         if let Some(ref nats) = self.nats {
             nats.publish_chat_event(session_id, user_msg_event);
         }
+        self.notify_attention(session_id, AttentionReason::UserMessage);
 
         // Start streaming directly
         let session_id_str = session_id.to_string();
@@ -5041,17 +5190,38 @@ impl ChatManager {
         request_id: &str,
         allow: bool,
     ) -> Result<()> {
+        self.send_permission_response_inner(session_id, request_id, allow, false)
+            .await
+            .map_err(|e| match e {
+                PermissionDeliveryError::Failed(e) => e,
+                other => anyhow!(other.to_string()),
+            })
+    }
+
+    /// Shared body of the permission answer. With `require_pending`, the
+    /// request must still be waiting in the session's pending map: the entry
+    /// is CLAIMED atomically (removed under the map lock), so two concurrent
+    /// answers to the same request cannot both reach the CLI — the second one
+    /// gets [`PermissionDeliveryError::NotPending`]. The WS path passes
+    /// `false` and keeps its historical lenient behaviour.
+    async fn send_permission_response_inner(
+        &self,
+        session_id: &str,
+        request_id: &str,
+        allow: bool,
+        require_pending: bool,
+    ) -> std::result::Result<(), PermissionDeliveryError> {
         let (stdin_tx, pending_perm_inputs, events_tx, session_uuid, next_seq) = {
             let mut sessions = self.active_sessions.write().await;
             let session = sessions
                 .get_mut(session_id)
-                .ok_or_else(|| anyhow!("Session {} not found or inactive", session_id))?;
+                .ok_or_else(|| PermissionDeliveryError::SessionDead(session_id.to_string()))?;
             session.last_activity = Instant::now();
             let tx = session.stdin_tx.clone().ok_or_else(|| {
-                anyhow!(
+                PermissionDeliveryError::Failed(anyhow!(
                     "No stdin sender for session {} (CLI may not be connected)",
                     session_id
-                )
+                ))
             })?;
             (
                 tx,
@@ -5068,11 +5238,23 @@ impl ChatManager {
         //   Deny:  { behavior: "deny",  message: <string> }
         // The `updatedInput` field REPLACES the original tool input in the CLI, so we
         // MUST pass back the original input — an empty {} would erase command/file_path/etc.
-        let original_input = pending_perm_inputs
-            .lock()
-            .await
-            .remove(request_id)
-            .unwrap_or_else(|| serde_json::json!({}));
+        let claimed = pending_perm_inputs.lock().await.remove(request_id);
+        if require_pending && claimed.is_none() {
+            return Err(PermissionDeliveryError::NotPending);
+        }
+        let was_claimed = claimed.is_some();
+        let original_input = claimed.unwrap_or_else(|| serde_json::json!({}));
+        // The entry is only really consumed once the decision reached the CLI:
+        // on a failed send it is put back so a retry is still `pending`.
+        let restore_claim = |input: serde_json::Value| {
+            let pending = pending_perm_inputs.clone();
+            let request_id = request_id.to_string();
+            async move {
+                if was_claimed {
+                    pending.lock().await.insert(request_id, input);
+                }
+            }
+        };
 
         let permission_response = if allow {
             serde_json::json!({
@@ -5096,8 +5278,16 @@ impl ChatManager {
             }
         });
 
-        let json = serde_json::to_string(&control_response)
-            .map_err(|e| anyhow!("Failed to serialize control response: {}", e))?;
+        let json = match serde_json::to_string(&control_response) {
+            Ok(j) => j,
+            Err(e) => {
+                restore_claim(original_input).await;
+                return Err(PermissionDeliveryError::Failed(anyhow!(
+                    "Failed to serialize control response: {}",
+                    e
+                )));
+            }
+        };
 
         info!(
             session_id = %session_id,
@@ -5106,10 +5296,13 @@ impl ChatManager {
             "Sending permission control response to CLI (via stdin_tx, lock-free)"
         );
 
-        stdin_tx
-            .send(json)
-            .await
-            .map_err(|e| anyhow!("Failed to send permission control response: {}", e))?;
+        if let Err(e) = stdin_tx.send(json).await {
+            restore_claim(original_input).await;
+            return Err(PermissionDeliveryError::Failed(anyhow!(
+                "Failed to send permission control response: {}",
+                e
+            )));
+        }
 
         // Persist and broadcast the permission decision so it survives session reload.
         let decision_event = ChatEvent::PermissionDecision {
@@ -5122,6 +5315,7 @@ impl ChatManager {
         if let Some(ref nats) = self.nats {
             nats.publish_chat_event(session_id, decision_event.clone());
         }
+        self.notify_attention(session_id, AttentionReason::PermissionDecision);
 
         // Persist to Neo4j
         if let Some(uuid) = session_uuid {
@@ -5145,6 +5339,83 @@ impl ChatManager {
         }
 
         Ok(())
+    }
+
+    /// Answer a permission request: local CLI first, then the instance that
+    /// owns the session (NATS RPC). The ONE routing used by the WS
+    /// `permission_response` frame and by the REST route.
+    ///
+    /// `require_pending` makes the answer strict for a LOCAL session (see
+    /// [`Self::send_permission_response_inner`]); a remote owner does its own
+    /// bookkeeping. No instance holds the session -> `SessionDead`.
+    pub async fn route_permission_response(
+        &self,
+        session_id: &str,
+        request_id: &str,
+        allow: bool,
+        require_pending: bool,
+    ) -> std::result::Result<DeliveryRoute, PermissionDeliveryError> {
+        if self.is_session_active(session_id).await {
+            return self
+                .send_permission_response_inner(session_id, request_id, allow, require_pending)
+                .await
+                .map(|()| DeliveryRoute::Local);
+        }
+        // The message_type "control_response" tells the receiving instance to
+        // use send_permission_response instead of send_message.
+        let payload = serde_json::json!({ "allow": allow }).to_string();
+        if self
+            .try_remote_send(session_id, &payload, "control_response")
+            .await
+            .unwrap_or(false)
+        {
+            Ok(DeliveryRoute::Remote)
+        } else {
+            Err(PermissionDeliveryError::SessionDead(session_id.to_string()))
+        }
+    }
+
+    /// Deliver a user message: local CLI -> owning instance (NATS) ->
+    /// `resume_session` (respawns the CLI, keeping the session's identity and
+    /// links). A failed local send falls back to `resume_session` too (dead
+    /// CLI). The ONE routing used by the WS `user_message` frame and by the
+    /// REST route; it is also the only way to answer an orphan question.
+    pub async fn route_user_message(
+        &self,
+        session_id: &str,
+        content: &str,
+        claims: Option<&crate::auth::jwt::Claims>,
+    ) -> std::result::Result<DeliveryRoute, MessageDeliveryError> {
+        if self.is_session_active(session_id).await {
+            match self.send_message(session_id, content).await {
+                Ok(()) => return Ok(DeliveryRoute::Local),
+                Err(send_err) => {
+                    warn!(
+                        session_id = %session_id,
+                        error = %send_err,
+                        "send_message failed, attempting resume_session as fallback"
+                    );
+                    return match self.resume_session(session_id, content, claims).await {
+                        Ok(()) => Ok(DeliveryRoute::ResumedAfterSendFailure),
+                        Err(resume) => Err(MessageDeliveryError::SendAndResume {
+                            send: send_err,
+                            resume,
+                        }),
+                    };
+                }
+            }
+        }
+        if self
+            .try_remote_send(session_id, content, "user_message")
+            .await
+            .unwrap_or(false)
+        {
+            return Ok(DeliveryRoute::Remote);
+        }
+        self.resume_session(session_id, content, claims)
+            .await
+            .map(|()| DeliveryRoute::Resumed)
+            .map_err(MessageDeliveryError::Resume)
     }
 
     /// Change the permission mode of an active CLI session mid-conversation.
@@ -5726,6 +5997,7 @@ impl ChatManager {
             );
             interrupt_flag
         };
+        self.notify_attention(session_id, AttentionReason::SessionActive);
 
         // Spawn NATS interrupt listener for cross-instance interrupt support
         self.spawn_nats_interrupt_listener(
@@ -5820,6 +6092,7 @@ impl ChatManager {
         if let Some(ref nats) = self.nats {
             nats.publish_chat_event(session_id, user_msg_event);
         }
+        self.notify_attention(session_id, AttentionReason::UserMessage);
 
         // Stream in background
         let session_id_str = session_id.to_string();
@@ -7114,6 +7387,7 @@ impl ChatManager {
                 session.protocol_state,
             )
         };
+        self.notify_attention(session_id, AttentionReason::SessionInactive);
 
         // 4. Finalize trajectory — fire-and-forget (non-blocking)
         //    Uses end_session_auto() so the collector computes the reward from
@@ -7298,6 +7572,26 @@ async fn store_pending_perm_input(
     input: &serde_json::Value,
 ) {
     map.lock().await.insert(id.to_string(), input.clone());
+}
+
+/// Relay a permission request / question as a light `attention_changed` on
+/// the general bus. Ids only: the command or question text never leaves the
+/// session's own WebSocket.
+fn notify_attention_for_chat_event(
+    emitter: &Option<Arc<dyn crate::events::EventEmitter>>,
+    session_id: &str,
+    event: &ChatEvent,
+) {
+    let reason = match event {
+        ChatEvent::PermissionRequest { .. } => AttentionReason::PermissionRequest,
+        ChatEvent::AskUserQuestion { .. } => AttentionReason::AskUserQuestion,
+        _ => return,
+    };
+    notify_attention(
+        emitter,
+        AttentionSubject::Session(session_id.to_string()),
+        reason,
+    );
 }
 
 /// without needing to spin up a full streaming session.
@@ -8663,6 +8957,232 @@ mod tests {
             !err_msg.contains("no CLI session ID"),
             "Should not fail with 'no CLI session ID', got: {}",
             err_msg
+        );
+    }
+
+    // ====================================================================
+    // Session -> run/thread attachment (task 1.7)
+    // ====================================================================
+
+    fn runner_request(run_id: Uuid, plan_id: Uuid, task_id: Uuid) -> ChatRequest {
+        ChatRequest {
+            message: "go".into(),
+            session_id: None,
+            cwd: "/tmp/test".into(),
+            project_slug: None,
+            model: None,
+            permission_mode: Some("bypassPermissions".into()),
+            add_dirs: None,
+            workspace_slug: None,
+            user_claims: None,
+            spawned_by: Some(
+                serde_json::json!({
+                    "type": "runner",
+                    "run_id": run_id.to_string(),
+                    "plan_id": plan_id.to_string(),
+                    "task_id": task_id.to_string(),
+                })
+                .to_string(),
+            ),
+            task_context: None,
+            scaffolding_override: None,
+            runner_context: None,
+        }
+    }
+
+    fn manager_with_mock() -> (ChatManager, Arc<crate::neo4j::mock::MockGraphStore>) {
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+        let state = mock_app_state();
+        (
+            ChatManager::new_without_memory(dyn_graph, state.meili, test_config()),
+            graph,
+        )
+    }
+
+    #[tokio::test]
+    async fn test_create_session_links_runner_session_to_its_run() {
+        let (manager, graph) = manager_with_mock();
+        let (run, plan, task) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        // The CLI is not available in tests: only the persisted side matters.
+        let _ = manager
+            .create_session(&runner_request(run, plan, task))
+            .await;
+
+        let sessions: Vec<_> = graph.chat_sessions.read().await.values().cloned().collect();
+        assert_eq!(sessions.len(), 1, "the runner session was persisted");
+        let rows = graph.session_link_rows.read().await.clone();
+        assert_eq!(rows.len(), 1, "exactly one run link: {rows:?}");
+        assert_eq!(rows[0].session_id, sessions[0].id);
+        assert_eq!(rows[0].run_id, Some(run));
+        assert_eq!(rows[0].plan_id, Some(plan));
+        assert_eq!(rows[0].task_id, Some(task));
+        // and the JSON mechanism is there too: both mechanisms on the session
+        let a = crate::chat::attachment::attach(&sessions, &rows);
+        assert_eq!(a.by_plan[&plan][0].links.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_create_session_of_a_resumed_run_links_to_the_new_run() {
+        let (manager, graph) = manager_with_mock();
+        let (old_run, new_run, plan) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let _ = manager
+            .create_session(&runner_request(old_run, plan, Uuid::new_v4()))
+            .await;
+        // free the single "active session" slot if the CLI did start
+        manager.active_sessions.write().await.clear();
+        let _ = manager
+            .create_session(&runner_request(new_run, plan, Uuid::new_v4()))
+            .await;
+        let sessions: Vec<_> = graph.chat_sessions.read().await.values().cloned().collect();
+        let rows = graph.session_link_rows.read().await.clone();
+        let a = crate::chat::attachment::attach(&sessions, &rows);
+        assert_eq!(a.by_plan.len(), 1, "same plan, same thread");
+        let relation_runs: std::collections::HashSet<_> =
+            rows.iter().filter_map(|r| r.run_id).collect();
+        assert_eq!(
+            relation_runs,
+            [old_run, new_run].into_iter().collect(),
+            "each session is linked by relation to ITS run"
+        );
+        let runs: std::collections::HashSet<_> = a.by_plan[&plan]
+            .iter()
+            .flat_map(|s| s.links.iter().filter_map(|l| l.run_id))
+            .collect();
+        assert_eq!(runs, [old_run, new_run].into_iter().collect());
+    }
+
+    #[tokio::test]
+    async fn test_create_session_free_chat_gets_no_run_link() {
+        let (manager, graph) = manager_with_mock();
+        let mut req = runner_request(Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        req.spawned_by = None;
+        let _ = manager.create_session(&req).await;
+        assert!(graph.session_link_rows.read().await.is_empty());
+        let sessions: Vec<_> = graph.chat_sessions.read().await.values().cloned().collect();
+        let a = crate::chat::attachment::attach(&sessions, &[]);
+        assert_eq!(a.unattached.len(), sessions.len());
+    }
+
+    #[tokio::test]
+    async fn test_resume_session_keeps_identity_and_links() {
+        let (manager, graph) = manager_with_mock();
+        let (run, plan, task) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let mut s = test_chat_session(None);
+        s.spawned_by = runner_request(run, plan, task).spawned_by;
+        graph.create_chat_session(&s).await.unwrap();
+        graph
+            .link_session_to_run(&s.id.to_string(), run, Some(plan), Some(task))
+            .await
+            .unwrap();
+        let before = crate::chat::attachment::attach(
+            &[s.clone()],
+            &graph.session_link_rows.read().await.clone(),
+        );
+
+        let rows_before = graph.session_link_rows.read().await.clone();
+
+        // WHAT THIS PROVES: `resume_session` reads the stored session, never
+        // creates another one and never touches its link rows, up to the CLI
+        // spawn. In tests the spawn itself fails (or succeeds against whatever
+        // `claude` is installed), so what happens to the links AFTER a real
+        // spawn is NOT exercised here: `resume_session` has no call to
+        // `link_session_to_run` / `create_spawned_by_relation` at all
+        // (they live in `create_session` only), which is what the row-for-row
+        // comparison below pins on the mock.
+        let _ = manager
+            .resume_session(&s.id.to_string(), "continue", None)
+            .await;
+
+        let after_sessions: Vec<_> = graph.chat_sessions.read().await.values().cloned().collect();
+        assert_eq!(
+            after_sessions.len(),
+            1,
+            "resume must not create another session"
+        );
+        assert_eq!(after_sessions[0].id, s.id, "same session id");
+        assert_eq!(
+            after_sessions[0].spawned_by, s.spawned_by,
+            "spawned_by kept"
+        );
+        let rows = graph.session_link_rows.read().await.clone();
+        assert_eq!(
+            rows, rows_before,
+            "the stored link rows are not rewritten, added to or removed by a resume"
+        );
+        let after = crate::chat::attachment::attach(&after_sessions, &rows);
+        assert_eq!(after.by_plan, before.by_plan, "same links, same thread");
+        assert!(after.unattached.is_empty(), "never a detached session");
+    }
+
+    #[tokio::test]
+    #[ignore = "needs the claude CLI on PATH (run with: cargo test -- --ignored)"]
+    async fn live_snapshot_reports_the_permissions_each_live_cli_still_holds() {
+        let (manager, _graph) = manager_with_mock();
+        let with = Uuid::new_v4();
+        let without = Uuid::new_v4();
+        let _a = super::test_support::insert_live_session(
+            &manager,
+            &with.to_string(),
+            true,
+            &["req-1", "req-2"],
+        )
+        .await
+        .expect("the Claude CLI binary must be installed to run this test");
+        let _b =
+            super::test_support::insert_live_session(&manager, &without.to_string(), false, &[])
+                .await
+                .expect("the Claude CLI binary must be installed to run this test");
+        let snap = manager.live_session_snapshot().await;
+        assert_eq!(snap.live, [with, without].into_iter().collect());
+        assert_eq!(snap.streaming, [with].into_iter().collect());
+        assert_eq!(
+            snap.pending_permissions.get(&with),
+            Some(
+                &["req-1".to_string(), "req-2".to_string()]
+                    .into_iter()
+                    .collect()
+            )
+        );
+        assert!(!snap.pending_permissions.contains_key(&without));
+    }
+
+    #[tokio::test]
+    #[ignore = "needs the claude CLI on PATH (run with: cargo test -- --ignored)"]
+    async fn failed_stdin_send_keeps_the_permission_pending_for_a_retry() {
+        let (manager, _graph) = manager_with_mock();
+        let sid = Uuid::new_v4().to_string();
+        let (stdin_rx, _q) =
+            super::test_support::insert_live_session(&manager, &sid, false, &["req-1"])
+                .await
+                .expect("the Claude CLI binary must be installed to run this test");
+        // The CLI is gone: the stdin channel is closed, the send fails.
+        drop(stdin_rx);
+        let mut events = {
+            let sessions = manager.active_sessions.read().await;
+            sessions[&sid].events_tx.subscribe()
+        };
+
+        for attempt in 1..=2 {
+            let err = manager
+                .send_permission_response_inner(&sid, "req-1", true, true)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, PermissionDeliveryError::Failed(_)),
+                "attempt {attempt}: a failed send stays a delivery failure, not NotPending ({err})"
+            );
+        }
+        let pending = manager.active_sessions.read().await[&sid]
+            .pending_permission_inputs
+            .clone();
+        assert!(
+            pending.lock().await.contains_key("req-1"),
+            "the request is still pending"
+        );
+        assert!(
+            events.try_recv().is_err(),
+            "no permission_decision is broadcast for a decision that was not sent"
         );
     }
 
@@ -10861,6 +11381,84 @@ mod tests {
         let result = manager.interrupt(session_id).await;
         assert!(result.is_ok(), "second interrupt should succeed");
         assert!(flag.load(Ordering::SeqCst), "flag should remain true");
+    }
+
+    // ── attention_changed relay ─────────────────────────────────────────
+
+    fn attention_hybrid() -> (
+        Arc<crate::events::HybridEmitter>,
+        tokio::sync::broadcast::Receiver<crate::events::CrudEvent>,
+    ) {
+        let h = Arc::new(crate::events::HybridEmitter::new(Arc::new(
+            crate::events::EventBus::default(),
+        )));
+        let rx = h.subscribe();
+        (h, rx)
+    }
+
+    #[tokio::test]
+    async fn test_permission_request_emits_attention_changed_without_the_command() {
+        let (h, mut rx) = attention_hybrid();
+        let emitter: Option<Arc<dyn crate::events::EventEmitter>> = Some(h);
+        let msg = serde_json::json!({
+            "type": "control_request",
+            "request_id": "req-1",
+            "request": {
+                "subtype": "can_use_tool",
+                "tool_name": "Bash",
+                "input": {"command": "rm -rf /secret-command-text"},
+                "tool_use_id": "tu-1"
+            }
+        });
+        let event = parse_permission_control_msg(&msg, None).expect("permission request");
+        assert!(matches!(event, ChatEvent::PermissionRequest { .. }));
+        notify_attention_for_chat_event(&emitter, "sess-1", &event);
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let ev = rx.try_recv().expect("attention_changed on the bus");
+        assert_eq!(ev.entity_type, crate::events::EntityType::AttentionChanged);
+        assert_eq!(ev.payload["session_id"], "sess-1");
+        assert_eq!(
+            ev.payload["reasons"],
+            serde_json::json!(["permission_request"])
+        );
+        assert!(
+            !serde_json::to_string(&ev)
+                .unwrap()
+                .contains("secret-command-text"),
+            "the command text must not transit on the general bus"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_permission_decision_emits_attention_changed() {
+        let state = mock_app_state();
+        let (h, mut rx) = attention_hybrid();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config())
+            .with_event_emitter(h);
+        let (mut session, _handle) = mock_active_session(false);
+        let (stdin_tx, _stdin_rx) = tokio::sync::mpsc::channel::<String>(16);
+        session.stdin_tx = Some(stdin_tx);
+        session
+            .pending_permission_inputs
+            .lock()
+            .await
+            .insert("req-d".to_string(), serde_json::json!({}));
+        manager
+            .active_sessions
+            .write()
+            .await
+            .insert("sess-d".to_string(), session);
+        manager
+            .send_permission_response("sess-d", "req-d", true)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let ev = rx.try_recv().expect("attention_changed on the bus");
+        assert_eq!(ev.payload["session_id"], "sess-d");
+        assert_eq!(
+            ev.payload["reasons"],
+            serde_json::json!(["permission_decision"])
+        );
     }
 
     // ── send_permission_response with mock transport ────────────────────
@@ -13452,6 +14050,95 @@ mod tests {
         )
         .await;
         assert!(!inserted);
+    }
+}
+
+/// Fixtures for handler tests that need a LIVE session (a registered
+/// `ActiveSession` whose CLI stdin is a channel the test can read).
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    pub(crate) fn chat_config() -> ChatConfig {
+        ChatConfig::default()
+    }
+
+    /// Register a live session. Returns the receiver of what would be written
+    /// to the CLI's stdin and the queue of messages received while streaming,
+    /// or `None` when the Claude CLI binary is not installed (the dummy client
+    /// needs it). Callers that assert something must `.expect` it: a test must
+    /// never pass without verifying anything.
+    pub(crate) async fn insert_live_session(
+        manager: &ChatManager,
+        session_id: &str,
+        is_streaming: bool,
+        pending_permissions: &[&str],
+    ) -> Option<(
+        tokio::sync::mpsc::Receiver<String>,
+        Arc<Mutex<VecDeque<PendingMessage>>>,
+    )> {
+        let client = InteractiveClient::new(nexus_claude::ClaudeCodeOptions {
+            model: Some("test".into()),
+            ..Default::default()
+        })
+        .ok()?;
+        let (events_tx, _rx) = broadcast::channel(16);
+        let (stdin_tx, stdin_rx) = tokio::sync::mpsc::channel(16);
+        let pending_messages = Arc::new(Mutex::new(VecDeque::<PendingMessage>::new()));
+        let mut pending = HashMap::new();
+        for id in pending_permissions {
+            pending.insert((*id).to_string(), serde_json::json!({ "command": "ls" }));
+        }
+        let session = ActiveSession {
+            events_tx,
+            last_activity: Instant::now(),
+            cli_session_id: None,
+            client: Arc::new(Mutex::new(client)),
+            interrupt_flag: Arc::new(AtomicBool::new(false)),
+            memory_manager: None,
+            next_seq: Arc::new(AtomicI64::new(1)),
+            pending_messages: pending_messages.clone(),
+            is_streaming: Arc::new(AtomicBool::new(is_streaming)),
+            streaming_text: Arc::new(Mutex::new(String::new())),
+            streaming_events: Arc::new(Mutex::new(Vec::new())),
+            permission_mode: None,
+            model: None,
+            sdk_control_rx: Arc::new(tokio::sync::Mutex::new(None)),
+            stdin_tx: Some(stdin_tx),
+            child_pid: None,
+            nats_cancel: CancellationToken::new(),
+            interrupt_token: CancellationToken::new(),
+            pending_permission_inputs: Arc::new(tokio::sync::Mutex::new(pending)),
+            auto_continue: Arc::new(AtomicBool::new(false)),
+            auto_continue_count: Arc::new(AtomicU32::new(0)),
+            max_auto_continues: 0,
+            rfc_accumulator: Arc::new(Mutex::new(
+                crate::chat::observation_detector::RfcAccumulator::new(),
+            )),
+            protocol_run_id: None,
+            protocol_state: None,
+            reasoning_path_tracker: crate::chat::feedback::ReasoningPathTracker::new(),
+            objective_tracking: false,
+            objective_reminder_turns_since: Arc::new(AtomicU32::new(0)),
+            work_log: Arc::new(Mutex::new(SessionWorkLog::default())),
+            oob_trigger_history: Arc::new(Mutex::new(VecDeque::new())),
+            oob_trigger_cap: OOB_TRIGGER_CAP_INTERACTIVE,
+            oob_trigger_window: Duration::from_secs(OOB_TRIGGER_WINDOW_SECS),
+            oob_capped_warned: Arc::new(AtomicBool::new(false)),
+            cancel_tools_history: Arc::new(Mutex::new(VecDeque::new())),
+            cancel_tools_cap: CANCEL_TOOLS_CAP,
+            cancel_tools_window: Duration::from_secs(CANCEL_TOOLS_WINDOW_SECS),
+            active_background_tasks: Arc::new(Mutex::new(HashMap::new())),
+            cancel_task_history: Arc::new(Mutex::new(VecDeque::new())),
+            cancel_task_cap: CANCEL_TASK_CAP,
+            cancel_task_window: Duration::from_secs(CANCEL_TASK_WINDOW_SECS),
+        };
+        manager
+            .active_sessions
+            .write()
+            .await
+            .insert(session_id.to_string(), session);
+        Some((stdin_rx, pending_messages))
     }
 }
 

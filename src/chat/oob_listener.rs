@@ -210,7 +210,14 @@ pub(crate) fn spawn_oob_listener(
                             );
                         }
                         None => {
-                            emit_subprocess_death(&session_id, &events_tx);
+                            emit_subprocess_death(
+                                &session_id,
+                                session_uuid,
+                                &events_tx,
+                                &next_seq,
+                                deps.graph.as_ref(),
+                            )
+                            .await;
                             return;
                         }
                     }
@@ -540,20 +547,49 @@ async fn maybe_trigger_stream(
 /// calls on this `session_id` will silently no-op until the session is
 /// recreated, so we surface a typed event the frontend can render
 /// prominently.
-fn emit_subprocess_death(session_id: &str, events_tx: &broadcast::Sender<ChatEvent>) {
+pub(crate) async fn emit_subprocess_death(
+    session_id: &str,
+    session_uuid: Option<Uuid>,
+    events_tx: &broadcast::Sender<ChatEvent>,
+    next_seq: &AtomicI64,
+    graph: &dyn GraphStore,
+) {
     warn!(
         session_id = %session_id,
         reason = "subprocess_exited",
         "OOB listener: SDK message broadcast closed (subprocess gone); exiting"
     );
-    let _ = events_tx.send(ChatEvent::SessionError {
+    let event = ChatEvent::SessionError {
         reason: "subprocess_exited".to_string(),
         message: "The CLI subprocess for this session has exited. \
                   Send a message to start a new turn (will resume \
                   the session if possible)."
             .into(),
         received_at: Utc::now(),
-    });
+    };
+    // Persist through the same path as the other stored events (same `seq`
+    // counter, same store): the attention cockpit reads `session_error` from
+    // the store to tell a dead CLI that died on an error from one that is
+    // merely idle. Persist BEFORE broadcasting so a client reacting to the
+    // broadcast finds it stored.
+    if let Some(uuid) = session_uuid {
+        let record = ChatEventRecord {
+            id: Uuid::new_v4(),
+            session_id: uuid,
+            seq: next_seq.fetch_add(1, Ordering::SeqCst),
+            event_type: event.event_type().to_string(),
+            data: serde_json::to_string(&event).unwrap_or_default(),
+            created_at: Utc::now(),
+        };
+        if let Err(e) = graph.store_chat_events(uuid, vec![record]).await {
+            warn!(
+                session_id = %session_id,
+                error = %e,
+                "OOB listener: failed to persist SessionError record (non-fatal)"
+            );
+        }
+    }
+    let _ = events_tx.send(event);
 }
 
 /// Sliding-window rate cap for OOB-driven `stream_response` spawns
@@ -1346,7 +1382,8 @@ mod tests {
     #[tokio::test]
     async fn test_emit_subprocess_death_emits_session_error() {
         let (events_tx, mut rx) = broadcast::channel(8);
-        emit_subprocess_death("session-123", &events_tx);
+        let graph = crate::neo4j::mock::MockGraphStore::new();
+        emit_subprocess_death("session-123", None, &events_tx, &AtomicI64::new(0), &graph).await;
 
         // The send must have produced exactly one event.
         let received = rx.try_recv().expect("expected one event on broadcast");
@@ -1371,5 +1408,40 @@ mod tests {
             other => panic!("expected SessionError, got {other:?}"),
         }
         assert!(rx.try_recv().is_err(), "no further events expected");
+    }
+
+    /// The death is persisted by the production path (same `seq` counter,
+    /// same store) and the cockpit's grouped read + derivation then see the
+    /// session as stuck on an error, dated by the death itself.
+    #[tokio::test]
+    async fn test_emit_subprocess_death_persists_and_feeds_the_attention_derivation() {
+        use crate::chat::attention::{derive_session_attention, SessionAttentionInput};
+        let (events_tx, mut rx) = broadcast::channel(8);
+        let graph = crate::neo4j::mock::MockGraphStore::new();
+        let sid = Uuid::new_v4();
+        let next_seq = AtomicI64::new(7);
+        emit_subprocess_death(&sid.to_string(), Some(sid), &events_tx, &next_seq, &graph).await;
+
+        assert!(matches!(rx.try_recv(), Ok(ChatEvent::SessionError { .. })));
+        assert_eq!(next_seq.load(Ordering::SeqCst), 8, "seq counter advanced");
+        let stored = graph.get_attention_events(&[sid]).await.unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].event_type, "session_error");
+        assert_eq!(stored[0].seq, 7);
+
+        let input = SessionAttentionInput {
+            session_id: sid,
+            workspace: "ws".into(),
+            thread_id: None,
+            alive: false,
+            pending_in_memory: HashSet::new(),
+        };
+        let d = derive_session_attention(&input, &stored, Utc::now());
+        assert_eq!(d.errors.len(), 1);
+        assert_eq!(d.errors[0].reason, "subprocess_exited");
+        // a non-UUID session id persists nothing
+        let other = crate::neo4j::mock::MockGraphStore::new();
+        emit_subprocess_death("not-a-uuid", None, &events_tx, &next_seq, &other).await;
+        assert_eq!(next_seq.load(Ordering::SeqCst), 8);
     }
 }

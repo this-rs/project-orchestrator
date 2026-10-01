@@ -81,6 +81,9 @@ pub struct RfcListQuery {
     pub status: Option<String>,
     pub importance: Option<String>,
     pub project_id: Option<Uuid>,
+    /// Restrict to the RFCs of the projects in this workspace
+    /// (ignored when `project_id` is given).
+    pub workspace_slug: Option<String>,
     pub limit: Option<usize>,
     pub offset: Option<usize>,
 }
@@ -401,7 +404,11 @@ pub async fn list_rfcs(
     let (notes, total) = state
         .orchestrator
         .note_manager()
-        .list_notes(query.project_id, None, &filters)
+        .list_notes(
+            query.project_id,
+            super::handlers::normalize_slug(query.workspace_slug.as_deref()),
+            &filters,
+        )
         .await?;
 
     let mut items: Vec<RfcResponse> = notes.iter().map(note_to_rfc).collect();

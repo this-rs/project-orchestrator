@@ -637,7 +637,7 @@ impl ModelCatalogCache {
 
         let mut keys = HashSet::new();
         for page in 0..MAX_PAGES {
-            let (alerts, _total) = graph.list_alerts(None, PAGE, page * PAGE).await?;
+            let (alerts, _total) = graph.list_alerts(None, None, PAGE, page * PAGE).await?;
             let fetched = alerts.len();
             keys.extend(
                 alerts
@@ -1051,7 +1051,7 @@ mod tests {
             "baseline run must not announce anything"
         );
         // But the markers ARE persisted, so the next run has a reference point.
-        let (alerts, _) = graph.list_alerts(None, 100, 0).await.unwrap();
+        let (alerts, _) = graph.list_alerts(None, None, 100, 0).await.unwrap();
         assert_eq!(alerts.len(), 2);
     }
 

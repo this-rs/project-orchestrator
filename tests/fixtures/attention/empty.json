@@ -1,0 +1,13 @@
+{
+  "generated_at": "2026-10-01T08:00:00Z",
+  "lanes": [],
+  "threads": [],
+  "waiting": [],
+  "orphans": [],
+  "runner": {
+    "status": "free",
+    "busy_with": null
+  },
+  "thinking": [],
+  "unattached": []
+}

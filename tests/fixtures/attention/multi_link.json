@@ -1,0 +1,116 @@
+{
+  "generated_at": "2026-10-01T08:00:00Z",
+  "lanes": [
+    {
+      "id": "455c1fdc-1014-5080-bbc7-3fe935113d29",
+      "slug": "project-orchestrator",
+      "name": "Project Orchestrator"
+    }
+  ],
+  "threads": [
+    {
+      "id": "d207c580-3682-5e87-8f2a-495c22147777",
+      "title": "Today cockpit - agregateur",
+      "workspace": "project-orchestrator",
+      "band": "running",
+      "stuck_reason": null,
+      "plan": {
+        "id": "84247ead-a737-58b8-947d-6c0309d195e9",
+        "title": "Today cockpit - agregateur"
+      },
+      "run": {
+        "id": "7e353593-7bb9-5184-a729-ebd1f08614bc",
+        "status": "running",
+        "started_at": "2026-10-01T07:10:00Z",
+        "duration_secs": 3000,
+        "cost_usd": 2.5
+      },
+      "session_ids": [
+        "d8e89a50-a25f-567f-8294-4bc57f3a5340",
+        "d29b439c-2407-507a-ab1d-736ee3d58be9"
+      ],
+      "sessions": [
+        {
+          "id": "d8e89a50-a25f-567f-8294-4bc57f3a5340",
+          "title": "Session runner - tache 1.1",
+          "state": "live",
+          "links": [
+            {
+              "via": "runner_run",
+              "run_id": "7e353593-7bb9-5184-a729-ebd1f08614bc",
+              "task_id": null,
+              "plan_id": "84247ead-a737-58b8-947d-6c0309d195e9"
+            },
+            {
+              "via": "spawned_by_json",
+              "run_id": "7e353593-7bb9-5184-a729-ebd1f08614bc",
+              "task_id": null,
+              "plan_id": "84247ead-a737-58b8-947d-6c0309d195e9"
+            },
+            {
+              "via": "task_association",
+              "run_id": null,
+              "task_id": "f1e55982-7858-59ac-b5c3-bfc97c18c9ff",
+              "plan_id": null
+            }
+          ]
+        },
+        {
+          "id": "d29b439c-2407-507a-ab1d-736ee3d58be9",
+          "title": "Session rattachee a la main",
+          "state": "live",
+          "links": [
+            {
+              "via": "task_association",
+              "run_id": null,
+              "task_id": "594bb81c-8421-51b0-82cd-92a7f73c653f",
+              "plan_id": null
+            },
+            {
+              "via": "plan_association",
+              "run_id": null,
+              "task_id": null,
+              "plan_id": "84247ead-a737-58b8-947d-6c0309d195e9"
+            }
+          ]
+        }
+      ],
+      "since": "2026-10-01T07:10:00Z",
+      "age_secs": 3000,
+      "waves": [
+        {
+          "wave_number": 1,
+          "points": [
+            {
+              "task_id": "f1e55982-7858-59ac-b5c3-bfc97c18c9ff",
+              "status": "done"
+            }
+          ]
+        },
+        {
+          "wave_number": 2,
+          "points": [
+            {
+              "task_id": "594bb81c-8421-51b0-82cd-92a7f73c653f",
+              "status": "running"
+            },
+            {
+              "task_id": "3d441614-9789-539d-90c7-d26c2c9c6b0f",
+              "status": "pending"
+            }
+          ]
+        }
+      ],
+      "blocked_tasks": [],
+      "resume": null
+    }
+  ],
+  "waiting": [],
+  "orphans": [],
+  "runner": {
+    "status": "free",
+    "busy_with": null
+  },
+  "thinking": [],
+  "unattached": []
+}

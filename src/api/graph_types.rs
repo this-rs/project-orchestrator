@@ -1053,7 +1053,7 @@ pub async fn build_intelligence_summary(
         // PageRank/risk distribution fitting) just to read one number.
         neo4j.count_orphan_files(pid),
         neo4j.list_notes(Some(pid), None, &note_filters),
-        neo4j.get_notes_needing_review(Some(pid)),
+        neo4j.get_notes_needing_review(Some(pid), None),
         // Count co-change pairs instead of pulling up to 100k rows to .len().
         neo4j.count_co_change_pairs(pid, 1),
         neo4j.get_neural_metrics(pid),

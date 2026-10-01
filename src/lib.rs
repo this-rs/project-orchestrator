@@ -1195,6 +1195,13 @@ pub async fn start_server(mut config: Config) -> Result<()> {
         None => events::HybridEmitter::new(local_bus),
     });
 
+    // Workspace resolver for the coalesced `attention_changed` events
+    event_bus
+        .attention_relay()
+        .set_scope(Arc::new(events::attention::GraphAttentionScope(
+            state.neo4j.clone(),
+        )));
+
     // Start NATS→local bridge: subscribes to NATS CRUD events and re-injects
     // them into the local broadcast bus. This makes the local bus the single
     // source of truth — WS handlers only need to listen to the local bus.
