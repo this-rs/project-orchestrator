@@ -1,5 +1,9 @@
 <!-- Genere par scripts/diagrams/check-index.mjs --write-orphans. Ne pas editer a la main. -->
 <!-- orphan-ceiling: 1201 -->
+<!-- orphan-ceiling-backend: 456 -->
+<!-- orphan-ceiling-frontend: 545 -->
+<!-- orphan-ceiling-nexus: 73 -->
+<!-- orphan-ceiling-website: 127 -->
 
 # Fichiers source sans diagramme proprietaire
 

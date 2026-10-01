@@ -143,13 +143,27 @@ Il descend seul des qu'un fichier gagne un proprietaire. Le marqueur est le meme
 gate de nexus (`claude-code-api/tests/diagram_index.rs`), pour que les deux depots se tiennent a
 la meme regle et qu'un lecteur n'ait qu'une forme a connaitre.
 
-**Le cliquet exige la portee complete.** Le plafond compte les quatre depots ; un checkout d'un
-seul depot en voit moins. Comparer un compte partiel au plafond complet (456 contre 1201) serait
-un vert permanent qui ne verifie rien, et `--write-orphans` ferait DESCENDRE le plafond a la
-valeur partielle, detruisant le vrai. Donc des qu'un depot voisin manque : le cliquet n'est ni
-applique ni mis a jour, le script le dit en avertissement, et `--write-orphans` est refuse. Les
-autres regles (structure, globs resolus, proprietaire unique, en-tetes) continuent de s'appliquer
-— une portee partielle n'est pas une amnistie.
+**Un plafond par depot, en plus du total.** `ORPHANS.md` porte
+`<!-- orphan-ceiling: 1201 -->` et un marqueur par depot :
+
+```
+<!-- orphan-ceiling-backend: 456 -->
+<!-- orphan-ceiling-frontend: 545 -->
+<!-- orphan-ceiling-nexus: 73 -->
+<!-- orphan-ceiling-website: 127 -->
+```
+
+C'est ce qui rend le cliquet reel la ou il tourne. Un checkout d'un seul depot — la CI — ne voit
+pas les quatre : comparer son compte partiel au total (456 contre 1201) serait un vert permanent
+qui ne verifie rien. Un plafond par depot porte sur le meme perimetre que le compte, donc il est
+comparable, et **chaque depot present est tenu a son chiffre meme en checkout partiel**. Ajouter
+un fichier source non revendique au backend fait echouer la CI du backend.
+
+Ce qui reste reserve a la portee complete : le **total**, qui n'est ni applique ni mis a jour
+quand un depot manque, et `--write-orphans`, refuse — il abaisserait le total a la valeur
+partielle et effacerait de la liste les orphelins des depots absents. Un depot absent n'est pas
+tenu a son plafond. Les autres regles s'appliquent toujours : une portee partielle n'est pas une
+amnistie, et un index casse echoue.
 
 ### Cartes provisoires reprises (`supersedes`)
 
@@ -231,11 +245,14 @@ chaine d'outils dans un depot Rust.
 Ce vert couvre : la structure de l'index, un glob `backend:` qui ne matche plus rien, un fichier
 revendique par deux diagrammes, une entree `verified` sans son `.mmd`, un en-tete invalide.
 
-Ce vert NE couvre PAS : les depots voisins, absents de ce checkout. Leurs globs ne sont pas
-resolus, le cliquet d'orphelins ne tourne pas, la fraicheur de `ORPHANS.md` n'est pas verifiee.
-**Ce vert ne prouve donc pas l'absence de derive** et ne doit pas etre cite comme tel ; c'est la
-tache 1.1 qui branchera le gate complet. Le script annonce lui-meme cette limite au lieu de
-passer vert en silence.
+Ce vert couvre aussi le **cliquet d'orphelins du backend** : son plafond par depot porte sur le
+meme perimetre que le checkout, donc ajouter un fichier source non revendique fait echouer la CI.
+
+Ce vert NE couvre PAS : les depots voisins, absents de ce checkout — leurs globs ne sont pas
+resolus, leurs plafonds ne sont pas appliques, le plafond TOTAL et la fraicheur de `ORPHANS.md`
+non plus. **Ce vert ne prouve donc pas l'absence de derive** et ne doit pas etre cite comme tel ;
+c'est la tache 1.1 qui branchera le gate complet. Le script annonce lui-meme ses limites au lieu
+de passer vert en silence.
 
 ## 12. Etat
 

@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { globToRegExp, parseIndex, parseHeader, checkDiagramFile, sharedOwnership, renderOrphans, localIndexOwners, orphanCeiling } from './check-index.mjs';
+import { globToRegExp, parseIndex, parseHeader, checkDiagramFile, sharedOwnership, renderOrphans, localIndexOwners, orphanCeiling, orphanCeilingsByRepo, orphansByRepo } from './check-index.mjs';
 
 test('glob: **, *, braces', () => {
   assert.ok(globToRegExp('src/heartbeat/**').test('src/heartbeat/checks/git_drift.rs'));
@@ -354,7 +354,8 @@ test('portee incomplete: le cliquet n est ni applique ni compare', () => {
     const { code, out } = partial(be, nx);
     assert.equal(code, 0, 'un index sain passe : le cliquet est hors sujet, pas viole');
     assert.match(out, /portee incomplete/);
-    assert.match(out, /ne sont pas comparables au plafond/);
+    assert.match(out, /le plafond TOTAL \(0\) n'est ni applique ni mis a jour/);
+    // sans marqueur par depot, rien n'est applique non plus : le total seul ne suffit pas
     assert.doesNotMatch(out, /au-dessus du plafond/);
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -382,6 +383,62 @@ test('portee incomplete: un index casse echoue quand meme', () => {
     const { code, out } = partial(be, nx);
     assert.equal(code, 1);
     assert.match(out, /ne matche aucun fichier/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// --- cliquet PAR DEPOT : c'est lui qui rend le mecanisme reel en CI.
+test('orphanCeilingsByRepo / orphansByRepo', () => {
+  assert.deepEqual(orphanCeilingsByRepo('<!-- orphan-ceiling-backend: 456 -->\n<!-- orphan-ceiling-nexus: 73 -->'), { backend: 456, nexus: 73 });
+  assert.deepEqual(orphanCeilingsByRepo('<!-- orphan-ceiling: 1201 -->'), {}, 'le total n est pas un depot');
+  assert.deepEqual(orphanCeilingsByRepo(''), {});
+  assert.deepEqual(orphansByRepo(['backend:a.rs', 'backend:b.rs', 'nexus:c.rs']), { backend: 2, nexus: 1 });
+  assert.deepEqual(orphansByRepo([]), {});
+});
+
+test('renderOrphans: ecrit un marqueur par depot, trie', () => {
+  const md = renderOrphans(['nexus:src/b.rs', 'backend:src/a.rs', 'backend:src/c.rs'], 9, [], 0, 3);
+  assert.match(md, /<!-- orphan-ceiling: 3 -->/);
+  assert.match(md, /<!-- orphan-ceiling-backend: 2 -->/);
+  assert.match(md, /<!-- orphan-ceiling-nexus: 1 -->/);
+  assert.ok(md.indexOf('ceiling-backend') < md.indexOf('ceiling-nexus'), 'ordre stable');
+});
+
+test('cliquet par depot: applique MEME en portee incomplete', () => {
+  // Le point de tout l'exercice : en CI un seul depot est la, et le cliquet doit quand meme
+  // mordre. Avant les plafonds par depot, il ne mordait jamais dans cette situation.
+  const { root, be, nx } = fixture({ mainCovers: ['backend:src/own.rs'], localCovers: null });
+  try {
+    writeFileSync(join(be, 'docs/diagrams/ORPHANS.md'), '<!-- orphan-ceiling: 1201 -->\n<!-- orphan-ceiling-backend: 0 -->\n');
+    const { code, out } = partial(be, nx);
+    assert.equal(code, 1, 'un orphelin backend au-dessus de 0 doit echouer');
+    assert.match(out, /backend : 1 fichiers source sans diagramme proprietaire, au-dessus du plafond de 0/);
+    assert.match(out, /le plafond TOTAL .* n'est ni applique/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('cliquet par depot: sous le plafond, il passe en portee incomplete', () => {
+  const { root, be, nx } = fixture({ mainCovers: ['backend:src/own.rs'], localCovers: null });
+  try {
+    writeFileSync(join(be, 'docs/diagrams/ORPHANS.md'), '<!-- orphan-ceiling: 1201 -->\n<!-- orphan-ceiling-backend: 5 -->\n');
+    const { code, out } = partial(be, nx);
+    assert.equal(code, 0, out);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('cliquet par depot: un depot absent n est pas tenu a son plafond', () => {
+  // nexus absent du checkout : son plafond ne doit pas faire echouer la CI du backend.
+  const { root, be, nx } = fixture({ mainCovers: ['backend:src/own.rs'], localCovers: null });
+  try {
+    writeFileSync(join(be, 'docs/diagrams/ORPHANS.md'), '<!-- orphan-ceiling: 1201 -->\n<!-- orphan-ceiling-backend: 5 -->\n<!-- orphan-ceiling-nexus: 0 -->\n');
+    const { code, out } = partial(be, nx);
+    assert.equal(code, 0, out);
+    assert.doesNotMatch(out, /nexus : /);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

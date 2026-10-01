@@ -129,13 +129,19 @@ jobs:
       # deux diagrammes, une entree `verified` sans son `.mmd`, un en-tete
       # invalide.
       #
+      # Et le CLIQUET D'ORPHELINS DU BACKEND : son plafond par depot
+      # (<!-- orphan-ceiling-backend: N -->) porte sur le meme perimetre que ce
+      # checkout, donc ajouter un fichier source que nul diagramme verifie ne
+      # revendique fait echouer cette etape.
+      #
       # CE QUI NE L'EST PAS : les depots voisins (frontend, nexus, website) ne
-      # sont pas dans ce checkout, donc leurs globs ne sont pas resolus, le
-      # cliquet d'orphelins NE TOURNE PAS et la fraicheur de ORPHANS.md n'est
-      # pas verifiee — le script le dit en avertissement plutot que de passer
-      # vert en silence. Ce vert ne prouve donc PAS l'absence de derive : c'est
-      # la tache 1.1 qui branchera le gate complet (checkout multi-depots ou
-      # artefact publie). Ne pas le citer comme preuve de non-derive.
+      # sont pas dans ce checkout, donc leurs globs ne sont pas resolus, leurs
+      # plafonds ne sont pas appliques, et ni le plafond TOTAL ni la fraicheur
+      # de ORPHANS.md ne sont verifies — le script le dit en avertissement
+      # plutot que de passer vert en silence. Ce vert ne prouve donc PAS
+      # l'absence de derive : c'est la tache 1.1 qui branchera le gate complet
+      # (checkout multi-depots ou artefact publie). Ne pas le citer comme
+      # preuve de non-derive.
       - name: Check diagram index (partial — see comment)
         run: node scripts/diagrams/check-index.mjs
 

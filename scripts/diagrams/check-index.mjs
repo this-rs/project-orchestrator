@@ -138,6 +138,27 @@ export function orphanCeiling(doc) {
   return m ? Number(m[1]) : null;
 }
 
+// Plafonds PAR DEPOT, en plus du total. Sans eux, le cliquet ne s'applique que la ou les quatre
+// depots sont presents — c'est-a-dire pas en CI, ou le checkout n'en contient qu'un. Chaque depot
+// present est alors tenu a SON chiffre, comparable parce qu'il porte sur le meme perimetre.
+export function orphanCeilingsByRepo(doc) {
+  const out = {};
+  const re = /<!--\s*orphan-ceiling-([a-z]+):\s*(\d+)\s*-->/g;
+  let m;
+  while ((m = re.exec(doc ?? '')) !== null) out[m[1]] = Number(m[2]);
+  return out;
+}
+
+// Compte les orphelins par depot a partir des cles 'repo:chemin'.
+export function orphansByRepo(orphans) {
+  const out = {};
+  for (const o of orphans) {
+    const repo = o.slice(0, o.indexOf(':'));
+    out[repo] = (out[repo] ?? 0) + 1;
+  }
+  return out;
+}
+
 // --- registre publie des orphelins : texte deterministe, sans sha ni date (verifiable hors reseau).
 export function renderOrphans(orphans, totalSources, localIndexes = [], reserved = 0, ceiling = orphans.length) {
   const byRepo = {};
@@ -146,6 +167,7 @@ export function renderOrphans(orphans, totalSources, localIndexes = [], reserved
   const out = [
     '<!-- Genere par scripts/diagrams/check-index.mjs --write-orphans. Ne pas editer a la main. -->',
     `<!-- orphan-ceiling: ${ceiling} -->`,
+    ...Object.entries(orphansByRepo(orphans)).sort().map(([r, n]) => `<!-- orphan-ceiling-${r}: ${n} -->`),
     '',
     '# Fichiers source sans diagramme proprietaire',
     '',
@@ -374,10 +396,25 @@ function main() {
   // --write-orphans le ferait DESCENDRE a la valeur partielle et detruirait le vrai plafond.
   // Donc : hors portee complete, on n'applique rien et on ne reecrit rien.
   const partialScope = missingRepos.length > 0;
+
+  // Le cliquet PAR DEPOT s'applique toujours, pour chaque depot present : son compte et son
+  // plafond portent sur le meme perimetre, donc ils sont comparables meme en checkout partiel.
+  // C'est ce qui rend le cliquet reel en CI, ou un seul depot est la.
+  const recordedByRepo = orphanCeilingsByRepo(previousDoc);
+  const actualByRepo = orphansByRepo(orphans);
+  for (const repo of Object.keys(files)) {
+    const limit = recordedByRepo[repo];
+    if (limit === undefined) continue; // pas encore de plafond pour ce depot
+    const actual = actualByRepo[repo] ?? 0;
+    if (actual > limit) {
+      problems.push(`${repo} : ${actual} fichiers source sans diagramme proprietaire, au-dessus du plafond de ${limit} pour ce depot : revendiquer le fichier par un glob 'covers' d'une entree verified`);
+    }
+  }
+
   if (partialScope) {
-    console.warn(`AVERTISSEMENT portee incomplete (${missingRepos.join(', ')} absent) : le cliquet d'orphelins n'est ni applique ni mis a jour — ${orphans.length} orphelins ici ne sont pas comparables au plafond de ${recordedCeiling ?? 'non fixe'}`);
+    console.warn(`AVERTISSEMENT portee incomplete (${missingRepos.join(', ')} absent) : le plafond TOTAL (${recordedCeiling ?? 'non fixe'}) n'est ni applique ni mis a jour ; les plafonds par depot present, eux, le sont`);
     if (args.includes('--write-orphans')) {
-      console.error(`ERREUR --write-orphans refuse en portee incomplete : il abaisserait le plafond a ${orphans.length} et effacerait les orphelins des depots absents. Relancer la ou les quatre depots sont presents.`);
+      console.error(`ERREUR --write-orphans refuse en portee incomplete : il abaisserait le total a ${orphans.length} et effacerait les orphelins des depots absents. Relancer la ou les quatre depots sont presents.`);
       process.exit(1);
     }
     for (const p of problems) console.error(`ERREUR ${p}`);
