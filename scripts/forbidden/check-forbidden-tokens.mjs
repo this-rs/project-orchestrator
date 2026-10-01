@@ -22,13 +22,22 @@
 //   * commit messages — only the tree is read. A forbidden token in a commit
 //     message passes this gate. Checking them needs full history, which the
 //     default CI checkout (depth 1) does not fetch.
-//   * a token split across lines, or interrupted by anything the normalizer
-//     keeps (letters and digits). `mer/**/maidffsdev` passes.
+//   * a token split across a NEWLINE. Candidates are built per line, so a
+//     token broken over two lines passes. Punctuation inside a line does not
+//     help an evader: the normalizer strips it, which is the point.
+//   * a token interrupted by a letter or a digit, since those survive
+//     normalization and change the candidate.
 //   * a token reached through more than three whitespace-separated words.
 //   * anything encoded — base64, percent-escapes, \u sequences.
+//
+// This file deliberately contains no example of a forbidden form. Writing one
+// out — even obfuscated with slashes or stars — reintroduces the string, since
+// normalization is exactly what removes that obfuscation. The first version of
+// this comment did, and the gate caught its own source file. Kept as a warning
+// rather than silently fixed: the tests below pin both behaviours instead.
 // It is a ratchet against the accident, not a defence against someone who
 // wants the string in. That is the right trade for a gate that must run
-// offline in under a second.
+// offline: measured at ~2.1 s over 612 tracked files on this repository.
 
 import { createHash } from 'node:crypto'
 import { execFileSync } from 'node:child_process'

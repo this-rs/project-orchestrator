@@ -114,3 +114,31 @@ test('loadDigests refuses a malformed file rather than passing silently', async 
     assert.throws(() => loadDigests(p), undefined, `should have rejected ${JSON.stringify(b)}`)
   }
 })
+
+test('punctuation obfuscation does NOT evade it — normalization is the point', () => {
+  // The first version of the script header claimed a slash-and-star form would
+  // pass, wrote one out as an example, and the gate promptly flagged its own
+  // source file. The claim was wrong in the safe direction: stripping
+  // punctuation is exactly what defeats this kind of evasion.
+  for (const evasion of [
+    'widget/**/example/**/invalid',
+    'widget..example..invalid',
+    'w-i-d-g-e-t.example.invalid',
+    '"widget" + "example" + "invalid"',
+  ]) {
+    assert.deepEqual(findInText(evasion, SET), [1], `evaded via: ${evasion}`)
+  }
+})
+
+test('a token split across a NEWLINE does evade it — the real blind spot', () => {
+  // Candidates are built per line, so this is missed by construction. Asserted
+  // rather than left to be discovered, so nobody reads the gate as airtight.
+  assert.deepEqual(findInText('widget.example.\ninvalid', SET), [])
+  assert.deepEqual(findInText('widget\n.example.invalid', SET), [])
+})
+
+test('a letter or digit inside the token also evades it', () => {
+  // These survive normalization, so the candidate genuinely differs.
+  assert.deepEqual(findInText('widget.exXample.invalid', SET), [])
+  assert.deepEqual(findInText('widget.example9.invalid', SET), [])
+})
