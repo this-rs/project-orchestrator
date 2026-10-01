@@ -1,0 +1,155 @@
+{
+  "generated_at": "2026-10-01T08:00:00Z",
+  "lanes": [
+    {
+      "id": "ad64271e-cd76-5c74-8860-5eedc2821899",
+      "slug": "acme-freelance",
+      "name": "Acme (freelance)"
+    },
+    {
+      "id": "455c1fdc-1014-5080-bbc7-3fe935113d29",
+      "slug": "project-orchestrator",
+      "name": "Project Orchestrator"
+    },
+    {
+      "id": "12f950bc-52fd-545b-b06c-856e611c9653",
+      "slug": "studio-site",
+      "name": "Studio site"
+    }
+  ],
+  "threads": [
+    {
+      "id": "abeac872-f6b6-5ab0-b34c-d53bbebe69d5",
+      "title": "Wave runner hardening",
+      "workspace": "project-orchestrator",
+      "band": "running",
+      "stuck_reason": null,
+      "plan": {
+        "id": "0176fb10-b844-5c6b-b406-b2aca2d10381",
+        "title": "Wave runner hardening"
+      },
+      "run": {
+        "id": "55610d36-e725-5102-af48-9499c083ea6b",
+        "status": "running",
+        "started_at": "2026-10-01T07:30:00Z",
+        "duration_secs": 1800,
+        "cost_usd": 1.2
+      },
+      "session_ids": [
+        "c90a93a2-c151-5385-a7d4-cd9db6a200c3"
+      ],
+      "sessions": [
+        {
+          "id": "c90a93a2-c151-5385-a7d4-cd9db6a200c3",
+          "title": "Session 1 - Wave runner hardening",
+          "state": "live",
+          "links": [
+            {
+              "via": "runner_run",
+              "run_id": "55610d36-e725-5102-af48-9499c083ea6b",
+              "task_id": null,
+              "plan_id": "0176fb10-b844-5c6b-b406-b2aca2d10381"
+            }
+          ]
+        }
+      ],
+      "since": "2026-10-01T07:30:00Z",
+      "age_secs": 1800,
+      "waves": [
+        {
+          "wave_number": 1,
+          "points": [
+            {
+              "task_id": "ac8bda5e-79c3-58c2-9b1e-3f11fc75e1d5",
+              "status": "done"
+            }
+          ]
+        },
+        {
+          "wave_number": 2,
+          "points": [
+            {
+              "task_id": "9843124a-fa41-5513-863e-a54c1ddb002a",
+              "status": "running"
+            }
+          ]
+        }
+      ],
+      "blocked_tasks": [],
+      "resume": null
+    }
+  ],
+  "waiting": [],
+  "orphans": [],
+  "runner": {
+    "status": "free",
+    "busy_with": null
+  },
+  "thinking": [],
+  "unattached": [
+    {
+      "id": "c19fe27d-9897-5da6-83fe-68f17119cd98",
+      "workspace_slug": "acme-freelance",
+      "title": "Relance client",
+      "state": "live",
+      "pending": [
+        {
+          "request_id": "req_u3",
+          "kind": "question",
+          "session_id": "c19fe27d-9897-5da6-83fe-68f17119cd98",
+          "thread_id": null,
+          "workspace": "acme-freelance",
+          "tool_name": null,
+          "text": "Quel ton pour la relance client ?",
+          "options": [
+            {
+              "label": "Cordial",
+              "description": null
+            },
+            {
+              "label": "Ferme",
+              "description": "Deuxieme relance"
+            }
+          ],
+          "seq": 31,
+          "requested_at": "2026-10-01T06:30:00Z",
+          "age_secs": 5400
+        }
+      ],
+      "since": "2026-10-01T06:30:00Z",
+      "age_secs": 5400
+    },
+    {
+      "id": "fc487a28-82c9-5c2c-b13c-06f871f85edd",
+      "workspace_slug": "project-orchestrator",
+      "title": "Conversation libre - nettoyage du cache",
+      "state": "live",
+      "pending": [
+        {
+          "request_id": "req_u1",
+          "kind": "permission",
+          "session_id": "fc487a28-82c9-5c2c-b13c-06f871f85edd",
+          "thread_id": null,
+          "workspace": "project-orchestrator",
+          "tool_name": "Bash",
+          "text": "git clean -fdx && rm -rf ~/.cache/project-orchestrator",
+          "options": [],
+          "seq": 205,
+          "requested_at": "2026-10-01T07:47:00Z",
+          "age_secs": 780
+        }
+      ],
+      "since": "2026-10-01T07:47:00Z",
+      "age_secs": 780
+    },
+    {
+      "id": "71a31da1-cfd4-5dd5-9622-688a516e38f6",
+      "workspace_slug": "studio-site",
+      "title": "Brainstorm tarifs (CLI arrete)",
+      "state": "dead",
+      "pending": [],
+      "since": "2026-09-30T07:00:00Z",
+      "age_secs": 90000
+    }
+  ]
+}

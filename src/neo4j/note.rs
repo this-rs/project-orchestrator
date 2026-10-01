@@ -211,12 +211,20 @@ impl Neo4jClient {
             where_conditions.push("(n.project_id IS NULL OR n.project_id = '')".to_string());
         } else if let Some(ref pid) = project_id {
             where_conditions.push(format!("n.project_id = '{}'", pid));
-        } else if let Some(ws) = workspace_slug {
-            where_conditions.push(format!(
-                "n.project_id IN [(w:Workspace {{slug: '{}'}})<-[:BELONGS_TO_WORKSPACE]-(proj:Project) | proj.id]",
-                ws
-            ));
+        } else if workspace_slug.is_some() {
+            // Bound parameter: the slug comes from an HTTP query string.
+            where_conditions.push(
+                "n.project_id IN [(w:Workspace {slug: $workspace_slug})<-[:BELONGS_TO_WORKSPACE]-(proj:Project) | proj.id]"
+                    .to_string(),
+            );
         }
+        // The slug is only bound when the clause above was actually emitted.
+        let ws_param: Option<String> = if filters.global_only != Some(true) && project_id.is_none()
+        {
+            workspace_slug.map(str::to_string)
+        } else {
+            None
+        };
 
         if let Some(ref statuses) = filters.status {
             let status_list = statuses
@@ -290,7 +298,11 @@ impl Neo4jClient {
             where_clause
         );
 
-        let mut count_result = self.graph.execute(query(&count_cypher)).await?;
+        let mut count_q = query(&count_cypher);
+        if let Some(ref ws) = ws_param {
+            count_q = count_q.param("workspace_slug", ws.clone());
+        }
+        let mut count_result = self.graph.execute(count_q).await?;
         let total: i64 = if let Some(row) = count_result.next().await? {
             row.get("total")?
         } else {
@@ -310,7 +322,11 @@ impl Neo4jClient {
             where_clause, order_field, order_dir, offset, limit
         );
 
-        let mut result = self.graph.execute(query(&cypher)).await?;
+        let mut list_q = query(&cypher);
+        if let Some(ref ws) = ws_param {
+            list_q = list_q.param("workspace_slug", ws.clone());
+        }
+        let mut result = self.graph.execute(list_q).await?;
         let mut notes = Vec::new();
 
         while let Some(row) = result.next().await? {
@@ -1786,10 +1802,20 @@ impl Neo4jClient {
     }
 
     /// Get notes that need review (stale or needs_review status)
-    pub async fn get_notes_needing_review(&self, project_id: Option<Uuid>) -> Result<Vec<Note>> {
-        let project_filter = project_id
-            .map(|pid| format!("AND n.project_id = '{}'", pid))
-            .unwrap_or_default();
+    pub async fn get_notes_needing_review(
+        &self,
+        project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
+    ) -> Result<Vec<Note>> {
+        // `project_id` wins over `workspace_slug` (same priority as list_notes).
+        // Every value is a bound parameter; the fragments below are static.
+        let scope = if project_id.is_some() {
+            "AND n.project_id = $project_id"
+        } else if workspace_slug.is_some() {
+            "AND n.project_id IN [(w:Workspace {slug: $workspace_slug})<-[:BELONGS_TO_WORKSPACE]-(proj:Project) | proj.id]"
+        } else {
+            ""
+        };
 
         let cypher = format!(
             r#"
@@ -1798,11 +1824,19 @@ impl Neo4jClient {
             {}
             RETURN n
             ORDER BY n.staleness_score DESC, n.importance DESC
+            LIMIT 500
             "#,
-            project_filter
+            scope
         );
 
-        let mut result = self.graph.execute(query(&cypher)).await?;
+        let mut q = query(&cypher);
+        if let Some(pid) = project_id {
+            q = q.param("project_id", pid.to_string());
+        } else if let Some(ws) = workspace_slug {
+            q = q.param("workspace_slug", ws.to_string());
+        }
+
+        let mut result = self.graph.execute(q).await?;
         let mut notes = Vec::new();
 
         while let Some(row) = result.next().await? {

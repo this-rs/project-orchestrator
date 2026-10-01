@@ -70,6 +70,7 @@
 //! | BatchCreated      | Code       | project sync completion (bulk IMPORTS/CALLS)          |
 //! | ScoresUpdated     | Fabric     | update_fabric_scores, bootstrap_knowledge_fabric     |
 
+pub mod attention;
 pub mod builtin_triggers;
 mod bus;
 pub mod graph;

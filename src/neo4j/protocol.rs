@@ -929,6 +929,75 @@ impl Neo4jClient {
         Ok(())
     }
 
+    /// List protocol runs across all protocols, newest first.
+    ///
+    /// The scope is resolved through the owning protocol's `project_id`
+    /// (`project_id` wins over `workspace_slug`). Values are bound
+    /// parameters; the status equality uses the `protocol_run_status` index;
+    /// the page is bounded by `LIMIT`.
+    pub async fn list_all_protocol_runs(
+        &self,
+        status: Option<RunStatus>,
+        project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<ProtocolRun>, usize)> {
+        let head = if status.is_some() {
+            "MATCH (r:ProtocolRun {status: $status})"
+        } else {
+            "MATCH (r:ProtocolRun)"
+        };
+        let join = if project_id.is_some() {
+            "MATCH (proto:Protocol {id: r.protocol_id}) WHERE proto.project_id = $project_id"
+        } else if workspace_slug.is_some() {
+            "MATCH (proto:Protocol {id: r.protocol_id}) WHERE proto.project_id IN [(w:Workspace {slug: $workspace_slug})<-[:BELONGS_TO_WORKSPACE]-(p:Project) | p.id]"
+        } else {
+            ""
+        };
+        let bind = |q: neo4rs::Query| -> neo4rs::Query {
+            let q = match status {
+                Some(ref s) => q.param("status", s.to_string()),
+                None => q,
+            };
+            if let Some(pid) = project_id {
+                q.param("project_id", pid.to_string())
+            } else if let Some(ws) = workspace_slug {
+                q.param("workspace_slug", ws.to_string())
+            } else {
+                q
+            }
+        };
+
+        let count_cypher = format!("{} {} RETURN count(r) AS total", head, join);
+        let mut count_result = self.graph.execute(bind(query(&count_cypher))).await?;
+        let total: usize = if let Some(row) = count_result.next().await? {
+            row.get::<i64>("total").unwrap_or(0) as usize
+        } else {
+            0
+        };
+        if total == 0 {
+            return Ok((vec![], 0));
+        }
+
+        let list_cypher = format!(
+            "{} {} RETURN r ORDER BY r.started_at DESC SKIP $offset LIMIT $limit",
+            head, join
+        );
+        let list_q = bind(
+            query(&list_cypher)
+                .param("offset", offset as i64)
+                .param("limit", limit as i64),
+        );
+        let mut result = self.graph.execute(list_q).await?;
+        let mut runs = Vec::new();
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("r")?;
+            runs.push(Self::node_to_protocol_run(&node)?);
+        }
+        Ok((runs, total))
+    }
+
     /// List protocol runs for a protocol with optional status filter and pagination.
     pub async fn list_protocol_runs(
         &self,
