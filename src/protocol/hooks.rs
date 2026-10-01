@@ -219,10 +219,13 @@ const ORPHAN_RUN_MAX_AGE_SECS: i64 = 3600;
 
 /// Recover orphaned protocol runs at server startup.
 ///
-/// Scans all projects for `ProtocolRun` nodes with `status = running` and
-/// last state entry older than [`ORPHAN_RUN_MAX_AGE_SECS`] and no live runner in this process. These runs were
-/// likely interrupted by a server crash or restart and will never complete
-/// on their own.
+/// Scans all projects for `ProtocolRun` nodes with `status = running` whose
+/// last state entry is older than [`ORPHAN_RUN_MAX_AGE_SECS`] (a run that keeps
+/// making progress is not orphaned just because it started long ago). Runs that
+/// still have a live runner in this process (present in `ACTIVE_RUNNERS`) are
+/// skipped: recovering them would fail them or spawn a second runner. The
+/// remaining runs were likely interrupted by a server crash or restart and will
+/// never complete on their own.
 ///
 /// Each orphaned run is marked as `Failed` with the error message
 /// "Recovered: server restarted during execution".
@@ -1033,6 +1036,9 @@ mod tests {
 
         let mut run = crate::protocol::ProtocolRun::new(protocol.id, protocol.entry_state, "Start");
         run.started_at = chrono::Utc::now() - chrono::Duration::hours(2);
+        if let Some(sv) = run.states_visited.first_mut() {
+            sv.entered_at = run.started_at;
+        }
         store.create_protocol_run(&run).await.unwrap();
 
         // A runner is alive in this process for that run.
