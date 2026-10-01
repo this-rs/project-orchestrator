@@ -502,7 +502,7 @@ impl Neo4jClient {
         Ok(n > 0)
     }
 
-    /// Stored links of many sessions in ONE query (3 branches, `UNION ALL`).
+    /// Stored links of many sessions in ONE query (4 branches, `UNION ALL`).
     pub async fn get_session_link_rows(&self, session_ids: &[Uuid]) -> Result<Vec<SessionLinkRow>> {
         if session_ids.is_empty() {
             return Ok(Vec::new());
@@ -527,6 +527,16 @@ impl Neo4jClient {
             MATCH (s:ChatSession {id: sid})-[:ASSOCIATED_WITH]->(p:Plan)
             RETURN s.id AS session_id, 'plan' AS kind, null AS run_id,
                    null AS task_id, p.id AS plan_id, p.id AS thread_plan_id
+            UNION ALL
+            UNWIND $ids AS sid
+            MATCH (s:ChatSession {id: sid})-[sb:SPAWNED_BY]->(parent:ChatSession)
+            OPTIONAL MATCH (rr:PlanRun {run_id: sb.run_id})
+            OPTIONAL MATCH (parent)-[:SPAWNED_BY_RUN]->(pr:PlanRun)
+            OPTIONAL MATCH (parent)-[:ASSOCIATED_WITH]->(pp:Plan)
+            WITH s, sb, COALESCE(rr.plan_id, pr.plan_id, pp.id) AS plan
+            RETURN DISTINCT s.id AS session_id, 'spawned' AS kind,
+                   NULLIF(sb.run_id, '') AS run_id, NULLIF(sb.task_id, '') AS task_id,
+                   plan AS plan_id, plan AS thread_plan_id
             "#,
         )
         .param("ids", ids);
@@ -543,6 +553,7 @@ impl Neo4jClient {
                 "run" => SessionLinkKind::RunRelation,
                 "task" => SessionLinkKind::TaskAssociation,
                 "plan" => SessionLinkKind::PlanAssociation,
+                "spawned" => SessionLinkKind::SpawnedByRelation,
                 _ => continue,
             };
             out.push(SessionLinkRow {

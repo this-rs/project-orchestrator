@@ -227,6 +227,10 @@ pub enum SessionLinkKind {
     TaskAssociation,
     /// `(:ChatSession)-[:ASSOCIATED_WITH]->(:Plan)`
     PlanAssociation,
+    /// `(:ChatSession)-[:SPAWNED_BY {type, run_id, task_id}]->(:ChatSession)`:
+    /// the plan is the one of the run carried by the relation, else the plan
+    /// of the PARENT session (its run relation or plan association)
+    SpawnedByRelation,
 }
 
 /// One stored session link, as read by the grouped

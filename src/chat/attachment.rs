@@ -8,14 +8,19 @@
 //! 2. the run relation `(:ChatSession)-[:SPAWNED_BY_RUN]->(:PlanRun)`
 //!    written by `ChatManager::create_session`            -> [`LinkVia::RunnerRun`];
 //! 3. explicit association to a task / a plan (`ASSOCIATED_WITH`)
-//!    -> [`LinkVia::TaskAssociation`] / [`LinkVia::PlanAssociation`].
+//!    -> [`LinkVia::TaskAssociation`] / [`LinkVia::PlanAssociation`];
+//! 4. the origin relation `(:ChatSession)-[:SPAWNED_BY]->(:ChatSession)`: a
+//!    child session inherits the thread of its parent (run carried by the
+//!    relation, else the parent's own run / association)
+//!    -> [`LinkVia::SpawnedByJson`] (same provenance family as 1.).
 //!
 //! Rules:
 //! - a session linked by several mechanisms appears ONCE, with one link per
 //!   mechanism (exact duplicates collapsed);
 //! - a session is in ONE thread (a thread = a plan). When its links resolve to
-//!   several plans, the plan of the strongest mechanism wins (run relation,
-//!   then JSON, then task, then plan association), ties broken by plan id;
+//!   several plans, the plan of the strongest mechanism wins: an EXPLICIT
+//!   association made by the user (plan, then task) beats what the runner
+//!   wrote (run relation, then JSON / parent spawn); ties broken by plan id;
 //! - a session with NO link is never dropped nor filed in a thread: it goes to
 //!   `unattached`, rendered by [`unattached_sessions`] in the lane of its
 //!   workspace, with its pending requests;
@@ -101,10 +106,10 @@ pub struct Attachment {
 
 fn via_rank(via: LinkVia) -> u8 {
     match via {
-        LinkVia::RunnerRun => 0,
-        LinkVia::SpawnedByJson => 1,
-        LinkVia::TaskAssociation => 2,
-        LinkVia::PlanAssociation => 3,
+        LinkVia::PlanAssociation => 0,
+        LinkVia::TaskAssociation => 1,
+        LinkVia::RunnerRun => 2,
+        LinkVia::SpawnedByJson => 3,
     }
 }
 
@@ -141,6 +146,7 @@ pub fn attach(sessions: &[ChatSessionNode], rows: &[SessionLinkRow]) -> Attachme
                 SessionLinkKind::RunRelation => (LinkVia::RunnerRun, r.run_id, r.plan_id),
                 SessionLinkKind::TaskAssociation => (LinkVia::TaskAssociation, None, None),
                 SessionLinkKind::PlanAssociation => (LinkVia::PlanAssociation, None, r.plan_id),
+                SessionLinkKind::SpawnedByRelation => (LinkVia::SpawnedByJson, r.run_id, r.plan_id),
             };
             let link_task = match r.kind {
                 SessionLinkKind::PlanAssociation => None,
@@ -406,8 +412,82 @@ mod tests {
         ];
         let a = attach(std::slice::from_ref(&s), &rows);
         assert_eq!(a.by_plan.len(), 1, "a session is in one thread only");
-        assert!(a.by_plan.contains_key(&plan_b), "run relation beats task");
-        assert_eq!(a.by_plan[&plan_b][0].links.len(), 2, "both links kept");
+        assert!(
+            a.by_plan.contains_key(&plan_a),
+            "an explicit task association beats the run relation"
+        );
+        assert_eq!(a.by_plan[&plan_a][0].links.len(), 2, "both links kept");
+    }
+
+    #[test]
+    fn manual_plan_association_beats_run_relation_and_json() {
+        let (run, plan_run, plan_manual) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let s = sess(Some(runner_json(run, plan_run)));
+        let rows = vec![
+            run_row(&s, run, plan_run),
+            SessionLinkRow {
+                session_id: s.id,
+                kind: SessionLinkKind::PlanAssociation,
+                run_id: None,
+                task_id: None,
+                plan_id: Some(plan_manual),
+                thread_plan_id: Some(plan_manual),
+            },
+        ];
+        let a = attach(std::slice::from_ref(&s), &rows);
+        assert_eq!(a.by_plan.len(), 1);
+        assert!(a.by_plan.contains_key(&plan_manual), "manual plan wins");
+        assert_eq!(a.by_plan[&plan_manual][0].links.len(), 3, "all links kept");
+    }
+
+    #[test]
+    fn child_session_inherits_the_thread_through_the_spawned_by_relation() {
+        let plan = Uuid::new_v4();
+        // No run_id in its JSON (a chat-spawned child), no run relation.
+        let child = sess(Some(r#"{"type":"chat","parent_session_id":"x"}"#.into()));
+        let row = SessionLinkRow {
+            session_id: child.id,
+            kind: SessionLinkKind::SpawnedByRelation,
+            run_id: None,
+            task_id: None,
+            plan_id: Some(plan),
+            thread_plan_id: Some(plan),
+        };
+        let a = attach(std::slice::from_ref(&child), &[row]);
+        assert!(a.unattached.is_empty() && a.unresolved.is_empty());
+        assert_eq!(a.by_plan[&plan][0].session.id, child.id);
+        assert_eq!(a.by_plan[&plan][0].links[0].via, LinkVia::SpawnedByJson);
+    }
+
+    #[tokio::test]
+    async fn spawned_by_relation_is_read_with_the_grouped_read_via_the_store() {
+        let g = MockGraphStore::new();
+        let plan = Uuid::new_v4();
+        let parent = sess(None);
+        g.create_chat_session(&parent).await.unwrap();
+        g.link_session_to_run(&parent.id.to_string(), Uuid::new_v4(), Some(plan), None)
+            .await
+            .unwrap();
+        let mut children = Vec::new();
+        for _ in 0..4 {
+            let c = sess(None);
+            g.create_chat_session(&c).await.unwrap();
+            g.create_spawned_by_relation(
+                &c.id.to_string(),
+                &parent.id.to_string(),
+                "chat",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            children.push(c);
+        }
+        g.session_link_reads.store(0, Ordering::SeqCst);
+        let a = attach_sessions(&g, &children).await.unwrap();
+        assert!(a.unattached.is_empty(), "children are not orphaned");
+        assert_eq!(a.by_plan[&plan].len(), 4);
+        assert_eq!(g.session_link_reads.load(Ordering::SeqCst), 1);
     }
 
     #[test]

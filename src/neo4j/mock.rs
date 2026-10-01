@@ -7091,13 +7091,39 @@ impl GraphStore for MockGraphStore {
 
     async fn create_spawned_by_relation(
         &self,
-        _child_session_id: &str,
-        _parent_session_id: &str,
+        child_session_id: &str,
+        parent_session_id: &str,
         _spawn_type: &str,
-        _run_id: Option<Uuid>,
-        _task_id: Option<Uuid>,
+        run_id: Option<Uuid>,
+        task_id: Option<Uuid>,
     ) -> Result<()> {
-        // Mock: no-op (relations are not tracked in mock)
+        // Mock: only the thread-relevant part is tracked, as the link row the
+        // real store derives (plan of the run carried, else of the parent).
+        let (Ok(child), Ok(parent)) = (
+            child_session_id.parse::<Uuid>(),
+            parent_session_id.parse::<Uuid>(),
+        ) else {
+            return Ok(());
+        };
+        let mut rows = self.session_link_rows.write().await;
+        let plan = rows
+            .iter()
+            .filter(|r| {
+                r.session_id == parent
+                    && matches!(
+                        r.kind,
+                        SessionLinkKind::RunRelation | SessionLinkKind::PlanAssociation
+                    )
+            })
+            .find_map(|r| r.thread_plan_id);
+        rows.push(SessionLinkRow {
+            session_id: child,
+            kind: SessionLinkKind::SpawnedByRelation,
+            run_id,
+            task_id,
+            plan_id: plan,
+            thread_plan_id: plan,
+        });
         Ok(())
     }
 
