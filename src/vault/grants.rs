@@ -261,7 +261,7 @@ mod tests {
     fn a_project_grant_covers_its_sessions_and_nothing_else() {
         let (_d, mut b) = book();
         b.create(
-            names(&["mermaid"]),
+            names(&["demo-secret"]),
             GrantScope::Project("po".into()),
             Duration::hours(2),
             None,
@@ -269,15 +269,15 @@ mod tests {
         )
         .unwrap();
         assert!(b
-            .covering(&req("mermaid", "s1", Some("po")), t0())
+            .covering(&req("demo-secret", "s1", Some("po")), t0())
             .is_some());
         assert!(b
-            .covering(&req("mermaid", "s2", Some("po")), t0())
+            .covering(&req("demo-secret", "s2", Some("po")), t0())
             .is_some());
         assert!(b
-            .covering(&req("mermaid", "s1", Some("obrain")), t0())
+            .covering(&req("demo-secret", "s1", Some("obrain")), t0())
             .is_none());
-        assert!(b.covering(&req("mermaid", "s1", None), t0()).is_none());
+        assert!(b.covering(&req("demo-secret", "s1", None), t0()).is_none());
         assert!(b.covering(&req("github", "s1", Some("po")), t0()).is_none());
     }
 
@@ -347,7 +347,7 @@ mod tests {
             t0(),
         )
         .unwrap();
-        let r = req("mermaid", "s1", Some("po"));
+        let r = req("demo-secret", "s1", Some("po"));
         assert_eq!(
             authorize(false, true, &b, &r, t0()),
             Err(Denied::VaultLocked)
@@ -358,7 +358,7 @@ mod tests {
     #[test]
     fn the_denial_says_what_to_do_next() {
         let (_d, b) = book();
-        let r = req("mermaid", "s1", Some("po"));
+        let r = req("demo-secret", "s1", Some("po"));
         assert_eq!(
             authorize(true, false, &b, &r, t0()),
             Err(Denied::UnknownSecret)
@@ -371,17 +371,17 @@ mod tests {
     fn grants_survive_a_reload() {
         let (d, mut b) = book();
         b.create(
-            names(&["mermaid"]),
+            names(&["demo-secret"]),
             GrantScope::Project("po".into()),
             Duration::hours(2),
-            Some("mermaid diagrams".into()),
+            Some("demo service".into()),
             t0(),
         )
         .unwrap();
         let reloaded = GrantBook::load(d.path().join("vault-grants.json")).unwrap();
         assert_eq!(reloaded.list(t0()).len(), 1);
         assert!(reloaded
-            .covering(&req("mermaid", "s9", Some("po")), t0())
+            .covering(&req("demo-secret", "s9", Some("po")), t0())
             .is_some());
     }
 

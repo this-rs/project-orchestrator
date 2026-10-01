@@ -525,7 +525,7 @@ mod tests {
     /// one at a time so the log-capture test sees every event: a callsite hit
     /// concurrently by a sibling can cache "no interest" for its subscriber.
     static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-    const VALUE: &str = "the-mermaid-passphrase";
+    const VALUE: &str = "the-demo-passphrase";
 
     fn auth() -> AuthConfig {
         AuthConfig {
@@ -661,7 +661,7 @@ mod tests {
         let (s, _) = call_with_proof(
             app,
             "PUT",
-            "/api/vault/secrets/mermaid",
+            "/api/vault/secrets/demo-secret",
             &t.human,
             Some(&proof),
             Some(serde_json::json!({"value": VALUE})),
@@ -728,7 +728,7 @@ mod tests {
         )
         .await;
         assert_eq!(s, StatusCode::CREATED);
-        let read = Some(serde_json::json!({"name": "mermaid"}));
+        let read = Some(serde_json::json!({"name": "demo-secret"}));
         let (s, _) = call(&app, "POST", "/api/vault/agent/read", &t.vault_s1, read).await;
         assert_eq!(s, StatusCode::OK);
 
@@ -783,9 +783,16 @@ mod tests {
             assert_eq!(s, StatusCode::FORBIDDEN, "proof {proof:?}");
         }
         let put = Some(serde_json::json!({"value": "attacker-chosen-value"}));
-        let (s, _) = call(&app, "PUT", "/api/vault/secrets/mermaid", &forged, put).await;
+        let (s, _) = call(&app, "PUT", "/api/vault/secrets/demo-secret", &forged, put).await;
         assert_eq!(s, StatusCode::FORBIDDEN);
-        let (s, _) = call(&app, "DELETE", "/api/vault/secrets/mermaid", &forged, None).await;
+        let (s, _) = call(
+            &app,
+            "DELETE",
+            "/api/vault/secrets/demo-secret",
+            &forged,
+            None,
+        )
+        .await;
         assert_eq!(s, StatusCode::FORBIDDEN);
 
         // The real proof works — until the vault locks.
@@ -870,14 +877,14 @@ mod tests {
         let (app, state) = app().await;
         let t = tokens();
         let proof = open_with_secret(&app, &t).await;
-        let read = || Some(serde_json::json!({"name": "mermaid"}));
+        let read = || Some(serde_json::json!({"name": "demo-secret"}));
 
         let (s, body) = call(&app, "POST", "/api/vault/agent/read", &t.vault_s1, read()).await;
         assert_eq!(s, StatusCode::FORBIDDEN);
         assert!(!body.contains(VALUE));
 
         let grant = serde_json::json!({
-            "secrets": {"kind": "names", "names": ["mermaid"]},
+            "secrets": {"kind": "names", "names": ["demo-secret"]},
             "scope": {"kind": "session", "value": "session-1"},
             "minutes": 30,
         });
@@ -896,7 +903,7 @@ mod tests {
         assert_eq!(s, StatusCode::OK);
         assert_eq!(body, VALUE);
         // Delivered → masked from now on.
-        assert_eq!(state.vault.masker().mask(VALUE), "[secret:mermaid]");
+        assert_eq!(state.vault.masker().mask(VALUE), "[secret:demo-secret]");
 
         // The other session is still refused: the session comes from the
         // signature, not from anything the agent sends.
@@ -913,7 +920,7 @@ mod tests {
         open_with_secret(&app, &t).await;
         let (s, body) = call(&app, "GET", "/api/vault", &t.human, None).await;
         assert_eq!(s, StatusCode::OK);
-        assert!(body.contains("mermaid"));
+        assert!(body.contains("demo-secret"));
         assert!(!body.contains(VALUE));
     }
 

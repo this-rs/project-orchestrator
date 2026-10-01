@@ -186,16 +186,16 @@ mod tests {
 
     #[test]
     fn a_known_value_is_replaced_by_its_label() {
-        let m = Masker::from_values([("mermaid", "the-mermaid-passphrase")]);
+        let m = Masker::from_values([("demo-secret", "the-demo-passphrase")]);
         assert_eq!(
-            m.mask("login with the-mermaid-passphrase ok"),
-            "login with [secret:mermaid] ok"
+            m.mask("login with the-demo-passphrase ok"),
+            "login with [secret:demo-secret] ok"
         );
     }
 
     #[test]
     fn text_without_secrets_is_borrowed_untouched() {
-        let m = Masker::from_values([("mermaid", "the-mermaid-passphrase")]);
+        let m = Masker::from_values([("demo-secret", "the-demo-passphrase")]);
         assert!(matches!(m.mask("nothing to see"), Cow::Borrowed(_)));
     }
 
@@ -234,17 +234,11 @@ mod tests {
     #[test]
     fn the_shared_set_masks_what_was_registered_and_forgets_on_delete() {
         let shared = SharedMasker::default();
-        assert_eq!(
-            shared.mask("the-mermaid-passphrase"),
-            "the-mermaid-passphrase"
-        );
-        shared.register("mermaid", "the-mermaid-passphrase");
-        assert_eq!(shared.mask("the-mermaid-passphrase"), "[secret:mermaid]");
-        shared.forget("mermaid");
-        assert_eq!(
-            shared.mask("the-mermaid-passphrase"),
-            "the-mermaid-passphrase"
-        );
+        assert_eq!(shared.mask("the-demo-passphrase"), "the-demo-passphrase");
+        shared.register("demo-secret", "the-demo-passphrase");
+        assert_eq!(shared.mask("the-demo-passphrase"), "[secret:demo-secret]");
+        shared.forget("demo-secret");
+        assert_eq!(shared.mask("the-demo-passphrase"), "the-demo-passphrase");
     }
 
     /// The CLI messages the chat masks: every shape a value can travel in.
@@ -311,9 +305,9 @@ mod tests {
     #[test]
     fn debug_shows_labels_never_values() {
         let shared = SharedMasker::default();
-        shared.register("mermaid", "the-mermaid-passphrase");
+        shared.register("demo-secret", "the-demo-passphrase");
         let debug = format!("{:?}", shared.snapshot());
-        assert!(debug.contains("[secret:mermaid]"));
-        assert!(!debug.contains("the-mermaid-passphrase"));
+        assert!(debug.contains("[secret:demo-secret]"));
+        assert!(!debug.contains("the-demo-passphrase"));
     }
 }

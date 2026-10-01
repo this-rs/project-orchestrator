@@ -124,8 +124,8 @@ mod tests {
     #[test]
     fn mappings_are_validated() {
         assert_eq!(
-            parse_mapping("MERMAID_PASS=mermaid").unwrap(),
-            ("MERMAID_PASS".into(), "mermaid".into())
+            parse_mapping("DEMO_PASS=demo-secret").unwrap(),
+            ("DEMO_PASS".into(), "demo-secret".into())
         );
         for bad in ["nope", "=x", "A=", "1A=x", "A-B=x"] {
             assert!(parse_mapping(bad).is_err(), "{bad}");

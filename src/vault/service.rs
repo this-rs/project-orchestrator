@@ -576,35 +576,36 @@ mod tests {
     async fn an_agent_reads_only_under_a_grant_and_the_value_is_then_masked() {
         let svc = open_vault().await;
         let now = Utc::now();
-        svc.put("mermaid", "the-mermaid-passphrase", None, now)
+        svc.put("demo-secret", "the-demo-passphrase", None, now)
             .unwrap();
 
         assert_eq!(
-            svc.read_for_agent("mermaid", "s1", None, now).unwrap_err(),
+            svc.read_for_agent("demo-secret", "s1", None, now)
+                .unwrap_err(),
             ServiceError::Denied(Denied::NoGrant)
         );
         // Nothing delivered yet → nothing to mask.
         assert_eq!(
-            svc.masker().mask("the-mermaid-passphrase"),
-            "the-mermaid-passphrase"
+            svc.masker().mask("the-demo-passphrase"),
+            "the-demo-passphrase"
         );
 
         svc.grant(
-            SecretSelector::Names(["mermaid".to_string()].into()),
+            SecretSelector::Names(["demo-secret".to_string()].into()),
             GrantScope::Session("s1".into()),
             Duration::hours(1),
             None,
             now,
         )
         .unwrap();
-        let v = svc.read_for_agent("mermaid", "s1", None, now).unwrap();
-        assert_eq!(v.as_str(), "the-mermaid-passphrase");
+        let v = svc.read_for_agent("demo-secret", "s1", None, now).unwrap();
+        assert_eq!(v.as_str(), "the-demo-passphrase");
         assert_eq!(
-            svc.masker().mask("x the-mermaid-passphrase"),
-            "x [secret:mermaid]"
+            svc.masker().mask("x the-demo-passphrase"),
+            "x [secret:demo-secret]"
         );
         // Another session is still refused.
-        assert!(svc.read_for_agent("mermaid", "s2", None, now).is_err());
+        assert!(svc.read_for_agent("demo-secret", "s2", None, now).is_err());
     }
 
     #[tokio::test]
@@ -651,12 +652,12 @@ mod tests {
         let svc = open_vault().await;
         let now = Utc::now();
         let req = svc
-            .open_request("mermaid", "publish diagrams", "s1", Some("po"), now)
+            .open_request("demo-secret", "publish diagrams", "s1", Some("po"), now)
             .unwrap();
         assert!(!req.exists);
         // Asking twice yields the same card.
         let again = svc
-            .open_request("mermaid", "publish diagrams", "s1", Some("po"), now)
+            .open_request("demo-secret", "publish diagrams", "s1", Some("po"), now)
             .unwrap();
         assert_eq!(req.id, again.id);
 
@@ -664,7 +665,7 @@ mod tests {
             .answer_request(
                 req.id,
                 RequestAnswer::Provide {
-                    value: "the-mermaid-passphrase".into(),
+                    value: "the-demo-passphrase".into(),
                     description: None,
                 },
                 None,
@@ -674,7 +675,9 @@ mod tests {
             .unwrap();
         assert_eq!(grant.unwrap().scope, GrantScope::Session("s1".into()));
         assert!(svc.pending_requests(now).is_empty());
-        assert!(svc.read_for_agent("mermaid", "s1", Some("po"), now).is_ok());
+        assert!(svc
+            .read_for_agent("demo-secret", "s1", Some("po"), now)
+            .is_ok());
     }
 
     #[tokio::test]
