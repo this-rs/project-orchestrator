@@ -185,6 +185,11 @@ pub static RUNNER_STATE: LazyLock<Arc<RwLock<Option<RunnerState>>>> =
 pub static RUNNER_CANCEL: LazyLock<Arc<AtomicBool>> =
     LazyLock::new(|| Arc::new(AtomicBool::new(false)));
 
+/// Serializes the tests (runner and API handlers) that touch the runner globals.
+#[cfg(test)]
+pub(crate) static RUNNER_GLOBALS_TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(()));
+
 /// Budget override — allows updating max_cost_usd during a running execution.
 /// Stores f64 bits in an AtomicU64 (0 = no override, use config default).
 /// Set via PATCH /api/plans/{plan_id}/run/budget.
@@ -4426,10 +4431,9 @@ mod tests {
     use super::*;
     use crate::runner::models::TriggerSource;
 
-    /// Mutex to serialize tests that touch global RUNNER_STATE / RUNNER_CANCEL.
-    /// tokio::sync::Mutex is used because these are async tests.
-    static TEST_MUTEX: std::sync::LazyLock<tokio::sync::Mutex<()>> =
-        std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+    /// Mutex to serialize tests that touch global RUNNER_STATE / RUNNER_CANCEL
+    /// (shared with the handler tests, see `RUNNER_GLOBALS_TEST_LOCK`).
+    use super::RUNNER_GLOBALS_TEST_LOCK as TEST_MUTEX;
 
     /// Reset global state to a clean baseline.
     async fn reset_globals() {
@@ -4438,6 +4442,7 @@ mod tests {
             *global = None;
         }
         RUNNER_CANCEL.store(false, Ordering::SeqCst);
+        RUNNER_BUDGET.store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
     #[tokio::test]
@@ -4484,7 +4489,6 @@ mod tests {
             bits,
             "budget override cleared"
         );
-        RUNNER_BUDGET.store(0, std::sync::atomic::Ordering::Relaxed);
         reset_globals().await;
     }
 
