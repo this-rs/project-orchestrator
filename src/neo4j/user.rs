@@ -443,6 +443,37 @@ impl Neo4jClient {
         Ok(tokens)
     }
 
+    /// Permanently delete the caller's MCP token records that can no longer
+    /// grant access — revoked ones and expired ones. Active tokens are never
+    /// touched. Returns how many records were removed.
+    ///
+    /// Safe by construction: `is_mcp_token_active` answers `Ok(false)` when no
+    /// node matches a `jti` (see its `None` arm), so removing a dead token's
+    /// record keeps the corresponding JWT rejected. A purge can never
+    /// resurrect a token — which is why deletion here is acceptable at all.
+    ///
+    /// `expires_at` is stored as an RFC 3339 string, always UTC (`+00:00`), so
+    /// the lexicographic `<` below is chronologically correct: the comparison
+    /// diverges on the date/time prefix long before the fractional seconds,
+    /// whose length is the only part that varies.
+    pub async fn purge_mcp_tokens(&self, user_id: Uuid) -> Result<u64> {
+        let q = query(
+            "MATCH (mt:McpToken {user_id: $user_id})
+             WHERE mt.revoked = true OR mt.expires_at < $now
+             WITH mt, mt.jti AS doomed
+             DETACH DELETE mt
+             RETURN count(doomed) AS purged",
+        )
+        .param("user_id", user_id.to_string())
+        .param("now", chrono::Utc::now().to_rfc3339());
+
+        let mut result = self.graph.execute(q).await?;
+        match result.next().await? {
+            Some(row) => Ok(row.get::<i64>("purged").unwrap_or(0).max(0) as u64),
+            None => Ok(0),
+        }
+    }
+
     /// Revoke all refresh tokens for a given user.
     pub async fn revoke_all_user_tokens(&self, user_id: Uuid) -> Result<u64> {
         let q = query(

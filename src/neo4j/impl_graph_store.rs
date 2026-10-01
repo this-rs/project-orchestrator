@@ -2735,6 +2735,10 @@ impl GraphStore for Neo4jClient {
         self.list_mcp_tokens(user_id).await
     }
 
+    async fn purge_mcp_tokens(&self, user_id: Uuid) -> anyhow::Result<u64> {
+        self.purge_mcp_tokens(user_id).await
+    }
+
     // Feature Graphs
     async fn create_feature_graph(&self, graph: &FeatureGraphNode) -> anyhow::Result<()> {
         self.create_feature_graph(graph).await

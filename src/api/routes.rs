@@ -302,11 +302,15 @@ fn protected_routes() -> Router<OrchestratorState> {
         // ================================================================
         .route("/auth/me", get(auth_handlers::get_me))
         // ================================================================
-        // MCP tokens (issue/list/revoke — auth for the remote MCP transport)
+        // MCP tokens (issue/list/revoke/purge — auth for the remote MCP transport)
         // ================================================================
         .route(
             "/auth/mcp-tokens",
-            get(auth_handlers::list_mcp_tokens).post(auth_handlers::create_mcp_token),
+            get(auth_handlers::list_mcp_tokens)
+                .post(auth_handlers::create_mcp_token)
+                // DELETE without a {jti} = purge the dead records (revoked or
+                // expired). Revoking ONE token keeps its record, on purpose.
+                .delete(auth_handlers::purge_mcp_tokens),
         )
         .route(
             "/auth/mcp-tokens/{jti}",

@@ -8034,6 +8034,15 @@ impl GraphStore for MockGraphStore {
             .collect())
     }
 
+    async fn purge_mcp_tokens(&self, user_id: Uuid) -> Result<u64> {
+        let mut tokens = self.mcp_tokens.write().await;
+        let now = chrono::Utc::now();
+        let before = tokens.len();
+        // Same predicate as the Cypher: owned by this user AND already dead.
+        tokens.retain(|_, t| !(t.user_id == user_id && (t.revoked || t.expires_at < now)));
+        Ok((before - tokens.len()) as u64)
+    }
+
     // Feature Graphs
     async fn create_feature_graph(&self, graph: &FeatureGraphNode) -> Result<()> {
         self.feature_graphs

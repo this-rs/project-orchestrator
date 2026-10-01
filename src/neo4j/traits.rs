@@ -2314,6 +2314,10 @@ pub trait GraphStore: Send + Sync {
         user_id: Uuid,
     ) -> Result<Vec<crate::neo4j::models::McpTokenNode>>;
 
+    /// Permanently remove a user's dead MCP token records (revoked or
+    /// expired). Never removes an active token. Returns the count removed.
+    async fn purge_mcp_tokens(&self, user_id: Uuid) -> Result<u64>;
+
     // ================================================================
     // Feature Graphs
     // ================================================================
