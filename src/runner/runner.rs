@@ -200,6 +200,29 @@ static VECTOR_COLLECTOR: LazyLock<Arc<RwLock<VectorCollector>>> =
 // PlanRunner — the execution engine
 // ============================================================================
 
+/// Tasks of a wave the runner will execute, per the shared eligibility rule
+/// (the resume preview uses the same rule). Logs a warning per skipped blocked task.
+pub(crate) fn eligible_wave_tasks(
+    wave: &crate::neo4j::plan::Wave,
+) -> Vec<&crate::neo4j::plan::WaveTask> {
+    use super::eligibility::{task_eligibility, Eligibility};
+    wave.tasks
+        .iter()
+        .filter(|t| match task_eligibility(&t.status) {
+            Eligibility::Run => true,
+            Eligibility::SkipDone => false,
+            Eligibility::SkipBlocked => {
+                warn!(
+                    "Skipping blocked task {}: {}",
+                    t.id,
+                    t.title.as_deref().unwrap_or("untitled")
+                );
+                false
+            }
+        })
+        .collect()
+}
+
 /// Autonomous plan execution engine.
 ///
 /// Spawns Claude Code agents for each task, monitors execution,
@@ -1383,25 +1406,8 @@ impl PlanRunner {
             aborted: false,
         };
 
-        // Filter tasks: skip completed and blocked
-        let eligible_tasks: Vec<_> = wave
-            .tasks
-            .iter()
-            .filter(|t| {
-                if t.status.eq_ignore_ascii_case("completed") {
-                    return false;
-                }
-                if t.status.eq_ignore_ascii_case("blocked") {
-                    warn!(
-                        "Skipping blocked task {}: {}",
-                        t.id,
-                        t.title.as_deref().unwrap_or("untitled")
-                    );
-                    return false;
-                }
-                true
-            })
-            .collect();
+        // Filter tasks with the shared eligibility rule (runner/eligibility.rs)
+        let eligible_tasks = eligible_wave_tasks(wave);
 
         if eligible_tasks.is_empty() {
             return Ok(wave_result);

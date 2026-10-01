@@ -16,6 +16,7 @@
 //! └── providers/   — trigger providers (schedule, webhook, event)
 //! ```
 
+pub mod eligibility;
 pub mod enricher;
 pub mod feedback;
 pub mod feedback_analyzer;
