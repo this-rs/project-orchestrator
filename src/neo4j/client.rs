@@ -34,6 +34,27 @@ pub(crate) fn pascal_to_snake_case(s: &str) -> String {
     result
 }
 
+/// Both on-disk spellings of a status, snake_case first (canonical) then
+/// PascalCase (legacy rows written with `{:?}`). Characters other than
+/// `[A-Za-z0-9_]` are dropped so the result is safe to embed in Cypher text.
+///
+/// Canonical encoding: Release, Milestone and WorkspaceMilestone store
+/// snake_case (`in_progress`); Plan, Task and Step still store PascalCase
+/// (`InProgress`). Reads must accept both (see `pascal_to_snake_case`).
+pub(crate) fn status_variants(s: &str) -> Vec<String> {
+    let clean: String = s
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    let snake = pascal_to_snake_case(&clean);
+    let pascal = snake_to_pascal_case(&snake);
+    if snake == pascal {
+        vec![snake]
+    } else {
+        vec![snake, pascal]
+    }
+}
+
 /// Convert snake_case to PascalCase (e.g., "in_progress" -> "InProgress")
 pub(crate) fn snake_to_pascal_case(s: &str) -> String {
     s.split('_')
@@ -47,10 +68,22 @@ pub(crate) fn snake_to_pascal_case(s: &str) -> String {
         .collect()
 }
 
-/// Builder for dynamic WHERE clauses in Cypher queries
+/// A value bound to a Cypher parameter by [`WhereBuilder`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum WhereParam {
+    Str(String),
+    StrList(Vec<String>),
+}
+
+/// Builder for dynamic WHERE clauses in Cypher queries.
+///
+/// User-supplied values are never interpolated into the Cypher text: they are
+/// referenced as `$wb_N` parameters and must be bound on the query with
+/// [`WhereBuilder::bind`] (or [`WhereBuilder::params`]).
 #[derive(Default)]
 pub struct WhereBuilder {
     conditions: Vec<String>,
+    params: Vec<(String, WhereParam)>,
 }
 
 impl WhereBuilder {
@@ -59,21 +92,54 @@ impl WhereBuilder {
         Self::default()
     }
 
+    /// Register a parameter and return its `$name` reference.
+    fn push_param(&mut self, value: WhereParam) -> String {
+        let name = format!("wb_{}", self.params.len());
+        self.params.push((name.clone(), value));
+        format!("${}", name)
+    }
+
+    /// Parameters collected so far (name without the `$`, value).
+    pub fn params(&self) -> &[(String, WhereParam)] {
+        &self.params
+    }
+
+    /// Bind every collected parameter onto a query.
+    pub fn bind(&self, mut q: neo4rs::Query) -> neo4rs::Query {
+        for (name, value) in &self.params {
+            q = match value {
+                WhereParam::Str(s) => q.param(name.as_str(), s.clone()),
+                WhereParam::StrList(l) => q.param(name.as_str(), l.clone()),
+            };
+        }
+        q
+    }
+
     /// Add a status filter (converts snake_case to PascalCase for Neo4j)
     pub fn add_status_filter(&mut self, alias: &str, statuses: Option<Vec<String>>) -> &mut Self {
         if let Some(statuses) = statuses {
             if !statuses.is_empty() {
                 let pascal_statuses: Vec<String> =
                     statuses.iter().map(|s| snake_to_pascal_case(s)).collect();
-                self.conditions.push(format!(
-                    "{}.status IN [{}]",
-                    alias,
-                    pascal_statuses
-                        .iter()
-                        .map(|s| format!("'{}'", s))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ));
+                let p = self.push_param(WhereParam::StrList(pascal_statuses));
+                self.conditions.push(format!("{}.status IN {}", alias, p));
+            }
+        }
+        self
+    }
+
+    /// Status filter matching both snake_case (canonical) and legacy PascalCase
+    /// rows. Use for entities migrated to snake_case (Release, Milestone).
+    pub fn add_status_filter_any_case(
+        &mut self,
+        alias: &str,
+        statuses: Option<Vec<String>>,
+    ) -> &mut Self {
+        if let Some(statuses) = statuses {
+            if !statuses.is_empty() {
+                let all: Vec<String> = statuses.iter().flat_map(|s| status_variants(s)).collect();
+                let p = self.push_param(WhereParam::StrList(all));
+                self.conditions.push(format!("{}.status IN {}", alias, p));
             }
         }
         self
@@ -101,7 +167,8 @@ impl WhereBuilder {
     pub fn add_tags_filter(&mut self, alias: &str, tags: Option<Vec<String>>) -> &mut Self {
         if let Some(tags) = tags {
             for tag in tags {
-                self.conditions.push(format!("'{}' IN {}.tags", tag, alias));
+                let p = self.push_param(WhereParam::Str(tag));
+                self.conditions.push(format!("{} IN {}.tags", p, alias));
             }
         }
         self
@@ -110,8 +177,9 @@ impl WhereBuilder {
     /// Add an assigned_to filter
     pub fn add_assigned_to_filter(&mut self, alias: &str, assigned_to: Option<&str>) -> &mut Self {
         if let Some(assigned) = assigned_to {
+            let p = self.push_param(WhereParam::Str(assigned.to_string()));
             self.conditions
-                .push(format!("{}.assigned_to = '{}'", alias, assigned));
+                .push(format!("{}.assigned_to = {}", alias, p));
         }
         self
     }
@@ -120,13 +188,28 @@ impl WhereBuilder {
     pub fn add_search_filter(&mut self, alias: &str, search: Option<&str>) -> &mut Self {
         if let Some(search) = search {
             if !search.trim().is_empty() {
-                let search_lower = search.to_lowercase();
+                let p = self.push_param(WhereParam::Str(search.to_lowercase()));
                 self.conditions.push(format!(
-                    "(toLower({0}.title) CONTAINS '{1}' OR toLower({0}.description) CONTAINS '{1}')",
-                    alias, search_lower
+                    "(toLower({0}.title) CONTAINS {1} OR toLower({0}.description) CONTAINS {1})",
+                    alias, p
                 ));
             }
         }
+        self
+    }
+
+    /// Add a raw condition containing a `{}` marker that is replaced by a
+    /// freshly bound `$wb_N` parameter holding `value`. The template itself
+    /// must be a trusted constant; the value is never spliced into the Cypher.
+    pub fn add_bound(&mut self, template: &str, value: WhereParam) -> &mut Self {
+        let p = self.push_param(value);
+        self.conditions.push(template.replacen("{}", &p, 1));
+        self
+    }
+
+    /// Add a verbatim condition that carries no user data (constants only).
+    pub fn add_static(&mut self, condition: &str) -> &mut Self {
+        self.conditions.push(condition.to_string());
         self
     }
 
@@ -683,5 +766,82 @@ impl Neo4jClient {
             rows.push(row);
         }
         Ok(rows)
+    }
+}
+
+#[cfg(test)]
+mod where_builder_tests {
+    use super::*;
+
+    const EVIL: &str = "a' OR 1=1 //";
+
+    #[test]
+    fn search_filter_is_parameterized() {
+        let mut wb = WhereBuilder::new();
+        wb.add_search_filter("p", Some(EVIL));
+        let clause = wb.build();
+        assert!(!clause.contains("OR 1=1"), "{clause}");
+        assert!(!clause.contains('\''), "{clause}");
+        assert!(clause.contains("$wb_0"));
+        assert_eq!(
+            wb.params(),
+            &[("wb_0".to_string(), WhereParam::Str(EVIL.to_lowercase()))]
+        );
+    }
+
+    #[test]
+    fn status_variants_cover_both_encodings() {
+        assert_eq!(
+            status_variants("in_progress"),
+            vec!["in_progress", "InProgress"]
+        );
+        assert_eq!(
+            status_variants("InProgress"),
+            vec!["in_progress", "InProgress"]
+        );
+        assert_eq!(status_variants("planned"), vec!["planned", "Planned"]);
+        for v in status_variants("x'] OR true //") {
+            assert!(
+                v.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
+                "{v}"
+            );
+        }
+    }
+
+    #[test]
+    fn any_case_filter_matches_milestone_snake_case() {
+        let mut wb = WhereBuilder::new();
+        wb.add_status_filter_any_case("m", Some(vec!["in_progress".into()]));
+        assert_eq!(
+            wb.params()[0].1,
+            WhereParam::StrList(vec!["in_progress".into(), "InProgress".into()])
+        );
+    }
+
+    #[test]
+    fn tags_assigned_status_are_parameterized() {
+        let mut wb = WhereBuilder::new();
+        wb.add_status_filter(
+            "t",
+            Some(vec!["in_progress".into(), "x'] OR true //".into()]),
+        )
+        .add_tags_filter("t", Some(vec![EVIL.into(), "b\\\"".into()]))
+        .add_assigned_to_filter("t", Some(EVIL));
+        let clause = wb.build_and();
+        for bad in ["'", "\"", "\\", "OR 1=1", "OR true"] {
+            assert!(!clause.contains(bad), "{bad} in {clause}");
+        }
+        assert_eq!(wb.params().len(), 4);
+        assert_eq!(
+            wb.params()[0].1,
+            WhereParam::StrList(vec![
+                "InProgress".into(),
+                snake_to_pascal_case("x'] OR true //")
+            ])
+        );
+        assert_eq!(wb.params()[1].1, WhereParam::Str(EVIL.into()));
+        assert_eq!(wb.params()[3].1, WhereParam::Str(EVIL.into()));
+        // binding must not panic
+        let _ = wb.bind(query("RETURN 1"));
     }
 }

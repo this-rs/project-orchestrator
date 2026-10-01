@@ -511,7 +511,7 @@ impl Neo4jClient {
         sort_order: &str,
     ) -> Result<(Vec<MilestoneNode>, usize)> {
         let mut where_builder = WhereBuilder::new();
-        where_builder.add_status_filter("m", statuses);
+        where_builder.add_status_filter_any_case("m", statuses);
 
         let where_clause = where_builder.build_and();
         let order_field = match sort_by {
@@ -527,7 +527,11 @@ impl Neo4jClient {
             if where_clause.is_empty() { "" } else { &where_clause }
         );
         let count_result = self
-            .execute_with_params(query(&count_cypher).param("project_id", project_id.to_string()))
+            .execute_with_params(
+                where_builder
+                    .bind(query(&count_cypher))
+                    .param("project_id", project_id.to_string()),
+            )
             .await?;
         let total: i64 = count_result
             .first()
@@ -549,7 +553,11 @@ impl Neo4jClient {
 
         let mut result = self
             .graph
-            .execute(query(&cypher).param("project_id", project_id.to_string()))
+            .execute(
+                where_builder
+                    .bind(query(&cypher))
+                    .param("project_id", project_id.to_string()),
+            )
             .await?;
         let mut milestones = Vec::new();
         while let Some(row) = result.next().await? {
