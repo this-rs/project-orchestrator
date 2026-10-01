@@ -6393,6 +6393,7 @@ pub enum AppError {
     Conflict(String),
     /// 410: the thing existed but is permanently gone (e.g. the CLI that asked).
     Gone(String),
+    NotImplemented(String),
 }
 
 impl IntoResponse for AppError {
@@ -6405,6 +6406,7 @@ impl IntoResponse for AppError {
             AppError::Forbidden(msg) => (StatusCode::FORBIDDEN, msg),
             AppError::Conflict(msg) => (StatusCode::CONFLICT, msg),
             AppError::Gone(msg) => (StatusCode::GONE, msg),
+            AppError::NotImplemented(msg) => (StatusCode::NOT_IMPLEMENTED, msg),
         };
 
         let body = Json(serde_json::json!({

@@ -338,7 +338,16 @@ fn test_tombstone_revocation() {
 
     // 2. Create a tombstone for that content_hash
     let mut tombstones = TombstoneRegistry::new();
-    let was_new = tombstones.apply_tombstone(&envelope.meta.content_hash);
+    tombstones.register_envelope_owner(&envelope);
+    let signed = project_orchestrator::sharing::tombstone::sign_tombstone_with_key(
+        &alice_key,
+        envelope.meta.content_hash.clone(),
+        chrono::Utc::now(),
+        None,
+    );
+    let was_new = tombstones
+        .apply_signed_tombstone(signed)
+        .expect("owner-signed tombstone must be accepted");
     assert!(was_new, "First tombstone application should return true");
 
     // Verify the tombstone registry marks it as revoked

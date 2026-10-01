@@ -8,8 +8,8 @@ use crate::episodes::distill_models::{
     ConsentStats, PrivacyMode, SharingConsent, SharingEvent, SharingMode, SharingPolicy,
 };
 use crate::notes::NoteFilters;
-use crate::reception::anchor::SignedTombstone;
 use crate::sharing::consent_gate::run_consent_gate;
+use crate::sharing::tombstone::AnnotatedTombstone;
 use axum::{
     extract::{Path, Query, State},
     Json,
@@ -388,18 +388,19 @@ pub async fn retract_sharing(
         ));
     };
 
-    // Build and persist tombstone
-    let tombstone = SignedTombstone {
-        content_hash: content_hash.clone(),
-        issuer_did: state
-            .identity
-            .as_ref()
-            .map(|id| id.did_key().to_string())
-            .unwrap_or_else(|| "did:local:unknown".to_string()),
-        signature_hex: "0".repeat(128), // placeholder — real signing requires InstanceIdentity
-        issued_at: Utc::now(),
-        reason: body.reason.clone(),
-    };
+    // Build and persist a really signed tombstone. Without an instance
+    // identity we cannot sign: refuse instead of persisting a fake signature.
+    let identity = state.identity.as_ref().ok_or_else(|| {
+        AppError::NotImplemented(
+            "tombstone signing requires an instance identity (none configured)".into(),
+        )
+    })?;
+    let tombstone = crate::sharing::tombstone::sign_tombstone(
+        identity,
+        content_hash.clone(),
+        Utc::now(),
+        body.reason.clone(),
+    );
 
     state
         .orchestrator
@@ -450,7 +451,7 @@ pub async fn retract_sharing(
 pub async fn list_tombstones(
     State(state): State<OrchestratorState>,
     Path(slug): Path<String>,
-) -> Result<Json<Vec<SignedTombstone>>, AppError> {
+) -> Result<Json<Vec<AnnotatedTombstone>>, AppError> {
     // Validate project exists
     let _project_id = resolve_project_id(&state, &slug).await?;
 
@@ -461,7 +462,13 @@ pub async fn list_tombstones(
         .await
         .map_err(AppError::Internal)?;
 
-    Ok(Json(tombstones))
+    // Mark legacy placeholders (fake signature) and unverifiable entries explicitly.
+    Ok(Json(
+        tombstones
+            .into_iter()
+            .map(crate::sharing::tombstone::annotate_tombstone)
+            .collect(),
+    ))
 }
 
 /// GET /api/projects/{slug}/sharing/last-report — last privacy/consent report
