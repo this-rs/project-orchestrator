@@ -50,7 +50,7 @@ Project Orchestrator gives your AI agents a shared brain. Instead of each agent 
 - **MCP Integration** — 22 mega-tools available for Claude Code, OpenAI Agents, and Cursor
 - **Autonomous Runner** — Execute plans automatically with parallel wave dispatch and agent personas
 - **Auto-Sync** — File watcher keeps the knowledge base updated as you code
-- **Authentication** — Google OAuth2, OIDC, and Password login with deny-by-default security
+- **Authentication** — Google OAuth2, OIDC, and Password login (JWT required once an `auth` section is configured; with no `auth` section the API is open/anonymous)
 - **Chat WebSocket** — Real-time conversational AI via Claude integration with smart context injection
 - **Event System** — Live CRUD notifications via WebSocket + streaming activation events
 - **NATS Integration** — Inter-process event sync for multi-instance deployments

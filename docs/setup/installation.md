@@ -254,10 +254,12 @@ in `config.yaml.example`). For example, `neo4j.uri` is overridden by `NEO4J_URI`
 
 ## Authentication Setup
 
-Authentication is **optional** but follows a **deny-by-default** security model:
+Authentication is **optional**. Once configured it is deny-by-default; without it the API is open:
 
-- If `config.yaml` has **no `auth` section**, the server denies all requests to
-  `/api/*` and `/ws/*` endpoints. The MCP server (stdio) is unaffected.
+- If `config.yaml` has **no `auth` section**, the server runs in **anonymous mode**:
+  every request to `/api/*` and `/ws/*` is served without a token (a WARN is logged
+  at startup). The listener binds on all interfaces, so only run this on a trusted
+  machine. The MCP server (stdio) is unaffected.
 - If `config.yaml` has an `auth` section, the configured providers are enabled:
   - **Password login** — Root account and/or user registration
   - **Google OAuth** — If `google_client_id` is set

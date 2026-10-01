@@ -10,7 +10,7 @@ Complete REST API documentation for Project Orchestrator.
 
 ## Authentication
 
-The API uses **JWT Bearer token authentication**. When authentication is configured, it operates on a **deny-by-default** basis: all routes require a valid JWT unless explicitly marked as public.
+The API uses **JWT Bearer token authentication**. When authentication is configured, it operates on a **deny-by-default** basis: all routes require a valid JWT unless explicitly marked as public. When no `auth` section is configured the server runs in anonymous (open) mode and accepts every request.
 
 Routes are split into two groups:
 

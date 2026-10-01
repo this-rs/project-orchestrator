@@ -685,7 +685,7 @@ pub struct Config {
     pub nats_url: Option<String>,
     pub workspace_path: String,
     pub server_port: u16,
-    /// Auth config — None means deny-by-default (no auth section in YAML)
+    /// Auth config — None means anonymous/open access (no auth section in YAML); a WARN is logged at startup
     pub auth_config: Option<AuthConfig>,
     /// Whether to serve the frontend static files (default: true)
     pub serve_frontend: bool,

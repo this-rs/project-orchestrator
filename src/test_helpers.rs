@@ -303,7 +303,7 @@ pub fn mock_app_state_with_stores() -> (AppState, Arc<MockGraphStore>, Arc<MockS
 ///
 /// Uses a fixed JWT secret and disables domain restriction.
 /// Tests that use `create_router()` should pass `Some(test_auth_config())`
-/// as `auth_config` to avoid deny-by-default 403 rejections.
+/// as `auth_config` so requests are authenticated with a real JWT instead of falling into anonymous (open) mode.
 pub fn test_auth_config() -> AuthConfig {
     AuthConfig {
         jwt_secret: "test-secret-key-minimum-32-chars!!".to_string(),
