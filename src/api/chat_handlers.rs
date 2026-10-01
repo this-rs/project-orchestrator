@@ -2291,6 +2291,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "needs the claude CLI on PATH (run with: cargo test -- --ignored)"]
     async fn permission_to_a_live_session_reaches_the_cli_then_a_second_answer_is_409() {
         let h = action_harness(None).await;
         let sid = seed_session(&h).await;
@@ -2330,6 +2331,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "needs the claude CLI on PATH (run with: cargo test -- --ignored)"]
     async fn permission_deny_is_forwarded_as_a_deny() {
         let h = action_harness(None).await;
         let sid = seed_session(&h).await;
@@ -2349,6 +2351,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "needs the claude CLI on PATH (run with: cargo test -- --ignored)"]
     async fn permission_already_claimed_but_not_yet_persisted_is_409_not_a_second_send() {
         // The request is stored without a decision and the live CLI no longer
         // holds it pending: another answer claimed it a moment ago.
@@ -2369,6 +2372,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "needs the claude CLI on PATH (run with: cargo test -- --ignored)"]
     async fn permission_never_asked_on_a_live_session_is_404() {
         let h = action_harness(None).await;
         let sid = seed_session(&h).await;
@@ -2474,6 +2478,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "needs the claude CLI on PATH (run with: cargo test -- --ignored)"]
     async fn message_to_a_live_session_goes_through_the_same_send_path() {
         let h = action_harness(None).await;
         let sid = seed_session(&h).await;

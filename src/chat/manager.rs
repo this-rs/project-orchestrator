@@ -9116,6 +9116,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "needs the claude CLI on PATH (run with: cargo test -- --ignored)"]
     async fn live_snapshot_reports_the_permissions_each_live_cli_still_holds() {
         let (manager, _graph) = manager_with_mock();
         let with = Uuid::new_v4();
@@ -9147,6 +9148,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "needs the claude CLI on PATH (run with: cargo test -- --ignored)"]
     async fn failed_stdin_send_keeps_the_permission_pending_for_a_retry() {
         let (manager, _graph) = manager_with_mock();
         let sid = Uuid::new_v4().to_string();
