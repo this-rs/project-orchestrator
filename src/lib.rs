@@ -1967,15 +1967,8 @@ pub async fn start_server(mut config: Config) -> Result<()> {
     // Create router
     let app = api::create_router(server_state);
 
-    if config.auth_config.is_none() {
-        // The listener is always bound on 0.0.0.0 (see top of start_server), so
-        // anonymous mode is reachable from the network, not just loopback.
-        tracing::warn!(
-            "AUTH DISABLED: no `auth` section configured — every API request is served \
-             anonymously. The server listens on {addr} (all interfaces), so anyone who can \
-             reach this port has full access. Configure `auth` (root_account or oidc) \
-             before exposing this host beyond a trusted machine."
-        );
+    if let Some(warning) = anonymous_mode_warning(config.auth_config.is_some(), &addr) {
+        tracing::warn!("{warning}");
     }
 
     // Log frontend serving mode
@@ -2097,6 +2090,35 @@ async fn start_setup_server(port: u16) -> Result<()> {
 // ============================================================================
 // Tests
 // ============================================================================
+
+/// Startup warning for anonymous mode, or `None` when auth is configured.
+///
+/// The listener is always bound on 0.0.0.0, so anonymous mode is reachable
+/// from the network, not just loopback.
+fn anonymous_mode_warning(auth_configured: bool, addr: &std::net::SocketAddr) -> Option<String> {
+    if auth_configured {
+        return None;
+    }
+    Some(format!(
+        "AUTH DISABLED: no `auth` section configured — every API request is served \
+         anonymously. The server listens on {addr} (all interfaces), so anyone who can \
+         reach this port has full access. Configure `auth` (root_account or oidc) \
+         before exposing this host beyond a trusted machine."
+    ))
+}
+
+#[cfg(test)]
+mod anonymous_warning_tests {
+    use super::*;
+
+    #[test]
+    fn warns_only_when_auth_is_not_configured() {
+        let addr = std::net::SocketAddr::from(([0, 0, 0, 0], 6600));
+        let msg = anonymous_mode_warning(false, &addr).expect("must warn");
+        assert!(msg.contains("AUTH DISABLED") && msg.contains("0.0.0.0:6600"));
+        assert!(anonymous_mode_warning(true, &addr).is_none());
+    }
+}
 
 #[cfg(test)]
 mod config_tests {

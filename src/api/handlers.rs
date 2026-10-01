@@ -3416,10 +3416,13 @@ pub async fn bootstrap_knowledge_fabric(
             "commits_backfilled": result.commits_backfilled,
             "touches_created": result.touches_created,
         })),
-        Err(e) => failed.push(serde_json::json!({
+        Err(e) => {
+            tracing::warn!(step = "backfill_touches", error = %e, "maintenance step failed");
+            failed.push(serde_json::json!({
             "step": "backfill_touches",
-            "error": e.to_string(),
-        })),
+            "error": STEP_FAILED_MESSAGE,
+            }))
+        }
     }
 
     // Step 2: Reindex decisions from Neo4j into MeiliSearch
@@ -3429,10 +3432,13 @@ pub async fn bootstrap_knowledge_fabric(
             "decisions_processed": total,
             "decisions_indexed": indexed,
         })),
-        Err(e) => failed.push(serde_json::json!({
+        Err(e) => {
+            tracing::warn!(step = "reindex_decisions", error = %e, "maintenance step failed");
+            failed.push(serde_json::json!({
             "step": "reindex_decisions",
-            "error": e.to_string(),
-        })),
+            "error": STEP_FAILED_MESSAGE,
+            }))
+        }
     }
 
     // Step 2b: Backfill decision embeddings
@@ -3447,10 +3453,13 @@ pub async fn bootstrap_knowledge_fabric(
             "decisions_processed": total,
             "embeddings_created": created,
         })),
-        Err(e) => failed.push(serde_json::json!({
+        Err(e) => {
+            tracing::warn!(step = "backfill_decision_embeddings", error = %e, "maintenance step failed");
+            failed.push(serde_json::json!({
             "step": "backfill_decision_embeddings",
-            "error": e.to_string(),
-        })),
+            "error": STEP_FAILED_MESSAGE,
+            }))
+        }
     }
 
     // Step 2c: Backfill decision project_slugs in Meilisearch
@@ -3465,10 +3474,13 @@ pub async fn bootstrap_knowledge_fabric(
             "decisions_processed": total,
             "decisions_updated": updated,
         })),
-        Err(e) => failed.push(serde_json::json!({
+        Err(e) => {
+            tracing::warn!(step = "backfill_decision_project_slugs", error = %e, "maintenance step failed");
+            failed.push(serde_json::json!({
             "step": "backfill_decision_project_slugs",
-            "error": e.to_string(),
-        })),
+            "error": STEP_FAILED_MESSAGE,
+            }))
+        }
     }
 
     // Step 3: Backfill DISCUSSED relations
@@ -3479,10 +3491,13 @@ pub async fn bootstrap_knowledge_fabric(
             "entities_found": entities,
             "relations_created": relations,
         })),
-        Err(e) => failed.push(serde_json::json!({
+        Err(e) => {
+            tracing::warn!(step = "backfill_discussed", error = %e, "maintenance step failed");
+            failed.push(serde_json::json!({
             "step": "backfill_discussed",
-            "error": e.to_string(),
-        })),
+            "error": STEP_FAILED_MESSAGE,
+            }))
+        }
     }
 
     // Step 4: Update fabric scores (the final analytics computation)
@@ -3502,10 +3517,13 @@ pub async fn bootstrap_knowledge_fabric(
             "nodes_updated": analytics.metrics.len(),
             "communities": analytics.communities.len(),
         })),
-        Ok(Err(e)) => failed.push(serde_json::json!({
+        Ok(Err(e)) => {
+            tracing::warn!(step = "update_fabric_scores", error = %e, "maintenance step failed");
+            failed.push(serde_json::json!({
             "step": "update_fabric_scores",
-            "error": e.to_string(),
-        })),
+            "error": STEP_FAILED_MESSAGE,
+            }))
+        }
         Err(_) => failed.push(serde_json::json!({
             "step": "update_fabric_scores",
             "error": "Timed out after 120s",
@@ -6115,6 +6133,10 @@ pub enum AppError {
 
 /// Generic message returned to clients for `AppError::Internal`.
 pub(crate) const INTERNAL_ERROR_MESSAGE: &str = "Internal server error";
+
+/// Generic per-step error reported in multi-step maintenance responses; the
+/// detail (Neo4j / filesystem errors) goes to the server log only.
+pub(crate) const STEP_FAILED_MESSAGE: &str = "step failed (see server logs)";
 
 impl IntoResponse for AppError {
     fn into_response(self) -> axum::response::Response {

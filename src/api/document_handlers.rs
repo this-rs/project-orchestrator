@@ -162,7 +162,15 @@ impl IntoResponse for DocumentError {
     fn into_response(self) -> axum::response::Response {
         let status = self.status();
         // Same envelope as `AppError`, so a client needs one error shape.
-        let body = Json(serde_json::json!({ "error": self.to_string() }));
+        let message = match &self {
+            // Never leak internals (graph errors, blob paths) to the client.
+            Self::Internal(e) => {
+                tracing::error!(error = ?e, "internal server error (documents)");
+                crate::api::handlers::INTERNAL_ERROR_MESSAGE.to_string()
+            }
+            _ => self.to_string(),
+        };
+        let body = Json(serde_json::json!({ "error": message }));
         (status, body).into_response()
     }
 }
@@ -1120,6 +1128,23 @@ mod tests {
             assert_eq!(err.status(), expected);
             assert!(seen.insert(expected), "status {expected} used twice");
         }
+    }
+
+    #[tokio::test]
+    async fn internal_error_body_is_generic_but_client_errors_keep_their_message() {
+        let read = |resp: axum::response::Response| async move {
+            let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+            String::from_utf8(bytes.to_vec()).unwrap()
+        };
+        let resp = DocumentError::Internal(anyhow::anyhow!("bolt://secret-host:7687 /var/blobs/x"))
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = read(resp).await;
+        assert!(!body.contains("secret-host") && !body.contains("/var/blobs"));
+        assert!(body.contains(crate::api::handlers::INTERNAL_ERROR_MESSAGE));
+
+        let body = read(DocumentError::NotFound("no such document".into()).into_response()).await;
+        assert!(body.contains("no such document"));
     }
 
     #[tokio::test]

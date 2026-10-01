@@ -48,8 +48,11 @@ pub async fn require_auth(
         .ok_or_else(|| AppError::Unauthorized("Invalid Authorization header format".to_string()))?;
 
     // 3. Decode and validate JWT
-    let claims = decode_jwt(token, &auth_config.jwt_secret)
-        .map_err(|e| AppError::Unauthorized(format!("Invalid token: {}", e)))?;
+    let claims = decode_jwt(token, &auth_config.jwt_secret).map_err(|e| {
+        // The jsonwebtoken error says which check failed; keep it server-side.
+        tracing::debug!(error = %e, "JWT rejected");
+        AppError::Unauthorized("Invalid or expired token".to_string())
+    })?;
 
     // 4. Check email restrictions (domain + individual whitelist).
     //    Bypass for the anonymous/MCP system user (ANONYMOUS_USER_ID = UUID nil)
@@ -275,6 +278,11 @@ mod tests {
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        // The jsonwebtoken error (which check failed) must not reach the client.
+        assert!(body.contains("Invalid or expired token"), "body: {body}");
+        assert!(!body.to_lowercase().contains("base64") && !body.contains("InvalidToken"));
     }
 
     #[tokio::test]

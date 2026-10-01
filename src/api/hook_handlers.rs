@@ -91,9 +91,11 @@ impl RateLimiter {
     }
 }
 
-/// Global rate limiter for the hooks endpoint: 500 requests per minute per IP.
+/// Rate limiter for the hooks endpoint: 500 requests per minute per client IP
+/// (the real TCP peer, see `extract_client_ip`).
 ///
-/// Generous limit because: (1) all sessions share localhost IP via extract_client_ip,
+/// Generous limit because: (1) sessions running on the same host (the common
+/// case: local Claude Code) share the loopback IP and therefore one bucket,
 /// (2) each Claude Code turn can fire 5-10 tool calls, and (3) automated agent
 /// mode can sustain high throughput. 500/min ≈ 8/sec handles concurrent sessions.
 static HOOK_RATE_LIMITER: LazyLock<RateLimiter> =
@@ -134,7 +136,7 @@ pub async fn activate_hook(
     Json(req): Json<HookActivateRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
     // --- Rate limiting ---
-    let client_ip = extract_client_ip(connect_info.as_ref().map(|c| c.0 .0));
+    let client_ip = client_ip_from_extension(connect_info);
     if !HOOK_RATE_LIMITER.check(client_ip) {
         return Ok((
             StatusCode::TOO_MANY_REQUESTS,
@@ -541,6 +543,14 @@ fn extract_client_ip(peer: Option<SocketAddr>) -> IpAddr {
         .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
 }
 
+/// `extract_client_ip` applied to the optional `ConnectInfo` request extension
+/// (present only when served via `into_make_service_with_connect_info`).
+fn client_ip_from_extension(
+    connect_info: Option<axum::Extension<ConnectInfo<SocketAddr>>>,
+) -> IpAddr {
+    extract_client_ip(connect_info.map(|c| c.0 .0))
+}
+
 // ============================================================================
 // Hook Installation
 // ============================================================================
@@ -629,6 +639,57 @@ mod tests {
             extract_client_ip(Some(peer)),
             "203.0.113.7".parse::<IpAddr>().unwrap()
         );
+    }
+
+    async fn probe(connect_info: Option<axum::Extension<ConnectInfo<SocketAddr>>>) -> String {
+        client_ip_from_extension(connect_info).to_string()
+    }
+
+    /// Served through `into_make_service_with_connect_info` (as `start_server`
+    /// does), the real peer address must reach the rate limiter's key. The
+    /// server is bound on IPv6 loopback so the peer (`::1`) differs from the
+    /// IPv4-localhost fallback and the assertion cannot pass by accident.
+    #[tokio::test]
+    async fn test_connect_info_reaches_extract_client_ip_over_tcp() {
+        let Ok(listener) = tokio::net::TcpListener::bind("[::1]:0").await else {
+            eprintln!("IPv6 loopback unavailable, skipping");
+            return;
+        };
+        let port = listener.local_addr().unwrap().port();
+        let app = axum::Router::new().route("/probe", axum::routing::get(probe));
+        tokio::spawn(async move {
+            let _ = axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await;
+        });
+        let body = reqwest::get(format!("http://[::1]:{port}/probe"))
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert_eq!(body, "::1");
+    }
+
+    /// Without `ConnectInfo` (router driven in memory) the limiter falls back
+    /// to localhost instead of failing the request.
+    #[tokio::test]
+    async fn test_router_without_connect_info_falls_back_to_localhost() {
+        use tower::ServiceExt;
+        let app = axum::Router::new().route("/probe", axum::routing::get(probe));
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/probe")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), 64).await.unwrap();
+        assert_eq!(&bytes[..], b"127.0.0.1");
     }
 
     #[test]
