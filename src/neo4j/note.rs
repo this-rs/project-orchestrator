@@ -334,10 +334,7 @@ impl Neo4jClient {
             where_clause
         );
 
-        let mut count_result = self
-            .graph
-            .execute(wb.bind(query(&count_cypher)))
-            .await?;
+        let mut count_result = self.graph.execute(wb.bind(query(&count_cypher))).await?;
         let total: i64 = if let Some(row) = count_result.next().await? {
             row.get("total")?
         } else {
@@ -3696,7 +3693,13 @@ impl Neo4jClient {
 mod injection_tests {
     use super::*;
 
-    const PAYLOADS: &[&str] = &["a' OR 1=1 //", "x\\", "it's", "\\' OR true //", "}) DETACH DELETE n //"];
+    const PAYLOADS: &[&str] = &[
+        "a' OR 1=1 //",
+        "x\\",
+        "it's",
+        "\\' OR true //",
+        "}) DETACH DELETE n //",
+    ];
 
     fn assert_clean(clause: &str, payload: &str) {
         assert!(
@@ -3740,7 +3743,9 @@ mod injection_tests {
     fn note_sort_is_whitelisted() {
         assert_eq!(note_order_field(Some("updated_at")), "updated_at");
         assert_eq!(
-            note_order_field(Some("created_at DESC RETURN n UNION MATCH (x) DETACH DELETE x //")),
+            note_order_field(Some(
+                "created_at DESC RETURN n UNION MATCH (x) DETACH DELETE x //"
+            )),
             "created_at"
         );
         assert_eq!(note_order_field(None), "created_at");

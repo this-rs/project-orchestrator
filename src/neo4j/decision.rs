@@ -14,7 +14,13 @@ use uuid::Uuid;
 pub(crate) fn safe_entity_label(entity_type: &str) -> Result<&'static str> {
     EntityType::from_str(entity_type)
         .map(|t| t.neo4j_label())
-        .map_err(|e| anyhow::anyhow!("invalid entity_type '{}': {}", entity_type.escape_debug(), e))
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "invalid entity_type '{}': {}",
+                entity_type.escape_debug(),
+                e
+            )
+        })
 }
 
 impl Neo4jClient {
