@@ -233,6 +233,7 @@ pub fn unattached_sessions(
     unattached: &[ChatSessionNode],
     events: Vec<ChatEventRecord>,
     live: &HashSet<Uuid>,
+    pending_permissions: &HashMap<Uuid, HashSet<String>>,
     project_workspace: &HashMap<String, String>,
     now: DateTime<Utc>,
 ) -> Vec<UnattachedSession> {
@@ -243,8 +244,7 @@ pub fn unattached_sessions(
             workspace: lane_of(s, project_workspace),
             thread_id: None,
             alive: live.contains(&s.id),
-            cli_stopped_at: None,
-            fallback_stopped_at: s.updated_at,
+            pending_in_memory: pending_permissions.get(&s.id).cloned().unwrap_or_default(),
         })
         .collect();
     let derived = derive_attention(&inputs, events, now);
@@ -567,7 +567,14 @@ mod tests {
         )];
         let live: HashSet<Uuid> = [a.id].into_iter().collect();
         let map: HashMap<String, String> = [("proj-b".to_string(), "beta".to_string())].into();
-        let out = unattached_sessions(&[a.clone(), b.clone(), c.clone()], events, &live, &map, now);
+        let out = unattached_sessions(
+            &[a.clone(), b.clone(), c.clone()],
+            events,
+            &live,
+            &HashMap::new(),
+            &map,
+            now,
+        );
         assert_eq!(out.len(), 3, "none dropped");
         let ua = out.iter().find(|u| u.id == a.id).unwrap();
         assert_eq!(ua.workspace_slug, "alpha");
@@ -602,6 +609,7 @@ mod tests {
             std::slice::from_ref(&s),
             events,
             &HashSet::new(),
+            &HashMap::new(),
             &HashMap::new(),
             now,
         );

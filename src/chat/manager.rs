@@ -106,6 +106,18 @@ pub(crate) const BACKGROUND_TASKS_POLL_INTERVAL_SECS: u64 = 5;
 /// Users who want immediate cleanup can `cancel_task` directly.
 pub(crate) const BACKGROUND_TASK_IDLE_DEATH_SECS: u64 = 1800;
 
+/// In-memory facts about the running CLIs (see
+/// [`ChatManager::live_session_snapshot`]).
+#[derive(Debug, Default, Clone)]
+pub struct LiveSessionSnapshot {
+    /// Sessions whose CLI is alive.
+    pub live: std::collections::HashSet<Uuid>,
+    /// Among them, those currently streaming a turn.
+    pub streaming: std::collections::HashSet<Uuid>,
+    /// Per live session, the `request_id`s of permissions still waiting.
+    pub pending_permissions: std::collections::HashMap<Uuid, std::collections::HashSet<String>>,
+}
+
 /// An active chat session with a live Claude CLI subprocess
 pub struct ActiveSession {
     /// Persistent broadcast sender — one per session lifetime, NOT replaced per message
@@ -2126,26 +2138,34 @@ impl ChatManager {
         (prompt, included_note_ids)
     }
 
-    /// Sessions whose CLI is alive, and among them those currently streaming,
-    /// read under ONE lock (the cockpit must not take it once per session).
-    pub async fn live_session_snapshot(
-        &self,
-    ) -> (
-        std::collections::HashSet<Uuid>,
-        std::collections::HashSet<Uuid>,
-    ) {
-        let sessions = self.active_sessions.read().await;
-        let mut live = std::collections::HashSet::new();
-        let mut streaming = std::collections::HashSet::new();
-        for (id, s) in sessions.iter() {
-            if let Ok(id) = id.parse::<Uuid>() {
-                live.insert(id);
-                if s.is_streaming.load(Ordering::SeqCst) {
-                    streaming.insert(id);
+    /// Sessions whose CLI is alive, those currently streaming, and the
+    /// permission requests each live CLI still holds in memory. The sessions
+    /// map is read under ONE lock (the cockpit must not take it once per
+    /// session); the per-session permission maps are locked after it is
+    /// released.
+    pub async fn live_session_snapshot(&self) -> LiveSessionSnapshot {
+        let mut snap = LiveSessionSnapshot::default();
+        let mut inputs = Vec::new();
+        {
+            let sessions = self.active_sessions.read().await;
+            for (id, s) in sessions.iter() {
+                if let Ok(id) = id.parse::<Uuid>() {
+                    snap.live.insert(id);
+                    if s.is_streaming.load(Ordering::SeqCst) {
+                        snap.streaming.insert(id);
+                    }
+                    inputs.push((id, s.pending_permission_inputs.clone()));
                 }
             }
         }
-        (live, streaming)
+        for (id, pending) in inputs {
+            let ids: std::collections::HashSet<String> =
+                pending.lock().await.keys().cloned().collect();
+            if !ids.is_empty() {
+                snap.pending_permissions.insert(id, ids);
+            }
+        }
+        snap
     }
 
     /// Check if a session is currently active (subprocess alive)
@@ -8997,6 +9017,37 @@ mod tests {
         let after = crate::chat::attachment::attach(&after_sessions, &rows);
         assert_eq!(after.by_plan, before.by_plan, "same links, same thread");
         assert!(after.unattached.is_empty(), "never a detached session");
+    }
+
+    #[tokio::test]
+    async fn live_snapshot_reports_the_permissions_each_live_cli_still_holds() {
+        let (manager, _graph) = manager_with_mock();
+        let with = Uuid::new_v4();
+        let without = Uuid::new_v4();
+        let _a = super::test_support::insert_live_session(
+            &manager,
+            &with.to_string(),
+            true,
+            &["req-1", "req-2"],
+        )
+        .await
+        .expect("the Claude CLI binary must be installed to run this test");
+        let _b =
+            super::test_support::insert_live_session(&manager, &without.to_string(), false, &[])
+                .await
+                .expect("the Claude CLI binary must be installed to run this test");
+        let snap = manager.live_session_snapshot().await;
+        assert_eq!(snap.live, [with, without].into_iter().collect());
+        assert_eq!(snap.streaming, [with].into_iter().collect());
+        assert_eq!(
+            snap.pending_permissions.get(&with),
+            Some(
+                &["req-1".to_string(), "req-2".to_string()]
+                    .into_iter()
+                    .collect()
+            )
+        );
+        assert!(!snap.pending_permissions.contains_key(&without));
     }
 
     #[tokio::test]

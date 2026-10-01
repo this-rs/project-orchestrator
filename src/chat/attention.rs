@@ -11,17 +11,20 @@
 //! - a question is pending = an `ask_user_question` with no `user_message` of
 //!   a HIGHER `seq` (answering is just a `send_message`: there is NO
 //!   `input_response` event);
-//! - a permission is also INVALIDATED by any `user_message` of a HIGHER `seq`:
-//!   a user turn (in particular the one `resume_session` sends) means the
-//!   CLI that asked is gone or moved on, and the CLI replaces the old request
-//!   with a NEW one (new id, new `permission_request`) when still needed
-//!   (spike note cd71cb07). Without this rule a permission asked before a
-//!   resume would come back as actionable although answering it is a no-op;
+//! - a permission followed by a `user_message` of a HIGHER `seq` is
+//!   INVALIDATED unless the live memory still holds it
+//!   ([`SessionAttentionInput::pending_in_memory`]): the store alone cannot
+//!   tell "the user typed while the CLI still waits" (still actionable,
+//!   answering works) from "the session was resumed" (new CLI, the old
+//!   request is gone, answering is a no-op; the CLI re-asks with a NEW id when
+//!   still needed, spike note cd71cb07). The memory says whether the
+//!   requester is still there, so it decides;
 //! - a `session_error` (the CLI died) with no later `user_message` on a DEAD
 //!   session is surfaced in [`DerivedAttention::errors`] (stuck band);
-//! - `cli_stopped_at` of an orphan = explicit input, else the timestamp of the
-//!   LAST stored attention event of the session, else the session's
-//!   `updated_at` (never null);
+//! - `cli_stopped_at` of an orphan = when the CLI died: the `session_error`
+//!   that killed it (when no user turn came after it), else the timestamp of
+//!   the LAST stored attention event. It is never null: an orphan exists only
+//!   because of a stored event, so there is always one to fall back on;
 //! - live session -> actionable ([`WaitingRequest`]); dead session -> orphan
 //!   ([`OrphanRequest`]), with since when the CLI is stopped.
 //!
@@ -49,11 +52,9 @@ pub struct SessionAttentionInput {
     pub thread_id: Option<Uuid>,
     /// Is the CLI process still there (in-memory state)?
     pub alive: bool,
-    /// Since when the CLI is stopped (only meaningful when `!alive`).
-    pub cli_stopped_at: Option<DateTime<Utc>>,
-    /// Last-resort value for `cli_stopped_at` of an orphan: the session's
-    /// `updated_at`.
-    pub fallback_stopped_at: DateTime<Utc>,
+    /// `request_id`s of the permissions the LIVE session still holds in
+    /// memory (`pending_permission_inputs`). Empty for a dead session.
+    pub pending_in_memory: HashSet<String>,
 }
 
 /// A dead CLI that died on a `session_error` and was not restarted since.
@@ -176,21 +177,25 @@ pub fn derive_session_attention(
         match e.event_type.as_str() {
             "permission_request" => {
                 let Ok(ChatEvent::PermissionRequest {
-                    id, tool, input, ..
+                    id,
+                    tool,
+                    input: tool_input,
+                    ..
                 }) = serde_json::from_str::<ChatEvent>(&e.data)
                 else {
                     continue;
                 };
-                // Decided, or invalidated by a later user turn (resume).
-                if decided.contains(&id) || last_user_seq > e.seq || !seen.insert(format!("p:{id}"))
-                {
+                // Decided, or followed by a user turn while the live memory no
+                // longer holds it (resumed session: the requester is gone).
+                let superseded = last_user_seq > e.seq && !input.pending_in_memory.contains(&id);
+                if decided.contains(&id) || superseded || !seen.insert(format!("p:{id}")) {
                     continue;
                 }
                 pending.push(Pending {
                     request_id: id,
                     kind: RequestKind::Permission,
                     tool_name: Some(tool),
-                    text: permission_text(&input),
+                    text: permission_text(&tool_input),
                     options: Vec::new(),
                     seq,
                     requested_at: e.created_at,
@@ -227,9 +232,11 @@ pub fn derive_session_attention(
     }
 
     let mut out = DerivedAttention::default();
+    let mut death: Option<DateTime<Utc>> = None;
     if !input.alive {
         if let Some((seq, reason, at)) = last_error {
             if last_user_seq < seq {
+                death = Some(at);
                 out.errors.push(SessionErrorInfo {
                     session_id: input.session_id,
                     thread_id: input.thread_id,
@@ -240,10 +247,9 @@ pub fn derive_session_attention(
             }
         }
     }
-    let stopped_at = input
-        .cli_stopped_at
-        .or(last_event_at)
-        .unwrap_or(input.fallback_stopped_at);
+    // `pending` is built from stored events, so `last_event_at` is Some
+    // whenever there is an orphan to date.
+    let stopped_at = death.or(last_event_at);
     for p in pending {
         let age_secs = u64::try_from((now - p.requested_at).num_seconds()).unwrap_or(0);
         if input.alive {
@@ -273,7 +279,7 @@ pub fn derive_session_attention(
                 seq: p.seq,
                 requested_at: p.requested_at,
                 age_secs,
-                cli_stopped_at: Some(stopped_at),
+                cli_stopped_at: stopped_at,
             });
         }
     }
@@ -458,8 +464,7 @@ mod tests {
             workspace: "ws".into(),
             thread_id: None,
             alive,
-            cli_stopped_at: if alive { None } else { Some(t(500)) },
-            fallback_stopped_at: t(7),
+            pending_in_memory: HashSet::new(),
         }
     }
 
@@ -517,7 +522,8 @@ mod tests {
         let dead = derive_session_attention(&input(s, false), &evs, t(1000));
         assert!(dead.waiting.is_empty());
         assert_eq!(dead.orphans.len(), 1);
-        assert_eq!(dead.orphans[0].cli_stopped_at, Some(t(500)));
+        // no session_error: the last stored event (seq 3 -> t(30)).
+        assert_eq!(dead.orphans[0].cli_stopped_at, Some(t(30)));
         assert_eq!(dead.orphans[0].request_id, "p1");
     }
 
@@ -556,6 +562,95 @@ mod tests {
         assert_eq!(d.waiting[0].session_id, a);
         assert_eq!(d.orphans.len(), 1);
         assert_eq!(d.orphans[0].session_id, b);
+    }
+
+    // ---- H3: permission vs user_message vs live memory ----
+
+    fn input_with_memory(s: Uuid, alive: bool, ids: &[&str]) -> SessionAttentionInput {
+        let mut i = input(s, alive);
+        i.pending_in_memory = ids.iter().map(|x| x.to_string()).collect();
+        i
+    }
+
+    #[test]
+    fn permission_after_the_user_message_stays_actionable() {
+        let s = Uuid::new_v4();
+        let evs = vec![user(s, 2), perm(s, 5, "p1")];
+        let d = derive_session_attention(&input(s, true), &evs, t(1000));
+        assert_eq!(d.waiting.len(), 1);
+        assert_eq!(d.waiting[0].request_id, "p1");
+    }
+
+    #[test]
+    fn permission_decision_then_user_message_is_not_pending() {
+        let s = Uuid::new_v4();
+        let evs = vec![perm(s, 1, "p1"), decision(s, 2, "p1"), user(s, 3)];
+        for alive in [true, false] {
+            let d = derive_session_attention(&input_with_memory(s, alive, &["p1"]), &evs, t(1000));
+            assert!(d.waiting.is_empty() && d.orphans.is_empty());
+        }
+    }
+
+    #[test]
+    fn user_message_does_not_hide_a_permission_the_live_cli_still_holds() {
+        let s = Uuid::new_v4();
+        let evs = vec![perm(s, 1, "p1"), user(s, 2)];
+        let d = derive_session_attention(&input_with_memory(s, true, &["p1"]), &evs, t(1000));
+        assert_eq!(d.waiting.len(), 1, "still waiting in memory: actionable");
+        assert_eq!(d.waiting[0].request_id, "p1");
+    }
+
+    #[test]
+    fn permission_before_user_message_and_absent_from_memory_is_dropped() {
+        let s = Uuid::new_v4();
+        let evs = vec![perm(s, 1, "p1"), user(s, 2)];
+        // resumed session: live CLI, but it no longer holds p1
+        let d = derive_session_attention(&input_with_memory(s, true, &["other"]), &evs, t(1000));
+        assert!(d.waiting.is_empty() && d.orphans.is_empty());
+        // memory only rescues the request it holds
+        let evs = vec![perm(s, 1, "p1"), perm(s, 2, "p2"), user(s, 3)];
+        let d = derive_session_attention(&input_with_memory(s, true, &["p2"]), &evs, t(1000));
+        let ids: Vec<_> = d.waiting.iter().map(|w| w.request_id.as_str()).collect();
+        assert_eq!(ids, vec!["p2"]);
+    }
+
+    // ---- H2: cli_stopped_at ----
+
+    fn session_error(s: Uuid, seq: i64, at: DateTime<Utc>) -> ChatEventRecord {
+        rec(
+            s,
+            seq,
+            ChatEvent::SessionError {
+                reason: "subprocess_exited".into(),
+                message: "gone".into(),
+                received_at: at,
+            },
+        )
+    }
+
+    #[test]
+    fn cli_stopped_at_is_the_session_error_time_first() {
+        let s = Uuid::new_v4();
+        // created_at of seq 9 is t(90); the death itself is stamped t(55)
+        let evs = vec![perm(s, 1, "p1"), session_error(s, 9, t(55))];
+        let d = derive_session_attention(&input(s, false), &evs, t(1000));
+        assert_eq!(d.orphans[0].cli_stopped_at, Some(t(55)));
+    }
+
+    #[test]
+    fn cli_stopped_at_is_the_last_event_without_a_usable_session_error() {
+        let s = Uuid::new_v4();
+        // no error at all: last stored event (seq 3 -> t(30))
+        let evs = vec![perm(s, 1, "p1"), decision(s, 2, "zz"), user(s, 3)];
+        let d = derive_session_attention(&input_with_memory(s, false, &[]), &evs, t(1000));
+        assert!(d.orphans.is_empty(), "p1 is behind the user turn");
+        let evs = vec![perm(s, 1, "p1"), decision(s, 2, "zz")];
+        let d = derive_session_attention(&input(s, false), &evs, t(1000));
+        assert_eq!(d.orphans[0].cli_stopped_at, Some(t(20)));
+        // error followed by a later user turn is stale: last event wins
+        let evs = vec![session_error(s, 1, t(5)), user(s, 2), perm(s, 3, "p2")];
+        let d = derive_session_attention(&input(s, false), &evs, t(1000));
+        assert_eq!(d.orphans[0].cli_stopped_at, Some(t(30)));
     }
 
     #[tokio::test]

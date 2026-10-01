@@ -72,6 +72,10 @@ pub struct AttentionParams {
     pub live: HashSet<Uuid>,
     /// Sessions currently streaming (in memory).
     pub streaming: HashSet<Uuid>,
+    /// Per live session, the permission `request_id`s its CLI still holds
+    /// (in memory). Decides whether a permission followed by a user message
+    /// is still actionable.
+    pub pending_permissions: HashMap<Uuid, HashSet<String>>,
     /// Snapshot of the global runner slot.
     pub runner: Option<PlanRunState>,
 }
@@ -450,8 +454,11 @@ pub async fn build_attention(graph: &dyn GraphStore, p: &AttentionParams) -> Att
                 workspace: lane.clone(),
                 thread_id: Some(*plan_id),
                 alive: live.contains(&a.session.id),
-                cli_stopped_at: None,
-                fallback_stopped_at: a.session.updated_at,
+                pending_in_memory: p
+                    .pending_permissions
+                    .get(&a.session.id)
+                    .cloned()
+                    .unwrap_or_default(),
             })
         })
         .collect();
@@ -796,7 +803,14 @@ pub async fn build_attention(graph: &dyn GraphStore, p: &AttentionParams) -> Att
     // ---- free sessions (no link, or links that resolve to no plan) ----
     let mut free: Vec<ChatSessionNode> = attachment.unattached.clone();
     free.extend(attachment.unresolved.iter().map(|a| a.session.clone()));
-    let unattached = unattached_sessions(&free, free_events, &p.live, &project_slug_lane, now);
+    let unattached = unattached_sessions(
+        &free,
+        free_events,
+        &p.live,
+        &p.pending_permissions,
+        &project_slug_lane,
+        now,
+    );
 
     // ---- thinking ----
     let mut thinking: Vec<ThinkingItem> = Vec::new();
@@ -955,7 +969,7 @@ pub async fn get_attention(
     State(state): State<OrchestratorState>,
     Query(q): Query<AttentionQuery>,
 ) -> Result<Json<AttentionResponse>, AppError> {
-    let (live, streaming) = match state.chat_manager.as_ref() {
+    let snap = match state.chat_manager.as_ref() {
         Some(cm) => cm.live_session_snapshot().await,
         None => Default::default(),
     };
@@ -963,8 +977,9 @@ pub async fn get_attention(
     let params = AttentionParams {
         now: Utc::now(),
         workspace_slug: normalize_slug(q.workspace_slug.as_deref()).map(str::to_string),
-        live,
-        streaming,
+        live: snap.live,
+        streaming: snap.streaming,
+        pending_permissions: snap.pending_permissions,
         runner,
     };
     Ok(Json(
@@ -1158,11 +1173,30 @@ mod tests {
             streaming: &[Uuid],
             ws: Option<&str>,
         ) -> AttentionResponse {
+            self.run_attention_mem(live, streaming, &[], ws).await
+        }
+
+        /// `held`: (session, request_id) permissions the live CLIs hold in memory.
+        async fn run_attention_mem(
+            &self,
+            live: &[Uuid],
+            streaming: &[Uuid],
+            held: &[(Uuid, &str)],
+            ws: Option<&str>,
+        ) -> AttentionResponse {
+            let mut pending_permissions: HashMap<Uuid, HashSet<String>> = HashMap::new();
+            for (sid, id) in held {
+                pending_permissions
+                    .entry(*sid)
+                    .or_default()
+                    .insert(id.to_string());
+            }
             let params = AttentionParams {
                 now: now(),
                 workspace_slug: ws.map(str::to_string),
                 live: live.iter().copied().collect(),
                 streaming: streaming.iter().copied().collect(),
+                pending_permissions,
                 runner: None,
             };
             let r = build_attention(&self.g, &params).await;
@@ -1305,6 +1339,63 @@ mod tests {
         let r = w.run_attention(&[s], &[], None).await;
         assert!(r.waiting.is_empty(), "pre-resume permission is stale");
         assert!(r.threads.iter().all(|t| t.id != p));
+    }
+
+    #[tokio::test]
+    async fn live_cli_still_holding_a_permission_keeps_it_actionable_after_a_user_message() {
+        let w = World::new();
+        let acme = w.lane("acme").await;
+        let p = w.plan(&acme, "Typing plan", PlanStatus::InProgress).await;
+        let run = w.run(p, &acme, PlanRunStatus::Completed, 5000).await;
+        let s = w.runner_session(p, run, 5).await;
+        w.ask_permission(s, "p-live", 300).await; // seq 1
+        w.store(
+            s,
+            3,
+            ChatEvent::UserMessage {
+                content: "any news?".into(),
+            },
+            200,
+        )
+        .await;
+        let r = w.run_attention_mem(&[s], &[], &[(s, "p-live")], None).await;
+        assert_eq!(
+            r.waiting.len(),
+            1,
+            "memory says the requester is still there"
+        );
+        assert_eq!(r.waiting[0].request_id, "p-live");
+        // same events, CLI no longer holds it (resume): stale
+        let r = w.run_attention_mem(&[s], &[], &[(s, "other")], None).await;
+        assert!(r.waiting.is_empty());
+    }
+
+    /// Production path: the death is written by `emit_subprocess_death`
+    /// (the function the OOB listener calls), read back by the aggregator's
+    /// grouped read and derived into a stuck thread dated by the death.
+    #[tokio::test]
+    async fn subprocess_death_written_by_the_listener_makes_the_thread_stuck() {
+        let w = World::new();
+        let acme = w.lane("acme").await;
+        let p = w.plan(&acme, "Dying plan", PlanStatus::InProgress).await;
+        let run = w.run(p, &acme, PlanRunStatus::Completed, 7000).await;
+        let s = w.runner_session(p, run, 100).await;
+        let (tx, _rx) = tokio::sync::broadcast::channel(4);
+        let next_seq = std::sync::atomic::AtomicI64::new(1);
+        crate::chat::oob_listener::emit_subprocess_death(
+            &s.to_string(),
+            Some(s),
+            &tx,
+            &next_seq,
+            &w.g,
+        )
+        .await;
+        let r = w.run_attention(&[], &[], None).await;
+        let t = thread(&r, p);
+        assert_eq!(
+            (t.band, t.stuck_reason),
+            (Band::Stuck, Some(StuckReason::SessionError))
+        );
     }
 
     #[tokio::test]
@@ -1637,6 +1728,7 @@ mod tests {
             workspace_slug: None,
             live: HashSet::new(),
             streaming: HashSet::new(),
+            pending_permissions: HashMap::new(),
             runner: Some(running.clone()),
         };
         let r = build_attention(&w.g, &params).await;
