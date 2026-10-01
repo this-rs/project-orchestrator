@@ -2291,13 +2291,10 @@ mod tests {
         let h = action_harness(None).await;
         let sid = seed_session(&h).await;
         seed_permission_request(&h, sid, 1, "req-1").await;
-        let Some((mut stdin, _)) =
+        let (mut stdin, _) =
             test_support::insert_live_session(&h.manager, &sid.to_string(), false, &["req-1"])
                 .await
-        else {
-            eprintln!("Skipping test: Claude CLI not installed");
-            return;
-        };
+                .expect("the Claude CLI binary must be installed to run this test");
 
         let (status, body) = call(
             &h.app,
@@ -2333,13 +2330,10 @@ mod tests {
         let h = action_harness(None).await;
         let sid = seed_session(&h).await;
         seed_permission_request(&h, sid, 1, "req-d").await;
-        let Some((mut stdin, _)) =
+        let (mut stdin, _) =
             test_support::insert_live_session(&h.manager, &sid.to_string(), false, &["req-d"])
                 .await
-        else {
-            eprintln!("Skipping test: Claude CLI not installed");
-            return;
-        };
+                .expect("the Claude CLI binary must be installed to run this test");
         let (status, _) = call(
             &h.app,
             auth_post(&perm_uri(sid, "req-d"), r#"{"allow":false}"#),
@@ -2357,12 +2351,10 @@ mod tests {
         let h = action_harness(None).await;
         let sid = seed_session(&h).await;
         seed_permission_request(&h, sid, 1, "req-race").await;
-        let Some((mut stdin, _)) =
-            test_support::insert_live_session(&h.manager, &sid.to_string(), false, &[]).await
-        else {
-            eprintln!("Skipping test: Claude CLI not installed");
-            return;
-        };
+        let (mut stdin, _) =
+            test_support::insert_live_session(&h.manager, &sid.to_string(), false, &[])
+                .await
+                .expect("the Claude CLI binary must be installed to run this test");
         let (status, _) = call(
             &h.app,
             auth_post(&perm_uri(sid, "req-race"), r#"{"allow":true}"#),
@@ -2376,12 +2368,9 @@ mod tests {
     async fn permission_never_asked_on_a_live_session_is_404() {
         let h = action_harness(None).await;
         let sid = seed_session(&h).await;
-        let Some(_live) =
-            test_support::insert_live_session(&h.manager, &sid.to_string(), false, &[]).await
-        else {
-            eprintln!("Skipping test: Claude CLI not installed");
-            return;
-        };
+        let _live = test_support::insert_live_session(&h.manager, &sid.to_string(), false, &[])
+            .await
+            .expect("the Claude CLI binary must be installed to run this test");
         let (status, _) = call(
             &h.app,
             auth_post(&perm_uri(sid, "nope"), r#"{"allow":true}"#),
@@ -2485,12 +2474,10 @@ mod tests {
         let h = action_harness(None).await;
         let sid = seed_session(&h).await;
         // Streaming: send_message queues the text for the running turn.
-        let Some((_stdin, queue)) =
-            test_support::insert_live_session(&h.manager, &sid.to_string(), true, &[]).await
-        else {
-            eprintln!("Skipping test: Claude CLI not installed");
-            return;
-        };
+        let (_stdin, queue) =
+            test_support::insert_live_session(&h.manager, &sid.to_string(), true, &[])
+                .await
+                .expect("the Claude CLI binary must be installed to run this test");
         let (status, body) = call(&h.app, auth_post(&msg_uri(sid), r#"{"content":"vas-y"}"#)).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["routed"], "local");
