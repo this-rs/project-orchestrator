@@ -164,6 +164,15 @@ pub(crate) fn plan_status_values(statuses: Option<&[String]>) -> Option<Vec<Stri
     )
 }
 
+/// AND-clause for the plan status filter: only the `$statuses` placeholder,
+/// whatever the values are (they are bound by the caller).
+pub(crate) fn plan_status_clause(values: Option<&[String]>) -> String {
+    match values {
+        Some(_) => "AND p.status IN $statuses".to_string(),
+        None => String::new(),
+    }
+}
+
 impl Neo4jClient {
     // ========================================================================
     // Plan operations
@@ -338,11 +347,7 @@ impl Neo4jClient {
     ) -> Result<(Vec<PlanNode>, usize)> {
         // Build status filter (values are bound, never spliced into the Cypher)
         let status_values = plan_status_values(status_filter.as_deref());
-        let status_clause = if status_values.is_some() {
-            "AND p.status IN $statuses"
-        } else {
-            ""
-        };
+        let status_clause = plan_status_clause(status_values.as_deref());
 
         // Count total
         let count_q = query(&format!(
@@ -1341,7 +1346,7 @@ impl Neo4jClient {
 
 #[cfg(test)]
 mod injection_tests {
-    use super::plan_status_values;
+    use super::{plan_status_clause, plan_status_values};
 
     #[test]
     fn plan_status_values_normalises_known_and_keeps_payload_as_data() {
@@ -1355,6 +1360,10 @@ mod injection_tests {
         // the payload is returned verbatim: it is bound, not interpolated
         assert_eq!(out[1], "a' OR 1=1 //");
         assert_eq!(out[2], "x\\");
+        let clause = plan_status_clause(Some(&out));
+        assert_eq!(clause, "AND p.status IN $statuses");
+        assert!(!clause.contains("OR 1=1") && !clause.contains('\''));
+        assert!(plan_status_clause(None).is_empty());
         assert!(plan_status_values(Some(&[])).is_none());
         assert!(plan_status_values(None).is_none());
     }
