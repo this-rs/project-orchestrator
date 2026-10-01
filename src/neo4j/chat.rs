@@ -803,6 +803,45 @@ impl Neo4jClient {
         Ok(events)
     }
 
+    /// Grouped read for the attention derivation (see the trait doc).
+    /// One query for every session: `session_id IN $ids` rides the composite
+    /// `(session_id, seq)` index. The payload of `user_message` is blanked
+    /// server-side — only its `seq` is needed and those rows are the bulk.
+    pub async fn get_attention_events(&self, session_ids: &[Uuid]) -> Result<Vec<ChatEventRecord>> {
+        if session_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids: Vec<String> = session_ids.iter().map(|id| id.to_string()).collect();
+        let q = query(
+            "MATCH (e:ChatEvent)
+             WHERE e.session_id IN $ids
+               AND e.event_type IN ['permission_request', 'permission_decision',
+                                    'ask_user_question', 'user_message']
+             RETURN e.id AS id, e.session_id AS session_id, e.seq AS seq,
+                    e.event_type AS event_type, e.created_at AS created_at,
+                    CASE WHEN e.event_type = 'user_message' THEN '' ELSE e.data END AS data
+             ORDER BY e.session_id ASC, e.seq ASC",
+        )
+        .param("ids", ids);
+
+        let mut result = self.graph.execute(q).await?;
+        let mut events = Vec::new();
+        while let Some(row) = result.next().await? {
+            events.push(ChatEventRecord {
+                id: row.get::<String>("id")?.parse()?,
+                session_id: row.get::<String>("session_id")?.parse()?,
+                seq: row.get("seq")?,
+                event_type: row.get("event_type")?,
+                data: row.get("data")?,
+                created_at: row
+                    .get::<String>("created_at")?
+                    .parse()
+                    .unwrap_or_else(|_| chrono::Utc::now()),
+            });
+        }
+        Ok(events)
+    }
+
     /// Get chat events with offset-based pagination (for REST/MCP).
     pub async fn get_chat_events_paginated(
         &self,

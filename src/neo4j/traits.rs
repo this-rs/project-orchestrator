@@ -1995,6 +1995,17 @@ pub trait GraphStore: Send + Sync {
     /// Count total chat events for a session.
     async fn count_chat_events(&self, session_id: Uuid) -> Result<i64>;
 
+    /// Grouped read for the attention derivation: the events needed to decide
+    /// what is still pending, for ALL the given sessions in ONE query (never
+    /// one query per session).
+    ///
+    /// Returns, ordered by `(session_id, seq)`: `permission_request`,
+    /// `permission_decision`, `ask_user_question` (full payload) and
+    /// `user_message` (payload blanked: only its `seq` matters here).
+    /// `input_request` is deliberately NOT read: it is a dead type, never
+    /// emitted in production, and counting it would invent phantom requests.
+    async fn get_attention_events(&self, session_ids: &[Uuid]) -> Result<Vec<ChatEventRecord>>;
+
     /// Get the latest sequence number for a session (0 if no events)
     async fn get_latest_chat_event_seq(&self, session_id: Uuid) -> Result<i64>;
 

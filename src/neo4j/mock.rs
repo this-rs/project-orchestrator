@@ -7104,6 +7104,29 @@ impl GraphStore for MockGraphStore {
         Ok(events)
     }
 
+    async fn get_attention_events(&self, session_ids: &[Uuid]) -> Result<Vec<ChatEventRecord>> {
+        let store = self.chat_events.read().await;
+        let mut out = Vec::new();
+        for id in session_ids {
+            if let Some(events) = store.get(id) {
+                for e in events {
+                    if matches!(
+                        e.event_type.as_str(),
+                        "permission_request" | "permission_decision" | "ask_user_question"
+                    ) {
+                        out.push(e.clone());
+                    } else if e.event_type == "user_message" {
+                        let mut e = e.clone();
+                        e.data = String::new();
+                        out.push(e);
+                    }
+                }
+            }
+        }
+        out.sort_by_key(|e| (e.session_id, e.seq));
+        Ok(out)
+    }
+
     async fn get_chat_events_paginated(
         &self,
         session_id: Uuid,

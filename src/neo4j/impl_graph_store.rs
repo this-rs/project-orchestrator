@@ -2395,6 +2395,13 @@ impl GraphStore for Neo4jClient {
         self.get_chat_events(session_id, after_seq, limit).await
     }
 
+    async fn get_attention_events(
+        &self,
+        session_ids: &[Uuid],
+    ) -> anyhow::Result<Vec<ChatEventRecord>> {
+        self.get_attention_events(session_ids).await
+    }
+
     async fn get_chat_events_paginated(
         &self,
         session_id: Uuid,
