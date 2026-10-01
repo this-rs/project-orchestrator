@@ -502,6 +502,33 @@ impl PlanRunner {
         // 1. Broadcast on the dedicated RunnerEvent channel
         let _ = self.event_tx.send(event.clone());
 
+        // 2a. Light `attention_changed` signal (ids only) for the cockpit
+        {
+            use crate::events::attention::{AttentionReason, AttentionSubject};
+            let attention = match &event {
+                RunnerEvent::PlanStarted { plan_id, .. } => Some((
+                    AttentionSubject::Plan(plan_id.to_string()),
+                    AttentionReason::PlanStarted,
+                )),
+                RunnerEvent::PlanCompleted { plan_id, .. } => Some((
+                    AttentionSubject::Plan(plan_id.to_string()),
+                    AttentionReason::PlanCompleted,
+                )),
+                RunnerEvent::BudgetExceeded { plan_id, .. } => Some((
+                    AttentionSubject::Plan(plan_id.to_string()),
+                    AttentionReason::BudgetExceeded,
+                )),
+                RunnerEvent::TaskFailed { run_id, .. } => Some((
+                    AttentionSubject::PlanRun(run_id.to_string()),
+                    AttentionReason::TaskFailed,
+                )),
+                _ => None,
+            };
+            if let Some((subject, reason)) = attention {
+                crate::events::attention::notify_attention(&self.event_emitter, subject, reason);
+            }
+        }
+
         // 2. Bridge to CrudEvent for WebSocket delivery
         if let Some(ref emitter) = self.event_emitter {
             let (entity_id, action) = match &event {

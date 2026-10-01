@@ -6,10 +6,11 @@
 //! When NATS is not configured, the emitter works in local-only mode
 //! with zero overhead — no connection attempts, no errors.
 
+use super::attention::AttentionRelay;
 use super::bus::EventBus;
 use super::graph::GraphEvent;
 use super::nats::NatsEmitter;
-use super::types::{CrudEvent, EventEmitter};
+use super::types::{CrudEvent, EntityType, EventEmitter};
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use tokio::sync::broadcast;
@@ -33,6 +34,8 @@ pub struct HybridEmitter {
     /// filtering (by layer) in the WebSocket handler.
     graph_sender: broadcast::Sender<GraphEvent>,
     nats: Option<Arc<NatsEmitter>>,
+    /// Coalesces `attention_changed` events (see `events::attention`).
+    attention: Arc<AttentionRelay>,
 }
 
 impl HybridEmitter {
@@ -45,6 +48,7 @@ impl HybridEmitter {
             local_bus,
             graph_sender,
             nats: None,
+            attention: Arc::new(AttentionRelay::default()),
         }
     }
 
@@ -57,6 +61,26 @@ impl HybridEmitter {
             local_bus,
             graph_sender,
             nats: Some(nats_emitter),
+            attention: Arc::new(AttentionRelay::default()),
+        }
+    }
+
+    /// The relay that coalesces `attention_changed` events (install the
+    /// workspace resolver on it at startup).
+    pub fn attention_relay(&self) -> &Arc<AttentionRelay> {
+        &self.attention
+    }
+
+    /// Fan out one event to the local bus and NATS (no coalescing).
+    fn dispatch(&self, event: CrudEvent) {
+        // 1. Always emit to local broadcast (intra-process)
+        self.local_bus.emit(event.clone());
+
+        // 2. Emit to NATS if configured (inter-process)
+        if let Some(nats) = &self.nats {
+            nats.emit(event);
+        } else {
+            debug!("HybridEmitter: NATS not configured, local-only mode");
         }
     }
 
@@ -205,15 +229,14 @@ impl HybridEmitter {
 
 impl EventEmitter for HybridEmitter {
     fn emit(&self, event: CrudEvent) {
-        // 1. Always emit to local broadcast (intra-process)
-        self.local_bus.emit(event.clone());
-
-        // 2. Emit to NATS if configured (inter-process)
-        if let Some(nats) = &self.nats {
-            nats.emit(event);
-        } else {
-            debug!("HybridEmitter: NATS not configured, local-only mode");
+        if event.entity_type == EntityType::AttentionChanged {
+            let me = self.clone();
+            if let Some(event) = self.attention.push(event, move |e| me.dispatch(e)) {
+                self.dispatch(event);
+            }
+            return;
         }
+        self.dispatch(event);
     }
 
     fn emit_graph(&self, event: GraphEvent) {

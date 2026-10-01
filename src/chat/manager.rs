@@ -17,6 +17,7 @@ use super::types::{
     ChatEventPage, ChatRequest, CreateSessionResponse, MessageSearchHit, MessageSearchResult,
     PendingMessage, SessionWorkLog,
 };
+use crate::events::attention::{notify_attention, AttentionReason, AttentionSubject};
 use crate::meilisearch::SearchStore;
 use crate::neo4j::models::ChatEventRecord;
 use crate::neo4j::models::ChatSessionNode;
@@ -857,6 +858,16 @@ impl ChatManager {
             nn_router: None,
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
         }
+    }
+
+    /// Emit the light `attention_changed` signal for a session (no-op without
+    /// an emitter). Ids only: never the text of a command or question.
+    pub(crate) fn notify_attention(&self, session_id: &str, reason: AttentionReason) {
+        notify_attention(
+            &self.event_emitter,
+            AttentionSubject::Session(session_id.to_string()),
+            reason,
+        );
     }
 
     /// Set the event emitter for CRUD events (streaming status notifications)
@@ -1720,6 +1731,13 @@ impl ChatManager {
                             };
                             let _ = events_tx.send(user_msg_event.clone());
                             nats.publish_chat_event(&session_id, user_msg_event);
+                            crate::events::attention::notify_attention(
+                                &event_emitter,
+                                crate::events::attention::AttentionSubject::Session(
+                                    session_id.clone(),
+                                ),
+                                crate::events::attention::AttentionReason::UserMessage,
+                            );
 
                             // Spawn stream_response
                             let session_id_clone = session_id.clone();
@@ -2962,6 +2980,7 @@ impl ChatManager {
             );
             interrupt_flag
         };
+        self.notify_attention(&session_id.to_string(), AttentionReason::SessionActive);
 
         // Spawn NATS interrupt listener for cross-instance interrupt support
         self.spawn_nats_interrupt_listener(
@@ -3063,6 +3082,7 @@ impl ChatManager {
         if let Some(ref nats) = self.nats {
             nats.publish_chat_event(&session_id.to_string(), user_msg_event);
         }
+        self.notify_attention(&session_id.to_string(), AttentionReason::UserMessage);
 
         // Emit CRUD event so other instances (via NATS) know a session was created
         if let Some(ref emitter) = self.event_emitter {
@@ -3961,6 +3981,11 @@ impl ChatManager {
                                     session_id, err_str
                                 );
                                 active_sessions.write().await.remove(&session_id);
+                                notify_attention(
+                                    &event_emitter,
+                                    AttentionSubject::Session(session_id.to_string()),
+                                    AttentionReason::SessionInactive,
+                                );
                             }
 
                             emit_chat(
@@ -4043,6 +4068,8 @@ impl ChatManager {
 
                         // Broadcast to WebSocket clients
                         emit_chat(event.clone(), &events_tx, &nats, &session_id);
+                        // Light signal on /ws/events (ids only, never the command/question)
+                        notify_attention_for_chat_event(&event_emitter, &session_id, &event);
                         Some(event)
                     };
 
@@ -4897,6 +4924,7 @@ impl ChatManager {
         if let Some(ref nats) = self.nats {
             nats.publish_chat_event(session_id, user_msg_event);
         }
+        self.notify_attention(session_id, AttentionReason::UserMessage);
 
         // Start streaming directly
         let session_id_str = session_id.to_string();
@@ -5129,6 +5157,7 @@ impl ChatManager {
         if let Some(ref nats) = self.nats {
             nats.publish_chat_event(session_id, decision_event.clone());
         }
+        self.notify_attention(session_id, AttentionReason::PermissionDecision);
 
         // Persist to Neo4j
         if let Some(uuid) = session_uuid {
@@ -5810,6 +5839,7 @@ impl ChatManager {
             );
             interrupt_flag
         };
+        self.notify_attention(session_id, AttentionReason::SessionActive);
 
         // Spawn NATS interrupt listener for cross-instance interrupt support
         self.spawn_nats_interrupt_listener(
@@ -5904,6 +5934,7 @@ impl ChatManager {
         if let Some(ref nats) = self.nats {
             nats.publish_chat_event(session_id, user_msg_event);
         }
+        self.notify_attention(session_id, AttentionReason::UserMessage);
 
         // Stream in background
         let session_id_str = session_id.to_string();
@@ -7198,6 +7229,7 @@ impl ChatManager {
                 session.protocol_state,
             )
         };
+        self.notify_attention(session_id, AttentionReason::SessionInactive);
 
         // 4. Finalize trajectory — fire-and-forget (non-blocking)
         //    Uses end_session_auto() so the collector computes the reward from
@@ -7382,6 +7414,26 @@ async fn store_pending_perm_input(
     input: &serde_json::Value,
 ) {
     map.lock().await.insert(id.to_string(), input.clone());
+}
+
+/// Relay a permission request / question as a light `attention_changed` on
+/// the general bus. Ids only: the command or question text never leaves the
+/// session's own WebSocket.
+fn notify_attention_for_chat_event(
+    emitter: &Option<Arc<dyn crate::events::EventEmitter>>,
+    session_id: &str,
+    event: &ChatEvent,
+) {
+    let reason = match event {
+        ChatEvent::PermissionRequest { .. } => AttentionReason::PermissionRequest,
+        ChatEvent::AskUserQuestion { .. } => AttentionReason::AskUserQuestion,
+        _ => return,
+    };
+    notify_attention(
+        emitter,
+        AttentionSubject::Session(session_id.to_string()),
+        reason,
+    );
 }
 
 /// without needing to spin up a full streaming session.
@@ -11092,6 +11144,84 @@ mod tests {
         let result = manager.interrupt(session_id).await;
         assert!(result.is_ok(), "second interrupt should succeed");
         assert!(flag.load(Ordering::SeqCst), "flag should remain true");
+    }
+
+    // ── attention_changed relay ─────────────────────────────────────────
+
+    fn attention_hybrid() -> (
+        Arc<crate::events::HybridEmitter>,
+        tokio::sync::broadcast::Receiver<crate::events::CrudEvent>,
+    ) {
+        let h = Arc::new(crate::events::HybridEmitter::new(Arc::new(
+            crate::events::EventBus::default(),
+        )));
+        let rx = h.subscribe();
+        (h, rx)
+    }
+
+    #[tokio::test]
+    async fn test_permission_request_emits_attention_changed_without_the_command() {
+        let (h, mut rx) = attention_hybrid();
+        let emitter: Option<Arc<dyn crate::events::EventEmitter>> = Some(h);
+        let msg = serde_json::json!({
+            "type": "control_request",
+            "request_id": "req-1",
+            "request": {
+                "subtype": "can_use_tool",
+                "tool_name": "Bash",
+                "input": {"command": "rm -rf /secret-command-text"},
+                "tool_use_id": "tu-1"
+            }
+        });
+        let event = parse_permission_control_msg(&msg, None).expect("permission request");
+        assert!(matches!(event, ChatEvent::PermissionRequest { .. }));
+        notify_attention_for_chat_event(&emitter, "sess-1", &event);
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let ev = rx.try_recv().expect("attention_changed on the bus");
+        assert_eq!(ev.entity_type, crate::events::EntityType::AttentionChanged);
+        assert_eq!(ev.payload["session_id"], "sess-1");
+        assert_eq!(
+            ev.payload["reasons"],
+            serde_json::json!(["permission_request"])
+        );
+        assert!(
+            !serde_json::to_string(&ev)
+                .unwrap()
+                .contains("secret-command-text"),
+            "the command text must not transit on the general bus"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_permission_decision_emits_attention_changed() {
+        let state = mock_app_state();
+        let (h, mut rx) = attention_hybrid();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config())
+            .with_event_emitter(h);
+        let (mut session, _handle) = mock_active_session(false);
+        let (stdin_tx, _stdin_rx) = tokio::sync::mpsc::channel::<String>(16);
+        session.stdin_tx = Some(stdin_tx);
+        session
+            .pending_permission_inputs
+            .lock()
+            .await
+            .insert("req-d".to_string(), serde_json::json!({}));
+        manager
+            .active_sessions
+            .write()
+            .await
+            .insert("sess-d".to_string(), session);
+        manager
+            .send_permission_response("sess-d", "req-d", true)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let ev = rx.try_recv().expect("attention_changed on the bus");
+        assert_eq!(ev.payload["session_id"], "sess-d");
+        assert_eq!(
+            ev.payload["reasons"],
+            serde_json::json!(["permission_decision"])
+        );
     }
 
     // ── send_permission_response with mock transport ────────────────────
