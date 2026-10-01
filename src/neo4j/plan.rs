@@ -433,6 +433,38 @@ impl Neo4jClient {
         Ok(())
     }
 
+    /// Slugs of every project a plan belongs to.
+    ///
+    /// A plan can be linked to several projects: `link_plan_to_project` MERGEs a
+    /// new HAS_PLAN edge and keeps the previous ones, but it also OVERWRITES
+    /// `plan.project_id` with the last project linked. So the field names one
+    /// project at most and not reliably the first — the HAS_PLAN edges are the
+    /// real membership, and both are read here.
+    ///
+    /// Used to scope task-context retrieval (similar code, related decisions) to
+    /// the plan's own projects instead of the whole index.
+    pub async fn list_plan_project_slugs(&self, plan_id: Uuid) -> Result<Vec<String>> {
+        let q = query(
+            r#"
+            MATCH (plan:Plan {id: $plan_id})
+            OPTIONAL MATCH (linked:Project)-[:HAS_PLAN]->(plan)
+            OPTIONAL MATCH (primary:Project) WHERE primary.id = plan.project_id
+            WITH collect(DISTINCT linked.slug) + collect(DISTINCT primary.slug) AS slugs
+            RETURN [s IN slugs WHERE s IS NOT NULL] AS slugs
+            "#,
+        )
+        .param("plan_id", plan_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut slugs: Vec<String> = match result.next().await? {
+            Some(row) => row.get("slugs").unwrap_or_default(),
+            None => Vec::new(),
+        };
+        slugs.sort();
+        slugs.dedup();
+        Ok(slugs)
+    }
+
     /// Link a plan to a project (creates HAS_PLAN relationship)
     pub async fn link_plan_to_project(&self, plan_id: Uuid, project_id: Uuid) -> Result<()> {
         let q = query(

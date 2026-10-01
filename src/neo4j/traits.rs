@@ -781,6 +781,10 @@ pub trait GraphStore: Send + Sync {
     /// Link a plan to a project (creates HAS_PLAN relationship)
     async fn link_plan_to_project(&self, plan_id: Uuid, project_id: Uuid) -> Result<()>;
 
+    /// Slugs of every project the plan belongs to (HAS_PLAN edges + plan.project_id).
+    /// Used to scope task-context retrieval to the plan's own projects.
+    async fn list_plan_project_slugs(&self, plan_id: Uuid) -> Result<Vec<String>>;
+
     /// Unlink a plan from its project
     async fn unlink_plan_from_project(&self, plan_id: Uuid) -> Result<()>;
 

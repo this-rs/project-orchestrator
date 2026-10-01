@@ -976,6 +976,10 @@ impl GraphStore for Neo4jClient {
         self.update_plan_status(id, status).await
     }
 
+    async fn list_plan_project_slugs(&self, plan_id: Uuid) -> anyhow::Result<Vec<String>> {
+        self.list_plan_project_slugs(plan_id).await
+    }
+
     async fn link_plan_to_project(&self, plan_id: Uuid, project_id: Uuid) -> anyhow::Result<()> {
         self.link_plan_to_project(plan_id, project_id).await
     }

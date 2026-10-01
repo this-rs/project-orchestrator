@@ -3376,6 +3376,32 @@ impl GraphStore for MockGraphStore {
         Ok(())
     }
 
+    async fn list_plan_project_slugs(&self, plan_id: Uuid) -> Result<Vec<String>> {
+        let primary = self
+            .plans
+            .read()
+            .await
+            .get(&plan_id)
+            .and_then(|p| p.project_id);
+        let linked: Vec<Uuid> = self
+            .project_plans
+            .read()
+            .await
+            .iter()
+            .filter(|(_, plans)| plans.contains(&plan_id))
+            .map(|(pid, _)| *pid)
+            .collect();
+        let projects = self.projects.read().await;
+        let mut slugs: Vec<String> = linked
+            .into_iter()
+            .chain(primary)
+            .filter_map(|pid| projects.get(&pid).map(|p| p.slug.clone()))
+            .collect();
+        slugs.sort();
+        slugs.dedup();
+        Ok(slugs)
+    }
+
     async fn link_plan_to_project(&self, plan_id: Uuid, project_id: Uuid) -> Result<()> {
         if let Some(p) = self.plans.write().await.get_mut(&plan_id) {
             // Remove from old project if any
