@@ -638,6 +638,8 @@ impl MeiliClient {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn meili_quote_escapes_quotes_and_backslashes() {
         assert_eq!(meili_quote("abc"), "\"abc\"");
@@ -651,8 +653,6 @@ mod tests {
             "project_slug = \"x\\\" OR 1 = 1\""
         );
     }
-
-    use super::*;
 
     #[test]
     fn test_path_to_id_consistent() {
