@@ -21,6 +21,13 @@ Thumbs.db
 /.claude/
 
 /config.yaml
+# …and every copy of it. `config.yaml` carries the JWT secret and the Google
+# OAuth client secret, so a backup of it carries them too. The rule above is
+# anchored and exact, which left `config.yaml.bak-<timestamp>` untracked but
+# NOT ignored — one `git add -A` away from publishing secrets in a public
+# repository. Found on 2026-10-01 with such a file sitting in the checkout.
+/config.yaml.*
+!/config.yaml.example
 tarpaulin-report.json
 
 # Desktop (Tauri)
