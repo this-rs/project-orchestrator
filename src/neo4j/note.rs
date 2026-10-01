@@ -1,6 +1,6 @@
 //! Neo4j Knowledge Note operations
 
-use super::client::Neo4jClient;
+use super::client::{Neo4jClient, WhereBuilder, WhereParam};
 use super::models::DecisionNode;
 use crate::notes::{
     EntityType, MemoryHorizon, Note, NoteAnchor, NoteChange, NoteFilters, NoteImportance,
@@ -9,6 +9,120 @@ use crate::notes::{
 use anyhow::{Context, Result};
 use neo4rs::query;
 use uuid::Uuid;
+
+/// Note properties a client may sort on. Anything else falls back to
+/// `created_at` (the field name is spliced into the Cypher, so it must come
+/// from this whitelist, never straight from the request).
+const NOTE_SORT_FIELDS: &[&str] = &[
+    "created_at",
+    "updated_at",
+    "importance",
+    "status",
+    "note_type",
+    "staleness_score",
+    "energy",
+    "last_confirmed_at",
+    "last_activated",
+    "scar_intensity",
+];
+
+fn note_order_field(requested: Option<&str>) -> &'static str {
+    requested
+        .and_then(|r| NOTE_SORT_FIELDS.iter().find(|f| **f == r))
+        .copied()
+        .unwrap_or("created_at")
+}
+
+fn note_order_dir(requested: Option<&str>) -> &'static str {
+    match requested.map(|d| d.trim().to_ascii_lowercase()) {
+        Some(d) if d == "asc" => "ASC",
+        _ => "DESC",
+    }
+}
+
+/// Build the WHERE conditions of `list_notes`. Every client-supplied value
+/// (project id, workspace slug, enum lists, tags, search text) is carried as
+/// a bound `$wb_N` parameter; nothing is spliced into the Cypher text.
+pub(crate) fn build_note_where(
+    project_id: Option<Uuid>,
+    workspace_slug: Option<&str>,
+    filters: &NoteFilters,
+) -> WhereBuilder {
+    let mut wb = WhereBuilder::new();
+
+    if filters.global_only == Some(true) {
+        wb.add_static("(n.project_id IS NULL OR n.project_id = '')");
+    } else if let Some(pid) = project_id {
+        wb.add_bound("n.project_id = {}", WhereParam::Str(pid.to_string()));
+    } else if let Some(ws) = workspace_slug {
+        wb.add_bound(
+            "n.project_id IN [(w:Workspace {slug: {}})<-[:BELONGS_TO_WORKSPACE]-(proj:Project) | proj.id]",
+            WhereParam::Str(ws.to_string()),
+        );
+    }
+
+    if let Some(ref statuses) = filters.status {
+        let list: Vec<String> = statuses.iter().map(|s| s.to_string()).collect();
+        wb.add_bound("n.status IN {}", WhereParam::StrList(list));
+    }
+    if let Some(ref types) = filters.note_type {
+        let list: Vec<String> = types.iter().map(|t| t.to_string()).collect();
+        wb.add_bound("n.note_type IN {}", WhereParam::StrList(list));
+    }
+    if let Some(ref importance) = filters.importance {
+        let list: Vec<String> = importance.iter().map(|i| i.to_string()).collect();
+        wb.add_bound("n.importance IN {}", WhereParam::StrList(list));
+    }
+    if let Some(ref tags) = filters.tags {
+        for tag in tags {
+            wb.add_bound("{} IN n.tags", WhereParam::Str(tag.clone()));
+        }
+    }
+    // f64 values: not injectable, but NaN/inf would render as invalid Cypher
+    if let Some(min) = filters.min_staleness.filter(|v| v.is_finite()) {
+        wb.add_static(&format!("n.staleness_score >= {}", min));
+    }
+    if let Some(max) = filters.max_staleness.filter(|v| v.is_finite()) {
+        wb.add_static(&format!("n.staleness_score <= {}", max));
+    }
+    if let Some(ref search) = filters.search {
+        if !search.trim().is_empty() {
+            wb.add_bound(
+                "toLower(n.content) CONTAINS {}",
+                WhereParam::Str(search.to_lowercase()),
+            );
+        }
+    }
+    wb
+}
+
+/// SET clauses of `update_note`. Values are bound as `$content`, `$importance`,
+/// `$status` and `$tags` by the caller; only constant text appears here.
+pub(crate) fn note_update_set_clauses(
+    has_content: bool,
+    has_importance: bool,
+    has_status: bool,
+    has_tags: bool,
+    staleness_score: Option<f64>,
+) -> Vec<String> {
+    let mut set_clauses = vec!["n.updated_at = datetime()".to_string()];
+    if has_content {
+        set_clauses.push("n.content = $content".to_string());
+    }
+    if has_importance {
+        set_clauses.push("n.importance = $importance".to_string());
+    }
+    if has_status {
+        set_clauses.push("n.status = $status".to_string());
+    }
+    if has_tags {
+        set_clauses.push("n.tags = $tags".to_string());
+    }
+    if let Some(s) = staleness_score.filter(|v| v.is_finite()) {
+        set_clauses.push(format!("n.staleness_score = {}", s));
+    }
+    set_clauses
+}
 
 impl Neo4jClient {
     // ========================================================================
@@ -135,28 +249,13 @@ impl Neo4jClient {
         tags: Option<Vec<String>>,
         staleness_score: Option<f64>,
     ) -> Result<Option<Note>> {
-        let mut set_clauses = vec!["n.updated_at = datetime()".to_string()];
-
-        if let Some(ref c) = content {
-            set_clauses.push(format!("n.content = '{}'", c.replace('\'', "\\'")));
-        }
-        if let Some(ref i) = importance {
-            set_clauses.push(format!("n.importance = '{}'", i));
-        }
-        if let Some(ref s) = status {
-            set_clauses.push(format!("n.status = '{}'", s));
-        }
-        if let Some(ref t) = tags {
-            let tags_str = t
-                .iter()
-                .map(|s| format!("'{}'", s.replace('\'', "\\'")))
-                .collect::<Vec<_>>()
-                .join(", ");
-            set_clauses.push(format!("n.tags = [{}]", tags_str));
-        }
-        if let Some(s) = staleness_score {
-            set_clauses.push(format!("n.staleness_score = {}", s));
-        }
+        let set_clauses = note_update_set_clauses(
+            content.is_some(),
+            importance.is_some(),
+            status.is_some(),
+            tags.is_some(),
+            staleness_score,
+        );
 
         let cypher = format!(
             r#"
@@ -167,7 +266,19 @@ impl Neo4jClient {
             set_clauses.join(", ")
         );
 
-        let q = query(&cypher).param("id", id.to_string());
+        let mut q = query(&cypher).param("id", id.to_string());
+        if let Some(c) = content {
+            q = q.param("content", c);
+        }
+        if let Some(i) = importance {
+            q = q.param("importance", i.to_string());
+        }
+        if let Some(s) = status {
+            q = q.param("status", s.to_string());
+        }
+        if let Some(t) = tags {
+            q = q.param("tags", t);
+        }
 
         let mut result = self.graph.execute(q).await?;
         if let Some(row) = result.next().await? {
@@ -205,78 +316,11 @@ impl Neo4jClient {
         workspace_slug: Option<&str>,
         filters: &NoteFilters,
     ) -> Result<(Vec<Note>, usize)> {
-        let mut where_conditions = Vec::new();
+        let wb = build_note_where(project_id, workspace_slug, filters);
+        let where_clause = wb.build();
 
-        if filters.global_only == Some(true) {
-            where_conditions.push("(n.project_id IS NULL OR n.project_id = '')".to_string());
-        } else if let Some(ref pid) = project_id {
-            where_conditions.push(format!("n.project_id = '{}'", pid));
-        } else if let Some(ws) = workspace_slug {
-            where_conditions.push(format!(
-                "n.project_id IN [(w:Workspace {{slug: '{}'}})<-[:BELONGS_TO_WORKSPACE]-(proj:Project) | proj.id]",
-                ws
-            ));
-        }
-
-        if let Some(ref statuses) = filters.status {
-            let status_list = statuses
-                .iter()
-                .map(|s| format!("'{}'", s))
-                .collect::<Vec<_>>()
-                .join(", ");
-            where_conditions.push(format!("n.status IN [{}]", status_list));
-        }
-
-        if let Some(ref types) = filters.note_type {
-            let type_list = types
-                .iter()
-                .map(|t| format!("'{}'", t))
-                .collect::<Vec<_>>()
-                .join(", ");
-            where_conditions.push(format!("n.note_type IN [{}]", type_list));
-        }
-
-        if let Some(ref importance) = filters.importance {
-            let imp_list = importance
-                .iter()
-                .map(|i| format!("'{}'", i))
-                .collect::<Vec<_>>()
-                .join(", ");
-            where_conditions.push(format!("n.importance IN [{}]", imp_list));
-        }
-
-        if let Some(ref tags) = filters.tags {
-            for tag in tags {
-                where_conditions.push(format!("'{}' IN n.tags", tag));
-            }
-        }
-
-        if let Some(min) = filters.min_staleness {
-            where_conditions.push(format!("n.staleness_score >= {}", min));
-        }
-
-        if let Some(max) = filters.max_staleness {
-            where_conditions.push(format!("n.staleness_score <= {}", max));
-        }
-
-        if let Some(ref search) = filters.search {
-            if !search.trim().is_empty() {
-                let search_lower = search.to_lowercase();
-                where_conditions.push(format!(
-                    "toLower(n.content) CONTAINS '{}'",
-                    search_lower.replace('\'', "\\'")
-                ));
-            }
-        }
-
-        let where_clause = if where_conditions.is_empty() {
-            String::new()
-        } else {
-            format!("WHERE {}", where_conditions.join(" AND "))
-        };
-
-        let order_field = filters.sort_by.as_deref().unwrap_or("created_at");
-        let order_dir = filters.sort_order.as_deref().unwrap_or("desc");
+        let order_field = note_order_field(filters.sort_by.as_deref());
+        let order_dir = note_order_dir(filters.sort_order.as_deref());
         let limit = filters.limit.unwrap_or(50);
         let offset = filters.offset.unwrap_or(0);
 
@@ -290,7 +334,7 @@ impl Neo4jClient {
             where_clause
         );
 
-        let mut count_result = self.graph.execute(query(&count_cypher)).await?;
+        let mut count_result = self.graph.execute(wb.bind(query(&count_cypher))).await?;
         let total: i64 = if let Some(row) = count_result.next().await? {
             row.get("total")?
         } else {
@@ -310,7 +354,7 @@ impl Neo4jClient {
             where_clause, order_field, order_dir, offset, limit
         );
 
-        let mut result = self.graph.execute(query(&cypher)).await?;
+        let mut result = self.graph.execute(wb.bind(query(&cypher))).await?;
         let mut notes = Vec::new();
 
         while let Some(row) = result.next().await? {
@@ -1787,9 +1831,11 @@ impl Neo4jClient {
 
     /// Get notes that need review (stale or needs_review status)
     pub async fn get_notes_needing_review(&self, project_id: Option<Uuid>) -> Result<Vec<Note>> {
-        let project_filter = project_id
-            .map(|pid| format!("AND n.project_id = '{}'", pid))
-            .unwrap_or_default();
+        let project_filter = if project_id.is_some() {
+            "AND n.project_id = $project_id"
+        } else {
+            ""
+        };
 
         let cypher = format!(
             r#"
@@ -1802,7 +1848,11 @@ impl Neo4jClient {
             project_filter
         );
 
-        let mut result = self.graph.execute(query(&cypher)).await?;
+        let mut q = query(&cypher);
+        if let Some(pid) = project_id {
+            q = q.param("project_id", pid.to_string());
+        }
+        let mut result = self.graph.execute(q).await?;
         let mut notes = Vec::new();
 
         while let Some(row) = result.next().await? {
@@ -2091,25 +2141,22 @@ impl Neo4jClient {
                 LIMIT $limit
             "#;
             (cypher.to_string(), Some(pid.to_string()))
-        } else if let Some(ws_slug) = workspace_slug {
+        } else if workspace_slug.is_some() {
             // Workspace filter: match notes belonging to any project in the workspace,
             // plus global notes (project_id IS NULL) for completeness
-            let cypher = format!(
-                r#"
+            let cypher = r#"
                 CALL db.index.vector.queryNodes('note_embeddings', $query_limit, $embedding)
                 YIELD node AS n, score
                 WHERE n.status IN ['active', 'needs_review']
                 AND (
-                    n.project_id IN [(w:Workspace {{slug: '{}'}})<-[:BELONGS_TO_WORKSPACE]-(proj:Project) | proj.id]
+                    n.project_id IN [(w:Workspace {slug: $ws_slug})<-[:BELONGS_TO_WORKSPACE]-(proj:Project) | proj.id]
                     OR n.project_id IS NULL
                 )
                 RETURN n, score
                 ORDER BY score DESC
                 LIMIT $limit
-                "#,
-                ws_slug
-            );
-            (cypher, None)
+                "#;
+            (cypher.to_string(), None)
         } else {
             // No filter — return all notes
             let cypher = r#"
@@ -2130,6 +2177,8 @@ impl Neo4jClient {
 
         if let Some(pid) = project_filter_value {
             q = q.param("project_id", pid);
+        } else if let (Some(ws), None) = (workspace_slug, project_id) {
+            q = q.param("ws_slug", ws.to_string());
         }
 
         let mut result = self.graph.execute(q).await?;
@@ -3671,7 +3720,7 @@ mod staleness_parity_tests {
             NoteType::Pattern,
             NoteType::Rfc,
         ] {
-            let note = Note::new(None, t.clone(), "x".into(), "t".into());
+            let note = Note::new(None, t, "x".into(), "t".into());
             let name = t.to_string();
             let cypher = block
                 .lines()
@@ -3688,5 +3737,83 @@ mod staleness_parity_tests {
             f64::MAX
         );
         assert!(src.contains("n.note_type <> 'assertion'"));
+    }
+}
+
+#[cfg(test)]
+mod injection_tests {
+    use super::*;
+
+    const PAYLOADS: &[&str] = &[
+        "a' OR 1=1 //",
+        "x\\",
+        "it's",
+        "\\' OR true //",
+        "}) DETACH DELETE n //",
+    ];
+
+    fn assert_clean(clause: &str, payload: &str) {
+        assert!(
+            !clause.contains(payload.trim()),
+            "payload leaked into Cypher: {clause}"
+        );
+        assert!(!clause.contains("OR 1=1"), "payload leaked: {clause}");
+        assert!(!clause.contains("DETACH"), "payload leaked: {clause}");
+    }
+
+    #[test]
+    fn list_notes_where_binds_slug_tags_and_search() {
+        for p in PAYLOADS {
+            let filters = NoteFilters {
+                tags: Some(vec![p.to_string()]),
+                search: Some(p.to_string()),
+                ..Default::default()
+            };
+            let wb = build_note_where(None, Some(p), &filters);
+            let clause = wb.build();
+            assert_clean(&clause, p);
+            assert!(clause.contains("{slug: $wb_0}"), "{clause}");
+            assert!(clause.contains("$wb_1 IN n.tags"), "{clause}");
+            assert!(clause.contains("CONTAINS $wb_2"), "{clause}");
+            let params = wb.params();
+            assert_eq!(params[0].1, WhereParam::Str(p.to_string()));
+            assert_eq!(params[1].1, WhereParam::Str(p.to_string()));
+            assert_eq!(params[2].1, WhereParam::Str(p.to_lowercase()));
+        }
+    }
+
+    #[test]
+    fn list_notes_where_binds_project_id() {
+        let pid = Uuid::new_v4();
+        let wb = build_note_where(Some(pid), None, &NoteFilters::default());
+        assert_eq!(wb.build(), "WHERE n.project_id = $wb_0");
+        assert_eq!(wb.params()[0].1, WhereParam::Str(pid.to_string()));
+    }
+
+    #[test]
+    fn note_sort_is_whitelisted() {
+        assert_eq!(note_order_field(Some("updated_at")), "updated_at");
+        assert_eq!(
+            note_order_field(Some(
+                "created_at DESC RETURN n UNION MATCH (x) DETACH DELETE x //"
+            )),
+            "created_at"
+        );
+        assert_eq!(note_order_field(None), "created_at");
+        assert_eq!(note_order_dir(Some("ASC")), "ASC");
+        assert_eq!(note_order_dir(Some("desc; MATCH (n) DELETE n")), "DESC");
+    }
+
+    #[test]
+    fn update_note_clauses_carry_no_values() {
+        let clauses = note_update_set_clauses(true, true, true, true, Some(0.5)).join(", ");
+        assert!(clauses.contains("n.content = $content"));
+        assert!(clauses.contains("n.tags = $tags"));
+        assert!(clauses.contains("n.status = $status"));
+        assert!(clauses.contains("n.importance = $importance"));
+        assert!(!clauses.contains('\''));
+        // non-finite staleness must not render invalid Cypher
+        let nan = note_update_set_clauses(false, false, false, false, Some(f64::NAN)).join(", ");
+        assert!(!nan.contains("NaN"));
     }
 }

@@ -198,6 +198,21 @@ impl WhereBuilder {
         self
     }
 
+    /// Add a raw condition containing a `{}` marker that is replaced by a
+    /// freshly bound `$wb_N` parameter holding `value`. The template itself
+    /// must be a trusted constant; the value is never spliced into the Cypher.
+    pub fn add_bound(&mut self, template: &str, value: WhereParam) -> &mut Self {
+        let p = self.push_param(value);
+        self.conditions.push(template.replacen("{}", &p, 1));
+        self
+    }
+
+    /// Add a verbatim condition that carries no user data (constants only).
+    pub fn add_static(&mut self, condition: &str) -> &mut Self {
+        self.conditions.push(condition.to_string());
+        self
+    }
+
     /// Build the WHERE clause (returns empty string if no conditions)
     pub fn build(&self) -> String {
         if self.conditions.is_empty() {
