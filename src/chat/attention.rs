@@ -538,15 +538,13 @@ mod tests {
     }
 
     #[test]
-    fn input_request_is_ignored() {
+    fn non_attention_event_is_ignored() {
         let s = Uuid::new_v4();
         let evs = vec![rec(
             s,
             1,
-            ChatEvent::InputRequest {
-                prompt: "?".into(),
-                options: None,
-                parent_tool_use_id: None,
+            ChatEvent::SystemHint {
+                content: "?".into(),
             },
         )];
         let d = derive_session_attention(&input(s, true), &evs, t(1000));
@@ -654,7 +652,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn grouped_store_read_returns_all_sessions_without_input_request_and_blank_user_data() {
+    async fn grouped_store_read_returns_all_sessions_without_non_attention_events_and_blank_user_data(
+    ) {
         use crate::neo4j::mock::MockGraphStore;
         use crate::neo4j::traits::GraphStore;
         let store = MockGraphStore::new();
@@ -668,10 +667,8 @@ mod tests {
                     rec(
                         a,
                         3,
-                        ChatEvent::InputRequest {
-                            prompt: "x".into(),
-                            options: None,
-                            parent_tool_use_id: None,
+                        ChatEvent::SystemHint {
+                            content: "x".into(),
                         },
                     ),
                 ],
@@ -684,7 +681,7 @@ mod tests {
             .unwrap();
         let got = store.get_attention_events(&[a, b]).await.unwrap();
         assert_eq!(got.len(), 3);
-        assert!(got.iter().all(|e| e.event_type != "input_request"));
+        assert!(got.iter().all(|e| e.event_type != "system_hint"));
         assert!(got
             .iter()
             .find(|e| e.event_type == "user_message")

@@ -7,8 +7,10 @@ use super::auth_handlers;
 use super::chat_handlers;
 use super::code_handlers;
 use super::document_handlers;
+use super::environment_handlers;
 use super::episode_handlers;
 use super::feedback_handlers;
+use super::graph_handlers;
 use super::handlers::{self, OrchestratorState};
 use super::hook_handlers;
 use super::mcp_federation_handlers;
@@ -25,6 +27,7 @@ use super::sharing_handlers;
 use super::skill_handlers;
 use super::trajectory_handlers;
 use super::trigger_handlers;
+use super::vault_handlers;
 use super::workspace_handlers;
 use super::ws_chat_handler;
 use super::ws_handlers;
@@ -456,6 +459,58 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/projects/{project_id}/releases",
             get(handlers::list_releases).post(handlers::create_release),
         )
+        // Secrets vault (user side: a person's token; agent side: vault token)
+        .route("/api/vault", get(vault_handlers::get_vault))
+        .route("/api/vault/init", post(vault_handlers::init_vault))
+        .route("/api/vault/unlock", post(vault_handlers::unlock_vault))
+        .route("/api/vault/lock", post(vault_handlers::lock_vault))
+        .route(
+            "/api/vault/secrets/{name}",
+            axum::routing::put(vault_handlers::put_secret).delete(vault_handlers::delete_secret),
+        )
+        .route("/api/vault/grants", post(vault_handlers::create_grant))
+        .route(
+            "/api/vault/grants/{id}",
+            delete(vault_handlers::revoke_grant),
+        )
+        .route(
+            "/api/vault/requests/{id}/answer",
+            post(vault_handlers::answer_request),
+        )
+        .route("/api/vault/agent/read", post(vault_handlers::agent_read))
+        .route(
+            "/api/vault/agent/requests",
+            post(vault_handlers::agent_request),
+        )
+        .route(
+            "/api/vault/agent/available",
+            get(vault_handlers::agent_available),
+        )
+        // Environments & deployments
+        .route(
+            "/api/projects/{project_id}/environments",
+            get(environment_handlers::list_environments)
+                .post(environment_handlers::create_environment),
+        )
+        .route(
+            "/api/projects/{project_id}/deployment-matrix",
+            get(environment_handlers::get_deployment_matrix),
+        )
+        .route(
+            "/api/environments/{id}",
+            get(environment_handlers::get_environment)
+                .patch(environment_handlers::update_environment)
+                .delete(environment_handlers::delete_environment),
+        )
+        .route(
+            "/api/environments/{id}/deployments",
+            get(environment_handlers::list_deployments)
+                .post(environment_handlers::create_deployment),
+        )
+        .route(
+            "/api/deployments/{id}",
+            axum::routing::patch(environment_handlers::update_deployment),
+        )
         // Milestones (by project_id)
         .route(
             "/api/projects/{project_id}/milestones",
@@ -518,6 +573,10 @@ fn protected_routes() -> Router<OrchestratorState> {
         .route(
             "/api/plans/{plan_id}/run/auto-pr",
             post(handlers::create_auto_pr),
+        )
+        .route(
+            "/api/plans/{plan_id}/run/tasks/{task_id}/retry",
+            post(handlers::retry_plan_task),
         )
         // Plan Runs
         .route("/api/runs", get(handlers::list_all_plan_runs))
@@ -751,6 +810,7 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/milestones/{milestone_id}/plans/{plan_id}",
             delete(handlers::unlink_plan_from_milestone),
         )
+        .route("/api/progress", get(handlers::get_progress_batch))
         .route(
             "/api/milestones/{milestone_id}/progress",
             get(handlers::get_milestone_progress),
@@ -1186,6 +1246,11 @@ fn protected_routes() -> Router<OrchestratorState> {
         .route(
             "/api/entities/{entity_type}/{entity_id}/notes",
             get(note_handlers::get_entity_notes),
+        )
+        // Ego-graph around any entity (entity pages, agents)
+        .route(
+            "/api/graph/neighborhood",
+            get(graph_handlers::get_neighborhood),
         )
         // ================================================================
         // Analysis Profiles
@@ -1741,6 +1806,10 @@ fn protected_routes() -> Router<OrchestratorState> {
             get(workspace_handlers::get_workspace_topology),
         )
         .route(
+            "/api/workspaces/{slug}/topology/derive",
+            post(workspace_handlers::derive_workspace_topology),
+        )
+        .route(
             "/api/workspaces/{slug}/coupling-matrix",
             get(workspace_handlers::get_coupling_matrix),
         )
@@ -1925,6 +1994,7 @@ mod tests {
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
             model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
+            vault: crate::vault::VaultService::ephemeral(),
         });
         create_router(state)
     }
@@ -1962,6 +2032,7 @@ mod tests {
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
             model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
+            vault: crate::vault::VaultService::ephemeral(),
         });
         create_router(state)
     }
@@ -2145,6 +2216,7 @@ mod tests {
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
             model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
+            vault: crate::vault::VaultService::ephemeral(),
         });
         create_router(state)
     }

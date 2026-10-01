@@ -86,6 +86,16 @@ impl Claims {
     pub fn is_mcp_token(&self) -> bool {
         self.token_type.as_deref() == Some(TOKEN_TYPE_MCP)
     }
+
+    /// Whether a person is behind this token — as opposed to an agent: a chat
+    /// session's MCP (`agent_session`), a vault token, an MCP access token, or
+    /// the standalone MCP server (which signs as the nil system user).
+    ///
+    /// Operations that widen an agent's own access (unlocking the vault,
+    /// granting secrets) must require this, or an agent could grant itself.
+    pub fn is_human(&self) -> bool {
+        self.token_type.is_none() && self.sub != ANONYMOUS_USER_ID.to_string()
+    }
 }
 
 /// Encode a JWT token for the given user.
@@ -134,7 +144,7 @@ pub fn generate_session_token(claims: &Claims, secret: &str, expiry_secs: u64) -
         name: claims.name.clone(),
         iat: now,
         exp: now + expiry_secs as i64,
-        token_type: None,
+        token_type: Some(TOKEN_TYPE_AGENT_SESSION.to_string()),
         scope: None,
         jti: None,
     };
@@ -145,6 +155,59 @@ pub fn generate_session_token(claims: &Claims, secret: &str, expiry_secs: u64) -
         &EncodingKey::from_secret(secret.as_bytes()),
     )
     .context("Failed to encode session token")
+}
+
+/// Token type of the session token given to a chat session's MCP server.
+pub const TOKEN_TYPE_AGENT_SESSION: &str = "agent_session";
+
+/// Token type of a vault token (see [`generate_vault_token`]).
+pub const VAULT_TOKEN_TYPE: &str = "vault";
+const VAULT_SCOPE_PREFIX: &str = "session:";
+
+/// Mint the token an agent session presents to read the secrets granted to it.
+///
+/// The session id is SIGNED into the token, in `scope`. An agent's environment
+/// also carries `PO_SESSION_ID`, but that variable is set by us and editable by
+/// the agent — trusting it would let any session claim another's grants. Only
+/// what the signature covers can say which session is asking.
+///
+/// Reuses the existing claim fields (`token_type`, `scope`) rather than adding
+/// one, so every token issued before this change still decodes.
+pub fn generate_vault_token(
+    claims: &Claims,
+    session_id: &str,
+    secret: &str,
+    expiry_secs: u64,
+) -> Result<String> {
+    let now = chrono::Utc::now().timestamp();
+    let vault_claims = Claims {
+        sub: claims.sub.clone(),
+        email: claims.email.clone(),
+        name: claims.name.clone(),
+        iat: now,
+        exp: now + expiry_secs as i64,
+        token_type: Some(VAULT_TOKEN_TYPE.to_string()),
+        scope: Some(format!("{VAULT_SCOPE_PREFIX}{session_id}")),
+        jti: None,
+    };
+    encode(
+        &Header::default(),
+        &vault_claims,
+        &EncodingKey::from_secret(secret.as_bytes()),
+    )
+    .context("Failed to encode vault token")
+}
+
+/// The session a vault token was issued for — `None` for any other token.
+pub fn vault_token_session(claims: &Claims) -> Option<&str> {
+    if claims.token_type.as_deref() != Some(VAULT_TOKEN_TYPE) {
+        return None;
+    }
+    claims
+        .scope
+        .as_deref()?
+        .strip_prefix(VAULT_SCOPE_PREFIX)
+        .filter(|s| !s.is_empty())
 }
 
 /// Encode a long-lived, revocable, scoped MCP access token.

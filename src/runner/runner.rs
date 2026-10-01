@@ -341,7 +341,10 @@ impl RunMemory {
             task_id,
             title,
             wave_number,
-            status: format!("failed: {}", &reason[..reason.len().min(200)]),
+            status: format!(
+                "failed: {}",
+                &reason[..crate::utils::floor_char_boundary(reason, 200)]
+            ),
             commits: vec![],
             files_modified: vec![],
         });
@@ -1161,7 +1164,7 @@ impl PlanRunner {
             let wave_number = wave_idx + 1;
 
             // Skip waves where all tasks are already completed (resume optimization)
-            let has_pending_tasks = wave.tasks.iter().any(|t| t.status != "completed");
+            let has_pending_tasks = wave.tasks.iter().any(|t| t.status != TaskStatus::Completed);
             if !has_pending_tasks {
                 info!(
                     "Skipping wave {} — all {} tasks already completed",
@@ -1215,7 +1218,7 @@ impl PlanRunner {
 
             // Execute all tasks in this wave in parallel via JoinSet
             let continuity_context = run_memory.to_markdown();
-            let wave_result = self
+            let mut wave_result = self
                 .execute_wave(
                     run_id,
                     plan_id,
@@ -1302,6 +1305,7 @@ impl PlanRunner {
             // only once (on the last task) since they verify the whole project.
             // The base_commit check runs on the last task to detect ghost completions.
             if !wave_result.tasks_completed.is_empty() {
+                let mut verification_failures: Vec<(Uuid, String)> = Vec::new();
                 for (idx, &task_id) in wave_result.tasks_completed.iter().enumerate() {
                     let is_last = idx == wave_result.tasks_completed.len() - 1;
                     // Use with_base_commit on the LAST task to verify the wave
@@ -1325,9 +1329,19 @@ impl PlanRunner {
                         let reason =
                             format!("Post-wave verification failed:\n- {}", reasons.join("\n- "));
                         warn!("Task {} verification failed: {}", task_id, reason);
-                        self.on_task_failed(run_id, plan_id, task_id, &reason, 0.0, 0.0)
+                        // Definitive: the wave's retry loop has already run, so
+                        // routing this through on_task_failed() would only flip
+                        // the task back to Pending and strand it there (while
+                        // still counted as completed in RunnerState).
+                        self.fail_task_definitively(run_id, task_id, &reason, 0)
                             .await?;
+                        verification_failures.push((task_id, reason));
                     }
+                }
+                // Keep RunMemory truthful for the next waves.
+                for (task_id, reason) in verification_failures {
+                    wave_result.tasks_completed.retain(|t| *t != task_id);
+                    wave_result.tasks_failed.push((task_id, reason));
                 }
             }
 
@@ -2562,7 +2576,11 @@ impl PlanRunner {
                     for note in notes.iter().take(3) {
                         // Truncate content to ~200 chars
                         let excerpt = if note.content.len() > 200 {
-                            format!("{}…", &note.content[..200])
+                            format!(
+                                "{}…",
+                                &note.content
+                                    [..crate::utils::floor_char_boundary(&note.content, 200)]
+                            )
                         } else {
                             note.content.clone()
                         };
@@ -2580,7 +2598,11 @@ impl PlanRunner {
                 {
                     for dec in decisions.iter().take(2) {
                         let rationale_excerpt = if dec.rationale.len() > 150 {
-                            format!("{}…", &dec.rationale[..150])
+                            format!(
+                                "{}…",
+                                &dec.rationale
+                                    [..crate::utils::floor_char_boundary(&dec.rationale, 150)]
+                            )
                         } else {
                             dec.rationale.clone()
                         };
@@ -3367,7 +3389,31 @@ impl PlanRunner {
         }
 
         // No retries left — mark as definitively Failed
+        self.fail_task_definitively(run_id, task_id, reason, retry_count)
+            .await?;
 
+        error!(
+            "Task {} failed (final): {} (duration: {:.1}s, cost: ${:.4})",
+            task_id, reason, duration_secs, cost_usd
+        );
+
+        Ok(false)
+    }
+
+    /// Mark a task as definitively Failed (no further retry in this run):
+    /// Neo4j status + RunnerState bookkeeping (persisted), close the agent's
+    /// chat session if one is still registered, and emit `TaskFailed`.
+    ///
+    /// Used by `on_task_failed` once retries are exhausted, by the retry loop
+    /// when a retry fails, and by post-wave verification (which runs after the
+    /// retry loop, so a verification failure can no longer be retried).
+    async fn fail_task_definitively(
+        &self,
+        run_id: Uuid,
+        task_id: Uuid,
+        reason: &str,
+        attempts: u32,
+    ) -> Result<()> {
         // Extract session_id BEFORE mark_task_failed removes the agent
         let agent_session_id = {
             let global = RUNNER_STATE.read().await;
@@ -3380,7 +3426,6 @@ impl PlanRunner {
         self.update_task_status_with_event(task_id, TaskStatus::Failed)
             .await?;
 
-        // Update global state
         {
             let mut global = RUNNER_STATE.write().await;
             if let Some(ref mut s) = *global {
@@ -3389,23 +3434,8 @@ impl PlanRunner {
             }
         }
 
-        // Close the agent's chat session (fire-and-forget, definitive failure only)
         if let Some(sid) = agent_session_id {
-            let chat_manager = self.chat_manager.clone();
-            tokio::spawn(async move {
-                let sid_str = sid.to_string();
-                if let Err(e) = chat_manager.close_session(&sid_str).await {
-                    warn!(
-                        "Failed to close agent session {} after task failure: {}",
-                        sid_str, e
-                    );
-                } else {
-                    debug!(
-                        "Closed agent session {} after task {} failed (final)",
-                        sid_str, task_id
-                    );
-                }
-            });
+            self.close_session_in_background(sid, task_id, "task failure");
         }
 
         self.emit_event(RunnerEvent::TaskFailed {
@@ -3413,15 +3443,29 @@ impl PlanRunner {
             task_id,
             task_title: String::new(),
             reason: reason.to_string(),
-            attempts: retry_count,
+            attempts,
         });
+        Ok(())
+    }
 
-        error!(
-            "Task {} failed (final): {} (duration: {:.1}s, cost: ${:.4})",
-            task_id, reason, duration_secs, cost_usd
-        );
-
-        Ok(false)
+    /// Close an agent chat session without blocking the caller. Closing kills
+    /// the Claude Code process group (CLI + its tool subprocesses).
+    fn close_session_in_background(&self, sid: Uuid, task_id: Uuid, why: &'static str) {
+        let chat_manager = self.chat_manager.clone();
+        tokio::spawn(async move {
+            let sid_str = sid.to_string();
+            if let Err(e) = chat_manager.close_session(&sid_str).await {
+                warn!(
+                    "Failed to close agent session {} after {}: {}",
+                    sid_str, why, e
+                );
+            } else {
+                debug!(
+                    "Closed agent session {} after {} (task {})",
+                    sid_str, why, task_id
+                );
+            }
+        });
     }
 
     /// Create a gotcha note when a task fails definitively after all retries.
@@ -4254,7 +4298,13 @@ impl PlanRunner {
                                 .unwrap_or_else(|| result.to_string());
                             // Keep last 500 chars to avoid bloat
                             metrics.last_error = Some(if err_text.len() > 500 {
-                                err_text[err_text.len() - 500..].to_string()
+                                // Keep the tail, cut on a char boundary (notes/errors are often
+                                // non-ASCII — byte slicing panicked the task).
+                                let cut = err_text.len() - 500;
+                                let cut = (cut..=err_text.len())
+                                    .find(|&i| err_text.is_char_boundary(i))
+                                    .unwrap_or(err_text.len());
+                                err_text[cut..].to_string()
                             } else {
                                 err_text
                             });
@@ -7700,5 +7750,45 @@ mod tests {
             let mut global = RUNNER_STATE.write().await;
             *global = None;
         }
+    }
+
+    // ---------------------------------------------------------------
+    // Runner hardening regression tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_run_memory_record_failed_multibyte_reason_does_not_panic() {
+        // 199 ASCII bytes followed by a 2-byte char straddling the 200-byte cut.
+        let reason = format!("{}é suite", "a".repeat(199));
+        let mut mem = RunMemory::default();
+        mem.record_failed(Uuid::new_v4(), "T".into(), 1, &reason);
+        assert!(mem.summaries[0].status.starts_with("failed: "));
+    }
+
+    #[tokio::test]
+    async fn test_listen_for_result_multibyte_error_truncation_does_not_panic() {
+        let runner = test_plan_runner();
+        let (tx, rx) = broadcast::channel::<ChatEvent>(16);
+        // 601 bytes: the "last 500 bytes" cut (byte 101) lands inside a 2-byte 'é'.
+        let long_error = format!("{}x", "é".repeat(300));
+        tx.send(ChatEvent::ToolResult {
+            id: "tr1".into(),
+            result: serde_json::json!(long_error),
+            is_error: true,
+            parent_tool_use_id: None,
+        })
+        .unwrap();
+        tx.send(ChatEvent::Result {
+            session_id: "s1".into(),
+            duration_ms: 1,
+            cost_usd: None,
+            subtype: "success".into(),
+            is_error: false,
+            num_turns: None,
+            result_text: None,
+        })
+        .unwrap();
+        let (_r, metrics) = runner.listen_for_result(rx, Uuid::new_v4(), None).await;
+        assert!(metrics.last_error.unwrap().len() <= 500);
     }
 }

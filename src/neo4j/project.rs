@@ -22,7 +22,8 @@ impl Neo4jClient {
                 root_path: $root_path,
                 description: $description,
                 created_at: datetime($created_at),
-                watch_enabled: $watch_enabled
+                watch_enabled: $watch_enabled,
+                profile: $profile
             })
             "#,
         )
@@ -35,7 +36,8 @@ impl Neo4jClient {
             project.description.clone().unwrap_or_default(),
         )
         .param("created_at", project.created_at.to_rfc3339())
-        .param("watch_enabled", project.watch_enabled);
+        .param("watch_enabled", project.watch_enabled)
+        .param("profile", project.profile.as_str());
 
         self.graph.run(q).await?;
         Ok(())
@@ -100,13 +102,16 @@ impl Neo4jClient {
         Ok(projects)
     }
 
-    /// Update project fields (name, description, root_path)
+    /// Update project fields (name, description, root_path, profile).
+    ///
+    /// `root_path: Some("")` clears the path.
     pub async fn update_project(
         &self,
         id: Uuid,
         name: Option<String>,
         description: Option<Option<String>>,
         root_path: Option<String>,
+        profile: Option<ProjectProfile>,
     ) -> Result<()> {
         let mut set_clauses = vec![];
 
@@ -118,6 +123,9 @@ impl Neo4jClient {
         }
         if root_path.is_some() {
             set_clauses.push("p.root_path = $root_path");
+        }
+        if profile.is_some() {
+            set_clauses.push("p.profile = $profile");
         }
 
         if set_clauses.is_empty() {
@@ -139,6 +147,9 @@ impl Neo4jClient {
         }
         if let Some(root_path) = root_path {
             q = q.param("root_path", root_path);
+        }
+        if let Some(profile) = profile {
+            q = q.param("profile", profile.as_str());
         }
 
         self.graph.run(q).await?;
@@ -328,6 +339,17 @@ impl Neo4jClient {
         .param("id", id.to_string());
         self.graph.run(q).await?;
 
+        // Delete environments and their deployments
+        let q = query(
+            r#"
+            MATCH (p:Project {id: $id})-[:HAS_ENVIRONMENT]->(e:Environment)
+            OPTIONAL MATCH (e)-[:HAS_DEPLOYMENT]->(d:Deployment)
+            DETACH DELETE d, e
+            "#,
+        )
+        .param("id", id.to_string());
+        self.graph.run(q).await?;
+
         // Delete feature graphs
         let q = query(
             r#"
@@ -385,7 +407,8 @@ impl Neo4jClient {
             id: node.get::<String>("id")?.parse()?,
             name: node.get("name")?,
             slug: node.get("slug")?,
-            root_path: node.get("root_path")?,
+            // Absent or empty for a project with no codebase.
+            root_path: node.get::<String>("root_path").unwrap_or_default(),
             description: node.get("description").ok(),
             created_at: node
                 .get::<String>("created_at")?
@@ -416,6 +439,12 @@ impl Neo4jClient {
                 .ok()
                 .and_then(|s| serde_json::from_str(&s).ok()),
             watch_enabled: node.get::<bool>("watch_enabled").unwrap_or(true),
+            // A node without the property predates profiles: it is software.
+            profile: node
+                .get::<String>("profile")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or_default(),
         })
     }
 

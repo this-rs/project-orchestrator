@@ -1641,6 +1641,7 @@ mod tests {
             scaffolding_override: None,
             sharing_policy: None,
             watch_enabled: true,
+            profile: Default::default(),
         };
         store.create_project(&project).await.unwrap();
 
@@ -1682,6 +1683,7 @@ mod tests {
             scaffolding_override: None,
             sharing_policy: None,
             watch_enabled: true,
+            profile: Default::default(),
         };
         store.create_project(&project).await.unwrap();
 
@@ -1728,6 +1730,7 @@ mod tests {
             scaffolding_override: None,
             sharing_policy: None,
             watch_enabled: true,
+            profile: Default::default(),
         };
         store.create_project(&project).await.unwrap();
 
@@ -1777,6 +1780,7 @@ mod tests {
             scaffolding_override: None,
             sharing_policy: None,
             watch_enabled: true,
+            profile: Default::default(),
         };
         store.create_project(&project).await.unwrap();
 
@@ -1829,6 +1833,7 @@ mod tests {
             scaffolding_override: None,
             sharing_policy: None,
             watch_enabled: true,
+            profile: Default::default(),
         };
         store.create_project(&project).await.unwrap();
 
@@ -1866,6 +1871,7 @@ mod tests {
             scaffolding_override: None,
             sharing_policy: None,
             watch_enabled: true,
+            profile: Default::default(),
         };
         store.create_project(&project).await.unwrap();
 
@@ -1901,6 +1907,7 @@ mod tests {
             scaffolding_override: None,
             sharing_policy: None,
             watch_enabled: true,
+            profile: Default::default(),
         };
         store.create_project(&project).await.unwrap();
 
@@ -1949,6 +1956,7 @@ mod tests {
             scaffolding_override: None,
             sharing_policy: None,
             watch_enabled: true,
+            profile: Default::default(),
         };
         store.create_project(&project).await.unwrap();
 
@@ -2021,6 +2029,7 @@ mod tests {
             scaffolding_override: None,
             sharing_policy: None,
             watch_enabled: true,
+            profile: Default::default(),
         };
         store.create_project(&project).await.unwrap();
 
@@ -2103,6 +2112,7 @@ mod tests {
             scaffolding_override: None,
             sharing_policy: None,
             watch_enabled: true,
+            profile: Default::default(),
         };
         store.create_project(&project).await.unwrap();
 
@@ -2156,6 +2166,7 @@ mod tests {
             scaffolding_override: None,
             sharing_policy: None,
             watch_enabled: true,
+            profile: Default::default(),
         };
         store.create_project(&project).await.unwrap();
 
@@ -2211,6 +2222,7 @@ mod tests {
             scaffolding_override: None,
             sharing_policy: None,
             watch_enabled: true,
+            profile: Default::default(),
         };
         store.create_project(&project).await.unwrap();
 
@@ -2263,6 +2275,7 @@ mod tests {
             scaffolding_override: None,
             sharing_policy: None,
             watch_enabled: true,
+            profile: Default::default(),
         };
         store.create_project(&project).await.unwrap();
 
@@ -2325,6 +2338,7 @@ mod tests {
             scaffolding_override: None,
             sharing_policy: None,
             watch_enabled: true,
+            profile: Default::default(),
         };
         store.create_project(&project).await.unwrap();
 

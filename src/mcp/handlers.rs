@@ -104,6 +104,478 @@ fn unstringify_json_values(args: &mut Value) {
     }
 }
 
+/// Single source of truth for mega-tool dispatch: `(mega_tool, action, internal_name)`.
+///
+/// `mega_tool_to_legacy` resolves through this table, and the tests in this module
+/// check it against the published schemas in `tools.rs` (action enums, descriptions,
+/// parameter names) so the two definitions of a tool cannot drift apart again.
+#[rustfmt::skip]
+pub(crate) const MEGA_TOOL_ACTIONS: &[(&str, &str, &str)] = &[
+    // Project
+    ("project", "list", "list_projects"),
+    ("project", "create", "create_project"),
+    ("project", "get", "get_project"),
+    ("project", "update", "update_project"),
+    ("project", "delete", "delete_project"),
+    ("project", "sync", "sync_project"),
+    ("project", "get_roadmap", "get_project_roadmap"),
+    ("project", "list_plans", "list_project_plans"),
+    ("project", "get_graph", "get_project_graph"),
+    ("project", "get_intelligence_summary", "get_intelligence_summary"),
+    ("project", "get_embeddings_projection", "get_embeddings_projection"),
+    ("project", "get_scaffolding_level", "get_scaffolding_level"),
+    ("project", "set_scaffolding_override", "set_scaffolding_override"),
+    ("project", "get_health_dashboard", "get_health_dashboard"),
+    ("project", "get_auto_roadmap", "get_auto_roadmap"),
+
+    // Plan
+    ("plan", "list", "list_plans"),
+    ("plan", "create", "create_plan"),
+    ("plan", "get", "get_plan"),
+    ("plan", "update", "update_plan"),
+    ("plan", "update_status", "update_plan_status"),
+    ("plan", "delete", "delete_plan"),
+    ("plan", "link_to_project", "link_plan_to_project"),
+    ("plan", "unlink_from_project", "unlink_plan_from_project"),
+    ("plan", "get_dependency_graph", "get_dependency_graph"),
+    ("plan", "get_critical_path", "get_critical_path"),
+    ("plan", "get_waves", "get_waves"),
+    ("plan", "run", "run_plan"),
+    ("plan", "run_status", "get_run_status"),
+    ("plan", "cancel_run", "cancel_plan_run"),
+    ("plan", "auto_pr", "create_auto_pr"),
+    ("plan", "add_trigger", "add_trigger"),
+    ("plan", "list_triggers", "list_triggers"),
+    ("plan", "remove_trigger", "remove_trigger"),
+    ("plan", "enable_trigger", "enable_trigger"),
+    ("plan", "disable_trigger", "disable_trigger"),
+    ("plan", "list_runs", "list_plan_runs"),
+    ("plan", "get_run", "get_plan_run"),
+    ("plan", "compare_runs", "compare_plan_runs"),
+    ("plan", "predict_run", "predict_plan_run"),
+    ("plan", "enrich", "enrich_plan"),
+    ("plan", "delegate_task", "delegate_task"),
+    ("plan", "get_sessions", "get_plan_sessions"),
+
+    // Task
+    ("task", "list", "list_tasks"),
+    ("task", "create", "create_task"),
+    ("task", "get", "get_task"),
+    ("task", "update", "update_task"),
+    ("task", "delete", "delete_task"),
+    ("task", "get_next", "get_next_task"),
+    ("task", "add_dependencies", "add_task_dependencies"),
+    ("task", "remove_dependency", "remove_task_dependency"),
+    ("task", "get_blockers", "get_task_blockers"),
+    ("task", "get_blocked_by", "get_tasks_blocked_by"),
+    ("task", "get_context", "get_task_context"),
+    ("task", "get_prompt", "get_task_prompt"),
+    ("task", "build_prompt", "build_task_prompt"),
+    ("task", "enrich", "enrich_task"),
+    ("task", "get_sessions", "get_task_sessions"),
+
+    // Step
+    ("step", "list", "list_steps"),
+    ("step", "create", "create_step"),
+    ("step", "update", "update_step"),
+    ("step", "get", "get_step"),
+    ("step", "delete", "delete_step"),
+    ("step", "get_progress", "get_step_progress"),
+
+    // Decision
+    ("decision", "add", "add_decision"),
+    ("decision", "get", "get_decision"),
+    ("decision", "update", "update_decision"),
+    ("decision", "delete", "delete_decision"),
+    ("decision", "search", "search_decisions"),
+    ("decision", "search_semantic", "search_decisions_semantic"),
+    ("decision", "add_affects", "add_decision_affects"),
+    ("decision", "remove_affects", "remove_decision_affects"),
+    ("decision", "list_affects", "list_decision_affects"),
+    ("decision", "get_affecting", "get_decisions_affecting"),
+    ("decision", "supersede", "supersede_decision"),
+    ("decision", "get_timeline", "get_decision_timeline"),
+
+    // Constraint
+    ("constraint", "list", "list_constraints"),
+    ("constraint", "add", "add_constraint"),
+    ("constraint", "get", "get_constraint"),
+    ("constraint", "update", "update_constraint"),
+    ("constraint", "delete", "delete_constraint"),
+
+    // Release
+    ("release", "list", "list_releases"),
+    ("release", "create", "create_release"),
+    ("release", "get", "get_release"),
+    ("release", "update", "update_release"),
+    ("release", "delete", "delete_release"),
+    ("release", "add_task", "add_task_to_release"),
+    ("release", "add_commit", "add_commit_to_release"),
+    ("release", "remove_commit", "remove_commit_from_release"),
+
+    // Environment / Deployment
+    ("environment", "list", "list_environments"),
+    ("environment", "create", "create_environment"),
+    ("environment", "get", "get_environment"),
+    ("environment", "update", "update_environment"),
+    ("environment", "delete", "delete_environment"),
+    ("environment", "deploy", "create_deployment"),
+    ("environment", "update_deployment", "update_deployment"),
+    ("environment", "list_deployments", "list_deployments"),
+    ("environment", "get_matrix", "get_deployment_matrix"),
+
+    // Vault (agent side: never returns a value)
+    ("vault", "list_available", "vault_list_available"),
+    ("vault", "request_secret", "vault_request_secret"),
+
+    // Milestone
+    ("milestone", "list", "list_milestones"),
+    ("milestone", "create", "create_milestone"),
+    ("milestone", "get", "get_milestone"),
+    ("milestone", "update", "update_milestone"),
+    ("milestone", "delete", "delete_milestone"),
+    ("milestone", "get_progress", "get_milestone_progress"),
+    ("milestone", "add_task", "add_task_to_milestone"),
+    ("milestone", "link_plan", "link_plan_to_milestone"),
+    ("milestone", "unlink_plan", "unlink_plan_from_milestone"),
+
+    // Commit
+    ("commit", "create", "create_commit"),
+    ("commit", "link_to_task", "link_commit_to_task"),
+    ("commit", "link_to_plan", "link_commit_to_plan"),
+    ("commit", "get_task_commits", "get_task_commits"),
+    ("commit", "get_plan_commits", "get_plan_commits"),
+    ("commit", "get_commit_files", "get_commit_files"),
+    ("commit", "get_file_history", "get_file_history"),
+
+    // Note
+    ("note", "list", "list_notes"),
+    ("note", "create", "create_note"),
+    ("note", "get", "get_note"),
+    ("note", "update", "update_note"),
+    ("note", "delete", "delete_note"),
+    ("note", "search", "search_notes"),
+    ("note", "search_semantic", "search_notes_semantic"),
+    ("note", "confirm", "confirm_note"),
+    ("note", "invalidate", "invalidate_note"),
+    ("note", "supersede", "supersede_note"),
+    ("note", "link_to_entity", "link_note_to_entity"),
+    ("note", "unlink_from_entity", "unlink_note_from_entity"),
+    ("note", "get_context", "get_context_notes"),
+    ("note", "get_needing_review", "get_notes_needing_review"),
+    ("note", "list_project", "list_project_notes"),
+    ("note", "get_propagated", "get_propagated_notes"),
+    ("note", "get_propagated_knowledge", "get_propagated_knowledge"),
+    ("note", "get_context_knowledge", "get_context_knowledge"),
+    ("note", "get_entity", "get_entity_notes"),
+    ("note", "list_rfcs", "list_rfcs"),
+    ("note", "advance_rfc", "advance_rfc"),
+    ("note", "get_rfc_status", "get_rfc_status"),
+
+    // Workspace
+    ("workspace", "list", "list_workspaces"),
+    ("workspace", "create", "create_workspace"),
+    ("workspace", "get", "get_workspace"),
+    ("workspace", "update", "update_workspace"),
+    ("workspace", "delete", "delete_workspace"),
+    ("workspace", "get_overview", "get_workspace_overview"),
+    ("workspace", "list_projects", "list_workspace_projects"),
+    ("workspace", "add_project", "add_project_to_workspace"),
+    ("workspace", "remove_project", "remove_project_from_workspace"),
+    ("workspace", "get_topology", "get_workspace_topology"),
+    ("workspace", "derive_topology", "derive_workspace_topology"),
+    ("workspace", "get_coupling_matrix", "get_coupling_matrix"),
+
+    // Workspace Milestone
+    ("workspace_milestone", "list_all", "list_all_workspace_milestones"),
+    ("workspace_milestone", "list", "list_workspace_milestones"),
+    ("workspace_milestone", "create", "create_workspace_milestone"),
+    ("workspace_milestone", "get", "get_workspace_milestone"),
+    ("workspace_milestone", "update", "update_workspace_milestone"),
+    ("workspace_milestone", "delete", "delete_workspace_milestone"),
+    ("workspace_milestone", "add_task", "add_task_to_workspace_milestone"),
+    ("workspace_milestone", "link_plan", "link_plan_to_workspace_milestone"),
+    ("workspace_milestone", "unlink_plan", "unlink_plan_from_workspace_milestone"),
+    ("workspace_milestone", "get_progress", "get_workspace_milestone_progress"),
+
+    // Resource
+    ("resource", "list", "list_resources"),
+    ("resource", "create", "create_resource"),
+    ("resource", "get", "get_resource"),
+    ("resource", "update", "update_resource"),
+    ("resource", "delete", "delete_resource"),
+    ("resource", "link_to_project", "link_resource_to_project"),
+
+    // Component
+    ("component", "list", "list_components"),
+    ("component", "create", "create_component"),
+    ("component", "get", "get_component"),
+    ("component", "update", "update_component"),
+    ("component", "delete", "delete_component"),
+    ("component", "add_dependency", "add_component_dependency"),
+    ("component", "remove_dependency", "remove_component_dependency"),
+    ("component", "map_to_project", "map_component_to_project"),
+
+    // Chat
+    ("chat", "list_sessions", "list_chat_sessions"),
+    ("chat", "get_session", "get_chat_session"),
+    ("chat", "get_children", "get_session_children"),
+    ("chat", "delete_session", "delete_chat_session"),
+    ("chat", "send_message", "chat_send_message"),
+    ("chat", "list_messages", "list_chat_messages"),
+    ("chat", "add_discussed", "add_discussed"),
+    ("chat", "get_session_entities", "get_session_entities"),
+    ("chat", "get_session_tree", "get_session_tree"),
+    ("chat", "get_run_sessions", "get_run_sessions"),
+    ("chat", "associate_with", "associate_session"),
+
+    // Feature Graph
+    ("feature_graph", "create", "create_feature_graph"),
+    ("feature_graph", "get", "get_feature_graph"),
+    ("feature_graph", "list", "list_feature_graphs"),
+    ("feature_graph", "add_entity", "add_to_feature_graph"),
+    ("feature_graph", "auto_build", "auto_build_feature_graph"),
+    ("feature_graph", "delete", "delete_feature_graph"),
+    ("feature_graph", "get_statistics", "get_feature_graph_statistics"),
+    ("feature_graph", "compare", "compare_feature_graphs"),
+    ("feature_graph", "find_overlapping", "find_overlapping_feature_graphs"),
+
+    // Code
+    ("code", "search", "search_code"),
+    ("code", "search_project", "search_project_code"),
+    ("code", "search_workspace", "search_workspace_code"),
+    ("code", "get_file_symbols", "get_file_symbols"),
+    ("code", "find_references", "find_references"),
+    ("code", "get_file_dependencies", "get_file_dependencies"),
+    ("code", "get_call_graph", "get_call_graph"),
+    ("code", "analyze_impact", "analyze_impact"),
+    ("code", "get_architecture", "get_architecture"),
+    ("code", "find_similar", "find_similar_code"),
+    ("code", "find_trait_implementations", "find_trait_implementations"),
+    ("code", "find_type_traits", "find_type_traits"),
+    ("code", "get_impl_blocks", "get_impl_blocks"),
+    ("code", "get_communities", "get_code_communities"),
+    ("code", "get_health", "get_code_health"),
+    ("code", "get_node_importance", "get_node_importance"),
+    ("code", "plan_implementation", "plan_implementation"),
+    ("code", "get_co_change_graph", "get_co_change_graph"),
+    ("code", "get_file_co_changers", "get_file_co_changers"),
+    ("code", "detect_processes", "detect_processes"),
+    ("code", "get_class_hierarchy", "get_class_hierarchy"),
+    ("code", "find_subclasses", "find_subclasses"),
+    ("code", "find_interface_implementors", "find_interface_implementors"),
+    ("code", "list_processes", "list_processes"),
+    ("code", "get_process", "get_process"),
+    ("code", "get_entry_points", "get_entry_points"),
+    ("code", "enrich_communities", "enrich_communities"),
+    ("code", "get_hotspots", "get_hotspots"),
+    ("code", "get_knowledge_gaps", "get_knowledge_gaps"),
+    ("code", "get_risk_assessment", "get_risk_assessment"),
+    ("code", "get_homeostasis", "get_homeostasis"),
+    ("code", "get_structural_drift", "get_structural_drift"),
+    ("code", "get_bridge", "get_bridge"),
+    ("code", "check_topology", "check_topology"),
+    ("code", "create_topology_rule", "create_topology_rule"),
+    ("code", "list_topology_rules", "list_topology_rules"),
+    ("code", "delete_topology_rule", "delete_topology_rule"),
+    ("code", "check_file_topology", "check_file_topology"),
+    ("code", "get_structural_profile", "get_structural_profile"),
+    ("code", "find_structural_twins", "find_structural_twins"),
+    ("code", "cluster_dna", "cluster_dna"),
+    ("code", "find_cross_project_twins", "find_cross_project_twins"),
+    ("code", "predict_missing_links", "predict_missing_links"),
+    ("code", "check_link_plausibility", "check_link_plausibility"),
+    ("code", "stress_test_node", "stress_test_node"),
+    ("code", "stress_test_edge", "stress_test_edge"),
+    ("code", "stress_test_cascade", "stress_test_cascade"),
+    ("code", "find_bridges", "find_bridges"),
+    ("code", "get_context_card", "get_context_card"),
+    ("code", "refresh_context_cards", "refresh_context_cards"),
+    ("code", "get_fingerprint", "get_fingerprint"),
+    ("code", "find_isomorphic", "find_isomorphic"),
+    ("code", "suggest_structural_templates", "suggest_structural_templates"),
+    ("code", "get_learning_health", "get_learning_health"),
+
+    // Skill
+    ("skill", "list", "list_skills"),
+    ("skill", "create", "create_skill"),
+    ("skill", "get", "get_skill"),
+    ("skill", "update", "update_skill"),
+    ("skill", "delete", "delete_skill"),
+    ("skill", "get_members", "get_skill_members"),
+    ("skill", "add_member", "add_skill_member"),
+    ("skill", "remove_member", "remove_skill_member"),
+    ("skill", "activate", "activate_skill"),
+    ("skill", "export", "export_skill"),
+    ("skill", "import", "import_skill"),
+    ("skill", "get_health", "get_skill_health"),
+    ("skill", "split", "split_skill"),
+    ("skill", "merge", "merge_skills"),
+
+    // Protocol (Pattern Federation)
+    ("protocol", "list", "list_protocols"),
+    ("protocol", "create", "create_protocol"),
+    ("protocol", "get", "get_protocol"),
+    ("protocol", "update", "update_protocol"),
+    ("protocol", "delete", "delete_protocol"),
+    ("protocol", "add_state", "add_protocol_state"),
+    ("protocol", "delete_state", "delete_protocol_state"),
+    ("protocol", "list_states", "list_protocol_states"),
+    ("protocol", "add_transition", "add_protocol_transition"),
+    ("protocol", "delete_transition", "delete_protocol_transition"),
+    ("protocol", "list_transitions", "list_protocol_transitions"),
+    ("protocol", "link_to_skill", "link_protocol_to_skill"),
+    ("protocol", "start_run", "start_protocol_run"),
+    ("protocol", "get_run", "get_protocol_run"),
+    ("protocol", "list_runs", "list_protocol_runs"),
+    ("protocol", "transition", "fire_protocol_transition"),
+    ("protocol", "cancel_run", "cancel_protocol_run"),
+    ("protocol", "fail_run", "fail_protocol_run"),
+    ("protocol", "report_progress", "report_protocol_progress"),
+    ("protocol", "delete_run", "delete_protocol_run"),
+    ("protocol", "route", "route_protocols"),
+    ("protocol", "compose", "compose_protocol"),
+    ("protocol", "simulate", "simulate_protocol"),
+    ("protocol", "get_run_tree", "get_protocol_run_tree"),
+    ("protocol", "get_run_children", "get_protocol_run_children"),
+
+    // Persona (Living Personas)
+    ("persona", "create", "create_persona"),
+    ("persona", "get", "get_persona"),
+    ("persona", "list", "list_personas"),
+    ("persona", "update", "update_persona"),
+    ("persona", "delete", "delete_persona"),
+    ("persona", "add_skill", "add_persona_skill"),
+    ("persona", "remove_skill", "remove_persona_skill"),
+    ("persona", "add_protocol", "add_persona_protocol"),
+    ("persona", "remove_protocol", "remove_persona_protocol"),
+    ("persona", "add_file", "add_persona_file"),
+    ("persona", "remove_file", "remove_persona_file"),
+    ("persona", "add_function", "add_persona_function"),
+    ("persona", "remove_function", "remove_persona_function"),
+    ("persona", "add_note", "add_persona_note"),
+    ("persona", "remove_note", "remove_persona_note"),
+    ("persona", "add_decision", "add_persona_decision"),
+    ("persona", "remove_decision", "remove_persona_decision"),
+    ("persona", "scope_to_feature_graph", "scope_persona_feature_graph"),
+    ("persona", "unscope_feature_graph", "unscope_persona_feature_graph"),
+    ("persona", "add_extends", "add_persona_extends"),
+    ("persona", "remove_extends", "remove_persona_extends"),
+    ("persona", "get_subgraph", "get_persona_subgraph"),
+    ("persona", "find_for_file", "find_personas_for_file"),
+    ("persona", "list_global", "list_global_personas"),
+    ("persona", "export", "export_persona"),
+    ("persona", "import", "import_persona"),
+    ("persona", "activate", "activate_persona"),
+    ("persona", "auto_build", "auto_build_persona"),
+    ("persona", "maintain", "maintain_personas"),
+    ("persona", "detect", "detect_personas"),
+
+    // Sharing (Privacy MVP)
+    ("sharing", "status", "get_sharing_status"),
+    ("sharing", "enable", "enable_sharing"),
+    ("sharing", "disable", "disable_sharing"),
+    ("sharing", "set_policy", "set_sharing_policy"),
+    ("sharing", "get_policy", "get_sharing_policy"),
+    ("sharing", "set_consent", "set_sharing_consent"),
+    ("sharing", "history", "get_sharing_history"),
+    ("sharing", "preview", "preview_sharing"),
+    ("sharing", "suggest", "suggest_sharing"),
+    ("sharing", "retract", "retract_sharing"),
+    ("sharing", "list_tombstones", "list_tombstones"),
+    ("sharing", "last_report", "get_last_privacy_report"),
+
+    // Neural Routing
+    ("neural_routing", "status", "get_neural_routing_status"),
+    ("neural_routing", "get_config", "get_neural_routing_config"),
+    ("neural_routing", "enable", "enable_neural_routing"),
+    ("neural_routing", "disable", "disable_neural_routing"),
+    ("neural_routing", "set_mode", "set_neural_routing_mode"),
+    ("neural_routing", "update_config", "update_neural_routing_config"),
+
+    // Trajectory
+    ("trajectory", "list", "list_trajectories"),
+    ("trajectory", "get", "get_trajectory"),
+    ("trajectory", "search_similar", "search_similar_trajectories"),
+    ("trajectory", "stats", "get_trajectory_stats"),
+
+    // Reasoning Tree
+    ("reasoning", "reason", "reason"),
+    ("reasoning", "reason_feedback", "reason_feedback"),
+
+    // Episode (Episodic Memory)
+    ("episode", "collect", "collect_episode"),
+    ("episode", "list", "list_episodes"),
+    ("episode", "anonymize", "anonymize_episode"),
+    ("episode", "export_artifact", "export_artifact"),
+
+    // Analysis Profile
+    ("analysis_profile", "list", "list_analysis_profiles"),
+    ("analysis_profile", "create", "create_analysis_profile"),
+    ("analysis_profile", "get", "get_analysis_profile"),
+    ("analysis_profile", "delete", "delete_analysis_profile"),
+
+    // Admin
+    ("admin", "sync_directory", "sync_directory"),
+    ("admin", "start_watch", "start_watch"),
+    ("admin", "stop_watch", "stop_watch"),
+    ("admin", "watch_status", "watch_status"),
+    ("admin", "meilisearch_stats", "get_meilisearch_stats"),
+    ("admin", "delete_meilisearch_orphans", "delete_meilisearch_orphans"),
+    ("admin", "cleanup_cross_project_calls", "cleanup_cross_project_calls"),
+    ("admin", "cleanup_builtin_calls", "cleanup_builtin_calls"),
+    ("admin", "migrate_calls_confidence", "migrate_calls_confidence"),
+    ("admin", "cleanup_sync_data", "cleanup_sync_data"),
+    ("admin", "update_staleness_scores", "update_staleness_scores"),
+    ("admin", "update_energy_scores", "update_energy_scores"),
+    ("admin", "search_neurons", "search_neurons"),
+    ("admin", "reinforce_neurons", "reinforce_neurons"),
+    ("admin", "decay_synapses", "decay_synapses"),
+    ("admin", "backfill_synapses", "backfill_synapses"),
+    ("admin", "reindex_decisions", "reindex_decisions"),
+    ("admin", "backfill_decision_embeddings", "backfill_decision_embeddings"),
+    ("admin", "backfill_note_embeddings", "backfill_note_embeddings"),
+    ("admin", "backfill_note_embeddings_status", "backfill_note_embeddings_status"),
+    ("admin", "backfill_touches", "backfill_touches"),
+    ("admin", "backfill_discussed", "backfill_discussed"),
+    ("admin", "update_fabric_scores", "update_fabric_scores"),
+    ("admin", "bootstrap_knowledge_fabric", "bootstrap_knowledge_fabric"),
+    ("admin", "reinforce_isomorphic", "reinforce_isomorphic"),
+    ("admin", "detect_skills", "detect_skills"),
+    ("admin", "detect_skill_fission", "detect_skill_fission"),
+    ("admin", "detect_skill_fusion", "detect_skill_fusion"),
+    ("admin", "maintain_skills", "maintain_skills"),
+    ("admin", "auto_anchor_notes", "auto_anchor_notes"),
+    ("admin", "reconstruct_knowledge", "reconstruct_knowledge"),
+    ("admin", "heal_scars", "heal_scars"),
+    ("admin", "consolidate_memory", "consolidate_memory"),
+    ("admin", "audit_gaps", "audit_gaps"),
+    ("admin", "persist_health_report", "persist_health_report"),
+    ("admin", "detect_stagnation", "detect_stagnation"),
+    ("admin", "deep_maintenance", "deep_maintenance"),
+    ("admin", "seed_prompt_fragments", "seed_prompt_fragments"),
+    ("admin", "install_hooks", "install_hooks"),
+    ("admin", "get_learning_stats", "get_learning_stats"),
+    ("admin", "learning_metrics", "learning_metrics"),
+    ("admin", "analyze_runner_feedback", "analyze_runner_feedback"),
+
+    // Lifecycle Hooks
+    ("lifecycle_hook", "list", "list_lifecycle_hooks"),
+    ("lifecycle_hook", "create", "create_lifecycle_hook"),
+    ("lifecycle_hook", "get", "get_lifecycle_hook"),
+    ("lifecycle_hook", "update", "update_lifecycle_hook"),
+    ("lifecycle_hook", "delete", "delete_lifecycle_hook"),
+
+    // MCP Federation (routed via REST API so all registries are shared)
+    ("mcp_federation", "connect", "federation_connect"),
+    ("mcp_federation", "disconnect", "federation_disconnect"),
+    ("mcp_federation", "list", "federation_list"),
+    ("mcp_federation", "status", "federation_status"),
+    ("mcp_federation", "tools", "federation_tools"),
+    ("mcp_federation", "probe", "federation_probe"),
+    ("mcp_federation", "reconnect", "federation_reconnect"),
+];
+
 /// Handles MCP tool calls by proxying to the REST API.
 ///
 /// For external MCP tools (FQN format "server_id::tool_name"), the handler
@@ -162,42 +634,8 @@ impl ToolHandler {
             return Ok((name.to_string(), args.clone()));
         }
 
-        // Mega-tool names: project, plan, task, step, decision, constraint,
-        // release, milestone, commit, note, workspace, workspace_milestone,
-        // resource, component, chat, feature_graph, code, admin
-        let mega_tools: &[&str] = &[
-            "project",
-            "plan",
-            "task",
-            "step",
-            "decision",
-            "constraint",
-            "release",
-            "milestone",
-            "commit",
-            "note",
-            "workspace",
-            "workspace_milestone",
-            "resource",
-            "component",
-            "chat",
-            "feature_graph",
-            "code",
-            "admin",
-            "skill",
-            "analysis_profile",
-            "protocol",
-            "episode",
-            "persona",
-            "sharing",
-            "neural_routing",
-            "trajectory",
-            "lifecycle_hook",
-            "mcp_federation",
-            "reasoning",
-        ];
-
-        if !mega_tools.contains(&name) {
+        // Mega-tool names are the tools that appear in MEGA_TOOL_ACTIONS.
+        if !MEGA_TOOL_ACTIONS.iter().any(|(t, _, _)| *t == name) {
             // Unknown tool — return as-is, let downstream handle the error
             return Ok((name.to_string(), args.clone()));
         }
@@ -217,466 +655,11 @@ impl ToolHandler {
 
     /// Map (mega_tool, action) → legacy tool name
     fn mega_tool_to_legacy(&self, tool: &str, action: &str) -> Result<String> {
-        let name = match (tool, action) {
-            // Project
-            ("project", "list") => "list_projects",
-            ("project", "create") => "create_project",
-            ("project", "get") => "get_project",
-            ("project", "update") => "update_project",
-            ("project", "delete") => "delete_project",
-            ("project", "sync") => "sync_project",
-            ("project", "get_roadmap") => "get_project_roadmap",
-            ("project", "list_plans") => "list_project_plans",
-            ("project", "get_graph") => "get_project_graph",
-            ("project", "get_intelligence_summary") => "get_intelligence_summary",
-            ("project", "get_embeddings_projection") => "get_embeddings_projection",
-            ("project", "get_scaffolding_level") => "get_scaffolding_level",
-            ("project", "set_scaffolding_override") => "set_scaffolding_override",
-            ("project", "get_health_dashboard") => "get_health_dashboard",
-            ("project", "get_auto_roadmap") => "get_auto_roadmap",
-
-            // Plan
-            ("plan", "list") => "list_plans",
-            ("plan", "create") => "create_plan",
-            ("plan", "get") => "get_plan",
-            ("plan", "update") => "update_plan",
-            ("plan", "update_status") => "update_plan_status",
-            ("plan", "delete") => "delete_plan",
-            ("plan", "link_to_project") => "link_plan_to_project",
-            ("plan", "unlink_from_project") => "unlink_plan_from_project",
-            ("plan", "get_dependency_graph") => "get_dependency_graph",
-            ("plan", "get_critical_path") => "get_critical_path",
-            ("plan", "get_waves") => "get_waves",
-            ("plan", "run") => "run_plan",
-            ("plan", "run_status") => "get_run_status",
-            ("plan", "cancel_run") => "cancel_plan_run",
-            ("plan", "auto_pr") => "create_auto_pr",
-            ("plan", "add_trigger") => "add_trigger",
-            ("plan", "list_triggers") => "list_triggers",
-            ("plan", "remove_trigger") => "remove_trigger",
-            ("plan", "enable_trigger") => "enable_trigger",
-            ("plan", "disable_trigger") => "disable_trigger",
-            ("plan", "list_runs") => "list_plan_runs",
-            ("plan", "get_run") => "get_plan_run",
-            ("plan", "compare_runs") => "compare_plan_runs",
-            ("plan", "predict_run") => "predict_plan_run",
-            ("plan", "enrich") => "enrich_plan",
-            ("plan", "delegate_task") => "delegate_task",
-            ("plan", "get_sessions") => "get_plan_sessions",
-
-            // Task
-            ("task", "list") => "list_tasks",
-            ("task", "create") => "create_task",
-            ("task", "get") => "get_task",
-            ("task", "update") => "update_task",
-            ("task", "delete") => "delete_task",
-            ("task", "get_next") => "get_next_task",
-            ("task", "add_dependencies") => "add_task_dependencies",
-            ("task", "remove_dependency") => "remove_task_dependency",
-            ("task", "get_blockers") => "get_task_blockers",
-            ("task", "get_blocked_by") => "get_tasks_blocked_by",
-            ("task", "get_context") => "get_task_context",
-            ("task", "get_prompt") => "get_task_prompt",
-            ("task", "build_prompt") => "build_task_prompt",
-            ("task", "enrich") => "enrich_task",
-            ("task", "get_sessions") => "get_task_sessions",
-
-            // Step
-            ("step", "list") => "list_steps",
-            ("step", "create") => "create_step",
-            ("step", "update") => "update_step",
-            ("step", "get") => "get_step",
-            ("step", "delete") => "delete_step",
-            ("step", "get_progress") => "get_step_progress",
-
-            // Decision
-            ("decision", "add") => "add_decision",
-            ("decision", "get") => "get_decision",
-            ("decision", "update") => "update_decision",
-            ("decision", "delete") => "delete_decision",
-            ("decision", "search") => "search_decisions",
-            ("decision", "search_semantic") => "search_decisions_semantic",
-            ("decision", "add_affects") => "add_decision_affects",
-            ("decision", "remove_affects") => "remove_decision_affects",
-            ("decision", "list_affects") => "list_decision_affects",
-            ("decision", "get_affecting") => "get_decisions_affecting",
-            ("decision", "supersede") => "supersede_decision",
-            ("decision", "get_timeline") => "get_decision_timeline",
-
-            // Constraint
-            ("constraint", "list") => "list_constraints",
-            ("constraint", "add") => "add_constraint",
-            ("constraint", "get") => "get_constraint",
-            ("constraint", "update") => "update_constraint",
-            ("constraint", "delete") => "delete_constraint",
-
-            // Release
-            ("release", "list") => "list_releases",
-            ("release", "create") => "create_release",
-            ("release", "get") => "get_release",
-            ("release", "update") => "update_release",
-            ("release", "delete") => "delete_release",
-            ("release", "add_task") => "add_task_to_release",
-            ("release", "add_commit") => "add_commit_to_release",
-            ("release", "remove_commit") => "remove_commit_from_release",
-
-            // Milestone
-            ("milestone", "list") => "list_milestones",
-            ("milestone", "create") => "create_milestone",
-            ("milestone", "get") => "get_milestone",
-            ("milestone", "update") => "update_milestone",
-            ("milestone", "delete") => "delete_milestone",
-            ("milestone", "get_progress") => "get_milestone_progress",
-            ("milestone", "add_task") => "add_task_to_milestone",
-            ("milestone", "link_plan") => "link_plan_to_milestone",
-            ("milestone", "unlink_plan") => "unlink_plan_from_milestone",
-
-            // Commit
-            ("commit", "create") => "create_commit",
-            ("commit", "link_to_task") => "link_commit_to_task",
-            ("commit", "link_to_plan") => "link_commit_to_plan",
-            ("commit", "get_task_commits") => "get_task_commits",
-            ("commit", "get_plan_commits") => "get_plan_commits",
-            ("commit", "get_commit_files") => "get_commit_files",
-            ("commit", "get_file_history") => "get_file_history",
-
-            // Note
-            ("note", "list") => "list_notes",
-            ("note", "create") => "create_note",
-            ("note", "get") => "get_note",
-            ("note", "update") => "update_note",
-            ("note", "delete") => "delete_note",
-            ("note", "search") => "search_notes",
-            ("note", "search_semantic") => "search_notes_semantic",
-            ("note", "confirm") => "confirm_note",
-            ("note", "invalidate") => "invalidate_note",
-            ("note", "supersede") => "supersede_note",
-            ("note", "link_to_entity") => "link_note_to_entity",
-            ("note", "unlink_from_entity") => "unlink_note_from_entity",
-            ("note", "get_context") => "get_context_notes",
-            ("note", "get_needing_review") => "get_notes_needing_review",
-            ("note", "list_project") => "list_project_notes",
-            ("note", "get_propagated") => "get_propagated_notes",
-            ("note", "get_propagated_knowledge") => "get_propagated_knowledge",
-            ("note", "get_context_knowledge") => "get_context_knowledge",
-            ("note", "get_entity") => "get_entity_notes",
-            ("note", "list_rfcs") => "list_rfcs",
-            ("note", "advance_rfc") => "advance_rfc",
-            ("note", "get_rfc_status") => "get_rfc_status",
-
-            // Workspace
-            ("workspace", "list") => "list_workspaces",
-            ("workspace", "create") => "create_workspace",
-            ("workspace", "get") => "get_workspace",
-            ("workspace", "update") => "update_workspace",
-            ("workspace", "delete") => "delete_workspace",
-            ("workspace", "get_overview") => "get_workspace_overview",
-            ("workspace", "list_projects") => "list_workspace_projects",
-            ("workspace", "add_project") => "add_project_to_workspace",
-            ("workspace", "remove_project") => "remove_project_from_workspace",
-            ("workspace", "get_topology") => "get_workspace_topology",
-            ("workspace", "get_coupling_matrix") => "get_coupling_matrix",
-
-            // Workspace Milestone
-            ("workspace_milestone", "list_all") => "list_all_workspace_milestones",
-            ("workspace_milestone", "list") => "list_workspace_milestones",
-            ("workspace_milestone", "create") => "create_workspace_milestone",
-            ("workspace_milestone", "get") => "get_workspace_milestone",
-            ("workspace_milestone", "update") => "update_workspace_milestone",
-            ("workspace_milestone", "delete") => "delete_workspace_milestone",
-            ("workspace_milestone", "add_task") => "add_task_to_workspace_milestone",
-            ("workspace_milestone", "link_plan") => "link_plan_to_workspace_milestone",
-            ("workspace_milestone", "unlink_plan") => "unlink_plan_from_workspace_milestone",
-            ("workspace_milestone", "get_progress") => "get_workspace_milestone_progress",
-
-            // Resource
-            ("resource", "list") => "list_resources",
-            ("resource", "create") => "create_resource",
-            ("resource", "get") => "get_resource",
-            ("resource", "update") => "update_resource",
-            ("resource", "delete") => "delete_resource",
-            ("resource", "link_to_project") => "link_resource_to_project",
-
-            // Component
-            ("component", "list") => "list_components",
-            ("component", "create") => "create_component",
-            ("component", "get") => "get_component",
-            ("component", "update") => "update_component",
-            ("component", "delete") => "delete_component",
-            ("component", "add_dependency") => "add_component_dependency",
-            ("component", "remove_dependency") => "remove_component_dependency",
-            ("component", "map_to_project") => "map_component_to_project",
-
-            // Chat
-            ("chat", "list_sessions") => "list_chat_sessions",
-            ("chat", "get_session") => "get_chat_session",
-            ("chat", "get_children") => "get_session_children",
-            ("chat", "delete_session") => "delete_chat_session",
-            ("chat", "send_message") => "chat_send_message",
-            ("chat", "list_messages") => "list_chat_messages",
-            ("chat", "add_discussed") => "add_discussed",
-            ("chat", "get_session_entities") => "get_session_entities",
-            ("chat", "get_session_tree") => "get_session_tree",
-            ("chat", "get_run_sessions") => "get_run_sessions",
-            ("chat", "associate_with") => "associate_session",
-
-            // Feature Graph
-            ("feature_graph", "create") => "create_feature_graph",
-            ("feature_graph", "get") => "get_feature_graph",
-            ("feature_graph", "list") => "list_feature_graphs",
-            ("feature_graph", "add_entity") => "add_to_feature_graph",
-            ("feature_graph", "auto_build") => "auto_build_feature_graph",
-            ("feature_graph", "delete") => "delete_feature_graph",
-            ("feature_graph", "get_statistics") => "get_feature_graph_statistics",
-            ("feature_graph", "compare") => "compare_feature_graphs",
-            ("feature_graph", "find_overlapping") => "find_overlapping_feature_graphs",
-
-            // Code
-            ("code", "search") => "search_code",
-            ("code", "search_project") => "search_project_code",
-            ("code", "search_workspace") => "search_workspace_code",
-            ("code", "get_file_symbols") => "get_file_symbols",
-            ("code", "find_references") => "find_references",
-            ("code", "get_file_dependencies") => "get_file_dependencies",
-            ("code", "get_call_graph") => "get_call_graph",
-            ("code", "analyze_impact") => "analyze_impact",
-            ("code", "get_architecture") => "get_architecture",
-            ("code", "find_similar") => "find_similar_code",
-            ("code", "find_trait_implementations") => "find_trait_implementations",
-            ("code", "find_type_traits") => "find_type_traits",
-            ("code", "get_impl_blocks") => "get_impl_blocks",
-            ("code", "get_communities") => "get_code_communities",
-            ("code", "get_health") => "get_code_health",
-            ("code", "get_node_importance") => "get_node_importance",
-            ("code", "plan_implementation") => "plan_implementation",
-            ("code", "get_co_change_graph") => "get_co_change_graph",
-            ("code", "get_file_co_changers") => "get_file_co_changers",
-            ("code", "detect_processes") => "detect_processes",
-            ("code", "get_class_hierarchy") => "get_class_hierarchy",
-            ("code", "find_subclasses") => "find_subclasses",
-            ("code", "find_interface_implementors") => "find_interface_implementors",
-            ("code", "list_processes") => "list_processes",
-            ("code", "get_process") => "get_process",
-            ("code", "get_entry_points") => "get_entry_points",
-            ("code", "enrich_communities") => "enrich_communities",
-            ("code", "get_hotspots") => "get_hotspots",
-            ("code", "get_knowledge_gaps") => "get_knowledge_gaps",
-            ("code", "get_risk_assessment") => "get_risk_assessment",
-            ("code", "get_homeostasis") => "get_homeostasis",
-            ("code", "get_structural_drift") => "get_structural_drift",
-            ("code", "get_bridge") => "get_bridge",
-            ("code", "check_topology") => "check_topology",
-            ("code", "create_topology_rule") => "create_topology_rule",
-            ("code", "list_topology_rules") => "list_topology_rules",
-            ("code", "delete_topology_rule") => "delete_topology_rule",
-            ("code", "check_file_topology") => "check_file_topology",
-            ("code", "get_structural_profile") => "get_structural_profile",
-            ("code", "find_structural_twins") => "find_structural_twins",
-            ("code", "cluster_dna") => "cluster_dna",
-            ("code", "find_cross_project_twins") => "find_cross_project_twins",
-            ("code", "predict_missing_links") => "predict_missing_links",
-            ("code", "check_link_plausibility") => "check_link_plausibility",
-            ("code", "stress_test_node") => "stress_test_node",
-            ("code", "stress_test_edge") => "stress_test_edge",
-            ("code", "stress_test_cascade") => "stress_test_cascade",
-            ("code", "find_bridges") => "find_bridges",
-            ("code", "get_context_card") => "get_context_card",
-            ("code", "refresh_context_cards") => "refresh_context_cards",
-            ("code", "get_fingerprint") => "get_fingerprint",
-            ("code", "find_isomorphic") => "find_isomorphic",
-            ("code", "suggest_structural_templates") => "suggest_structural_templates",
-            ("code", "get_learning_health") => "get_learning_health",
-
-            // Skill
-            ("skill", "list") => "list_skills",
-            ("skill", "create") => "create_skill",
-            ("skill", "get") => "get_skill",
-            ("skill", "update") => "update_skill",
-            ("skill", "delete") => "delete_skill",
-            ("skill", "get_members") => "get_skill_members",
-            ("skill", "add_member") => "add_skill_member",
-            ("skill", "remove_member") => "remove_skill_member",
-            ("skill", "activate") => "activate_skill",
-            ("skill", "export") => "export_skill",
-            ("skill", "import") => "import_skill",
-            ("skill", "get_health") => "get_skill_health",
-            ("skill", "split") => "split_skill",
-            ("skill", "merge") => "merge_skills",
-
-            // Protocol (Pattern Federation)
-            ("protocol", "list") => "list_protocols",
-            ("protocol", "create") => "create_protocol",
-            ("protocol", "get") => "get_protocol",
-            ("protocol", "update") => "update_protocol",
-            ("protocol", "delete") => "delete_protocol",
-            ("protocol", "add_state") => "add_protocol_state",
-            ("protocol", "delete_state") => "delete_protocol_state",
-            ("protocol", "list_states") => "list_protocol_states",
-            ("protocol", "add_transition") => "add_protocol_transition",
-            ("protocol", "delete_transition") => "delete_protocol_transition",
-            ("protocol", "list_transitions") => "list_protocol_transitions",
-            ("protocol", "link_to_skill") => "link_protocol_to_skill",
-            ("protocol", "start_run") => "start_protocol_run",
-            ("protocol", "get_run") => "get_protocol_run",
-            ("protocol", "list_runs") => "list_protocol_runs",
-            ("protocol", "transition") => "fire_protocol_transition",
-            ("protocol", "cancel_run") => "cancel_protocol_run",
-            ("protocol", "fail_run") => "fail_protocol_run",
-            ("protocol", "report_progress") => "report_protocol_progress",
-            ("protocol", "delete_run") => "delete_protocol_run",
-            ("protocol", "route") => "route_protocols",
-            ("protocol", "compose") => "compose_protocol",
-            ("protocol", "simulate") => "simulate_protocol",
-            ("protocol", "get_run_tree") => "get_protocol_run_tree",
-            ("protocol", "get_run_children") => "get_protocol_run_children",
-
-            // Persona (Living Personas)
-            ("persona", "create") => "create_persona",
-            ("persona", "get") => "get_persona",
-            ("persona", "list") => "list_personas",
-            ("persona", "update") => "update_persona",
-            ("persona", "delete") => "delete_persona",
-            ("persona", "add_skill") => "add_persona_skill",
-            ("persona", "remove_skill") => "remove_persona_skill",
-            ("persona", "add_protocol") => "add_persona_protocol",
-            ("persona", "remove_protocol") => "remove_persona_protocol",
-            ("persona", "add_file") => "add_persona_file",
-            ("persona", "remove_file") => "remove_persona_file",
-            ("persona", "add_function") => "add_persona_function",
-            ("persona", "remove_function") => "remove_persona_function",
-            ("persona", "add_note") => "add_persona_note",
-            ("persona", "remove_note") => "remove_persona_note",
-            ("persona", "add_decision") => "add_persona_decision",
-            ("persona", "remove_decision") => "remove_persona_decision",
-            ("persona", "scope_to_feature_graph") => "scope_persona_feature_graph",
-            ("persona", "unscope_feature_graph") => "unscope_persona_feature_graph",
-            ("persona", "add_extends") => "add_persona_extends",
-            ("persona", "remove_extends") => "remove_persona_extends",
-            ("persona", "get_subgraph") => "get_persona_subgraph",
-            ("persona", "find_for_file") => "find_personas_for_file",
-            ("persona", "list_global") => "list_global_personas",
-            ("persona", "export") => "export_persona",
-            ("persona", "import") => "import_persona",
-            ("persona", "activate") => "activate_persona",
-            ("persona", "auto_build") => "auto_build_persona",
-            ("persona", "maintain") => "maintain_personas",
-            ("persona", "detect") => "detect_personas",
-
-            // Sharing (Privacy MVP)
-            ("sharing", "status") => "get_sharing_status",
-            ("sharing", "enable") => "enable_sharing",
-            ("sharing", "disable") => "disable_sharing",
-            ("sharing", "set_policy") => "set_sharing_policy",
-            ("sharing", "get_policy") => "get_sharing_policy",
-            ("sharing", "set_consent") => "set_sharing_consent",
-            ("sharing", "history") => "get_sharing_history",
-            ("sharing", "preview") => "preview_sharing",
-            ("sharing", "suggest") => "suggest_sharing",
-            ("sharing", "retract") => "retract_sharing",
-            ("sharing", "list_tombstones") => "list_tombstones",
-            ("sharing", "last_report") => "get_last_privacy_report",
-
-            // Neural Routing
-            ("neural_routing", "status") => "get_neural_routing_status",
-            ("neural_routing", "get_config") => "get_neural_routing_config",
-            ("neural_routing", "enable") => "enable_neural_routing",
-            ("neural_routing", "disable") => "disable_neural_routing",
-            ("neural_routing", "set_mode") => "set_neural_routing_mode",
-            ("neural_routing", "update_config") => "update_neural_routing_config",
-
-            // Trajectory
-            ("trajectory", "list") => "list_trajectories",
-            ("trajectory", "get") => "get_trajectory",
-            ("trajectory", "search_similar") => "search_similar_trajectories",
-            ("trajectory", "stats") => "get_trajectory_stats",
-
-            // Reasoning Tree
-            ("reasoning", "reason") => "reason",
-            ("reasoning", "reason_feedback") => "reason_feedback",
-
-            // Episode (Episodic Memory)
-            ("episode", "collect") => "collect_episode",
-            ("episode", "list") => "list_episodes",
-            ("episode", "anonymize") => "anonymize_episode",
-            ("episode", "export_artifact") => "export_artifact",
-
-            // Analysis Profile
-            ("analysis_profile", "list") => "list_analysis_profiles",
-            ("analysis_profile", "create") => "create_analysis_profile",
-            ("analysis_profile", "get") => "get_analysis_profile",
-            ("analysis_profile", "delete") => "delete_analysis_profile",
-
-            // Admin
-            ("admin", "sync_directory") => "sync_directory",
-            ("admin", "start_watch") => "start_watch",
-            ("admin", "stop_watch") => "stop_watch",
-            ("admin", "watch_status") => "watch_status",
-            ("admin", "meilisearch_stats") => "get_meilisearch_stats",
-            ("admin", "delete_meilisearch_orphans") => "delete_meilisearch_orphans",
-            ("admin", "cleanup_cross_project_calls") => "cleanup_cross_project_calls",
-            ("admin", "cleanup_builtin_calls") => "cleanup_builtin_calls",
-            ("admin", "migrate_calls_confidence") => "migrate_calls_confidence",
-            ("admin", "cleanup_sync_data") => "cleanup_sync_data",
-            ("admin", "update_staleness_scores") => "update_staleness_scores",
-            ("admin", "update_energy_scores") => "update_energy_scores",
-            ("admin", "search_neurons") => "search_neurons",
-            ("admin", "reinforce_neurons") => "reinforce_neurons",
-            ("admin", "decay_synapses") => "decay_synapses",
-            ("admin", "backfill_synapses") => "backfill_synapses",
-            ("admin", "reindex_decisions") => "reindex_decisions",
-            ("admin", "backfill_decision_embeddings") => "backfill_decision_embeddings",
-            ("admin", "backfill_note_embeddings") => "backfill_note_embeddings",
-            ("admin", "backfill_note_embeddings_status") => "backfill_note_embeddings_status",
-            ("admin", "backfill_touches") => "backfill_touches",
-            ("admin", "backfill_discussed") => "backfill_discussed",
-            ("admin", "update_fabric_scores") => "update_fabric_scores",
-            ("admin", "bootstrap_knowledge_fabric") => "bootstrap_knowledge_fabric",
-            ("admin", "reinforce_isomorphic") => "reinforce_isomorphic",
-            ("admin", "detect_skills") => "detect_skills",
-            ("admin", "detect_skill_fission") => "detect_skill_fission",
-            ("admin", "detect_skill_fusion") => "detect_skill_fusion",
-            ("admin", "maintain_skills") => "maintain_skills",
-            ("admin", "auto_anchor_notes") => "auto_anchor_notes",
-            ("admin", "reconstruct_knowledge") => "reconstruct_knowledge",
-            ("admin", "heal_scars") => "heal_scars",
-            ("admin", "consolidate_memory") => "consolidate_memory",
-            ("admin", "audit_gaps") => "audit_gaps",
-            ("admin", "persist_health_report") => "persist_health_report",
-            ("admin", "detect_stagnation") => "detect_stagnation",
-            ("admin", "deep_maintenance") => "deep_maintenance",
-            ("admin", "seed_prompt_fragments") => "seed_prompt_fragments",
-            ("admin", "install_hooks") => "install_hooks",
-            ("admin", "get_learning_stats") => "get_learning_stats",
-            ("admin", "learning_metrics") => "learning_metrics",
-            ("admin", "analyze_runner_feedback") => "analyze_runner_feedback",
-
-            // Lifecycle Hooks
-            ("lifecycle_hook", "list") => "list_lifecycle_hooks",
-            ("lifecycle_hook", "create") => "create_lifecycle_hook",
-            ("lifecycle_hook", "get") => "get_lifecycle_hook",
-            ("lifecycle_hook", "update") => "update_lifecycle_hook",
-            ("lifecycle_hook", "delete") => "delete_lifecycle_hook",
-
-            // MCP Federation (routed via REST API so all registries are shared)
-            ("mcp_federation", "connect") => "federation_connect",
-            ("mcp_federation", "disconnect") => "federation_disconnect",
-            ("mcp_federation", "list") => "federation_list",
-            ("mcp_federation", "status") => "federation_status",
-            ("mcp_federation", "tools") => "federation_tools",
-            ("mcp_federation", "probe") => "federation_probe",
-            ("mcp_federation", "reconnect") => "federation_reconnect",
-            ("mcp_federation", "backfill_relations") => "backfill_co_activated_with",
-            ("mcp_federation", "backfill_sequences") => "backfill_often_follows",
-
-            _ => {
-                return Err(anyhow!(
-                    "Unknown action '{}' for mega-tool '{}'",
-                    action,
-                    tool
-                ))
-            }
-        };
-        Ok(name.to_string())
+        MEGA_TOOL_ACTIONS
+            .iter()
+            .find(|(t, a, _)| *t == tool && *a == action)
+            .map(|(_, _, name)| name.to_string())
+            .ok_or_else(|| anyhow!("Unknown action '{}' for mega-tool '{}'", action, tool))
     }
 
     /// Handle a tool call and return the result as JSON.
@@ -965,6 +948,9 @@ impl ToolHandler {
                 }
                 if let Some(v) = args.get("root_path") {
                     body.insert("root_path".to_string(), v.clone());
+                }
+                if let Some(v) = args.get("profile") {
+                    body.insert("profile".to_string(), v.clone());
                 }
                 let result = http
                     .patch(&format!("/api/projects/{}", slug), &Value::Object(body))
@@ -2076,6 +2062,132 @@ impl ToolHandler {
                 }))
             }
 
+            // ── Environments & deployments ─────────────────────────────
+            "vault_list_available" => Ok(Some(
+                http.vault_call(reqwest::Method::GET, "/api/vault/agent/available", None)
+                    .await?,
+            )),
+
+            "vault_request_secret" => {
+                let name = args
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("`name` is required"))?;
+                let reason = args.get("reason").and_then(|v| v.as_str()).unwrap_or("");
+                let body = json!({"name": name, "reason": reason});
+                Ok(Some(
+                    http.vault_call(
+                        reqwest::Method::POST,
+                        "/api/vault/agent/requests",
+                        Some(&body),
+                    )
+                    .await?,
+                ))
+            }
+
+            "list_environments" => {
+                let project_id = extract_id(args, "project_id")?;
+                let result = http
+                    .get(&format!("/api/projects/{}/environments", project_id))
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "create_environment" => {
+                let project_id = extract_id(args, "project_id")?;
+                let result = http
+                    .post(&format!("/api/projects/{}/environments", project_id), args)
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "get_environment" => {
+                let id = extract_id(args, "environment_id")?;
+                let result = http.get(&format!("/api/environments/{}", id)).await?;
+                Ok(Some(result))
+            }
+
+            "update_environment" => {
+                let id = extract_id(args, "environment_id")?;
+                let mut body = serde_json::Map::new();
+                for key in ["name", "kind", "url", "description", "config"] {
+                    if let Some(v) = args.get(key) {
+                        body.insert(key.to_string(), v.clone());
+                    }
+                }
+                let result = http
+                    .patch(&format!("/api/environments/{}", id), &Value::Object(body))
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "delete_environment" => {
+                let id = extract_id(args, "environment_id")?;
+                let result = http.delete(&format!("/api/environments/{}", id)).await?;
+                Ok(Some(if result.is_null() {
+                    json!({"deleted": true})
+                } else {
+                    result
+                }))
+            }
+
+            "create_deployment" => {
+                let id = extract_id(args, "environment_id")?;
+                let mut body = serde_json::Map::new();
+                for key in ["version", "commit_sha", "status", "notes", "created_by"] {
+                    if let Some(v) = args.get(key) {
+                        body.insert(key.to_string(), v.clone());
+                    }
+                }
+                let result = http
+                    .post(
+                        &format!("/api/environments/{}/deployments", id),
+                        &Value::Object(body),
+                    )
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "update_deployment" => {
+                let id = extract_id(args, "deployment_id")?;
+                let mut body = serde_json::Map::new();
+                for key in ["status", "finished_at", "notes"] {
+                    if let Some(v) = args.get(key) {
+                        body.insert(key.to_string(), v.clone());
+                    }
+                }
+                let result = http
+                    .patch(&format!("/api/deployments/{}", id), &Value::Object(body))
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "list_deployments" => {
+                let id = extract_id(args, "environment_id")?;
+                let mut query = Vec::new();
+                if let Some(l) = args.get("limit").and_then(|v| v.as_u64()) {
+                    query.push(("limit".to_string(), l.to_string()));
+                }
+                if let Some(o) = args.get("offset").and_then(|v| v.as_u64()) {
+                    query.push(("offset".to_string(), o.to_string()));
+                }
+                let path = format!("/api/environments/{}/deployments", id);
+                let result = if query.is_empty() {
+                    http.get(&path).await?
+                } else {
+                    http.get_with_query(&path, &query).await?
+                };
+                Ok(Some(result))
+            }
+
+            "get_deployment_matrix" => {
+                let project_id = extract_id(args, "project_id")?;
+                let result = http
+                    .get(&format!("/api/projects/{}/deployment-matrix", project_id))
+                    .await?;
+                Ok(Some(result))
+            }
+
             // ── P5: Releases (8 tools) ─────────────────────────────────
             "list_releases" => {
                 let project_id = extract_id(args, "project_id")?;
@@ -2933,6 +3045,19 @@ impl ToolHandler {
                 Ok(Some(result))
             }
 
+            // Published and dispatched since the feedback analyzer landed, but the
+            // arm was missing: every call ended as "Unknown tool".
+            "analyze_runner_feedback" => {
+                let path = if args.get("project_id").is_some() {
+                    let pid = extract_id(args, "project_id")?;
+                    format!("/api/admin/analyze-runner-feedback?project_id={}", pid)
+                } else {
+                    "/api/admin/analyze-runner-feedback".to_string()
+                };
+                let result = http.post(&path, &json!({})).await?;
+                Ok(Some(result))
+            }
+
             "seed_prompt_fragments" => {
                 let pid = args
                     .get("project_id")
@@ -3167,6 +3292,17 @@ impl ToolHandler {
                 let slug = extract_string(args, "slug")?;
                 let result = http
                     .get(&format!("/api/workspaces/{}/topology", slug))
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "derive_workspace_topology" => {
+                let slug = extract_string(args, "slug")?;
+                let result = http
+                    .post(
+                        &format!("/api/workspaces/{}/topology/derive", slug),
+                        &json!({}),
+                    )
                     .await?;
                 Ok(Some(result))
             }
@@ -3409,8 +3545,10 @@ impl ToolHandler {
             "link_resource_to_project" => {
                 let id = extract_id(args, "id")?;
                 let project_id = extract_id(args, "project_id")?;
-                let link_type = extract_string(args, "link_type")?;
-                let body = json!({"project_id": project_id, "link_type": link_type});
+                // The REST DTO (LinkResourceRequest) requires `relation`; this arm used
+                // to send `link_type`, so every call was rejected with 422.
+                let relation = extract_string(args, "relation")?;
+                let body = json!({"project_id": project_id, "relation": relation});
                 let result = http
                     .post(&format!("/api/resources/{}/projects", id), &body)
                     .await?;
@@ -3462,6 +3600,9 @@ impl ToolHandler {
                 let mut body = serde_json::Map::new();
                 if let Some(v) = args.get("name") {
                     body.insert("name".to_string(), v.clone());
+                }
+                if let Some(v) = args.get("component_type") {
+                    body.insert("component_type".to_string(), v.clone());
                 }
                 if let Some(v) = args.get("description") {
                     body.insert("description".to_string(), v.clone());
@@ -5691,8 +5832,10 @@ impl ToolHandler {
                 if let Some(v) = args.get("content_hash") {
                     body.insert("content_hash".to_string(), v.clone());
                 }
-                if let Some(v) = args.get("urgent") {
-                    body.insert("urgent".to_string(), v.clone());
+                // RetractRequest reads `reason` (stored on the tombstone); the arm used
+                // to forward an `urgent` flag that the REST DTO silently dropped.
+                if let Some(v) = args.get("reason") {
+                    body.insert("reason".to_string(), v.clone());
                 }
                 let slug = extract_string(args, "project_slug")?;
                 let result = http
@@ -6163,6 +6306,7 @@ mod tests {
             ("step", "list"),
             ("constraint", "list"),
             ("release", "list"),
+            ("environment", "list"),
             ("milestone", "list"),
             ("commit", "create"),
             ("code", "search"),
@@ -6303,6 +6447,35 @@ mod tests {
         assert_eq!(result["method"], "POST");
         assert_eq!(result["path"], "/api/projects");
         assert_eq!(result["body"]["name"], "My Project");
+    }
+
+    #[tokio::test]
+    async fn test_http_create_work_project_without_root_path() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "create_project",
+                Some(json!({"name": "Hiring", "profile": "work"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert_eq!(result["body"]["profile"], "work");
+        assert!(result["body"].get("root_path").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_http_update_project_forwards_profile() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "update_project",
+                Some(json!({"slug": "p", "profile": "work", "root_path": ""})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["body"]["profile"], "work");
+        assert_eq!(result["body"]["root_path"], "");
     }
 
     #[tokio::test]
@@ -6560,6 +6733,28 @@ mod tests {
             "query should contain query=ToolHandler, got: {}",
             query
         );
+    }
+    // -- Admin: analyze_runner_feedback (arm was missing -> "Unknown tool") --
+
+    #[tokio::test]
+    async fn test_http_analyze_runner_feedback() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "admin",
+                Some(json!({"action": "analyze_runner_feedback", "project_id": UUID1})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert_eq!(result["path"], "/api/admin/analyze-runner-feedback");
+        assert_eq!(result["query"], format!("project_id={}", UUID1));
+
+        let result = handler
+            .handle("admin", Some(json!({"action": "analyze_runner_feedback"})))
+            .await
+            .unwrap();
+        assert_eq!(result["query"], "");
     }
 
     // -- Workspaces --------------------------------------------------------
@@ -7319,6 +7514,91 @@ mod tests {
             .unwrap();
         assert_eq!(result["method"], "DELETE");
         assert!(result["path"].as_str().unwrap().contains("/plans/"));
+    }
+
+    // -- Environments & deployments -----------------------------------------
+
+    #[tokio::test]
+    async fn test_http_environment_actions() {
+        let (handler, _) = make_http_handler().await;
+        let cases: Vec<(&str, Value, &str, &str)> = vec![
+            (
+                "list_environments",
+                json!({"project_id": UUID1}),
+                "GET",
+                "/environments",
+            ),
+            (
+                "create_environment",
+                json!({"project_id": UUID1, "name": "prod", "kind": "production"}),
+                "POST",
+                "/environments",
+            ),
+            (
+                "get_environment",
+                json!({"environment_id": UUID1}),
+                "GET",
+                "/api/environments/",
+            ),
+            (
+                "update_environment",
+                json!({"environment_id": UUID1, "url": "https://x"}),
+                "PATCH",
+                "/api/environments/",
+            ),
+            (
+                "delete_environment",
+                json!({"environment_id": UUID1}),
+                "DELETE",
+                "/api/environments/",
+            ),
+            (
+                "create_deployment",
+                json!({"environment_id": UUID1, "version": "1.0.0", "status": "running"}),
+                "POST",
+                "/deployments",
+            ),
+            (
+                "update_deployment",
+                json!({"deployment_id": UUID2, "status": "succeeded"}),
+                "PATCH",
+                "/api/deployments/",
+            ),
+            (
+                "list_deployments",
+                json!({"environment_id": UUID1, "limit": 5}),
+                "GET",
+                "/deployments",
+            ),
+            (
+                "get_deployment_matrix",
+                json!({"project_id": UUID1}),
+                "GET",
+                "/deployment-matrix",
+            ),
+        ];
+        for (tool, args, method, path_part) in cases {
+            let result = handler.handle(tool, Some(args)).await.unwrap();
+            assert_eq!(result["method"], method, "{tool}");
+            assert!(
+                result["path"].as_str().unwrap().contains(path_part),
+                "{tool}: {}",
+                result["path"]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_http_environment_requires_ids() {
+        let (handler, _) = make_http_handler().await;
+        assert!(handler
+            .handle("get_environment", Some(json!({})))
+            .await
+            .is_err());
+        assert!(handler
+            .handle("update_deployment", Some(json!({})))
+            .await
+            .is_err());
     }
 
     // -- Releases -----------------------------------------------------------
@@ -8464,12 +8744,15 @@ mod tests {
         let result = handler
             .handle(
                 "link_resource_to_project",
-                Some(json!({"id": UUID1, "project_id": UUID2, "link_type": "uses"})),
+                Some(json!({"id": UUID1, "project_id": UUID2, "relation": "uses"})),
             )
             .await
             .unwrap();
         assert_eq!(result["method"], "POST");
         assert!(result["path"].as_str().unwrap().ends_with("/projects"));
+        // The REST DTO (LinkResourceRequest) reads `relation`, not `link_type`.
+        assert_eq!(result["body"]["relation"], "uses");
+        assert!(result["body"].get("link_type").is_none());
     }
 
     // -- Components ---------------------------------------------------------
@@ -9929,6 +10212,26 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_mega_tool_environment_actions() {
+        let handler = make_handler();
+        for (action, expected) in [
+            ("list", "list_environments"),
+            ("create", "create_environment"),
+            ("get", "get_environment"),
+            ("update", "update_environment"),
+            ("delete", "delete_environment"),
+            ("deploy", "create_deployment"),
+            ("update_deployment", "update_deployment"),
+            ("list_deployments", "list_deployments"),
+            ("get_matrix", "get_deployment_matrix"),
+        ] {
+            let args = json!({"action": action});
+            let (name, _) = handler.resolve_mega_tool("environment", &args).unwrap();
+            assert_eq!(name, expected);
+        }
+    }
+
+    #[test]
     fn test_resolve_mega_tool_milestone_actions() {
         let handler = make_handler();
         for (action, expected) in [
@@ -10769,8 +11072,6 @@ mod tests {
             ("tools", "federation_tools"),
             ("probe", "federation_probe"),
             ("reconnect", "federation_reconnect"),
-            ("backfill_relations", "backfill_co_activated_with"),
-            ("backfill_sequences", "backfill_often_follows"),
         ] {
             let args = json!({"action": action});
             let (name, _) = handler.resolve_mega_tool("mcp_federation", &args).unwrap();
@@ -11643,5 +11944,382 @@ mod tests {
                 .await;
             assert!(result2.is_ok());
         }
+    }
+}
+
+/// Guards against drift between the two definitions of every mega-tool:
+/// the schema published to agents (`tools.rs`) and the dispatch that actually
+/// reads the arguments (`MEGA_TOOL_ACTIONS` + `try_handle_http` in this file).
+///
+/// History: `component.add_dependency` published `from_id`/`to_id` while the
+/// handler read `id`/`depends_on_id` — the action was unusable for six months.
+#[cfg(test)]
+mod schema_drift_tests {
+    use super::*;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    /// Published keys that no explicit handler arm reads, because the arm forwards
+    /// the whole `args` object as the REST body (`http.post(url, args)`) and the
+    /// REST DTO consumes them. Every entry was checked against the DTO fields.
+    /// Adding a key here means: "I verified the REST DTO reads it".
+    #[rustfmt::skip]
+    const PASSTHROUGH_KEYS: &[(&str, &str)] = &[
+        // ReinforceNeuronsBody / DecaySynapsesBody
+        ("admin", "decay_amount"), ("admin", "energy_boost"), ("admin", "note_ids"), ("admin", "prune_threshold"), ("admin", "synapse_boost"),
+        // CreateProfileBody
+        ("analysis_profile", "description"), ("analysis_profile", "edge_weights"), ("analysis_profile", "fusion_weights"), ("analysis_profile", "name"),
+        // SimilarCodeQuery, StructuralDnaBody, ClusterDnaBody, CrossProjectTwinsBody, PredictMissingLinksBody, StressTest*Body
+        ("code", "from_id"), ("code", "max_iterations"), ("code", "min_plausibility"), ("code", "n_clusters"), ("code", "snippet"), ("code", "source_project_slug"), ("code", "target_id"), ("code", "to_id"), ("code", "top_n"),
+        // CreateDecisionRequest
+        ("decision", "alternatives"), ("decision", "run_id"),
+        // CollectEpisodeRequest / ExportArtifactRequest
+        ("episode", "include_structure"), ("episode", "max_episodes"), ("episode", "run_id"),
+        // CreateLifecycleHookRequest
+        ("lifecycle_hook", "action_type"), ("lifecycle_hook", "scope"),
+        // ConnectServerBody
+        ("mcp_federation", "args"), ("mcp_federation", "command"), ("mcp_federation", "display_name"), ("mcp_federation", "env"), ("mcp_federation", "headers"), ("mcp_federation", "transport"), ("mcp_federation", "url"),
+        // CreateNoteBody (create/supersede)
+        ("note", "anchors"), ("note", "assertion_rule"), ("note", "run_id"), ("note", "scope"),
+        // CreatePersonaBody / ImportPersonaBody / AutoBuildPersonaBody
+        ("persona", "conflict_strategy"), ("persona", "depth"), ("persona", "entry_function"), ("persona", "file_pattern"), ("persona", "origin"), ("persona", "package"),
+        // CreatePlanRequest / DelegateTaskRequest
+        ("plan", "constraints"), ("plan", "custom_sections"), ("plan", "parent_session_id"),
+        // ReasonRequest
+        ("reasoning", "depth"), ("reasoning", "include_actions"), ("reasoning", "max_nodes"), ("reasoning", "project_id"), ("reasoning", "request"),
+        // CreateReleaseRequest
+        ("release", "version"),
+        // CreateResourceRequest
+        ("resource", "format"), ("resource", "metadata"),
+        // ImportSkillBody / MergeSkillsRequest
+        ("skill", "conflict_strategy"), ("skill", "package"), ("skill", "skill_ids"),
+        // CreateTaskRequest / BuildPromptRequest
+        ("task", "acceptance_criteria"), ("task", "affected_files"), ("task", "custom_sections"), ("task", "depends_on"), ("task", "steps"),
+        // CreateWorkspaceMilestoneRequest
+        ("workspace_milestone", "tags"),
+    ];
+
+    fn published_tools() -> BTreeMap<String, (BTreeSet<String>, BTreeSet<String>, String)> {
+        let mut out = BTreeMap::new();
+        for tool in crate::mcp::tools::all_tools() {
+            let props = tool
+                .input_schema
+                .properties
+                .as_ref()
+                .and_then(|p| p.as_object())
+                .expect("tool has properties");
+            let actions: BTreeSet<String> = props["action"]["enum"]
+                .as_array()
+                .expect("action enum")
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect();
+            let keys: BTreeSet<String> = props
+                .keys()
+                .filter(|k| k.as_str() != "action")
+                .cloned()
+                .collect();
+            out.insert(tool.name.clone(), (actions, keys, tool.description.clone()));
+        }
+        out
+    }
+
+    fn dispatch_actions() -> BTreeMap<String, BTreeSet<String>> {
+        let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for (tool, action, _) in MEGA_TOOL_ACTIONS {
+            out.entry(tool.to_string())
+                .or_default()
+                .insert(action.to_string());
+        }
+        out
+    }
+
+    /// Parse this very file and return, for each arm of `try_handle_http`,
+    /// the argument keys it reads (`extract_*(args, "k")`, `args.get("k")`,
+    /// `args["k"]`, and `for key in ["a", "b"] { args.get(key) }`).
+    fn keys_read_per_arm() -> BTreeMap<String, BTreeSet<String>> {
+        let src = include_str!("handlers.rs");
+        let start = src
+            .find("async fn try_handle_http(")
+            .expect("try_handle_http present");
+        let end = start
+            + src[start..]
+                .find("\n            _ => Ok(None),")
+                .expect("try_handle_http fallback arm");
+        let region = &src[start..end];
+
+        let arm_start = regex::Regex::new(
+            r#"^            (?:\| )?"[a-z_0-9]+"(?: \| "[a-z_0-9]+")*\s*(?:=>|\|)?"#,
+        )
+        .unwrap();
+        let name_re = regex::Regex::new(r#""([a-z_0-9]+)""#).unwrap();
+        let ws_dot = regex::Regex::new(r"\s+\.").unwrap();
+        let ws_paren = regex::Regex::new(r"\(\s+").unwrap();
+        let ws_comma = regex::Regex::new(r",\s+").unwrap();
+        let key_res = [
+            regex::Regex::new(r#"extract_[a-z_]+\(&?args, "([a-z_0-9]+)""#).unwrap(),
+            regex::Regex::new(r#"args\.get\("([a-z_0-9]+)"\)"#).unwrap(),
+            regex::Regex::new(r#"args\["([a-z_0-9]+)"\]"#).unwrap(),
+        ];
+        let for_list = regex::Regex::new(r"for \w+ in &?\[([^\]]*)\]").unwrap();
+
+        let mut arms: Vec<(Vec<String>, String)> = Vec::new();
+        let mut continuing = false;
+        for line in region.lines() {
+            let is_arm = arm_start.is_match(line) && !line.trim_start().starts_with("//");
+            if is_arm {
+                let head = line.split("=>").next().unwrap_or(line);
+                let names: Vec<String> = name_re
+                    .captures_iter(head)
+                    .map(|c| c[1].to_string())
+                    .collect();
+                if continuing || line.trim_start().starts_with('|') {
+                    if let Some(last) = arms.last_mut() {
+                        last.0.extend(names);
+                    }
+                } else {
+                    arms.push((names, String::new()));
+                }
+                continuing = !line.contains("=>");
+                continue;
+            }
+            continuing = false;
+            if let Some(last) = arms.last_mut() {
+                last.1.push(' ');
+                last.1.push_str(line.trim());
+            }
+        }
+
+        let mut out = BTreeMap::new();
+        for (names, body) in arms {
+            let body = ws_dot.replace_all(&body, ".");
+            let body = ws_paren.replace_all(&body, "(");
+            let body = ws_comma.replace_all(&body, ", ");
+            let mut keys = BTreeSet::new();
+            for re in &key_res {
+                for c in re.captures_iter(&body) {
+                    keys.insert(c[1].to_string());
+                }
+            }
+            for c in for_list.captures_iter(&body) {
+                for n in name_re.captures_iter(&c[1]) {
+                    keys.insert(n[1].to_string());
+                }
+            }
+            keys.remove("action");
+            for name in names {
+                out.entry(name)
+                    .or_insert_with(BTreeSet::new)
+                    .extend(keys.iter().cloned());
+            }
+        }
+        out
+    }
+
+    /// `json!` keeps the last of two identical keys, silently dropping the first
+    /// description (`code.target` was declared twice). Check the source of tools.rs.
+    #[test]
+    fn test_no_duplicate_property_keys_in_tool_schemas() {
+        let src = include_str!("tools.rs");
+        let key_re = regex::Regex::new(r#"^                "([a-z_0-9]+)": "#).unwrap();
+        let mut errors = Vec::new();
+        let mut tool = String::new();
+        let mut seen = BTreeSet::new();
+        for line in src.lines() {
+            if line.starts_with("fn ") && line.contains("_tool() -> ToolDefinition") {
+                tool = line
+                    .trim_start_matches("fn ")
+                    .split('(')
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                seen.clear();
+                continue;
+            }
+            if let Some(c) = key_re.captures(line) {
+                if !seen.insert(c[1].to_string()) {
+                    errors.push(format!("{tool}: property '{}' declared twice", &c[1]));
+                }
+            }
+        }
+        assert!(errors.is_empty(), "duplicate keys:\n{}", errors.join("\n"));
+    }
+
+    /// (c) Every dispatched action is published in the tool's `action` enum, and
+    /// every published action is dispatched.
+    #[test]
+    fn test_dispatch_actions_match_published_enums() {
+        let published = published_tools();
+        let dispatched = dispatch_actions();
+        let tools_pub: BTreeSet<_> = published.keys().cloned().collect();
+        let tools_disp: BTreeSet<_> = dispatched.keys().cloned().collect();
+        assert_eq!(tools_pub, tools_disp, "mega-tool sets differ");
+
+        let mut errors = Vec::new();
+        for (tool, (enum_actions, _, _)) in &published {
+            let disp = &dispatched[tool];
+            for a in disp.difference(enum_actions) {
+                errors.push(format!(
+                    "{tool}.{a}: dispatched but missing from published enum"
+                ));
+            }
+            for a in enum_actions.difference(disp) {
+                errors.push(format!("{tool}.{a}: published in enum but not dispatched"));
+            }
+        }
+        assert!(errors.is_empty(), "action drift:\n{}", errors.join("\n"));
+    }
+
+    /// (c) The "Actions: a, b, c" list in each tool description matches its enum.
+    #[test]
+    fn test_description_action_lists_match_enums() {
+        let mut errors = Vec::new();
+        for (tool, (enum_actions, _, description)) in published_tools() {
+            let Some(list) = description.split("Actions: ").nth(1) else {
+                continue;
+            };
+            let list = list.split(". ").next().unwrap_or(list);
+            let described: BTreeSet<String> = list
+                .split(',')
+                .map(|s| s.trim().trim_end_matches('.').to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            for a in described.difference(&enum_actions) {
+                errors.push(format!("{tool}.{a}: in description but not in enum"));
+            }
+            for a in enum_actions.difference(&described) {
+                errors.push(format!("{tool}.{a}: in enum but not in description"));
+            }
+        }
+        assert!(
+            errors.is_empty(),
+            "description drift:\n{}",
+            errors.join("\n")
+        );
+    }
+
+    /// (e) Every internal name in MEGA_TOOL_ACTIONS has an arm in the source
+    /// of `try_handle_http` (otherwise the call ends as "Unknown tool").
+    #[test]
+    fn test_every_dispatched_action_has_a_handler_arm() {
+        let arms = keys_read_per_arm();
+        let missing: Vec<String> = MEGA_TOOL_ACTIONS
+            .iter()
+            .filter(|(_, _, internal)| !arms.contains_key(*internal))
+            .map(|(t, a, internal)| format!("{t}.{a} -> {internal}"))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "dispatched actions without a try_handle_http arm:\n{}",
+            missing.join("\n")
+        );
+    }
+
+    /// Sanity check of the source parser against arms whose keys are known.
+    #[test]
+    fn test_keys_parser_sees_known_arms() {
+        let arms = keys_read_per_arm();
+        let expect = |arm: &str, keys: &[&str]| {
+            let got = arms
+                .get(arm)
+                .unwrap_or_else(|| panic!("arm {arm} not parsed"));
+            for k in keys {
+                assert!(
+                    got.contains(*k),
+                    "arm {arm} should read {k}, parsed {got:?}"
+                );
+            }
+        };
+        // single-line extract + args.get
+        expect(
+            "add_component_dependency",
+            &["id", "depends_on_id", "protocol", "required"],
+        );
+        // multi-line `args\n.get("cwd")`
+        expect("run_plan", &["plan_id", "cwd", "project_slug"]);
+        // `.or_else(|_| extract_string(args, "..."))` fallbacks
+        expect(
+            "get_context_card",
+            &["path", "file_path", "node_path", "project_slug"],
+        );
+        // `for key in [..] { args.get(key) }`
+        expect(
+            "update_environment",
+            &["name", "kind", "url", "description", "config"],
+        );
+        assert!(arms.len() > 350, "parser found only {} arms", arms.len());
+    }
+
+    /// (a) Every key a handler reads is published by its tool — otherwise an
+    /// agent has no way to know the parameter exists.
+    #[test]
+    fn test_handler_keys_are_published() {
+        let published = published_tools();
+        let arms = keys_read_per_arm();
+        let mut errors = Vec::new();
+        for (tool, action, internal) in MEGA_TOOL_ACTIONS {
+            let Some(read) = arms.get(*internal) else {
+                continue;
+            };
+            let keys = &published[*tool].1;
+            for k in read.difference(keys) {
+                errors.push(format!(
+                    "{tool}.{action} reads '{k}' which is not published"
+                ));
+            }
+        }
+        assert!(
+            errors.is_empty(),
+            "unpublished parameters:\n{}",
+            errors.join("\n")
+        );
+    }
+
+    /// (b) Every published key is read by some arm of its tool, or is a
+    /// verified pass-through key (see PASSTHROUGH_KEYS) — otherwise it is
+    /// silently ignored.
+    #[test]
+    fn test_published_keys_are_read() {
+        let published = published_tools();
+        let arms = keys_read_per_arm();
+        let mut read_by_tool: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
+        for (tool, _, internal) in MEGA_TOOL_ACTIONS {
+            if let Some(keys) = arms.get(*internal) {
+                read_by_tool
+                    .entry(tool)
+                    .or_default()
+                    .extend(keys.iter().cloned());
+            }
+        }
+        let passthrough: BTreeSet<(&str, &str)> = PASSTHROUGH_KEYS.iter().copied().collect();
+        let mut errors = Vec::new();
+        for (tool, (_, keys, _)) in &published {
+            let read = read_by_tool.get(tool.as_str()).cloned().unwrap_or_default();
+            for k in keys {
+                if !read.contains(k) && !passthrough.contains(&(tool.as_str(), k.as_str())) {
+                    errors.push(format!("{tool}.{k} is published but never read"));
+                }
+            }
+        }
+        for (tool, k) in PASSTHROUGH_KEYS {
+            let Some((_, keys, _)) = published.get(*tool) else {
+                errors.push(format!("PASSTHROUGH_KEYS names unknown tool {tool}"));
+                continue;
+            };
+            if !keys.contains(*k) {
+                errors.push(format!(
+                    "PASSTHROUGH_KEYS entry {tool}.{k} is no longer published"
+                ));
+            }
+            if read_by_tool.get(tool).is_some_and(|r| r.contains(*k)) {
+                errors.push(format!(
+                    "PASSTHROUGH_KEYS entry {tool}.{k} is read explicitly — remove it"
+                ));
+            }
+        }
+        assert!(
+            errors.is_empty(),
+            "ignored parameters:\n{}",
+            errors.join("\n")
+        );
     }
 }

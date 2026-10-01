@@ -28,6 +28,7 @@ impl Neo4jClient {
                 transport_url: $transport_url,
                 transport_command: $transport_command,
                 transport_args: $transport_args,
+                transport_secrets: $transport_secrets,
                 status: $status,
                 protocol_version: $protocol_version,
                 server_name: $server_name,
@@ -53,6 +54,10 @@ impl Neo4jClient {
         .param(
             "transport_args",
             server.transport_args.clone().unwrap_or_default(),
+        )
+        .param(
+            "transport_secrets",
+            server.transport_secrets.clone().unwrap_or_default(),
         )
         .param("status", server.status.clone())
         .param(
@@ -371,6 +376,10 @@ impl Neo4jClient {
                 .filter(|s: &String| !s.is_empty()),
             transport_args: node
                 .get("transport_args")
+                .ok()
+                .filter(|s: &String| !s.is_empty()),
+            transport_secrets: node
+                .get("transport_secrets")
                 .ok()
                 .filter(|s: &String| !s.is_empty()),
             status: node

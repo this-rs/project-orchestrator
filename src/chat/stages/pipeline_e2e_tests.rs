@@ -71,6 +71,7 @@ mod tests {
             scaffolding_override: None,
             sharing_policy: None,
             watch_enabled: true,
+            profile: Default::default(),
         };
         graph.projects.write().await.insert(project_id, project);
         (project_id, slug)

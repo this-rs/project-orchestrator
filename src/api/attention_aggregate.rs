@@ -695,7 +695,7 @@ pub async fn build_attention(graph: &dyn GraphStore, p: &AttentionParams) -> Att
                 .map(|t| crate::neo4j::plan::WaveTask {
                     id: t.id,
                     title: t.title.clone(),
-                    status: format!("{:?}", t.status),
+                    status: t.status.clone(),
                     priority: t.priority,
                     affected_files: Vec::new(),
                     depends_on: Vec::new(),

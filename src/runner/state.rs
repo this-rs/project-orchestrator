@@ -121,15 +121,27 @@ impl RunnerState {
     }
 
     /// Record a task as completed. Also removes it from active_agents.
+    ///
+    /// Idempotent, and a task is never both completed and failed: the latest
+    /// outcome wins (e.g. a successful retry of a failed task moves it here).
     pub fn mark_task_completed(&mut self, task_id: Uuid) {
-        self.completed_tasks.push(task_id);
+        self.failed_tasks.retain(|t| *t != task_id);
+        if !self.completed_tasks.contains(&task_id) {
+            self.completed_tasks.push(task_id);
+        }
         self.remove_agent(&task_id);
         self.sync_current_task_compat();
     }
 
     /// Record a task as failed. Also removes it from active_agents.
+    ///
+    /// Idempotent, and removes the task from `completed_tasks` (post-wave
+    /// verification can fail a task that was already marked completed).
     pub fn mark_task_failed(&mut self, task_id: Uuid) {
-        self.failed_tasks.push(task_id);
+        self.completed_tasks.retain(|t| *t != task_id);
+        if !self.failed_tasks.contains(&task_id) {
+            self.failed_tasks.push(task_id);
+        }
         self.remove_agent(&task_id);
         self.sync_current_task_compat();
     }
@@ -431,5 +443,36 @@ mod tests {
             2,
             "Different task_ids should not be deduped"
         );
+    }
+
+    #[test]
+    fn test_mark_task_completed_is_idempotent() {
+        // A task can reach mark_task_completed twice (e.g. step-coherence
+        // auto-complete + post-wave watchdog, or a resumed run re-completing a
+        // task). It must be counted once, otherwise progress_pct exceeds 100%.
+        let mut state = RunnerState::new(Uuid::new_v4(), Uuid::new_v4(), 1, TriggerSource::Manual);
+        let task_id = Uuid::new_v4();
+        state.mark_task_completed(task_id);
+        state.mark_task_completed(task_id);
+        assert_eq!(state.completed_tasks, vec![task_id]);
+        assert!((state.progress_pct() - 100.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_completed_then_failed_task_is_only_failed() {
+        // Post-wave verification can fail a task that was already marked
+        // completed. The task must then leave `completed_tasks`, otherwise it is
+        // counted both as completed and failed (tc + tf > total).
+        let mut state = RunnerState::new(Uuid::new_v4(), Uuid::new_v4(), 1, TriggerSource::Manual);
+        let task_id = Uuid::new_v4();
+        state.mark_task_completed(task_id);
+        state.mark_task_failed(task_id);
+        assert!(state.completed_tasks.is_empty());
+        assert_eq!(state.failed_tasks, vec![task_id]);
+
+        // And a successful retry of a failed task moves it back.
+        state.mark_task_completed(task_id);
+        assert!(state.failed_tasks.is_empty());
+        assert_eq!(state.completed_tasks, vec![task_id]);
     }
 }

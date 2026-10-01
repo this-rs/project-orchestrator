@@ -891,17 +891,24 @@ pub async fn update_workspace_milestone(
         .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
         .map(|dt| dt.with_timezone(&chrono::Utc));
 
-    state
+    let found = state
         .orchestrator
         .update_workspace_milestone(id, req.title, req.description, status, target_date)
         .await?;
+    if !found {
+        return Err(AppError::NotFound(format!(
+            "Workspace milestone {} not found",
+            id
+        )));
+    }
 
+    // Re-read; may race with a concurrent delete, so no unwrap here.
     let updated = state
         .orchestrator
         .neo4j()
         .get_workspace_milestone(id)
         .await?
-        .unwrap();
+        .ok_or_else(|| AppError::NotFound(format!("Workspace milestone {} not found", id)))?;
 
     Ok(Json(WorkspaceMilestoneResponse::from(updated)))
 }
@@ -1236,7 +1243,7 @@ pub async fn update_resource(
         .parse()
         .map_err(|_| AppError::BadRequest("Invalid resource ID".to_string()))?;
 
-    state
+    let found = state
         .orchestrator
         .update_resource(
             id,
@@ -1247,6 +1254,9 @@ pub async fn update_resource(
             req.description,
         )
         .await?;
+    if !found {
+        return Err(AppError::NotFound(format!("Resource {} not found", id)));
+    }
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1346,17 +1356,17 @@ pub async fn create_component(
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Workspace '{}' not found", slug)))?;
 
-    let component_type = match req.component_type.to_lowercase().as_str() {
-        "service" => ComponentType::Service,
-        "frontend" => ComponentType::Frontend,
-        "worker" => ComponentType::Worker,
-        "database" => ComponentType::Database,
-        "messagequeue" | "message_queue" => ComponentType::MessageQueue,
-        "cache" => ComponentType::Cache,
-        "gateway" => ComponentType::Gateway,
-        "external" => ComponentType::External,
-        _ => ComponentType::Other,
-    };
+    // Parse through ComponentType::FromStr (models.rs) rather than a local match:
+    // a second copy drifts, and the drift is silent. An unknown type is rejected
+    // instead of collapsing to `Other` — a mistyped component is otherwise
+    // uncorrectable forever (the type is only writable here and on update).
+    let component_type: ComponentType = req.component_type.parse().map_err(|_| {
+        AppError::BadRequest(format!(
+            "Unknown component_type '{}'. Expected one of: service, frontend, worker, \
+             database, message_queue, cache, gateway, external, library, cli, other",
+            req.component_type
+        ))
+    })?;
 
     let component = ComponentNode {
         id: Uuid::new_v4(),
@@ -1401,6 +1411,8 @@ pub async fn get_component(
 #[derive(Deserialize)]
 pub struct UpdateComponentRequest {
     pub name: Option<String>,
+    /// Component type. Omitted = unchanged. Accepts the same spellings as creation.
+    pub component_type: Option<String>,
     pub description: Option<String>,
     pub runtime: Option<String>,
     pub config: Option<serde_json::Value>,
@@ -1417,17 +1429,37 @@ pub async fn update_component(
         .parse()
         .map_err(|_| AppError::BadRequest("Invalid component ID".to_string()))?;
 
-    state
+    let component_type = req
+        .component_type
+        .as_deref()
+        .map(|raw| {
+            raw.parse::<ComponentType>().map_err(|_| {
+                AppError::BadRequest(format!(
+                    "Unknown component_type '{}'. Expected one of: service, frontend, worker, \
+                     database, message_queue, cache, gateway, external, library, cli, other",
+                    raw
+                ))
+            })
+        })
+        .transpose()?;
+
+    let found = state
         .orchestrator
         .update_component(
             id,
-            req.name,
-            req.description,
-            req.runtime,
-            req.config,
-            req.tags,
+            ComponentUpdate {
+                name: req.name,
+                component_type,
+                description: req.description,
+                runtime: req.runtime,
+                config: req.config,
+                tags: req.tags,
+            },
         )
         .await?;
+    if !found {
+        return Err(AppError::NotFound(format!("Component {} not found", id)));
+    }
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1514,6 +1546,34 @@ pub async fn map_component_to_project(
 }
 
 /// Get workspace topology
+/// Re-derive the workspace topology from its projects' source trees.
+///
+/// The derivation also runs after every sync and on a heartbeat rotation; this
+/// exists so the result can be demanded rather than waited for — after editing a
+/// compose file, say, or right after registering a project.
+///
+/// Safe to call repeatedly: the derivation is deterministic and writes through an
+/// upsert, so a run that finds nothing new changes nothing.
+pub async fn derive_workspace_topology(
+    State(state): State<OrchestratorState>,
+    Path(slug): Path<String>,
+) -> Result<Json<crate::architecture::sync::DerivationOutcome>, AppError> {
+    let workspace = state
+        .orchestrator
+        .neo4j()
+        .get_workspace_by_slug(&slug)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("Workspace '{}' not found", slug)))?;
+
+    let outcome = crate::architecture::sync::derive_and_store_workspace(
+        state.orchestrator.neo4j_arc(),
+        workspace.id,
+    )
+    .await?;
+
+    Ok(Json(outcome))
+}
+
 pub async fn get_workspace_topology(
     State(state): State<OrchestratorState>,
     Path(slug): Path<String>,
@@ -2009,6 +2069,7 @@ mod tests {
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
             model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
+            vault: crate::vault::VaultService::ephemeral(),
         });
         create_router(state)
     }
@@ -2095,6 +2156,7 @@ mod tests {
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
             model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
+            vault: crate::vault::VaultService::ephemeral(),
         });
         (create_router(state), milestone_id, task1.id, task2.id)
     }
@@ -2212,9 +2274,13 @@ mod tests {
 
     #[test]
     fn test_update_component_request_all_fields() {
-        let json = r#"{"name":"Auth","description":"Auth service","runtime":"rust","config":{"port":8080},"tags":["auth","core"]}"#;
+        let json = r#"{"name":"Auth","component_type":"gateway","description":"Auth service","runtime":"rust","config":{"port":8080},"tags":["auth","core"]}"#;
         let req: UpdateComponentRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.name, Some("Auth".to_string()));
+        // This assertion is the point of the test: the field was missing from the
+        // struct, so serde silently dropped it and the API answered 204 while
+        // changing nothing. "all_fields" was green without ever covering it.
+        assert_eq!(req.component_type, Some("gateway".to_string()));
         assert_eq!(req.description, Some("Auth service".to_string()));
         assert_eq!(req.runtime, Some("rust".to_string()));
         assert!(req.config.is_some());
@@ -2227,10 +2293,47 @@ mod tests {
         let json = r#"{}"#;
         let req: UpdateComponentRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.name, None);
+        assert_eq!(req.component_type, None);
         assert_eq!(req.description, None);
         assert_eq!(req.runtime, None);
         assert_eq!(req.config, None);
         assert_eq!(req.tags, None);
+    }
+
+    #[test]
+    fn test_component_type_parses_documented_spellings() {
+        // create_component used to carry its own match with a `_ => Other` arm, so
+        // "queue" and "message_queue" — both advertised by the MCP schema — landed
+        // silently as Other. Both handlers now go through ComponentType::FromStr.
+        for (raw, expected) in [
+            ("service", ComponentType::Service),
+            ("frontend", ComponentType::Frontend),
+            ("message_queue", ComponentType::MessageQueue),
+            ("queue", ComponentType::MessageQueue),
+            ("database", ComponentType::Database),
+            ("gateway", ComponentType::Gateway),
+            ("external", ComponentType::External),
+            ("library", ComponentType::Library),
+            ("framework", ComponentType::Library),
+            ("cli", ComponentType::Cli),
+            ("other", ComponentType::Other),
+        ] {
+            assert_eq!(
+                raw.parse::<ComponentType>().unwrap(),
+                expected,
+                "'{}' must not collapse to Other",
+                raw
+            );
+        }
+    }
+
+    #[test]
+    fn test_component_type_rejects_unknown_instead_of_defaulting() {
+        // An unknown type must fail loudly rather than collapse to Other: a
+        // mistyped component used to be uncorrectable forever.
+        assert!("".parse::<ComponentType>().is_err());
+        assert!("queue_thing".parse::<ComponentType>().is_err());
+        assert!("Postgres".parse::<ComponentType>().is_err());
     }
 
     #[test]
@@ -2493,6 +2596,7 @@ mod tests {
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
             model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
+            vault: crate::vault::VaultService::ephemeral(),
         });
         let app = create_router(state);
 
@@ -2552,6 +2656,7 @@ mod tests {
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
             model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
+            vault: crate::vault::VaultService::ephemeral(),
         });
         let app = create_router(state);
 
@@ -2607,6 +2712,7 @@ mod tests {
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
             model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
+            vault: crate::vault::VaultService::ephemeral(),
         });
         let app = create_router(state);
 
@@ -2662,6 +2768,7 @@ mod tests {
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
             model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
+            vault: crate::vault::VaultService::ephemeral(),
         });
         let app = create_router(state);
 
@@ -2711,6 +2818,7 @@ mod tests {
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
             model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
+            vault: crate::vault::VaultService::ephemeral(),
         });
         let app = create_router(state);
 
@@ -2760,6 +2868,7 @@ mod tests {
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
             model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
+            vault: crate::vault::VaultService::ephemeral(),
         });
         let app = create_router(state);
 
@@ -2807,6 +2916,7 @@ mod tests {
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
             model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
+            vault: crate::vault::VaultService::ephemeral(),
         });
         let app = create_router(state);
 
@@ -2899,6 +3009,7 @@ mod tests {
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
             model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
+            vault: crate::vault::VaultService::ephemeral(),
         });
         let app = create_router(state);
 
@@ -2953,6 +3064,7 @@ mod tests {
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
             model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
+            vault: crate::vault::VaultService::ephemeral(),
         });
         let app = create_router(state);
 
@@ -3005,6 +3117,7 @@ mod tests {
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
             model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
+            vault: crate::vault::VaultService::ephemeral(),
         });
         let app = create_router(state);
 
@@ -3057,6 +3170,7 @@ mod tests {
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
             model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
+            vault: crate::vault::VaultService::ephemeral(),
         });
         let app = create_router(state);
 
@@ -3116,6 +3230,7 @@ mod tests {
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
             model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
+            vault: crate::vault::VaultService::ephemeral(),
         });
         let app = create_router(state);
 
@@ -3168,6 +3283,7 @@ mod tests {
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
             model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
+            vault: crate::vault::VaultService::ephemeral(),
         });
         let app = create_router(state);
 
@@ -3181,5 +3297,165 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), HttpStatus::OK);
+    }
+
+    // ================================================================
+    // couac2: PATCH on an unknown id must answer 404, not a silent 204
+    // ================================================================
+
+    fn auth_patch_json(uri: &str, body: serde_json::Value) -> Request<Body> {
+        Request::builder()
+            .method("PATCH")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header("authorization", test_bearer_token())
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap()
+    }
+
+    /// Create a workspace through the API and return its slug.
+    async fn create_ws_via_api(app: &axum::Router) -> String {
+        let resp = app
+            .clone()
+            .oneshot(auth_post_json(
+                "/api/workspaces",
+                serde_json::json!({"name": "Couac2 WS"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::CREATED);
+        body_json(resp).await["slug"].as_str().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn test_patch_component_unknown_id_returns_404() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_patch_json(
+                &format!("/api/components/{}", Uuid::new_v4()),
+                serde_json::json!({"name": "ghost"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_patch_component_unknown_id_empty_body_returns_404() {
+        // No field to set used to early-return Ok -> 204 without even
+        // checking that the component exists.
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_patch_json(
+                &format!("/api/components/{}", Uuid::new_v4()),
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_patch_component_existing_returns_204_and_writes() {
+        let app = test_app().await;
+        let slug = create_ws_via_api(&app).await;
+        let resp = app
+            .clone()
+            .oneshot(auth_post_json(
+                &format!("/api/workspaces/{}/components", slug),
+                serde_json::json!({"name": "api", "component_type": "service"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::CREATED);
+        let id = body_json(resp).await["id"].as_str().unwrap().to_string();
+
+        let resp = app
+            .clone()
+            .oneshot(auth_patch_json(
+                &format!("/api/components/{}", id),
+                serde_json::json!({"name": "api-v2"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::NO_CONTENT);
+
+        let resp = app
+            .oneshot(auth_get(&format!("/api/components/{}", id)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        assert_eq!(body_json(resp).await["name"], "api-v2");
+    }
+
+    #[tokio::test]
+    async fn test_patch_resource_unknown_id_returns_404() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_patch_json(
+                &format!("/api/resources/{}", Uuid::new_v4()),
+                serde_json::json!({"name": "ghost"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_patch_resource_existing_returns_204() {
+        let app = test_app().await;
+        let slug = create_ws_via_api(&app).await;
+        let resp = app
+            .clone()
+            .oneshot(auth_post_json(
+                &format!("/api/workspaces/{}/resources", slug),
+                serde_json::json!({
+                    "name": "spec",
+                    "resource_type": "api_contract",
+                    "file_path": "api.yaml"
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::CREATED);
+        let id = body_json(resp).await["id"].as_str().unwrap().to_string();
+
+        let resp = app
+            .oneshot(auth_patch_json(
+                &format!("/api/resources/{}", id),
+                serde_json::json!({"version": "2.0"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn test_patch_workspace_milestone_unknown_id_returns_404_not_panic() {
+        // Before couac2 the handler did get_workspace_milestone(id).unwrap()
+        // after the silent update: an unknown id panicked the request task.
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_patch_json(
+                &format!("/api/workspace-milestones/{}", Uuid::new_v4()),
+                serde_json::json!({"title": "ghost"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_patch_workspace_milestone_existing_returns_200() {
+        let (app, milestone_id, _, _) = test_app_with_milestone_tasks().await;
+        let resp = app
+            .oneshot(auth_patch_json(
+                &format!("/api/workspace-milestones/{}", milestone_id),
+                serde_json::json!({"title": "renamed"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        assert_eq!(body_json(resp).await["title"], "renamed");
     }
 }

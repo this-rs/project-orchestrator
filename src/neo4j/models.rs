@@ -8,12 +8,77 @@ use uuid::Uuid;
 // Project Node (multi-project support)
 // ============================================================================
 
+/// What kind of work a project holds.
+///
+/// Drives which parts of the product are relevant, not what is possible: a
+/// `work` project (a marketing plan, a budget, a hiring pipeline) has plans,
+/// tasks, notes and attachments like any other, but no source tree to index.
+/// Stored on the node as a lowercase string; a node with no `profile` property
+/// predates the field and is `software`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectProfile {
+    /// A codebase: has a root path, is synced, parsed and watched.
+    #[default]
+    Software,
+    /// Knowledge work around documents and tasks; no code to analyse.
+    Work,
+}
+
+impl ProjectProfile {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Software => "software",
+            Self::Work => "work",
+        }
+    }
+}
+
+impl std::str::FromStr for ProjectProfile {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "software" => Ok(Self::Software),
+            "work" => Ok(Self::Work),
+            other => Err(format!(
+                "unknown project profile {other:?} (expected \"software\" or \"work\")"
+            )),
+        }
+    }
+}
+
+/// Serialize an absent path as `null` rather than `""`.
+fn serialize_root_path<S: serde::Serializer>(value: &str, s: S) -> Result<S::Ok, S::Error> {
+    if value.is_empty() {
+        s.serialize_none()
+    } else {
+        s.serialize_str(value)
+    }
+}
+
+/// Accept `null` (and a missing key) as "no path".
+fn deserialize_root_path<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    Ok(Option::<String>::deserialize(d)?.unwrap_or_default())
+}
+
 /// A project/codebase being tracked
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectNode {
     pub id: Uuid,
     pub name: String,
     pub slug: String, // URL-safe identifier
+    /// Directory of the codebase. **Empty means the project has none** — a
+    /// `work` project, or a software project not yet bound to a checkout. It is
+    /// a `String` rather than an `Option` because the value is threaded through
+    /// path arithmetic in a few dozen places that already treat `""` as "no
+    /// root"; use [`ProjectNode::root_path_opt`] where absence must be handled
+    /// explicitly. Serialized as `null` when empty.
+    #[serde(
+        default,
+        serialize_with = "serialize_root_path",
+        deserialize_with = "deserialize_root_path"
+    )]
     pub root_path: String,
     pub description: Option<String>,
     pub created_at: DateTime<Utc>,
@@ -41,6 +106,22 @@ pub struct ProjectNode {
     /// Defaults to true for backward compatibility with existing projects.
     #[serde(default = "default_watch_enabled")]
     pub watch_enabled: bool,
+    /// `software` (default, and what nodes without the property are) or `work`.
+    #[serde(default)]
+    pub profile: ProjectProfile,
+}
+
+impl ProjectNode {
+    /// The root path, or `None` when the project has none.
+    pub fn root_path_opt(&self) -> Option<&str> {
+        let trimmed = self.root_path.trim();
+        (!trimmed.is_empty()).then_some(self.root_path.as_str())
+    }
+
+    /// The root path with `~` expanded, or `None` when the project has none.
+    pub fn expanded_root_path(&self) -> Option<String> {
+        self.root_path_opt().map(crate::expand_tilde)
+    }
 }
 
 fn default_watch_enabled() -> bool {
@@ -161,7 +242,7 @@ pub struct ChatEventRecord {
     /// Monotonically increasing sequence number (per session)
     pub seq: i64,
     /// Event type: "user_message", "assistant_text", "thinking", "tool_use",
-    /// "tool_result", "permission_request", "input_request", "result", "error"
+    /// "tool_result", "permission_request", "ask_user_question", "result", "error"
     pub event_type: String,
     /// JSON-serialized event payload
     pub data: String,
@@ -543,6 +624,49 @@ pub enum TaskStatus {
     Blocked,
     Completed,
     Failed,
+}
+
+/// Task counters for one entity (plan, project or milestone).
+///
+/// Returned in batch by `GET /api/progress` so list cards can show a progress
+/// bar without one request per row.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskCounts {
+    pub total: u32,
+    pub completed: u32,
+    pub in_progress: u32,
+    pub blocked: u32,
+    pub pending: u32,
+    pub failed: u32,
+}
+
+impl TaskCounts {
+    /// Count tasks by status.
+    pub fn from_tasks(tasks: &[TaskNode]) -> Self {
+        let mut c = Self {
+            total: tasks.len() as u32,
+            ..Self::default()
+        };
+        for t in tasks {
+            match t.status {
+                TaskStatus::Completed => c.completed += 1,
+                TaskStatus::InProgress => c.in_progress += 1,
+                TaskStatus::Blocked => c.blocked += 1,
+                TaskStatus::Pending => c.pending += 1,
+                TaskStatus::Failed => c.failed += 1,
+            }
+        }
+        c
+    }
+}
+
+/// Entity kind a batch progress request is computed for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgressKind {
+    Plan,
+    Project,
+    Milestone,
 }
 
 /// A task with its parent plan information (for global task queries)
@@ -929,6 +1053,154 @@ pub enum ReleaseStatus {
     Cancelled,
 }
 
+// ============================================================================
+// Environments & deployments
+// ============================================================================
+
+/// A place where a project runs (dev, staging, production, ...).
+///
+/// `(Project)-[:HAS_ENVIRONMENT]->(Environment)`. The name is unique per project.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EnvironmentNode {
+    pub id: Uuid,
+    pub project_id: Uuid,
+    pub name: String,
+    pub kind: EnvironmentKind,
+    pub url: Option<String>,
+    pub description: Option<String>,
+    /// Free-form JSON string (host, region, runtime, ...)
+    pub config: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Kind of environment
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EnvironmentKind {
+    Dev,
+    Staging,
+    Production,
+    Other,
+}
+
+impl EnvironmentKind {
+    /// Canonical snake_case name (also the value persisted in Neo4j)
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Dev => "dev",
+            Self::Staging => "staging",
+            Self::Production => "production",
+            Self::Other => "other",
+        }
+    }
+}
+
+impl std::fmt::Display for EnvironmentKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for EnvironmentKind {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_lowercase().as_str() {
+            "dev" => Ok(Self::Dev),
+            "staging" => Ok(Self::Staging),
+            "production" => Ok(Self::Production),
+            "other" => Ok(Self::Other),
+            _ => Err(format!(
+                "Invalid environment kind '{}': expected dev, staging, production or other",
+                s
+            )),
+        }
+    }
+}
+
+/// One deployment of a project version/commit to an environment.
+///
+/// `(Environment)-[:HAS_DEPLOYMENT]->(Deployment)`, and optionally
+/// `(Deployment)-[:DEPLOYS]->(Commit)` when a commit node with that sha exists.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DeploymentNode {
+    pub id: Uuid,
+    pub environment_id: Uuid,
+    pub version: Option<String>,
+    pub commit_sha: Option<String>,
+    pub status: DeploymentStatus,
+    pub notes: Option<String>,
+    pub created_by: String,
+    pub started_at: DateTime<Utc>,
+    pub finished_at: Option<DateTime<Utc>>,
+}
+
+/// Status of a deployment
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DeploymentStatus {
+    Pending,
+    Running,
+    Succeeded,
+    Failed,
+    RolledBack,
+}
+
+impl DeploymentStatus {
+    /// Canonical snake_case name (also the value persisted in Neo4j)
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::RolledBack => "rolled_back",
+        }
+    }
+
+    /// True once the deployment can no longer change on its own
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, Self::Succeeded | Self::Failed | Self::RolledBack)
+    }
+}
+
+impl std::fmt::Display for DeploymentStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for DeploymentStatus {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_lowercase().as_str() {
+            "pending" => Ok(Self::Pending),
+            "running" => Ok(Self::Running),
+            "succeeded" => Ok(Self::Succeeded),
+            "failed" => Ok(Self::Failed),
+            "rolled_back" => Ok(Self::RolledBack),
+            _ => Err(format!(
+                "Invalid deployment status '{}': expected pending, running, succeeded, failed or rolled_back",
+                s
+            )),
+        }
+    }
+}
+
+/// Number of recent statuses reported per environment in the deployment matrix
+pub const DEPLOYMENT_MATRIX_RECENT: usize = 5;
+
+/// One row of the deployment matrix: an environment and what was deployed there.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DeploymentMatrixEntry {
+    pub environment: EnvironmentNode,
+    pub latest_deployment: Option<DeploymentNode>,
+    /// Statuses of the last deployments, newest first (at most
+    /// [`DEPLOYMENT_MATRIX_RECENT`])
+    pub recent_statuses: Vec<DeploymentStatus>,
+}
+
 /// A milestone in the roadmap
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MilestoneNode {
@@ -1069,6 +1341,12 @@ pub enum ComponentType {
     Gateway,
     /// External service (third-party)
     External,
+    /// Library or framework consumed at build time, not deployed on its own.
+    /// Without this, every library lands in `Other` beside genuine services.
+    Library,
+    /// Command-line tool. An entry point into the system like a frontend is,
+    /// which is why typing one as `Service` misplaces it entirely.
+    Cli,
     /// Other component type
     Other,
 }
@@ -1086,10 +1364,48 @@ impl std::str::FromStr for ComponentType {
             "cache" => Ok(ComponentType::Cache),
             "gateway" | "apigateway" | "api_gateway" => Ok(ComponentType::Gateway),
             "external" => Ok(ComponentType::External),
+            "library" | "lib" | "framework" => Ok(ComponentType::Library),
+            "cli" | "commandline" | "tool" => Ok(ComponentType::Cli),
             "other" => Ok(ComponentType::Other),
             _ => Err(format!("Unknown ComponentType: {}", s)),
         }
     }
+}
+
+/// A component as architecture derivation wants it written.
+///
+/// A struct rather than a parameter list: this carries two `Option<String>` and a
+/// `Vec<String>` side by side, which is the shape that let `component_type` go
+/// missing from the update path unnoticed in the first place.
+#[derive(Debug, Clone)]
+pub struct DerivedComponentWrite {
+    pub workspace_id: Uuid,
+    /// Identity, together with the workspace. The product name, not the client
+    /// package: a Rust project and a TypeScript one reaching the same Neo4j must
+    /// resolve to one node.
+    pub name: String,
+    pub component_type: ComponentType,
+    pub description: Option<String>,
+    pub runtime: Option<String>,
+    pub tags: Vec<String>,
+    /// Free-form config carrying the provenance of this derivation.
+    pub config: serde_json::Value,
+}
+
+/// Fields to change on a component. `None` leaves a field untouched.
+///
+/// A named struct rather than a positional argument list: the update path carries
+/// four `Option<String>` in a row, and two of them were once swappable without the
+/// compiler noticing. `component_type` in particular was absent from this update
+/// path entirely, so the API reported success while silently discarding it.
+#[derive(Debug, Clone, Default)]
+pub struct ComponentUpdate {
+    pub name: Option<String>,
+    pub component_type: Option<ComponentType>,
+    pub description: Option<String>,
+    pub runtime: Option<String>,
+    pub config: Option<serde_json::Value>,
+    pub tags: Option<Vec<String>>,
 }
 
 /// A component in the deployment topology
@@ -1710,7 +2026,7 @@ pub enum FeatureRole {
 }
 
 /// An entity included in a feature graph (file, function, struct, trait).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FeatureGraphEntity {
     pub entity_type: String,
     pub entity_id: String,
@@ -1723,6 +2039,104 @@ pub struct FeatureGraphEntity {
     /// Allows visualizing the most important nodes in the feature graph.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub importance_score: Option<f64>,
+    /// Source file: the path itself for files, the containing file for
+    /// functions/structs/traits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_path: Option<String>,
+    /// Doc comment of the entity (trimmed, capped at ~400 chars).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub docstring: Option<String>,
+    /// Rust-like signature, e.g. `pub async fn foo(a: T) -> R`, `struct Foo`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+    /// First line of the definition in its file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line_start: Option<u32>,
+    /// Normalized visibility (`public`, `private`, `crate`, `super`, `restricted`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visibility: Option<String>,
+}
+
+/// Maximum number of characters kept from a docstring in feature graph entities.
+pub const FEATURE_GRAPH_DOCSTRING_MAX_CHARS: usize = 400;
+
+/// Trim a docstring and cap it at [`FEATURE_GRAPH_DOCSTRING_MAX_CHARS`] chars
+/// (adding an ellipsis when truncated). Returns `None` for empty/blank input.
+pub fn clean_entity_docstring(raw: &str) -> Option<String> {
+    let t = raw.trim();
+    if t.is_empty() {
+        return None;
+    }
+    if t.chars().count() <= FEATURE_GRAPH_DOCSTRING_MAX_CHARS {
+        return Some(t.to_string());
+    }
+    let cut: String = t.chars().take(FEATURE_GRAPH_DOCSTRING_MAX_CHARS).collect();
+    Some(format!("{}…", cut.trim_end()))
+}
+
+/// Normalize a visibility as stored in Neo4j (`format!("{:?}", Visibility)`,
+/// e.g. `Public`, `InPath("crate::x")`) to a lowercase label.
+pub fn normalize_visibility(raw: &str) -> Option<String> {
+    let t = raw.trim();
+    if t.is_empty() {
+        return None;
+    }
+    Some(if t.starts_with("InPath") {
+        "restricted".to_string()
+    } else {
+        t.to_lowercase()
+    })
+}
+
+fn visibility_prefix(vis: Option<&str>) -> &'static str {
+    match vis {
+        Some("public") => "pub ",
+        Some("crate") => "pub(crate) ",
+        Some("super") => "pub(super) ",
+        Some("restricted") => "pub(in ..) ",
+        _ => "",
+    }
+}
+
+/// Build a function signature from stored node properties.
+/// `params_json` is the JSON array stored in `Function.params`
+/// (`[{"name":..,"type_name":..}]`); invalid/empty JSON yields no params.
+pub fn build_function_signature(
+    name: &str,
+    visibility: Option<&str>,
+    is_async: bool,
+    is_unsafe: bool,
+    params_json: Option<&str>,
+    return_type: Option<&str>,
+) -> String {
+    let params: Vec<Parameter> = params_json
+        .and_then(|j| serde_json::from_str(j).ok())
+        .unwrap_or_default();
+    let params = params
+        .iter()
+        .map(|p| match p.type_name.as_deref().map(str::trim) {
+            Some(t) if !t.is_empty() => format!("{}: {}", p.name, t),
+            _ => p.name.clone(),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut sig = String::from(visibility_prefix(visibility));
+    if is_async {
+        sig.push_str("async ");
+    }
+    if is_unsafe {
+        sig.push_str("unsafe ");
+    }
+    sig.push_str(&format!("fn {}({})", name, params));
+    if let Some(r) = return_type.map(str::trim).filter(|r| !r.is_empty()) {
+        sig.push_str(&format!(" -> {}", r));
+    }
+    sig
+}
+
+/// Build `pub struct Name` / `trait Name` style signatures.
+pub fn build_type_signature(keyword: &str, name: &str, visibility: Option<&str>) -> String {
+    format!("{}{} {}", visibility_prefix(visibility), keyword, name)
 }
 
 /// A relationship between two entities inside a feature graph.
@@ -2506,6 +2920,10 @@ pub struct McpServerNode {
     pub transport_command: Option<String>,
     /// Transport args (for Stdio, JSON array as string).
     pub transport_args: Option<String>,
+    /// Stdio env vars / HTTP headers needed to reconnect after a restart, as JSON
+    /// `{"env":{..},"headers":{..}}`. May hold secrets: never serialised to API output.
+    #[serde(default, skip_serializing)]
+    pub transport_secrets: Option<String>,
     /// Current connection status: "connected", "disconnected", "error".
     pub status: String,
     /// MCP protocol version reported by the server.
@@ -2544,6 +2962,108 @@ pub struct McpToolNode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── FeatureGraphEntity enrichment ──
+
+    #[test]
+    fn test_signature_pub_async_with_params_and_return() {
+        let sig = build_function_signature(
+            "run",
+            Some("public"),
+            true,
+            false,
+            Some(r#"[{"name":"a","type_name":"T"},{"name":"b","type_name":"U"}]"#),
+            Some("R"),
+        );
+        assert_eq!(sig, "pub async fn run(a: T, b: U) -> R");
+    }
+
+    #[test]
+    fn test_signature_no_params_private() {
+        assert_eq!(
+            build_function_signature("go", Some("private"), false, false, Some("[]"), None),
+            "fn go()"
+        );
+        assert_eq!(
+            build_function_signature("go", None, false, false, Some("not json"), Some("")),
+            "fn go()"
+        );
+    }
+
+    #[test]
+    fn test_signature_untyped_param_and_unsafe_crate() {
+        let sig = build_function_signature(
+            "f",
+            Some("crate"),
+            false,
+            true,
+            Some(r#"[{"name":"self","type_name":null}]"#),
+            None,
+        );
+        assert_eq!(sig, "pub(crate) unsafe fn f(self)");
+    }
+
+    #[test]
+    fn test_signature_struct_and_trait() {
+        assert_eq!(
+            build_type_signature("struct", "Foo", Some("public")),
+            "pub struct Foo"
+        );
+        assert_eq!(build_type_signature("trait", "Bar", None), "trait Bar");
+    }
+
+    #[test]
+    fn test_normalize_visibility_and_docstring() {
+        assert_eq!(normalize_visibility("Public").as_deref(), Some("public"));
+        assert_eq!(
+            normalize_visibility("InPath(\"crate::x\")").as_deref(),
+            Some("restricted")
+        );
+        assert_eq!(normalize_visibility(" "), None);
+        assert_eq!(clean_entity_docstring("  \n "), None);
+        assert_eq!(clean_entity_docstring(" hi \n").as_deref(), Some("hi"));
+        let long = "x".repeat(1000);
+        let c = clean_entity_docstring(&long).unwrap();
+        assert_eq!(c.chars().count(), FEATURE_GRAPH_DOCSTRING_MAX_CHARS + 1);
+        assert!(c.ends_with('…'));
+    }
+
+    #[test]
+    fn test_feature_graph_entity_new_fields_serialization() {
+        let bare = FeatureGraphEntity {
+            entity_type: "function".into(),
+            entity_id: "f".into(),
+            ..Default::default()
+        };
+        let v = serde_json::to_value(&bare).unwrap();
+        for k in [
+            "file_path",
+            "docstring",
+            "signature",
+            "line_start",
+            "visibility",
+        ] {
+            assert!(v.get(k).is_none(), "{k} should be absent");
+        }
+        let full = FeatureGraphEntity {
+            file_path: Some("src/a.rs".into()),
+            docstring: Some("doc".into()),
+            signature: Some("fn f()".into()),
+            line_start: Some(3),
+            visibility: Some("public".into()),
+            ..bare
+        };
+        let v = serde_json::to_value(&full).unwrap();
+        assert_eq!(v["file_path"], "src/a.rs");
+        assert_eq!(v["docstring"], "doc");
+        assert_eq!(v["signature"], "fn f()");
+        assert_eq!(v["line_start"], 3);
+        assert_eq!(v["visibility"], "public");
+        // Old payloads without the new fields still deserialize.
+        let old: FeatureGraphEntity =
+            serde_json::from_str(r#"{"entity_type":"file","entity_id":"a","name":null}"#).unwrap();
+        assert!(old.signature.is_none());
+    }
 
     #[test]
     fn test_workspace_node_serialization() {
@@ -3156,6 +3676,7 @@ mod tests {
             transport_url: Some("http://localhost:8080/sse".to_string()),
             transport_command: None,
             transport_args: None,
+            transport_secrets: None,
             status: "connected".to_string(),
             protocol_version: Some("2025-03-26".to_string()),
             server_name: Some("Grafeo".to_string()),
@@ -3198,6 +3719,7 @@ mod tests {
             transport_url: None,
             transport_command: Some("npx".to_string()),
             transport_args: Some(r#"["-y","@modelcontextprotocol/server-github"]"#.to_string()),
+            transport_secrets: None,
             status: "connected".to_string(),
             protocol_version: Some("2024-11-05".to_string()),
             server_name: None,

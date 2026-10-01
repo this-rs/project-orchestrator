@@ -132,7 +132,7 @@ Events sent from the server to the client. Each event includes a `type` field an
 | `tool_result` | Result of a tool invocation | `id`, `result`, `is_error` |
 | `tool_use_input_resolved` | Full input resolved for a tool_use (emitted when the complete input arrives after an initial empty one) | `id`, `input` |
 | `permission_request` | Claude needs permission to use a tool | `id`, `tool`, `input` |
-| `input_request` | Claude needs user input | `prompt`, `options` (optional array) |
+| `ask_user_question` | Claude asks the user a question (AskUserQuestion tool) | `id`, `tool_call_id`, `questions`, `input` |
 | `result` | Conversation turn completed | `session_id`, `duration_ms`, `cost_usd` (optional) |
 | `stream_delta` | Raw streaming text token (real-time) | `text` |
 | `streaming_status` | Stream state change | `is_streaming` (boolean) |

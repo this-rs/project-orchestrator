@@ -76,6 +76,23 @@ pub struct Document {
     pub project_id: Option<Uuid>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<Uuid>,
+    /// Whether any extractor read this file. `false` for an opaque attachment
+    /// (a `.zip`, an image…): the bytes are stored and downloadable, but there
+    /// is no text, no chunks, and nothing for search or an agent to read.
+    ///
+    /// Nodes written before this field existed were all extracted, so a
+    /// missing property reads back as `true`.
+    #[serde(default = "default_extracted")]
+    pub extracted: bool,
+    /// Media type the file is served as, derived server-side from the content
+    /// (never echoed from the client). `None` on nodes that predate the field;
+    /// readers fall back to a type implied by `format`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+}
+
+fn default_extracted() -> bool {
+    true
 }
 
 /// One chunk of a document, as stored on a `(:DocumentChunk)` node.
@@ -143,6 +160,9 @@ fn format_from_str(s: &str) -> DocumentFormat {
     match s {
         "docx" => DocumentFormat::Docx,
         "pdf" => DocumentFormat::Pdf,
+        "xlsx" => DocumentFormat::Xlsx,
+        "pptx" => DocumentFormat::Pptx,
+        "binary" => DocumentFormat::Binary,
         _ => DocumentFormat::PlainText,
     }
 }
@@ -234,7 +254,9 @@ impl Neo4jClient {
                 d.warnings = $warnings,
                 d.created_at = datetime($created_at),
                 d.project_id = $project_id,
-                d.session_id = $session_id
+                d.session_id = $session_id,
+                d.extracted = $extracted,
+                d.mime_type = $mime_type
             "#,
         )
         .param("id", document.id.to_string())
@@ -247,7 +269,9 @@ impl Neo4jClient {
         .param("warnings", document.warnings.clone())
         .param("created_at", document.created_at.to_rfc3339())
         .param("project_id", document.project_id.map(|id| id.to_string()))
-        .param("session_id", document.session_id.map(|id| id.to_string()));
+        .param("session_id", document.session_id.map(|id| id.to_string()))
+        .param("extracted", document.extracted)
+        .param("mime_type", document.mime_type.clone());
 
         self.graph
             .run(q)
@@ -766,6 +790,10 @@ impl Neo4jClient {
                 .get::<String>("session_id")
                 .ok()
                 .and_then(|s| s.parse().ok()),
+            // Absent on nodes written before opaque attachments existed, all of
+            // which were extracted.
+            extracted: node.get::<bool>("extracted").unwrap_or(true),
+            mime_type: node.get::<String>("mime_type").ok(),
         })
     }
 
@@ -809,6 +837,8 @@ mod tests {
             created_at: Utc::now(),
             project_id,
             session_id: None,
+            extracted: true,
+            mime_type: Some("application/pdf".to_string()),
         }
     }
 

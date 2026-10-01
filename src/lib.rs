@@ -12,6 +12,7 @@
 
 pub mod analytics;
 pub mod api;
+pub mod architecture;
 pub mod auth;
 pub mod chat;
 pub mod documents;
@@ -47,6 +48,7 @@ pub mod skills;
 pub mod transport;
 pub mod update;
 pub(crate) mod utils;
+pub mod vault;
 
 #[cfg(test)]
 pub(crate) mod test_helpers;
@@ -1235,7 +1237,15 @@ pub async fn start_server(mut config: Config) -> Result<()> {
                         skipped += 1;
                         continue;
                     }
-                    let expanded = expand_tilde(&project.root_path);
+                    let Some(expanded) = project.expanded_root_path() else {
+                        tracing::debug!(
+                            "Auto-watch: skipping project '{}' — no root_path (profile={})",
+                            project.slug,
+                            project.profile.as_str(),
+                        );
+                        skipped += 1;
+                        continue;
+                    };
                     let path = std::path::Path::new(&expanded);
                     if !path.exists() {
                         tracing::warn!(
@@ -1278,8 +1288,8 @@ pub async fn start_server(mut config: Config) -> Result<()> {
                     let project_ids: Vec<_> = projects
                         .iter()
                         .filter(|p| {
-                            let expanded = expand_tilde(&p.root_path);
-                            std::path::Path::new(&expanded).exists()
+                            p.expanded_root_path()
+                                .is_some_and(|e| std::path::Path::new(&e).exists())
                         })
                         .map(|p| (p.id, p.slug.clone()))
                         .collect();
@@ -1323,8 +1333,8 @@ pub async fn start_server(mut config: Config) -> Result<()> {
                     let skill_project_ids: Vec<_> = projects
                         .iter()
                         .filter(|p| {
-                            let expanded = expand_tilde(&p.root_path);
-                            std::path::Path::new(&expanded).exists()
+                            p.expanded_root_path()
+                                .is_some_and(|e| std::path::Path::new(&e).exists())
                         })
                         .map(|p| (p.id, p.slug.clone()))
                         .collect();
@@ -1432,6 +1442,21 @@ pub async fn start_server(mut config: Config) -> Result<()> {
         w
     };
 
+    // Secrets vault — always LOCKED at start: the server cannot open it alone.
+    let vault = match vault::VaultService::open(
+        vault::Vault::default_path(),
+        vault::crypto::KdfParams::default(),
+        vault::mask::global().clone(),
+    ) {
+        Ok(v) => Arc::new(v),
+        Err(e) => {
+            // A malformed vault file must not take the server down; the vault
+            // API then reports it and nothing can be read.
+            tracing::error!("Secrets vault unavailable: {e}");
+            vault::VaultService::unavailable(e.to_string())
+        }
+    };
+
     // Create chat manager (optional — requires Claude CLI)
     let chat_manager = {
         let mut chat_config = chat::ChatConfig::from_env();
@@ -1489,7 +1514,8 @@ pub async fn start_server(mut config: Config) -> Result<()> {
             chat_config,
         )
         .await
-        .with_event_emitter(event_bus.clone());
+        .with_event_emitter(event_bus.clone())
+        .with_vault(vault.clone());
         // Pass config.yaml path so permission changes can be persisted to disk
         if let Some(ref yaml_path) = config.config_yaml_path {
             cm = cm.with_config_yaml_path(yaml_path.clone());
@@ -1648,8 +1674,9 @@ pub async fn start_server(mut config: Config) -> Result<()> {
     // Runs independently of chat sessions (like ScheduleProvider).
     {
         use heartbeat::checks::{
-            consolidation::ConsolidationCheck, convention_guard::ConventionGuardCheck,
-            git_drift::GitDriftCheck, homeostasis::HomeostasisCheck, maintenance::MaintenanceCheck,
+            architecture_drift::ArchitectureDriftCheck, consolidation::ConsolidationCheck,
+            convention_guard::ConventionGuardCheck, git_drift::GitDriftCheck,
+            homeostasis::HomeostasisCheck, maintenance::MaintenanceCheck,
             staleness::StalenessCheck, synapse_decay::SynapseDecayCheck,
             synapse_replenish::SynapseReplenishCheck,
         };
@@ -1668,6 +1695,11 @@ pub async fn start_server(mut config: Config) -> Result<()> {
             Box::new(MaintenanceCheck::new()),
             Box::new(ConsolidationCheck),
             Box::new(HomeostasisCheck::new()),
+            // Derives the architecture of ONE workspace per tick, rotating. It
+            // touches nothing the synapse checks care about, so its position here
+            // is free — but its per-run bound is not: the engine awaits each
+            // check inline, so an unbounded one starves the rest (PR #309).
+            Box::new(ArchitectureDriftCheck::new()),
             // MUST run LAST: the engine executes checks in vec order within a tick
             // (engine.rs:88). SynapseDecayCheck and MaintenanceCheck (deep_maintenance
             // applies an aggressive 3x decay + prune) both delete synapses; replenish
@@ -1773,6 +1805,7 @@ pub async fn start_server(mut config: Config) -> Result<()> {
             catalog_emitter,
             catalog_graph,
         ),
+        vault: vault.clone(),
     });
 
     // ── EventReactor: build, register built-in reactions, and spawn ──
@@ -1854,6 +1887,18 @@ pub async fn start_server(mut config: Config) -> Result<()> {
                     let mut failed = 0usize;
 
                     for server in &unique_servers {
+                        // Env vars / headers saved with the server (secrets included).
+                        let secrets: serde_json::Value = server
+                            .transport_secrets
+                            .as_deref()
+                            .and_then(|s| serde_json::from_str(s).ok())
+                            .unwrap_or_default();
+                        let saved_map = |key: &str| -> std::collections::HashMap<String, String> {
+                            secrets
+                                .get(key)
+                                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                                .unwrap_or_default()
+                        };
                         // Rebuild McpTransport from stored fields
                         let transport = match server.transport_type.as_str() {
                             "stdio" => {
@@ -1873,7 +1918,7 @@ pub async fn start_server(mut config: Config) -> Result<()> {
                                 mcp_federation::McpTransport::Stdio {
                                     command: command.clone(),
                                     args,
-                                    env: std::collections::HashMap::new(),
+                                    env: saved_map("env"),
                                 }
                             }
                             "sse" => {
@@ -1887,7 +1932,7 @@ pub async fn start_server(mut config: Config) -> Result<()> {
                                 };
                                 mcp_federation::McpTransport::Sse {
                                     url: url.clone(),
-                                    headers: std::collections::HashMap::new(),
+                                    headers: saved_map("headers"),
                                 }
                             }
                             "streamable_http" => {
@@ -1901,7 +1946,7 @@ pub async fn start_server(mut config: Config) -> Result<()> {
                                 };
                                 mcp_federation::McpTransport::StreamableHttp {
                                     url: url.clone(),
-                                    headers: std::collections::HashMap::new(),
+                                    headers: saved_map("headers"),
                                 }
                             }
                             other => {
@@ -1921,12 +1966,23 @@ pub async fn start_server(mut config: Config) -> Result<()> {
                             transport,
                         };
 
-                        match tokio::time::timeout(
-                            std::time::Duration::from_secs(30),
-                            registry.write().await.connect(config),
-                        )
-                        .await
-                        {
+                        // A few attempts with a growing pause: at boot the network, the
+                        // package runner or the PATH may not be ready on the first try.
+                        let mut attempt = 0u32;
+                        let outcome = loop {
+                            let res = tokio::time::timeout(
+                                std::time::Duration::from_secs(30),
+                                registry.write().await.connect(config.clone()),
+                            )
+                            .await;
+                            if matches!(res, Ok(Ok(_))) || attempt >= 2 {
+                                break res;
+                            }
+                            attempt += 1;
+                            tokio::time::sleep(std::time::Duration::from_secs(10 * attempt as u64))
+                                .await;
+                        };
+                        match outcome {
                             Ok(Ok(_summary)) => {
                                 tracing::info!("MCP federation: restored '{}'", server.server_id);
                                 connected += 1;
@@ -1980,6 +2036,14 @@ pub async fn start_server(mut config: Config) -> Result<()> {
     } else {
         tracing::info!("Frontend serving disabled (API-only mode)");
     }
+
+    // Release checker (startup + every ~6h, never blocks or fails startup).
+    // Self-install of the binary is OPT-IN: only an explicit
+    // `chat.auto_update_app: true` / CHAT_AUTO_UPDATE_APP=true enables it (the
+    // chat default of `true` is about the desktop updater), and even then it
+    // only stages the new binary on disk for standalone deployments — the
+    // running process is never restarted automatically.
+    let _ = update::service::start_global(config.chat_auto_update_app == Some(true));
 
     // Start serving. The port was bound at the top of `start_server`.
     tracing::info!("Server listening on {}", addr);

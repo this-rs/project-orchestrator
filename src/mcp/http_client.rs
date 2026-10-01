@@ -215,6 +215,28 @@ impl McpHttpClient {
         }
     }
 
+    /// Call a vault agent route. These accept only the session's vault token
+    /// (`PO_VAULT_TOKEN`), never the MCP session token.
+    pub async fn vault_call(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<&Value>,
+    ) -> Result<Value> {
+        let token = std::env::var("PO_VAULT_TOKEN").ok().filter(|t| !t.is_empty()).ok_or_else(|| {
+            anyhow::anyhow!(
+                "No vault access here: PO_VAULT_TOKEN is set only for Project Orchestrator chat sessions (with auth enabled)."
+            )
+        })?;
+        let url = format!("{}{}", self.base_url, path);
+        let mut req = self.client.request(method.clone(), &url).bearer_auth(token);
+        if let Some(b) = body {
+            req = req.json(b);
+        }
+        let resp = req.send().await.context("HTTP vault request failed")?;
+        self.handle_response(resp, method.as_str(), &url).await
+    }
+
     /// Process HTTP response: check status, parse JSON, provide context on errors.
     async fn handle_response(&self, resp: Response, method: &str, url: &str) -> Result<Value> {
         let status = resp.status();

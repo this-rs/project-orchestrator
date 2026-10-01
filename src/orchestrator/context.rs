@@ -64,15 +64,24 @@ impl ContextBuilder {
             target_files.push(file_context);
         }
 
-        // Search for similar code
+        // Retrieval is scoped to the plan's own projects. Both searches used to
+        // run against the WHOLE index: a React card task in the PO Frontend got
+        // an eigensolver decision from obrain and replay-buffer code from elun —
+        // pure noise in the agent's context, on every plan. A plan with no
+        // project gets no retrieval at all rather than a guess from everywhere.
+        let project_slugs = self
+            .neo4j
+            .list_plan_project_slugs(plan_id)
+            .await
+            .unwrap_or_default();
+        let search_query = task_search_query(&task_details.task);
+
         let similar_code = self
-            .search_similar_code(&task_details.task.description, 5)
+            .search_similar_code(&search_query, 5, &project_slugs)
             .await?;
 
-        // Search for related decisions
         let related_decisions = self
-            .plan_manager
-            .search_decisions(&task_details.task.description, 5, None)
+            .search_related_decisions(&search_query, 5, &project_slugs)
             .await?;
 
         // Get notes for the task
@@ -89,13 +98,14 @@ impl ContextBuilder {
         let mut all_notes = task_notes;
         all_notes.extend(plan_notes);
 
-        // Deduplicate notes by ID
-        all_notes.sort_by(|a, b| {
-            b.relevance_score
-                .partial_cmp(&a.relevance_score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        all_notes.dedup_by_key(|n| n.id);
+        // Deduplicate notes by ID, keeping the most relevant copy.
+        //
+        // `Vec::dedup_by_key` only removes CONSECUTIVE duplicates. After sorting
+        // by relevance — where linked notes all score 1.0 — two copies of the
+        // same note are not necessarily adjacent, so both survived: a note linked
+        // to the task came back once through the task and once through its
+        // project. A seen-set removes every repeat whatever its position.
+        dedupe_notes_by_id(&mut all_notes);
 
         // Biomimicry: Frustration-Catharsis — inject signals when frustration is elevated
         let frustration_signals =
@@ -254,23 +264,55 @@ impl ContextBuilder {
         Ok(imports.into_iter().map(|i| i.path).collect())
     }
 
-    /// Search for similar code using Meilisearch
-    async fn search_similar_code(&self, query: &str, limit: usize) -> Result<Vec<CodeReference>> {
-        let hits = self
-            .meili
-            .search_code_with_scores(query, limit, None, None, None)
-            .await?;
-
-        let references = hits
-            .into_iter()
-            .map(|hit| CodeReference {
+    /// Search for similar code, restricted to the given projects.
+    ///
+    /// Each project is searched separately (the index takes one project filter),
+    /// then hits are merged by score. No project → no results: an unscoped search
+    /// returns whatever is closest anywhere on the machine, which is how unrelated
+    /// repositories ended up in task prompts.
+    async fn search_similar_code(
+        &self,
+        query: &str,
+        limit: usize,
+        project_slugs: &[String],
+    ) -> Result<Vec<CodeReference>> {
+        let mut references: Vec<CodeReference> = Vec::new();
+        for slug in project_slugs {
+            let hits = self
+                .meili
+                .search_code_with_scores(query, limit, None, Some(slug), None)
+                .await?;
+            references.extend(hits.into_iter().map(|hit| CodeReference {
                 path: hit.document.path,
                 snippet: hit.document.docstrings.chars().take(500).collect(),
                 relevance: hit.score as f32,
-            })
-            .collect();
+            }));
+        }
 
-        Ok(references)
+        Ok(merge_code_references(references, limit))
+    }
+
+    /// Search past decisions, restricted to the given projects.
+    ///
+    /// Decisions carry no score, so per-project results are interleaved rather
+    /// than concatenated — otherwise the alphabetically first project would take
+    /// every slot and a backend task on a frontend+backend plan would only ever
+    /// see frontend decisions.
+    async fn search_related_decisions(
+        &self,
+        query: &str,
+        limit: usize,
+        project_slugs: &[String],
+    ) -> Result<Vec<DecisionNode>> {
+        let mut per_project: Vec<Vec<DecisionNode>> = Vec::new();
+        for slug in project_slugs {
+            per_project.push(
+                self.plan_manager
+                    .search_decisions(query, limit, Some(slug))
+                    .await?,
+            );
+        }
+        Ok(interleave_decisions(per_project, limit))
     }
 
     /// Build enriched context by running the EnrichmentPipeline on top of the base context.
@@ -349,8 +391,14 @@ impl ContextBuilder {
     pub fn build_prompt_builder(&self, context: &AgentContext) -> PromptBuilder {
         let mut builder = PromptBuilder::new();
 
-        // Task description
-        builder = builder.with_task(format!("{}\n", context.task.description));
+        // Task statement — same rendering as generate_prompt (render_task_statement).
+        let (heading, body) = render_task_statement(&context.task);
+        let task_section = if body.is_empty() {
+            format!("{}\n", heading)
+        } else {
+            format!("{}\n\n{}", heading, body)
+        };
+        builder = builder.with_task(task_section);
 
         // Constraints
         if !context.constraints.is_empty() {
@@ -562,8 +610,15 @@ impl ContextBuilder {
     pub fn generate_prompt(&self, context: &AgentContext) -> String {
         let mut prompt = String::new();
 
-        // Task description
-        prompt.push_str(&format!("# Task: {}\n\n", context.task.description));
+        // Task statement: title, description, acceptance criteria.
+        // Shared with build_prompt_builder so the two prompt paths cannot drift —
+        // they already had, both dropping the acceptance criteria.
+        let (heading, body) = render_task_statement(&context.task);
+        prompt.push_str(&format!("# Task: {}\n\n", heading));
+        if !body.is_empty() {
+            prompt.push_str(&body);
+            prompt.push('\n');
+        }
 
         // Constraints
         if !context.constraints.is_empty() {
@@ -996,6 +1051,121 @@ pub async fn pre_read_affected_files(
     output
 }
 
+/// The task statement both prompt builders emit: a heading and a body.
+///
+/// The heading is the title when there is one, the description otherwise (the
+/// historical behaviour, kept for tasks created without a title). The body then
+/// carries the description — when it is not already the heading — and the
+/// acceptance criteria.
+///
+/// The acceptance criteria were missing from BOTH prompt paths: an agent was
+/// told what to do but never what "done" meant. Everything written there —
+/// edge cases, accessibility, UX rules — was invisible to the one reader it
+/// was written for.
+pub(crate) fn render_task_statement(task: &TaskNode) -> (String, String) {
+    let title = task
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty());
+
+    let (heading, mut body) = match title {
+        Some(title) => (title.to_string(), task.description.trim().to_string()),
+        None => (task.description.trim().to_string(), String::new()),
+    };
+
+    let criteria: Vec<&str> = task
+        .acceptance_criteria
+        .iter()
+        .map(|c| c.trim())
+        .filter(|c| !c.is_empty())
+        .collect();
+
+    if !criteria.is_empty() {
+        if !body.is_empty() {
+            body.push_str("\n\n");
+        }
+        body.push_str("## Acceptance Criteria\n");
+        body.push_str(
+            "The task is done only when EVERY criterion below holds. \
+             Check each one before reporting completion.\n",
+        );
+        for criterion in criteria {
+            body.push_str(&format!("- [ ] {}\n", criterion));
+        }
+    }
+
+    (heading, body)
+}
+
+/// Search text for a task: title and description together.
+///
+/// The description alone is often a paragraph of rationale; the title names the
+/// thing being built, which is what similar code and past decisions match on.
+fn task_search_query(task: &TaskNode) -> String {
+    match task
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+    {
+        Some(title) => format!("{} {}", title, task.description),
+        None => task.description.clone(),
+    }
+}
+
+/// Remove every repeated note id, keeping the most relevant copy.
+///
+/// Not `dedup_by_key`: that only drops CONSECUTIVE repeats, and after a sort by
+/// relevance two copies of one note are not guaranteed to be neighbours.
+fn dedupe_notes_by_id(notes: &mut Vec<ContextNote>) {
+    notes.sort_by(|a, b| {
+        b.relevance_score
+            .partial_cmp(&a.relevance_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut seen = std::collections::HashSet::new();
+    notes.retain(|n| seen.insert(n.id));
+}
+
+/// Merge per-project code hits: best score first, one entry per path.
+fn merge_code_references(mut refs: Vec<CodeReference>, limit: usize) -> Vec<CodeReference> {
+    refs.sort_by(|a, b| {
+        b.relevance
+            .partial_cmp(&a.relevance)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut seen = std::collections::HashSet::new();
+    refs.retain(|r| seen.insert(r.path.clone()));
+    refs.truncate(limit);
+    refs
+}
+
+/// Interleave per-project decision lists (they carry no score to merge on),
+/// dropping repeats, so each project gets a fair share of the slots.
+fn interleave_decisions(per_project: Vec<Vec<DecisionNode>>, limit: usize) -> Vec<DecisionNode> {
+    let mut iters: Vec<_> = per_project.into_iter().map(|v| v.into_iter()).collect();
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    loop {
+        let mut progressed = false;
+        for it in iters.iter_mut() {
+            if out.len() >= limit {
+                return out;
+            }
+            if let Some(d) = it.next() {
+                progressed = true;
+                if seen.insert(d.id) {
+                    out.push(d);
+                }
+            }
+        }
+        if !progressed {
+            return out;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1410,5 +1580,330 @@ mod tests {
 
         assert!(code_ref.relevance > 0.9);
         assert!(code_ref.snippet.contains("fn process_data"));
+    }
+
+    // -----------------------------------------------------------------
+    // Acceptance criteria reach the agent (regression: both prompt paths
+    // used to render the description only)
+    // -----------------------------------------------------------------
+
+    fn context_for(task: TaskNode) -> AgentContext {
+        AgentContext {
+            task,
+            steps: vec![],
+            constraints: vec![],
+            decisions: vec![],
+            target_files: vec![],
+            similar_code: vec![],
+            related_decisions: vec![],
+            notes: vec![],
+            frustration_signals: None,
+        }
+    }
+
+    fn mock_builder() -> ContextBuilder {
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let search: Arc<dyn SearchStore> =
+            Arc::new(crate::meilisearch::mock::MockSearchStore::new());
+        ContextBuilder::new(
+            graph.clone(),
+            search.clone(),
+            Arc::new(PlanManager::new(graph.clone(), search.clone())),
+            Arc::new(NoteManager::new(graph, search)),
+        )
+    }
+
+    #[test]
+    fn task_statement_carries_title_description_and_criteria() {
+        let mut task = create_test_task();
+        task.acceptance_criteria = vec![
+            "The command is shown in full, never truncated".into(),
+            "Targets are at least 36 px".into(),
+        ];
+        let (heading, body) = render_task_statement(&task);
+
+        assert_eq!(heading, "Test Task");
+        assert!(body.starts_with("Implement a new feature"));
+        assert!(body.contains("## Acceptance Criteria"));
+        assert!(body.contains("- [ ] The command is shown in full, never truncated"));
+        assert!(body.contains("- [ ] Targets are at least 36 px"));
+    }
+
+    #[test]
+    fn task_without_title_keeps_description_as_heading_without_repeating_it() {
+        let mut task = create_test_task();
+        task.title = None;
+        let (heading, body) = render_task_statement(&task);
+
+        assert_eq!(heading, "Implement a new feature");
+        assert!(
+            !body.contains("Implement a new feature"),
+            "description must not appear twice"
+        );
+        assert!(body.contains("- [ ] Tests pass"));
+    }
+
+    #[test]
+    fn blank_title_and_blank_criteria_are_ignored() {
+        let mut task = create_test_task();
+        task.title = Some("   ".into());
+        task.acceptance_criteria = vec!["  ".into(), String::new()];
+        let (heading, body) = render_task_statement(&task);
+
+        assert_eq!(heading, "Implement a new feature");
+        assert!(
+            !body.contains("Acceptance Criteria"),
+            "no empty criteria section"
+        );
+    }
+
+    #[test]
+    fn generate_prompt_renders_acceptance_criteria() {
+        let mut task = create_test_task();
+        task.acceptance_criteria = vec!["Double tap is impossible".into()];
+        let prompt = mock_builder().generate_prompt(&context_for(task));
+
+        assert!(prompt.starts_with("# Task: Test Task\n"));
+        assert!(prompt.contains("Implement a new feature"));
+        assert!(prompt.contains("## Acceptance Criteria"));
+        assert!(prompt.contains("- [ ] Double tap is impossible"));
+    }
+
+    #[test]
+    fn both_prompt_paths_render_the_same_criteria() {
+        // generate_prompt (runner fallback, get_prompt) and build_prompt_builder
+        // (enriched path, prompt_cache) had drifted: neither rendered criteria.
+        // They now share render_task_statement — this pins it.
+        let mut task = create_test_task();
+        task.acceptance_criteria = vec!["Region is named for screen readers".into()];
+        let builder = mock_builder();
+        let ctx = context_for(task);
+
+        let plain = builder.generate_prompt(&ctx);
+        let enriched = builder.build_prompt_builder(&ctx).build();
+
+        for prompt in [&plain, &enriched] {
+            assert!(prompt.contains("Test Task"));
+            assert!(prompt.contains("## Acceptance Criteria"));
+            assert!(prompt.contains("- [ ] Region is named for screen readers"));
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Note de-duplication (regression: dedup_by_key only drops neighbours)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn non_adjacent_duplicate_notes_are_removed() {
+        let a = create_test_context_note("context", "design ref A", "high", false);
+        let b = create_test_context_note("rfc", "the RFC", "high", false);
+        let mut a_again = a.clone();
+        a_again.propagated = true;
+
+        // [A, B, A] — both A copies score 1.0, so a stable sort keeps them apart,
+        // which is exactly the case dedup_by_key missed.
+        let mut notes = vec![a.clone(), b.clone(), a_again];
+        dedupe_notes_by_id(&mut notes);
+
+        assert_eq!(notes.len(), 2);
+        assert_eq!(notes.iter().filter(|n| n.id == a.id).count(), 1);
+        assert!(notes.iter().any(|n| n.id == b.id));
+    }
+
+    #[test]
+    fn dedupe_keeps_the_most_relevant_copy() {
+        let mut low = create_test_context_note("gotcha", "x", "high", false);
+        low.relevance_score = 0.2;
+        let mut high = low.clone();
+        high.relevance_score = 0.9;
+
+        let mut notes = vec![low, high];
+        dedupe_notes_by_id(&mut notes);
+
+        assert_eq!(notes.len(), 1);
+        assert!((notes[0].relevance_score - 0.9).abs() < f64::EPSILON);
+    }
+
+    // -----------------------------------------------------------------
+    // Retrieval scoped to the plan's projects (regression: unscoped search
+    // pulled code and decisions from every repository on the machine)
+    // -----------------------------------------------------------------
+
+    fn code_doc(
+        path: &str,
+        slug: &str,
+        docstrings: &str,
+    ) -> crate::meilisearch::indexes::CodeDocument {
+        crate::meilisearch::indexes::CodeDocument {
+            id: path.to_string(),
+            path: path.to_string(),
+            language: "rust".into(),
+            symbols: vec![],
+            docstrings: docstrings.to_string(),
+            signatures: vec![],
+            imports: vec![],
+            project_id: Uuid::new_v4().to_string(),
+            project_slug: slug.to_string(),
+        }
+    }
+
+    #[test]
+    fn code_references_are_merged_by_score_and_path() {
+        let refs = vec![
+            CodeReference {
+                path: "a.rs".into(),
+                snippet: "".into(),
+                relevance: 0.4,
+            },
+            CodeReference {
+                path: "b.rs".into(),
+                snippet: "".into(),
+                relevance: 0.9,
+            },
+            CodeReference {
+                path: "a.rs".into(),
+                snippet: "".into(),
+                relevance: 0.7,
+            },
+            CodeReference {
+                path: "c.rs".into(),
+                snippet: "".into(),
+                relevance: 0.1,
+            },
+        ];
+        let merged = merge_code_references(refs, 2);
+
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].path, "b.rs");
+        assert_eq!(merged[1].path, "a.rs");
+        assert!(
+            (merged[1].relevance - 0.7).abs() < f32::EPSILON,
+            "best copy kept"
+        );
+    }
+
+    #[test]
+    fn decisions_are_interleaved_so_every_project_gets_slots() {
+        let mk = |d: &str| DecisionNode {
+            id: Uuid::new_v4(),
+            description: d.into(),
+            rationale: String::new(),
+            alternatives: vec![],
+            chosen_option: None,
+            decided_by: "agent".into(),
+            decided_at: chrono::Utc::now(),
+            status: DecisionStatus::Accepted,
+            embedding: None,
+            embedding_model: None,
+            scar_intensity: 0.0,
+        };
+        let front = vec![mk("f1"), mk("f2"), mk("f3")];
+        let back = vec![mk("b1"), mk("b2")];
+
+        let out = interleave_decisions(vec![front, back], 3);
+        let names: Vec<_> = out.iter().map(|d| d.description.as_str()).collect();
+        assert_eq!(names, vec!["f1", "b1", "f2"]);
+    }
+
+    #[tokio::test]
+    async fn similar_code_only_comes_from_the_plans_projects() {
+        let builder = mock_builder();
+        builder
+            .meili
+            .index_code(&code_doc(
+                "front/card.tsx",
+                "frontend",
+                "attention card render",
+            ))
+            .await
+            .unwrap();
+        builder
+            .meili
+            .index_code(&code_doc(
+                "obrain/solver.rs",
+                "obrain",
+                "attention card render",
+            ))
+            .await
+            .unwrap();
+
+        let hits = builder
+            .search_similar_code("attention card", 5, &["frontend".to_string()])
+            .await
+            .unwrap();
+
+        assert!(!hits.is_empty());
+        assert!(
+            hits.iter().all(|h| h.path.starts_with("front/")),
+            "code from another project leaked into the task context: {:?}",
+            hits.iter().map(|h| &h.path).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_plan_without_project_gets_no_retrieval_rather_than_everything() {
+        let builder = mock_builder();
+        builder
+            .meili
+            .index_code(&code_doc(
+                "obrain/solver.rs",
+                "obrain",
+                "attention card render",
+            ))
+            .await
+            .unwrap();
+
+        let hits = builder
+            .search_similar_code("attention card", 5, &[])
+            .await
+            .unwrap();
+        assert!(hits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn plan_projects_include_linked_projects_not_only_the_primary() {
+        // link_plan_to_project overwrites plan.project_id with the LAST project
+        // linked; the membership is the HAS_PLAN edges. A backend task on a
+        // frontend+backend plan must still search the backend.
+        let graph = crate::neo4j::mock::MockGraphStore::new();
+        let mk_project = |slug: &str| ProjectNode {
+            id: Uuid::new_v4(),
+            name: slug.into(),
+            slug: slug.into(),
+            root_path: String::new(),
+            description: None,
+            created_at: chrono::Utc::now(),
+            last_synced: None,
+            analytics_computed_at: None,
+            last_co_change_computed_at: None,
+            default_note_energy: None,
+            scaffolding_override: None,
+            sharing_policy: None,
+            watch_enabled: true,
+            profile: Default::default(),
+        };
+        let front = mk_project("frontend");
+        graph.create_project(&front).await.unwrap();
+
+        let plan = PlanNode {
+            id: Uuid::new_v4(),
+            title: "p".into(),
+            description: String::new(),
+            status: PlanStatus::Draft,
+            created_at: chrono::Utc::now(),
+            created_by: "test".into(),
+            priority: 1,
+            project_id: None,
+            execution_context: None,
+            persona: None,
+        };
+        graph.create_plan(&plan).await.unwrap();
+        graph.link_plan_to_project(plan.id, front.id).await.unwrap();
+
+        let slugs = graph.list_plan_project_slugs(plan.id).await.unwrap();
+        assert_eq!(slugs, vec!["frontend".to_string()]);
+
+        let unknown = graph.list_plan_project_slugs(Uuid::new_v4()).await.unwrap();
+        assert!(unknown.is_empty());
     }
 }

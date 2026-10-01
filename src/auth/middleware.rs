@@ -12,6 +12,9 @@ use axum::{
     response::Response,
 };
 
+/// The only routes a vault token may call.
+pub const VAULT_AGENT_PATH_PREFIX: &str = "/api/vault/agent/";
+
 /// Middleware that handles authentication adaptively.
 ///
 /// # Behavior
@@ -22,6 +25,7 @@ use axum::{
 ///    b. Validate JWT with the configured secret → 401 if invalid/expired
 ///    c. Check `allowed_email_domain` if configured → 403 if domain mismatch
 ///    d. Inject `Claims` into request extensions for downstream handlers
+///    e. A vault token is refused outside [`VAULT_AGENT_PATH_PREFIX`] → 403
 pub async fn require_auth(
     State(state): State<OrchestratorState>,
     mut req: Request,
@@ -81,6 +85,17 @@ pub async fn require_auth(
                 "MCP token revoked, expired or unknown".to_string(),
             ));
         }
+    }
+
+    // 4c. A vault token lives in an agent's shell environment. It opens the
+    //     agent read path and nothing else — otherwise that shell would hold a
+    //     key to the whole API.
+    if crate::auth::jwt::vault_token_session(&claims).is_some()
+        && !req.uri().path().starts_with(VAULT_AGENT_PATH_PREFIX)
+    {
+        return Err(AppError::Forbidden(
+            "vault tokens are only valid for reading granted secrets".to_string(),
+        ));
     }
 
     // 5. Inject claims into request extensions
@@ -167,6 +182,7 @@ mod tests {
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
             model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
+            vault: crate::vault::VaultService::ephemeral(),
         })
     }
 

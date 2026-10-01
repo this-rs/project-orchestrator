@@ -107,7 +107,9 @@ pub struct Wave {
 pub struct WaveTask {
     pub id: Uuid,
     pub title: Option<String>,
-    pub status: String,
+    /// Serialized through serde (`snake_case`, e.g. `in_progress`) like every
+    /// other task status in the API — never through `Debug` (`InProgress`).
+    pub status: TaskStatus,
     pub priority: Option<i32>,
     pub affected_files: Vec<String>,
     pub depends_on: Vec<Uuid>,
@@ -431,6 +433,38 @@ impl Neo4jClient {
 
         self.graph.run(q).await?;
         Ok(())
+    }
+
+    /// Slugs of every project a plan belongs to.
+    ///
+    /// A plan can be linked to several projects: `link_plan_to_project` MERGEs a
+    /// new HAS_PLAN edge and keeps the previous ones, but it also OVERWRITES
+    /// `plan.project_id` with the last project linked. So the field names one
+    /// project at most and not reliably the first — the HAS_PLAN edges are the
+    /// real membership, and both are read here.
+    ///
+    /// Used to scope task-context retrieval (similar code, related decisions) to
+    /// the plan's own projects instead of the whole index.
+    pub async fn list_plan_project_slugs(&self, plan_id: Uuid) -> Result<Vec<String>> {
+        let q = query(
+            r#"
+            MATCH (plan:Plan {id: $plan_id})
+            OPTIONAL MATCH (linked:Project)-[:HAS_PLAN]->(plan)
+            OPTIONAL MATCH (primary:Project) WHERE primary.id = plan.project_id
+            WITH collect(DISTINCT linked.slug) + collect(DISTINCT primary.slug) AS slugs
+            RETURN [s IN slugs WHERE s IS NOT NULL] AS slugs
+            "#,
+        )
+        .param("plan_id", plan_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut slugs: Vec<String> = match result.next().await? {
+            Some(row) => row.get("slugs").unwrap_or_default(),
+            None => Vec::new(),
+        };
+        slugs.sort();
+        slugs.dedup();
+        Ok(slugs)
     }
 
     /// Link a plan to a project (creates HAS_PLAN relationship)
@@ -877,7 +911,7 @@ impl Neo4jClient {
                     wave_tasks.push(WaveTask {
                         id: task.id,
                         title: task.title.clone(),
-                        status: format!("{:?}", task.status),
+                        status: task.status.clone(),
                         priority: task.priority,
                         affected_files: task.affected_files.clone(),
                         depends_on: deps_of
@@ -1316,5 +1350,78 @@ impl Neo4jClient {
         }
 
         Ok((nodes, edges))
+    }
+}
+
+impl Neo4jClient {
+    /// Aggregate task counters for many plans / projects / milestones in one query.
+    ///
+    /// Entities with no task are still present in the result (all zeros) so the
+    /// caller never has to distinguish "unknown" from "empty".
+    pub async fn get_progress_batch(
+        &self,
+        kind: ProgressKind,
+        ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, TaskCounts>> {
+        let mut out: HashMap<Uuid, TaskCounts> =
+            ids.iter().map(|id| (*id, TaskCounts::default())).collect();
+        if ids.is_empty() {
+            return Ok(out);
+        }
+
+        let cypher = match kind {
+            ProgressKind::Plan => {
+                r#"
+                MATCH (e:Plan) WHERE e.id IN $ids
+                OPTIONAL MATCH (e)-[:HAS_TASK]->(t:Task)
+                WITH e, collect(t) AS tasks
+                RETURN e.id AS id, tasks
+                "#
+            }
+            ProgressKind::Project => {
+                r#"
+                MATCH (e:Project) WHERE e.id IN $ids
+                OPTIONAL MATCH (e)-[:HAS_PLAN]->(:Plan)-[:HAS_TASK]->(t:Task)
+                WITH e, collect(DISTINCT t) AS tasks
+                RETURN e.id AS id, tasks
+                "#
+            }
+            ProgressKind::Milestone => {
+                r#"
+                MATCH (e:Milestone) WHERE e.id IN $ids
+                OPTIONAL MATCH (e)-[:INCLUDES_TASK]->(t1:Task)
+                OPTIONAL MATCH (p:Plan)-[:TARGETS_MILESTONE]->(e), (p)-[:HAS_TASK]->(t2:Task)
+                WITH e, collect(DISTINCT t1) AS a, collect(DISTINCT t2) AS b
+                RETURN e.id AS id, a + [y IN b WHERE NOT y IN a] AS tasks
+                "#
+            }
+        };
+
+        let q = query(cypher).param("ids", ids.iter().map(|i| i.to_string()).collect::<Vec<_>>());
+        let mut result = self.graph.execute(q).await?;
+        while let Some(row) = result.next().await? {
+            let Ok(id_str) = row.get::<String>("id") else {
+                continue;
+            };
+            let Ok(id) = Uuid::parse_str(&id_str) else {
+                continue;
+            };
+            let nodes: Vec<neo4rs::Node> = row.get("tasks").unwrap_or_default();
+            let mut c = TaskCounts {
+                total: nodes.len() as u32,
+                ..TaskCounts::default()
+            };
+            for n in &nodes {
+                match n.get::<String>("status").unwrap_or_default().as_str() {
+                    "Completed" | "completed" => c.completed += 1,
+                    "InProgress" | "in_progress" => c.in_progress += 1,
+                    "Blocked" | "blocked" => c.blocked += 1,
+                    "Failed" | "failed" => c.failed += 1,
+                    _ => c.pending += 1,
+                }
+            }
+            out.insert(id, c);
+        }
+        Ok(out)
     }
 }

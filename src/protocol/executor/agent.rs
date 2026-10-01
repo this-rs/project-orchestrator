@@ -563,7 +563,7 @@ impl Executor for AgentExecutor {
         // Load transitions and project root for prompt building
         let transitions = store.get_protocol_transitions(run.protocol_id).await?;
         let project = store.get_project(protocol.project_id).await?;
-        let project_root = project.as_ref().map(|p| p.root_path.as_str());
+        let project_root = project.as_ref().and_then(|p| p.root_path_opt());
 
         // Build the agent prompt
         let prompt = build_agent_prompt(state, run, protocol, &transitions, project_root);

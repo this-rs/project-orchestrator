@@ -36,6 +36,7 @@ pub mod engine;
 pub mod enrichment;
 pub mod extraction;
 pub mod models;
+pub mod neighborhood;
 pub mod process;
 pub mod writer;
 

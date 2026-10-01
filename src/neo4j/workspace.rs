@@ -37,7 +37,30 @@ pub fn validate_workspace_slug(slug: &str) -> Result<()> {
     Ok(())
 }
 
+/// Build the ` SET a, b` suffix of a partial-update query ("" when nothing
+/// to set: the query then only checks that the node exists).
+fn set_suffix<S: AsRef<str>>(clauses: &[S]) -> String {
+    if clauses.is_empty() {
+        String::new()
+    } else {
+        let joined: Vec<&str> = clauses.iter().map(|c| c.as_ref()).collect();
+        format!(" SET {}", joined.join(", "))
+    }
+}
+
 impl Neo4jClient {
+    /// Run a `MATCH … [SET …] RETURN count(x) AS matched` query and report
+    /// whether the node existed. Partial updates must not answer "ok" for an
+    /// id that matched nothing (couac2: silent 204 on unknown ids).
+    async fn run_matched(&self, q: neo4rs::Query) -> Result<bool> {
+        let mut result = self.graph.execute(q).await?;
+        let matched = match result.next().await? {
+            Some(row) => row.get::<i64>("matched")? > 0,
+            None => false,
+        };
+        Ok(matched)
+    }
+
     // ========================================================================
     // Workspace operations
     // ========================================================================
@@ -641,7 +664,7 @@ impl Neo4jClient {
         description: Option<String>,
         status: Option<MilestoneStatus>,
         target_date: Option<chrono::DateTime<chrono::Utc>>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let mut set_clauses = Vec::new();
 
         if title.is_some() {
@@ -657,16 +680,9 @@ impl Neo4jClient {
             set_clauses.push("wm.target_date = $target_date".to_string());
         }
 
-        if set_clauses.is_empty() {
-            return Ok(());
-        }
-
         let cypher = format!(
-            r#"
-            MATCH (wm:WorkspaceMilestone {{id: $id}})
-            SET {}
-            "#,
-            set_clauses.join(", ")
+            "MATCH (wm:WorkspaceMilestone {{id: $id}}){} RETURN count(wm) AS matched",
+            set_suffix(&set_clauses)
         );
 
         let mut q = query(&cypher).param("id", id.to_string());
@@ -691,8 +707,7 @@ impl Neo4jClient {
             q = q.param("target_date", td.to_rfc3339());
         }
 
-        self.graph.run(q).await?;
-        Ok(())
+        self.run_matched(q).await
     }
 
     /// Delete a workspace milestone
@@ -1098,7 +1113,7 @@ impl Neo4jClient {
         url: Option<String>,
         version: Option<String>,
         description: Option<String>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let mut set_clauses = vec![];
         if name.is_some() {
             set_clauses.push("r.name = $name");
@@ -1116,13 +1131,9 @@ impl Neo4jClient {
             set_clauses.push("r.description = $description");
         }
 
-        if set_clauses.is_empty() {
-            return Ok(());
-        }
-
         let cypher = format!(
-            "MATCH (r:Resource {{id: $id}}) SET {}",
-            set_clauses.join(", ")
+            "MATCH (r:Resource {{id: $id}}){} RETURN count(r) AS matched",
+            set_suffix(&set_clauses)
         );
 
         let mut q = query(&cypher).param("id", id.to_string());
@@ -1142,8 +1153,7 @@ impl Neo4jClient {
             q = q.param("description", description);
         }
 
-        self.graph.run(q).await?;
-        Ok(())
+        self.run_matched(q).await
     }
 
     /// Delete a resource
@@ -1332,6 +1342,72 @@ impl Neo4jClient {
         Ok(())
     }
 
+    /// Create the component if absent, refresh it if already there, and return its id.
+    ///
+    /// `create_component` is a bare `CREATE` with no uniqueness constraint on the
+    /// name, so replaying a derivation on every sync would stack duplicates.
+    /// Identity here is (workspace, name) — the service, not the client package,
+    /// which is what makes a Rust project and a TypeScript one reaching the same
+    /// Neo4j land on a single node.
+    ///
+    /// Human-authored fields are preserved: a derivation may refine what it
+    /// previously derived, never overwrite what somebody wrote. `description`
+    /// is only filled when empty, and existing tags are kept.
+    pub async fn upsert_derived_component(&self, write: DerivedComponentWrite) -> Result<Uuid> {
+        let DerivedComponentWrite {
+            workspace_id,
+            name,
+            component_type,
+            description,
+            runtime,
+            tags,
+            config,
+        } = write;
+        let new_id = Uuid::new_v4();
+        let q = query(
+            r#"
+            MATCH (w:Workspace {id: $workspace_id})
+            MERGE (w)-[:HAS_COMPONENT]->(c:Component {workspace_id: $workspace_id, name: $name})
+            ON CREATE SET
+                c.id = $new_id,
+                c.created_at = datetime($now),
+                c.description = $description,
+                c.tags = $tags
+            SET c.component_type = $component_type,
+                c.runtime = CASE WHEN $runtime = '' THEN coalesce(c.runtime, '') ELSE $runtime END,
+                c.config = $config,
+                c.description = CASE
+                    WHEN coalesce(c.description, '') = '' THEN $description
+                    ELSE c.description
+                END,
+                c.tags = CASE
+                    WHEN coalesce(size(c.tags), 0) = 0 THEN $tags
+                    ELSE c.tags
+                END
+            RETURN c.id AS id
+            "#,
+        )
+        .param("workspace_id", workspace_id.to_string())
+        .param("name", name.clone())
+        .param("new_id", new_id.to_string())
+        .param("now", chrono::Utc::now().to_rfc3339())
+        .param("component_type", format!("{:?}", component_type))
+        .param("description", description.unwrap_or_default())
+        .param("runtime", runtime.unwrap_or_default())
+        .param("tags", tags)
+        .param("config", config.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        match result.next().await? {
+            Some(row) => Ok(row.get::<String>("id")?.parse()?),
+            None => Err(anyhow::anyhow!(
+                "workspace {} not found while upserting component '{}'",
+                workspace_id,
+                name
+            )),
+        }
+    }
+
     /// Get a component by ID
     pub async fn get_component(&self, id: Uuid) -> Result<Option<ComponentNode>> {
         let q = query(
@@ -1374,18 +1450,23 @@ impl Neo4jClient {
     }
 
     /// Update a component
-    pub async fn update_component(
-        &self,
-        id: Uuid,
-        name: Option<String>,
-        description: Option<String>,
-        runtime: Option<String>,
-        config: Option<serde_json::Value>,
-        tags: Option<Vec<String>>,
-    ) -> Result<()> {
+    /// Returns `false` when no component has this id (nothing was written).
+    pub async fn update_component(&self, id: Uuid, patch: ComponentUpdate) -> Result<bool> {
+        let ComponentUpdate {
+            name,
+            component_type,
+            description,
+            runtime,
+            config,
+            tags,
+        } = patch;
+
         let mut set_clauses = vec![];
         if name.is_some() {
             set_clauses.push("c.name = $name");
+        }
+        if component_type.is_some() {
+            set_clauses.push("c.component_type = $component_type");
         }
         if description.is_some() {
             set_clauses.push("c.description = $description");
@@ -1400,18 +1481,21 @@ impl Neo4jClient {
             set_clauses.push("c.tags = $tags");
         }
 
-        if set_clauses.is_empty() {
-            return Ok(());
-        }
-
+        // No early return when nothing is set: the query still checks that the
+        // component exists, so an unknown id is reported (404), not "ok".
         let cypher = format!(
-            "MATCH (c:Component {{id: $id}}) SET {}",
-            set_clauses.join(", ")
+            "MATCH (c:Component {{id: $id}}){} RETURN count(c) AS matched",
+            set_suffix(&set_clauses)
         );
 
         let mut q = query(&cypher).param("id", id.to_string());
         if let Some(name) = name {
             q = q.param("name", name);
+        }
+        if let Some(component_type) = component_type {
+            // Debug formatting is the storage encoding — node_to_component reads it
+            // back case-insensitively. Keep the two in step.
+            q = q.param("component_type", format!("{:?}", component_type));
         }
         if let Some(description) = description {
             q = q.param("description", description);
@@ -1426,8 +1510,7 @@ impl Neo4jClient {
             q = q.param("tags", tags);
         }
 
-        self.graph.run(q).await?;
-        Ok(())
+        self.run_matched(q).await
     }
 
     /// Delete a component
@@ -1575,6 +1658,8 @@ impl Neo4jClient {
             "cache" => ComponentType::Cache,
             "gateway" => ComponentType::Gateway,
             "external" => ComponentType::External,
+            "library" => ComponentType::Library,
+            "cli" => ComponentType::Cli,
             _ => ComponentType::Other,
         };
 

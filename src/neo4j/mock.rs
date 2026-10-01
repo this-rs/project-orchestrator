@@ -57,6 +57,8 @@ pub struct MockGraphStore {
     pub constraints: RwLock<HashMap<Uuid, ConstraintNode>>,
     pub commits: RwLock<HashMap<String, CommitNode>>,
     pub releases: RwLock<HashMap<Uuid, ReleaseNode>>,
+    pub environments: RwLock<HashMap<Uuid, EnvironmentNode>>,
+    pub deployments: RwLock<HashMap<Uuid, DeploymentNode>>,
     pub milestones: RwLock<HashMap<Uuid, MilestoneNode>>,
     pub workspace_milestones: RwLock<HashMap<Uuid, WorkspaceMilestoneNode>>,
     pub resources: RwLock<HashMap<Uuid, ResourceNode>>,
@@ -229,6 +231,8 @@ pub struct MockGraphStore {
     pub mock_has_context_cards: std::sync::atomic::AtomicBool,
     /// When true, `set_watch_enabled()` returns an error (default: false)
     pub mock_fail_set_watch_enabled: std::sync::atomic::AtomicBool,
+    /// Generic graph served by `get_entity_neighborhood` (seeded by tests).
+    pub neighborhood_graph: RwLock<crate::graph::neighborhood::InMemoryGraph>,
 }
 
 #[allow(dead_code)]
@@ -245,6 +249,8 @@ impl MockGraphStore {
             constraints: RwLock::new(HashMap::new()),
             commits: RwLock::new(HashMap::new()),
             releases: RwLock::new(HashMap::new()),
+            environments: RwLock::new(HashMap::new()),
+            deployments: RwLock::new(HashMap::new()),
             milestones: RwLock::new(HashMap::new()),
             workspace_milestones: RwLock::new(HashMap::new()),
             resources: RwLock::new(HashMap::new()),
@@ -346,6 +352,7 @@ impl MockGraphStore {
             mcp_often_follows: RwLock::new(HashMap::new()),
             mock_has_context_cards: std::sync::atomic::AtomicBool::new(false),
             mock_fail_set_watch_enabled: std::sync::atomic::AtomicBool::new(false),
+            neighborhood_graph: RwLock::new(Default::default()),
         }
     }
 
@@ -585,6 +592,7 @@ impl GraphStore for MockGraphStore {
         name: Option<String>,
         description: Option<Option<String>>,
         root_path: Option<String>,
+        profile: Option<ProjectProfile>,
     ) -> Result<()> {
         if let Some(p) = self.projects.write().await.get_mut(&id) {
             if let Some(n) = name {
@@ -595,6 +603,9 @@ impl GraphStore for MockGraphStore {
             }
             if let Some(r) = root_path {
                 p.root_path = r;
+            }
+            if let Some(pr) = profile {
+                p.profile = pr;
             }
         }
         Ok(())
@@ -632,6 +643,18 @@ impl GraphStore for MockGraphStore {
         }
         self.project_releases.write().await.remove(&id);
         self.project_milestones.write().await.remove(&id);
+        // Cascade: remove environments and their deployments
+        let env_ids: Vec<Uuid> = self
+            .environments
+            .read()
+            .await
+            .values()
+            .filter(|e| e.project_id == id)
+            .map(|e| e.id)
+            .collect();
+        for env_id in env_ids {
+            self.delete_environment(env_id).await?;
+        }
         Ok(())
     }
 
@@ -905,22 +928,24 @@ impl GraphStore for MockGraphStore {
         description: Option<String>,
         status: Option<MilestoneStatus>,
         target_date: Option<chrono::DateTime<chrono::Utc>>,
-    ) -> Result<()> {
-        if let Some(m) = self.workspace_milestones.write().await.get_mut(&id) {
-            if let Some(t) = title {
-                m.title = t;
-            }
-            if let Some(d) = description {
-                m.description = Some(d);
-            }
-            if let Some(s) = status {
-                m.status = s;
-            }
-            if let Some(td) = target_date {
-                m.target_date = Some(td);
-            }
+    ) -> Result<bool> {
+        let mut milestones = self.workspace_milestones.write().await;
+        let Some(m) = milestones.get_mut(&id) else {
+            return Ok(false);
+        };
+        if let Some(t) = title {
+            m.title = t;
         }
-        Ok(())
+        if let Some(d) = description {
+            m.description = Some(d);
+        }
+        if let Some(s) = status {
+            m.status = s;
+        }
+        if let Some(td) = target_date {
+            m.target_date = Some(td);
+        }
+        Ok(true)
     }
 
     async fn delete_workspace_milestone(&self, id: Uuid) -> Result<()> {
@@ -1131,26 +1156,28 @@ impl GraphStore for MockGraphStore {
         url: Option<String>,
         version: Option<String>,
         description: Option<String>,
-    ) -> Result<()> {
-        if let Some(r) = self.resources.write().await.get_mut(&id) {
-            if let Some(n) = name {
-                r.name = n;
-            }
-            if let Some(fp) = file_path {
-                r.file_path = fp;
-            }
-            if let Some(u) = url {
-                r.url = Some(u);
-            }
-            if let Some(v) = version {
-                r.version = Some(v);
-            }
-            if let Some(d) = description {
-                r.description = Some(d);
-            }
-            r.updated_at = Some(Utc::now());
+    ) -> Result<bool> {
+        let mut resources = self.resources.write().await;
+        let Some(r) = resources.get_mut(&id) else {
+            return Ok(false);
+        };
+        if let Some(n) = name {
+            r.name = n;
         }
-        Ok(())
+        if let Some(fp) = file_path {
+            r.file_path = fp;
+        }
+        if let Some(u) = url {
+            r.url = Some(u);
+        }
+        if let Some(v) = version {
+            r.version = Some(v);
+        }
+        if let Some(d) = description {
+            r.description = Some(d);
+        }
+        r.updated_at = Some(Utc::now());
+        Ok(true)
     }
 
     async fn delete_resource(&self, id: Uuid) -> Result<()> {
@@ -1241,33 +1268,103 @@ impl GraphStore for MockGraphStore {
             .collect())
     }
 
-    async fn update_component(
-        &self,
-        id: Uuid,
-        name: Option<String>,
-        description: Option<String>,
-        runtime: Option<String>,
-        config: Option<serde_json::Value>,
-        tags: Option<Vec<String>>,
-    ) -> Result<()> {
-        if let Some(c) = self.components.write().await.get_mut(&id) {
-            if let Some(n) = name {
-                c.name = n;
-            }
-            if let Some(d) = description {
-                c.description = Some(d);
-            }
-            if let Some(r) = runtime {
-                c.runtime = Some(r);
-            }
-            if let Some(cfg) = config {
-                c.config = cfg;
-            }
-            if let Some(t) = tags {
-                c.tags = t;
-            }
+    async fn update_component(&self, id: Uuid, patch: ComponentUpdate) -> Result<bool> {
+        let ComponentUpdate {
+            name,
+            component_type,
+            description,
+            runtime,
+            config,
+            tags,
+        } = patch;
+        let mut components = self.components.write().await;
+        // Same contract as the store: an unknown id writes nothing and says so.
+        let Some(c) = components.get_mut(&id) else {
+            return Ok(false);
+        };
+        if let Some(n) = name {
+            c.name = n;
         }
-        Ok(())
+        if let Some(t) = component_type {
+            c.component_type = t;
+        }
+        if let Some(d) = description {
+            c.description = Some(d);
+        }
+        if let Some(r) = runtime {
+            c.runtime = Some(r);
+        }
+        if let Some(cfg) = config {
+            c.config = cfg;
+        }
+        if let Some(t) = tags {
+            c.tags = t;
+        }
+        Ok(true)
+    }
+
+    async fn upsert_derived_component(&self, write: DerivedComponentWrite) -> Result<Uuid> {
+        let DerivedComponentWrite {
+            workspace_id,
+            name,
+            component_type,
+            description,
+            runtime,
+            tags,
+            config,
+        } = write;
+        let mut components = self.components.write().await;
+
+        // Identity is (workspace, name) — mirrors the MERGE key in Cypher.
+        if let Some(existing) = components
+            .values_mut()
+            .find(|c| c.workspace_id == workspace_id && c.name == name)
+        {
+            existing.component_type = component_type;
+            existing.config = config;
+            if let Some(r) = runtime.filter(|r| !r.is_empty()) {
+                existing.runtime = Some(r);
+            }
+            // Human-authored text survives a re-derivation.
+            if existing
+                .description
+                .as_deref()
+                .unwrap_or_default()
+                .is_empty()
+            {
+                existing.description = description;
+            }
+            if existing.tags.is_empty() {
+                existing.tags = tags;
+            }
+            return Ok(existing.id);
+        }
+
+        let id = Uuid::new_v4();
+        components.insert(
+            id,
+            ComponentNode {
+                id,
+                workspace_id,
+                name,
+                component_type,
+                description,
+                runtime: runtime.filter(|r| !r.is_empty()),
+                config,
+                created_at: chrono::Utc::now(),
+                tags,
+            },
+        );
+        drop(components);
+
+        self.workspace_components
+            .write()
+            .await
+            .entry(workspace_id)
+            .or_default()
+            .push(id);
+
+        Ok(id)
     }
 
     async fn delete_component(&self, id: Uuid) -> Result<()> {
@@ -3416,31 +3513,65 @@ impl GraphStore for MockGraphStore {
         Ok(())
     }
 
-    async fn link_plan_to_project(&self, plan_id: Uuid, project_id: Uuid) -> Result<()> {
-        if let Some(p) = self.plans.write().await.get_mut(&plan_id) {
-            // Remove from old project if any
-            if let Some(old_pid) = p.project_id {
-                if let Some(ids) = self.project_plans.write().await.get_mut(&old_pid) {
-                    ids.retain(|id| *id != plan_id);
-                }
-            }
-            p.project_id = Some(project_id);
-        }
-        self.project_plans
-            .write()
+    async fn list_plan_project_slugs(&self, plan_id: Uuid) -> Result<Vec<String>> {
+        let primary = self
+            .plans
+            .read()
             .await
-            .entry(project_id)
-            .or_default()
-            .push(plan_id);
+            .get(&plan_id)
+            .and_then(|p| p.project_id);
+        let linked: Vec<Uuid> = self
+            .project_plans
+            .read()
+            .await
+            .iter()
+            .filter(|(_, plans)| plans.contains(&plan_id))
+            .map(|(pid, _)| *pid)
+            .collect();
+        let projects = self.projects.read().await;
+        let mut slugs: Vec<String> = linked
+            .into_iter()
+            .chain(primary)
+            .filter_map(|pid| projects.get(&pid).map(|p| p.slug.clone()))
+            .collect();
+        slugs.sort();
+        slugs.dedup();
+        Ok(slugs)
+    }
+
+    /// Mirrors Neo4j (`plan.rs` link_plan_to_project): `MATCH` project and
+    /// plan (no-op if either is missing), `SET plan.project_id`, then
+    /// `MERGE (project)-[:HAS_PLAN]->(plan)`. MERGE is additive and
+    /// idempotent: previous HAS_PLAN links are KEPT (this is not a move).
+    async fn link_plan_to_project(&self, plan_id: Uuid, project_id: Uuid) -> Result<()> {
+        if !self.projects.read().await.contains_key(&project_id) {
+            return Ok(());
+        }
+        match self.plans.write().await.get_mut(&plan_id) {
+            Some(p) => p.project_id = Some(project_id),
+            None => return Ok(()),
+        }
+        let mut project_plans = self.project_plans.write().await;
+        let ids = project_plans.entry(project_id).or_default();
+        if !ids.contains(&plan_id) {
+            ids.push(plan_id);
+        }
         Ok(())
     }
 
+    /// Mirrors Neo4j: deletes EVERY HAS_PLAN pointing at the plan (not only
+    /// the one matching `plan.project_id`) and clears `project_id`.
     async fn unlink_plan_from_project(&self, plan_id: Uuid) -> Result<()> {
-        if let Some(p) = self.plans.write().await.get_mut(&plan_id) {
-            if let Some(pid) = p.project_id.take() {
-                if let Some(ids) = self.project_plans.write().await.get_mut(&pid) {
-                    ids.retain(|id| *id != plan_id);
-                }
+        let mut linked = false;
+        for ids in self.project_plans.write().await.values_mut() {
+            let before = ids.len();
+            ids.retain(|id| *id != plan_id);
+            linked |= ids.len() != before;
+        }
+        // Neo4j only reaches the SET when at least one HAS_PLAN matched.
+        if linked {
+            if let Some(p) = self.plans.write().await.get_mut(&plan_id) {
+                p.project_id = None;
             }
         }
         Ok(())
@@ -3460,11 +3591,10 @@ impl GraphStore for MockGraphStore {
             }
         }
         self.plan_commits.write().await.remove(&plan_id);
-        if let Some(plan) = self.plans.write().await.remove(&plan_id) {
-            if let Some(pid) = plan.project_id {
-                if let Some(ids) = self.project_plans.write().await.get_mut(&pid) {
-                    ids.retain(|id| *id != plan_id);
-                }
+        if self.plans.write().await.remove(&plan_id).is_some() {
+            // DETACH DELETE drops every HAS_PLAN, not only plan.project_id's.
+            for ids in self.project_plans.write().await.values_mut() {
+                ids.retain(|id| *id != plan_id);
             }
         }
         Ok(())
@@ -3897,7 +4027,7 @@ impl GraphStore for MockGraphStore {
                     wave_tasks.push(WaveTask {
                         id: task.id,
                         title: task.title.clone(),
-                        status: format!("{:?}", task.status),
+                        status: task.status.clone(),
                         priority: task.priority,
                         affected_files: task.affected_files.clone(),
                         depends_on: deps_of
@@ -5034,6 +5164,176 @@ impl GraphStore for MockGraphStore {
         self.release_tasks.write().await.remove(&release_id);
         self.release_commits.write().await.remove(&release_id);
         Ok(())
+    }
+
+    // ========================================================================
+    // Environment & deployment operations
+    // ========================================================================
+
+    async fn create_environment(&self, env: &EnvironmentNode) -> Result<()> {
+        let mut envs = self.environments.write().await;
+        if envs
+            .values()
+            .any(|e| e.project_id == env.project_id && e.name == env.name)
+        {
+            anyhow::bail!(
+                "Cannot create environment '{}': project not found or name already used",
+                env.name
+            );
+        }
+        envs.insert(env.id, env.clone());
+        Ok(())
+    }
+
+    async fn get_environment(&self, id: Uuid) -> Result<Option<EnvironmentNode>> {
+        Ok(self.environments.read().await.get(&id).cloned())
+    }
+
+    async fn list_project_environments(&self, project_id: Uuid) -> Result<Vec<EnvironmentNode>> {
+        let mut envs: Vec<EnvironmentNode> = self
+            .environments
+            .read()
+            .await
+            .values()
+            .filter(|e| e.project_id == project_id)
+            .cloned()
+            .collect();
+        envs.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.name.cmp(&b.name))
+        });
+        Ok(envs)
+    }
+
+    async fn update_environment(
+        &self,
+        id: Uuid,
+        name: Option<String>,
+        kind: Option<EnvironmentKind>,
+        url: Option<String>,
+        description: Option<String>,
+        config: Option<String>,
+    ) -> Result<()> {
+        // Empty string clears an optional field (mirrors the Neo4j store)
+        fn opt(v: String) -> Option<String> {
+            if v.is_empty() {
+                None
+            } else {
+                Some(v)
+            }
+        }
+        if let Some(e) = self.environments.write().await.get_mut(&id) {
+            if let Some(n) = name {
+                e.name = n;
+            }
+            if let Some(k) = kind {
+                e.kind = k;
+            }
+            if let Some(u) = url {
+                e.url = opt(u);
+            }
+            if let Some(d) = description {
+                e.description = opt(d);
+            }
+            if let Some(c) = config {
+                e.config = opt(c);
+            }
+        }
+        Ok(())
+    }
+
+    async fn delete_environment(&self, id: Uuid) -> Result<()> {
+        self.environments.write().await.remove(&id);
+        self.deployments
+            .write()
+            .await
+            .retain(|_, d| d.environment_id != id);
+        Ok(())
+    }
+
+    async fn create_deployment(&self, deployment: &DeploymentNode) -> Result<()> {
+        if !self
+            .environments
+            .read()
+            .await
+            .contains_key(&deployment.environment_id)
+        {
+            anyhow::bail!(
+                "Cannot create deployment: environment {} not found",
+                deployment.environment_id
+            );
+        }
+        self.deployments
+            .write()
+            .await
+            .insert(deployment.id, deployment.clone());
+        Ok(())
+    }
+
+    async fn get_deployment(&self, id: Uuid) -> Result<Option<DeploymentNode>> {
+        Ok(self.deployments.read().await.get(&id).cloned())
+    }
+
+    async fn list_environment_deployments(
+        &self,
+        environment_id: Uuid,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<DeploymentNode>, usize)> {
+        let mut all: Vec<DeploymentNode> = self
+            .deployments
+            .read()
+            .await
+            .values()
+            .filter(|d| d.environment_id == environment_id)
+            .cloned()
+            .collect();
+        // Newest first (same ordering as the Neo4j store)
+        all.sort_by(|a, b| {
+            b.started_at
+                .cmp(&a.started_at)
+                .then_with(|| b.id.cmp(&a.id))
+        });
+        let total = all.len();
+        Ok((all.into_iter().skip(offset).take(limit).collect(), total))
+    }
+
+    async fn update_deployment(
+        &self,
+        id: Uuid,
+        status: Option<DeploymentStatus>,
+        finished_at: Option<chrono::DateTime<chrono::Utc>>,
+        notes: Option<String>,
+    ) -> Result<()> {
+        if let Some(d) = self.deployments.write().await.get_mut(&id) {
+            if let Some(s) = status {
+                d.status = s;
+            }
+            if let Some(f) = finished_at {
+                d.finished_at = Some(f);
+            }
+            if let Some(n) = notes {
+                d.notes = if n.is_empty() { None } else { Some(n) };
+            }
+        }
+        Ok(())
+    }
+
+    async fn get_deployment_matrix(&self, project_id: Uuid) -> Result<Vec<DeploymentMatrixEntry>> {
+        // The mock may loop (the Neo4j store does this in one aggregate query)
+        let mut matrix = Vec::new();
+        for environment in self.list_project_environments(project_id).await? {
+            let (recent, _) = self
+                .list_environment_deployments(environment.id, DEPLOYMENT_MATRIX_RECENT, 0)
+                .await?;
+            matrix.push(DeploymentMatrixEntry {
+                environment,
+                recent_statuses: recent.iter().map(|d| d.status).collect(),
+                latest_deployment: recent.into_iter().next(),
+            });
+        }
+        Ok(matrix)
     }
 
     // ========================================================================
@@ -7754,16 +8054,75 @@ impl GraphStore for MockGraphStore {
         };
 
         let fg_entities = self.feature_graph_entities.read().await;
+        let funcs = self.functions.read().await;
+        let structs = self.structs_map.read().await;
+        let traits = self.traits_map.read().await;
         let entities = fg_entities
             .get(&id)
             .map(|ents| {
                 ents.iter()
-                    .map(|(et, eid, role)| FeatureGraphEntity {
-                        entity_type: et.clone(),
-                        entity_id: eid.clone(),
-                        name: Some(eid.clone()),
-                        role: role.clone(),
-                        importance_score: None,
+                    .map(|(et, eid, role)| {
+                        let mut ent = FeatureGraphEntity {
+                            entity_type: et.clone(),
+                            entity_id: eid.clone(),
+                            name: Some(eid.clone()),
+                            role: role.clone(),
+                            ..Default::default()
+                        };
+                        match et.to_lowercase().as_str() {
+                            "file" => ent.file_path = Some(eid.clone()),
+                            "function" => {
+                                if let Some(f) = funcs.values().find(|f| &f.name == eid) {
+                                    let vis = normalize_visibility(&format!("{:?}", f.visibility));
+                                    let params = serde_json::to_string(&f.params).ok();
+                                    ent.file_path = Some(f.file_path.clone());
+                                    ent.docstring =
+                                        f.docstring.as_deref().and_then(clean_entity_docstring);
+                                    ent.signature = Some(build_function_signature(
+                                        &f.name,
+                                        vis.as_deref(),
+                                        f.is_async,
+                                        f.is_unsafe,
+                                        params.as_deref(),
+                                        f.return_type.as_deref(),
+                                    ));
+                                    ent.line_start = Some(f.line_start);
+                                    ent.visibility = vis;
+                                }
+                            }
+                            "struct" => {
+                                if let Some(x) = structs.values().find(|x| &x.name == eid) {
+                                    let vis = normalize_visibility(&format!("{:?}", x.visibility));
+                                    ent.file_path = Some(x.file_path.clone());
+                                    ent.docstring =
+                                        x.docstring.as_deref().and_then(clean_entity_docstring);
+                                    ent.signature = Some(build_type_signature(
+                                        "struct",
+                                        &x.name,
+                                        vis.as_deref(),
+                                    ));
+                                    ent.line_start = Some(x.line_start);
+                                    ent.visibility = vis;
+                                }
+                            }
+                            "trait" => {
+                                if let Some(x) = traits.values().find(|x| &x.name == eid) {
+                                    let vis = normalize_visibility(&format!("{:?}", x.visibility));
+                                    ent.file_path = Some(x.file_path.clone());
+                                    ent.docstring =
+                                        x.docstring.as_deref().and_then(clean_entity_docstring);
+                                    ent.signature = Some(build_type_signature(
+                                        "trait",
+                                        &x.name,
+                                        vis.as_deref(),
+                                    ));
+                                    ent.line_start = Some(x.line_start);
+                                    ent.visibility = vis;
+                                }
+                            }
+                            _ => {}
+                        }
+                        ent
                     })
                     .collect()
             })
@@ -8134,6 +8493,7 @@ impl GraphStore for MockGraphStore {
                 name: Some(func_name.clone()),
                 role: Some(role.to_string()),
                 importance_score: None,
+                ..Default::default()
             });
         }
         for file_path in &files {
@@ -8152,6 +8512,7 @@ impl GraphStore for MockGraphStore {
                 name: Some(file_path.clone()),
                 role: Some("support".to_string()),
                 importance_score: None,
+                ..Default::default()
             });
         }
 
@@ -8172,6 +8533,7 @@ impl GraphStore for MockGraphStore {
                 name: Some(struct_name.clone()),
                 role: Some("data_model".to_string()),
                 importance_score: None,
+                ..Default::default()
             });
         }
 
@@ -8192,6 +8554,7 @@ impl GraphStore for MockGraphStore {
                 name: Some(trait_name.clone()),
                 role: Some("trait_contract".to_string()),
                 importance_score: None,
+                ..Default::default()
             });
         }
 
@@ -8373,6 +8736,7 @@ impl GraphStore for MockGraphStore {
                 name: Some(func_name.clone()),
                 role: Some(role.to_string()),
                 importance_score: None,
+                ..Default::default()
             });
         }
         for file_path in &files {
@@ -8391,6 +8755,7 @@ impl GraphStore for MockGraphStore {
                 name: Some(file_path.clone()),
                 role: Some("support".to_string()),
                 importance_score: None,
+                ..Default::default()
             });
         }
         for struct_name in &discovered_structs {
@@ -8409,6 +8774,7 @@ impl GraphStore for MockGraphStore {
                 name: Some(struct_name.clone()),
                 role: Some("data_model".to_string()),
                 importance_score: None,
+                ..Default::default()
             });
         }
         for trait_name in &discovered_traits {
@@ -8427,6 +8793,7 @@ impl GraphStore for MockGraphStore {
                 name: Some(trait_name.clone()),
                 role: Some("trait_contract".to_string()),
                 importance_score: None,
+                ..Default::default()
             });
         }
 
@@ -11631,6 +11998,21 @@ impl GraphStore for MockGraphStore {
         // Mock: no chat event records to scan, return 0
         Ok(0)
     }
+
+    async fn get_entity_neighborhood(
+        &self,
+        center_type: &str,
+        center_id: &str,
+        params: &crate::graph::neighborhood::NeighborhoodParams,
+    ) -> Result<Option<crate::graph::neighborhood::RawNeighborhood>> {
+        let graph = self.neighborhood_graph.read().await;
+        Ok(crate::graph::neighborhood::expand_in_memory(
+            &graph,
+            center_type,
+            center_id,
+            params,
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -12953,6 +13335,60 @@ mod tests {
             docstring: None,
             is_external: false,
             source: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_feature_graph_detail_entity_enrichment_round_trip() {
+        let project = test_project();
+        let pid = project.id;
+        let store = MockGraphStore::new();
+        store.create_project(&project).await.unwrap();
+
+        let mut func = make_function("build_system_prompt", "src/prompt.rs", 42);
+        func.is_async = true;
+        func.return_type = Some("String".to_string());
+        func.params = vec![Parameter {
+            name: "ctx".to_string(),
+            type_name: Some("&Ctx".to_string()),
+        }];
+        func.docstring = Some("  Builds the prompt.  ".to_string());
+        store.upsert_function(&func).await.unwrap();
+        store
+            .project_files
+            .write()
+            .await
+            .entry(pid)
+            .or_default()
+            .push("src/prompt.rs".to_string());
+
+        let built = store
+            .auto_build_feature_graph("fg", None, pid, "build_system_prompt", 1, None, None)
+            .await
+            .unwrap();
+        let detail = store
+            .get_feature_graph_detail(built.graph.id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let f = detail
+            .entities
+            .iter()
+            .find(|e| e.entity_type == "function")
+            .expect("function entity");
+        assert_eq!(
+            f.signature.as_deref(),
+            Some("pub async fn build_system_prompt(ctx: &Ctx) -> String")
+        );
+        assert_eq!(f.docstring.as_deref(), Some("Builds the prompt."));
+        assert_eq!(f.file_path.as_deref(), Some("src/prompt.rs"));
+        assert_eq!(f.line_start, Some(42));
+        assert_eq!(f.visibility.as_deref(), Some("public"));
+
+        if let Some(file) = detail.entities.iter().find(|e| e.entity_type == "file") {
+            assert_eq!(file.file_path.as_deref(), Some(file.entity_id.as_str()));
+            assert!(file.signature.is_none());
         }
     }
 
@@ -14940,6 +15376,111 @@ mod tests {
         assert_eq!(store.count_project_files(p2.id).await.unwrap(), 5);
     }
 
+    // ── couac2: link_plan_to_project must mirror Neo4j (MERGE = additive) ──
+
+    async fn plan_ids_of(store: &MockGraphStore, project_id: Uuid) -> Vec<Uuid> {
+        store
+            .list_project_plans(project_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|p| p.id)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_link_plan_to_second_project_keeps_first_link() {
+        let store = MockGraphStore::new();
+        let p1 = crate::test_helpers::test_project_named("p1");
+        let p2 = crate::test_helpers::test_project_named("p2");
+        store.create_project(&p1).await.unwrap();
+        store.create_project(&p2).await.unwrap();
+        let plan = crate::test_helpers::test_plan_for_project(p1.id);
+        store.create_plan(&plan).await.unwrap();
+
+        store.link_plan_to_project(plan.id, p2.id).await.unwrap();
+
+        // Neo4j: MERGE adds (p2)-[:HAS_PLAN]->(plan), (p1)-[:HAS_PLAN] stays.
+        assert_eq!(plan_ids_of(&store, p1.id).await, vec![plan.id]);
+        assert_eq!(plan_ids_of(&store, p2.id).await, vec![plan.id]);
+        // SET plan.project_id = the last linked project
+        let stored = store.get_plan(plan.id).await.unwrap().unwrap();
+        assert_eq!(stored.project_id, Some(p2.id));
+    }
+
+    #[tokio::test]
+    async fn test_link_plan_to_project_is_idempotent() {
+        let store = MockGraphStore::new();
+        let p = test_project();
+        store.create_project(&p).await.unwrap();
+        let plan = crate::test_helpers::test_plan_for_project(p.id);
+        store.create_plan(&plan).await.unwrap();
+        store.link_plan_to_project(plan.id, p.id).await.unwrap();
+        store.link_plan_to_project(plan.id, p.id).await.unwrap();
+        assert_eq!(plan_ids_of(&store, p.id).await, vec![plan.id]);
+        assert_eq!(store.count_project_plans(p.id).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_link_plan_to_missing_project_or_plan_is_noop() {
+        let store = MockGraphStore::new();
+        let p = test_project();
+        store.create_project(&p).await.unwrap();
+        let plan = crate::test_helpers::test_plan();
+        store.create_plan(&plan).await.unwrap();
+
+        let ghost_project = Uuid::new_v4();
+        store
+            .link_plan_to_project(plan.id, ghost_project)
+            .await
+            .unwrap();
+        assert!(plan_ids_of(&store, ghost_project).await.is_empty());
+        let stored = store.get_plan(plan.id).await.unwrap().unwrap();
+        assert_eq!(stored.project_id, plan.project_id, "MATCH failed: no SET");
+
+        store
+            .link_plan_to_project(Uuid::new_v4(), p.id)
+            .await
+            .unwrap();
+        assert!(plan_ids_of(&store, p.id).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_unlink_plan_removes_every_project_link() {
+        let store = MockGraphStore::new();
+        let p1 = crate::test_helpers::test_project_named("p1");
+        let p2 = crate::test_helpers::test_project_named("p2");
+        store.create_project(&p1).await.unwrap();
+        store.create_project(&p2).await.unwrap();
+        let plan = crate::test_helpers::test_plan_for_project(p1.id);
+        store.create_plan(&plan).await.unwrap();
+        store.link_plan_to_project(plan.id, p2.id).await.unwrap();
+
+        store.unlink_plan_from_project(plan.id).await.unwrap();
+
+        assert!(plan_ids_of(&store, p1.id).await.is_empty());
+        assert!(plan_ids_of(&store, p2.id).await.is_empty());
+        let stored = store.get_plan(plan.id).await.unwrap().unwrap();
+        assert_eq!(stored.project_id, None);
+    }
+
+    #[tokio::test]
+    async fn test_delete_plan_linked_to_two_projects_removes_both_links() {
+        let store = MockGraphStore::new();
+        let p1 = crate::test_helpers::test_project_named("p1");
+        let p2 = crate::test_helpers::test_project_named("p2");
+        store.create_project(&p1).await.unwrap();
+        store.create_project(&p2).await.unwrap();
+        let plan = crate::test_helpers::test_plan_for_project(p1.id);
+        store.create_plan(&plan).await.unwrap();
+        store.link_plan_to_project(plan.id, p2.id).await.unwrap();
+
+        store.delete_plan(plan.id).await.unwrap();
+
+        assert!(plan_ids_of(&store, p1.id).await.is_empty());
+        assert!(plan_ids_of(&store, p2.id).await.is_empty());
+    }
+
     #[tokio::test]
     async fn test_count_project_plans_empty() {
         let store = MockGraphStore::new();
@@ -15222,6 +15763,7 @@ mod tests {
             transport_url: None,
             transport_command: Some("echo".to_string()),
             transport_args: None,
+            transport_secrets: None,
             status: "connected".to_string(),
             protocol_version: Some("2024-11-05".to_string()),
             server_name: Some("TestMCP".to_string()),
@@ -15610,5 +16152,40 @@ mod tests {
         // Should not error, just no-op
         let result = store.set_watch_enabled(Uuid::new_v4(), false).await;
         assert!(result.is_ok());
+    }
+
+    /// Regression (couac 3): wave task statuses reached the UI as `Debug`
+    /// strings (`"Failed"`, `"InProgress"`), so the runner dashboard's
+    /// lowercase comparisons fell through and showed failed tasks as
+    /// completed. They must serialize like every other `TaskStatus`.
+    #[tokio::test]
+    async fn test_compute_waves_serializes_task_status_as_snake_case() {
+        use crate::test_helpers::{test_plan, test_task_titled};
+
+        let store = MockGraphStore::new();
+        let plan = test_plan();
+        store.create_plan(&plan).await.unwrap();
+
+        let mut done = test_task_titled("done");
+        done.status = TaskStatus::Completed;
+        let mut failed = test_task_titled("failed");
+        failed.status = TaskStatus::Failed;
+        let mut running = test_task_titled("running");
+        running.status = TaskStatus::InProgress;
+        for t in [&done, &failed, &running] {
+            store.create_task(plan.id, t).await.unwrap();
+        }
+
+        let result = store.compute_waves(plan.id).await.unwrap();
+        let json = serde_json::to_value(&result).unwrap();
+        let mut statuses: Vec<String> = json["waves"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|w| w["tasks"].as_array().unwrap().clone())
+            .map(|t| t["status"].as_str().unwrap().to_string())
+            .collect();
+        statuses.sort();
+        assert_eq!(statuses, vec!["completed", "failed", "in_progress"]);
     }
 }

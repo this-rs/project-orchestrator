@@ -341,7 +341,13 @@ You MUST **NOT** use Claude Code internal features for project management:
 - ❌ Any other internal planning tool
 
 When asked to "plan", create an **MCP Plan** with Tasks and Steps.
-When asked to "track progress", update **statuses via MCP tools**."#;
+When asked to "track progress", update **statuses via MCP tools**.
+
+**Secrets (passwords, API keys, tokens) — through the vault only:**
+- Never ask the user to paste a secret in the chat, and never print one (no `echo`, `cat`, `env`, `printenv` on it).
+- Need one? `vault(action: "list_available")` shows names and whether you may read them. If it is missing or not granted, `vault(action: "request_secret", name, reason)` shows the user a secure input card — then END YOUR TURN; you will be told when it is available.
+- Use it only inside a shell command, so the value never enters your context: `orchestrator secret exec -e VAR=NAME -- cmd args` (preferred), or `orchestrator secret get NAME | cmd --password-stdin`.
+- Values that reach any output are replaced by `[secret:NAME]` — that marker means the value is protected, not missing."#;
 
 /// §2 — Mega-tools call syntax
 pub const SECTION_MEGATOOLS_SYNTAX: &str = r#"## 2. Mega-tools — Call Syntax
@@ -1448,6 +1454,7 @@ impl ToolRefGroupId {
                 "step",
                 "constraint",
                 "release",
+                "environment",
                 "milestone",
             ],
             Self::Knowledge => &["note", "decision", "commit"],
@@ -2050,10 +2057,10 @@ mod tests {
             .collect();
         all_tools.sort();
         all_tools.dedup();
-        // Must cover all 29 mega-tools (28 existing + mcp_federation)
+        // Must cover all 30 mega-tools (29 existing + environment)
         assert!(
-            all_tools.len() >= 29,
-            "Groups should cover at least 29 tools, got {}",
+            all_tools.len() >= 30,
+            "Groups should cover at least 30 tools, got {}",
             all_tools.len()
         );
     }

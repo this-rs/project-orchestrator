@@ -43,8 +43,10 @@ impl GraphStore for Neo4jClient {
         name: Option<String>,
         description: Option<Option<String>>,
         root_path: Option<String>,
+        profile: Option<ProjectProfile>,
     ) -> anyhow::Result<()> {
-        self.update_project(id, name, description, root_path).await
+        self.update_project(id, name, description, root_path, profile)
+            .await
     }
 
     async fn update_project_synced(&self, id: Uuid) -> anyhow::Result<()> {
@@ -197,7 +199,7 @@ impl GraphStore for Neo4jClient {
         description: Option<String>,
         status: Option<MilestoneStatus>,
         target_date: Option<chrono::DateTime<chrono::Utc>>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
         self.update_workspace_milestone(id, title, description, status, target_date)
             .await
     }
@@ -290,7 +292,7 @@ impl GraphStore for Neo4jClient {
         url: Option<String>,
         version: Option<String>,
         description: Option<String>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
         self.update_resource(id, name, file_path, url, version, description)
             .await
     }
@@ -344,17 +346,12 @@ impl GraphStore for Neo4jClient {
         self.list_components(workspace_id).await
     }
 
-    async fn update_component(
-        &self,
-        id: Uuid,
-        name: Option<String>,
-        description: Option<String>,
-        runtime: Option<String>,
-        config: Option<serde_json::Value>,
-        tags: Option<Vec<String>>,
-    ) -> anyhow::Result<()> {
-        self.update_component(id, name, description, runtime, config, tags)
-            .await
+    async fn update_component(&self, id: Uuid, patch: ComponentUpdate) -> anyhow::Result<bool> {
+        self.update_component(id, patch).await
+    }
+
+    async fn upsert_derived_component(&self, write: DerivedComponentWrite) -> anyhow::Result<Uuid> {
+        self.upsert_derived_component(write).await
     }
 
     async fn delete_component(&self, id: Uuid) -> anyhow::Result<()> {
@@ -974,6 +971,10 @@ impl GraphStore for Neo4jClient {
         self.update_plan_status(id, status).await
     }
 
+    async fn list_plan_project_slugs(&self, plan_id: Uuid) -> anyhow::Result<Vec<String>> {
+        self.list_plan_project_slugs(plan_id).await
+    }
+
     async fn link_plan_to_project(&self, plan_id: Uuid, project_id: Uuid) -> anyhow::Result<()> {
         self.link_plan_to_project(plan_id, project_id).await
     }
@@ -1548,6 +1549,77 @@ impl GraphStore for Neo4jClient {
     }
 
     // ========================================================================
+    // Environment & deployment operations
+    // ========================================================================
+
+    async fn create_environment(&self, env: &EnvironmentNode) -> anyhow::Result<()> {
+        self.create_environment(env).await
+    }
+
+    async fn get_environment(&self, id: Uuid) -> anyhow::Result<Option<EnvironmentNode>> {
+        self.get_environment(id).await
+    }
+
+    async fn list_project_environments(
+        &self,
+        project_id: Uuid,
+    ) -> anyhow::Result<Vec<EnvironmentNode>> {
+        self.list_project_environments(project_id).await
+    }
+
+    async fn update_environment(
+        &self,
+        id: Uuid,
+        name: Option<String>,
+        kind: Option<EnvironmentKind>,
+        url: Option<String>,
+        description: Option<String>,
+        config: Option<String>,
+    ) -> anyhow::Result<()> {
+        self.update_environment(id, name, kind, url, description, config)
+            .await
+    }
+
+    async fn delete_environment(&self, id: Uuid) -> anyhow::Result<()> {
+        self.delete_environment(id).await
+    }
+
+    async fn create_deployment(&self, deployment: &DeploymentNode) -> anyhow::Result<()> {
+        self.create_deployment(deployment).await
+    }
+
+    async fn get_deployment(&self, id: Uuid) -> anyhow::Result<Option<DeploymentNode>> {
+        self.get_deployment(id).await
+    }
+
+    async fn list_environment_deployments(
+        &self,
+        environment_id: Uuid,
+        limit: usize,
+        offset: usize,
+    ) -> anyhow::Result<(Vec<DeploymentNode>, usize)> {
+        self.list_environment_deployments(environment_id, limit, offset)
+            .await
+    }
+
+    async fn update_deployment(
+        &self,
+        id: Uuid,
+        status: Option<DeploymentStatus>,
+        finished_at: Option<chrono::DateTime<chrono::Utc>>,
+        notes: Option<String>,
+    ) -> anyhow::Result<()> {
+        self.update_deployment(id, status, finished_at, notes).await
+    }
+
+    async fn get_deployment_matrix(
+        &self,
+        project_id: Uuid,
+    ) -> anyhow::Result<Vec<DeploymentMatrixEntry>> {
+        self.get_deployment_matrix(project_id).await
+    }
+
+    // ========================================================================
     // Milestone operations
     // ========================================================================
 
@@ -1645,6 +1717,14 @@ impl GraphStore for Neo4jClient {
 
     async fn get_project_progress(&self, project_id: Uuid) -> anyhow::Result<(u32, u32, u32, u32)> {
         self.get_project_progress(project_id).await
+    }
+
+    async fn get_progress_batch(
+        &self,
+        kind: ProgressKind,
+        ids: &[Uuid],
+    ) -> anyhow::Result<std::collections::HashMap<Uuid, TaskCounts>> {
+        self.get_progress_batch(kind, ids).await
     }
 
     async fn get_project_task_dependencies(
@@ -4304,5 +4384,15 @@ impl GraphStore for Neo4jClient {
 
     async fn backfill_often_follows(&self) -> anyhow::Result<usize> {
         self.backfill_often_follows().await
+    }
+
+    async fn get_entity_neighborhood(
+        &self,
+        center_type: &str,
+        center_id: &str,
+        params: &crate::graph::neighborhood::NeighborhoodParams,
+    ) -> anyhow::Result<Option<crate::graph::neighborhood::RawNeighborhood>> {
+        self.get_entity_neighborhood(center_type, center_id, params)
+            .await
     }
 }

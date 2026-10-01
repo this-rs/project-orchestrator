@@ -15,6 +15,10 @@ tokio-stream = "0.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_yaml = "0.9"
+# Manifest parsing for architecture derivation (src/architecture).
+# Pinned to 0.8 because that version is already resolved transitively — a wider
+# range would pull a second copy for no benefit.
+toml = "0.8"
 
 # Neo4j
 neo4rs = "0.8"
@@ -69,6 +73,7 @@ tower-http = { version = "0.7", features = ["cors", "trace", "fs", "set-header",
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
+toml = { workspace = true }
 
 # Neo4j
 neo4rs = { workspace = true }
@@ -122,6 +127,13 @@ glob = "0.3"
 sha2 = "0.11"
 hmac = "0.13"
 hex = "0.4"
+# Vault (src/vault): Argon2id derives a key from the user's passphrase,
+# XChaCha20-Poly1305 seals each secret, zeroize wipes keys from memory.
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+zeroize = { version = "1", features = ["derive", "serde"] }
+# Release version comparison (self-update checker)
+semver = "1"
 rayon = "1.10"
 futures = { workspace = true }
 async-trait = { workspace = true }
@@ -130,7 +142,7 @@ async-trait = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 # Chat / Claude Code SDK
-nexus-claude = { git = "https://github.com/this-rs/nexus.git", rev = "c68f046fe11e031060db32380385468a5b611a85", features = ["memory", "auto-download"] }
+nexus-claude = { git = "https://github.com/this-rs/nexus.git", rev = "3abe13e25ad06e8121c04a3ef1a68da61b4e208a", features = ["memory", "auto-download"] }
 tokio-stream = { workspace = true }
 
 # Auth
@@ -153,6 +165,12 @@ zip = { version = "8", default-features = false, features = ["deflate"] }
 # already in Cargo.lock as a transitive dependency — pinning the same minor
 # reuses that resolution instead of vendoring a second copy of the crate.
 quick-xml = { version = "0.39", optional = true }
+
+# XLSX text extraction (feature `xlsx`). Spreadsheets are cell grids with shared
+# strings, typed values and several storage formats, so unlike DOCX/PPTX this is
+# not worth hand-rolling on top of `zip`. Default features are off: `dates` and
+# `picture` are not needed to read cell text.
+calamine = { version = "0.36", default-features = false, optional = true }
 
 # Home directory detection
 dirs = "6"
@@ -217,12 +235,16 @@ libc = "0.2"
 [features]
 default = []
 docx = ["dep:quick-xml"]
+pptx = ["dep:quick-xml"]
+xlsx = ["dep:calamine"]
 embedded-frontend = ["dep:rust-embed", "dep:mime_guess"]
 vendored-openssl = ["dep:openssl-sys"]
 pdf = ["dep:pdf_oxide", "dep:office_oxide"]
 
 [dev-dependencies]
 tokio-test = "0.4"
+# Paused clock for the periodic update-check test
+tokio = { workspace = true, features = ["test-util"] }
 tempfile = "3.14"
 wiremock = "0.6.5"
 

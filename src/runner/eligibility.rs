@@ -10,6 +10,7 @@
 use crate::api::attention::{
     ResumePreview, RunnerOccupant, RunnerState as AttentionRunnerState, RunnerStatus, TaskRef,
 };
+use crate::neo4j::models::TaskStatus;
 use crate::neo4j::plan::WaveTask;
 use crate::runner::models::PlanRunStatus;
 use crate::runner::state::RunnerState;
@@ -32,14 +33,12 @@ impl Eligibility {
     }
 }
 
-/// The one eligibility decision. `status` is the stored task status string.
-pub fn task_eligibility(status: &str) -> Eligibility {
-    if status.eq_ignore_ascii_case("completed") {
-        Eligibility::SkipDone
-    } else if status.eq_ignore_ascii_case("blocked") {
-        Eligibility::SkipBlocked
-    } else {
-        Eligibility::Run
+/// The one eligibility decision.
+pub fn task_eligibility(status: &TaskStatus) -> Eligibility {
+    match status {
+        TaskStatus::Completed => Eligibility::SkipDone,
+        TaskStatus::Blocked => Eligibility::SkipBlocked,
+        TaskStatus::Pending | TaskStatus::InProgress | TaskStatus::Failed => Eligibility::Run,
     }
 }
 
@@ -77,7 +76,7 @@ pub fn resume_breakdown<'a>(tasks: impl IntoIterator<Item = &'a WaveTask>) -> Re
                 title: t.title.clone().unwrap_or_else(|| "untitled".to_string()),
             }),
             Eligibility::Run => {
-                if t.status.eq_ignore_ascii_case("failed") {
+                if t.status == TaskStatus::Failed {
                     b.failed_to_retry += 1;
                 } else {
                     b.todo += 1;
@@ -149,11 +148,11 @@ mod tests {
     use crate::neo4j::plan::Wave;
     use crate::runner::models::TriggerSource;
 
-    fn wt(status: &str, title: &str) -> WaveTask {
+    fn wt(status: TaskStatus, title: &str) -> WaveTask {
         WaveTask {
             id: Uuid::new_v4(),
             title: Some(title.into()),
-            status: status.into(),
+            status,
             priority: None,
             affected_files: vec![],
             depends_on: vec![],
@@ -162,21 +161,31 @@ mod tests {
 
     fn plan() -> Vec<WaveTask> {
         vec![
-            wt("completed", "a"),
-            wt("Completed", "b"),
-            wt("blocked", "needs creds"),
-            wt("failed", "flaky"),
-            wt("pending", "todo1"),
-            wt("in_progress", "todo2"),
+            wt(TaskStatus::Completed, "a"),
+            wt(TaskStatus::Completed, "b"),
+            wt(TaskStatus::Blocked, "needs creds"),
+            wt(TaskStatus::Failed, "flaky"),
+            wt(TaskStatus::Pending, "todo1"),
+            wt(TaskStatus::InProgress, "todo2"),
         ]
     }
 
     #[test]
     fn eligibility_rule() {
-        assert_eq!(task_eligibility("completed"), Eligibility::SkipDone);
-        assert_eq!(task_eligibility("BLOCKED"), Eligibility::SkipBlocked);
-        for s in ["pending", "in_progress", "failed"] {
-            assert!(task_eligibility(s).is_run(), "{s}");
+        assert_eq!(
+            task_eligibility(&TaskStatus::Completed),
+            Eligibility::SkipDone
+        );
+        assert_eq!(
+            task_eligibility(&TaskStatus::Blocked),
+            Eligibility::SkipBlocked
+        );
+        for s in [
+            TaskStatus::Pending,
+            TaskStatus::InProgress,
+            TaskStatus::Failed,
+        ] {
+            assert!(task_eligibility(&s).is_run(), "{s:?}");
         }
     }
 

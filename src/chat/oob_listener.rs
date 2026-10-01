@@ -170,6 +170,7 @@ pub(crate) fn spawn_oob_listener(
                 next = stream.next() => {
                     match next {
                         Some(Ok(message)) => {
+                            let message = ChatManager::mask_cli_message(message);
                             remember_subagent_launches(&message, &mut subagent_parents);
                             if last_activity_touch.elapsed() >= ACTIVITY_TOUCH_INTERVAL {
                                 last_activity_touch = Instant::now();

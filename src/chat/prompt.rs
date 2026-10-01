@@ -116,7 +116,7 @@ Business processes: `code(action: "list_processes")`, `code(action: "get_process
   - `code(action: "find_trait_implementations", trait_name)` — trait implementations
   - `code(action: "find_type_traits", type_name)` — traits implemented by a type
   - `code(action: "get_impl_blocks", type_name)` — impl blocks for a type
-  - `code(action: "find_similar_code", code_snippet)` — similar code
+  - `code(action: "find_similar", snippet)` — similar code
 
 ## 4. Git Workflow
 
@@ -661,7 +661,7 @@ Plans can be executed autonomously and triggered automatically:
 - `plan(action: "enrich", plan_id)` — auto-enrich plan with affected files and dependencies
 "#;
 
-/// Exhaustive reference of all 29 MCP mega-tools with every action and parameter.
+/// Exhaustive reference of all 30 MCP mega-tools with every action and parameter.
 /// Injected as the final section of the system prompt by `build_system_prompt()`.
 pub const TOOL_REFERENCE: &str = r#"# MCP Mega-Tools Reference
 
@@ -673,9 +673,9 @@ Manage projects. Actions: list, create, get, update, delete, sync, get_roadmap, 
 | Action | Key Parameters | Description |
 |--------|---------------|-------------|
 | list | `search`, `limit`, `offset`, `sort_by`, `sort_order` | List all projects |
-| create | `name` (req), `description`, `root_path` | Create a project |
+| create | `name` (req), `description`, `root_path` (optional), `profile` (`software`\|`work`) | Create a project. `work` projects (documents, plans, tasks, notes) have no `root_path` and are never synced or watched |
 | get | `slug` (req) | Get project by slug |
-| update | `slug` (req), `name`, `description`, `root_path` | Update project fields |
+| update | `slug` (req), `name`, `description`, `root_path` (empty string clears), `profile` | Update project fields |
 | delete | `slug` (req) | Delete a project |
 | sync | `slug` (req) | Sync project from filesystem |
 | get_roadmap | `slug` (req) | Get project roadmap |
@@ -795,6 +795,21 @@ Manage releases. Actions: list, create, get, update, delete, add_task, add_commi
 | add_commit | `release_id` (req), `commit_sha` (req) | Add commit to release |
 | remove_commit | `release_id` (req), `commit_sha` (req) | Remove commit from release |
 
+## environment
+Manage project environments (dev/staging/production) and what was deployed where. Actions: list, create, get, update, delete, deploy, update_deployment, list_deployments, get_matrix
+
+| Action | Key Parameters | Description |
+|--------|---------------|-------------|
+| list | `project_id` (req) | List environments of a project |
+| create | `project_id` (req), `name` (req, unique per project), `kind` (dev/staging/production/other), `url`, `description`, `config` (free JSON) | Create environment |
+| get | `environment_id` (req) | Get environment by UUID |
+| update | `environment_id` (req), `name`, `kind`, `url`, `description`, `config` | Update environment |
+| delete | `environment_id` (req) | Delete environment and its deployments |
+| deploy | `environment_id` (req), `version`, `commit_sha`, `status` (pending/running/succeeded/failed/rolled_back), `notes`, `created_by` | Record a deployment |
+| update_deployment | `deployment_id` (req), `status`, `notes`, `finished_at` | Update deployment (terminal status sets finished_at) |
+| list_deployments | `environment_id` (req), `limit`, `offset` | Deployments of an environment, newest first |
+| get_matrix | `project_id` (req) | Environments x latest deployment + last 5 statuses |
+
 ## milestone
 Manage project milestones. Actions: list, create, get, update, delete, get_progress, add_task, link_plan, unlink_plan
 
@@ -836,8 +851,8 @@ Manage knowledge notes. Actions: list, create, get, update, delete, search, sear
 | search | `query` (req) | Full-text search notes (BM25) |
 | search_semantic | `query` (req), `project_id` | Semantic vector search notes |
 | confirm | `note_id` (req) | Confirm note validity |
-| invalidate | `note_id` (req) | Mark note as invalid |
-| supersede | `note_id` (req), `superseded_by_id` (req) | Supersede with newer note |
+| invalidate | `note_id` (req), `reason` (req) | Mark note as invalid |
+| supersede | `old_note_id` (req), `note_type` (req), `content` (req), `project_id` | Create a new note that supersedes `old_note_id` |
 | link_to_entity | `note_id` (req), `entity_type` (req), `entity_id` (req) | Link note to entity |
 | unlink_from_entity | `note_id` (req), `entity_type` (req), `entity_id` (req) | Unlink note from entity |
 | get_context | `entity_type` (req), `entity_id` (req) | Get contextual notes |
@@ -863,7 +878,7 @@ Manage workspaces. Actions: list, create, get, update, delete, get_overview, lis
 | delete | `slug` (req) | Delete workspace |
 | get_overview | `slug` (req) | Get workspace overview |
 | list_projects | `slug` (req) | List projects in workspace |
-| add_project | `slug` (req), `project_id` (req), `role` | Add project to workspace |
+| add_project | `slug` (req), `project_id` (req) | Add project to workspace |
 | remove_project | `slug` (req), `project_id` (req) | Remove project from workspace |
 | get_topology | `slug` (req) | Get component topology |
 
@@ -893,7 +908,7 @@ Manage workspace resources (API contracts, schemas). Actions: list, create, get,
 | get | `id` (req) | Get resource by UUID |
 | update | `id` (req), `name`, `description`, `file_path`, `url`, `version` | Update resource |
 | delete | `id` (req) | Delete resource |
-| link_to_project | `resource_id` (req), `project_id` (req) | Link resource to project |
+| link_to_project | `id` (req), `project_id` (req), `relation` (req: implements/uses) | Link resource to project |
 
 ## component
 Manage workspace components (services, modules). Actions: list, create, get, update, delete, add_dependency, remove_dependency, map_to_project
@@ -905,8 +920,8 @@ Manage workspace components (services, modules). Actions: list, create, get, upd
 | get | `id` (req) | Get component by UUID |
 | update | `id` (req), `name`, `description`, `runtime`, `config`, `tags` | Update component |
 | delete | `id` (req) | Delete component |
-| add_dependency | `from_id` (req), `to_id` (req), `dependency_type` | Add dependency between components |
-| remove_dependency | `from_id` (req), `to_id` (req) | Remove dependency |
+| add_dependency | `id` (req), `depends_on_id` (req), `protocol`, `required` | `id` depends on `depends_on_id` |
+| remove_dependency | `id` (req), `dep_id` (req) | Remove dependency |
 | map_to_project | `component_id` (req), `project_id` (req) | Map component to project |
 
 ## chat
@@ -954,7 +969,7 @@ Explore and analyze code. Actions: search, search_project, search_workspace, get
 | get_call_graph | `function` (req), `limit` (depth) | Get call graph for function |
 | analyze_impact | `target` (req) | Analyze impact of changes |
 | get_architecture | `project_slug` | Get project architecture overview |
-| find_similar | `code_snippet` (req) | Find similar code |
+| find_similar | `snippet` (req), `limit` | Find similar code |
 | find_trait_implementations | `trait_name` (req) | Find trait implementations |
 | find_type_traits | `type_name` (req) | Find traits for type |
 | get_impl_blocks | `type_name` (req) | Get impl blocks for type |
@@ -1299,19 +1314,17 @@ Manage lifecycle hooks — automatic actions triggered on entity status changes.
 | delete | `hook_id` (req) | Delete a hook |
 
 ## mcp_federation
-Manage external MCP server connections (federation). Actions: connect, disconnect, list, status, tools, probe, reconnect, backfill_relations, backfill_sequences
+Manage external MCP server connections (federation). Actions: connect, disconnect, list, status, tools, probe, reconnect
 
 | Action | Key Parameters | Description |
 |--------|---------------|-------------|
-| connect | `server_id` (req), `transport` (req: stdio/sse/streamable_http), `command`, `args` (array), `env` (object) for stdio, `url`, `headers` (object) for sse/streamable_http, `display_name`, `auto_probe` (default true) | Connect an external MCP server |
+| connect | `server_id` (req), `transport` (req: stdio/sse/streamable_http), `command`, `args` (array), `env` (object) for stdio, `url`, `headers` (object) for sse/streamable_http, `display_name` | Connect an external MCP server |
 | disconnect | `server_id` (req) | Disconnect a server |
 | list | | List connected external MCP servers |
 | status | `server_id` (req) | Get connection status of a server |
 | tools | `server_id` (req) | List the tools exposed by a server |
 | probe | `server_id` (req) | Probe a server's read-only tools |
 | reconnect | `server_id` (req) | Reconnect a server |
-| backfill_relations | | Backfill CO_ACTIVATED_WITH relations between external tools used in the same session |
-| backfill_sequences | | Backfill OFTEN_FOLLOWS relations between consecutively used external tools |
 "#;
 
 use anyhow::Result;
@@ -1493,7 +1506,7 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
     ToolGroup {
         name: "releases_milestones",
         description: "Deliverable versions and milestones",
-        keywords: &["release", "milestone", "version", "deliverable", "livrable", "jalon", "delivery", "livraison"],
+        keywords: &["release", "milestone", "version", "deliverable", "livrable", "jalon", "delivery", "livraison", "environment", "deploy", "deployment", "staging", "production"],
         tools: &[
             ToolRef {
                 name: "release",
@@ -1503,7 +1516,24 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
                 name: "milestone",
                 description: "Manage milestones (list/create/get/update/delete/get_progress/add_task/link_plan/unlink_plan)",
             },
+            ToolRef {
+                name: "environment",
+                description: "Manage environments and deployments (list/create/get/update/delete/deploy/update_deployment/list_deployments/get_matrix)",
+            },
         ],
+    },
+    // ── Secrets ─────────────────────────────────────────────────────
+    ToolGroup {
+        name: "secrets",
+        description: "Ask the user for a secret and use it without seeing it (vault)",
+        keywords: &[
+            "secret", "password", "mot de passe", "passphrase", "token", "jeton", "api key",
+            "clé api", "credential", "identifiant", "login", "vault", "coffre",
+        ],
+        tools: &[ToolRef {
+            name: "vault",
+            description: "Secrets vault for agents (list_available/request_secret) — use values only via `orchestrator secret exec|get` in the shell",
+        }],
     },
     // ── Workspace ───────────────────────────────────────────────────
     ToolGroup {
@@ -1651,14 +1681,14 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
             },
             ToolRef {
                 name: "mcp_federation",
-                description: "Manage external MCP server connections (connect/disconnect/list/status/tools/probe/reconnect/backfill_relations/backfill_sequences) — federation layer for consuming external MCP servers",
+                description: "Manage external MCP server connections (connect/disconnect/list/status/tools/probe/reconnect) — federation layer for consuming external MCP servers",
             },
         ],
     },
 ];
 
 /// Total number of unique tools across all groups.
-/// Must match the MCP tools.rs count (currently 29 mega-tools).
+/// Must match the MCP tools.rs count (currently 30 mega-tools).
 pub fn tool_catalog_tool_count() -> usize {
     let mut names: Vec<&str> = TOOL_GROUPS
         .iter()
@@ -2127,7 +2157,13 @@ pub fn context_to_markdown(ctx: &ProjectContext, user_message: Option<&str>) -> 
 
     if let Some(ref p) = ctx.project {
         md.push_str(&format!("## Active Project: {} ({})\n", p.name, p.slug));
-        md.push_str(&format!("Root: {}\n", p.root_path));
+        match p.root_path_opt() {
+            Some(root) => md.push_str(&format!("Root: {}\n", root)),
+            None => md.push_str(&format!(
+                "Profile: {} (no root path: nothing to sync)\n",
+                p.profile.as_str()
+            )),
+        }
         if let Some(ref desc) = p.description {
             md.push_str(&format!("Description: {}\n", desc));
         }
@@ -2620,6 +2656,7 @@ mod tests {
                 scaffolding_override: None,
                 sharing_policy: None,
                 watch_enabled: true,
+                profile: Default::default(),
             }),
             ..Default::default()
         };
@@ -2646,6 +2683,7 @@ mod tests {
                 scaffolding_override: None,
                 sharing_policy: None,
                 watch_enabled: true,
+                profile: Default::default(),
             }),
             language_stats: vec![LanguageStatsNode {
                 language: "Rust".into(),
@@ -2801,6 +2839,7 @@ mod tests {
                 scaffolding_override: None,
                 sharing_policy: None,
                 watch_enabled: true,
+                profile: Default::default(),
             }),
             workspace: Some(WorkspaceNode {
                 id: uuid::Uuid::new_v4(),
@@ -2826,6 +2865,7 @@ mod tests {
                     scaffolding_override: None,
                     sharing_policy: None,
                     watch_enabled: true,
+                    profile: Default::default(),
                 },
                 ProjectNode {
                     id: uuid::Uuid::new_v4(),
@@ -2841,6 +2881,7 @@ mod tests {
                     scaffolding_override: None,
                     sharing_policy: None,
                     watch_enabled: true,
+                    profile: Default::default(),
                 },
             ],
             ..Default::default()
@@ -2922,6 +2963,7 @@ mod tests {
                 scaffolding_override: None,
                 sharing_policy: None,
                 watch_enabled: true,
+                profile: Default::default(),
             }),
             global_guidelines: vec![{
                 let mut n = crate::notes::Note::new(
@@ -2953,11 +2995,11 @@ mod tests {
     // ================================================================
 
     #[test]
-    fn test_tool_groups_cover_all_29_mega_tools() {
+    fn test_tool_groups_cover_all_mega_tools() {
         let count = tool_catalog_tool_count();
         assert_eq!(
-            count, 29,
-            "TOOL_GROUPS must cover exactly 29 unique mega-tools (got {}). \
+            count, 31,
+            "TOOL_GROUPS must cover exactly 31 unique mega-tools (got {}). \
              Update the catalog when adding/removing MCP tools.",
             count
         );
@@ -3006,8 +3048,28 @@ mod tests {
     }
 
     #[test]
+    fn test_project_tool_docs_cover_profile_and_optional_root_path() {
+        // The prompt reference and the MCP schema must both tell the model
+        // that `root_path` is optional and that `profile` exists.
+        assert!(TOOL_REFERENCE.contains("`profile` (`software`\\|`work`)"));
+        assert!(TOOL_REFERENCE.contains("`root_path` (optional)"));
+
+        let mcp = crate::mcp::tools::all_tools();
+        let project = mcp.iter().find(|t| t.name == "project").unwrap();
+        let props = project.input_schema.properties.as_ref().unwrap();
+        assert_eq!(
+            props["profile"]["enum"],
+            serde_json::json!(["software", "work"])
+        );
+        assert!(props["root_path"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("Optional"));
+    }
+
+    #[test]
     fn test_tool_groups_count() {
-        assert_eq!(TOOL_GROUPS.len(), 15, "Expected 15 tool groups");
+        assert_eq!(TOOL_GROUPS.len(), 16, "Expected 16 tool groups");
     }
 
     #[test]
@@ -3214,6 +3276,7 @@ mod tests {
                 scaffolding_override: None,
                 sharing_policy: None,
                 watch_enabled: true,
+                profile: Default::default(),
             }),
             ..Default::default()
         };
@@ -3257,6 +3320,7 @@ mod tests {
                 scaffolding_override: None,
                 sharing_policy: None,
                 watch_enabled: true,
+                profile: Default::default(),
             }),
             feature_graphs: make_feature_graphs(3),
             ..Default::default()
@@ -3289,6 +3353,7 @@ mod tests {
                 scaffolding_override: None,
                 sharing_policy: None,
                 watch_enabled: true,
+                profile: Default::default(),
             }),
             ..Default::default()
         };
@@ -3329,6 +3394,7 @@ mod tests {
                 scaffolding_override: None,
                 sharing_policy: None,
                 watch_enabled: true,
+                profile: Default::default(),
             }),
             feature_graphs: fgs,
             ..Default::default()

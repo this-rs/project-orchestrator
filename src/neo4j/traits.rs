@@ -54,6 +54,7 @@ pub trait GraphStore: Send + Sync {
         name: Option<String>,
         description: Option<Option<String>>,
         root_path: Option<String>,
+        profile: Option<ProjectProfile>,
     ) -> Result<()>;
 
     /// Update project last_synced timestamp
@@ -163,6 +164,8 @@ pub trait GraphStore: Send + Sync {
     ) -> Result<usize>;
 
     /// Update a workspace milestone
+    ///
+    /// Returns `false` when no milestone has this id (nothing was written).
     async fn update_workspace_milestone(
         &self,
         id: Uuid,
@@ -170,7 +173,7 @@ pub trait GraphStore: Send + Sync {
         description: Option<String>,
         status: Option<MilestoneStatus>,
         target_date: Option<chrono::DateTime<chrono::Utc>>,
-    ) -> Result<()>;
+    ) -> Result<bool>;
 
     /// Delete a workspace milestone
     async fn delete_workspace_milestone(&self, id: Uuid) -> Result<()>;
@@ -232,6 +235,8 @@ pub trait GraphStore: Send + Sync {
     async fn list_workspace_resources(&self, workspace_id: Uuid) -> Result<Vec<ResourceNode>>;
 
     /// Update a resource
+    ///
+    /// Returns `false` when no resource has this id (nothing was written).
     async fn update_resource(
         &self,
         id: Uuid,
@@ -240,7 +245,7 @@ pub trait GraphStore: Send + Sync {
         url: Option<String>,
         version: Option<String>,
         description: Option<String>,
-    ) -> Result<()>;
+    ) -> Result<bool>;
 
     /// Delete a resource
     async fn delete_resource(&self, id: Uuid) -> Result<()>;
@@ -275,15 +280,14 @@ pub trait GraphStore: Send + Sync {
     async fn list_components(&self, workspace_id: Uuid) -> Result<Vec<ComponentNode>>;
 
     /// Update a component
-    async fn update_component(
-        &self,
-        id: Uuid,
-        name: Option<String>,
-        description: Option<String>,
-        runtime: Option<String>,
-        config: Option<serde_json::Value>,
-        tags: Option<Vec<String>>,
-    ) -> Result<()>;
+    ///
+    /// Returns `false` when no component has this id (nothing was written).
+    async fn update_component(&self, id: Uuid, patch: ComponentUpdate) -> Result<bool>;
+
+    /// Create the component if absent, refresh it if present, and return its id.
+    /// Identity is (workspace, name). Used by architecture derivation, which runs
+    /// on every sync and must not stack duplicates the way `create_component` would.
+    async fn upsert_derived_component(&self, write: DerivedComponentWrite) -> Result<Uuid>;
 
     /// Delete a component
     async fn delete_component(&self, id: Uuid) -> Result<()>;
@@ -780,6 +784,10 @@ pub trait GraphStore: Send + Sync {
     /// Link a plan to a project (creates HAS_PLAN relationship)
     async fn link_plan_to_project(&self, plan_id: Uuid, project_id: Uuid) -> Result<()>;
 
+    /// Slugs of every project the plan belongs to (HAS_PLAN edges + plan.project_id).
+    /// Used to scope task-context retrieval to the plan's own projects.
+    async fn list_plan_project_slugs(&self, plan_id: Uuid) -> Result<Vec<String>>;
+
     /// Unlink a plan from its project
     async fn unlink_plan_from_project(&self, plan_id: Uuid) -> Result<()>;
 
@@ -1237,6 +1245,61 @@ pub trait GraphStore: Send + Sync {
     async fn delete_release(&self, release_id: Uuid) -> Result<()>;
 
     // ========================================================================
+    // Environment & deployment operations
+    // ========================================================================
+
+    /// Create an environment. Errors when the project does not exist or when the
+    /// name is already used by another environment of the project.
+    async fn create_environment(&self, env: &EnvironmentNode) -> Result<()>;
+
+    /// Get an environment by ID
+    async fn get_environment(&self, id: Uuid) -> Result<Option<EnvironmentNode>>;
+
+    /// List the environments of a project (oldest first)
+    async fn list_project_environments(&self, project_id: Uuid) -> Result<Vec<EnvironmentNode>>;
+
+    /// Update an environment (empty string clears url/description/config)
+    async fn update_environment(
+        &self,
+        id: Uuid,
+        name: Option<String>,
+        kind: Option<EnvironmentKind>,
+        url: Option<String>,
+        description: Option<String>,
+        config: Option<String>,
+    ) -> Result<()>;
+
+    /// Delete an environment and its deployments
+    async fn delete_environment(&self, id: Uuid) -> Result<()>;
+
+    /// Record a deployment (linked to the Commit node with the same sha, if any)
+    async fn create_deployment(&self, deployment: &DeploymentNode) -> Result<()>;
+
+    /// Get a deployment by ID
+    async fn get_deployment(&self, id: Uuid) -> Result<Option<DeploymentNode>>;
+
+    /// List deployments of an environment, newest first, with the total count
+    async fn list_environment_deployments(
+        &self,
+        environment_id: Uuid,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<DeploymentNode>, usize)>;
+
+    /// Update a deployment (status, finished_at, notes)
+    async fn update_deployment(
+        &self,
+        id: Uuid,
+        status: Option<DeploymentStatus>,
+        finished_at: Option<chrono::DateTime<chrono::Utc>>,
+        notes: Option<String>,
+    ) -> Result<()>;
+
+    /// Deployment matrix of a project: every environment with its latest
+    /// deployment and the statuses of its last 5 deployments (newest first)
+    async fn get_deployment_matrix(&self, project_id: Uuid) -> Result<Vec<DeploymentMatrixEntry>>;
+
+    // ========================================================================
     // Milestone operations
     // ========================================================================
 
@@ -1303,6 +1366,28 @@ pub trait GraphStore: Send + Sync {
 
     /// Get project progress stats
     async fn get_project_progress(&self, project_id: Uuid) -> Result<(u32, u32, u32, u32)>;
+
+    /// Task counters for many entities at once (one round trip for list cards).
+    ///
+    /// The default implementation loops over the per-entity task getters so
+    /// every store (including mocks) supports it; `Neo4jClient` overrides it
+    /// with a single aggregated query.
+    async fn get_progress_batch(
+        &self,
+        kind: ProgressKind,
+        ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, TaskCounts>> {
+        let mut out = std::collections::HashMap::with_capacity(ids.len());
+        for id in ids {
+            let tasks = match kind {
+                ProgressKind::Plan => self.get_plan_tasks(*id).await?,
+                ProgressKind::Project => self.get_project_tasks(*id).await?,
+                ProgressKind::Milestone => self.get_milestone_tasks(*id).await?,
+            };
+            out.insert(*id, TaskCounts::from_tasks(&tasks));
+        }
+        Ok(out)
+    }
 
     /// Get all task dependencies for a project (across all plans)
     async fn get_project_task_dependencies(&self, project_id: Uuid) -> Result<Vec<(Uuid, Uuid)>>;
@@ -3656,4 +3741,18 @@ pub trait GraphStore: Send + Sync {
 
     /// Backfill OFTEN_FOLLOWS relations from consecutive tool use events
     async fn backfill_often_follows(&self) -> Result<usize>;
+
+    // ========================================================================
+    // Entity neighbourhood (ego-graph)
+    // ========================================================================
+
+    /// Bounded candidate neighbourhood around an entity, walked hop by hop
+    /// over the relationship types of `params.layers` (see
+    /// `crate::graph::neighborhood`). `Ok(None)` when the centre is unknown.
+    async fn get_entity_neighborhood(
+        &self,
+        center_type: &str,
+        center_id: &str,
+        params: &crate::graph::neighborhood::NeighborhoodParams,
+    ) -> Result<Option<crate::graph::neighborhood::RawNeighborhood>>;
 }

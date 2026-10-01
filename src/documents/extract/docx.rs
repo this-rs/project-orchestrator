@@ -257,7 +257,7 @@ fn extract_body_text(xml: &str, warnings: &mut Vec<String>) -> Result<String, Ex
             // resolving them, so `R&amp;D` arrives as three events. Ignoring
             // this one would quietly delete the `&` from every company name and
             // every `&lt;` from every quoted snippet.
-            Ok(Event::GeneralRef(e)) if in_text_node => match resolve_entity(&e) {
+            Ok(Event::GeneralRef(e)) if in_text_node => match super::xml::resolve_entity(&e) {
                 Some(resolved) => text.push_str(&resolved),
                 None => warnings.push(format!(
                     "dropped an entity reference this parser cannot resolve: &{};",
@@ -315,18 +315,6 @@ fn extract_body_text(xml: &str, warnings: &mut Vec<String>) -> Result<String, Ex
     // content and would surface downstream as empty chunks.
     text.truncate(text.trim_end_matches('\n').len());
     Ok(text)
-}
-
-/// Resolve one entity reference to the text it stands for.
-///
-/// Delegates to quick-xml rather than matching the five predefined names by
-/// hand, because Word also emits numeric references (`&#8217;` for a curly
-/// apostrophe) and those have to resolve the same way.
-fn resolve_entity(reference: &quick_xml::events::BytesRef<'_>) -> Option<String> {
-    let name = reference.decode().ok()?;
-    quick_xml::escape::unescape(&format!("&{name};"))
-        .ok()
-        .map(|s| s.into_owned())
 }
 
 #[cfg(test)]

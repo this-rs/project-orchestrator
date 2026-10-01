@@ -1,6 +1,6 @@
 //! MCP Tool definitions — Mega-tools architecture
 //!
-//! Instead of 160 individual tools, we expose 28 mega-tools with an `action` parameter.
+//! Instead of 160 individual tools, we expose 30 mega-tools with an `action` parameter.
 //! Each mega-tool groups all operations for a domain (e.g., project, plan, task).
 //! The `action` parameter selects the specific operation; additional parameters vary by action.
 //!
@@ -19,6 +19,8 @@ pub fn all_tools() -> Vec<ToolDefinition> {
         decision_tool(),
         constraint_tool(),
         release_tool(),
+        environment_tool(),
+        vault_tool(),
         milestone_tool(),
         commit_tool(),
         note_tool(),
@@ -370,7 +372,8 @@ fn project_tool() -> ToolDefinition {
                 },
                 "slug": {"type": "string", "description": "Project slug (get/update/delete/sync/get_roadmap/list_plans/get_graph/get_intelligence_summary/get_embeddings_projection/get_scaffolding_level/set_scaffolding_override/get_health_dashboard/get_auto_roadmap)"},
                 "name": {"type": "string", "description": "Project name (create/update)"},
-                "root_path": {"type": "string", "description": "Path to codebase root (create/update)"},
+                "root_path": {"type": "string", "description": "Path to codebase root (create/update). Optional: omit it for a `work` project (no code to index); on update an empty string clears it"},
+                "profile": {"type": "string", "enum": ["software", "work"], "description": "Project kind (create/update). `software` (default) = a codebase that is synced and watched; `work` = documents, plans, tasks and notes with no source tree"},
                 "description": {"type": "string", "description": "Project description (create/update)"},
                 "search": {"type": "string", "description": "Search filter (list)"},
                 "limit": {"type": "integer", "description": "Max items (list/get_graph)"},
@@ -379,7 +382,9 @@ fn project_tool() -> ToolDefinition {
                 "sort_order": {"type": "string", "description": "asc or desc (list)"},
                 "layers": {"type": "string", "description": "Comma-separated layers: code,knowledge,fabric,neural,skills,behavioral (get_graph, default: code)"},
                 "community": {"type": "integer", "description": "Filter by community_id (get_graph)"},
-                "level": {"type": "integer", "description": "Scaffolding level 0-4 to override, or null to clear (set_scaffolding_override)"}
+                "level": {"type": "integer", "description": "Scaffolding level 0-4 to override, or null to clear (set_scaffolding_override)"},
+                "force": {"type": "boolean", "description": "Force a full re-sync, ignoring file hashes (sync)"},
+                "status": {"type": "string", "description": "Plan status filter (list_plans)"}
             })),
             required: Some(vec!["action".to_string()]),
         },
@@ -403,6 +408,7 @@ fn plan_tool() -> ToolDefinition {
                 "title": {"type": "string", "description": "Plan title (create/update)"},
                 "description": {"type": "string", "description": "Plan description (create/update)"},
                 "priority": {"type": "integer", "description": "Priority 1-100 (create/update)"},
+                "constraints": {"type": "array", "items": {"type": "object"}, "description": "Constraints to create with the plan, each {constraint_type, description, enforced_by?} (create)"},
                 "status": {"type": "string", "description": "New status (update/update_status): draft, approved, in_progress, completed, cancelled"},
                 "search": {"type": "string", "description": "Search filter (list)"},
                 "limit": {"type": "integer", "description": "Max items (list)"},
@@ -411,8 +417,8 @@ fn plan_tool() -> ToolDefinition {
                 "sort_order": {"type": "string", "description": "asc or desc (list)"},
                 "priority_min": {"type": "integer", "description": "Min priority filter (list)"},
                 "priority_max": {"type": "integer", "description": "Max priority filter (list)"},
-                "cwd": {"type": "string", "description": "Working directory for the runner (run)"},
-                "project_slug": {"type": "string", "description": "Project slug for the runner (run)"},
+                "cwd": {"type": "string", "description": "Working directory for the runner (run/delegate_task)"},
+                "project_slug": {"type": "string", "description": "Project slug for the runner (run/delegate_task)"},
                 "trigger_id": {"type": "string", "description": "Trigger UUID (remove_trigger/enable_trigger/disable_trigger)"},
                 "trigger_type": {"type": "string", "description": "Trigger type (add_trigger): schedule, webhook, event, chat"},
                 "config": {"type": "object", "description": "Trigger config JSON (add_trigger): e.g. {\"cron\": \"0 2 * * *\"} for schedule"},
@@ -445,14 +451,23 @@ fn task_tool() -> ToolDefinition {
                 "title": {"type": "string", "description": "Task title (create)"},
                 "description": {"type": "string", "description": "Task description (create)"},
                 "priority": {"type": "integer", "description": "Priority (create/update)"},
-                "status": {"type": "string", "description": "Status (update): pending, in_progress, blocked, completed, failed"},
+                "status": {"type": "string", "description": "Status (update, list filter): pending, in_progress, blocked, completed, failed"},
                 "tags": {"type": "array", "items": {"type": "string"}, "description": "Tags (create/update)"},
                 "assigned_to": {"type": "string", "description": "Assignee (update)"},
                 "acceptance_criteria": {"type": "array", "items": {"type": "string"}, "description": "Criteria (create)"},
                 "affected_files": {"type": "array", "items": {"type": "string"}, "description": "Files (create)"},
                 "dependency_ids": {"type": "array", "items": {"type": "string"}, "description": "Task UUIDs to depend on (add_dependencies)"},
                 "dependency_id": {"type": "string", "description": "Dependency task UUID to remove (remove_dependency)"},
-                "search": {"type": "string", "description": "Search filter (list)"},
+                "depends_on": {"type": "array", "items": {"type": "string"}, "description": "Task UUIDs this task depends on (create)"},
+                "steps": {"type": "array", "items": {"type": "object"}, "description": "Steps to create with the task, each {description, verification?} (create)"},
+                "estimated_complexity": {"type": "integer", "description": "Estimated complexity 1-10 (create/update)"},
+                "actual_complexity": {"type": "integer", "description": "Actual complexity 1-10 (update)"},
+                "project_id": {"type": "string", "description": "Project UUID filter (list)"},
+                "workspace_slug": {"type": "string", "description": "Workspace slug filter (list)"},
+                "priority_min": {"type": "integer", "description": "Min priority filter (list)"},
+                "priority_max": {"type": "integer", "description": "Max priority filter (list)"},
+                "sort_by": {"type": "string", "description": "Sort field (list)"},
+                "sort_order": {"type": "string", "description": "asc or desc (list)"},
                 "limit": {"type": "integer", "description": "Max items (list)"},
                 "offset": {"type": "integer", "description": "Skip items (list)"},
                 "custom_sections": {"type": "array", "items": {"type": "string"}, "description": "Custom prompt sections to append (build_prompt)"},
@@ -510,6 +525,9 @@ fn decision_tool() -> ToolDefinition {
                 "status": {"type": "string", "description": "New status (update): proposed, accepted, deprecated, superseded"},
                 "query": {"type": "string", "description": "Search query (search/search_semantic)"},
                 "project_id": {"type": "string", "description": "Project UUID filter (search_semantic — post-query filtering)"},
+                "project_slug": {"type": "string", "description": "Project slug filter (search)"},
+                "limit": {"type": "integer", "description": "Max results (search/search_semantic)"},
+                "run_id": {"type": "string", "description": "Protocol run UUID for PRODUCED_DURING (add)"},
                 "entity_type": {"type": "string", "description": "Entity type (add_affects/remove_affects/get_affecting)"},
                 "entity_id": {"type": "string", "description": "Entity identifier (add_affects/remove_affects)"},
                 "impact_description": {"type": "string", "description": "Description of how the decision impacts the entity (add_affects)"},
@@ -541,8 +559,7 @@ fn constraint_tool() -> ToolDefinition {
                 "plan_id": {"type": "string", "description": "Plan UUID (list/add)"},
                 "constraint_type": {"type": "string", "description": "Type (add/update): performance, security, style, compatibility, other"},
                 "description": {"type": "string", "description": "Description (add/update)"},
-                "severity": {"type": "string", "description": "Severity (add): must, should, nice_to_have"},
-                "enforced_by": {"type": "string", "description": "Enforcement (update)"}
+                "enforced_by": {"type": "string", "description": "How the constraint is enforced (add/update)"}
             })),
             required: Some(vec!["action".to_string()]),
         },
@@ -563,13 +580,70 @@ fn release_tool() -> ToolDefinition {
                 },
                 "release_id": {"type": "string", "description": "Release UUID"},
                 "project_id": {"type": "string", "description": "Project UUID (list/create)"},
-                "version": {"type": "string", "description": "Version (create/update)"},
+                "version": {"type": "string", "description": "Version (create)"},
                 "title": {"type": "string", "description": "Title (create/update)"},
                 "description": {"type": "string", "description": "Description (create/update)"},
                 "status": {"type": "string", "description": "Status (update): planned, in_progress, released, cancelled"},
                 "target_date": {"type": "string", "description": "Target date ISO (create/update)"},
                 "task_id": {"type": "string", "description": "Task UUID (add_task)"},
-                "commit_sha": {"type": "string", "description": "Commit SHA (add_commit/remove_commit)"}
+                "commit_sha": {"type": "string", "description": "Commit SHA (add_commit/remove_commit)"},
+                "released_at": {"type": "string", "description": "Release date ISO (update)"},
+                "limit": {"type": "integer", "description": "Max items (list)"},
+                "offset": {"type": "integer", "description": "Skip items (list)"}
+            })),
+            required: Some(vec!["action".to_string()]),
+        },
+    }
+}
+
+fn environment_tool() -> ToolDefinition {
+    ToolDefinition {
+        name: "environment".to_string(),
+        description: "Manage project environments (dev/staging/production) and their deployments. Actions: list, create, get, update, delete, deploy, update_deployment, list_deployments, get_matrix".to_string(),
+        input_schema: InputSchema {
+            schema_type: "object".to_string(),
+            properties: Some(json!({
+                "action": {
+                    "type": "string",
+                    "enum": ["list", "create", "get", "update", "delete", "deploy", "update_deployment", "list_deployments", "get_matrix"],
+                    "description": "Operation to perform"
+                },
+                "environment_id": {"type": "string", "description": "Environment UUID (get/update/delete/deploy/list_deployments)"},
+                "project_id": {"type": "string", "description": "Project UUID (list/create/get_matrix)"},
+                "name": {"type": "string", "description": "Environment name, unique per project (create/update)"},
+                "kind": {"type": "string", "description": "Kind (create/update): dev, staging, production, other"},
+                "url": {"type": "string", "description": "Environment URL (create/update)"},
+                "description": {"type": "string", "description": "Description (create/update)"},
+                "config": {"description": "Free-form JSON config: host, region, runtime... (create/update)"},
+                "version": {"type": "string", "description": "Deployed version (deploy)"},
+                "commit_sha": {"type": "string", "description": "Deployed commit SHA (deploy); linked to the Commit node when it exists"},
+                "status": {"type": "string", "description": "Deployment status (deploy/update_deployment): pending, running, succeeded, failed, rolled_back"},
+                "notes": {"type": "string", "description": "Deployment notes (deploy/update_deployment)"},
+                "created_by": {"type": "string", "description": "Who triggered the deployment (deploy)"},
+                "deployment_id": {"type": "string", "description": "Deployment UUID (update_deployment)"},
+                "finished_at": {"type": "string", "description": "Finish time ISO (update_deployment); auto-set on terminal status"},
+                "limit": {"type": "integer", "description": "Max results (list_deployments)"},
+                "offset": {"type": "integer", "description": "Offset (list_deployments)"}
+            })),
+            required: Some(vec!["action".to_string()]),
+        },
+    }
+}
+
+fn vault_tool() -> ToolDefinition {
+    ToolDefinition {
+        name: "vault".to_string(),
+        description: "Use the user's secrets vault without ever seeing a value. Actions: list_available, request_secret. list_available returns names and whether this session may read each, never values. request_secret asks the user for a secret through a secure input card in the chat: END YOUR TURN after calling it and wait, you are told when it is available. To USE a granted secret, run it in the shell so the value never enters your context: `orchestrator secret exec -e VAR=NAME -- cmd args` (preferred), or `orchestrator secret get NAME | cmd --password-stdin`. Never echo or print a secret.".to_string(),
+        input_schema: InputSchema {
+            schema_type: "object".to_string(),
+            properties: Some(json!({
+                "action": {
+                    "type": "string",
+                    "enum": ["list_available", "request_secret"],
+                    "description": "Operation to perform"
+                },
+                "name": {"type": "string", "description": "Secret name, 1-64 chars of letters, digits, _ - . (request_secret)"},
+                "reason": {"type": "string", "description": "Why you need it, shown to the user on the card (request_secret)"}
             })),
             required: Some(vec!["action".to_string()]),
         },
@@ -596,7 +670,10 @@ fn milestone_tool() -> ToolDefinition {
                 "target_date": {"type": "string", "description": "Target date ISO (create/update)"},
                 "task_id": {"type": "string", "description": "Task UUID (add_task)"},
                 "plan_id": {"type": "string", "description": "Plan UUID (link_plan/unlink_plan)"},
-                "include_tasks": {"type": "boolean", "description": "Include flat top-level tasks list in get response (default false). Plans with their tasks/steps are always returned."}
+                "include_tasks": {"type": "boolean", "description": "Include flat top-level tasks list in get response (default false). Plans with their tasks/steps are always returned."},
+                "closed_at": {"type": "string", "description": "Closing date ISO (update)"},
+                "limit": {"type": "integer", "description": "Max items (list)"},
+                "offset": {"type": "integer", "description": "Skip items (list)"}
             })),
             required: Some(vec!["action".to_string()]),
         },
@@ -651,11 +728,14 @@ fn note_tool() -> ToolDefinition {
                 "tags": {"type": "array", "items": {"type": "string"}, "description": "Tags"},
                 "status": {"type": "string", "description": "Status filter (list)"},
                 "query": {"type": "string", "description": "Search query (search/search_semantic)"},
-                "superseded_by_id": {"type": "string", "description": "New note UUID (supersede)"},
+                "old_note_id": {"type": "string", "description": "UUID of the note being superseded (supersede). The new note is created from note_type/content/importance/tags/... in the same call"},
+                "reason": {"type": "string", "description": "Why the note is invalid (invalidate, required)"},
+                "scope": {"type": "object", "description": "Note scope (create/supersede), e.g. {\"type\": \"file\", \"path\": \"src/x.rs\"}"},
+                "anchors": {"type": "array", "items": {"type": "object"}, "description": "Anchors to code entities, each {entity_type, entity_id} (create/supersede)"},
+                "assertion_rule": {"type": "object", "description": "Assertion rule for note_type=assertion (create/supersede)"},
+                "run_id": {"type": "string", "description": "Protocol run UUID for PRODUCED_DURING (create/supersede)"},
                 "entity_type": {"type": "string", "description": "Entity type (link_to_entity/unlink_from_entity/get_context/get_entity)"},
                 "entity_id": {"type": "string", "description": "Entity identifier (link_to_entity/unlink_from_entity/get_context/get_entity)"},
-                "slug": {"type": "string", "description": "Project slug (list_project/get_propagated)"},
-                "file_path": {"type": "string", "description": "File path (get_propagated)"},
                 "source_project_id": {"type": "string", "description": "Source project UUID for cross-project coupling weighting (get_propagated)"},
                 "force_cross_project": {"type": "boolean", "description": "Force cross-project propagation even when coupling < 0.2 (get_propagated, default false)"},
                 "limit": {"type": "integer", "description": "Max items"},
@@ -663,7 +743,16 @@ fn note_tool() -> ToolDefinition {
                 "temperature": {"type": "number", "description": "Thermal noise 0.0-1.0 for stochastic exploration (search_semantic, default 0 = deterministic)"},
                 "profile": {"type": "string", "description": "Optional profile name to override auto-detection for search_semantic (e.g., 'debug', 'explore', 'impact', 'plan', 'security', 'architect', 'onboarding', 'refactoring')"},
                 "intent_mode": {"type": "string", "description": "Optional intent mode to force for search_semantic (debug/explore/impact/plan) — auto-detected from query if not provided"},
-                "trigger": {"type": "string", "description": "Transition trigger to fire on the RFC's protocol run (advance_rfc)"}
+                "trigger": {"type": "string", "description": "Transition trigger to fire on the RFC's protocol run (advance_rfc)"},
+                "search": {"type": "string", "description": "Text filter (list)"},
+                "global_only": {"type": "boolean", "description": "Only notes without a project (list)"},
+                "min_staleness": {"type": "number", "description": "Min staleness 0-1 filter (list)"},
+                "max_staleness": {"type": "number", "description": "Max staleness 0-1 filter (list)"},
+                "project_slug": {"type": "string", "description": "Project slug filter (search/search_semantic)"},
+                "workspace_slug": {"type": "string", "description": "Workspace slug filter (search_semantic)"},
+                "max_depth": {"type": "integer", "description": "Max graph traversal depth (get_context/get_context_knowledge/get_propagated/get_propagated_knowledge)"},
+                "min_score": {"type": "number", "description": "Min relevance score (get_context/get_context_knowledge/get_propagated/get_propagated_knowledge)"},
+                "relation_types": {"type": "string", "description": "Comma-separated relation types to follow (get_propagated/get_propagated_knowledge)"}
             })),
             required: Some(vec!["action".to_string()]),
         },
@@ -673,13 +762,13 @@ fn note_tool() -> ToolDefinition {
 fn workspace_tool() -> ToolDefinition {
     ToolDefinition {
         name: "workspace".to_string(),
-        description: "Manage workspaces. Actions: list, create, get, update, delete, get_overview, list_projects, add_project, remove_project, get_topology, get_coupling_matrix".to_string(),
+        description: "Manage workspaces. Actions: list, create, get, update, delete, get_overview, list_projects, add_project, remove_project, get_topology, derive_topology, get_coupling_matrix. `derive_topology` rebuilds the architecture from the projects' source trees (manifests, compose files, dev-server proxies) — it is idempotent and also runs after every sync.".to_string(),
         input_schema: InputSchema {
             schema_type: "object".to_string(),
             properties: Some(json!({
                 "action": {
                     "type": "string",
-                    "enum": ["list", "create", "get", "update", "delete", "get_overview", "list_projects", "add_project", "remove_project", "get_topology"],
+                    "enum": ["list", "create", "get", "update", "delete", "get_overview", "list_projects", "add_project", "remove_project", "get_topology", "derive_topology", "get_coupling_matrix"],
                     "description": "Operation to perform"
                 },
                 "slug": {"type": "string", "description": "Workspace slug (identifier)"},
@@ -687,7 +776,8 @@ fn workspace_tool() -> ToolDefinition {
                 "name": {"type": "string", "description": "Workspace name (create/update)"},
                 "description": {"type": "string", "description": "Description (create/update)"},
                 "project_id": {"type": "string", "description": "Project UUID (add_project/remove_project)"},
-                "role": {"type": "string", "description": "Project role in workspace (add_project)"},
+                "metadata": {"type": "object", "description": "Free-form metadata (create/update)"},
+                "search": {"type": "string", "description": "Search filter (list)"},
                 "limit": {"type": "integer", "description": "Max items (list)"},
                 "offset": {"type": "integer", "description": "Skip items (list)"}
             })),
@@ -711,6 +801,7 @@ fn workspace_milestone_tool() -> ToolDefinition {
                 "milestone_id": {"type": "string", "description": "Workspace milestone UUID"},
                 "slug": {"type": "string", "description": "Workspace slug (list/create)"},
                 "workspace_id": {"type": "string", "description": "Workspace UUID (list_all)"},
+                "tags": {"type": "array", "items": {"type": "string"}, "description": "Tags (create)"},
                 "title": {"type": "string", "description": "Title (create/update)"},
                 "description": {"type": "string", "description": "Description (create/update)"},
                 "status": {"type": "string", "description": "Status (update/list filter)"},
@@ -737,16 +828,20 @@ fn resource_tool() -> ToolDefinition {
                     "enum": ["list", "create", "get", "update", "delete", "link_to_project"],
                     "description": "Operation to perform"
                 },
-                "id": {"type": "string", "description": "Resource UUID (get/update/delete)"},
+                "id": {"type": "string", "description": "Resource UUID (get/update/delete/link_to_project)"},
                 "slug": {"type": "string", "description": "Workspace slug (list/create)"},
                 "name": {"type": "string", "description": "Resource name (create/update)"},
-                "resource_type": {"type": "string", "description": "Type (create): api_contract, schema, config, documentation, other"},
+                "resource_type": {"type": "string", "enum": ["api_contract", "protobuf", "graphql_schema", "json_schema", "database_schema", "shared_types", "config", "documentation", "other"], "description": "Type (create). Unknown values are stored as other"},
                 "file_path": {"type": "string", "description": "File path (create/update)"},
                 "url": {"type": "string", "description": "URL (create/update)"},
+                "format": {"type": "string", "description": "Format, e.g. openapi, protobuf (create)"},
                 "version": {"type": "string", "description": "Version (create/update)"},
                 "description": {"type": "string", "description": "Description (create/update)"},
+                "metadata": {"type": "object", "description": "Free-form metadata (create)"},
                 "project_id": {"type": "string", "description": "Project UUID (link_to_project)"},
-                "resource_id": {"type": "string", "description": "Resource UUID (link_to_project)"}
+                "relation": {"type": "string", "enum": ["implements", "uses"], "description": "How the project relates to the resource (link_to_project, required)"},
+                "limit": {"type": "integer", "description": "Max items (list)"},
+                "offset": {"type": "integer", "description": "Skip items (list)"}
             })),
             required: Some(vec!["action".to_string()]),
         },
@@ -756,7 +851,7 @@ fn resource_tool() -> ToolDefinition {
 fn component_tool() -> ToolDefinition {
     ToolDefinition {
         name: "component".to_string(),
-        description: "Manage workspace components (services, modules). Actions: list, create, get, update, delete, add_dependency, remove_dependency, map_to_project".to_string(),
+        description: "Manage workspace components (services, modules). Actions: list, create, get, update, delete, add_dependency, remove_dependency, map_to_project. Dependencies use `id` (source) + `depends_on_id`/`dep_id` (target).".to_string(),
         input_schema: InputSchema {
             schema_type: "object".to_string(),
             properties: Some(json!({
@@ -765,19 +860,25 @@ fn component_tool() -> ToolDefinition {
                     "enum": ["list", "create", "get", "update", "delete", "add_dependency", "remove_dependency", "map_to_project"],
                     "description": "Operation to perform"
                 },
-                "id": {"type": "string", "description": "Component UUID (get/update/delete)"},
+                "id": {"type": "string", "description": "Component UUID (get/update/delete/add_dependency/remove_dependency/map_to_project). For add_dependency/remove_dependency this is the component that depends on another"},
                 "slug": {"type": "string", "description": "Workspace slug (list/create)"},
                 "name": {"type": "string", "description": "Component name (create/update)"},
-                "component_type": {"type": "string", "description": "Type (create): service, library, database, queue, external"},
+                "component_type": {
+                    "type": "string",
+                    "enum": ["service", "frontend", "worker", "database", "message_queue", "cache", "gateway", "external", "library", "cli", "other"],
+                    "description": "Type (create/update). Mirrors ComponentType in neo4j/models.rs; an unknown value is rejected."
+                },
                 "description": {"type": "string", "description": "Description (create/update)"},
                 "runtime": {"type": "string", "description": "Runtime (create/update)"},
                 "config": {"type": "object", "description": "Config (create/update)"},
                 "tags": {"type": "array", "items": {"type": "string"}, "description": "Tags (create/update)"},
-                "from_id": {"type": "string", "description": "Source component UUID (add_dependency/remove_dependency)"},
-                "to_id": {"type": "string", "description": "Target component UUID (add_dependency/remove_dependency)"},
-                "dependency_type": {"type": "string", "description": "Dependency type (add_dependency)"},
-                "component_id": {"type": "string", "description": "Component UUID (map_to_project)"},
-                "project_id": {"type": "string", "description": "Project UUID (map_to_project)"}
+                "depends_on_id": {"type": "string", "description": "Target component UUID (add_dependency) — the source is `id`"},
+                "dep_id": {"type": "string", "description": "Target component UUID (remove_dependency) — the source is `id`"},
+                "protocol": {"type": "string", "description": "Wire protocol of the dependency (add_dependency), e.g. HTTP, Bolt, NATS. Rendered as the edge label."},
+                "required": {"type": "boolean", "description": "Whether the dependency is required (add_dependency, default true). Optional ones render dashed."},
+                "project_id": {"type": "string", "description": "Project UUID (map_to_project)"},
+                "limit": {"type": "integer", "description": "Max items (list)"},
+                "offset": {"type": "integer", "description": "Skip items (list)"}
             })),
             required: Some(vec!["action".to_string()]),
         },
@@ -806,6 +907,7 @@ fn chat_tool() -> ToolDefinition {
                 "permission_mode": {"type": "string", "description": "Permission mode (send_message)"},
                 "workspace_slug": {"type": "string", "description": "Workspace slug (send_message)"},
                 "add_dirs": {"type": "array", "items": {"type": "string"}, "description": "Additional directories (send_message)"},
+                "include_detached": {"type": "boolean", "description": "Include detached sessions spawned by the runner or sub-agents (list_sessions, default false)"},
                 "entities": {"type": "array", "items": {"type": "object"}, "description": "Entities to mark as discussed (add_discussed): [{entity_type, entity_id}]"},
                 "entity_type": {"type": "string", "description": "Entity type (associate_with): 'Plan' or 'Task'"},
                 "entity_id": {"type": "string", "description": "Entity UUID (associate_with): plan or task UUID to link"},
@@ -858,13 +960,13 @@ fn feature_graph_tool() -> ToolDefinition {
 fn code_tool() -> ToolDefinition {
     ToolDefinition {
         name: "code".to_string(),
-        description: "Explore and analyze code. Actions: search, search_project, search_workspace, get_file_symbols, find_references, get_file_dependencies, get_call_graph, analyze_impact, get_architecture, find_similar, find_trait_implementations, find_type_traits, get_impl_blocks, get_communities, get_health, get_node_importance, plan_implementation, get_co_change_graph, get_file_co_changers, detect_processes, get_class_hierarchy, find_subclasses, find_interface_implementors, list_processes, get_process, get_entry_points, enrich_communities, get_hotspots, get_knowledge_gaps, get_risk_assessment, get_homeostasis, get_structural_drift, get_structural_profile, find_structural_twins, cluster_dna, find_cross_project_twins, predict_missing_links, check_link_plausibility, stress_test_node, stress_test_edge, stress_test_cascade, find_bridges, get_context_card, refresh_context_cards, get_fingerprint, find_isomorphic, suggest_structural_templates, get_bridge, check_topology, list_topology_rules, create_topology_rule, delete_topology_rule, check_file_topology".to_string(),
+        description: "Explore and analyze code. Actions: search, search_project, search_workspace, get_file_symbols, find_references, get_file_dependencies, get_call_graph, analyze_impact, get_architecture, find_similar, find_trait_implementations, find_type_traits, get_impl_blocks, get_communities, get_health, get_node_importance, plan_implementation, get_co_change_graph, get_file_co_changers, detect_processes, get_class_hierarchy, find_subclasses, find_interface_implementors, list_processes, get_process, get_entry_points, enrich_communities, get_hotspots, get_knowledge_gaps, get_risk_assessment, get_homeostasis, get_structural_drift, get_learning_health, get_structural_profile, find_structural_twins, cluster_dna, find_cross_project_twins, predict_missing_links, check_link_plausibility, stress_test_node, stress_test_edge, stress_test_cascade, find_bridges, get_context_card, refresh_context_cards, get_fingerprint, find_isomorphic, suggest_structural_templates, get_bridge, check_topology, list_topology_rules, create_topology_rule, delete_topology_rule, check_file_topology".to_string(),
         input_schema: InputSchema {
             schema_type: "object".to_string(),
             properties: Some(json!({
                 "action": {
                     "type": "string",
-                    "enum": ["search", "search_project", "search_workspace", "get_file_symbols", "find_references", "get_file_dependencies", "get_call_graph", "analyze_impact", "get_architecture", "find_similar", "find_trait_implementations", "find_type_traits", "get_impl_blocks", "get_communities", "get_health", "get_node_importance", "plan_implementation", "get_co_change_graph", "get_file_co_changers", "detect_processes", "get_class_hierarchy", "find_subclasses", "find_interface_implementors", "list_processes", "get_process", "get_entry_points", "enrich_communities", "get_hotspots", "get_knowledge_gaps", "get_risk_assessment", "get_homeostasis", "get_structural_profile", "find_structural_twins", "cluster_dna", "find_cross_project_twins", "predict_missing_links", "check_link_plausibility", "stress_test_node", "stress_test_edge", "stress_test_cascade", "find_bridges", "get_context_card", "refresh_context_cards", "get_fingerprint", "find_isomorphic", "suggest_structural_templates", "get_bridge", "check_topology", "list_topology_rules", "create_topology_rule", "delete_topology_rule", "check_file_topology"],
+                    "enum": ["search", "search_project", "search_workspace", "get_file_symbols", "find_references", "get_file_dependencies", "get_call_graph", "analyze_impact", "get_architecture", "find_similar", "find_trait_implementations", "find_type_traits", "get_impl_blocks", "get_communities", "get_health", "get_node_importance", "plan_implementation", "get_co_change_graph", "get_file_co_changers", "detect_processes", "get_class_hierarchy", "find_subclasses", "find_interface_implementors", "list_processes", "get_process", "get_entry_points", "enrich_communities", "get_hotspots", "get_knowledge_gaps", "get_risk_assessment", "get_homeostasis", "get_structural_drift", "get_learning_health", "get_structural_profile", "find_structural_twins", "cluster_dna", "find_cross_project_twins", "predict_missing_links", "check_link_plausibility", "stress_test_node", "stress_test_edge", "stress_test_cascade", "find_bridges", "get_context_card", "refresh_context_cards", "get_fingerprint", "find_isomorphic", "suggest_structural_templates", "get_bridge", "check_topology", "list_topology_rules", "create_topology_rule", "delete_topology_rule", "check_file_topology"],
                     "description": "Operation to perform"
                 },
                 "query": {"type": "string", "description": "Search query (search/search_project/search_workspace)"},
@@ -873,8 +975,7 @@ fn code_tool() -> ToolDefinition {
                 "file_path": {"type": "string", "description": "File path (get_file_symbols/get_file_dependencies/get_context_card/get_fingerprint/get_structural_profile/find_structural_twins/find_cross_project_twins/check_file_topology)"},
                 "symbol": {"type": "string", "description": "Symbol name (find_references)"},
                 "function": {"type": "string", "description": "Function name (get_call_graph)"},
-                "target": {"type": "string", "description": "Target for impact analysis (analyze_impact)"},
-                "code_snippet": {"type": "string", "description": "Code to find similar (find_similar)"},
+                "snippet": {"type": "string", "description": "Code snippet to find similar code for (find_similar, required)"},
                 "trait_name": {"type": "string", "description": "Trait name (find_trait_implementations)"},
                 "type_name": {"type": "string", "description": "Type name (find_type_traits/get_impl_blocks/get_class_hierarchy)"},
                 "class_name": {"type": "string", "description": "Class name (find_subclasses)"},
@@ -894,7 +995,7 @@ fn code_tool() -> ToolDefinition {
                 "source_project_slug": {"type": "string", "description": "Source project slug (find_cross_project_twins)"},
                 "min_plausibility": {"type": "number", "description": "Minimum plausibility score (0-1) for predicted links"},
                 "source": {"type": "string", "description": "Source node path (check_link_plausibility/get_bridge)"},
-                "target": {"type": "string", "description": "Target node path (check_link_plausibility/get_bridge)"},
+                "target": {"type": "string", "description": "Target for impact analysis (analyze_impact); target node path (check_link_plausibility/get_bridge)"},
                 "target_id": {"type": "string", "description": "Target node ID (stress_test_node/stress_test_cascade)"},
                 "from_id": {"type": "string", "description": "Source node ID (stress_test_edge)"},
                 "to_id": {"type": "string", "description": "Target node ID (stress_test_edge)"},
@@ -908,7 +1009,18 @@ fn code_tool() -> ToolDefinition {
                 "threshold": {"type": "integer", "description": "Threshold value for max_distance/max_fan_out rules (create_topology_rule)"},
                 "severity": {"type": "string", "description": "Rule severity (create_topology_rule): error, warning"},
                 "new_imports": {"type": "array", "items": {"type": "string"}, "description": "New import paths to check against topology rules (check_file_topology)"},
-                "limit": {"type": "integer", "description": "Max results / depth (search/get_call_graph)"}
+                "limit": {"type": "integer", "description": "Max results / depth (search/get_call_graph/find_similar)"},
+                "language": {"type": "string", "description": "Language filter (search/search_project/search_workspace)"},
+                "multi": {"type": "boolean", "description": "Multi-signal impact analysis (analyze_impact, default false)"},
+                "profile": {"type": "string", "description": "Analysis profile name (analyze_impact)"},
+                "target_type": {"type": "string", "description": "Target kind, e.g. file, function (analyze_impact)"},
+                "path": {"type": "string", "description": "Node path (get_context_card/get_fingerprint); file_path or node_path are accepted as fallbacks"},
+                "god_function_threshold": {"type": "integer", "description": "Min outgoing calls to flag a god function (get_health)"},
+                "min_count": {"type": "integer", "description": "Min co-change count (get_co_change_graph/get_file_co_changers)"},
+                "min_group_size": {"type": "integer", "description": "Min isomorphic group size (find_isomorphic)"},
+                "min_occurrences": {"type": "integer", "description": "Min occurrences of a pattern (suggest_structural_templates)"},
+                "warning_threshold": {"type": "number", "description": "Drift warning threshold (get_structural_drift)"},
+                "critical_threshold": {"type": "number", "description": "Drift critical threshold (get_structural_drift)"}
             })),
             required: Some(vec!["action".to_string()]),
         },
@@ -982,8 +1094,7 @@ fn analysis_profile_tool() -> ToolDefinition {
                 "id": {"type": "string", "description": "Profile UUID (get/delete)"},
                 "name": {"type": "string", "description": "Profile name (create)"},
                 "description": {"type": "string", "description": "Profile description (create)"},
-                "project_slug": {"type": "string", "description": "Project slug (create — scopes the profile to a project)"},
-                "project_id": {"type": "string", "description": "Project UUID filter (list)"},
+                "project_id": {"type": "string", "description": "Project UUID (list: filter; create: scopes the profile to a project, omit for a global profile)"},
                 "edge_weights": {"type": "object", "description": "Edge type weights (create): {\"IMPORTS\": 0.7, \"CALLS\": 0.5, \"EXTENDS\": 0.9, ...}"},
                 "fusion_weights": {"type": "object", "description": "Fusion signal weights (create): {\"structural\": 0.3, \"co_change\": 0.25, \"knowledge\": 0.15, \"pagerank\": 0.15, \"bridge\": 0.15}"}
             })),
@@ -995,27 +1106,32 @@ fn analysis_profile_tool() -> ToolDefinition {
 fn admin_tool() -> ToolDefinition {
     ToolDefinition {
         name: "admin".to_string(),
-        description: "Admin operations. Actions: sync_directory, start_watch, stop_watch, watch_status, meilisearch_stats, delete_meilisearch_orphans, cleanup_cross_project_calls, cleanup_builtin_calls, migrate_calls_confidence, cleanup_sync_data, update_staleness_scores, update_energy_scores, search_neurons, reinforce_neurons, decay_synapses, backfill_synapses, reindex_decisions, backfill_decision_embeddings, backfill_note_embeddings, backfill_note_embeddings_status, backfill_touches, backfill_discussed, update_fabric_scores, bootstrap_knowledge_fabric, reinforce_isomorphic, detect_skills, detect_skill_fission, detect_skill_fusion, heal_scars, consolidate_memory, detect_stagnation, deep_maintenance, analyze_runner_feedback, install_hooks".to_string(),
+        description: "Admin operations. Actions: sync_directory, start_watch, stop_watch, watch_status, meilisearch_stats, delete_meilisearch_orphans, cleanup_cross_project_calls, cleanup_builtin_calls, migrate_calls_confidence, cleanup_sync_data, update_staleness_scores, update_energy_scores, search_neurons, reinforce_neurons, decay_synapses, backfill_synapses, reindex_decisions, backfill_decision_embeddings, backfill_note_embeddings, backfill_note_embeddings_status, backfill_touches, backfill_discussed, update_fabric_scores, bootstrap_knowledge_fabric, reinforce_isomorphic, detect_skills, detect_skill_fission, detect_skill_fusion, heal_scars, consolidate_memory, maintain_skills, auto_anchor_notes, reconstruct_knowledge, detect_stagnation, deep_maintenance, seed_prompt_fragments, audit_gaps, persist_health_report, learning_metrics, get_learning_stats, analyze_runner_feedback, install_hooks".to_string(),
         input_schema: InputSchema {
             schema_type: "object".to_string(),
             properties: Some(json!({
                 "action": {
                     "type": "string",
-                    "enum": ["sync_directory", "start_watch", "stop_watch", "watch_status", "meilisearch_stats", "delete_meilisearch_orphans", "cleanup_cross_project_calls", "cleanup_builtin_calls", "migrate_calls_confidence", "cleanup_sync_data", "update_staleness_scores", "update_energy_scores", "search_neurons", "reinforce_neurons", "decay_synapses", "backfill_synapses", "reindex_decisions", "backfill_decision_embeddings", "backfill_note_embeddings", "backfill_note_embeddings_status", "backfill_touches", "backfill_discussed", "update_fabric_scores", "bootstrap_knowledge_fabric", "reinforce_isomorphic", "detect_skills", "detect_skill_fission", "detect_skill_fusion", "maintain_skills", "auto_anchor_notes", "reconstruct_knowledge", "heal_scars", "consolidate_memory", "detect_stagnation", "deep_maintenance", "seed_prompt_fragments", "analyze_runner_feedback", "install_hooks"],
+                    "enum": ["sync_directory", "start_watch", "stop_watch", "watch_status", "meilisearch_stats", "delete_meilisearch_orphans", "cleanup_cross_project_calls", "cleanup_builtin_calls", "migrate_calls_confidence", "cleanup_sync_data", "update_staleness_scores", "update_energy_scores", "search_neurons", "reinforce_neurons", "decay_synapses", "backfill_synapses", "reindex_decisions", "backfill_decision_embeddings", "backfill_note_embeddings", "backfill_note_embeddings_status", "backfill_touches", "backfill_discussed", "update_fabric_scores", "bootstrap_knowledge_fabric", "reinforce_isomorphic", "detect_skills", "detect_skill_fission", "detect_skill_fusion", "maintain_skills", "auto_anchor_notes", "reconstruct_knowledge", "heal_scars", "consolidate_memory", "detect_stagnation", "deep_maintenance", "seed_prompt_fragments", "audit_gaps", "persist_health_report", "learning_metrics", "get_learning_stats", "analyze_runner_feedback", "install_hooks"],
                     "description": "Operation to perform"
                 },
                 "path": {"type": "string", "description": "Directory path (sync_directory/start_watch)"},
-                "project_id": {"type": "string", "description": "Project UUID (sync_directory/start_watch/update_staleness_scores/update_energy_scores/update_fabric_scores/bootstrap_knowledge_fabric/detect_skills)"},
-                "cwd": {"type": "string", "description": "Working directory (install_hooks — deprecated, hooks are now automatic)"},
-                "port": {"type": "integer", "description": "PO server port (install_hooks — deprecated, default 6600)"},
+                "project_id": {"type": "string", "description": "Project UUID (sync_directory/start_watch/update_staleness_scores/update_energy_scores/update_fabric_scores/bootstrap_knowledge_fabric/detect_skills/audit_gaps/persist_health_report/detect_stagnation/deep_maintenance/learning_metrics/seed_prompt_fragments/analyze_runner_feedback)"},
                 "query": {"type": "string", "description": "Search query (search_neurons)"},
                 "note_ids": {"type": "array", "items": {"type": "string"}, "description": "Note UUIDs to co-activate (reinforce_neurons, min 2)"},
                 "energy_boost": {"type": "number", "description": "Energy boost amount 0-1 (reinforce_neurons, default 0.2)"},
                 "synapse_boost": {"type": "number", "description": "Synapse weight boost 0-1 (reinforce_neurons, default 0.05)"},
-                "min_strength": {"type": "number", "description": "Min strength filter (search_neurons)"},
                 "decay_amount": {"type": "number", "description": "Amount to subtract from each synapse weight (decay_synapses, default 0.01)"},
                 "prune_threshold": {"type": "number", "description": "Prune synapses below this weight (decay_synapses, default 0.1)"},
-                "limit": {"type": "integer", "description": "Max items (search_neurons)"},
+                "max_results": {"type": "integer", "description": "Max neurons returned (search_neurons)"},
+                "max_hops": {"type": "integer", "description": "Max spreading-activation hops (search_neurons)"},
+                "min_score": {"type": "number", "description": "Min activation score (search_neurons)"},
+                "project_slug": {"type": "string", "description": "Project slug (search_neurons; backfill_touches, required)"},
+                "slug": {"type": "string", "description": "Alias of project_slug (backfill_touches)"},
+                "batch_size": {"type": "integer", "description": "Batch size (backfill_note_embeddings/backfill_synapses)"},
+                "min_similarity": {"type": "number", "description": "Min cosine similarity to create a synapse (backfill_synapses)"},
+                "max_neighbors": {"type": "integer", "description": "Max synapses per note (backfill_synapses)"},
+                "half_life": {"type": "number", "description": "Energy half-life in days (update_energy_scores, default 90)"},
                 "level": {"type": "string", "enum": ["hourly", "daily", "weekly", "full"], "description": "Maintenance level (maintain_skills, default: daily)"},
                 "force": {"type": "boolean", "description": "Force re-detection from scratch, deleting all existing skills first (detect_skills, default: false)"},
                 "node_id": {"type": "string", "description": "Note or Decision UUID (heal_scars)"}
@@ -1056,6 +1172,8 @@ fn skill_tool() -> ToolDefinition {
                 "query": {"type": "string", "description": "Activation query (activate)"},
                 "package": {"type": "object", "description": "SkillPackage JSON to import (import)"},
                 "conflict_strategy": {"type": "string", "description": "Conflict strategy (import): skip, merge, replace. Default: skip"},
+                "skill_ids": {"type": "array", "items": {"type": "string"}, "description": "Skill UUIDs to merge, at least 2 (merge, required)"},
+                "sub_clusters": {"type": "array", "items": {"type": "array", "items": {"type": "string"}}, "description": "Note UUID groups, one per new skill (split). Omit to re-run detection"},
                 "source_project_name": {"type": "string", "description": "Source project name for export metadata (export)"},
                 "limit": {"type": "integer", "description": "Max items (list)"},
                 "offset": {"type": "integer", "description": "Skip items (list)"}
@@ -1082,6 +1200,8 @@ fn protocol_tool() -> ToolDefinition {
                 "name": {"type": "string", "description": "Protocol or state name (create/update/add_state)"},
                 "description": {"type": "string", "description": "Description (create/update/add_state)"},
                 "protocol_category": {"type": "string", "description": "Category (create/update): system, business. Default: business"},
+                "trigger_mode": {"type": "string", "description": "How runs start (create/update): manual, event, scheduled, auto"},
+                "trigger_config": {"type": "object", "description": "Trigger configuration: events, schedule, conditions (create/update)"},
                 "skill_id": {"type": "string", "description": "Skill UUID (create/link_to_skill)"},
                 "category": {"type": "string", "description": "Category filter (list): system, business"},
                 "state_id": {"type": "string", "description": "State UUID (delete_state)"},
@@ -1188,22 +1308,22 @@ fn persona_tool() -> ToolDefinition {
 fn sharing_tool() -> ToolDefinition {
     ToolDefinition {
         name: "sharing".to_string(),
-        description: "Manage sharing policies and consent for P2P knowledge federation. Actions: status, enable, disable, set_policy, get_policy, set_consent, history".to_string(),
+        description: "Manage sharing policies and consent for P2P knowledge federation. Actions: status, enable, disable, set_policy, get_policy, set_consent, history, preview, suggest, retract, list_tombstones, last_report".to_string(),
         input_schema: InputSchema {
             schema_type: "object".to_string(),
             properties: Some(json!({
                 "action": {
                     "type": "string",
                     "description": "The operation to perform",
-                    "enum": ["status", "enable", "disable", "set_policy", "get_policy", "set_consent", "history"]
+                    "enum": ["status", "enable", "disable", "set_policy", "get_policy", "set_consent", "history", "preview", "suggest", "retract", "list_tombstones", "last_report"]
                 },
                 "project_slug": {
                     "type": "string",
-                    "description": "Project slug (required for status/enable/disable/set_policy/get_policy/history)"
+                    "description": "Project slug (required for status/enable/disable/set_policy/get_policy/history/preview/suggest/retract/list_tombstones/last_report)"
                 },
                 "note_id": {
                     "type": "string",
-                    "description": "Note UUID (required for set_consent)"
+                    "description": "Note UUID (required for set_consent; retract: note to retract, or give content_hash)"
                 },
                 "consent": {
                     "type": "string",
@@ -1226,6 +1346,14 @@ fn sharing_tool() -> ToolDefinition {
                 "limit": {
                     "type": "integer",
                     "description": "Max results for history"
+                },
+                "content_hash": {
+                    "type": "string",
+                    "description": "Content hash of the shared note to retract (retract, alternative to note_id)"
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "Why the note is retracted, stored on the tombstone (retract)"
                 },
                 "offset": {
                     "type": "integer",
@@ -1388,13 +1516,13 @@ fn lifecycle_hook_tool() -> ToolDefinition {
 fn mcp_federation_tool() -> ToolDefinition {
     ToolDefinition {
         name: "mcp_federation".to_string(),
-        description: "Manage external MCP server connections (federation). Actions: connect, disconnect, list, status, tools, probe, reconnect, backfill_relations, backfill_sequences".to_string(),
+        description: "Manage external MCP server connections (federation). Actions: connect, disconnect, list, status, tools, probe, reconnect".to_string(),
         input_schema: InputSchema {
             schema_type: "object".to_string(),
             properties: Some(json!({
                 "action": {
                     "type": "string",
-                    "enum": ["connect", "disconnect", "list", "status", "tools", "probe", "reconnect", "backfill_relations", "backfill_sequences"],
+                    "enum": ["connect", "disconnect", "list", "status", "tools", "probe", "reconnect"],
                     "description": "Operation to perform"
                 },
                 "server_id": {"type": "string", "description": "Server identifier (connect/disconnect/status/tools/probe/reconnect)"},
@@ -1418,8 +1546,7 @@ fn mcp_federation_tool() -> ToolDefinition {
                     "type": "object",
                     "description": "HTTP headers (connect, for sse/streamable_http transports)"
                 },
-                "display_name": {"type": "string", "description": "Human-readable name (connect, optional)"},
-                "auto_probe": {"type": "boolean", "description": "Probe read-only tools on connect (connect, default true)"}
+                "display_name": {"type": "string", "description": "Human-readable name (connect, optional)"}
             })),
             required: Some(vec!["action".to_string()]),
         },
@@ -1435,8 +1562,8 @@ mod tests {
         let tools = all_tools();
         assert_eq!(
             tools.len(),
-            29,
-            "Expected 29 mega-tools, got {}",
+            31,
+            "Expected 31 mega-tools, got {}",
             tools.len()
         );
     }

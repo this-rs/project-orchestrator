@@ -57,10 +57,44 @@ enum Commands {
         #[arg(long)]
         port: Option<u16>,
     },
+
+    /// Use a secret granted to this chat session (agents only; needs PO_VAULT_TOKEN)
+    #[command(subcommand)]
+    Secret(SecretCommand),
+}
+
+#[derive(Subcommand)]
+enum SecretCommand {
+    /// Run a command with secrets in its environment — nothing is printed.
+    /// Example: orchestrator secret exec -e PGPASSWORD=db-prod -- psql -h db
+    Exec {
+        /// VAR=SECRET_NAME (repeatable)
+        #[arg(short = 'e', long = "env", required = true, value_parser = project_orchestrator::vault::agent_cli::parse_mapping)]
+        env: Vec<(String, String)>,
+        /// The command and its arguments, after `--`
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
+    },
+    /// Write a secret to stdout, to pipe it: orchestrator secret get NAME | cmd --password-stdin
+    Get { name: String },
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    // Before anything else: no tracing, no config, no .env — stdout must carry
+    // the value and nothing else, and none of it is needed.
+    if let Commands::Secret(cmd) = &cli.command {
+        use project_orchestrator::vault::agent_cli;
+        let code = match cmd {
+            SecretCommand::Get { name } => agent_cli::get(name).await,
+            SecretCommand::Exec { env, command } => agent_cli::exec(env, command).await,
+        };
+        // Exit here: falling through would start logging.
+        std::process::exit(code);
+    }
+
     // Load .env file
     dotenvy::dotenv().ok();
 
@@ -72,8 +106,6 @@ async fn main() -> Result<()> {
         )
         .with(tracing_subscriber::fmt::layer())
         .init();
-
-    let cli = Cli::parse();
 
     // Load configuration — explicit --config path wins, otherwise auto-detect
     let mut config = Config::from_yaml_and_env(cli.config.as_deref())?;
@@ -105,6 +137,7 @@ async fn main() -> Result<()> {
             run_setup_claude(&config, effective_port);
             Ok(())
         }
+        Commands::Secret(_) => unreachable!("handled before startup"),
     }
 }
 
@@ -237,11 +270,11 @@ async fn run_update(check_only: bool) -> Result<()> {
 
     println!();
     match update::perform_update(&info).await? {
-        update::UpdateStatus::Updated { from, to } => {
+        update::UpdateOutcome::Updated { from, to } => {
             println!("  Successfully updated from v{} to v{}!", from, to);
             println!("  Please restart orchestrator to use the new version.");
         }
-        update::UpdateStatus::AlreadyUpToDate => {
+        update::UpdateOutcome::AlreadyUpToDate => {
             println!("  Already up to date.");
         }
     }

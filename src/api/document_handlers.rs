@@ -16,13 +16,24 @@
 //! | Situation                                   | Status | What the caller should do        |
 //! |---------------------------------------------|--------|----------------------------------|
 //! | Over the blob-store cap                     | 413    | Send a smaller file              |
-//! | Nothing recognises the bytes                | 415    | Send a different format          |
+//! | Nothing recognises the bytes                | 201    | Stored as an opaque attachment   |
 //! | Format known, feature not compiled in       | 501    | Rebuild the server; file is fine |
 //! | Recognised but broken, or empty, or no file | 422    | The file itself is the problem   |
 //!
 //! 501 rather than 415 for a disabled feature: the *format* is supported, this
 //! *build* is not. Telling someone their valid PDF is unsupported sends them
 //! looking for a fault in the file that is not there.
+//!
+//! ## Files nobody can read are still attachments
+//!
+//! Knowledge work is full of files the platform has no reason to understand — a
+//! `.zip` of deliverables, a screenshot, a `.mov`. Rejecting them with 415 would
+//! make "attach it to the task" impossible. When no extractor recognises the
+//! bytes the file is stored as a `binary` document instead: same size limit,
+//! same content-addressed blob, `extracted: false`, no chunks, and a warning
+//! saying it will not be searchable. The 415 status (and
+//! [`DocumentError::UnsupportedFormat`]) remains for callers that need to
+//! distinguish, but the upload pipeline no longer produces it.
 //!
 //! ## Why the body limit is set explicitly
 //!
@@ -207,6 +218,8 @@ struct UploadFields {
     filename: Option<String>,
     project_id: Option<Uuid>,
     session_id: Option<Uuid>,
+    entity_type: Option<String>,
+    entity_id: Option<String>,
 }
 
 /// Query parameters for `GET /api/documents`.
@@ -214,6 +227,9 @@ struct UploadFields {
 pub struct DocumentsListQuery {
     pub project_id: Option<Uuid>,
     pub session_id: Option<Uuid>,
+    /// With `entity_id`: documents attached to that entity (a task, a plan…).
+    pub entity_type: Option<String>,
+    pub entity_id: Option<String>,
     pub limit: Option<usize>,
     pub offset: Option<usize>,
 }
@@ -241,6 +257,10 @@ pub struct UploadedDocument {
     pub project_id: Option<Uuid>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<Uuid>,
+    /// `false` when the file was stored as an opaque attachment: it can be
+    /// downloaded but has no text and no chunks.
+    pub extracted: bool,
+    pub mime_type: String,
 }
 
 /// A document list page.
@@ -354,7 +374,7 @@ fn header_safe_filename(name: &str) -> String {
     }
 }
 
-/// The media type to serve a stored blob as.
+/// The media type implied by a format alone.
 fn content_type_for(format: DocumentFormat) -> &'static str {
     match format {
         DocumentFormat::PlainText => "text/plain; charset=utf-8",
@@ -362,7 +382,56 @@ fn content_type_for(format: DocumentFormat) -> &'static str {
             "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
         }
         DocumentFormat::Pdf => "application/pdf",
+        DocumentFormat::Xlsx => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        DocumentFormat::Pptx => {
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+        }
+        DocumentFormat::Binary => "application/octet-stream",
     }
+}
+
+/// The media type to record for an upload.
+///
+/// Derived here, from the content and a fixed table — never copied from the
+/// client's `Content-Type`, because the value is later served back in a
+/// response header and an uploader must not be able to pick it. Anything that a
+/// browser would render as active content (HTML, SVG, scripts) is deliberately
+/// absent from the table and comes out as `application/octet-stream`.
+fn mime_for(format: DocumentFormat, filename: &str, bytes: &[u8]) -> &'static str {
+    if format != DocumentFormat::Binary {
+        return content_type_for(format);
+    }
+    // Magic bytes first, extension only to tell apart what shares a container.
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return "image/png";
+    }
+    if bytes.starts_with(b"\xff\xd8\xff") {
+        return "image/jpeg";
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return "image/gif";
+    }
+    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return "image/webp";
+    }
+    if bytes.starts_with(b"PK\x03\x04") {
+        let ext = filename
+            .rsplit_once('.')
+            .map(|(_, e)| e.to_ascii_lowercase());
+        return match ext.as_deref() {
+            Some("docx") => content_type_for(DocumentFormat::Docx),
+            Some("xlsx") => content_type_for(DocumentFormat::Xlsx),
+            Some("pptx") => content_type_for(DocumentFormat::Pptx),
+            _ => "application/zip",
+        };
+    }
+    if bytes.starts_with(b"\x1f\x8b") {
+        return "application/gzip";
+    }
+    if bytes.starts_with(b"%PDF-") {
+        return "application/pdf";
+    }
+    "application/octet-stream"
 }
 
 // ============================================================================
@@ -416,6 +485,24 @@ impl<'a> Ingestor<'a> {
         project_id: Option<Uuid>,
         session_id: Option<Uuid>,
     ) -> Result<UploadedDocument, DocumentError> {
+        self.ingest_for(bytes, filename, project_id, session_id, None)
+            .await
+    }
+
+    /// [`Self::ingest`], additionally attaching the document to a knowledge
+    /// entity (a task, a plan, a milestone…) with a `LINKED_TO` edge.
+    ///
+    /// The link is a no-op in the graph when the entity does not exist, exactly
+    /// like `link_note_to_entity`; the document is still stored and reachable
+    /// through its project or by id.
+    pub async fn ingest_for(
+        &self,
+        bytes: Vec<u8>,
+        filename: &str,
+        project_id: Option<Uuid>,
+        session_id: Option<Uuid>,
+        entity: EntityLink,
+    ) -> Result<UploadedDocument, DocumentError> {
         // Size first: the store would reject this anyway, but only after we had
         // paid to extract and chunk a file we were always going to refuse.
         let size_bytes = bytes.len() as u64;
@@ -431,7 +518,21 @@ impl<'a> Ingestor<'a> {
         }
 
         let filename = sanitize_filename(filename);
-        let extracted: ExtractedText = EXTRACTORS.extract(&bytes, Some(&filename))?;
+        let extracted: ExtractedText = match EXTRACTORS.extract(&bytes, Some(&filename)) {
+            Ok(extracted) => extracted,
+            // Nobody reads this — but it is still a legitimate thing to attach.
+            // Only "no extractor claims it" falls back: a recognised-but-broken
+            // file (422) or a disabled feature (501) is a different answer.
+            Err(ExtractError::UnsupportedFormat { .. }) => ExtractedText {
+                text: String::new(),
+                format: DocumentFormat::Binary,
+                pages: Vec::new(),
+                warnings: Vec::new(),
+            },
+            Err(other) => return Err(other.into()),
+        };
+        let is_opaque = extracted.format == DocumentFormat::Binary;
+        let mime_type = mime_for(extracted.format, &filename, &bytes);
 
         let text_chunks = chunk_text(&extracted.text, &self.chunk_config);
         let chunks: Vec<DocumentChunk> = text_chunks
@@ -446,7 +547,13 @@ impl<'a> Ingestor<'a> {
         // Warnings the caller sees; warnings the node keeps stay exactly what
         // the extractor said (see `UploadedDocument::warnings`).
         let mut response_warnings = extracted.warnings.clone();
-        if chunks.is_empty() {
+        if is_opaque {
+            response_warnings.push(
+                "this file type is not readable by the platform — it is stored and can be \
+                 downloaded, but it has no text and will not appear in search"
+                    .to_string(),
+            );
+        } else if chunks.is_empty() {
             response_warnings.push(
                 "no text could be extracted from this document — it is stored, but it will not \
                  appear in search or be readable by an agent"
@@ -479,9 +586,17 @@ impl<'a> Ingestor<'a> {
             created_at: Utc::now(),
             project_id,
             session_id,
+            extracted: !is_opaque,
+            mime_type: Some(mime_type.to_string()),
         };
 
         self.graph.create_document(&document, &chunks).await?;
+
+        if let Some((entity_type, entity_id)) = &entity {
+            self.graph
+                .link_document_to_entity(document.id, entity_type, entity_id)
+                .await?;
+        }
 
         // A document attached to a conversation is also a citizen of the
         // knowledge graph: the `LINKED_TO` edge is what lets it be found the
@@ -524,6 +639,8 @@ impl<'a> Ingestor<'a> {
             created_at: document.created_at,
             project_id: document.project_id,
             session_id: document.session_id,
+            extracted: document.extracted,
+            mime_type: mime_type.to_string(),
         })
     }
 
@@ -575,13 +692,16 @@ impl<'a> Ingestor<'a> {
 
 /// `POST /api/documents` — multipart upload.
 ///
-/// Fields: `file` (required), `project_id`, `session_id`.
+/// Fields: `file` (required), `project_id`, `session_id`, and optionally
+/// `entity_type` + `entity_id` to attach the file to a task, plan, milestone…
+/// (`entity_type=project` is the same as passing `project_id`).
 pub async fn upload_document(
     State(state): State<OrchestratorState>,
     multipart: Multipart,
 ) -> Result<impl IntoResponse, DocumentError> {
     let fields = read_upload_fields(multipart).await?;
 
+    let (project_id, entity) = resolve_entity_field(&fields)?;
     let bytes = fields.file.ok_or_else(|| {
         DocumentError::Unprocessable("no `file` field in the request".to_string())
     })?;
@@ -592,10 +712,56 @@ pub async fn upload_document(
     let store = DocumentStore::from_config(state.orchestrator.config());
     let ingestor = Ingestor::from_state(&state, &store);
     let uploaded = ingestor
-        .ingest(bytes, &filename, fields.project_id, fields.session_id)
+        .ingest_for(bytes, &filename, project_id, fields.session_id, entity)
         .await?;
 
     Ok((StatusCode::CREATED, Json(uploaded)))
+}
+
+/// An entity a document is attached to: its type and id. `None` when the
+/// upload is not attached to anything beyond a project or session.
+type EntityLink = Option<(EntityType, String)>;
+
+/// Interpret the optional `entity_type` / `entity_id` pair.
+///
+/// Returns the effective `project_id` (a `project` entity is the project link
+/// itself, which is what `list_project_documents` and `HAS_DOCUMENT` read) and
+/// the entity to `LINKED_TO`, if any.
+fn resolve_entity_field(
+    fields: &UploadFields,
+) -> Result<(Option<Uuid>, EntityLink), DocumentError> {
+    let parsed = parse_entity(fields.entity_type.as_deref(), fields.entity_id.as_deref())?;
+    match parsed {
+        Some((EntityType::Project, id)) => {
+            let pid = Uuid::parse_str(&id).map_err(|_| {
+                DocumentError::Unprocessable("`entity_id` is not a valid project UUID".to_string())
+            })?;
+            Ok((fields.project_id.or(Some(pid)), None))
+        }
+        other => Ok((fields.project_id, other)),
+    }
+}
+
+/// Both fields or neither; the type must be a known entity type.
+fn parse_entity(
+    entity_type: Option<&str>,
+    entity_id: Option<&str>,
+) -> Result<EntityLink, DocumentError> {
+    match (
+        entity_type.map(str::trim).filter(|s| !s.is_empty()),
+        entity_id.map(str::trim).filter(|s| !s.is_empty()),
+    ) {
+        (None, None) => Ok(None),
+        (Some(t), Some(id)) => {
+            let parsed = t.parse::<EntityType>().map_err(|_| {
+                DocumentError::Unprocessable(format!("unknown `entity_type` {t:?}"))
+            })?;
+            Ok(Some((parsed, id.to_string())))
+        }
+        _ => Err(DocumentError::Unprocessable(
+            "`entity_type` and `entity_id` must be given together".to_string(),
+        )),
+    }
 }
 
 /// Drain the multipart body into memory.
@@ -622,6 +788,12 @@ async fn read_upload_fields(mut multipart: Multipart) -> Result<UploadFields, Do
             }
             "session_id" => {
                 fields.session_id = parse_optional_uuid(field, "session_id").await?;
+            }
+            "entity_type" => {
+                fields.entity_type = Some(field.text().await.map_err(multipart_error)?);
+            }
+            "entity_id" => {
+                fields.entity_id = Some(field.text().await.map_err(multipart_error)?);
             }
             // Unknown fields are ignored rather than rejected: the frontend may
             // legitimately send more than this version knows about.
@@ -663,16 +835,24 @@ pub async fn list_documents(
 ) -> Result<Json<DocumentListResponse>, DocumentError> {
     let graph = state.orchestrator.neo4j();
 
-    let mut items: Vec<Document> = match (params.project_id, params.session_id) {
-        (Some(project_id), _) => graph.list_project_documents(project_id).await?,
-        (None, Some(session_id)) => {
+    let entity = parse_entity(params.entity_type.as_deref(), params.entity_id.as_deref())?;
+
+    let mut items: Vec<Document> = match (params.project_id, params.session_id, &entity) {
+        (Some(project_id), _, _) => graph.list_project_documents(project_id).await?,
+        (None, _, Some((entity_type, entity_id))) => {
+            graph
+                .get_documents_for_entity(entity_type, entity_id)
+                .await?
+        }
+        (None, Some(session_id), None) => {
             graph
                 .get_documents_for_entity(&EntityType::ChatSession, &session_id.to_string())
                 .await?
         }
-        (None, None) => {
+        (None, None, None) => {
             return Err(DocumentError::BadRequest(
-                "one of `project_id` or `session_id` is required".to_string(),
+                "one of `project_id`, `session_id` or `entity_type` + `entity_id` is required"
+                    .to_string(),
             ))
         }
     };
@@ -730,6 +910,12 @@ pub async fn get_document_raw(
     let store = DocumentStore::from_config(state.orchestrator.config());
     let bytes = store.get(&document.sha256)?;
 
+    // The type recorded at upload; nodes that predate the field fall back to
+    // what the format implies.
+    let content_type = document
+        .mime_type
+        .clone()
+        .unwrap_or_else(|| content_type_for(document.format).to_string());
     let disposition = format!(
         "attachment; filename=\"{}\"",
         header_safe_filename(&document.filename)
@@ -737,8 +923,11 @@ pub async fn get_document_raw(
     Ok((
         StatusCode::OK,
         [
-            (header::CONTENT_TYPE, content_type_for(document.format)),
+            (header::CONTENT_TYPE, content_type.as_str()),
             (header::CONTENT_DISPOSITION, disposition.as_str()),
+            // Served as a download of whatever the bytes are; never sniffed
+            // into something a browser would execute.
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
         ],
         bytes,
     )
@@ -1029,17 +1218,252 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_unreadable_blob_is_415_not_500() {
+    async fn an_unreadable_blob_is_stored_as_an_opaque_attachment() {
         let h = Harness::new();
         // Invalid UTF-8, no known magic: nothing claims it.
-        let err = h
+        let bytes = vec![0xff, 0xfe, 0x00, 0x01];
+        let out = h
             .ingestor(None)
-            .ingest(vec![0xff, 0xfe, 0x00, 0x01], "mystery.bin", None, None)
+            .ingest(bytes.clone(), "mystery.bin", None, None)
             .await
-            .expect_err("must be rejected");
+            .expect("an unreadable file is still a valid attachment");
 
-        assert_eq!(err.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
-        assert_eq!(blob_count(h.store.root()), 0);
+        assert_eq!(out.format, DocumentFormat::Binary);
+        assert!(!out.extracted);
+        assert_eq!(out.chunk_count, 0);
+        assert_eq!(out.page_count, 0);
+        assert_eq!(out.mime_type, "application/octet-stream");
+        assert!(
+            out.warnings.iter().any(|w| w.contains("not readable")),
+            "the uploader must be told it will not be searchable: {:?}",
+            out.warnings
+        );
+        // The bytes are kept, byte for byte.
+        assert_eq!(h.store.get(&out.sha256).unwrap(), bytes);
+        let stored = h.graph.get_document(out.id).await.unwrap().unwrap();
+        assert!(!stored.extracted);
+        assert!(h
+            .graph
+            .get_document_chunks(out.id)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_zip_and_a_png_are_attachments_with_the_right_media_type() {
+        let h = Harness::new();
+        let zip = h
+            .ingestor(None)
+            .ingest(
+                b"PK\x03\x04 not really a docx".to_vec(),
+                "deliverables.zip",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(zip.format, DocumentFormat::Binary);
+        assert_eq!(zip.mime_type, "application/zip");
+
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        png.extend_from_slice(&[0, 0, 0, 13, 0xff, 0xfe]);
+        let png = h
+            .ingestor(None)
+            .ingest(png, "screenshot.png", None, None)
+            .await
+            .unwrap();
+        assert_eq!(png.mime_type, "image/png");
+        assert!(!png.extracted);
+    }
+
+    #[tokio::test]
+    async fn an_opaque_attachment_keeps_the_size_limit() {
+        let h = Harness::new();
+        let store = DocumentStore::new(h.store.root()).with_max_blob_bytes(8);
+        let ingestor = Ingestor {
+            graph: h.graph.as_ref(),
+            store: &store,
+            embeddings: None,
+            chunk_config: ChunkConfig::default(),
+        };
+        let err = ingestor
+            .ingest(vec![0xff; 64], "big.bin", None, None)
+            .await
+            .expect_err("over the cap");
+        assert_eq!(err.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(blob_count(store.root()), 0);
+    }
+
+    #[test]
+    fn html_and_svg_are_never_served_as_themselves() {
+        // Same-origin active content: the recorded type must not be the
+        // uploader's to choose, so unknown markup comes out inert.
+        assert_eq!(
+            mime_for(DocumentFormat::Binary, "x.html", b"\xff<html>"),
+            "application/octet-stream"
+        );
+        assert_eq!(
+            mime_for(DocumentFormat::Binary, "x.svg", b"\xff<svg>"),
+            "application/octet-stream"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_attachment_can_be_linked_to_a_task_and_listed_from_it() {
+        let h = Harness::new();
+        let task_id = Uuid::new_v4().to_string();
+        let out = h
+            .ingestor(None)
+            .ingest_for(
+                b"budget notes".to_vec(),
+                "budget.txt",
+                None,
+                None,
+                Some((EntityType::Task, task_id.clone())),
+            )
+            .await
+            .unwrap();
+        // The mock records the edge whether or not the task node exists.
+        let linked = h
+            .graph
+            .get_documents_for_entity(&EntityType::Task, &task_id)
+            .await
+            .unwrap();
+        assert_eq!(linked.len(), 1);
+        assert_eq!(linked[0].id, out.id);
+    }
+
+    #[test]
+    fn entity_fields_must_come_as_a_valid_pair() {
+        assert!(parse_entity(None, None).unwrap().is_none());
+        assert!(parse_entity(Some(" "), Some("")).unwrap().is_none());
+        let (t, id) = parse_entity(Some("plan"), Some("abc")).unwrap().unwrap();
+        assert_eq!(t, EntityType::Plan);
+        assert_eq!(id, "abc");
+        assert_eq!(
+            parse_entity(Some("task"), None).unwrap_err().status(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        assert_eq!(
+            parse_entity(Some("nonsense"), Some("x"))
+                .unwrap_err()
+                .status(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+    }
+
+    // -- Office formats -----------------------------------------------------
+
+    /// A ZIP holding `word/`-less parts named like a workbook: enough for the
+    /// extractor's content probe, and for the feature-off path to see PK magic.
+    #[cfg(any(feature = "xlsx", feature = "pptx"))]
+    fn zip_with(entries: &[(&str, &str)]) -> Vec<u8> {
+        use std::io::Write;
+        let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for (name, body) in entries {
+            w.start_file(*name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            w.write_all(body.as_bytes()).unwrap();
+        }
+        w.finish().unwrap().into_inner()
+    }
+
+    #[cfg(feature = "xlsx")]
+    #[tokio::test]
+    async fn an_xlsx_upload_is_extracted_into_searchable_chunks() {
+        let h = Harness::new();
+        let bytes = zip_with(&[
+            (
+                "[Content_Types].xml",
+                r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>"#,
+            ),
+            (
+                "_rels/.rels",
+                r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"#,
+            ),
+            (
+                "xl/workbook.xml",
+                r#"<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Plan" sheetId="1" r:id="rId1"/></sheets></workbook>"#,
+            ),
+            (
+                "xl/_rels/workbook.xml.rels",
+                r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>"#,
+            ),
+            (
+                "xl/worksheets/sheet1.xml",
+                r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>Milestone</t></is></c><c r="B1" t="inlineStr"><is><t>Owner</t></is></c></row></sheetData></worksheet>"#,
+            ),
+        ]);
+        let out = h
+            .ingestor(None)
+            .ingest(bytes, "plan.xlsx", None, None)
+            .await
+            .unwrap();
+        assert_eq!(out.format, DocumentFormat::Xlsx);
+        assert!(out.extracted);
+        assert_eq!(out.page_count, 1);
+        assert!(out.chunk_count > 0);
+        assert_eq!(
+            out.mime_type,
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        );
+        let chunks = h.graph.get_document_chunks(out.id).await.unwrap();
+        assert!(
+            chunks[0].text.contains("Milestone\tOwner"),
+            "{}",
+            chunks[0].text
+        );
+    }
+
+    #[cfg(feature = "pptx")]
+    #[tokio::test]
+    async fn a_pptx_upload_is_extracted_into_searchable_chunks() {
+        let h = Harness::new();
+        let bytes = zip_with(&[
+            (
+                "ppt/presentation.xml",
+                r#"<p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><p:sldIdLst><p:sldId id="256" r:id="rId1"/></p:sldIdLst></p:presentation>"#,
+            ),
+            (
+                "ppt/_rels/presentation.xml.rels",
+                r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="x/slide" Target="slides/slide1.xml"/></Relationships>"#,
+            ),
+            (
+                "ppt/slides/slide1.xml",
+                r#"<p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"><p:cSld><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>Launch plan</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:sld>"#,
+            ),
+        ]);
+        let out = h
+            .ingestor(None)
+            .ingest(bytes, "deck.pptx", None, None)
+            .await
+            .unwrap();
+        assert_eq!(out.format, DocumentFormat::Pptx);
+        assert!(out.extracted);
+        let chunks = h.graph.get_document_chunks(out.id).await.unwrap();
+        assert!(chunks[0].text.contains("Launch plan"));
+    }
+
+    /// Feature off: an Office file nobody here can read is still an attachment,
+    /// not a 415 — the same outcome as any other unreadable file.
+    #[cfg(not(feature = "xlsx"))]
+    #[tokio::test]
+    async fn without_the_xlsx_feature_a_workbook_is_an_opaque_attachment() {
+        let h = Harness::new();
+        let mut bytes = b"PK\x03\x04".to_vec();
+        bytes.extend_from_slice(&[0xff, 0xfe, 0x00]);
+        let out = h
+            .ingestor(None)
+            .ingest(bytes, "budget.xlsx", None, None)
+            .await
+            .unwrap();
+        assert_eq!(out.format, DocumentFormat::Binary);
+        assert!(!out.extracted);
+        assert_eq!(
+            out.mime_type,
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        );
     }
 
     #[tokio::test]
@@ -1239,6 +1663,8 @@ mod tests {
             created_at: Utc::now(),
             project_id: None,
             session_id: None,
+            extracted: true,
+            mime_type: None,
         };
         h.graph.create_document(&doc, &[]).await.unwrap();
 
@@ -1485,6 +1911,7 @@ mod tests {
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
             model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
+            vault: crate::vault::VaultService::ephemeral(),
         });
         (state, dir)
     }
@@ -1624,21 +2051,85 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_unreadable_upload_is_415_over_http() {
+    async fn an_unreadable_upload_is_stored_and_downloadable_over_http() {
         let (state, _dir) = server_state().await;
         let app = create_router(state);
+        let bytes = [0xff, 0xfe, 0x00, 0x01, 0x02];
 
         let resp = app
+            .clone()
+            .oneshot(upload_request("mystery.bin", &bytes, &[]))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let json = json_of(resp).await;
+        assert_eq!(json["extracted"], false);
+        assert_eq!(json["format"], "binary");
+        assert_eq!(json["chunk_count"], 0);
+        assert_eq!(json["mime_type"], "application/octet-stream");
+        let id = json["id"].as_str().unwrap().to_string();
+
+        let resp = app
+            .oneshot(authed("GET", &format!("/api/documents/{id}/raw")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "application/octet-stream"
+        );
+        assert_eq!(
+            resp.headers().get("x-content-type-options").unwrap(),
+            "nosniff"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), &bytes);
+    }
+
+    #[tokio::test]
+    async fn a_file_uploaded_for_a_task_is_listed_by_that_task() {
+        let (state, _dir) = server_state().await;
+        let app = create_router(state);
+        let task_id = Uuid::new_v4().to_string();
+
+        let resp = app
+            .clone()
             .oneshot(upload_request(
-                "mystery.bin",
-                &[0xff, 0xfe, 0x00, 0x01, 0x02],
-                &[],
+                "notes.md",
+                b"# Notes\n\nSomething to remember.",
+                &[
+                    ("entity_type", "task".to_string()),
+                    ("entity_id", task_id.clone()),
+                ],
             ))
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let resp = app
+            .clone()
+            .oneshot(authed(
+                "GET",
+                &format!("/api/documents?entity_type=task&entity_id={task_id}"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
         let json = json_of(resp).await;
-        assert!(json["error"].as_str().unwrap().contains("no extractor"));
+        assert_eq!(json["total"], 1, "{json}");
+
+        // Half a pair is the caller's mistake.
+        let resp = app
+            .oneshot(upload_request(
+                "notes.md",
+                b"x y z",
+                &[("entity_type", "task".to_string())],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     #[tokio::test]

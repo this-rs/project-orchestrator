@@ -420,6 +420,7 @@ curl -H "Authorization: Bearer <JWT>" \
       "name": "My Project",
       "slug": "my-project",
       "root_path": "/path/to/project",
+      "profile": "software",
       "description": "Project description",
       "created_at": "2024-01-15T10:00:00Z",
       "last_synced": "2024-01-15T10:30:00Z"
@@ -452,7 +453,8 @@ curl -X POST http://localhost:8080/api/projects \
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `name` | string | Yes | Project name |
-| `root_path` | string | Yes | Absolute path to codebase |
+| `root_path` | string | No | Absolute path to codebase. Omit (or `null`) for a `work` project; it is then returned as `null` and sync is a no-op |
+| `profile` | string | No | `software` (default) or `work`. Projects created before profiles existed are `software` |
 | `description` | string | No | Project description |
 | `slug` | string | No | URL-safe identifier (auto-generated) |
 
@@ -469,7 +471,7 @@ curl -H "Authorization: Bearer <JWT>" \
 
 ### PATCH /api/projects/{slug} -- Protected
 
-Update a project's name, description, or root_path.
+Update a project's name, description, root_path, or profile.
 
 ```bash
 curl -X PATCH http://localhost:8080/api/projects/my-project \
@@ -478,7 +480,7 @@ curl -X PATCH http://localhost:8080/api/projects/my-project \
   -d '{"description": "Updated description", "name": "New Name"}'
 ```
 
-**Updatable Fields:** `name`, `description`, `root_path`
+**Updatable Fields:** `name`, `description`, `root_path` (an empty string clears it), `profile`
 
 ### DELETE /api/projects/{slug} -- Protected
 
@@ -545,6 +547,28 @@ curl -H "Authorization: Bearer <JWT>" \
   }
 }
 ```
+
+---
+
+## Environments & Deployments
+
+Describe where a project runs and what was deployed where. All routes are Protected.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/projects/{project_id}/environments` | List environments |
+| POST | `/api/projects/{project_id}/environments` | Create (`name` unique per project -> 409 on duplicate) |
+| GET / PATCH / DELETE | `/api/environments/{id}` | Read, update, delete (delete also removes its deployments) |
+| GET | `/api/environments/{id}/deployments` | Paginated, newest first (`limit`, `offset`) |
+| POST | `/api/environments/{id}/deployments` | Record a deployment |
+| PATCH | `/api/deployments/{id}` | Update `status`, `notes`, `finished_at` |
+| GET | `/api/projects/{project_id}/deployment-matrix` | Environments x latest deployment |
+
+Environment: `{id, project_id, name, kind, url?, description?, config?, created_at}` where `kind` is `dev | staging | production | other` and `config` is a free JSON string.
+
+Deployment: `{id, environment_id, version?, commit_sha?, status, notes?, created_by, started_at, finished_at?}` where `status` is `pending | running | succeeded | failed | rolled_back`. Moving to `succeeded`, `failed` or `rolled_back` stamps `finished_at` unless one is given. When a Commit with `commit_sha` exists, a `(Deployment)-[:DEPLOYS]->(Commit)` relation is created; otherwise the deployment is still recorded.
+
+Invalid `kind` / `status` return 400. Matrix rows: `{environment, latest_deployment, recent_statuses}` with the last 5 statuses, newest first.
 
 ---
 

@@ -442,6 +442,9 @@ pub struct ChatManager {
     /// MCP Federation registry for external server connections.
     /// The McpFederationStage injects tool availability into prompts when servers are connected.
     pub(crate) mcp_registry: crate::mcp_federation::registry::SharedRegistry,
+    /// Secrets vault: mints the per-session vault token and masks agent output.
+    /// None in tests and when the server runs without one.
+    pub(crate) vault: Option<Arc<crate::vault::VaultService>>,
 }
 
 // ============================================================================
@@ -721,6 +724,25 @@ async fn enrichment_project_id(
         .map(|p| p.id)
 }
 
+/// Server secrets an agent must not inherit, among those present.
+///
+/// Not listed on purpose: `ANTHROPIC_API_KEY` and `CLAUDE_CODE_OAUTH_TOKEN` —
+/// the CLI itself needs them to authenticate.
+pub(crate) const SERVER_ONLY_SECRETS: &[&str] = &[
+    "NEO4J_PASSWORD",
+    "MEILISEARCH_KEY",
+    "EMBEDDING_API_KEY",
+    "PO_JWT_SECRET",
+];
+
+pub(crate) fn server_secrets_to_hide(present: impl Fn(&str) -> bool) -> Vec<&'static str> {
+    SERVER_ONLY_SECRETS
+        .iter()
+        .copied()
+        .filter(|k| present(k))
+        .collect()
+}
+
 impl ChatManager {
     /// Build the standard enrichment pipeline with optional reasoning engine and trajectory collector.
     ///
@@ -803,6 +825,7 @@ impl ChatManager {
             context_injector: None,
             memory_config: None,
             event_emitter: None,
+            vault: None,
             nats: None,
             permission_config,
             config_yaml_path: None,
@@ -858,6 +881,7 @@ impl ChatManager {
             context_injector,
             memory_config: Some(memory_config),
             event_emitter: None,
+            vault: None,
             nats: None,
             permission_config,
             config_yaml_path: None,
@@ -891,6 +915,12 @@ impl ChatManager {
     /// Set the config.yaml path for persisting permission config changes.
     pub fn with_config_yaml_path(mut self, path: std::path::PathBuf) -> Self {
         self.config_yaml_path = Some(path);
+        self
+    }
+
+    /// Attach the secrets vault (per-session vault token + output masking).
+    pub fn with_vault(mut self, vault: Arc<crate::vault::VaultService>) -> Self {
+        self.vault = Some(vault);
         self
     }
 
@@ -2205,7 +2235,8 @@ impl ChatManager {
                         let expanded_cwd = expand_tilde(cwd);
                         return projects
                             .into_iter()
-                            .map(|p| expand_tilde(&p.root_path))
+                            // Projects without a codebase contribute no directory.
+                            .filter_map(|p| p.expanded_root_path())
                             .filter(|path| *path != expanded_cwd)
                             .collect();
                     }
@@ -2306,6 +2337,36 @@ impl ChatManager {
             }
         }
 
+        // Vault token: signs the session id, so the server knows which session
+        // is asking for a secret without trusting anything the agent can edit.
+        // Needs auth (a signing key) and a session; otherwise the agent has no
+        // vault access at all.
+        let vault_token = match (
+            &self.vault,
+            &self.config.jwt_secret,
+            user_claims,
+            session_id,
+        ) {
+            (Some(_), Some(secret), Some(claims), Some(sid)) => {
+                match crate::auth::jwt::generate_vault_token(
+                    claims,
+                    sid,
+                    secret,
+                    self.config.session_token_expiry_secs,
+                ) {
+                    Ok(t) => Some(t),
+                    Err(e) => {
+                        tracing::warn!("Failed to mint vault token: {e} — no vault access");
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+        if let Some(ref t) = vault_token {
+            env.insert("PO_VAULT_TOKEN".into(), t.clone());
+        }
+
         // Inject session ID so MCP subprocess can send it as X-Session-Id header
         // on all REST API calls — enables server-side auto-linking of sessions
         // to tasks/plans without the agent needing to pass session_id explicitly.
@@ -2379,12 +2440,44 @@ impl ChatManager {
             }
         }
 
+        // The agent's shell reads granted secrets with `orchestrator secret get`,
+        // which needs these two. The value then flows through a pipe, never
+        // through the model's context.
+        if let Some(t) = vault_token {
+            builder = builder.env("PO_VAULT_TOKEN", &t).env(
+                "PO_SERVER_URL",
+                format!("http://127.0.0.1:{}", self.config.server_port),
+            );
+        }
+
+        // The CLI inherits the server's whole environment, and so does every
+        // shell the agent opens. When the server was configured through env
+        // vars (Docker, .env), its own secrets would sit in the agent's `env`.
+        // Override them with an empty value in the CHILD only — mutating the
+        // server's environment at runtime would race with other threads.
+        for name in server_secrets_to_hide(|k| std::env::var_os(k).is_some()) {
+            builder = builder.env(name, "");
+        }
+
         builder.build()
     }
 
     // ========================================================================
     // Message → ChatEvent conversion
     // ========================================================================
+
+    /// Replace every secret value delivered by the vault inside a CLI message,
+    /// before anything reads, stores or broadcasts it.
+    pub(crate) fn mask_cli_message(msg: Message) -> Message {
+        let masker = crate::vault::mask::global().snapshot();
+        match crate::vault::mask::mask_serde(&masker, msg) {
+            Ok(m) => m,
+            Err(m) => {
+                tracing::error!("vault: a CLI message could not be masked; passing it unmasked");
+                m
+            }
+        }
+    }
 
     /// Convert a Nexus SDK `Message` to a list of `ChatEvent`s
     pub fn message_to_events(msg: &Message) -> Vec<ChatEvent> {
@@ -4283,6 +4376,9 @@ impl ChatManager {
                             }
                         };
 
+                        // Secrets first: everything below (deltas, events,
+                        // persistence, NATS, memory) reads the masked message.
+                        let result = result.map(Self::mask_cli_message);
                         match result {
                             Ok(ref msg) => {
                                 // Track the current parent_tool_use_id from every stream message.
@@ -9920,11 +10016,6 @@ mod tests {
                 input: serde_json::json!({"command": "ls"}),
                 parent_tool_use_id: None,
             },
-            ChatEvent::InputRequest {
-                prompt: "Choose:".into(),
-                options: Some(vec!["A".into(), "B".into()]),
-                parent_tool_use_id: None,
-            },
             ChatEvent::Error {
                 message: "Something went wrong".into(),
                 parent_tool_use_id: None,
@@ -14046,5 +14137,47 @@ pub(crate) mod test_support {
             .await
             .insert(session_id.to_string(), session);
         Some((stdin_rx, pending_messages))
+    }
+}
+
+#[cfg(test)]
+mod agent_env_tests {
+    use super::server_secrets_to_hide;
+
+    #[test]
+    fn only_the_server_secrets_that_exist_are_hidden() {
+        let present = |k: &str| k == "NEO4J_PASSWORD" || k == "PO_JWT_SECRET";
+        assert_eq!(
+            server_secrets_to_hide(present),
+            vec!["NEO4J_PASSWORD", "PO_JWT_SECRET"]
+        );
+        assert!(server_secrets_to_hide(|_| false).is_empty());
+    }
+
+    #[test]
+    fn the_cli_keeps_the_credentials_it_needs_to_authenticate() {
+        let hidden = server_secrets_to_hide(|_| true);
+        for needed in [
+            "ANTHROPIC_API_KEY",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "PATH",
+            "HOME",
+        ] {
+            assert!(
+                !hidden.contains(&needed),
+                "{needed} must stay visible to the CLI"
+            );
+        }
+        for secret in [
+            "NEO4J_PASSWORD",
+            "MEILISEARCH_KEY",
+            "EMBEDDING_API_KEY",
+            "PO_JWT_SECRET",
+        ] {
+            assert!(
+                hidden.contains(&secret),
+                "{secret} must be hidden from agents"
+            );
+        }
     }
 }

@@ -2,7 +2,7 @@
 
 use crate::api::{PaginatedResponse, PaginationParams, SearchFilter};
 use crate::events::{EntityType, EventEmitter};
-use crate::neo4j::models::ProjectNode;
+use crate::neo4j::models::{ProjectNode, ProjectProfile};
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -27,8 +27,13 @@ use super::handlers::{AppError, OrchestratorState};
 pub struct CreateProjectRequest {
     pub name: String,
     pub slug: Option<String>,
-    pub root_path: String,
+    /// Codebase directory. Optional: a `work` project has none.
+    #[serde(default)]
+    pub root_path: Option<String>,
     pub description: Option<String>,
+    /// `software` (default) or `work`.
+    #[serde(default)]
+    pub profile: Option<ProjectProfile>,
 }
 
 #[derive(Serialize)]
@@ -36,12 +41,31 @@ pub struct ProjectResponse {
     pub id: String,
     pub name: String,
     pub slug: String,
-    pub root_path: String,
+    /// `null` when the project has no codebase.
+    pub root_path: Option<String>,
+    pub profile: ProjectProfile,
     pub description: Option<String>,
     pub created_at: String,
     pub last_synced: Option<String>,
     pub file_count: usize,
     pub plan_count: usize,
+}
+
+impl ProjectResponse {
+    fn from_node(project: &ProjectNode, file_count: usize, plan_count: usize) -> Self {
+        Self {
+            id: project.id.to_string(),
+            name: project.name.clone(),
+            slug: project.slug.clone(),
+            root_path: project.root_path_opt().map(str::to_string),
+            profile: project.profile,
+            description: project.description.clone(),
+            created_at: project.created_at.to_rfc3339(),
+            last_synced: project.last_synced.map(|dt| dt.to_rfc3339()),
+            file_count,
+            plan_count,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -97,17 +121,11 @@ pub async fn list_projects(
             .await
             .unwrap_or(0);
 
-        responses.push(ProjectResponse {
-            id: project.id.to_string(),
-            name: project.name.clone(),
-            slug: project.slug.clone(),
-            root_path: project.root_path.clone(),
-            description: project.description.clone(),
-            created_at: project.created_at.to_rfc3339(),
-            last_synced: project.last_synced.map(|dt| dt.to_rfc3339()),
-            file_count: file_count as usize,
-            plan_count: plan_count as usize,
-        });
+        responses.push(ProjectResponse::from_node(
+            project,
+            file_count as usize,
+            plan_count as usize,
+        ));
     }
 
     Ok(Json(PaginatedResponse::new(
@@ -144,7 +162,13 @@ pub async fn create_project(
         id: Uuid::new_v4(),
         name: req.name,
         slug: slug.clone(),
-        root_path: expand_tilde(&req.root_path),
+        root_path: req
+            .root_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(expand_tilde)
+            .unwrap_or_default(),
         description: req.description,
         created_at: chrono::Utc::now(),
         last_synced: None,
@@ -154,6 +178,7 @@ pub async fn create_project(
         scaffolding_override: None,
         sharing_policy: None,
         watch_enabled: true,
+        profile: req.profile.unwrap_or_default(),
     };
 
     state.orchestrator.create_project(&project).await?;
@@ -176,17 +201,7 @@ pub async fn create_project(
         });
     }
 
-    Ok(Json(ProjectResponse {
-        id: project.id.to_string(),
-        name: project.name,
-        slug: project.slug,
-        root_path: project.root_path,
-        description: project.description,
-        created_at: project.created_at.to_rfc3339(),
-        last_synced: None,
-        file_count: 0,
-        plan_count: 0,
-    }))
+    Ok(Json(ProjectResponse::from_node(&project, 0, 0)))
 }
 
 /// Get a project by slug
@@ -214,17 +229,11 @@ pub async fn get_project(
         .await
         .unwrap_or(0);
 
-    Ok(Json(ProjectResponse {
-        id: project.id.to_string(),
-        name: project.name,
-        slug: project.slug,
-        root_path: project.root_path,
-        description: project.description,
-        created_at: project.created_at.to_rfc3339(),
-        last_synced: project.last_synced.map(|dt| dt.to_rfc3339()),
-        file_count: file_count as usize,
-        plan_count: plan_count as usize,
-    }))
+    Ok(Json(ProjectResponse::from_node(
+        &project,
+        file_count as usize,
+        plan_count as usize,
+    )))
 }
 
 /// Request to update a project
@@ -232,7 +241,9 @@ pub async fn get_project(
 pub struct UpdateProjectRequest {
     pub name: Option<String>,
     pub description: Option<Option<String>>,
+    /// Set the codebase directory; an empty string clears it.
     pub root_path: Option<String>,
+    pub profile: Option<ProjectProfile>,
 }
 
 /// Update a project
@@ -253,7 +264,20 @@ pub async fn update_project(
     // root_path changes to re-register the project on the file watcher.
     state
         .orchestrator
-        .update_project(project.id, req.name, req.description, req.root_path)
+        .update_project(
+            project.id,
+            req.name,
+            req.description,
+            req.root_path.map(|p| {
+                let p = p.trim();
+                if p.is_empty() {
+                    String::new()
+                } else {
+                    expand_tilde(p)
+                }
+            }),
+            req.profile,
+        )
         .await?;
 
     Ok(StatusCode::NO_CONTENT)
@@ -286,6 +310,9 @@ pub struct SyncProjectResponse {
     pub files_deleted: usize,
     pub symbols_deleted: usize,
     pub errors: usize,
+    /// Set when nothing was synced on purpose (e.g. the project has no root path).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skipped_reason: Option<String>,
 }
 
 /// Query parameters for sync_project
@@ -306,9 +333,21 @@ pub async fn sync_project(
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Project '{}' not found", slug)))?;
 
+    // A project with no codebase (a `work` profile, or one not yet bound to a
+    // checkout) has nothing to index: report that instead of failing.
+    let Some(expanded) = project.expanded_root_path() else {
+        return Ok(Json(SyncProjectResponse {
+            files_synced: 0,
+            files_skipped: 0,
+            files_deleted: 0,
+            symbols_deleted: 0,
+            errors: 0,
+            skipped_reason: Some("project has no root_path; nothing to sync".to_string()),
+        }));
+    };
+
     let is_first_sync = project.last_synced.is_none();
     let force = query.force.unwrap_or(false);
-    let expanded = expand_tilde(&project.root_path);
     let path = std::path::Path::new(&expanded);
 
     let sync_start = std::time::Instant::now();
@@ -347,6 +386,15 @@ pub async fn sync_project(
     // Refresh auto-built feature graphs in background (best-effort)
     state.orchestrator.spawn_refresh_feature_graphs(project.id);
 
+    // Re-derive the architecture from the source tree (best-effort).
+    // Attached to all three sync paths, which do not otherwise run the same
+    // hooks: wiring it to only one would leave the topology stale depending on
+    // what triggered the sync, which is the failure this whole thing removes.
+    crate::architecture::sync::spawn_derive_architecture(
+        state.orchestrator.neo4j_arc(),
+        project.id,
+    );
+
     // Spawn event-triggered protocol runs (post_sync)
     crate::protocol::hooks::spawn_event_triggered_protocols(
         state.orchestrator.neo4j_arc(),
@@ -361,6 +409,7 @@ pub async fn sync_project(
         files_deleted: result.files_deleted,
         symbols_deleted: result.symbols_deleted,
         errors: result.errors,
+        skipped_reason: None,
     }))
 }
 
@@ -889,6 +938,7 @@ mod tests {
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
             model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
+            vault: crate::vault::VaultService::ephemeral(),
         })
     }
 
@@ -992,6 +1042,7 @@ mod tests {
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
             model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
+            vault: crate::vault::VaultService::ephemeral(),
         });
         let app = create_router(state);
 
@@ -1064,6 +1115,7 @@ mod tests {
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
             model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
+            vault: crate::vault::VaultService::ephemeral(),
         });
         let app = create_router(state);
 
@@ -1119,6 +1171,222 @@ mod tests {
         assert_eq!(json["slug"], "new-project");
         assert_eq!(json["file_count"], 0);
         assert_eq!(json["plan_count"], 0);
+    }
+
+    fn authed_patch(uri: &str, body: serde_json::Value) -> Request<Body> {
+        Request::builder()
+            .method("PATCH")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header("authorization", test_bearer_token())
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    async fn json_of(resp: axum::response::Response) -> serde_json::Value {
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_create_project_defaults_to_software_profile() {
+        let state = mock_server_state().await;
+        let resp = create_router(state)
+            .oneshot(authed_post(
+                "/api/projects",
+                serde_json::json!({"name": "Code", "root_path": "/tmp/code"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), AxumStatus::OK);
+        let json = json_of(resp).await;
+        assert_eq!(json["profile"], "software");
+        assert_eq!(json["root_path"], "/tmp/code");
+    }
+
+    #[tokio::test]
+    async fn test_create_work_project_without_root_path() {
+        let state = mock_server_state().await;
+        let resp = create_router(state.clone())
+            .oneshot(authed_post(
+                "/api/projects",
+                serde_json::json!({"name": "Q3 Marketing", "profile": "work"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), AxumStatus::OK);
+        let json = json_of(resp).await;
+        assert_eq!(json["profile"], "work");
+        assert!(json["root_path"].is_null());
+
+        // GET returns the same shape
+        let resp = create_router(state.clone())
+            .oneshot(authed_get("/api/projects/q3-marketing"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), AxumStatus::OK);
+        let json = json_of(resp).await;
+        assert_eq!(json["profile"], "work");
+        assert!(json["root_path"].is_null());
+
+        // and so does the list
+        let resp = create_router(state)
+            .oneshot(authed_get("/api/projects"))
+            .await
+            .unwrap();
+        let json = json_of(resp).await;
+        assert_eq!(json["items"][0]["profile"], "work");
+        assert!(json["items"][0]["root_path"].is_null());
+    }
+
+    #[tokio::test]
+    async fn test_create_project_blank_root_path_is_none() {
+        let state = mock_server_state().await;
+        let resp = create_router(state)
+            .oneshot(authed_post(
+                "/api/projects",
+                serde_json::json!({"name": "Blank", "root_path": "  ", "profile": "work"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), AxumStatus::OK);
+        assert!(json_of(resp).await["root_path"].is_null());
+    }
+
+    #[tokio::test]
+    async fn test_create_project_unknown_profile_rejected() {
+        let state = mock_server_state().await;
+        let resp = create_router(state)
+            .oneshot(authed_post(
+                "/api/projects",
+                serde_json::json!({"name": "Bad", "profile": "hobby"}),
+            ))
+            .await
+            .unwrap();
+        assert!(resp.status().is_client_error());
+    }
+
+    #[tokio::test]
+    async fn test_update_project_profile_and_root_path() {
+        let state = mock_server_state().await;
+        create_router(state.clone())
+            .oneshot(authed_post(
+                "/api/projects",
+                serde_json::json!({"name": "Flip", "root_path": "/tmp/flip"}),
+            ))
+            .await
+            .unwrap();
+
+        let resp = create_router(state.clone())
+            .oneshot(authed_patch(
+                "/api/projects/flip",
+                serde_json::json!({"profile": "work", "root_path": ""}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), AxumStatus::NO_CONTENT);
+
+        let json = json_of(
+            create_router(state.clone())
+                .oneshot(authed_get("/api/projects/flip"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(json["profile"], "work");
+        assert!(json["root_path"].is_null());
+
+        // A patch that omits both leaves them alone.
+        create_router(state.clone())
+            .oneshot(authed_patch(
+                "/api/projects/flip",
+                serde_json::json!({"name": "Flop"}),
+            ))
+            .await
+            .unwrap();
+        let json = json_of(
+            create_router(state)
+                .oneshot(authed_get("/api/projects/flip"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(json["profile"], "work");
+        assert_eq!(json["name"], "Flop");
+    }
+
+    #[tokio::test]
+    async fn test_sync_project_without_root_path_is_a_clean_skip() {
+        let state = mock_server_state().await;
+        create_router(state.clone())
+            .oneshot(authed_post(
+                "/api/projects",
+                serde_json::json!({"name": "Docs Only", "profile": "work"}),
+            ))
+            .await
+            .unwrap();
+
+        let resp = create_router(state.clone())
+            .oneshot(authed_post(
+                "/api/projects/docs-only/sync",
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), AxumStatus::OK);
+        let json = json_of(resp).await;
+        assert_eq!(json["files_synced"], 0);
+        assert_eq!(json["errors"], 0);
+        assert!(json["skipped_reason"]
+            .as_str()
+            .unwrap()
+            .contains("root_path"));
+
+        // last_synced stays unset: nothing was synced.
+        let json = json_of(
+            create_router(state)
+                .oneshot(authed_get("/api/projects/docs-only"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(json["last_synced"].is_null());
+    }
+
+    #[tokio::test]
+    async fn test_legacy_project_json_without_profile_is_software() {
+        // Nodes and serialized payloads from before profiles existed.
+        let mut v = serde_json::to_value(crate::test_helpers::test_project()).unwrap();
+        let obj = v.as_object_mut().unwrap();
+        obj.remove("profile");
+        let p: ProjectNode = serde_json::from_value(v).unwrap();
+        assert_eq!(p.profile, ProjectProfile::Software);
+
+        // Missing or null root_path both mean "none".
+        let mut v = serde_json::to_value(crate::test_helpers::test_project()).unwrap();
+        v["root_path"] = serde_json::Value::Null;
+        let p: ProjectNode = serde_json::from_value(v.clone()).unwrap();
+        assert_eq!(p.root_path_opt(), None);
+        v.as_object_mut().unwrap().remove("root_path");
+        let p: ProjectNode = serde_json::from_value(v).unwrap();
+        assert_eq!(p.root_path_opt(), None);
+
+        // An empty path serializes as null.
+        let mut p = crate::test_helpers::test_project();
+        p.root_path = String::new();
+        assert!(serde_json::to_value(&p).unwrap()["root_path"].is_null());
+    }
+
+    #[test]
+    fn test_project_profile_parse() {
+        assert_eq!("work".parse::<ProjectProfile>(), Ok(ProjectProfile::Work));
+        assert_eq!(
+            " Software ".parse::<ProjectProfile>(),
+            Ok(ProjectProfile::Software)
+        );
+        assert!("nope".parse::<ProjectProfile>().is_err());
     }
 
     // ====================================================================
@@ -1238,6 +1506,7 @@ mod tests {
             confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
             mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
             model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
+            vault: crate::vault::VaultService::ephemeral(),
         })
     }
 

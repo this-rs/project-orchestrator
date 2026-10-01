@@ -405,14 +405,6 @@ pub enum ChatEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         parent_tool_use_id: Option<String>,
     },
-    /// Claude is waiting for user input
-    InputRequest {
-        prompt: String,
-        #[serde(default)]
-        options: Option<Vec<String>>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        parent_tool_use_id: Option<String>,
-    },
     /// Conversation turn completed
     Result {
         session_id: String,
@@ -641,6 +633,21 @@ pub enum ChatEvent {
         /// render the toolbar accordingly (no pill).
         tasks: Vec<BackgroundTaskInfo>,
     },
+    /// The agent asked the user for a secret (MCP `vault.request_secret`).
+    /// The frontend shows a secure input card; the value goes straight to
+    /// the vault API, never through the chat. Ephemeral — pending requests are
+    /// re-read from `GET /api/vault/requests` on reconnect.
+    SecretRequest {
+        id: String,
+        name: String,
+        reason: String,
+        /// The secret already exists: the card offers to grant it instead of
+        /// asking the value again.
+        exists: bool,
+    },
+    /// A secret request was answered (`provided`, `granted` or `declined`).
+    /// Carries no value.
+    SecretRequestResolved { id: String, outcome: String },
 }
 
 impl ChatEvent {
@@ -657,7 +664,6 @@ impl ChatEvent {
             ChatEvent::ToolCancelled { .. } => "tool_cancelled",
             ChatEvent::PermissionRequest { .. } => "permission_request",
             ChatEvent::AskUserQuestion { .. } => "ask_user_question",
-            ChatEvent::InputRequest { .. } => "input_request",
             ChatEvent::Result { .. } => "result",
             ChatEvent::StreamDelta { .. } => "stream_delta",
             ChatEvent::StreamingStatus { .. } => "streaming_status",
@@ -677,6 +683,8 @@ impl ChatEvent {
             ChatEvent::SessionError { .. } => "session_error",
             ChatEvent::ToolsCancelled { .. } => "tools_cancelled",
             ChatEvent::ActiveTasksUpdate { .. } => "active_tasks_update",
+            ChatEvent::SecretRequest { .. } => "secret_request",
+            ChatEvent::SecretRequestResolved { .. } => "secret_request_resolved",
         }
     }
 
@@ -747,7 +755,6 @@ impl ChatEvent {
                 Some(format!("error:{}", hasher.finish()))
             }
             ChatEvent::Result { session_id, .. } => Some(format!("result:{}", session_id)),
-            ChatEvent::InputRequest { prompt, .. } => Some(format!("input_request:{}", prompt)),
             ChatEvent::PermissionModeChanged { mode } => {
                 Some(format!("permission_mode_changed:{}", mode))
             }
@@ -840,7 +847,9 @@ impl ChatEvent {
             // useful state changes from the frontend). Plan 754a1379, T4.
             ChatEvent::StreamDelta { .. }
             | ChatEvent::StreamingStatus { .. }
-            | ChatEvent::ActiveTasksUpdate { .. } => None,
+            | ChatEvent::ActiveTasksUpdate { .. }
+            | ChatEvent::SecretRequest { .. }
+            | ChatEvent::SecretRequestResolved { .. } => None,
         }
     }
 }
@@ -1580,16 +1589,6 @@ mod tests {
                 input: serde_json::json!({"command": "rm -rf /"}),
                 parent_tool_use_id: None,
             },
-            ChatEvent::InputRequest {
-                prompt: "Which option?".into(),
-                options: Some(vec!["A".into(), "B".into()]),
-                parent_tool_use_id: None,
-            },
-            ChatEvent::InputRequest {
-                prompt: "Enter value:".into(),
-                options: None,
-                parent_tool_use_id: Some("toolu_parent_2".into()),
-            },
             ChatEvent::Result {
                 session_id: "cli-123".into(),
                 duration_ms: 5000,
@@ -1768,9 +1767,10 @@ mod tests {
         let event: ChatEvent = serde_json::from_str(json).unwrap();
         assert!(matches!(event, ChatEvent::PermissionRequest { .. }));
 
+        // couac2: `input_request` was never emitted in production (only built in
+        // tests) and was removed; user questions go through AskUserQuestion.
         let json = r#"{"type":"input_request","prompt":"Choose:","options":["A","B"]}"#;
-        let event: ChatEvent = serde_json::from_str(json).unwrap();
-        assert!(matches!(event, ChatEvent::InputRequest { ref options, .. } if options.is_some()));
+        assert!(serde_json::from_str::<ChatEvent>(json).is_err());
 
         // CompactionStarted with auto trigger
         let json = r#"{"type":"compaction_started","trigger":"auto"}"#;
@@ -1971,11 +1971,6 @@ mod tests {
                 tool: "bash".into(),
                 input: serde_json::json!({}),
                 parent_tool_use_id: Some("p5".into()),
-            },
-            ChatEvent::InputRequest {
-                prompt: "?".into(),
-                options: None,
-                parent_tool_use_id: Some("p6".into()),
             },
             ChatEvent::ToolUseInputResolved {
                 id: "tu1".into(),

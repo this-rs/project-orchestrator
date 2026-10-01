@@ -626,11 +626,6 @@ mod tests {
                 input: serde_json::json!({"command": "ls"}),
                 parent_tool_use_id: None,
             },
-            ChatEvent::InputRequest {
-                prompt: "Choose:".into(),
-                options: Some(vec!["A".into(), "B".into()]),
-                parent_tool_use_id: None,
-            },
             ChatEvent::Result {
                 session_id: "sess-1".into(),
                 duration_ms: 5000,

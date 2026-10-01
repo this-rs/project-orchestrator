@@ -409,15 +409,26 @@ impl WorktreeCollector {
     // Step 5 — cleanup_worktrees
     // --------------------------------------------------------------------
 
-    /// Remove all `.claude/worktrees/*` worktrees after resolution.
+    /// Remove the disposable agent worktrees (`.claude/worktrees/agent-*`)
+    /// after resolution.
     ///
-    /// Called in `finalize_run()` to clean up at the end of a plan.
+    /// Called in `finalize_run()` to clean up at the end of a plan. Only agent
+    /// worktrees are candidates: a user's own `.claude/worktrees/<name>` (e.g. an
+    /// interactive session in the same repo) is never touched. An agent
+    /// worktree whose branch still holds commits that were not recovered onto
+    /// the current branch is kept as well, since `worktree remove --force` +
+    /// `branch -D` would destroy that work. Returns the number of removed
+    /// worktrees.
     pub async fn cleanup_worktrees(cwd: &str) -> Result<usize> {
         let worktrees = Self::list_worktrees(cwd).await?;
 
         let agent_worktrees: Vec<&WorktreeInfo> = worktrees
             .iter()
-            .filter(|wt| wt.path.to_string_lossy().contains(".claude/worktrees/"))
+            .filter(|wt| {
+                wt.path
+                    .to_string_lossy()
+                    .contains(".claude/worktrees/agent-")
+            })
             .collect();
 
         if agent_worktrees.is_empty() {
@@ -431,12 +442,61 @@ impl WorktreeCollector {
 
         let mut cleaned = 0;
         for wt in agent_worktrees {
+            if let Some(branch) = &wt.branch {
+                match Self::unrecovered_commit_count(branch, cwd).await {
+                    Ok(0) => {}
+                    Ok(n) => {
+                        warn!(
+                            "Keeping worktree {}: {} commit(s) on '{}' were not recovered",
+                            wt.path.display(),
+                            n,
+                            branch
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Keeping worktree {}: cannot verify its commits are recovered: {}",
+                            wt.path.display(),
+                            e
+                        );
+                        continue;
+                    }
+                }
+            }
             if Self::cleanup_single_worktree(cwd, wt).await {
                 cleaned += 1;
             }
         }
 
         Ok(cleaned)
+    }
+
+    /// Number of commits on `branch` with no patch-equivalent commit on `HEAD`.
+    ///
+    /// Recovered commits are cherry-picked (new SHAs), so ancestry can't be
+    /// used: `git cherry HEAD <branch>` matches by patch-id instead and marks
+    /// commits missing from HEAD with `+`.
+    async fn unrecovered_commit_count(branch: &str, cwd: &str) -> Result<usize> {
+        let output = Command::new("git")
+            .args(["cherry", "HEAD", branch])
+            .current_dir(cwd)
+            .output()
+            .await
+            .context("Failed to run git cherry")?;
+
+        if !output.status.success() {
+            anyhow::bail!(
+                "git cherry HEAD {} failed: {}",
+                branch,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        Ok(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|l| l.starts_with('+'))
+            .count())
     }
 
     /// Remove a single worktree and optionally delete its branch.
@@ -911,5 +971,139 @@ branch refs/heads/feature
         // In a clean repo without agent worktrees, everything should be zero
         assert_eq!(r.total_merged, 0);
         assert_eq!(r.total_conflicts, 0);
+    }
+
+    /// `cleanup_worktrees` runs at the end of every plan run. It must only
+    /// touch disposable agent worktrees: a user's own `.claude/worktrees/<name>`
+    /// (e.g. an interactive session working in the same repo) and agent
+    /// worktrees holding commits that were NOT recovered onto the run branch
+    /// must survive — `worktree remove --force` + `branch -D` would destroy
+    /// that work.
+    #[tokio::test]
+    async fn test_cleanup_worktrees_preserves_user_and_unrecovered_worktrees() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |cwd: &std::path::Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(["-c", "user.email=t@t", "-c", "user.name=t"])
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {:?}: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(root, &["init", "-q", "-b", "main"]);
+        git(root, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        // A user worktree (not an agent one) and an agent worktree with an
+        // unrecovered commit, plus a stale agent worktree with no new commit.
+        git(
+            root,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feat",
+                ".claude/worktrees/my-feature",
+            ],
+        );
+        git(
+            root,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "agent-a",
+                ".claude/worktrees/agent-a",
+            ],
+        );
+        git(
+            &root.join(".claude/worktrees/agent-a"),
+            &["commit", "-q", "--allow-empty", "-m", "agent work"],
+        );
+        git(
+            root,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "agent-b",
+                ".claude/worktrees/agent-b",
+            ],
+        );
+
+        let cwd = root.to_string_lossy().to_string();
+        let cleaned = WorktreeCollector::cleanup_worktrees(&cwd).await.unwrap();
+
+        assert!(
+            root.join(".claude/worktrees/my-feature").exists(),
+            "user worktree removed"
+        );
+        assert!(
+            root.join(".claude/worktrees/agent-a").exists(),
+            "unrecovered agent work removed"
+        );
+        assert!(
+            !root.join(".claude/worktrees/agent-b").exists(),
+            "stale agent worktree kept"
+        );
+        assert_eq!(cleaned, 1);
+    }
+
+    /// Recovered commits are cherry-picked onto the run branch (new SHAs), so a
+    /// recovered agent worktree is NOT an ancestor-merge: it must still be
+    /// recognised as fully recovered (patch-equivalent) and cleaned up.
+    #[tokio::test]
+    async fn test_cleanup_worktrees_removes_cherry_picked_agent_worktree() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |cwd: &std::path::Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(["-c", "user.email=t@t", "-c", "user.name=t"])
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {:?}: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        git(root, &["init", "-q", "-b", "main"]);
+        git(root, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        git(
+            root,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "agent-c",
+                ".claude/worktrees/agent-c",
+            ],
+        );
+        let wt = root.join(".claude/worktrees/agent-c");
+        std::fs::write(wt.join("f.txt"), "hello").unwrap();
+        git(&wt, &["add", "f.txt"]);
+        git(&wt, &["commit", "-q", "-m", "agent work"]);
+        let sha = git(&wt, &["rev-parse", "HEAD"]);
+        // Recover it onto main via cherry-pick (different SHA, same patch).
+        git(root, &["cherry-pick", &sha]);
+
+        let cwd = root.to_string_lossy().to_string();
+        let cleaned = WorktreeCollector::cleanup_worktrees(&cwd).await.unwrap();
+
+        assert_eq!(cleaned, 1);
+        assert!(!wt.exists(), "recovered agent worktree kept");
     }
 }
