@@ -84,6 +84,11 @@ fn unstringify_json_values(args: &mut Value, properties: Option<&Value>) {
         let Some(declared) = props.get(key).and_then(|p| p.get("type")) else {
             continue;
         };
+        // A list-typed declaration such as ["array", "integer"] is resolved by the
+        // branches below in a fixed order: array/object first, then boolean, then
+        // integer/number. So a string that parses as JSON array/object becomes one,
+        // and otherwise falls through to None (it is not retried as an integer).
+        // No current schema declares such a mixed type.
         let accepts = |t: &str| match declared {
             Value::String(d) => d == t,
             Value::Array(ds) => ds.iter().any(|d| d == t),
@@ -126,9 +131,23 @@ fn unstringify_json_values(args: &mut Value, properties: Option<&Value>) {
     }
 }
 
-/// Look up the declared input properties of `tool` (mega-tool or legacy alias)
-/// and apply [`unstringify_json_values`] against them.
-fn unstringify_args_for_tool(tool: &str, args: &mut Value) {
+/// Mega-tool that owns `tool`: the name itself when it is a mega-tool, otherwise
+/// the mega-tool of a legacy name. Both dispatch tables are consulted, because
+/// `resolve_legacy_alias` does not know every legacy name that
+/// `MEGA_TOOL_ACTIONS` (the table the dispatcher routes with) accepts.
+fn mega_tool_for(tool: &str) -> &str {
+    if let Some((mega, _)) = super::tools::resolve_legacy_alias(tool) {
+        return mega;
+    }
+    MEGA_TOOL_ACTIONS
+        .iter()
+        .find(|(_, _, internal)| *internal == tool)
+        .map(|(mega, _, _)| *mega)
+        .unwrap_or(tool)
+}
+
+/// Declared input properties of the mega-tool that owns `tool`.
+fn declared_properties_for_tool(tool: &str) -> Option<&'static Value> {
     use std::collections::HashMap;
     use std::sync::OnceLock;
     static SCHEMAS: OnceLock<HashMap<String, Value>> = OnceLock::new();
@@ -138,10 +157,13 @@ fn unstringify_args_for_tool(tool: &str, args: &mut Value) {
             .filter_map(|t| t.input_schema.properties.map(|p| (t.name, p)))
             .collect()
     });
-    let mega = super::tools::resolve_legacy_alias(tool)
-        .map(|(m, _)| m)
-        .unwrap_or(tool);
-    unstringify_json_values(args, schemas.get(mega));
+    schemas.get(mega_tool_for(tool))
+}
+
+/// Look up the declared input properties of `tool` (mega-tool or legacy name)
+/// and apply [`unstringify_json_values`] against them.
+fn unstringify_args_for_tool(tool: &str, args: &mut Value) {
+    unstringify_json_values(args, declared_properties_for_tool(tool));
 }
 
 /// Single source of truth for mega-tool dispatch: `(mega_tool, action, internal_name)`.
@@ -10922,6 +10944,65 @@ mod tests {
         let mut v = json!({"whatever": "42"});
         unstringify_args_for_tool("no_such_tool", &mut v);
         assert_eq!(v["whatever"], json!("42"));
+    }
+
+    #[test]
+    fn test_unstringify_covers_every_legacy_name_in_dispatch_table() {
+        // Every legacy name the dispatcher accepts (MEGA_TOOL_ACTIONS) must be
+        // coerced by the schema of its mega-tool, whether or not
+        // `resolve_legacy_alias` knows it.
+        let mut checked = 0;
+        for (mega, _action, internal) in MEGA_TOOL_ACTIONS {
+            let props = declared_properties_for_tool(internal)
+                .unwrap_or_else(|| panic!("legacy name '{internal}' lost its schema"));
+            let mega_props = declared_properties_for_tool(mega).unwrap();
+            assert!(
+                std::ptr::eq(props, mega_props),
+                "'{internal}' must resolve to the schema of '{mega}'"
+            );
+            // Any integer-typed parameter of the mega-tool must still be coerced.
+            if let Some(key) =
+                props.as_object().unwrap().iter().find_map(|(k, v)| {
+                    (v.get("type") == Some(&json!("integer"))).then(|| k.clone())
+                })
+            {
+                let mut args = json!({ key.clone(): "42" });
+                unstringify_args_for_tool(internal, &mut args);
+                assert_eq!(
+                    args[&key],
+                    json!(42),
+                    "'{internal}' lost coercion of '{key}'"
+                );
+            }
+            checked += 1;
+        }
+        assert_eq!(checked, MEGA_TOOL_ACTIONS.len());
+        assert!(checked > 100);
+    }
+
+    #[tokio::test]
+    async fn test_handle_coerces_arguments_by_schema_for_legacy_and_mega_names() {
+        let pid = "550e8400-e29b-41d4-a716-446655440000";
+        // `update_plan` is accepted by the dispatcher but unknown to
+        // `resolve_legacy_alias`; the mega-tool form resolves to the same handler.
+        let calls = [
+            (
+                "update_plan",
+                json!({"plan_id": pid, "priority": "5", "title": "007"}),
+            ),
+            (
+                "plan",
+                json!({"action": "update", "plan_id": pid, "priority": "5", "title": "007"}),
+            ),
+        ];
+        for (name, args) in calls {
+            let (handler, _) = make_http_handler().await;
+            let result = handler.handle(name, Some(args)).await.unwrap();
+            assert_eq!(result["method"], "PATCH", "{name}");
+            // priority is declared integer: coerced; title is declared string: verbatim.
+            assert_eq!(result["body"]["priority"], json!(5), "{name}");
+            assert_eq!(result["body"]["title"], json!("007"), "{name}");
+        }
     }
 
     // ========================================================================
