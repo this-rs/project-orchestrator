@@ -988,3 +988,120 @@ async fn test_update_workspace_milestone_reports_whether_the_id_matched() {
         .is_none());
     store.delete_workspace(workspace.id).await.unwrap();
 }
+
+/// MCP tokens end to end against a real graph: issue, check, revoke, inventory,
+/// purge.
+///
+/// Why this one earns its place beyond the coverage number: `purge_mcp_tokens`
+/// is the only call in this family that **deletes rows**, and the sole reason
+/// deleting is safe is that `is_mcp_token_active` answers `false` for a `jti`
+/// it cannot find. The unit tests can only pin that in `MockGraphStore`; the
+/// assertion after the purge below is what keeps it true in the Cypher. If a
+/// future rewrite made an unknown `jti` return `true`, a purge would silently
+/// re-enable every revoked token — and this test is what fails first.
+#[tokio::test]
+async fn test_mcp_token_lifecycle_revocation_and_purge() {
+    let client = store_or_skip!();
+    let store: &dyn GraphStore = &client;
+
+    let user = Uuid::new_v4();
+    let other = Uuid::new_v4();
+    let future = chrono::Utc::now() + chrono::Duration::days(30);
+    let past = chrono::Utc::now() - chrono::Duration::days(1);
+
+    let live = format!("jti-live-{}", Uuid::new_v4());
+    let revoked = format!("jti-revoked-{}", Uuid::new_v4());
+    let expired = format!("jti-expired-{}", Uuid::new_v4());
+    let foreign = format!("jti-foreign-{}", Uuid::new_v4());
+    let never_issued = format!("jti-never-issued-{}", Uuid::new_v4());
+
+    // --- happy path: issue, then ask whether each one still grants access ---
+    store
+        .create_mcp_token(user, &live, "working", "mcp:read", future)
+        .await
+        .unwrap();
+    store
+        .create_mcp_token(user, &revoked, "to revoke", "mcp:read mcp:write", future)
+        .await
+        .unwrap();
+    store
+        .create_mcp_token(user, &expired, "lapsed", "mcp:read", past)
+        .await
+        .unwrap();
+    store
+        .create_mcp_token(other, &foreign, "another user's", "mcp:read", future)
+        .await
+        .unwrap();
+
+    assert!(store.is_mcp_token_active(&live).await.unwrap());
+    assert!(
+        !store.is_mcp_token_active(&expired).await.unwrap(),
+        "expiry alone must reject, without any revocation"
+    );
+    assert!(
+        !store.is_mcp_token_active(&never_issued).await.unwrap(),
+        "an unknown jti must be rejected — this is the fail-closed arm the \
+         purge below depends on"
+    );
+
+    // --- revocation, and what it reports ---
+    assert!(store.revoke_mcp_token(user, &revoked).await.unwrap());
+    assert!(!store.is_mcp_token_active(&revoked).await.unwrap());
+    assert!(
+        store.revoke_mcp_token(user, &revoked).await.unwrap(),
+        "revoking twice is idempotent: the row is still there, so it matched"
+    );
+    assert!(
+        !store.revoke_mcp_token(user, &never_issued).await.unwrap(),
+        "an unknown jti reports NO match, so the API can answer 404 instead of \
+         telling the operator a token was revoked when none was"
+    );
+    assert!(
+        !store.revoke_mcp_token(user, &foreign).await.unwrap(),
+        "another user's token is not ours to revoke"
+    );
+    assert!(
+        store.is_mcp_token_active(&foreign).await.unwrap(),
+        "and it is left working"
+    );
+
+    // --- the inventory deliberately keeps the dead ones: that is the audit
+    //     trail, and the reason a separate purge has to exist at all ---
+    assert_eq!(store.list_mcp_tokens(user).await.unwrap().len(), 3);
+
+    // --- purge ---
+    assert_eq!(
+        store.purge_mcp_tokens(user).await.unwrap(),
+        2,
+        "the revoked one and the expired one, not the working one"
+    );
+    let left = store.list_mcp_tokens(user).await.unwrap();
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].jti, live);
+    assert!(
+        store.is_mcp_token_active(&live).await.unwrap(),
+        "a purge must never disable a token that still works"
+    );
+    assert!(
+        !store.is_mcp_token_active(&revoked).await.unwrap(),
+        "a purged row stays rejected — deleting it must not resurrect the token"
+    );
+    assert_eq!(
+        store.purge_mcp_tokens(user).await.unwrap(),
+        0,
+        "a second purge has nothing left to do"
+    );
+    assert_eq!(
+        store.list_mcp_tokens(other).await.unwrap().len(),
+        1,
+        "the purge never reached the other user's records"
+    );
+
+    // --- cleanup: leave the database as we found it ---
+    store.revoke_mcp_token(user, &live).await.unwrap();
+    store.purge_mcp_tokens(user).await.unwrap();
+    store.revoke_mcp_token(other, &foreign).await.unwrap();
+    store.purge_mcp_tokens(other).await.unwrap();
+    assert!(store.list_mcp_tokens(user).await.unwrap().is_empty());
+    assert!(store.list_mcp_tokens(other).await.unwrap().is_empty());
+}
