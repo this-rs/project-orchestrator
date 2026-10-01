@@ -51,7 +51,14 @@ impl ParallelEnrichmentStage for ReflexStage {
             affected_files: affected,
             task_title: None,
             step_description: None,
-            embedding: None, // Will be populated when embedding pipeline is wired
+            // Intentionally None: no embedding exists upstream. `EnrichmentInput`
+            // carries only the raw message (no vector), stages run in parallel so
+            // none can hand one to this stage, and `ReflexStage` owns only a
+            // `GraphStore` (no EmbeddingProvider). Wiring it would mean injecting a
+            // provider here and paying an embed call on every user message. Until
+            // then `fetch_episode_suggestions` skips episode recall by design
+            // (scar + co-change reflexes are unaffected).
+            embedding: None,
             project_id,
         };
 

@@ -2313,8 +2313,8 @@ impl GraphStore for Neo4jClient {
         self.get_step_parent_task_id(step_id).await
     }
 
-    async fn init_note_energy(&self) -> anyhow::Result<usize> {
-        self.init_note_energy().await
+    async fn init_note_energy(&self, project_id: Option<Uuid>) -> anyhow::Result<usize> {
+        self.init_note_energy(project_id).await
     }
 
     async fn list_notes_needing_synapses(

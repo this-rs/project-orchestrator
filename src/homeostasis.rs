@@ -256,12 +256,15 @@ pub struct ExecuteContext<'a> {
 /// Each action maps to a specific GraphStore method:
 /// - `DecaySynapses` → `graph.decay_project_synapses` for `ctx.project_id`
 ///   (global `decay_synapses` only without a project)
-/// - `BackfillSynapses` → `NoteManager::backfill_synapses` (paginated via cursor)
+/// - `BackfillSynapses` → `NoteManager::backfill_synapses` scoped to
+///   `ctx.project_id` (global only without a project)
 /// - `ReduceInitialEnergy` → logged only (informational, caller adjusts defaults)
 ///
-/// When `search` is `Some`, BackfillSynapses processes one batch of notes
-/// starting from `ctx.cursor.offset`. The returned `ExecuteResult` contains
-/// the updated cursor for the next cycle.
+/// When `search` is `Some`, BackfillSynapses runs `NoteManager::backfill_synapses`,
+/// which pages internally (`batch_size` per page) until the candidate list is
+/// exhausted; it has no start-offset parameter, so `ctx.cursor.offset` is only
+/// used to report/preserve the cursor, not to resume (the project scope is what
+/// bounds the work). The returned `ExecuteResult` contains the updated cursor.
 ///
 /// When `None`, BackfillSynapses is logged as a recommendation only.
 ///
@@ -332,7 +335,10 @@ pub async fn execute_actions(
                             0.0,
                             params.max_neighbors,
                             /* cancel */ None,
-                            /* project_id */ None,
+                            // Scope to the project being corrected (same as
+                            // DecaySynapses above): a global sweep here rebuilt
+                            // every tenant's synapses to fix one project.
+                            ctx.project_id,
                         )
                         .await
                     {
@@ -893,5 +899,76 @@ mod tests {
             .backfill_cursor
             .expect("backfill should return cursor");
         assert!(cursor.completed, "empty graph → done immediately");
+    }
+
+    #[tokio::test]
+    async fn test_execute_backfill_is_scoped_to_ctx_project() {
+        use crate::neo4j::mock::MockGraphStore;
+        use crate::notes::{Note, NoteType};
+
+        let mock = Arc::new(MockGraphStore::new());
+        let project_a = Uuid::new_v4();
+        let project_b = Uuid::new_v4();
+        let mut ids_a = vec![];
+        let mut ids_b = vec![];
+        for (pid, ids) in [(project_a, &mut ids_a), (project_b, &mut ids_b)] {
+            for i in 0..2 {
+                let n = Note::new(
+                    Some(pid),
+                    NoteType::Observation,
+                    format!("note {i}"),
+                    "test".to_string(),
+                );
+                let mut n = n;
+                // Energy-less note: the mock initializes it only when asked to.
+                n.energy = 0.0;
+                n.last_activated = None;
+                mock.create_note(&n).await.unwrap();
+                mock.set_note_embedding(n.id, &[1.0, 0.0, 0.0], "m")
+                    .await
+                    .unwrap();
+                ids.push(n.id);
+            }
+        }
+        let graph: Arc<dyn GraphStore> = mock.clone();
+        let search: Arc<dyn crate::meilisearch::SearchStore> = Arc::new(MockSearchStore::new());
+
+        let result = execute_actions(
+            &graph,
+            Some(&search),
+            &[HomeostasisAction::BackfillSynapses],
+            ExecuteContext {
+                project_id: Some(project_a),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.executed, 1);
+
+        let synapses = mock.note_synapses.read().await;
+        assert!(
+            ids_a.iter().all(|id| synapses.contains_key(id)),
+            "project A notes must get synapses"
+        );
+        assert!(
+            ids_b.iter().all(|id| !synapses.contains_key(id)),
+            "project B notes must be untouched by a project-A correction"
+        );
+
+        assert_eq!(
+            *mock.init_note_energy_calls.read().await,
+            vec![Some(project_a)],
+            "init_note_energy must be called once, scoped to project A"
+        );
+        let notes = mock.notes.read().await;
+        assert!(
+            ids_a.iter().all(|id| notes[id].last_activated.is_some()),
+            "project A notes get their energy initialized"
+        );
+        assert!(
+            ids_b.iter().all(|id| notes[id].last_activated.is_none()),
+            "project B energy must not be initialized by a project-A correction"
+        );
     }
 }

@@ -148,6 +148,8 @@ pub struct MockGraphStore {
     pub note_embeddings: RwLock<HashMap<Uuid, (Vec<f32>, String)>>,
     /// Note synapses: bidirectional adjacency list (note_id -> Vec<(neighbor_id, weight)>)
     pub note_synapses: RwLock<HashMap<Uuid, Vec<(Uuid, f64)>>>,
+    /// Scope argument of every `init_note_energy` call, in order (test probe).
+    pub init_note_energy_calls: RwLock<Vec<Option<Uuid>>>,
     /// Synapse source tags: (note_a, note_b) -> source ("cosine" | "coactivation")
     /// Sorted key pair (min, max) to ensure canonical ordering.
     pub synapse_sources: RwLock<HashMap<(Uuid, Uuid), String>>,
@@ -316,6 +318,7 @@ impl MockGraphStore {
             function_analytics: RwLock::new(HashMap::new()),
             note_embeddings: RwLock::new(HashMap::new()),
             note_synapses: RwLock::new(HashMap::new()),
+            init_note_energy_calls: RwLock::new(Vec::new()),
             synapse_sources: RwLock::new(HashMap::new()),
             file_embeddings: RwLock::new(HashMap::new()),
             function_embeddings: RwLock::new(HashMap::new()),
@@ -7116,10 +7119,14 @@ impl GraphStore for MockGraphStore {
         Ok(None)
     }
 
-    async fn init_note_energy(&self) -> Result<usize> {
+    async fn init_note_energy(&self, project_id: Option<Uuid>) -> Result<usize> {
+        self.init_note_energy_calls.write().await.push(project_id);
         let mut notes = self.notes.write().await;
         let mut count = 0;
-        for note in notes.values_mut() {
+        for note in notes
+            .values_mut()
+            .filter(|n| project_id.is_none_or(|pid| n.project_id == Some(pid)))
+        {
             // Simulate: only init if energy would have been NULL (we use 0.0 sentinel or check default)
             // In mock, energy is always set by Note::new(), so this is a no-op
             // But for completeness, ensure energy is at least 1.0 if it was 0.0 and never activated
