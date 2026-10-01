@@ -2040,7 +2040,8 @@ pub trait GraphStore: Send + Sync {
     ///
     /// Returns, ordered by `(session_id, seq)`: `permission_request`,
     /// `permission_decision`, `ask_user_question` (full payload) and
-    /// `user_message` (payload blanked: only its `seq` matters here).
+    /// `user_message` (payload blanked: only its `seq` matters here) and
+    /// `session_error` (the CLI died).
     /// `input_request` is deliberately NOT read: it is a dead type, never
     /// emitted in production, and counting it would invent phantom requests.
     async fn get_attention_events(&self, session_ids: &[Uuid]) -> Result<Vec<ChatEventRecord>>;

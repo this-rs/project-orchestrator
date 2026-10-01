@@ -11,6 +11,17 @@
 //! - a question is pending = an `ask_user_question` with no `user_message` of
 //!   a HIGHER `seq` (answering is just a `send_message`: there is NO
 //!   `input_response` event);
+//! - a permission is also INVALIDATED by any `user_message` of a HIGHER `seq`:
+//!   a user turn (in particular the one `resume_session` sends) means the
+//!   CLI that asked is gone or moved on, and the CLI replaces the old request
+//!   with a NEW one (new id, new `permission_request`) when still needed
+//!   (spike note cd71cb07). Without this rule a permission asked before a
+//!   resume would come back as actionable although answering it is a no-op;
+//! - a `session_error` (the CLI died) with no later `user_message` on a DEAD
+//!   session is surfaced in [`DerivedAttention::errors`] (stuck band);
+//! - `cli_stopped_at` of an orphan = explicit input, else the timestamp of the
+//!   LAST stored attention event of the session, else the session's
+//!   `updated_at` (never null);
 //! - live session -> actionable ([`WaitingRequest`]); dead session -> orphan
 //!   ([`OrphanRequest`]), with since when the CLI is stopped.
 //!
@@ -40,6 +51,19 @@ pub struct SessionAttentionInput {
     pub alive: bool,
     /// Since when the CLI is stopped (only meaningful when `!alive`).
     pub cli_stopped_at: Option<DateTime<Utc>>,
+    /// Last-resort value for `cli_stopped_at` of an orphan: the session's
+    /// `updated_at`.
+    pub fallback_stopped_at: DateTime<Utc>,
+}
+
+/// A dead CLI that died on a `session_error` and was not restarted since.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionErrorInfo {
+    pub session_id: Uuid,
+    pub thread_id: Option<Uuid>,
+    pub workspace: String,
+    pub reason: String,
+    pub occurred_at: DateTime<Utc>,
 }
 
 /// Result of the derivation: both lists are ordered oldest first.
@@ -47,6 +71,8 @@ pub struct SessionAttentionInput {
 pub struct DerivedAttention {
     pub waiting: Vec<WaitingRequest>,
     pub orphans: Vec<OrphanRequest>,
+    /// Dead sessions whose last word is a `session_error`.
+    pub errors: Vec<SessionErrorInfo>,
 }
 
 /// A pending request before it is classified live/dead.
@@ -111,8 +137,23 @@ pub fn derive_session_attention(
 ) -> DerivedAttention {
     let mut decided: HashSet<String> = HashSet::new();
     let mut last_user_seq: i64 = i64::MIN;
+    let mut last_event_at: Option<DateTime<Utc>> = None;
+    let mut last_error: Option<(i64, String, DateTime<Utc>)> = None;
     for e in events {
+        last_event_at = last_event_at.max(Some(e.created_at));
         match e.event_type.as_str() {
+            "session_error" => {
+                if let Ok(ChatEvent::SessionError {
+                    reason,
+                    received_at,
+                    ..
+                }) = serde_json::from_str::<ChatEvent>(&e.data)
+                {
+                    if last_error.as_ref().is_none_or(|(sq, _, _)| e.seq > *sq) {
+                        last_error = Some((e.seq, reason, received_at));
+                    }
+                }
+            }
             "permission_decision" => {
                 if let Ok(ChatEvent::PermissionDecision { id, .. }) =
                     serde_json::from_str::<ChatEvent>(&e.data)
@@ -140,7 +181,9 @@ pub fn derive_session_attention(
                 else {
                     continue;
                 };
-                if decided.contains(&id) || !seen.insert(format!("p:{id}")) {
+                // Decided, or invalidated by a later user turn (resume).
+                if decided.contains(&id) || last_user_seq > e.seq || !seen.insert(format!("p:{id}"))
+                {
                     continue;
                 }
                 pending.push(Pending {
@@ -184,6 +227,23 @@ pub fn derive_session_attention(
     }
 
     let mut out = DerivedAttention::default();
+    if !input.alive {
+        if let Some((seq, reason, at)) = last_error {
+            if last_user_seq < seq {
+                out.errors.push(SessionErrorInfo {
+                    session_id: input.session_id,
+                    thread_id: input.thread_id,
+                    workspace: input.workspace.clone(),
+                    reason,
+                    occurred_at: at,
+                });
+            }
+        }
+    }
+    let stopped_at = input
+        .cli_stopped_at
+        .or(last_event_at)
+        .unwrap_or(input.fallback_stopped_at);
     for p in pending {
         let age_secs = u64::try_from((now - p.requested_at).num_seconds()).unwrap_or(0);
         if input.alive {
@@ -213,7 +273,7 @@ pub fn derive_session_attention(
                 seq: p.seq,
                 requested_at: p.requested_at,
                 age_secs,
-                cli_stopped_at: input.cli_stopped_at,
+                cli_stopped_at: Some(stopped_at),
             });
         }
     }
@@ -238,6 +298,7 @@ pub fn derive_attention(
         let d = derive_session_attention(s, &evs, now);
         out.waiting.extend(d.waiting);
         out.orphans.extend(d.orphans);
+        out.errors.extend(d.errors);
     }
     out.waiting
         .sort_by_key(|r| (r.requested_at, r.session_id, r.seq));
@@ -398,6 +459,7 @@ mod tests {
             thread_id: None,
             alive,
             cli_stopped_at: if alive { None } else { Some(t(500)) },
+            fallback_stopped_at: t(7),
         }
     }
 

@@ -5883,7 +5883,8 @@ impl GraphStore for MockGraphStore {
                     }
                 }
                 if let Some(ref tag_filter) = filters.tags {
-                    if !tag_filter.iter().any(|tg| n.tags.contains(tg)) {
+                    // AND semantics, like the real query (`'t' IN n.tags` per tag).
+                    if !tag_filter.iter().all(|tg| n.tags.contains(tg)) {
                         return false;
                     }
                 }
@@ -7328,7 +7329,10 @@ impl GraphStore for MockGraphStore {
                 for e in events {
                     if matches!(
                         e.event_type.as_str(),
-                        "permission_request" | "permission_decision" | "ask_user_question"
+                        "permission_request"
+                            | "permission_decision"
+                            | "ask_user_question"
+                            | "session_error"
                     ) {
                         out.push(e.clone());
                     } else if e.event_type == "user_message" {

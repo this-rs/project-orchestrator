@@ -228,22 +228,38 @@ fn rfc_status(note: &Note) -> Option<&str> {
     note.tags.iter().find_map(|t| t.strip_prefix("rfc-status:"))
 }
 
+/// Open RFCs (proposed + under review). `list_notes` combines `tags` with AND
+/// and an RFC carries exactly one `rfc-status:*` tag, so one query per status
+/// and a de-duplicated union (never one query with both tags).
+async fn list_open_rfcs(
+    graph: &dyn GraphStore,
+    ws: Option<&str>,
+) -> anyhow::Result<(Vec<Note>, usize)> {
+    let filters = |status: &str| NoteFilters {
+        note_type: Some(vec![NoteType::Rfc]),
+        tags: Some(vec![format!("rfc-status:{status}")]),
+        limit: Some(THINKING_LIMIT as i64),
+        ..Default::default()
+    };
+    let (fa, fb) = (filters("proposed"), filters("under_review"));
+    let (a, b) = tokio::join!(
+        graph.list_notes(None, ws, &fa),
+        graph.list_notes(None, ws, &fb)
+    );
+    let (mut notes, _) = a?;
+    let (more, _) = b?;
+    let seen: HashSet<Uuid> = notes.iter().map(|n| n.id).collect();
+    notes.extend(more.into_iter().filter(|n| !seen.contains(&n.id)));
+    let total = notes.len();
+    Ok((notes, total))
+}
+
 /// Build the whole response. Never fails: a failing source is reported in
 /// `source_errors`.
 pub async fn build_attention(graph: &dyn GraphStore, p: &AttentionParams) -> AttentionResponse {
     let now = p.now;
     let ws = p.workspace_slug.as_deref();
     let mut errs = Errors::default();
-
-    let rfc_filters = NoteFilters {
-        note_type: Some(vec![NoteType::Rfc]),
-        tags: Some(vec![
-            "rfc-status:proposed".to_string(),
-            "rfc-status:under_review".to_string(),
-        ]),
-        limit: Some(THINKING_LIMIT as i64),
-        ..Default::default()
-    };
 
     // ---- round 1: every independent source, concurrently ----
     let (
@@ -289,7 +305,7 @@ pub async fn build_attention(graph: &dyn GraphStore, p: &AttentionParams) -> Att
             0,
         ),
         graph.list_decisions_by_status(DecisionStatus::Proposed, None, ws, THINKING_LIMIT, 0),
-        graph.list_notes(None, ws, &rfc_filters),
+        list_open_rfcs(graph, ws),
         graph.get_notes_needing_review(None, ws),
         graph.list_alerts(None, ws, THINKING_LIMIT, 0),
     );
@@ -435,6 +451,7 @@ pub async fn build_attention(graph: &dyn GraphStore, p: &AttentionParams) -> Att
                 thread_id: Some(*plan_id),
                 alive: live.contains(&a.session.id),
                 cli_stopped_at: None,
+                fallback_stopped_at: a.session.updated_at,
             })
         })
         .collect();
@@ -450,6 +467,7 @@ pub async fn build_attention(graph: &dyn GraphStore, p: &AttentionParams) -> Att
     let mut candidates: HashSet<Uuid> = HashSet::new();
     candidates.extend(derived.waiting.iter().filter_map(|w| w.thread_id));
     candidates.extend(derived.orphans.iter().filter_map(|w| w.thread_id));
+    candidates.extend(derived.errors.iter().filter_map(|e| e.thread_id));
     candidates.extend(
         latest_run
             .iter()
@@ -500,6 +518,13 @@ pub async fn build_attention(graph: &dyn GraphStore, p: &AttentionParams) -> Att
                 .iter()
                 .filter(|w| w.thread_id == Some(*plan_id))
                 .map(|w| w.requested_at),
+        );
+        let error_since = oldest(
+            derived
+                .errors
+                .iter()
+                .filter(|e| e.thread_id == Some(*plan_id))
+                .map(|e| e.occurred_at),
         );
         let run = latest_run.get(plan_id).copied();
         let streaming_since = oldest(
@@ -556,6 +581,13 @@ pub async fn build_attention(graph: &dyn GraphStore, p: &AttentionParams) -> Att
                 plan_id: *plan_id,
                 band: Band::Stuck,
                 stuck_reason: Some(StuckReason::OrphanRequest),
+                since,
+            }
+        } else if let Some(since) = error_since {
+            Draft {
+                plan_id: *plan_id,
+                band: Band::Stuck,
+                stuck_reason: Some(StuckReason::SessionError),
                 since,
             }
         } else if let Some(since) = open
@@ -1238,6 +1270,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn proposed_and_under_review_rfcs_are_both_listed() {
+        // `list_notes` ANDs the tags (as does the mock): one query per status.
+        let w = World::new();
+        let acme = w.lane("acme").await;
+        let a = w.rfc(&acme, "A", "proposed").await;
+        let b = w.rfc(&acme, "B", "under_review").await;
+        let c = w.rfc(&acme, "C", "accepted").await;
+        let r = w.run_attention(&[], &[], None).await;
+        let ids: HashSet<String> = r.thinking.iter().map(|i| i.id.clone()).collect();
+        assert!(ids.contains(&a.to_string()), "proposed RFC missing");
+        assert!(ids.contains(&b.to_string()), "under_review RFC missing");
+        assert!(!ids.contains(&c.to_string()), "accepted RFC is not open");
+    }
+
+    #[tokio::test]
+    async fn permission_asked_before_a_resume_is_not_actionable() {
+        let w = World::new();
+        let acme = w.lane("acme").await;
+        let p = w.plan(&acme, "Resumed plan", PlanStatus::InProgress).await;
+        let run = w.run(p, &acme, PlanRunStatus::Completed, 5000).await;
+        let s = w.runner_session(p, run, 5).await;
+        w.ask_permission(s, "old", 300).await; // seq 1
+                                               // resume_session sends a user_message (seq 3 > 1)
+        w.store(
+            s,
+            3,
+            ChatEvent::UserMessage {
+                content: "Continue.".into(),
+            },
+            200,
+        )
+        .await;
+        let r = w.run_attention(&[s], &[], None).await;
+        assert!(r.waiting.is_empty(), "pre-resume permission is stale");
+        assert!(r.threads.iter().all(|t| t.id != p));
+    }
+
+    #[tokio::test]
+    async fn orphan_always_carries_a_cli_stopped_at() {
+        let w = World::new();
+        let acme = w.lane("acme").await;
+        let p = w.plan(&acme, "Orphan plan", PlanStatus::InProgress).await;
+        let run = w.run(p, &acme, PlanRunStatus::Completed, 7000).await;
+        let s = w.runner_session(p, run, 600).await;
+        w.ask_question(s, "q-1", 650).await;
+        let r = w.run_attention(&[], &[], None).await;
+        assert_eq!(r.orphans.len(), 1);
+        assert_eq!(r.orphans[0].cli_stopped_at, Some(ago(650)));
+    }
+
+    #[tokio::test]
+    async fn cli_dead_on_session_error_is_stuck_session_error() {
+        let w = World::new();
+        let acme = w.lane("acme").await;
+        let p = w.plan(&acme, "Crashed plan", PlanStatus::InProgress).await;
+        let run = w.run(p, &acme, PlanRunStatus::Completed, 7000).await;
+        let s = w.runner_session(p, run, 100).await;
+        w.store(
+            s,
+            4,
+            ChatEvent::SessionError {
+                reason: "subprocess_exited".into(),
+                message: "gone".into(),
+                received_at: ago(120),
+            },
+            120,
+        )
+        .await;
+        let r = w.run_attention(&[], &[], None).await;
+        let t = thread(&r, p);
+        assert_eq!(
+            (t.band, t.stuck_reason),
+            (Band::Stuck, Some(StuckReason::SessionError))
+        );
+        // restarted since (later user_message): no longer stuck
+        w.store(
+            s,
+            5,
+            ChatEvent::UserMessage {
+                content: "go".into(),
+            },
+            50,
+        )
+        .await;
+        let r = w.run_attention(&[], &[], None).await;
+        assert!(r.threads.iter().all(|t| t.id != p));
+    }
+
+    #[tokio::test]
     async fn streaming_session_puts_its_thread_in_running() {
         let w = World::new();
         let acme = w.lane("acme").await;
@@ -1319,6 +1440,12 @@ mod tests {
             "no N+1: {reads_large:?}"
         );
         let mut names = reads_large.clone();
+        // open RFCs: one query per status (2), by design, whatever N is.
+        assert_eq!(
+            names.iter().copied().filter(|n| *n == "list_notes").count(),
+            2
+        );
+        names.retain(|n| *n != "list_notes");
         names.sort();
         let before = names.len();
         names.dedup();

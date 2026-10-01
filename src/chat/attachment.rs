@@ -238,6 +238,7 @@ pub fn unattached_sessions(
             thread_id: None,
             alive: live.contains(&s.id),
             cli_stopped_at: None,
+            fallback_stopped_at: s.updated_at,
         })
         .collect();
     let derived = derive_attention(&inputs, events, now);

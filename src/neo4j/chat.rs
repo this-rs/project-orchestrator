@@ -907,7 +907,7 @@ impl Neo4jClient {
             "MATCH (e:ChatEvent)
              WHERE e.session_id IN $ids
                AND e.event_type IN ['permission_request', 'permission_decision',
-                                    'ask_user_question', 'user_message']
+                                    'ask_user_question', 'user_message', 'session_error']
              RETURN e.id AS id, e.session_id AS session_id, e.seq AS seq,
                     e.event_type AS event_type, e.created_at AS created_at,
                     CASE WHEN e.event_type = 'user_message' THEN '' ELSE e.data END AS data
