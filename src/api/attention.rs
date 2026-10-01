@@ -115,8 +115,10 @@ pub enum ThinkingKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LinkVia {
-    /// `(:ChatSession)-[:SPAWNED_BY {type, run_id, task_id}]->(parent)`,
-    /// read by `get_run_sessions`. Carries `run_id` (and `task_id` if known).
+    /// `(:ChatSession)-[:SPAWNED_BY_RUN {run_id, plan_id, task_id}]->(:PlanRun)`,
+    /// written by `ChatManager::create_session` for every runner session (a
+    /// runner has no parent session, so the parent-based `SPAWNED_BY` cannot
+    /// carry it). Carries `run_id` and `plan_id` (and `task_id` if known).
     RunnerRun,
     /// `ChatSession.spawned_by` JSON written by the runner
     /// (`{"type":"runner","run_id","plan_id"}`).

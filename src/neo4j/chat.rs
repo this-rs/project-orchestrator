@@ -466,6 +466,97 @@ impl Neo4jClient {
         Ok(())
     }
 
+    /// Link a runner session to its PlanRun (see `GraphStore::link_session_to_run`).
+    pub async fn link_session_to_run(
+        &self,
+        session_id: &str,
+        run_id: Uuid,
+        plan_id: Option<Uuid>,
+        task_id: Option<Uuid>,
+    ) -> Result<bool> {
+        let q = query(
+            r#"
+            MATCH (s:ChatSession {id: $session_id})
+            MATCH (r:PlanRun {run_id: $run_id})
+            MERGE (s)-[l:SPAWNED_BY_RUN {run_id: $run_id}]->(r)
+            ON CREATE SET l.created_at = datetime()
+            SET l.plan_id = $plan_id, l.task_id = $task_id
+            RETURN count(l) AS n
+            "#,
+        )
+        .param("session_id", session_id.to_string())
+        .param("run_id", run_id.to_string())
+        .param(
+            "plan_id",
+            plan_id.map(|u| u.to_string()).unwrap_or_default(),
+        )
+        .param(
+            "task_id",
+            task_id.map(|u| u.to_string()).unwrap_or_default(),
+        );
+        let mut result = self.graph.execute(q).await?;
+        let n: i64 = match result.next().await? {
+            Some(row) => row.get("n").unwrap_or(0),
+            None => 0,
+        };
+        Ok(n > 0)
+    }
+
+    /// Stored links of many sessions in ONE query (3 branches, `UNION ALL`).
+    pub async fn get_session_link_rows(&self, session_ids: &[Uuid]) -> Result<Vec<SessionLinkRow>> {
+        if session_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids: Vec<String> = session_ids.iter().map(|u| u.to_string()).collect();
+        let q = query(
+            r#"
+            UNWIND $ids AS sid
+            MATCH (s:ChatSession {id: sid})-[l:SPAWNED_BY_RUN]->(r:PlanRun)
+            RETURN s.id AS session_id, 'run' AS kind, l.run_id AS run_id,
+                   l.task_id AS task_id,
+                   COALESCE(NULLIF(l.plan_id, ''), r.plan_id) AS plan_id,
+                   COALESCE(NULLIF(l.plan_id, ''), r.plan_id) AS thread_plan_id
+            UNION ALL
+            UNWIND $ids AS sid
+            MATCH (s:ChatSession {id: sid})-[:ASSOCIATED_WITH]->(t:Task)
+            OPTIONAL MATCH (p:Plan)-[:HAS_TASK]->(t)
+            RETURN s.id AS session_id, 'task' AS kind, null AS run_id,
+                   t.id AS task_id, null AS plan_id, p.id AS thread_plan_id
+            UNION ALL
+            UNWIND $ids AS sid
+            MATCH (s:ChatSession {id: sid})-[:ASSOCIATED_WITH]->(p:Plan)
+            RETURN s.id AS session_id, 'plan' AS kind, null AS run_id,
+                   null AS task_id, p.id AS plan_id, p.id AS thread_plan_id
+            "#,
+        )
+        .param("ids", ids);
+        let mut result = self.graph.execute(q).await?;
+        let uuid = |row: &neo4rs::Row, key: &str| -> Option<Uuid> {
+            row.get::<String>(key).ok().and_then(|s| s.parse().ok())
+        };
+        let mut out = Vec::new();
+        while let Some(row) = result.next().await? {
+            let Some(session_id) = uuid(&row, "session_id") else {
+                continue;
+            };
+            let kind = match row.get::<String>("kind").unwrap_or_default().as_str() {
+                "run" => SessionLinkKind::RunRelation,
+                "task" => SessionLinkKind::TaskAssociation,
+                "plan" => SessionLinkKind::PlanAssociation,
+                _ => continue,
+            };
+            out.push(SessionLinkRow {
+                session_id,
+                kind,
+                run_id: uuid(&row, "run_id"),
+                task_id: uuid(&row, "task_id"),
+                plan_id: uuid(&row, "plan_id"),
+                thread_plan_id: uuid(&row, "thread_plan_id"),
+            });
+        }
+        Ok(out)
+    }
+
     /// Get the full session tree rooted at `session_id` (recursive traversal via SPAWNED_BY).
     /// Bounded to 10 levels max for performance.
     pub async fn get_session_tree(&self, session_id: &str) -> Result<Vec<SessionTreeNode>> {

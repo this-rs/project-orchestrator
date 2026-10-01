@@ -2634,6 +2634,36 @@ impl ChatManager {
             None => (None, None),
         };
 
+        // A plan-runner session has no parent session, so the SPAWNED_BY
+        // relation above is never created for it. Link it to its PlanRun here,
+        // for EVERY caller (task, retry, wave, resumed run): the cockpit's
+        // session -> thread attachment reads this relation (chat::attachment).
+        if let Some(spawn) = request
+            .spawned_by
+            .as_deref()
+            .and_then(super::attachment::parse_plan_run_spawn)
+        {
+            if let Some(run_id) = spawn.run_id {
+                match self
+                    .graph
+                    .link_session_to_run(
+                        &session_id.to_string(),
+                        run_id,
+                        spawn.plan_id,
+                        spawn.task_id,
+                    )
+                    .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => warn!(
+                        session_id = %session_id, run_id = %run_id,
+                        "Runner session not linked to its run (PlanRun not found)"
+                    ),
+                    Err(e) => warn!("Failed to link runner session to its run: {e}"),
+                }
+            }
+        }
+
         // Create broadcast channel early so CompactionNotifier can use the sender
         let (events_tx, _) = broadcast::channel(BROADCAST_BUFFER);
 
@@ -8568,6 +8598,148 @@ mod tests {
             "Should not fail with 'no CLI session ID', got: {}",
             err_msg
         );
+    }
+
+    // ====================================================================
+    // Session -> run/thread attachment (task 1.7)
+    // ====================================================================
+
+    fn runner_request(run_id: Uuid, plan_id: Uuid, task_id: Uuid) -> ChatRequest {
+        ChatRequest {
+            message: "go".into(),
+            session_id: None,
+            cwd: "/tmp/test".into(),
+            project_slug: None,
+            model: None,
+            permission_mode: Some("bypassPermissions".into()),
+            add_dirs: None,
+            workspace_slug: None,
+            user_claims: None,
+            spawned_by: Some(
+                serde_json::json!({
+                    "type": "runner",
+                    "run_id": run_id.to_string(),
+                    "plan_id": plan_id.to_string(),
+                    "task_id": task_id.to_string(),
+                })
+                .to_string(),
+            ),
+            task_context: None,
+            scaffolding_override: None,
+            runner_context: None,
+        }
+    }
+
+    fn manager_with_mock() -> (ChatManager, Arc<crate::neo4j::mock::MockGraphStore>) {
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+        let state = mock_app_state();
+        (
+            ChatManager::new_without_memory(dyn_graph, state.meili, test_config()),
+            graph,
+        )
+    }
+
+    #[tokio::test]
+    async fn test_create_session_links_runner_session_to_its_run() {
+        let (manager, graph) = manager_with_mock();
+        let (run, plan, task) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        // The CLI is not available in tests: only the persisted side matters.
+        let _ = manager
+            .create_session(&runner_request(run, plan, task))
+            .await;
+
+        let sessions: Vec<_> = graph.chat_sessions.read().await.values().cloned().collect();
+        assert_eq!(sessions.len(), 1, "the runner session was persisted");
+        let rows = graph.session_link_rows.read().await.clone();
+        assert_eq!(rows.len(), 1, "exactly one run link: {rows:?}");
+        assert_eq!(rows[0].session_id, sessions[0].id);
+        assert_eq!(rows[0].run_id, Some(run));
+        assert_eq!(rows[0].plan_id, Some(plan));
+        assert_eq!(rows[0].task_id, Some(task));
+        // and the JSON mechanism is there too: both mechanisms on the session
+        let a = crate::chat::attachment::attach(&sessions, &rows);
+        assert_eq!(a.by_plan[&plan][0].links.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_create_session_of_a_resumed_run_links_to_the_new_run() {
+        let (manager, graph) = manager_with_mock();
+        let (old_run, new_run, plan) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let _ = manager
+            .create_session(&runner_request(old_run, plan, Uuid::new_v4()))
+            .await;
+        // free the single "active session" slot if the CLI did start
+        manager.active_sessions.write().await.clear();
+        let _ = manager
+            .create_session(&runner_request(new_run, plan, Uuid::new_v4()))
+            .await;
+        let sessions: Vec<_> = graph.chat_sessions.read().await.values().cloned().collect();
+        let rows = graph.session_link_rows.read().await.clone();
+        let a = crate::chat::attachment::attach(&sessions, &rows);
+        assert_eq!(a.by_plan.len(), 1, "same plan, same thread");
+        let relation_runs: std::collections::HashSet<_> =
+            rows.iter().filter_map(|r| r.run_id).collect();
+        assert_eq!(
+            relation_runs,
+            [old_run, new_run].into_iter().collect(),
+            "each session is linked by relation to ITS run"
+        );
+        let runs: std::collections::HashSet<_> = a.by_plan[&plan]
+            .iter()
+            .flat_map(|s| s.links.iter().filter_map(|l| l.run_id))
+            .collect();
+        assert_eq!(runs, [old_run, new_run].into_iter().collect());
+    }
+
+    #[tokio::test]
+    async fn test_create_session_free_chat_gets_no_run_link() {
+        let (manager, graph) = manager_with_mock();
+        let mut req = runner_request(Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        req.spawned_by = None;
+        let _ = manager.create_session(&req).await;
+        assert!(graph.session_link_rows.read().await.is_empty());
+        let sessions: Vec<_> = graph.chat_sessions.read().await.values().cloned().collect();
+        let a = crate::chat::attachment::attach(&sessions, &[]);
+        assert_eq!(a.unattached.len(), sessions.len());
+    }
+
+    #[tokio::test]
+    async fn test_resume_session_keeps_identity_and_links() {
+        let (manager, graph) = manager_with_mock();
+        let (run, plan, task) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let mut s = test_chat_session(None);
+        s.spawned_by = runner_request(run, plan, task).spawned_by;
+        graph.create_chat_session(&s).await.unwrap();
+        graph
+            .link_session_to_run(&s.id.to_string(), run, Some(plan), Some(task))
+            .await
+            .unwrap();
+        let before = crate::chat::attachment::attach(
+            &[s.clone()],
+            &graph.session_link_rows.read().await.clone(),
+        );
+
+        // Fails at CLI start in tests: identity must hold either way.
+        let _ = manager
+            .resume_session(&s.id.to_string(), "continue", None)
+            .await;
+
+        let after_sessions: Vec<_> = graph.chat_sessions.read().await.values().cloned().collect();
+        assert_eq!(
+            after_sessions.len(),
+            1,
+            "resume must not create another session"
+        );
+        assert_eq!(after_sessions[0].id, s.id, "same session id");
+        assert_eq!(
+            after_sessions[0].spawned_by, s.spawned_by,
+            "spawned_by kept"
+        );
+        let rows = graph.session_link_rows.read().await.clone();
+        let after = crate::chat::attachment::attach(&after_sessions, &rows);
+        assert_eq!(after.by_plan, before.by_plan, "same links, same thread");
+        assert!(after.unattached.is_empty(), "never a detached session");
     }
 
     // ====================================================================

@@ -77,6 +77,10 @@ pub struct MockGraphStore {
     /// undirected the way the Cypher reads them
     pub document_links: RwLock<HashMap<Uuid, Vec<(EntityType, String)>>>,
     pub chat_sessions: RwLock<HashMap<Uuid, ChatSessionNode>>,
+    /// Stored session links (run relation / associations), seedable by tests
+    pub session_link_rows: RwLock<Vec<SessionLinkRow>>,
+    /// Number of `get_session_link_rows` calls (query-count assertions)
+    pub session_link_reads: std::sync::atomic::AtomicUsize,
     pub chat_events: RwLock<HashMap<Uuid, Vec<ChatEventRecord>>>,
     /// Per-session auto_continue flag (stored separately from ChatSessionNode)
     pub session_auto_continue: RwLock<HashMap<Uuid, bool>>,
@@ -252,6 +256,8 @@ impl MockGraphStore {
             document_chunks: RwLock::new(HashMap::new()),
             document_links: RwLock::new(HashMap::new()),
             chat_sessions: RwLock::new(HashMap::new()),
+            session_link_rows: RwLock::new(Vec::new()),
+            session_link_reads: std::sync::atomic::AtomicUsize::new(0),
             chat_events: RwLock::new(HashMap::new()),
             session_auto_continue: RwLock::new(HashMap::new()),
             plan_runs: RwLock::new(HashMap::new()),
@@ -6970,6 +6976,49 @@ impl GraphStore for MockGraphStore {
     ) -> Result<()> {
         // Mock: no-op (relations are not tracked in mock)
         Ok(())
+    }
+
+    async fn link_session_to_run(
+        &self,
+        session_id: &str,
+        run_id: Uuid,
+        plan_id: Option<Uuid>,
+        task_id: Option<Uuid>,
+    ) -> Result<bool> {
+        let Ok(sid) = session_id.parse::<Uuid>() else {
+            return Ok(false);
+        };
+        if !self.chat_sessions.read().await.contains_key(&sid) {
+            return Ok(false);
+        }
+        let mut rows = self.session_link_rows.write().await;
+        let already = rows.iter().any(|r| {
+            r.session_id == sid
+                && r.kind == SessionLinkKind::RunRelation
+                && r.run_id == Some(run_id)
+        });
+        if !already {
+            rows.push(SessionLinkRow {
+                session_id: sid,
+                kind: SessionLinkKind::RunRelation,
+                run_id: Some(run_id),
+                task_id,
+                plan_id,
+                thread_plan_id: plan_id,
+            });
+        }
+        Ok(true)
+    }
+
+    async fn get_session_link_rows(&self, session_ids: &[Uuid]) -> Result<Vec<SessionLinkRow>> {
+        self.session_link_reads
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let rows = self.session_link_rows.read().await;
+        Ok(rows
+            .iter()
+            .filter(|r| session_ids.contains(&r.session_id))
+            .cloned()
+            .collect())
     }
 
     async fn get_session_tree(&self, session_id: &str) -> Result<Vec<SessionTreeNode>> {

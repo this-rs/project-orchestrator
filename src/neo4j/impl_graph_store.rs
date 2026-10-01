@@ -2313,6 +2313,24 @@ impl GraphStore for Neo4jClient {
         .await
     }
 
+    async fn link_session_to_run(
+        &self,
+        session_id: &str,
+        run_id: Uuid,
+        plan_id: Option<Uuid>,
+        task_id: Option<Uuid>,
+    ) -> anyhow::Result<bool> {
+        self.link_session_to_run(session_id, run_id, plan_id, task_id)
+            .await
+    }
+
+    async fn get_session_link_rows(
+        &self,
+        session_ids: &[Uuid],
+    ) -> anyhow::Result<Vec<SessionLinkRow>> {
+        self.get_session_link_rows(session_ids).await
+    }
+
     async fn get_session_tree(&self, session_id: &str) -> anyhow::Result<Vec<SessionTreeNode>> {
         self.get_session_tree(session_id).await
     }

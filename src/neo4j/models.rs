@@ -71,7 +71,7 @@ pub struct WorkspaceNode {
 // ============================================================================
 
 /// A chat session with Claude Code CLI
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ChatSessionNode {
     pub id: Uuid,
     /// Claude CLI session ID (for --resume)
@@ -216,6 +216,33 @@ pub struct LinkedSessionInfo {
     pub linked_tasks: Vec<LinkedTaskInfo>,
     #[serde(default)]
     pub linked_rfcs: Vec<LinkedRfcInfo>,
+}
+
+/// Which stored relation a [`SessionLinkRow`] was read from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SessionLinkKind {
+    /// `(:ChatSession)-[:SPAWNED_BY_RUN {run_id, plan_id, task_id}]->(:PlanRun)`
+    RunRelation,
+    /// `(:ChatSession)-[:ASSOCIATED_WITH]->(:Task)`
+    TaskAssociation,
+    /// `(:ChatSession)-[:ASSOCIATED_WITH]->(:Plan)`
+    PlanAssociation,
+}
+
+/// One stored session link, as read by the grouped
+/// `GraphStore::get_session_link_rows` (one row per relation).
+///
+/// `plan_id` is the plan the link CARRIES (run relation, plan association);
+/// `thread_plan_id` is the plan the link RESOLVES to (a task association
+/// resolves through `(:Plan)-[:HAS_TASK]->(:Task)`), `None` when unknown.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionLinkRow {
+    pub session_id: Uuid,
+    pub kind: SessionLinkKind,
+    pub run_id: Option<Uuid>,
+    pub task_id: Option<Uuid>,
+    pub plan_id: Option<Uuid>,
+    pub thread_plan_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

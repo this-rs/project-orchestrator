@@ -1933,6 +1933,24 @@ pub trait GraphStore: Send + Sync {
     /// Follow SPAWNED_BY upward to find the root session
     async fn get_session_root(&self, session_id: &str) -> Result<Option<String>>;
 
+    /// Link a runner-spawned session to its PlanRun:
+    /// `(:ChatSession)-[:SPAWNED_BY_RUN {run_id, plan_id, task_id}]->(:PlanRun)`.
+    /// Idempotent (MERGE). A runner has no parent session, so the parent-based
+    /// `SPAWNED_BY` relation cannot be used (and pointing it at a PlanRun
+    /// would break `get_session_root`). Returns `false` when the session or
+    /// the run does not exist (nothing linked).
+    async fn link_session_to_run(
+        &self,
+        session_id: &str,
+        run_id: Uuid,
+        plan_id: Option<Uuid>,
+        task_id: Option<Uuid>,
+    ) -> Result<bool>;
+
+    /// Stored links (run relation, task / plan association) of many sessions,
+    /// in ONE grouped query whatever the number of sessions.
+    async fn get_session_link_rows(&self, session_ids: &[Uuid]) -> Result<Vec<SessionLinkRow>>;
+
     /// Get all sessions for a PlanRun via SPAWNED_BY relation metadata
     async fn get_run_sessions(&self, run_id: Uuid) -> Result<Vec<SessionInfo>>;
 
