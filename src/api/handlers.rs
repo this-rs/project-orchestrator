@@ -5493,22 +5493,25 @@ pub async fn retry_plan_task(
 /// GET /api/plans/:id/run/status — Get current runner status.
 pub async fn get_run_status(
     State(_state): State<OrchestratorState>,
-    Path(_plan_id): Path<Uuid>,
+    Path(plan_id): Path<Uuid>,
 ) -> Result<Json<crate::runner::RunStatus>, AppError> {
     let status = crate::runner::PlanRunner::status().await;
+    // A run of another plan is not this plan's status: report idle instead.
+    if status.plan_id.is_some_and(|p| p != plan_id) {
+        return Ok(Json(crate::runner::RunStatus::default()));
+    }
     Ok(Json(status))
 }
 
 /// POST /api/plans/:id/run/cancel — Cancel an active plan run.
 pub async fn cancel_run(
     State(state): State<OrchestratorState>,
-    Path(_plan_id): Path<Uuid>,
+    Path(plan_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     // Get the current run_id to cancel
-    let status = crate::runner::PlanRunner::status().await;
-    let run_id = status
-        .run_id
-        .ok_or_else(|| AppError::NotFound("No active run".to_string()))?;
+    let run_id = crate::runner::PlanRunner::active_run_id_for_plan(plan_id)
+        .await
+        .map_err(|e| AppError::NotFound(e.to_string()))?;
 
     crate::runner::PlanRunner::cancel(run_id, state.chat_manager.clone())
         .await
@@ -5527,12 +5530,11 @@ pub async fn cancel_run(
 /// to the graceful cancel flag.
 pub async fn force_cancel_run(
     State(state): State<OrchestratorState>,
-    Path(_plan_id): Path<Uuid>,
+    Path(plan_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let status = crate::runner::PlanRunner::status().await;
-    let run_id = status
-        .run_id
-        .ok_or_else(|| AppError::NotFound("No active run".to_string()))?;
+    let run_id = crate::runner::PlanRunner::active_run_id_for_plan(plan_id)
+        .await
+        .map_err(|e| AppError::NotFound(e.to_string()))?;
 
     crate::runner::PlanRunner::force_cancel(
         run_id,
@@ -5551,7 +5553,7 @@ pub async fn force_cancel_run(
 /// PATCH /api/plans/{plan_id}/run/budget — Update the budget of a running execution.
 pub async fn update_run_budget(
     State(_state): State<OrchestratorState>,
-    Path(_plan_id): Path<Uuid>,
+    Path(plan_id): Path<Uuid>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let max_cost_usd = body
@@ -5570,10 +5572,9 @@ pub async fn update_run_budget(
     }
 
     // Get the current run_id
-    let status = crate::runner::PlanRunner::status().await;
-    let run_id = status
-        .run_id
-        .ok_or_else(|| AppError::NotFound("No active run".to_string()))?;
+    let run_id = crate::runner::PlanRunner::active_run_id_for_plan(plan_id)
+        .await
+        .map_err(|e| AppError::NotFound(e.to_string()))?;
 
     crate::runner::PlanRunner::update_budget(run_id, max_cost_usd)
         .await
