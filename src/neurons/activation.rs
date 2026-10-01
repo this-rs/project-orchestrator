@@ -266,6 +266,13 @@ impl SpreadingActivationEngine {
 
         for hop in 0..config.max_hops {
             let mut next_frontier: Vec<(Uuid, f64)> = Vec::new();
+            // Index in `next_frontier` of nodes reached during this hop, so a
+            // stronger parent seen later in the same hop can replace the score.
+            // (`visited` only holds nodes settled in earlier hops.)
+            let mut reached_this_hop: HashMap<Uuid, usize> = HashMap::new();
+
+            // Deterministic order (the frontier is built from a HashMap).
+            frontier.sort_by(|a, b| a.0.cmp(&b.0));
 
             for (node_id, parent_activation) in &frontier {
                 // Get cross-entity synapses (Note↔Note, Note↔Decision, Decision↔Note)
@@ -310,6 +317,20 @@ impl SpreadingActivationEngine {
                                 _ => continue,
                             }
                         };
+
+                    // Skip archived/obsolete/stale notes and notes of another
+                    // project (same filter as the Phase 1 vector search).
+                    if !matches!(
+                        neighbor_note.status,
+                        crate::notes::NoteStatus::Active | crate::notes::NoteStatus::NeedsReview
+                    ) {
+                        continue;
+                    }
+                    if let (Some(pid), Some(npid)) = (project_id, neighbor_note.project_id) {
+                        if pid != npid {
+                            continue;
+                        }
+                    }
 
                     // Skip dead neurons (decisions always have energy=1.0)
                     if neighbor_energy < config.min_energy {
@@ -359,10 +380,20 @@ impl SpreadingActivationEngine {
                         );
                     }
 
-                    visited.insert(neighbor_id);
-                    next_frontier.push((neighbor_id, spread_score));
+                    match reached_this_hop.get(&neighbor_id) {
+                        Some(&idx) => {
+                            if spread_score > next_frontier[idx].1 {
+                                next_frontier[idx].1 = spread_score;
+                            }
+                        }
+                        None => {
+                            reached_this_hop.insert(neighbor_id, next_frontier.len());
+                            next_frontier.push((neighbor_id, spread_score));
+                        }
+                    }
                 }
             }
+            visited.extend(reached_this_hop.keys().copied());
 
             debug!(
                 "Phase 2: hop {} spread to {} new entities",
@@ -811,6 +842,95 @@ mod tests {
             b_result.unwrap().source,
             ActivationSource::Propagated { hops: 1, .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn test_spreading_skips_archived_and_foreign_project_neighbors() {
+        let mock = Arc::new(MockGraphStore::new());
+        let store = gs(&mock);
+        let project_id = Uuid::new_v4();
+
+        let seed = note_with_energy(Uuid::new_v4(), Some(project_id), "scoped source", 1.0);
+        let ok = note_with_energy(Uuid::new_v4(), Some(project_id), "live neighbor", 1.0);
+        let mut archived = note_with_energy(Uuid::new_v4(), Some(project_id), "old", 1.0);
+        archived.status = crate::notes::NoteStatus::Archived;
+        let foreign = note_with_energy(Uuid::new_v4(), Some(Uuid::new_v4()), "other", 1.0);
+        for n in [&seed, &ok, &archived, &foreign] {
+            store.create_note(n).await.unwrap();
+        }
+        let emb = mock_embedding_provider()
+            .embed_text("scoped source")
+            .await
+            .unwrap();
+        store
+            .set_note_embedding(seed.id, &emb, "mock")
+            .await
+            .unwrap();
+        for n in [&ok, &archived, &foreign] {
+            store
+                .create_synapses(seed.id, &[(n.id, 0.9)])
+                .await
+                .unwrap();
+        }
+
+        let config = SpreadingActivationConfig {
+            max_hops: 1,
+            min_activation: 0.01,
+            ..Default::default()
+        };
+        let engine = SpreadingActivationEngine::new(store, mock_embedding_provider());
+        let results = engine
+            .activate("scoped source", Some(project_id), &config)
+            .await
+            .unwrap();
+        let ids: Vec<Uuid> = results.iter().map(|r| r.note.id).collect();
+        assert!(ids.contains(&ok.id));
+        assert!(!ids.contains(&archived.id), "archived neighbor leaked");
+        assert!(
+            !ids.contains(&foreign.id),
+            "foreign-project neighbor leaked"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_spreading_keeps_max_score_among_same_hop_parents() {
+        // Two seeds both link to the same target; the stronger parent must win
+        // regardless of HashMap iteration order.
+        for _ in 0..20 {
+            let mock = Arc::new(MockGraphStore::new());
+            let store = gs(&mock);
+            let project_id = Uuid::new_v4();
+            let a = note_with_energy(Uuid::new_v4(), Some(project_id), "shared query", 1.0);
+            let b = note_with_energy(Uuid::new_v4(), Some(project_id), "shared query", 1.0);
+            let t = note_with_energy(Uuid::new_v4(), Some(project_id), "target", 1.0);
+            for n in [&a, &b, &t] {
+                store.create_note(n).await.unwrap();
+            }
+            let emb = mock_embedding_provider()
+                .embed_text("shared query")
+                .await
+                .unwrap();
+            store.set_note_embedding(a.id, &emb, "mock").await.unwrap();
+            store.set_note_embedding(b.id, &emb, "mock").await.unwrap();
+            store.create_synapses(a.id, &[(t.id, 0.2)]).await.unwrap();
+            store.create_synapses(b.id, &[(t.id, 0.9)]).await.unwrap();
+
+            let config = SpreadingActivationConfig {
+                max_hops: 1,
+                min_activation: 0.01,
+                ..Default::default()
+            };
+            let engine = SpreadingActivationEngine::new(store, mock_embedding_provider());
+            let results = engine
+                .activate("shared query", Some(project_id), &config)
+                .await
+                .unwrap();
+            let r = results.iter().find(|r| r.note.id == t.id).unwrap();
+            match r.source {
+                ActivationSource::Propagated { via, .. } => assert_eq!(via, b.id),
+                _ => panic!("target should be propagated"),
+            }
+        }
     }
 
     #[tokio::test]
