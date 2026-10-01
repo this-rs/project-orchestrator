@@ -9,8 +9,11 @@ coverage:
         threshold: 1%
     patch:
       default:
-        # Patch coverage gate: new/modified code must be ≥80% covered.
-        # Raises the bar from 30% to enforce quality on all new contributions.
+        # PATCH COVERAGE GATE - SINGLE PLACE TO RATCHET.
+        # New/modified lines must be covered at least at `target`.
+        # Planned ratchet: 80% -> 90% -> 100%. Change ONLY this value
+        # (and the matching mention in CONTRIBUTING.md) when raising the bar.
+        # Do not add `ignore` entries to make the number pass.
         target: 80%
         threshold: 5%
 
