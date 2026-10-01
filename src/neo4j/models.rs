@@ -648,6 +648,21 @@ pub struct AffectsRelation {
     pub impact_description: Option<String>,
 }
 
+/// A decision as listed by status (cockpit "to decide" lane), with the
+/// task that recorded it and the project that task belongs to so the caller
+/// can attach it to a workspace lane without a second round trip.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DecisionListItem {
+    #[serde(flatten)]
+    pub decision: DecisionNode,
+    /// Task that recorded the decision (INFORMED_BY), if still linked.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub task_id: Option<Uuid>,
+    /// Project owning that task's plan, if any.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub project_id: Option<Uuid>,
+}
+
 /// A decision in a timeline view, with its supersession chain
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DecisionTimelineEntry {

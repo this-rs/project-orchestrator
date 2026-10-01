@@ -670,6 +670,7 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/tasks/{task_id}/decisions",
             post(handlers::add_decision),
         )
+        .route("/api/decisions", get(handlers::list_decisions))
         .route(
             "/api/decisions/affecting",
             get(handlers::get_decisions_affecting),
@@ -1414,6 +1415,7 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/protocols/{protocol_id}/runs",
             get(protocol_handlers::list_runs).post(protocol_handlers::start_run),
         )
+        .route("/api/protocols/runs", get(protocol_handlers::list_all_runs))
         .route(
             "/api/protocols/runs/{run_id}",
             get(protocol_handlers::get_run).delete(protocol_handlers::delete_run),

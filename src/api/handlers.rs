@@ -1674,6 +1674,68 @@ pub struct DecisionTimelineQuery {
     pub to: Option<String>,
 }
 
+/// An empty or blank `workspace_slug` means "no filter" (the frontend sends
+/// an empty value for the "all workspaces" lane).
+pub(crate) fn normalize_slug(slug: Option<&str>) -> Option<&str> {
+    slug.map(str::trim).filter(|s| !s.is_empty())
+}
+
+/// Query parameters for listing decisions by status.
+#[derive(Debug, Deserialize, Default)]
+pub struct DecisionListQuery {
+    /// Required: proposed | accepted | deprecated | superseded
+    pub status: Option<String>,
+    /// Restrict to one project (wins over `workspace_slug`).
+    pub project_id: Option<Uuid>,
+    /// Restrict to the projects of one workspace. Default: all workspaces.
+    pub workspace_slug: Option<String>,
+    #[serde(flatten)]
+    pub pagination: PaginationParams,
+}
+
+/// List decisions by status, all workspaces by default.
+///
+/// GET /api/decisions?status=proposed[&workspace_slug=..|&project_id=..]
+pub async fn list_decisions(
+    State(state): State<OrchestratorState>,
+    Query(query): Query<DecisionListQuery>,
+) -> Result<Json<PaginatedResponse<crate::neo4j::models::DecisionListItem>>, AppError> {
+    let raw = query
+        .status
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| AppError::BadRequest("status is required (e.g. status=proposed)".into()))?;
+    let status: crate::neo4j::models::DecisionStatus = raw
+        .parse()
+        .map_err(|_| AppError::BadRequest(format!("Invalid decision status: {}", raw)))?;
+
+    let limit = query.pagination.limit.clamp(1, 200);
+    let offset = query.pagination.offset;
+
+    let (items, total) = state
+        .orchestrator
+        .neo4j()
+        .list_decisions_by_status(
+            status,
+            query.project_id,
+            normalize_slug(query.workspace_slug.as_deref()),
+            limit,
+            offset,
+        )
+        .await
+        .map_err(AppError::Internal)?;
+
+    let has_more = offset + items.len() < total;
+    Ok(Json(PaginatedResponse {
+        items,
+        total,
+        limit,
+        offset,
+        has_more,
+    }))
+}
+
 /// Get a timeline of decisions with supersession chains
 pub async fn get_decision_timeline(
     State(state): State<OrchestratorState>,
@@ -4119,11 +4181,14 @@ pub async fn seed_prompt_fragments(
 pub struct AlertsListQuery {
     /// Filter by project ID.
     pub project_id: Option<Uuid>,
+    /// Filter by workspace slug (alerts of the projects in this workspace).
+    /// Ignored when `project_id` is given.
+    pub workspace_slug: Option<String>,
     #[serde(flatten)]
     pub pagination: PaginationParams,
 }
 
-/// List alerts (optionally filtered by project).
+/// List alerts (optionally filtered by project or workspace).
 pub async fn list_alerts(
     State(state): State<OrchestratorState>,
     Query(query): Query<AlertsListQuery>,
@@ -4134,7 +4199,12 @@ pub async fn list_alerts(
     let (alerts, total) = state
         .orchestrator
         .neo4j()
-        .list_alerts(query.project_id, limit, offset)
+        .list_alerts(
+            query.project_id,
+            normalize_slug(query.workspace_slug.as_deref()),
+            limit,
+            offset,
+        )
         .await
         .map_err(AppError::Internal)?;
 

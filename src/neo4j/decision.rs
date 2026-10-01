@@ -747,6 +747,90 @@ impl Neo4jClient {
         Ok(entries)
     }
 
+    /// List decisions with a given status, newest first, with the recording
+    /// task and owning project.
+    ///
+    /// Default scope is every project. `project_id` wins over
+    /// `workspace_slug`. All values are bound parameters; the only
+    /// interpolated fragments are static strings. The status match is an
+    /// equality on `d.status` (indexed by `decision_status`) and the page is
+    /// bounded by `LIMIT`.
+    pub async fn list_decisions_by_status(
+        &self,
+        status: DecisionStatus,
+        project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<DecisionListItem>, usize)> {
+        let scope = if project_id.is_some() {
+            "WHERE project_id = $project_id"
+        } else if workspace_slug.is_some() {
+            "WHERE project_id IN [(w:Workspace {slug: $workspace_slug})<-[:BELONGS_TO_WORKSPACE]-(p:Project) | p.id]"
+        } else {
+            ""
+        };
+        let bind = |q: neo4rs::Query| -> neo4rs::Query {
+            let q = q.param("status", status.to_string());
+            if let Some(pid) = project_id {
+                q.param("project_id", pid.to_string())
+            } else if let Some(ws) = workspace_slug {
+                q.param("workspace_slug", ws.to_string())
+            } else {
+                q
+            }
+        };
+        // One row per decision (LIMIT 1 on the recording task) so the count
+        // and the page agree.
+        let head = r#"
+            MATCH (d:Decision {status: $status})
+            OPTIONAL MATCH (t:Task)-[:INFORMED_BY]->(d)
+            OPTIONAL MATCH (proj:Project)-[:HAS_PLAN]->(:Plan)-[:HAS_TASK]->(t)
+            WITH d, head(collect({task: t.id, project: proj.id})) AS link
+            WITH d, link.task AS task_id, link.project AS project_id
+        "#;
+
+        let count_cypher = format!("{} {} RETURN count(d) AS total", head, scope);
+        let mut count_result = self.graph.execute(bind(query(&count_cypher))).await?;
+        let total = if let Some(row) = count_result.next().await? {
+            row.get::<i64>("total").unwrap_or(0) as usize
+        } else {
+            0
+        };
+        if total == 0 {
+            return Ok((vec![], 0));
+        }
+
+        let list_cypher = format!(
+            "{} {} RETURN d, task_id, project_id \
+             ORDER BY d.decided_at DESC SKIP $offset LIMIT $limit",
+            head, scope
+        );
+        let list_q = bind(
+            query(&list_cypher)
+                .param("offset", offset as i64)
+                .param("limit", limit as i64),
+        );
+
+        let mut result = self.graph.execute(list_q).await?;
+        let mut items = Vec::new();
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("d")?;
+            items.push(DecisionListItem {
+                decision: Self::node_to_decision(&node)?,
+                task_id: row
+                    .get::<String>("task_id")
+                    .ok()
+                    .and_then(|s| s.parse().ok()),
+                project_id: row
+                    .get::<String>("project_id")
+                    .ok()
+                    .and_then(|s| s.parse().ok()),
+            });
+        }
+        Ok((items, total))
+    }
+
     // ========================================================================
     // SUPERSEDES relation (Decision → Decision)
     // ========================================================================

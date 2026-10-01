@@ -1038,6 +1038,17 @@ pub trait GraphStore: Send + Sync {
         to: Option<&str>,
     ) -> Result<Vec<DecisionTimelineEntry>>;
 
+    /// List decisions having a given status, across all projects by default,
+    /// newest first. `project_id` wins over `workspace_slug`. Returns (page, total).
+    async fn list_decisions_by_status(
+        &self,
+        status: DecisionStatus,
+        project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<DecisionListItem>, usize)>;
+
     // ========================================================================
     // Dependency analysis
     // ========================================================================
@@ -1585,7 +1596,11 @@ pub trait GraphStore: Send + Sync {
     async fn confirm_note(&self, note_id: Uuid, confirmed_by: &str) -> Result<Option<Note>>;
 
     /// Get notes that need review (stale or needs_review status)
-    async fn get_notes_needing_review(&self, project_id: Option<Uuid>) -> Result<Vec<Note>>;
+    async fn get_notes_needing_review(
+        &self,
+        project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
+    ) -> Result<Vec<Note>>;
 
     /// Update staleness scores for all active notes
     async fn update_staleness_scores(&self) -> Result<usize>;
@@ -3115,6 +3130,19 @@ pub trait GraphStore: Send + Sync {
         offset: usize,
     ) -> Result<(Vec<ProtocolRun>, usize)>;
 
+    /// List protocol runs across ALL protocols (cross-cutting), newest first.
+    ///
+    /// `project_id` wins over `workspace_slug`; with neither, every project is
+    /// included. Returns (page, total).
+    async fn list_all_protocol_runs(
+        &self,
+        status: Option<RunStatus>,
+        project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<ProtocolRun>, usize)>;
+
     /// List child runs for a given parent run.
     async fn list_child_runs(&self, parent_run_id: Uuid) -> Result<Vec<ProtocolRun>>;
 
@@ -3485,6 +3513,7 @@ pub trait GraphStore: Send + Sync {
     async fn list_alerts(
         &self,
         project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
         limit: usize,
         offset: usize,
     ) -> Result<(Vec<AlertNode>, usize)>;

@@ -1318,6 +1318,18 @@ impl GraphStore for Neo4jClient {
         self.get_decision_timeline(task_id, from, to).await
     }
 
+    async fn list_decisions_by_status(
+        &self,
+        status: DecisionStatus,
+        project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> anyhow::Result<(Vec<DecisionListItem>, usize)> {
+        self.list_decisions_by_status(status, project_id, workspace_slug, limit, offset)
+            .await
+    }
+
     // ========================================================================
     // Dependency analysis
     // ========================================================================
@@ -2015,8 +2027,10 @@ impl GraphStore for Neo4jClient {
     async fn get_notes_needing_review(
         &self,
         project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
     ) -> anyhow::Result<Vec<Note>> {
-        self.get_notes_needing_review(project_id).await
+        self.get_notes_needing_review(project_id, workspace_slug)
+            .await
     }
 
     async fn update_staleness_scores(&self) -> anyhow::Result<usize> {
@@ -3639,6 +3653,18 @@ impl GraphStore for Neo4jClient {
         self.update_protocol_run(run).await
     }
 
+    async fn list_all_protocol_runs(
+        &self,
+        status: Option<crate::protocol::RunStatus>,
+        project_id: Option<uuid::Uuid>,
+        workspace_slug: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> anyhow::Result<(Vec<crate::protocol::ProtocolRun>, usize)> {
+        self.list_all_protocol_runs(status, project_id, workspace_slug, limit, offset)
+            .await
+    }
+
     async fn list_protocol_runs(
         &self,
         protocol_id: uuid::Uuid,
@@ -4086,10 +4112,12 @@ impl GraphStore for Neo4jClient {
     async fn list_alerts(
         &self,
         project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
         limit: usize,
         offset: usize,
     ) -> anyhow::Result<(Vec<AlertNode>, usize)> {
-        self.list_alerts_impl(project_id, limit, offset).await
+        self.list_alerts_impl(project_id, workspace_slug, limit, offset)
+            .await
     }
 
     // ========================================================================

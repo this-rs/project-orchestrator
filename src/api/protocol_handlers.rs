@@ -192,6 +192,19 @@ pub struct RunsListQuery {
     pub status: Option<String>,
 }
 
+/// Query parameters for listing runs across all protocols
+#[derive(Debug, Deserialize, Default)]
+pub struct AllRunsListQuery {
+    #[serde(flatten)]
+    pub pagination: PaginationParams,
+    /// running | completed | failed | cancelled (omitted = every status)
+    pub status: Option<String>,
+    /// Restrict to the protocols of one project (wins over `workspace_slug`).
+    pub project_id: Option<Uuid>,
+    /// Restrict to the protocols of one workspace's projects.
+    pub workspace_slug: Option<String>,
+}
+
 /// Query parameters for routing protocols
 #[derive(Debug, Deserialize)]
 pub struct RouteProtocolsQuery {
@@ -1301,6 +1314,54 @@ pub async fn get_run_tree(
 
     let tree = build_tree(neo4j, root, 0).await?;
     Ok(Json(tree))
+}
+
+/// List runs across ALL protocols (no protocol id needed)
+///
+/// GET /api/protocols/runs?status=running[&workspace_slug=..|&project_id=..]
+pub async fn list_all_runs(
+    State(state): State<OrchestratorState>,
+    Query(query): Query<AllRunsListQuery>,
+) -> Result<Json<PaginatedResponse<ProtocolRun>>, AppError> {
+    // Unlike the per-protocol list, an unknown status is an error: silently
+    // dropping it would answer "every run" to a request for "running" ones.
+    let status_filter: Option<RunStatus> = match query
+        .status
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(s) => Some(
+            s.parse()
+                .map_err(|_| AppError::BadRequest(format!("Invalid run status: {}", s)))?,
+        ),
+        None => None,
+    };
+
+    let limit = query.pagination.limit.clamp(1, 100);
+    let offset = query.pagination.offset;
+
+    let (runs, total) = state
+        .orchestrator
+        .neo4j()
+        .list_all_protocol_runs(
+            status_filter,
+            query.project_id,
+            super::handlers::normalize_slug(query.workspace_slug.as_deref()),
+            limit,
+            offset,
+        )
+        .await
+        .map_err(AppError::Internal)?;
+
+    let has_more = offset + runs.len() < total;
+    Ok(Json(PaginatedResponse {
+        items: runs,
+        total,
+        limit,
+        offset,
+        has_more,
+    }))
 }
 
 /// List runs for a protocol

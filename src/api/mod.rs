@@ -10,6 +10,8 @@ pub mod feedback_handlers;
 pub mod graph_types;
 pub mod handlers;
 pub mod hook_handlers;
+#[cfg(test)]
+mod list_routes_tests;
 pub mod mcp_federation_handlers;
 pub mod neural_routing_handlers;
 pub mod note_handlers;

@@ -491,6 +491,36 @@ fn paginate<T: Clone>(items: &[T], limit: usize, offset: usize) -> Vec<T> {
 // GraphStore trait implementation
 // ============================================================================
 
+impl MockGraphStore {
+    /// Ids of the projects belonging to the workspace with this slug.
+    /// An unknown slug yields an empty set (same as the Cypher pattern
+    /// comprehension: nothing matches).
+    async fn project_ids_in_workspace_slug(&self, slug: &str) -> std::collections::HashSet<Uuid> {
+        let workspaces = self.workspaces.read().await;
+        let wp = self.workspace_projects.read().await;
+        workspaces
+            .values()
+            .filter(|w| w.slug == slug)
+            .flat_map(|w| wp.get(&w.id).cloned().unwrap_or_default())
+            .collect()
+    }
+
+    /// `project_id` wins over `workspace_slug`; `None` means "no scope".
+    async fn scope_projects(
+        &self,
+        project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
+    ) -> Option<std::collections::HashSet<Uuid>> {
+        if let Some(pid) = project_id {
+            Some([pid].into_iter().collect())
+        } else if let Some(ws) = workspace_slug {
+            Some(self.project_ids_in_workspace_slug(ws).await)
+        } else {
+            None
+        }
+    }
+}
+
 #[async_trait]
 impl GraphStore for MockGraphStore {
     // ========================================================================
@@ -4289,6 +4319,55 @@ impl GraphStore for MockGraphStore {
         Ok(self.decisions.read().await.get(&decision_id).cloned())
     }
 
+    async fn list_decisions_by_status(
+        &self,
+        status: DecisionStatus,
+        project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<DecisionListItem>, usize)> {
+        let scope = self.scope_projects(project_id, workspace_slug).await;
+        let decisions = self.decisions.read().await;
+        let task_decisions = self.task_decisions.read().await;
+        let plan_tasks = self.plan_tasks.read().await;
+        let project_plans = self.project_plans.read().await;
+
+        let mut items: Vec<DecisionListItem> = decisions
+            .values()
+            .filter(|d| d.status == status)
+            .map(|d| {
+                let task_id = task_decisions
+                    .iter()
+                    .find(|(_, ds)| ds.contains(&d.id))
+                    .map(|(t, _)| *t);
+                let project_id = task_id.and_then(|t| {
+                    let plan = plan_tasks
+                        .iter()
+                        .find(|(_, ts)| ts.contains(&t))
+                        .map(|(p, _)| *p)?;
+                    project_plans
+                        .iter()
+                        .find(|(_, ps)| ps.contains(&plan))
+                        .map(|(pr, _)| *pr)
+                });
+                DecisionListItem {
+                    decision: d.clone(),
+                    task_id,
+                    project_id,
+                }
+            })
+            .filter(|i| match scope {
+                Some(ref s) => i.project_id.is_some_and(|p| s.contains(&p)),
+                None => true,
+            })
+            .collect();
+        items.sort_by(|a, b| b.decision.decided_at.cmp(&a.decision.decided_at));
+        let total = items.len();
+        let page = items.into_iter().skip(offset).take(limit).collect();
+        Ok((page, total))
+    }
+
     async fn get_decision_project_id(&self, _decision_id: Uuid) -> Result<Option<String>> {
         // Mock doesn't track Decision→Task→Plan→Project chain
         Ok(None)
@@ -5736,9 +5815,14 @@ impl GraphStore for MockGraphStore {
     async fn list_notes(
         &self,
         project_id: Option<Uuid>,
-        _workspace_slug: Option<&str>,
+        workspace_slug: Option<&str>,
         filters: &NoteFilters,
     ) -> Result<(Vec<Note>, usize)> {
+        let ws_projects = if filters.global_only == Some(true) {
+            None
+        } else {
+            self.scope_projects(project_id, workspace_slug).await
+        };
         let notes = self.notes.read().await;
         let filtered: Vec<Note> = notes
             .values()
@@ -5747,8 +5831,8 @@ impl GraphStore for MockGraphStore {
                     if n.project_id.is_some() {
                         return false;
                     }
-                } else if let Some(pid) = project_id {
-                    if n.project_id != Some(pid) {
+                } else if let Some(ref scope) = ws_projects {
+                    if !n.project_id.is_some_and(|p| scope.contains(&p)) {
                         return false;
                     }
                 }
@@ -5982,13 +6066,18 @@ impl GraphStore for MockGraphStore {
         }
     }
 
-    async fn get_notes_needing_review(&self, project_id: Option<Uuid>) -> Result<Vec<Note>> {
+    async fn get_notes_needing_review(
+        &self,
+        project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
+    ) -> Result<Vec<Note>> {
+        let scope = self.scope_projects(project_id, workspace_slug).await;
         let notes = self.notes.read().await;
         Ok(notes
             .values()
             .filter(|n| {
-                if let Some(pid) = project_id {
-                    if n.project_id != Some(pid) {
+                if let Some(ref scope) = scope {
+                    if !n.project_id.is_some_and(|p| scope.contains(&p)) {
                         return false;
                     }
                 }
@@ -10362,6 +10451,34 @@ impl GraphStore for MockGraphStore {
         }
     }
 
+    async fn list_all_protocol_runs(
+        &self,
+        status: Option<crate::protocol::RunStatus>,
+        project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> anyhow::Result<(Vec<crate::protocol::ProtocolRun>, usize)> {
+        let scope = self.scope_projects(project_id, workspace_slug).await;
+        let protocols = self.protocols.read().await;
+        let store = self.protocol_runs.read().await;
+        let mut filtered: Vec<_> = store
+            .values()
+            .filter(|r| status.as_ref().is_none_or(|s| r.status == *s))
+            .filter(|r| match scope {
+                Some(ref s) => protocols
+                    .get(&r.protocol_id)
+                    .is_some_and(|p| s.contains(&p.project_id)),
+                None => true,
+            })
+            .cloned()
+            .collect();
+        filtered.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+        let total = filtered.len();
+        let page = filtered.into_iter().skip(offset).take(limit).collect();
+        Ok((page, total))
+    }
+
     async fn list_protocol_runs(
         &self,
         protocol_id: Uuid,
@@ -11081,14 +11198,16 @@ impl GraphStore for MockGraphStore {
     async fn list_alerts(
         &self,
         project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
         limit: usize,
         offset: usize,
     ) -> anyhow::Result<(Vec<AlertNode>, usize)> {
+        let scope = self.scope_projects(project_id, workspace_slug).await;
         let alerts = self.alerts.read().await;
         let mut all: Vec<_> = alerts
             .values()
-            .filter(|a| match project_id {
-                Some(pid) => a.project_id == Some(pid),
+            .filter(|a| match scope {
+                Some(ref s) => a.project_id.is_some_and(|p| s.contains(&p)),
                 None => true,
             })
             .cloned()
