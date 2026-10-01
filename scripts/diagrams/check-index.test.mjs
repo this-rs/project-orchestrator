@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { globToRegExp, parseIndex, parseHeader, checkDiagramFile, sharedOwnership, renderOrphans } from './check-index.mjs';
+import { globToRegExp, parseIndex, parseHeader, checkDiagramFile, sharedOwnership, renderOrphans, localIndexOwners } from './check-index.mjs';
 
 test('glob: **, *, braces', () => {
   assert.ok(globToRegExp('src/heartbeat/**').test('src/heartbeat/checks/git_drift.rs'));
@@ -76,4 +76,130 @@ test('renderOrphans: deterministe (aucun sha ni date), donc verifiable hors rese
 
 test('renderOrphans: zero orphelin ne divise pas par zero', () => {
   assert.match(renderOrphans([], 0), /\*\*0 orphelins sur 0 fichiers source \(0\.0 %\)\.\*\*/);
+});
+
+const nexusFiles = {
+  nexus: ['claude-code-api/src/core/model_registry.rs', 'claude-code-api/src/main.rs', 'claude-code-sdk-rs/src/lib.rs'],
+  frontend: ['src/App.tsx'],
+};
+const nexusIndex = [{
+  repo: 'nexus',
+  entries: parseIndex('diagrams:\n  - name: nexus-model-catalogue\n    status: verified\n    covers:\n      - "nexus:claude-code-api/src/core/model_registry.rs"\n'),
+}];
+
+test('localIndexOwners: un index local possede les fichiers de son depot', () => {
+  const owned = localIndexOwners(nexusIndex, nexusFiles);
+  assert.deepEqual([...owned.keys()], ['nexus:claude-code-api/src/core/model_registry.rs']);
+  assert.equal(owned.get('nexus:claude-code-api/src/core/model_registry.rs'), 'nexus/INDEX.yml#nexus-model-catalogue');
+});
+
+test('localIndexOwners: un index local ne peut pas revendiquer un AUTRE depot', () => {
+  // Sinon nexus pourrait s'attribuer du code du frontend sans que personne la-bas le sache.
+  const greedy = [{ repo: 'nexus', entries: parseIndex('diagrams:\n  - name: nexus-x\n    covers:\n      - "frontend:src/App.tsx"\n      - "nexus:claude-code-api/src/main.rs"\n') }];
+  const owned = localIndexOwners(greedy, nexusFiles);
+  assert.deepEqual([...owned.keys()], ['nexus:claude-code-api/src/main.rs']);
+});
+
+test('localIndexOwners: globs et accolades resolus comme dans l index principal', () => {
+  const idx = [{ repo: 'nexus', entries: parseIndex('diagrams:\n  - name: nexus-y\n    covers:\n      - "nexus:claude-code-api/src/**"\n') }];
+  assert.equal(localIndexOwners(idx, nexusFiles).size, 2);
+});
+
+test('localIndexOwners: entrees sans covers, ou depot absent, ne cassent rien', () => {
+  assert.equal(localIndexOwners([{ repo: 'nexus', entries: [{ name: 'x', covers: [] }] }], nexusFiles).size, 0);
+  assert.equal(localIndexOwners(nexusIndex, {}).size, 0);
+  assert.equal(localIndexOwners([], nexusFiles).size, 0);
+});
+
+test('renderOrphans: les index locaux sont expliques dans le registre publie', () => {
+  const md = renderOrphans(['backend:src/a.rs'], 10, [{ repo: 'nexus', diagrams: 3, owned: 24 }]);
+  assert.match(md, /- `nexus` : 3 diagrammes, 24 fichiers possedes la-bas/);
+  assert.match(md, /collision entre les deux index est une erreur/);
+  // sans index local, pas de section parasite
+  assert.doesNotMatch(renderOrphans(['backend:src/a.rs'], 10), /possedes la-bas/);
+});
+
+// --- controle negatif de bout en bout : le gate doit REFUSER une collision entre index.
+// Un gate qui ne refuse rien est pire que pas de gate, parce qu'il se cite comme preuve.
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { tmpdir } from 'node:os';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const script = join(dirname(fileURLToPath(import.meta.url)), 'check-index.mjs');
+
+function fixture({ mainCovers, localCovers }) {
+  const root = mkdtempSync(join(tmpdir(), 'diagram-index-'));
+  const be = join(root, 'backend');
+  const nx = join(root, 'nexus');
+  mkdirSync(join(be, 'docs/diagrams'), { recursive: true });
+  mkdirSync(join(be, 'src'), { recursive: true });
+  mkdirSync(join(nx, 'claude-code-api/src/core'), { recursive: true });
+  writeFileSync(join(be, 'src/own.rs'), '// backend\n');
+  writeFileSync(join(nx, 'claude-code-api/src/core/model_registry.rs'), '// nexus\n');
+  writeFileSync(join(be, 'docs/diagrams/INDEX.yml'),
+    `diagrams:\n  - name: po-carte\n    owner: t\n    status: planned\n    role: index\n    covers:\n      - "backend:docs/diagrams/INDEX.yml"\n  - name: po-x\n    owner: t\n    status: planned\n    covers:\n${mainCovers.map((c) => `      - "${c}"\n`).join('')}`);
+  if (localCovers) {
+    mkdirSync(join(nx, 'docs/diagrams'), { recursive: true });
+    writeFileSync(join(nx, 'docs/diagrams/INDEX.yml'),
+      `diagrams:\n  - name: nexus-model-catalogue\n    owner: t\n    status: planned\n    covers:\n${localCovers.map((c) => `      - "${c}"\n`).join('')}`);
+  }
+  return { root, be, nx };
+}
+
+function run(be, nx, args = []) {
+  try {
+    const stdout = execFileSync('node', [script, ...args], {
+      encoding: 'utf8',
+      env: { ...process.env, DIAGRAM_ROOT_BACKEND: be, DIAGRAM_ROOT_NEXUS: nx, DIAGRAM_ROOT_FRONTEND: join(nx, 'absent'), DIAGRAM_ROOT_WEBSITE: join(nx, 'absent') },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    return { code: 0, out: stdout };
+  } catch (e) {
+    return { code: e.status, out: `${e.stdout ?? ''}${e.stderr ?? ''}` };
+  }
+}
+
+test('gate: une collision entre index principal et index local est REFUSEE', () => {
+  const { root, be, nx } = fixture({
+    mainCovers: ['backend:src/own.rs', 'nexus:claude-code-api/src/core/model_registry.rs'],
+    localCovers: ['nexus:claude-code-api/src/core/model_registry.rs'],
+  });
+  try {
+    const { code, out } = run(be, nx);
+    assert.equal(code, 1, 'le script doit echouer');
+    assert.match(out, /revendique par po-x ET par nexus\/INDEX\.yml#nexus-model-catalogue/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('gate: sans collision il passe, et le fichier de l index local n est pas orphelin', () => {
+  const { root, be, nx } = fixture({
+    mainCovers: ['backend:src/own.rs'],
+    localCovers: ['nexus:claude-code-api/src/core/model_registry.rs'],
+  });
+  try {
+    const { code, out } = run(be, nx, ['--write-orphans']);
+    assert.equal(code, 0, out);
+    assert.match(out, /index local 'nexus' : 1 diagrammes, 1 fichiers possedes ailleurs/);
+    assert.match(out, /0 orphelins/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('gate: sans index local, le fichier du depot voisin est bien orphelin', () => {
+  // Controle du controle : si localIndexOwners cessait de fonctionner, ce test passerait
+  // et le precedent echouerait. Les deux ensemble pincent la logique.
+  const { root, be, nx } = fixture({ mainCovers: ['backend:src/own.rs'], localCovers: null });
+  try {
+    const { code, out } = run(be, nx, ['--write-orphans']);
+    assert.equal(code, 0, out);
+    assert.match(out, /1 orphelins/);
+    assert.doesNotMatch(out, /index local/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });

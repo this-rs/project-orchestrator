@@ -6,13 +6,19 @@ Un fichier source est **orphelin** quand aucun `covers` de `INDEX.yml` ne le mat
 aucun diagramme ne repond de son comportement. Cette liste est publiee pour etre honnete
 sur ce que la cartographie couvre reellement — on ne reduit pas le denominateur, on la reduit elle.
 
-**734 orphelins sur 1204 fichiers source (61.0 %).**
+**731 orphelins sur 1204 fichiers source (60.7 %).**
 
 Regeneration (hors reseau) :
 
 ```
 node scripts/diagrams/check-index.mjs --write-orphans
 ```
+
+Un depot voisin peut tenir son propre index pour les diagrammes dont le `.mmd` vit chez lui.
+Les fichiers qu'il possede ont un proprietaire et ne figurent donc pas ci-dessous ; toute
+collision entre les deux index est une erreur, pas un arrangement.
+
+- `nexus` : 3 diagrammes, 24 fichiers possedes la-bas
 
 ## backend (162)
 
@@ -88,17 +94,17 @@ node scripts/diagrams/check-index.mjs --write-orphans
 - `src/utils/` (7) : `architecture.ts`, `chatExport.ts`, `compactYamlParser.ts`, `motion.ts`, `openExternal.ts`, `paths.ts`, `watch.ts`
 - `src/workers/` (1) : `dagreWorker.ts`
 
-## nexus (67)
+## nexus (64)
 
 - `claude-code-api/src/` (1) : `main.rs`
-- `claude-code-api/src/api/` (8) : `chat.rs`, `conversations.rs`, `mod.rs`, `models.rs`, `projects.rs`, `sessions.rs`, `stats.rs`, `streaming_handler.rs`
+- `claude-code-api/src/api/` (7) : `chat.rs`, `conversations.rs`, `mod.rs`, `projects.rs`, `sessions.rs`, `stats.rs`, `streaming_handler.rs`
 - `claude-code-api/src/bin/` (1) : `ccapi.rs`
-- `claude-code-api/src/core/` (13) : `auth.rs`, `cache.rs`, `claude_manager.rs`, `config.rs`, `conversation.rs`, `interactive_session.rs`, `mod.rs`, `model_registry.rs`, `objective_tracker.rs`, `process_pool.rs`, `retry.rs`, `session_manager.rs`, `session_process.rs`
+- `claude-code-api/src/core/` (12) : `auth.rs`, `cache.rs`, `claude_manager.rs`, `config.rs`, `conversation.rs`, `interactive_session.rs`, `mod.rs`, `objective_tracker.rs`, `process_pool.rs`, `retry.rs`, `session_manager.rs`, `session_process.rs`
 - `claude-code-api/src/core/hooks/` (3) : `mod.rs`, `neo4j_hook_callback.rs`, `neo4j_permission_provider.rs`
 - `claude-code-api/src/core/memory/` (6) : `long_term.rs`, `medium_term.rs`, `mod.rs`, `short_term.rs`, `traits.rs`, `unified.rs`
 - `claude-code-api/src/core/storage/` (7) : `combined.rs`, `meilisearch.rs`, `memory.rs`, `mod.rs`, `neo4j.rs`, `tiered_cache.rs`, `traits.rs`
 - `claude-code-api/src/middleware/` (3) : `error_handler.rs`, `mod.rs`, `request_id.rs`
-- `claude-code-api/src/models/` (4) : `claude.rs`, `error.rs`, `mod.rs`, `openai.rs`
+- `claude-code-api/src/models/` (3) : `error.rs`, `mod.rs`, `openai.rs`
 - `claude-code-api/src/utils/` (5) : `function_calling.rs`, `mod.rs`, `parser.rs`, `streaming.rs`, `text_chunker.rs`
 - `claude-code-sdk-rs/src/` (8) : `cli_download.rs`, `client_working.rs`, `errors.rs`, `model_recommendation.rs`, `optimized_client.rs`, `perf_utils.rs`, `sdk_mcp.rs`, `token_tracker.rs`
 - `claude-code-sdk-rs/src/bin/` (1) : `test_interactive.rs`

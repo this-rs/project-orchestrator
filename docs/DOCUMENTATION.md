@@ -78,6 +78,30 @@ l'amorcage. On ne retire pas des fichiers du denominateur pour embellir le chiff
 chiffre en ecrivant des diagrammes. Le fichier est deterministe (ni sha ni date) pour servir de
 gate hors reseau, et il ne s'edite pas a la main.
 
+### Un depot peut tenir son propre index (et la regle vaut ENTRE les index)
+
+Cet index est l'index de la cartographie : il porte les cartes `po-*`, dont les `.mmd` vivent
+ici. Un depot voisin qui veut tenir ses propres diagrammes de conception a un probleme que cet
+index ne resout pas : il n'a aucun moyen de pointer un `.mmd` situe la-bas, et son gate tourne
+dans sa chaine d'outils, pas dans la notre (nexus est un depot Rust : son verificateur d'index
+est un test `cargo`, pas un script Node, et c'est le bon choix pour lui).
+
+Un depot voisin peut donc tenir son propre `docs/diagrams/INDEX.yml`, au meme format, pour les
+diagrammes dont le `.mmd` vit chez lui. Deux regles rendent la coexistence verifiable plutot que
+polie :
+
+1. **Un index local ne possede que des chemins de SON depot.** Un glob `frontend:` dans l'index
+   de nexus serait une prise de pouvoir sur un depot voisin : le script l'ignore.
+2. **La regle du proprietaire unique vaut entre les index.** Si cet index et un index local
+   revendiquent le meme fichier, c'est une **erreur** : deux gates se contrediraient sur le meme
+   fichier, et chacun se croirait couvert par l'autre. Le script lit les index locaux des depots
+   voisins, signale toute collision en nommant les deux revendications, et **ne compte pas comme
+   orphelins** les fichiers qu'un index local possede — ils ont un proprietaire, ailleurs.
+
+En pratique, nexus tient un index de 3 diagrammes verifies (`release-readiness`, `po-bugs`,
+`nexus-model-catalogue`) qui possede 24 fichiers. Aucune collision avec les cartes `po-*` : c'est
+verifie a chaque execution, pas suppose. Le decompte des orphelins en tient compte.
+
 ### Cartes provisoires reprises (`supersedes`)
 
 Deux cartes de la cartographie d'origine portaient un suffixe numerique et n'etaient rattachees a
@@ -135,7 +159,8 @@ node --test scripts/diagrams/check-index.test.mjs
 ```
 
 Regles verifiees : chaque glob `covers` matche au moins un fichier existant ; **aucun fichier n'est
-couvert par deux diagrammes** ; l'index porte une seule carte `role: index` et elle couvre
+couvert par deux diagrammes**, ni ici ni entre cet index et l'index local d'un depot voisin ;
+l'index porte une seule carte `role: index` et elle couvre
 `INDEX.yml` ; toute carte declaree dans `supersedes` a bien disparu de l'index ; chaque entree
 `verified` a son `.mmd` avec les en-tetes `%% name`, `%% covers` (identique a l'index) et
 `%% verified` (sha court) ; aucune entree `planned` n'a de fichier ; tout `.mmd` du dossier est dans
@@ -150,7 +175,8 @@ Les depots voisins sont resolus par `DIAGRAM_ROOT_BACKEND|FRONTEND|NEXUS|WEBSITE
 - 27 diagrammes prevus dans l'index, tous `planned` : **aucun `.mmd` n'existe encore**. Un index de
   27 entrees n'est pas 27 diagrammes ; c'est la liste des proprietaires, et c'est deja ce qui manquait
   au gate de derive.
-- 1204 fichiers source, 470 couverts, **734 orphelins (61 %)**, listes dans `docs/diagrams/ORPHANS.md`.
-- Zero recouvrement : chaque fichier couvert a exactement un diagramme proprietaire.
+- 1204 fichiers source, **731 orphelins (60,7 %)**, listes dans `docs/diagrams/ORPHANS.md`.
+- Zero recouvrement : chaque fichier couvert a exactement un diagramme proprietaire, ici comme
+  entre cet index et celui de nexus (3 diagrammes verifies, 24 fichiers possedes la-bas).
 - Les `covers` ne couvrent que ce que la cartographie a reellement lu ; le reste est orphelin, c'est
   voulu : on ne gonfle pas la couverture.

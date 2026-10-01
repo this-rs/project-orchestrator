@@ -7,7 +7,11 @@
 //      status planned => pas de fichier ; tout .mmd du dossier est dans l'index ;
 //   4. l'index porte la carte d'index `po-carte` (role: index) et toute carte provisoire
 //      reprise est declaree par `supersedes:` sur l'entree qui la remplace ;
-//   5. liste les fichiers source sans diagramme proprietaire (orphelins) et tient a jour
+//   5. la regle du proprietaire unique vaut ENTRE les index : un depot voisin peut tenir son
+//      propre docs/diagrams/INDEX.yml pour les diagrammes dont le .mmd vit chez lui ; toute
+//      collision entre cet index local et celui-ci est une erreur, et les fichiers qu'il
+//      possede ne sont pas comptes comme orphelins ici ;
+//   6. liste les fichiers source sans diagramme proprietaire (orphelins) et tient a jour
 //      le registre publie docs/diagrams/ORPHANS.md.
 //
 // Usage : node scripts/diagrams/check-index.mjs [options]
@@ -118,7 +122,7 @@ export function sharedOwnership(owners) {
 }
 
 // --- registre publie des orphelins : texte deterministe, sans sha ni date (verifiable hors reseau).
-export function renderOrphans(orphans, totalSources) {
+export function renderOrphans(orphans, totalSources, localIndexes = []) {
   const byRepo = {};
   for (const o of orphans) { const [repo, path] = [o.slice(0, o.indexOf(':')), o.slice(o.indexOf(':') + 1)]; (byRepo[repo] ??= []).push(path); }
   const pct = totalSources ? ((orphans.length / totalSources) * 100).toFixed(1) : '0.0';
@@ -140,6 +144,18 @@ export function renderOrphans(orphans, totalSources) {
     '```',
     '',
   ];
+  if (localIndexes.length) {
+    out.push(
+      'Un depot voisin peut tenir son propre index pour les diagrammes dont le `.mmd` vit chez lui.',
+      'Les fichiers qu\'il possede ont un proprietaire et ne figurent donc pas ci-dessous ; toute',
+      'collision entre les deux index est une erreur, pas un arrangement.',
+      '',
+    );
+    for (const { repo, owned, diagrams } of [...localIndexes].sort((a, b) => (a.repo < b.repo ? -1 : 1))) {
+      out.push(`- \`${repo}\` : ${diagrams} diagrammes, ${owned} fichiers possedes la-bas`);
+    }
+    out.push('');
+  }
   for (const repo of Object.keys(byRepo).sort()) {
     const paths = byRepo[repo].sort();
     out.push(`## ${repo} (${paths.length})`, '');
@@ -149,6 +165,44 @@ export function renderOrphans(orphans, totalSources) {
     out.push('');
   }
   return out.join('\n');
+}
+
+// --- index locaux des depots voisins.
+// Un depot peut tenir son propre `docs/diagrams/INDEX.yml` pour les diagrammes dont le `.mmd`
+// vit chez lui (son gate tourne alors dans sa chaine d'outils, pas la notre). La regle du
+// proprietaire unique vaut ENTRE les index : on resout leurs `covers` pour pouvoir detecter
+// une collision avec le notre, et pour ne pas compter leurs fichiers comme orphelins.
+// `files` : {repo: [chemins]}. Retourne Map<'repo:chemin', 'repo/INDEX.yml#nom'>.
+export function localIndexOwners(indexes, files) {
+  const owned = new Map();
+  for (const { repo, entries } of indexes) {
+    for (const e of entries) {
+      for (const g of e.covers) {
+        const m = g.match(/^([a-z]+):(.+)$/);
+        // Un index local ne possede que des chemins de SON depot : un glob qui en designe un
+        // autre serait une prise de pouvoir sur un depot voisin, on l'ignore.
+        if (!m || m[1] !== repo) continue;
+        const re = globToRegExp(m[2]);
+        for (const f of (files[repo] ?? [])) if (re.test(f)) owned.set(`${repo}:${f}`, `${repo}/INDEX.yml#${e.name}`);
+      }
+    }
+  }
+  return owned;
+}
+
+function readLocalIndexes(files) {
+  const out = [];
+  for (const [repo, root] of Object.entries(roots)) {
+    if (repo === 'backend' || !files[repo]) continue;
+    const p = join(root, 'docs/diagrams/INDEX.yml');
+    if (!existsSync(p)) continue;
+    try {
+      out.push({ repo, entries: parseIndex(readFileSync(p, 'utf8')) });
+    } catch (err) {
+      console.warn(`AVERTISSEMENT index local de '${repo}' illisible (${err.message}) : ses fichiers resteront orphelins ici`);
+    }
+  }
+  return out;
 }
 
 function listFiles(root) {
@@ -181,6 +235,10 @@ function main() {
     files[repo] = listFiles(root);
   }
   for (const r of missingRepos) console.warn(`AVERTISSEMENT depot '${r}' introuvable (${roots[r]}) : globs correspondants non verifies`);
+
+  // Index locaux des depots voisins : leurs fichiers ont un proprietaire, ailleurs.
+  const localIndexes = readLocalIndexes(files);
+  const elsewhere = localIndexOwners(localIndexes, files);
 
   const owners = new Map();
   const problems = [];
@@ -223,6 +281,13 @@ function main() {
   // Un fichier couvert par deux diagrammes n'a pas de proprietaire : c'est une erreur, pas un detail.
   for (const { file, names: n } of sharedOwnership(owners)) problems.push(`${file} : couvert par ${n.length} diagrammes (${n.join(', ')}) ; un fichier n'a qu'un proprietaire`);
 
+  // La meme regle vaut ENTRE les index : si un depot voisin revendique deja un fichier, cet
+  // index ne doit pas le revendiquer aussi, sinon deux gates se contredisent sur le meme fichier.
+  for (const [file, where] of elsewhere) {
+    const here = owners.get(file);
+    if (here) problems.push(`${file} : revendique par ${[...new Set(here)].join(', ')} ET par ${where} ; les deux index se contredisent`);
+  }
+
   const dir = join(backendRoot, 'docs/diagrams');
   if (existsSync(dir)) for (const f of readdirSync(dir)) if (f.endsWith('.mmd') && !names.has(f.slice(0, -4))) problems.push(`${f} : diagramme absent de l'index`);
 
@@ -230,7 +295,8 @@ function main() {
   for (const [repo, list] of Object.entries(files)) {
     for (const f of list) {
       if (!SOURCE[repo].some((r) => r.test(f)) || NOT_SOURCE.some((r) => r.test(f))) continue;
-      if (!owners.has(`${repo}:${f}`)) orphans.push(`${repo}:${f}`);
+      const key = `${repo}:${f}`;
+      if (!owners.has(key) && !elsewhere.has(key)) orphans.push(key);
     }
   }
   orphans.sort();
@@ -238,6 +304,10 @@ function main() {
   const totalSources = Object.entries(files).reduce((n, [repo, list]) => n + list.filter((f) => SOURCE[repo].some((r) => r.test(f)) && !NOT_SOURCE.some((r) => r.test(f))).length, 0);
   const nVerified = entries.filter((e) => e.status === 'verified').length;
   console.log(`${entries.length} diagrammes indexes (${nVerified} verified, ${entries.length - nVerified} planned) ; ${totalSources} fichiers source ; ${orphans.length} orphelins (sans diagramme proprietaire)`);
+  for (const { repo, entries: le } of localIndexes) {
+    const n = [...elsewhere.keys()].filter((k) => k.startsWith(`${repo}:`)).length;
+    console.log(`  index local '${repo}' : ${le.length} diagrammes, ${n} fichiers possedes ailleurs (non comptes ici)`);
+  }
   const byDir = {};
   for (const o of orphans) { const d = o.replace(/\/[^/]*$/, ''); (byDir[d] ??= []).push(o.slice(d.length + 1)); }
   const verbose = args.includes('--list');
@@ -246,7 +316,11 @@ function main() {
   // Registre publie : on le regenere ou on verifie qu'il est a jour. Deterministe, donc
   // utilisable comme gate hors reseau ; il ne depend que de l'index et de la liste des fichiers.
   const orphansPath = join(backendRoot, ORPHANS_DOC);
-  const rendered = renderOrphans(orphans, totalSources);
+  const rendered = renderOrphans(orphans, totalSources, localIndexes.map(({ repo, entries: le }) => ({
+    repo,
+    diagrams: le.length,
+    owned: [...elsewhere.keys()].filter((k) => k.startsWith(`${repo}:`)).length,
+  })));
   if (args.includes('--write-orphans')) {
     writeFileSync(orphansPath, rendered);
     console.log(`${ORPHANS_DOC} regenere (${orphans.length} orphelins)`);
