@@ -729,6 +729,12 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/tasks/{task_id}/decisions",
             post(handlers::add_decision),
         )
+        // The cross-workspace "Today" cockpit: one request, every source.
+        .route(
+            "/api/attention",
+            get(super::attention_aggregate::get_attention),
+        )
+        .route("/api/decisions", get(handlers::list_decisions))
         .route(
             "/api/decisions/affecting",
             get(handlers::get_decisions_affecting),
@@ -1479,6 +1485,7 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/protocols/{protocol_id}/runs",
             get(protocol_handlers::list_runs).post(protocol_handlers::start_run),
         )
+        .route("/api/protocols/runs", get(protocol_handlers::list_all_runs))
         .route(
             "/api/protocols/runs/{run_id}",
             get(protocol_handlers::get_run).delete(protocol_handlers::delete_run),
@@ -1835,7 +1842,13 @@ fn protected_routes() -> Router<OrchestratorState> {
         )
         .route(
             "/api/chat/sessions/{id}/messages",
-            get(chat_handlers::list_messages),
+            get(chat_handlers::list_messages).post(chat_handlers::send_session_message),
+        )
+        // Answer a permission request over REST (same server path as the WS
+        // `permission_response` frame): 410 dead session, 409 already decided.
+        .route(
+            "/api/chat/sessions/{id}/permissions/{request_id}",
+            post(chat_handlers::respond_permission),
         )
         .route(
             "/api/chat/sessions/{id}/children",

@@ -1046,6 +1046,17 @@ pub trait GraphStore: Send + Sync {
         to: Option<&str>,
     ) -> Result<Vec<DecisionTimelineEntry>>;
 
+    /// List decisions having a given status, across all projects by default,
+    /// newest first. `project_id` wins over `workspace_slug`. Returns (page, total).
+    async fn list_decisions_by_status(
+        &self,
+        status: DecisionStatus,
+        project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<DecisionListItem>, usize)>;
+
     // ========================================================================
     // Dependency analysis
     // ========================================================================
@@ -1670,7 +1681,11 @@ pub trait GraphStore: Send + Sync {
     async fn confirm_note(&self, note_id: Uuid, confirmed_by: &str) -> Result<Option<Note>>;
 
     /// Get notes that need review (stale or needs_review status)
-    async fn get_notes_needing_review(&self, project_id: Option<Uuid>) -> Result<Vec<Note>>;
+    async fn get_notes_needing_review(
+        &self,
+        project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
+    ) -> Result<Vec<Note>>;
 
     /// Update staleness scores for all active notes
     async fn update_staleness_scores(&self) -> Result<usize>;
@@ -2018,6 +2033,30 @@ pub trait GraphStore: Send + Sync {
     /// Follow SPAWNED_BY upward to find the root session
     async fn get_session_root(&self, session_id: &str) -> Result<Option<String>>;
 
+    /// Link a runner-spawned session to its PlanRun:
+    /// `(:ChatSession)-[:SPAWNED_BY_RUN {run_id, plan_id, task_id}]->(:PlanRun)`.
+    /// Idempotent (MERGE). A runner has no parent session, so the parent-based
+    /// `SPAWNED_BY` relation cannot be used (and pointing it at a PlanRun
+    /// would break `get_session_root`). Returns `false` when the session or
+    /// the run does not exist (nothing linked).
+    async fn link_session_to_run(
+        &self,
+        session_id: &str,
+        run_id: Uuid,
+        plan_id: Option<Uuid>,
+        task_id: Option<Uuid>,
+    ) -> Result<bool>;
+
+    /// Stored links (run relation, task / plan association) of many sessions,
+    /// in ONE grouped query whatever the number of sessions.
+    async fn get_session_link_rows(&self, session_ids: &[Uuid]) -> Result<Vec<SessionLinkRow>>;
+
+    /// Tasks + dependency edges of many plans in ONE grouped read.
+    async fn get_plans_task_graph(&self, plan_ids: &[Uuid]) -> Result<PlansTaskGraph>;
+
+    /// Every project with its workspace, in ONE read (project -> lane map).
+    async fn list_project_workspace_rows(&self) -> Result<Vec<ProjectWorkspaceRow>>;
+
     /// Get all sessions for a PlanRun via SPAWNED_BY relation metadata
     async fn get_run_sessions(&self, run_id: Uuid) -> Result<Vec<SessionInfo>>;
 
@@ -2079,6 +2118,18 @@ pub trait GraphStore: Send + Sync {
 
     /// Count total chat events for a session.
     async fn count_chat_events(&self, session_id: Uuid) -> Result<i64>;
+
+    /// Grouped read for the attention derivation: the events needed to decide
+    /// what is still pending, for ALL the given sessions in ONE query (never
+    /// one query per session).
+    ///
+    /// Returns, ordered by `(session_id, seq)`: `permission_request`,
+    /// `permission_decision`, `ask_user_question` (full payload) and
+    /// `user_message` (payload blanked: only its `seq` matters here) and
+    /// `session_error` (the CLI died).
+    /// `input_request` is deliberately NOT read: it is a dead type, never
+    /// emitted in production, and counting it would invent phantom requests.
+    async fn get_attention_events(&self, session_ids: &[Uuid]) -> Result<Vec<ChatEventRecord>>;
 
     /// Get the latest sequence number for a session (0 if no events)
     async fn get_latest_chat_event_seq(&self, session_id: Uuid) -> Result<i64>;
@@ -3171,6 +3222,19 @@ pub trait GraphStore: Send + Sync {
         offset: usize,
     ) -> Result<(Vec<ProtocolRun>, usize)>;
 
+    /// List protocol runs across ALL protocols (cross-cutting), newest first.
+    ///
+    /// `project_id` wins over `workspace_slug`; with neither, every project is
+    /// included. Returns (page, total).
+    async fn list_all_protocol_runs(
+        &self,
+        status: Option<RunStatus>,
+        project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<ProtocolRun>, usize)>;
+
     /// List child runs for a given parent run.
     async fn list_child_runs(&self, parent_run_id: Uuid) -> Result<Vec<ProtocolRun>>;
 
@@ -3541,6 +3605,7 @@ pub trait GraphStore: Send + Sync {
     async fn list_alerts(
         &self,
         project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
         limit: usize,
         offset: usize,
     ) -> Result<(Vec<AlertNode>, usize)>;

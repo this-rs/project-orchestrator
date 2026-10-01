@@ -877,8 +877,14 @@ impl NoteManager {
     }
 
     /// Get notes that need review
-    pub async fn get_notes_needing_review(&self, project_id: Option<Uuid>) -> Result<Vec<Note>> {
-        self.neo4j.get_notes_needing_review(project_id).await
+    pub async fn get_notes_needing_review(
+        &self,
+        project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
+    ) -> Result<Vec<Note>> {
+        self.neo4j
+            .get_notes_needing_review(project_id, workspace_slug)
+            .await
     }
 
     /// Update staleness scores for all active notes
@@ -2294,7 +2300,7 @@ mod tests {
         .await
         .unwrap();
 
-        let needing_review = mgr.get_notes_needing_review(Some(pid)).await.unwrap();
+        let needing_review = mgr.get_notes_needing_review(Some(pid), None).await.unwrap();
 
         assert_eq!(needing_review.len(), 2);
         for n in &needing_review {

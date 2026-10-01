@@ -15,7 +15,11 @@ Mesuré le 2026-10-01 sur `origin/main` @ 94c04bce. Deux chiffres sont toujours 
 
 Les exclusions masquent 23,7 % des lignes. Ne pas fixer un objectif de 100 % sur le gated. N'utilisez pas `tarpaulin-report.json` (mars 2026, périmé).
 
-Périmètre : la CI exécute `cargo llvm-cov --lib --test parser_tests --test integration_tests --test data_migrations`, soit le crate racine uniquement. Les crates `crates/*` (neural-routing-*, tree-sitter-*) et `desktop/` ne sont pas mesurés, ni les tests `api_tests`, `workspace_tests`, `p2p_*`, `mcp_federation_integration`, etc.
+Périmètre à la date de la mesure : la CI exécutait `cargo llvm-cov --lib --test parser_tests --test integration_tests --test data_migrations`, soit le crate racine uniquement. Les crates `crates/*` (neural-routing-*, tree-sitter-*) et `desktop/` n'étaient pas mesurés, ni les tests `api_tests`, `workspace_tests`, `p2p_*`, `mcp_federation_integration`, etc.
+
+**Depuis la tâche 3.1**, le job `coverage` collecte en plusieurs passes puis les **fusionne** (`cargo llvm-cov --no-report` ×3, puis `cargo llvm-cov report --lcov`) : tests unitaires du workspace entier (`--workspace --exclude project-orchestrator-desktop --lib`, ce qui inclut enfin les crates membres), `parser_tests`, puis les suites qui parlent au vrai Neo4j (`integration_tests`, `data_migrations`, `workspace_tests`, `neo4j_store_tests`). Les chiffres de ce document sont donc un plancher : ils datent d'avant cet élargissement.
+
+Le registre des exclusions, avec le propriétaire de chacune et le compteur qui ne peut que baisser, est dans [COVERAGE_EXCLUSIONS.md](COVERAGE_EXCLUSIONS.md).
 
 ## Par module (run CI-équivalent, avec Neo4j)
 
@@ -93,6 +97,8 @@ Détail par fichier : voir les commandes ci-dessous (`lcov-an.py files`).
 - Avec le Neo4j de test : 17 tests `integration_tests` + 1 `data_migrations` passent, 0 échec.
 - Attention : `integration_tests`, `data_migrations` et `workspace_tests` se connectent par défaut à `bolt://localhost:7687`. Sur une machine de dev, ce port peut être un Neo4j réel : toujours définir `NEO4J_URI` explicitement vers une instance jetable.
 
+- Une suite d'intégration qui ne trouve pas Neo4j **se saute elle-même** et sort en 0 : le rapport téléversé serait alors plein de zéros sur `src/neo4j`, ce qui se lit « ce code n'est pas testable » au lieu de « le service n'était pas là ». Deux garde-fous depuis la tâche 3.1 : `tests/neo4j_store_tests.rs` panique quand `CI` est défini et que Neo4j ne répond pas, et `scripts/assert_lcov_covers.py` échoue si le lcov fusionné ne contient aucune ligne couverte pour les fichiers `src/neo4j` dont l'exclusion a été retirée.
+
 ## Commandes exactes (reproductibles)
 
 ```bash
@@ -131,3 +137,52 @@ python3 scripts/coverage_by_module.py lcov-ci.info "$PWD" ignores.txt files    #
 ```
 
 Durée : environ 10 min de tests lib sous instrumentation (+ compilation).
+
+## Reproduire le lcov FUSIONNÉ de la CI (tâche 3.1)
+
+Ce que fait le job `coverage` depuis la tâche 3.1 : plusieurs passes de collecte,
+une seule fusion. `--no-report` accumule les `.profraw` ; `llvm-cov report` les
+fusionne. Une invocation unique ne pouvait pas couvrir à la fois le workspace
+entier et les suites par cible de test.
+
+```bash
+export PATH=$HOME/.cargo/bin:$PATH
+export CARGO_TARGET_DIR=$PWD/../target-cov-be        # un target dir par worktree
+
+# Services JETABLES sur des ports non standard : 7687 est souvent un vrai Neo4j.
+docker run -d --rm --name po-cov-neo4j -p 37687:7687 \
+  -e NEO4J_AUTH=neo4j/testpassword -e 'NEO4J_PLUGINS=["apoc"]' neo4j:5
+docker run -d --rm --name po-cov-meili -p 37700:7700 \
+  -e MEILI_MASTER_KEY=test-master-key -e MEILI_NO_ANALYTICS=true getmeili/meilisearch:v1.34
+
+export NEO4J_URI=bolt://localhost:37687 NEO4J_USER=neo4j NEO4J_PASSWORD=testpassword
+export MEILISEARCH_URL=http://localhost:37700 MEILISEARCH_KEY=test-master-key
+
+cargo llvm-cov clean --workspace
+
+# (1) unité, workspace entier (les crates membres ont leurs propres suites)
+cargo llvm-cov --no-report --no-fail-fast \
+  --workspace --exclude project-orchestrator-desktop --lib \
+  -- --skip test_large_index_performance
+# (2) parser
+cargo llvm-cov --no-report --no-fail-fast --test parser_tests
+# (3) les suites qui parlent au VRAI Neo4j
+cargo llvm-cov --no-report --no-fail-fast \
+  --test integration_tests --test data_migrations \
+  --test workspace_tests --test neo4j_store_tests
+# (4) fusion
+cargo llvm-cov report --lcov --output-path lcov.info
+
+# garde-fou : une suite sautée en silence ne doit pas passer pour du code intestable
+python3 scripts/assert_lcov_covers.py lcov.info \
+  src/neo4j/workspace.rs src/neo4j/milestone.rs src/neo4j/constraint.rs \
+  src/neo4j/release.rs src/neo4j/commit.rs src/neo4j/decision.rs \
+  src/neo4j/user.rs src/neo4j/traits.rs src/neo4j/client.rs
+
+docker stop po-cov-neo4j po-cov-meili
+```
+
+`test_large_index_performance` (`src/resolver/suffix_index.rs`) est une assertion
+de temps de parois qui ne tient pas sous l'instrumentation llvm-cov. Elle est
+sautée **dans la passe de couverture uniquement** ; le job `Unit Tests` continue
+de l'exécuter sans instrumentation.

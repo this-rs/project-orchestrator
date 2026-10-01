@@ -79,6 +79,15 @@ pub struct MockGraphStore {
     /// undirected the way the Cypher reads them
     pub document_links: RwLock<HashMap<Uuid, Vec<(EntityType, String)>>>,
     pub chat_sessions: RwLock<HashMap<Uuid, ChatSessionNode>>,
+    /// Stored session links (run relation / associations), seedable by tests
+    pub session_link_rows: RwLock<Vec<SessionLinkRow>>,
+    /// Number of `get_session_link_rows` calls (query-count assertions)
+    pub session_link_reads: std::sync::atomic::AtomicUsize,
+    /// Log of the grouped reads the cockpit aggregator performs, in order
+    /// (query-count assertions: one entry per store call).
+    pub read_log: std::sync::Mutex<Vec<&'static str>>,
+    /// Names of the reads that must fail (see `log_read`).
+    pub fail_reads: std::sync::Mutex<std::collections::HashSet<&'static str>>,
     pub chat_events: RwLock<HashMap<Uuid, Vec<ChatEventRecord>>>,
     /// Per-session auto_continue flag (stored separately from ChatSessionNode)
     pub session_auto_continue: RwLock<HashMap<Uuid, bool>>,
@@ -258,6 +267,10 @@ impl MockGraphStore {
             document_chunks: RwLock::new(HashMap::new()),
             document_links: RwLock::new(HashMap::new()),
             chat_sessions: RwLock::new(HashMap::new()),
+            session_link_rows: RwLock::new(Vec::new()),
+            session_link_reads: std::sync::atomic::AtomicUsize::new(0),
+            read_log: std::sync::Mutex::new(Vec::new()),
+            fail_reads: std::sync::Mutex::new(std::collections::HashSet::new()),
             chat_events: RwLock::new(HashMap::new()),
             session_auto_continue: RwLock::new(HashMap::new()),
             plan_runs: RwLock::new(HashMap::new()),
@@ -492,6 +505,55 @@ fn paginate<T: Clone>(items: &[T], limit: usize, offset: usize) -> Vec<T> {
 // GraphStore trait implementation
 // ============================================================================
 
+impl MockGraphStore {
+    /// Ids of the projects belonging to the workspace with this slug.
+    /// An unknown slug yields an empty set (same as the Cypher pattern
+    /// comprehension: nothing matches).
+    async fn project_ids_in_workspace_slug(&self, slug: &str) -> std::collections::HashSet<Uuid> {
+        let workspaces = self.workspaces.read().await;
+        let wp = self.workspace_projects.read().await;
+        workspaces
+            .values()
+            .filter(|w| w.slug == slug)
+            .flat_map(|w| wp.get(&w.id).cloned().unwrap_or_default())
+            .collect()
+    }
+
+    /// `project_id` wins over `workspace_slug`; `None` means "no scope".
+    async fn scope_projects(
+        &self,
+        project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
+    ) -> Option<std::collections::HashSet<Uuid>> {
+        if let Some(pid) = project_id {
+            Some([pid].into_iter().collect())
+        } else if let Some(ws) = workspace_slug {
+            Some(self.project_ids_in_workspace_slug(ws).await)
+        } else {
+            None
+        }
+    }
+}
+
+impl MockGraphStore {
+    /// Record a store read; fails when the test asked this read to fail
+    /// (`fail_reads`), to exercise "a source in error does not sink the response".
+    fn log_read(&self, name: &'static str) -> Result<()> {
+        if let Ok(mut l) = self.read_log.lock() {
+            l.push(name);
+        }
+        if self.fail_reads.lock().is_ok_and(|f| f.contains(name)) {
+            anyhow::bail!("injected failure of {name}");
+        }
+        Ok(())
+    }
+
+    /// Names of the store reads performed so far (see `read_log`).
+    pub fn reads(&self) -> Vec<&'static str> {
+        self.read_log.lock().map(|l| l.clone()).unwrap_or_default()
+    }
+}
+
 #[async_trait]
 impl GraphStore for MockGraphStore {
     // ========================================================================
@@ -623,6 +685,7 @@ impl GraphStore for MockGraphStore {
     }
 
     async fn list_workspaces(&self) -> Result<Vec<WorkspaceNode>> {
+        self.log_read("list_workspaces")?;
         Ok(self.workspaces.read().await.values().cloned().collect())
     }
 
@@ -4413,6 +4476,56 @@ impl GraphStore for MockGraphStore {
         Ok(self.decisions.read().await.get(&decision_id).cloned())
     }
 
+    async fn list_decisions_by_status(
+        &self,
+        status: DecisionStatus,
+        project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<DecisionListItem>, usize)> {
+        self.log_read("list_decisions_by_status")?;
+        let scope = self.scope_projects(project_id, workspace_slug).await;
+        let decisions = self.decisions.read().await;
+        let task_decisions = self.task_decisions.read().await;
+        let plan_tasks = self.plan_tasks.read().await;
+        let project_plans = self.project_plans.read().await;
+
+        let mut items: Vec<DecisionListItem> = decisions
+            .values()
+            .filter(|d| d.status == status)
+            .map(|d| {
+                let task_id = task_decisions
+                    .iter()
+                    .find(|(_, ds)| ds.contains(&d.id))
+                    .map(|(t, _)| *t);
+                let project_id = task_id.and_then(|t| {
+                    let plan = plan_tasks
+                        .iter()
+                        .find(|(_, ts)| ts.contains(&t))
+                        .map(|(p, _)| *p)?;
+                    project_plans
+                        .iter()
+                        .find(|(_, ps)| ps.contains(&plan))
+                        .map(|(pr, _)| *pr)
+                });
+                DecisionListItem {
+                    decision: d.clone(),
+                    task_id,
+                    project_id,
+                }
+            })
+            .filter(|i| match scope {
+                Some(ref s) => i.project_id.is_some_and(|p| s.contains(&p)),
+                None => true,
+            })
+            .collect();
+        items.sort_by(|a, b| b.decision.decided_at.cmp(&a.decision.decided_at));
+        let total = items.len();
+        let page = items.into_iter().skip(offset).take(limit).collect();
+        Ok((page, total))
+    }
+
     async fn get_decision_project_id(&self, _decision_id: Uuid) -> Result<Option<String>> {
         // Mock doesn't track Decision→Task→Plan→Project chain
         Ok(None)
@@ -5532,6 +5645,7 @@ impl GraphStore for MockGraphStore {
         _sort_by: Option<&str>,
         _sort_order: &str,
     ) -> Result<(Vec<PlanNode>, usize)> {
+        self.log_read("list_plans_filtered")?;
         let plans = self.plans.read().await;
         let pp = self.project_plans.read().await;
 
@@ -5598,6 +5712,7 @@ impl GraphStore for MockGraphStore {
         _sort_by: Option<&str>,
         _sort_order: &str,
     ) -> Result<(Vec<TaskWithPlan>, usize)> {
+        self.log_read("list_all_tasks_filtered")?;
         let pt = self.plan_tasks.read().await;
         let tasks = self.tasks.read().await;
         let plans = self.plans.read().await;
@@ -6030,9 +6145,15 @@ impl GraphStore for MockGraphStore {
     async fn list_notes(
         &self,
         project_id: Option<Uuid>,
-        _workspace_slug: Option<&str>,
+        workspace_slug: Option<&str>,
         filters: &NoteFilters,
     ) -> Result<(Vec<Note>, usize)> {
+        self.log_read("list_notes")?;
+        let ws_projects = if filters.global_only == Some(true) {
+            None
+        } else {
+            self.scope_projects(project_id, workspace_slug).await
+        };
         let notes = self.notes.read().await;
         let filtered: Vec<Note> = notes
             .values()
@@ -6041,8 +6162,8 @@ impl GraphStore for MockGraphStore {
                     if n.project_id.is_some() {
                         return false;
                     }
-                } else if let Some(pid) = project_id {
-                    if n.project_id != Some(pid) {
+                } else if let Some(ref scope) = ws_projects {
+                    if !n.project_id.is_some_and(|p| scope.contains(&p)) {
                         return false;
                     }
                 }
@@ -6062,7 +6183,8 @@ impl GraphStore for MockGraphStore {
                     }
                 }
                 if let Some(ref tag_filter) = filters.tags {
-                    if !tag_filter.iter().any(|tg| n.tags.contains(tg)) {
+                    // AND semantics, like the real query (`'t' IN n.tags` per tag).
+                    if !tag_filter.iter().all(|tg| n.tags.contains(tg)) {
                         return false;
                     }
                 }
@@ -6276,13 +6398,19 @@ impl GraphStore for MockGraphStore {
         }
     }
 
-    async fn get_notes_needing_review(&self, project_id: Option<Uuid>) -> Result<Vec<Note>> {
+    async fn get_notes_needing_review(
+        &self,
+        project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
+    ) -> Result<Vec<Note>> {
+        self.log_read("get_notes_needing_review")?;
+        let scope = self.scope_projects(project_id, workspace_slug).await;
         let notes = self.notes.read().await;
         Ok(notes
             .values()
             .filter(|n| {
-                if let Some(pid) = project_id {
-                    if n.project_id != Some(pid) {
+                if let Some(ref scope) = scope {
+                    if !n.project_id.is_some_and(|p| scope.contains(&p)) {
                         return false;
                     }
                 }
@@ -7197,6 +7325,7 @@ impl GraphStore for MockGraphStore {
         offset: usize,
         include_detached: bool,
     ) -> Result<(Vec<ChatSessionNode>, usize)> {
+        self.log_read("list_chat_sessions")?;
         let sessions = self.chat_sessions.read().await;
         // Collect workspace project slugs for membership check
         let ws_project_slugs: Vec<String> = if let Some(ws) = workspace_slug {
@@ -7262,14 +7391,127 @@ impl GraphStore for MockGraphStore {
 
     async fn create_spawned_by_relation(
         &self,
-        _child_session_id: &str,
-        _parent_session_id: &str,
+        child_session_id: &str,
+        parent_session_id: &str,
         _spawn_type: &str,
-        _run_id: Option<Uuid>,
-        _task_id: Option<Uuid>,
+        run_id: Option<Uuid>,
+        task_id: Option<Uuid>,
     ) -> Result<()> {
-        // Mock: no-op (relations are not tracked in mock)
+        // Mock: only the thread-relevant part is tracked, as the link row the
+        // real store derives (plan of the run carried, else of the parent).
+        let (Ok(child), Ok(parent)) = (
+            child_session_id.parse::<Uuid>(),
+            parent_session_id.parse::<Uuid>(),
+        ) else {
+            return Ok(());
+        };
+        let mut rows = self.session_link_rows.write().await;
+        let plan = rows
+            .iter()
+            .filter(|r| {
+                r.session_id == parent
+                    && matches!(
+                        r.kind,
+                        SessionLinkKind::RunRelation | SessionLinkKind::PlanAssociation
+                    )
+            })
+            .find_map(|r| r.thread_plan_id);
+        rows.push(SessionLinkRow {
+            session_id: child,
+            kind: SessionLinkKind::SpawnedByRelation,
+            run_id,
+            task_id,
+            plan_id: plan,
+            thread_plan_id: plan,
+        });
         Ok(())
+    }
+
+    async fn link_session_to_run(
+        &self,
+        session_id: &str,
+        run_id: Uuid,
+        plan_id: Option<Uuid>,
+        task_id: Option<Uuid>,
+    ) -> Result<bool> {
+        let Ok(sid) = session_id.parse::<Uuid>() else {
+            return Ok(false);
+        };
+        if !self.chat_sessions.read().await.contains_key(&sid) {
+            return Ok(false);
+        }
+        let mut rows = self.session_link_rows.write().await;
+        let already = rows.iter().any(|r| {
+            r.session_id == sid
+                && r.kind == SessionLinkKind::RunRelation
+                && r.run_id == Some(run_id)
+        });
+        if !already {
+            rows.push(SessionLinkRow {
+                session_id: sid,
+                kind: SessionLinkKind::RunRelation,
+                run_id: Some(run_id),
+                task_id,
+                plan_id,
+                thread_plan_id: plan_id,
+            });
+        }
+        Ok(true)
+    }
+
+    async fn get_session_link_rows(&self, session_ids: &[Uuid]) -> Result<Vec<SessionLinkRow>> {
+        self.log_read("get_session_link_rows")?;
+        self.session_link_reads
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let rows = self.session_link_rows.read().await;
+        Ok(rows
+            .iter()
+            .filter(|r| session_ids.contains(&r.session_id))
+            .cloned()
+            .collect())
+    }
+
+    async fn get_plans_task_graph(&self, plan_ids: &[Uuid]) -> Result<PlansTaskGraph> {
+        self.log_read("get_plans_task_graph")?;
+        let plan_tasks = self.plan_tasks.read().await;
+        let tasks = self.tasks.read().await;
+        let deps = self.task_dependencies.read().await;
+        let mut graph = PlansTaskGraph::default();
+        for pid in plan_ids {
+            for tid in plan_tasks.get(pid).into_iter().flatten() {
+                if let Some(t) = tasks.get(tid) {
+                    graph.tasks.push((*pid, t.clone()));
+                }
+                for d in deps.get(tid).into_iter().flatten() {
+                    graph.edges.push((*tid, *d));
+                }
+            }
+        }
+        Ok(graph)
+    }
+
+    async fn list_project_workspace_rows(&self) -> Result<Vec<ProjectWorkspaceRow>> {
+        self.log_read("list_project_workspace_rows")?;
+        let workspaces = self.workspaces.read().await;
+        let projects = self.projects.read().await;
+        let wp = self.workspace_projects.read().await;
+        let mut rows = Vec::new();
+        for (wid, pids) in wp.iter() {
+            let Some(w) = workspaces.get(wid) else {
+                continue;
+            };
+            for pid in pids {
+                if let Some(p) = projects.get(pid) {
+                    rows.push(ProjectWorkspaceRow {
+                        project_id: p.id,
+                        project_slug: p.slug.clone(),
+                        workspace_id: w.id,
+                        workspace_slug: w.slug.clone(),
+                    });
+                }
+            }
+        }
+        Ok(rows)
     }
 
     async fn get_session_tree(&self, session_id: &str) -> Result<Vec<SessionTreeNode>> {
@@ -7402,6 +7644,33 @@ impl GraphStore for MockGraphStore {
             })
             .unwrap_or_default();
         Ok(events)
+    }
+
+    async fn get_attention_events(&self, session_ids: &[Uuid]) -> Result<Vec<ChatEventRecord>> {
+        self.log_read("get_attention_events")?;
+        let store = self.chat_events.read().await;
+        let mut out = Vec::new();
+        for id in session_ids {
+            if let Some(events) = store.get(id) {
+                for e in events {
+                    if matches!(
+                        e.event_type.as_str(),
+                        "permission_request"
+                            | "permission_decision"
+                            | "ask_user_question"
+                            | "session_error"
+                    ) {
+                        out.push(e.clone());
+                    } else if e.event_type == "user_message" {
+                        let mut e = e.clone();
+                        e.data = String::new();
+                        out.push(e);
+                    }
+                }
+            }
+        }
+        out.sort_by_key(|e| (e.session_id, e.seq));
+        Ok(out)
     }
 
     async fn get_chat_events_paginated(
@@ -10657,6 +10926,35 @@ impl GraphStore for MockGraphStore {
         }
     }
 
+    async fn list_all_protocol_runs(
+        &self,
+        status: Option<crate::protocol::RunStatus>,
+        project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> anyhow::Result<(Vec<crate::protocol::ProtocolRun>, usize)> {
+        self.log_read("list_all_protocol_runs")?;
+        let scope = self.scope_projects(project_id, workspace_slug).await;
+        let protocols = self.protocols.read().await;
+        let store = self.protocol_runs.read().await;
+        let mut filtered: Vec<_> = store
+            .values()
+            .filter(|r| status.as_ref().is_none_or(|s| r.status == *s))
+            .filter(|r| match scope {
+                Some(ref s) => protocols
+                    .get(&r.protocol_id)
+                    .is_some_and(|p| s.contains(&p.project_id)),
+                None => true,
+            })
+            .cloned()
+            .collect();
+        filtered.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+        let total = filtered.len();
+        let page = filtered.into_iter().skip(offset).take(limit).collect();
+        Ok((page, total))
+    }
+
     async fn list_protocol_runs(
         &self,
         protocol_id: Uuid,
@@ -11015,6 +11313,7 @@ impl GraphStore for MockGraphStore {
         status: Option<&str>,
         _workspace_slug: Option<&str>,
     ) -> anyhow::Result<Vec<crate::runner::RunnerState>> {
+        self.log_read("list_all_plan_runs")?;
         let runs = self.plan_runs.read().await;
         let mut result: Vec<_> = runs
             .values()
@@ -11376,14 +11675,17 @@ impl GraphStore for MockGraphStore {
     async fn list_alerts(
         &self,
         project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
         limit: usize,
         offset: usize,
     ) -> anyhow::Result<(Vec<AlertNode>, usize)> {
+        self.log_read("list_alerts")?;
+        let scope = self.scope_projects(project_id, workspace_slug).await;
         let alerts = self.alerts.read().await;
         let mut all: Vec<_> = alerts
             .values()
-            .filter(|a| match project_id {
-                Some(pid) => a.project_id == Some(pid),
+            .filter(|a| match scope {
+                Some(ref s) => a.project_id.is_some_and(|p| s.contains(&p)),
                 None => true,
             })
             .cloned()

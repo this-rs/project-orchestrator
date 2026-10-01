@@ -345,6 +345,37 @@ impl Neo4jClient {
         Ok(projects)
     }
 
+    /// Every project with its workspace in ONE query (project -> lane map).
+    pub async fn list_project_workspace_rows(&self) -> Result<Vec<ProjectWorkspaceRow>> {
+        let q = query(
+            r#"
+            MATCH (p:Project)-[:BELONGS_TO_WORKSPACE]->(w:Workspace)
+            RETURN p.id AS project_id, p.slug AS project_slug,
+                   w.id AS workspace_id, w.slug AS workspace_slug
+            "#,
+        );
+        let mut result = self.graph.execute(q).await?;
+        let mut rows = Vec::new();
+        while let Some(row) = result.next().await? {
+            let id = |k: &str| {
+                row.get::<String>(k)
+                    .ok()
+                    .and_then(|s| s.parse::<Uuid>().ok())
+            };
+            let (Some(project_id), Some(workspace_id)) = (id("project_id"), id("workspace_id"))
+            else {
+                continue;
+            };
+            rows.push(ProjectWorkspaceRow {
+                project_id,
+                project_slug: row.get("project_slug").unwrap_or_default(),
+                workspace_id,
+                workspace_slug: row.get("workspace_slug").unwrap_or_default(),
+            });
+        }
+        Ok(rows)
+    }
+
     /// Get the workspace a project belongs to
     pub async fn get_project_workspace(&self, project_id: Uuid) -> Result<Option<WorkspaceNode>> {
         let q = query(

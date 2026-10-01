@@ -152,7 +152,7 @@ pub struct WorkspaceNode {
 // ============================================================================
 
 /// A chat session with Claude Code CLI
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ChatSessionNode {
     pub id: Uuid,
     /// Claude CLI session ID (for --resume)
@@ -297,6 +297,57 @@ pub struct LinkedSessionInfo {
     pub linked_tasks: Vec<LinkedTaskInfo>,
     #[serde(default)]
     pub linked_rfcs: Vec<LinkedRfcInfo>,
+}
+
+/// Which stored relation a [`SessionLinkRow`] was read from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SessionLinkKind {
+    /// `(:ChatSession)-[:SPAWNED_BY_RUN {run_id, plan_id, task_id}]->(:PlanRun)`
+    RunRelation,
+    /// `(:ChatSession)-[:ASSOCIATED_WITH]->(:Task)`
+    TaskAssociation,
+    /// `(:ChatSession)-[:ASSOCIATED_WITH]->(:Plan)`
+    PlanAssociation,
+    /// `(:ChatSession)-[:SPAWNED_BY {type, run_id, task_id}]->(:ChatSession)`:
+    /// the plan is the one of the run carried by the relation, else the plan
+    /// of the PARENT session (its run relation or plan association)
+    SpawnedByRelation,
+}
+
+/// One stored session link, as read by the grouped
+/// `GraphStore::get_session_link_rows` (one row per relation).
+///
+/// `plan_id` is the plan the link CARRIES (run relation, plan association);
+/// `thread_plan_id` is the plan the link RESOLVES to (a task association
+/// resolves through `(:Plan)-[:HAS_TASK]->(:Task)`), `None` when unknown.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionLinkRow {
+    pub session_id: Uuid,
+    pub kind: SessionLinkKind,
+    pub run_id: Option<Uuid>,
+    pub task_id: Option<Uuid>,
+    pub plan_id: Option<Uuid>,
+    pub thread_plan_id: Option<Uuid>,
+}
+
+/// Tasks and dependency edges of SEVERAL plans, read in one grouped query
+/// (the cockpit must not call `compute_waves` once per plan).
+#[derive(Debug, Clone, Default)]
+pub struct PlansTaskGraph {
+    /// `(plan_id, task)` for every task of the requested plans.
+    pub tasks: Vec<(Uuid, TaskNode)>,
+    /// `(from, to)`: `from` DEPENDS_ON `to`, both in the same plan.
+    pub edges: Vec<(Uuid, Uuid)>,
+}
+
+/// One project with the workspace it belongs to (grouped read of the
+/// project -> lane map).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectWorkspaceRow {
+    pub project_id: Uuid,
+    pub project_slug: String,
+    pub workspace_id: Uuid,
+    pub workspace_slug: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -743,6 +794,21 @@ pub struct AffectsRelation {
     /// Optional description of how the decision impacts this entity
     #[serde(skip_serializing_if = "Option::is_none")]
     pub impact_description: Option<String>,
+}
+
+/// A decision as listed by status (cockpit "to decide" lane), with the
+/// task that recorded it and the project that task belongs to so the caller
+/// can attach it to a workspace lane without a second round trip.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DecisionListItem {
+    #[serde(flatten)]
+    pub decision: DecisionNode,
+    /// Task that recorded the decision (INFORMED_BY), if still linked.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub task_id: Option<Uuid>,
+    /// Project owning that task's plan, if any.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub project_id: Option<Uuid>,
 }
 
 /// A decision in a timeline view, with its supersession chain

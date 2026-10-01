@@ -165,25 +165,35 @@ impl Neo4jClient {
     }
 
     /// List all alerts with pagination.
+    ///
+    /// `project_id` wins over `workspace_slug`. Values are bound parameters.
     pub async fn list_alerts_impl(
         &self,
         project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
         limit: usize,
         offset: usize,
     ) -> Result<(Vec<AlertNode>, usize)> {
-        // Count total
-        let count_cypher = if project_id.is_some() {
-            "MATCH (a:Alert) WHERE a.project_id = $project_id RETURN count(a) AS total"
+        let scope = if project_id.is_some() {
+            "WHERE a.project_id = $project_id"
+        } else if workspace_slug.is_some() {
+            "WHERE a.project_id IN [(w:Workspace {slug: $workspace_slug})<-[:BELONGS_TO_WORKSPACE]-(proj:Project) | proj.id]"
         } else {
-            "MATCH (a:Alert) RETURN count(a) AS total"
+            ""
+        };
+        let bind = |q: neo4rs::Query| -> neo4rs::Query {
+            if let Some(pid) = project_id {
+                q.param("project_id", pid.to_string())
+            } else if let Some(ws) = workspace_slug {
+                q.param("workspace_slug", ws.to_string())
+            } else {
+                q
+            }
         };
 
-        let mut count_q = query(count_cypher);
-        if let Some(pid) = project_id {
-            count_q = count_q.param("project_id", pid.to_string());
-        }
-
-        let mut count_result = self.graph.execute(count_q).await?;
+        // Count total
+        let count_cypher = format!("MATCH (a:Alert) {} RETURN count(a) AS total", scope);
+        let mut count_result = self.graph.execute(bind(query(&count_cypher))).await?;
         let total = if let Some(row) = count_result.next().await? {
             row.get::<i64>("total").unwrap_or(0) as usize
         } else {
@@ -191,29 +201,22 @@ impl Neo4jClient {
         };
 
         // Fetch page
-        let list_cypher = if project_id.is_some() {
+        let list_cypher = format!(
             r#"
             MATCH (a:Alert)
-            WHERE a.project_id = $project_id
+            {}
             RETURN a
             ORDER BY coalesce(a.priority, 0.0) DESC, coalesce(a.last_seen, a.created_at) DESC
             SKIP $offset LIMIT $limit
-            "#
-        } else {
-            r#"
-            MATCH (a:Alert)
-            RETURN a
-            ORDER BY coalesce(a.priority, 0.0) DESC, coalesce(a.last_seen, a.created_at) DESC
-            SKIP $offset LIMIT $limit
-            "#
-        };
+            "#,
+            scope
+        );
 
-        let mut list_q = query(list_cypher)
-            .param("limit", limit as i64)
-            .param("offset", offset as i64);
-        if let Some(pid) = project_id {
-            list_q = list_q.param("project_id", pid.to_string());
-        }
+        let list_q = bind(
+            query(&list_cypher)
+                .param("limit", limit as i64)
+                .param("offset", offset as i64),
+        );
 
         let mut result = self.graph.execute(list_q).await?;
         let mut alerts = Vec::new();
