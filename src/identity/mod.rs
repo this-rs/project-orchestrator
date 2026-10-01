@@ -146,13 +146,27 @@ impl InstanceIdentity {
 
         // Write atomically: write to temp file, then rename
         let tmp_path = self.storage_path.with_extension("key.tmp");
-        fs::write(&tmp_path, &json)?;
 
-        // Set secure permissions (Unix only)
+        // Never reuse a pre-existing temp file: it could have looser permissions
+        // or be held open by someone else.
+        match fs::remove_file(&tmp_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+
+        // Create with 0o600 from the start so the key is never world-readable.
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600))?;
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        {
+            use std::io::Write;
+            let mut file = options.open(&tmp_path)?;
+            file.write_all(json.as_bytes())?;
         }
 
         fs::rename(&tmp_path, &self.storage_path)?;
@@ -341,5 +355,36 @@ mod tests {
 
         let perms = fs::metadata(&key_path).unwrap().permissions();
         assert_eq!(perms.mode() & 0o777, 0o600, "Key file should be 0o600");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_save_does_not_reuse_preexisting_tmp_file() {
+        use std::io::Read;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let key_path = dir.path().join("identity.key");
+        let tmp_path = key_path.with_extension("key.tmp");
+
+        // A world-readable file already sits at the temp path and is held open.
+        fs::write(&tmp_path, "").unwrap();
+        fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o644)).unwrap();
+        let mut spy = fs::File::open(&tmp_path).unwrap();
+
+        let mut identity = InstanceIdentity::generate();
+        identity.storage_path = key_path.clone();
+        identity.save_to_file().unwrap();
+
+        let mut leaked = String::new();
+        spy.read_to_string(&mut leaked).unwrap();
+        assert!(
+            leaked.is_empty(),
+            "key bytes were written into a pre-existing 0644 file"
+        );
+        assert_eq!(
+            fs::metadata(&key_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 }

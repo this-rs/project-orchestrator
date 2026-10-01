@@ -128,14 +128,14 @@ pub fn verify_token(token: &str, verifying_key: &VerifyingKey) -> Result<TokenCl
         .and_then(|v| v.as_str())
         .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
         .map(|dt| dt.with_timezone(&Utc))
-        .unwrap_or_else(Utc::now);
+        .ok_or_else(|| anyhow!("Token has a missing or invalid `iat` claim"))?;
 
     let exp = claims_json
         .get_claim("exp")
         .and_then(|v| v.as_str())
         .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
         .map(|dt| dt.with_timezone(&Utc))
-        .unwrap_or_else(Utc::now);
+        .ok_or_else(|| anyhow!("Token has a missing or invalid `exp` claim"))?;
 
     // Check expiration
     if exp < Utc::now() {
@@ -237,5 +237,36 @@ mod tests {
         let key = SigningKey::generate(&mut &mut rand_core_06::OsRng);
         let result = verify_token("not-a-valid-token", &key.verifying_key());
         assert!(result.is_err());
+    }
+
+    fn sign_claims(signing_key: &SigningKey, claims: &Claims) -> String {
+        let mut full_key = signing_key.to_bytes().to_vec();
+        full_key.extend_from_slice(&signing_key.verifying_key().to_bytes());
+        let sk = AsymmetricSecretKey::<V4>::from(&full_key).unwrap();
+        public::sign(&sk, claims, None, None).unwrap()
+    }
+
+    #[test]
+    fn test_token_without_exp_is_rejected() {
+        let signing_key = SigningKey::generate(&mut &mut rand_core_06::OsRng);
+        let mut claims = Claims::new().unwrap();
+        claims.issuer("did:key:z6MkTest123").unwrap();
+        claims.subject("p2p-sync").unwrap();
+        claims.non_expiring();
+        let token = sign_claims(&signing_key, &claims);
+
+        assert!(verify_token(&token, &signing_key.verifying_key()).is_err());
+    }
+
+    #[test]
+    fn test_token_without_iat_is_rejected() {
+        let signing_key = SigningKey::generate(&mut &mut rand_core_06::OsRng);
+        let mut claims = Claims::new().unwrap();
+        claims.issuer("did:key:z6MkTest123").unwrap();
+        claims.subject("p2p-sync").unwrap();
+        claims.remove_claim("iat");
+        let token = sign_claims(&signing_key, &claims);
+
+        assert!(verify_token(&token, &signing_key.verifying_key()).is_err());
     }
 }
