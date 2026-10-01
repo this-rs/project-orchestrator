@@ -1,4 +1,5 @@
 <!-- Genere par scripts/diagrams/check-index.mjs --write-orphans. Ne pas editer a la main. -->
+<!-- orphan-ceiling: 1201 -->
 
 # Fichiers source sans diagramme proprietaire
 
@@ -13,6 +14,11 @@ sans qu'un diagramme existe : compter ses globs ferait baisser ce nombre sans qu
 soit ecrite, et l'index acheterait du credit sur des intentions.
 Sur les 1201 orphelins, **470 sont deja reserves** par une entree `planned` :
 leur proprietaire est designe, son diagramme reste a ecrire.
+
+Le plafond est **1201** : le verificateur echoue si le nombre reel le depasse.
+Il ne peut que descendre. Ajouter un fichier source sans proprietaire fait echouer la build ;
+la sortie est un glob `covers`, pas un plafond plus haut. `--raise-ceiling` existe mais exige
+une raison ecrite, et un plafond releve se voit dans la revue.
 
 Regeneration (hors reseau) :
 

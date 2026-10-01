@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { globToRegExp, parseIndex, parseHeader, checkDiagramFile, sharedOwnership, renderOrphans, localIndexOwners } from './check-index.mjs';
+import { globToRegExp, parseIndex, parseHeader, checkDiagramFile, sharedOwnership, renderOrphans, localIndexOwners, orphanCeiling } from './check-index.mjs';
 
 test('glob: **, *, braces', () => {
   assert.ok(globToRegExp('src/heartbeat/**').test('src/heartbeat/checks/git_drift.rs'));
@@ -121,8 +121,8 @@ test('renderOrphans: les index locaux sont expliques dans le registre publie', (
 
 // --- controle negatif de bout en bout : le gate doit REFUSER une collision entre index.
 // Un gate qui ne refuse rien est pire que pas de gate, parce qu'il se cite comme preuve.
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
-import { execFileSync } from 'node:child_process';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -150,16 +150,13 @@ function fixture({ mainCovers, localCovers }) {
 }
 
 function run(be, nx, args = []) {
-  try {
-    const stdout = execFileSync('node', [script, ...args], {
-      encoding: 'utf8',
-      env: { ...process.env, DIAGRAM_ROOT_BACKEND: be, DIAGRAM_ROOT_NEXUS: nx, DIAGRAM_ROOT_FRONTEND: join(nx, 'absent'), DIAGRAM_ROOT_WEBSITE: join(nx, 'absent') },
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-    return { code: 0, out: stdout };
-  } catch (e) {
-    return { code: e.status, out: `${e.stdout ?? ''}${e.stderr ?? ''}` };
-  }
+  // stdout ET stderr : les avertissements (plafond releve, depot absent) passent par stderr,
+  // et un test qui ne lit que stdout les manquerait.
+  const r = spawnSync('node', [script, ...args], {
+    encoding: 'utf8',
+    env: { ...process.env, DIAGRAM_ROOT_BACKEND: be, DIAGRAM_ROOT_NEXUS: nx, DIAGRAM_ROOT_FRONTEND: join(nx, 'absent'), DIAGRAM_ROOT_WEBSITE: join(nx, 'absent') },
+  });
+  return { code: r.status, out: `${r.stdout ?? ''}${r.stderr ?? ''}` };
 }
 
 test('gate: une collision entre index principal et index local est REFUSEE', () => {
@@ -236,6 +233,93 @@ test('gate: une entree planned ne retire PAS son perimetre des orphelins', () =>
     // src/own.rs est couvert par po-x, mais po-x est `planned` : il reste orphelin.
     assert.match(out, /2 orphelins/);
     assert.match(out, /dont 1 reserves par une entree planned/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// --- le cliquet d'orphelins
+test('orphanCeiling: lit le marqueur, tolere les espaces, rejette le reste', () => {
+  assert.equal(orphanCeiling('<!-- orphan-ceiling: 42 -->'), 42);
+  assert.equal(orphanCeiling('texte <!--orphan-ceiling:7--> suite'), 7);
+  assert.equal(orphanCeiling('<!-- orphan-ceiling: -->'), null);
+  assert.equal(orphanCeiling('<!-- orphan-ceiling: beaucoup -->'), null);
+  assert.equal(orphanCeiling('aucun marqueur'), null);
+  assert.equal(orphanCeiling(null), null);
+});
+
+test('renderOrphans: publie le plafond et dit que le relever n est pas la sortie', () => {
+  const md = renderOrphans(['backend:src/a.rs'], 4, [], 0, 7);
+  assert.match(md, /<!-- orphan-ceiling: 7 -->/);
+  assert.match(md, /Le plafond est \*\*7\*\*/);
+  assert.match(md, /pas un plafond plus haut/);
+});
+
+function withCeiling(be, n) {
+  const p = join(be, 'docs/diagrams/ORPHANS.md');
+  writeFileSync(p, `<!-- orphan-ceiling: ${n} -->\n`);
+}
+
+test('cliquet: au-dessus du plafond, le gate ECHOUE avec la sortie indiquee', () => {
+  const { root, be, nx } = fixture({ mainCovers: ['backend:src/own.rs'], localCovers: null });
+  try {
+    withCeiling(be, 1); // 2 orphelins reels
+    const { code, out } = run(be, nx);
+    assert.equal(code, 1);
+    assert.match(out, /au-dessus du plafond de 1/);
+    assert.match(out, /Relever le plafond n'est pas la sortie/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('cliquet: --write-orphans ne releve PAS le plafond tout seul', () => {
+  // Le coeur du cliquet : s'il se releve a la regeneration, il ne tient rien.
+  const { root, be, nx } = fixture({ mainCovers: ['backend:src/own.rs'], localCovers: null });
+  try {
+    withCeiling(be, 1);
+    const { code } = run(be, nx, ['--write-orphans']);
+    assert.equal(code, 1, 'la regeneration doit echouer, pas absoudre');
+    assert.equal(orphanCeiling(readFileSync(join(be, 'docs/diagrams/ORPHANS.md'), 'utf8')), 1, 'plafond intact');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('cliquet: --raise-ceiling exige une raison, et la trace', () => {
+  const { root, be, nx } = fixture({ mainCovers: ['backend:src/own.rs'], localCovers: null });
+  try {
+    withCeiling(be, 1);
+    // sans raison (drapeau suivant), c'est refuse
+    assert.equal(run(be, nx, ['--write-orphans', '--raise-ceiling', '--list']).code, 1);
+    const { code, out } = run(be, nx, ['--write-orphans', '--raise-ceiling', 'raison ecrite']);
+    assert.equal(code, 0, out);
+    assert.match(out, /plafond d'orphelins releve 1 -> 2 : raison ecrite/);
+    assert.equal(orphanCeiling(readFileSync(join(be, 'docs/diagrams/ORPHANS.md'), 'utf8')), 2);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('cliquet: il descend seul quand un fichier gagne un proprietaire', () => {
+  const { root, be, nx } = fixture({ mainCovers: ['backend:src/own.rs'], localCovers: ['nexus:claude-code-api/src/core/model_registry.rs'] });
+  try {
+    withCeiling(be, 5); // large
+    const { code } = run(be, nx, ['--write-orphans']);
+    assert.equal(code, 0);
+    assert.equal(orphanCeiling(readFileSync(join(be, 'docs/diagrams/ORPHANS.md'), 'utf8')), 1, 'descendu a la valeur reelle');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('cliquet: supprimer le marqueur ne le desarme pas', () => {
+  const { root, be, nx } = fixture({ mainCovers: ['backend:src/own.rs'], localCovers: null });
+  try {
+    writeFileSync(join(be, 'docs/diagrams/ORPHANS.md'), 'liste sans marqueur\n');
+    const { code, out } = run(be, nx);
+    assert.equal(code, 1);
+    assert.match(out, /ne porte pas de marqueur/);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

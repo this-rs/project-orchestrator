@@ -124,6 +124,25 @@ En pratique, nexus tient un index de 3 diagrammes verifies (`release-readiness`,
 `nexus-model-catalogue`) qui possede 24 fichiers. Aucune collision avec les cartes `po-*` : c'est
 verifie a chaque execution, pas suppose. Le decompte des orphelins en tient compte.
 
+### Le nombre d'orphelins ne peut que descendre (cliquet)
+
+Viser « zero orphelin » echouerait des le premier jour, et un gate que personne ne peut
+satisfaire finit desactive. `ORPHANS.md` porte donc un marqueur
+`<!-- orphan-ceiling: N -->`, et le verificateur echoue si le compte reel le depasse :
+ajouter un fichier source sans proprietaire casse la build. La sortie est un glob `covers`
+sur une entree `verified`, **pas un plafond plus haut**.
+
+Trois proprietes, chacune verifiee par un test de bout en bout, parce qu'un cliquet qui se
+desserre tout seul ne tient rien :
+
+- `--write-orphans` **ne releve jamais** le plafond : au-dessus, il echoue au lieu d'absoudre.
+- le relever exige `--raise-ceiling "<raison>"`, qui laisse une trace lisible en revue.
+- supprimer le marqueur **echoue** aussi : on ne desarme pas le cliquet en effacant son compteur.
+
+Il descend seul des qu'un fichier gagne un proprietaire. Le marqueur est le meme que celui du
+gate de nexus (`claude-code-api/tests/diagram_index.rs`), pour que les deux depots se tiennent a
+la meme regle et qu'un lecteur n'ait qu'une forme a connaitre.
+
 ### Cartes provisoires reprises (`supersedes`)
 
 Deux cartes de la cartographie d'origine portaient un suffixe numerique et n'etaient rattachees a
@@ -175,6 +194,7 @@ node scripts/diagrams/check-index.mjs --list           # noms des fichiers orphe
 node scripts/diagrams/check-index.mjs --write-orphans  # regenere docs/diagrams/ORPHANS.md
 node scripts/diagrams/check-index.mjs --check-orphans   # echoue si ORPHANS.md n'est pas a jour
 node scripts/diagrams/check-index.mjs --fail-on-orphans # cible finale : plus aucun orphelin
+node scripts/diagrams/check-index.mjs --write-orphans --raise-ceiling "<raison>"  # a eviter
 node scripts/diagrams/check-index.mjs --json out.json
 node scripts/diagrams/check-index.mjs --strict         # echoue aussi si un depot voisin est absent
 node --test scripts/diagrams/check-index.test.mjs
@@ -182,7 +202,8 @@ node --test scripts/diagrams/check-index.test.mjs
 
 Regles verifiees : chaque glob `covers` matche au moins un fichier existant ; **aucun fichier n'est
 couvert par deux diagrammes**, ni ici ni entre cet index et l'index local d'un depot voisin ;
-seule une entree `verified` compte comme proprietaire pour le calcul des orphelins ;
+seule une entree `verified` compte comme proprietaire pour le calcul des orphelins ; le nombre
+d'orphelins ne depasse pas le plafond publie dans `ORPHANS.md`, qui ne peut que descendre ;
 l'index porte une seule carte `role: index` et elle couvre
 `INDEX.yml` ; toute carte declaree dans `supersedes` a bien disparu de l'index ; chaque entree
 `verified` a son `.mmd` avec les en-tetes `%% name`, `%% covers` (identique a l'index) et

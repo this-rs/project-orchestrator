@@ -24,6 +24,7 @@
 //   --write-orphans       (re)genere docs/diagrams/ORPHANS.md
 //   --check-orphans       echoue si docs/diagrams/ORPHANS.md n'est pas a jour (defaut : avertissement)
 //   --fail-on-orphans     echoue s'il reste un orphelin (cible finale, pas l'etat actuel)
+//   --raise-ceiling "<raison>"  releve le plafond d'orphelins (a eviter : la sortie est un glob)
 //   --strict              echoue aussi si un depot voisin est absent
 //   --json <fichier>      ecrit un resume machine
 //
@@ -126,13 +127,25 @@ export function sharedOwnership(owners) {
   return out.sort((a, b) => (a.file < b.file ? -1 : 1));
 }
 
+// --- cliquet : `<!-- orphan-ceiling: N -->` dans le registre publie.
+// Meme marqueur que le gate de nexus (claude-code-api/tests/diagram_index.rs, `orphan_ceiling`),
+// pour que les deux depots se tiennent a la meme regle et qu'un lecteur n'ait qu'une forme a
+// connaitre. Viser zero orphelin echouerait des le premier jour et le gate serait supprime ;
+// un plafond qui ne peut que descendre tient une PR a quelque chose d'atteignable aujourd'hui :
+// revendiquer un fichier, ou au moins n'en ajouter aucun qui ne soit revendique.
+export function orphanCeiling(doc) {
+  const m = /<!--\s*orphan-ceiling:\s*(\d+)\s*-->/.exec(doc ?? '');
+  return m ? Number(m[1]) : null;
+}
+
 // --- registre publie des orphelins : texte deterministe, sans sha ni date (verifiable hors reseau).
-export function renderOrphans(orphans, totalSources, localIndexes = [], reserved = 0) {
+export function renderOrphans(orphans, totalSources, localIndexes = [], reserved = 0, ceiling = orphans.length) {
   const byRepo = {};
   for (const o of orphans) { const [repo, path] = [o.slice(0, o.indexOf(':')), o.slice(o.indexOf(':') + 1)]; (byRepo[repo] ??= []).push(path); }
   const pct = totalSources ? ((orphans.length / totalSources) * 100).toFixed(1) : '0.0';
   const out = [
     '<!-- Genere par scripts/diagrams/check-index.mjs --write-orphans. Ne pas editer a la main. -->',
+    `<!-- orphan-ceiling: ${ceiling} -->`,
     '',
     '# Fichiers source sans diagramme proprietaire',
     '',
@@ -147,6 +160,11 @@ export function renderOrphans(orphans, totalSources, localIndexes = [], reserved
     'soit ecrite, et l\'index acheterait du credit sur des intentions.',
     `Sur les ${orphans.length} orphelins, **${reserved} sont deja reserves** par une entree \`planned\` :`,
     'leur proprietaire est designe, son diagramme reste a ecrire.',
+    '',
+    `Le plafond est **${ceiling}** : le verificateur echoue si le nombre reel le depasse.`,
+    'Il ne peut que descendre. Ajouter un fichier source sans proprietaire fait echouer la build ;',
+    'la sortie est un glob `covers`, pas un plafond plus haut. `--raise-ceiling` existe mais exige',
+    'une raison ecrite, et un plafond releve se voit dans la revue.',
     '',
     'Regeneration (hors reseau) :',
     '',
@@ -326,6 +344,7 @@ function main() {
   // ne sont pas du code source (Cargo.toml, workflows, docs) et qui ne sont donc pas orphelins.
   const reserved = orphans.filter((o) => owners.has(o)).length;
   console.log(`${entries.length} diagrammes indexes (${nVerified} verified, ${entries.length - nVerified} planned) ; ${totalSources} fichiers source ; ${orphans.length} orphelins (aucun diagramme VERIFIE ne les couvre)`);
+  console.log(`  plafond : ${orphanCeiling(existsSync(join(backendRoot, ORPHANS_DOC)) ? readFileSync(join(backendRoot, ORPHANS_DOC), 'utf8') : '') ?? 'non fixe'}`);
   console.log(`  dont ${reserved} reserves par une entree planned : perimetre annonce, diagramme pas ecrit — ne compte pas comme couvert`);
   for (const { repo, entries: le } of localIndexes) {
     const n = [...elsewhere.keys()].filter((k) => k.startsWith(`${repo}:`)).length;
@@ -339,11 +358,34 @@ function main() {
   // Registre publie : on le regenere ou on verifie qu'il est a jour. Deterministe, donc
   // utilisable comme gate hors reseau ; il ne depend que de l'index et de la liste des fichiers.
   const orphansPath = join(backendRoot, ORPHANS_DOC);
+  const previousDoc = existsSync(orphansPath) ? readFileSync(orphansPath, 'utf8') : null;
+  const recordedCeiling = orphanCeiling(previousDoc);
+
+  // Le cliquet. Un plafond qui se releve tout seul a la regeneration ne tient rien :
+  // --write-orphans ne peut que le baisser. Le relever demande --raise-ceiling <raison>,
+  // qui laisse une trace dans la revue au lieu d'un chiffre qui glisse.
+  const raiseAt = args.indexOf('--raise-ceiling');
+  const raiseReason = raiseAt >= 0 ? args[raiseAt + 1] : null;
+  let ceiling = recordedCeiling ?? orphans.length;
+  if (orphans.length > ceiling) {
+    if (raiseReason && !raiseReason.startsWith('--')) {
+      console.warn(`AVERTISSEMENT plafond d'orphelins releve ${ceiling} -> ${orphans.length} : ${raiseReason}`);
+      ceiling = orphans.length;
+    } else {
+      problems.push(`${orphans.length} fichiers source sans diagramme proprietaire, au-dessus du plafond de ${ceiling} : revendiquer le fichier par un glob 'covers' d'une entree verified. Relever le plafond n'est pas la sortie ; si c'est vraiment voulu, --raise-ceiling "<raison>".`);
+    }
+  } else if (orphans.length < ceiling) {
+    ceiling = orphans.length; // le cliquet descend, et ne remonte pas
+  }
+  if (previousDoc !== null && recordedCeiling === null) {
+    problems.push(`${ORPHANS_DOC} ne porte pas de marqueur '<!-- orphan-ceiling: N -->' : le cliquet serait desarme en le supprimant`);
+  }
+
   const rendered = renderOrphans(orphans, totalSources, localIndexes.map(({ repo, entries: le }) => ({
     repo,
     diagrams: le.length,
     owned: [...elsewhere.keys()].filter((k) => k.startsWith(`${repo}:`)).length,
-  })), reserved);
+  })), reserved, ceiling);
   if (args.includes('--write-orphans')) {
     writeFileSync(orphansPath, rendered);
     console.log(`${ORPHANS_DOC} regenere (${orphans.length} orphelins)`);
