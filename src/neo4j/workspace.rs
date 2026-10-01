@@ -1301,6 +1301,72 @@ impl Neo4jClient {
         Ok(())
     }
 
+    /// Create the component if absent, refresh it if already there, and return its id.
+    ///
+    /// `create_component` is a bare `CREATE` with no uniqueness constraint on the
+    /// name, so replaying a derivation on every sync would stack duplicates.
+    /// Identity here is (workspace, name) — the service, not the client package,
+    /// which is what makes a Rust project and a TypeScript one reaching the same
+    /// Neo4j land on a single node.
+    ///
+    /// Human-authored fields are preserved: a derivation may refine what it
+    /// previously derived, never overwrite what somebody wrote. `description`
+    /// is only filled when empty, and existing tags are kept.
+    pub async fn upsert_derived_component(&self, write: DerivedComponentWrite) -> Result<Uuid> {
+        let DerivedComponentWrite {
+            workspace_id,
+            name,
+            component_type,
+            description,
+            runtime,
+            tags,
+            config,
+        } = write;
+        let new_id = Uuid::new_v4();
+        let q = query(
+            r#"
+            MATCH (w:Workspace {id: $workspace_id})
+            MERGE (w)-[:HAS_COMPONENT]->(c:Component {workspace_id: $workspace_id, name: $name})
+            ON CREATE SET
+                c.id = $new_id,
+                c.created_at = datetime($now),
+                c.description = $description,
+                c.tags = $tags
+            SET c.component_type = $component_type,
+                c.runtime = CASE WHEN $runtime = '' THEN coalesce(c.runtime, '') ELSE $runtime END,
+                c.config = $config,
+                c.description = CASE
+                    WHEN coalesce(c.description, '') = '' THEN $description
+                    ELSE c.description
+                END,
+                c.tags = CASE
+                    WHEN coalesce(size(c.tags), 0) = 0 THEN $tags
+                    ELSE c.tags
+                END
+            RETURN c.id AS id
+            "#,
+        )
+        .param("workspace_id", workspace_id.to_string())
+        .param("name", name.clone())
+        .param("new_id", new_id.to_string())
+        .param("now", chrono::Utc::now().to_rfc3339())
+        .param("component_type", format!("{:?}", component_type))
+        .param("description", description.unwrap_or_default())
+        .param("runtime", runtime.unwrap_or_default())
+        .param("tags", tags)
+        .param("config", config.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        match result.next().await? {
+            Some(row) => Ok(row.get::<String>("id")?.parse()?),
+            None => Err(anyhow::anyhow!(
+                "workspace {} not found while upserting component '{}'",
+                workspace_id,
+                name
+            )),
+        }
+    }
+
     /// Get a component by ID
     pub async fn get_component(&self, id: Uuid) -> Result<Option<ComponentNode>> {
         let q = query(
@@ -1343,18 +1409,22 @@ impl Neo4jClient {
     }
 
     /// Update a component
-    pub async fn update_component(
-        &self,
-        id: Uuid,
-        name: Option<String>,
-        description: Option<String>,
-        runtime: Option<String>,
-        config: Option<serde_json::Value>,
-        tags: Option<Vec<String>>,
-    ) -> Result<()> {
+    pub async fn update_component(&self, id: Uuid, patch: ComponentUpdate) -> Result<()> {
+        let ComponentUpdate {
+            name,
+            component_type,
+            description,
+            runtime,
+            config,
+            tags,
+        } = patch;
+
         let mut set_clauses = vec![];
         if name.is_some() {
             set_clauses.push("c.name = $name");
+        }
+        if component_type.is_some() {
+            set_clauses.push("c.component_type = $component_type");
         }
         if description.is_some() {
             set_clauses.push("c.description = $description");
@@ -1373,6 +1443,9 @@ impl Neo4jClient {
             return Ok(());
         }
 
+        // NOTE: a non-existent id matches nothing and still reports success —
+        // the caller gets 204 No Content. Fixing that means returning a match count
+        // up through GraphStore, which is a separate change.
         let cypher = format!(
             "MATCH (c:Component {{id: $id}}) SET {}",
             set_clauses.join(", ")
@@ -1381,6 +1454,11 @@ impl Neo4jClient {
         let mut q = query(&cypher).param("id", id.to_string());
         if let Some(name) = name {
             q = q.param("name", name);
+        }
+        if let Some(component_type) = component_type {
+            // Debug formatting is the storage encoding — node_to_component reads it
+            // back case-insensitively. Keep the two in step.
+            q = q.param("component_type", format!("{:?}", component_type));
         }
         if let Some(description) = description {
             q = q.param("description", description);
@@ -1544,6 +1622,8 @@ impl Neo4jClient {
             "cache" => ComponentType::Cache,
             "gateway" => ComponentType::Gateway,
             "external" => ComponentType::External,
+            "library" => ComponentType::Library,
+            "cli" => ComponentType::Cli,
             _ => ComponentType::Other,
         };
 

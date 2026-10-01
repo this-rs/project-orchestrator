@@ -1201,18 +1201,21 @@ impl GraphStore for MockGraphStore {
             .collect())
     }
 
-    async fn update_component(
-        &self,
-        id: Uuid,
-        name: Option<String>,
-        description: Option<String>,
-        runtime: Option<String>,
-        config: Option<serde_json::Value>,
-        tags: Option<Vec<String>>,
-    ) -> Result<()> {
+    async fn update_component(&self, id: Uuid, patch: ComponentUpdate) -> Result<()> {
+        let ComponentUpdate {
+            name,
+            component_type,
+            description,
+            runtime,
+            config,
+            tags,
+        } = patch;
         if let Some(c) = self.components.write().await.get_mut(&id) {
             if let Some(n) = name {
                 c.name = n;
+            }
+            if let Some(t) = component_type {
+                c.component_type = t;
             }
             if let Some(d) = description {
                 c.description = Some(d);
@@ -1228,6 +1231,70 @@ impl GraphStore for MockGraphStore {
             }
         }
         Ok(())
+    }
+
+    async fn upsert_derived_component(&self, write: DerivedComponentWrite) -> Result<Uuid> {
+        let DerivedComponentWrite {
+            workspace_id,
+            name,
+            component_type,
+            description,
+            runtime,
+            tags,
+            config,
+        } = write;
+        let mut components = self.components.write().await;
+
+        // Identity is (workspace, name) — mirrors the MERGE key in Cypher.
+        if let Some(existing) = components
+            .values_mut()
+            .find(|c| c.workspace_id == workspace_id && c.name == name)
+        {
+            existing.component_type = component_type;
+            existing.config = config;
+            if let Some(r) = runtime.filter(|r| !r.is_empty()) {
+                existing.runtime = Some(r);
+            }
+            // Human-authored text survives a re-derivation.
+            if existing
+                .description
+                .as_deref()
+                .unwrap_or_default()
+                .is_empty()
+            {
+                existing.description = description;
+            }
+            if existing.tags.is_empty() {
+                existing.tags = tags;
+            }
+            return Ok(existing.id);
+        }
+
+        let id = Uuid::new_v4();
+        components.insert(
+            id,
+            ComponentNode {
+                id,
+                workspace_id,
+                name,
+                component_type,
+                description,
+                runtime: runtime.filter(|r| !r.is_empty()),
+                config,
+                created_at: chrono::Utc::now(),
+                tags,
+            },
+        );
+        drop(components);
+
+        self.workspace_components
+            .write()
+            .await
+            .entry(workspace_id)
+            .or_default()
+            .push(id);
+
+        Ok(id)
     }
 
     async fn delete_component(&self, id: Uuid) -> Result<()> {

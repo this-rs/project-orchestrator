@@ -6406,6 +6406,7 @@ dependencies = [
  "tokio-stream",
  "tokio-test",
  "tokio-util",
+ "toml 0.8.2",
  "tower",
  "tower-http 0.7.0",
  "tracing",

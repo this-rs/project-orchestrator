@@ -730,13 +730,13 @@ fn note_tool() -> ToolDefinition {
 fn workspace_tool() -> ToolDefinition {
     ToolDefinition {
         name: "workspace".to_string(),
-        description: "Manage workspaces. Actions: list, create, get, update, delete, get_overview, list_projects, add_project, remove_project, get_topology, get_coupling_matrix".to_string(),
+        description: "Manage workspaces. Actions: list, create, get, update, delete, get_overview, list_projects, add_project, remove_project, get_topology, derive_topology, get_coupling_matrix. `derive_topology` rebuilds the architecture from the projects' source trees (manifests, compose files, dev-server proxies) — it is idempotent and also runs after every sync.".to_string(),
         input_schema: InputSchema {
             schema_type: "object".to_string(),
             properties: Some(json!({
                 "action": {
                     "type": "string",
-                    "enum": ["list", "create", "get", "update", "delete", "get_overview", "list_projects", "add_project", "remove_project", "get_topology"],
+                    "enum": ["list", "create", "get", "update", "delete", "get_overview", "list_projects", "add_project", "remove_project", "get_topology", "derive_topology", "get_coupling_matrix"],
                     "description": "Operation to perform"
                 },
                 "slug": {"type": "string", "description": "Workspace slug (identifier)"},
@@ -813,7 +813,7 @@ fn resource_tool() -> ToolDefinition {
 fn component_tool() -> ToolDefinition {
     ToolDefinition {
         name: "component".to_string(),
-        description: "Manage workspace components (services, modules). Actions: list, create, get, update, delete, add_dependency, remove_dependency, map_to_project".to_string(),
+        description: "Manage workspace components (services, modules). Actions: list, create, get, update, delete, add_dependency, remove_dependency, map_to_project. Dependencies use `id` (source) + `depends_on_id`/`dep_id` (target).".to_string(),
         input_schema: InputSchema {
             schema_type: "object".to_string(),
             properties: Some(json!({
@@ -825,14 +825,19 @@ fn component_tool() -> ToolDefinition {
                 "id": {"type": "string", "description": "Component UUID (get/update/delete)"},
                 "slug": {"type": "string", "description": "Workspace slug (list/create)"},
                 "name": {"type": "string", "description": "Component name (create/update)"},
-                "component_type": {"type": "string", "description": "Type (create): service, library, database, queue, external"},
+                "component_type": {
+                    "type": "string",
+                    "enum": ["service", "frontend", "worker", "database", "message_queue", "cache", "gateway", "external", "library", "cli", "other"],
+                    "description": "Type (create/update). Mirrors ComponentType in neo4j/models.rs; an unknown value is rejected."
+                },
                 "description": {"type": "string", "description": "Description (create/update)"},
                 "runtime": {"type": "string", "description": "Runtime (create/update)"},
                 "config": {"type": "object", "description": "Config (create/update)"},
                 "tags": {"type": "array", "items": {"type": "string"}, "description": "Tags (create/update)"},
-                "from_id": {"type": "string", "description": "Source component UUID (add_dependency/remove_dependency)"},
-                "to_id": {"type": "string", "description": "Target component UUID (add_dependency/remove_dependency)"},
-                "dependency_type": {"type": "string", "description": "Dependency type (add_dependency)"},
+                "depends_on_id": {"type": "string", "description": "Target component UUID (add_dependency) — the source is `id`"},
+                "dep_id": {"type": "string", "description": "Target component UUID (remove_dependency) — the source is `id`"},
+                "protocol": {"type": "string", "description": "Wire protocol of the dependency (add_dependency), e.g. HTTP, Bolt, NATS. Rendered as the edge label."},
+                "required": {"type": "boolean", "description": "Whether the dependency is required (add_dependency, default true). Optional ones render dashed."},
                 "component_id": {"type": "string", "description": "Component UUID (map_to_project)"},
                 "project_id": {"type": "string", "description": "Project UUID (map_to_project)"}
             })),

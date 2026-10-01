@@ -1063,6 +1063,11 @@ async fn handle_project_created(
                         orch.spawn_analyze_project(project_id);
                         // Refresh auto-built feature graphs
                         orch.spawn_refresh_feature_graphs(project_id);
+                        // Re-derive the architecture from the source tree
+                        crate::architecture::sync::spawn_derive_architecture(
+                            orch.neo4j_arc(),
+                            project_id,
+                        );
                     }
                     Err(e) => {
                         tracing::warn!(

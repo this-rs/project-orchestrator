@@ -346,17 +346,12 @@ impl GraphStore for Neo4jClient {
         self.list_components(workspace_id).await
     }
 
-    async fn update_component(
-        &self,
-        id: Uuid,
-        name: Option<String>,
-        description: Option<String>,
-        runtime: Option<String>,
-        config: Option<serde_json::Value>,
-        tags: Option<Vec<String>>,
-    ) -> anyhow::Result<()> {
-        self.update_component(id, name, description, runtime, config, tags)
-            .await
+    async fn update_component(&self, id: Uuid, patch: ComponentUpdate) -> anyhow::Result<()> {
+        self.update_component(id, patch).await
+    }
+
+    async fn upsert_derived_component(&self, write: DerivedComponentWrite) -> anyhow::Result<Uuid> {
+        self.upsert_derived_component(write).await
     }
 
     async fn delete_component(&self, id: Uuid) -> anyhow::Result<()> {

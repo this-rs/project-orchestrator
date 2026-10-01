@@ -390,6 +390,7 @@ impl ToolHandler {
             ("workspace", "add_project") => "add_project_to_workspace",
             ("workspace", "remove_project") => "remove_project_from_workspace",
             ("workspace", "get_topology") => "get_workspace_topology",
+            ("workspace", "derive_topology") => "derive_workspace_topology",
             ("workspace", "get_coupling_matrix") => "get_coupling_matrix",
 
             // Workspace Milestone
@@ -3315,6 +3316,17 @@ impl ToolHandler {
                 Ok(Some(result))
             }
 
+            "derive_workspace_topology" => {
+                let slug = extract_string(args, "slug")?;
+                let result = http
+                    .post(
+                        &format!("/api/workspaces/{}/topology/derive", slug),
+                        &json!({}),
+                    )
+                    .await?;
+                Ok(Some(result))
+            }
+
             "get_coupling_matrix" => {
                 let slug = extract_string(args, "slug")?;
                 let result = http
@@ -3606,6 +3618,9 @@ impl ToolHandler {
                 let mut body = serde_json::Map::new();
                 if let Some(v) = args.get("name") {
                     body.insert("name".to_string(), v.clone());
+                }
+                if let Some(v) = args.get("component_type") {
+                    body.insert("component_type".to_string(), v.clone());
                 }
                 if let Some(v) = args.get("description") {
                     body.insert("description".to_string(), v.clone());

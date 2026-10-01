@@ -1805,6 +1805,9 @@ pub async fn sync_directory(
             }
         });
 
+        // Re-derive the architecture from the source tree (best-effort).
+        crate::architecture::sync::spawn_derive_architecture(state.orchestrator.neo4j_arc(), pid);
+
         // Spawn event-triggered protocol runs (post_sync)
         crate::protocol::hooks::spawn_event_triggered_protocols(
             state.orchestrator.neo4j_arc(),

@@ -12,6 +12,7 @@
 
 pub mod analytics;
 pub mod api;
+pub mod architecture;
 pub mod auth;
 pub mod chat;
 pub mod documents;
@@ -1666,8 +1667,9 @@ pub async fn start_server(mut config: Config) -> Result<()> {
     // Runs independently of chat sessions (like ScheduleProvider).
     {
         use heartbeat::checks::{
-            consolidation::ConsolidationCheck, convention_guard::ConventionGuardCheck,
-            git_drift::GitDriftCheck, homeostasis::HomeostasisCheck, maintenance::MaintenanceCheck,
+            architecture_drift::ArchitectureDriftCheck, consolidation::ConsolidationCheck,
+            convention_guard::ConventionGuardCheck, git_drift::GitDriftCheck,
+            homeostasis::HomeostasisCheck, maintenance::MaintenanceCheck,
             staleness::StalenessCheck, synapse_decay::SynapseDecayCheck,
             synapse_replenish::SynapseReplenishCheck,
         };
@@ -1686,6 +1688,11 @@ pub async fn start_server(mut config: Config) -> Result<()> {
             Box::new(MaintenanceCheck::new()),
             Box::new(ConsolidationCheck),
             Box::new(HomeostasisCheck::new()),
+            // Derives the architecture of ONE workspace per tick, rotating. It
+            // touches nothing the synapse checks care about, so its position here
+            // is free — but its per-run bound is not: the engine awaits each
+            // check inline, so an unbounded one starves the rest (PR #309).
+            Box::new(ArchitectureDriftCheck::new()),
             // MUST run LAST: the engine executes checks in vec order within a tick
             // (engine.rs:88). SynapseDecayCheck and MaintenanceCheck (deep_maintenance
             // applies an aggressive 3x decay + prune) both delete synapses; replenish

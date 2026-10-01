@@ -1346,17 +1346,17 @@ pub async fn create_component(
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Workspace '{}' not found", slug)))?;
 
-    let component_type = match req.component_type.to_lowercase().as_str() {
-        "service" => ComponentType::Service,
-        "frontend" => ComponentType::Frontend,
-        "worker" => ComponentType::Worker,
-        "database" => ComponentType::Database,
-        "messagequeue" | "message_queue" => ComponentType::MessageQueue,
-        "cache" => ComponentType::Cache,
-        "gateway" => ComponentType::Gateway,
-        "external" => ComponentType::External,
-        _ => ComponentType::Other,
-    };
+    // Parse through ComponentType::FromStr (models.rs) rather than a local match:
+    // a second copy drifts, and the drift is silent. An unknown type is rejected
+    // instead of collapsing to `Other` — a mistyped component is otherwise
+    // uncorrectable forever (the type is only writable here and on update).
+    let component_type: ComponentType = req.component_type.parse().map_err(|_| {
+        AppError::BadRequest(format!(
+            "Unknown component_type '{}'. Expected one of: service, frontend, worker, \
+             database, message_queue, cache, gateway, external, library, cli, other",
+            req.component_type
+        ))
+    })?;
 
     let component = ComponentNode {
         id: Uuid::new_v4(),
@@ -1401,6 +1401,8 @@ pub async fn get_component(
 #[derive(Deserialize)]
 pub struct UpdateComponentRequest {
     pub name: Option<String>,
+    /// Component type. Omitted = unchanged. Accepts the same spellings as creation.
+    pub component_type: Option<String>,
     pub description: Option<String>,
     pub runtime: Option<String>,
     pub config: Option<serde_json::Value>,
@@ -1417,15 +1419,32 @@ pub async fn update_component(
         .parse()
         .map_err(|_| AppError::BadRequest("Invalid component ID".to_string()))?;
 
+    let component_type = req
+        .component_type
+        .as_deref()
+        .map(|raw| {
+            raw.parse::<ComponentType>().map_err(|_| {
+                AppError::BadRequest(format!(
+                    "Unknown component_type '{}'. Expected one of: service, frontend, worker, \
+                     database, message_queue, cache, gateway, external, library, cli, other",
+                    raw
+                ))
+            })
+        })
+        .transpose()?;
+
     state
         .orchestrator
         .update_component(
             id,
-            req.name,
-            req.description,
-            req.runtime,
-            req.config,
-            req.tags,
+            ComponentUpdate {
+                name: req.name,
+                component_type,
+                description: req.description,
+                runtime: req.runtime,
+                config: req.config,
+                tags: req.tags,
+            },
         )
         .await?;
 
@@ -1514,6 +1533,34 @@ pub async fn map_component_to_project(
 }
 
 /// Get workspace topology
+/// Re-derive the workspace topology from its projects' source trees.
+///
+/// The derivation also runs after every sync and on a heartbeat rotation; this
+/// exists so the result can be demanded rather than waited for — after editing a
+/// compose file, say, or right after registering a project.
+///
+/// Safe to call repeatedly: the derivation is deterministic and writes through an
+/// upsert, so a run that finds nothing new changes nothing.
+pub async fn derive_workspace_topology(
+    State(state): State<OrchestratorState>,
+    Path(slug): Path<String>,
+) -> Result<Json<crate::architecture::sync::DerivationOutcome>, AppError> {
+    let workspace = state
+        .orchestrator
+        .neo4j()
+        .get_workspace_by_slug(&slug)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("Workspace '{}' not found", slug)))?;
+
+    let outcome = crate::architecture::sync::derive_and_store_workspace(
+        state.orchestrator.neo4j_arc(),
+        workspace.id,
+    )
+    .await?;
+
+    Ok(Json(outcome))
+}
+
 pub async fn get_workspace_topology(
     State(state): State<OrchestratorState>,
     Path(slug): Path<String>,
@@ -2214,9 +2261,13 @@ mod tests {
 
     #[test]
     fn test_update_component_request_all_fields() {
-        let json = r#"{"name":"Auth","description":"Auth service","runtime":"rust","config":{"port":8080},"tags":["auth","core"]}"#;
+        let json = r#"{"name":"Auth","component_type":"gateway","description":"Auth service","runtime":"rust","config":{"port":8080},"tags":["auth","core"]}"#;
         let req: UpdateComponentRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.name, Some("Auth".to_string()));
+        // This assertion is the point of the test: the field was missing from the
+        // struct, so serde silently dropped it and the API answered 204 while
+        // changing nothing. "all_fields" was green without ever covering it.
+        assert_eq!(req.component_type, Some("gateway".to_string()));
         assert_eq!(req.description, Some("Auth service".to_string()));
         assert_eq!(req.runtime, Some("rust".to_string()));
         assert!(req.config.is_some());
@@ -2229,10 +2280,47 @@ mod tests {
         let json = r#"{}"#;
         let req: UpdateComponentRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.name, None);
+        assert_eq!(req.component_type, None);
         assert_eq!(req.description, None);
         assert_eq!(req.runtime, None);
         assert_eq!(req.config, None);
         assert_eq!(req.tags, None);
+    }
+
+    #[test]
+    fn test_component_type_parses_documented_spellings() {
+        // create_component used to carry its own match with a `_ => Other` arm, so
+        // "queue" and "message_queue" — both advertised by the MCP schema — landed
+        // silently as Other. Both handlers now go through ComponentType::FromStr.
+        for (raw, expected) in [
+            ("service", ComponentType::Service),
+            ("frontend", ComponentType::Frontend),
+            ("message_queue", ComponentType::MessageQueue),
+            ("queue", ComponentType::MessageQueue),
+            ("database", ComponentType::Database),
+            ("gateway", ComponentType::Gateway),
+            ("external", ComponentType::External),
+            ("library", ComponentType::Library),
+            ("framework", ComponentType::Library),
+            ("cli", ComponentType::Cli),
+            ("other", ComponentType::Other),
+        ] {
+            assert_eq!(
+                raw.parse::<ComponentType>().unwrap(),
+                expected,
+                "'{}' must not collapse to Other",
+                raw
+            );
+        }
+    }
+
+    #[test]
+    fn test_component_type_rejects_unknown_instead_of_defaulting() {
+        // An unknown type must fail loudly rather than collapse to Other: a
+        // mistyped component used to be uncorrectable forever.
+        assert!("".parse::<ComponentType>().is_err());
+        assert!("queue_thing".parse::<ComponentType>().is_err());
+        assert!("Postgres".parse::<ComponentType>().is_err());
     }
 
     #[test]

@@ -5064,18 +5064,8 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
     }
 
     /// Update a component and emit event
-    pub async fn update_component(
-        &self,
-        id: Uuid,
-        name: Option<String>,
-        description: Option<String>,
-        runtime: Option<String>,
-        config: Option<serde_json::Value>,
-        tags: Option<Vec<String>>,
-    ) -> Result<()> {
-        self.neo4j()
-            .update_component(id, name, description, runtime, config, tags)
-            .await?;
+    pub async fn update_component(&self, id: Uuid, patch: ComponentUpdate) -> Result<()> {
+        self.neo4j().update_component(id, patch).await?;
         self.emit(CrudEvent::new(
             EventEntityType::Component,
             CrudAction::Updated,
@@ -6282,11 +6272,55 @@ mod tests {
     #[tokio::test]
     async fn test_update_component_emits_event() {
         let (orch, mut rx) = orch_with_bus().await;
-        orch.update_component(Uuid::new_v4(), Some("n".into()), None, None, None, None)
-            .await
-            .unwrap();
+        orch.update_component(
+            Uuid::new_v4(),
+            ComponentUpdate {
+                name: Some("n".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
         let ev = rx.try_recv().unwrap();
         assert_eq!(ev.action, CrudAction::Updated);
+    }
+
+    /// `component_type` used to be absent from the update path: the request struct
+    /// had no such field, so the API answered 204 No Content while changing nothing
+    /// and a mistyped component stayed mistyped forever. The event-emission test
+    /// above passes either way, so it cannot guard this — assert the write lands.
+    #[tokio::test]
+    async fn test_update_component_persists_component_type() {
+        let (orch, _rx) = orch_with_bus().await;
+        let comp = ComponentNode {
+            id: Uuid::new_v4(),
+            workspace_id: Uuid::new_v4(),
+            name: "PO Frontend".into(),
+            component_type: ComponentType::Service,
+            description: None,
+            runtime: None,
+            config: serde_json::json!({}),
+            created_at: chrono::Utc::now(),
+            tags: vec![],
+        };
+        orch.create_component(&comp).await.unwrap();
+
+        orch.update_component(
+            comp.id,
+            ComponentUpdate {
+                component_type: Some(ComponentType::Frontend),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let stored = orch.neo4j().get_component(comp.id).await.unwrap().unwrap();
+        assert_eq!(
+            stored.component_type,
+            ComponentType::Frontend,
+            "component_type must be writable — a frontend stuck as Service never reaches tier 0 in the architecture view"
+        );
     }
 
     #[tokio::test]

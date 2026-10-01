@@ -386,6 +386,15 @@ pub async fn sync_project(
     // Refresh auto-built feature graphs in background (best-effort)
     state.orchestrator.spawn_refresh_feature_graphs(project.id);
 
+    // Re-derive the architecture from the source tree (best-effort).
+    // Attached to all three sync paths, which do not otherwise run the same
+    // hooks: wiring it to only one would leave the topology stale depending on
+    // what triggered the sync, which is the failure this whole thing removes.
+    crate::architecture::sync::spawn_derive_architecture(
+        state.orchestrator.neo4j_arc(),
+        project.id,
+    );
+
     // Spawn event-triggered protocol runs (post_sync)
     crate::protocol::hooks::spawn_event_triggered_protocols(
         state.orchestrator.neo4j_arc(),

@@ -276,15 +276,12 @@ pub trait GraphStore: Send + Sync {
     async fn list_components(&self, workspace_id: Uuid) -> Result<Vec<ComponentNode>>;
 
     /// Update a component
-    async fn update_component(
-        &self,
-        id: Uuid,
-        name: Option<String>,
-        description: Option<String>,
-        runtime: Option<String>,
-        config: Option<serde_json::Value>,
-        tags: Option<Vec<String>>,
-    ) -> Result<()>;
+    async fn update_component(&self, id: Uuid, patch: ComponentUpdate) -> Result<()>;
+
+    /// Create the component if absent, refresh it if present, and return its id.
+    /// Identity is (workspace, name). Used by architecture derivation, which runs
+    /// on every sync and must not stack duplicates the way `create_component` would.
+    async fn upsert_derived_component(&self, write: DerivedComponentWrite) -> Result<Uuid>;
 
     /// Delete a component
     async fn delete_component(&self, id: Uuid) -> Result<()>;

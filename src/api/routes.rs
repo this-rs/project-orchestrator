@@ -1795,6 +1795,10 @@ fn protected_routes() -> Router<OrchestratorState> {
             get(workspace_handlers::get_workspace_topology),
         )
         .route(
+            "/api/workspaces/{slug}/topology/derive",
+            post(workspace_handlers::derive_workspace_topology),
+        )
+        .route(
             "/api/workspaces/{slug}/coupling-matrix",
             get(workspace_handlers::get_coupling_matrix),
         )

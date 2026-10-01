@@ -1275,6 +1275,12 @@ pub enum ComponentType {
     Gateway,
     /// External service (third-party)
     External,
+    /// Library or framework consumed at build time, not deployed on its own.
+    /// Without this, every library lands in `Other` beside genuine services.
+    Library,
+    /// Command-line tool. An entry point into the system like a frontend is,
+    /// which is why typing one as `Service` misplaces it entirely.
+    Cli,
     /// Other component type
     Other,
 }
@@ -1292,10 +1298,48 @@ impl std::str::FromStr for ComponentType {
             "cache" => Ok(ComponentType::Cache),
             "gateway" | "apigateway" | "api_gateway" => Ok(ComponentType::Gateway),
             "external" => Ok(ComponentType::External),
+            "library" | "lib" | "framework" => Ok(ComponentType::Library),
+            "cli" | "commandline" | "tool" => Ok(ComponentType::Cli),
             "other" => Ok(ComponentType::Other),
             _ => Err(format!("Unknown ComponentType: {}", s)),
         }
     }
+}
+
+/// A component as architecture derivation wants it written.
+///
+/// A struct rather than a parameter list: this carries two `Option<String>` and a
+/// `Vec<String>` side by side, which is the shape that let `component_type` go
+/// missing from the update path unnoticed in the first place.
+#[derive(Debug, Clone)]
+pub struct DerivedComponentWrite {
+    pub workspace_id: Uuid,
+    /// Identity, together with the workspace. The product name, not the client
+    /// package: a Rust project and a TypeScript one reaching the same Neo4j must
+    /// resolve to one node.
+    pub name: String,
+    pub component_type: ComponentType,
+    pub description: Option<String>,
+    pub runtime: Option<String>,
+    pub tags: Vec<String>,
+    /// Free-form config carrying the provenance of this derivation.
+    pub config: serde_json::Value,
+}
+
+/// Fields to change on a component. `None` leaves a field untouched.
+///
+/// A named struct rather than a positional argument list: the update path carries
+/// four `Option<String>` in a row, and two of them were once swappable without the
+/// compiler noticing. `component_type` in particular was absent from this update
+/// path entirely, so the API reported success while silently discarding it.
+#[derive(Debug, Clone, Default)]
+pub struct ComponentUpdate {
+    pub name: Option<String>,
+    pub component_type: Option<ComponentType>,
+    pub description: Option<String>,
+    pub runtime: Option<String>,
+    pub config: Option<serde_json::Value>,
+    pub tags: Option<Vec<String>>,
 }
 
 /// A component in the deployment topology
