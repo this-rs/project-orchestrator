@@ -6,6 +6,13 @@ on:
   pull_request:
     branches: [main]
 
+# Toolchain: every job pins dtolnay/rust-toolchain@1.95.0, the same version as
+# rust-toolchain.toml (keep the two in sync when bumping). "@stable" was
+# ambiguous: the action installs stable, then rustup's rust-toolchain.toml
+# override silently wins for cargo, so the action input was dead. cargo-audit /
+# cargo-deny are installed with --locked under 1.95 on purpose: an unlocked
+# install resolves deps needing rustc >= 1.96 (kstring 2.0.5) and fails to build
+# (see security.yml).
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -21,7 +28,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.95.0
 
       - name: Cache cargo registry
         uses: Swatinem/rust-cache@v2
@@ -52,7 +59,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.95.0
 
       - name: Cache cargo registry
         uses: Swatinem/rust-cache@v2
@@ -98,7 +105,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.95.0
         with:
           components: clippy, rustfmt
 
@@ -159,7 +166,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.95.0
 
       - name: Cache cargo registry
         uses: Swatinem/rust-cache@v2
@@ -176,6 +183,17 @@ jobs:
 
       - name: Run parser tests
         run: cargo test --test parser_tests
+
+      # Integration targets that need no external service (in-process axum on
+      # random ports, pure logic). They were never run in CI before.
+      #   p2p_integration, p2p_http_exchange: P2P pipeline + two local axum servers
+      #   prompt_completeness: tool-reference/group coverage guard
+      #   routing_metamorphic: RoutingProvider invariance harness
+      # Deliberately NOT run here (all #[ignore]d, need live resources):
+      #   mcp_federation_integration: real remote MCP servers over the network
+      #   cancel_task_e2e, cancel_tools_e2e: Anthropic API key + Claude Code CLI
+      - name: Run service-free integration tests
+        run: cargo test --test p2p_integration --test p2p_http_exchange --test prompt_completeness --test routing_metamorphic
 
   # ==========================================================================
   # Integration Tests - Requires Neo4j and Meilisearch
@@ -217,7 +235,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.95.0
 
       - name: Cache cargo registry
         uses: Swatinem/rust-cache@v2
@@ -240,7 +258,7 @@ jobs:
           NEO4J_PASSWORD: testpassword
           MEILISEARCH_URL: http://localhost:7700
           MEILISEARCH_KEY: test-master-key
-        run: cargo test --test integration_tests --test data_migrations
+        run: cargo test --test integration_tests --test data_migrations --test workspace_tests
 
   # ==========================================================================
   # API Tests - Downloads pre-built binary, requires Neo4j and Meilisearch
@@ -282,7 +300,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.95.0
 
       - name: Cache cargo registry
         uses: Swatinem/rust-cache@v2
@@ -373,7 +391,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.95.0
         with:
           components: llvm-tools-preview
 
