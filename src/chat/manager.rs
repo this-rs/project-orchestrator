@@ -5126,7 +5126,19 @@ impl ChatManager {
         if require_pending && claimed.is_none() {
             return Err(PermissionDeliveryError::NotPending);
         }
+        let was_claimed = claimed.is_some();
         let original_input = claimed.unwrap_or_else(|| serde_json::json!({}));
+        // The entry is only really consumed once the decision reached the CLI:
+        // on a failed send it is put back so a retry is still `pending`.
+        let restore_claim = |input: serde_json::Value| {
+            let pending = pending_perm_inputs.clone();
+            let request_id = request_id.to_string();
+            async move {
+                if was_claimed {
+                    pending.lock().await.insert(request_id, input);
+                }
+            }
+        };
 
         let permission_response = if allow {
             serde_json::json!({
@@ -5150,9 +5162,16 @@ impl ChatManager {
             }
         });
 
-        let json = serde_json::to_string(&control_response).map_err(|e| {
-            PermissionDeliveryError::Failed(anyhow!("Failed to serialize control response: {}", e))
-        })?;
+        let json = match serde_json::to_string(&control_response) {
+            Ok(j) => j,
+            Err(e) => {
+                restore_claim(original_input).await;
+                return Err(PermissionDeliveryError::Failed(anyhow!(
+                    "Failed to serialize control response: {}",
+                    e
+                )));
+            }
+        };
 
         info!(
             session_id = %session_id,
@@ -5161,12 +5180,13 @@ impl ChatManager {
             "Sending permission control response to CLI (via stdin_tx, lock-free)"
         );
 
-        stdin_tx.send(json).await.map_err(|e| {
-            PermissionDeliveryError::Failed(anyhow!(
+        if let Err(e) = stdin_tx.send(json).await {
+            restore_claim(original_input).await;
+            return Err(PermissionDeliveryError::Failed(anyhow!(
                 "Failed to send permission control response: {}",
                 e
-            ))
-        })?;
+            )));
+        }
 
         // Persist and broadcast the permission decision so it survives session reload.
         let decision_event = ChatEvent::PermissionDecision {
@@ -8944,7 +8964,16 @@ mod tests {
             &graph.session_link_rows.read().await.clone(),
         );
 
-        // Fails at CLI start in tests: identity must hold either way.
+        let rows_before = graph.session_link_rows.read().await.clone();
+
+        // WHAT THIS PROVES: `resume_session` reads the stored session, never
+        // creates another one and never touches its link rows, up to the CLI
+        // spawn. In tests the spawn itself fails (or succeeds against whatever
+        // `claude` is installed), so what happens to the links AFTER a real
+        // spawn is NOT exercised here: `resume_session` has no call to
+        // `link_session_to_run` / `create_spawned_by_relation` at all
+        // (they live in `create_session` only), which is what the row-for-row
+        // comparison below pins on the mock.
         let _ = manager
             .resume_session(&s.id.to_string(), "continue", None)
             .await;
@@ -8961,9 +8990,51 @@ mod tests {
             "spawned_by kept"
         );
         let rows = graph.session_link_rows.read().await.clone();
+        assert_eq!(
+            rows, rows_before,
+            "the stored link rows are not rewritten, added to or removed by a resume"
+        );
         let after = crate::chat::attachment::attach(&after_sessions, &rows);
         assert_eq!(after.by_plan, before.by_plan, "same links, same thread");
         assert!(after.unattached.is_empty(), "never a detached session");
+    }
+
+    #[tokio::test]
+    async fn failed_stdin_send_keeps_the_permission_pending_for_a_retry() {
+        let (manager, _graph) = manager_with_mock();
+        let sid = Uuid::new_v4().to_string();
+        let (stdin_rx, _q) =
+            super::test_support::insert_live_session(&manager, &sid, false, &["req-1"])
+                .await
+                .expect("the Claude CLI binary must be installed to run this test");
+        // The CLI is gone: the stdin channel is closed, the send fails.
+        drop(stdin_rx);
+        let mut events = {
+            let sessions = manager.active_sessions.read().await;
+            sessions[&sid].events_tx.subscribe()
+        };
+
+        for attempt in 1..=2 {
+            let err = manager
+                .send_permission_response_inner(&sid, "req-1", true, true)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, PermissionDeliveryError::Failed(_)),
+                "attempt {attempt}: a failed send stays a delivery failure, not NotPending ({err})"
+            );
+        }
+        let pending = manager.active_sessions.read().await[&sid]
+            .pending_permission_inputs
+            .clone();
+        assert!(
+            pending.lock().await.contains_key("req-1"),
+            "the request is still pending"
+        );
+        assert!(
+            events.try_recv().is_err(),
+            "no permission_decision is broadcast for a decision that was not sent"
+        );
     }
 
     // ====================================================================
@@ -13851,7 +13922,8 @@ pub(crate) mod test_support {
     /// Register a live session. Returns the receiver of what would be written
     /// to the CLI's stdin and the queue of messages received while streaming,
     /// or `None` when the Claude CLI binary is not installed (the dummy client
-    /// needs it).
+    /// needs it). Callers that assert something must `.expect` it: a test must
+    /// never pass without verifying anything.
     pub(crate) async fn insert_live_session(
         manager: &ChatManager,
         session_id: &str,
