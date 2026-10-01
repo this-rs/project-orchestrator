@@ -1,8 +1,8 @@
 <!-- Genere par scripts/diagrams/check-index.mjs --write-orphans. Ne pas editer a la main. -->
-<!-- orphan-ceiling: 1201 -->
-<!-- orphan-ceiling-backend: 456 -->
-<!-- orphan-ceiling-frontend: 545 -->
-<!-- orphan-ceiling-nexus: 73 -->
+<!-- orphan-ceiling: 1224 -->
+<!-- orphan-ceiling-backend: 462 -->
+<!-- orphan-ceiling-frontend: 559 -->
+<!-- orphan-ceiling-nexus: 76 -->
 <!-- orphan-ceiling-website: 127 -->
 
 # Fichiers source sans diagramme proprietaire
@@ -11,15 +11,15 @@ Un fichier source est **orphelin** quand aucun `covers` de `INDEX.yml` ne le mat
 aucun diagramme ne repond de son comportement. Cette liste est publiee pour etre honnete
 sur ce que la cartographie couvre reellement — on ne reduit pas le denominateur, on la reduit elle.
 
-**1201 orphelins sur 1204 fichiers source (99.8 %).**
+**1224 orphelins sur 1224 fichiers source (100.0 %).**
 
 SEULE une entree `verified` possede un fichier. Une entree `planned` annonce un perimetre
 sans qu'un diagramme existe : compter ses globs ferait baisser ce nombre sans qu'une ligne
 soit ecrite, et l'index acheterait du credit sur des intentions.
-Sur les 1201 orphelins, **470 sont deja reserves** par une entree `planned` :
+Sur les 1224 orphelins, **471 sont deja reserves** par une entree `planned` :
 leur proprietaire est designe, son diagramme reste a ecrire.
 
-Le plafond est **1201** : le verificateur echoue si le nombre reel le depasse.
+Le plafond est **1224** : le verificateur echoue si le nombre reel le depasse.
 Il ne peut que descendre. Ajouter un fichier source sans proprietaire fait echouer la build ;
 la sortie est un glob `covers`, pas un plafond plus haut. `--raise-ceiling` existe mais exige
 une raison ecrite, et un plafond releve se voit dans la revue.
@@ -30,13 +30,7 @@ Regeneration (hors reseau) :
 node scripts/diagrams/check-index.mjs --write-orphans
 ```
 
-Un depot voisin peut tenir son propre index pour les diagrammes dont le `.mmd` vit chez lui.
-Les fichiers qu'il possede ont un proprietaire et ne figurent donc pas ci-dessous ; toute
-collision entre les deux index est une erreur, pas un arrangement.
-
-- `nexus` : 3 diagrammes, 24 fichiers possedes la-bas
-
-## backend (456)
+## backend (462)
 
 - `crates/neural-routing-core/src/` (12) : `augmentation.rs`, `error.rs`, `lib.rs`, `mcts.rs`, `migration.rs`, `models.rs`, `proxy_model.rs`, `reward.rs`, `store.rs`, `traits.rs`, `validation.rs`, `vector_builder.rs`
 - `crates/neural-routing-gnn/src/` (9) : `encoder.rs`, `features.rs`, `graph_sage.rs`, `inference.rs`, `lib.rs`, `message_passing.rs`, `rgcn.rs`, `sampler.rs`, `training.rs`
@@ -51,17 +45,17 @@ collision entre les deux index est une erreur, pas un arrangement.
 - `src/` (5) : `cli.rs`, `homeostasis.rs`, `lib.rs`, `main.rs`, `setup_claude.rs`
 - `src/analytics/` (3) : `distribution.rs`, `hypothesis.rs`, `mod.rs`
 - `src/analytics/stats/` (5) : `anova.rs`, `fitting.rs`, `golden_fixtures.rs`, `mean_std.rs`, `mod.rs`
-- `src/api/` (35) : `auth_handlers.rs`, `chat_handlers.rs`, `code_handlers.rs`, `document_handlers.rs`, `embedded_frontend.rs`, `environment_handlers.rs`, `episode_handlers.rs`, `feedback_handlers.rs`, `graph_handlers.rs`, `graph_types.rs`, `handlers.rs`, `hook_handlers.rs`, `mcp_federation_handlers.rs`, `mod.rs`, `neural_routing_handlers.rs`, `note_handlers.rs`, `persona_handlers.rs`, `profile_handlers.rs`, `project_handlers.rs`, `protocol_handlers.rs`, `query.rs`, `reason_handlers.rs`, `registry_handlers.rs`, `rfc_handlers.rs`, `routes.rs`, `sharing_handlers.rs`, `skill_handlers.rs`, `trajectory_handlers.rs`, `trigger_handlers.rs`, `vault_handlers.rs`, `workspace_handlers.rs`, `ws_auth.rs`, `ws_chat_handler.rs`, `ws_handlers.rs`, `ws_run_handler.rs`
+- `src/api/` (37) : `attention.rs`, `attention_aggregate.rs`, `auth_handlers.rs`, `chat_handlers.rs`, `code_handlers.rs`, `document_handlers.rs`, `embedded_frontend.rs`, `environment_handlers.rs`, `episode_handlers.rs`, `feedback_handlers.rs`, `graph_handlers.rs`, `graph_types.rs`, `handlers.rs`, `hook_handlers.rs`, `mcp_federation_handlers.rs`, `mod.rs`, `neural_routing_handlers.rs`, `note_handlers.rs`, `persona_handlers.rs`, `profile_handlers.rs`, `project_handlers.rs`, `protocol_handlers.rs`, `query.rs`, `reason_handlers.rs`, `registry_handlers.rs`, `rfc_handlers.rs`, `routes.rs`, `sharing_handlers.rs`, `skill_handlers.rs`, `trajectory_handlers.rs`, `trigger_handlers.rs`, `vault_handlers.rs`, `workspace_handlers.rs`, `ws_auth.rs`, `ws_chat_handler.rs`, `ws_handlers.rs`, `ws_run_handler.rs`
 - `src/architecture/` (7) : `catalogue.rs`, `compose.rs`, `derive.rs`, `manifest.rs`, `mod.rs`, `runtime_config.rs`, `sync.rs`
 - `src/auth/` (8) : `extractor.rs`, `google.rs`, `jwt.rs`, `middleware.rs`, `mod.rs`, `oauth_server.rs`, `oidc.rs`, `refresh.rs`
 - `src/bin/` (1) : `mcp_server.rs`
-- `src/chat/` (27) : `cli_auth.rs`, `cli_version.rs`, `compaction_context.rs`, `composer.rs`, `config.rs`, `continuity.rs`, `control_pump.rs`, `drain.rs`, `enrichment.rs`, `entity_extractor.rs`, `feedback.rs`, `hook_ledger.rs`, `manager.rs`, `mod.rs`, `model_catalog.rs`, `observation_detector.rs`, `oob_listener.rs`, `path_detect.rs`, `post_stream.rs`, `post_tool_hook.rs`, `prompt.rs`, `prompt_sections.rs`, `routing.rs`, `skill_hook.rs`, `types.rs`, `viz.rs`, `viz_builder.rs`
+- `src/chat/` (29) : `attachment.rs`, `attention.rs`, `cli_auth.rs`, `cli_version.rs`, `compaction_context.rs`, `composer.rs`, `config.rs`, `continuity.rs`, `control_pump.rs`, `drain.rs`, `enrichment.rs`, `entity_extractor.rs`, `feedback.rs`, `hook_ledger.rs`, `manager.rs`, `mod.rs`, `model_catalog.rs`, `observation_detector.rs`, `oob_listener.rs`, `path_detect.rs`, `post_stream.rs`, `post_tool_hook.rs`, `prompt.rs`, `prompt_sections.rs`, `routing.rs`, `skill_hook.rs`, `types.rs`, `viz.rs`, `viz_builder.rs`
 - `src/chat/stages/` (10) : `biomimicry.rs`, `file_context.rs`, `intent_weights.rs`, `knowledge_injection.rs`, `mcp_federation_stage.rs`, `mod.rs`, `persona.rs`, `skill_activation.rs`, `status_injection.rs`, `user_profile.rs`
 - `src/documents/` (4) : `align.rs`, `chunk.rs`, `mod.rs`, `store.rs`
 - `src/documents/extract/` (7) : `docx.rs`, `mod.rs`, `pdf.rs`, `pptx.rs`, `text.rs`, `xlsx.rs`, `xml.rs`
 - `src/embeddings/` (5) : `fastembed.rs`, `mock.rs`, `mod.rs`, `provider.rs`, `traits.rs`
 - `src/episodes/` (8) : `anonymize.rs`, `artifact_comparison.rs`, `collector.rs`, `distill.rs`, `distill_models.rs`, `evaluation.rs`, `mod.rs`, `models.rs`
-- `src/events/` (12) : `builtin_triggers.rs`, `bus.rs`, `graph.rs`, `hybrid.rs`, `mod.rs`, `nats.rs`, `notifier.rs`, `reactions.rs`, `reactor.rs`, `trigger.rs`, `trigger_routing.rs`, `types.rs`
+- `src/events/` (13) : `attention.rs`, `builtin_triggers.rs`, `bus.rs`, `graph.rs`, `hybrid.rs`, `mod.rs`, `nats.rs`, `notifier.rs`, `reactions.rs`, `reactor.rs`, `trigger.rs`, `trigger_routing.rs`, `types.rs`
 - `src/feedback/` (6) : `handlers.rs`, `mod.rs`, `models.rs`, `propagator.rs`, `signals.rs`, `tracker.rs`
 - `src/graph/` (12) : `algorithms.rs`, `confidence.rs`, `debouncer.rs`, `engine.rs`, `enrichment.rs`, `extraction.rs`, `mock.rs`, `mod.rs`, `models.rs`, `neighborhood.rs`, `process.rs`, `writer.rs`
 - `src/heartbeat/` (2) : `engine.rs`, `mod.rs`
@@ -86,7 +80,7 @@ collision entre les deux index est une erreur, pas un arrangement.
 - `src/reception/` (7) : `anchor.rs`, `mod.rs`, `replay.rs`, `score.rs`, `tombstone_scheduler.rs`, `trust.rs`, `verify.rs`
 - `src/reflex/` (5) : `co_change.rs`, `episode_recall.rs`, `mod.rs`, `scar_warning.rs`, `stage.rs`
 - `src/resolver/` (4) : `mod.rs`, `resolve_cache.rs`, `suffix_index.rs`, `symbol_table.rs`
-- `src/runner/` (15) : `enricher.rs`, `feedback.rs`, `feedback_analyzer.rs`, `git.rs`, `guard.rs`, `lifecycle.rs`, `mod.rs`, `models.rs`, `persona.rs`, `prompt.rs`, `runner.rs`, `state.rs`, `trigger.rs`, `vector.rs`, `verifier.rs`
+- `src/runner/` (16) : `eligibility.rs`, `enricher.rs`, `feedback.rs`, `feedback_analyzer.rs`, `git.rs`, `guard.rs`, `lifecycle.rs`, `mod.rs`, `models.rs`, `persona.rs`, `prompt.rs`, `runner.rs`, `state.rs`, `trigger.rs`, `vector.rs`, `verifier.rs`
 - `src/runner/providers/` (4) : `event.rs`, `mod.rs`, `schedule.rs`, `webhook.rs`
 - `src/sharing/` (5) : `consent_gate.rs`, `mod.rs`, `revocation.rs`, `tombstone.rs`, `ttl.rs`
 - `src/skills/` (20) : `activation.rs`, `cache.rs`, `detection.rs`, `evolution.rs`, `export.rs`, `feedback.rs`, `hook_extractor.rs`, `import.rs`, `lifecycle.rs`, `maintenance.rs`, `mod.rs`, `models.rs`, `naming.rs`, `package.rs`, `project_resolver.rs`, `registry.rs`, `templates.rs`, `triggers.rs`, `trust.rs`, `validation.rs`
@@ -95,14 +89,14 @@ collision entre les deux index est une erreur, pas un arrangement.
 - `src/utils/` (3) : `file_path_extractor.rs`, `mod.rs`, `paths.rs`
 - `src/vault/` (7) : `agent_cli.rs`, `crypto.rs`, `grants.rs`, `mask.rs`, `mod.rs`, `service.rs`, `store.rs`
 
-## frontend (545)
+## frontend (559)
 
 - `src/` (2) : `App.tsx`, `main.tsx`
 - `src/adapters/` (3) : `MilestoneGraphAdapter.ts`, `PlanGraphAdapter.ts`, `TaskGraphAdapter.ts`
 - `src/atoms/` (13) : `auth.ts`, `chat.ts`, `events.ts`, `index.ts`, `intelligence.ts`, `modelCatalog.ts`, `notes.ts`, `plans.ts`, `projects.ts`, `setup.ts`, `tasks.ts`, `ui.ts`, `workspaces.ts`
 - `src/components/` (6) : `DependencyGraphView.tsx`, `SetupGuard.tsx`, `TitleBar.tsx`, `UpdateBanner.tsx`, `WorkspaceRouteGuard.tsx`, `WorkspaceSwitcher.tsx`
 - `src/components/auth/` (4) : `PasswordLoginForm.tsx`, `ProtectedRoute.tsx`, `RegisterForm.tsx`, `UserMenu.tsx`
-- `src/components/chat/` (43) : `AgentGroup.tsx`, `AgenticModeBanner.tsx`, `AgenticModePill.tsx`, `AskUserQuestionBlock.tsx`, `Attachments.tsx`, `BackgroundActivityBlock.tsx`, `BackgroundTasksIndicator.tsx`, `ChatInput.tsx`, `ChatMessageBubble.tsx`, `ChatMessages.tsx`, `ChatPanel.tsx`, `ChatSessionContext.tsx`, `ChatWelcome.tsx`, `CompactBoundaryBlock.tsx`, `CompactionBanner.tsx`, `ContinueIndicatorBlock.tsx`, `CopyMarkdownButton.tsx`, `DetachedRunsPanel.tsx`, `InputRequestBlock.tsx`, `MarkdownText.tsx`, `MessageQueueBar.tsx`, `ModelChangedBlock.tsx`, `ModelFamilyPicker.tsx`, `PermissionRequestBlock.tsx`, `PermissionSettingsPanel.tsx`, `ProjectSelect.tsx`, `ResultErrorBlock.tsx`, `ResultMaxTurnsBlock.tsx`, `RetryIndicatorBlock.tsx`, `SessionBreadcrumb.tsx`, `SessionList.tsx`, `SystemHintBlock.tsx`, `SystemInitBlock.tsx`, `ThinkingBlock.tsx`, `ToolCallBlock.tsx`, `ToolCallGroup.tsx`, `attachmentState.ts`, `chatUrlState.ts`, `index.ts`, `inputAction.ts`, `messageQueue.ts`, `sessionListUtils.ts`, `useElapsedMs.ts`
+- `src/components/chat/` (45) : `AgentGroup.tsx`, `AgenticModeBanner.tsx`, `AgenticModePill.tsx`, `AskUserQuestionBlock.tsx`, `Attachments.tsx`, `BackgroundActivityBlock.tsx`, `BackgroundActivityCard.tsx`, `BackgroundTasksIndicator.tsx`, `ChatInput.tsx`, `ChatMessageBubble.tsx`, `ChatMessages.tsx`, `ChatPanel.tsx`, `ChatSessionContext.tsx`, `ChatWelcome.tsx`, `CompactBoundaryBlock.tsx`, `CompactionBanner.tsx`, `ContinueIndicatorBlock.tsx`, `CopyMarkdownButton.tsx`, `DetachedRunsPanel.tsx`, `InputRequestBlock.tsx`, `MarkdownText.tsx`, `MessageQueueBar.tsx`, `ModelChangedBlock.tsx`, `ModelFamilyPicker.tsx`, `PermissionRequestBlock.tsx`, `PermissionSettingsPanel.tsx`, `ProjectSelect.tsx`, `ResultErrorBlock.tsx`, `ResultMaxTurnsBlock.tsx`, `RetryIndicatorBlock.tsx`, `SecretRequestTray.tsx`, `SessionBreadcrumb.tsx`, `SessionList.tsx`, `SystemHintBlock.tsx`, `SystemInitBlock.tsx`, `ThinkingBlock.tsx`, `ToolCallBlock.tsx`, `ToolCallGroup.tsx`, `attachmentState.ts`, `chatUrlState.ts`, `index.ts`, `inputAction.ts`, `messageQueue.ts`, `sessionListUtils.ts`, `useElapsedMs.ts`
 - `src/components/chat/tools/` (13) : `BashToolRenderer.tsx`, `DefaultToolRenderer.tsx`, `EditToolRenderer.tsx`, `McpToolRenderer.tsx`, `ReadToolRenderer.tsx`, `SearchToolRenderer.tsx`, `TodoWriteRenderer.tsx`, `WebToolRenderer.tsx`, `WriteToolRenderer.tsx`, `index.tsx`, `summaries.ts`, `syntax.ts`, `types.ts`
 - `src/components/chat/tools/mcp/` (7) : `ChatRenderer.tsx`, `CodeRenderer.tsx`, `EntityRenderer.tsx`, `ListRenderer.tsx`, `ProgressRenderer.tsx`, `index.tsx`, `utils.tsx`
 - `src/components/chat/viz/` (10) : `ContextRadarViz.tsx`, `ImpactGraphViz.tsx`, `KnowledgeCardViz.tsx`, `ProgressBarViz.tsx`, `ProtocolRunViz.tsx`, `ReasoningTreeViz.tsx`, `VizBlockRenderer.tsx`, `VizExpandDialog.tsx`, `index.ts`, `registry.ts`
@@ -111,6 +105,7 @@ collision entre les deux index est une erreur, pas un arrangement.
 - `src/components/composer/` (6) : `FSMCanvas.tsx`, `NotePool.tsx`, `PatternComposer.tsx`, `TriggerBuilder.tsx`, `index.ts`, `types.ts`
 - `src/components/discussions/` (3) : `DiscussionNode.tsx`, `DiscussionTreeView.tsx`, `InlineConversationPanel.tsx`
 - `src/components/expandable/` (1) : `index.tsx`
+- `src/components/featureGraphs/` (3) : `EntityBrowser.tsx`, `EntityDetailPanel.tsx`, `FeatureGraphHelp.tsx`
 - `src/components/forms/` (26) : `AutoBuildFeatureGraphForm.tsx`, `CreateComponentForm.tsx`, `CreateConstraintForm.tsx`, `CreateDecisionForm.tsx`, `CreateFeatureGraphForm.tsx`, `CreateMilestoneForm.tsx`, `CreateNoteForm.tsx`, `CreatePlanForm.tsx`, `CreateProjectForm.tsx`, `CreateReleaseForm.tsx`, `CreateResourceForm.tsx`, `CreateSkillForm.tsx`, `CreateStepForm.tsx`, `CreateTaskForm.tsx`, `CreateWorkspaceForm.tsx`, `DecisionForms.tsx`, `EditMilestoneForm.tsx`, `EditPersonaForm.tsx`, `EditPlanForm.tsx`, `EditProjectForm.tsx`, `EditStepForm.tsx`, `EditTaskForm.tsx`, `EditWorkspaceForm.tsx`, `ImportSkillForm.tsx`, `NoteForms.tsx`, `index.ts`
 - `src/components/graph/` (2) : `EntityGroupPanel.tsx`, `UnifiedGraphSection.tsx`
 - `src/components/graph/entity/` (13) : `EntityGraph.tsx`, `EntityGraphCanvas.tsx`, `EntityGraphControls.tsx`, `EntityGraphExplainer.tsx`, `EntityTypeIcon.tsx`, `NodeInfoCard.tsx`, `entityHref.ts`, `entityVisuals.ts`, `index.ts`, `radialLayout.ts`, `useNeighborhood.ts`, `usePanZoom.ts`, `useReducedMotion.ts`
@@ -137,31 +132,31 @@ collision entre les deux index est une erreur, pas un arrangement.
 - `src/components/runner/` (15) : `AgentExecutionDetail.tsx`, `BudgetEditor.tsx`, `CancelButton.tsx`, `ConversationPanel.tsx`, `InlineConversation.tsx`, `LiveProgress.tsx`, `PlanRunHistory.tsx`, `PlanRunRow.tsx`, `RunnerHeader.tsx`, `StatsRow.tsx`, `WaveAgentCard.tsx`, `WaveSection.tsx`, `WsStatusIndicator.tsx`, `index.ts`, `shared.ts`
 - `src/components/settings/` (1) : `SettingRow.tsx`
 - `src/components/tasks/` (5) : `DetailRows.tsx`, `RowStateLink.tsx`, `StatusBreakdown.tsx`, `TaskUniverse3D.tsx`, `useTaskUniverse.ts`
-- `src/components/ui/` (62) : `AmbientBackground.tsx`, `AnimatedCounter.tsx`, `Badge.tsx`, `Branding.tsx`, `BulkActionBar.tsx`, `Button.tsx`, `Card.tsx`, `CollapsibleMarkdown.tsx`, `CollapsibleSection.tsx`, `CompactStatCard.tsx`, `ConfirmDialog.tsx`, `Dialog.tsx`, `Dropdown.tsx`, `EmptyState.tsx`, `EntityRow.tsx`, `ErrorState.tsx`, `ExternalLink.tsx`, `FilterBar.tsx`, `FloatingMenu.tsx`, `FormDialog.tsx`, `Graph3DErrorBoundary.tsx`, `Input.tsx`, `LinkEntityDialog.tsx`, `LinkedEntityBadge.tsx`, `LoadMoreSentinel.tsx`, `MetaLine.tsx`, `MetricTooltip.tsx`, `Metrics.tsx`, `OverflowMenu.tsx`, `PageHeader.tsx`, `PageShell.tsx`, `Pagination.tsx`, `ProgressBar.tsx`, `ProgressLine.tsx`, `PulseIndicator.tsx`, `RadarChart.tsx`, `RowCheckbox.tsx`, `Section.tsx`, `SectionNav.tsx`, `Select.tsx`, `Skeleton.tsx`, `Sparkline.tsx`, `Spinner.tsx`, `StatCard.tsx`, `Status.tsx`, `StatusSelect.tsx`, `Switch.tsx`, `TabLayout.tsx`, `TaskProgress.tsx`, `Textarea.tsx`, `Toast.tsx`, `Tooltip.tsx`, `ViewTabs.tsx`, `ViewToggle.tsx`, `WatcherToggle.tsx`, `WebUpdateBanner.tsx`, `classes.ts`, `format.ts`, `index.ts`, `menuPosition.ts`, `statusMeta.ts`, `useFloatingFallback.ts`
+- `src/components/ui/` (63) : `AmbientBackground.tsx`, `AnimatedCounter.tsx`, `Badge.tsx`, `Branding.tsx`, `BulkActionBar.tsx`, `Button.tsx`, `Card.tsx`, `CollapsibleMarkdown.tsx`, `CollapsibleSection.tsx`, `CompactStatCard.tsx`, `ConfirmDialog.tsx`, `Dialog.tsx`, `Dropdown.tsx`, `EmptyState.tsx`, `EntityRow.tsx`, `ErrorState.tsx`, `ExternalLink.tsx`, `FilterBar.tsx`, `FloatingMenu.tsx`, `FormDialog.tsx`, `Graph3DErrorBoundary.tsx`, `Input.tsx`, `LinkEntityDialog.tsx`, `LinkedEntityBadge.tsx`, `LoadMoreSentinel.tsx`, `MetaLine.tsx`, `MetricTooltip.tsx`, `Metrics.tsx`, `OverflowMenu.tsx`, `PageHeader.tsx`, `PageShell.tsx`, `Pagination.tsx`, `ProgressBar.tsx`, `ProgressLine.tsx`, `PulseIndicator.tsx`, `RadarChart.tsx`, `RowCheckbox.tsx`, `Section.tsx`, `SectionNav.tsx`, `Select.tsx`, `Skeleton.tsx`, `Sparkline.tsx`, `Spinner.tsx`, `StatCard.tsx`, `Status.tsx`, `StatusSelect.tsx`, `Switch.tsx`, `TabLayout.tsx`, `TaskProgress.tsx`, `Textarea.tsx`, `Toast.tsx`, `Tooltip.tsx`, `ViewTabs.tsx`, `ViewToggle.tsx`, `WatcherToggle.tsx`, `WebUpdateBanner.tsx`, `WindowedList.tsx`, `classes.ts`, `format.ts`, `index.ts`, `menuPosition.ts`, `statusMeta.ts`, `useFloatingFallback.ts`
 - `src/components/universe/` (3) : `Universe3DPanel.tsx`, `index.ts`, `useEntityUniverse.ts`
 - `src/constants/` (4) : `index.ts`, `intelligence.ts`, `models.ts`, `nomenclature.ts`
-- `src/hooks/` (42) : `index.ts`, `useActivationWebSocket.ts`, `useBackgroundTasks.ts`, `useChat.ts`, `useChatUrlSync.ts`, `useConfirmDialog.ts`, `useCrudEventRefresh.ts`, `useCrudEventSync.ts`, `useDetachedRuns.ts`, `useDiscussionTree.ts`, `useDragRegion.ts`, `useElapsedTime.ts`, `useEntityGroups.ts`, `useEventBus.ts`, `useFormDialog.ts`, `useInfiniteList.ts`, `useInfiniteScroll.ts`, `useKanbanColumnData.ts`, `useKanbanFilters.ts`, `useLinkDialog.ts`, `useMediaQuery.ts`, `useMilestoneGraphData.ts`, `useModelCatalogEvents.ts`, `useMultiSelect.ts`, `usePagination.ts`, `usePipelineProgress.ts`, `usePlanGraphData.ts`, `useProjectFilter.ts`, `useSectionObserver.ts`, `useSessionTree.ts`, `useTaskGraphData.ts`, `useTaskProgress.ts`, `useToast.ts`, `useTrayNavigation.ts`, `useUpdateCheck.ts`, `useViewMode.ts`, `useViewTransition.ts`, `useVisualViewportHeight.ts`, `useVizData.ts`, `useWelcomeData.ts`, `useWindowFullscreen.ts`, `useWorkspace.ts`
+- `src/hooks/` (43) : `index.ts`, `useActivationWebSocket.ts`, `useBackgroundTasks.ts`, `useChat.ts`, `useChatUrlSync.ts`, `useConfirmDialog.ts`, `useCrudEventRefresh.ts`, `useCrudEventSync.ts`, `useDetachedRuns.ts`, `useDiscussionTree.ts`, `useDragRegion.ts`, `useElapsedTime.ts`, `useEntityGroups.ts`, `useEventBus.ts`, `useFormDialog.ts`, `useIncrementalList.ts`, `useInfiniteList.ts`, `useInfiniteScroll.ts`, `useKanbanColumnData.ts`, `useKanbanFilters.ts`, `useLinkDialog.ts`, `useMediaQuery.ts`, `useMilestoneGraphData.ts`, `useModelCatalogEvents.ts`, `useMultiSelect.ts`, `usePagination.ts`, `usePipelineProgress.ts`, `usePlanGraphData.ts`, `useProjectFilter.ts`, `useSectionObserver.ts`, `useSessionTree.ts`, `useTaskGraphData.ts`, `useTaskProgress.ts`, `useToast.ts`, `useTrayNavigation.ts`, `useUpdateCheck.ts`, `useViewMode.ts`, `useViewTransition.ts`, `useVisualViewportHeight.ts`, `useVizData.ts`, `useWelcomeData.ts`, `useWindowFullscreen.ts`, `useWorkspace.ts`
 - `src/hooks/runner/` (6) : `index.ts`, `useAgentExecutionsMap.ts`, `useConversationWs.ts`, `useLatestPlanRun.ts`, `useRunRootSession.ts`, `useWavesData.ts`
-- `src/layouts/` (2) : `MainLayout.tsx`, `index.ts`
+- `src/layouts/` (3) : `MainLayout.tsx`, `RouteErrorBoundary.tsx`, `index.ts`
 - `src/lib/` (1) : `glossary.ts`
-- `src/pages/` (44) : `AdminPage.tsx`, `ArchitecturePage.tsx`, `AuthCallbackPage.tsx`, `ChatSessionPage.tsx`, `CodePage.tsx`, `DecisionDetailPage.tsx`, `DecisionsPage.tsx`, `DeploymentsPage.tsx`, `DocumentsPage.tsx`, `FeatureGraphDetailPage.tsx`, `FeatureGraphsPage.tsx`, `IntelligencePage.tsx`, `LoginPage.tsx`, `McpFederationPage.tsx`, `MilestoneDetailPage.tsx`, `MilestonesPage.tsx`, `NeuralRoutingPage.tsx`, `NotFoundPage.tsx`, `NoteDetailPage.tsx`, `NotesPage.tsx`, `PersonaDetailPage.tsx`, `PersonasPage.tsx`, `PipelineDashboardPage.tsx`, `PlanDetailPage.tsx`, `PlansPage.tsx`, `ProjectDetailPage.tsx`, `ProjectMilestoneDetailPage.tsx`, `ProjectsPage.tsx`, `ProtocolDetailPage.tsx`, `ProtocolsPage.tsx`, `RfcDetailPage.tsx`, `RunnerDashboard.tsx`, `SettingsPage.tsx`, `SharingPage.tsx`, `SkillDetailPage.tsx`, `SkillsPage.tsx`, `TaskDetailPage.tsx`, `TasksPage.tsx`, `TodayPage.tsx`, `TrajectoryPage.tsx`, `TriggerDashboardPage.tsx`, `WorkspaceDetailPage.tsx`, `WorkspaceSelectorPage.tsx`, `index.ts`
+- `src/pages/` (45) : `AdminPage.tsx`, `ArchitecturePage.tsx`, `AuthCallbackPage.tsx`, `ChatSessionPage.tsx`, `CodePage.tsx`, `DecisionDetailPage.tsx`, `DecisionsPage.tsx`, `DeploymentsPage.tsx`, `DocumentsPage.tsx`, `FeatureGraphDetailPage.tsx`, `FeatureGraphsPage.tsx`, `IntelligencePage.tsx`, `LoginPage.tsx`, `McpFederationPage.tsx`, `MilestoneDetailPage.tsx`, `MilestonesPage.tsx`, `NeuralRoutingPage.tsx`, `NotFoundPage.tsx`, `NoteDetailPage.tsx`, `NotesPage.tsx`, `PersonaDetailPage.tsx`, `PersonasPage.tsx`, `PipelineDashboardPage.tsx`, `PlanDetailPage.tsx`, `PlansPage.tsx`, `ProjectDetailPage.tsx`, `ProjectMilestoneDetailPage.tsx`, `ProjectsPage.tsx`, `ProtocolDetailPage.tsx`, `ProtocolsPage.tsx`, `RfcDetailPage.tsx`, `RunnerDashboard.tsx`, `SettingsPage.tsx`, `SharingPage.tsx`, `SkillDetailPage.tsx`, `SkillsPage.tsx`, `TaskDetailPage.tsx`, `TasksPage.tsx`, `TodayPage.tsx`, `TrajectoryPage.tsx`, `TriggerDashboardPage.tsx`, `VaultPage.tsx`, `WorkspaceDetailPage.tsx`, `WorkspaceSelectorPage.tsx`, `index.ts`
 - `src/pages/setup/` (7) : `AuthPage.tsx`, `ChatPage.tsx`, `InfrastructurePage.tsx`, `LaunchPage.tsx`, `SetupLayout.tsx`, `SetupWizard.tsx`, `index.ts`
-- `src/services/` (36) : `admin.ts`, `api.ts`, `auth.ts`, `authManager.ts`, `chat.ts`, `chatWebSocket.ts`, `code.ts`, `commits.ts`, `decisions.ts`, `discussions.ts`, `documents.ts`, `env.ts`, `environments.ts`, `eventBus.ts`, `featureGraphs.ts`, `index.ts`, `intelligence.ts`, `mcpFederation.ts`, `neighborhood.ts`, `neuralRouting.ts`, `notes.ts`, `paginate.ts`, `personas.ts`, `plans.ts`, `progress.ts`, `projects.ts`, `protocolApi.ts`, `registry.ts`, `rfcApi.ts`, `runner.ts`, `sharing.ts`, `skills.ts`, `tasks.ts`, `triggers.ts`, `workspaces.ts`, `wsAdapter.ts`
+- `src/services/` (37) : `admin.ts`, `api.ts`, `auth.ts`, `authManager.ts`, `chat.ts`, `chatWebSocket.ts`, `code.ts`, `commits.ts`, `decisions.ts`, `discussions.ts`, `documents.ts`, `env.ts`, `environments.ts`, `eventBus.ts`, `featureGraphs.ts`, `index.ts`, `intelligence.ts`, `mcpFederation.ts`, `neighborhood.ts`, `neuralRouting.ts`, `notes.ts`, `paginate.ts`, `personas.ts`, `plans.ts`, `progress.ts`, `projects.ts`, `protocolApi.ts`, `registry.ts`, `rfcApi.ts`, `runner.ts`, `sharing.ts`, `skills.ts`, `tasks.ts`, `triggers.ts`, `vault.ts`, `workspaces.ts`, `wsAdapter.ts`
 - `src/types/` (7) : `chat.ts`, `documents.ts`, `events.ts`, `fractal-graph.ts`, `index.ts`, `intelligence.ts`, `protocol.ts`
-- `src/utils/` (8) : `architecture.ts`, `chatAssembly.ts`, `chatExport.ts`, `compactYamlParser.ts`, `motion.ts`, `openExternal.ts`, `paths.ts`, `watch.ts`
+- `src/utils/` (12) : `architecture.ts`, `backgroundActivity.ts`, `chatAssembly.ts`, `chatExport.ts`, `compactYamlParser.ts`, `featureGraphModel.ts`, `featureGraphReadable.ts`, `motion.ts`, `openExternal.ts`, `paths.ts`, `stepRefreshKey.ts`, `watch.ts`
 - `src/workers/` (1) : `dagreWorker.ts`
 
-## nexus (73)
+## nexus (76)
 
 - `claude-code-api/src/` (1) : `main.rs`
-- `claude-code-api/src/api/` (7) : `chat.rs`, `conversations.rs`, `mod.rs`, `projects.rs`, `sessions.rs`, `stats.rs`, `streaming_handler.rs`
+- `claude-code-api/src/api/` (8) : `chat.rs`, `conversations.rs`, `mod.rs`, `models.rs`, `projects.rs`, `sessions.rs`, `stats.rs`, `streaming_handler.rs`
 - `claude-code-api/src/bin/` (1) : `ccapi.rs`
-- `claude-code-api/src/core/` (12) : `auth.rs`, `cache.rs`, `claude_manager.rs`, `config.rs`, `conversation.rs`, `interactive_session.rs`, `mod.rs`, `objective_tracker.rs`, `process_pool.rs`, `retry.rs`, `session_manager.rs`, `session_process.rs`
+- `claude-code-api/src/core/` (13) : `auth.rs`, `cache.rs`, `claude_manager.rs`, `config.rs`, `conversation.rs`, `interactive_session.rs`, `mod.rs`, `model_registry.rs`, `objective_tracker.rs`, `process_pool.rs`, `retry.rs`, `session_manager.rs`, `session_process.rs`
 - `claude-code-api/src/core/hooks/` (3) : `mod.rs`, `neo4j_hook_callback.rs`, `neo4j_permission_provider.rs`
 - `claude-code-api/src/core/memory/` (6) : `long_term.rs`, `medium_term.rs`, `mod.rs`, `short_term.rs`, `traits.rs`, `unified.rs`
 - `claude-code-api/src/core/storage/` (7) : `combined.rs`, `meilisearch.rs`, `memory.rs`, `mod.rs`, `neo4j.rs`, `tiered_cache.rs`, `traits.rs`
 - `claude-code-api/src/middleware/` (3) : `error_handler.rs`, `mod.rs`, `request_id.rs`
-- `claude-code-api/src/models/` (3) : `error.rs`, `mod.rs`, `openai.rs`
+- `claude-code-api/src/models/` (4) : `claude.rs`, `error.rs`, `mod.rs`, `openai.rs`
 - `claude-code-api/src/utils/` (5) : `function_calling.rs`, `mod.rs`, `parser.rs`, `streaming.rs`, `text_chunker.rs`
 - `claude-code-sdk-rs/src/` (15) : `cli_download.rs`, `client.rs`, `client_working.rs`, `errors.rs`, `interactive.rs`, `internal_query.rs`, `lib.rs`, `message_parser.rs`, `model_recommendation.rs`, `optimized_client.rs`, `perf_utils.rs`, `query.rs`, `sdk_mcp.rs`, `token_tracker.rs`, `types.rs`
 - `claude-code-sdk-rs/src/bin/` (1) : `test_interactive.rs`
