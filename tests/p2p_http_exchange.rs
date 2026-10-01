@@ -553,7 +553,17 @@ async fn test_tombstone_propagation_over_http() {
 
     // Bob's tombstone registry should now block this envelope
     let mut tombstones = TombstoneRegistry::new();
-    tombstones.apply_tombstone(&envelope.meta.content_hash);
+    tombstones.register_envelope_owner(&envelope);
+    tombstones
+        .apply_signed_tombstone(
+            project_orchestrator::sharing::tombstone::sign_tombstone_with_key(
+                &alice_key,
+                envelope.meta.content_hash.clone(),
+                chrono::Utc::now(),
+                None,
+            ),
+        )
+        .expect("owner-signed tombstone must be accepted");
 
     let result = receive_envelope_checked(&envelope, &bob_context, &tombstones);
     assert!(result.is_err(), "Tombstoned envelope should be rejected");

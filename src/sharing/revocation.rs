@@ -93,8 +93,10 @@ pub fn build_broadcast_messages(
 
 /// Process an incoming tombstone message.
 ///
-/// The tombstone's Ed25519 signature is verified first; an invalid or forged
-/// tombstone is dropped (fail-closed): no ack, no re-broadcast.
+/// The tombstone's Ed25519 signature is verified first, then its issuer must be
+/// the known original owner of the content (`known_owner`, e.g. the artifact's
+/// `origin_did`). An invalid, forged, wrongly-attributed or unattributable
+/// (owner unknown) tombstone is dropped (fail-closed): no ack, no re-broadcast.
 ///
 /// Returns:
 /// - An optional ack (if the sender requested acknowledgement)
@@ -103,6 +105,7 @@ pub fn handle_incoming_tombstone(
     request: &RevocationRequest,
     local_did: &str,
     content_found_locally: bool,
+    known_owner: Option<&str>,
 ) -> (Option<RevocationAck>, Option<RevocationRequest>) {
     let t = &request.tombstone;
     let signed = crate::reception::anchor::SignedTombstone {
@@ -112,11 +115,12 @@ pub fn handle_incoming_tombstone(
         issued_at: t.issued_at,
         reason: t.reason.clone(),
     };
-    if !crate::sharing::tombstone::verify_tombstone_ed25519(&signed) {
+    if let Err(err) = crate::sharing::tombstone::verify_tombstone_authority(&signed, known_owner) {
         tracing::warn!(
             content_hash = %t.content_hash,
             issuer = %t.issuer_did,
-            "rejecting incoming tombstone: invalid signature"
+            %err,
+            "rejecting incoming tombstone"
         );
         return (None, None);
     }
@@ -183,9 +187,38 @@ mod tests {
         let mut p = make_tombstone_payload();
         p.signature_hex = "0".repeat(128);
         let req = build_revocation_request(p, false);
-        let (ack, rebroadcast) = handle_incoming_tombstone(&req, "did:key:bob", true);
+        let (ack, rebroadcast) = handle_incoming_tombstone(
+            &req,
+            "did:key:bob",
+            true,
+            Some(req.tombstone.issuer_did.as_str()),
+        );
         assert!(ack.is_none());
         assert!(rebroadcast.is_none());
+    }
+
+    #[test]
+    fn test_incoming_tombstone_wrong_owner_or_unknown_rejected() {
+        let req = build_revocation_request(make_tombstone_payload(), false);
+        let other = crate::identity::InstanceIdentity::generate();
+        let (ack, rb) = handle_incoming_tombstone(&req, "did:key:bob", true, Some(other.did_key()));
+        assert!(ack.is_none() && rb.is_none());
+        let (ack, rb) = handle_incoming_tombstone(&req, "did:key:bob", true, None);
+        assert!(ack.is_none() && rb.is_none());
+    }
+
+    #[test]
+    fn test_incoming_tombstone_altered_reason_rejected() {
+        let mut p = make_tombstone_payload();
+        p.reason = Some("altered".into());
+        let req = build_revocation_request(p, false);
+        let (ack, rb) = handle_incoming_tombstone(
+            &req,
+            "did:key:bob",
+            true,
+            Some(req.tombstone.issuer_did.as_str()),
+        );
+        assert!(ack.is_none() && rb.is_none());
     }
 
     #[test]
@@ -262,7 +295,12 @@ mod tests {
     #[test]
     fn test_handle_incoming_content_found() {
         let req = build_revocation_request(make_tombstone_payload(), false);
-        let (ack, rebroadcast) = handle_incoming_tombstone(&req, "did:key:bob", true);
+        let (ack, rebroadcast) = handle_incoming_tombstone(
+            &req,
+            "did:key:bob",
+            true,
+            Some(req.tombstone.issuer_did.as_str()),
+        );
 
         let ack = ack.expect("should have ack");
         assert_eq!(ack.ack_type, AckStatus::Deleted);
@@ -276,7 +314,12 @@ mod tests {
     #[test]
     fn test_handle_incoming_content_not_found() {
         let req = build_revocation_request(make_tombstone_payload(), false);
-        let (ack, _) = handle_incoming_tombstone(&req, "did:key:bob", false);
+        let (ack, _) = handle_incoming_tombstone(
+            &req,
+            "did:key:bob",
+            false,
+            Some(req.tombstone.issuer_did.as_str()),
+        );
 
         let ack = ack.expect("should have ack");
         assert_eq!(ack.ack_type, AckStatus::NotFound);
@@ -286,7 +329,12 @@ mod tests {
     fn test_handle_incoming_no_rebroadcast_at_zero() {
         let mut req = build_revocation_request(make_tombstone_payload(), false);
         req.hop_count = 0;
-        let (_, rebroadcast) = handle_incoming_tombstone(&req, "did:key:bob", true);
+        let (_, rebroadcast) = handle_incoming_tombstone(
+            &req,
+            "did:key:bob",
+            true,
+            Some(req.tombstone.issuer_did.as_str()),
+        );
         assert!(rebroadcast.is_none());
     }
 
@@ -294,7 +342,12 @@ mod tests {
     fn test_handle_incoming_no_ack_when_not_requested() {
         let mut req = build_revocation_request(make_tombstone_payload(), false);
         req.ack_requested = false;
-        let (ack, _) = handle_incoming_tombstone(&req, "did:key:bob", true);
+        let (ack, _) = handle_incoming_tombstone(
+            &req,
+            "did:key:bob",
+            true,
+            Some(req.tombstone.issuer_did.as_str()),
+        );
         assert!(ack.is_none());
     }
 
