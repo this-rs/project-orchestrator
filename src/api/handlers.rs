@@ -6179,6 +6179,8 @@ pub enum AppError {
     Unauthorized(String),
     Forbidden(String),
     Conflict(String),
+    /// 410: the thing existed but is permanently gone (e.g. the CLI that asked).
+    Gone(String),
 }
 
 impl IntoResponse for AppError {
@@ -6190,6 +6192,7 @@ impl IntoResponse for AppError {
             AppError::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, msg),
             AppError::Forbidden(msg) => (StatusCode::FORBIDDEN, msg),
             AppError::Conflict(msg) => (StatusCode::CONFLICT, msg),
+            AppError::Gone(msg) => (StatusCode::GONE, msg),
         };
 
         let body = Json(serde_json::json!({

@@ -60,6 +60,48 @@ struct Pending {
     requested_at: DateTime<Utc>,
 }
 
+/// What the stored events say about one permission request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionStatus {
+    /// Asked, no decision stored yet.
+    Pending,
+    /// A `permission_decision` of this id is stored.
+    Decided,
+    /// No `permission_request` of this id in the events.
+    Unknown,
+}
+
+/// Status of permission `request_id` according to a session's stored events.
+pub fn permission_status(events: &[ChatEventRecord], request_id: &str) -> PermissionStatus {
+    let mut asked = false;
+    for e in events {
+        match e.event_type.as_str() {
+            "permission_decision" => {
+                if let Ok(ChatEvent::PermissionDecision { id, .. }) =
+                    serde_json::from_str::<ChatEvent>(&e.data)
+                {
+                    if id == request_id {
+                        return PermissionStatus::Decided;
+                    }
+                }
+            }
+            "permission_request" => {
+                if let Ok(ChatEvent::PermissionRequest { id, .. }) =
+                    serde_json::from_str::<ChatEvent>(&e.data)
+                {
+                    asked |= id == request_id;
+                }
+            }
+            _ => {}
+        }
+    }
+    if asked {
+        PermissionStatus::Pending
+    } else {
+        PermissionStatus::Unknown
+    }
+}
+
 /// Derive the pending requests of ONE session from its events.
 /// `events` may be in any order and may contain unrelated event types.
 pub fn derive_session_attention(
@@ -274,6 +316,30 @@ mod tests {
             data: serde_json::to_string(&ev).unwrap(),
             created_at: t(seq * 10),
         }
+    }
+
+    #[test]
+    fn permission_status_reads_pending_decided_unknown() {
+        let s = Uuid::new_v4();
+        let asked = perm(s, 1, "a");
+        let decided = rec(
+            s,
+            2,
+            ChatEvent::PermissionDecision {
+                id: "a".into(),
+                allow: true,
+            },
+        );
+        assert_eq!(
+            permission_status(std::slice::from_ref(&asked), "a"),
+            PermissionStatus::Pending
+        );
+        assert_eq!(
+            permission_status(&[asked.clone(), decided], "a"),
+            PermissionStatus::Decided
+        );
+        assert_eq!(permission_status(&[asked], "b"), PermissionStatus::Unknown);
+        assert_eq!(permission_status(&[], "a"), PermissionStatus::Unknown);
     }
 
     fn perm(s: Uuid, seq: i64, id: &str) -> ChatEventRecord {

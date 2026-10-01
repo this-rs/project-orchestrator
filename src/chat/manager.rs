@@ -252,6 +252,55 @@ pub struct ActiveSession {
     pub cancel_task_window: Duration,
 }
 
+/// Where a message or permission answer ended up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryRoute {
+    /// Handed to the CLI running in this process.
+    Local,
+    /// Proxied to the instance that owns the session.
+    Remote,
+    /// Nobody held the session: the CLI was respawned (`resume_session`).
+    Resumed,
+    /// The local send failed (dead CLI) and the session was resumed instead.
+    ResumedAfterSendFailure,
+}
+
+/// Why a permission answer was not delivered.
+#[derive(Debug)]
+pub enum PermissionDeliveryError {
+    /// No instance holds the session: the CLI that asked is gone.
+    SessionDead(String),
+    /// The CLI is alive but the request is no longer waiting (already
+    /// answered, or never asked).
+    NotPending,
+    Failed(anyhow::Error),
+}
+
+impl std::fmt::Display for PermissionDeliveryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SessionDead(id) => write!(f, "Session {id} not found or inactive"),
+            Self::NotPending => write!(f, "Permission request is no longer pending"),
+            Self::Failed(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for PermissionDeliveryError {}
+
+/// Why a user message was not delivered.
+#[derive(Debug)]
+pub enum MessageDeliveryError {
+    /// Nobody held the session and `resume_session` failed.
+    Resume(anyhow::Error),
+    /// The local send failed and the resume fallback failed too.
+    SendAndResume {
+        send: anyhow::Error,
+        resume: anyhow::Error,
+    },
+}
+
 /// Result of `ChatManager::cancel_running_tools`. Surfaced to REST/WS
 /// callers so the UI can display "killed N processes" feedback or
 /// degrade gracefully when the rate cap is hit (T2 of plan 28e9afe3).
@@ -4975,17 +5024,38 @@ impl ChatManager {
         request_id: &str,
         allow: bool,
     ) -> Result<()> {
+        self.send_permission_response_inner(session_id, request_id, allow, false)
+            .await
+            .map_err(|e| match e {
+                PermissionDeliveryError::Failed(e) => e,
+                other => anyhow!(other.to_string()),
+            })
+    }
+
+    /// Shared body of the permission answer. With `require_pending`, the
+    /// request must still be waiting in the session's pending map: the entry
+    /// is CLAIMED atomically (removed under the map lock), so two concurrent
+    /// answers to the same request cannot both reach the CLI — the second one
+    /// gets [`PermissionDeliveryError::NotPending`]. The WS path passes
+    /// `false` and keeps its historical lenient behaviour.
+    async fn send_permission_response_inner(
+        &self,
+        session_id: &str,
+        request_id: &str,
+        allow: bool,
+        require_pending: bool,
+    ) -> std::result::Result<(), PermissionDeliveryError> {
         let (stdin_tx, pending_perm_inputs, events_tx, session_uuid, next_seq) = {
             let mut sessions = self.active_sessions.write().await;
             let session = sessions
                 .get_mut(session_id)
-                .ok_or_else(|| anyhow!("Session {} not found or inactive", session_id))?;
+                .ok_or_else(|| PermissionDeliveryError::SessionDead(session_id.to_string()))?;
             session.last_activity = Instant::now();
             let tx = session.stdin_tx.clone().ok_or_else(|| {
-                anyhow!(
+                PermissionDeliveryError::Failed(anyhow!(
                     "No stdin sender for session {} (CLI may not be connected)",
                     session_id
-                )
+                ))
             })?;
             (
                 tx,
@@ -5002,11 +5072,11 @@ impl ChatManager {
         //   Deny:  { behavior: "deny",  message: <string> }
         // The `updatedInput` field REPLACES the original tool input in the CLI, so we
         // MUST pass back the original input — an empty {} would erase command/file_path/etc.
-        let original_input = pending_perm_inputs
-            .lock()
-            .await
-            .remove(request_id)
-            .unwrap_or_else(|| serde_json::json!({}));
+        let claimed = pending_perm_inputs.lock().await.remove(request_id);
+        if require_pending && claimed.is_none() {
+            return Err(PermissionDeliveryError::NotPending);
+        }
+        let original_input = claimed.unwrap_or_else(|| serde_json::json!({}));
 
         let permission_response = if allow {
             serde_json::json!({
@@ -5030,8 +5100,9 @@ impl ChatManager {
             }
         });
 
-        let json = serde_json::to_string(&control_response)
-            .map_err(|e| anyhow!("Failed to serialize control response: {}", e))?;
+        let json = serde_json::to_string(&control_response).map_err(|e| {
+            PermissionDeliveryError::Failed(anyhow!("Failed to serialize control response: {}", e))
+        })?;
 
         info!(
             session_id = %session_id,
@@ -5040,10 +5111,12 @@ impl ChatManager {
             "Sending permission control response to CLI (via stdin_tx, lock-free)"
         );
 
-        stdin_tx
-            .send(json)
-            .await
-            .map_err(|e| anyhow!("Failed to send permission control response: {}", e))?;
+        stdin_tx.send(json).await.map_err(|e| {
+            PermissionDeliveryError::Failed(anyhow!(
+                "Failed to send permission control response: {}",
+                e
+            ))
+        })?;
 
         // Persist and broadcast the permission decision so it survives session reload.
         let decision_event = ChatEvent::PermissionDecision {
@@ -5079,6 +5152,83 @@ impl ChatManager {
         }
 
         Ok(())
+    }
+
+    /// Answer a permission request: local CLI first, then the instance that
+    /// owns the session (NATS RPC). The ONE routing used by the WS
+    /// `permission_response` frame and by the REST route.
+    ///
+    /// `require_pending` makes the answer strict for a LOCAL session (see
+    /// [`Self::send_permission_response_inner`]); a remote owner does its own
+    /// bookkeeping. No instance holds the session -> `SessionDead`.
+    pub async fn route_permission_response(
+        &self,
+        session_id: &str,
+        request_id: &str,
+        allow: bool,
+        require_pending: bool,
+    ) -> std::result::Result<DeliveryRoute, PermissionDeliveryError> {
+        if self.is_session_active(session_id).await {
+            return self
+                .send_permission_response_inner(session_id, request_id, allow, require_pending)
+                .await
+                .map(|()| DeliveryRoute::Local);
+        }
+        // The message_type "control_response" tells the receiving instance to
+        // use send_permission_response instead of send_message.
+        let payload = serde_json::json!({ "allow": allow }).to_string();
+        if self
+            .try_remote_send(session_id, &payload, "control_response")
+            .await
+            .unwrap_or(false)
+        {
+            Ok(DeliveryRoute::Remote)
+        } else {
+            Err(PermissionDeliveryError::SessionDead(session_id.to_string()))
+        }
+    }
+
+    /// Deliver a user message: local CLI -> owning instance (NATS) ->
+    /// `resume_session` (respawns the CLI, keeping the session's identity and
+    /// links). A failed local send falls back to `resume_session` too (dead
+    /// CLI). The ONE routing used by the WS `user_message` frame and by the
+    /// REST route; it is also the only way to answer an orphan question.
+    pub async fn route_user_message(
+        &self,
+        session_id: &str,
+        content: &str,
+        claims: Option<&crate::auth::jwt::Claims>,
+    ) -> std::result::Result<DeliveryRoute, MessageDeliveryError> {
+        if self.is_session_active(session_id).await {
+            match self.send_message(session_id, content).await {
+                Ok(()) => return Ok(DeliveryRoute::Local),
+                Err(send_err) => {
+                    warn!(
+                        session_id = %session_id,
+                        error = %send_err,
+                        "send_message failed, attempting resume_session as fallback"
+                    );
+                    return match self.resume_session(session_id, content, claims).await {
+                        Ok(()) => Ok(DeliveryRoute::ResumedAfterSendFailure),
+                        Err(resume) => Err(MessageDeliveryError::SendAndResume {
+                            send: send_err,
+                            resume,
+                        }),
+                    };
+                }
+            }
+        }
+        if self
+            .try_remote_send(session_id, content, "user_message")
+            .await
+            .unwrap_or(false)
+        {
+            return Ok(DeliveryRoute::Remote);
+        }
+        self.resume_session(session_id, content, claims)
+            .await
+            .map(|()| DeliveryRoute::Resumed)
+            .map_err(MessageDeliveryError::Resume)
     }
 
     /// Change the permission mode of an active CLI session mid-conversation.
@@ -13533,5 +13683,93 @@ mod tests {
         )
         .await;
         assert!(!inserted);
+    }
+}
+
+/// Fixtures for handler tests that need a LIVE session (a registered
+/// `ActiveSession` whose CLI stdin is a channel the test can read).
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    pub(crate) fn chat_config() -> ChatConfig {
+        ChatConfig::default()
+    }
+
+    /// Register a live session. Returns the receiver of what would be written
+    /// to the CLI's stdin and the queue of messages received while streaming,
+    /// or `None` when the Claude CLI binary is not installed (the dummy client
+    /// needs it).
+    pub(crate) async fn insert_live_session(
+        manager: &ChatManager,
+        session_id: &str,
+        is_streaming: bool,
+        pending_permissions: &[&str],
+    ) -> Option<(
+        tokio::sync::mpsc::Receiver<String>,
+        Arc<Mutex<VecDeque<PendingMessage>>>,
+    )> {
+        let client = InteractiveClient::new(nexus_claude::ClaudeCodeOptions {
+            model: Some("test".into()),
+            ..Default::default()
+        })
+        .ok()?;
+        let (events_tx, _rx) = broadcast::channel(16);
+        let (stdin_tx, stdin_rx) = tokio::sync::mpsc::channel(16);
+        let pending_messages = Arc::new(Mutex::new(VecDeque::<PendingMessage>::new()));
+        let mut pending = HashMap::new();
+        for id in pending_permissions {
+            pending.insert((*id).to_string(), serde_json::json!({ "command": "ls" }));
+        }
+        let session = ActiveSession {
+            events_tx,
+            last_activity: Instant::now(),
+            cli_session_id: None,
+            client: Arc::new(Mutex::new(client)),
+            interrupt_flag: Arc::new(AtomicBool::new(false)),
+            memory_manager: None,
+            next_seq: Arc::new(AtomicI64::new(1)),
+            pending_messages: pending_messages.clone(),
+            is_streaming: Arc::new(AtomicBool::new(is_streaming)),
+            streaming_text: Arc::new(Mutex::new(String::new())),
+            streaming_events: Arc::new(Mutex::new(Vec::new())),
+            permission_mode: None,
+            model: None,
+            sdk_control_rx: Arc::new(tokio::sync::Mutex::new(None)),
+            stdin_tx: Some(stdin_tx),
+            child_pid: None,
+            nats_cancel: CancellationToken::new(),
+            interrupt_token: CancellationToken::new(),
+            pending_permission_inputs: Arc::new(tokio::sync::Mutex::new(pending)),
+            auto_continue: Arc::new(AtomicBool::new(false)),
+            auto_continue_count: Arc::new(AtomicU32::new(0)),
+            max_auto_continues: 0,
+            rfc_accumulator: Arc::new(Mutex::new(
+                crate::chat::observation_detector::RfcAccumulator::new(),
+            )),
+            protocol_run_id: None,
+            protocol_state: None,
+            reasoning_path_tracker: crate::chat::feedback::ReasoningPathTracker::new(),
+            objective_tracking: false,
+            objective_reminder_turns_since: Arc::new(AtomicU32::new(0)),
+            work_log: Arc::new(Mutex::new(SessionWorkLog::default())),
+            oob_trigger_history: Arc::new(Mutex::new(VecDeque::new())),
+            oob_trigger_cap: OOB_TRIGGER_CAP_INTERACTIVE,
+            oob_trigger_window: Duration::from_secs(OOB_TRIGGER_WINDOW_SECS),
+            oob_capped_warned: Arc::new(AtomicBool::new(false)),
+            cancel_tools_history: Arc::new(Mutex::new(VecDeque::new())),
+            cancel_tools_cap: CANCEL_TOOLS_CAP,
+            cancel_tools_window: Duration::from_secs(CANCEL_TOOLS_WINDOW_SECS),
+            active_background_tasks: Arc::new(Mutex::new(HashMap::new())),
+            cancel_task_history: Arc::new(Mutex::new(VecDeque::new())),
+            cancel_task_cap: CANCEL_TASK_CAP,
+            cancel_task_window: Duration::from_secs(CANCEL_TASK_WINDOW_SECS),
+        };
+        manager
+            .active_sessions
+            .write()
+            .await
+            .insert(session_id.to_string(), session);
+        Some((stdin_rx, pending_messages))
     }
 }

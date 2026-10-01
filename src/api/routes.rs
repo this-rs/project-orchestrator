@@ -1768,7 +1768,13 @@ fn protected_routes() -> Router<OrchestratorState> {
         )
         .route(
             "/api/chat/sessions/{id}/messages",
-            get(chat_handlers::list_messages),
+            get(chat_handlers::list_messages).post(chat_handlers::send_session_message),
+        )
+        // Answer a permission request over REST (same server path as the WS
+        // `permission_response` frame): 410 dead session, 409 already decided.
+        .route(
+            "/api/chat/sessions/{id}/permissions/{request_id}",
+            post(chat_handlers::respond_permission),
         )
         .route(
             "/api/chat/sessions/{id}/children",
