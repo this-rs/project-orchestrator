@@ -1,0 +1,205 @@
+# Index des diagrammes du depot (voir docs/DOCUMENTATION.md). Verifie hors reseau par scripts/diagrams/check-index.mjs.
+# Sous-ensemble YAML strict : entrees "- name:", scalaires "cle: valeur", liste "covers:" de "- glob".
+# Globs prefixes par depot : backend: frontend: nexus: website:
+# status: planned = pas encore de fichier .mmd (contenu a verifier contre le code avant export) ; verified = docs/diagrams/<name>.mmd present et releve.
+# po-p2p-transport et po-architecture-derive reprennent le perimetre de deux cartes provisoires mal nommees (suffixe -2).
+diagrams:
+  - name: po-carte
+    owner: theotime
+    status: planned
+    covers:
+      - "backend:docs/diagrams/INDEX.yml"
+  - name: po-api
+    owner: theotime
+    status: planned
+    covers:
+      - "backend:src/api/{mod,routes,handlers,query,ws_auth,ws_handlers,hook_handlers,auth_handlers}.rs"
+      - "backend:src/auth/{mod,middleware,extractor}.rs"
+  - name: po-autonomic
+    owner: theotime
+    status: planned
+    covers:
+      - "backend:src/heartbeat/**"
+      - "backend:src/homeostasis.rs"
+      - "backend:src/reflex/**"
+      - "backend:src/events/{mod,bus,hybrid,reactor,trigger,builtin_triggers,reactions}.rs"
+  - name: po-chat-manager
+    owner: theotime
+    status: planned
+    covers:
+      - "backend:src/chat/{mod,manager,drain,post_stream,control_pump,oob_listener,config,types}.rs"
+  - name: po-chat-transport
+    owner: theotime
+    status: planned
+    covers:
+      - "backend:src/api/{ws_chat_handler,ws_auth,ws_handlers}.rs"
+  - name: po-p2p-transport
+    owner: theotime
+    status: planned
+    covers:
+      - "backend:src/transport/**"
+      - "backend:src/reception/**"
+  - name: po-code-intelligence
+    owner: theotime
+    status: planned
+    covers:
+      - "backend:src/graph/{mod,engine,algorithms,models,process,debouncer,extraction,writer,enrichment,confidence}.rs"
+      - "backend:src/analytics/{mod,hypothesis,distribution}.rs"
+      - "backend:src/analytics/stats/mod.rs"
+  - name: po-architecture-derive
+    owner: theotime
+    status: planned
+    covers:
+      - "backend:src/architecture/**"
+  - name: po-crates-tests
+    owner: theotime
+    status: planned
+    covers:
+      - "backend:Cargo.toml"
+      - "backend:crates/**"
+      - "backend:tests/*.rs"
+      - "backend:.github/workflows/{ci,security,release}.yml"
+      - "backend:.github/dependabot.yml"
+      - "backend:deny.toml"
+      - "backend:codecov.yml"
+      - "backend:rust-toolchain.toml"
+      - "backend:scripts/test.sh"
+  - name: po-documents-workspace
+    owner: theotime
+    status: planned
+    covers:
+      - "backend:src/documents/**"
+      - "backend:src/api/{document,workspace,project}_handlers.rs"
+      - "backend:src/neo4j/{document,workspace,milestone,release,project}.rs"
+  - name: po-entry-deploy
+    owner: theotime
+    status: planned
+    covers:
+      - "backend:src/{main,cli,setup_claude,lib}.rs"
+      - "backend:src/bin/mcp_server.rs"
+      - "backend:src/update/**"
+      - "backend:Dockerfile"
+      - "backend:docker-compose*.yml"
+      - "backend:config.yaml.example"
+      - "backend:packaging/**"
+      - "backend:desktop/src-tauri/{tauri.conf.json,src/**}"
+      - "backend:scripts/build-desktop.sh"
+  - name: po-frontend-chat
+    owner: theotime
+    status: planned
+    covers:
+      - "frontend:src/services/chatWebSocket.ts"
+      - "frontend:src/hooks/{useChat,useSessionTree}.ts"
+      - "frontend:src/atoms/chat.ts"
+      - "frontend:src/utils/chatAssembly.ts"
+      - "frontend:src/components/chat/{ChatMessageBubble,ChatSessionContext,PermissionRequestBlock,SessionList}.tsx"
+      - "frontend:src/components/chat/{messageQueue,inputAction,chatUrlState,sessionListUtils}.ts"
+  - name: po-frontend-shell
+    owner: theotime
+    status: planned
+    covers:
+      - "frontend:src/{App,main}.tsx"
+      - "frontend:src/layouts/**"
+      - "frontend:src/components/{SetupGuard,WorkspaceRouteGuard}.tsx"
+      - "frontend:src/components/auth/ProtectedRoute.tsx"
+  - name: po-frontend-views
+    owner: theotime
+    status: planned
+    covers:
+      - "frontend:src/hooks/{useCrudEventRefresh,useCrudEventSync,useViewMode,useKanbanColumnData,usePlanGraphData}.ts"
+      - "frontend:src/components/graph/entity/{EntityGraph.tsx,useNeighborhood.ts}"
+      - "frontend:src/components/graph/UnifiedGraphSection.tsx"
+      - "frontend:src/components/kanban/UniversalKanban.tsx"
+      - "frontend:src/components/protocols/{FsmViewer,RunTreeView}.tsx"
+      - "frontend:src/components/protocols/rfcLifecycle.ts"
+      - "frontend:src/pages/{TodayPage,PlansPage,TasksPage,NotesPage,ProtocolsPage,ProtocolDetailPage}.tsx"
+      - "frontend:src/constants/nomenclature.ts"
+      - "frontend:src/services/eventBus.ts"
+  - name: po-graph-store
+    owner: theotime
+    status: planned
+    covers:
+      - "backend:src/neo4j/{mod,client,traits,impl_graph_store,data_migrations,batch,registry,analytics}.rs"
+      - "backend:migrations/**"
+      - "backend:src/graph/{engine,writer,extraction,debouncer}.rs"
+  - name: po-knowledge-notes
+    owner: theotime
+    status: planned
+    covers:
+      - "backend:src/notes/**"
+      - "backend:src/neo4j/note.rs"
+  - name: po-mcp
+    owner: theotime
+    status: planned
+    covers:
+      - "backend:src/mcp/**"
+      - "backend:src/bin/mcp_server.rs"
+  - name: po-mcp-federation
+    owner: theotime
+    status: planned
+    covers:
+      - "backend:src/mcp_federation/**"
+      - "backend:src/api/mcp_federation_handlers.rs"
+      - "backend:src/chat/stages/mcp_federation_stage.rs"
+  - name: po-neurons-embeddings
+    owner: theotime
+    status: planned
+    covers:
+      - "backend:src/neurons/**"
+      - "backend:src/embeddings/**"
+      - "backend:src/meilisearch/**"
+  - name: po-nexus-sdk
+    owner: theotime
+    status: planned
+    covers:
+      - "nexus:claude-code-sdk-rs/src/{lib,client,query,interactive,internal_query,message_parser,types}.rs"
+      - "nexus:claude-code-sdk-rs/src/transport/{mod,subprocess}.rs"
+  - name: po-personas-identity
+    owner: theotime
+    status: planned
+    covers:
+      - "backend:src/identity/**"
+      - "backend:src/sharing/**"
+      - "backend:src/profile/**"
+      - "backend:src/api/sharing_handlers.rs"
+  - name: po-plan-lifecycle
+    owner: theotime
+    status: planned
+    covers:
+      - "backend:src/plan/**"
+      - "backend:src/lifecycle/**"
+      - "backend:src/neo4j/{lifecycle_hook,step,task,plan}.rs"
+      - "backend:src/events/{types,reactions}.rs"
+  - name: po-protocols
+    owner: theotime
+    status: planned
+    covers:
+      - "backend:src/protocol/**"
+  - name: po-runner-orchestrator
+    owner: theotime
+    status: planned
+    covers:
+      - "backend:src/runner/{mod,runner,state,models,guard}.rs"
+      - "backend:src/orchestrator/{mod,runner}.rs"
+  - name: po-skills-reasoning
+    owner: theotime
+    status: planned
+    covers:
+      - "backend:src/skills/{mod,models,detection,evolution,lifecycle,maintenance,activation,feedback}.rs"
+      - "backend:src/reasoning/**"
+      - "backend:src/feedback/**"
+      - "backend:src/episodes/{mod,models,collector,distill,anonymize}.rs"
+  - name: po-sync-parser
+    owner: theotime
+    status: planned
+    covers:
+      - "backend:src/parser/{mod,ast_cache,helpers,noise_filter}.rs"
+      - "backend:src/resolver/**"
+      - "backend:src/orchestrator/{mod,runner,watcher}.rs"
+  - name: po-website-docs
+    owner: theotime
+    status: planned
+    covers:
+      - "website:{package.json,vite.config.ts,src/**,scripts/**,public/robots.txt}"
+      - "backend:{SKILL,AGENTS,CLAUDE}.md"
+      - "backend:docs/api/**"
