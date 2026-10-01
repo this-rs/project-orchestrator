@@ -338,7 +338,9 @@ fn test_tombstone_revocation() {
 
     // 2. Create a tombstone for that content_hash
     let mut tombstones = TombstoneRegistry::new();
-    tombstones.register_envelope_owner(&envelope);
+    tombstones
+        .register_envelope_owner(&envelope)
+        .expect("envelope is validly signed");
     let signed = project_orchestrator::sharing::tombstone::sign_tombstone_with_key(
         &alice_key,
         envelope.meta.content_hash.clone(),

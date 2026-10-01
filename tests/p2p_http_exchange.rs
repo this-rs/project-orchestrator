@@ -553,7 +553,9 @@ async fn test_tombstone_propagation_over_http() {
 
     // Bob's tombstone registry should now block this envelope
     let mut tombstones = TombstoneRegistry::new();
-    tombstones.register_envelope_owner(&envelope);
+    tombstones
+        .register_envelope_owner(&envelope)
+        .expect("envelope is validly signed");
     tombstones
         .apply_signed_tombstone(
             project_orchestrator::sharing::tombstone::sign_tombstone_with_key(
