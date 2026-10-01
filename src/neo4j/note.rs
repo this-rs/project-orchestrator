@@ -40,6 +40,19 @@ fn note_order_dir(requested: Option<&str>) -> &'static str {
     }
 }
 
+/// Split synapse neighbors into the parallel `$ids` / `$weights` lists bound
+/// to the UNWIND queries. A non-finite weight (NaN/inf) is rejected up front:
+/// it used to be spliced into the Cypher text and produced an invalid query.
+pub(crate) fn synapse_bind_params(neighbors: &[(Uuid, f64)]) -> Result<(Vec<String>, Vec<f64>)> {
+    if let Some((nid, w)) = neighbors.iter().find(|(_, w)| !w.is_finite()) {
+        anyhow::bail!("non-finite synapse weight {} for neighbor {}", w, nid);
+    }
+    Ok((
+        neighbors.iter().map(|(n, _)| n.to_string()).collect(),
+        neighbors.iter().map(|(_, w)| *w).collect(),
+    ))
+}
+
 /// Build the WHERE conditions of `list_notes`. Every client-supplied value
 /// (project id, workspace slug, enum lists, tags, search text) is carried as
 /// a bound `$wb_N` parameter; nothing is spliced into the Cypher text.
@@ -2448,31 +2461,28 @@ impl Neo4jClient {
             return Ok(0);
         }
 
-        // Build UNWIND list directly in Cypher (internal computed data, no injection risk)
-        let entries: Vec<String> = neighbors
-            .iter()
-            .map(|(nid, weight)| format!("{{id: '{}', weight: {}}}", nid, weight))
-            .collect();
+        let (ids, weights) = synapse_bind_params(neighbors)?;
 
-        let cypher = format!(
-            r#"
-            MATCH (source:Note {{id: $source_id}})
-            UNWIND [{}] AS neighbor
-            MATCH (target:Note {{id: neighbor.id}})
+        let cypher = r#"
+            MATCH (source:Note {id: $source_id})
+            UNWIND range(0, size($ids) - 1) AS i
+            WITH source, $ids[i] AS nid, $weights[i] AS w
+            MATCH (target:Note {id: nid})
             MERGE (source)-[s1:SYNAPSE]->(target)
-            ON CREATE SET s1.weight = neighbor.weight, s1.created_at = datetime(),
+            ON CREATE SET s1.weight = w, s1.created_at = datetime(),
               s1.source = 'cosine'
-            ON MATCH SET s1.weight = neighbor.weight
+            ON MATCH SET s1.weight = w
             MERGE (target)-[s2:SYNAPSE]->(source)
-            ON CREATE SET s2.weight = neighbor.weight, s2.created_at = datetime(),
+            ON CREATE SET s2.weight = w, s2.created_at = datetime(),
               s2.source = 'cosine'
-            ON MATCH SET s2.weight = neighbor.weight
+            ON MATCH SET s2.weight = w
             RETURN count(s1) + count(s2) AS total
-            "#,
-            entries.join(", ")
-        );
+            "#;
 
-        let q = query(&cypher).param("source_id", note_id.to_string());
+        let q = query(cypher)
+            .param("source_id", note_id.to_string())
+            .param("ids", ids)
+            .param("weights", weights);
 
         let mut result = self.graph.execute(q).await?;
         if let Some(row) = result.next().await? {
@@ -2550,33 +2560,30 @@ impl Neo4jClient {
             return Ok(0);
         }
 
-        // Build UNWIND list (internal computed data, no injection risk)
-        let entries: Vec<String> = neighbors
-            .iter()
-            .map(|(nid, weight)| format!("{{id: '{}', weight: {}}}", nid, weight))
-            .collect();
+        let (ids, weights) = synapse_bind_params(neighbors)?;
 
-        let cypher = format!(
-            r#"
-            MATCH (source {{id: $source_id}})
+        let cypher = r#"
+            MATCH (source {id: $source_id})
             WHERE source:Note OR source:Decision
-            UNWIND [{}] AS neighbor
-            MATCH (target {{id: neighbor.id}})
+            UNWIND range(0, size($ids) - 1) AS i
+            WITH source, $ids[i] AS nid, $weights[i] AS w
+            MATCH (target {id: nid})
             WHERE target:Note OR target:Decision
             MERGE (source)-[s1:SYNAPSE]->(target)
-            ON CREATE SET s1.weight = neighbor.weight, s1.created_at = datetime(),
+            ON CREATE SET s1.weight = w, s1.created_at = datetime(),
               s1.source = 'cosine'
-            ON MATCH SET s1.weight = neighbor.weight
+            ON MATCH SET s1.weight = w
             MERGE (target)-[s2:SYNAPSE]->(source)
-            ON CREATE SET s2.weight = neighbor.weight, s2.created_at = datetime(),
+            ON CREATE SET s2.weight = w, s2.created_at = datetime(),
               s2.source = 'cosine'
-            ON MATCH SET s2.weight = neighbor.weight
+            ON MATCH SET s2.weight = w
             RETURN count(s1) + count(s2) AS total
-            "#,
-            entries.join(", ")
-        );
+            "#;
 
-        let q = query(&cypher).param("source_id", source_id.to_string());
+        let q = query(cypher)
+            .param("source_id", source_id.to_string())
+            .param("ids", ids)
+            .param("weights", weights);
 
         let mut result = self.graph.execute(q).await?;
         if let Some(row) = result.next().await? {
@@ -3827,5 +3834,26 @@ mod injection_tests {
         // non-finite staleness must not render invalid Cypher
         let nan = note_update_set_clauses(false, false, false, false, Some(f64::NAN)).join(", ");
         assert!(!nan.contains("NaN"));
+    }
+}
+
+#[cfg(test)]
+mod synapse_param_tests {
+    use super::synapse_bind_params;
+    use uuid::Uuid;
+
+    #[test]
+    fn finite_weights_become_parallel_lists() {
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let (ids, w) = synapse_bind_params(&[(a, 0.5), (b, 1.0)]).unwrap();
+        assert_eq!(ids, vec![a.to_string(), b.to_string()]);
+        assert_eq!(w, vec![0.5, 1.0]);
+    }
+
+    #[test]
+    fn non_finite_weights_are_rejected() {
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(synapse_bind_params(&[(Uuid::new_v4(), 0.3), (Uuid::new_v4(), bad)]).is_err());
+        }
     }
 }
