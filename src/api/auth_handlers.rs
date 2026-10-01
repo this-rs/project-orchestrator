@@ -484,7 +484,10 @@ pub async fn google_callback(
         }
         None => client.exchange_code(&req.code).await,
     }
-    .map_err(|e| AppError::BadRequest(format!("OAuth code exchange failed: {}", e)))?;
+    .map_err(|e| {
+        tracing::warn!(error = %e, "OAuth code exchange failed");
+        AppError::BadRequest("OAuth code exchange failed".to_string())
+    })?;
 
     // 2. Check email restrictions (domain + individual whitelist)
     if !auth_config.is_email_allowed(&google_user.email) {
@@ -587,7 +590,10 @@ pub async fn oidc_callback(
         }
         None => client.exchange_code(&req.code).await,
     }
-    .map_err(|e| AppError::BadRequest(format!("OIDC code exchange failed: {}", e)))?;
+    .map_err(|e| {
+        tracing::warn!(error = %e, "OIDC code exchange failed");
+        AppError::BadRequest("OIDC code exchange failed".to_string())
+    })?;
 
     // 2. Check email restrictions (domain + individual whitelist)
     if !auth_config.is_email_allowed(&oidc_user.email) {

@@ -21,13 +21,13 @@ use crate::skills::models::HookActivateRequest;
 use crate::skills::project_resolver::{find_longest_prefix_match, load_project_entries};
 use crate::skills::SkillStatus;
 use axum::{
-    extract::{Query, State},
-    http::{HeaderMap, StatusCode},
+    extract::{ConnectInfo, Query, State},
+    http::StatusCode,
     Json,
 };
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -91,9 +91,11 @@ impl RateLimiter {
     }
 }
 
-/// Global rate limiter for the hooks endpoint: 500 requests per minute per IP.
+/// Rate limiter for the hooks endpoint: 500 requests per minute per client IP
+/// (the real TCP peer, see `extract_client_ip`).
 ///
-/// Generous limit because: (1) all sessions share localhost IP via extract_client_ip,
+/// Generous limit because: (1) sessions running on the same host (the common
+/// case: local Claude Code) share the loopback IP and therefore one bucket,
 /// (2) each Claude Code turn can fire 5-10 tool calls, and (3) automated agent
 /// mode can sustain high throughput. 500/min ≈ 8/sec handles concurrent sessions.
 static HOOK_RATE_LIMITER: LazyLock<RateLimiter> =
@@ -130,11 +132,11 @@ pub fn skill_cache() -> &'static SkillCache {
 /// - 429 Too Many Requests if rate limited
 pub async fn activate_hook(
     State(state): State<OrchestratorState>,
-    headers: HeaderMap,
+    connect_info: Option<axum::Extension<ConnectInfo<SocketAddr>>>,
     Json(req): Json<HookActivateRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
     // --- Rate limiting ---
-    let client_ip = extract_client_ip(&headers);
+    let client_ip = client_ip_from_extension(connect_info);
     if !HOOK_RATE_LIMITER.check(client_ip) {
         return Ok((
             StatusCode::TOO_MANY_REQUESTS,
@@ -528,21 +530,25 @@ fn truncate_str(s: &str, max_len: usize) -> String {
     }
 }
 
-/// Extract client IP from request headers.
+/// Determine the client IP used for rate limiting.
 ///
-/// **Security**: Does NOT trust X-Forwarded-For or X-Real-IP headers
-/// because PO runs as a localhost service without a reverse proxy.
-/// These headers can be trivially spoofed by any client to bypass
-/// the rate limiter. Always returns localhost for consistent rate limiting.
-///
-/// If PO is ever deployed behind a trusted reverse proxy, this function
-/// should be updated to read the IP from the proxy's header, but only
-/// after configuring the trusted proxy IP list.
-fn extract_client_ip(_headers: &HeaderMap) -> IpAddr {
-    // PO is a localhost service — the "client" is always local.
-    // Trusting X-Forwarded-For without a known reverse proxy
-    // allows trivial rate limiter bypass via header spoofing.
-    IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+/// Uses the real TCP peer address (axum `ConnectInfo`). `X-Forwarded-For` /
+/// `X-Real-IP` are deliberately NOT honored: PO is served directly (no trusted
+/// reverse proxy configured), so those headers are client-controlled and would
+/// let any caller dodge the limiter by rotating a fake value. If the peer
+/// address is unavailable (e.g. router driven without `ConnectInfo`), fall back
+/// to localhost so the limiter still applies globally.
+fn extract_client_ip(peer: Option<SocketAddr>) -> IpAddr {
+    peer.map(|a| a.ip())
+        .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
+}
+
+/// `extract_client_ip` applied to the optional `ConnectInfo` request extension
+/// (present only when served via `into_make_service_with_connect_info`).
+fn client_ip_from_extension(
+    connect_info: Option<axum::Extension<ConnectInfo<SocketAddr>>>,
+) -> IpAddr {
+    extract_client_ip(connect_info.map(|c| c.0 .0))
 }
 
 // ============================================================================
@@ -627,32 +633,68 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_client_ip_always_localhost() {
-        // Security: PO is a localhost service, so we never trust proxy headers.
-        // This prevents rate limiter bypass via X-Forwarded-For spoofing.
-        let headers = HeaderMap::new();
-        let ip = extract_client_ip(&headers);
-        assert_eq!(ip, IpAddr::V4(Ipv4Addr::LOCALHOST));
+    fn test_extract_client_ip_uses_peer_address() {
+        let peer: SocketAddr = "203.0.113.7:5555".parse().unwrap();
+        assert_eq!(
+            extract_client_ip(Some(peer)),
+            "203.0.113.7".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    async fn probe(connect_info: Option<axum::Extension<ConnectInfo<SocketAddr>>>) -> String {
+        client_ip_from_extension(connect_info).to_string()
+    }
+
+    /// Served through `into_make_service_with_connect_info` (as `start_server`
+    /// does), the real peer address must reach the rate limiter's key. The
+    /// server is bound on IPv6 loopback so the peer (`::1`) differs from the
+    /// IPv4-localhost fallback and the assertion cannot pass by accident.
+    #[tokio::test]
+    async fn test_connect_info_reaches_extract_client_ip_over_tcp() {
+        let Ok(listener) = tokio::net::TcpListener::bind("[::1]:0").await else {
+            eprintln!("IPv6 loopback unavailable, skipping");
+            return;
+        };
+        let port = listener.local_addr().unwrap().port();
+        let app = axum::Router::new().route("/probe", axum::routing::get(probe));
+        tokio::spawn(async move {
+            let _ = axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await;
+        });
+        let body = reqwest::get(format!("http://[::1]:{port}/probe"))
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert_eq!(body, "::1");
+    }
+
+    /// Without `ConnectInfo` (router driven in memory) the limiter falls back
+    /// to localhost instead of failing the request.
+    #[tokio::test]
+    async fn test_router_without_connect_info_falls_back_to_localhost() {
+        use tower::ServiceExt;
+        let app = axum::Router::new().route("/probe", axum::routing::get(probe));
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/probe")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), 64).await.unwrap();
+        assert_eq!(&bytes[..], b"127.0.0.1");
     }
 
     #[test]
-    fn test_extract_client_ip_ignores_xff() {
-        // X-Forwarded-For headers should be ignored (security: spoofable)
-        let mut headers = HeaderMap::new();
-        headers.insert("x-forwarded-for", "1.2.3.4, 5.6.7.8".parse().unwrap());
-
-        let ip = extract_client_ip(&headers);
-        assert_eq!(ip, IpAddr::V4(Ipv4Addr::LOCALHOST)); // Always localhost
-    }
-
-    #[test]
-    fn test_extract_client_ip_ignores_xri() {
-        // X-Real-IP headers should be ignored (security: spoofable)
-        let mut headers = HeaderMap::new();
-        headers.insert("x-real-ip", "10.0.0.5".parse().unwrap());
-
-        let ip = extract_client_ip(&headers);
-        assert_eq!(ip, IpAddr::V4(Ipv4Addr::LOCALHOST)); // Always localhost
+    fn test_extract_client_ip_falls_back_to_localhost() {
+        assert_eq!(extract_client_ip(None), IpAddr::V4(Ipv4Addr::LOCALHOST));
     }
 
     // ================================================================

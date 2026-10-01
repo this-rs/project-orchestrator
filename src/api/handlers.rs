@@ -37,7 +37,9 @@ pub struct ServerState {
     /// NATS emitter for inter-process chat events and interrupts.
     /// None when NATS is not configured (local-only mode).
     pub nats_emitter: Option<Arc<NatsEmitter>>,
-    /// Auth config — None means deny-by-default
+    /// Auth config. `None` means **anonymous/open access**: `require_auth`
+    /// injects anonymous claims and lets every request through (no JWT needed).
+    /// Only intended for local single-user use; a WARN is logged at startup.
     pub auth_config: Option<AuthConfig>,
     /// Whether the app has been fully configured (setup wizard completed).
     /// When false, the frontend should show the setup wizard.
@@ -3526,10 +3528,13 @@ pub async fn bootstrap_knowledge_fabric(
             "commits_backfilled": result.commits_backfilled,
             "touches_created": result.touches_created,
         })),
-        Err(e) => failed.push(serde_json::json!({
+        Err(e) => {
+            tracing::warn!(step = "backfill_touches", error = %e, "maintenance step failed");
+            failed.push(serde_json::json!({
             "step": "backfill_touches",
-            "error": e.to_string(),
-        })),
+            "error": STEP_FAILED_MESSAGE,
+            }))
+        }
     }
 
     // Step 2: Reindex decisions from Neo4j into MeiliSearch
@@ -3539,10 +3544,13 @@ pub async fn bootstrap_knowledge_fabric(
             "decisions_processed": total,
             "decisions_indexed": indexed,
         })),
-        Err(e) => failed.push(serde_json::json!({
+        Err(e) => {
+            tracing::warn!(step = "reindex_decisions", error = %e, "maintenance step failed");
+            failed.push(serde_json::json!({
             "step": "reindex_decisions",
-            "error": e.to_string(),
-        })),
+            "error": STEP_FAILED_MESSAGE,
+            }))
+        }
     }
 
     // Step 2b: Backfill decision embeddings
@@ -3557,10 +3565,13 @@ pub async fn bootstrap_knowledge_fabric(
             "decisions_processed": total,
             "embeddings_created": created,
         })),
-        Err(e) => failed.push(serde_json::json!({
+        Err(e) => {
+            tracing::warn!(step = "backfill_decision_embeddings", error = %e, "maintenance step failed");
+            failed.push(serde_json::json!({
             "step": "backfill_decision_embeddings",
-            "error": e.to_string(),
-        })),
+            "error": STEP_FAILED_MESSAGE,
+            }))
+        }
     }
 
     // Step 2c: Backfill decision project_slugs in Meilisearch
@@ -3575,10 +3586,13 @@ pub async fn bootstrap_knowledge_fabric(
             "decisions_processed": total,
             "decisions_updated": updated,
         })),
-        Err(e) => failed.push(serde_json::json!({
+        Err(e) => {
+            tracing::warn!(step = "backfill_decision_project_slugs", error = %e, "maintenance step failed");
+            failed.push(serde_json::json!({
             "step": "backfill_decision_project_slugs",
-            "error": e.to_string(),
-        })),
+            "error": STEP_FAILED_MESSAGE,
+            }))
+        }
     }
 
     // Step 3: Backfill DISCUSSED relations
@@ -3589,10 +3603,13 @@ pub async fn bootstrap_knowledge_fabric(
             "entities_found": entities,
             "relations_created": relations,
         })),
-        Err(e) => failed.push(serde_json::json!({
+        Err(e) => {
+            tracing::warn!(step = "backfill_discussed", error = %e, "maintenance step failed");
+            failed.push(serde_json::json!({
             "step": "backfill_discussed",
-            "error": e.to_string(),
-        })),
+            "error": STEP_FAILED_MESSAGE,
+            }))
+        }
     }
 
     // Step 4: Update fabric scores (the final analytics computation)
@@ -3612,10 +3629,13 @@ pub async fn bootstrap_knowledge_fabric(
             "nodes_updated": analytics.metrics.len(),
             "communities": analytics.communities.len(),
         })),
-        Ok(Err(e)) => failed.push(serde_json::json!({
+        Ok(Err(e)) => {
+            tracing::warn!(step = "update_fabric_scores", error = %e, "maintenance step failed");
+            failed.push(serde_json::json!({
             "step": "update_fabric_scores",
-            "error": e.to_string(),
-        })),
+            "error": STEP_FAILED_MESSAGE,
+            }))
+        }
         Err(_) => failed.push(serde_json::json!({
             "step": "update_fabric_scores",
             "error": "Timed out after 120s",
@@ -6396,10 +6416,24 @@ pub enum AppError {
     NotImplemented(String),
 }
 
+/// Generic message returned to clients for `AppError::Internal`.
+pub(crate) const INTERNAL_ERROR_MESSAGE: &str = "Internal server error";
+
+/// Generic per-step error reported in multi-step maintenance responses; the
+/// detail (Neo4j / filesystem errors) goes to the server log only.
+pub(crate) const STEP_FAILED_MESSAGE: &str = "step failed (see server logs)";
+
 impl IntoResponse for AppError {
     fn into_response(self) -> axum::response::Response {
         let (status, message) = match self {
-            AppError::Internal(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+            AppError::Internal(e) => {
+                // Never leak internal details (DB errors, paths, queries) to the client.
+                tracing::error!(error = ?e, "internal server error");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    INTERNAL_ERROR_MESSAGE.to_string(),
+                )
+            }
             AppError::NotFound(msg) => (StatusCode::NOT_FOUND, msg),
             AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
             AppError::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, msg),
@@ -6426,6 +6460,17 @@ impl From<anyhow::Error> for AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn test_internal_error_does_not_leak_detail() {
+        let resp =
+            AppError::Internal(anyhow::anyhow!("bolt://secret-host:7687 refused")).into_response();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(!body.contains("secret-host"));
+        assert!(body.contains(INTERNAL_ERROR_MESSAGE));
+    }
 
     #[test]
     fn test_update_decision_request_all_fields() {
