@@ -60,10 +60,23 @@ export async function lintLocal(code, mermaidPath = MERMAID_PATH) {
   return r.ok ? { ok: true, errors: [] } : { ok: false, errors: [r.error] };
 }
 
+/** Accepts a raw "name=value" header string or a curl -c (Netscape) cookie file. */
+export function cookieHeader(raw) {
+  const lines = raw.split('\n').map((l) => l.replace(/\r$/, '')).filter(Boolean);
+  const pairs = [];
+  for (const l of lines) {
+    const t = l.replace(/^#HttpOnly_/, '');
+    if (t.startsWith('#')) continue;
+    const f = t.split('\t');
+    if (f.length >= 7) pairs.push(`${f[5]}=${f[6]}`);
+  }
+  return pairs.length ? pairs.join('; ') : raw.trim();
+}
+
 function cookie() {
-  if (process.env.MERMAID_COOKIE) return process.env.MERMAID_COOKIE.trim();
+  if (process.env.MERMAID_COOKIE) return cookieHeader(process.env.MERMAID_COOKIE);
   const f = process.env.MERMAID_COOKIE_FILE;
-  if (f && existsSync(f)) return readFileSync(f, 'utf8').trim();
+  if (f && existsSync(f)) return cookieHeader(readFileSync(f, 'utf8'));
   throw new Error('no session: set MERMAID_COOKIE or MERMAID_COOKIE_FILE (file outside the repo)');
 }
 
@@ -118,8 +131,10 @@ async function main() {
       const code = readFileSync(rest[1], 'utf8'); await gate(code);
       console.log(JSON.stringify(await api('POST', '/update', { id: rest[0], code, by: f.by || 'agent' }))); break;
     }
-    case 'archive': // UNVERIFIED endpoint: not documented in note 47c540b9; confirm with a logged-in session.
+    case 'archive': // POST /archive {id}: confirmed in the page JS (archiveButton); reversible via POST /restore {id}.
       console.log(JSON.stringify(await api('POST', '/archive', { id: rest[0] }))); break;
+    case 'workspace': // create a project: workspace <label>
+      console.log(JSON.stringify(await api('POST', '/workspaces', { label: rest[0] }))); break;
     default:
       console.error('usage: publish.mjs fetch-vendor | lint <f> | create <f> [--workspace W --session S] | update <id> <f> [--by who] | archive <id>');
       process.exit(2);

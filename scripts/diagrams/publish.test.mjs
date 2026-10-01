@@ -24,3 +24,10 @@ test('state "x" as Y is refused', async () => {
   const r = await lintLocal(fx('state-as.mmd'));
   assert.equal(r.ok, false); assert.match(r.errors[0], /state/);
 });
+
+import { cookieHeader } from './publish.mjs';
+test('cookieHeader parses a curl -c file', () => {
+  const f = '# Netscape HTTP Cookie File\n#HttpOnly_h.dev\tFALSE\t/\tTRUE\t0\tsid\tabc\n';
+  assert.equal(cookieHeader(f), 'sid=abc');
+  assert.equal(cookieHeader('sid=abc'), 'sid=abc');
+});

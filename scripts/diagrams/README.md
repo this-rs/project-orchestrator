@@ -13,7 +13,8 @@ mermaid.ffs.dev API. Background and linter traps: note 47c540b9.
     node publish.mjs lint diagram.mmd                 # local only: negative control + trap checks + exact mermaid parse
     node publish.mjs create diagram.mmd --workspace <id> --session <s>
     node publish.mjs update <id> diagram.mmd --by <who>
-    node publish.mjs archive <id>                     # endpoint unverified, confirm with an open session
+    node publish.mjs archive <id>                     # POST /archive {id}, reversible via /restore
+    node publish.mjs workspace <label>                # create a project, prints {id,label}
 
 Every create/update first runs the negative control (a deliberately broken diagram
 MUST be rejected, otherwise the helper aborts), the trap checks (bare `%%`,
@@ -23,7 +24,7 @@ MUST be rejected, otherwise the helper aborts), the trap checks (bare `%%`,
 
 The service is locked until someone POSTs `/login {vault, passphrase}`. The helper
 never handles the passphrase. Provide the resulting session cookie via
-`MERMAID_COOKIE` or `MERMAID_COOKIE_FILE` (a file outside the repo). Never commit it.
+`MERMAID_COOKIE` or `MERMAID_COOKIE_FILE` (a file outside the repo; raw `name=value` or curl `-c` Netscape format both work). Never commit it.
 
 ## Read back exactly and verify
 
