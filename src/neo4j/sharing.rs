@@ -234,47 +234,52 @@ impl Neo4jClient {
         Ok(())
     }
 
-    /// List all tombstones.
+    /// List all tombstones (including legacy placeholders; callers annotate
+    /// them with `sharing::tombstone::annotate_tombstone`).
     pub async fn list_tombstones(&self) -> Result<Vec<SignedTombstone>> {
+        // `issued_at` is stored as a Neo4j datetime: read it back as an ISO
+        // string with toString(), a typed String read of a DateTime fails.
         let q = query(
             r#"
             MATCH (t:Tombstone)
-            RETURN t
+            RETURN t.content_hash AS content_hash,
+                   t.issuer_did AS issuer_did,
+                   t.signature_hex AS signature_hex,
+                   toString(t.issued_at) AS issued_at,
+                   t.reason AS reason
             "#,
         );
 
         let mut result = self.graph.execute(q).await?;
         let mut tombstones = Vec::new();
         while let Some(row) = result.next().await? {
-            let node: neo4rs::Node = row.get("t")?;
-            let content_hash: String = node.get("content_hash").unwrap_or_default();
-            let issuer_did: String = node.get("issuer_did").unwrap_or_default();
-            let signature_hex: String = node.get("signature_hex").unwrap_or_default();
-            let issued_at_str: String = node.get("issued_at").unwrap_or_default();
-            let reason: String = node.get("reason").unwrap_or_default();
-
-            tombstones.push(SignedTombstone {
+            let content_hash: String = row.get("content_hash").unwrap_or_default();
+            let issuer_did: String = row.get("issuer_did").unwrap_or_default();
+            let signature_hex: String = row.get("signature_hex").unwrap_or_default();
+            let issued_at: String = row.get("issued_at").unwrap_or_default();
+            let reason: String = row.get("reason").unwrap_or_default();
+            tombstones.push(tombstone_from_stored(
                 content_hash,
                 issuer_did,
                 signature_hex,
-                issued_at: chrono::DateTime::parse_from_rfc3339(&issued_at_str)
-                    .map(|dt| dt.with_timezone(&chrono::Utc))
-                    .unwrap_or_else(|_| chrono::Utc::now()),
-                reason: if reason.is_empty() {
-                    None
-                } else {
-                    Some(reason)
-                },
-            });
+                &issued_at,
+                reason,
+            ));
         }
         Ok(tombstones)
     }
 
-    /// Check if a content hash has been tombstoned.
+    /// Check if a content hash has been tombstoned by a non-legacy tombstone
+    /// (placeholder entries with a fake signature never count).
     pub async fn is_tombstoned(&self, content_hash: &str) -> Result<bool> {
         let q = query(
             r#"
             MATCH (t:Tombstone {content_hash: $hash})
+            WHERE t.signature_hex IS NOT NULL
+              AND NOT t.signature_hex =~ '^0*$'
+              AND t.issuer_did IS NOT NULL
+              AND t.issuer_did <> ''
+              AND t.issuer_did <> 'did:local:unknown'
             RETURN count(t) > 0 AS exists
             "#,
         )
@@ -287,5 +292,83 @@ impl Neo4jClient {
         } else {
             Ok(false)
         }
+    }
+}
+
+/// Rebuild a [`SignedTombstone`] from stored fields.
+///
+/// An unparsable `issued_at` falls back to the Unix epoch, NOT `Utc::now()`:
+/// a clock-dependent fallback would change the signed payload on every read,
+/// while the epoch is deterministic and simply fails verification.
+fn tombstone_from_stored(
+    content_hash: String,
+    issuer_did: String,
+    signature_hex: String,
+    issued_at: &str,
+    reason: String,
+) -> SignedTombstone {
+    SignedTombstone {
+        content_hash,
+        issuer_did,
+        signature_hex,
+        issued_at: chrono::DateTime::parse_from_rfc3339(issued_at)
+            .map(|dt| dt.with_timezone(&chrono::Utc))
+            .unwrap_or(chrono::DateTime::UNIX_EPOCH),
+        reason: if reason.is_empty() {
+            None
+        } else {
+            Some(reason)
+        },
+    }
+}
+
+#[cfg(test)]
+mod tombstone_roundtrip_tests {
+    use super::*;
+    use crate::sharing::tombstone::{sign_tombstone, verify_tombstone};
+
+    /// sign -> store (datetime() of the RFC 3339 param; toString() on read;
+    /// None reason stored as "") -> reload -> verify.
+    #[test]
+    fn signature_survives_simulated_persistence() {
+        let id = crate::identity::InstanceIdentity::generate();
+        for reason in [None, Some("gdpr".to_string())] {
+            let t = sign_tombstone(&id, "hash".into(), chrono::Utc::now(), reason);
+            // Neo4j's toString(datetime) is ISO-8601 with up to 9 fractional digits.
+            let stored_at = t
+                .issued_at
+                .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+            let back = tombstone_from_stored(
+                t.content_hash.clone(),
+                t.issuer_did.clone(),
+                t.signature_hex.clone(),
+                &stored_at,
+                t.reason.clone().unwrap_or_default(),
+            );
+            assert_eq!(back.issued_at, t.issued_at);
+            assert!(verify_tombstone(&back));
+        }
+    }
+
+    #[test]
+    fn unparsable_issued_at_is_deterministic_and_unverifiable() {
+        let id = crate::identity::InstanceIdentity::generate();
+        let t = sign_tombstone(&id, "hash".into(), chrono::Utc::now(), None);
+        let a = tombstone_from_stored(
+            "hash".into(),
+            t.issuer_did.clone(),
+            t.signature_hex.clone(),
+            "",
+            String::new(),
+        );
+        let b = tombstone_from_stored(
+            "hash".into(),
+            t.issuer_did.clone(),
+            t.signature_hex.clone(),
+            "",
+            String::new(),
+        );
+        assert_eq!(a.issued_at, b.issued_at);
+        assert!(!verify_tombstone(&a));
     }
 }

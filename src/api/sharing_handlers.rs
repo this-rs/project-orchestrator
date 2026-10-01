@@ -8,8 +8,8 @@ use crate::episodes::distill_models::{
     ConsentStats, PrivacyMode, SharingConsent, SharingEvent, SharingMode, SharingPolicy,
 };
 use crate::notes::NoteFilters;
-use crate::reception::anchor::SignedTombstone;
 use crate::sharing::consent_gate::run_consent_gate;
+use crate::sharing::tombstone::AnnotatedTombstone;
 use axum::{
     extract::{Path, Query, State},
     Json,
@@ -451,7 +451,7 @@ pub async fn retract_sharing(
 pub async fn list_tombstones(
     State(state): State<OrchestratorState>,
     Path(slug): Path<String>,
-) -> Result<Json<Vec<SignedTombstone>>, AppError> {
+) -> Result<Json<Vec<AnnotatedTombstone>>, AppError> {
     // Validate project exists
     let _project_id = resolve_project_id(&state, &slug).await?;
 
@@ -462,7 +462,13 @@ pub async fn list_tombstones(
         .await
         .map_err(AppError::Internal)?;
 
-    Ok(Json(tombstones))
+    // Mark legacy placeholders (fake signature) and unverifiable entries explicitly.
+    Ok(Json(
+        tombstones
+            .into_iter()
+            .map(crate::sharing::tombstone::annotate_tombstone)
+            .collect(),
+    ))
 }
 
 /// GET /api/projects/{slug}/sharing/last-report — last privacy/consent report
