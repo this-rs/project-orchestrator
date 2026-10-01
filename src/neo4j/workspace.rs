@@ -37,6 +37,29 @@ pub fn validate_workspace_slug(slug: &str) -> Result<()> {
     Ok(())
 }
 
+/// WHERE clause for the cross-workspace milestone listings. Returns the clause
+/// (placeholders `$workspace_id` / `$status` only) and the PascalCase status to
+/// bind as `$status`, if any.
+pub(crate) fn all_milestones_where(
+    workspace_id: Option<Uuid>,
+    status: Option<&str>,
+) -> (String, Option<String>) {
+    let mut conditions = Vec::new();
+    if workspace_id.is_some() {
+        conditions.push("w.id = $workspace_id");
+    }
+    let pascal = status.map(snake_to_pascal_case);
+    if pascal.is_some() {
+        conditions.push("wm.status = $status");
+    }
+    let clause = if conditions.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", conditions.join(" AND "))
+    };
+    (clause, pascal)
+}
+
 impl Neo4jClient {
     // ========================================================================
     // Workspace operations
@@ -475,20 +498,22 @@ impl Neo4jClient {
         limit: usize,
         offset: usize,
     ) -> Result<(Vec<WorkspaceMilestoneNode>, usize)> {
-        let status_filter = if let Some(s) = status {
-            format!("WHERE toLower(wm.status) = toLower('{}')", s)
+        // status is client-supplied: bound as $status, never spliced
+        let status_filter = if status.is_some() {
+            "WHERE toLower(wm.status) = toLower($status)"
         } else {
-            String::new()
+            ""
         };
 
         let count_cypher = format!(
             "MATCH (w:Workspace {{id: $workspace_id}})-[:HAS_WORKSPACE_MILESTONE]->(wm:WorkspaceMilestone) {} RETURN count(wm) AS total",
             status_filter
         );
-        let mut count_stream = self
-            .graph
-            .execute(query(&count_cypher).param("workspace_id", workspace_id.to_string()))
-            .await?;
+        let mut count_q = query(&count_cypher).param("workspace_id", workspace_id.to_string());
+        if let Some(st) = status {
+            count_q = count_q.param("status", st.to_string());
+        }
+        let mut count_stream = self.graph.execute(count_q).await?;
         let total: i64 = if let Some(row) = count_stream.next().await? {
             row.get("total")?
         } else {
@@ -507,10 +532,11 @@ impl Neo4jClient {
             status_filter, offset, limit
         );
 
-        let mut result = self
-            .graph
-            .execute(query(&data_cypher).param("workspace_id", workspace_id.to_string()))
-            .await?;
+        let mut data_q = query(&data_cypher).param("workspace_id", workspace_id.to_string());
+        if let Some(st) = status {
+            data_q = data_q.param("status", st.to_string());
+        }
+        let mut result = self.graph.execute(data_q).await?;
         let mut milestones = Vec::new();
         while let Some(row) = result.next().await? {
             let node: neo4rs::Node = row.get("wm")?;
@@ -530,19 +556,7 @@ impl Neo4jClient {
         limit: usize,
         offset: usize,
     ) -> Result<Vec<(WorkspaceMilestoneNode, String, String, String)>> {
-        let mut conditions = Vec::new();
-        if let Some(wid) = workspace_id {
-            conditions.push(format!("w.id = '{}'", wid));
-        }
-        if let Some(s) = status {
-            let pascal = snake_to_pascal_case(s);
-            conditions.push(format!("wm.status = '{}'", pascal));
-        }
-        let where_clause = if conditions.is_empty() {
-            String::new()
-        } else {
-            format!("WHERE {}", conditions.join(" AND "))
-        };
+        let (where_clause, pascal_status) = all_milestones_where(workspace_id, status);
 
         let cypher = format!(
             r#"
@@ -556,7 +570,14 @@ impl Neo4jClient {
             where_clause, offset, limit
         );
 
-        let mut result = self.graph.execute(query(&cypher)).await?;
+        let mut q = query(&cypher);
+        if let Some(wid) = workspace_id {
+            q = q.param("workspace_id", wid.to_string());
+        }
+        if let Some(st) = pascal_status {
+            q = q.param("status", st);
+        }
+        let mut result = self.graph.execute(q).await?;
         let mut items = Vec::new();
         while let Some(row) = result.next().await? {
             let node: neo4rs::Node = row.get("wm")?;
@@ -575,25 +596,20 @@ impl Neo4jClient {
         workspace_id: Option<Uuid>,
         status: Option<&str>,
     ) -> Result<usize> {
-        let mut conditions = Vec::new();
-        if let Some(wid) = workspace_id {
-            conditions.push(format!("w.id = '{}'", wid));
-        }
-        if let Some(s) = status {
-            let pascal = snake_to_pascal_case(s);
-            conditions.push(format!("wm.status = '{}'", pascal));
-        }
-        let where_clause = if conditions.is_empty() {
-            String::new()
-        } else {
-            format!("WHERE {}", conditions.join(" AND "))
-        };
+        let (where_clause, pascal_status) = all_milestones_where(workspace_id, status);
 
         let cypher = format!(
             "MATCH (w:Workspace)-[:HAS_WORKSPACE_MILESTONE]->(wm:WorkspaceMilestone) {} RETURN count(wm) AS total",
             where_clause
         );
-        let count_result = self.execute(&cypher).await?;
+        let mut q = query(&cypher);
+        if let Some(wid) = workspace_id {
+            q = q.param("workspace_id", wid.to_string());
+        }
+        if let Some(st) = pascal_status {
+            q = q.param("status", st);
+        }
+        let count_result = self.execute_with_params(q).await?;
         let total: i64 = count_result
             .first()
             .and_then(|r| r.get("total").ok())
@@ -1756,5 +1772,23 @@ impl Neo4jClient {
             entries,
             project_count,
         })
+    }
+}
+
+#[cfg(test)]
+mod injection_tests {
+    use super::*;
+
+    #[test]
+    fn all_milestones_where_binds_status_and_workspace() {
+        for payload in ["a' OR 1=1 //", "x\\", "it's"] {
+            let (clause, status) = all_milestones_where(Some(Uuid::new_v4()), Some(payload));
+            assert_eq!(clause, "WHERE w.id = $workspace_id AND wm.status = $status");
+            assert!(!clause.contains(payload));
+            // the payload travels as data (first letter is capitalised by the normaliser)
+            assert!(status.unwrap().ends_with(&payload[1..]));
+        }
+        let (clause, status) = all_milestones_where(None, None);
+        assert!(clause.is_empty() && status.is_none());
     }
 }
