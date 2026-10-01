@@ -1,0 +1,426 @@
+{
+  "generated_at": "2026-10-01T08:00:00Z",
+  "lanes": [
+    {
+      "id": "ad64271e-cd76-5c74-8860-5eedc2821899",
+      "slug": "acme-freelance",
+      "name": "Acme (freelance)"
+    },
+    {
+      "id": "455c1fdc-1014-5080-bbc7-3fe935113d29",
+      "slug": "project-orchestrator",
+      "name": "Project Orchestrator"
+    },
+    {
+      "id": "12f950bc-52fd-545b-b06c-856e611c9653",
+      "slug": "studio-site",
+      "name": "Studio site"
+    }
+  ],
+  "threads": [
+    {
+      "id": "201db061-1fa2-52e6-9c84-9b4f299625e0",
+      "title": "Positionnement 2027",
+      "workspace": "acme-freelance",
+      "band": "thinking",
+      "stuck_reason": null,
+      "plan": null,
+      "run": null,
+      "session_ids": [],
+      "sessions": [],
+      "since": "2026-09-29T08:00:00Z",
+      "age_secs": 172800,
+      "waves": [],
+      "blocked_tasks": [],
+      "resume": null
+    },
+    {
+      "id": "05ee08c6-5841-559d-b269-119ba270dd13",
+      "title": "Migration du site",
+      "workspace": "studio-site",
+      "band": "stuck",
+      "stuck_reason": "failed",
+      "plan": {
+        "id": "4c50a307-bf9e-5d7a-b37b-bb3157e98fb1",
+        "title": "Migration du site"
+      },
+      "run": {
+        "id": "4e09be79-4ed3-5921-bc53-d915a72b9152",
+        "status": "failed",
+        "started_at": "2026-09-30T07:00:00Z",
+        "duration_secs": 3600,
+        "cost_usd": 2.05
+      },
+      "session_ids": [
+        "0645550a-a1c6-5c00-adaa-e99b27f602e1"
+      ],
+      "sessions": [
+        {
+          "id": "0645550a-a1c6-5c00-adaa-e99b27f602e1",
+          "title": "Session 1 - Migration du site",
+          "state": "dead",
+          "links": [
+            {
+              "via": "runner_run",
+              "run_id": "4e09be79-4ed3-5921-bc53-d915a72b9152",
+              "task_id": null,
+              "plan_id": "4c50a307-bf9e-5d7a-b37b-bb3157e98fb1"
+            }
+          ]
+        }
+      ],
+      "since": "2026-09-30T08:00:00Z",
+      "age_secs": 86400,
+      "waves": [
+        {
+          "wave_number": 1,
+          "points": [
+            {
+              "task_id": "65af4d09-d43f-5693-a570-b4f26c10fdb8",
+              "status": "done"
+            },
+            {
+              "task_id": "af9d015b-e558-5b3a-8f23-a13fcc96cb8e",
+              "status": "done"
+            }
+          ]
+        },
+        {
+          "wave_number": 2,
+          "points": [
+            {
+              "task_id": "ef03e9e2-bd00-5ff9-ab5a-29c0683f6709",
+              "status": "failed"
+            },
+            {
+              "task_id": "568f3999-c40a-5e20-896e-002559a130a1",
+              "status": "pending"
+            }
+          ]
+        }
+      ],
+      "blocked_tasks": [],
+      "resume": {
+        "done_count": 2,
+        "skipped_blocked": [],
+        "rerun_count": 1
+      }
+    },
+    {
+      "id": "c056e15a-d215-5a79-bdb2-a08e04a7d71f",
+      "title": "Today cockpit",
+      "workspace": "project-orchestrator",
+      "band": "running",
+      "stuck_reason": null,
+      "plan": {
+        "id": "5d623b4a-fdfa-5bf9-b7ba-37f7a7704900",
+        "title": "Today cockpit"
+      },
+      "run": {
+        "id": "abc5b4d4-54ca-526f-bf00-d1709dd609c0",
+        "status": "running",
+        "started_at": "2026-10-01T07:20:00Z",
+        "duration_secs": 2400,
+        "cost_usd": 7.85
+      },
+      "session_ids": [
+        "06b118be-7138-5515-b6ff-9ec1662ff8da",
+        "7f548042-dfc6-57e7-9e06-bf79c860c4f2",
+        "65991ce8-dd5d-5326-905a-8b09bad04535"
+      ],
+      "sessions": [
+        {
+          "id": "06b118be-7138-5515-b6ff-9ec1662ff8da",
+          "title": "Session 1 - Today cockpit",
+          "state": "live",
+          "links": [
+            {
+              "via": "runner_run",
+              "run_id": "abc5b4d4-54ca-526f-bf00-d1709dd609c0",
+              "task_id": null,
+              "plan_id": "5d623b4a-fdfa-5bf9-b7ba-37f7a7704900"
+            }
+          ]
+        },
+        {
+          "id": "7f548042-dfc6-57e7-9e06-bf79c860c4f2",
+          "title": "Session 2 - Today cockpit",
+          "state": "live",
+          "links": [
+            {
+              "via": "runner_run",
+              "run_id": "abc5b4d4-54ca-526f-bf00-d1709dd609c0",
+              "task_id": null,
+              "plan_id": "5d623b4a-fdfa-5bf9-b7ba-37f7a7704900"
+            }
+          ]
+        },
+        {
+          "id": "65991ce8-dd5d-5326-905a-8b09bad04535",
+          "title": "Session 3 - Today cockpit",
+          "state": "live",
+          "links": [
+            {
+              "via": "runner_run",
+              "run_id": "abc5b4d4-54ca-526f-bf00-d1709dd609c0",
+              "task_id": null,
+              "plan_id": "5d623b4a-fdfa-5bf9-b7ba-37f7a7704900"
+            }
+          ]
+        }
+      ],
+      "since": "2026-10-01T07:20:00Z",
+      "age_secs": 2400,
+      "waves": [
+        {
+          "wave_number": 1,
+          "points": [
+            {
+              "task_id": "15175dd1-c985-51ae-86e5-1fa3f17990ad",
+              "status": "done"
+            },
+            {
+              "task_id": "6bfbb8cf-597d-507d-bfe0-0adf70575ef2",
+              "status": "done"
+            }
+          ]
+        },
+        {
+          "wave_number": 2,
+          "points": [
+            {
+              "task_id": "6d526a4e-912b-5a25-9a1d-9c77d98d4a5e",
+              "status": "running"
+            },
+            {
+              "task_id": "8be6e15d-dff9-51b0-837f-963c6a3068ff",
+              "status": "running"
+            }
+          ]
+        },
+        {
+          "wave_number": 3,
+          "points": [
+            {
+              "task_id": "05991fab-765f-5d6f-ae8e-b11112bb3c77",
+              "status": "pending"
+            }
+          ]
+        }
+      ],
+      "blocked_tasks": [],
+      "resume": null
+    },
+    {
+      "id": "81c8f400-7990-5544-9961-1ae4de4f03c1",
+      "title": "Auth hardening",
+      "workspace": "project-orchestrator",
+      "band": "waiting",
+      "stuck_reason": null,
+      "plan": {
+        "id": "6eebac83-5ff0-56b3-8192-db0f9e59fbeb",
+        "title": "Auth hardening"
+      },
+      "run": {
+        "id": "0ecf398d-ea74-5090-ae80-c4bb15675454",
+        "status": "running",
+        "started_at": "2026-10-01T06:53:20Z",
+        "duration_secs": 4000,
+        "cost_usd": 1.1
+      },
+      "session_ids": [
+        "b0cd5b12-a11c-5af7-9ff8-94fd195733a5"
+      ],
+      "sessions": [
+        {
+          "id": "b0cd5b12-a11c-5af7-9ff8-94fd195733a5",
+          "title": "Session 1 - Auth hardening",
+          "state": "live",
+          "links": [
+            {
+              "via": "runner_run",
+              "run_id": "0ecf398d-ea74-5090-ae80-c4bb15675454",
+              "task_id": null,
+              "plan_id": "6eebac83-5ff0-56b3-8192-db0f9e59fbeb"
+            }
+          ]
+        }
+      ],
+      "since": "2026-10-01T07:39:00Z",
+      "age_secs": 1260,
+      "waves": [
+        {
+          "wave_number": 1,
+          "points": [
+            {
+              "task_id": "5497657c-931a-54a7-b58c-fa8c8b12bf22",
+              "status": "done"
+            },
+            {
+              "task_id": "98b84255-0128-5d11-aab1-6e3148ff5ec4",
+              "status": "done"
+            }
+          ]
+        },
+        {
+          "wave_number": 2,
+          "points": [
+            {
+              "task_id": "81b766c7-b6fe-5c06-ac2e-9000127a4b91",
+              "status": "waiting"
+            },
+            {
+              "task_id": "bea6f84d-3c52-5dbb-b358-4e984f328128",
+              "status": "pending"
+            }
+          ]
+        }
+      ],
+      "blocked_tasks": [],
+      "resume": null
+    },
+    {
+      "id": "165ee8b4-32f4-5952-8bc0-ba487679e991",
+      "title": "Facturation septembre",
+      "workspace": "acme-freelance",
+      "band": "waiting",
+      "stuck_reason": null,
+      "plan": {
+        "id": "914ac330-e330-554a-82a4-1d27e98eb806",
+        "title": "Facturation septembre"
+      },
+      "run": null,
+      "session_ids": [
+        "8e147687-4b78-5296-911f-10917bb6b174"
+      ],
+      "sessions": [
+        {
+          "id": "8e147687-4b78-5296-911f-10917bb6b174",
+          "title": "Session 1 - Facturation septembre",
+          "state": "live",
+          "links": [
+            {
+              "via": "plan_association",
+              "run_id": null,
+              "task_id": null,
+              "plan_id": "914ac330-e330-554a-82a4-1d27e98eb806"
+            }
+          ]
+        }
+      ],
+      "since": "2026-10-01T07:55:00Z",
+      "age_secs": 300,
+      "waves": [
+        {
+          "wave_number": 1,
+          "points": [
+            {
+              "task_id": "50800cf0-6f9d-59fa-b3e9-e2de6cc4ab9f",
+              "status": "done"
+            }
+          ]
+        },
+        {
+          "wave_number": 2,
+          "points": [
+            {
+              "task_id": "19743517-d6a0-5afd-a948-24386f541361",
+              "status": "waiting"
+            }
+          ]
+        }
+      ],
+      "blocked_tasks": [],
+      "resume": null
+    }
+  ],
+  "waiting": [
+    {
+      "request_id": "req_p1",
+      "kind": "permission",
+      "session_id": "b0cd5b12-a11c-5af7-9ff8-94fd195733a5",
+      "thread_id": "81c8f400-7990-5544-9961-1ae4de4f03c1",
+      "workspace": "project-orchestrator",
+      "tool_name": "Bash",
+      "text": "rm -rf target/debug/incremental && cargo build --lib\n# deletes 4.2 GB",
+      "options": [],
+      "seq": 812,
+      "requested_at": "2026-10-01T07:39:00Z",
+      "age_secs": 1260
+    },
+    {
+      "request_id": "req_q1",
+      "kind": "question",
+      "session_id": "8e147687-4b78-5296-911f-10917bb6b174",
+      "thread_id": "165ee8b4-32f4-5952-8bc0-ba487679e991",
+      "workspace": "acme-freelance",
+      "tool_name": null,
+      "text": "Quel taux appliquer pour la facture de septembre ?\n(le contrat mentionne 480 EUR/jour, l'avenant 520 EUR/jour)",
+      "options": [
+        {
+          "label": "480 EUR/jour",
+          "description": "Contrat initial"
+        },
+        {
+          "label": "520 EUR/jour",
+          "description": "Avenant du 12 septembre"
+        },
+        {
+          "label": "Autre",
+          "description": null
+        }
+      ],
+      "seq": 97,
+      "requested_at": "2026-10-01T07:55:00Z",
+      "age_secs": 300
+    }
+  ],
+  "orphans": [],
+  "runner": {
+    "status": "free",
+    "busy_with": null
+  },
+  "thinking": [
+    {
+      "id": "c1c85a1b-2fd5-56b1-942b-cde5669bee06",
+      "kind": "note_review",
+      "title": "Gotcha : migration Neo4j a revoir",
+      "workspace": "project-orchestrator",
+      "status": "needs_review",
+      "thread_id": null,
+      "since": "2026-09-24T08:00:00Z",
+      "age_secs": 604800
+    },
+    {
+      "id": "aa151be4-1e8c-53d0-b24a-b6f6d3574fa4",
+      "kind": "rfc",
+      "title": "RFC - Today devient le cockpit transversal",
+      "workspace": "project-orchestrator",
+      "status": "proposed",
+      "thread_id": "201db061-1fa2-52e6-9c84-9b4f299625e0",
+      "since": "2026-09-29T08:00:00Z",
+      "age_secs": 172800
+    },
+    {
+      "id": "461ea4d8-c16f-5f94-b8da-14d67a6b78ba",
+      "kind": "decision",
+      "title": "Garder SQLite pour le cache du site",
+      "workspace": "studio-site",
+      "status": "proposed",
+      "thread_id": null,
+      "since": "2026-09-30T22:00:00Z",
+      "age_secs": 36000
+    },
+    {
+      "id": "5a995229-8211-5a9e-9530-43a1bb2d28da",
+      "kind": "alert",
+      "title": "Budget mensuel a 85 %",
+      "workspace": "acme-freelance",
+      "status": "open",
+      "thread_id": null,
+      "since": "2026-10-01T06:00:00Z",
+      "age_secs": 7200
+    }
+  ],
+  "unattached": []
+}

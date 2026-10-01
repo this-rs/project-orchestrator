@@ -200,6 +200,29 @@ static VECTOR_COLLECTOR: LazyLock<Arc<RwLock<VectorCollector>>> =
 // PlanRunner — the execution engine
 // ============================================================================
 
+/// Tasks of a wave the runner will execute, per the shared eligibility rule
+/// (the resume preview uses the same rule). Logs a warning per skipped blocked task.
+pub(crate) fn eligible_wave_tasks(
+    wave: &crate::neo4j::plan::Wave,
+) -> Vec<&crate::neo4j::plan::WaveTask> {
+    use super::eligibility::{task_eligibility, Eligibility};
+    wave.tasks
+        .iter()
+        .filter(|t| match task_eligibility(&t.status) {
+            Eligibility::Run => true,
+            Eligibility::SkipDone => false,
+            Eligibility::SkipBlocked => {
+                warn!(
+                    "Skipping blocked task {}: {}",
+                    t.id,
+                    t.title.as_deref().unwrap_or("untitled")
+                );
+                false
+            }
+        })
+        .collect()
+}
+
 /// Autonomous plan execution engine.
 ///
 /// Spawns Claude Code agents for each task, monitors execution,
@@ -481,6 +504,33 @@ impl PlanRunner {
     fn emit_event(&self, event: RunnerEvent) {
         // 1. Broadcast on the dedicated RunnerEvent channel
         let _ = self.event_tx.send(event.clone());
+
+        // 2a. Light `attention_changed` signal (ids only) for the cockpit
+        {
+            use crate::events::attention::{AttentionReason, AttentionSubject};
+            let attention = match &event {
+                RunnerEvent::PlanStarted { plan_id, .. } => Some((
+                    AttentionSubject::Plan(plan_id.to_string()),
+                    AttentionReason::PlanStarted,
+                )),
+                RunnerEvent::PlanCompleted { plan_id, .. } => Some((
+                    AttentionSubject::Plan(plan_id.to_string()),
+                    AttentionReason::PlanCompleted,
+                )),
+                RunnerEvent::BudgetExceeded { plan_id, .. } => Some((
+                    AttentionSubject::Plan(plan_id.to_string()),
+                    AttentionReason::BudgetExceeded,
+                )),
+                RunnerEvent::TaskFailed { run_id, .. } => Some((
+                    AttentionSubject::PlanRun(run_id.to_string()),
+                    AttentionReason::TaskFailed,
+                )),
+                _ => None,
+            };
+            if let Some((subject, reason)) = attention {
+                crate::events::attention::notify_attention(&self.event_emitter, subject, reason);
+            }
+        }
 
         // 2. Bridge to CrudEvent for WebSocket delivery
         if let Some(ref emitter) = self.event_emitter {
@@ -1397,25 +1447,8 @@ impl PlanRunner {
             aborted: false,
         };
 
-        // Filter tasks: skip completed and blocked
-        let eligible_tasks: Vec<_> = wave
-            .tasks
-            .iter()
-            .filter(|t| {
-                if t.status == TaskStatus::Completed {
-                    return false;
-                }
-                if t.status == TaskStatus::Blocked {
-                    warn!(
-                        "Skipping blocked task {}: {}",
-                        t.id,
-                        t.title.as_deref().unwrap_or("untitled")
-                    );
-                    return false;
-                }
-                true
-            })
-            .collect();
+        // Filter tasks with the shared eligibility rule (runner/eligibility.rs)
+        let eligible_tasks = eligible_wave_tasks(wave);
 
         if eligible_tasks.is_empty() {
             return Ok(wave_result);

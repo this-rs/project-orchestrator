@@ -1319,6 +1319,18 @@ impl GraphStore for Neo4jClient {
         self.get_decision_timeline(task_id, from, to).await
     }
 
+    async fn list_decisions_by_status(
+        &self,
+        status: DecisionStatus,
+        project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> anyhow::Result<(Vec<DecisionListItem>, usize)> {
+        self.list_decisions_by_status(status, project_id, workspace_slug, limit, offset)
+            .await
+    }
+
     // ========================================================================
     // Dependency analysis
     // ========================================================================
@@ -2095,8 +2107,10 @@ impl GraphStore for Neo4jClient {
     async fn get_notes_needing_review(
         &self,
         project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
     ) -> anyhow::Result<Vec<Note>> {
-        self.get_notes_needing_review(project_id).await
+        self.get_notes_needing_review(project_id, workspace_slug)
+            .await
     }
 
     async fn update_staleness_scores(&self) -> anyhow::Result<usize> {
@@ -2393,6 +2407,32 @@ impl GraphStore for Neo4jClient {
         .await
     }
 
+    async fn link_session_to_run(
+        &self,
+        session_id: &str,
+        run_id: Uuid,
+        plan_id: Option<Uuid>,
+        task_id: Option<Uuid>,
+    ) -> anyhow::Result<bool> {
+        self.link_session_to_run(session_id, run_id, plan_id, task_id)
+            .await
+    }
+
+    async fn get_session_link_rows(
+        &self,
+        session_ids: &[Uuid],
+    ) -> anyhow::Result<Vec<SessionLinkRow>> {
+        self.get_session_link_rows(session_ids).await
+    }
+
+    async fn get_plans_task_graph(&self, plan_ids: &[Uuid]) -> anyhow::Result<PlansTaskGraph> {
+        self.get_plans_task_graph(plan_ids).await
+    }
+
+    async fn list_project_workspace_rows(&self) -> anyhow::Result<Vec<ProjectWorkspaceRow>> {
+        self.list_project_workspace_rows().await
+    }
+
     async fn get_session_tree(&self, session_id: &str) -> anyhow::Result<Vec<SessionTreeNode>> {
         self.get_session_tree(session_id).await
     }
@@ -2473,6 +2513,13 @@ impl GraphStore for Neo4jClient {
         limit: i64,
     ) -> anyhow::Result<Vec<ChatEventRecord>> {
         self.get_chat_events(session_id, after_seq, limit).await
+    }
+
+    async fn get_attention_events(
+        &self,
+        session_ids: &[Uuid],
+    ) -> anyhow::Result<Vec<ChatEventRecord>> {
+        self.get_attention_events(session_ids).await
     }
 
     async fn get_chat_events_paginated(
@@ -3694,6 +3741,18 @@ impl GraphStore for Neo4jClient {
         self.update_protocol_run(run).await
     }
 
+    async fn list_all_protocol_runs(
+        &self,
+        status: Option<crate::protocol::RunStatus>,
+        project_id: Option<uuid::Uuid>,
+        workspace_slug: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> anyhow::Result<(Vec<crate::protocol::ProtocolRun>, usize)> {
+        self.list_all_protocol_runs(status, project_id, workspace_slug, limit, offset)
+            .await
+    }
+
     async fn list_protocol_runs(
         &self,
         protocol_id: uuid::Uuid,
@@ -4141,10 +4200,12 @@ impl GraphStore for Neo4jClient {
     async fn list_alerts(
         &self,
         project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
         limit: usize,
         offset: usize,
     ) -> anyhow::Result<(Vec<AlertNode>, usize)> {
-        self.list_alerts_impl(project_id, limit, offset).await
+        self.list_alerts_impl(project_id, workspace_slug, limit, offset)
+            .await
     }
 
     // ========================================================================

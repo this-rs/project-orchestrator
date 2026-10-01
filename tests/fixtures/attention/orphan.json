@@ -1,0 +1,107 @@
+{
+  "generated_at": "2026-10-01T08:00:00Z",
+  "lanes": [
+    {
+      "id": "455c1fdc-1014-5080-bbc7-3fe935113d29",
+      "slug": "project-orchestrator",
+      "name": "Project Orchestrator"
+    }
+  ],
+  "threads": [
+    {
+      "id": "d339381a-fc94-5c2f-98b2-38a8a989a33b",
+      "title": "Attention backend",
+      "workspace": "project-orchestrator",
+      "band": "stuck",
+      "stuck_reason": "orphan_request",
+      "plan": {
+        "id": "fab52906-c964-5e65-8c69-5c73a1d17cac",
+        "title": "Attention backend"
+      },
+      "run": {
+        "id": "cd2f7bfc-6251-5f0b-93aa-e9a2d63d9df9",
+        "status": "failed",
+        "started_at": "2026-09-30T15:53:20Z",
+        "duration_secs": 4000,
+        "cost_usd": 1.9
+      },
+      "session_ids": [
+        "2b124ec9-df9c-57ba-82a0-c6a2c25d1a31"
+      ],
+      "sessions": [
+        {
+          "id": "2b124ec9-df9c-57ba-82a0-c6a2c25d1a31",
+          "title": "Session 1 - Attention backend",
+          "state": "dead",
+          "links": [
+            {
+              "via": "runner_run",
+              "run_id": "cd2f7bfc-6251-5f0b-93aa-e9a2d63d9df9",
+              "task_id": null,
+              "plan_id": "fab52906-c964-5e65-8c69-5c73a1d17cac"
+            }
+          ]
+        }
+      ],
+      "since": "2026-09-30T17:00:00Z",
+      "age_secs": 54000,
+      "waves": [
+        {
+          "wave_number": 1,
+          "points": [
+            {
+              "task_id": "7187ecca-e3e2-5933-b603-54ec165a77c0",
+              "status": "done"
+            },
+            {
+              "task_id": "6de34665-a882-5c9d-a5eb-760e75c0689d",
+              "status": "done"
+            }
+          ]
+        },
+        {
+          "wave_number": 2,
+          "points": [
+            {
+              "task_id": "5fc6e078-91d2-57b6-ba78-c51822981dc9",
+              "status": "waiting"
+            },
+            {
+              "task_id": "bbee31a8-09b5-5e81-87fe-f042190cb1c3",
+              "status": "pending"
+            }
+          ]
+        }
+      ],
+      "blocked_tasks": [],
+      "resume": {
+        "done_count": 2,
+        "skipped_blocked": [],
+        "rerun_count": 1
+      }
+    }
+  ],
+  "waiting": [],
+  "orphans": [
+    {
+      "request_id": "req_o1",
+      "kind": "permission",
+      "session_id": "2b124ec9-df9c-57ba-82a0-c6a2c25d1a31",
+      "thread_id": "d339381a-fc94-5c2f-98b2-38a8a989a33b",
+      "workspace": "project-orchestrator",
+      "tool_name": "Bash",
+      "text": "git push --force origin feat/attention-backend",
+      "options": [],
+      "seq": 640,
+      "requested_at": "2026-09-30T17:00:00Z",
+      "age_secs": 54000,
+      "cli_stopped_at": "2026-09-30T18:00:00Z"
+    }
+  ],
+  "runner": {
+    "status": "free",
+    "busy_with": null
+  },
+  "thinking": [],
+  "unattached": []
+}

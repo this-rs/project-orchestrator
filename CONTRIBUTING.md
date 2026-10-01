@@ -77,6 +77,64 @@ docs(api): update REST endpoint documentation
 test(mcp): add unit tests for workspace handlers
 ```
 
+## Git Workflow
+
+### Branch naming
+
+| Prefix | Use |
+|---|---|
+| `docs/<domain>` | documentation and diagrams only for a domain |
+| `fix/<domain>-<subject>` | bug fix |
+| `test/<domain>-<subject>` | tests only |
+| `chore/<subject>` | tooling, CI, maintenance |
+
+### One PR = one vertical slice
+
+A pull request carries a complete slice: the fix, a regression test that
+**fails without the fix** (paste the failing command and output in the PR),
+the updated diagram under `docs/diagrams/<name>.mmd` (or an explicit
+`Diagram-Unchanged: <name> — <reason>`), and the documentation. Diagram-only
+PRs describing unverified code are not accepted. The PR template checklist
+must be fully ticked; an unticked box means the PR is not mergeable.
+
+Always report coverage as two figures when both exist: **raw** and **gated**
+(see `docs/COVERAGE.md`). Never exclude code from coverage to make a number pass.
+
+### Pushing
+
+Never push directly to `main`. Push your branch with an explicit refspec:
+
+```bash
+git push origin HEAD:refs/heads/<branch>
+```
+
+Do not create releases, tags or version bumps in a feature PR.
+
+### Build directory per worktree
+
+When you use several `git worktree`s, give each one its own build directory so
+they never contend for the same Cargo lock or invalidate each other's cache:
+
+```bash
+export CARGO_TARGET_DIR=/path/to/target-<worktree-name>
+```
+
+### Pre-push hooks
+
+Make sure the Rust toolchain is on the `PATH` before pushing, otherwise the
+pre-push hooks cannot find `cargo`:
+
+```bash
+PATH=$HOME/.cargo/bin:$PATH git push origin HEAD:refs/heads/<branch>
+```
+Never bypass the hooks with `--no-verify`.
+
+### Patch coverage gate
+
+`codecov.yml` enforces a patch coverage target (currently 80%) on the lines a
+PR adds or modifies. The target lives in a single place (`coverage.status.patch.default.target`)
+and is meant to ratchet 80% -> 90% -> 100%.
+
 ## Pull Request Process
 
 1. **Create a branch** from `main`:
@@ -91,7 +149,7 @@ test(mcp): add unit tests for workspace handlers
    - `cargo clippy -- -D warnings`
    - `cargo test`
 
-4. **Push your branch** and create a Pull Request
+4. **Push your branch** (see *Pushing* above) and create a Pull Request, filling in the PR template
 
 5. **PR Description** should include:
    - Summary of changes

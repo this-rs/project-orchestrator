@@ -575,7 +575,10 @@ pub async fn get_notes_needing_review(
     let notes = state
         .orchestrator
         .note_manager()
-        .get_notes_needing_review(query.project_id)
+        .get_notes_needing_review(
+            query.project_id,
+            super::handlers::normalize_slug(query.workspace_slug.as_deref()),
+        )
         .await?;
 
     Ok(Json(notes))

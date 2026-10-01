@@ -624,6 +624,150 @@ pub async fn interrupt_session(
 }
 
 // ============================================================================
+// Action routes: answer a permission, send a message (REST twins of the WS frames)
+// ============================================================================
+
+/// Body of `POST /api/chat/sessions/{id}/permissions/{request_id}`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PermissionAnswerRequest {
+    pub allow: bool,
+}
+
+/// Body of `POST /api/chat/sessions/{id}/messages`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SendMessageRequest {
+    pub content: String,
+}
+
+const PERMISSION_GONE_REASON: &str = "le CLI qui demandait s'est arrêté ; continue par un message \
+     (POST .../messages)";
+
+/// POST /api/chat/sessions/{id}/permissions/{request_id} `{ "allow": bool }`
+///
+/// REST twin of the WS `permission_response` frame: both go through
+/// `ChatManager::route_permission_response`, so there is one routing.
+///
+/// - **200** `{ "routed": "local" | "remote" }` — delivered to the CLI.
+/// - **404** — unknown session, or no such permission request on it.
+/// - **409** — the request was already decided (double click, two tabs).
+/// - **410** — the CLI that asked is gone; the answer is REFUSED, never
+///   silently dropped. Continue with `POST .../messages`.
+pub async fn respond_permission(
+    State(state): State<OrchestratorState>,
+    Path((session_id, request_id)): Path<(Uuid, String)>,
+    Json(body): Json<PermissionAnswerRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    use crate::chat::attention::{permission_status, PermissionStatus};
+    use crate::chat::manager::PermissionDeliveryError;
+
+    let chat_manager = state.chat_manager.as_ref().ok_or_else(|| {
+        AppError::NotFound("chat_manager not configured on this server".to_string())
+    })?;
+    if request_id.trim().is_empty() {
+        return Err(AppError::BadRequest("request_id must not be empty".into()));
+    }
+    let neo4j = state.orchestrator.neo4j();
+    neo4j
+        .get_chat_session(session_id)
+        .await
+        .map_err(AppError::Internal)?
+        .ok_or_else(|| AppError::NotFound(format!("Session {} not found", session_id)))?;
+
+    let status = |events: Vec<crate::neo4j::models::ChatEventRecord>| {
+        permission_status(&events, &request_id)
+    };
+    let stored = || async {
+        neo4j
+            .get_attention_events(&[session_id])
+            .await
+            .map(status)
+            .map_err(AppError::Internal)
+    };
+    let already = || {
+        AppError::Conflict(format!(
+            "permission request {request_id} was already decided"
+        ))
+    };
+
+    // A decision already stored wins over everything: a second click on a
+    // session that has since died is still "already decided", not "gone".
+    if stored().await? == PermissionStatus::Decided {
+        return Err(already());
+    }
+
+    match chat_manager
+        .route_permission_response(&session_id.to_string(), &request_id, body.allow, true)
+        .await
+    {
+        Ok(route) => Ok(Json(serde_json::json!({ "routed": route }))),
+        Err(PermissionDeliveryError::SessionDead(_)) => {
+            Err(AppError::Gone(PERMISSION_GONE_REASON.to_string()))
+        }
+        Err(PermissionDeliveryError::NotPending) => {
+            // Alive CLI, request not waiting: decided a moment ago (race with
+            // the persisted decision) or never asked.
+            match stored().await? {
+                PermissionStatus::Unknown => Err(AppError::NotFound(format!(
+                    "no permission request {request_id} on session {session_id}"
+                ))),
+                _ => Err(already()),
+            }
+        }
+        Err(PermissionDeliveryError::Failed(e)) => Err(AppError::Internal(e)),
+    }
+}
+
+/// POST /api/chat/sessions/{id}/messages `{ "content": "…" }`
+///
+/// REST twin of the WS `user_message` frame, same routing
+/// (`ChatManager::route_user_message`): local CLI → owning instance →
+/// `resume_session`. A message to a dead session therefore respawns the CLI
+/// and KEEPS the session's identity and links. This is also THE way to answer
+/// a question (`input_response` is just a `send_message`), including an
+/// orphan one.
+///
+/// - **200** `{ "routed": "local" | "remote" | "resumed" | "resumed_after_send_failure" }`
+/// - **400** — empty `content`. **404** — unknown session.
+pub async fn send_session_message(
+    State(state): State<OrchestratorState>,
+    Path(session_id): Path<Uuid>,
+    claims: Option<axum::Extension<crate::auth::jwt::Claims>>,
+    Json(body): Json<SendMessageRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    use crate::chat::manager::MessageDeliveryError;
+
+    let chat_manager = state.chat_manager.as_ref().ok_or_else(|| {
+        AppError::NotFound("chat_manager not configured on this server".to_string())
+    })?;
+    if body.content.trim().is_empty() {
+        return Err(AppError::BadRequest("content must not be empty".into()));
+    }
+    state
+        .orchestrator
+        .neo4j()
+        .get_chat_session(session_id)
+        .await
+        .map_err(AppError::Internal)?
+        .ok_or_else(|| AppError::NotFound(format!("Session {} not found", session_id)))?;
+
+    let sid = session_id.to_string();
+    let claims = claims.map(|axum::Extension(c)| c);
+    // Same side effect as the WS path.
+    super::ws_chat_handler::spawn_entity_extraction(&state, &sid, &body.content);
+
+    match chat_manager
+        .route_user_message(&sid, &body.content, claims.as_ref())
+        .await
+    {
+        Ok(route) => Ok(Json(serde_json::json!({ "routed": route }))),
+        Err(MessageDeliveryError::Resume(e)) => Err(AppError::Internal(e)),
+        Err(MessageDeliveryError::SendAndResume { resume, .. }) => Err(AppError::Internal(resume)),
+    }
+}
+
+// ============================================================================
 // Background tasks (T6 + T8 of plan 754a1379)
 // ============================================================================
 
@@ -2026,5 +2170,364 @@ mod tests {
         assert_eq!(first["tier"], "current");
         assert_eq!(first["shortLabel"], "Opus 5.5");
         assert_eq!(first["fullLabel"], "Claude Opus 5.5");
+    }
+
+    // ====================================================================
+    // Action routes: POST .../permissions/{request_id} and POST .../messages
+    // ====================================================================
+
+    use crate::chat::manager::{test_support, ChatManager};
+    use crate::chat::types::ChatEvent;
+    use crate::neo4j::models::ChatEventRecord;
+
+    struct ActionHarness {
+        app: axum::Router,
+        manager: Arc<ChatManager>,
+        graph: Arc<dyn crate::neo4j::traits::GraphStore>,
+    }
+
+    async fn action_harness(cli_path: Option<&str>) -> ActionHarness {
+        let app_state = mock_app_state();
+        let graph = app_state.neo4j.clone();
+        let mut config = test_support::chat_config();
+        config.claude_cli_path = cli_path.map(str::to_string);
+        let manager = Arc::new(ChatManager::new_without_memory(
+            app_state.neo4j.clone(),
+            app_state.meili.clone(),
+            config,
+        ));
+        let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
+        let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
+            orchestrator.clone(),
+        )));
+        let base = mock_server_state().await;
+        let state = Arc::new(ServerState {
+            orchestrator,
+            watcher,
+            chat_manager: Some(manager.clone()),
+            event_bus: base.event_bus.clone(),
+            nats_emitter: None,
+            auth_config: Some(crate::test_helpers::test_auth_config()),
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+            setup_completed: true,
+            server_port: 6600,
+            public_url: None,
+            remote_mcp: crate::RemoteMcpConfig::default(),
+            ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
+            registry_remote_url: None,
+            oidc_client: None,
+            neural_router: crate::test_helpers::mock_neural_router(),
+            trajectory_collector: std::sync::RwLock::new(None),
+            trajectory_store_neo4j: None,
+            trajectory_store: None,
+            identity: None,
+            reactor_counters: std::sync::OnceLock::new(),
+            confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
+            mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
+            model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
+            vault: crate::vault::VaultService::ephemeral(),
+        });
+        ActionHarness {
+            app: create_router(state),
+            manager,
+            graph,
+        }
+    }
+
+    async fn seed_session(h: &ActionHarness) -> Uuid {
+        let s = test_chat_session(None);
+        h.graph.create_chat_session(&s).await.unwrap();
+        s.id
+    }
+
+    async fn seed_event(h: &ActionHarness, sid: Uuid, seq: i64, kind: &str, ev: ChatEvent) {
+        h.graph
+            .store_chat_events(
+                sid,
+                vec![ChatEventRecord {
+                    id: Uuid::new_v4(),
+                    session_id: sid,
+                    seq,
+                    event_type: kind.to_string(),
+                    data: serde_json::to_string(&ev).unwrap(),
+                    created_at: chrono::Utc::now(),
+                }],
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn seed_permission_request(h: &ActionHarness, sid: Uuid, seq: i64, id: &str) {
+        seed_event(
+            h,
+            sid,
+            seq,
+            "permission_request",
+            ChatEvent::PermissionRequest {
+                id: id.to_string(),
+                tool: "Bash".to_string(),
+                input: serde_json::json!({"command": "ls"}),
+                parent_tool_use_id: None,
+            },
+        )
+        .await;
+    }
+
+    async fn call(app: &axum::Router, req: Request<Body>) -> (StatusCode, serde_json::Value) {
+        let res = app.clone().oneshot(req).await.unwrap();
+        let status = res.status();
+        let bytes = axum::body::to_bytes(res.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    fn perm_uri(sid: Uuid, rid: &str) -> String {
+        format!("/api/chat/sessions/{sid}/permissions/{rid}")
+    }
+
+    #[tokio::test]
+    #[ignore = "needs the claude CLI on PATH (run with: cargo test -- --ignored)"]
+    async fn permission_to_a_live_session_reaches_the_cli_then_a_second_answer_is_409() {
+        let h = action_harness(None).await;
+        let sid = seed_session(&h).await;
+        seed_permission_request(&h, sid, 1, "req-1").await;
+        let (mut stdin, _) =
+            test_support::insert_live_session(&h.manager, &sid.to_string(), false, &["req-1"])
+                .await
+                .expect("the Claude CLI binary must be installed to run this test");
+
+        let (status, body) = call(
+            &h.app,
+            auth_post(&perm_uri(sid, "req-1"), r#"{"allow":true}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["routed"], "local");
+        let written: serde_json::Value =
+            serde_json::from_str(&stdin.try_recv().expect("the CLI got the answer")).unwrap();
+        assert_eq!(written["response"]["request_id"], "req-1");
+        assert_eq!(written["response"]["response"]["behavior"], "allow");
+        assert_eq!(
+            written["response"]["response"]["updatedInput"]["command"], "ls",
+            "the original tool input is handed back"
+        );
+
+        // Double click / second tab: refused, nothing more reaches the CLI.
+        let (status, body) = call(
+            &h.app,
+            auth_post(&perm_uri(sid, "req-1"), r#"{"allow":false}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(
+            stdin.try_recv().is_err(),
+            "a second answer must not be sent"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "needs the claude CLI on PATH (run with: cargo test -- --ignored)"]
+    async fn permission_deny_is_forwarded_as_a_deny() {
+        let h = action_harness(None).await;
+        let sid = seed_session(&h).await;
+        seed_permission_request(&h, sid, 1, "req-d").await;
+        let (mut stdin, _) =
+            test_support::insert_live_session(&h.manager, &sid.to_string(), false, &["req-d"])
+                .await
+                .expect("the Claude CLI binary must be installed to run this test");
+        let (status, _) = call(
+            &h.app,
+            auth_post(&perm_uri(sid, "req-d"), r#"{"allow":false}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let written: serde_json::Value = serde_json::from_str(&stdin.try_recv().unwrap()).unwrap();
+        assert_eq!(written["response"]["response"]["behavior"], "deny");
+    }
+
+    #[tokio::test]
+    #[ignore = "needs the claude CLI on PATH (run with: cargo test -- --ignored)"]
+    async fn permission_already_claimed_but_not_yet_persisted_is_409_not_a_second_send() {
+        // The request is stored without a decision and the live CLI no longer
+        // holds it pending: another answer claimed it a moment ago.
+        let h = action_harness(None).await;
+        let sid = seed_session(&h).await;
+        seed_permission_request(&h, sid, 1, "req-race").await;
+        let (mut stdin, _) =
+            test_support::insert_live_session(&h.manager, &sid.to_string(), false, &[])
+                .await
+                .expect("the Claude CLI binary must be installed to run this test");
+        let (status, _) = call(
+            &h.app,
+            auth_post(&perm_uri(sid, "req-race"), r#"{"allow":true}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(stdin.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    #[ignore = "needs the claude CLI on PATH (run with: cargo test -- --ignored)"]
+    async fn permission_never_asked_on_a_live_session_is_404() {
+        let h = action_harness(None).await;
+        let sid = seed_session(&h).await;
+        let _live = test_support::insert_live_session(&h.manager, &sid.to_string(), false, &[])
+            .await
+            .expect("the Claude CLI binary must be installed to run this test");
+        let (status, _) = call(
+            &h.app,
+            auth_post(&perm_uri(sid, "nope"), r#"{"allow":true}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn permission_to_a_dead_session_is_410_with_a_readable_reason() {
+        let h = action_harness(None).await;
+        let sid = seed_session(&h).await;
+        seed_permission_request(&h, sid, 1, "req-orphan").await;
+
+        let (status, body) = call(
+            &h.app,
+            auth_post(&perm_uri(sid, "req-orphan"), r#"{"allow":true}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::GONE, "never a silent 204: {body}");
+        let reason = body["error"].as_str().unwrap();
+        assert!(reason.contains("s'est arrêté"), "{reason}");
+        assert!(reason.contains("continue par un message"), "{reason}");
+    }
+
+    #[tokio::test]
+    async fn permission_already_decided_on_a_dead_session_is_409() {
+        let h = action_harness(None).await;
+        let sid = seed_session(&h).await;
+        seed_permission_request(&h, sid, 1, "req-x").await;
+        seed_event(
+            &h,
+            sid,
+            2,
+            "permission_decision",
+            ChatEvent::PermissionDecision {
+                id: "req-x".into(),
+                allow: true,
+            },
+        )
+        .await;
+        let (status, _) = call(
+            &h.app,
+            auth_post(&perm_uri(sid, "req-x"), r#"{"allow":true}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn permission_to_an_unknown_session_is_404() {
+        let h = action_harness(None).await;
+        let (status, _) = call(
+            &h.app,
+            auth_post(&perm_uri(Uuid::new_v4(), "r"), r#"{"allow":true}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn permission_rejects_a_body_without_allow() {
+        let h = action_harness(None).await;
+        let sid = seed_session(&h).await;
+        let (status, _) = call(
+            &h.app,
+            auth_post(&perm_uri(sid, "r"), r#"{"allowed":true}"#),
+        )
+        .await;
+        assert!(status.is_client_error(), "{status}");
+    }
+
+    #[tokio::test]
+    async fn action_routes_require_authentication() {
+        let h = action_harness(None).await;
+        let sid = Uuid::new_v4();
+        for (uri, body) in [
+            (perm_uri(sid, "r"), r#"{"allow":true}"#),
+            (
+                format!("/api/chat/sessions/{sid}/messages"),
+                r#"{"content":"x"}"#,
+            ),
+        ] {
+            let req = Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap();
+            let (status, _) = call(&h.app, req).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+        }
+    }
+
+    fn msg_uri(sid: Uuid) -> String {
+        format!("/api/chat/sessions/{sid}/messages")
+    }
+
+    #[tokio::test]
+    #[ignore = "needs the claude CLI on PATH (run with: cargo test -- --ignored)"]
+    async fn message_to_a_live_session_goes_through_the_same_send_path() {
+        let h = action_harness(None).await;
+        let sid = seed_session(&h).await;
+        // Streaming: send_message queues the text for the running turn.
+        let (_stdin, queue) =
+            test_support::insert_live_session(&h.manager, &sid.to_string(), true, &[])
+                .await
+                .expect("the Claude CLI binary must be installed to run this test");
+        let (status, body) = call(&h.app, auth_post(&msg_uri(sid), r#"{"content":"vas-y"}"#)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["routed"], "local");
+        assert_eq!(queue.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn message_to_a_dead_session_attempts_resume_session_not_a_410() {
+        // No CLI at this path: resume_session is attempted (it is what
+        // spawns the CLI) and fails. A 410/404 would mean it was never tried.
+        let h = action_harness(Some("/nonexistent/claude-cli")).await;
+        let sid = seed_session(&h).await;
+        assert!(!h.manager.is_session_active(&sid.to_string()).await);
+        let (status, body) = call(
+            &h.app,
+            auth_post(&msg_uri(sid), r#"{"content":"reprends"}"#),
+        )
+        .await;
+        assert_ne!(status, StatusCode::GONE);
+        assert_ne!(status, StatusCode::NOT_FOUND, "{body}");
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains("resumed InteractiveClient"),
+            "the error must come from resume_session spawning the CLI: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn message_validation_and_unknown_session() {
+        let h = action_harness(None).await;
+        let sid = seed_session(&h).await;
+        let (status, _) = call(&h.app, auth_post(&msg_uri(sid), r#"{"content":"   "}"#)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = call(
+            &h.app,
+            auth_post(&msg_uri(Uuid::new_v4()), r#"{"content":"x"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 }
