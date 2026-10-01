@@ -1,5 +1,6 @@
 //! HTTP API for the orchestrator
 
+pub mod attention;
 pub mod auth_handlers;
 pub mod chat_handlers;
 pub mod code_handlers;

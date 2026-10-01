@@ -1,0 +1,133 @@
+{
+  "generated_at": "2026-10-01T08:00:00Z",
+  "lanes": [
+    {
+      "id": "455c1fdc-1014-5080-bbc7-3fe935113d29",
+      "slug": "project-orchestrator",
+      "name": "Project Orchestrator"
+    },
+    {
+      "id": "12f950bc-52fd-545b-b06c-856e611c9653",
+      "slug": "studio-site",
+      "name": "Studio site"
+    }
+  ],
+  "threads": [
+    {
+      "id": "746c8a50-3afc-53ba-99fe-2f618bb2818a",
+      "title": "Refonte du site",
+      "workspace": "studio-site",
+      "band": "stuck",
+      "stuck_reason": "budget_exceeded",
+      "plan": {
+        "id": "64e804ae-586b-520e-bb8e-40c34cc3aeb0",
+        "title": "Refonte du site"
+      },
+      "run": {
+        "id": "d76b87ef-8917-556c-8a4f-934c21c5428a",
+        "status": "budget_exceeded",
+        "started_at": "2026-10-01T05:30:00Z",
+        "duration_secs": 1800,
+        "cost_usd": 10.0
+      },
+      "session_ids": [
+        "8788695d-0fc2-5cb0-8fe4-3ba6fba87b84"
+      ],
+      "since": "2026-10-01T06:00:00Z",
+      "age_secs": 7200,
+      "waves": [
+        {
+          "wave_number": 1,
+          "points": [
+            {
+              "task_id": "d1924fa3-bee5-5bf4-894a-66e8d81d6c97",
+              "status": "done"
+            }
+          ]
+        },
+        {
+          "wave_number": 2,
+          "points": [
+            {
+              "task_id": "2334e41d-474a-5d55-836c-1c661e3a9c01",
+              "status": "failed"
+            }
+          ]
+        },
+        {
+          "wave_number": 3,
+          "points": [
+            {
+              "task_id": "3117d3ac-7a17-5237-a096-b9f57f3400d5",
+              "status": "pending"
+            }
+          ]
+        }
+      ],
+      "blocked_tasks": [],
+      "resume": {
+        "done_count": 1,
+        "skipped_blocked": [],
+        "rerun_count": 2
+      }
+    },
+    {
+      "id": "164986af-0f29-52ac-946e-42f454eb9ff4",
+      "title": "Today cockpit",
+      "workspace": "project-orchestrator",
+      "band": "running",
+      "stuck_reason": null,
+      "plan": {
+        "id": "030191f0-3710-56aa-81a6-09c27389179c",
+        "title": "Today cockpit"
+      },
+      "run": {
+        "id": "ef982668-23d1-521a-831b-85a576827e01",
+        "status": "running",
+        "started_at": "2026-10-01T07:00:00Z",
+        "duration_secs": 3600,
+        "cost_usd": 4.2
+      },
+      "session_ids": [
+        "b4407e64-b4e4-500f-9d54-2d9ae9164241"
+      ],
+      "since": "2026-10-01T07:00:00Z",
+      "age_secs": 3600,
+      "waves": [
+        {
+          "wave_number": 1,
+          "points": [
+            {
+              "task_id": "48d2c8f0-6fe0-5b5e-ab2f-4b6f58ad4988",
+              "status": "done"
+            }
+          ]
+        },
+        {
+          "wave_number": 2,
+          "points": [
+            {
+              "task_id": "f5935baa-c8b5-5100-9024-b36c1aae31f0",
+              "status": "running"
+            }
+          ]
+        }
+      ],
+      "blocked_tasks": [],
+      "resume": null
+    }
+  ],
+  "waiting": [],
+  "orphans": [],
+  "runner": {
+    "status": "busy",
+    "busy_with": {
+      "plan_id": "030191f0-3710-56aa-81a6-09c27389179c",
+      "plan_title": "Today cockpit",
+      "run_id": "ef982668-23d1-521a-831b-85a576827e01",
+      "workspace": "project-orchestrator",
+      "since": "2026-10-01T07:00:00Z"
+    }
+  },
+  "thinking": []
+}

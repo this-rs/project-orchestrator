@@ -1,0 +1,124 @@
+{
+  "generated_at": "2026-10-01T08:00:00Z",
+  "lanes": [
+    {
+      "id": "455c1fdc-1014-5080-bbc7-3fe935113d29",
+      "slug": "project-orchestrator",
+      "name": "Project Orchestrator"
+    }
+  ],
+  "threads": [
+    {
+      "id": "c7e0acc9-9b60-596e-94f5-38cc55754666",
+      "title": "Wave runner hardening",
+      "workspace": "project-orchestrator",
+      "band": "running",
+      "stuck_reason": null,
+      "plan": {
+        "id": "ab3b10f6-b592-5b50-9db2-dbd2b84adfd4",
+        "title": "Wave runner hardening"
+      },
+      "run": {
+        "id": "cecac6a2-bc18-5e07-a6cf-76f2480f15b4",
+        "status": "running",
+        "started_at": "2026-10-01T06:30:00Z",
+        "duration_secs": 5400,
+        "cost_usd": 3.42
+      },
+      "session_ids": [
+        "1e9909d7-c627-5f26-83a4-8eb6a217fb46",
+        "c97b00e4-3bb3-5e21-8b93-953aa13489ae"
+      ],
+      "since": "2026-10-01T06:30:00Z",
+      "age_secs": 5400,
+      "waves": [
+        {
+          "wave_number": 1,
+          "points": [
+            {
+              "task_id": "70fdfd9a-7f56-5e27-ad3f-a15e8285f478",
+              "status": "done"
+            },
+            {
+              "task_id": "688fc1ec-b70b-5048-a795-9510ff3f9761",
+              "status": "done"
+            },
+            {
+              "task_id": "6a23c4f3-c421-5f2c-88df-e50f5fd458e9",
+              "status": "done"
+            }
+          ]
+        },
+        {
+          "wave_number": 2,
+          "points": [
+            {
+              "task_id": "49f85370-be46-5b9f-bf8b-06d11b10c6e1",
+              "status": "running"
+            },
+            {
+              "task_id": "adec3118-ff14-58d9-bdcc-675c7e032f99",
+              "status": "pending"
+            }
+          ]
+        }
+      ],
+      "blocked_tasks": [],
+      "resume": null
+    },
+    {
+      "id": "f99fff3f-800f-50c7-8c64-86ed0b2f6a27",
+      "title": "Embed wave summary",
+      "workspace": "project-orchestrator",
+      "band": "running",
+      "stuck_reason": null,
+      "plan": {
+        "id": "2f562500-1e3b-5854-92aa-36e69d5ccdf9",
+        "title": "Embed wave summary"
+      },
+      "run": null,
+      "session_ids": [
+        "3303d320-03a7-56c5-809d-95cd088bd39a"
+      ],
+      "since": "2026-10-01T07:45:00Z",
+      "age_secs": 900,
+      "waves": [
+        {
+          "wave_number": 1,
+          "points": [
+            {
+              "task_id": "19c3f932-cc48-51bf-aeb0-749a385d0210",
+              "status": "done"
+            },
+            {
+              "task_id": "8d73cad7-757f-55f8-b570-87a9ed5650d7",
+              "status": "running"
+            }
+          ]
+        },
+        {
+          "wave_number": 2,
+          "points": [
+            {
+              "task_id": "7f7d744c-7748-570b-af70-49c6ed172cfd",
+              "status": "pending"
+            },
+            {
+              "task_id": "62f389ce-b336-54c8-939d-c093d85dd1ca",
+              "status": "pending"
+            }
+          ]
+        }
+      ],
+      "blocked_tasks": [],
+      "resume": null
+    }
+  ],
+  "waiting": [],
+  "orphans": [],
+  "runner": {
+    "status": "free",
+    "busy_with": null
+  },
+  "thinking": []
+}

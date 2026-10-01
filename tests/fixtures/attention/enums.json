@@ -1,0 +1,44 @@
+{
+  "band": [
+    "waiting",
+    "running",
+    "stuck",
+    "thinking"
+  ],
+  "wave_point_status": [
+    "done",
+    "running",
+    "pending",
+    "waiting",
+    "failed",
+    "blocked"
+  ],
+  "run_status": [
+    "running",
+    "completed",
+    "failed",
+    "budget_exceeded",
+    "cancelled"
+  ],
+  "stuck_reason": [
+    "failed",
+    "budget_exceeded",
+    "task_blocked",
+    "session_error",
+    "orphan_request"
+  ],
+  "request_kind": [
+    "permission",
+    "question"
+  ],
+  "runner_status": [
+    "free",
+    "busy"
+  ],
+  "thinking_kind": [
+    "rfc",
+    "decision",
+    "note_review",
+    "alert"
+  ]
+}

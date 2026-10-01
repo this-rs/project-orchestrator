@@ -1,0 +1,95 @@
+{
+  "generated_at": "2026-10-01T08:00:00Z",
+  "lanes": [
+    {
+      "id": "ad64271e-cd76-5c74-8860-5eedc2821899",
+      "slug": "acme-freelance",
+      "name": "Acme (freelance)"
+    }
+  ],
+  "threads": [
+    {
+      "id": "795d8cda-7cb0-51d9-a996-125302bb75e5",
+      "title": "Facturation automatique",
+      "workspace": "acme-freelance",
+      "band": "stuck",
+      "stuck_reason": "task_blocked",
+      "plan": {
+        "id": "1c2c673f-032c-575a-b916-2a94bee1a2fd",
+        "title": "Facturation automatique"
+      },
+      "run": {
+        "id": "0e8b3aff-4213-5f11-a370-92e1ce315fcf",
+        "status": "failed",
+        "started_at": "2026-10-01T03:33:20Z",
+        "duration_secs": 1600,
+        "cost_usd": 0.8
+      },
+      "session_ids": [
+        "d3f8df68-4a9b-5e5a-8eae-1cb87d925acb"
+      ],
+      "since": "2026-10-01T04:00:00Z",
+      "age_secs": 14400,
+      "waves": [
+        {
+          "wave_number": 1,
+          "points": [
+            {
+              "task_id": "1ad345a3-b7c7-5da1-88cb-ae05db3cd806",
+              "status": "done"
+            },
+            {
+              "task_id": "7adde485-6856-5829-9e72-fb8f9e1a5b5d",
+              "status": "done"
+            }
+          ]
+        },
+        {
+          "wave_number": 2,
+          "points": [
+            {
+              "task_id": "e6a3ae16-9ef0-51e5-9a94-4ca784f21a78",
+              "status": "blocked"
+            },
+            {
+              "task_id": "b0d06f68-9626-54f3-a0e2-c4e67819b6cd",
+              "status": "pending"
+            }
+          ]
+        },
+        {
+          "wave_number": 3,
+          "points": [
+            {
+              "task_id": "47b6cc7d-0458-5c04-8518-909282e031b2",
+              "status": "pending"
+            }
+          ]
+        }
+      ],
+      "blocked_tasks": [
+        {
+          "id": "e6a3ae16-9ef0-51e5-9a94-4ca784f21a78",
+          "title": "Configurer le webhook de paiement"
+        }
+      ],
+      "resume": {
+        "done_count": 2,
+        "skipped_blocked": [
+          {
+            "id": "e6a3ae16-9ef0-51e5-9a94-4ca784f21a78",
+            "title": "Configurer le webhook de paiement"
+          }
+        ],
+        "rerun_count": 1
+      }
+    }
+  ],
+  "waiting": [],
+  "orphans": [],
+  "runner": {
+    "status": "free",
+    "busy_with": null
+  },
+  "thinking": []
+}
