@@ -670,6 +670,11 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/tasks/{task_id}/decisions",
             post(handlers::add_decision),
         )
+        // The cross-workspace "Today" cockpit: one request, every source.
+        .route(
+            "/api/attention",
+            get(super::attention_aggregate::get_attention),
+        )
         .route("/api/decisions", get(handlers::list_decisions))
         .route(
             "/api/decisions/affecting",

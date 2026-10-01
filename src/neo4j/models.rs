@@ -245,6 +245,26 @@ pub struct SessionLinkRow {
     pub thread_plan_id: Option<Uuid>,
 }
 
+/// Tasks and dependency edges of SEVERAL plans, read in one grouped query
+/// (the cockpit must not call `compute_waves` once per plan).
+#[derive(Debug, Clone, Default)]
+pub struct PlansTaskGraph {
+    /// `(plan_id, task)` for every task of the requested plans.
+    pub tasks: Vec<(Uuid, TaskNode)>,
+    /// `(from, to)`: `from` DEPENDS_ON `to`, both in the same plan.
+    pub edges: Vec<(Uuid, Uuid)>,
+}
+
+/// One project with the workspace it belongs to (grouped read of the
+/// project -> lane map).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectWorkspaceRow {
+    pub project_id: Uuid,
+    pub project_slug: String,
+    pub workspace_id: Uuid,
+    pub workspace_slug: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionWithLinks {
     pub session: ChatSessionNode,

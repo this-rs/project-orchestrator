@@ -2345,6 +2345,14 @@ impl GraphStore for Neo4jClient {
         self.get_session_link_rows(session_ids).await
     }
 
+    async fn get_plans_task_graph(&self, plan_ids: &[Uuid]) -> anyhow::Result<PlansTaskGraph> {
+        self.get_plans_task_graph(plan_ids).await
+    }
+
+    async fn list_project_workspace_rows(&self) -> anyhow::Result<Vec<ProjectWorkspaceRow>> {
+        self.list_project_workspace_rows().await
+    }
+
     async fn get_session_tree(&self, session_id: &str) -> anyhow::Result<Vec<SessionTreeNode>> {
         self.get_session_tree(session_id).await
     }

@@ -1966,6 +1966,12 @@ pub trait GraphStore: Send + Sync {
     /// in ONE grouped query whatever the number of sessions.
     async fn get_session_link_rows(&self, session_ids: &[Uuid]) -> Result<Vec<SessionLinkRow>>;
 
+    /// Tasks + dependency edges of many plans in ONE grouped read.
+    async fn get_plans_task_graph(&self, plan_ids: &[Uuid]) -> Result<PlansTaskGraph>;
+
+    /// Every project with its workspace, in ONE read (project -> lane map).
+    async fn list_project_workspace_rows(&self) -> Result<Vec<ProjectWorkspaceRow>>;
+
     /// Get all sessions for a PlanRun via SPAWNED_BY relation metadata
     async fn get_run_sessions(&self, run_id: Uuid) -> Result<Vec<SessionInfo>>;
 

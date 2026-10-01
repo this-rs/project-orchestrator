@@ -2126,6 +2126,28 @@ impl ChatManager {
         (prompt, included_note_ids)
     }
 
+    /// Sessions whose CLI is alive, and among them those currently streaming,
+    /// read under ONE lock (the cockpit must not take it once per session).
+    pub async fn live_session_snapshot(
+        &self,
+    ) -> (
+        std::collections::HashSet<Uuid>,
+        std::collections::HashSet<Uuid>,
+    ) {
+        let sessions = self.active_sessions.read().await;
+        let mut live = std::collections::HashSet::new();
+        let mut streaming = std::collections::HashSet::new();
+        for (id, s) in sessions.iter() {
+            if let Ok(id) = id.parse::<Uuid>() {
+                live.insert(id);
+                if s.is_streaming.load(Ordering::SeqCst) {
+                    streaming.insert(id);
+                }
+            }
+        }
+        (live, streaming)
+    }
+
     /// Check if a session is currently active (subprocess alive)
     pub async fn is_session_active(&self, session_id: &str) -> bool {
         self.active_sessions.read().await.contains_key(session_id)

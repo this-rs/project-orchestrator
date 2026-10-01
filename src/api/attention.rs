@@ -371,6 +371,21 @@ pub struct UnattachedSession {
     pub age_secs: u64,
 }
 
+/// A source the aggregator could not read. The response is still served:
+/// the bands that depend on that source are degraded, the others are intact.
+///
+/// Emitted ONLY when something failed (`source_errors` is skipped when empty),
+/// so the shared fixtures, which describe the healthy case, stay valid as is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct SourceError {
+    /// Name of the source (`plans`, `runs`, `sessions`, `decisions`, ...).
+    pub source: String,
+    /// Bands whose content is incomplete because of it.
+    pub bands: Vec<Band>,
+    pub message: String,
+}
+
 /// Full response of `GET /api/attention`: everything the page displays,
 /// without a second call.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -388,6 +403,9 @@ pub struct AttentionResponse {
     pub thinking: Vec<ThinkingItem>,
     /// Sessions without any link, grouped by lane — never dropped.
     pub unattached: Vec<UnattachedSession>,
+    /// Sources that failed (absent when every source answered).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_errors: Vec<SourceError>,
 }
 
 impl AttentionResponse {
@@ -430,6 +448,113 @@ impl AttentionResponse {
         });
         self.unattached = un;
     }
+}
+
+/// Invariants of the contract that a response must hold, whatever produced it
+/// (a fixture or the aggregator). Returns one message per violation; empty
+/// means conformant. The fixture tests and the aggregator tests share it.
+pub fn contract_violations(r: &AttentionResponse) -> Vec<String> {
+    use std::collections::HashSet;
+    let mut v = Vec::new();
+    let slugs: HashSet<&str> = r.lanes.iter().map(|l| l.slug.as_str()).collect();
+    let mut thread_ids = HashSet::new();
+    let mut attached: HashSet<Uuid> = HashSet::new();
+    for t in &r.threads {
+        if !thread_ids.insert(t.id) {
+            v.push(format!("thread {} appears twice (two bands)", t.id));
+        }
+        if !slugs.contains(t.workspace.as_str()) {
+            v.push(format!("thread {}: unknown lane {}", t.id, t.workspace));
+        }
+        if t.stuck_reason.is_some() != (t.band == Band::Stuck) {
+            v.push(format!("thread {}: stuck_reason iff stuck", t.id));
+        }
+        let ids: Vec<Uuid> = t.sessions.iter().map(|s| s.id).collect();
+        if ids != t.session_ids {
+            v.push(format!("thread {}: session_ids != sessions[].id", t.id));
+        }
+        for s in &t.sessions {
+            if !attached.insert(s.id) {
+                v.push(format!("session {} in two threads", s.id));
+            }
+            if s.links.is_empty() {
+                v.push(format!("session {}: attached without link", s.id));
+            }
+            let uniq: HashSet<&SessionLink> = s.links.iter().collect();
+            if uniq.len() != s.links.len() {
+                v.push(format!("session {}: duplicated link", s.id));
+            }
+        }
+    }
+    if r.runner.busy_with.is_some() != (r.runner.status == RunnerStatus::Busy) {
+        v.push("runner: busy_with iff busy".into());
+    }
+    for u in &r.unattached {
+        if attached.contains(&u.id) {
+            v.push(format!("session {}: unattached AND attached", u.id));
+        }
+        if !slugs.contains(u.workspace_slug.as_str()) {
+            v.push(format!("unattached {}: unknown lane", u.id));
+        }
+        for p in &u.pending {
+            if p.session_id != u.id || p.thread_id.is_some() || p.workspace != u.workspace_slug {
+                v.push(format!(
+                    "unattached {}: inconsistent pending {}",
+                    u.id, p.request_id
+                ));
+            }
+        }
+    }
+    let unattached_ids: HashSet<Uuid> = r.unattached.iter().map(|u| u.id).collect();
+    let check = |thread_id: Option<Uuid>, session_id: Uuid, rid: &str, v: &mut Vec<String>| {
+        if unattached_ids.contains(&session_id) {
+            v.push(format!("request {rid}: repeated outside `unattached`"));
+        }
+        if let Some(tid) = thread_id {
+            match r.threads.iter().find(|t| t.id == tid) {
+                Some(t) if t.session_ids.contains(&session_id) => {}
+                _ => v.push(format!("request {rid}: not in its thread")),
+            }
+        }
+    };
+    for w in &r.waiting {
+        check(w.thread_id, w.session_id, &w.request_id, &mut v);
+        // A thread holding a live request is in band 1 and nowhere else.
+        if let Some(t) = w
+            .thread_id
+            .and_then(|id| r.threads.iter().find(|t| t.id == id))
+        {
+            if t.band != Band::Waiting {
+                v.push(format!(
+                    "request {}: its thread is not in band waiting",
+                    w.request_id
+                ));
+            }
+        }
+    }
+    for w in &r.orphans {
+        check(w.thread_id, w.session_id, &w.request_id, &mut v);
+        if let Some(t) = w
+            .thread_id
+            .and_then(|id| r.threads.iter().find(|t| t.id == id))
+        {
+            if t.band == Band::Waiting && r.waiting.iter().all(|x| x.thread_id != Some(t.id)) {
+                v.push(format!(
+                    "orphan {}: thread in band waiting without live request",
+                    w.request_id
+                ));
+            }
+        }
+    }
+    for t in &r.threads {
+        if t.band == Band::Waiting && r.waiting.iter().all(|w| w.thread_id != Some(t.id)) {
+            v.push(format!(
+                "thread {}: band waiting without a live request",
+                t.id
+            ));
+        }
+    }
+    v
 }
 
 #[cfg(test)]
@@ -603,6 +728,7 @@ mod tests {
             runner: r,
             thinking: vec![],
             unattached: vec![],
+            source_errors: vec![],
         };
         let v = ser(&resp);
         for key in v.as_object().unwrap().keys() {
@@ -767,6 +893,36 @@ mod tests {
                 "{name}: busy_with iff busy"
             );
         }
+    }
+
+    /// The validator the aggregator tests rely on agrees with every shared
+    /// fixture, and a healthy response carries no `source_errors` key.
+    #[test]
+    fn contract_validator_accepts_every_fixture() {
+        for name in DATASETS {
+            let (raw, r) = load(name);
+            assert_eq!(contract_violations(&r), Vec::<String>::new(), "{name}");
+            assert!(!raw.contains("source_errors"), "{name}");
+        }
+    }
+
+    #[test]
+    fn source_errors_are_emitted_only_when_present() {
+        let (_, mut r) = load("empty");
+        assert!(ser(&r).get("source_errors").is_none());
+        r.source_errors.push(SourceError {
+            source: "runs".into(),
+            bands: vec![Band::Running, Band::Stuck],
+            message: "boom".into(),
+        });
+        assert_eq!(
+            ser(&r)["source_errors"],
+            json!([{"source": "runs", "bands": ["running", "stuck"], "message": "boom"}])
+        );
+        assert_eq!(
+            serde_json::from_value::<AttentionResponse>(ser(&r)).unwrap(),
+            r
+        );
     }
 
     /// Session-link rules (note 07909b4a): every session of a thread carries

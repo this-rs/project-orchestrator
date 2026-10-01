@@ -77,6 +77,50 @@ impl Neo4jClient {
         Ok(tasks)
     }
 
+    /// Tasks and DEPENDS_ON edges of several plans in two grouped queries
+    /// (constant, whatever the number of plans).
+    pub async fn get_plans_task_graph(&self, plan_ids: &[Uuid]) -> Result<PlansTaskGraph> {
+        let mut graph = PlansTaskGraph::default();
+        if plan_ids.is_empty() {
+            return Ok(graph);
+        }
+        let ids: Vec<String> = plan_ids.iter().map(|u| u.to_string()).collect();
+        let q = query(
+            r#"
+            UNWIND $ids AS pid
+            MATCH (p:Plan {id: pid})-[:HAS_TASK]->(t:Task)
+            RETURN p.id AS plan_id, t
+            ORDER BY COALESCE(t.priority, 0) DESC, t.created_at
+            "#,
+        )
+        .param("ids", ids.clone());
+        let mut result = self.graph.execute(q).await?;
+        while let Some(row) = result.next().await? {
+            let plan_id: String = row.get("plan_id")?;
+            let node: neo4rs::Node = row.get("t")?;
+            if let Ok(plan_id) = plan_id.parse::<Uuid>() {
+                graph.tasks.push((plan_id, self.node_to_task(&node)?));
+            }
+        }
+        let q = query(
+            r#"
+            UNWIND $ids AS pid
+            MATCH (p:Plan {id: pid})-[:HAS_TASK]->(t:Task)-[:DEPENDS_ON]->(d:Task)<-[:HAS_TASK]-(p)
+            RETURN t.id AS from_id, d.id AS to_id
+            "#,
+        )
+        .param("ids", ids);
+        let mut result = self.graph.execute(q).await?;
+        while let Some(row) = result.next().await? {
+            let from_id: String = row.get("from_id")?;
+            let to_id: String = row.get("to_id")?;
+            if let (Ok(from), Ok(to)) = (from_id.parse::<Uuid>(), to_id.parse::<Uuid>()) {
+                graph.edges.push((from, to));
+            }
+        }
+        Ok(graph)
+    }
+
     /// Helper to convert Neo4j node to TaskNode
     pub(crate) fn node_to_task(&self, node: &neo4rs::Node) -> Result<TaskNode> {
         Ok(TaskNode {
