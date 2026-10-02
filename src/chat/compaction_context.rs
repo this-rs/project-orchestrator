@@ -1653,10 +1653,7 @@ mod tests {
     /// `"IN_PROGRESS"` after `.to_uppercase()`.
     #[test]
     fn to_markdown_never_emits_debug_format_status() {
-        let mut ctx = CompactionContext {
-            session_mode: crate::chat::compaction_context::SessionMode::Interactive,
-            ..Default::default()
-        };
+        let mut ctx = CompactionContext::default();
         ctx.pending_tasks
             .push(crate::chat::compaction_context::TaskSummary {
                 title: "test task".to_string(),
