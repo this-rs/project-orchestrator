@@ -55,10 +55,29 @@ pub async fn require_auth(
     let claims = decode_jwt(token, &auth_config.jwt_secret)
         .map_err(|e| AppError::Unauthorized(format!("Invalid token: {}", e)))?;
 
-    // 4. Check email restrictions (domain + individual whitelist).
-    //    Bypass for the anonymous/MCP system user (ANONYMOUS_USER_ID = UUID nil)
-    //    since it's a machine identity used by `mcp_server` auto-auth, not a human
-    //    subject to email policies.
+    // 4. Email allowlist, MCP-token revocation, vault-token path scope.
+    enforce_token_policy(&state, auth_config, &claims, req.uri().path()).await?;
+
+    // 5. Inject claims into request extensions
+    req.extensions_mut().insert(claims);
+
+    Ok(next.run(req).await)
+}
+
+/// Policy every decoded token must satisfy before it is trusted: the email
+/// allowlist, MCP-token revocation and the vault-token path scope. Shared by
+/// [`require_auth`] and every other entry point that turns a Bearer token into
+/// a credential (e.g. WebSocket tickets), so none of them can drift.
+pub async fn enforce_token_policy(
+    state: &OrchestratorState,
+    auth_config: &crate::AuthConfig,
+    claims: &Claims,
+    path: &str,
+) -> Result<(), AppError> {
+    // Email restrictions (domain + individual whitelist).
+    // Bypass for the anonymous/MCP system user (ANONYMOUS_USER_ID = UUID nil)
+    // since it's a machine identity used by `mcp_server` auto-auth, not a human
+    // subject to email policies.
     let is_system_user = claims.sub == ANONYMOUS_USER_ID.to_string();
     if !is_system_user && !auth_config.is_email_allowed(&claims.email) {
         return Err(AppError::Forbidden(
@@ -66,9 +85,9 @@ pub async fn require_auth(
         ));
     }
 
-    // 4b. MCP tokens are long-lived but revocable: signature + expiry alone
-    //     are not enough — the jti must still be active in the McpToken
-    //     store. Fail closed on a missing jti or a store error.
+    // MCP tokens are long-lived but revocable: signature + expiry alone
+    // are not enough — the jti must still be active in the McpToken
+    // store. Fail closed on a missing jti or a store error.
     if claims.is_mcp_token() {
         let jti = claims
             .jti
@@ -87,21 +106,18 @@ pub async fn require_auth(
         }
     }
 
-    // 4c. A vault token lives in an agent's shell environment. It opens the
-    //     agent read path and nothing else — otherwise that shell would hold a
-    //     key to the whole API.
-    if crate::auth::jwt::vault_token_session(&claims).is_some()
-        && !req.uri().path().starts_with(VAULT_AGENT_PATH_PREFIX)
+    // A vault token lives in an agent's shell environment. It opens the
+    // agent read path and nothing else — otherwise that shell would hold a
+    // key to the whole API.
+    if crate::auth::jwt::vault_token_session(claims).is_some()
+        && !path.starts_with(VAULT_AGENT_PATH_PREFIX)
     {
         return Err(AppError::Forbidden(
             "vault tokens are only valid for reading granted secrets".to_string(),
         ));
     }
 
-    // 5. Inject claims into request extensions
-    req.extensions_mut().insert(claims);
-
-    Ok(next.run(req).await)
+    Ok(())
 }
 
 // ============================================================================

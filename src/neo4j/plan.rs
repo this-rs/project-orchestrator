@@ -143,6 +143,38 @@ pub struct WaveComputationResult {
     pub edges: Vec<(Uuid, Uuid)>,
 }
 
+/// Normalise the client-supplied plan status filter to the stored PascalCase
+/// values. Unknown values are kept as-is (they simply match nothing) and are
+/// always bound as a Cypher parameter. `None` means "no status filter".
+pub(crate) fn plan_status_values(statuses: Option<&[String]>) -> Option<Vec<String>> {
+    let statuses = statuses?;
+    if statuses.is_empty() {
+        return None;
+    }
+    Some(
+        statuses
+            .iter()
+            .map(|s| match s.to_lowercase().as_str() {
+                "draft" => "Draft".to_string(),
+                "approved" => "Approved".to_string(),
+                "in_progress" => "InProgress".to_string(),
+                "completed" => "Completed".to_string(),
+                "cancelled" => "Cancelled".to_string(),
+                _ => s.clone(),
+            })
+            .collect(),
+    )
+}
+
+/// AND-clause for the plan status filter: only the `$statuses` placeholder,
+/// whatever the values are (they are bound by the caller).
+pub(crate) fn plan_status_clause(values: Option<&[String]>) -> String {
+    match values {
+        Some(_) => "AND p.status IN $statuses".to_string(),
+        None => String::new(),
+    }
+}
+
 impl Neo4jClient {
     // ========================================================================
     // Plan operations
@@ -315,31 +347,9 @@ impl Neo4jClient {
         limit: usize,
         offset: usize,
     ) -> Result<(Vec<PlanNode>, usize)> {
-        // Build status filter
-        let status_clause = if let Some(statuses) = &status_filter {
-            if !statuses.is_empty() {
-                let status_list: Vec<String> = statuses
-                    .iter()
-                    .map(|s| {
-                        // Convert to PascalCase for enum matching
-                        let pascal = match s.to_lowercase().as_str() {
-                            "draft" => "Draft",
-                            "approved" => "Approved",
-                            "in_progress" => "InProgress",
-                            "completed" => "Completed",
-                            "cancelled" => "Cancelled",
-                            _ => s.as_str(),
-                        };
-                        format!("'{}'", pascal)
-                    })
-                    .collect();
-                format!("AND p.status IN [{}]", status_list.join(", "))
-            } else {
-                String::new()
-            }
-        } else {
-            String::new()
-        };
+        // Build status filter (values are bound, never spliced into the Cypher)
+        let status_values = plan_status_values(status_filter.as_deref());
+        let status_clause = plan_status_clause(status_values.as_deref());
 
         // Count total
         let count_q = query(&format!(
@@ -351,6 +361,10 @@ impl Neo4jClient {
             status_clause
         ))
         .param("project_id", project_id.to_string());
+        let count_q = match &status_values {
+            Some(v) => count_q.param("statuses", v.clone()),
+            None => count_q,
+        };
 
         let count_rows = self.execute_with_params(count_q).await?;
         let total: i64 = count_rows
@@ -373,6 +387,10 @@ impl Neo4jClient {
         .param("project_id", project_id.to_string())
         .param("offset", offset as i64)
         .param("limit", limit as i64);
+        let q = match &status_values {
+            Some(v) => q.param("statuses", v.clone()),
+            None => q,
+        };
 
         let mut result = self.graph.execute(q).await?;
         let mut plans = Vec::new();
@@ -1142,16 +1160,10 @@ impl Neo4jClient {
         };
         let order_dir = if sort_order == "asc" { "ASC" } else { "DESC" };
 
-        let match_clause = if let Some(pid) = project_id {
-            format!(
-                "MATCH (proj:Project {{id: '{}'}})-[:HAS_PLAN]->(p:Plan)",
-                pid
-            )
-        } else if let Some(ws) = workspace_slug {
-            format!(
-                "MATCH (w:Workspace {{slug: '{}'}})<-[:BELONGS_TO_WORKSPACE]-(proj:Project)-[:HAS_PLAN]->(p:Plan)",
-                ws
-            )
+        let match_clause = if project_id.is_some() {
+            "MATCH (proj:Project {id: $scope_project_id})-[:HAS_PLAN]->(p:Plan)".to_string()
+        } else if workspace_slug.is_some() {
+            "MATCH (w:Workspace {slug: $scope_workspace_slug})<-[:BELONGS_TO_WORKSPACE]-(proj:Project)-[:HAS_PLAN]->(p:Plan)".to_string()
         } else {
             "MATCH (p:Plan)".to_string()
         };
@@ -1161,7 +1173,20 @@ impl Neo4jClient {
             "{} {} RETURN count(DISTINCT p) AS total",
             match_clause, where_clause
         );
-        let count_result = self.execute(&count_cypher).await?;
+        let scope = |q: neo4rs::Query| {
+            let q = where_builder.bind(q);
+            let q = match project_id {
+                Some(pid) => q.param("scope_project_id", pid.to_string()),
+                None => q,
+            };
+            match (project_id, workspace_slug) {
+                (None, Some(ws)) => q.param("scope_workspace_slug", ws.to_string()),
+                _ => q,
+            }
+        };
+        let count_result = self
+            .execute_with_params(scope(query(&count_cypher)))
+            .await?;
         let total: i64 = count_result
             .first()
             .and_then(|r| r.get("total").ok())
@@ -1180,7 +1205,7 @@ impl Neo4jClient {
             match_clause, where_clause, order_field, order_dir, offset, limit
         );
 
-        let mut result = self.graph.execute(query(&cypher)).await?;
+        let mut result = self.graph.execute(scope(query(&cypher))).await?;
         let mut plans = Vec::new();
         while let Some(row) = result.next().await? {
             let node: neo4rs::Node = row.get("p")?;
@@ -1423,5 +1448,30 @@ impl Neo4jClient {
             out.insert(id, c);
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod injection_tests {
+    use super::{plan_status_clause, plan_status_values};
+
+    #[test]
+    fn plan_status_values_normalises_known_and_keeps_payload_as_data() {
+        let input = vec![
+            "in_progress".to_string(),
+            "a' OR 1=1 //".to_string(),
+            "x\\".to_string(),
+        ];
+        let out = plan_status_values(Some(&input)).unwrap();
+        assert_eq!(out[0], "InProgress");
+        // the payload is returned verbatim: it is bound, not interpolated
+        assert_eq!(out[1], "a' OR 1=1 //");
+        assert_eq!(out[2], "x\\");
+        let clause = plan_status_clause(Some(&out));
+        assert_eq!(clause, "AND p.status IN $statuses");
+        assert!(!clause.contains("OR 1=1") && !clause.contains('\''));
+        assert!(plan_status_clause(None).is_empty());
+        assert!(plan_status_values(Some(&[])).is_none());
+        assert!(plan_status_values(None).is_none());
     }
 }

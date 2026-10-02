@@ -8,6 +8,21 @@ use neo4rs::query;
 use std::str::FromStr;
 use uuid::Uuid;
 
+/// Map a client-supplied entity type to its Neo4j label. The label is spliced
+/// into the Cypher (labels cannot be parameters), so anything that is not a
+/// known [`EntityType`] is rejected rather than interpolated.
+pub(crate) fn safe_entity_label(entity_type: &str) -> Result<&'static str> {
+    EntityType::from_str(entity_type)
+        .map(|t| t.neo4j_label())
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "invalid entity_type '{}': {}",
+                entity_type.escape_debug(),
+                e
+            )
+        })
+}
+
 impl Neo4jClient {
     // ========================================================================
     // Decision operations
@@ -175,6 +190,8 @@ impl Neo4jClient {
         entity_id: &str,
         limit: u32,
     ) -> Result<Vec<DecisionNode>> {
+        // entity_type ends up in a label position: only a known label may pass.
+        let entity_type = safe_entity_label(entity_type)?;
         // Try both direct AFFECTS and indirect via task affected_files.
         // For File entities with relative paths, use ENDS WITH matching
         // since Neo4j stores absolute paths.
@@ -427,6 +444,8 @@ impl Neo4jClient {
         status_filter: Option<&str>,
     ) -> Result<Vec<DecisionNode>> {
         let status = status_filter.unwrap_or("accepted");
+        // entity_type ends up in a label position: only a known label may pass.
+        let entity_type = safe_entity_label(entity_type)?;
 
         let cypher = if entity_type == "File" && !entity_id.starts_with('/') {
             format!(
@@ -928,5 +947,25 @@ impl Neo4jClient {
         }
 
         Ok(results)
+    }
+}
+
+#[cfg(test)]
+mod injection_tests {
+    use super::safe_entity_label;
+
+    #[test]
+    fn entity_label_is_whitelisted() {
+        assert_eq!(safe_entity_label("File").unwrap(), "File");
+        assert_eq!(safe_entity_label("function").unwrap(), "Function");
+        for payload in [
+            "File) DETACH DELETE n //",
+            "a' OR 1=1 //",
+            "Function {id: 'x'}) RETURN d //",
+            "x\\",
+            "",
+        ] {
+            assert!(safe_entity_label(payload).is_err(), "accepted: {payload}");
+        }
     }
 }

@@ -1,0 +1,10 @@
+{
+  "note": "SHA-256 of the separator-stripped, lowercased form of each token that must never appear in this public repository. The plaintext is deliberately absent: a gate that carries the string it forbids defeats itself. Each entry's `len` is the length of that normalized form, which lets the checker hash only candidates of a matching length instead of every token in the tree.",
+  "entries": [
+    {
+      "len": 13,
+      "sha256": "5087190f1217d4d7aea578f5f174d272af21e302409ab04aadc08462a70f375b"
+    }
+  ],
+  "howToAdd": "node -e \"const{createHash}=require('crypto');const n=s=>s.toLowerCase().replace(/[^a-z0-9]/g,'');const v=process.argv[1];console.log(JSON.stringify({len:n(v).length,sha256:createHash('sha256').update(n(v)).digest('hex')}))\" '<the-token>'"
+}
