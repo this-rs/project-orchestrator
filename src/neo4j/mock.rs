@@ -229,6 +229,8 @@ pub struct MockGraphStore {
     pub mcp_co_activated: RwLock<HashMap<(String, String), i64>>,
     /// fqn -> fqn -> (count, avg_delta_ms) (OFTEN_FOLLOWS)
     pub mcp_often_follows: RwLock<HashMap<(String, String), (i64, f64)>>,
+    /// ProtocolRun id -> reasoning tree id (REASONING_FOR links)
+    pub run_reasoning_trees: RwLock<HashMap<Uuid, Uuid>>,
 
     // Test flags
     /// Controls what `has_context_cards()` returns (default: false)
@@ -356,6 +358,7 @@ impl MockGraphStore {
             mcp_similar_to: RwLock::new(HashMap::new()),
             mcp_co_activated: RwLock::new(HashMap::new()),
             mcp_often_follows: RwLock::new(HashMap::new()),
+            run_reasoning_trees: RwLock::new(HashMap::new()),
             mock_has_context_cards: std::sync::atomic::AtomicBool::new(false),
             mock_fail_set_watch_enabled: std::sync::atomic::AtomicBool::new(false),
             neighborhood_graph: RwLock::new(Default::default()),
@@ -11083,16 +11086,21 @@ impl GraphStore for MockGraphStore {
     async fn persist_reasoning_tree(
         &self,
         tree: &crate::reasoning::ReasoningTree,
-        _linked_entity_type: Option<&str>,
-        _linked_entity_id: Option<Uuid>,
+        linked_entity_type: Option<&str>,
+        linked_entity_id: Option<Uuid>,
     ) -> anyhow::Result<Uuid> {
-        // Mock: return the tree's ID
+        if let (Some("run" | "ProtocolRun"), Some(run_id)) = (linked_entity_type, linked_entity_id)
+        {
+            self.run_reasoning_trees
+                .write()
+                .await
+                .insert(run_id, tree.id);
+        }
         Ok(tree.id)
     }
 
-    async fn get_run_reasoning_tree_id(&self, _run_id: Uuid) -> anyhow::Result<Option<Uuid>> {
-        // Mock: no persisted reasoning tree
-        Ok(None)
+    async fn get_run_reasoning_tree_id(&self, run_id: Uuid) -> anyhow::Result<Option<Uuid>> {
+        Ok(self.run_reasoning_trees.read().await.get(&run_id).copied())
     }
 
     async fn list_completed_runs_for_project(

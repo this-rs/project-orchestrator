@@ -6,6 +6,25 @@ use anyhow::Result;
 use neo4rs::query;
 use uuid::Uuid;
 
+/// Cypher of `list_all_plan_runs_impl`. The workspace slug and the status are
+/// bound as `$ws_slug` / `$status` by the caller.
+pub(crate) fn list_all_plan_runs_cypher(by_workspace: bool, by_status: bool) -> String {
+    let mut cypher = String::new();
+    if by_workspace {
+        // Scope to workspace: traverse PlanRun->Plan<-Project->Workspace
+        cypher.push_str(
+            "MATCH (w:Workspace {slug: $ws_slug})<-[:BELONGS_TO_WORKSPACE]-(proj:Project)-[:HAS_PLAN]->(plan:Plan)<-[:RUNS]-(r:PlanRun)\n",
+        );
+    } else {
+        cypher.push_str("MATCH (r:PlanRun)\n");
+    }
+    if by_status {
+        cypher.push_str("WHERE r.status = $status\n");
+    }
+    cypher.push_str("RETURN r\nORDER BY r.started_at DESC\nSKIP $offset\nLIMIT $limit");
+    cypher
+}
+
 impl Neo4jClient {
     // ========================================================================
     // PlanRun operations
@@ -88,17 +107,15 @@ impl Neo4jClient {
             "#,
         );
 
-        if let Some(task_id) = state.current_task_id {
-            cypher.push_str(&format!(", r.current_task_id = '{}'", task_id));
+        // current_task_id is a typed Uuid, but bind it anyway
+        if state.current_task_id.is_some() {
+            cypher.push_str(", r.current_task_id = $current_task_id");
         } else {
             cypher.push_str(", r.current_task_id = null");
         }
 
-        if let Some(completed_at) = state.completed_at {
-            cypher.push_str(&format!(
-                ", r.completed_at = datetime('{}')",
-                completed_at.to_rfc3339()
-            ));
+        if state.completed_at.is_some() {
+            cypher.push_str(", r.completed_at = datetime($completed_at)");
         }
 
         let q = query(&cypher)
@@ -129,6 +146,14 @@ impl Neo4jClient {
                 "state_json",
                 serde_json::to_string(state).unwrap_or_default(),
             );
+        let q = match state.current_task_id {
+            Some(t) => q.param("current_task_id", t.to_string()),
+            None => q,
+        };
+        let q = match state.completed_at {
+            Some(c) => q.param("completed_at", c.to_rfc3339()),
+            None => q,
+        };
 
         self.graph.run(q).await?;
         Ok(())
@@ -182,27 +207,14 @@ impl Neo4jClient {
         status: Option<&str>,
         workspace_slug: Option<&str>,
     ) -> Result<Vec<RunnerState>> {
-        let mut cypher = String::new();
-
-        if let Some(ws) = workspace_slug {
-            // Scope to workspace: traverse PlanRun→Plan←Project→Workspace
-            cypher.push_str(&format!(
-                "MATCH (w:Workspace {{slug: '{}'}})<-[:BELONGS_TO_WORKSPACE]-(proj:Project)-[:HAS_PLAN]->(plan:Plan)<-[:RUNS]-(r:PlanRun)\n",
-                ws.replace('\'', "\\'")
-            ));
-        } else {
-            cypher.push_str("MATCH (r:PlanRun)\n");
-        }
-
-        if status.is_some() {
-            cypher.push_str("WHERE r.status = $status\n");
-        }
-
-        cypher.push_str("RETURN r\nORDER BY r.started_at DESC\nSKIP $offset\nLIMIT $limit");
+        let cypher = list_all_plan_runs_cypher(workspace_slug.is_some(), status.is_some());
 
         let mut q = query(&cypher).param("limit", limit).param("offset", offset);
         if let Some(s) = status {
             q = q.param("status", s.to_string());
+        }
+        if let Some(ws) = workspace_slug {
+            q = q.param("ws_slug", ws.to_string());
         }
 
         let mut result = self.graph.execute(q).await?;
@@ -309,5 +321,20 @@ impl Neo4jClient {
                 .ok()
                 .and_then(|s| s.parse().ok()),
         })
+    }
+}
+
+#[cfg(test)]
+mod injection_tests {
+    use super::list_all_plan_runs_cypher;
+
+    #[test]
+    fn plan_runs_query_binds_workspace_slug_and_status() {
+        let c = list_all_plan_runs_cypher(true, true);
+        assert!(c.contains("{slug: $ws_slug}"), "{c}");
+        assert!(c.contains("r.status = $status"), "{c}");
+        // no string literal can carry user data
+        assert!(!c.contains('\''), "{c}");
+        assert!(!list_all_plan_runs_cypher(false, false).contains("$ws_slug"));
     }
 }

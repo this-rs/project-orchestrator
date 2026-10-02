@@ -83,16 +83,16 @@ impl Neo4jClient {
 
     /// List all triggers, optionally filtered by type.
     pub async fn list_all_triggers_impl(&self, trigger_type: Option<&str>) -> Result<Vec<Trigger>> {
-        let cypher = if let Some(tt) = trigger_type {
-            format!(
-                "MATCH (t:Trigger) WHERE t.trigger_type = '{}' RETURN t ORDER BY t.created_at DESC",
-                tt
-            )
+        let cypher = if trigger_type.is_some() {
+            "MATCH (t:Trigger) WHERE t.trigger_type = $trigger_type RETURN t ORDER BY t.created_at DESC"
         } else {
-            "MATCH (t:Trigger) RETURN t ORDER BY t.created_at DESC".to_string()
+            "MATCH (t:Trigger) RETURN t ORDER BY t.created_at DESC"
         };
 
-        let q = query(&cypher);
+        let mut q = query(cypher);
+        if let Some(tt) = trigger_type {
+            q = q.param("trigger_type", tt.to_string());
+        }
         let mut result = self.graph.execute(q).await?;
         let mut triggers = Vec::new();
         while let Some(row) = result.next().await? {
@@ -183,18 +183,17 @@ impl Neo4jClient {
             "#,
         );
 
-        if let Some(run_id) = firing.plan_run_id {
-            cypher.push_str(&format!(
+        if firing.plan_run_id.is_some() {
+            cypher.push_str(
                 r#"
                 WITH f
-                MATCH (r:PlanRun {{run_id: '{}'}})
+                MATCH (r:PlanRun {run_id: $plan_run_id})
                 CREATE (f)-[:STARTED]->(r)
                 "#,
-                run_id
-            ));
+            );
         }
 
-        let q = query(&cypher)
+        let mut q = query(&cypher)
             .param("id", firing.id.to_string())
             .param("trigger_id", firing.trigger_id.to_string())
             .param("fired_at", firing.fired_at.to_rfc3339())
@@ -206,6 +205,9 @@ impl Neo4jClient {
                     .map(|p| serde_json::to_string(p).unwrap_or_default())
                     .unwrap_or_default(),
             );
+        if let Some(run_id) = firing.plan_run_id {
+            q = q.param("plan_run_id", run_id.to_string());
+        }
 
         self.graph.run(q).await?;
         Ok(())

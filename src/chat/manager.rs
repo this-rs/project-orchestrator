@@ -6191,7 +6191,7 @@ impl ChatManager {
             .map_err(|e| anyhow!("Failed to create Meilisearch client: {}", e))?;
 
             let index = meili_client.index("nexus_messages");
-            let filter = format!("conversation_id = \"{}\"", conversation_id);
+            let filter = legacy_messages_filter(&conversation_id);
 
             let results: meilisearch_sdk::search::SearchResults<
                 nexus_claude::memory::MessageDocument,
@@ -7704,9 +7704,26 @@ mod runner_spawn_tests {
     }
 }
 
+/// Meilisearch filter selecting one conversation in `nexus_messages`.
+/// `conversation_id` is stored data (not trusted): it is quoted/escaped so a
+/// value containing `"` cannot widen the filter.
+pub(crate) fn legacy_messages_filter(conversation_id: &str) -> String {
+    crate::meilisearch::client::meili_filter_eq("conversation_id", conversation_id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_messages_filter_escapes_the_conversation_id() {
+        assert_eq!(legacy_messages_filter("abc"), "conversation_id = \"abc\"");
+        let evil = legacy_messages_filter("x\" OR conversation_id != \"y");
+        assert_eq!(
+            evil,
+            "conversation_id = \"x\\\" OR conversation_id != \\\"y\""
+        );
+    }
 
     #[tokio::test]
     async fn test_enrichment_project_id_resolves_the_session_slug() {
