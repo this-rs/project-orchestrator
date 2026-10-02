@@ -12,7 +12,8 @@ pub mod manager;
 pub mod models;
 pub mod witness;
 
-/// Time constant (days) of note energy decay — the single value used by the
+/// Time constant tau (days) of the stored energy decay `exp(-t/tau)` (halves every
+/// tau·ln2 ≈ 62.4 days; NOT a half-life, despite the name) — the single value used by the
 /// heartbeat, skill maintenance and data migrations (it used to be 14 days
 /// in one place and 90 in others).
 pub const ENERGY_HALF_LIFE_DAYS: f64 = 90.0;
