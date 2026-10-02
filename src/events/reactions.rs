@@ -188,7 +188,7 @@ async fn on_task_completed_cascade_steps(event: CrudEvent, state: Arc<ServerStat
         .unwrap_or("");
 
     // Only react to Completed transitions
-    if new_status != "Completed" {
+    if new_status != "completed" {
         return;
     }
 
@@ -238,8 +238,8 @@ async fn on_task_completed_cascade_steps(event: CrudEvent, state: Arc<ServerStat
 // Reaction: Task::StatusChanged(Completed) → auto-complete plan
 // ─────────────────────────────────────────────────────────────
 
-/// When a task status changes to "Completed", check if all tasks in the parent plan
-/// are now completed. If so, automatically transition the plan to "Completed".
+/// When a task status changes to "completed", check if all tasks in the parent plan
+/// are now completed. If so, automatically transition the plan to "completed".
 ///
 /// This provides automatic plan lifecycle management — no manual intervention needed
 /// to mark a plan as complete when all its tasks are done.
@@ -251,7 +251,7 @@ async fn on_task_status_changed(event: CrudEvent, state: Arc<ServerState>) {
         .unwrap_or("");
 
     // Only react to Completed transitions
-    if new_status != "Completed" {
+    if new_status != "completed" {
         return;
     }
 
@@ -352,8 +352,8 @@ async fn on_task_status_changed(event: CrudEvent, state: Arc<ServerState>) {
             state.event_bus.emit_status_changed(
                 EntityType::Plan,
                 &plan_id.to_string(),
-                "InProgress",
-                "Completed",
+                "in_progress",
+                "completed",
                 None,
             );
         }
@@ -410,7 +410,7 @@ async fn on_plan_status_changed(event: CrudEvent, state: Arc<ServerState>) {
         .unwrap_or("");
 
     // Only react to terminal statuses
-    if new_status != "Completed" && new_status != "Failed" {
+    if new_status != "completed" && new_status != "failed" {
         return;
     }
 
@@ -543,7 +543,7 @@ async fn on_protocol_run_completed_collect_episode(event: CrudEvent, state: Arc<
         .unwrap_or("");
 
     // Only react to terminal statuses
-    if new_status != "Completed" && new_status != "Failed" {
+    if new_status != "completed" && new_status != "failed" {
         return;
     }
 
@@ -1614,9 +1614,9 @@ mod tests {
             EntityType::Task,
             CrudAction::StatusChanged,
             &Uuid::new_v4().to_string(),
-            json!({"new_status": "InProgress", "old_status": "Pending"}),
+            json!({"new_status": "in_progress", "old_status": "pending"}),
         );
-        // Should return early (not "Completed")
+        // Should return early (not "completed")
         on_task_status_changed(event, state).await;
     }
 
@@ -1629,7 +1629,7 @@ mod tests {
             &Uuid::new_v4().to_string(),
             json!({}),
         );
-        // Empty payload → new_status defaults to "" → not "Completed"
+        // Empty payload → new_status defaults to "" → not "completed"
         on_task_status_changed(event, state).await;
     }
 
@@ -1640,7 +1640,7 @@ mod tests {
             EntityType::Task,
             CrudAction::StatusChanged,
             "bad-uuid",
-            json!({"new_status": "Completed"}),
+            json!({"new_status": "completed"}),
         );
         on_task_status_changed(event, state).await;
     }
@@ -1652,7 +1652,7 @@ mod tests {
             EntityType::Task,
             CrudAction::StatusChanged,
             &Uuid::new_v4().to_string(),
-            json!({"new_status": "Completed"}),
+            json!({"new_status": "completed"}),
         );
         // Task not linked to any plan → early return
         on_task_status_changed(event, state).await;
@@ -1680,7 +1680,7 @@ mod tests {
             EntityType::Task,
             CrudAction::StatusChanged,
             &task_id.to_string(),
-            json!({"new_status": "Completed", "old_status": "InProgress"}),
+            json!({"new_status": "completed", "old_status": "in_progress"}),
         );
         on_task_status_changed(event, state.clone()).await;
 
@@ -1714,7 +1714,7 @@ mod tests {
             EntityType::Task,
             CrudAction::StatusChanged,
             &t1_id.to_string(),
-            json!({"new_status": "Completed"}),
+            json!({"new_status": "completed"}),
         );
         on_task_status_changed(event, state.clone()).await;
 
@@ -1747,7 +1747,7 @@ mod tests {
             EntityType::Task,
             CrudAction::StatusChanged,
             &t1_id.to_string(),
-            json!({"new_status": "Completed"}),
+            json!({"new_status": "completed"}),
         );
         on_task_status_changed(event, state.clone()).await;
 
@@ -1776,7 +1776,7 @@ mod tests {
             EntityType::Task,
             CrudAction::StatusChanged,
             &task_id.to_string(),
-            json!({"new_status": "Completed"}),
+            json!({"new_status": "completed"}),
         );
         on_task_status_changed(event, state.clone()).await;
 
@@ -1794,9 +1794,9 @@ mod tests {
             EntityType::Task,
             CrudAction::StatusChanged,
             &Uuid::new_v4().to_string(),
-            json!({"new_status": "InProgress", "old_status": "Pending"}),
+            json!({"new_status": "in_progress", "old_status": "pending"}),
         );
-        // Should return early — not "Completed"
+        // Should return early — not "completed"
         on_task_completed_cascade_steps(event, state).await;
     }
 
@@ -1807,7 +1807,7 @@ mod tests {
             EntityType::Task,
             CrudAction::StatusChanged,
             "bad-uuid",
-            json!({"new_status": "Completed"}),
+            json!({"new_status": "completed"}),
         );
         on_task_completed_cascade_steps(event, state).await;
     }
@@ -1853,7 +1853,7 @@ mod tests {
             EntityType::Task,
             CrudAction::StatusChanged,
             &task_id.to_string(),
-            json!({"new_status": "Completed", "old_status": "InProgress"}),
+            json!({"new_status": "completed", "old_status": "in_progress"}),
         );
         on_task_completed_cascade_steps(event, state.clone()).await;
 
@@ -1890,7 +1890,7 @@ mod tests {
             EntityType::Task,
             CrudAction::StatusChanged,
             &task_id.to_string(),
-            json!({"new_status": "Completed"}),
+            json!({"new_status": "completed"}),
         );
         // Should complete gracefully with 0 updates
         on_task_completed_cascade_steps(event, state).await;
@@ -1905,7 +1905,7 @@ mod tests {
             EntityType::Plan,
             CrudAction::StatusChanged,
             &Uuid::new_v4().to_string(),
-            json!({"new_status": "InProgress", "old_status": "Draft"}),
+            json!({"new_status": "in_progress", "old_status": "draft"}),
         );
         on_plan_status_changed(event, state).await;
     }
@@ -1929,7 +1929,7 @@ mod tests {
             EntityType::Plan,
             CrudAction::StatusChanged,
             "not-a-uuid",
-            json!({"new_status": "Completed"}),
+            json!({"new_status": "completed"}),
         );
         on_plan_status_changed(event, state).await;
     }
@@ -1942,7 +1942,7 @@ mod tests {
             EntityType::Plan,
             CrudAction::StatusChanged,
             &plan_id.to_string(),
-            json!({"new_status": "Completed", "old_status": "InProgress"}),
+            json!({"new_status": "completed", "old_status": "in_progress"}),
         );
         // Should log and return without panicking (no plan in store → early return)
         on_plan_status_changed(event, state).await;
@@ -1955,7 +1955,7 @@ mod tests {
             EntityType::Plan,
             CrudAction::StatusChanged,
             &Uuid::new_v4().to_string(),
-            json!({"new_status": "InProgress", "old_status": "Draft"}),
+            json!({"new_status": "in_progress", "old_status": "draft"}),
         );
         // InProgress is not a terminal status — should return early
         on_plan_status_changed(event, state).await;
@@ -2006,7 +2006,7 @@ mod tests {
             EntityType::Plan,
             CrudAction::StatusChanged,
             &plan_id.to_string(),
-            json!({"new_status": "Completed", "old_status": "InProgress"}),
+            json!({"new_status": "completed", "old_status": "in_progress"}),
         );
         on_plan_status_changed(event, state.clone()).await;
 
@@ -2027,7 +2027,7 @@ mod tests {
             EntityType::ProtocolRun,
             CrudAction::StatusChanged,
             &Uuid::new_v4().to_string(),
-            json!({"new_status": "Running", "old_status": "Pending"}),
+            json!({"new_status": "Running", "old_status": "pending"}),
         );
         // Running is not terminal — should return early
         on_protocol_run_completed_collect_episode(event, state).await;
@@ -2040,7 +2040,7 @@ mod tests {
             EntityType::ProtocolRun,
             CrudAction::StatusChanged,
             "not-a-uuid",
-            json!({"new_status": "Completed"}),
+            json!({"new_status": "completed"}),
         );
         on_protocol_run_completed_collect_episode(event, state).await;
     }
@@ -2062,7 +2062,7 @@ mod tests {
             EntityType::ProtocolRun,
             CrudAction::StatusChanged,
             &run_id.to_string(),
-            json!({"new_status": "Completed", "old_status": "Running"}),
+            json!({"new_status": "completed", "old_status": "Running"}),
         );
         event.project_id = Some(project_id.to_string());
 
@@ -2083,7 +2083,7 @@ mod tests {
             EntityType::ProtocolRun,
             CrudAction::StatusChanged,
             &run_id.to_string(),
-            json!({"new_status": "Completed", "old_status": "Running"}),
+            json!({"new_status": "completed", "old_status": "Running"}),
         );
         on_protocol_run_completed_collect_episode(event, state).await;
     }
@@ -2208,13 +2208,13 @@ mod tests {
             EntityType::Task,
             CrudAction::StatusChanged,
             "abc",
-            json!({"new_status": "Completed", "old_status": "Pending"}),
+            json!({"new_status": "completed", "old_status": "pending"}),
         );
         assert_eq!(event.entity_type, EntityType::Task);
         assert_eq!(event.action, CrudAction::StatusChanged);
         assert_eq!(event.entity_id, "abc");
-        assert_eq!(event.payload["new_status"], "Completed");
-        assert_eq!(event.payload["old_status"], "Pending");
+        assert_eq!(event.payload["new_status"], "completed");
+        assert_eq!(event.payload["old_status"], "pending");
     }
 
     #[test]
@@ -2223,14 +2223,14 @@ mod tests {
             EntityType::Task,
             CrudAction::StatusChanged,
             &Uuid::new_v4().to_string(),
-            json!({"new_status": "Completed"}),
+            json!({"new_status": "completed"}),
         );
         let status = event
             .payload
             .get("new_status")
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        assert_eq!(status, "Completed");
+        assert_eq!(status, "completed");
     }
 
     #[test]

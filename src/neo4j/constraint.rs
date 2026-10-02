@@ -31,10 +31,7 @@ impl Neo4jClient {
         )
         .param("plan_id", plan_id.to_string())
         .param("id", constraint.id.to_string())
-        .param(
-            "constraint_type",
-            format!("{:?}", constraint.constraint_type),
-        )
+        .param("constraint_type", constraint.constraint_type.to_string())
         .param("description", constraint.description.clone())
         .param(
             "enforced_by",

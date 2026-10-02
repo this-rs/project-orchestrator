@@ -188,7 +188,7 @@ impl CompactionContextBuilder {
                 .map(|s| StepSummary {
                     order: s.order,
                     description: truncate(&s.description, 120),
-                    status: format!("{:?}", s.status).to_lowercase(),
+                    status: s.status.to_string(),
                 })
                 .collect();
 
@@ -339,7 +339,7 @@ impl CompactionContextBuilder {
                         .map(|s| StepSummary {
                             order: s.order,
                             description: truncate(&s.description, 100),
-                            status: format!("{:?}", s.status).to_lowercase(),
+                            status: s.status.to_string(),
                         })
                         .collect(),
                     Err(_) => vec![],
@@ -347,7 +347,7 @@ impl CompactionContextBuilder {
 
                 ctx.pending_tasks.push(TaskSummary {
                     title: task_title,
-                    status: format!("{:?}", task.status).to_lowercase(),
+                    status: task.status.to_string(),
                     affected_files: task.affected_files.clone(),
                     steps,
                 });
@@ -458,7 +458,7 @@ impl CompactionContext {
             out.push_str("## Pending Objectives\n");
             for task in &self.pending_tasks {
                 let icon = match task.status.as_str() {
-                    "inprogress" | "in_progress" => "🔄",
+                    "in_progress" => "🔄",
                     _ => "⬜",
                 };
                 let _ = writeln!(
@@ -473,7 +473,7 @@ impl CompactionContext {
                     for step in &task.steps {
                         let step_icon = match step.status.as_str() {
                             "completed" => "✅",
-                            "in_progress" | "inprogress" => "🔄",
+                            "in_progress" => "🔄",
                             "skipped" => "⏭️",
                             _ => "⬜",
                         };
@@ -526,7 +526,7 @@ impl CompactionContext {
             for step in &self.steps {
                 let icon = match step.status.as_str() {
                     "completed" => "✅",
-                    "in_progress" | "inprogress" => "🔄",
+                    "in_progress" => "🔄",
                     "skipped" => "⏭️",
                     _ => "⬜",
                 };
@@ -655,7 +655,7 @@ impl CompactionContext {
             for step in &self.steps {
                 let icon = match step.status.as_str() {
                     "completed" => "✅",
-                    "in_progress" | "inprogress" => "🔄",
+                    "in_progress" => "🔄",
                     "skipped" => "⏭️",
                     _ => "⬜",
                 };
@@ -772,7 +772,7 @@ impl CompactionContext {
         let tasks: Vec<String> = self
             .pending_tasks
             .iter()
-            .filter(|t| t.status == "inprogress" || t.status == "pending")
+            .filter(|t| t.status == "in_progress" || t.status == "pending")
             .take(4)
             .map(|t| truncate(&t.title, 60))
             .collect();
@@ -923,7 +923,7 @@ mod tests {
             pending_tasks: vec![
                 TaskSummary {
                     title: "Enrich compaction context".to_string(),
-                    status: "inprogress".to_string(),
+                    status: "in_progress".to_string(),
                     affected_files: vec!["src/chat/compaction_context.rs".to_string()],
                     steps: vec![
                         StepSummary {
@@ -1278,7 +1278,7 @@ mod tests {
                 title: format!(
                     "Task {i}: Very long task title that tests truncation behavior in the session context"
                 ),
-                status: if i % 2 == 0 { "inprogress" } else { "pending" }.to_string(),
+                status: if i % 2 == 0 { "in_progress" } else { "pending" }.to_string(),
                 affected_files: vec![format!("src/module_{i}/handler.rs")],
                 steps: (1..=5)
                     .map(|j| StepSummary {
@@ -1535,7 +1535,7 @@ mod tests {
             }],
             pending_tasks: vec![TaskSummary {
                 title: "Do something".to_string(),
-                status: "inprogress".to_string(),
+                status: "in_progress".to_string(),
                 affected_files: vec![],
                 steps: vec![],
             }],
@@ -1643,6 +1643,34 @@ mod tests {
             ci.contains("src/new.rs") || ci.contains("Files already modified"),
             "Missing work_log file in output: {}",
             ci
+        );
+    }
+
+    /// Regression: `to_markdown` must never emit the Debug-format status
+    /// `INPROGRESS`. Before the fix, `format!("{:?}", task.status).to_lowercase()`
+    /// produced `"inprogress"` and `.to_uppercase()` in the markdown template
+    /// turned it into `"INPROGRESS"`. The correct snake_case form produces
+    /// `"IN_PROGRESS"` after `.to_uppercase()`.
+    #[test]
+    fn to_markdown_never_emits_debug_format_status() {
+        let mut ctx = CompactionContext {
+            session_mode: crate::chat::compaction_context::SessionMode::Interactive,
+            ..Default::default()
+        };
+        ctx.pending_tasks.push(crate::chat::compaction_context::TaskSummary {
+            title: "test task".to_string(),
+            status: "in_progress".to_string(),
+            affected_files: vec![],
+            steps: vec![],
+        });
+        let md = ctx.to_markdown();
+        assert!(
+            !md.contains("INPROGRESS"),
+            "to_markdown emits Debug-format status INPROGRESS: {md}"
+        );
+        assert!(
+            md.contains("IN_PROGRESS"),
+            "to_markdown should show IN_PROGRESS (snake_case uppercased): {md}"
         );
     }
 }

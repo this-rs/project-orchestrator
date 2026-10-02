@@ -2,6 +2,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use uuid::Uuid;
 
 // ============================================================================
@@ -573,6 +574,18 @@ pub enum PlanStatus {
     Cancelled,
 }
 
+impl fmt::Display for PlanStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Draft => "draft",
+            Self::Approved => "approved",
+            Self::InProgress => "in_progress",
+            Self::Completed => "completed",
+            Self::Cancelled => "cancelled",
+        })
+    }
+}
+
 /// A task within a plan
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskNode {
@@ -624,6 +637,18 @@ pub enum TaskStatus {
     Blocked,
     Completed,
     Failed,
+}
+
+impl fmt::Display for TaskStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Pending => "pending",
+            Self::InProgress => "in_progress",
+            Self::Blocked => "blocked",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+        })
+    }
 }
 
 /// Task counters for one entity (plan, project or milestone).
@@ -711,6 +736,17 @@ pub enum StepStatus {
     InProgress,
     Completed,
     Skipped,
+}
+
+impl fmt::Display for StepStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Pending => "pending",
+            Self::InProgress => "in_progress",
+            Self::Completed => "completed",
+            Self::Skipped => "skipped",
+        })
+    }
 }
 
 /// Decision status lifecycle: proposed → accepted → deprecated/superseded
@@ -842,6 +878,19 @@ pub enum ConstraintType {
     Style,
     Testing,
     Other,
+}
+
+impl fmt::Display for ConstraintType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Performance => "performance",
+            Self::Compatibility => "compatibility",
+            Self::Security => "security",
+            Self::Style => "style",
+            Self::Testing => "testing",
+            Self::Other => "other",
+        })
+    }
 }
 
 /// An agent that executes tasks
@@ -1053,6 +1102,17 @@ pub enum ReleaseStatus {
     Cancelled,
 }
 
+impl fmt::Display for ReleaseStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Planned => "planned",
+            Self::InProgress => "in_progress",
+            Self::Released => "released",
+            Self::Cancelled => "cancelled",
+        })
+    }
+}
+
 // ============================================================================
 // Environments & deployments
 // ============================================================================
@@ -1223,6 +1283,18 @@ pub enum MilestoneStatus {
     InProgress,
     Completed,
     Closed,
+}
+
+impl fmt::Display for MilestoneStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Planned => "planned",
+            Self::Open => "open",
+            Self::InProgress => "in_progress",
+            Self::Completed => "completed",
+            Self::Closed => "closed",
+        })
+    }
 }
 
 // ============================================================================
@@ -3862,5 +3934,70 @@ mod tests {
             !project.watch_enabled,
             "watch_enabled should be false when explicitly set"
         );
+    }
+}
+
+#[cfg(test)]
+mod status_display_tests {
+    use super::*;
+
+    /// Regression: status Display must use snake_case (matching serde), not
+    /// Debug (PascalCase). Before the fix, `format!("{:?}", TaskStatus::Failed)`
+    /// produced `"Failed"` which leaked into WS CrudEvent payloads and compaction
+    /// prompts, breaking both the reactions cascade and the model's reading of
+    /// the task status.
+    ///
+    /// This test would fail on the old code because Debug gave `"Failed"` not
+    /// `"failed"` and `"InProgress"` not `"in_progress"`.
+    #[test]
+    fn task_status_display_is_snake_case() {
+        assert_eq!(TaskStatus::Pending.to_string(), "pending");
+        assert_eq!(TaskStatus::InProgress.to_string(), "in_progress");
+        assert_eq!(TaskStatus::Blocked.to_string(), "blocked");
+        assert_eq!(TaskStatus::Completed.to_string(), "completed");
+        assert_eq!(TaskStatus::Failed.to_string(), "failed");
+    }
+
+    #[test]
+    fn plan_status_display_is_snake_case() {
+        assert_eq!(PlanStatus::Draft.to_string(), "draft");
+        assert_eq!(PlanStatus::Approved.to_string(), "approved");
+        assert_eq!(PlanStatus::InProgress.to_string(), "in_progress");
+        assert_eq!(PlanStatus::Completed.to_string(), "completed");
+        assert_eq!(PlanStatus::Cancelled.to_string(), "cancelled");
+    }
+
+    #[test]
+    fn step_status_display_is_snake_case() {
+        assert_eq!(StepStatus::Pending.to_string(), "pending");
+        assert_eq!(StepStatus::InProgress.to_string(), "in_progress");
+        assert_eq!(StepStatus::Completed.to_string(), "completed");
+        assert_eq!(StepStatus::Skipped.to_string(), "skipped");
+    }
+
+    /// Regression: the serde snake_case serialization must agree with Display.
+    /// They describe the same wire format; if they drift the status in a JSON
+    /// response body and the status in a WS event differ.
+    #[test]
+    fn task_status_display_matches_serde() {
+        for s in [
+            TaskStatus::Pending,
+            TaskStatus::InProgress,
+            TaskStatus::Blocked,
+            TaskStatus::Completed,
+            TaskStatus::Failed,
+        ] {
+            let serde_str = serde_json::to_value(&s)
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .to_string();
+            assert_eq!(
+                s.to_string(),
+                serde_str,
+                "Display and serde disagree for {s:?}: Display={}, serde={serde_str}",
+                s.to_string()
+            );
+        }
     }
 }

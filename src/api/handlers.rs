@@ -428,7 +428,7 @@ pub async fn create_plan(
     state.event_bus.emit_created(
         crate::events::EntityType::Plan,
         &plan.id.to_string(),
-        serde_json::json!({"title": &plan.title, "status": format!("{:?}", plan.status)}),
+        serde_json::json!({"title": &plan.title, "status": plan.status.to_string()}),
         plan.project_id.map(|id| id.to_string()),
     );
     Ok(Json(plan))
@@ -510,7 +510,7 @@ pub async fn update_plan_status(
             .await
             .ok()
             .flatten()
-            .map(|p| format!("{:?}", p.status))
+            .map(|p| p.status.to_string())
             .unwrap_or_default();
         state
             .orchestrator
@@ -521,7 +521,7 @@ pub async fn update_plan_status(
             crate::events::EntityType::Plan,
             &plan_id.to_string(),
             &old_status,
-            &format!("{:?}", status),
+            &status.to_string(),
             None,
         );
     }
@@ -637,8 +637,8 @@ pub async fn update_task(
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string())
     });
-    let new_status_str = req.status.as_ref().map(|s| format!("{:?}", s));
-    let is_transition_to_in_progress = new_status_str.as_deref() == Some("InProgress");
+    let new_status_str = req.status.as_ref().map(|s| s.to_string());
+    let is_transition_to_in_progress = new_status_str.as_deref() == Some("in_progress");
 
     let status_change = if req.status.is_some() {
         let old_status = state
@@ -648,7 +648,7 @@ pub async fn update_task(
             .await
             .ok()
             .flatten()
-            .map(|t| format!("{:?}", t.status))
+            .map(|t| t.status.to_string())
             .unwrap_or_default();
         Some((old_status, new_status_str.clone().unwrap_or_default()))
     } else {
@@ -3824,7 +3824,7 @@ pub async fn detect_skills(
         .await;
 
     Ok(Json(serde_json::json!({
-        "status": format!("{:?}", result.status),
+        "status": serde_json::to_value(&result.status).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_else(|| format!("{:?}", result.status)),
         "skills_detected": result.skills_detected,
         "skills_created": result.skills_created,
         "skills_updated": result.skills_updated,
@@ -4427,9 +4427,9 @@ pub async fn update_release(
             .await
             .ok()
             .flatten()
-            .map(|r| format!("{:?}", r.status))
+            .map(|r| r.status.to_string())
             .unwrap_or_default();
-        let new_status = format!("{:?}", new_status_val);
+        let new_status = new_status_val.to_string();
         Some((old_status, new_status))
     } else {
         None
@@ -4667,9 +4667,9 @@ pub async fn update_milestone(
             .await
             .ok()
             .flatten()
-            .map(|m| format!("{:?}", m.status))
+            .map(|m| m.status.to_string())
             .unwrap_or_default();
-        let new_status = format!("{:?}", new_status_val);
+        let new_status = new_status_val.to_string();
         Some((old_status, new_status))
     } else {
         None
