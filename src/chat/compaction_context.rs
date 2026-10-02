@@ -1657,12 +1657,13 @@ mod tests {
             session_mode: crate::chat::compaction_context::SessionMode::Interactive,
             ..Default::default()
         };
-        ctx.pending_tasks.push(crate::chat::compaction_context::TaskSummary {
-            title: "test task".to_string(),
-            status: "in_progress".to_string(),
-            affected_files: vec![],
-            steps: vec![],
-        });
+        ctx.pending_tasks
+            .push(crate::chat::compaction_context::TaskSummary {
+                title: "test task".to_string(),
+                status: "in_progress".to_string(),
+                affected_files: vec![],
+                steps: vec![],
+            });
         let md = ctx.to_markdown();
         assert!(
             !md.contains("INPROGRESS"),
