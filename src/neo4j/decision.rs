@@ -1029,6 +1029,7 @@ mod parent_existence_tests {
     }
 }
 
+#[cfg(test)]
 mod injection_tests {
     use super::safe_entity_label;
 
