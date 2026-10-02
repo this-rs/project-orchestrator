@@ -411,44 +411,16 @@ impl FileWatcher {
                             continue;
                         }
 
-                        match event_kind {
-                            WatchEventKind::Deleted => {
-                                // For deletions we do NOT check path.exists()
-                                // (the file is gone — that's the whole point)
-                                if let Some(ctx) = resolve_project(&path, &project_map).await {
-                                    let project_id = ctx.project_id;
-                                    let path_clone = path.clone();
-                                    pending_deletions
-                                        .entry(project_id)
-                                        .or_insert_with(|| (ctx, HashSet::new()))
-                                        .1
-                                        .insert(path);
-                                    // Also remove from pending_files to avoid syncing a deleted file
-                                    if let Some((_, files)) = pending_files.get_mut(&project_id) {
-                                        files.remove(&path_clone);
-                                    }
-                                } else {
-                                    let path_clone = path.clone();
-                                    pending_orphan_deletions.insert(path);
-                                    pending_orphans.remove(&path_clone);
-                                }
-                            }
-                            WatchEventKind::Changed => {
-                                // For changes we still need the file on disk
-                                if !path.exists() {
-                                    continue;
-                                }
-                                if let Some(ctx) = resolve_project(&path, &project_map).await {
-                                    pending_files
-                                        .entry(ctx.project_id)
-                                        .or_insert_with(|| (ctx, HashSet::new()))
-                                        .1
-                                        .insert(path);
-                                } else {
-                                    pending_orphans.insert(path);
-                                }
-                            }
-                        }
+                        let ctx = resolve_project(&path, &project_map).await;
+                        route_watch_event(
+                            path,
+                            event_kind,
+                            ctx,
+                            &mut pending_files,
+                            &mut pending_deletions,
+                            &mut pending_orphans,
+                            &mut pending_orphan_deletions,
+                        );
 
                         // Reset the debounce timer
                         has_pending = true;
@@ -866,32 +838,77 @@ async fn resolve_project(
         .map(|(_, ctx)| ctx.clone())
 }
 
+/// Route one watcher event into the pending debounce collections.
+fn route_watch_event(
+    path: PathBuf,
+    event_kind: WatchEventKind,
+    ctx: Option<ProjectContext>,
+    pending_files: &mut HashMap<Uuid, (ProjectContext, HashSet<PathBuf>)>,
+    pending_deletions: &mut HashMap<Uuid, (ProjectContext, HashSet<PathBuf>)>,
+    pending_orphans: &mut HashSet<PathBuf>,
+    pending_orphan_deletions: &mut HashSet<PathBuf>,
+) {
+    // A "changed" event for a path that no longer exists is how a rename
+    // reports its old name: treat it as a deletion so the stale file is purged.
+    let event_kind = if event_kind == WatchEventKind::Changed && !path.exists() {
+        WatchEventKind::Deleted
+    } else {
+        event_kind
+    };
+
+    match event_kind {
+        WatchEventKind::Deleted => {
+            // For deletions we do NOT check path.exists() (the file is gone).
+            if let Some(ctx) = ctx {
+                let project_id = ctx.project_id;
+                let path_clone = path.clone();
+                pending_deletions
+                    .entry(project_id)
+                    .or_insert_with(|| (ctx, HashSet::new()))
+                    .1
+                    .insert(path);
+                // Avoid syncing a deleted file
+                if let Some((_, files)) = pending_files.get_mut(&project_id) {
+                    files.remove(&path_clone);
+                }
+            } else {
+                let path_clone = path.clone();
+                pending_orphan_deletions.insert(path);
+                pending_orphans.remove(&path_clone);
+            }
+        }
+        WatchEventKind::Changed => {
+            // The file exists again (recreated / atomic save): cancel any
+            // pending deletion so it is not erased from the graph.
+            if let Some(ctx) = ctx {
+                if let Some((_, dels)) = pending_deletions.get_mut(&ctx.project_id) {
+                    dels.remove(&path);
+                }
+                pending_files
+                    .entry(ctx.project_id)
+                    .or_insert_with(|| (ctx, HashSet::new()))
+                    .1
+                    .insert(path);
+            } else {
+                pending_orphan_deletions.remove(&path);
+                pending_orphans.insert(path);
+            }
+        }
+    }
+}
+
 /// Check if a file should be synced based on extension and path
 ///
-/// Supports all 21 extensions matching the main sync engine in runner.rs.
+/// Supports every extension known to `SupportedLanguage::from_extension`.
 fn should_sync_file(path: &Path) -> bool {
-    let ext = path
+    // Delegate to the parser's extension table (case-insensitive) so the
+    // watcher can never drift from the languages the sync engine supports.
+    let supported = path
         .extension()
         .and_then(|e| e.to_str())
-        .unwrap_or_default();
-
-    // All supported languages — must stay aligned with runner.rs sync_directory_for_project()
-    let supported_extensions = [
-        "rs", // Rust
-        "ts", "tsx", "js", "jsx",  // TypeScript/JavaScript
-        "py",   // Python
-        "go",   // Go
-        "java", // Java
-        "c", "h", // C
-        "cpp", "cc", "cxx", "hpp", "hxx", // C++
-        "rb",  // Ruby
-        "php", // PHP
-        "kt", "kts",   // Kotlin
-        "swift", // Swift
-        "sh", "bash", // Bash
-    ];
-
-    if !supported_extensions.contains(&ext) {
+        .and_then(crate::parser::SupportedLanguage::from_extension)
+        .is_some();
+    if !supported {
         return false;
     }
 
@@ -1186,6 +1203,129 @@ async fn handle_project_updated(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── route_watch_event regression tests ────────────────────────────
+
+    type Pending = HashMap<Uuid, (ProjectContext, HashSet<PathBuf>)>;
+
+    fn test_ctx() -> ProjectContext {
+        ProjectContext {
+            project_id: Uuid::new_v4(),
+            project_slug: "route".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_changed_after_deleted_cancels_pending_deletion() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("recreated.rs");
+        std::fs::write(&path, "fn a() {}").unwrap();
+        let ctx = test_ctx();
+        let (mut files, mut dels): (Pending, Pending) = (HashMap::new(), HashMap::new());
+        let (mut orph, mut orph_del) = (HashSet::new(), HashSet::new());
+
+        route_watch_event(
+            path.clone(),
+            WatchEventKind::Deleted,
+            Some(ctx.clone()),
+            &mut files,
+            &mut dels,
+            &mut orph,
+            &mut orph_del,
+        );
+        route_watch_event(
+            path.clone(),
+            WatchEventKind::Changed,
+            Some(ctx.clone()),
+            &mut files,
+            &mut dels,
+            &mut orph,
+            &mut orph_del,
+        );
+
+        assert!(dels.get(&ctx.project_id).is_none_or(|(_, s)| s.is_empty()));
+        assert!(files[&ctx.project_id].1.contains(&path));
+    }
+
+    #[test]
+    fn test_orphan_changed_after_deleted_cancels_pending_deletion() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("orphan.rs");
+        std::fs::write(&path, "fn a() {}").unwrap();
+        let (mut files, mut dels): (Pending, Pending) = (HashMap::new(), HashMap::new());
+        let (mut orph, mut orph_del) = (HashSet::new(), HashSet::new());
+
+        route_watch_event(
+            path.clone(),
+            WatchEventKind::Deleted,
+            None,
+            &mut files,
+            &mut dels,
+            &mut orph,
+            &mut orph_del,
+        );
+        route_watch_event(
+            path.clone(),
+            WatchEventKind::Changed,
+            None,
+            &mut files,
+            &mut dels,
+            &mut orph,
+            &mut orph_del,
+        );
+
+        assert!(orph_del.is_empty());
+        assert!(orph.contains(&path));
+    }
+
+    #[test]
+    fn test_changed_on_missing_path_is_treated_as_deletion() {
+        // Rename: the old path is reported as a modify event, but is gone.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old_name.rs");
+        let ctx = test_ctx();
+        let (mut files, mut dels): (Pending, Pending) = (HashMap::new(), HashMap::new());
+        let (mut orph, mut orph_del) = (HashSet::new(), HashSet::new());
+
+        route_watch_event(
+            path.clone(),
+            WatchEventKind::Changed,
+            Some(ctx.clone()),
+            &mut files,
+            &mut dels,
+            &mut orph,
+            &mut orph_del,
+        );
+        assert!(dels[&ctx.project_id].1.contains(&path));
+        assert!(files.is_empty());
+
+        route_watch_event(
+            path.clone(),
+            WatchEventKind::Changed,
+            None,
+            &mut files,
+            &mut dels,
+            &mut orph,
+            &mut orph_del,
+        );
+        assert!(orph_del.contains(&path));
+    }
+
+    #[test]
+    fn test_should_sync_file_extensions_and_case() {
+        for p in [
+            "/p/a.cs",
+            "/p/A.RS",
+            "/p/a.scala",
+            "/p/a.zig",
+            "/p/a.hh",
+            "/p/a.dart",
+            "/p/a.tf",
+        ] {
+            assert!(should_sync_file(Path::new(p)), "{p} should be synced");
+        }
+        assert!(!should_sync_file(Path::new("/p/a.txt")));
+    }
 
     // ── should_sync_file tests (unchanged) ────────────────────────────
 

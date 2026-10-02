@@ -1072,7 +1072,8 @@ fn reasoning_tool() -> ToolDefinition {
                 "max_nodes": {"type": "integer", "description": "Max activated nodes (reason, default 50)"},
                 "tree_id": {"type": "string", "description": "ReasoningTree UUID (reason_feedback)"},
                 "followed_nodes": {"type": "array", "items": {"type": "string"}, "description": "Node UUIDs that were followed/useful (reason_feedback)"},
-                "outcome": {"type": "string", "enum": ["success", "partial", "failure"], "description": "Outcome of following the reasoning path (reason_feedback, default success)"}
+                "outcome": {"type": "string", "enum": ["success", "partial", "failure"], "description": "Outcome of following the reasoning path (reason_feedback, default success)"},
+                "run_id": {"type": "string", "description": "Optional ProtocolRun UUID to link the persisted tree to (reason_feedback, on success)"}
             })),
             required: Some(vec!["action".to_string()]),
         },

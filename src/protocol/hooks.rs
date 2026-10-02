@@ -219,10 +219,13 @@ const ORPHAN_RUN_MAX_AGE_SECS: i64 = 3600;
 
 /// Recover orphaned protocol runs at server startup.
 ///
-/// Scans all projects for `ProtocolRun` nodes with `status = running` and
-/// `started_at` older than [`ORPHAN_RUN_MAX_AGE_SECS`]. These runs were
-/// likely interrupted by a server crash or restart and will never complete
-/// on their own.
+/// Scans all projects for `ProtocolRun` nodes with `status = running` whose
+/// last state entry is older than [`ORPHAN_RUN_MAX_AGE_SECS`] (a run that keeps
+/// making progress is not orphaned just because it started long ago). Runs that
+/// still have a live runner in this process (present in `ACTIVE_RUNNERS`) are
+/// skipped: recovering them would fail them or spawn a second runner. The
+/// remaining runs were likely interrupted by a server crash or restart and will
+/// never complete on their own.
 ///
 /// Each orphaned run is marked as `Failed` with the error message
 /// "Recovered: server restarted during execution".
@@ -253,7 +256,20 @@ pub async fn recover_orphaned_runs(
                 .await?;
 
             for run in &running_runs {
-                let age_secs = (now - run.started_at).num_seconds();
+                // A runner is alive in this process: not an orphan. Recovering
+                // it would fail it or spawn a second runner for the same run.
+                if ACTIVE_RUNNERS.contains_key(&run.id) {
+                    continue;
+                }
+
+                // Age since the last state entry, so a run that keeps making
+                // progress is not considered orphaned just because it started long ago.
+                let last_activity = run
+                    .states_visited
+                    .last()
+                    .map(|sv| sv.entered_at)
+                    .unwrap_or(run.started_at);
+                let age_secs = (now - last_activity).num_seconds();
                 if age_secs > ORPHAN_RUN_MAX_AGE_SECS {
                     if run.runner_managed {
                         // Re-spawn the runner instead of failing
@@ -385,6 +401,8 @@ pub async fn timeout_stale_runs(store: &dyn GraphStore) -> anyhow::Result<u32> {
                         "Failed to timeout stale run: {}", e
                     );
                 } else {
+                    // Stop the runner task too, otherwise it keeps driving a Failed run.
+                    cancel_active_runner(run.id);
                     tracing::warn!(
                         run_id = %run.id,
                         protocol_id = %protocol.id,
@@ -939,6 +957,9 @@ mod tests {
         // Create a run that's been "running" for 2 hours (orphaned)
         let mut run = crate::protocol::ProtocolRun::new(protocol.id, protocol.entry_state, "Start");
         run.started_at = chrono::Utc::now() - chrono::Duration::hours(2);
+        if let Some(sv) = run.states_visited.first_mut() {
+            sv.entered_at = run.started_at;
+        }
         store.create_protocol_run(&run).await.unwrap();
 
         let count = recover_orphaned_runs(store.clone() as Arc<dyn GraphStore>, None)
@@ -1001,6 +1022,65 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_recover_skips_run_with_live_runner() {
+        let store = Arc::new(MockGraphStore::new());
+        let (_, protocol) = setup_event_triggered_protocol(
+            &store,
+            TriggerMode::Event,
+            vec!["post_sync".to_string()],
+        )
+        .await;
+
+        let mut run = crate::protocol::ProtocolRun::new(protocol.id, protocol.entry_state, "Start");
+        run.started_at = chrono::Utc::now() - chrono::Duration::hours(2);
+        if let Some(sv) = run.states_visited.first_mut() {
+            sv.entered_at = run.started_at;
+        }
+        store.create_protocol_run(&run).await.unwrap();
+
+        // A runner is alive in this process for that run.
+        let token = CancellationToken::new();
+        ACTIVE_RUNNERS.insert(run.id, token);
+
+        let count = recover_orphaned_runs(store.clone() as Arc<dyn GraphStore>, None)
+            .await
+            .unwrap();
+        ACTIVE_RUNNERS.remove(&run.id);
+        assert_eq!(count, 0);
+
+        let updated = store.get_protocol_run(run.id).await.unwrap().unwrap();
+        assert_eq!(updated.status, crate::protocol::RunStatus::Running);
+    }
+
+    #[tokio::test]
+    async fn test_recover_measures_age_from_last_state_entry() {
+        let store = Arc::new(MockGraphStore::new());
+        let (_, protocol) = setup_event_triggered_protocol(
+            &store,
+            TriggerMode::Event,
+            vec!["post_sync".to_string()],
+        )
+        .await;
+
+        // Started 2h ago but the current state was entered 5 minutes ago:
+        // the run is making progress and must not be recovered.
+        let mut run = crate::protocol::ProtocolRun::new(protocol.id, protocol.entry_state, "Start");
+        run.started_at = chrono::Utc::now() - chrono::Duration::hours(2);
+        if let Some(sv) = run.states_visited.last_mut() {
+            sv.entered_at = chrono::Utc::now() - chrono::Duration::minutes(5);
+        }
+        store.create_protocol_run(&run).await.unwrap();
+
+        let count = recover_orphaned_runs(store.clone() as Arc<dyn GraphStore>, None)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+
+        let updated = store.get_protocol_run(run.id).await.unwrap().unwrap();
+        assert_eq!(updated.status, crate::protocol::RunStatus::Running);
     }
 
     #[tokio::test]
@@ -1562,6 +1642,33 @@ mod tests {
 
         let updated = store.get_protocol_run(run.id).await.unwrap().unwrap();
         assert_eq!(updated.status, crate::protocol::RunStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn test_timeout_cancels_active_runner() {
+        let store = Arc::new(MockGraphStore::new());
+        let (_, protocol) = setup_event_triggered_protocol(
+            &store,
+            TriggerMode::Event,
+            vec!["post_sync".to_string()],
+        )
+        .await;
+
+        let mut run = crate::protocol::ProtocolRun::new(protocol.id, protocol.entry_state, "Start");
+        run.triggered_by = "event:post_sync".to_string();
+        run.started_at = chrono::Utc::now() - chrono::Duration::hours(9);
+        if let Some(sv) = run.states_visited.first_mut() {
+            sv.entered_at = run.started_at;
+        }
+        store.create_protocol_run(&run).await.unwrap();
+
+        let token = CancellationToken::new();
+        ACTIVE_RUNNERS.insert(run.id, token.clone());
+
+        let count = timeout_stale_runs(&*store).await.unwrap();
+        assert_eq!(count, 1);
+        assert!(token.is_cancelled(), "timeout must cancel the live runner");
+        assert!(ACTIVE_RUNNERS.get(&run.id).is_none());
     }
 
     // ── cancel_active_runner tests ──

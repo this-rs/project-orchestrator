@@ -511,9 +511,13 @@ impl Neo4jClient {
         sort_order: &str,
     ) -> Result<(Vec<MilestoneNode>, usize)> {
         let mut where_builder = WhereBuilder::new();
-        where_builder.add_status_filter("m", statuses);
+        where_builder.add_status_filter_any_case("m", statuses);
 
-        let where_clause = where_builder.build_and();
+        // `build()` (WHERE ...), not `build_and()`: the templates below splice this
+        // straight after the MATCH pattern, with no WHERE of their own. With
+        // `build_and()` a status filter produced `MATCH (...) AND ...`, which Neo4j
+        // rejects as a syntax error — the filtered listing was dead on arrival.
+        let where_clause = where_builder.build();
         let order_field = match sort_by {
             Some("title") => "m.title",
             Some("created_at") => "m.created_at",
@@ -527,7 +531,11 @@ impl Neo4jClient {
             if where_clause.is_empty() { "" } else { &where_clause }
         );
         let count_result = self
-            .execute_with_params(query(&count_cypher).param("project_id", project_id.to_string()))
+            .execute_with_params(
+                where_builder
+                    .bind(query(&count_cypher))
+                    .param("project_id", project_id.to_string()),
+            )
             .await?;
         let total: i64 = count_result
             .first()
@@ -549,7 +557,11 @@ impl Neo4jClient {
 
         let mut result = self
             .graph
-            .execute(query(&cypher).param("project_id", project_id.to_string()))
+            .execute(
+                where_builder
+                    .bind(query(&cypher))
+                    .param("project_id", project_id.to_string()),
+            )
             .await?;
         let mut milestones = Vec::new();
         while let Some(row) = result.next().await? {
