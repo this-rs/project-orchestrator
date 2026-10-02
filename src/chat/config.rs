@@ -288,31 +288,6 @@ impl ChatConfig {
         // Fallback
         PathBuf::from("mcp_server")
     }
-
-    /// Build the MCP server config JSON for ClaudeCodeOptions
-    pub fn mcp_server_config(&self) -> serde_json::Value {
-        let mut env = serde_json::json!({
-            "NEO4J_URI": self.neo4j_uri,
-            "NEO4J_USER": self.neo4j_user,
-            "NEO4J_PASSWORD": self.neo4j_password,
-            "MEILISEARCH_URL": self.meilisearch_url,
-            "MEILISEARCH_KEY": self.meilisearch_key
-        });
-
-        // Forward NATS_URL so the spawned MCP server can sync events back
-        // to the desktop app. Without this, CRUD events from chat sessions
-        // are invisible to the UI when launched from the macOS dock.
-        if let Some(ref nats_url) = self.nats_url {
-            env["NATS_URL"] = serde_json::Value::String(nats_url.clone());
-        }
-
-        serde_json::json!({
-            "project-orchestrator": {
-                "command": self.mcp_server_path.to_string_lossy(),
-                "env": env
-            }
-        })
-    }
 }
 
 impl Default for ChatConfig {
@@ -479,72 +454,6 @@ mod tests {
         std::env::remove_var("CHAT_PROCESS_PATH");
         std::env::remove_var("CLAUDE_CLI_PATH");
         std::env::remove_var("CHAT_AUTO_UPDATE_CLI");
-    }
-
-    #[test]
-    fn test_mcp_server_config_json() {
-        let config = ChatConfig {
-            mcp_server_path: PathBuf::from("/path/to/mcp_server"),
-            default_model: "claude-opus-4-6".into(),
-            max_sessions: 10,
-            session_timeout: Duration::from_secs(1800),
-            neo4j_uri: "bolt://localhost:7687".into(),
-            neo4j_user: "neo4j".into(),
-            neo4j_password: "pass".into(),
-            meilisearch_url: "http://localhost:7700".into(),
-            meilisearch_key: "key".into(),
-            nats_url: Some("nats://localhost:4222".into()),
-            max_turns: 10,
-            permission: PermissionConfig::default(),
-            auto_continue: false,
-            retry: RetryConfig::default(),
-            process_path: None,
-            claude_cli_path: None,
-            auto_update_cli: false,
-            auto_update_app: true,
-            jwt_secret: None,
-            server_port: 8080,
-            session_token_expiry_secs: 86400,
-        };
-
-        let json = config.mcp_server_config();
-        let server = &json["project-orchestrator"];
-        assert_eq!(server["command"], "/path/to/mcp_server");
-        assert_eq!(server["env"]["NEO4J_URI"], "bolt://localhost:7687");
-        assert_eq!(server["env"]["NATS_URL"], "nats://localhost:4222");
-    }
-
-    #[test]
-    fn test_mcp_server_config_without_nats() {
-        let config = ChatConfig {
-            mcp_server_path: PathBuf::from("/path/to/mcp_server"),
-            default_model: "claude-opus-4-6".into(),
-            max_sessions: 10,
-            session_timeout: Duration::from_secs(1800),
-            neo4j_uri: "bolt://localhost:7687".into(),
-            neo4j_user: "neo4j".into(),
-            neo4j_password: "pass".into(),
-            meilisearch_url: "http://localhost:7700".into(),
-            meilisearch_key: "key".into(),
-            nats_url: None,
-            max_turns: 10,
-            permission: PermissionConfig::default(),
-            auto_continue: false,
-            retry: RetryConfig::default(),
-            process_path: None,
-            claude_cli_path: None,
-            auto_update_cli: false,
-            auto_update_app: true,
-            jwt_secret: None,
-            server_port: 8080,
-            session_token_expiry_secs: 86400,
-        };
-
-        let json = config.mcp_server_config();
-        let server = &json["project-orchestrator"];
-        assert_eq!(server["command"], "/path/to/mcp_server");
-        // NATS_URL should not be present when not configured
-        assert!(server["env"]["NATS_URL"].is_null());
     }
 
     #[test]
