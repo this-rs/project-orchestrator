@@ -1035,6 +1035,11 @@ mod tests {
         )];
 
         let task_id = Uuid::new_v4();
+        let mut parent = crate::test_helpers::test_task();
+        parent.id = task_id;
+        crate::neo4j::GraphStore::create_task(store.as_ref(), Uuid::new_v4(), &parent)
+            .await
+            .unwrap();
         let result = evolver
             .evolve(protocol_id, &patterns, Some(task_id))
             .await
