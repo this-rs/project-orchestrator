@@ -846,3 +846,1105 @@ async fn test_neo4j_entity_neighborhood() {
         .await
         .unwrap();
 }
+
+// ============================================================================
+// Cypher / MeiliSearch injection hardening — live-backend coverage
+// ============================================================================
+//
+// The hardening of this PR replaced string-interpolated Cypher and MeiliSearch
+// filters with bound parameters. A bound parameter can be *inert* in two ways
+// that a pure unit test on the builder cannot see:
+//
+//   1. the placeholder is referenced by the query text but never bound (or
+//      bound under another name) — Neo4j then raises ParameterMissing, or
+//      silently matches nothing;
+//   2. the encoding written by the writer no longer matches the encoding the
+//      reader filters on — the filter becomes a guaranteed empty result, which
+//      looks like "no rows" rather than like a bug.
+//
+// Both only show up against a real server, so these tests hit the Neo4j and
+// MeiliSearch instances the coverage job provisions. Each one asserts the
+// *positive* path (a legitimate filter still returns its row) and the
+// *negative* path (a payload travels as data and matches nothing) — a guard
+// that rejects everything would pass the negative half alone.
+
+/// A Cypher/filter breakout attempt used as a plain value everywhere below.
+const EVIL: &str = "a' OR 1=1 //";
+
+#[tokio::test]
+async fn test_trigger_type_filter_is_bound_not_spliced() {
+    use project_orchestrator::neo4j::client::Neo4jClient;
+    use project_orchestrator::runner::{Trigger, TriggerType};
+
+    let config = test_config();
+    let client = match Neo4jClient::new(
+        &config.neo4j_uri,
+        &config.neo4j_user,
+        &config.neo4j_password,
+    )
+    .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Skipping test: Neo4j not available: {e}");
+            return;
+        }
+    };
+    let raw = neo4rs::Graph::new(
+        &config.neo4j_uri,
+        &config.neo4j_user,
+        &config.neo4j_password,
+    )
+    .await
+    .unwrap();
+
+    let plan_id = Uuid::new_v4();
+    raw.run(
+        neo4rs::query("CREATE (p:Plan {id: $id, name: 'trigger-filter-test'})")
+            .param("id", plan_id.to_string()),
+    )
+    .await
+    .unwrap();
+
+    let webhook = Trigger {
+        id: Uuid::new_v4(),
+        plan_id,
+        trigger_type: TriggerType::Webhook,
+        config: serde_json::json!({"secret": "s"}),
+        enabled: true,
+        cooldown_secs: 0,
+        last_fired: None,
+        fire_count: 0,
+        created_at: chrono::Utc::now(),
+    };
+    let schedule = Trigger {
+        id: Uuid::new_v4(),
+        trigger_type: TriggerType::Schedule,
+        config: serde_json::json!({"cron": "0 2 * * *"}),
+        ..webhook.clone()
+    };
+    client.create_trigger_impl(&webhook).await.unwrap();
+    client.create_trigger_impl(&schedule).await.unwrap();
+
+    // Positive: the filter still selects, so the $trigger_type parameter is
+    // really bound (an unbound placeholder would error or match nothing).
+    let only_webhook = client
+        .list_all_triggers_impl(Some("webhook"))
+        .await
+        .unwrap();
+    assert!(
+        only_webhook.iter().any(|t| t.id == webhook.id),
+        "webhook trigger must be returned by its own filter"
+    );
+    assert!(
+        !only_webhook.iter().any(|t| t.id == schedule.id),
+        "schedule trigger must not leak into the webhook filter"
+    );
+
+    // No filter: both are listed.
+    let all = client.list_all_triggers_impl(None).await.unwrap();
+    assert!(all.iter().any(|t| t.id == webhook.id));
+    assert!(all.iter().any(|t| t.id == schedule.id));
+
+    // Negative: a breakout payload is compared as a literal value. Spliced,
+    // `WHERE t.trigger_type = 'a' OR 1=1 //` would have returned every row.
+    let injected = client.list_all_triggers_impl(Some(EVIL)).await.unwrap();
+    assert!(
+        injected.is_empty(),
+        "payload must match nothing, got {} rows",
+        injected.len()
+    );
+    // And the tautology must not have reached the server as Cypher.
+    let injected2 = client
+        .list_all_triggers_impl(Some("webhook' OR 1=1 //"))
+        .await
+        .unwrap();
+    assert!(
+        injected2.is_empty(),
+        "`webhook' OR 1=1 //` must match nothing, got {}",
+        injected2.len()
+    );
+
+    raw.run(
+        neo4rs::query(
+            "MATCH (p:Plan {id: $id}) OPTIONAL MATCH (t:Trigger)-[:TRIGGERS]->(p) \
+             DETACH DELETE p, t",
+        )
+        .param("id", plan_id.to_string()),
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn test_trigger_firing_binds_plan_run_id() {
+    use project_orchestrator::neo4j::client::Neo4jClient;
+    use project_orchestrator::runner::{Trigger, TriggerFiring, TriggerType};
+
+    let config = test_config();
+    let client = match Neo4jClient::new(
+        &config.neo4j_uri,
+        &config.neo4j_user,
+        &config.neo4j_password,
+    )
+    .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Skipping test: Neo4j not available: {e}");
+            return;
+        }
+    };
+    let raw = neo4rs::Graph::new(
+        &config.neo4j_uri,
+        &config.neo4j_user,
+        &config.neo4j_password,
+    )
+    .await
+    .unwrap();
+
+    let plan_id = Uuid::new_v4();
+    let run_id = Uuid::new_v4();
+    raw.run(
+        neo4rs::query(
+            "CREATE (p:Plan {id: $pid, name: 'firing-test'}), \
+                    (r:PlanRun {run_id: $rid, status: 'running'})",
+        )
+        .param("pid", plan_id.to_string())
+        .param("rid", run_id.to_string()),
+    )
+    .await
+    .unwrap();
+
+    let trigger = Trigger {
+        id: Uuid::new_v4(),
+        plan_id,
+        trigger_type: TriggerType::Event,
+        config: serde_json::Value::Null,
+        enabled: true,
+        cooldown_secs: 0,
+        last_fired: None,
+        fire_count: 0,
+        created_at: chrono::Utc::now(),
+    };
+    client.create_trigger_impl(&trigger).await.unwrap();
+
+    // With a run: the STARTED edge is created, so `MATCH (r:PlanRun {run_id:
+    // $plan_run_id})` really resolved its bound parameter.
+    let linked = TriggerFiring {
+        id: Uuid::new_v4(),
+        trigger_id: trigger.id,
+        plan_run_id: Some(run_id),
+        fired_at: chrono::Utc::now(),
+        source_payload: Some(serde_json::json!({"body": EVIL})),
+    };
+    client.record_trigger_firing_impl(&linked).await.unwrap();
+
+    let started: i64 = raw
+        .execute(
+            neo4rs::query(
+                "MATCH (f:TriggerFiring {id: $fid})-[:STARTED]->(r:PlanRun {run_id: $rid}) \
+                 RETURN count(*) AS c",
+            )
+            .param("fid", linked.id.to_string())
+            .param("rid", run_id.to_string()),
+        )
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get("c")
+        .unwrap();
+    assert_eq!(started, 1, "the firing must be linked to its PlanRun");
+
+    // Without a run: the firing is still recorded, with no STARTED edge.
+    let unlinked = TriggerFiring {
+        id: Uuid::new_v4(),
+        trigger_id: trigger.id,
+        plan_run_id: None,
+        fired_at: chrono::Utc::now(),
+        source_payload: None,
+    };
+    client.record_trigger_firing_impl(&unlinked).await.unwrap();
+    let (exists, edges): (i64, i64) = {
+        let mut r = raw
+            .execute(
+                neo4rs::query(
+                    "MATCH (f:TriggerFiring {id: $fid}) \
+                     OPTIONAL MATCH (f)-[s:STARTED]->() \
+                     RETURN count(DISTINCT f) AS f, count(s) AS s",
+                )
+                .param("fid", unlinked.id.to_string()),
+            )
+            .await
+            .unwrap();
+        let row = r.next().await.unwrap().unwrap();
+        (row.get("f").unwrap(), row.get("s").unwrap())
+    };
+    assert_eq!(exists, 1, "the firing must be recorded without a run");
+    assert_eq!(edges, 0, "no STARTED edge without a plan_run_id");
+
+    raw.run(
+        neo4rs::query(
+            "MATCH (p:Plan {id: $pid}) OPTIONAL MATCH (t:Trigger)-[:TRIGGERS]->(p) \
+             OPTIONAL MATCH (f:TriggerFiring)-[:FIRED_BY]->(t) \
+             DETACH DELETE p, t, f",
+        )
+        .param("pid", plan_id.to_string()),
+    )
+    .await
+    .unwrap();
+    raw.run(
+        neo4rs::query("MATCH (r:PlanRun {run_id: $rid}) DETACH DELETE r")
+            .param("rid", run_id.to_string()),
+    )
+    .await
+    .unwrap();
+}
+
+/// Create a bare Project node and return its id.
+async fn make_project(client: &project_orchestrator::neo4j::client::Neo4jClient) -> Uuid {
+    let id = Uuid::new_v4();
+    let project = ProjectNode {
+        id,
+        name: format!("Injection Test {id}"),
+        slug: format!("injection-test-{id}"),
+        root_path: String::new(),
+        description: None,
+        created_at: chrono::Utc::now(),
+        last_synced: None,
+        analytics_computed_at: None,
+        last_co_change_computed_at: None,
+        default_note_energy: None,
+        scaffolding_override: None,
+        sharing_policy: None,
+        watch_enabled: false,
+        profile: Default::default(),
+    };
+    client.create_project(&project).await.unwrap();
+    id
+}
+
+/// Delete a test project and everything hanging off it, scoped by its id.
+async fn drop_project(raw: &neo4rs::Graph, project_id: Uuid) {
+    raw.run(
+        neo4rs::query(
+            "MATCH (p:Project {id: $id})              OPTIONAL MATCH (p)-[:HAS_MILESTONE|HAS_RELEASE]->(x)              DETACH DELETE p, x",
+        )
+        .param("id", project_id.to_string()),
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn test_milestone_status_filter_is_bound_and_matches_stored_encoding() {
+    use project_orchestrator::neo4j::client::Neo4jClient;
+
+    let config = test_config();
+    let client = match Neo4jClient::new(
+        &config.neo4j_uri,
+        &config.neo4j_user,
+        &config.neo4j_password,
+    )
+    .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Skipping test: Neo4j not available: {e}");
+            return;
+        }
+    };
+
+    let raw = neo4rs::Graph::new(
+        &config.neo4j_uri,
+        &config.neo4j_user,
+        &config.neo4j_password,
+    )
+    .await
+    .unwrap();
+
+    let project_id = make_project(&client).await;
+
+    let in_progress = MilestoneNode {
+        id: Uuid::new_v4(),
+        title: "Hardening".to_string(),
+        description: None,
+        status: MilestoneStatus::InProgress,
+        target_date: None,
+        closed_at: None,
+        created_at: chrono::Utc::now(),
+        project_id,
+    };
+    let completed = MilestoneNode {
+        id: Uuid::new_v4(),
+        title: "Shipped".to_string(),
+        status: MilestoneStatus::Completed,
+        ..in_progress.clone()
+    };
+    client.create_milestone(&in_progress).await.unwrap();
+    client.create_milestone(&completed).await.unwrap();
+
+    // Positive, snake_case — this is the encoding `create_milestone` writes.
+    // `add_status_filter` (PascalCase only) returned 0 rows here; the switch to
+    // `add_status_filter_any_case` is what makes the filter work at all.
+    let (rows, total) = client
+        .list_milestones_filtered(
+            project_id,
+            Some(vec!["in_progress".into()]),
+            10,
+            0,
+            None,
+            "asc",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        total, 1,
+        "snake_case status filter must match the stored row"
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, in_progress.id);
+
+    // Positive, PascalCase — legacy callers must keep working.
+    let (rows, total) = client
+        .list_milestones_filtered(
+            project_id,
+            Some(vec!["InProgress".into()]),
+            10,
+            0,
+            None,
+            "asc",
+        )
+        .await
+        .unwrap();
+    assert_eq!(total, 1, "PascalCase status filter must match too");
+    assert_eq!(rows[0].id, in_progress.id);
+
+    // Both statuses.
+    let (_, total) = client
+        .list_milestones_filtered(
+            project_id,
+            Some(vec!["in_progress".into(), "completed".into()]),
+            10,
+            0,
+            Some("title"),
+            "desc",
+        )
+        .await
+        .unwrap();
+    assert_eq!(total, 2);
+
+    // No filter.
+    let (_, total) = client
+        .list_milestones_filtered(project_id, None, 10, 0, Some("created_at"), "asc")
+        .await
+        .unwrap();
+    assert_eq!(total, 2);
+
+    // Negative: the payload is a value in an IN list, not Cypher. Spliced, the
+    // `' OR 1=1 //` would have returned both rows.
+    let (rows, total) = client
+        .list_milestones_filtered(project_id, Some(vec![EVIL.into()]), 10, 0, None, "asc")
+        .await
+        .unwrap();
+    assert_eq!(total, 0, "payload must match no milestone");
+    assert!(rows.is_empty());
+
+    drop_project(&raw, project_id).await;
+}
+
+#[tokio::test]
+async fn test_release_status_round_trips_snake_case_and_filter_is_bound() {
+    use project_orchestrator::neo4j::client::Neo4jClient;
+
+    let config = test_config();
+    let client = match Neo4jClient::new(
+        &config.neo4j_uri,
+        &config.neo4j_user,
+        &config.neo4j_password,
+    )
+    .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Skipping test: Neo4j not available: {e}");
+            return;
+        }
+    };
+    let raw = neo4rs::Graph::new(
+        &config.neo4j_uri,
+        &config.neo4j_user,
+        &config.neo4j_password,
+    )
+    .await
+    .unwrap();
+
+    let project_id = make_project(&client).await;
+
+    let rel = ReleaseNode {
+        id: Uuid::new_v4(),
+        version: "1.0.0".to_string(),
+        title: Some("First".to_string()),
+        description: None,
+        status: ReleaseStatus::InProgress,
+        target_date: None,
+        released_at: None,
+        created_at: chrono::Utc::now(),
+        project_id,
+    };
+    let planned = ReleaseNode {
+        id: Uuid::new_v4(),
+        version: "2.0.0".to_string(),
+        status: ReleaseStatus::Planned,
+        ..rel.clone()
+    };
+    client.create_release(&rel).await.unwrap();
+    client.create_release(&planned).await.unwrap();
+
+    // `create_release` must store the canonical snake_case encoding. With the
+    // old `format!("{:?}")` this property held "InProgress", which no
+    // snake_case reader could match.
+    let stored: String = raw
+        .execute(
+            neo4rs::query("MATCH (r:Release {id: $id}) RETURN r.status AS s")
+                .param("id", rel.id.to_string()),
+        )
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get("s")
+        .unwrap();
+    assert_eq!(stored, "in_progress", "release status must be snake_case");
+
+    // Positive filter, both encodings.
+    for spelling in ["in_progress", "InProgress"] {
+        let (rows, total) = client
+            .list_releases_filtered(project_id, Some(vec![spelling.into()]), 10, 0, None, "asc")
+            .await
+            .unwrap();
+        assert_eq!(total, 1, "{spelling} must match the stored release");
+        assert_eq!(rows[0].id, rel.id);
+    }
+
+    let (_, total) = client
+        .list_releases_filtered(project_id, None, 10, 0, Some("version"), "desc")
+        .await
+        .unwrap();
+    assert_eq!(total, 2);
+
+    // Negative.
+    let (rows, total) = client
+        .list_releases_filtered(project_id, Some(vec![EVIL.into()]), 10, 0, None, "asc")
+        .await
+        .unwrap();
+    assert_eq!(total, 0, "payload must match no release");
+    assert!(rows.is_empty());
+
+    // `update_release` must keep the snake_case encoding too.
+    client
+        .update_release(
+            rel.id,
+            Some(ReleaseStatus::Released),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let stored: String = raw
+        .execute(
+            neo4rs::query("MATCH (r:Release {id: $id}) RETURN r.status AS s")
+                .param("id", rel.id.to_string()),
+        )
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get("s")
+        .unwrap();
+    assert_eq!(stored, "released", "update_release must stay snake_case");
+
+    drop_project(&raw, project_id).await;
+}
+
+#[tokio::test]
+async fn test_workspace_milestone_status_filters_are_bound() {
+    use project_orchestrator::neo4j::client::Neo4jClient;
+
+    let config = test_config();
+    let client = match Neo4jClient::new(
+        &config.neo4j_uri,
+        &config.neo4j_user,
+        &config.neo4j_password,
+    )
+    .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Skipping test: Neo4j not available: {e}");
+            return;
+        }
+    };
+
+    let ws = WorkspaceNode {
+        id: Uuid::new_v4(),
+        name: "Injection WS".to_string(),
+        slug: format!("injection-ws-{}", Uuid::new_v4()),
+        description: None,
+        created_at: chrono::Utc::now(),
+        updated_at: None,
+        metadata: serde_json::json!({}),
+    };
+    client.create_workspace(&ws).await.unwrap();
+
+    let wm_in_progress = WorkspaceMilestoneNode {
+        id: Uuid::new_v4(),
+        workspace_id: ws.id,
+        title: "Cross-project hardening".to_string(),
+        description: None,
+        status: MilestoneStatus::InProgress,
+        target_date: None,
+        closed_at: None,
+        created_at: chrono::Utc::now(),
+        tags: vec!["security".to_string()],
+    };
+    let wm_open = WorkspaceMilestoneNode {
+        id: Uuid::new_v4(),
+        title: "Later".to_string(),
+        status: MilestoneStatus::Open,
+        ..wm_in_progress.clone()
+    };
+    client
+        .create_workspace_milestone(&wm_in_progress)
+        .await
+        .unwrap();
+    client.create_workspace_milestone(&wm_open).await.unwrap();
+
+    // Per-workspace listing: positive on the stored snake_case encoding, and
+    // the status must survive the node -> model conversion.
+    let (rows, total) = client
+        .list_workspace_milestones_filtered(ws.id, Some("in_progress"), 10, 0)
+        .await
+        .unwrap();
+    assert_eq!(total, 1, "in_progress must match the stored milestone");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, wm_in_progress.id);
+    assert_eq!(
+        rows[0].status,
+        MilestoneStatus::InProgress,
+        "node_to_workspace_milestone must decode snake_case status"
+    );
+    assert_eq!(rows[0].tags, vec!["security".to_string()]);
+
+    // PascalCase input must work as well.
+    let (_, total) = client
+        .list_workspace_milestones_filtered(ws.id, Some("InProgress"), 10, 0)
+        .await
+        .unwrap();
+    assert_eq!(total, 1, "PascalCase input must match too");
+
+    let (_, total) = client
+        .list_workspace_milestones_filtered(ws.id, None, 10, 0)
+        .await
+        .unwrap();
+    assert_eq!(total, 2);
+
+    // Negative.
+    let (rows, total) = client
+        .list_workspace_milestones_filtered(ws.id, Some(EVIL), 10, 0)
+        .await
+        .unwrap();
+    assert_eq!(total, 0, "payload must match no workspace milestone");
+    assert!(rows.is_empty());
+
+    // Cross-workspace listing. The old code compared `wm.status` against the
+    // PascalCase spelling while the writer stored snake_case, so this filter
+    // could never match — the parameterization also fixed that mismatch.
+    let all = client
+        .list_all_workspace_milestones_filtered(Some(ws.id), Some("in_progress"), 10, 0)
+        .await
+        .unwrap();
+    assert_eq!(all.len(), 1, "cross-workspace status filter must match");
+    assert_eq!(all[0].0.id, wm_in_progress.id);
+
+    let all = client
+        .list_all_workspace_milestones_filtered(Some(ws.id), None, 10, 0)
+        .await
+        .unwrap();
+    assert_eq!(all.len(), 2);
+
+    let injected = client
+        .list_all_workspace_milestones_filtered(Some(ws.id), Some(EVIL), 10, 0)
+        .await
+        .unwrap();
+    assert!(injected.is_empty(), "payload must match nothing");
+
+    // Counts must agree with the listings, workspace-scoped and global.
+    assert_eq!(
+        client
+            .count_all_workspace_milestones(Some(ws.id), Some("in_progress"))
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        client
+            .count_all_workspace_milestones(Some(ws.id), None)
+            .await
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        client
+            .count_all_workspace_milestones(Some(ws.id), Some(EVIL))
+            .await
+            .unwrap(),
+        0
+    );
+    // Global (no workspace filter) must at least see our two rows.
+    assert!(
+        client
+            .count_all_workspace_milestones(None, None)
+            .await
+            .unwrap()
+            >= 2
+    );
+
+    client
+        .delete_workspace_milestone(wm_in_progress.id)
+        .await
+        .ok();
+    client.delete_workspace_milestone(wm_open.id).await.ok();
+    client.delete_workspace(ws.id).await.ok();
+}
+
+#[tokio::test]
+async fn test_agent_execution_completed_at_is_bound() {
+    use project_orchestrator::neo4j::client::Neo4jClient;
+    use project_orchestrator::neo4j::{AgentExecutionNode, AgentExecutionStatus};
+
+    let config = test_config();
+    let client = match Neo4jClient::new(
+        &config.neo4j_uri,
+        &config.neo4j_user,
+        &config.neo4j_password,
+    )
+    .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Skipping test: Neo4j not available: {e}");
+            return;
+        }
+    };
+    let raw = neo4rs::Graph::new(
+        &config.neo4j_uri,
+        &config.neo4j_user,
+        &config.neo4j_password,
+    )
+    .await
+    .unwrap();
+
+    let run_id = Uuid::new_v4();
+    let task_id = Uuid::new_v4();
+    raw.run(
+        neo4rs::query(
+            "CREATE (r:PlanRun {run_id: $rid, status: 'running'}), \
+                    (t:Task {id: $tid, title: 'ae-test'})",
+        )
+        .param("rid", run_id.to_string())
+        .param("tid", task_id.to_string()),
+    )
+    .await
+    .unwrap();
+
+    let mut ae = AgentExecutionNode {
+        id: Uuid::new_v4(),
+        run_id,
+        task_id,
+        session_id: None,
+        started_at: chrono::Utc::now(),
+        completed_at: None,
+        cost_usd: 0.0,
+        duration_secs: 0.0,
+        status: AgentExecutionStatus::Running,
+        tools_used: "[]".to_string(),
+        files_modified: vec![],
+        commits: vec![],
+        persona_profile: String::new(),
+        vector_json: None,
+        report_json: None,
+        execution_type: Default::default(),
+    };
+    client.create_agent_execution_impl(&ae).await.unwrap();
+
+    // Update with a completion timestamp: the value travels as $completed_at
+    // and must still be understood by Cypher's datetime().
+    let done_at = chrono::Utc::now();
+    ae.completed_at = Some(done_at);
+    ae.status = AgentExecutionStatus::Completed;
+    ae.cost_usd = 1.25;
+    ae.duration_secs = 42.0;
+    ae.files_modified = vec!["src/lib.rs".to_string()];
+    ae.commits = vec!["deadbeef".to_string()];
+    client.update_agent_execution_impl(&ae).await.unwrap();
+
+    let (completed, status): (bool, String) = {
+        let mut r = raw
+            .execute(
+                neo4rs::query(
+                    "MATCH (ae:AgentExecution {id: $id}) \
+                     RETURN ae.completed_at IS NOT NULL AS done, ae.status AS st",
+                )
+                .param("id", ae.id.to_string()),
+            )
+            .await
+            .unwrap();
+        let row = r.next().await.unwrap().unwrap();
+        (row.get("done").unwrap(), row.get("st").unwrap())
+    };
+    assert!(
+        completed,
+        "completed_at must be set — a $completed_at left unbound would have \
+         raised ParameterMissing or stored nothing"
+    );
+    assert_eq!(status, "completed");
+
+    // And an update that leaves completed_at unset must not reference the
+    // parameter at all (an unbound $completed_at would make the query fail).
+    let mut still_running = ae.clone();
+    still_running.completed_at = None;
+    still_running.status = AgentExecutionStatus::Running;
+    client
+        .update_agent_execution_impl(&still_running)
+        .await
+        .expect("update without completed_at must not reference $completed_at");
+
+    raw.run(
+        neo4rs::query(
+            "MATCH (r:PlanRun {run_id: $rid}) OPTIONAL MATCH (ae:AgentExecution)-[:PART_OF]->(r) \
+             DETACH DELETE r, ae",
+        )
+        .param("rid", run_id.to_string()),
+    )
+    .await
+    .unwrap();
+    raw.run(
+        neo4rs::query("MATCH (t:Task {id: $tid}) DETACH DELETE t")
+            .param("tid", task_id.to_string()),
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn test_meili_filters_escape_payloads_and_stay_valid() {
+    use project_orchestrator::meilisearch::indexes::{
+        CodeDocument, DecisionDocument, NoteDocument,
+    };
+
+    if !backends_available().await {
+        eprintln!("Skipping test: backends not available");
+        return;
+    }
+
+    let config = test_config();
+    let state = AppState::new(config).await.unwrap();
+
+    let tag = Uuid::new_v4().to_string();
+    let slug = format!("inj-{tag}");
+
+    // --- notes ------------------------------------------------------------
+    let note = NoteDocument {
+        id: format!("note-{tag}"),
+        project_id: Uuid::new_v4().to_string(),
+        project_slug: slug.clone(),
+        note_type: "guideline".to_string(),
+        status: "active".to_string(),
+        importance: "high".to_string(),
+        scope_type: "project".to_string(),
+        scope_path: "src".to_string(),
+        content: "parameterize every filter".to_string(),
+        tags: vec!["security".to_string()],
+        anchor_entities: vec![],
+        created_at: chrono::Utc::now().timestamp(),
+        created_by: "test".to_string(),
+        staleness_score: 0.0,
+    };
+    state.meili.index_note(&note).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    // Positive: every filter field at once still finds the document, so the
+    // quoted literals are valid MeiliSearch filter syntax.
+    let hits = state
+        .meili
+        .search_notes_with_scores(
+            "parameterize",
+            10,
+            Some(&slug),
+            Some("guideline"),
+            Some("active"),
+            Some("high"),
+        )
+        .await
+        .expect("a fully filtered note search must be accepted by MeiliSearch");
+    assert!(
+        hits.iter().any(|h| h.document.id == note.id),
+        "the note must be found through its own filters"
+    );
+
+    // Negative: a payload that tries to close the literal and OR a tautology.
+    // MeiliSearch must accept the escaped filter (no Err) and match nothing.
+    for payload in [
+        "x\" OR project_slug != \"zzz",
+        "x\" OR status = \"active",
+        "x\\",
+        EVIL,
+    ] {
+        let injected = state
+            .meili
+            .search_notes_with_scores("parameterize", 10, Some(payload), None, None, None)
+            .await
+            .unwrap_or_else(|e| panic!("escaped filter must stay valid for {payload:?}: {e}"));
+        assert!(
+            injected.is_empty(),
+            "payload {payload:?} must match no note, got {}",
+            injected.len()
+        );
+    }
+
+    // --- code -------------------------------------------------------------
+    let code = CodeDocument {
+        id: format!("code-{tag}"),
+        path: format!("/inj/{tag}/example.rs"),
+        language: "rust".to_string(),
+        symbols: vec![format!("inj_{tag}")],
+        docstrings: "injection fixture".to_string(),
+        signatures: vec![],
+        imports: vec![],
+        project_id: Uuid::new_v4().to_string(),
+        project_slug: slug.clone(),
+    };
+    state.meili.index_code(&code).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    let hits = state
+        .meili
+        .search_code_with_scores(
+            "injection",
+            10,
+            Some("rust"),
+            Some(&slug),
+            Some(&format!("/inj/{tag}/")),
+        )
+        .await
+        .expect("language + slug + path_prefix filter must be valid");
+    assert!(
+        hits.iter().any(|h| h.document.id == code.id),
+        "the code document must be found through its own filters"
+    );
+
+    for payload in ["x\" OR language != \"zzz", "x\\"] {
+        let injected = state
+            .meili
+            .search_code_with_scores("injection", 10, Some(payload), None, None)
+            .await
+            .unwrap_or_else(|e| panic!("escaped code filter must stay valid for {payload:?}: {e}"));
+        assert!(
+            injected.is_empty(),
+            "payload {payload:?} must match no code"
+        );
+        let injected = state
+            .meili
+            .search_code_with_scores("injection", 10, None, None, Some(payload))
+            .await
+            .unwrap_or_else(|e| panic!("escaped path prefix must stay valid for {payload:?}: {e}"));
+        assert!(
+            injected.is_empty(),
+            "payload {payload:?} must match no path"
+        );
+    }
+
+    // --- decisions --------------------------------------------------------
+    let task_id = Uuid::new_v4().to_string();
+    let decision = DecisionDocument {
+        id: format!("dec-{tag}"),
+        description: "bind the filters".to_string(),
+        rationale: "injection fixture".to_string(),
+        task_id: task_id.clone(),
+        agent: "test".to_string(),
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        tags: vec![],
+        project_id: None,
+        project_slug: Some(slug.clone()),
+    };
+    state.meili.index_decision(&decision).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    let hits = state
+        .meili
+        .search_decisions_in_project("bind", 10, Some(&slug))
+        .await
+        .expect("single-slug decision filter must be valid");
+    assert!(hits.iter().any(|d| d.id == decision.id));
+
+    let hits = state
+        .meili
+        .search_decisions_in_projects("bind", 10, &[slug.clone(), EVIL.to_string()])
+        .await
+        .expect("an IN [...] list with a payload must stay valid");
+    assert!(
+        hits.iter().any(|d| d.id == decision.id),
+        "the legitimate slug must still match inside the IN list"
+    );
+
+    for payload in ["x\" OR project_slug != \"zzz", "x\\"] {
+        let injected = state
+            .meili
+            .search_decisions_in_project("bind", 10, Some(payload))
+            .await
+            .unwrap_or_else(|e| panic!("escaped decision filter must stay valid: {e}"));
+        assert!(
+            injected.is_empty(),
+            "payload {payload:?} must match nothing"
+        );
+    }
+
+    // Deletions build the same escaped `field = "value"` filter. A payload must
+    // be accepted as a literal and delete nothing — in particular it must not
+    // widen into "delete everything".
+    for payload in ["x\" OR project_slug != \"zzz", "x\\", EVIL] {
+        state
+            .meili
+            .delete_code_for_project(payload)
+            .await
+            .unwrap_or_else(|e| {
+                panic!("delete_code_for_project({payload:?}) must stay valid: {e}")
+            });
+        state
+            .meili
+            .delete_decisions_for_project(payload)
+            .await
+            .unwrap_or_else(|e| panic!("delete_decisions_for_project({payload:?}): {e}"));
+        state
+            .meili
+            .delete_decisions_for_task(payload)
+            .await
+            .unwrap_or_else(|e| panic!("delete_decisions_for_task({payload:?}): {e}"));
+        state
+            .meili
+            .delete_notes_for_project(payload)
+            .await
+            .unwrap_or_else(|e| panic!("delete_notes_for_project({payload:?}): {e}"));
+    }
+
+    // Our fixtures must have survived every injected deletion.
+    let hits = state
+        .meili
+        .search_notes_with_scores("parameterize", 10, Some(&slug), None, None, None)
+        .await
+        .unwrap();
+    assert!(
+        hits.iter().any(|h| h.document.id == note.id),
+        "an injected delete filter must not have removed unrelated notes"
+    );
+    let hits = state
+        .meili
+        .search_decisions_in_project("bind", 10, Some(&slug))
+        .await
+        .unwrap();
+    assert!(
+        hits.iter().any(|d| d.id == decision.id),
+        "an injected delete filter must not have removed unrelated decisions"
+    );
+
+    // Cleanup: the real slug does delete.
+    state.meili.delete_notes_for_project(&slug).await.unwrap();
+    state
+        .meili
+        .delete_decisions_for_project(&slug)
+        .await
+        .unwrap();
+    state.meili.delete_code_for_project(&slug).await.unwrap();
+}
+
+/// `entity_type` reaches a Cypher **label** position, which cannot be a bound
+/// parameter — the whitelist in `safe_entity_label` is the only thing between
+/// the caller and arbitrary Cypher. Both reverse-lookup entry points must
+/// consult it *before* building their query.
+#[tokio::test]
+async fn test_decision_entity_label_whitelist_blocks_label_injection() {
+    use project_orchestrator::neo4j::client::Neo4jClient;
+
+    let config = test_config();
+    let client = match Neo4jClient::new(
+        &config.neo4j_uri,
+        &config.neo4j_user,
+        &config.neo4j_password,
+    )
+    .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Skipping test: Neo4j not available: {e}");
+            return;
+        }
+    };
+
+    // Positive: a known entity type is accepted and the query is valid Cypher
+    // (an empty result is fine — what matters is Ok, not a syntax error).
+    for ok_type in ["file", "function", "File", "struct"] {
+        client
+            .get_decisions_for_entity(ok_type, "src/lib.rs", 5)
+            .await
+            .unwrap_or_else(|e| panic!("get_decisions_for_entity({ok_type:?}) must work: {e}"));
+        client
+            .get_decisions_affecting(ok_type, "src/lib.rs", None)
+            .await
+            .unwrap_or_else(|e| panic!("get_decisions_affecting({ok_type:?}) must work: {e}"));
+    }
+
+    // A status filter is still honoured on the accepted path.
+    client
+        .get_decisions_affecting("file", "src/lib.rs", Some("accepted"))
+        .await
+        .unwrap();
+
+    // Negative: anything that is not a known label is rejected outright. If it
+    // were interpolated instead, `File) DETACH DELETE n //` would splice a
+    // delete into the MATCH.
+    for payload in [
+        "File) DETACH DELETE n //",
+        "a' OR 1=1 //",
+        "Function {id: 'x'}) RETURN d //",
+        "x\\",
+        "",
+        "Milestone|File",
+    ] {
+        let err = client
+            .get_decisions_for_entity(payload, "src/lib.rs", 5)
+            .await
+            .expect_err(&format!("get_decisions_for_entity accepted {payload:?}"));
+        assert!(
+            err.to_string().contains("invalid entity_type"),
+            "unexpected error for {payload:?}: {err}"
+        );
+        let err = client
+            .get_decisions_affecting(payload, "src/lib.rs", None)
+            .await
+            .expect_err(&format!("get_decisions_affecting accepted {payload:?}"));
+        assert!(
+            err.to_string().contains("invalid entity_type"),
+            "unexpected error for {payload:?}: {err}"
+        );
+    }
+}

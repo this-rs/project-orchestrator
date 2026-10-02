@@ -79,6 +79,21 @@ fn model_dimensions(model: &EmbeddingModel) -> usize {
 /// All embedding calls are dispatched to `tokio::spawn_blocking` to avoid blocking
 /// the async runtime (ONNX inference is CPU-bound).
 ///
+/// # The lock is taken before the blocking thread, not on it
+///
+/// `embed()` needing `&mut self` means there is exactly one inference in flight
+/// per process, whatever the caller count — that is inherent, and callers must
+/// expect a queue. What is *not* inherent is where they wait. Acquiring the
+/// mutex inside `spawn_blocking` makes every waiter park an OS thread from the
+/// blocking pool to do nothing but block on a lock, so a burst of concurrent
+/// embedders (chat, notes, plans, reasoning and document uploads all share this
+/// one provider) converts directly into parked threads and starves every other
+/// user of `spawn_blocking`.
+///
+/// So the guard is taken with `lock_owned().await` *first* — waiters cost a
+/// cheap async task — and only the winner is handed to a blocking thread, which
+/// it occupies for exactly as long as it is actually computing.
+///
 /// # Example
 ///
 /// ```rust,ignore
@@ -158,16 +173,14 @@ impl FastEmbedProvider {
 #[async_trait]
 impl EmbeddingProvider for FastEmbedProvider {
     async fn embed_text(&self, text: &str) -> Result<Vec<f32>> {
-        let model = self.model.clone();
         let text = text.to_string();
+        // Wait for the model as a task, not as a parked OS thread. See the type docs.
+        let mut guard = self.model.clone().lock_owned().await;
 
-        let embeddings = tokio::task::spawn_blocking(move || {
-            let mut model = model.blocking_lock();
-            model.embed(vec![&text], None)
-        })
-        .await
-        .context("FastEmbed spawn_blocking panicked")?
-        .context("FastEmbed embed_text failed")?;
+        let embeddings = tokio::task::spawn_blocking(move || guard.embed(vec![&text], None))
+            .await
+            .context("FastEmbed spawn_blocking panicked")?
+            .context("FastEmbed embed_text failed")?;
 
         embeddings
             .into_iter()
@@ -180,16 +193,13 @@ impl EmbeddingProvider for FastEmbedProvider {
             return Ok(vec![]);
         }
 
-        let model = self.model.clone();
         let texts = texts.to_vec();
+        let mut guard = self.model.clone().lock_owned().await;
 
-        tokio::task::spawn_blocking(move || {
-            let mut model = model.blocking_lock();
-            model.embed(texts, None)
-        })
-        .await
-        .context("FastEmbed spawn_blocking panicked")?
-        .context("FastEmbed embed_batch failed")
+        tokio::task::spawn_blocking(move || guard.embed(texts, None))
+            .await
+            .context("FastEmbed spawn_blocking panicked")?
+            .context("FastEmbed embed_batch failed")
     }
 
     fn dimensions(&self) -> usize {
