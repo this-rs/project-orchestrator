@@ -443,3 +443,74 @@ test('cliquet par depot: un depot absent n est pas tenu a son plafond', () => {
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+// --- Index voisin DERIVE (format de nexus : scripts/derive_diagram_index.py) ---------------
+// Trois differences avec cet index : une section `orphans:` apres `diagrams:`, des globs sans
+// prefixe de depot, et des entrees sans `status` (l'entree existe parce que le .mmd existe,
+// `file` + `verified` a la place). Mesure du 02/10/2026 : l'index de nexus etait declare
+// « illisible », ses 77 fichiers possedes comptes orphelins ici, et son plafond releve.
+
+const derivedIndex = `# genere\ndiagrams:\n  - name: nexus-sdk-types\n    file: nexus-sdk-types.mmd\n    verified: 2026-10-01\n    covers:\n      - claude-code-api/src/core/*.rs\n\norphans:\n  - claude-code-api/src/bin/ccapi.rs\n`;
+
+test('parseIndex: un index derive avec une section orphans: est lu, et orphans: ignoree', () => {
+  const entries = parseIndex(derivedIndex);
+  assert.equal(entries.length, 1);
+  assert.equal(entries[0].name, 'nexus-sdk-types');
+  assert.equal(entries[0].file, 'nexus-sdk-types.mmd');
+  assert.deepEqual(entries[0].covers, ['claude-code-api/src/core/*.rs']);
+});
+
+test('localIndexOwners: une entree derivee (file, sans status, glob sans prefixe) possede ses fichiers', () => {
+  const owned = localIndexOwners([{ repo: 'nexus', entries: parseIndex(derivedIndex) }], nexusFiles);
+  assert.equal(owned.get('nexus:claude-code-api/src/core/model_registry.rs'), 'nexus/INDEX.yml#nexus-sdk-types');
+});
+
+test('localIndexOwners: un glob sans prefixe ne possede que son propre depot', () => {
+  const idx = [{ repo: 'nexus', entries: [{ name: 'x', file: 'x.mmd', covers: ['src/**'] }] }];
+  assert.equal(localIndexOwners(idx, { nexus: ['claude-code-api/src/a.rs'], backend: ['src/a.rs'] }).size, 0);
+});
+
+test('gate: les fichiers possedes par un index voisin DERIVE ne sont pas des orphelins ici', () => {
+  const { root, be, nx } = fixture({ mainCovers: ['backend:src/own.rs'], localCovers: null });
+  try {
+    mkdirSync(join(nx, 'docs/diagrams'), { recursive: true });
+    writeFileSync(join(nx, 'docs/diagrams/INDEX.yml'), derivedIndex);
+    const { code, out } = run(be, nx, ['--list']);
+    assert.equal(code, 0, out);
+    assert.doesNotMatch(out, /illisible/);
+    assert.doesNotMatch(out, /nexus:claude-code-api\/src\/core\/model_registry\.rs/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('cliquet par depot: --write-orphans ne releve PAS un plafond de depot, et refuse d ecrire', () => {
+  // Rejoue sans le correctif : le registre etait reecrit depuis le compte reel, donc
+  // `orphan-ceiling-backend` passait de 0 a 1 par la commande meme censee l'en empecher.
+  const { root, be, nx } = fixture({ mainCovers: ['backend:src/own.rs'], localCovers: null });
+  try {
+    const p = join(be, 'docs/diagrams/ORPHANS.md');
+    writeFileSync(p, '<!-- orphan-ceiling: 1201 -->\n<!-- orphan-ceiling-backend: 0 -->\n');
+    const { code, out } = run(be, nx, ['--write-orphans']);
+    assert.equal(code, 1, out);
+    assert.match(out, /backend : 1 fichiers source sans diagramme proprietaire, au-dessus du plafond de 0/);
+    assert.match(out, /--write-orphans refuse/);
+    assert.deepEqual(orphanCeilingsByRepo(readFileSync(p, 'utf8')), { backend: 0 }, 'plafond de depot intact, registre non reecrit');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('cliquet par depot: --raise-ceiling avec raison releve aussi le plafond de depot, et le trace', () => {
+  const { root, be, nx } = fixture({ mainCovers: ['backend:src/own.rs'], localCovers: null });
+  try {
+    const p = join(be, 'docs/diagrams/ORPHANS.md');
+    writeFileSync(p, '<!-- orphan-ceiling: 1201 -->\n<!-- orphan-ceiling-backend: 0 -->\n');
+    const { code, out } = run(be, nx, ['--write-orphans', '--raise-ceiling', 'trois fichiers ajoutes en amont']);
+    assert.equal(code, 0, out);
+    assert.match(out, /plafond de backend releve 0 -> 1 : trois fichiers ajoutes en amont/);
+    assert.equal(orphanCeilingsByRepo(readFileSync(p, 'utf8')).backend, 1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

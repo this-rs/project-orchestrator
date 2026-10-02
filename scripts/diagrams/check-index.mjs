@@ -103,9 +103,16 @@ export function parseIndex(text) {
   const entries = [];
   let cur = null;
   let list = null;
+  let section = null;
   for (const raw of text.split('\n')) {
-    if (!raw.trim() || raw.trim().startsWith('#') || raw.trim() === 'diagrams:') continue;
+    if (!raw.trim() || raw.trim().startsWith('#')) continue;
     let m;
+    // Section de premier niveau. Seule `diagrams:` porte des entrees ; un index DERIVE (nexus :
+    // scripts/derive_diagram_index.py) publie aussi `orphans:`, une liste informative qui n'est
+    // la propriete de personne. On la saute au lieu d'echouer : un index voisin illisible
+    // rendait tous ses fichiers orphelins ici, sans que rien ne le dise au-dela d'un avertissement.
+    if ((m = raw.match(/^([a-z_]+):\s*$/))) { section = m[1]; cur = null; list = null; continue; }
+    if (section !== null && section !== 'diagrams') continue;
     if ((m = raw.match(/^ {2}- name:\s*(.+?)\s*$/))) { cur = { name: m[1], covers: [] }; entries.push(cur); list = null; continue; }
     if (!cur) throw new Error(`INDEX.yml : ligne hors entree : ${raw}`);
     if ((m = raw.match(/^ {4}covers:\s*$/))) { list = cur.covers; continue; }
@@ -160,14 +167,14 @@ export function orphansByRepo(orphans) {
 }
 
 // --- registre publie des orphelins : texte deterministe, sans sha ni date (verifiable hors reseau).
-export function renderOrphans(orphans, totalSources, localIndexes = [], reserved = 0, ceiling = orphans.length) {
+export function renderOrphans(orphans, totalSources, localIndexes = [], reserved = 0, ceiling = orphans.length, ceilingsByRepo = orphansByRepo(orphans)) {
   const byRepo = {};
   for (const o of orphans) { const [repo, path] = [o.slice(0, o.indexOf(':')), o.slice(o.indexOf(':') + 1)]; (byRepo[repo] ??= []).push(path); }
   const pct = totalSources ? ((orphans.length / totalSources) * 100).toFixed(1) : '0.0';
   const out = [
     '<!-- Genere par scripts/diagrams/check-index.mjs --write-orphans. Ne pas editer a la main. -->',
     `<!-- orphan-ceiling: ${ceiling} -->`,
-    ...Object.entries(orphansByRepo(orphans)).sort().map(([r, n]) => `<!-- orphan-ceiling-${r}: ${n} -->`),
+    ...Object.entries(ceilingsByRepo).sort().map(([r, n]) => `<!-- orphan-ceiling-${r}: ${n} -->`),
     '',
     '# Fichiers source sans diagramme proprietaire',
     '',
@@ -228,14 +235,19 @@ export function localIndexOwners(indexes, files) {
   const owned = new Map();
   for (const { repo, entries } of indexes) {
     for (const e of entries) {
-      // Meme regle que pour notre index : une entree `planned` ne possede rien.
-      if (e.status !== 'verified') continue;
+      // Meme regle que pour notre index : une entree `planned` ne possede rien. Un index DERIVE
+      // des en-tetes (nexus) n'a pas de champ `status` : son entree n'existe que parce que le
+      // .mmd existe, donc `file` vaut `verified`.
+      const verified = e.status === 'verified' || (e.status === undefined && Boolean(e.file));
+      if (!verified) continue;
       for (const g of e.covers) {
         const m = g.match(/^([a-z]+):(.+)$/);
         // Un index local ne possede que des chemins de SON depot : un glob qui en designe un
-        // autre serait une prise de pouvoir sur un depot voisin, on l'ignore.
-        if (!m || m[1] !== repo) continue;
-        const re = globToRegExp(m[2]);
+        // autre serait une prise de pouvoir sur un depot voisin, on l'ignore. Un glob SANS
+        // prefixe (format de l'index derive de nexus) ne peut designer que son propre depot.
+        const [owner, pattern] = m ? [m[1], m[2]] : [repo, g];
+        if (owner !== repo) continue;
+        const re = globToRegExp(pattern);
         for (const f of (files[repo] ?? [])) if (re.test(f)) owned.set(`${repo}:${f}`, `${repo}/INDEX.yml#${e.name}`);
       }
     }
@@ -402,12 +414,26 @@ function main() {
   // C'est ce qui rend le cliquet reel en CI, ou un seul depot est la.
   const recordedByRepo = orphanCeilingsByRepo(previousDoc);
   const actualByRepo = orphansByRepo(orphans);
+  // Les plafonds par depot que --write-orphans ECRIRA : le compte reel quand il est sous le
+  // plafond (le cliquet descend), le plafond enregistre quand il est au-dessus (il ne remonte
+  // pas tout seul). Avant cette distinction, le registre etait reecrit depuis le compte reel,
+  // et un depot qui avait gagne trois fichiers sans proprietaire voyait son plafond releve de
+  // trois par la commande meme qui devait l'en empecher.
+  const ceilingsByRepo = { ...actualByRepo };
+  let ceilingBreach = false;
+  const raiseAllowed = Boolean(raiseReason) && !raiseReason.startsWith('--');
   for (const repo of Object.keys(files)) {
     const limit = recordedByRepo[repo];
     if (limit === undefined) continue; // pas encore de plafond pour ce depot
     const actual = actualByRepo[repo] ?? 0;
     if (actual > limit) {
-      problems.push(`${repo} : ${actual} fichiers source sans diagramme proprietaire, au-dessus du plafond de ${limit} pour ce depot : revendiquer le fichier par un glob 'covers' d'une entree verified`);
+      if (raiseAllowed) {
+        console.warn(`AVERTISSEMENT plafond de ${repo} releve ${limit} -> ${actual} : ${raiseReason}`);
+      } else {
+        ceilingsByRepo[repo] = limit;
+        ceilingBreach = true;
+        problems.push(`${repo} : ${actual} fichiers source sans diagramme proprietaire, au-dessus du plafond de ${limit} pour ce depot : revendiquer le fichier par un glob 'covers' d'une entree verified`);
+      }
     }
   }
 
@@ -428,6 +454,7 @@ function main() {
       console.warn(`AVERTISSEMENT plafond d'orphelins releve ${ceiling} -> ${orphans.length} : ${raiseReason}`);
       ceiling = orphans.length;
     } else {
+      ceilingBreach = true;
       problems.push(`${orphans.length} fichiers source sans diagramme proprietaire, au-dessus du plafond de ${ceiling} : revendiquer le fichier par un glob 'covers' d'une entree verified. Relever le plafond n'est pas la sortie ; si c'est vraiment voulu, --raise-ceiling "<raison>".`);
     }
   } else if (orphans.length < ceiling) {
@@ -441,10 +468,15 @@ function main() {
     repo,
     diagrams: le.length,
     owned: [...elsewhere.keys()].filter((k) => k.startsWith(`${repo}:`)).length,
-  })), reserved, ceiling);
+  })), reserved, ceiling, ceilingsByRepo);
   if (args.includes('--write-orphans')) {
-    writeFileSync(orphansPath, rendered);
-    console.log(`${ORPHANS_DOC} regenere (${orphans.length} orphelins)`);
+    if (ceilingBreach) {
+      // Ecrire ici reviendrait a publier un registre dont un plafond a ete releve en silence.
+      console.error(`ERREUR --write-orphans refuse : un plafond serait releve ; ${ORPHANS_DOC} n'est pas modifie`);
+    } else {
+      writeFileSync(orphansPath, rendered);
+      console.log(`${ORPHANS_DOC} regenere (${orphans.length} orphelins)`);
+    }
   } else if (missingRepos.length) {
     console.warn(`AVERTISSEMENT ${ORPHANS_DOC} non verifie : des depots manquent (${missingRepos.join(', ')})`);
   } else {

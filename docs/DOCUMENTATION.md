@@ -109,7 +109,10 @@ dans sa chaine d'outils, pas dans la notre (nexus est un depot Rust : son verifi
 est un test `cargo`, pas un script Node, et c'est le bon choix pour lui).
 
 Un depot voisin peut donc tenir son propre `docs/diagrams/INDEX.yml`, au meme format, pour les
-diagrammes dont le `.mmd` vit chez lui. Deux regles rendent la coexistence verifiable plutot que
+diagrammes dont le `.mmd` vit chez lui. Un index **derive** des en-tetes (nexus :
+`scripts/derive_diagram_index.py`) est lu aussi : ses globs sans prefixe designent son propre
+depot, une entree qui a un `file` sans `status` possede (le .mmd existe), et sa section
+`orphans:` est ignoree (liste informative, propriete de personne). Deux regles rendent la coexistence verifiable plutot que
 polie :
 
 1. **Un index local ne possede que des chemins de SON depot.** Un glob `frontend:` dans l'index
@@ -136,6 +139,9 @@ Trois proprietes, chacune verifiee par un test de bout en bout, parce qu'un cliq
 desserre tout seul ne tient rien :
 
 - `--write-orphans` **ne releve jamais** le plafond : au-dessus, il echoue au lieu d'absoudre.
+  Cela vaut pour le total ET pour chaque plafond par depot : au-dessus de l'un d'eux, le
+  registre n'est pas reecrit (mesure du 02/10/2026 : il etait regenere depuis le compte reel,
+  et relevait le plafond du depot par la commande meme censee l'en empecher).
 - le relever exige `--raise-ceiling "<raison>"`, qui laisse une trace lisible en revue.
 - supprimer le marqueur **echoue** aussi : on ne desarme pas le cliquet en effacant son compteur.
 

@@ -161,12 +161,11 @@ diagrams:
       - "backend:src/neurons/**"
       - "backend:src/embeddings/**"
       - "backend:src/meilisearch/**"
-  - name: po-nexus-sdk
-    owner: theotime
-    status: planned
-    covers:
-      - "nexus:claude-code-sdk-rs/src/{lib,client,query,interactive,internal_query,message_parser,types}.rs"
-      - "nexus:claude-code-sdk-rs/src/transport/{mod,subprocess}.rs"
+  # Arbitrage (2026-10-02) : po-nexus-sdk est RETIRE. Son perimetre (claude-code-sdk-rs/src/{lib,client,
+  # query,interactive,internal_query,message_parser,types}.rs et transport/{mod,subprocess}.rs) est possede
+  # par l'index DERIVE de nexus (nexus-sdk-client, -interactive, -types, -transport, -provider-boundary),
+  # avec des .mmd verifies. La regle du proprietaire unique vaut ENTRE les index : des que le script a su
+  # relire l'index de nexus, la reservation planned d'ici est devenue une collision sur 8 fichiers.
   - name: po-personas-identity
     owner: theotime
     status: planned
