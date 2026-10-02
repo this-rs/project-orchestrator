@@ -412,9 +412,9 @@ impl Neo4jClient {
 
 #[cfg(test)]
 mod parent_existence_tests {
-    use super::super::mock::MockNeo4jClient;
     use super::super::models::{ReleaseNode, ReleaseStatus};
     use super::super::traits::GraphStore;
+    use crate::neo4j::mock::MockGraphStore;
     use uuid::Uuid;
 
     fn dummy_release(project_id: Uuid) -> ReleaseNode {
@@ -435,7 +435,7 @@ mod parent_existence_tests {
     /// Regression for bug 3693617b.
     #[tokio::test]
     async fn create_release_rejects_missing_project() {
-        let db = MockNeo4jClient::new();
+        let db = MockGraphStore::new();
         let ghost_project = Uuid::new_v4();
         let r = dummy_release(ghost_project);
         let err = db.create_release(&r).await.unwrap_err();
@@ -449,7 +449,7 @@ mod parent_existence_tests {
     #[tokio::test]
     async fn create_release_accepts_existing_project() {
         use super::super::models::{ProjectNode, ProjectProfile};
-        let db = MockNeo4jClient::new();
+        let db = MockGraphStore::new();
         let project = ProjectNode {
             id: Uuid::new_v4(),
             name: "proj".into(),

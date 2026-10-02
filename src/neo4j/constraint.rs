@@ -230,9 +230,9 @@ impl Neo4jClient {
 
 #[cfg(test)]
 mod parent_existence_tests {
-    use super::super::mock::MockNeo4jClient;
     use super::super::models::{ConstraintNode, ConstraintType};
     use super::super::traits::GraphStore;
+    use crate::neo4j::mock::MockGraphStore;
     use uuid::Uuid;
 
     /// create_constraint must return Err when the plan does not exist.
@@ -240,7 +240,7 @@ mod parent_existence_tests {
     /// a missing parent because an empty result is not an error.
     #[tokio::test]
     async fn create_constraint_rejects_missing_plan() {
-        let db = MockNeo4jClient::new();
+        let db = MockGraphStore::new();
         let ghost_plan = Uuid::new_v4(); // not inserted into the mock
         let c = ConstraintNode::new(ConstraintType::Security, "test".into(), None);
         let err = db.create_constraint(ghost_plan, &c).await.unwrap_err();
@@ -254,7 +254,7 @@ mod parent_existence_tests {
     #[tokio::test]
     async fn create_constraint_accepts_existing_plan() {
         use super::super::models::{PlanNode, PlanStatus};
-        let db = MockNeo4jClient::new();
+        let db = MockGraphStore::new();
         let plan = PlanNode {
             id: Uuid::new_v4(),
             title: "p".into(),

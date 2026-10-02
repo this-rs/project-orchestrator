@@ -959,9 +959,9 @@ impl Neo4jClient {
 
 #[cfg(test)]
 mod parent_existence_tests {
-    use super::super::mock::MockNeo4jClient;
     use super::super::models::{DecisionNode, DecisionStatus};
     use super::super::traits::GraphStore;
+    use crate::neo4j::mock::MockGraphStore;
     use uuid::Uuid;
 
     fn dummy_decision(task_id: Uuid) -> DecisionNode {
@@ -985,7 +985,7 @@ mod parent_existence_tests {
     /// Regression for bug 3693617b.
     #[tokio::test]
     async fn create_decision_rejects_missing_task() {
-        let db = MockNeo4jClient::new();
+        let db = MockGraphStore::new();
         let ghost_task = Uuid::new_v4();
         let d = dummy_decision(ghost_task);
         let err = db.create_decision(ghost_task, &d).await.unwrap_err();
@@ -999,7 +999,7 @@ mod parent_existence_tests {
     #[tokio::test]
     async fn create_decision_accepts_existing_task() {
         use super::super::models::{TaskNode, TaskStatus};
-        let db = MockNeo4jClient::new();
+        let db = MockGraphStore::new();
         let task = TaskNode {
             id: Uuid::new_v4(),
             title: Some("t".into()),
