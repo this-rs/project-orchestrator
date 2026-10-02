@@ -74,6 +74,7 @@ impl Neo4jClient {
                 status: $status
             })
             CREATE (t)-[:INFORMED_BY]->(d)
+            RETURN d.id AS created_id
             "#,
         )
         .param("task_id", task_id.to_string())
@@ -89,7 +90,13 @@ impl Neo4jClient {
         .param("decided_at", decision.decided_at.to_rfc3339())
         .param("status", decision.status.to_string());
 
-        self.graph.run(q).await?;
+        let mut result = self.graph.execute(q).await?;
+        if result.next().await?.is_none() {
+            anyhow::bail!(
+                "Failed to create decision: Task {} not found in Neo4j",
+                task_id
+            );
+        }
         Ok(())
     }
 
@@ -951,6 +958,77 @@ impl Neo4jClient {
 }
 
 #[cfg(test)]
+mod parent_existence_tests {
+    use super::super::mock::MockNeo4jClient;
+    use super::super::models::{DecisionNode, DecisionStatus};
+    use super::super::traits::GraphStore;
+    use uuid::Uuid;
+
+    fn dummy_decision(task_id: Uuid) -> DecisionNode {
+        let _ = task_id;
+        DecisionNode {
+            id: Uuid::new_v4(),
+            description: "d".into(),
+            rationale: String::new(),
+            alternatives: vec![],
+            chosen_option: None,
+            decided_by: "agent".into(),
+            decided_at: chrono::Utc::now(),
+            status: DecisionStatus::Proposed,
+            embedding: None,
+            embedding_model: None,
+            scar_intensity: 0.0,
+        }
+    }
+
+    /// create_decision must return Err when the task does not exist.
+    /// Regression for bug 3693617b.
+    #[tokio::test]
+    async fn create_decision_rejects_missing_task() {
+        let db = MockNeo4jClient::new();
+        let ghost_task = Uuid::new_v4();
+        let d = dummy_decision(ghost_task);
+        let err = db.create_decision(ghost_task, &d).await.unwrap_err();
+        assert!(
+            err.to_string().contains("not found in Neo4j"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// create_decision must succeed when the task exists.
+    #[tokio::test]
+    async fn create_decision_accepts_existing_task() {
+        use super::super::models::{TaskNode, TaskStatus};
+        let db = MockNeo4jClient::new();
+        let task = TaskNode {
+            id: Uuid::new_v4(),
+            title: Some("t".into()),
+            description: String::new(),
+            status: TaskStatus::Pending,
+            assigned_to: None,
+            priority: None,
+            tags: vec![],
+            acceptance_criteria: vec![],
+            affected_files: vec![],
+            estimated_complexity: None,
+            actual_complexity: None,
+            created_at: chrono::Utc::now(),
+            updated_at: None,
+            started_at: None,
+            completed_at: None,
+            frustration_score: 0.0,
+            execution_context: None,
+            persona: None,
+            prompt_cache: None,
+        };
+        db.tasks.write().await.insert(task.id, task.clone());
+        let d = dummy_decision(task.id);
+        db.create_decision(task.id, &d).await.unwrap();
+        let stored = db.get_decision(d.id).await.unwrap();
+        assert!(stored.is_some());
+    }
+}
+
 mod injection_tests {
     use super::safe_entity_label;
 

@@ -27,21 +27,25 @@ impl Neo4jClient {
                 enforced_by: $enforced_by
             })
             CREATE (p)-[:CONSTRAINED_BY]->(c)
+            RETURN c.id AS created_id
             "#,
         )
         .param("plan_id", plan_id.to_string())
         .param("id", constraint.id.to_string())
-        .param(
-            "constraint_type",
-            format!("{:?}", constraint.constraint_type),
-        )
+        .param("constraint_type", constraint.constraint_type.to_string())
         .param("description", constraint.description.clone())
         .param(
             "enforced_by",
             constraint.enforced_by.clone().unwrap_or_default(),
         );
 
-        self.graph.run(q).await?;
+        let mut result = self.graph.execute(q).await?;
+        if result.next().await?.is_none() {
+            anyhow::bail!(
+                "Failed to create constraint: Plan {} not found in Neo4j",
+                plan_id
+            );
+        }
         Ok(())
     }
 
@@ -193,7 +197,7 @@ impl Neo4jClient {
             q = q.param("description", description);
         }
         if let Some(constraint_type) = constraint_type {
-            q = q.param("constraint_type", format!("{:?}", constraint_type));
+            q = q.param("constraint_type", constraint_type.to_string());
         }
         if let Some(enforced_by) = enforced_by {
             q = q.param("enforced_by", enforced_by);
@@ -215,5 +219,52 @@ impl Neo4jClient {
 
         self.graph.run(q).await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod parent_existence_tests {
+    use super::super::mock::MockNeo4jClient;
+    use super::super::models::{ConstraintNode, ConstraintType};
+    use super::super::traits::GraphStore;
+    use uuid::Uuid;
+
+    /// create_constraint must return Err when the plan does not exist.
+    /// Regression for bug 3693617b: Neo4j MATCH+CREATE silently succeeds on
+    /// a missing parent because an empty result is not an error.
+    #[tokio::test]
+    async fn create_constraint_rejects_missing_plan() {
+        let db = MockNeo4jClient::new();
+        let ghost_plan = Uuid::new_v4(); // not inserted into the mock
+        let c = ConstraintNode::new(ConstraintType::Security, "test".into(), None);
+        let err = db.create_constraint(ghost_plan, &c).await.unwrap_err();
+        assert!(
+            err.to_string().contains("not found in Neo4j"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// create_constraint must succeed when the plan exists.
+    #[tokio::test]
+    async fn create_constraint_accepts_existing_plan() {
+        use super::super::models::{PlanNode, PlanStatus};
+        let db = MockNeo4jClient::new();
+        let plan = PlanNode {
+            id: Uuid::new_v4(),
+            title: "p".into(),
+            description: String::new(),
+            status: PlanStatus::Draft,
+            created_at: chrono::Utc::now(),
+            created_by: "test".into(),
+            priority: 50,
+            project_id: None,
+            execution_context: None,
+            persona: None,
+        };
+        db.plans.write().await.insert(plan.id, plan.clone());
+        let c = ConstraintNode::new(ConstraintType::Security, "test".into(), None);
+        db.create_constraint(plan.id, &c).await.unwrap();
+        let stored = db.get_plan_constraints(plan.id).await.unwrap();
+        assert_eq!(stored.len(), 1);
     }
 }
