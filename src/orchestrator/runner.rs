@@ -5965,7 +5965,9 @@ mod tests {
     #[tokio::test]
     async fn test_create_release_emits_event() {
         let (orch, mut rx) = orch_with_bus().await;
-        let release = test_release(Uuid::new_v4(), "1.0.0");
+        let project = crate::test_helpers::test_project();
+        orch.neo4j().create_project(&project).await.unwrap();
+        let release = test_release(project.id, "1.0.0");
         orch.create_release(&release).await.unwrap();
         let ev = rx.try_recv().unwrap();
         assert_eq!(ev.entity_type, EventEntityType::Release);

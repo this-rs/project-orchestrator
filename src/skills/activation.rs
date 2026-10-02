@@ -4317,6 +4317,9 @@ mod tests {
             "Modify `src/neo4j/client.rs` and `src/api/handlers.rs`",
             "Direct implementation",
         );
+        let mut parent = crate::test_helpers::test_task();
+        parent.id = task_id;
+        store.create_task(Uuid::new_v4(), &parent).await.unwrap();
         store.create_decision(task_id, &decision).await.unwrap();
 
         let result = auto_anchor_decisions_for_project(&store, project_id).await;
@@ -4445,6 +4448,9 @@ mod tests {
             "Refactor `src/neo4j/client.rs` for performance",
             "Batch queries",
         );
+        let mut parent = crate::test_helpers::test_task();
+        parent.id = task_id;
+        store.create_task(Uuid::new_v4(), &parent).await.unwrap();
         store.create_decision(task_id, &decision).await.unwrap();
 
         let result = reconstruct_knowledge_links(&store, project_id).await;

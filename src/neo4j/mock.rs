@@ -4410,6 +4410,12 @@ impl GraphStore for MockGraphStore {
     // ========================================================================
 
     async fn create_constraint(&self, plan_id: Uuid, constraint: &ConstraintNode) -> Result<()> {
+        if !self.plans.read().await.contains_key(&plan_id) {
+            anyhow::bail!(
+                "Failed to create constraint: Plan {} not found in Neo4j",
+                plan_id
+            );
+        }
         let cid = constraint.id;
         self.plan_constraints
             .write()
@@ -4473,6 +4479,12 @@ impl GraphStore for MockGraphStore {
     // ========================================================================
 
     async fn create_decision(&self, task_id: Uuid, decision: &DecisionNode) -> Result<()> {
+        if !self.tasks.read().await.contains_key(&task_id) {
+            anyhow::bail!(
+                "Failed to create decision: Task {} not found in Neo4j",
+                task_id
+            );
+        }
         let did = decision.id;
         self.task_decisions
             .write()
@@ -5047,8 +5059,14 @@ impl GraphStore for MockGraphStore {
     // ========================================================================
 
     async fn create_release(&self, release: &ReleaseNode) -> Result<()> {
-        let rid = release.id;
         let pid = release.project_id;
+        if !self.projects.read().await.contains_key(&pid) {
+            anyhow::bail!(
+                "Failed to create release: Project {} not found in Neo4j",
+                pid
+            );
+        }
+        let rid = release.id;
         self.project_releases
             .write()
             .await

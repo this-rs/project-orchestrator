@@ -3975,6 +3975,90 @@ mod status_display_tests {
         assert_eq!(StepStatus::Skipped.to_string(), "skipped");
     }
 
+    #[test]
+    fn constraint_type_display_is_snake_case() {
+        assert_eq!(ConstraintType::Performance.to_string(), "performance");
+        assert_eq!(ConstraintType::Compatibility.to_string(), "compatibility");
+        assert_eq!(ConstraintType::Security.to_string(), "security");
+        assert_eq!(ConstraintType::Style.to_string(), "style");
+        assert_eq!(ConstraintType::Testing.to_string(), "testing");
+        assert_eq!(ConstraintType::Other.to_string(), "other");
+    }
+
+    #[test]
+    fn release_status_display_is_snake_case() {
+        assert_eq!(ReleaseStatus::Planned.to_string(), "planned");
+        assert_eq!(ReleaseStatus::InProgress.to_string(), "in_progress");
+        assert_eq!(ReleaseStatus::Released.to_string(), "released");
+        assert_eq!(ReleaseStatus::Cancelled.to_string(), "cancelled");
+    }
+
+    #[test]
+    fn milestone_status_display_is_snake_case() {
+        assert_eq!(MilestoneStatus::Planned.to_string(), "planned");
+        assert_eq!(MilestoneStatus::Open.to_string(), "open");
+        assert_eq!(MilestoneStatus::InProgress.to_string(), "in_progress");
+        assert_eq!(MilestoneStatus::Completed.to_string(), "completed");
+        assert_eq!(MilestoneStatus::Closed.to_string(), "closed");
+    }
+
+    /// Every enum that gained a Display impl must print exactly what serde writes,
+    /// variant by variant: a variant added to one side only fails here.
+    #[test]
+    fn display_matches_serde_for_every_variant() {
+        fn serde_str<T: serde::Serialize>(v: &T) -> String {
+            serde_json::to_value(v)
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .to_string()
+        }
+        for v in [
+            PlanStatus::Draft,
+            PlanStatus::Approved,
+            PlanStatus::InProgress,
+            PlanStatus::Completed,
+            PlanStatus::Cancelled,
+        ] {
+            assert_eq!(v.to_string(), serde_str(&v), "PlanStatus {v:?}");
+        }
+        for v in [
+            StepStatus::Pending,
+            StepStatus::InProgress,
+            StepStatus::Completed,
+            StepStatus::Skipped,
+        ] {
+            assert_eq!(v.to_string(), serde_str(&v), "StepStatus {v:?}");
+        }
+        for v in [
+            ConstraintType::Performance,
+            ConstraintType::Compatibility,
+            ConstraintType::Security,
+            ConstraintType::Style,
+            ConstraintType::Testing,
+            ConstraintType::Other,
+        ] {
+            assert_eq!(v.to_string(), serde_str(&v), "ConstraintType {v:?}");
+        }
+        for v in [
+            ReleaseStatus::Planned,
+            ReleaseStatus::InProgress,
+            ReleaseStatus::Released,
+            ReleaseStatus::Cancelled,
+        ] {
+            assert_eq!(v.to_string(), serde_str(&v), "ReleaseStatus {v:?}");
+        }
+        for v in [
+            MilestoneStatus::Planned,
+            MilestoneStatus::Open,
+            MilestoneStatus::InProgress,
+            MilestoneStatus::Completed,
+            MilestoneStatus::Closed,
+        ] {
+            assert_eq!(v.to_string(), serde_str(&v), "MilestoneStatus {v:?}");
+        }
+    }
+
     /// Regression: the serde snake_case serialization must agree with Display.
     /// They describe the same wire format; if they drift the status in a JSON
     /// response body and the status in a WS event differ.

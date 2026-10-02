@@ -1243,7 +1243,14 @@ pub async fn add_decision(
         .orchestrator
         .plan_manager()
         .add_decision(task_id, req, "agent")
-        .await?;
+        .await
+        .map_err(|e| {
+            if e.to_string().contains("not found in Neo4j") {
+                AppError::NotFound(format!("Task {task_id} not found"))
+            } else {
+                AppError::Internal(e)
+            }
+        })?;
 
     // Resolve run_id: explicit > auto-detect from active run
     let run_id = match explicit_run_id {
@@ -2294,12 +2301,19 @@ pub async fn add_constraint(
         .orchestrator
         .plan_manager()
         .add_constraint(plan_id, &constraint)
-        .await?;
+        .await
+        .map_err(|e| {
+            if e.to_string().contains("not found in Neo4j") {
+                AppError::NotFound(format!("Plan {plan_id} not found"))
+            } else {
+                AppError::Internal(e)
+            }
+        })?;
 
     state.event_bus.emit_created(
         crate::events::EntityType::Constraint,
         &constraint.id.to_string(),
-        serde_json::json!({"plan_id": plan_id, "constraint_type": format!("{:?}", constraint.constraint_type)}),
+        serde_json::json!({"plan_id": plan_id, "constraint_type": constraint.constraint_type.to_string()}),
         None,
     );
 
@@ -4355,7 +4369,17 @@ pub async fn create_release(
         project_id,
     };
 
-    state.orchestrator.create_release(&release).await?;
+    state
+        .orchestrator
+        .create_release(&release)
+        .await
+        .map_err(|e| {
+            if e.to_string().contains("not found in Neo4j") {
+                AppError::NotFound(format!("Project {project_id} not found"))
+            } else {
+                AppError::Internal(e)
+            }
+        })?;
     state.event_bus.emit_created(
         crate::events::EntityType::Release,
         &release.id.to_string(),

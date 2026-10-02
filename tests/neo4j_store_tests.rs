@@ -261,6 +261,23 @@ async fn test_constraint_lifecycle_and_error_cases() {
         .await
         .expect("deleting an unknown constraint is idempotent");
 
+    // --- error case: creating a constraint under an unknown plan must return Err.
+    //     Fix for bug 3693617b: Neo4j MATCH+CREATE was silently succeeding when
+    //     the parent plan did not exist. ---
+    let orphan_c = ConstraintNode::new(ConstraintType::Other, "orphan".into(), None);
+    let err = store
+        .create_constraint(Uuid::new_v4(), &orphan_c)
+        .await
+        .expect_err("create_constraint must fail when the plan does not exist");
+    assert!(
+        err.to_string().contains("not found in Neo4j"),
+        "error message must name the missing parent: {err}"
+    );
+    assert!(
+        store.get_constraint(orphan_c.id).await.unwrap().is_none(),
+        "no constraint node must have been written on Err"
+    );
+
     // --- error case: unknown plan has no constraints ---
     assert!(
         store
@@ -547,20 +564,21 @@ async fn test_release_lifecycle_commit_links_and_error_cases() {
         ReleaseStatus::Released
     );
 
-    // --- known gap, asserted so it is not mistaken for working: a release
-    //     created under an unknown project is dropped SILENTLY. MATCH finds no
-    //     Project, so the CREATE never runs, yet create_release answers Ok.
-    //     create_milestone (above) bails in the same situation. Tracked as a
-    //     bug of its own; this assertion fails the day it is fixed, which is
-    //     when the fix must update it to expect an error. ---
+    // --- error case: a release created under an unknown project must return Err.
+    //     Fix for bug 3693617b: Neo4j MATCH+CREATE was silently succeeding when
+    //     the parent project did not exist. ---
     let orphan = a_release(Uuid::new_v4());
-    store
+    let err = store
         .create_release(&orphan)
         .await
-        .expect("current behaviour: Ok even though nothing was written");
+        .expect_err("create_release must fail when the project does not exist");
+    assert!(
+        err.to_string().contains("not found in Neo4j"),
+        "error message must name the missing parent: {err}"
+    );
     assert!(
         store.get_release(orphan.id).await.unwrap().is_none(),
-        "nothing is written — the Ok above is a silent failure, not a success"
+        "no release node must have been written on Err"
     );
 
     // --- cleanup ---
@@ -755,16 +773,21 @@ async fn test_decision_lifecycle_and_error_cases() {
         .await
         .expect("deleting an unknown decision is idempotent");
 
-    // --- error case: unknown task — MATCH finds nothing, so no Decision is
-    //     written. Asserted on the read, because the write answers Ok. ---
+    // --- error case: creating a decision under an unknown task must return Err.
+    //     Fix for bug 3693617b: Neo4j MATCH+CREATE was silently succeeding when
+    //     the parent task did not exist. ---
     let orphan = a_decision();
-    store
+    let err = store
         .create_decision(Uuid::new_v4(), &orphan)
         .await
-        .expect("current behaviour: Ok even though nothing was written");
+        .expect_err("create_decision must fail when the task does not exist");
+    assert!(
+        err.to_string().contains("not found in Neo4j"),
+        "error message must name the missing parent: {err}"
+    );
     assert!(
         store.get_decision(orphan.id).await.unwrap().is_none(),
-        "no task to hang it on means no decision node"
+        "no decision node must have been written on Err"
     );
 
     // --- cleanup ---

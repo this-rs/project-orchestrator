@@ -672,7 +672,7 @@ pub async fn build_project_graph_data(
                 label,
                 layer: "knowledge".to_string(),
                 attributes: Some(serde_json::json!({
-                    "constraint_type": format!("{:?}", constraint.constraint_type).to_lowercase(),
+                    "constraint_type": constraint.constraint_type.to_string(),
                     "enforced_by": constraint.enforced_by,
                 })),
             });

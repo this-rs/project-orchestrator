@@ -217,3 +217,9 @@ diagrams:
       - "website:{package.json,vite.config.ts,src/**,scripts/**,public/robots.txt}"
       - "backend:{SKILL,AGENTS,CLAUDE}.md"
       - "backend:docs/api/**"
+  - name: po-bugs
+    owner: theotime
+    status: verified
+    file: docs/diagrams/po-bugs.mmd
+    covers:
+      - "backend:docs/BUGS.md"

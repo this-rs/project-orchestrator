@@ -36,6 +36,7 @@ impl Neo4jClient {
                 project_id: $project_id
             })
             CREATE (p)-[:HAS_RELEASE]->(r)
+            RETURN r.id AS created_id
             "#,
         )
         .param("id", release.id.to_string())
@@ -63,7 +64,13 @@ impl Neo4jClient {
         )
         .param("created_at", release.created_at.to_rfc3339());
 
-        self.graph.run(q).await?;
+        let mut result = self.graph.execute(q).await?;
+        if result.next().await?.is_none() {
+            anyhow::bail!(
+                "Failed to create release: Project {} not found in Neo4j",
+                release.project_id
+            );
+        }
         Ok(())
     }
 
@@ -400,5 +407,72 @@ impl Neo4jClient {
         }
 
         Ok((releases, total as usize))
+    }
+}
+
+#[cfg(test)]
+mod parent_existence_tests {
+    use super::super::models::{ReleaseNode, ReleaseStatus};
+    use super::super::traits::GraphStore;
+    use crate::neo4j::mock::MockGraphStore;
+    use uuid::Uuid;
+
+    fn dummy_release(project_id: Uuid) -> ReleaseNode {
+        ReleaseNode {
+            id: Uuid::new_v4(),
+            version: "0.0.1".into(),
+            title: None,
+            description: None,
+            status: ReleaseStatus::Planned,
+            target_date: None,
+            released_at: None,
+            created_at: chrono::Utc::now(),
+            project_id,
+        }
+    }
+
+    /// create_release must return Err when the project does not exist.
+    /// Regression for bug 3693617b.
+    #[tokio::test]
+    async fn create_release_rejects_missing_project() {
+        let db = MockGraphStore::new();
+        let ghost_project = Uuid::new_v4();
+        let r = dummy_release(ghost_project);
+        let err = db.create_release(&r).await.unwrap_err();
+        assert!(
+            err.to_string().contains("not found in Neo4j"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// create_release must succeed when the project exists.
+    #[tokio::test]
+    async fn create_release_accepts_existing_project() {
+        use super::super::models::{ProjectNode, ProjectProfile};
+        let db = MockGraphStore::new();
+        let project = ProjectNode {
+            id: Uuid::new_v4(),
+            name: "proj".into(),
+            slug: "proj".into(),
+            root_path: String::new(),
+            description: None,
+            created_at: chrono::Utc::now(),
+            last_synced: None,
+            analytics_computed_at: None,
+            last_co_change_computed_at: None,
+            default_note_energy: None,
+            scaffolding_override: None,
+            sharing_policy: None,
+            watch_enabled: false,
+            profile: ProjectProfile::Software,
+        };
+        db.projects
+            .write()
+            .await
+            .insert(project.id, project.clone());
+        let r = dummy_release(project.id);
+        db.create_release(&r).await.unwrap();
+        let stored = db.get_release(r.id).await.unwrap();
+        assert!(stored.is_some());
     }
 }

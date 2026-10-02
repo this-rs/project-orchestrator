@@ -1274,6 +1274,9 @@ mod tests {
         use crate::neo4j::models::DecisionStatus;
         let store = crate::neo4j::mock::MockGraphStore::new();
         let task = Uuid::new_v4();
+        let mut parent = crate::test_helpers::test_task();
+        parent.id = task;
+        store.create_task(Uuid::new_v4(), &parent).await.unwrap();
         let mut accepted = crate::test_helpers::test_decision("use A", "because");
         accepted.status = DecisionStatus::Accepted;
         let mut superseded = crate::test_helpers::test_decision("use B", "old");
