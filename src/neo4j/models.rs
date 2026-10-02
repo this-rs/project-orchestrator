@@ -3995,8 +3995,7 @@ mod status_display_tests {
             assert_eq!(
                 s.to_string(),
                 serde_str,
-                "Display and serde disagree for {s:?}: Display={}, serde={serde_str}",
-                s.to_string()
+                "Display and serde disagree for {s:?}: Display={s}, serde={serde_str}"
             );
         }
     }
