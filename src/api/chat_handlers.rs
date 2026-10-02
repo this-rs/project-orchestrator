@@ -2508,12 +2508,16 @@ mod tests {
         assert_ne!(status, StatusCode::GONE);
         assert_ne!(status, StatusCode::NOT_FOUND, "{body}");
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
-        assert!(
-            body["error"]
-                .as_str()
-                .unwrap()
-                .contains("resumed InteractiveClient"),
-            "the error must come from resume_session spawning the CLI: {body}"
+        // A 500 here can only come from `AppError::Internal`, which is what
+        // `resume_session` returns when the spawn fails — the 410/404 checks
+        // above are what prove it was *tried*. The body must therefore be the
+        // generic message and must NOT name the internal failure: this PR stops
+        // leaking DB errors, paths and queries to clients, and the old
+        // assertion on "resumed InteractiveClient" depended on that leak.
+        assert_eq!(
+            body["error"].as_str().unwrap(),
+            crate::api::handlers::INTERNAL_ERROR_MESSAGE,
+            "an internal failure must reach the client generic: {body}"
         );
     }
 
