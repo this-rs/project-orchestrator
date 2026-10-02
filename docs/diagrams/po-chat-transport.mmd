@@ -56,7 +56,7 @@ flowchart TD
         LAG["✅ broadcast en retard (Lagged) → trame events_lagged<br/>(le client se reconnecte et rejoue l'écart)<br/><i>vérifié : test_broadcast_close_returns_closed_error</i>"]
         DORMANT["✅ broadcast fermé (CLI nettoyé) → trame session_dormant,<br/>re-souscription après reprise<br/><i>vérifié : test_session_dormant_json_format, test_resubscribe_after_broadcast_close,<br/>test_dormant_resume_lifecycle</i>"]
         FRAMES["✅ trames serveur hors ChatEvent : auth_ok, partial_text, replay_complete,<br/>events_lagged, session_dormant, error<br/><i>vérifié : test_session_dormant_json_format</i>"]
-        NOCLOSED["🔴 session_closed : attendue et testée par le frontend<br/>(chatWebSocket.test « disconnect on session_closed ») mais jamais émise ici<br/>(grep session_closed src → 0 hors FSM) → code client mort, contrat front↔back divergent"]
+        NOCLOSED["🟠 session_closed : jamais émise ici (grep session_closed src → 0 hors FSM), et le<br/>frontend la traite comme branche RÉSERVÉE (« explicit close — future use »). Fermer une<br/>session supprime son canal → session_dormant, le client reste connecté : voulu.<br/>L'émettre serait un changement de contrat à décider à part"]
         SELECT --> LAG
         SELECT --> DORMANT
         FRAMES --> NOCLOSED

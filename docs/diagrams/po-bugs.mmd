@@ -46,7 +46,7 @@ graph TD
 
     subgraph chat_dead ["chat"]
         B9["✅ InputRequest type mort\njamais émis en prod\ndocumenté · attention.rs:31"]
-        B11["🔴 contrat WS front↔back divergent\nsession_closed jamais émise · ClientMessage mort\nsession_error / tools_cancelled non rendus\nuseConversationWs ×3 · tâche c2139265"]
+        B11["✅ session_error non rendu · ClientMessage mort\nrejoue-sans · frontend#198 · chatAssembly.sessionError.test\n🟠 reste : useConversationWs ×3 implémentations divergentes\ntâche c2139265 (session_closed = réservé, tools_cancelled = voulu)"]
         B12["🔴 ChatConfig::mcp_server_config code mort\nbuild_options construit McpServerConfig::Stdio\ntâche e6919f99"]
     end
 

@@ -29,7 +29,7 @@
 %%     (deriveInputAction), chatUrlState.ts, sessionListUtils.ts, tools/index.tsx (TOOL_REGISTRY)
 %%   Commandes : grep -rn 'function useConversationWs' src  → 3 définitions
 %%               grep -n 'session_error\|tools_cancelled' src/hooks/useChat.ts src/utils/chatAssembly.ts → 0
-%%               grep -rn 'ClientMessage\b' src | grep -v WsChatClientMessage → définition + 2 commentaires
+%%               grep -rn 'ClientMessage\b' src | grep -v WsChatClientMessage → 0 (type supprimé, frontend#198)
 %% ---
 %% CONVENTION : « 🟠 écrit, sans test » = le code existe et a été lu, mais aucun test ne le
 %%   prouve ; la vérification est décidée et pas écrite (tâche 3.3 du plan). Un ✅ nomme son test.
@@ -65,8 +65,8 @@ flowchart TD
         CONSUMED["✅ trames consommées, jamais transmises à onEvent :<br/>auth_ok, auth_error, replay_complete, events_lagged,<br/>session_dormant (reste connecté), session_closed (arrêt)<br/><i>vérifié : chatWebSocket.test (session_dormant / session_closed)</i>"]
         SEND["✅ WsChatClientMessage : user_message, interrupt,<br/>permission_response, input_response, set_permission_mode,<br/>set_model, set_auto_continue ; faux si socket mort<br/><i>vérifié : chatWebSocket.test (send on a dead socket returns false)</i>"]
         ADAPTER["🟠 wsAdapter.createWebSocket<br/>BrowserWebSocket ou TauriWebSocket<br/>écrit, sans test"]
-        DEADTYPE["🔴 types/chat.ts ClientMessage<br/>type mort : champs tool_call_id/allowed divergents<br/>de WsChatClientMessage ; aucun usage hors commentaires (grep)"]
-        NOCLOSED["🔴 session_closed : consommée et testée ici (chatWebSocket.test<br/>« disconnect on session_closed ») mais JAMAIS émise par le backend<br/>(grep session_closed backend/src → 0 hors FSM) → branche morte,<br/>contrat front↔back divergent (voir po-chat-transport)"]
+        DEADTYPE["✅ types/chat.ts ClientMessage supprimé (type mort, champs divergents<br/>de WsChatClientMessage)<br/><i>vérifié : grep -rn 'ClientMessage\b' src | grep -v WsChatClientMessage → 0 ; tsc propre (frontend#198)</i>"]
+        NOCLOSED["🟠 session_closed : branche RÉSERVÉE (le code dit « explicit close — future use »),<br/>testée ici (chatWebSocket.test) mais sans producteur : le backend ferme une session<br/>en supprimant son canal → session_dormant, le client reste connecté (voulu).<br/>Décision : la garder ; l'émettre serait un changement de contrat à part<br/><i>vérifié : grep session_closed backend/src → 0 hors FSM</i>"]
         CONNECT --> AUTH --> REPLAY
         CONNECT --> ADAPTER
         RECONNECT --> CONNECT
@@ -86,12 +86,14 @@ flowchart TD
         ACTIONS["✅ respondPermission / respondInput / sendContinue<br/>ne mutent l'état que si le socket a accepté l'envoi<br/><i>vérifié : useChat.sendResult.test</i>"]
         INTERRUPT["🟠 interrupt() : ws.sendInterrupt, sinon REST<br/>chatApi.interruptSession(sid) ; isStreaming=false si non livré<br/>écrit, sans test"]
         OUTBOX["🟠 pendingSendRef : messages tombés sur un socket mort,<br/>rejoués à replay_complete — écrit, sans test"]
-        UNHANDLED["🔴 session_error et tools_cancelled : typés dans ChatEvent,<br/>aucun bras dans handleEvent ni historyEventsToMessages (grep)<br/>→ ignorés en silence"]
+        UNHANDLED["✅ session_error : rendu en bloc d'erreur « message (raison) » par handleEvent,<br/>historyEventsToMessages et les deux parseurs privés ; isStreaming remis à faux en live<br/><i>vérifié : chatAssembly.sessionError.test — 2 échecs sur main, 2 passes avec le correctif (frontend#198)</i>"]
+        TOOLSCANCEL["🟠 tools_cancelled : volontairement non rendu — chaque outil reçoit déjà son<br/>tool_cancelled ; un second bloc ferait doublon (décision prise, rien à écrire)"]
         ASKQ["🟠 ⚓ branche toolName === #quot;AskUserQuestion#quot;<br/>→ bloc ask_user_question (useChat ET chatAssembly)<br/>nom d'outil Claude Code codé en dur ; sans test dédié"]
         EFFECT --> GATES --> REDUCE
         REDUCE --> RESYNC
         REDUCE --> AUTOAPPROVE
         REDUCE --> UNHANDLED
+        REDUCE --> TOOLSCANCEL
         REDUCE --> ASKQ
     end
 
@@ -115,7 +117,7 @@ flowchart TD
     subgraph readonly["Lecteurs seuls — hooks/runner/useConversationWs.ts"]
         direction TB
         RO["🟠 useConversationWs : last_event=0, rejeu complet,<br/>n'envoie que #quot;ready#quot;, reconstruit historyEventsToMessages<br/>à chaque événement — écrit, sans test"]
-        DUP["🔴 trois copies de useConversationWs :<br/>hooks/runner/useConversationWs.ts,<br/>components/runner/ConversationPanel.tsx,<br/>components/discussions/InlineConversationPanel.tsx<br/>(grep 'function useConversationWs') → dérive garantie"]
+        DUP["🔴 trois implémentations sous le même nom useConversationWs (PAS des copies) :<br/>hooks/runner/useConversationWs.ts passe par historyEventsToMessages ;<br/>ConversationPanel.tsx et InlineConversationPanel.tsx ont chacun un ancien parseur privé<br/>(type local ConversationMessage) qui ne l'utilise pas — seul session_error y a été ajouté<br/><i>vérifié : grep -c historyEventsToMessages sur les trois fichiers → 4, 0, 0</i>"]
         RO --> DUP
     end
 

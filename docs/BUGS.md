@@ -69,7 +69,8 @@ merge + CI verte (status: completed)
 | `ChatEvent::InputRequest` défini mais jamais émis (type mort, non supprimé) | chat | low | ✅ documenté | commentaire `attention.rs:31` |
 | `update_workspace_milestone` paniquait sur id inconnu | api | medium | ✅ ci-verte | PR #483 |
 | `check-index.mjs` ne lit pas l'index dérivé de nexus (77 fichiers comptés orphelins) et `--write-orphans` relève les plafonds par dépôt | docs | medium | 🟠 PR | [fix/diagrams-gate-neighbour-index](https://github.com/this-rs/project-orchestrator/tree/fix/diagrams-gate-neighbour-index) · tâche PO `efa9fd3c` |
-| Contrat WS front↔back divergent : `session_closed` jamais émise, `ClientMessage` mort, `session_error`/`tools_cancelled` non rendus, `useConversationWs` en trois copies | chat | medium | 🔴 ouvert | tâche PO `c2139265` · nœuds 🔴 de po-chat-transport et po-frontend-chat |
+| `session_error` (mort du CLI) non rendu par le frontend, et type mort `ClientMessage` | chat | medium | ✅ rejoue-sans | frontend#198 · `chatAssembly.sessionError.test` |
+| `useConversationWs` : trois implémentations sous le même nom, dont deux anciens parseurs privés qui contournent `historyEventsToMessages` | chat | low | 🔴 ouvert | tâche PO `c2139265` |
 | `ChatConfig::mcp_server_config` : aucun appelant de production (`build_options` construit `McpServerConfig::Stdio`) | chat | low | 🔴 ouvert | tâche PO `e6919f99` · nœud MCPJSON de po-chat-manager |
 
 ### Bugs non reproduits / invalidés après vérification du code
