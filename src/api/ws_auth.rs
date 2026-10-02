@@ -148,13 +148,19 @@ pub async fn ws_authenticate(
 
     // 2. Try cookie first (primary path — works in normal browsers)
     let cookie_result = try_cookie_auth(headers, config, neo4j).await;
-    if let Some(result) = cookie_result {
-        return result;
-    }
+    let cookie_failure = match cookie_result {
+        Some(ok @ CookieAuthResult::Authenticated(_)) => return ok,
+        // An unusable cookie (stale, wrong user) must not shadow a valid ticket.
+        Some(invalid) if ticket.is_none() => return invalid,
+        other => other,
+    };
 
-    // 3. No cookie → try ticket fallback (Tauri/WKWebView workaround)
+    // 3. No usable cookie → try ticket fallback (Tauri/WKWebView workaround)
     if let Some(ticket_value) = ticket {
-        debug!("WS auth: no cookie, trying ticket fallback");
+        debug!(
+            cookie_rejected = cookie_failure.is_some(),
+            "WS auth: no usable cookie, trying ticket fallback"
+        );
         if let Some(claims) = ticket_store.consume_ticket(ticket_value).await {
             debug!(email = %claims.email, "WS auth: authenticated via ticket");
             return CookieAuthResult::Authenticated(claims);
@@ -229,6 +235,14 @@ async fn try_cookie_auth(
             )));
         }
     };
+
+    // Same allowlist as the HTTP middleware.
+    if !config.is_email_allowed(&email) {
+        warn!("WS cookie auth: email not allowed by server policy");
+        return Some(CookieAuthResult::Invalid(
+            "Email not allowed by server policy".to_string(),
+        ));
+    }
 
     // Build Claims
     let now = chrono::Utc::now().timestamp();
@@ -886,5 +900,54 @@ mod tests {
     #[test]
     fn test_ready_timeout_constant() {
         assert_eq!(READY_TIMEOUT_SECS, 5);
+    }
+
+    #[tokio::test]
+    async fn test_cookie_auth_refuses_email_outside_allowlist() {
+        let (mock, _user_id, raw_token) = setup_mock_with_user_and_token().await;
+        let headers = headers_with_cookie(&raw_token);
+        let mut cfg = test_auth_config();
+        cfg.allowed_email_domain = Some("other.example".to_string());
+        let config = Some(cfg);
+        let store = empty_store();
+
+        let result = ws_authenticate(
+            &headers,
+            &config,
+            &(mock as Arc<dyn GraphStore>),
+            None,
+            &store,
+        )
+        .await;
+
+        assert!(
+            matches!(result, CookieAuthResult::Invalid(_)),
+            "user outside the allowlist must be refused, got {:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn test_invalid_cookie_falls_back_to_valid_ticket() {
+        let mock = Arc::new(MockGraphStore::new());
+        let headers = headers_with_cookie("not-a-known-refresh-token");
+        let config = Some(test_auth_config());
+        let store = empty_store();
+        let ticket = store.create_ticket(Claims::anonymous()).await;
+
+        let result = ws_authenticate(
+            &headers,
+            &config,
+            &(mock as Arc<dyn GraphStore>),
+            Some(&ticket),
+            &store,
+        )
+        .await;
+
+        assert!(
+            matches!(result, CookieAuthResult::Authenticated(_)),
+            "a valid ticket must be honoured when the cookie is stale, got {:?}",
+            result
+        );
     }
 }
