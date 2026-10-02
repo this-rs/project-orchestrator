@@ -7114,7 +7114,20 @@ mod tests {
 
     /// Build a simple test router (no seeded data)
     async fn test_app() -> axum::Router {
-        let app_state = mock_app_state();
+        test_app_parts(Arc::new(crate::neo4j::mock::MockGraphStore::new()))
+            .await
+            .0
+    }
+
+    /// The router plus the event bus it emits on and the store behind it, so a test
+    /// can seed entities directly and read back the events a handler emitted.
+    async fn test_app_parts(
+        graph: Arc<crate::neo4j::mock::MockGraphStore>,
+    ) -> (axum::Router, Arc<crate::events::HybridEmitter>) {
+        let app_state = crate::test_helpers::mock_app_state_with_graph(graph);
+        let event_bus = Arc::new(crate::events::HybridEmitter::new(Arc::new(
+            crate::events::EventBus::default(),
+        )));
         let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
         let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
             orchestrator.clone(),
@@ -7123,9 +7136,7 @@ mod tests {
             orchestrator,
             watcher,
             chat_manager: None,
-            event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(
-                crate::events::EventBus::default(),
-            ))),
+            event_bus: event_bus.clone(),
             nats_emitter: None,
             auth_config: Some(crate::test_helpers::test_auth_config()),
             serve_frontend: false,
@@ -7148,7 +7159,7 @@ mod tests {
             model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
             vault: crate::vault::VaultService::ephemeral(),
         });
-        create_router(state)
+        (create_router(state), event_bus)
     }
 
     /// Create an authenticated POST request with JSON body
@@ -7160,6 +7171,157 @@ mod tests {
             .header("content-type", "application/json")
             .body(Body::from(serde_json::to_string(&body).unwrap()))
             .unwrap()
+    }
+
+    /// Create an authenticated PATCH request with JSON body
+    fn auth_patch_json(uri: &str, body: serde_json::Value) -> Request<Body> {
+        Request::builder()
+            .method("PATCH")
+            .uri(uri)
+            .header("authorization", test_bearer_token())
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap()
+    }
+
+    fn drain_events(
+        rx: &mut tokio::sync::broadcast::Receiver<crate::events::CrudEvent>,
+    ) -> Vec<crate::events::CrudEvent> {
+        let mut out = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            out.push(e);
+        }
+        out
+    }
+
+    /// A status in a WS event must read as the wire format (snake_case), the same
+    /// string the JSON responses carry. Debug formatting leaked `InProgress`.
+    fn assert_payload_has(events: &[crate::events::CrudEvent], key: &str, want: &str) {
+        let hit = events
+            .iter()
+            .any(|e| e.payload.get(key).and_then(|v| v.as_str()) == Some(want));
+        assert!(hit, "no event carried {key}={want}: {events:?}");
+    }
+
+    #[tokio::test]
+    async fn test_create_plan_event_carries_snake_case_status() {
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let (app, bus) = test_app_parts(graph).await;
+        let mut rx = bus.subscribe();
+        let resp = app
+            .oneshot(auth_post_json(
+                "/api/plans",
+                serde_json::json!({"title": "P", "description": "d"}),
+            ))
+            .await
+            .unwrap();
+        assert!(resp.status().is_success(), "{}", resp.status());
+        assert_payload_has(&drain_events(&mut rx), "status", "draft");
+    }
+
+    #[tokio::test]
+    async fn test_update_plan_status_event_carries_snake_case_status() {
+        use crate::neo4j::GraphStore as _;
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let plan = crate::test_helpers::test_plan();
+        graph.create_plan(&plan).await.unwrap();
+        let (app, bus) = test_app_parts(graph).await;
+        let mut rx = bus.subscribe();
+        let resp = app
+            .oneshot(auth_patch_json(
+                &format!("/api/plans/{}", plan.id),
+                serde_json::json!({"status": "in_progress"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let events = drain_events(&mut rx);
+        assert_payload_has(&events, "new_status", "in_progress");
+        assert_payload_has(&events, "old_status", "draft");
+    }
+
+    #[tokio::test]
+    async fn test_update_task_status_event_carries_snake_case_status() {
+        use crate::neo4j::GraphStore as _;
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let plan = crate::test_helpers::test_plan();
+        graph.create_plan(&plan).await.unwrap();
+        let task = crate::test_helpers::test_task();
+        graph.create_task(plan.id, &task).await.unwrap();
+        let (app, bus) = test_app_parts(graph).await;
+        let mut rx = bus.subscribe();
+        let resp = app
+            .oneshot(auth_patch_json(
+                &format!("/api/tasks/{}", task.id),
+                serde_json::json!({"status": "in_progress"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let events = drain_events(&mut rx);
+        assert_payload_has(&events, "new_status", "in_progress");
+        assert_payload_has(&events, "old_status", "pending");
+    }
+
+    #[tokio::test]
+    async fn test_add_constraint_event_carries_snake_case_type() {
+        use crate::neo4j::GraphStore as _;
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let plan = crate::test_helpers::test_plan();
+        graph.create_plan(&plan).await.unwrap();
+        let (app, bus) = test_app_parts(graph).await;
+        let mut rx = bus.subscribe();
+        let resp = app
+            .oneshot(auth_post_json(
+                &format!("/api/plans/{}/constraints", plan.id),
+                serde_json::json!({"constraint_type": "performance", "description": "fast"}),
+            ))
+            .await
+            .unwrap();
+        assert!(resp.status().is_success(), "{}", resp.status());
+        assert_payload_has(&drain_events(&mut rx), "constraint_type", "performance");
+    }
+
+    #[tokio::test]
+    async fn test_update_release_status_event_carries_snake_case_status() {
+        use crate::neo4j::GraphStore as _;
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let project = crate::test_helpers::test_project();
+        graph.create_project(&project).await.unwrap();
+        let release = crate::test_helpers::test_release(project.id, "1.0.0");
+        graph.create_release(&release).await.unwrap();
+        let (app, bus) = test_app_parts(graph).await;
+        let mut rx = bus.subscribe();
+        let resp = app
+            .oneshot(auth_patch_json(
+                &format!("/api/releases/{}", release.id),
+                serde_json::json!({"status": "in_progress"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert_payload_has(&drain_events(&mut rx), "new_status", "in_progress");
+    }
+
+    #[tokio::test]
+    async fn test_update_milestone_status_event_carries_snake_case_status() {
+        use crate::neo4j::GraphStore as _;
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let project = crate::test_helpers::test_project();
+        graph.create_project(&project).await.unwrap();
+        let milestone = crate::test_helpers::test_milestone(project.id, "M1");
+        graph.create_milestone(&milestone).await.unwrap();
+        let (app, bus) = test_app_parts(graph).await;
+        let mut rx = bus.subscribe();
+        let resp = app
+            .oneshot(auth_patch_json(
+                &format!("/api/milestones/{}", milestone.id),
+                serde_json::json!({"status": "in_progress"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert_payload_has(&drain_events(&mut rx), "new_status", "in_progress");
     }
 
     /// Create an authenticated DELETE request
