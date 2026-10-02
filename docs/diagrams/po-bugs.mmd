@@ -1,10 +1,11 @@
 %% name: po-bugs
 %% covers: backend:docs/BUGS.md
-%% verified: 85340dec
-%%
+%% verified: d42312a2
+%% ---
 %% PROUVE : inventaire des bugs du dépôt project-orchestrator/backend
-%%   relu contre le code au sha 85340dec (2026-10-02)
-%%
+%%   relu contre le code au sha d42312a2 (2026-10-02, soir) : PR #500 et #501 fusionnees,
+%%   trois bugs ajoutes depuis les cartes po-chat-manager, po-chat-transport, po-frontend-chat
+%% ---
 %% SOURCES LUES :
 %%   src/api/protocol_handlers.rs  — FireTransitionBody { trigger }
 %%   src/api/routes.rs             — routes retry / progress / neighborhood / transition présentes
@@ -15,10 +16,10 @@
 %%   src/chat/types.rs             — ChatEvent::PermissionRequest, pas d'InputRequest émis
 %%   src/neo4j/task.rs             — format!("{:?}", task.status) encore présent sur main
 %%   src/neo4j/plan.rs             — format!("{:?}", plan.status) encore présent sur main
-%%
+%% ---
 %% NON ETABLI :
 %%   update_workspace_milestone : aucune occurrence dans handlers.rs → validé absent
-%%
+%% ---
 %% LEGENDE
 %%   🔴 ouvert       🟠 PR ouverte       ✅ corrigé + preuve (mock/neo4j-reel/rejoue-sans/ci-verte)
 %%   ⚪ hors périmètre
@@ -27,8 +28,8 @@ graph TD
     REGISTRY["📋 po-bugs — registre"]
 
     subgraph neo4j ["neo4j"]
-        B1["🟠 TaskStatus+ConstraintType {:?}\nWS payload + compaction\nPR #501"]
-        B2["🟠 create_release/decision/constraint Ok\nparent absent → silencieux\nPR #500"]
+        B1["✅ TaskStatus+ConstraintType {:?}\nWS payload + compaction\nci-verte · PR #501 (d42312a2)"]
+        B2["✅ create_release/decision/constraint Ok\nparent absent → silencieux\nci-verte · PR #500 (64e508e6)"]
         B3["✅ Injection Cypher WhereBuilder\nci-verte · PR #489\nsafe_entity_label"]
     end
 
@@ -45,6 +46,12 @@ graph TD
 
     subgraph chat_dead ["chat"]
         B9["✅ InputRequest type mort\njamais émis en prod\ndocumenté · attention.rs:31"]
+        B11["🔴 contrat WS front↔back divergent\nsession_closed jamais émise · ClientMessage mort\nsession_error / tools_cancelled non rendus\nuseConversationWs ×3 · tâche c2139265"]
+        B12["🔴 ChatConfig::mcp_server_config code mort\nbuild_options construit McpServerConfig::Stdio\ntâche e6919f99"]
+    end
+
+    subgraph docs_gate ["docs / gate"]
+        B10["🟠 check-index.mjs : index dérivé de nexus illisible\n+ --write-orphans relevait les plafonds par dépôt\nPR fix/diagrams-gate-neighbour-index · 5 tests rouges sans · tâche efa9fd3c"]
     end
 
     REGISTRY --> B1
@@ -56,3 +63,6 @@ graph TD
     REGISTRY --> B7
     REGISTRY --> B8
     REGISTRY --> B9
+    REGISTRY --> B10
+    REGISTRY --> B11
+    REGISTRY --> B12

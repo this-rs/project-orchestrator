@@ -35,12 +35,14 @@ diagrams:
       - "backend:src/events/{mod,bus,hybrid,reactor,trigger,builtin_triggers,reactions}.rs"
   - name: po-chat-manager
     owner: theotime
-    status: planned
+    status: verified
+    file: docs/diagrams/po-chat-manager.mmd
     covers:
-      - "backend:src/chat/{mod,manager,drain,post_stream,control_pump,oob_listener,config,types}.rs"
+      - "backend:src/chat/{mod,manager,drain,post_stream,control_pump,oob_listener,config,types,skill_hook,post_tool_hook,hook_ledger,cli_auth,cli_version,model_catalog,compaction_context}.rs"
   - name: po-chat-transport
     owner: theotime
-    status: planned
+    status: verified
+    file: docs/diagrams/po-chat-transport.mmd
     covers:
       - "backend:src/api/ws_chat_handler.rs"
   - name: po-p2p-transport
@@ -100,14 +102,19 @@ diagrams:
       - "backend:scripts/build-desktop.sh"
   - name: po-frontend-chat
     owner: theotime
-    status: planned
+    status: verified
+    file: docs/diagrams/po-frontend-chat.mmd
     covers:
-      - "frontend:src/services/chatWebSocket.ts"
-      - "frontend:src/hooks/{useChat,useSessionTree}.ts"
-      - "frontend:src/atoms/chat.ts"
+      - "frontend:src/services/{chatWebSocket,chat,wsAdapter}.ts"
+      - "frontend:src/hooks/{useChat,useChatUrlSync,useSessionTree}.ts"
+      - "frontend:src/hooks/runner/useConversationWs.ts"
+      - "frontend:src/atoms/{chat,modelCatalog}.ts"
       - "frontend:src/utils/chatAssembly.ts"
-      - "frontend:src/components/chat/{ChatMessageBubble,ChatSessionContext,PermissionRequestBlock,SessionList}.tsx"
+      - "frontend:src/types/chat.ts"
+      - "frontend:src/constants/models.ts"
+      - "frontend:src/components/chat/{ChatPanel,ChatInput,ChatMessages,ChatMessageBubble,ChatSessionContext,PermissionRequestBlock,PermissionSettingsPanel,SessionList}.tsx"
       - "frontend:src/components/chat/{messageQueue,inputAction,chatUrlState,sessionListUtils}.ts"
+      - "frontend:src/components/chat/tools/**"
   - name: po-frontend-shell
     owner: theotime
     status: planned

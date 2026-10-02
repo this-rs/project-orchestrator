@@ -55,12 +55,12 @@ merge + CI verte (status: completed)
        + nœud ✅ dans po-bugs (niveau de preuve)
 ```
 
-## Inventaire (état au commit `85340dec`, 2026-10-02)
+## Inventaire (état au commit `d42312a2`, 2026-10-02)
 
 | Bug | Domaine | Sévérité | Statut | PR / commit |
 |---|---|---|---|---|
-| `TaskStatus` et `ConstraintType` sérialisés en `{:?}` dans le payload WS et le prompt de compaction | api | medium | 🟠 PR #501 | [fix/task-status-debug-format](https://github.com/this-rs/project-orchestrator/pull/501) |
-| `create_release`, `create_decision`, `create_constraint` renvoient `Ok(())` quand le parent est absent | neo4j | high | 🟠 PR #500 | [fix/neo4j-parent-existence-check](https://github.com/this-rs/project-orchestrator/pull/500) |
+| `TaskStatus` et `ConstraintType` sérialisés en `{:?}` dans le payload WS et le prompt de compaction | api | medium | ✅ ci-verte | PR #501 (`d42312a2`) |
+| `create_release`, `create_decision`, `create_constraint` renvoient `Ok(())` quand le parent est absent | neo4j | high | ✅ ci-verte | PR #500 (`64e508e6`) |
 | `protocolApi.triggerEvent` envoyait `{event}` au lieu de `{trigger}` | frontend | high | ✅ ci-verte | PR #466 |
 | Routes frontend appelant le backend absent (`retry`, `/api/progress`, `neighborhood`, `runs/{id}/history`) | api | high | ✅ ci-verte | PR #466 + routes ajoutées |
 | Tombstone signé par 128 zéros (signature non vérifiée) | auth | critical | ✅ ci-verte | PR #490 |
@@ -68,6 +68,9 @@ merge + CI verte (status: completed)
 | `require_auth` en mode anonyme sans configuration explicite | auth | high | ✅ ci-verte | PR #480 |
 | `ChatEvent::InputRequest` défini mais jamais émis (type mort, non supprimé) | chat | low | ✅ documenté | commentaire `attention.rs:31` |
 | `update_workspace_milestone` paniquait sur id inconnu | api | medium | ✅ ci-verte | PR #483 |
+| `check-index.mjs` ne lit pas l'index dérivé de nexus (77 fichiers comptés orphelins) et `--write-orphans` relève les plafonds par dépôt | docs | medium | 🟠 PR | [fix/diagrams-gate-neighbour-index](https://github.com/this-rs/project-orchestrator/tree/fix/diagrams-gate-neighbour-index) · tâche PO `efa9fd3c` |
+| Contrat WS front↔back divergent : `session_closed` jamais émise, `ClientMessage` mort, `session_error`/`tools_cancelled` non rendus, `useConversationWs` en trois copies | chat | medium | 🔴 ouvert | tâche PO `c2139265` · nœuds 🔴 de po-chat-transport et po-frontend-chat |
+| `ChatConfig::mcp_server_config` : aucun appelant de production (`build_options` construit `McpServerConfig::Stdio`) | chat | low | 🔴 ouvert | tâche PO `e6919f99` · nœud MCPJSON de po-chat-manager |
 
 ### Bugs non reproduits / invalidés après vérification du code
 

@@ -1,0 +1,187 @@
+%% name: po-chat-manager
+%% covers: backend:src/chat/{mod,manager,drain,post_stream,control_pump,oob_listener,config,types,skill_hook,post_tool_hook,hook_ledger,cli_auth,cli_version,model_catalog,compaction_context}.rs
+%% verified: d42312a2
+%% ---
+%% PROUVE : le harness de chat côté serveur — comment ChatManager lance, pilote et
+%%   ferme une session Claude Code via le SDK nexus_claude (InteractiveClient), et où
+%%   le couplage avec Claude Code est inscrit — tel que le code le fait au sha d42312a2
+%%   (relu le 2026-10-02 ; SDK épinglé par Cargo.toml : nexus-claude rev 2887a5ab).
+%% ---
+%% SOURCES LUES (backend@d42312a2) :
+%%   src/chat/manager.rs        — ChatManager, ActiveSession, CompactionNotifier, create_session,
+%%                                resume_session, build_system_prompt, build_options, stream_response,
+%%                                message_to_events, mask_cli_message, send_message, route_user_message,
+%%                                route_permission_response, send_permission_response_inner,
+%%                                set_session_permission_mode, set_session_model, interrupt_scoped,
+%%                                cancel_running_tools, cancel_task, close_session, handle_control_msg,
+%%                                parse_permission_control_msg
+%%   src/chat/control_pump.rs   — spawn, MAX_CONCURRENT_HOOKS
+%%   src/chat/drain.rs          — drain_pending_messages
+%%   src/chat/oob_listener.rs   — spawn_oob_listener, should_trigger_turn, check_and_record_trigger_cap,
+%%                                emit_subprocess_death
+%%   src/chat/post_stream.rs    — PostStreamContext::build, PostStreamHandler::handle_*
+%%   src/chat/skill_hook.rs     — SkillActivationHook ; src/chat/post_tool_hook.rs — PostToolUseRedirectHook
+%%   src/chat/hook_ledger.rs    — HookLedger, HookLedgerReset
+%%   src/chat/config.rs         — PermissionConfig::to_nexus_mode, DEFAULT_ALLOWED_TOOLS, ChatConfig,
+%%                                ChatConfig::mcp_server_config
+%%   src/chat/types.rs          — ChatEvent (31 variantes), classify_api_error, RETRYABLE_ERROR_TYPES
+%%   src/chat/cli_version.rs    — check_cli_status, install_or_upgrade_cli
+%%   src/chat/cli_auth.rs       — check_cli_auth_status
+%%   src/chat/model_catalog.rs  — ModelCatalogCache::get_models, read_claude_code_oauth_token
+%%   src/chat/compaction_context.rs — CompactionContextBuilder::build_for_task / build_for_session
+%%   Commandes : grep -rl nexus_claude src → 13 fichiers, 12 de prod (liste dans le nœud K1)
+%%               grep -rn 'mcp_server_config()' src → 2 tests config.rs + 1 test manager.rs, 0 prod
+%%               grep -rln from_transport src → manager.rs, post_stream.rs, oob_listener.rs (tests seulement)
+%%               grep -rn session_closed src → 0 hors src/protocol (FSM), le backend n'émet pas cette trame
+%% ---
+%% CONVENTION : « 🟠 écrit, sans test » = code lu, aucun test ne le prouve. Un ✅ nomme son test.
+%%   Les comptes de tests sont ceux de `grep -c '#\[test\]|#\[tokio::test\]'` par fichier.
+%% ---
+%% NON ETABLI :
+%%   le chemin NATS (sessions sur une autre instance : try_remote_send, request_send_message)
+%%   n'est relu qu'en surface : ses tests tournent sans NATS réel
+%%   build_system_prompt : composer.rs, prompt.rs, routing.rs, stages/* sont hors de ce diagramme
+%% ---
+%% LEGENDE
+%%   ✅ vérifié (le nœud dit par quel test)  🟠 décidé non écrit / écrit sans test
+%%   🔴 défaut constaté (raison dans le nœud)  ⚪ amont ou autre domaine
+%%   ⚓ = point de couplage avec Claude Code (protocole filaire, CLI, noms de modes/outils/modèles)
+
+flowchart TD
+    subgraph legend["Légende"]
+        direction LR
+        L1["✅ vérifié : test nommé"]
+        L2["🟠 écrit, sans test / décidé non écrit"]
+        L3["🔴 défaut constaté"]
+        L4["⚪ amont / autre domaine"]
+        L5["⚓ couplage Claude Code"]
+    end
+
+    WS["⚪ ws_chat_handler.rs (po-chat-transport)<br/>route_user_message, route_permission_response,<br/>interrupt, cancel_running_tools, set_session_*"]
+    REST["⚪ chat_handlers.rs (po-api)<br/>create_session, resume_session, close_session,<br/>get_cli_status, install_cli, get_cli_auth_status"]
+    RUNNER["⚪ runner/runner.rs (po-runner-orchestrator)<br/>execute_task → create_session avec<br/>permission_mode bypassPermissions, spawned_by runner"]
+    NEXUS["⚪ nexus_claude::InteractiveClient<br/>(nexus-sdk-interactive, nexus-sdk-transport)"]
+    CLI["⚪ processus claude (stream-json sur stdin/stdout)"]
+
+    subgraph entry["Ouvrir une session — create_session, resume_session"]
+        direction TB
+        CREATE["✅ create_session : max_sessions, ChatSessionNode en Neo4j,<br/>build_system_prompt, hooks, build_options,<br/>InteractiveClient::new → connect → initialize_hooks (échec non fatal),<br/>ConversationMemoryManager, écouteurs NATS, poller des tâches de fond<br/><i>vérifié : test_create_session_of_a_resumed_run_links_to_the_new_run (MockTransport)</i>"]
+        RESUME["✅ ⚓ resume_session : même séquence avec resume = cli_session_id<br/>(--resume du CLI) ; sans cli_session_id → session neuve ;<br/>relance pompe, OOB et écouteurs NATS<br/><i>vérifié : test_resume_session_keeps_identity_and_links,<br/>test_resume_session_no_cli_session_id_starts_fresh</i>"]
+        PROMPT["✅ build_system_prompt (indépendant du provider) :<br/>fetch_project_context → context_to_markdown → load_session_context<br/>→ FsmPromptComposer::compose_with_router (HeuristicRouter ou DualTrackRouter)<br/><i>vérifié : test_build_system_prompt_with_project / _with_active_plans / _no_project</i>"]
+        OPTIONS["✅ ⚓ build_options → ClaudeCodeOptions::builder :<br/>model, cwd, system_prompt, permission_mode (to_nexus_mode), max_turns,<br/>include_partial_messages, permission_prompt_tool_name stdio,<br/>cli_channel_buffer_size 8192, add_mcp_server project-orchestrator (Stdio +<br/>env NEO4J_*, MEILISEARCH_*, PO_SERVER_URL, PO_AUTH_TOKEN, PO_VAULT_TOKEN, PO_SESSION_ID),<br/>allowed_tools / disallowed_tools, resume, hooks, add_dir, env PATH, cli_path,<br/>secrets du serveur masqués par env(name, vide)<br/><i>vérifié : test_build_options_* (14 tests)</i>"]
+        HOOKS["✅ ⚓ hooks SDK (HookCallback) :<br/>PreCompact → CompactionNotifier (toujours) + HookLedgerReset (hors runner)<br/>PreToolUse → SkillActivationHook::with_ledger (hors runner)<br/>PostToolUse → PostToolUseRedirectHook (hors runner)<br/><i>vérifié : test_build_options_with_hooks, test_compaction_hook_e2e_dispatch_broadcasts_event,<br/>skill_hook.rs 68 tests, post_tool_hook.rs 7, hook_ledger.rs 7</i>"]
+        WIRES["✅ câblage hors verrou : clone_stdin_sender → stdin_tx ;<br/>take_sdk_control_receiver → control_pump::spawn ; child_pid ;<br/>subscribe_messages → oob_listener<br/><i>vérifié : control_pump.rs 4 tests, oob_listener.rs 34 tests</i>"]
+        CREATE --> PROMPT --> OPTIONS --> HOOKS --> WIRES
+        RESUME --> OPTIONS
+    end
+
+    REST --> CREATE
+    REST --> RESUME
+    RUNNER --> CREATE
+    WS -->|"reprise d'une session dormante"| RESUME
+    OPTIONS --> NEXUS
+    NEXUS <--> CLI
+
+    subgraph pump["Pompe de contrôle — control_pump.rs"]
+        direction TB
+        PUMP["✅ ⚓ spawn : une tâche par session possède le récepteur de contrôle ;<br/>hook_callback → dispatch_hook_from_registry → build_hook_response_json → stdin,<br/>en parallèle sous sémaphore MAX_CONCURRENT_HOOKS ;<br/>tout le reste (can_use_tool, control_response) → canal lu par stream_response<br/><i>vérifié : hooks_are_answered_even_when_no_turn_reads_the_forward_channel,<br/>non_hook_messages_are_forwarded_untouched_and_hooks_are_not,<br/>an_unknown_callback_does_not_block_the_next_hook, the_pump_stops_when_the_transport_closes</i>"]
+    end
+
+    WIRES --> PUMP
+
+    subgraph turn["Un tour — stream_response (fn associée, relancée par drain et OOB)"]
+        direction TB
+        ENRICH["⚪ EnrichmentPipeline::execute → to_system_prompt_markdown<br/>préfixé au message (enrichment.rs, stages/* : autre domaine)"]
+        SENDRECV["✅ ⚓ client.lock → send_and_receive_stream(prompt) ;<br/>select! biased : interrupt_token · control_rx · stream.next<br/><i>vérifié : test_interrupt_during_active_stream, streaming_session_is_kept</i>"]
+        CTRL["✅ ⚓ handle_control_msg → parse_permission_control_msg :<br/>can_use_tool → PermissionRequest (input mémorisé dans pending_permission_inputs) ;<br/>AskUserQuestion → auto-allow par control_response brut sur stdin_tx<br/><i>vérifié : live_snapshot_reports_the_permissions_each_live_cli_still_holds</i>"]
+        EVENTS["✅ ⚓ mask_cli_message (vault) → message_to_events :<br/>Assistant Text/Thinking/ToolUse/ToolResult, Result (subtype, coût),<br/>StreamEvent delta → StreamDelta, System init → SystemInit,<br/>compact_boundary → CompactBoundary, task_* → Workflow, User ToolResult ;<br/>parent_tool_use_id sur chaque événement (sous-agents)<br/><i>vérifié : test_message_to_events_* (29 tests), test_message_to_events_system_unknown</i>"]
+        RETRY["✅ classify_api_error : api_error / overloaded_error (5xx, 529) ;<br/>retente seulement si 0 token émis et non interrompu, RetryConfig.max_attempts,<br/>délai exponentiel interruptible → ChatEvent::Retrying<br/><i>vérifié : types.rs tests de classify_api_error, config.rs delay_for_attempt</i>"]
+        DEAD["✅ erreur de canal ou Not connected → session retirée d'active_sessions<br/>→ le prochain message passe par resume_session<br/><i>vérifié : test_dormant_resume_lifecycle (ws_chat_handler.rs)</i>"]
+        POST["✅ PostStreamHandler, dans l'ordre : handle_interrupt_cleanup →<br/>handle_post_compaction (SystemHint depuis CompactionContextBuilder, CompactionRecovery)<br/>→ handle_auto_continue (Continue après error_max_turns) → handle_objective_tracking<br/>→ persist_events → handle_feedback<br/><i>vérifié : post_stream.rs 40 tests (test_auto_continue_enriched, test_reminder_*)</i>"]
+        DRAIN["✅ drain_pending_messages : user avant system_hint avant background_output,<br/>FIFO dans une classe, relance stream_response par message<br/><i>vérifié : drain.rs test_priority_* (20 tests)</i>"]
+        ENRICH --> SENDRECV
+        SENDRECV --> CTRL
+        SENDRECV --> EVENTS
+        SENDRECV --> RETRY
+        SENDRECV --> DEAD
+        EVENTS --> POST --> DRAIN
+        DRAIN -.->|"message suivant"| SENDRECV
+    end
+
+    PUMP -->|"can_use_tool, control_response"| CTRL
+    WIRES --> SENDRECV
+    SENDRECV <--> NEXUS
+    EVENTS -->|"emit_chat : broadcast + nats.publish_chat_event"| WS
+
+    subgraph oob["Hors bande — oob_listener.rs"]
+        direction TB
+        OOB["✅ ⚓ spawn_oob_listener : subscribe_messages du client ;<br/>quand is_streaming est faux → BackgroundOutput (Monitor, BashOutput, Task)<br/>persisté et diffusé ; should_trigger_turn → relance un tour sous plafond<br/>(50 par 5 min, 5 pour un runner)<br/><i>vérifié : test_background_tool_output_triggers_a_turn,<br/>test_assistant_output_never_triggers_a_turn, test_trigger_cap_*</i>"]
+        DEATH["✅ fermeture du broadcast → emit_subprocess_death → SessionError<br/><i>vérifié : test_emit_subprocess_death_emits_session_error</i>"]
+        OOB --> DEATH
+    end
+
+    WIRES --> OOB
+    OOB -.->|"tour déclenché"| SENDRECV
+
+    subgraph inputs["Entrées du client — send, route, permissions, réglages, interruption"]
+        direction TB
+        SENDMSG["✅ send_message : en flux → PendingMessage::user, interrupt_token.cancel,<br/>build_interrupt_json sur stdin_tx ; sinon UserMessage diffusé + stream_response<br/><i>vérifié : test_send_message_queues_when_streaming, test_send_message_queues_multiple_when_streaming</i>"]
+        ROUTE["🟠 route_user_message : local send_message → (échec) resume_session<br/>→ try_remote_send (NATS RPC) → resume_session ;<br/>DeliveryRoute Local · Remote · Resumed · ResumedAfterSendFailure<br/>écrit ; le chemin Remote n'est pas testé contre un NATS réel"]
+        PERM["✅ ⚓ route_permission_response → send_permission_response_inner :<br/>JSON brut control_response (subtype success, request_id,<br/>behavior allow + updatedInput, ou behavior deny + message) écrit sur stdin_tx<br/>sans prendre le verrou → PermissionDecision ; NATS si session distante<br/><i>vérifié : failed_stdin_send_keeps_the_permission_pending_for_a_retry</i>"]
+        SETTINGS["✅ ⚓ set_session_permission_mode / set_session_model :<br/>control_request brut (subtype set_permission_mode / set_model) sur stdin_tx ;<br/>modes admis default · acceptEdits · bypassPermissions · plan ;<br/>session dormante → persisté seulement<br/><i>vérifié : test_set_session_model_sends_control_request_via_stdin,<br/>test_set_session_model_dormant_session_persists</i>"]
+        RAWJSON["🟠 ⚓ à encapsuler : le backend sérialise lui-même le protocole filaire<br/>de Claude Code en quatre endroits (PERM, SETTINGS, AskUserQuestion dans CTRL,<br/>build_interrupt_json) au lieu de passer par une API du SDK<br/>— décidé, non écrit : RFC « harness multi-provider »"]
+        INTERRUPT["✅ interrupt_scoped(kill_tools) : flag + token.cancel +<br/>build_interrupt_json sur stdin_tx (sans verrou) ; si kill_tools : SIGINT aux<br/>descendants (get_descendant_pids par pgrep -P, libc::kill) ; publié sur NATS<br/><i>vérifié : test_interrupt_does_not_wait_for_client_lock,<br/>test_double_interrupt_is_idempotent, test_interrupt_latency_benchmark</i>"]
+        CANCEL["✅ cancel_running_tools : SIGINT aux descendants SEULEMENT,<br/>jamais le control_request interrupt (le tour survit, décision d2bf0e7b) ;<br/>plafond check_and_record_cancel_cap → ToolsCancelled<br/><i>vérifié : test_cancel_cap_allows_up_to_cap_then_refuses, test_cancel_tools_result_serde_*</i>"]
+        CANCELTASK["✅ cancel_task → kill_subtree(pid) → ActiveTasksUpdate ; plafond dédié<br/><i>vérifié : test_cancel_task_with_pid_calls_kill_subtree, test_cancel_task_rate_cap_enforced</i>"]
+        CLOSE["🟠 close_session : interrupt → disconnect sous 5 s → retrait ;<br/>start_cleanup_task ferme les sessions expirées (session_is_expired)<br/>écrit, test non identifié dans ce relevé"]
+        SENDMSG --> ROUTE
+        PERM --> RAWJSON
+        SETTINGS --> RAWJSON
+        INTERRUPT --> CANCEL
+    end
+
+    WS --> ROUTE
+    WS --> PERM
+    WS --> SETTINGS
+    WS --> INTERRUPT
+    WS --> CANCEL
+    WS --> CANCELTASK
+    REST --> CLOSE
+    ROUTE --> SENDRECV
+    PERM -->|"stdin_tx"| CLI
+    SETTINGS -->|"stdin_tx"| CLI
+    INTERRUPT -->|"stdin_tx + SIGINT"| CLI
+    CANCEL -->|"SIGINT descendants"| CLI
+    SENDMSG --> DRAIN
+
+    subgraph cfg["Configuration et CLI — config.rs, cli_version.rs, cli_auth.rs, model_catalog.rs"]
+        direction TB
+        CONFIG["✅ ⚓ PermissionConfig.mode (4 modes CLI) → to_nexus_mode, repli Default ;<br/>DEFAULT_ALLOWED_TOOLS mcp__project-orchestrator__* (syntaxe de règles Claude Code) ;<br/>ChatConfig : mcp_server_path, max_turns, claude_cli_path (CLAUDE_CLI_PATH),<br/>auto_update_cli, default_model claude-sonnet-5, RetryConfig<br/><i>vérifié : config.rs 24 tests</i>"]
+        MCPJSON["🔴 ChatConfig::mcp_server_config : aucun appelant en production<br/>(2 tests config.rs + test_build_options_mcp_server_config) ;<br/>build_options construit McpServerConfig::Stdio directement → code mort (grep)"]
+        CLIVER["✅ ⚓ cli_version : check_cli_status, install_or_upgrade_cli via<br/>find_claude_cli, get_cli_version, check_latest_npm_version, download_cli<br/><i>vérifié : cli_version.rs 18 tests</i>"]
+        CLIAUTH["✅ ⚓ cli_auth : check_cli_auth_status exécute claude auth status et lit son JSON<br/><i>vérifié : cli_auth.rs 10 tests</i>"]
+        CATALOG["✅ ⚓ model_catalog : GET api.anthropic.com/v1/models<br/>(ANTHROPIC_API_KEY ou jeton OAuth de Claude Code), stale-while-revalidate,<br/>liste statique de repli<br/><i>vérifié : model_catalog.rs 44 tests</i>"]
+        COMPACT["✅ compaction_context : CompactionContextBuilder build_for_task / build_for_session<br/>→ custom_instructions du hook PreCompact et SystemHint après compaction (moins de 2000 tokens)<br/><i>vérifié : compaction_context.rs 67 tests</i>"]
+        CONFIG --> MCPJSON
+    end
+
+    CONFIG --> OPTIONS
+    CLIVER --> REST
+    CLIAUTH --> REST
+    CATALOG --> REST
+    COMPACT --> HOOKS
+    COMPACT --> POST
+
+    subgraph coupling["⚓ Relevé du couplage Claude Code (entrée de la RFC multi-provider)"]
+        direction TB
+        K1["✅ types nexus_claude utilisés directement en prod (12 fichiers) :<br/>InteractiveClient dans manager, drain, oob_listener, post_stream ;<br/>HookCallback dans manager, control_pump, skill_hook, post_tool_hook, hook_ledger ;<br/>PermissionMode dans config ; find_claude_cli dans cli_auth, cli_version ;<br/>+ orchestrator/runner.rs (one-shot propose_feature_graphs_with_llm) ;<br/>vault/mask.rs en test seulement<br/><i>vérifié : grep -rl nexus_claude src → 13 fichiers</i>"]
+        K2["✅ protocole filaire écrit à la main sur stdin_tx (4 endroits) :<br/>send_permission_response_inner, set_session_permission_mode / set_session_model,<br/>auto-allow AskUserQuestion, InteractiveClient::build_interrupt_json<br/><i>vérifié : grep -n stdin_tx src/chat/manager.rs</i>"]
+        K3["✅ seule couture : trait transport::Transport + MockTransport +<br/>InteractiveClient::from_transport — utilisée uniquement dans les tests<br/><i>vérifié : grep -rln from_transport src (3 fichiers, blocs cfg(test))</i>"]
+        K4["✅ aucune abstraction de backend d'agent : les traits *Provider du dépôt<br/>sont EmbeddingProvider, RoutingProvider, TriggerProvider, ProtocolStatusProvider<br/><i>vérifié : grep -rn 'trait .*Provider' src</i>"]
+        K5["✅ texte du prompt et hooks écrits pour Claude Code : BASE_SYSTEM_PROMPT nomme<br/>TodoWrite ; skill_hook / post_tool_hook injectent par additionalContext<br/>PreToolUse / PostToolUse ; modes et syntaxe de règles d'outils dans config.rs<br/><i>vérifié : grep -n TodoWrite src/chat/prompt.rs</i>"]
+    end
+
+    RAWJSON -.-> K2
+    OPTIONS -.-> K1
+    HOOKS -.-> K5
+    CONFIG -.-> K5

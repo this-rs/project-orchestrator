@@ -1,0 +1,186 @@
+%% name: po-frontend-chat
+%% covers: frontend:src/services/{chatWebSocket,chat,wsAdapter}.ts frontend:src/hooks/{useChat,useChatUrlSync,useSessionTree}.ts frontend:src/hooks/runner/useConversationWs.ts frontend:src/atoms/{chat,modelCatalog}.ts frontend:src/utils/chatAssembly.ts frontend:src/types/chat.ts frontend:src/constants/models.ts frontend:src/components/chat/{ChatPanel,ChatInput,ChatMessages,ChatMessageBubble,ChatSessionContext,PermissionRequestBlock,PermissionSettingsPanel,SessionList}.tsx frontend:src/components/chat/{messageQueue,inputAction,chatUrlState,sessionListUtils}.ts frontend:src/components/chat/tools/**
+%% verified: d42312a2
+%% ---
+%% PROUVE : le harness de chat côté navigateur — du socket /ws/chat/{id} au rendu
+%%   des blocs et à la réponse aux demandes de permission — tel que le code le fait
+%%   au sha frontend 575bce1 (relu le 2026-10-02 ; le sha `verified` ci-dessus est
+%%   celui du dépôt backend qui porte cet index).
+%% ---
+%% SOURCES LUES (frontend@575bce1) :
+%%   src/services/chatWebSocket.ts   — ChatWebSocket.connect, openSocket, scheduleReconnect,
+%%                                     forceReconnect, startStallWatchdog, send*, SKIP_REPLAY_THRESHOLD
+%%   src/services/wsAdapter.ts        — createWebSocket (BrowserWebSocket, TauriWebSocket)
+%%   src/services/chat.ts             — chatApi (createSession, getMessages, interruptSession,
+%%                                     cancelTools, getModelCatalog, getCliStatus, installCli, detectPath)
+%%   src/hooks/useChat.ts             — useChat, handleEvent, resyncFromRest, fetchRenderableTail,
+%%                                     reconcileReplayedText, respondPermission, respondInput, interrupt
+%%   src/hooks/useChatUrlSync.ts      — useChatUrlSync ; src/hooks/useSessionTree.ts — useSessionTree
+%%   src/hooks/runner/useConversationWs.ts — useConversationWs (lecture seule)
+%%   src/utils/chatAssembly.ts        — historyEventsToMessages, workflowEventToTick,
+%%                                     attachToParentToolUse, appendBackgroundActivity
+%%   src/types/chat.ts                — ChatEvent (32 variantes, discriminant `type`), PermissionMode,
+%%                                     WsChatClientMessage, ClientMessage, ContentBlock
+%%   src/atoms/chat.ts                — chatPermissionInteractiveAtom, chatAutoApprovedToolsAtom, …
+%%   src/atoms/modelCatalog.ts, src/constants/models.ts — modelCatalogAtom, parseModelFamily, DEFAULT_MODEL_ID
+%%   src/components/chat/ChatPanel.tsx, ChatInput.tsx, ChatMessages.tsx, ChatMessageBubble.tsx
+%%     (groupBlocksByAgent), ChatSessionContext.tsx, PermissionRequestBlock.tsx (classifyTool),
+%%     PermissionSettingsPanel.tsx, SessionList.tsx, messageQueue.ts, inputAction.ts
+%%     (deriveInputAction), chatUrlState.ts, sessionListUtils.ts, tools/index.tsx (TOOL_REGISTRY)
+%%   Commandes : grep -rn 'function useConversationWs' src  → 3 définitions
+%%               grep -n 'session_error\|tools_cancelled' src/hooks/useChat.ts src/utils/chatAssembly.ts → 0
+%%               grep -rn 'ClientMessage\b' src | grep -v WsChatClientMessage → définition + 2 commentaires
+%% ---
+%% CONVENTION : « 🟠 écrit, sans test » = le code existe et a été lu, mais aucun test ne le
+%%   prouve ; la vérification est décidée et pas écrite (tâche 3.3 du plan). Un ✅ nomme son test.
+%% ---
+%% NON ETABLI :
+%%   le backend émet-il réellement session_error et tools_cancelled ? (voir po-chat-manager)
+%%   wsAdapter.ts (TauriWebSocket) : aucun test trouvé, comportement non reproduit ici
+%% ---
+%% LEGENDE
+%%   ✅ vérifié (le nœud dit par quel test)  🟠 décidé non écrit / écrit sans test
+%%   🔴 défaut constaté (raison dans le nœud)  ⚪ hors de ce dépôt
+%%   ⚓ = point de couplage avec Claude Code (noms d'outils, de modes, de modèles, du CLI)
+
+flowchart TD
+    subgraph legend["Légende"]
+        direction LR
+        L1["✅ vérifié : test nommé"]
+        L2["🟠 écrit, sans test / décidé non écrit"]
+        L3["🔴 défaut constaté"]
+        L4["⚪ hors dépôt"]
+        L5["⚓ couplage Claude Code"]
+    end
+
+    BACKEND_WS["⚪ backend ws_chat_handler.rs<br/>/ws/chat/{id}?last_event=N"]
+    BACKEND_REST["⚪ backend chat_handlers.rs<br/>/api/chat/*"]
+
+    subgraph transport["Transport — services/chatWebSocket.ts, wsAdapter.ts"]
+        direction TB
+        CONNECT["✅ ChatWebSocket.connect → openSocket<br/>jeton de génération contre les sockets périmés ;<br/>ticket WS en Tauri, cookie HttpOnly en navigateur ;<br/>trame texte #quot;ready#quot; à l'ouverture<br/><i>vérifié : __tests__/chatWebSocket.test (socket périmé jeté, socket sain réutilisé)</i>"]
+        AUTH["✅ premier message auth_ok / auth_error<br/>auth_error → stop + forceLogout si auth requise<br/><i>vérifié : chatWebSocket.test (connected after auth_ok)</i>"]
+        REPLAY["✅ rejeu : last_event=N, replay_complete → onReplayComplete<br/>SKIP_REPLAY_THRESHOLD (1e12) → pas de rejeu, onResync<br/><i>vérifié : __tests__/chatWebSocket.test (skip-replay fires onResync)</i>"]
+        RECONNECT["✅ scheduleReconnect : 1 s → 30 s, 10 essais<br/>forceReconnect sur events_lagged, envoi sur socket mort,<br/>retour au premier plan après 45 s, événement online,<br/>garde-fou 60 s si le serveur streame sans rien envoyer<br/><i>vérifié : chatWebSocket.test (events_lagged, dead socket, foreground)</i>"]
+        CONSUMED["✅ trames consommées, jamais transmises à onEvent :<br/>auth_ok, auth_error, replay_complete, events_lagged,<br/>session_dormant (reste connecté), session_closed (arrêt)<br/><i>vérifié : chatWebSocket.test (session_dormant / session_closed)</i>"]
+        SEND["✅ WsChatClientMessage : user_message, interrupt,<br/>permission_response, input_response, set_permission_mode,<br/>set_model, set_auto_continue ; faux si socket mort<br/><i>vérifié : chatWebSocket.test (send on a dead socket returns false)</i>"]
+        ADAPTER["🟠 wsAdapter.createWebSocket<br/>BrowserWebSocket ou TauriWebSocket<br/>écrit, sans test"]
+        DEADTYPE["🔴 types/chat.ts ClientMessage<br/>type mort : champs tool_call_id/allowed divergents<br/>de WsChatClientMessage ; aucun usage hors commentaires (grep)"]
+        NOCLOSED["🔴 session_closed : consommée et testée ici (chatWebSocket.test<br/>« disconnect on session_closed ») mais JAMAIS émise par le backend<br/>(grep session_closed backend/src → 0 hors FSM) → branche morte,<br/>contrat front↔back divergent (voir po-chat-transport)"]
+        CONNECT --> AUTH --> REPLAY
+        CONNECT --> ADAPTER
+        RECONNECT --> CONNECT
+        AUTH --> CONSUMED
+        CONSUMED --> NOCLOSED
+    end
+
+    BACKEND_WS <--> CONNECT
+
+    subgraph reducer["Réducteur — hooks/useChat.ts"]
+        direction TB
+        EFFECT["✅ effet sur sessionId : connect(sid, MAX_SAFE_INTEGER)<br/>+ REST fetchRenderableTail élargi ×4 jusqu'à 800 événements ;<br/>repli : rejeu WS complet (last_event=0) si le REST échoue<br/><i>vérifié : useChat.renderableTail.test</i>"]
+        GATES["✅ handleEvent — tampons : pendingEventsRef tant que<br/>l'historique n'est pas chargé, pendingTailEventsRef hors queue<br/><i>vérifié : useChat.resync.test (buffered live events after history)</i>"]
+        REDUCE["✅ réduction en blocs : stream_delta, assistant_text, thinking,<br/>tool_use, tool_result, permission_request, result, compact_boundary…<br/>reconcileReplayedText : append-only, jamais destructif<br/><i>vérifié : useChat.resync.test (NEVER deletes already-rendered content)</i>"]
+        RESYNC["✅ resyncFromRest : idempotent sur deux reconnexions,<br/>ignoré pendant un chargement, jeté après un changement de session<br/><i>vérifié : useChat.resync.test</i>"]
+        AUTOAPPROVE["✅ permission_request d'un outil mémorisé →<br/>sendPermissionResponse(id, true) ; pas d'auto_approved<br/>si l'envoi n'est pas parti<br/><i>vérifié : useChat.sendResult.test</i>"]
+        ACTIONS["✅ respondPermission / respondInput / sendContinue<br/>ne mutent l'état que si le socket a accepté l'envoi<br/><i>vérifié : useChat.sendResult.test</i>"]
+        INTERRUPT["🟠 interrupt() : ws.sendInterrupt, sinon REST<br/>chatApi.interruptSession(sid) ; isStreaming=false si non livré<br/>écrit, sans test"]
+        OUTBOX["🟠 pendingSendRef : messages tombés sur un socket mort,<br/>rejoués à replay_complete — écrit, sans test"]
+        UNHANDLED["🔴 session_error et tools_cancelled : typés dans ChatEvent,<br/>aucun bras dans handleEvent ni historyEventsToMessages (grep)<br/>→ ignorés en silence"]
+        ASKQ["🟠 ⚓ branche toolName === #quot;AskUserQuestion#quot;<br/>→ bloc ask_user_question (useChat ET chatAssembly)<br/>nom d'outil Claude Code codé en dur ; sans test dédié"]
+        EFFECT --> GATES --> REDUCE
+        REDUCE --> RESYNC
+        REDUCE --> AUTOAPPROVE
+        REDUCE --> UNHANDLED
+        REDUCE --> ASKQ
+    end
+
+    CONSUMED -->|"tout autre type → onEvent"| GATES
+    REPLAY -->|"onResync"| RESYNC
+    REPLAY -->|"onReplayComplete"| OUTBOX
+    ACTIONS --> SEND
+    INTERRUPT --> SEND
+    INTERRUPT -.->|"repli"| REST
+
+    subgraph assembly["Assemblage — utils/chatAssembly.ts"]
+        direction TB
+        HIST["✅ historyEventsToMessages : événements bruts REST →<br/>messages user/assistant, blocs par type, métriques du result<br/><i>vérifié : chatAssembly.test</i>"]
+        BG["✅ workflowEventToTick → attachToParentToolUse,<br/>sinon appendBackgroundActivity (orphelins pliés, 20 entrées max)<br/><i>vérifié : chatAssembly.test (orphan folded, keyed by tool_use_id)</i>"]
+        HIST --> BG
+    end
+
+    EFFECT -->|"REST getMessages"| HIST
+    BG --> REDUCE
+
+    subgraph readonly["Lecteurs seuls — hooks/runner/useConversationWs.ts"]
+        direction TB
+        RO["🟠 useConversationWs : last_event=0, rejeu complet,<br/>n'envoie que #quot;ready#quot;, reconstruit historyEventsToMessages<br/>à chaque événement — écrit, sans test"]
+        DUP["🔴 trois copies de useConversationWs :<br/>hooks/runner/useConversationWs.ts,<br/>components/runner/ConversationPanel.tsx,<br/>components/discussions/InlineConversationPanel.tsx<br/>(grep 'function useConversationWs') → dérive garantie"]
+        RO --> DUP
+    end
+
+    BACKEND_WS --> RO
+    RO --> HIST
+
+    subgraph state["État — atoms/chat.ts, atoms/modelCatalog.ts, constants/models.ts, types/chat.ts"]
+        direction TB
+        ATOMS["🟠 jotai : chatSessionIdAtom, chatStreamingAtom, chatWsStatusAtom,<br/>chatAutoApprovedToolsAtom, chatSessionModelAtom, chatMessageQueueAtom,<br/>chatBackgroundTasksAtom, chatSecretRequestsAtom…<br/>écrit, sans test"]
+        MODES["🟠 ⚓ PermissionMode = default · acceptEdits · plan · bypassPermissions<br/>chatPermissionInteractiveAtom = mode !== bypassPermissions<br/>valeurs du CLI Claude (doc-comment : « supported by Claude CLI via Nexus SDK »)"]
+        MODELS["✅ ⚓ constants/models : parseModelFamily, getModelShortLabel<br/>retirent le préfixe claude- ; DEFAULT_MODEL_ID = claude-sonnet-5 ;<br/>familles opus · fable · sonnet · haiku · mythos<br/><i>vérifié : ModelFamilyPicker.test (picker) — parseModelFamily sans test dédié</i>"]
+        EVENTS["🟠 ⚓ ChatEvent : 32 variantes ; propres au CLI Claude :<br/>system_init, compact_boundary, compaction_started, thinking,<br/>tool_use_input_resolved, workflow, background_output (Monitor),<br/>result.subtype error_max_turns — écrit, parse vérifié pour 2 variantes<br/><i>types/chat.test : active_tasks_update, background_output</i>"]
+        ATOMS --> MODES
+        ATOMS --> MODELS
+    end
+
+    REDUCE --> ATOMS
+    EVENTS --> REDUCE
+
+    subgraph rest["REST — services/chat.ts"]
+        direction TB
+        REST["🟠 chatApi : createSession, listSessions, getMessages,<br/>interruptSession(scope), cancelTools, getBackgroundTasks,<br/>getModelCatalog, config permissions ; pas d'endpoint resume :<br/>une user_message WS sur une session dormante relance le CLI<br/>écrit, sans test"]
+        CLI["🟠 ⚓ chatApi.detectPath, getCliStatus, installCli<br/>/chat/detect-path, /chat/cli/status, /chat/cli/install :<br/>gestion du binaire Claude Code depuis le navigateur"]
+        REST --> CLI
+    end
+
+    BACKEND_REST <--> REST
+
+    subgraph render["Rendu — components/chat/*"]
+        direction TB
+        PANEL["🟠 ChatPanel : useChat + useChatUrlSync + ChatSessionProvider ;<br/>handleSend → chat.sendMessage ; handleStopRun → interruptSession(enfant)<br/>écrit, jamais couvert (docs/COVERAGE.md)"]
+        MSGS["✅ ChatMessages : ancrage bas pendant le flux,<br/>scroll inversé (onLoadOlder / onLoadNewer), badge « nouveaux »<br/><i>vérifié : ChatMessages.streaming.test</i>"]
+        BUBBLE["✅ ChatMessageBubble.groupBlocksByAgent :<br/>blocs portant parent_tool_use_id repliés sous leur tool_use (sous-agent),<br/>tool_use consécutifs groupés, tool_result rendus dans leur outil<br/><i>vérifié : BackgroundActivityIntegration.test (regroupement d'activité)</i>"]
+        INPUT["✅ ChatInput : file d'attente chatMessageQueueAtom,<br/>un message par tour, « envoyer maintenant » = second clic + interruption ;<br/>deriveInputAction → send · stop · stopping · waiting · idle<br/><i>vérifié : ChatInput.queue.test, inputAction.test, messageQueue.test</i>"]
+        INPUTMODES["🟠 ⚓ ChatInput MODE_LABELS / PermissionSettingsPanel MODES et presets<br/>Bash(git *), Read(.env*), mcp__project-orchestrator__* :<br/>syntaxe des règles d'outils de Claude Code — sans test"]
+        PERM["✅ ⚓ PermissionRequestBlock.classifyTool<br/>Bash · Read/Glob/Grep · Edit/Write/NotebookEdit · mcp__ · WebFetch/WebSearch ;<br/>Allow / Deny / Remember → onRespond ; « Not sent » si le socket a refusé<br/><i>vérifié : ResponseBlocks.sendFailure.test</i>"]
+        TOOLS["🟠 ⚓ tools/index.tsx TOOL_REGISTRY : Bash, Edit, Read, Write, Glob, Grep,<br/>WebFetch, WebSearch, TodoWrite → tools/*Renderer.tsx ; préfixe<br/>mcp__project-orchestrator__ ou input.action → McpToolRenderer → tools/mcp/*Renderer.tsx<br/>(classifyAction : list · entity · chat · code · progress) ; sinon DefaultToolRenderer ;<br/>summaries.ts, syntax.ts, types.ts — écrit, sans test"]
+        SESSIONS["✅ SessionList + sessionListUtils (shortModelName retire claude-,<br/>PERMISSION_MODE_META, groupSessionsByDate)<br/><i>vérifié : SessionList.test, sessionListUtils.test</i>"]
+        URL["✅ chatUrlState parseChatUrl / writeChatUrl (?chat=&chatView=)<br/>via useChatUrlSync<br/><i>vérifié : chatUrlState.test</i>"]
+        PANEL --> MSGS --> BUBBLE
+        BUBBLE --> PERM
+        BUBBLE --> TOOLS
+        PANEL --> INPUT --> INPUTMODES
+        PANEL --> SESSIONS
+        PANEL --> URL
+    end
+
+    PANEL --> EFFECT
+    REDUCE -->|"messages[]"| MSGS
+    PERM -->|"onRespond(toolCallId, allow, remember)"| ACTIONS
+    INPUT -->|"onInterrupt"| INTERRUPT
+    INPUT -->|"set_permission_mode / set_model"| SEND
+    MODES --> INPUTMODES
+    MODELS --> INPUT
+    DEADTYPE -.-> SEND
+
+    subgraph coupling["⚓ Relevé du couplage Claude Code (entrée de la RFC multi-provider)"]
+        direction TB
+        C1["✅ modes de permission : 5 fichiers<br/>ChatInput, ChatPanel, PermissionSettingsPanel, sessionListUtils, atoms/chat<br/><i>vérifié : grep bypassPermissions src</i>"]
+        C2["✅ noms d'outils : tools/index (registre), PermissionRequestBlock.classifyTool,<br/>useChat + chatAssembly (AskUserQuestion), utils/backgroundActivity,<br/>AgentGroup (subagent_type)<br/><i>vérifié : grep AskUserQuestion src</i>"]
+        C3["✅ identifiants de modèle : constants/models (claude-, familles),<br/>sessionListUtils.shortModelName, modelCatalog (Models API Anthropic)<br/><i>vérifié : grep 'claude-' src</i>"]
+        C4["✅ événements et endpoints du CLI : system_init, compact_boundary,<br/>cli_session_id, add_dirs (--add-dir), /chat/cli/*, /chat/detect-path<br/><i>vérifié : grep cli_session_id src</i>"]
+    end
+
+    INPUTMODES -.-> C1
+    TOOLS -.-> C2
+    MODELS -.-> C3
+    CLI -.-> C4
