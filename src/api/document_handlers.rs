@@ -453,30 +453,53 @@ fn mime_for(format: DocumentFormat, filename: &str, bytes: &[u8]) -> &'static st
 /// the pipeline is not written inline in the handler: the interesting behaviour
 /// (batching, deduplication, warning propagation) is then testable without a
 /// live Neo4j or an HTTP server.
-pub struct Ingestor<'a> {
-    pub graph: &'a dyn GraphStore,
-    pub store: &'a DocumentStore,
+pub struct Ingestor {
+    pub graph: Arc<dyn GraphStore>,
+    pub store: DocumentStore,
     /// `None` when embeddings are disabled. A supported state: the document is
     /// still ingested, it is just not semantically searchable.
-    pub embeddings: Option<&'a dyn EmbeddingProvider>,
+    pub embeddings: Option<Arc<dyn EmbeddingProvider>>,
     pub chunk_config: ChunkConfig,
 }
 
-impl<'a> Ingestor<'a> {
+impl Ingestor {
     /// Build an ingestor from the server state.
-    pub fn from_state(state: &'a OrchestratorState, store: &'a DocumentStore) -> Ingestor<'a> {
+    ///
+    /// Owned handles rather than borrows, because the vectorising half of the
+    /// pipeline outlives the request that started it — see [`Ingestor::ingest`].
+    pub fn from_state(state: &OrchestratorState, store: DocumentStore) -> Ingestor {
         Ingestor {
-            graph: state.orchestrator.neo4j(),
+            graph: state.orchestrator.neo4j_arc(),
             store,
-            embeddings: state
-                .orchestrator
-                .embedding_provider()
-                .map(|p| p.as_ref() as &dyn EmbeddingProvider),
+            embeddings: state.orchestrator.embedding_provider().cloned(),
             chunk_config: ChunkConfig::default(),
         }
     }
 
-    /// Run the full pipeline: extract → chunk → embed (batched) → store → graph.
+    /// Run the pipeline: extract → chunk → store → graph, then vectorise in the
+    /// background.
+    ///
+    /// ## Why embedding does not block the response
+    ///
+    /// Vectorising is the only unbounded step here. Local ONNX inference costs
+    /// roughly a quarter of a second per chunk on CPU and every embedding call
+    /// in the process is serialised through one `Mutex<TextEmbedding>`, because
+    /// `embed()` needs `&mut self`. A one-megabyte text file is some seven
+    /// hundred chunks, so the arithmetic lands at minutes — past the 60s
+    /// `TimeoutLayer` in `routes.rs`, and far past the patience of whoever is
+    /// watching a progress bar that already said 100%.
+    ///
+    /// So the response is sent as soon as the document is *durable*: the bytes
+    /// are in the blob store and the node and its chunks are in the graph. The
+    /// vectors land afterwards, on a spawned task. This is the same bargain the
+    /// module already struck for a provider that is down — "the document is
+    /// already persisted and readable; only semantic search is degraded" — only
+    /// now it also covers a provider that is merely slow.
+    ///
+    /// The cost is that an embedding failure can no longer be reported in the
+    /// upload response, since there is nothing left to report into. It is
+    /// logged instead. `chunk_count` is unaffected: chunks are persisted before
+    /// the response, only their vectors are not.
     ///
     /// ## On deduplication
     ///
@@ -511,6 +534,40 @@ impl<'a> Ingestor<'a> {
         session_id: Option<Uuid>,
         entity: EntityLink,
     ) -> Result<UploadedDocument, DocumentError> {
+        self.ingest_deferred_for(bytes, filename, project_id, session_id, entity)
+            .await
+            .map(|(uploaded, _)| uploaded)
+    }
+
+    /// [`Self::ingest`], plus a handle on the background vectorising task.
+    ///
+    /// A thin no-entity wrapper over [`Self::ingest_deferred_for`]. Exists so a
+    /// test can await the vectors instead of polling for them; the handlers drop
+    /// the handle, which is what makes the upload return early.
+    pub async fn ingest_deferred(
+        &self,
+        bytes: Vec<u8>,
+        filename: &str,
+        project_id: Option<Uuid>,
+        session_id: Option<Uuid>,
+    ) -> Result<(UploadedDocument, Option<tokio::task::JoinHandle<()>>), DocumentError> {
+        self.ingest_deferred_for(bytes, filename, project_id, session_id, None)
+            .await
+    }
+
+    /// The pipeline itself: every other entry point lands here.
+    ///
+    /// Returns the response alongside the vectorising task, `None` when there
+    /// was nothing to vectorise (no provider, or no chunks). Callers that are
+    /// answering an HTTP request drop the handle on purpose.
+    pub async fn ingest_deferred_for(
+        &self,
+        bytes: Vec<u8>,
+        filename: &str,
+        project_id: Option<Uuid>,
+        session_id: Option<Uuid>,
+        entity: EntityLink,
+    ) -> Result<(UploadedDocument, Option<tokio::task::JoinHandle<()>>), DocumentError> {
         // Size first: the store would reject this anyway, but only after we had
         // paid to extract and chunk a file we were always going to refuse.
         let size_bytes = bytes.len() as u64;
@@ -569,14 +626,6 @@ impl<'a> Ingestor<'a> {
             );
         }
 
-        let embeddings = match self.embed_chunks(&chunks).await {
-            Ok(vectors) => vectors,
-            Err(msg) => {
-                response_warnings.push(msg);
-                Vec::new()
-            }
-        };
-
         // Bytes before graph: a node pointing at a blob that is not there is a
         // dangling reference, while a blob with no node is inert garbage the
         // next identical upload reuses.
@@ -615,83 +664,111 @@ impl<'a> Ingestor<'a> {
                 .await?;
         }
 
-        if !embeddings.is_empty() {
-            let model = self
-                .embeddings
-                .map(|p| p.model_name().to_string())
-                .unwrap_or_default();
-            if let Err(e) = self
-                .graph
+        // Everything the uploader is waiting for is now durable. Vectorising is
+        // handed to a task that outlives this request; see the method docs.
+        let embed_task = self.spawn_embedding(document.id, chunks);
+
+        Ok((
+            UploadedDocument {
+                id: document.id,
+                filename: document.filename,
+                format: document.format,
+                size_bytes: document.size_bytes,
+                sha256: document.sha256,
+                page_count: document.page_count,
+                chunk_count: document.chunk_count,
+                warnings: response_warnings,
+                created_at: document.created_at,
+                project_id: document.project_id,
+                session_id: document.session_id,
+                extracted: document.extracted,
+                mime_type: mime_type.to_string(),
+            },
+            embed_task,
+        ))
+    }
+
+    /// Vectorise `chunks` and write the result back, on a task of its own.
+    ///
+    /// Returns `None` when there is nothing to do. Failures are logged, never
+    /// propagated: by the time this runs the upload has already been answered
+    /// 201, and the document is readable and downloadable without its vectors.
+    fn spawn_embedding(
+        &self,
+        document_id: Uuid,
+        chunks: Vec<DocumentChunk>,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        let provider = self.embeddings.clone()?;
+        if chunks.is_empty() {
+            return None;
+        }
+        let graph = self.graph.clone();
+
+        Some(tokio::spawn(async move {
+            let model = provider.model_name().to_string();
+            let embeddings = match embed_chunks_with(provider.as_ref(), &chunks).await {
+                Ok(vectors) => vectors,
+                Err(msg) => {
+                    tracing::warn!(%document_id, reason = %msg, "document vectorising failed");
+                    return;
+                }
+            };
+            if embeddings.is_empty() {
+                return;
+            }
+            if let Err(e) = graph
                 .set_document_chunk_embeddings(&embeddings, &model)
                 .await
             {
-                // The document is already persisted and readable; only semantic
-                // search is degraded. Say so rather than failing the upload.
-                tracing::warn!(document_id = %document.id, error = %e, "failed to store document chunk embeddings");
-                response_warnings.push(
-                    "embeddings could not be stored — semantic search will not find this document"
-                        .to_string(),
+                tracing::warn!(%document_id, error = %e, "failed to store document chunk embeddings");
+            } else {
+                tracing::debug!(
+                    %document_id,
+                    chunks = embeddings.len(),
+                    "document vectorised"
                 );
             }
-        }
+        }))
+    }
+}
 
-        Ok(UploadedDocument {
-            id: document.id,
-            filename: document.filename,
-            format: document.format,
-            size_bytes: document.size_bytes,
-            sha256: document.sha256,
-            page_count: document.page_count,
-            chunk_count: document.chunk_count,
-            warnings: response_warnings,
-            created_at: document.created_at,
-            project_id: document.project_id,
-            session_id: document.session_id,
-            extracted: document.extracted,
-            mime_type: mime_type.to_string(),
-        })
+/// The batching loop, free of the [`Ingestor`] so the background task can call
+/// it without holding a borrow on one.
+///
+/// The error case returns a message rather than propagating: an embedding
+/// provider being down is not a reason to reject a document the user can still
+/// read.
+async fn embed_chunks_with(
+    provider: &dyn EmbeddingProvider,
+    chunks: &[DocumentChunk],
+) -> Result<Vec<(Uuid, Vec<f32>)>, String> {
+    if chunks.is_empty() {
+        return Ok(Vec::new());
     }
 
-    /// Embed every chunk, [`EMBED_BATCH_SIZE`] at a time.
-    ///
-    /// The error case returns a message rather than propagating: an embedding
-    /// provider being down is not a reason to reject a document the user can
-    /// still read and download.
-    async fn embed_chunks(
-        &self,
-        chunks: &[DocumentChunk],
-    ) -> Result<Vec<(Uuid, Vec<f32>)>, String> {
-        let Some(provider) = self.embeddings else {
-            return Ok(Vec::new());
-        };
-        if chunks.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let mut out = Vec::with_capacity(chunks.len());
-        for batch in chunks.chunks(EMBED_BATCH_SIZE) {
-            let texts: Vec<String> = batch.iter().map(|c| c.text.clone()).collect();
-            let vectors = provider.embed_batch(&texts).await.map_err(|e| {
-                tracing::warn!(error = %e, "document chunk embedding failed");
-                "embeddings could not be computed — this document will not be found by semantic \
+    let mut out = Vec::with_capacity(chunks.len());
+    for batch in chunks.chunks(EMBED_BATCH_SIZE) {
+        let texts: Vec<String> = batch.iter().map(|c| c.text.clone()).collect();
+        let vectors = provider.embed_batch(&texts).await.map_err(|e| {
+            tracing::warn!(error = %e, "document chunk embedding failed");
+            "embeddings could not be computed — this document will not be found by semantic \
                  search until it is re-uploaded"
-                    .to_string()
-            })?;
-            if vectors.len() != batch.len() {
-                tracing::warn!(
-                    expected = batch.len(),
-                    got = vectors.len(),
-                    "embedding provider returned the wrong number of vectors"
-                );
-                return Err(
-                    "embeddings could not be computed — the provider returned a mismatched batch"
-                        .to_string(),
-                );
-            }
-            out.extend(batch.iter().map(|c| c.id).zip(vectors));
+                .to_string()
+        })?;
+        if vectors.len() != batch.len() {
+            tracing::warn!(
+                expected = batch.len(),
+                got = vectors.len(),
+                "embedding provider returned the wrong number of vectors"
+            );
+            return Err(
+                "embeddings could not be computed — the provider returned a mismatched batch"
+                    .to_string(),
+            );
         }
-        Ok(out)
+        out.extend(batch.iter().map(|c| c.id).zip(vectors));
     }
+    Ok(out)
 }
 
 // ============================================================================
@@ -718,7 +795,7 @@ pub async fn upload_document(
         .unwrap_or_else(|| FALLBACK_FILENAME.to_string());
 
     let store = DocumentStore::from_config(state.orchestrator.config());
-    let ingestor = Ingestor::from_state(&state, &store);
+    let ingestor = Ingestor::from_state(&state, store);
     let uploaded = ingestor
         .ingest_for(bytes, &filename, project_id, fields.session_id, entity)
         .await?;
@@ -991,7 +1068,48 @@ mod tests {
     use crate::neo4j::mock::MockGraphStore;
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
     use tempfile::TempDir;
+
+    /// A provider that will not answer until the test releases it.
+    ///
+    /// Models the real cost without paying it: local ONNX inference runs about
+    /// a quarter of a second per chunk and every embedding call in the process
+    /// queues behind the one `Mutex<TextEmbedding>` that `embed(&mut self)`
+    /// forces, so a document of any size spends minutes in here. A gate
+    /// reproduces "the provider has not come back yet" exactly, with no sleep
+    /// and therefore no race.
+    struct GatedProvider {
+        inner: MockEmbeddingProvider,
+        gate: Arc<tokio::sync::Semaphore>,
+    }
+
+    impl GatedProvider {
+        fn new(gate: Arc<tokio::sync::Semaphore>) -> Self {
+            Self {
+                inner: MockEmbeddingProvider::new(8),
+                gate,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl EmbeddingProvider for GatedProvider {
+        async fn embed_text(&self, text: &str) -> anyhow::Result<Vec<f32>> {
+            let _permit = self.gate.acquire().await?;
+            self.inner.embed_text(text).await
+        }
+        async fn embed_batch(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
+            let _permit = self.gate.acquire().await?;
+            self.inner.embed_batch(texts).await
+        }
+        fn dimensions(&self) -> usize {
+            self.inner.dimensions()
+        }
+        fn model_name(&self) -> &str {
+            self.inner.model_name()
+        }
+    }
 
     /// Counts `embed_batch` calls so "batched, not one per chunk" is an
     /// assertion rather than a claim.
@@ -1152,10 +1270,10 @@ mod tests {
             }
         }
 
-        fn ingestor<'a>(&'a self, embeddings: Option<&'a dyn EmbeddingProvider>) -> Ingestor<'a> {
+        fn ingestor(&self, embeddings: Option<Arc<dyn EmbeddingProvider>>) -> Ingestor {
             Ingestor {
-                graph: self.graph.as_ref(),
-                store: &self.store,
+                graph: self.graph.clone(),
+                store: self.store.clone(),
                 embeddings,
                 chunk_config: ChunkConfig::default(),
             }
@@ -1205,9 +1323,10 @@ mod tests {
     async fn an_oversized_upload_is_refused_with_413_before_anything_is_written() {
         let h = Harness::new();
         let store = DocumentStore::new(h.store.root()).with_max_blob_bytes(16);
+        let store_root = store.root().to_path_buf();
         let ingestor = Ingestor {
-            graph: h.graph.as_ref(),
-            store: &store,
+            graph: h.graph.clone(),
+            store,
             embeddings: None,
             chunk_config: ChunkConfig::default(),
         };
@@ -1219,7 +1338,7 @@ mod tests {
 
         assert_eq!(err.status(), StatusCode::PAYLOAD_TOO_LARGE);
         assert_eq!(
-            blob_count(store.root()),
+            blob_count(&store_root),
             0,
             "nothing may be written on refusal"
         );
@@ -1289,9 +1408,10 @@ mod tests {
     async fn an_opaque_attachment_keeps_the_size_limit() {
         let h = Harness::new();
         let store = DocumentStore::new(h.store.root()).with_max_blob_bytes(8);
+        let store_root = store.root().to_path_buf();
         let ingestor = Ingestor {
-            graph: h.graph.as_ref(),
-            store: &store,
+            graph: h.graph.clone(),
+            store,
             embeddings: None,
             chunk_config: ChunkConfig::default(),
         };
@@ -1300,7 +1420,7 @@ mod tests {
             .await
             .expect_err("over the cap");
         assert_eq!(err.status(), StatusCode::PAYLOAD_TOO_LARGE);
-        assert_eq!(blob_count(store.root()), 0);
+        assert_eq!(blob_count(&store_root), 0);
     }
 
     #[test]
@@ -1598,7 +1718,7 @@ mod tests {
     #[tokio::test]
     async fn embeddings_are_computed_in_batches_not_one_call_per_chunk() {
         let h = Harness::new();
-        let provider = CountingProvider::new();
+        let provider = Arc::new(CountingProvider::new());
 
         // Enough distinct sentences to spill past one batch. Each sentence is
         // well under the chunk budget, so chunks pack several together; the
@@ -1608,11 +1728,14 @@ mod tests {
             text.push_str(&format!("Sentence number {i} about an entirely unremarkable subject that nonetheless occupies some space. "));
         }
 
-        let out = h
-            .ingestor(Some(&provider))
-            .ingest(text.into_bytes(), "long.txt", None, None)
+        let (out, task) = h
+            .ingestor(Some(provider.clone() as Arc<dyn EmbeddingProvider>))
+            .ingest_deferred(text.into_bytes(), "long.txt", None, None)
             .await
             .unwrap();
+        // Vectorising is a background task now, so the counters are only final
+        // once it has run.
+        task.expect("a vectorising task").await.expect("no panic");
 
         let chunk_count = out.chunk_count;
         assert!(
@@ -1641,33 +1764,96 @@ mod tests {
     #[tokio::test]
     async fn a_small_document_takes_exactly_one_batch_call() {
         let h = Harness::new();
-        let provider = CountingProvider::new();
+        let provider = Arc::new(CountingProvider::new());
 
-        let out = h
-            .ingestor(Some(&provider))
-            .ingest(b"One short sentence.".to_vec(), "s.txt", None, None)
+        let (out, task) = h
+            .ingestor(Some(provider.clone() as Arc<dyn EmbeddingProvider>))
+            .ingest_deferred(b"One short sentence.".to_vec(), "s.txt", None, None)
             .await
             .unwrap();
+        task.expect("a vectorising task").await.expect("no panic");
 
         assert_eq!(out.chunk_count, 1);
         assert_eq!(provider.batch_calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
-    async fn a_failing_embedding_provider_warns_but_does_not_fail_the_upload() {
+    async fn a_failing_embedding_provider_does_not_fail_the_upload() {
         let h = Harness::new();
-        let out = h
-            .ingestor(Some(&FailingProvider))
-            .ingest(b"Some readable prose.".to_vec(), "s.txt", None, None)
+        let (out, task) = h
+            .ingestor(Some(Arc::new(FailingProvider) as Arc<dyn EmbeddingProvider>))
+            .ingest_deferred(b"Some readable prose.".to_vec(), "s.txt", None, None)
             .await
             .expect("the document is still ingested");
 
-        assert!(
-            out.warnings.iter().any(|w| w.contains("embeddings")),
-            "the uploader must be told search will not find it: {:?}",
-            out.warnings
-        );
+        // The failure happens after the response, so it is logged rather than
+        // reported — but it must stay a failure of *vectorising only*: the
+        // document is readable, downloadable and in the graph regardless.
+        task.expect("a vectorising task")
+            .await
+            .expect("a provider error must not panic the task");
+
         assert!(h.graph.get_document(out.id).await.unwrap().is_some());
+        let chunks = h.graph.get_document_chunks(out.id).await.unwrap();
+        assert_eq!(chunks.len(), out.chunk_count);
+        assert!(
+            chunks.iter().all(|c| c.embedding.is_none()),
+            "a provider that errors must leave no half-written vectors"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_upload_is_answered_before_its_vectors_are_computed() {
+        let h = Harness::new();
+        // Zero permits: nothing gets through until the test says so.
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let provider = Arc::new(GatedProvider::new(gate.clone()));
+
+        // Several batches' worth — an ordinary PDF attachment easily is.
+        let mut text = String::new();
+        for i in 0..4000 {
+            text.push_str(&format!("Sentence number {i} about an entirely unremarkable subject that nonetheless occupies some space. "));
+        }
+
+        // The guard is the point. Before vectorising moved off the request path
+        // this call awaited the gate and never returned, which is what the 60s
+        // `TimeoutLayer` in `routes.rs` turned into a 408 — and what the
+        // attachment chip showed as a progress bar wedged at 100%.
+        let (out, task) = tokio::time::timeout(
+            Duration::from_secs(5),
+            h.ingestor(Some(provider.clone() as Arc<dyn EmbeddingProvider>))
+                .ingest_deferred(text.into_bytes(), "long.txt", None, None),
+        )
+        .await
+        .expect("the upload must be answered without waiting for the vectors")
+        .expect("ingest");
+
+        assert!(
+            out.chunk_count > EMBED_BATCH_SIZE,
+            "need more than one batch to make the point (got {})",
+            out.chunk_count
+        );
+
+        // Already durable: the chunks are in the graph, only the vectors are not.
+        let chunks = h.graph.get_document_chunks(out.id).await.unwrap();
+        assert_eq!(chunks.len(), out.chunk_count);
+        assert!(
+            chunks.iter().all(|c| c.embedding.is_none()),
+            "no vector can exist yet — the provider has not been let go"
+        );
+
+        // Let the vectoriser run; the vectors land afterwards.
+        gate.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(10), task.expect("a vectorising task"))
+            .await
+            .expect("the vectoriser must finish once released")
+            .expect("no panic");
+
+        let chunks = h.graph.get_document_chunks(out.id).await.unwrap();
+        assert!(
+            chunks.iter().all(|c| c.embedding.is_some()),
+            "every chunk is vectorised in the end"
+        );
     }
 
     #[tokio::test]
@@ -1835,12 +2021,13 @@ mod tests {
     #[tokio::test]
     async fn chunk_views_carry_offsets_and_drop_embeddings() {
         let h = Harness::new();
-        let provider = MockEmbeddingProvider::new(8);
-        let out = h
-            .ingestor(Some(&provider))
-            .ingest(b"A sentence worth embedding.".to_vec(), "s.txt", None, None)
+        let provider = Arc::new(MockEmbeddingProvider::new(8));
+        let (out, task) = h
+            .ingestor(Some(provider as Arc<dyn EmbeddingProvider>))
+            .ingest_deferred(b"A sentence worth embedding.".to_vec(), "s.txt", None, None)
             .await
             .unwrap();
+        task.expect("a vectorising task").await.expect("no panic");
 
         let chunks = h.graph.get_document_chunks(out.id).await.unwrap();
         assert!(

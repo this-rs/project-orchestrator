@@ -185,6 +185,11 @@ pub static RUNNER_STATE: LazyLock<Arc<RwLock<Option<RunnerState>>>> =
 pub static RUNNER_CANCEL: LazyLock<Arc<AtomicBool>> =
     LazyLock::new(|| Arc::new(AtomicBool::new(false)));
 
+/// Serializes the tests (runner and API handlers) that touch the runner globals.
+#[cfg(test)]
+pub(crate) static RUNNER_GLOBALS_TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(()));
+
 /// Budget override — allows updating max_cost_usd during a running execution.
 /// Stores f64 bits in an AtomicU64 (0 = no override, use config default).
 /// Set via PATCH /api/plans/{plan_id}/run/budget.
@@ -375,7 +380,7 @@ impl TaskExecutionResult {
 }
 
 /// Snapshot of the current runner status (for the status endpoint).
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct RunStatus {
     pub running: bool,
     pub run_id: Option<Uuid>,
@@ -951,14 +956,13 @@ impl PlanRunner {
         graph: Arc<dyn GraphStore>,
         chat_manager: Option<Arc<ChatManager>>,
     ) -> Result<()> {
-        // Set cancel flag so any in-flight code that checks it will stop
-        RUNNER_CANCEL.store(true, Ordering::SeqCst);
-        // Clear budget override
-        RUNNER_BUDGET.store(0, std::sync::atomic::Ordering::Relaxed);
-
         let mut global = RUNNER_STATE.write().await;
         match &mut *global {
             Some(state) if state.run_id == run_id => {
+                // Only touch the global flags once the run id is confirmed,
+                // otherwise a stale/foreign id would cancel an unrelated run.
+                RUNNER_CANCEL.store(true, Ordering::SeqCst);
+                RUNNER_BUDGET.store(0, std::sync::atomic::Ordering::Relaxed);
                 let plan_id = state.plan_id;
 
                 // Collect active session IDs before finalizing
@@ -1012,6 +1016,18 @@ impl PlanRunner {
             if let Err(e) = chat_manager.close_session(&sid_str).await {
                 warn!("Failed to close agent session {} on cancel: {}", sid_str, e);
             }
+        }
+    }
+
+    /// Run id of the active run, provided it belongs to `plan_id`.
+    /// Errors with "No active run" when nothing runs, or when the active run
+    /// belongs to another plan (the caller must not act on someone else's run).
+    pub async fn active_run_id_for_plan(plan_id: Uuid) -> Result<Uuid> {
+        let global = RUNNER_STATE.read().await;
+        match &*global {
+            Some(state) if state.plan_id == plan_id => Ok(state.run_id),
+            Some(_) => Err(anyhow!("No active run for plan {}", plan_id)),
+            None => Err(anyhow!("No active run")),
         }
     }
 
@@ -4415,10 +4431,9 @@ mod tests {
     use super::*;
     use crate::runner::models::TriggerSource;
 
-    /// Mutex to serialize tests that touch global RUNNER_STATE / RUNNER_CANCEL.
-    /// tokio::sync::Mutex is used because these are async tests.
-    static TEST_MUTEX: std::sync::LazyLock<tokio::sync::Mutex<()>> =
-        std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+    /// Mutex to serialize tests that touch global RUNNER_STATE / RUNNER_CANCEL
+    /// (shared with the handler tests, see `RUNNER_GLOBALS_TEST_LOCK`).
+    use super::RUNNER_GLOBALS_TEST_LOCK as TEST_MUTEX;
 
     /// Reset global state to a clean baseline.
     async fn reset_globals() {
@@ -4427,6 +4442,54 @@ mod tests {
             *global = None;
         }
         RUNNER_CANCEL.store(false, Ordering::SeqCst);
+        RUNNER_BUDGET.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[tokio::test]
+    async fn test_active_run_id_for_plan_rejects_other_plan() {
+        let _guard = TEST_MUTEX.lock().await;
+        reset_globals().await;
+        let (plan_a, plan_b, run_id) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        {
+            let mut global = RUNNER_STATE.write().await;
+            *global = Some(RunnerState::new(run_id, plan_b, 1, TriggerSource::Manual));
+        }
+        assert!(PlanRunner::active_run_id_for_plan(plan_a).await.is_err());
+        assert_eq!(
+            PlanRunner::active_run_id_for_plan(plan_b).await.unwrap(),
+            run_id
+        );
+        reset_globals().await;
+    }
+
+    #[tokio::test]
+    async fn test_force_cancel_wrong_run_leaves_flags_untouched() {
+        let _guard = TEST_MUTEX.lock().await;
+        reset_globals().await;
+        let (_runner, graph) = test_plan_runner_with_graph();
+        let graph: Arc<dyn GraphStore> = graph;
+        {
+            let mut global = RUNNER_STATE.write().await;
+            *global = Some(RunnerState::new(
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                1,
+                TriggerSource::Manual,
+            ));
+        }
+        let bits = 5.0f64.to_bits();
+        RUNNER_BUDGET.store(bits, std::sync::atomic::Ordering::Relaxed);
+
+        let res = PlanRunner::force_cancel(Uuid::new_v4(), graph, None).await;
+
+        assert!(res.is_err());
+        assert!(!RUNNER_CANCEL.load(Ordering::SeqCst), "cancel flag leaked");
+        assert_eq!(
+            RUNNER_BUDGET.load(std::sync::atomic::Ordering::Relaxed),
+            bits,
+            "budget override cleared"
+        );
+        reset_globals().await;
     }
 
     #[test]

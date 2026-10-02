@@ -703,7 +703,7 @@ pub struct Note {
 
     // Neural energy (Phase 2)
     /// Neural energy level (0.0-1.0). Represents "freshness" via exponential decay.
-    /// Starts at 1.0 on creation, decays with half_life=90 days, boosted on activation.
+    /// Starts at 1.0 on creation, decays with time constant 90 days in the stored batch decay (`update_energy_scores`, halves every ~62 days) and a true 90-day half-life in `computed_energy()`; boosted on activation.
     /// Coexists with staleness_score for dual-run comparison (Phase 3).
     #[serde(default = "default_energy")]
     pub energy: f64,
@@ -813,6 +813,9 @@ impl Note {
 
     /// Compute current energy using lazy decay formula (boucle-1).
     /// E(t) = energy × 0.5^((now - last_activated).days / 90.0)
+    /// (true 90-day half-life; the stored batch decay uses exp(-t/90) — see
+    /// `ENERGY_HALF_LIFE_DAYS`. Kept distinct on purpose: unifying would change
+    /// prod ranking.)
     /// Falls back to stored energy if last_activated is None.
     pub fn computed_energy(&self) -> f64 {
         match self.last_activated {

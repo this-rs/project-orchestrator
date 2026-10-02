@@ -172,11 +172,8 @@ impl Neo4jClient {
             "#,
         );
 
-        if let Some(completed_at) = ae.completed_at {
-            cypher.push_str(&format!(
-                ", ae.completed_at = datetime('{}')",
-                completed_at.to_rfc3339()
-            ));
+        if ae.completed_at.is_some() {
+            cypher.push_str(", ae.completed_at = datetime($completed_at)");
         }
 
         if ae.vector_json.is_some() {
@@ -196,6 +193,10 @@ impl Neo4jClient {
             .param("tools_used", ae.tools_used.clone())
             .param("files_modified", ae.files_modified.clone())
             .param("commits", ae.commits.clone());
+
+        if let Some(completed_at) = ae.completed_at {
+            q = q.param("completed_at", completed_at.to_rfc3339());
+        }
 
         if let Some(ref vector_json) = ae.vector_json {
             q = q.param("vector_json", vector_json.clone());

@@ -873,6 +873,15 @@ pub async fn ws_ticket(
     // --- Strategy 2: Try Bearer JWT (fallback — Tauri cross-origin) ---
     let bearer_claims = try_ws_ticket_via_bearer(&headers, auth_config);
     if let Some(claims) = bearer_claims {
+        // Same policy as `require_auth`: allowlist, MCP revocation, and vault
+        // tokens (never valid outside the vault read path) are refused here too.
+        crate::auth::middleware::enforce_token_policy(
+            &state,
+            auth_config,
+            &claims,
+            "/auth/ws-ticket",
+        )
+        .await?;
         tracing::info!(email = %claims.email, "WS ticket issued via Bearer token");
         let ticket = state.ws_ticket_store.create_ticket(claims).await;
         return Ok(Json(serde_json::json!({ "ticket": ticket })));
@@ -923,6 +932,12 @@ async fn try_ws_ticket_via_cookie(
             }
         }
     };
+
+    // Same allowlist as the HTTP middleware: a revoked-by-policy user must not
+    // obtain a ticket with a still-valid refresh cookie.
+    if !auth_config.is_email_allowed(&email) {
+        return None;
+    }
 
     let now = chrono::Utc::now().timestamp();
     Some(crate::auth::jwt::Claims {
@@ -992,12 +1007,21 @@ pub struct CreateMcpTokenResponse {
 pub async fn create_mcp_token(
     State(state): State<OrchestratorState>,
     user: AuthUser,
+    axum::Extension(claims): axum::Extension<crate::auth::jwt::Claims>,
     Json(req): Json<CreateMcpTokenRequest>,
 ) -> Result<Json<CreateMcpTokenResponse>, AppError> {
     let auth_config = state
         .auth_config
         .as_ref()
         .ok_or_else(|| AppError::Forbidden("Authentication not configured".to_string()))?;
+
+    // A long-lived token widens access: only a person may mint one, not an
+    // agent session, vault or MCP token.
+    if !claims.is_human() {
+        return Err(AppError::Forbidden(
+            "MCP tokens can only be issued from a user session".to_string(),
+        ));
+    }
 
     if req.label.trim().is_empty() {
         return Err(AppError::BadRequest("label is required".to_string()));
@@ -2157,5 +2181,167 @@ mod tests {
         assert_eq!(providers.len(), 1);
         assert_eq!(providers[0]["name"], "Okta");
         assert_eq!(providers[0]["type"], "oidc");
+    }
+
+    // ------------------------------------------------------------------
+    // ws-ticket / mcp-token hardening
+    // ------------------------------------------------------------------
+
+    use crate::auth::jwt::Claims;
+
+    fn router_with(state: OrchestratorState) -> Router {
+        Router::new()
+            .route("/auth/ws-ticket", post(ws_ticket))
+            .route(
+                "/auth/mcp-tokens",
+                post(create_mcp_token).layer(from_fn_with_state(state.clone(), require_auth)),
+            )
+            .with_state(state)
+    }
+
+    async fn post_status(app: Router, uri: &str, auth: Option<String>, body: &str) -> StatusCode {
+        let mut b = HttpRequest::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json");
+        if let Some(a) = auth {
+            b = b.header("authorization", format!("Bearer {a}"));
+        }
+        app.oneshot(b.body(Body::from(body.to_string())).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    fn sample_claims() -> Claims {
+        let now = chrono::Utc::now().timestamp();
+        Claims {
+            sub: Uuid::new_v4().to_string(),
+            email: "alice@ffs.holdings".to_string(),
+            name: "Alice".to_string(),
+            iat: now,
+            exp: now + 600,
+            token_type: None,
+            scope: None,
+            jti: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ws_ticket_bearer_refuses_revoked_mcp_token() {
+        let cfg = test_auth_config();
+        let state = make_server_state(Some(cfg.clone())).await;
+        let user = Uuid::new_v4();
+        let (token, _jti) = crate::auth::jwt::encode_mcp_token(
+            user,
+            "alice@ffs.holdings",
+            "Alice",
+            "mcp:read",
+            &cfg.jwt_secret,
+            3600,
+        )
+        .unwrap();
+        // jti never stored -> unknown/revoked
+        let status = post_status(router_with(state), "/auth/ws-ticket", Some(token), "").await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_ws_ticket_bearer_refuses_vault_token() {
+        let cfg = test_auth_config();
+        let state = make_server_state(Some(cfg.clone())).await;
+        let token =
+            crate::auth::jwt::generate_vault_token(&sample_claims(), "sess1", &cfg.jwt_secret, 600)
+                .unwrap();
+        let status = post_status(router_with(state), "/auth/ws-ticket", Some(token), "").await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn test_ws_ticket_bearer_refuses_email_outside_allowlist() {
+        let mut cfg = test_auth_config();
+        cfg.allowed_email_domain = Some("other.example".to_string());
+        let state = make_server_state(Some(cfg.clone())).await;
+        let token = encode_jwt(
+            Uuid::new_v4(),
+            "alice@ffs.holdings",
+            "Alice",
+            &cfg.jwt_secret,
+            600,
+        )
+        .unwrap();
+        let status = post_status(router_with(state), "/auth/ws-ticket", Some(token), "").await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn test_ws_ticket_cookie_refuses_email_outside_allowlist() {
+        let mut cfg = test_auth_config();
+        cfg.allowed_email_domain = Some("other.example".to_string());
+        let state = make_server_state(Some(cfg)).await;
+        let neo4j = state.orchestrator.neo4j();
+        let user = neo4j
+            .create_password_user("alice@ffs.holdings", "Alice", "hash")
+            .await
+            .unwrap();
+        let raw = refresh::generate_token();
+        neo4j
+            .create_refresh_token(
+                user.id,
+                &refresh::hash_token(&raw),
+                chrono::Utc::now() + chrono::Duration::hours(1),
+            )
+            .await
+            .unwrap();
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/auth/ws-ticket")
+            .header("cookie", format!("refresh_token={raw}"))
+            .body(Body::empty())
+            .unwrap();
+        let status = router_with(state).oneshot(req).await.unwrap().status();
+        assert!(
+            status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN,
+            "got {status}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_mcp_token_refuses_agent_session_token() {
+        let cfg = test_auth_config();
+        let state = make_server_state(Some(cfg.clone())).await;
+        let token =
+            crate::auth::jwt::generate_session_token(&sample_claims(), &cfg.jwt_secret, 600)
+                .unwrap();
+        let status = post_status(
+            router_with(state),
+            "/auth/mcp-tokens",
+            Some(token),
+            r#"{"label":"x"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn test_create_mcp_token_accepts_human_session() {
+        let cfg = test_auth_config();
+        let state = make_server_state(Some(cfg.clone())).await;
+        let token = encode_jwt(
+            Uuid::new_v4(),
+            "alice@ffs.holdings",
+            "Alice",
+            &cfg.jwt_secret,
+            600,
+        )
+        .unwrap();
+        let status = post_status(
+            router_with(state),
+            "/auth/mcp-tokens",
+            Some(token),
+            r#"{"label":"x"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
     }
 }

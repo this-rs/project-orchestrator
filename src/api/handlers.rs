@@ -5513,22 +5513,25 @@ pub async fn retry_plan_task(
 /// GET /api/plans/:id/run/status — Get current runner status.
 pub async fn get_run_status(
     State(_state): State<OrchestratorState>,
-    Path(_plan_id): Path<Uuid>,
+    Path(plan_id): Path<Uuid>,
 ) -> Result<Json<crate::runner::RunStatus>, AppError> {
     let status = crate::runner::PlanRunner::status().await;
+    // A run of another plan is not this plan's status: report idle instead.
+    if status.plan_id.is_some_and(|p| p != plan_id) {
+        return Ok(Json(crate::runner::RunStatus::default()));
+    }
     Ok(Json(status))
 }
 
 /// POST /api/plans/:id/run/cancel — Cancel an active plan run.
 pub async fn cancel_run(
     State(state): State<OrchestratorState>,
-    Path(_plan_id): Path<Uuid>,
+    Path(plan_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     // Get the current run_id to cancel
-    let status = crate::runner::PlanRunner::status().await;
-    let run_id = status
-        .run_id
-        .ok_or_else(|| AppError::NotFound("No active run".to_string()))?;
+    let run_id = crate::runner::PlanRunner::active_run_id_for_plan(plan_id)
+        .await
+        .map_err(|e| AppError::NotFound(e.to_string()))?;
 
     crate::runner::PlanRunner::cancel(run_id, state.chat_manager.clone())
         .await
@@ -5547,12 +5550,11 @@ pub async fn cancel_run(
 /// to the graceful cancel flag.
 pub async fn force_cancel_run(
     State(state): State<OrchestratorState>,
-    Path(_plan_id): Path<Uuid>,
+    Path(plan_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let status = crate::runner::PlanRunner::status().await;
-    let run_id = status
-        .run_id
-        .ok_or_else(|| AppError::NotFound("No active run".to_string()))?;
+    let run_id = crate::runner::PlanRunner::active_run_id_for_plan(plan_id)
+        .await
+        .map_err(|e| AppError::NotFound(e.to_string()))?;
 
     crate::runner::PlanRunner::force_cancel(
         run_id,
@@ -5571,7 +5573,7 @@ pub async fn force_cancel_run(
 /// PATCH /api/plans/{plan_id}/run/budget — Update the budget of a running execution.
 pub async fn update_run_budget(
     State(_state): State<OrchestratorState>,
-    Path(_plan_id): Path<Uuid>,
+    Path(plan_id): Path<Uuid>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let max_cost_usd = body
@@ -5590,10 +5592,9 @@ pub async fn update_run_budget(
     }
 
     // Get the current run_id
-    let status = crate::runner::PlanRunner::status().await;
-    let run_id = status
-        .run_id
-        .ok_or_else(|| AppError::NotFound("No active run".to_string()))?;
+    let run_id = crate::runner::PlanRunner::active_run_id_for_plan(plan_id)
+        .await
+        .map_err(|e| AppError::NotFound(e.to_string()))?;
 
     crate::runner::PlanRunner::update_budget(run_id, max_cost_usd)
         .await
@@ -8317,6 +8318,82 @@ mod tests {
             .await
             .unwrap();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// Seed the global runner state with a run of `plan_id` and return its run id.
+    async fn seed_run_for_plan(plan_id: Uuid) -> Uuid {
+        let run_id = Uuid::new_v4();
+        let mut global = crate::runner::RUNNER_STATE.write().await;
+        *global = Some(crate::runner::RunnerState::new(
+            run_id,
+            plan_id,
+            1,
+            crate::runner::models::TriggerSource::Manual,
+        ));
+        run_id
+    }
+
+    async fn reset_runner_globals() {
+        *crate::runner::RUNNER_STATE.write().await = None;
+        crate::runner::RUNNER_CANCEL.store(false, std::sync::atomic::Ordering::SeqCst);
+        crate::runner::runner::RUNNER_BUDGET.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The run endpoints must refuse to act on a run that belongs to another plan.
+    #[tokio::test]
+    async fn test_run_handlers_reject_run_of_another_plan() {
+        let _guard = crate::runner::runner::RUNNER_GLOBALS_TEST_LOCK.lock().await;
+        reset_runner_globals().await;
+        let state = mock_server_state().await;
+        let (plan_a, plan_b) = (Uuid::new_v4(), Uuid::new_v4());
+        let run_b = seed_run_for_plan(plan_b).await;
+
+        let cancel = cancel_run(State(state.clone()), Path(plan_a)).await;
+        assert!(matches!(cancel, Err(AppError::NotFound(_))), "cancel");
+
+        let force = force_cancel_run(State(state.clone()), Path(plan_a)).await;
+        assert!(matches!(force, Err(AppError::NotFound(_))), "force-cancel");
+
+        let budget = update_run_budget(
+            State(state.clone()),
+            Path(plan_a),
+            Json(serde_json::json!({ "max_cost_usd": 9.0 })),
+        )
+        .await;
+        assert!(matches!(budget, Err(AppError::NotFound(_))), "budget");
+
+        // Plan B's run is untouched: still registered, no flag raised, no budget override.
+        let global = crate::runner::RUNNER_STATE.read().await;
+        assert_eq!(global.as_ref().map(|s| s.run_id), Some(run_b));
+        drop(global);
+        assert!(!crate::runner::RUNNER_CANCEL.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            crate::runner::runner::RUNNER_BUDGET.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        reset_runner_globals().await;
+    }
+
+    /// Status of plan A must be idle while plan B runs, and real for plan B.
+    #[tokio::test]
+    async fn test_get_run_status_idle_for_another_plan() {
+        let _guard = crate::runner::runner::RUNNER_GLOBALS_TEST_LOCK.lock().await;
+        reset_runner_globals().await;
+        let state = mock_server_state().await;
+        let (plan_a, plan_b) = (Uuid::new_v4(), Uuid::new_v4());
+        let run_b = seed_run_for_plan(plan_b).await;
+
+        let Json(other) = get_run_status(State(state.clone()), Path(plan_a))
+            .await
+            .unwrap();
+        assert!(!other.running);
+        assert_eq!(other.run_id, None);
+        assert_eq!(other.plan_id, None);
+
+        let Json(own) = get_run_status(State(state), Path(plan_b)).await.unwrap();
+        assert_eq!(own.run_id, Some(run_b));
+        assert_eq!(own.plan_id, Some(plan_b));
+        reset_runner_globals().await;
     }
 
     /// Build a mock OrchestratorState for handler tests.
