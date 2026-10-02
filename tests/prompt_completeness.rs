@@ -103,6 +103,12 @@ fn external_group_renders_tool_documentation() {
         "ToolRefGroupId::External output is missing the `## mcp_federation` section:\n{}",
         external
     );
+    // Exactly the actions `mcp_federation` implements: the dispatch table in
+    // `src/mcp/handlers.rs` and the `enum` of its schema in `src/mcp/tools.rs`
+    // both list these seven. `backfill_relations` and `backfill_sequences` used
+    // to be required here, but no such action exists anywhere in the code —
+    // this test was demanding documentation for features that were never built,
+    // and it went unnoticed because no CI job ran this suite until now.
     for action in [
         "| connect ",
         "| disconnect ",
@@ -111,8 +117,6 @@ fn external_group_renders_tool_documentation() {
         "| tools ",
         "| probe ",
         "| reconnect ",
-        "| backfill_relations ",
-        "| backfill_sequences ",
     ] {
         assert!(
             external.contains(action),
