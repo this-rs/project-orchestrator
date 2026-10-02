@@ -1660,7 +1660,14 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         );
 
         // ── Cleanup: remove stale files ────────────────────────────
-        if let Some(pid) = project_id {
+        // An empty scan (missing, unmounted or emptied root) is not proof that
+        // every file was deleted: skip the purge so the project graph survives.
+        if project_id.is_some() && synced_paths.is_empty() {
+            tracing::warn!(
+                "sync of {} scanned no files; skipping stale-file cleanup",
+                dir_path.display()
+            );
+        } else if let Some(pid) = project_id {
             let valid_paths: Vec<String> = synced_paths.into_iter().collect();
             match self.neo4j().delete_stale_files(pid, &valid_paths).await {
                 Ok((files_deleted, symbols_deleted, stale_paths)) => {
@@ -10079,6 +10086,46 @@ mod tests {
         for path in &stale_paths {
             meili.delete_code(path).await.unwrap();
         }
+    }
+
+    /// A scan that finds nothing (missing/unmounted/empty root) must not be
+    /// treated as "every file was deleted": the project graph must survive.
+    #[tokio::test]
+    async fn test_sync_empty_scan_does_not_purge_project() {
+        use crate::neo4j::models::FileNode;
+        use crate::neo4j::GraphStore;
+        use crate::test_helpers::mock_app_state_with_stores;
+
+        let (state, neo4j, _meili) = mock_app_state_with_stores();
+        let project_id = Uuid::new_v4();
+        for i in 0..3 {
+            let path = format!("/tmp/empty-scan-test/src/file_{}.rs", i);
+            GraphStore::upsert_file(
+                neo4j.as_ref(),
+                &FileNode {
+                    path: path.clone(),
+                    language: "rust".to_string(),
+                    hash: format!("hash_{}", i),
+                    last_parsed: chrono::Utc::now(),
+                    project_id: Some(project_id),
+                },
+            )
+            .await
+            .unwrap();
+            GraphStore::link_file_to_project(neo4j.as_ref(), &path, project_id)
+                .await
+                .unwrap();
+        }
+
+        let orch = Orchestrator::new(state).await.unwrap();
+        let empty = tempfile::tempdir().unwrap();
+        let result = orch
+            .sync_directory_for_project_with_options(empty.path(), Some(project_id), None, false)
+            .await
+            .unwrap();
+
+        assert_eq!(result.files_deleted, 0, "empty scan must not purge files");
+        assert_eq!(neo4j.files.read().await.len(), 3);
     }
 
     /// Scenario 6: Add + delete simultaneously in debounce window → consistency

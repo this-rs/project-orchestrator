@@ -4772,7 +4772,8 @@ impl ToolHandler {
                 let tree_id = extract_id(args, "tree_id")?;
                 let body = json!({
                     "followed_nodes": args.get("followed_nodes").cloned().unwrap_or(json!([])),
-                    "outcome": args.get("outcome").and_then(|v| v.as_str()).unwrap_or("success")
+                    "outcome": args.get("outcome").and_then(|v| v.as_str()).unwrap_or("success"),
+                    "run_id": args.get("run_id").cloned().unwrap_or(json!(null))
                 });
                 let result = http
                     .post(&format!("/api/reason/{}/feedback", tree_id), &body)

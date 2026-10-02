@@ -148,6 +148,22 @@ jobs:
       - name: Test the diagram index checker
         run: node --test scripts/diagrams/check-index.test.mjs
 
+      # Forbidden tokens. This repository is public, and a few identifiers (a
+      # private service host and its API paths) must never appear in it. The
+      # gate stores SHA-256 digests of the normalized forms, never the strings,
+      # so it cannot publish what it forbids — the cost of that choice is that a
+      # failure gives you file:line and not the token. Offline, ~2 s on this tree.
+      #
+      # SCOPE: the tracked tree. Commit messages are NOT checked (that needs
+      # full history, which this checkout does not fetch). The script's header
+      # lists the other blind spots. Do not cite this step as proof that a
+      # branch is free of them.
+      - name: Check forbidden tokens (tree only — see the script header)
+        run: node scripts/forbidden/check-forbidden-tokens.mjs
+
+      - name: Test the forbidden-token checker
+        run: node --test scripts/forbidden/check-forbidden-tokens.test.mjs
+
   # ==========================================================================
   # Unit Tests - Library and parser tests without external services
   # ==========================================================================

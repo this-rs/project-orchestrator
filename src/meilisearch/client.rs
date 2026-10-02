@@ -10,6 +10,26 @@ pub struct MeiliClient {
     client: Client,
 }
 
+/// Quote a string literal for a MeiliSearch filter expression, escaping
+/// backslashes and double quotes so user input cannot break out of the literal.
+pub(crate) fn meili_quote(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for c in value.chars() {
+        if c == '\\' || c == '"' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('"');
+    out
+}
+
+/// Build a `field = "value"` MeiliSearch filter with the value escaped.
+pub(crate) fn meili_filter_eq(field: &str, value: &str) -> String {
+    format!("{} = {}", field, meili_quote(value))
+}
+
 impl MeiliClient {
     /// Check if Meilisearch is reachable and healthy.
     pub async fn is_healthy(&self) -> bool {
@@ -203,13 +223,13 @@ impl MeiliClient {
 
         let mut filters = Vec::new();
         if let Some(lang) = language_filter {
-            filters.push(format!("language = \"{}\"", lang));
+            filters.push(meili_filter_eq("language", lang));
         }
         if let Some(slug) = project_slug {
-            filters.push(format!("project_slug = \"{}\"", slug));
+            filters.push(meili_filter_eq("project_slug", slug));
         }
         if let Some(prefix) = path_prefix {
-            filters.push(format!("path STARTS WITH \"{}\"", prefix));
+            filters.push(format!("path STARTS WITH {}", meili_quote(prefix)));
         }
 
         let filter_str = if filters.is_empty() {
@@ -255,7 +275,7 @@ impl MeiliClient {
 
         let index = self.client.index(index_names::CODE);
         let mut query = DocumentDeletionQuery::new(&index);
-        let filter = format!("project_slug = \"{}\"", project_slug);
+        let filter = meili_filter_eq("project_slug", project_slug);
         query.with_filter(&filter);
 
         let task = index.delete_documents_with(&query).await?;
@@ -329,7 +349,7 @@ impl MeiliClient {
     ) -> Result<Vec<DecisionDocument>> {
         let index = self.client.index(index_names::DECISIONS);
 
-        let filter_str = project_slug.map(|slug| format!("project_slug = \"{}\"", slug));
+        let filter_str = project_slug.map(|slug| meili_filter_eq("project_slug", slug));
 
         let mut search = index.search();
         search.with_query(query).with_limit(limit);
@@ -357,7 +377,7 @@ impl MeiliClient {
 
         let index = self.client.index(index_names::DECISIONS);
 
-        let quoted: Vec<String> = project_slugs.iter().map(|s| format!("\"{}\"", s)).collect();
+        let quoted: Vec<String> = project_slugs.iter().map(|s| meili_quote(s)).collect();
         let filter_str = format!("project_slug IN [{}]", quoted.join(", "));
 
         let mut search = index.search();
@@ -385,7 +405,7 @@ impl MeiliClient {
 
         let index = self.client.index(index_names::DECISIONS);
         let mut query = DocumentDeletionQuery::new(&index);
-        let filter = format!("project_slug = \"{}\"", project_slug);
+        let filter = meili_filter_eq("project_slug", project_slug);
         query.with_filter(&filter);
 
         let task = index.delete_documents_with(&query).await?;
@@ -400,7 +420,7 @@ impl MeiliClient {
 
         let index = self.client.index(index_names::DECISIONS);
         let mut query = DocumentDeletionQuery::new(&index);
-        let filter = format!("task_id = \"{}\"", task_id);
+        let filter = meili_filter_eq("task_id", task_id);
         query.with_filter(&filter);
 
         let task = index.delete_documents_with(&query).await?;
@@ -471,19 +491,19 @@ impl MeiliClient {
         let mut filters = Vec::new();
 
         if let Some(slug) = project_slug {
-            filters.push(format!("project_slug = \"{}\"", slug));
+            filters.push(meili_filter_eq("project_slug", slug));
         }
         if let Some(nt) = note_type {
-            filters.push(format!("note_type = \"{}\"", nt));
+            filters.push(meili_filter_eq("note_type", nt));
         }
         if let Some(s) = status {
-            filters.push(format!("status = \"{}\"", s));
+            filters.push(meili_filter_eq("status", s));
         } else {
             // By default, only search active and needs_review notes
             filters.push("status IN [\"active\", \"needs_review\"]".to_string());
         }
         if let Some(imp) = importance {
-            filters.push(format!("importance = \"{}\"", imp));
+            filters.push(meili_filter_eq("importance", imp));
         }
 
         let filter_str = if filters.is_empty() {
@@ -528,7 +548,7 @@ impl MeiliClient {
 
         let index = self.client.index(index_names::NOTES);
         let mut query = DocumentDeletionQuery::new(&index);
-        let filter = format!("project_slug = \"{}\"", project_slug);
+        let filter = meili_filter_eq("project_slug", project_slug);
         query.with_filter(&filter);
 
         let task = index.delete_documents_with(&query).await?;
@@ -619,6 +639,20 @@ impl MeiliClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn meili_quote_escapes_quotes_and_backslashes() {
+        assert_eq!(meili_quote("abc"), "\"abc\"");
+        assert_eq!(
+            meili_quote("a\" OR project_slug != \"x"),
+            "\"a\\\" OR project_slug != \\\"x\""
+        );
+        assert_eq!(meili_quote("a\\"), "\"a\\\\\"");
+        assert_eq!(
+            meili_filter_eq("project_slug", "x\" OR 1 = 1"),
+            "project_slug = \"x\\\" OR 1 = 1\""
+        );
+    }
 
     #[test]
     fn test_path_to_id_consistent() {
