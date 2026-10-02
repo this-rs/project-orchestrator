@@ -809,6 +809,33 @@ mod where_builder_tests {
     }
 
     #[test]
+    fn empty_or_absent_status_filter_adds_no_condition() {
+        // An absent or empty status list must leave the clause untouched, not
+        // emit `status IN []` (which matches nothing and would silently empty
+        // every unfiltered listing).
+        let mut wb = WhereBuilder::new();
+        wb.add_status_filter("t", None);
+        wb.add_status_filter("t", Some(vec![]));
+        wb.add_status_filter_any_case("m", None);
+        wb.add_status_filter_any_case("m", Some(vec![]));
+        assert!(wb.build().is_empty(), "{}", wb.build());
+        assert!(wb.build_and().is_empty());
+        assert!(wb.params().is_empty());
+        assert!(!wb.has_conditions());
+    }
+
+    #[test]
+    fn status_variants_collapses_when_both_spellings_agree() {
+        // A value whose snake_case and PascalCase spellings coincide must be
+        // bound once, not twice.
+        assert_eq!(status_variants("123"), vec!["123"]);
+        assert_eq!(status_variants(""), vec![""]);
+        // and the sanitizer still strips anything that is not an identifier,
+        // so no quote or space can reach the Cypher text even in this position
+        assert_eq!(status_variants("'; DROP //"), vec!["d_r_o_p", "DROP"]);
+    }
+
+    #[test]
     fn any_case_filter_matches_milestone_snake_case() {
         let mut wb = WhereBuilder::new();
         wb.add_status_filter_any_case("m", Some(vec!["in_progress".into()]));
