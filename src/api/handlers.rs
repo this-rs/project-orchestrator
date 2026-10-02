@@ -2313,7 +2313,7 @@ pub async fn add_constraint(
     state.event_bus.emit_created(
         crate::events::EntityType::Constraint,
         &constraint.id.to_string(),
-        serde_json::json!({"plan_id": plan_id, "constraint_type": constraint.constraint_type.to_string()}),
+        serde_json::json!({"plan_id": plan_id, "constraint_type": format!("{:?}", constraint.constraint_type).to_lowercase()}),
         None,
     );
 
