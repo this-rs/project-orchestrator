@@ -2501,6 +2501,81 @@ mod tests {
         format!("/api/chat/sessions/{sid}/messages")
     }
 
+    /// Store a one-chunk document so a message can refer to it.
+    async fn seed_document(h: &ActionHarness) -> Uuid {
+        use crate::documents::DocumentFormat;
+        use crate::neo4j::document::{Document, DocumentChunk};
+        let id = Uuid::new_v4();
+        let doc = Document {
+            id,
+            filename: "notes.txt".to_string(),
+            format: DocumentFormat::PlainText,
+            sha256: "0".repeat(64),
+            size_bytes: 5,
+            page_count: 0,
+            chunk_count: 1,
+            warnings: vec![],
+            created_at: chrono::Utc::now(),
+            project_id: None,
+            session_id: None,
+            extracted: true,
+            mime_type: Some("text/plain".to_string()),
+        };
+        let chunk = DocumentChunk {
+            id: Uuid::new_v4(),
+            text: "hello".to_string(),
+            start_byte: 0,
+            end_byte: 5,
+            page: None,
+            ordinal: 0,
+            embedding: None,
+        };
+        h.graph.create_document(&doc, &[chunk]).await.unwrap();
+        id
+    }
+
+    #[tokio::test]
+    async fn message_naming_an_unknown_attachment_is_refused_not_sent_without_it() {
+        let h = action_harness(Some("/nonexistent/claude-cli")).await;
+        let sid = seed_session(&h).await;
+        let ghost = Uuid::new_v4();
+        let body = format!(r#"{{"content":"lis ça","attachments":["{ghost}"]}}"#);
+        let (status, resp) = call(&h.app, auth_post(&msg_uri(sid), &body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{resp}");
+        assert!(resp.to_string().contains("does not exist"), "{resp}");
+    }
+
+    #[tokio::test]
+    async fn message_with_a_known_attachment_gets_past_validation_to_delivery() {
+        // The id exists, so the request is not a 400: it proceeds to delivery,
+        // which fails here only because there is no CLI to resume.
+        let h = action_harness(Some("/nonexistent/claude-cli")).await;
+        let sid = seed_session(&h).await;
+        let doc = seed_document(&h).await;
+        let body = format!(r#"{{"content":"lis ça","attachments":["{doc}"]}}"#);
+        let (status, resp) = call(&h.app, auth_post(&msg_uri(sid), &body)).await;
+        assert_ne!(status, StatusCode::BAD_REQUEST, "{resp}");
+        assert_ne!(status, StatusCode::UNPROCESSABLE_ENTITY, "{resp}");
+    }
+
+    #[tokio::test]
+    async fn first_message_naming_an_unknown_attachment_creates_no_session() {
+        let h = action_harness(Some("/nonexistent/claude-cli")).await;
+        let ghost = Uuid::new_v4();
+        let body = format!(r#"{{"message":"lis ça","cwd":"/tmp","attachments":["{ghost}"]}}"#);
+        let (status, resp) = call(&h.app, auth_post("/api/chat/sessions", &body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{resp}");
+        let sessions = h
+            .graph
+            .list_chat_sessions(None, None, 10, 0, true)
+            .await
+            .unwrap();
+        assert!(
+            sessions.0.is_empty(),
+            "no session may be created for a refused message"
+        );
+    }
+
     #[tokio::test]
     #[ignore = "needs the claude CLI on PATH (run with: cargo test -- --ignored)"]
     async fn message_to_a_live_session_goes_through_the_same_send_path() {
