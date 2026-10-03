@@ -127,7 +127,14 @@ flowchart TD
         direction TB
         OOB["✅ ⚓ spawn_oob_listener : subscribe_messages du client ;<br/>quand is_streaming est faux → BackgroundOutput (Monitor, BashOutput, Task)<br/>persisté et diffusé ; should_trigger_turn → relance un tour sous plafond<br/>(50 par 5 min, 5 pour un runner)<br/><i>vérifié : test_background_tool_output_triggers_a_turn,<br/>test_assistant_output_never_triggers_a_turn, test_trigger_cap_*</i>"]
         DEATH["✅ fermeture du broadcast → emit_subprocess_death → SessionError<br/><i>vérifié : test_emit_subprocess_death_emits_session_error</i>"]
+        CLIBG["✅ cli_background_task_count : chaque message system background_tasks_changed du CLI<br/>(liste complète de ses tâches de fond, à chaque départ et fin) → ActiveSession.cli_background_tasks,<br/>lu sur tous les messages, y compris pendant un tour<br/><i>vérifié : test_cli_background_task_count_reads_the_cli_report</i>"]
+        BGDEAD["✅ tick_purge_background_tasks : une tâche silencieuse depuis 30 min n'est retirée que si rien ne dit<br/>qu'elle tourne (background_task_is_idle_dead) : pid connu → process_alive décide ;<br/>pid inconnu → retirée seulement si le CLI n'annonce plus de tâche de fond<br/><i>vérifié : test_tick_purge_keeps_a_silent_task_whose_process_is_running,<br/>test_tick_purge_keeps_a_silent_task_while_the_cli_reports_work,<br/>test_tick_purge_marks_a_silent_task_whose_process_is_gone</i>"]
+        BGSILENT["🔴 refusé : le silence seul comme preuve de mort — une compilation dont la sortie va<br/>dans un fichier était retirée encore vivante ; la session, vue sans travail, était fermée<br/>et le CLI tué (« The CLI subprocess for this session has exited »)"]
         OOB --> DEATH
+        OOB --> CLIBG
+        CLIBG --> BGDEAD
+        BGSILENT --> BGDEAD
+        BGDEAD --> CLOSE
     end
 
     subgraph activity["Qui travaille, maintenant — la seule vérité est en mémoire"]
@@ -152,7 +159,7 @@ flowchart TD
         INTERRUPT["✅ interrupt_scoped(kill_tools) : flag + token.cancel +<br/>build_interrupt_json sur stdin_tx (sans verrou) ; si kill_tools : SIGINT aux<br/>descendants (get_descendant_pids par pgrep -P, libc::kill) ; publié sur NATS<br/><i>vérifié : test_interrupt_does_not_wait_for_client_lock,<br/>test_double_interrupt_is_idempotent, test_interrupt_latency_benchmark</i>"]
         CANCEL["✅ cancel_running_tools : SIGINT aux descendants SEULEMENT,<br/>jamais le control_request interrupt (le tour survit, décision d2bf0e7b) ;<br/>plafond check_and_record_cancel_cap → ToolsCancelled<br/><i>vérifié : test_cancel_cap_allows_up_to_cap_then_refuses, test_cancel_tools_result_serde_*</i>"]
         CANCELTASK["✅ cancel_task → kill_subtree(pid) → ActiveTasksUpdate ; plafond dédié<br/><i>vérifié : test_cancel_task_with_pid_calls_kill_subtree, test_cancel_task_rate_cap_enforced</i>"]
-        CLOSE["🟠 close_session : interrupt → disconnect sous 5 s → retrait ;<br/>start_cleanup_task ferme les sessions expirées (session_is_expired)<br/>écrit, test non identifié dans ce relevé"]
+        CLOSE["✅ close_session : interrupt → disconnect sous 5 s → retrait ;<br/>start_cleanup_task (toutes les session_timeout / 2) ferme une session inactive depuis plus de<br/>session_timeout, sauf si elle diffuse ou a du travail de fond : max(tâches suivies,<br/>tâches annoncées par le CLI) ; plafond dur à 8 × session_timeout<br/><i>vérifié : idle_expiry_tests (session_is_expired,<br/>idle_session_is_kept_while_the_cli_reports_background_work)</i>"]
         ATTACH["✅ pièces jointes : compose (API, avant le manager) ajoute un bloc <po-attachments> de références<br/>au texte ; tous les chemins le portent tel quel ; stream_response l'étend en texte extrait<br/>(expand_for_agent, 60 ko max par document) juste avant l'enrichissement. Id inconnu → refus<br/><i>vérifié : message_attachments.rs 10 tests ; chat_handlers.rs : message_naming_an_unknown_attachment_is_refused_not_sent_without_it, first_message_naming_an_unknown_attachment_creates_no_session</i>"]
         SENDMSG --> ROUTE
         PERM --> RAWJSON
