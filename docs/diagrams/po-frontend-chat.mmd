@@ -1,5 +1,5 @@
 %% name: po-frontend-chat
-%% covers: frontend:src/services/{chatWebSocket,chat,wsAdapter}.ts frontend:src/hooks/{useChat,useChatUrlSync,useSessionTree}.ts frontend:src/hooks/runner/useConversationWs.ts frontend:src/atoms/{chat,modelCatalog}.ts frontend:src/utils/chatAssembly.ts frontend:src/types/chat.ts frontend:src/constants/models.ts frontend:src/components/chat/{ChatPanel,ChatInput,ChatMessages,ChatMessageBubble,ChatSessionContext,PermissionRequestBlock,PermissionSettingsPanel,SessionList}.tsx frontend:src/components/chat/{messageQueue,inputAction,chatUrlState,sessionListUtils}.ts frontend:src/components/chat/tools/**
+%% covers: frontend:src/services/{chatWebSocket,chat,wsAdapter}.ts frontend:src/hooks/{useChat,useChatUrlSync,useSessionTree}.ts frontend:src/hooks/runner/useConversationWs.ts frontend:src/atoms/{chat,modelCatalog}.ts frontend:src/utils/chatAssembly.ts frontend:src/types/chat.ts frontend:src/constants/models.ts frontend:src/components/chat/{ChatPanel,ChatInput,ActivityBar,ChatMessages,ChatMessageBubble,ChatSessionContext,PermissionRequestBlock,PermissionSettingsPanel,SessionList}.tsx frontend:src/components/chat/{messageQueue,inputAction,runningActivity,chatUrlState,sessionListUtils}.ts frontend:src/components/chat/tools/**
 %% verified: ff5bb7b0
 %% ---
 %% PROUVE : le harness de chat côté navigateur — du socket /ws/chat/{id} au rendu
@@ -27,6 +27,7 @@
 %%     (groupBlocksByAgent), ChatSessionContext.tsx, PermissionRequestBlock.tsx (classifyTool),
 %%     PermissionSettingsPanel.tsx, SessionList.tsx, messageQueue.ts, inputAction.ts
 %%     (deriveInputAction), chatUrlState.ts, sessionListUtils.ts, tools/index.tsx (TOOL_REGISTRY)
+%%   src/components/chat/runningActivity.ts (collectRunning, countByKind), ActivityBar.tsx — lus à frontend@de44980 (#215)
 %%   Commandes : grep -rn 'function useConversationWs' src  → 1 définition (frontend@7e664ea ; 3 avant #199)
 %%               grep -n 'session_error\|tools_cancelled' src/hooks/useChat.ts src/utils/chatAssembly.ts → 0
 %%               grep -rn 'ClientMessage\b' src | grep -v WsChatClientMessage → 0 (type supprimé, frontend#198)
@@ -152,6 +153,9 @@ flowchart TD
         MSGS["✅ ChatMessages : ancrage bas pendant le flux,<br/>scroll inversé (onLoadOlder / onLoadNewer), badge « nouveaux »<br/><i>vérifié : ChatMessages.streaming.test</i>"]
         BUBBLE["✅ ChatMessageBubble.groupBlocksByAgent :<br/>blocs portant parent_tool_use_id repliés sous leur tool_use (sous-agent),<br/>tool_use consécutifs groupés, tool_result rendus dans leur outil<br/><i>vérifié : BackgroundActivityIntegration.test (regroupement d'activité)</i>"]
         INPUT["✅ ChatInput : file d'attente chatMessageQueueAtom,<br/>un message par tour, « envoyer maintenant » = second clic + interruption ;<br/>deriveInputAction → send · stop · stopping · waiting · idle<br/><i>vérifié : ChatInput.queue.test, inputAction.test, messageQueue.test</i>"]
+        RUNNING["✅ ⚓ runningActivity.collectRunning : UNE liste de ce qui tourne dans la session —<br/>Monitor / Bash depuis le registre backend SEUL (jamais devinés depuis le fil),<br/>workflows (progression du fan-out) et sous-agents depuis les tool_use ;<br/>un sous-agent au premier plan ne compte que pendant le flux de SON tour ;<br/>runs détachés (useDetachedRuns) listés seulement tant qu'ils streament (frontend #216)<br/><i>vérifié : runningActivity.test (17 cas ; rouge si la règle du registre est retirée)</i>"]
+        ACTIVITY["✅ ActivityBar : compteur par type au-dessus du composeur, liste dépliable,<br/>saut vers le bloc du fil (data-tool-call-id / data-activity-anchors),<br/>Stop = cancel-task, réservé aux tâches que le backend sait arrêter seules ;<br/>remplace la pastille BackgroundTasksIndicator (supprimée) ;<br/>ligne d'un run : ouvrir sa conversation, tableau de bord du runner, arrêter (frontend #216)<br/><i>vérifié : ActivityBar.test, ChatInput.activity.test ; jamais essayé dans un navigateur</i>"]
+        RUNSPANEL["✅ ChatPanel : un run qui streame n'est montré QUE dans la barre ;<br/>DetachedRunsPanel ne reçoit que les runs terminés ; AgenticModeBanner / AgenticModePill<br/>ne sont plus montés ici (restent sur ChatSessionPage) — plus de polling runner depuis le chat<br/><i>vérifié : ChatPanel.runs.test (rouge si le filtre est retiré) ; frontend #216</i>"]
         INPUTMODES["🟠 ⚓ ChatInput MODE_LABELS / PermissionSettingsPanel MODES et presets<br/>Bash(git *), Read(.env*), mcp__project-orchestrator__* :<br/>syntaxe des règles d'outils de Claude Code — sans test"]
         PERM["✅ ⚓ PermissionRequestBlock.classifyTool<br/>Bash · Read/Glob/Grep · Edit/Write/NotebookEdit · mcp__ · WebFetch/WebSearch ;<br/>Allow / Deny / Remember → onRespond ; « Not sent » si le socket a refusé<br/><i>vérifié : ResponseBlocks.sendFailure.test</i>"]
         TOOLS["🟠 ⚓ tools/index.tsx TOOL_REGISTRY : Bash, Edit, Read, Write, Glob, Grep,<br/>WebFetch, WebSearch, TodoWrite → tools/*Renderer.tsx ; préfixe<br/>mcp__project-orchestrator__ ou input.action → McpToolRenderer → tools/mcp/*Renderer.tsx<br/>(classifyAction : list · entity · chat · code · progress) ; sinon DefaultToolRenderer ;<br/>summaries.ts, syntax.ts, types.ts — écrit, sans test"]
@@ -161,6 +165,10 @@ flowchart TD
         BUBBLE --> PERM
         BUBBLE --> TOOLS
         PANEL --> INPUT --> INPUTMODES
+        PANEL -->|"collectRunning(messages, tâches de fond, isStreaming)"| RUNNING
+        RUNNING --> ACTIVITY
+        PANEL --> RUNSPANEL
+        INPUT -->|"une seule carte : activité au-dessus, file dessous"| ACTIVITY
         PANEL --> SESSIONS
         PANEL --> URL
     end
