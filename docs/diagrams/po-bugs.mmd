@@ -1,6 +1,6 @@
 %% name: po-bugs
 %% covers: backend:docs/BUGS.md
-%% verified: d42312a2
+%% verified: ff5bb7b0
 %% ---
 %% PROUVE : inventaire des bugs du dépôt project-orchestrator/backend
 %%   relu contre le code au sha d42312a2 (2026-10-02, soir) : PR #500 et #501 fusionnees,
@@ -46,12 +46,21 @@ graph TD
 
     subgraph chat_dead ["chat"]
         B9["✅ InputRequest type mort\njamais émis en prod\ndocumenté · attention.rs:31"]
-        B11["✅ session_error non rendu · ClientMessage mort\nrejoue-sans · frontend#198 · chatAssembly.sessionError.test\n🟠 reste : useConversationWs ×3 implémentations divergentes\ntâche c2139265 (session_closed = réservé, tools_cancelled = voulu)"]
-        B12["🔴 ChatConfig::mcp_server_config code mort\nbuild_options construit McpServerConfig::Stdio\ntâche e6919f99"]
+        B11["✅ session_error non rendu · ClientMessage mort · useConversationWs ×3 implémentations
+rejoue-sans · frontend#198 + #199 · chatAssembly.sessionError.test, InlineConversationPanel.events.test
+⚪ décisions : session_closed = branche réservée, tools_cancelled = voulu (tâche c2139265)"]
+        B12["✅ ChatConfig::mcp_server_config code mort
+supprimée · grep → 0 · backend#508 (670b50a8)
+NATS_URL : le serveur MCP est un proxy HTTP"]
     end
 
     subgraph docs_gate ["docs / gate"]
-        B10["🟠 check-index.mjs : index dérivé de nexus illisible\n+ --write-orphans relevait les plafonds par dépôt\nPR fix/diagrams-gate-neighbour-index · 5 tests rouges sans · tâche efa9fd3c"]
+        B10["✅ check-index.mjs : index dérivé de nexus illisible + plafonds par dépôt relevés
+rejoue-sans · backend#506 · 5 tests rouges sans le correctif"]
+        B13["✅ nexus : verified non rejouable (yesterday, TODO) accepté
+rejoue-sans · nexus#60 · 4 tests rouges sans le correctif"]
+        B14["✅ nexus : MSRV 1.88 cassé par uuid 1.27 (Cargo.lock non versionné)
+rejoue-sans · cargo +1.88 check · nexus#61"]
     end
 
     REGISTRY --> B1
@@ -66,3 +75,5 @@ graph TD
     REGISTRY --> B10
     REGISTRY --> B11
     REGISTRY --> B12
+    REGISTRY --> B13
+    REGISTRY --> B14

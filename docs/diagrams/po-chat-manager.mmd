@@ -1,6 +1,6 @@
 %% name: po-chat-manager
 %% covers: backend:src/chat/{mod,manager,drain,post_stream,control_pump,oob_listener,config,types,skill_hook,post_tool_hook,hook_ledger,cli_auth,cli_version,model_catalog,compaction_context,message_attachments}.rs
-%% verified: d42312a2
+%% verified: ff5bb7b0
 %% ---
 %% PROUVE : le harness de chat côté serveur — comment ChatManager lance, pilote et
 %%   ferme une session Claude Code via le SDK nexus_claude (InteractiveClient), et où
@@ -23,7 +23,7 @@
 %%   src/chat/skill_hook.rs     — SkillActivationHook ; src/chat/post_tool_hook.rs — PostToolUseRedirectHook
 %%   src/chat/hook_ledger.rs    — HookLedger, HookLedgerReset
 %%   src/chat/config.rs         — PermissionConfig::to_nexus_mode, DEFAULT_ALLOWED_TOOLS, ChatConfig,
-%%                                ChatConfig::mcp_server_config
+%%                                build_options (seule source de la config MCP du CLI)
 %%   src/chat/types.rs          — ChatEvent (31 variantes), classify_api_error, RETRYABLE_ERROR_TYPES
 %%   src/chat/cli_version.rs    — check_cli_status, install_or_upgrade_cli
 %%   src/chat/cli_auth.rs       — check_cli_auth_status
@@ -31,7 +31,7 @@
 %%   src/chat/compaction_context.rs — CompactionContextBuilder::build_for_task / build_for_session
 %%   src/chat/message_attachments.rs — encode, split, compose, expand_for_agent (lu à f29712ea ; le reste du diagramme reste vérifié à d42312a2)
 %%   Commandes : grep -rl nexus_claude src → 13 fichiers, 12 de prod (liste dans le nœud K1)
-%%               grep -rn 'mcp_server_config()' src → 2 tests config.rs + 1 test manager.rs, 0 prod
+%%               grep -rn 'mcp_server_config' src → 1 nom de test dans manager.rs, 0 fonction (supprimée, backend#508 ; relu à ff5bb7b0)
 %%               grep -rln from_transport src → manager.rs, post_stream.rs, oob_listener.rs (tests seulement)
 %%               grep -rn session_closed src → 0 hors src/protocol (FSM), le backend n'émet pas cette trame
 %% ---
@@ -161,8 +161,8 @@ flowchart TD
 
     subgraph cfg["Configuration et CLI — config.rs, cli_version.rs, cli_auth.rs, model_catalog.rs"]
         direction TB
-        CONFIG["✅ ⚓ PermissionConfig.mode (4 modes CLI) → to_nexus_mode, repli Default ;<br/>DEFAULT_ALLOWED_TOOLS mcp__project-orchestrator__* (syntaxe de règles Claude Code) ;<br/>ChatConfig : mcp_server_path, max_turns, claude_cli_path (CLAUDE_CLI_PATH),<br/>auto_update_cli, default_model claude-sonnet-5, RetryConfig<br/><i>vérifié : config.rs 24 tests</i>"]
-        MCPJSON["🔴 ChatConfig::mcp_server_config : aucun appelant en production<br/>(2 tests config.rs + test_build_options_mcp_server_config) ;<br/>build_options construit McpServerConfig::Stdio directement → code mort (grep)"]
+        CONFIG["✅ ⚓ PermissionConfig.mode (4 modes CLI) → to_nexus_mode, repli Default ;<br/>DEFAULT_ALLOWED_TOOLS mcp__project-orchestrator__* (syntaxe de règles Claude Code) ;<br/>ChatConfig : mcp_server_path, max_turns, claude_cli_path (CLAUDE_CLI_PATH),<br/>auto_update_cli, default_model claude-sonnet-5, RetryConfig<br/><i>vérifié : config.rs 10 tests (12 avant la suppression de mcp_server_config)</i>"]
+        MCPJSON["✅ build_options est la SEULE source de la configuration MCP injectée au CLI :<br/>McpServerConfig::Stdio construit directement. Il existait une seconde, ChatConfig::mcp_server_config<br/>(JSON Claude Code, sans appelant de production) : supprimée, avec NATS_URL qu'elle seule transmettait<br/>— le serveur MCP est un proxy HTTP, src/bin/mcp_server.rs ne mentionne pas NATS<br/><i>vérifié : grep -rn 'fn mcp_server_config' src → 0 ; grep -in nats src/bin/mcp_server.rs → 0 ; test_build_options_* (14 tests) ; backend#508</i>"]
         CLIVER["✅ ⚓ cli_version : check_cli_status, install_or_upgrade_cli via<br/>find_claude_cli, get_cli_version, check_latest_npm_version, download_cli<br/><i>vérifié : cli_version.rs 18 tests</i>"]
         CLIAUTH["✅ ⚓ cli_auth : check_cli_auth_status exécute claude auth status et lit son JSON<br/><i>vérifié : cli_auth.rs 10 tests</i>"]
         CATALOG["✅ ⚓ model_catalog : GET api.anthropic.com/v1/models<br/>(ANTHROPIC_API_KEY ou jeton OAuth de Claude Code), stale-while-revalidate,<br/>liste statique de repli<br/><i>vérifié : model_catalog.rs 44 tests</i>"]
