@@ -1,7 +1,7 @@
 <!-- Genere par scripts/diagrams/check-index.mjs --write-orphans. Ne pas editer a la main. -->
-<!-- orphan-ceiling: 1119 -->
+<!-- orphan-ceiling: 1115 -->
 <!-- orphan-ceiling-backend: 446 -->
-<!-- orphan-ceiling-frontend: 542 -->
+<!-- orphan-ceiling-frontend: 538 -->
 <!-- orphan-ceiling-nexus: 4 -->
 <!-- orphan-ceiling-website: 127 -->
 
@@ -11,15 +11,15 @@ Un fichier source est **orphelin** quand aucun `covers` de `INDEX.yml` ne le mat
 aucun diagramme ne repond de son comportement. Cette liste est publiee pour etre honnete
 sur ce que la cartographie couvre reellement — on ne reduit pas le denominateur, on la reduit elle.
 
-**1119 orphelins sur 1253 fichiers source (89.3 %).**
+**1115 orphelins sur 1252 fichiers source (89.1 %).**
 
 SEULE une entree `verified` possede un fichier. Une entree `planned` annonce un perimetre
 sans qu'un diagramme existe : compter ses globs ferait baisser ce nombre sans qu'une ligne
 soit ecrite, et l'index acheterait du credit sur des intentions.
-Sur les 1119 orphelins, **440 sont deja reserves** par une entree `planned` :
+Sur les 1115 orphelins, **440 sont deja reserves** par une entree `planned` :
 leur proprietaire est designe, son diagramme reste a ecrire.
 
-Le plafond est **1119** : le verificateur echoue si le nombre reel le depasse.
+Le plafond est **1115** : le verificateur echoue si le nombre reel le depasse.
 Il ne peut que descendre. Ajouter un fichier source sans proprietaire fait echouer la build ;
 la sortie est un glob `covers`, pas un plafond plus haut. `--raise-ceiling` existe mais exige
 une raison ecrite, et un plafond releve se voit dans la revue.
@@ -95,14 +95,14 @@ collision entre les deux index est une erreur, pas un arrangement.
 - `src/utils/` (3) : `file_path_extractor.rs`, `mod.rs`, `paths.rs`
 - `src/vault/` (7) : `agent_cli.rs`, `crypto.rs`, `grants.rs`, `mask.rs`, `mod.rs`, `service.rs`, `store.rs`
 
-## frontend (542)
+## frontend (538)
 
 - `src/` (2) : `App.tsx`, `main.tsx`
 - `src/adapters/` (3) : `MilestoneGraphAdapter.ts`, `PlanGraphAdapter.ts`, `TaskGraphAdapter.ts`
 - `src/atoms/` (13) : `attentionCount.ts`, `attentionDigest.ts`, `auth.ts`, `events.ts`, `index.ts`, `intelligence.ts`, `notes.ts`, `plans.ts`, `projects.ts`, `setup.ts`, `tasks.ts`, `ui.ts`, `workspaces.ts`
-- `src/components/` (8) : `AttentionBadge.tsx`, `DependencyGraphView.tsx`, `GlobalRouteLayout.tsx`, `SetupGuard.tsx`, `TitleBar.tsx`, `UpdateBanner.tsx`, `WorkspaceRouteGuard.tsx`, `WorkspaceSwitcher.tsx`
+- `src/components/` (9) : `AttentionBadge.tsx`, `DependencyGraphView.tsx`, `GlobalRouteLayout.tsx`, `SetupGuard.tsx`, `TitleBar.tsx`, `TodayLogoLink.tsx`, `UpdateBanner.tsx`, `WorkspaceRouteGuard.tsx`, `WorkspaceSwitcher.tsx`
 - `src/components/auth/` (4) : `PasswordLoginForm.tsx`, `ProtectedRoute.tsx`, `RegisterForm.tsx`, `UserMenu.tsx`
-- `src/components/chat/` (32) : `AgentGroup.tsx`, `AgenticModeBanner.tsx`, `AgenticModePill.tsx`, `AskUserQuestionBlock.tsx`, `Attachments.tsx`, `BackgroundActivityBlock.tsx`, `BackgroundActivityCard.tsx`, `BackgroundTasksIndicator.tsx`, `ChatWelcome.tsx`, `CompactBoundaryBlock.tsx`, `CompactionBanner.tsx`, `ContinueIndicatorBlock.tsx`, `CopyMarkdownButton.tsx`, `DetachedRunsPanel.tsx`, `MarkdownText.tsx`, `MessageQueueBar.tsx`, `ModelChangedBlock.tsx`, `ModelFamilyPicker.tsx`, `ProjectSelect.tsx`, `ResultErrorBlock.tsx`, `ResultMaxTurnsBlock.tsx`, `RetryIndicatorBlock.tsx`, `SecretRequestTray.tsx`, `SessionBreadcrumb.tsx`, `SystemHintBlock.tsx`, `SystemInitBlock.tsx`, `ThinkingBlock.tsx`, `ToolCallBlock.tsx`, `ToolCallGroup.tsx`, `attachmentState.ts`, `index.ts`, `useElapsedMs.ts`
+- `src/components/chat/` (33) : `AgentGroup.tsx`, `AgenticModeBanner.tsx`, `AgenticModePill.tsx`, `AskUserQuestionBlock.tsx`, `Attachments.tsx`, `BackgroundActivityBlock.tsx`, `BackgroundActivityCard.tsx`, `ChatWelcome.tsx`, `CompactBoundaryBlock.tsx`, `CompactionBanner.tsx`, `ComposerDock.tsx`, `ContinueIndicatorBlock.tsx`, `CopyMarkdownButton.tsx`, `DetachedRunsPanel.tsx`, `MarkdownText.tsx`, `MessageQueueBar.tsx`, `ModelChangedBlock.tsx`, `ModelFamilyPicker.tsx`, `ProjectSelect.tsx`, `ResultErrorBlock.tsx`, `ResultMaxTurnsBlock.tsx`, `RetryIndicatorBlock.tsx`, `SecretRequestTray.tsx`, `SessionBreadcrumb.tsx`, `SystemHintBlock.tsx`, `SystemInitBlock.tsx`, `ThinkingBlock.tsx`, `ToolCallBlock.tsx`, `ToolCallGroup.tsx`, `attachmentState.ts`, `index.ts`, `sessionActivity.ts`, `useElapsedMs.ts`
 - `src/components/chat/viz/` (10) : `ContextRadarViz.tsx`, `ImpactGraphViz.tsx`, `KnowledgeCardViz.tsx`, `ProgressBarViz.tsx`, `ProtocolRunViz.tsx`, `ReasoningTreeViz.tsx`, `VizBlockRenderer.tsx`, `VizExpandDialog.tsx`, `index.ts`, `registry.ts`
 - `src/components/code/` (11) : `CoChangeGraph.tsx`, `CodeArchitectureFullTab.tsx`, `CodeArchitectureTab.tsx`, `CodeCommunitiesTab.tsx`, `CodeExplorerTab.tsx`, `CodeHealthTab.tsx`, `CodeHeritageTab.tsx`, `CodeProcessesTab.tsx`, `CodeSanteTab.tsx`, `FileHistoryDrawer.tsx`, `index.ts`
 - `src/components/commits/` (2) : `CommitList.tsx`, `index.ts`
@@ -130,16 +130,15 @@ collision entre les deux index est une erreur, pas un arrangement.
 - `src/components/particles/widgets/` (7) : `CommunityVizWidget.tsx`, `ImpactPreviewWidget.tsx`, `ProjectHealthWidget.tsx`, `PropagationVizWidget.tsx`, `ProtocolRunWidget.tsx`, `WaveDispatchWidget.tsx`, `index.ts`
 - `src/components/personas/` (2) : `PersonaBuilder.tsx`, `index.ts`
 - `src/components/pipeline/` (4) : `ImplementDialog.tsx`, `PipelineNodeRow.tsx`, `PipelineProgressHeader.tsx`, `PipelineTreeView.tsx`
-- `src/components/plans/` (3) : `PlanUniverse3D.tsx`, `WaveView.tsx`, `usePlanUniverse.ts`
+- `src/components/plans/` (1) : `WaveView.tsx`
 - `src/components/protocols/` (13) : `Explainer.tsx`, `FsmBreadcrumbs.tsx`, `FsmViewer.tsx`, `GanttTimeline.tsx`, `RecentRunsPanel.tsx`, `RfcDashboardPage.tsx`, `RfcStatusBadge.tsx`, `RunStatusBadge.tsx`, `RunTreeView.tsx`, `ScheduledActionsPanel.tsx`, `index.ts`, `rfcLifecycle.ts`, `runHelpers.ts`
 - `src/components/registry/` (7) : `ImportWizard.tsx`, `SkillBrowser.tsx`, `TrustBadge.tsx`, `concepts.tsx`, `fetchAll.ts`, `index.ts`, `metrics.ts`
 - `src/components/runner/` (14) : `AgentExecutionDetail.tsx`, `BudgetEditor.tsx`, `CancelButton.tsx`, `InlineConversation.tsx`, `LiveProgress.tsx`, `PlanRunHistory.tsx`, `PlanRunRow.tsx`, `RunnerHeader.tsx`, `StatsRow.tsx`, `WaveAgentCard.tsx`, `WaveSection.tsx`, `WsStatusIndicator.tsx`, `index.ts`, `shared.ts`
 - `src/components/settings/` (1) : `SettingRow.tsx`
-- `src/components/tasks/` (5) : `DetailRows.tsx`, `RowStateLink.tsx`, `StatusBreakdown.tsx`, `TaskUniverse3D.tsx`, `useTaskUniverse.ts`
+- `src/components/tasks/` (3) : `DetailRows.tsx`, `RowStateLink.tsx`, `StatusBreakdown.tsx`
 - `src/components/today/` (10) : `AttentionCard.tsx`, `ContinueSheet.tsx`, `LaneChips.tsx`, `MiniThreadGraph.tsx`, `PlanRunRow.tsx`, `ThinkingList.tsx`, `ThreadRow.tsx`, `TodayView.tsx`, `bands.ts`, `startHere.ts`
 - `src/components/today/work/` (5) : `WorkDashboard.tsx`, `dayPlan.ts`, `model.ts`, `text.ts`, `useWorkDashboard.ts`
 - `src/components/ui/` (63) : `AmbientBackground.tsx`, `AnimatedCounter.tsx`, `Badge.tsx`, `Branding.tsx`, `BulkActionBar.tsx`, `Button.tsx`, `Card.tsx`, `CollapsibleMarkdown.tsx`, `CollapsibleSection.tsx`, `CompactStatCard.tsx`, `ConfirmDialog.tsx`, `Dialog.tsx`, `Dropdown.tsx`, `EmptyState.tsx`, `EntityRow.tsx`, `ErrorState.tsx`, `ExternalLink.tsx`, `FilterBar.tsx`, `FloatingMenu.tsx`, `FormDialog.tsx`, `Graph3DErrorBoundary.tsx`, `Input.tsx`, `LinkEntityDialog.tsx`, `LinkedEntityBadge.tsx`, `LoadMoreSentinel.tsx`, `MetaLine.tsx`, `MetricTooltip.tsx`, `Metrics.tsx`, `OverflowMenu.tsx`, `PageHeader.tsx`, `PageShell.tsx`, `Pagination.tsx`, `ProgressBar.tsx`, `ProgressLine.tsx`, `PulseIndicator.tsx`, `RadarChart.tsx`, `RowCheckbox.tsx`, `Section.tsx`, `SectionNav.tsx`, `Select.tsx`, `Skeleton.tsx`, `Sparkline.tsx`, `Spinner.tsx`, `StatCard.tsx`, `Status.tsx`, `StatusSelect.tsx`, `Switch.tsx`, `TabLayout.tsx`, `TaskProgress.tsx`, `Textarea.tsx`, `Toast.tsx`, `Tooltip.tsx`, `ViewTabs.tsx`, `ViewToggle.tsx`, `WatcherToggle.tsx`, `WebUpdateBanner.tsx`, `WindowedList.tsx`, `classes.ts`, `format.ts`, `index.ts`, `menuPosition.ts`, `statusMeta.ts`, `useFloatingFallback.ts`
-- `src/components/universe/` (3) : `Universe3DPanel.tsx`, `index.ts`, `useEntityUniverse.ts`
 - `src/constants/` (3) : `index.ts`, `intelligence.ts`, `nomenclature.ts`
 - `src/hooks/` (42) : `index.ts`, `useActivationWebSocket.ts`, `useAttention.ts`, `useAttentionCount.ts`, `useBackgroundTasks.ts`, `useConfirmDialog.ts`, `useCrudEventRefresh.ts`, `useCrudEventSync.ts`, `useDetachedRuns.ts`, `useDiscussionTree.ts`, `useDragRegion.ts`, `useElapsedTime.ts`, `useEntityGroups.ts`, `useEventBus.ts`, `useFormDialog.ts`, `useIncrementalList.ts`, `useInfiniteList.ts`, `useInfiniteScroll.ts`, `useKanbanColumnData.ts`, `useKanbanFilters.ts`, `useLinkDialog.ts`, `useMediaQuery.ts`, `useMilestoneGraphData.ts`, `useModelCatalogEvents.ts`, `useMultiSelect.ts`, `usePagination.ts`, `usePipelineProgress.ts`, `usePlanGraphData.ts`, `useProjectFilter.ts`, `useSectionObserver.ts`, `useTaskGraphData.ts`, `useTaskProgress.ts`, `useToast.ts`, `useTrayNavigation.ts`, `useUpdateCheck.ts`, `useViewMode.ts`, `useViewTransition.ts`, `useVisualViewportHeight.ts`, `useVizData.ts`, `useWelcomeData.ts`, `useWindowFullscreen.ts`, `useWorkspace.ts`
 - `src/hooks/runner/` (5) : `index.ts`, `useAgentExecutionsMap.ts`, `useLatestPlanRun.ts`, `useRunRootSession.ts`, `useWavesData.ts`
@@ -149,7 +148,7 @@ collision entre les deux index est une erreur, pas un arrangement.
 - `src/pages/setup/` (7) : `AuthPage.tsx`, `ChatPage.tsx`, `InfrastructurePage.tsx`, `LaunchPage.tsx`, `SetupLayout.tsx`, `SetupWizard.tsx`, `index.ts`
 - `src/services/` (35) : `admin.ts`, `api.ts`, `attention.ts`, `auth.ts`, `authManager.ts`, `code.ts`, `commits.ts`, `decisions.ts`, `discussions.ts`, `documents.ts`, `env.ts`, `environments.ts`, `eventBus.ts`, `featureGraphs.ts`, `index.ts`, `intelligence.ts`, `mcpFederation.ts`, `neighborhood.ts`, `neuralRouting.ts`, `notes.ts`, `paginate.ts`, `personas.ts`, `plans.ts`, `progress.ts`, `projects.ts`, `protocolApi.ts`, `registry.ts`, `rfcApi.ts`, `runner.ts`, `sharing.ts`, `skills.ts`, `tasks.ts`, `triggers.ts`, `vault.ts`, `workspaces.ts`
 - `src/types/` (7) : `attention.ts`, `documents.ts`, `events.ts`, `fractal-graph.ts`, `index.ts`, `intelligence.ts`, `protocol.ts`
-- `src/utils/` (11) : `architecture.ts`, `backgroundActivity.ts`, `chatExport.ts`, `compactYamlParser.ts`, `featureGraphModel.ts`, `featureGraphReadable.ts`, `motion.ts`, `openExternal.ts`, `paths.ts`, `stepRefreshKey.ts`, `watch.ts`
+- `src/utils/` (12) : `architecture.ts`, `backgroundActivity.ts`, `chatExport.ts`, `compactYamlParser.ts`, `featureGraphModel.ts`, `featureGraphReadable.ts`, `messageAttachments.ts`, `motion.ts`, `openExternal.ts`, `paths.ts`, `stepRefreshKey.ts`, `watch.ts`
 - `src/workers/` (1) : `dagreWorker.ts`
 
 ## nexus (4)
