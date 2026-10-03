@@ -9271,4 +9271,133 @@ mod retry_plan_task_tests {
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(status_of(graph.as_ref(), task.id).await, TaskStatus::Failed);
     }
+
+    // ----------------------------------------------------------------------
+    // GET /api/plans/{id}/dependency-graph: `active_session_count` is read
+    // from the live ChatManager, not from anything stored in Neo4j.
+    // ----------------------------------------------------------------------
+
+    fn linked_session(session_id: &str) -> crate::neo4j::plan::TaskSessionSummary {
+        crate::neo4j::plan::TaskSessionSummary {
+            session_id: session_id.to_string(),
+            title: None,
+            child_count: 0,
+        }
+    }
+
+    /// Serve a plan with one task linked to `session_id` and return what the
+    /// graph route says about that task: `(session_count, active_session_count)`.
+    /// `live` is the sessions registered as running in the ChatManager, or
+    /// `None` for a server started without one.
+    async fn graph_counts(session_id: &str, live: Option<&[Uuid]>) -> (u64, u64) {
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let plan_id = Uuid::new_v4();
+        let task = test_task();
+        graph.create_task(plan_id, &task).await.unwrap();
+        graph
+            .task_sessions
+            .write()
+            .await
+            .insert(task.id, vec![linked_session(session_id)]);
+        let app_state = crate::test_helpers::mock_app_state_with_graph(graph);
+        let chat_manager = match live {
+            Some(ids) => {
+                let manager = Arc::new(crate::chat::ChatManager::new_without_memory(
+                    app_state.neo4j.clone(),
+                    app_state.meili.clone(),
+                    crate::chat::manager::test_support::chat_config(),
+                ));
+                for id in ids {
+                    crate::chat::manager::test_support::insert_live_session_without_cli(
+                        &manager,
+                        &id.to_string(),
+                    )
+                    .await;
+                }
+                Some(manager)
+            }
+            None => None,
+        };
+        let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
+        let watcher = Arc::new(RwLock::new(FileWatcher::new(orchestrator.clone())));
+        let state = Arc::new(ServerState {
+            orchestrator,
+            watcher,
+            chat_manager,
+            event_bus: Arc::new(HybridEmitter::new(Arc::new(
+                crate::events::EventBus::default(),
+            ))),
+            nats_emitter: None,
+            auth_config: Some(test_auth_config()),
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+            setup_completed: true,
+            server_port: 0,
+            public_url: None,
+            remote_mcp: crate::RemoteMcpConfig::default(),
+            ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
+            registry_remote_url: None,
+            oidc_client: None,
+            neural_router: crate::test_helpers::mock_neural_router(),
+            trajectory_collector: std::sync::RwLock::new(None),
+            trajectory_store_neo4j: None,
+            trajectory_store: None,
+            identity: None,
+            reactor_counters: std::sync::OnceLock::new(),
+            confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
+            mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
+            model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
+            vault: crate::vault::VaultService::ephemeral(),
+        });
+        let app = crate::api::routes::create_router(state);
+        let req = Request::builder()
+            .uri(format!("/api/plans/{plan_id}/dependency-graph"))
+            .header("authorization", test_bearer_token())
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let node = &json["nodes"][0];
+        assert_eq!(node["id"], task.id.to_string(), "{json}");
+        (
+            node["session_count"].as_u64().expect("session_count"),
+            node["active_session_count"]
+                .as_u64()
+                .expect("active_session_count"),
+        )
+    }
+
+    #[tokio::test]
+    async fn plan_graph_counts_a_task_session_that_is_live_in_the_chat_manager() {
+        let sid = Uuid::new_v4();
+        assert_eq!(graph_counts(&sid.to_string(), Some(&[sid])).await, (1, 1));
+    }
+
+    #[tokio::test]
+    async fn plan_graph_without_a_chat_manager_counts_no_active_session() {
+        let sid = Uuid::new_v4();
+        assert_eq!(graph_counts(&sid.to_string(), None).await, (1, 0));
+    }
+
+    #[tokio::test]
+    async fn plan_graph_does_not_count_a_session_id_that_is_not_a_uuid() {
+        let other = Uuid::new_v4();
+        assert_eq!(graph_counts("not-a-uuid", Some(&[other])).await, (1, 0));
+    }
+
+    /// The regression: a session that ended is not active, whatever the graph
+    /// store remembers about it. Liveness is the running ChatManager's alone.
+    #[tokio::test]
+    async fn plan_graph_does_not_count_a_finished_session_absent_from_the_chat_manager() {
+        let ended = Uuid::new_v4();
+        let still_running = Uuid::new_v4();
+        assert_eq!(
+            graph_counts(&ended.to_string(), Some(&[still_running])).await,
+            (1, 0)
+        );
+    }
 }

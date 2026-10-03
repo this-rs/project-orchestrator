@@ -14278,6 +14278,40 @@ pub(crate) mod test_support {
             ..Default::default()
         })
         .ok()?;
+        insert_session_with_client(
+            manager,
+            session_id,
+            client,
+            is_streaming,
+            pending_permissions,
+        )
+        .await
+    }
+
+    /// Like `insert_live_session`, but needs no Claude CLI installed: the
+    /// client is given an explicit (never spawned) binary path, so building
+    /// it does not search the machine. For tests that only care that the
+    /// session is registered as live.
+    pub(crate) async fn insert_live_session_without_cli(manager: &ChatManager, session_id: &str) {
+        let client = InteractiveClient::new(nexus_claude::ClaudeCodeOptions {
+            model: Some("test".into()),
+            cli_path: Some("/nonexistent/claude".into()),
+            ..Default::default()
+        })
+        .expect("an explicit CLI path is never searched for");
+        insert_session_with_client(manager, session_id, client, false, &[]).await;
+    }
+
+    async fn insert_session_with_client(
+        manager: &ChatManager,
+        session_id: &str,
+        client: InteractiveClient,
+        is_streaming: bool,
+        pending_permissions: &[&str],
+    ) -> Option<(
+        tokio::sync::mpsc::Receiver<String>,
+        Arc<Mutex<VecDeque<PendingMessage>>>,
+    )> {
         let (events_tx, _rx) = broadcast::channel(16);
         let (stdin_tx, stdin_rx) = tokio::sync::mpsc::channel(16);
         let pending_messages = Arc::new(Mutex::new(VecDeque::<PendingMessage>::new()));
