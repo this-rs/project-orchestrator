@@ -93,6 +93,9 @@ pub struct MockGraphStore {
     pub session_auto_continue: RwLock<HashMap<Uuid, bool>>,
     /// PlanRun states (Runner)
     pub plan_runs: RwLock<HashMap<Uuid, crate::runner::RunnerState>>,
+    /// Test injection: when set, `list_active_plan_runs` returns this frozen
+    /// snapshot instead of the current state (the run may have changed since).
+    pub frozen_active_plan_runs: std::sync::Mutex<Option<Vec<crate::runner::RunnerState>>>,
     /// AgentExecution nodes, by id.
     pub agent_executions: RwLock<HashMap<Uuid, crate::neo4j::agent_execution::AgentExecutionNode>>,
     /// Failure injection: AgentExecution ids whose `update_agent_execution` errors.
@@ -290,6 +293,7 @@ impl MockGraphStore {
             chat_events: RwLock::new(HashMap::new()),
             session_auto_continue: RwLock::new(HashMap::new()),
             plan_runs: RwLock::new(HashMap::new()),
+            frozen_active_plan_runs: std::sync::Mutex::new(None),
             agent_executions: RwLock::new(HashMap::new()),
             fail_agent_execution_updates: std::sync::Mutex::new(std::collections::HashSet::new()),
             fail_plan_run_updates: std::sync::Mutex::new(std::collections::HashSet::new()),
@@ -11376,6 +11380,14 @@ impl GraphStore for MockGraphStore {
     }
 
     async fn list_active_plan_runs(&self) -> anyhow::Result<Vec<crate::runner::RunnerState>> {
+        if let Some(frozen) = self
+            .frozen_active_plan_runs
+            .lock()
+            .ok()
+            .and_then(|f| f.clone())
+        {
+            return Ok(frozen);
+        }
         let runs = self.plan_runs.read().await;
         let mut active: Vec<_> = runs
             .values()

@@ -295,7 +295,24 @@ pub async fn reconcile_stale_runs(graph: &dyn GraphStore, grace_secs: i64) -> Re
     // (b) PlanRuns `running` that nobody drives.
     match graph.list_active_plan_runs().await {
         Ok(active) => {
-            for mut run in active {
+            for snapshot in active {
+                if is_plan_run_live(snapshot.run_id).await {
+                    continue;
+                }
+                // The listing is a snapshot: the run may have ended (and dropped its
+                // LiveRunGuard) since. Re-read it right before writing and only close
+                // a run that is STILL `running` and STILL not driven by this process,
+                // otherwise a `completed` run would be overwritten by `interrupted`
+                // (and its state by a stale copy).
+                let mut run = match graph.get_plan_run(snapshot.run_id).await {
+                    Ok(Some(fresh)) if fresh.status == PlanRunStatus::Running => fresh,
+                    Ok(_) => continue,
+                    Err(e) => {
+                        error!(run_id = %snapshot.run_id, "Cannot re-read PlanRun before interrupting it: {}", e);
+                        report.errors += 1;
+                        continue;
+                    }
+                };
                 if is_plan_run_live(run.run_id).await {
                     continue;
                 }
@@ -8444,6 +8461,52 @@ mod tests {
             PlanRunStatus::Failed,
             "the run after the failing one was never examined"
         );
+        reset_globals().await;
+    }
+
+    #[tokio::test]
+    async fn reconcile_does_not_overwrite_a_run_that_ended_after_the_listing() {
+        let _guard = TEST_MUTEX.lock().await;
+        reset_globals().await;
+        let g = MockGraphStore::new();
+        // The snapshot says `running`; by the time reconciliation writes, the run
+        // has completed (and its guard is gone).
+        let snapshot = stale_run(PlanRunStatus::Running, None);
+        let mut ended = snapshot.clone();
+        ended.finalize(PlanRunStatus::Completed);
+        ended.completed_tasks = vec![Uuid::new_v4()];
+        g.create_plan_run(&ended).await.unwrap();
+        *g.frozen_active_plan_runs.lock().unwrap() = Some(vec![snapshot]);
+
+        let report = reconcile_stale_runs(&g, 0).await;
+
+        let after = g.get_plan_run(ended.run_id).await.unwrap().unwrap();
+        assert_eq!(
+            after.status,
+            PlanRunStatus::Completed,
+            "completed run clobbered"
+        );
+        assert_eq!(after.completed_tasks, ended.completed_tasks);
+        assert_eq!(report.plan_runs_interrupted, 0);
+    }
+
+    #[tokio::test]
+    async fn recovery_resumes_a_run_with_a_valid_cwd_and_interrupts_the_second_one() {
+        let _guard = TEST_MUTEX.lock().await;
+        reset_globals().await;
+        let (runner, g) = test_plan_runner_with_graph();
+        let here = std::env::temp_dir().to_string_lossy().into_owned();
+        let first = resumable_candidate(&g, Some(here.clone()), 1).await;
+        let second = resumable_candidate(&g, Some(here), 2).await;
+
+        let recovered = Arc::new(runner).recover_interrupted_runs().await.unwrap();
+
+        assert_eq!(recovered, 1, "exactly one run is resumed");
+        // The newest is the one resumed; the other is closed with a reason.
+        let second_after = g.get_plan_run(second.run_id).await.unwrap().unwrap();
+        assert_eq!(second_after.status, PlanRunStatus::Interrupted);
+        let first_after = g.get_plan_run(first.run_id).await.unwrap().unwrap();
+        assert_ne!(first_after.status, PlanRunStatus::Interrupted);
         reset_globals().await;
     }
 }
