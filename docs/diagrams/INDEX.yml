@@ -112,8 +112,8 @@ diagrams:
       - "frontend:src/utils/chatAssembly.ts"
       - "frontend:src/types/chat.ts"
       - "frontend:src/constants/models.ts"
-      - "frontend:src/components/chat/{ChatPanel,ChatInput,ChatMessages,ChatMessageBubble,ChatSessionContext,PermissionRequestBlock,PermissionSettingsPanel,SessionList}.tsx"
-      - "frontend:src/components/chat/{messageQueue,inputAction,chatUrlState,sessionListUtils,sessionActivity}.ts"
+      - "frontend:src/components/chat/{ChatPanel,ChatInput,ActivityBar,ChatMessages,ChatMessageBubble,ChatSessionContext,PermissionRequestBlock,PermissionSettingsPanel,SessionList}.tsx"
+      - "frontend:src/components/chat/{messageQueue,inputAction,runningActivity,chatUrlState,sessionListUtils,sessionActivity}.ts"
       - "frontend:src/components/chat/tools/**"
   - name: po-frontend-shell
     owner: theotime
