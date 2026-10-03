@@ -161,6 +161,20 @@ struct TriggerSupport {
     event_bus: Arc<dyn EventEmitter>,
 }
 
+/// Start the protocol run a fired [`EventTrigger`] points at.
+///
+/// `triggered_by` is `trigger:<name>` so a run can be traced back to the
+/// trigger. Fails (without side effect) when the protocol does not exist or
+/// already has a running run (mutual exclusion in `engine::start_run`).
+async fn start_trigger_run(
+    store: &dyn GraphStore,
+    trigger: &EventTrigger,
+) -> anyhow::Result<crate::protocol::ProtocolRun> {
+    let triggered_by = format!("trigger:{}", trigger.name);
+    crate::protocol::engine::start_run(store, trigger.protocol_id, None, None, Some(&triggered_by))
+        .await
+}
+
 /// The EventReactor — subscribes to the event bus and dispatches to handlers.
 pub struct EventReactor {
     rules: Vec<ReactionRule>,
@@ -322,11 +336,43 @@ impl EventReactor {
                                 "EventTrigger fired"
                             );
 
-                            // Emit a CrudEvent for the trigger firing
+                            // Start the protocol run the trigger points at. Until this
+                            // was wired, a matching trigger only bumped `triggers_fired`
+                            // and emitted `Trigger::Created`: no protocol ever started.
                             if let Some(ref support) = self.trigger_support {
+                                let (run_id, start_error) = match start_trigger_run(
+                                    support.neo4j.as_ref(),
+                                    trigger,
+                                )
+                                .await
+                                {
+                                    Ok(run) => {
+                                        crate::protocol::hooks::spawn_protocol_runner(
+                                            Arc::clone(&support.neo4j),
+                                            run.id,
+                                            Arc::clone(&support.event_bus),
+                                            None,
+                                        );
+                                        (Some(run.id.to_string()), None)
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            trigger_name = %trigger.name,
+                                            trigger_id = %trigger.id,
+                                            protocol_id = %trigger.protocol_id,
+                                            error = %e,
+                                            "EventTrigger fired but its protocol run did not start"
+                                        );
+                                        (None, Some(e.to_string()))
+                                    }
+                                };
+
+                                // Emit a CrudEvent for the trigger firing
                                 let payload = serde_json::json!({
                                     "trigger_name": trigger.name,
                                     "protocol_id": trigger.protocol_id.to_string(),
+                                    "run_id": run_id,
+                                    "start_error": start_error,
                                     "matched_event": {
                                         "entity_type": format!("{:?}", event.entity_type),
                                         "action": format!("{:?}", event.action),
@@ -606,5 +652,148 @@ mod tests {
         assert!(counters.handler_errors.load(Ordering::Relaxed) >= 1);
 
         handle.abort();
+    }
+
+    /// A persistent EventTrigger that matches an event must START its
+    /// protocol: a run appears, tagged `trigger:<name>`, and the
+    /// `Trigger::Created` event carries its id. Before the wiring, the reactor
+    /// only counted the firing and emitted the event.
+    #[tokio::test]
+    async fn test_event_trigger_starts_protocol_run() {
+        use crate::neo4j::mock::MockGraphStore;
+        use crate::protocol::{Protocol, ProtocolCategory, ProtocolState, ProtocolTransition};
+
+        let store = Arc::new(MockGraphStore::new());
+        let protocol_id = Uuid::new_v4();
+        let start = ProtocolState::start(protocol_id, "Start");
+        let done = ProtocolState::terminal(protocol_id, "Done");
+        let mut protocol = Protocol::new_full(
+            Uuid::new_v4(),
+            "triggered",
+            "started by an EventTrigger",
+            start.id,
+            vec![done.id],
+            ProtocolCategory::System,
+        );
+        protocol.id = protocol_id;
+        store.upsert_protocol(&protocol).await.unwrap();
+        store.upsert_protocol_state(&start).await.unwrap();
+        store.upsert_protocol_state(&done).await.unwrap();
+        store
+            .upsert_protocol_transition(&ProtocolTransition::new(
+                protocol_id,
+                start.id,
+                done.id,
+                "complete",
+            ))
+            .await
+            .unwrap();
+
+        let now = chrono::Utc::now();
+        let trigger = EventTrigger {
+            id: Uuid::new_v4(),
+            name: "on-task-created".into(),
+            protocol_id,
+            entity_type_pattern: Some("task".into()),
+            action_pattern: Some("created".into()),
+            payload_conditions: None,
+            cooldown_secs: 0,
+            enabled: true,
+            project_scope: None,
+            created_at: now,
+            updated_at: now,
+        };
+        store.create_event_trigger(&trigger).await.unwrap();
+
+        let bus = Arc::new(crate::events::EventBus::default());
+        let mut fired = bus.subscribe();
+        let (reactor, counters) = ReactorBuilder::new(
+            bus.subscribe(),
+            Arc::new(()) as Arc<dyn std::any::Any + Send + Sync>,
+        )
+        .with_trigger_support(
+            store.clone() as Arc<dyn GraphStore>,
+            bus.clone() as Arc<dyn EventEmitter>,
+        )
+        .build();
+        let handle = tokio::spawn(reactor.run());
+
+        // The reactor loads its trigger cache before it reads the first event,
+        // so the event below is evaluated against the persisted trigger.
+        bus.emit_created(EntityType::Task, "t1", serde_json::Value::Null, None);
+
+        // Wait on the reactor's own output event, not on the clock.
+        let announced = loop {
+            let ev = fired.recv().await.unwrap();
+            if ev.entity_type == EntityType::Trigger {
+                break ev;
+            }
+        };
+        handle.abort();
+
+        assert_eq!(counters.triggers_fired.load(Ordering::Relaxed), 1);
+        let (runs, total) = store
+            .list_protocol_runs(protocol_id, None, 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(total, 1, "the matching trigger must start one run");
+        assert_eq!(runs[0].triggered_by, "trigger:on-task-created");
+        assert_eq!(
+            announced.payload["run_id"],
+            serde_json::json!(runs[0].id.to_string())
+        );
+        assert!(announced.payload["start_error"].is_null());
+    }
+
+    /// A trigger pointing at a protocol that does not exist still announces
+    /// the firing, with the reason the run did not start.
+    #[tokio::test]
+    async fn test_event_trigger_reports_failed_start() {
+        use crate::neo4j::mock::MockGraphStore;
+
+        let store = Arc::new(MockGraphStore::new());
+        let now = chrono::Utc::now();
+        let trigger = EventTrigger {
+            id: Uuid::new_v4(),
+            name: "dangling".into(),
+            protocol_id: Uuid::new_v4(),
+            entity_type_pattern: None,
+            action_pattern: None,
+            payload_conditions: None,
+            cooldown_secs: 0,
+            enabled: true,
+            project_scope: None,
+            created_at: now,
+            updated_at: now,
+        };
+        store.create_event_trigger(&trigger).await.unwrap();
+
+        let bus = Arc::new(crate::events::EventBus::default());
+        let mut fired = bus.subscribe();
+        let (reactor, _counters) = ReactorBuilder::new(
+            bus.subscribe(),
+            Arc::new(()) as Arc<dyn std::any::Any + Send + Sync>,
+        )
+        .with_trigger_support(
+            store.clone() as Arc<dyn GraphStore>,
+            bus.clone() as Arc<dyn EventEmitter>,
+        )
+        .build();
+        let handle = tokio::spawn(reactor.run());
+        bus.emit_created(EntityType::Task, "t1", serde_json::Value::Null, None);
+
+        let announced = loop {
+            let ev = fired.recv().await.unwrap();
+            if ev.entity_type == EntityType::Trigger {
+                break ev;
+            }
+        };
+        handle.abort();
+
+        assert!(announced.payload["run_id"].is_null());
+        assert!(announced.payload["start_error"]
+            .as_str()
+            .unwrap()
+            .contains("Protocol not found"));
     }
 }

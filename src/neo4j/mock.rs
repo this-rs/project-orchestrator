@@ -187,6 +187,7 @@ pub struct MockGraphStore {
     pub protocol_transitions: RwLock<HashMap<Uuid, crate::protocol::ProtocolTransition>>,
     pub protocol_runs: RwLock<HashMap<Uuid, crate::protocol::ProtocolRun>>,
     pub runtime_states: RwLock<HashMap<Uuid, crate::protocol::RuntimeState>>,
+    pub event_triggers: RwLock<HashMap<Uuid, EventTrigger>>,
 
     // Registry (published skills)
     pub published_skills: RwLock<HashMap<Uuid, crate::skills::registry::PublishedSkill>>,
@@ -357,6 +358,7 @@ impl MockGraphStore {
             protocol_transitions: RwLock::new(HashMap::new()),
             protocol_runs: RwLock::new(HashMap::new()),
             runtime_states: RwLock::new(HashMap::new()),
+            event_triggers: RwLock::new(HashMap::new()),
             published_skills: RwLock::new(HashMap::new()),
             analysis_profiles: RwLock::new(HashMap::new()),
             topology_rules: RwLock::new(HashMap::new()),
@@ -11838,14 +11840,26 @@ impl GraphStore for MockGraphStore {
 
     async fn list_event_triggers(
         &self,
-        _project_scope: Option<Uuid>,
-        _enabled_only: bool,
+        project_scope: Option<Uuid>,
+        enabled_only: bool,
     ) -> Result<Vec<EventTrigger>> {
-        Ok(vec![])
+        Ok(self
+            .event_triggers
+            .read()
+            .await
+            .values()
+            .filter(|t| !enabled_only || t.enabled)
+            .filter(|t| project_scope.is_none() || t.project_scope == project_scope)
+            .cloned()
+            .collect())
     }
 
-    async fn create_event_trigger(&self, _trigger: &EventTrigger) -> Result<Uuid> {
-        Ok(Uuid::new_v4())
+    async fn create_event_trigger(&self, trigger: &EventTrigger) -> Result<Uuid> {
+        self.event_triggers
+            .write()
+            .await
+            .insert(trigger.id, trigger.clone());
+        Ok(trigger.id)
     }
 
     async fn get_event_trigger(&self, _id: Uuid) -> Result<Option<EventTrigger>> {
