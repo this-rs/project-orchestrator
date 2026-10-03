@@ -202,7 +202,8 @@ fn remote_mcp_public_routes() -> Router<OrchestratorState> {
         )
         .route(
             "/oauth/authorize",
-            get(crate::auth::oauth_server::authorize),
+            get(crate::auth::oauth_server::authorize)
+                .post(crate::auth::oauth_server::authorize_consent),
         )
         .route("/oauth/token", post(crate::auth::oauth_server::token))
 }
@@ -267,12 +268,9 @@ fn public_routes() -> Router<OrchestratorState> {
         .route("/ws/events", get(ws_handlers::ws_events))
         .route("/ws/chat/{session_id}", get(ws_chat_handler::ws_chat))
         .route("/ws/run/{run_id}", get(ws_run_handler::ws_run))
-        // ================================================================
-        // Webhooks & Internal
-        // ================================================================
-        .route("/hooks/wake", post(handlers::wake))
-        // DEPRECATED: Use NATS for inter-process events. Kept for backward compatibility.
-        .route("/internal/events", post(handlers::receive_event))
+        // NOTE: `/hooks/wake` and `/internal/events` are NOT public. They mutate
+        // state (complete a task, inject an event into the bus), so they live in
+        // `protected_routes` behind `require_auth`.
         // ================================================================
         // Hook activation (public — called from Claude Code hooks, rate limited)
         // ================================================================
@@ -856,6 +854,12 @@ fn protected_routes() -> Router<OrchestratorState> {
         )
         // Webhooks (protected — /api prefix)
         .route("/api/wake", post(handlers::wake))
+        // Same handler under its historical path (agent webhook). Protected: it
+        // marks a task completed.
+        .route("/hooks/wake", post(handlers::wake))
+        // DEPRECATED: Use NATS for inter-process events. Kept for backward
+        // compatibility. Protected: it injects events into the bus.
+        .route("/internal/events", post(handlers::receive_event))
         // ================================================================
         // File Watcher (auto-sync on file changes)
         // ================================================================
@@ -2019,7 +2023,14 @@ mod tests {
     /// Build a test router with a specific remote MCP config and no frontend, so
     /// unmounted routes resolve to a clean 404 (not the SPA fallback).
     async fn test_app_remote_mcp(remote_mcp: crate::RemoteMcpConfig) -> Router {
-        let app_state = mock_app_state();
+        test_app_remote_mcp_with(mock_app_state(), remote_mcp).await
+    }
+
+    /// Same, on a caller-provided state (to seed the mock store beforehand).
+    async fn test_app_remote_mcp_with(
+        app_state: crate::AppState,
+        remote_mcp: crate::RemoteMcpConfig,
+    ) -> Router {
         let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
         let watcher = Arc::new(RwLock::new(FileWatcher::new(orchestrator.clone())));
         let state = Arc::new(handlers::ServerState {
@@ -2125,6 +2136,234 @@ mod tests {
             StatusCode::UNAUTHORIZED,
             "/mcp must remain behind require_auth (401 without a token)"
         );
+    }
+
+    /// A signed-in user who merely OPENS an authorize link must not hand a code
+    /// to the client: `GET /oauth/authorize` renders a consent page, and only
+    /// the user's explicit approval (`POST`, with the session of the same
+    /// user) issues the code. Before the consent step, the GET redirected to
+    /// the client's `redirect_uri` with `code=` straight away — and client
+    /// registration is open to anyone.
+    #[tokio::test]
+    async fn test_oauth_authorize_requires_explicit_consent() {
+        use crate::neo4j::traits::GraphStore;
+
+        // A user with a live session (refresh cookie).
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let user_id = uuid::Uuid::new_v4();
+        let now = chrono::Utc::now();
+        graph
+            .upsert_user(&crate::neo4j::models::UserNode {
+                id: user_id,
+                email: "victim@example.com".into(),
+                name: "Victim".into(),
+                picture_url: None,
+                auth_provider: crate::neo4j::models::AuthProvider::Password,
+                external_id: None,
+                password_hash: None,
+                created_at: now,
+                last_login_at: now,
+            })
+            .await
+            .unwrap();
+        let raw_refresh = crate::auth::refresh::generate_token();
+        graph
+            .create_refresh_token(
+                user_id,
+                &crate::auth::refresh::hash_token(&raw_refresh),
+                now + chrono::Duration::hours(1),
+            )
+            .await
+            .unwrap();
+        let cookie = format!("refresh_token={raw_refresh}");
+
+        let app = test_app_remote_mcp_with(
+            crate::test_helpers::mock_app_state_with_graph(graph),
+            crate::RemoteMcpConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let body_of = |resp: axum::response::Response| async move {
+            let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+                .await
+                .unwrap();
+            String::from_utf8(bytes.to_vec()).unwrap()
+        };
+
+        // Anyone can register a client — here, under a hostile name.
+        let registered = app
+            .clone()
+            .oneshot(
+                Request::post("/oauth/register")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"client_name":"<b>Claude</b>","redirect_uris":["https://attacker.example/cb"]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(registered.status(), StatusCode::CREATED);
+        let registration: serde_json::Value =
+            serde_json::from_str(&body_of(registered).await).unwrap();
+        let client_id = registration["client_id"].as_str().unwrap().to_string();
+
+        let authorize_url = format!(
+            "/oauth/authorize?response_type=code&client_id={client_id}\
+             &redirect_uri=https%3A%2F%2Fattacker.example%2Fcb\
+             &code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM\
+             &code_challenge_method=S256&state=xyz"
+        );
+
+        // GET with the victim's session: a page, not a redirect carrying a code.
+        let page = app
+            .clone()
+            .oneshot(
+                Request::get(&authorize_url)
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            page.status(),
+            StatusCode::OK,
+            "authorize must show a consent page, not redirect with a code"
+        );
+        assert!(page.headers().get("location").is_none());
+        assert_eq!(page.headers().get("x-frame-options").unwrap(), "DENY");
+        let html = body_of(page).await;
+        assert!(
+            html.contains("https://attacker.example"),
+            "destination shown"
+        );
+        assert!(html.contains("victim@example.com"), "account shown");
+        assert!(
+            html.contains("&lt;b&gt;Claude&lt;/b&gt;") && !html.contains("<b>Claude</b>"),
+            "the client name is escaped"
+        );
+        let token = html
+            .split("name=\"consent_token\" value=\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .expect("consent token in the form")
+            .to_string();
+
+        let post = |cookie: Option<String>, form: String| {
+            let mut req = Request::post("/oauth/authorize")
+                .header("content-type", "application/x-www-form-urlencoded");
+            if let Some(cookie) = cookie {
+                req = req.header("cookie", cookie);
+            }
+            req.body(Body::from(form)).unwrap()
+        };
+
+        // The approval without the user's session (cross-site POST): refused.
+        let no_session = app
+            .clone()
+            .oneshot(post(
+                None,
+                format!("consent_token={token}&decision=approve"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(no_session.status(), StatusCode::FORBIDDEN);
+        assert!(no_session.headers().get("location").is_none());
+
+        // A forged token: refused.
+        let forged = app
+            .clone()
+            .oneshot(post(
+                Some(cookie.clone()),
+                "consent_token=not-a-token&decision=approve".to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(forged.status(), StatusCode::BAD_REQUEST);
+
+        // Deny: back to the client with access_denied and the state, no code.
+        let denied = app
+            .clone()
+            .oneshot(post(
+                Some(cookie.clone()),
+                format!("consent_token={token}&decision=deny"),
+            ))
+            .await
+            .unwrap();
+        assert!(denied.status().is_redirection());
+        let location = denied.headers().get("location").unwrap().to_str().unwrap();
+        assert!(location.starts_with("https://attacker.example/cb?error=access_denied"));
+        assert!(location.ends_with("&state=xyz") && !location.contains("code="));
+
+        // Approve with the session: the code is issued, with the state.
+        let approved = app
+            .clone()
+            .oneshot(post(
+                Some(cookie),
+                format!("consent_token={token}&decision=approve"),
+            ))
+            .await
+            .unwrap();
+        assert!(approved.status().is_redirection());
+        let location = approved
+            .headers()
+            .get("location")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(location.starts_with("https://attacker.example/cb?code="));
+        assert!(location.ends_with("&state=xyz"));
+    }
+
+    /// `/hooks/wake` completes a task and `/internal/events` injects an event
+    /// into the bus: with auth configured, neither may answer without a token.
+    /// The authenticated leg keeps the test honest: the routes are still
+    /// mounted (an empty body is a 4xx other than 401/404, not a pass-through).
+    #[tokio::test]
+    async fn test_state_changing_hooks_require_auth() {
+        let app = test_app_no_frontend().await;
+        let token = crate::test_helpers::test_bearer_token();
+
+        for path in ["/hooks/wake", "/internal/events"] {
+            let anonymous = app
+                .clone()
+                .oneshot(
+                    Request::post(path)
+                        .header("content-type", "application/json")
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                anonymous.status(),
+                StatusCode::UNAUTHORIZED,
+                "{path} must refuse a request without a Bearer token"
+            );
+
+            let authed = app
+                .clone()
+                .oneshot(
+                    Request::post(path)
+                        .header("content-type", "application/json")
+                        .header("authorization", token.as_str())
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert!(
+                authed.status().is_client_error()
+                    && authed.status() != StatusCode::UNAUTHORIZED
+                    && authed.status() != StatusCode::NOT_FOUND,
+                "{path} must stay mounted behind auth, got {}",
+                authed.status()
+            );
+        }
     }
 
     /// The interrupt route must be **mounted**.

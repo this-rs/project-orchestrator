@@ -42,6 +42,10 @@ graph TD
     subgraph auth ["auth / security"]
         B7["✅ Tombstone 128 zéros\nEd25519 non vérifié\nci-verte · PR #490\napply_signed_tombstone"]
         B8["✅ require_auth anonyme\nsans config explicite\nci-verte · PR #480"]
+        B15["🟠 EventReactor ne démarrait aucun protocole\nstart_trigger_run + spawn_protocol_runner\nPR #518 · rejoue-sans · tâche adc10369"]
+        B16["🟠 /hooks/wake + /internal/events publics\npassés sous require_auth\nPR #518 · rejoue-sans · test_state_changing_hooks_require_auth · tâche 21dda16f"]
+        B17["🟠 Fédération MCP : politique jamais appliquée\nMcpServerRegistry::enforce_call dans handle_external\nPR #518 · rejoue-sans · tâche 01376efd"]
+        B18["🟠 /oauth/authorize émettait un code sans consentement (DCR ouverte)\npage de consentement + authorize_consent en POST · userinfo refusé\nPR #518 · rejoue-sans · tâche d0d09cae"]
     end
 
     subgraph chat_dead ["chat"]
@@ -79,3 +83,7 @@ rejoue-sans · cargo +1.88 check · nexus#61"]
     REGISTRY --> B13
     REGISTRY --> B14
     REGISTRY --> B19
+    REGISTRY --> B15
+    REGISTRY --> B16
+    REGISTRY --> B17
+    REGISTRY --> B18

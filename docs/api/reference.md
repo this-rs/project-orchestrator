@@ -33,8 +33,8 @@ For detailed setup instructions (Google OAuth, JWT configuration, environment va
 | `/auth/oidc`, `/auth/oidc/callback` | Public | Generic OIDC login flow |
 | `/auth/me`, `/auth/refresh` | **Protected** | User info and token refresh |
 | `/ws/*` | Public | Auth via first WebSocket message |
-| `/hooks/wake` | Public | Agent webhook |
-| `/internal/events` | Public | Internal event receiver |
+| `/hooks/wake` | **Protected** | Agent webhook (same handler as `/api/wake`) |
+| `/internal/events` | **Protected** | Internal event receiver (deprecated) |
 | `/api/*` | **Protected** | All API routes require JWT |
 
 ### Authenticated Request Example
@@ -2207,12 +2207,13 @@ curl -X POST http://localhost:8080/api/wake \
   }'
 ```
 
-### POST /hooks/wake -- Public
+### POST /hooks/wake -- Protected
 
-Agent completion webhook (public variant, no auth required).
+Agent completion webhook (historical path of `/api/wake`; requires a Bearer token).
 
 ```bash
 curl -X POST http://localhost:8080/hooks/wake \
+  -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
     "task_id": "uuid",
@@ -2222,12 +2223,13 @@ curl -X POST http://localhost:8080/hooks/wake \
   }'
 ```
 
-### POST /internal/events -- Public
+### POST /internal/events -- Protected
 
-Internal event receiver. Used for inter-service communication.
+Internal event receiver (deprecated, requires a Bearer token).
 
 ```bash
 curl -X POST http://localhost:8080/internal/events \
+  -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"event_type": "task_completed", "payload": {...}}'
 ```
