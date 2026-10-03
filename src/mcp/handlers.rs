@@ -823,15 +823,30 @@ impl ToolHandler {
     ) -> Result<Value> {
         let fqn = format!("{}::{}", server_id, tool_name);
 
-        // 1. Circuit breaker check (needs write lock for state transition)
+        // 1. Security policy, then circuit breaker (write lock: the rate
+        //    limiter records the call, the breaker may change state).
         {
             let mut reg = registry.write().await;
-            let conn = reg.get_mut(server_id).ok_or_else(|| {
-                anyhow!(
+            if reg.get(server_id).is_none() {
+                return Err(anyhow!(
                     "External MCP server '{}' is not connected. Use mcp_federation(action: \"connect\") first.",
                     server_id
-                )
-            })?;
+                ));
+            }
+
+            // Policy first: a refused call must reach neither the server nor
+            // the breaker (it would otherwise consume a half-open probe).
+            if let Err(violation) = reg.enforce_call(server_id, tool_name) {
+                return Err(anyhow!(
+                    "External tool '{}' refused by the federation security policy: {}",
+                    fqn,
+                    violation
+                ));
+            }
+
+            let conn = reg
+                .get_mut(server_id)
+                .ok_or_else(|| anyhow!("MCP server '{}' disconnected during call", server_id))?;
 
             if !conn.circuit_breaker.allow_request() {
                 return Err(anyhow!(
@@ -11833,6 +11848,7 @@ mod tests {
             ConnectionStatus, McpServerConnection, McpServerRegistry, ServerStats,
         };
         use crate::mcp_federation::McpTransport;
+        use crate::mcp_federation::{DiscoveredTool, InferredCategory, McpSecurityPolicy};
         use anyhow::Result;
         use async_trait::async_trait;
         use chrono::Utc;
@@ -11901,6 +11917,51 @@ mod tests {
 
         // ── Helper: build a registry with one mock server ────────────────
 
+        fn discovered(server_id: &str, name: &str, category: InferredCategory) -> DiscoveredTool {
+            DiscoveredTool {
+                name: name.to_string(),
+                fqn: format!("{server_id}::{name}"),
+                description: String::new(),
+                input_schema: json!({"type": "object"}),
+                category,
+                embedding: None,
+                similar_internal: vec![],
+                profile: None,
+            }
+        }
+
+        /// Counts the calls that actually reach the external server.
+        #[derive(Debug, Default)]
+        struct CountingClient {
+            calls: Arc<std::sync::atomic::AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl McpClient for CountingClient {
+            async fn initialize(&self) -> Result<crate::mcp_federation::client::InitializeResult> {
+                unimplemented!()
+            }
+            async fn initialized_notification(&self) -> Result<()> {
+                unimplemented!()
+            }
+            async fn tools_list(&self) -> Result<Vec<crate::mcp_federation::client::McpToolDef>> {
+                unimplemented!()
+            }
+            async fn call_tool(&self, _name: &str, _arguments: Option<Value>) -> Result<Value> {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(json!({"ok": true}))
+            }
+            async fn ping(&self) -> Result<()> {
+                Ok(())
+            }
+            async fn shutdown(&self) -> Result<()> {
+                Ok(())
+            }
+            fn transport_name(&self) -> &'static str {
+                "mock"
+            }
+        }
+
         fn make_registry_with_server(
             server_id: &str,
             client: Box<dyn McpClient>,
@@ -11916,7 +11977,12 @@ mod tests {
                 },
                 status: ConnectionStatus::Connected,
                 client,
-                discovered_tools: vec![],
+                // What the server declared at discovery: one read-only tool
+                // and one mutating tool. Anything else is undeclared.
+                discovered_tools: vec![
+                    discovered(server_id, "query", InferredCategory::Query),
+                    discovered(server_id, "create_pr", InferredCategory::Create),
+                ],
                 circuit_breaker: CircuitBreaker::new(),
                 stats: ServerStats::new(),
                 connected_at: Utc::now(),
@@ -12105,18 +12171,130 @@ mod tests {
                 .await;
             assert!(result.is_ok());
 
-            // Also test with nested namespaces
+            // Also test with another server and a mutating tool — which only
+            // runs because this registry's policy allows mutations.
             let registry2 = make_registry_with_server(
                 "github",
                 Box::new(MockExternalClient {
                     response: json!({"pr": 42}),
                 }),
             );
+            registry2
+                .write()
+                .await
+                .set_security_policy(McpSecurityPolicy::permissive());
             let handler2 = make_handler_with_registry(registry2);
             let result2 = handler2
                 .handle("github::create_pr", Some(json!({"title": "test"})))
                 .await;
             assert!(result2.is_ok());
+        }
+
+        /// The federation security policy is applied by the dispatch itself:
+        /// under the default policy a mutating external tool is refused and
+        /// the external server is never called. Before the wiring,
+        /// `SecurityEnforcer` was referenced by a test only and the call went
+        /// straight through.
+        #[tokio::test]
+        async fn test_external_mutating_tool_is_refused_by_default_policy() {
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let registry = make_registry_with_server(
+                "github",
+                Box::new(CountingClient {
+                    calls: calls.clone(),
+                }),
+            );
+            let handler = make_handler_with_registry(registry.clone());
+
+            let err = handler
+                .handle("github::create_pr", Some(json!({"title": "x"})))
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("allow_mutations"),
+                "expected a policy refusal, got: {err}"
+            );
+
+            // A tool the server never declared has no category: refused too.
+            let err = handler
+                .handle("github::drop_everything", Some(json!({})))
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("allow_mutations"),
+                "expected a policy refusal, got: {err}"
+            );
+
+            assert_eq!(
+                calls.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "a refused call must not reach the external server"
+            );
+            // Not an attempt: neither the stats nor the breaker saw it.
+            assert_eq!(
+                registry
+                    .read()
+                    .await
+                    .get("github")
+                    .unwrap()
+                    .stats
+                    .call_count,
+                0
+            );
+
+            // The declared read-only tool still goes through.
+            handler
+                .handle("github::query", Some(json!({})))
+                .await
+                .expect("read-only tool is allowed");
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
+
+        /// The allowlist and the per-server rate limit are enforced by the
+        /// dispatch as well, and a rate-limited call does not reach the server.
+        #[tokio::test]
+        async fn test_external_allowlist_and_rate_limit_are_enforced() {
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let registry = make_registry_with_server(
+                "grafeo",
+                Box::new(CountingClient {
+                    calls: calls.clone(),
+                }),
+            );
+            let handler = make_handler_with_registry(registry.clone());
+
+            registry
+                .write()
+                .await
+                .set_security_policy(McpSecurityPolicy {
+                    allowed_servers: Some(vec!["other".to_string()]),
+                    ..Default::default()
+                });
+            let err = handler
+                .handle("grafeo::query", Some(json!({})))
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("allowed_servers"), "got: {err}");
+
+            registry
+                .write()
+                .await
+                .set_security_policy(McpSecurityPolicy {
+                    max_calls_per_minute: 2,
+                    ..Default::default()
+                });
+            for _ in 0..2 {
+                handler
+                    .handle("grafeo::query", Some(json!({})))
+                    .await
+                    .expect("under the rate limit");
+            }
+            let err = handler
+                .handle("grafeo::query", Some(json!({})))
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("rate_limit"), "got: {err}");
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
         }
     }
 }

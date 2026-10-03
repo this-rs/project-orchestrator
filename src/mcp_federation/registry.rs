@@ -11,9 +11,10 @@ use tracing::{debug, info, warn};
 use super::circuit_breaker::{CircuitBreaker, CircuitState};
 use super::client::{create_client, McpClient, McpTransportConfig};
 use super::discovery::{
-    DiscoveredTool, InternalToolDescriptor, IntrospectorConfig, ToolIntrospector,
+    DiscoveredTool, InferredCategory, InternalToolDescriptor, IntrospectorConfig, ToolIntrospector,
 };
 use super::prober::{ProberConfig, ToolProber};
+use super::security::{McpSecurityPolicy, PolicyViolation, SecurityEnforcer};
 use super::{ExternalToolInfo, McpTransport, ServerId, ToolFqn};
 use crate::embeddings::EmbeddingProvider;
 
@@ -188,6 +189,9 @@ pub struct McpServerRegistry {
     internal_tools: Vec<InternalToolDescriptor>,
     /// Configuration.
     config: RegistryConfig,
+    /// Security policy + rate limiter applied to every external tool call
+    /// (see [`Self::enforce_call`]).
+    enforcer: SecurityEnforcer,
 }
 
 impl std::fmt::Debug for McpServerRegistry {
@@ -215,7 +219,38 @@ impl McpServerRegistry {
             embedding_provider: None,
             internal_tools: vec![],
             config: RegistryConfig::default(),
+            enforcer: SecurityEnforcer::default(),
         }
+    }
+
+    /// Replace the security policy (and reset the rate limiter to its rate).
+    pub fn set_security_policy(&mut self, policy: McpSecurityPolicy) {
+        self.enforcer = SecurityEnforcer::new(policy);
+    }
+
+    /// The security policy currently enforced on external tool calls.
+    pub fn security_policy(&self) -> &McpSecurityPolicy {
+        &self.enforcer.policy
+    }
+
+    /// Apply the security policy to one external tool call, and count it
+    /// against the server's rate limit when it is allowed.
+    ///
+    /// The category is the one inferred at discovery. A tool the server never
+    /// declared has no category, so it is treated as `Unknown` — which the
+    /// default policy refuses: an undeclared tool cannot be assumed read-only.
+    pub fn enforce_call(
+        &mut self,
+        server_id: &str,
+        tool_name: &str,
+    ) -> std::result::Result<(), PolicyViolation> {
+        let category = self
+            .servers
+            .get(server_id)
+            .and_then(|conn| conn.discovered_tools.iter().find(|t| t.name == tool_name))
+            .map(|t| t.category)
+            .unwrap_or(InferredCategory::Unknown);
+        self.enforcer.enforce(server_id, tool_name, &category)
     }
 
     /// Create a registry with full introspection capabilities.
@@ -230,6 +265,7 @@ impl McpServerRegistry {
             embedding_provider,
             internal_tools,
             config,
+            enforcer: SecurityEnforcer::default(),
         }
     }
 
@@ -573,9 +609,12 @@ impl McpServerRegistry {
 /// Thread-safe wrapper for the registry (used in AppState).
 pub type SharedRegistry = Arc<RwLock<McpServerRegistry>>;
 
-/// Create a new shared registry.
+/// Create a new shared registry, enforcing the security policy configured in
+/// the environment (see [`McpSecurityPolicy::from_env`]).
 pub fn new_shared_registry() -> SharedRegistry {
-    Arc::new(RwLock::new(McpServerRegistry::new()))
+    let mut registry = McpServerRegistry::new();
+    registry.set_security_policy(McpSecurityPolicy::from_env());
+    Arc::new(RwLock::new(registry))
 }
 
 #[cfg(test)]

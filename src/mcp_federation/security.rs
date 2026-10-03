@@ -75,6 +75,43 @@ impl McpSecurityPolicy {
         }
     }
 
+    /// Build the policy the server enforces, from the process environment:
+    ///
+    /// - `MCP_FEDERATION_ALLOW_MUTATIONS` — `true`/`1` lets external tools
+    ///   classified Create/Mutation/Delete/Unknown run (default: refused);
+    /// - `MCP_FEDERATION_ALLOWED_SERVERS` — comma-separated server ids; when
+    ///   set, any other server is refused (default: every connected server);
+    /// - `MCP_FEDERATION_MAX_CALLS_PER_MINUTE` — per-server rate (default 60).
+    pub fn from_env() -> Self {
+        Self::from_lookup(|key| std::env::var(key).ok())
+    }
+
+    /// [`Self::from_env`] with the variable source injected, so the parsing is
+    /// testable without touching the process environment. An unparsable value
+    /// keeps the conservative default rather than widening the policy.
+    pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Self {
+        let defaults = Self::default();
+        let allow_mutations = lookup("MCP_FEDERATION_ALLOW_MUTATIONS")
+            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true"))
+            .unwrap_or(defaults.allow_mutations);
+        let allowed_servers = lookup("MCP_FEDERATION_ALLOWED_SERVERS").map(|v| {
+            v.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        });
+        let max_calls_per_minute = lookup("MCP_FEDERATION_MAX_CALLS_PER_MINUTE")
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(defaults.max_calls_per_minute);
+        Self {
+            allow_mutations,
+            allowed_servers,
+            max_calls_per_minute,
+            credential_isolation: true,
+        }
+    }
+
     /// Check if a tool call is allowed by this policy.
     ///
     /// Returns `Ok(())` if allowed, `Err(PolicyViolation)` if blocked.
@@ -313,6 +350,38 @@ mod tests {
 
         // Different server is not affected
         assert!(limiter.check_and_record("other", "tool").is_ok());
+    }
+
+    #[test]
+    fn test_policy_from_lookup() {
+        // Nothing set: the conservative default.
+        let policy = McpSecurityPolicy::from_lookup(|_| None);
+        assert!(!policy.allow_mutations);
+        assert!(policy.allowed_servers.is_none());
+        assert_eq!(policy.max_calls_per_minute, 60);
+
+        let policy = McpSecurityPolicy::from_lookup(|key| match key {
+            "MCP_FEDERATION_ALLOW_MUTATIONS" => Some(" TRUE ".to_string()),
+            "MCP_FEDERATION_ALLOWED_SERVERS" => Some("grafeo, github,,".to_string()),
+            "MCP_FEDERATION_MAX_CALLS_PER_MINUTE" => Some("5".to_string()),
+            _ => None,
+        });
+        assert!(policy.allow_mutations);
+        assert_eq!(
+            policy.allowed_servers,
+            Some(vec!["grafeo".to_string(), "github".to_string()])
+        );
+        assert_eq!(policy.max_calls_per_minute, 5);
+        assert!(policy.credential_isolation);
+
+        // Unparsable values never widen the policy.
+        let policy = McpSecurityPolicy::from_lookup(|key| match key {
+            "MCP_FEDERATION_ALLOW_MUTATIONS" => Some("yes please".to_string()),
+            "MCP_FEDERATION_MAX_CALLS_PER_MINUTE" => Some("lots".to_string()),
+            _ => None,
+        });
+        assert!(!policy.allow_mutations);
+        assert_eq!(policy.max_calls_per_minute, 60);
     }
 
     #[test]
