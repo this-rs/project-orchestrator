@@ -79,8 +79,37 @@ enum SecretCommand {
     Get { name: String },
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// Stack size of every runtime thread (workers and `spawn_blocking`), in bytes.
+///
+/// The default is 2 MiB, and the chat turn does not fit in it: `stream_response`
+/// is one very large `async fn`, polled through the enrichment pipeline, the
+/// status stage, a Neo4j query, `neo4rs`, `deadpool` and the Bolt encoder, each
+/// layer's future living on the worker's stack while it is polled. On
+/// 2026-10-03 that chain overflowed a worker at the leaf (`BytesMut::reserve`),
+/// the process aborted with SIGABRT, and every live Claude CLI died with it
+/// ("The CLI subprocess for this session has exited"). Stack pages are mapped
+/// lazily, so a larger size costs address space, not memory.
+pub const RUNTIME_STACK_BYTES: usize = 16 * 1024 * 1024;
+
+// Checked when the crate compiles, not when tests run: a size that is not a whole
+// number of 16 KiB pages (Apple silicon) or that falls under 8 MiB is a build error.
+const _: () = assert!(
+    RUNTIME_STACK_BYTES.is_multiple_of(16 * 1024) && RUNTIME_STACK_BYTES >= 8 * 1024 * 1024
+);
+
+/// The multi-thread runtime of the server: `#[tokio::main]` with the stack above.
+fn build_runtime() -> std::io::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(RUNTIME_STACK_BYTES)
+        .build()
+}
+
+fn main() -> Result<()> {
+    build_runtime()?.block_on(run())
+}
+
+async fn run() -> Result<()> {
     let cli = Cli::parse();
 
     // Before anything else: no tracing, no config, no .env — stdout must carry
@@ -305,4 +334,31 @@ async fn run_sync(config: Config, path: &str) -> Result<()> {
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod runtime_tests {
+    use super::*;
+
+    /// Touches `bytes` of stack. Not inlined, and `black_box` keeps the array.
+    #[inline(never)]
+    fn burn_stack<const N: usize>() -> usize {
+        let buf = [7u8; N];
+        std::hint::black_box(&buf)
+            .iter()
+            .step_by(4096)
+            .map(|b| *b as usize)
+            .sum()
+    }
+
+    #[test]
+    fn a_worker_has_room_for_a_stack_far_beyond_the_two_mib_default() {
+        // 8 MiB of live stack: more than 4 times the default, below our size.
+        // On a 2 MiB worker this aborts the whole test process, as it did the server.
+        let rt = build_runtime().expect("runtime");
+        let touched = rt
+            .block_on(async { tokio::spawn(async { burn_stack::<{ 8 * 1024 * 1024 }>() }).await })
+            .expect("task");
+        assert!(touched > 0);
+    }
 }
