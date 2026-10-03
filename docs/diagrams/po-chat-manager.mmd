@@ -38,6 +38,15 @@
 %% CONVENTION : « 🟠 écrit, sans test » = code lu, aucun test ne le prouve. Un ✅ nomme son test.
 %%   Les comptes de tests sont ceux de `grep -c '#\[test\]|#\[tokio::test\]'` par fichier.
 %% ---
+%% CORRIGE LE 2026-10-03 (feat/chat-live-activity) : rien ne publiait l'état de travail
+%%   d'une session. `is_streaming` ne vit que dans un AtomicBool d'ActiveSession ; la
+%%   propriété Neo4j `cs.is_streaming` n'est ECRITE NULLE PART et n'était lue qu'à un
+%%   endroit (neo4j/plan.rs, `COALESCE(cs.is_streaming,false) AS is_active`), donc
+%%   `active_session_count` du graphe de plan valait zéro pour toute session ayant jamais
+%%   existé. Lecture morte supprimée, le handler estampille depuis live_session_snapshot.
+%%   live_session_snapshot compte en plus les tâches de fond, SessionActivity est né, et
+%%   `GET /api/chat/live-activity` (api/chat_handlers.rs, hors de ce diagramme) l'expose.
+%% ---
 %% NON ETABLI :
 %%   le chemin NATS (sessions sur une autre instance : try_remote_send, request_send_message)
 %%   n'est relu qu'en surface : ses tests tournent sans NATS réel
@@ -120,6 +129,15 @@ flowchart TD
         DEATH["✅ fermeture du broadcast → emit_subprocess_death → SessionError<br/><i>vérifié : test_emit_subprocess_death_emits_session_error</i>"]
         OOB --> DEATH
     end
+
+    subgraph activity["Qui travaille, maintenant — la seule vérité est en mémoire"]
+        direction TB
+        SNAP["✅ live_session_snapshot : un seul verrou sur active_sessions<br/>→ live, streaming (AtomicBool), pending_permissions (request_id),<br/>background_tasks (monitors, bash) via count_background_tasks<br/>(les entrées pending_removal_at ne comptent pas : une veille annulée<br/>cesse d'être annoncée tout de suite, pas après la grâce de 5 s)<br/><i>vérifié : a_live_session_reports_what_it_is_waiting_on,<br/>counting_separates_monitors_from_background_commands,<br/>a_cancelled_watch_stops_being_advertised_at_once</i>"]
+        ACT["✅ SessionActivity (types.rs) : live · streaming · pending_permissions ·<br/>monitors · bash_tasks ; activity_for(id) — une session absente de la carte<br/>est CALME, pas inconnue ; is_quiet décide si le champ part sur le fil<br/><i>vérifié : an_unknown_session_is_quiet_rather_than_unknown,<br/>a_live_but_idle_session_is_not_quiet,<br/>session_activity_serialises_the_five_fields_the_ui_reads</i>"]
+        SNAP --> ACT
+    end
+
+    WIRES --> SNAP
 
     WIRES --> OOB
     OOB -.->|"tour déclenché"| SENDRECV

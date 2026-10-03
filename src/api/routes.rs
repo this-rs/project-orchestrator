@@ -1834,6 +1834,14 @@ fn protected_routes() -> Router<OrchestratorState> {
             get(chat_handlers::list_sessions).post(chat_handlers::create_session),
         )
         .route("/api/chat/search", get(chat_handlers::search_messages))
+        // What every session is doing right now, read from the live
+        // ChatManager. Polled by the conversation list to reconcile its
+        // working indicators — an indicator driven by events alone goes
+        // stale on mount and on any dropped event.
+        .route(
+            "/api/chat/live-activity",
+            get(chat_handlers::get_live_activity),
+        )
         .route(
             "/api/chat/sessions/backfill-previews",
             post(chat_handlers::backfill_previews),

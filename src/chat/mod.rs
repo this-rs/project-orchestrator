@@ -40,5 +40,5 @@ pub use entity_extractor::{
     extract_entities, validate_entities, EntityType, ExtractedEntity, ExtractionSource,
     ValidatedEntity,
 };
-pub use manager::ChatManager;
-pub use types::{ChatEvent, ChatRequest, ChatSession, ClientMessage, SpawnedBy};
+pub use manager::{ChatManager, LiveSessionSnapshot};
+pub use types::{ChatEvent, ChatRequest, ChatSession, ClientMessage, SessionActivity, SpawnedBy};

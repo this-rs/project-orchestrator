@@ -5208,6 +5208,21 @@ pub async fn get_plan_dependency_graph(
         .await
         .unwrap_or_default();
 
+    // Which of those sessions are actually running. This used to be read from
+    // `cs.is_streaming` in Neo4j, a property nothing writes, so
+    // `active_session_count` was zero on every plan graph ever rendered. The
+    // only truth is the live ChatManager.
+    let live_sessions = match state.chat_manager.as_ref() {
+        Some(cm) => cm.live_session_snapshot().await.live,
+        None => std::collections::HashSet::new(),
+    };
+    let is_live = |s: &crate::neo4j::plan::TaskSessionSummary| {
+        s.session_id
+            .parse::<uuid::Uuid>()
+            .map(|id| live_sessions.contains(&id))
+            .unwrap_or(false)
+    };
+
     let nodes: Vec<DependencyGraphNode> = tasks
         .into_iter()
         .map(|t| {
@@ -5239,7 +5254,7 @@ pub async fn get_plan_dependency_graph(
                     })
                     .collect(),
                 session_count: data.sessions.len(),
-                active_session_count: data.sessions.iter().filter(|s| s.is_active).count(),
+                active_session_count: data.sessions.iter().filter(|s| is_live(s)).count(),
                 child_session_count: data.sessions.iter().map(|s| s.child_count).sum(),
                 discussed_files: data
                     .discussed_files

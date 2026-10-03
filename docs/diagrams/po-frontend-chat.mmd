@@ -1,5 +1,5 @@
 %% name: po-frontend-chat
-%% covers: frontend:src/services/{chatWebSocket,chat,wsAdapter}.ts frontend:src/hooks/{useChat,useChatUrlSync,useSessionTree}.ts frontend:src/hooks/runner/useConversationWs.ts frontend:src/atoms/{chat,modelCatalog}.ts frontend:src/utils/chatAssembly.ts frontend:src/types/chat.ts frontend:src/constants/models.ts frontend:src/components/chat/{ChatPanel,ChatInput,ChatMessages,ChatMessageBubble,ChatSessionContext,PermissionRequestBlock,PermissionSettingsPanel,SessionList}.tsx frontend:src/components/chat/{messageQueue,inputAction,chatUrlState,sessionListUtils}.ts frontend:src/components/chat/tools/**
+%% covers: frontend:src/services/{chatWebSocket,chat,wsAdapter}.ts frontend:src/hooks/{useChat,useChatUrlSync,useSessionTree}.ts frontend:src/hooks/runner/useConversationWs.ts frontend:src/atoms/{chat,modelCatalog}.ts frontend:src/utils/chatAssembly.ts frontend:src/types/chat.ts frontend:src/constants/models.ts frontend:src/components/chat/{ChatPanel,ChatInput,ChatMessages,ChatMessageBubble,ChatSessionContext,PermissionRequestBlock,PermissionSettingsPanel,SessionList}.tsx frontend:src/components/chat/{messageQueue,inputAction,chatUrlState,sessionListUtils,sessionActivity}.ts frontend:src/components/chat/tools/**
 %% verified: d42312a2
 %% ---
 %% PROUVE : le harness de chat côté navigateur — du socket /ws/chat/{id} au rendu
@@ -25,8 +25,11 @@
 %%   src/atoms/modelCatalog.ts, src/constants/models.ts — modelCatalogAtom, parseModelFamily, DEFAULT_MODEL_ID
 %%   src/components/chat/ChatPanel.tsx, ChatInput.tsx, ChatMessages.tsx, ChatMessageBubble.tsx
 %%     (groupBlocksByAgent), ChatSessionContext.tsx, PermissionRequestBlock.tsx (classifyTool),
-%%     PermissionSettingsPanel.tsx, SessionList.tsx, messageQueue.ts, inputAction.ts
-%%     (deriveInputAction), chatUrlState.ts, sessionListUtils.ts, tools/index.tsx (TOOL_REGISTRY)
+%%     PermissionSettingsPanel.tsx, SessionList.tsx (SessionRow, RenameInput, fetchSessions
+%%     modes initial/more/reconcile), messageQueue.ts, inputAction.ts
+%%     (deriveInputAction), chatUrlState.ts, sessionListUtils.ts, sessionActivity.ts
+%%     (describeActivity, applySnapshot, applyWindow, applyStreamingEvent, anyLive),
+%%     tools/index.tsx (TOOL_REGISTRY)
 %%   Commandes : grep -rn 'function useConversationWs' src  → 3 définitions
 %%               grep -n 'session_error\|tools_cancelled' src/hooks/useChat.ts src/utils/chatAssembly.ts → 0
 %%               grep -rn 'ClientMessage\b' src | grep -v WsChatClientMessage → 0 (type supprimé, frontend#198)
@@ -34,9 +37,23 @@
 %% CONVENTION : « 🟠 écrit, sans test » = le code existe et a été lu, mais aucun test ne le
 %%   prouve ; la vérification est décidée et pas écrite (tâche 3.3 du plan). Un ✅ nomme son test.
 %% ---
+%% CORRIGE LE 2026-10-03 (frontend fix/session-list-no-remount, backend feat/chat-live-activity) :
+%%   1. un événement CRUD `chat_session` passait par le chemin de CHARGEMENT INITIAL
+%%      (setLoading(true) + offsetRef=0) : la liste entière cédait la place au spinner
+%%      « Loading... », donc le sous-arbre était DEMONTE — lignes dépliées refermées,
+%%      un useDetachedRuns relancé par rangée — et les pages scrollées étaient perdues.
+%%      Changer d'état repeignait tout. Mode `reconcile` ajouté : même fenêtre, sans
+%%      spinner, mêmes rangées rendues à React.
+%%   2. l'indicateur « working » ne venait QUE des événements reçus pendant que la liste
+%%      était montée : après un rechargement, toute conversation en train de travailler
+%%      paraissait inactive, et rien ne disait ce qu'une session vivante mais muette
+%%      attendait. L'activité est désormais estampillée par le serveur (voir po-chat-manager).
+%% ---
 %% NON ETABLI :
 %%   le backend émet-il réellement session_error et tools_cancelled ? (voir po-chat-manager)
 %%   wsAdapter.ts (TauriWebSocket) : aucun test trouvé, comportement non reproduit ici
+%%   aucune mesure navigateur du non-repeint : les preuves ci-dessus sont des tests JSDOM
+%%     (identité du nœud DOM conservée, absence de « Loading... », fenêtre relue entière)
 %% ---
 %% LEGENDE
 %%   ✅ vérifié (le nœud dit par quel test)  🟠 décidé non écrit / écrit sans test
@@ -155,13 +172,17 @@ flowchart TD
         INPUTMODES["🟠 ⚓ ChatInput MODE_LABELS / PermissionSettingsPanel MODES et presets<br/>Bash(git *), Read(.env*), mcp__project-orchestrator__* :<br/>syntaxe des règles d'outils de Claude Code — sans test"]
         PERM["✅ ⚓ PermissionRequestBlock.classifyTool<br/>Bash · Read/Glob/Grep · Edit/Write/NotebookEdit · mcp__ · WebFetch/WebSearch ;<br/>Allow / Deny / Remember → onRespond ; « Not sent » si le socket a refusé<br/><i>vérifié : ResponseBlocks.sendFailure.test</i>"]
         TOOLS["🟠 ⚓ tools/index.tsx TOOL_REGISTRY : Bash, Edit, Read, Write, Glob, Grep,<br/>WebFetch, WebSearch, TodoWrite → tools/*Renderer.tsx ; préfixe<br/>mcp__project-orchestrator__ ou input.action → McpToolRenderer → tools/mcp/*Renderer.tsx<br/>(classifyAction : list · entity · chat · code · progress) ; sinon DefaultToolRenderer ;<br/>summaries.ts, syntax.ts, types.ts — écrit, sans test"]
-        SESSIONS["✅ SessionList + sessionListUtils (shortModelName retire claude-,<br/>PERMISSION_MODE_META, groupSessionsByDate)<br/><i>vérifié : SessionList.test, sessionListUtils.test</i>"]
+        SESSIONS["✅ SessionList + sessionListUtils (shortModelName retire claude-,<br/>PERMISSION_MODE_META, groupSessionsByDate)<br/>rangées mémoïsées (SessionRow) ; un événement d'état ne repeint pas la liste :<br/>reconcile silencieux sur la fenêtre chargée, jamais setLoading(true)<br/><i>vérifié : SessionList.test, sessionListUtils.test, SessionList.liveState.test</i>"]
+        ACTIVITY["✅ sessionActivity : describeActivity → Working… · Waiting for your approval ·<br/>Watching N targets · N background tasks running · Idle — waiting for you<br/>applySnapshot remplace la carte en entier (un « Working… » figé ne survit pas),<br/>applyWindow ne parle que des sessions listées, applyStreamingEvent accélère<br/><i>vérifié : sessionActivity.test (19 cas)</i>"]
+        LIVEACT["✅ GET /api/chat/live-activity (chatApi.getLiveActivity), relu toutes les 5 s<br/>TANT QU'une session est vivante, jamais sinon, pause onglet caché<br/><i>vérifié : SessionList.liveState.test — « ne sonde pas quand tout est calme »</i>"]
         URL["✅ chatUrlState parseChatUrl / writeChatUrl (?chat=&chatView=)<br/>via useChatUrlSync<br/><i>vérifié : chatUrlState.test</i>"]
         PANEL --> MSGS --> BUBBLE
         BUBBLE --> PERM
         BUBBLE --> TOOLS
         PANEL --> INPUT --> INPUTMODES
         PANEL --> SESSIONS
+        SESSIONS --> ACTIVITY
+        LIVEACT --> ACTIVITY
         PANEL --> URL
     end
 

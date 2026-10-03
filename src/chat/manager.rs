@@ -15,7 +15,7 @@ use super::skill_hook;
 use super::types::{
     classify_api_error, truncate_snippet, BackgroundTaskInfo, BackgroundTaskKind, ChatEvent,
     ChatEventPage, ChatRequest, CreateSessionResponse, MessageSearchHit, MessageSearchResult,
-    PendingMessage, SessionWorkLog,
+    PendingMessage, SessionActivity, SessionWorkLog,
 };
 use crate::events::attention::{notify_attention, AttentionReason, AttentionSubject};
 use crate::meilisearch::SearchStore;
@@ -116,6 +116,52 @@ pub struct LiveSessionSnapshot {
     pub streaming: std::collections::HashSet<Uuid>,
     /// Per live session, the `request_id`s of permissions still waiting.
     pub pending_permissions: std::collections::HashMap<Uuid, std::collections::HashSet<String>>,
+    /// Per live session, the active background subprocesses it is waiting
+    /// on, as `(monitors, bash)`. A session can stream nothing for minutes
+    /// while one of these runs, so this is what keeps a working session
+    /// from looking dead.
+    pub background_tasks: std::collections::HashMap<Uuid, (usize, usize)>,
+}
+
+/// Count the live `(monitors, bash)` among a session's tracked background
+/// tasks.
+///
+/// Entries carrying `pending_removal_at` are deliberately NOT counted. They
+/// are already dying — cancelled, or detected dead — and only linger in the
+/// map for the poller's 5 s grace period so late `BackgroundOutput` ticks
+/// still route correctly. Advertising them would keep a cancelled watch on
+/// screen for five seconds after the user killed it.
+pub(crate) fn count_background_tasks<'a>(
+    tasks: impl IntoIterator<Item = &'a BackgroundTaskInfo>,
+) -> (usize, usize) {
+    let mut monitors = 0usize;
+    let mut bash = 0usize;
+    for info in tasks {
+        if info.pending_removal_at.is_some() {
+            continue;
+        }
+        match info.kind {
+            BackgroundTaskKind::Monitor => monitors += 1,
+            BackgroundTaskKind::BashBackground => bash += 1,
+        }
+    }
+    (monitors, bash)
+}
+
+impl LiveSessionSnapshot {
+    /// The activity of one session, as the API reports it. A session the
+    /// snapshot has never heard of is quiet by definition — which is the
+    /// honest answer, not a missing value.
+    pub fn activity_for(&self, id: Uuid) -> SessionActivity {
+        let (monitors, bash_tasks) = self.background_tasks.get(&id).copied().unwrap_or((0, 0));
+        SessionActivity {
+            live: self.live.contains(&id),
+            streaming: self.streaming.contains(&id),
+            pending_permissions: self.pending_permissions.get(&id).map_or(0, |p| p.len()),
+            monitors,
+            bash_tasks,
+        }
+    }
 }
 
 /// An active chat session with a live Claude CLI subprocess
@@ -2176,6 +2222,7 @@ impl ChatManager {
     pub async fn live_session_snapshot(&self) -> LiveSessionSnapshot {
         let mut snap = LiveSessionSnapshot::default();
         let mut inputs = Vec::new();
+        let mut tasks = Vec::new();
         {
             let sessions = self.active_sessions.read().await;
             for (id, s) in sessions.iter() {
@@ -2185,6 +2232,7 @@ impl ChatManager {
                         snap.streaming.insert(id);
                     }
                     inputs.push((id, s.pending_permission_inputs.clone()));
+                    tasks.push((id, s.active_background_tasks.clone()));
                 }
             }
         }
@@ -2195,7 +2243,24 @@ impl ChatManager {
                 snap.pending_permissions.insert(id, ids);
             }
         }
+        for (id, map) in tasks {
+            let counts = count_background_tasks(map.lock().await.values());
+            if counts != (0, 0) {
+                snap.background_tasks.insert(id, counts);
+            }
+        }
         snap
+    }
+
+    /// Live activity for every session the manager knows about, keyed by id.
+    /// Sessions absent from the map are quiet; callers fill them in with
+    /// [`SessionActivity::default`] rather than treating absence as unknown.
+    pub async fn session_activity_map(&self) -> std::collections::HashMap<Uuid, SessionActivity> {
+        let snap = self.live_session_snapshot().await;
+        snap.live
+            .iter()
+            .map(|id| (*id, snap.activity_for(*id)))
+            .collect()
     }
 
     /// Check if a session is currently active (subprocess alive)
@@ -9167,6 +9232,115 @@ mod tests {
             )
         );
         assert!(!snap.pending_permissions.contains_key(&without));
+    }
+
+    /// `is_streaming` lives in an `AtomicBool` and is written to Neo4j
+    /// nowhere, so turning the in-memory snapshot into the per-session
+    /// activity the API reports is the whole mechanism behind a working
+    /// indicator that survives a page reload. These tests need no CLI: the
+    /// mapping and the counting are pure.
+    mod activity {
+        use super::super::{count_background_tasks, LiveSessionSnapshot};
+        use crate::chat::types::{BackgroundTaskInfo, BackgroundTaskKind};
+        use uuid::Uuid;
+
+        fn task(kind: BackgroundTaskKind, dying: bool) -> BackgroundTaskInfo {
+            let now = chrono::Utc::now();
+            BackgroundTaskInfo {
+                id: Uuid::new_v4().to_string(),
+                kind,
+                description: "watch the log".into(),
+                started_at: now,
+                last_seen_at: now,
+                pid: Some(1234),
+                parent_tool_use_id: None,
+                pending_removal_at: dying.then(std::time::Instant::now),
+            }
+        }
+
+        #[test]
+        fn an_unknown_session_is_quiet_rather_than_unknown() {
+            let snap = LiveSessionSnapshot::default();
+            let a = snap.activity_for(Uuid::new_v4());
+            assert!(
+                a.is_quiet(),
+                "absence from the map is an answer: nothing is running"
+            );
+            assert!(!a.live);
+            assert_eq!(a.background_tasks(), 0);
+        }
+
+        #[test]
+        fn a_live_session_reports_what_it_is_waiting_on() {
+            let id = Uuid::new_v4();
+            let other = Uuid::new_v4();
+            let mut snap = LiveSessionSnapshot::default();
+            snap.live.insert(id);
+            snap.live.insert(other);
+            snap.streaming.insert(id);
+            snap.pending_permissions.insert(
+                id,
+                ["req-1".to_string(), "req-2".to_string()]
+                    .into_iter()
+                    .collect(),
+            );
+            snap.background_tasks.insert(id, (2, 1));
+
+            let a = snap.activity_for(id);
+            assert!(a.live && a.streaming);
+            assert_eq!(a.pending_permissions, 2);
+            assert_eq!(a.monitors, 2);
+            assert_eq!(a.bash_tasks, 1);
+            assert_eq!(a.background_tasks(), 3);
+            assert!(!a.is_quiet());
+
+            // A second live session must not inherit the first one's state —
+            // the bug this guards against is one row's indicator leaking onto
+            // every other row.
+            let b = snap.activity_for(other);
+            assert!(b.live);
+            assert!(!b.streaming);
+            assert_eq!(b.pending_permissions, 0);
+            assert_eq!(b.background_tasks(), 0);
+        }
+
+        #[test]
+        fn a_live_but_idle_session_is_not_quiet() {
+            let id = Uuid::new_v4();
+            let mut snap = LiveSessionSnapshot::default();
+            snap.live.insert(id);
+            // The distinction the UI needs: "the agent is up, waiting for you"
+            // must be sayable, because showing nothing there is what made a
+            // running conversation look dead.
+            assert!(!snap.activity_for(id).is_quiet());
+        }
+
+        #[test]
+        fn counting_separates_monitors_from_background_commands() {
+            let tasks = [
+                task(BackgroundTaskKind::Monitor, false),
+                task(BackgroundTaskKind::Monitor, false),
+                task(BackgroundTaskKind::BashBackground, false),
+            ];
+            assert_eq!(count_background_tasks(tasks.iter()), (2, 1));
+        }
+
+        #[test]
+        fn a_cancelled_watch_stops_being_advertised_at_once() {
+            // `pending_removal_at` entries linger for a 5 s grace period so
+            // late ticks still route. Counting them would keep a cancelled
+            // watch on screen for those five seconds.
+            let tasks = [
+                task(BackgroundTaskKind::Monitor, true),
+                task(BackgroundTaskKind::BashBackground, true),
+            ];
+            assert_eq!(count_background_tasks(tasks.iter()), (0, 0));
+        }
+
+        #[test]
+        fn nothing_tracked_counts_as_nothing() {
+            assert_eq!(count_background_tasks(std::iter::empty()), (0, 0));
+        }
     }
 
     #[tokio::test]

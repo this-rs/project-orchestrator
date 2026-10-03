@@ -4,7 +4,7 @@ use crate::api::handlers::{AppError, OrchestratorState};
 use crate::api::query::{PaginatedResponse, PaginationParams};
 use crate::chat::types::{
     ChatLinkedPlan, ChatLinkedRfc, ChatLinkedTask, ChatRequest, ChatSession, CreateSessionResponse,
-    MessageSearchResult,
+    MessageSearchResult, SessionActivity,
 };
 use crate::events::{CrudAction, CrudEvent, EntityType, EventEmitter};
 use axum::{
@@ -262,6 +262,36 @@ fn session_node_to_response(s: crate::neo4j::models::ChatSessionNode) -> ChatSes
         linked_plans: Vec::new(),
         linked_tasks: Vec::new(),
         linked_rfcs: Vec::new(),
+        activity: None,
+    }
+}
+
+/// Stamp every session in `items` with its live activity, read in ONE pass
+/// over the chat manager's in-memory map.
+///
+/// Why this exists: `is_streaming` is an `AtomicBool` inside `ActiveSession`
+/// and nothing writes it to Neo4j, so a listing built from the graph alone
+/// cannot say which conversation is working. Clients used to learn it only
+/// from `chat_session` CRUD events that happened to arrive while their list
+/// was mounted — meaning a reload showed every running conversation as idle.
+///
+/// Quiet sessions keep `activity: None` so a page of cold sessions is
+/// exactly as small on the wire as it was before this field existed.
+async fn stamp_activity(state: &OrchestratorState, items: &mut [ChatSession]) {
+    let Some(cm) = state.chat_manager.as_ref() else {
+        return;
+    };
+    let snap = cm.live_session_snapshot().await;
+    if snap.live.is_empty() {
+        return;
+    }
+    for item in items.iter_mut() {
+        if let Ok(id) = item.id.parse::<Uuid>() {
+            let activity = snap.activity_for(id);
+            if !activity.is_quiet() {
+                item.activity = Some(activity);
+            }
+        }
     }
 }
 
@@ -318,7 +348,7 @@ pub async fn list_sessions(
             .map_err(AppError::Internal)?;
 
         let total = sessions_with_links.len();
-        let items: Vec<ChatSession> = sessions_with_links
+        let mut items: Vec<ChatSession> = sessions_with_links
             .into_iter()
             .skip(query.pagination.offset)
             .take(query.pagination.validated_limit())
@@ -328,6 +358,7 @@ pub async fn list_sessions(
                 session
             })
             .collect();
+        stamp_activity(&state, &mut items).await;
 
         return Ok(Json(PaginatedResponse::new(
             items,
@@ -344,7 +375,7 @@ pub async fn list_sessions(
             .map_err(AppError::Internal)?;
 
         let total = sessions_with_links.len();
-        let items: Vec<ChatSession> = sessions_with_links
+        let mut items: Vec<ChatSession> = sessions_with_links
             .into_iter()
             .skip(query.pagination.offset)
             .take(query.pagination.validated_limit())
@@ -354,6 +385,7 @@ pub async fn list_sessions(
                 session
             })
             .collect();
+        stamp_activity(&state, &mut items).await;
 
         return Ok(Json(PaginatedResponse::new(
             items,
@@ -382,7 +414,7 @@ pub async fn list_sessions(
         .await
         .unwrap_or_default();
 
-    let items: Vec<ChatSession> = sessions
+    let mut items: Vec<ChatSession> = sessions
         .into_iter()
         .map(|s| {
             let sid = s.id;
@@ -393,6 +425,7 @@ pub async fn list_sessions(
             session
         })
         .collect();
+    stamp_activity(&state, &mut items).await;
 
     Ok(Json(PaginatedResponse::new(
         items,
@@ -422,6 +455,8 @@ pub async fn get_session(
         enrich_session_with_links(&mut session, &links);
     }
 
+    stamp_activity(&state, std::slice::from_mut(&mut session)).await;
+
     Ok(Json(session))
 }
 
@@ -437,7 +472,8 @@ pub async fn get_session_children(
         .await
         .map_err(AppError::Internal)?;
 
-    let items: Vec<ChatSession> = children.into_iter().map(session_node_to_response).collect();
+    let mut items: Vec<ChatSession> = children.into_iter().map(session_node_to_response).collect();
+    stamp_activity(&state, &mut items).await;
 
     Ok(Json(items))
 }
@@ -827,6 +863,51 @@ pub async fn get_background_tasks(
     Ok(Json(serde_json::json!({ "tasks": tasks })))
 }
 
+/// Body of `GET /api/chat/live-activity`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LiveActivityResponse {
+    /// When the snapshot was taken, so a client can tell a fresh "nothing
+    /// is running" from a response it failed to refresh.
+    pub generated_at: String,
+    /// Activity per session id. A session absent from this map is quiet:
+    /// absence is an answer, not missing data.
+    pub sessions: std::collections::HashMap<String, SessionActivity>,
+}
+
+/// GET /api/chat/live-activity — what every known session is doing, now.
+///
+/// Reads the `ChatManager`'s in-memory map only: no Neo4j, no pagination,
+/// no per-session locks beyond the ones `live_session_snapshot` already
+/// takes. It exists so a conversation list can *reconcile* its working
+/// indicators instead of trusting that it received every CRUD event.
+///
+/// That distinction is the whole point. An indicator driven by events alone
+/// has two failure modes a user actually hits: a list mounted after a turn
+/// started shows it as idle, and a dropped "streaming stopped" event leaves
+/// a "Working…" that never clears. Both are unfixable from the event stream
+/// itself — only re-reading the truth fixes them.
+///
+/// Answers `{}` (not 404) when no chat manager is configured, so a client
+/// may poll it unconditionally.
+pub async fn get_live_activity(
+    State(state): State<OrchestratorState>,
+) -> Json<LiveActivityResponse> {
+    let generated_at = chrono::Utc::now().to_rfc3339();
+    let sessions = match state.chat_manager.as_ref() {
+        Some(cm) => cm
+            .session_activity_map()
+            .await
+            .into_iter()
+            .map(|(id, a)| (id.to_string(), a))
+            .collect(),
+        None => std::collections::HashMap::new(),
+    };
+    Json(LiveActivityResponse {
+        generated_at,
+        sessions,
+    })
+}
+
 /// POST /api/chat/sessions/{id}/cancel-task/{task_id} — Cancel a
 /// single tracked background task by id.
 ///
@@ -905,29 +986,11 @@ pub async fn update_session(
         })),
     );
 
-    Ok(Json(ChatSession {
-        id: updated.id.to_string(),
-        cli_session_id: updated.cli_session_id,
-        project_slug: updated.project_slug,
-        workspace_slug: updated.workspace_slug,
-        cwd: updated.cwd,
-        title: updated.title,
-        model: updated.model,
-        created_at: updated.created_at.to_rfc3339(),
-        updated_at: updated.updated_at.to_rfc3339(),
-        message_count: updated.message_count,
-        total_cost_usd: updated.total_cost_usd,
-        conversation_id: updated.conversation_id,
-        preview: updated.preview,
-        permission_mode: updated.permission_mode,
-        add_dirs: updated.add_dirs,
-        spawned_by: updated
-            .spawned_by
-            .and_then(|sb| serde_json::from_str(&sb).ok()),
-        linked_plans: Vec::new(),
-        linked_tasks: Vec::new(),
-        linked_rfcs: Vec::new(),
-    }))
+    // Field-for-field copy of `session_node_to_response`, so a rename cannot
+    // start answering a different shape from the rest of the endpoints.
+    let mut session = session_node_to_response(updated);
+    stamp_activity(&state, std::slice::from_mut(&mut session)).await;
+    Ok(Json(session))
 }
 
 // ============================================================================
@@ -1603,6 +1666,76 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["total"], 2);
         assert_eq!(json["items"].as_array().unwrap().len(), 2);
+    }
+
+    // ====================================================================
+    // Live activity — what a conversation is doing *now*
+    // ====================================================================
+
+    /// A client may poll this endpoint unconditionally: no chat manager is
+    /// "nothing is running", not an error. Answering 404 here would make every
+    /// conversation list log failures on a server built without chat.
+    #[tokio::test]
+    async fn live_activity_answers_an_empty_map_when_chat_is_not_configured() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_get("/api/chat/live-activity"))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            json["sessions"].as_object().unwrap().is_empty(),
+            "no manager means no live session, not a missing field"
+        );
+        assert!(
+            json["generated_at"].as_str().is_some(),
+            "a client must be able to tell a fresh empty answer from a stale one"
+        );
+    }
+
+    /// The field is omitted, not sent as zeroes: a page of cold sessions costs
+    /// exactly what it cost before live activity existed.
+    #[tokio::test]
+    async fn a_quiet_session_carries_no_activity_field_at_all() {
+        let app = test_app_with_sessions(&[test_chat_session(Some("proj-a"))]).await;
+        let resp = app.oneshot(auth_get("/api/chat/sessions")).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let item = &json["items"][0];
+        assert!(item["id"].is_string(), "the session itself is still there");
+        assert!(
+            item.get("activity").is_none(),
+            "quiet sessions stay off the wire: got {}",
+            item
+        );
+    }
+
+    /// The shape the frontend decodes. Pinned here because the status line in
+    /// the conversation list reads these five fields by name.
+    #[test]
+    fn session_activity_serialises_the_five_fields_the_ui_reads() {
+        let json = serde_json::to_value(SessionActivity {
+            live: true,
+            streaming: true,
+            pending_permissions: 2,
+            monitors: 1,
+            bash_tasks: 3,
+        })
+        .unwrap();
+        assert_eq!(json["live"], true);
+        assert_eq!(json["streaming"], true);
+        assert_eq!(json["pending_permissions"], 2);
+        assert_eq!(json["monitors"], 1);
+        assert_eq!(json["bash_tasks"], 3);
     }
 
     #[tokio::test]
