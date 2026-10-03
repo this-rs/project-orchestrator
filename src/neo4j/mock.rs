@@ -81,6 +81,9 @@ pub struct MockGraphStore {
     pub chat_sessions: RwLock<HashMap<Uuid, ChatSessionNode>>,
     /// Stored session links (run relation / associations), seedable by tests
     pub session_link_rows: RwLock<Vec<SessionLinkRow>>,
+    /// Chat sessions linked to a task, as `get_task_enrichment_data` reports
+    /// them. Seedable by tests; empty by default.
+    pub task_sessions: RwLock<HashMap<Uuid, Vec<crate::neo4j::plan::TaskSessionSummary>>>,
     /// Number of `get_session_link_rows` calls (query-count assertions)
     pub session_link_reads: std::sync::atomic::AtomicUsize,
     /// Log of the grouped reads the cockpit aggregator performs, in order
@@ -287,6 +290,7 @@ impl MockGraphStore {
             document_links: RwLock::new(HashMap::new()),
             chat_sessions: RwLock::new(HashMap::new()),
             session_link_rows: RwLock::new(Vec::new()),
+            task_sessions: RwLock::new(HashMap::new()),
             session_link_reads: std::sync::atomic::AtomicUsize::new(0),
             read_log: std::sync::Mutex::new(Vec::new()),
             fail_reads: std::sync::Mutex::new(std::collections::HashSet::new()),
@@ -3912,6 +3916,7 @@ impl GraphStore for MockGraphStore {
         let counts = self.get_task_enrichment_counts(task_ids).await?;
         let steps_store = self.steps.read().await;
         let task_steps_map = self.task_steps.read().await;
+        let task_sessions = self.task_sessions.read().await;
         let mut map = std::collections::HashMap::new();
         for tid in task_ids {
             if let Ok(uuid) = tid.parse::<Uuid>() {
@@ -3932,7 +3937,7 @@ impl GraphStore for MockGraphStore {
                     TaskEnrichmentData {
                         counts: counts.get(tid).cloned().unwrap_or_default(),
                         steps: task_steps,
-                        sessions: vec![],
+                        sessions: task_sessions.get(&uuid).cloned().unwrap_or_default(),
                         discussed_files: vec![],
                     },
                 );

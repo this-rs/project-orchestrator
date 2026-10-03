@@ -33,11 +33,16 @@ pub struct StepSummary {
 }
 
 /// Chat session summary linked to a task (via SPAWNED_BY{task_id})
+///
+/// Deliberately carries no "is it running" flag. It used to, read from
+/// `cs.is_streaming` — a property **nothing in this codebase ever writes**,
+/// so it was `false` for every session that has ever existed and the plan
+/// graph's `active_session_count` was permanently zero. Liveness lives in
+/// the running `ChatManager`; the handler stamps it from there.
 #[derive(Debug, Clone, Serialize)]
 pub struct TaskSessionSummary {
     pub session_id: String,
     pub title: Option<String>,
-    pub is_active: bool,
     pub child_count: usize,
 }
 
@@ -750,7 +755,6 @@ impl Neo4jClient {
             RETURN tid,
                    cs.id AS session_id,
                    cs.title AS title,
-                   COALESCE(cs.is_streaming, false) AS is_active,
                    count(child) AS child_count
             "#,
         )
@@ -765,7 +769,6 @@ impl Neo4jClient {
             if let Some(sid) = session_id {
                 if !sid.is_empty() {
                     let title: Option<String> = row.get("title").ok();
-                    let is_active: bool = row.get("is_active").unwrap_or(false);
                     let child_count: i64 = row.get("child_count").unwrap_or(0);
 
                     sessions_map
@@ -774,7 +777,6 @@ impl Neo4jClient {
                         .push(TaskSessionSummary {
                             session_id: sid,
                             title,
-                            is_active,
                             child_count: child_count as usize,
                         });
                 }

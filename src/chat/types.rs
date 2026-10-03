@@ -945,6 +945,54 @@ pub struct ChatSession {
     /// RFCs transitively linked via plans
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub linked_rfcs: Vec<ChatLinkedRfc>,
+    /// What the session is doing right now, from the live `ChatManager`.
+    /// `None` when the chat manager is not configured at all; omitted from
+    /// the wire when the session is quiet, so a listing of cold sessions
+    /// stays exactly as small as it was before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<SessionActivity>,
+}
+
+/// What a chat session is doing *right now*, read from the live
+/// `ChatManager` and never from Neo4j.
+///
+/// There is no persisted truth to read: `is_streaming` lives in an
+/// `AtomicBool` inside `ActiveSession`, and nothing ever writes it to the
+/// graph. Deriving this from the in-memory map is therefore not a shortcut
+/// but the only correct source — and it self-heals, because a session that
+/// was mid-turn when the server died simply is not in the map any more and
+/// reports `live: false` instead of a "Working…" that never clears.
+///
+/// `Default` is the honest answer for a session the manager has never heard
+/// of: not live, not streaming, waiting on nothing.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionActivity {
+    /// The Claude CLI subprocess for this session is alive.
+    pub live: bool,
+    /// A turn is being streamed right now (the session is actively working).
+    pub streaming: bool,
+    /// Permission requests still waiting for a human answer. Non-zero means
+    /// the session is blocked on the user, not idle.
+    pub pending_permissions: usize,
+    /// Active `Monitor` subprocesses — what the user calls a "watch". A
+    /// session can legitimately produce no tokens for minutes while one of
+    /// these runs, which is exactly the case that used to look dead.
+    pub monitors: usize,
+    /// Active `Bash run_in_background` subprocesses.
+    pub bash_tasks: usize,
+}
+
+impl SessionActivity {
+    /// Nothing at all is happening — used to decide whether the field is
+    /// worth putting on the wire.
+    pub fn is_quiet(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Total tracked background subprocesses (monitors + bash).
+    pub fn background_tasks(&self) -> usize {
+        self.monitors + self.bash_tasks
+    }
 }
 
 /// A plan linked to a chat session (API response type).
@@ -2073,6 +2121,7 @@ mod tests {
             linked_plans: Vec::new(),
             linked_tasks: Vec::new(),
             linked_rfcs: Vec::new(),
+            activity: None,
         };
 
         let json = serde_json::to_string(&session).unwrap();
@@ -2290,6 +2339,7 @@ mod tests {
             linked_plans: Vec::new(),
             linked_tasks: Vec::new(),
             linked_rfcs: Vec::new(),
+            activity: None,
         };
 
         let json = serde_json::to_string(&session).unwrap();
