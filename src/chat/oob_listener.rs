@@ -172,6 +172,17 @@ pub(crate) fn spawn_oob_listener(
                         Some(Ok(message)) => {
                             let message = ChatManager::mask_cli_message(message);
                             remember_subagent_launches(&message, &mut subagent_parents);
+                            // The CLI's own count of running background tasks.
+                            // Read from every message, in-stream ones included:
+                            // a task is usually launched during a turn and
+                            // finishes outside of one.
+                            if let Some(count) = cli_background_task_count(&message) {
+                                if let Some(active) =
+                                    deps.active_sessions.read().await.get(&session_id)
+                                {
+                                    active.cli_background_tasks.store(count, Ordering::Relaxed);
+                                }
+                            }
                             if last_activity_touch.elapsed() >= ACTIVITY_TOUCH_INTERVAL {
                                 last_activity_touch = Instant::now();
                                 if let Some(active) =
@@ -670,6 +681,21 @@ const ACTIVITY_TOUCH_INTERVAL: Duration = Duration::from_secs(30);
 /// the cap only guards a pathological one against unbounded growth.
 const MAX_REMEMBERED_SUBAGENTS: usize = 1024;
 
+/// How many background tasks the CLI says it is running, when `message` is
+/// its `background_tasks_changed` report (sent on every start and finish, with
+/// the full current list). `None` for any other message, and for a report
+/// whose `tasks` is not a list — an unreadable report must not be read as
+/// "nothing is running".
+pub(crate) fn cli_background_task_count(message: &Message) -> Option<usize> {
+    let Message::System { subtype, data } = message else {
+        return None;
+    };
+    if subtype != "background_tasks_changed" {
+        return None;
+    }
+    data.get("tasks")?.as_array().map(Vec::len)
+}
+
 /// Record the ids of `Agent` / `Task` tool calls, at any depth: a sub-agent
 /// may launch its own sub-agent, whose traffic is parented to that launch.
 fn remember_subagent_launches(message: &Message, parents: &mut HashSet<String>) {
@@ -862,6 +888,50 @@ mod tests {
             "content should include tool_result text, got: {content}"
         );
         assert_eq!(corr.as_deref(), Some("tool-bg-123"));
+    }
+
+    /// The CLI's report, in the shape observed on the wire: the full list of
+    /// its running background tasks, sent on every start and finish.
+    #[test]
+    fn test_cli_background_task_count_reads_the_cli_report() {
+        let report = |tasks: serde_json::Value| Message::System {
+            subtype: "background_tasks_changed".to_string(),
+            data: serde_json::json!({
+                "session_id": "ca77d9e2-03a8-40ce-b0b8-245d431fa046",
+                "uuid": "5c33ae71-bbae-4ce2-8089-b781f833a460",
+                "tasks": tasks,
+            }),
+        };
+
+        let two = report(serde_json::json!([
+            {"task_id": "bckko8e7n", "task_type": "local_bash", "description": "clippy"},
+            {"task_id": "babp3g9yp", "task_type": "local_bash", "description": "grep"},
+        ]));
+        assert_eq!(cli_background_task_count(&two), Some(2));
+        assert_eq!(
+            cli_background_task_count(&report(serde_json::json!([]))),
+            Some(0),
+            "an empty list means the last task finished"
+        );
+
+        // An unreadable report is not "nothing is running".
+        assert_eq!(
+            cli_background_task_count(&report(serde_json::json!("?"))),
+            None
+        );
+        let no_tasks = Message::System {
+            subtype: "background_tasks_changed".to_string(),
+            data: serde_json::json!({}),
+        };
+        assert_eq!(cli_background_task_count(&no_tasks), None);
+
+        // Any other message says nothing about background tasks.
+        let other = Message::System {
+            subtype: "task_notification".to_string(),
+            data: serde_json::json!({"tasks": [1, 2, 3]}),
+        };
+        assert_eq!(cli_background_task_count(&other), None);
+        assert_eq!(cli_background_task_count(&user_plain("hello")), None);
     }
 
     #[test]

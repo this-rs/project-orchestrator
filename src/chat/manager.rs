@@ -31,7 +31,7 @@ use nexus_claude::{
     StreamDelta, StreamEventData,
 };
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, Mutex, RwLock};
@@ -254,6 +254,15 @@ pub struct ActiveSession {
     /// `get_descendant_pids(child_pid)` (decision 33bce470, audit note
     /// 2482f4e0).
     pub active_background_tasks: Arc<Mutex<HashMap<String, BackgroundTaskInfo>>>,
+    /// How many background tasks the CLI itself says are running, from its
+    /// last `background_tasks_changed` system message (0 until one arrives).
+    ///
+    /// `active_background_tasks` is this server's own bookkeeping and can
+    /// only infer liveness from output: a command that runs silently (a
+    /// build, a test run redirected to a file) emits nothing for its whole
+    /// life. The CLI knows. Written by the OOB listener, read by the
+    /// background-task purge and by the idle-session cleanup.
+    pub cli_background_tasks: Arc<AtomicUsize>,
     /// Sliding-window history of `cancel_task` invocations on this session.
     /// Same shape and intent as `cancel_tools_history`, but scoped to the
     /// granular per-task cancel path introduced by plan 754a1379 (T9).
@@ -3108,6 +3117,7 @@ impl ChatManager {
                     cancel_tools_cap: CANCEL_TOOLS_CAP,
                     cancel_tools_window: Duration::from_secs(CANCEL_TOOLS_WINDOW_SECS),
                     active_background_tasks: Arc::new(Mutex::new(HashMap::new())),
+                    cli_background_tasks: Arc::new(AtomicUsize::new(0)),
                     cancel_task_history: Arc::new(Mutex::new(VecDeque::new())),
                     cancel_task_cap: CANCEL_TASK_CAP,
                     cancel_task_window: Duration::from_secs(CANCEL_TASK_WINDOW_SECS),
@@ -3771,10 +3781,13 @@ impl ChatManager {
         nats: &Option<Arc<crate::events::NatsEmitter>>,
         grace: Duration,
     ) {
-        let tasks_arc = {
+        let (tasks_arc, cli_reports_live_tasks) = {
             let sessions = active_sessions.read().await;
             match sessions.get(session_id) {
-                Some(active) => active.active_background_tasks.clone(),
+                Some(active) => (
+                    active.active_background_tasks.clone(),
+                    active.cli_background_tasks.load(Ordering::Relaxed) > 0,
+                ),
                 None => return,
             }
         };
@@ -3786,14 +3799,20 @@ impl ChatManager {
         let snapshot = {
             let mut tasks = tasks_arc.lock().await;
 
-            // Phase 1: idle-death detection. Mark live entries that
-            // haven't emitted in too long.
+            // Phase 1: idle-death detection. Mark entries that haven't
+            // emitted in too long AND are not known to be running: silence
+            // alone is not death (see `background_task_is_idle_dead`).
             let mut newly_marked = 0usize;
             for info in tasks.values_mut() {
                 if info.pending_removal_at.is_some() {
                     continue;
                 }
-                if (now_chrono - info.last_seen_at) >= idle_death {
+                if background_task_is_idle_dead(
+                    now_chrono - info.last_seen_at,
+                    idle_death,
+                    process_alive(info.pid),
+                    cli_reports_live_tasks,
+                ) {
                     info.pending_removal_at = Some(now_inst);
                     newly_marked += 1;
                 }
@@ -5994,6 +6013,7 @@ impl ChatManager {
                     cancel_tools_cap: CANCEL_TOOLS_CAP,
                     cancel_tools_window: Duration::from_secs(CANCEL_TOOLS_WINDOW_SECS),
                     active_background_tasks: Arc::new(Mutex::new(HashMap::new())),
+                    cli_background_tasks: Arc::new(AtomicUsize::new(0)),
                     cancel_task_history: Arc::new(Mutex::new(VecDeque::new())),
                     cancel_task_cap: CANCEL_TASK_CAP,
                     cancel_task_window: Duration::from_secs(CANCEL_TASK_WINDOW_SECS),
@@ -7461,15 +7481,22 @@ impl ChatManager {
                                 s.last_activity.elapsed(),
                                 s.is_streaming.clone(),
                                 s.active_background_tasks.clone(),
+                                s.cli_background_tasks.clone(),
                             )
                         })
                         .collect()
                 };
 
                 let mut expired = Vec::new();
-                for (id, idle, streaming, background) in candidates {
+                for (id, idle, streaming, background, cli_background) in candidates {
                     let is_streaming = streaming.load(Ordering::Relaxed);
-                    let background_tasks = background.lock().await.len();
+                    // Whichever knows of more work wins: this server's own
+                    // tracking, or what the CLI reports about itself.
+                    let background_tasks = background
+                        .lock()
+                        .await
+                        .len()
+                        .max(cli_background.load(Ordering::Relaxed));
                     if session_is_expired(idle, timeout, is_streaming, background_tasks) {
                         expired.push(id);
                     } else {
@@ -7496,6 +7523,67 @@ impl ChatManager {
     /// Get the number of currently active sessions
     pub async fn active_session_count(&self) -> usize {
         self.active_sessions.read().await.len()
+    }
+}
+
+/// Is the process `pid` still there? `None` when it cannot be told (no pid
+/// was ever discovered for the task, or the platform has no cheap probe).
+pub(crate) fn process_alive(pid: Option<u32>) -> Option<bool> {
+    let pid = pid?;
+    #[cfg(unix)]
+    {
+        // 0 and negative values address process GROUPS in kill(2); a pid
+        // that does not fit a positive i32 is not a process we tracked.
+        let Ok(pid) = i32::try_from(pid) else {
+            return Some(false);
+        };
+        if pid <= 0 {
+            return Some(false);
+        }
+        // SAFETY: signal 0 delivers nothing; it only checks that the pid
+        // exists and that we may signal it.
+        let rc = unsafe { libc::kill(pid, 0) };
+        if rc == 0 {
+            return Some(true);
+        }
+        // EPERM: the process exists but belongs to someone else.
+        Some(std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// Should a tracked background task be declared dead for having been silent?
+///
+/// Silence used to be enough: 30 minutes without output and the entry was
+/// purged. But a build or a test run whose output goes to a file is silent
+/// for its whole life. Purged while still running, it left the session with
+/// "no background work", so the idle cleanup closed the session — killing the
+/// CLI, the command with it, and showing the user "The CLI subprocess for this
+/// session has exited". A silent task is now dead only when nothing says it
+/// runs:
+///
+/// - its process is known → the process decides;
+/// - its process is unknown (the pid claim often fails) → the CLI's own
+///   report decides: while the CLI says it has background tasks, keep it.
+///
+/// A task that is kept wrongly is bounded by the session hard cap
+/// (`IDLE_HARD_CAP_FACTOR`).
+pub(crate) fn background_task_is_idle_dead(
+    silent_for: chrono::Duration,
+    idle_death: chrono::Duration,
+    process_alive: Option<bool>,
+    cli_reports_live_tasks: bool,
+) -> bool {
+    if silent_for < idle_death {
+        return false;
+    }
+    match process_alive {
+        Some(alive) => !alive,
+        None => !cli_reports_live_tasks,
     }
 }
 
@@ -7530,10 +7618,122 @@ pub(crate) fn session_is_expired(
 
 #[cfg(test)]
 mod idle_expiry_tests {
-    use super::session_is_expired;
+    use super::{background_task_is_idle_dead, process_alive, session_is_expired};
     use std::time::Duration;
 
     const T: Duration = Duration::from_secs(1800);
+
+    fn mins(m: i64) -> chrono::Duration {
+        chrono::Duration::minutes(m)
+    }
+
+    #[test]
+    fn a_task_that_emitted_recently_is_alive_whatever_else_is_known() {
+        for process in [None, Some(true), Some(false)] {
+            for cli in [false, true] {
+                assert!(!background_task_is_idle_dead(
+                    mins(29),
+                    mins(30),
+                    process,
+                    cli
+                ));
+            }
+        }
+    }
+
+    /// The failure this guards: a build that writes to a file says nothing for
+    /// 40 minutes. Its process runs → it is not dead.
+    #[test]
+    fn a_silent_task_whose_process_runs_is_not_dead() {
+        assert!(!background_task_is_idle_dead(
+            mins(40),
+            mins(30),
+            Some(true),
+            false
+        ));
+        // The process is the stronger evidence: it wins over a CLI report
+        // that is empty (or that never came).
+        assert!(!background_task_is_idle_dead(
+            mins(600),
+            mins(30),
+            Some(true),
+            false
+        ));
+    }
+
+    #[test]
+    fn a_silent_task_whose_process_is_gone_is_dead() {
+        assert!(background_task_is_idle_dead(
+            mins(30),
+            mins(30),
+            Some(false),
+            false
+        ));
+        // Even if the CLI still reports work: that is some other task.
+        assert!(background_task_is_idle_dead(
+            mins(31),
+            mins(30),
+            Some(false),
+            true
+        ));
+    }
+
+    /// The pid claim often fails ("no new PID in diff"): then the CLI's own
+    /// report is the only evidence.
+    #[test]
+    fn a_silent_task_without_a_pid_follows_the_cli_report() {
+        assert!(!background_task_is_idle_dead(
+            mins(40),
+            mins(30),
+            None,
+            true
+        ));
+        // Nothing says it runs: the previous behaviour, unchanged.
+        assert!(background_task_is_idle_dead(
+            mins(40),
+            mins(30),
+            None,
+            false
+        ));
+    }
+
+    #[test]
+    fn process_alive_tells_a_running_process_from_a_dead_one() {
+        assert_eq!(process_alive(None), None);
+
+        #[cfg(unix)]
+        {
+            assert_eq!(process_alive(Some(std::process::id())), Some(true));
+            // kill(0, ..) would address our whole process group.
+            assert_eq!(process_alive(Some(0)), Some(false));
+            assert_eq!(process_alive(Some(u32::MAX)), Some(false));
+
+            // A child that has exited and been reaped no longer exists.
+            let mut child = std::process::Command::new("true")
+                .spawn()
+                .expect("spawn `true`");
+            let pid = child.id();
+            child.wait().expect("wait for `true`");
+            assert_eq!(process_alive(Some(pid)), Some(false));
+        }
+    }
+
+    /// What the cleanup feeds `session_is_expired`: the larger of this
+    /// server's tracking and the CLI's report. With the tracking emptied (the
+    /// old purge) but the CLI reporting one task, the session is kept.
+    #[test]
+    fn idle_session_is_kept_while_the_cli_reports_background_work() {
+        let tracked = 0usize;
+        let cli_reported = 1usize;
+        assert!(!session_is_expired(
+            T * 2,
+            T,
+            false,
+            tracked.max(cli_reported)
+        ));
+        // Without the CLI's report, the emptied tracking alone closes it.
+        assert!(session_is_expired(T * 2, T, false, tracked));
+    }
 
     #[test]
     fn active_session_is_kept() {
@@ -9841,6 +10041,7 @@ mod tests {
             cancel_tools_cap: CANCEL_TOOLS_CAP,
             cancel_tools_window: Duration::from_secs(CANCEL_TOOLS_WINDOW_SECS),
             active_background_tasks: Arc::new(Mutex::new(HashMap::new())),
+            cli_background_tasks: Arc::new(AtomicUsize::new(0)),
             cancel_task_history: Arc::new(Mutex::new(VecDeque::new())),
             cancel_task_cap: CANCEL_TASK_CAP,
             cancel_task_window: Duration::from_secs(CANCEL_TASK_WINDOW_SECS),
@@ -10865,6 +11066,7 @@ mod tests {
             cancel_tools_cap: CANCEL_TOOLS_CAP,
             cancel_tools_window: Duration::from_secs(CANCEL_TOOLS_WINDOW_SECS),
             active_background_tasks: Arc::new(Mutex::new(HashMap::new())),
+            cli_background_tasks: Arc::new(AtomicUsize::new(0)),
             cancel_task_history: Arc::new(Mutex::new(VecDeque::new())),
             cancel_task_cap: CANCEL_TASK_CAP,
             cancel_task_window: Duration::from_secs(CANCEL_TASK_WINDOW_SECS),
@@ -13805,6 +14007,168 @@ mod tests {
     }
 
     // ========================================================================
+    // A silent background task is not a dead one (idle-death vs. liveness)
+    // ========================================================================
+
+    /// One silent `Bash run_in_background` entry, last seen well past the
+    /// idle-death threshold, in a session inserted under `sid`.
+    async fn session_with_silent_background_task(
+        sid: &str,
+        pid: Option<u32>,
+        cli_reported: usize,
+    ) -> Option<(
+        Arc<RwLock<HashMap<String, ActiveSession>>>,
+        broadcast::Sender<ChatEvent>,
+    )> {
+        let (session, _) = try_create_dummy_session(false, "", vec![])?;
+        let events_tx = session.events_tx.clone();
+        let now = chrono::Utc::now();
+        let silent_since =
+            now - chrono::Duration::seconds((BACKGROUND_TASK_IDLE_DEATH_SECS + 60) as i64);
+        session.active_background_tasks.lock().await.insert(
+            "tool_silent".into(),
+            BackgroundTaskInfo {
+                id: "tool_silent".into(),
+                kind: BackgroundTaskKind::BashBackground,
+                description: "cargo test > log 2>&1".into(),
+                started_at: silent_since,
+                last_seen_at: silent_since,
+                pid,
+                parent_tool_use_id: None,
+                pending_removal_at: None,
+            },
+        );
+        session
+            .cli_background_tasks
+            .store(cli_reported, Ordering::Relaxed);
+        let map: Arc<RwLock<HashMap<String, ActiveSession>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        map.write().await.insert(sid.into(), session);
+        Some((map, events_tx))
+    }
+
+    async fn silent_task_is_marked(
+        map: &Arc<RwLock<HashMap<String, ActiveSession>>>,
+        sid: &str,
+    ) -> bool {
+        let sessions = map.read().await;
+        let tasks = sessions
+            .get(sid)
+            .unwrap()
+            .active_background_tasks
+            .lock()
+            .await;
+        tasks
+            .get("tool_silent")
+            .expect("the entry is never removed within one tick")
+            .pending_removal_at
+            .is_some()
+    }
+
+    /// The bug: 30 minutes without output and the task was purged although
+    /// its process was still running; the session then had "no background
+    /// work" and the idle cleanup closed it, killing the CLI and the command.
+    /// A task whose process runs is kept, and nothing is broadcast.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_tick_purge_keeps_a_silent_task_whose_process_is_running() {
+        let Some((map, events_tx)) =
+            session_with_silent_background_task("s-silent-pid", Some(std::process::id()), 0).await
+        else {
+            eprintln!("Skipping test: Claude CLI not installed");
+            return;
+        };
+        let mut events_rx = events_tx.subscribe();
+
+        ChatManager::tick_purge_background_tasks(
+            "s-silent-pid",
+            &map,
+            &events_tx,
+            &None,
+            Duration::from_secs(BACKGROUND_TASK_PURGE_GRACE_SECS),
+        )
+        .await;
+
+        assert!(
+            !silent_task_is_marked(&map, "s-silent-pid").await,
+            "a task whose process is running must not be marked for removal"
+        );
+        assert!(
+            events_rx.try_recv().is_err(),
+            "a quiet tick broadcasts nothing"
+        );
+    }
+
+    /// No pid was discovered (the claim often fails), but the CLI reports one
+    /// running background task: the entry is kept.
+    #[tokio::test]
+    async fn test_tick_purge_keeps_a_silent_task_while_the_cli_reports_work() {
+        let Some((map, events_tx)) =
+            session_with_silent_background_task("s-silent-cli", None, 1).await
+        else {
+            eprintln!("Skipping test: Claude CLI not installed");
+            return;
+        };
+
+        ChatManager::tick_purge_background_tasks(
+            "s-silent-cli",
+            &map,
+            &events_tx,
+            &None,
+            Duration::from_secs(BACKGROUND_TASK_PURGE_GRACE_SECS),
+        )
+        .await;
+        assert!(!silent_task_is_marked(&map, "s-silent-cli").await);
+
+        // The CLI then reports that nothing runs any more: the next tick
+        // marks the entry, as before.
+        map.read()
+            .await
+            .get("s-silent-cli")
+            .unwrap()
+            .cli_background_tasks
+            .store(0, Ordering::Relaxed);
+        ChatManager::tick_purge_background_tasks(
+            "s-silent-cli",
+            &map,
+            &events_tx,
+            &None,
+            Duration::from_secs(BACKGROUND_TASK_PURGE_GRACE_SECS),
+        )
+        .await;
+        assert!(silent_task_is_marked(&map, "s-silent-cli").await);
+    }
+
+    /// A known pid whose process is gone is dead, whatever the CLI reports
+    /// (its report is about some other task).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_tick_purge_marks_a_silent_task_whose_process_is_gone() {
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn `true`");
+        let dead_pid = child.id();
+        child.wait().expect("wait for `true`");
+
+        let Some((map, events_tx)) =
+            session_with_silent_background_task("s-silent-dead", Some(dead_pid), 1).await
+        else {
+            eprintln!("Skipping test: Claude CLI not installed");
+            return;
+        };
+
+        ChatManager::tick_purge_background_tasks(
+            "s-silent-dead",
+            &map,
+            &events_tx,
+            &None,
+            Duration::from_secs(BACKGROUND_TASK_PURGE_GRACE_SECS),
+        )
+        .await;
+        assert!(silent_task_is_marked(&map, "s-silent-dead").await);
+    }
+
+    // ========================================================================
     // T12 of plan 754a1379 — tick_purge_background_tasks (grace period purge)
     // ========================================================================
 
@@ -14151,6 +14515,7 @@ pub(crate) mod test_support {
             cancel_tools_cap: CANCEL_TOOLS_CAP,
             cancel_tools_window: Duration::from_secs(CANCEL_TOOLS_WINDOW_SECS),
             active_background_tasks: Arc::new(Mutex::new(HashMap::new())),
+            cli_background_tasks: Arc::new(AtomicUsize::new(0)),
             cancel_task_history: Arc::new(Mutex::new(VecDeque::new())),
             cancel_task_cap: CANCEL_TASK_CAP,
             cancel_task_window: Duration::from_secs(CANCEL_TASK_WINDOW_SECS),

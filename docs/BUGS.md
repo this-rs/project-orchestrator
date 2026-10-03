@@ -74,6 +74,7 @@ merge + CI verte (status: completed)
 | `session_error` (mort du CLI) non rendu par le frontend, et type mort `ClientMessage` | chat | medium | ✅ rejoue-sans | frontend#198 · `chatAssembly.sessionError.test` |
 | `useConversationWs` : trois implémentations sous le même nom ; le parseur privé du panneau de discussion lisait `tool_use.name` (le backend envoie `tool`) | chat | medium | ✅ rejoue-sans | frontend#199 (`InlineConversationPanel.events.test` rouge sur l'ancien panneau) |
 | `ChatConfig::mcp_server_config` : aucun appelant de production (`build_options` construit `McpServerConfig::Stdio`) | chat | low | ✅ preuve par absence | backend#508 (`grep` → 0 ; `NATS_URL` : `mcp_server` est un proxy HTTP) |
+| Une commande d'arrière-plan silencieuse (sortie redirigée) était déclarée morte après 30 min sans vérifier son processus ; la session, vue sans travail de fond, était fermée pour inactivité et le CLI tué avec la commande (« The CLI subprocess for this session has exited ») | chat | high | 🟠 PR | `fix/chat-idle-expiry-kills-background-work` · `background_task_is_idle_dead`, `process_alive`, `cli_background_task_count` · `test_tick_purge_keeps_a_silent_task_*` (rejoue-sans) |
 
 ### Bugs non reproduits / invalidés après vérification du code
 

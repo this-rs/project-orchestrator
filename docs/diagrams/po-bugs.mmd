@@ -50,6 +50,7 @@ graph TD
 rejoue-sans · frontend#198 + #199 · chatAssembly.sessionError.test, InlineConversationPanel.events.test
 ⚪ décisions : session_closed = branche réservée, tools_cancelled = voulu (tâche c2139265)"]
         B12["✅ ChatConfig::mcp_server_config code mort
+        B19["🟠 tâche de fond silencieuse déclarée morte après 30 min sans vérifier son processus\nsession fermée pour inactivité, CLI tué (subprocess_exited)\nPR fix/chat-idle-expiry-kills-background-work · rejoue-sans · test_tick_purge_keeps_a_silent_task_*"]
 supprimée · grep → 0 · backend#508 (670b50a8)
 NATS_URL : le serveur MCP est un proxy HTTP"]
     end
@@ -77,3 +78,4 @@ rejoue-sans · cargo +1.88 check · nexus#61"]
     REGISTRY --> B12
     REGISTRY --> B13
     REGISTRY --> B14
+    REGISTRY --> B19
