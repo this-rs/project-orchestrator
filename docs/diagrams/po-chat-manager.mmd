@@ -1,5 +1,5 @@
 %% name: po-chat-manager
-%% covers: backend:src/chat/{mod,manager,drain,post_stream,control_pump,oob_listener,config,types,skill_hook,post_tool_hook,hook_ledger,cli_auth,cli_version,model_catalog,compaction_context}.rs
+%% covers: backend:src/chat/{mod,manager,drain,post_stream,control_pump,oob_listener,config,types,skill_hook,post_tool_hook,hook_ledger,cli_auth,cli_version,model_catalog,compaction_context,message_attachments}.rs
 %% verified: d42312a2
 %% ---
 %% PROUVE : le harness de chat côté serveur — comment ChatManager lance, pilote et
@@ -29,6 +29,7 @@
 %%   src/chat/cli_auth.rs       — check_cli_auth_status
 %%   src/chat/model_catalog.rs  — ModelCatalogCache::get_models, read_claude_code_oauth_token
 %%   src/chat/compaction_context.rs — CompactionContextBuilder::build_for_task / build_for_session
+%%   src/chat/message_attachments.rs — encode, split, compose, expand_for_agent (lu à f29712ea ; le reste du diagramme reste vérifié à d42312a2)
 %%   Commandes : grep -rl nexus_claude src → 13 fichiers, 12 de prod (liste dans le nœud K1)
 %%               grep -rn 'mcp_server_config()' src → 2 tests config.rs + 1 test manager.rs, 0 prod
 %%               grep -rln from_transport src → manager.rs, post_stream.rs, oob_listener.rs (tests seulement)
@@ -134,12 +135,16 @@ flowchart TD
         CANCEL["✅ cancel_running_tools : SIGINT aux descendants SEULEMENT,<br/>jamais le control_request interrupt (le tour survit, décision d2bf0e7b) ;<br/>plafond check_and_record_cancel_cap → ToolsCancelled<br/><i>vérifié : test_cancel_cap_allows_up_to_cap_then_refuses, test_cancel_tools_result_serde_*</i>"]
         CANCELTASK["✅ cancel_task → kill_subtree(pid) → ActiveTasksUpdate ; plafond dédié<br/><i>vérifié : test_cancel_task_with_pid_calls_kill_subtree, test_cancel_task_rate_cap_enforced</i>"]
         CLOSE["🟠 close_session : interrupt → disconnect sous 5 s → retrait ;<br/>start_cleanup_task ferme les sessions expirées (session_is_expired)<br/>écrit, test non identifié dans ce relevé"]
+        ATTACH["✅ pièces jointes : compose (API, avant le manager) ajoute un bloc <po-attachments> de références<br/>au texte ; tous les chemins le portent tel quel ; stream_response l'étend en texte extrait<br/>(expand_for_agent, 60 ko max par document) juste avant l'enrichissement. Id inconnu → refus<br/><i>vérifié : message_attachments.rs 10 tests (aller-retour, nom de fichier fermant la balise, id inconnu, sans texte)</i>"]
         SENDMSG --> ROUTE
         PERM --> RAWJSON
         SETTINGS --> RAWJSON
         INTERRUPT --> CANCEL
     end
 
+    WS --> ATTACH
+    REST --> ATTACH
+    ATTACH --> ROUTE
     WS --> ROUTE
     WS --> PERM
     WS --> SETTINGS
