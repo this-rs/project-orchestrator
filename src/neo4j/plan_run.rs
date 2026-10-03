@@ -292,6 +292,7 @@ impl Neo4jClient {
             "failed" => PlanRunStatus::Failed,
             "cancelled" => PlanRunStatus::Cancelled,
             "budget_exceeded" => PlanRunStatus::BudgetExceeded,
+            "interrupted" => PlanRunStatus::Interrupted,
             _ => PlanRunStatus::Running,
         };
 
@@ -320,6 +321,9 @@ impl Neo4jClient {
                 .get::<String>("lifecycle_run_id")
                 .ok()
                 .and_then(|s| s.parse().ok()),
+            // Only `state_json` carries the cwd; a node rebuilt from its flat
+            // fields predates it, so the run cannot be resumed in a known directory.
+            cwd: None,
         })
     }
 }

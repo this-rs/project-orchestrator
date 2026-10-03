@@ -327,6 +327,10 @@ pub enum PlanRunStatus {
     Cancelled,
     /// Run was aborted because the budget was exceeded
     BudgetExceeded,
+    /// Run was left `running` by a process that no longer exists (server
+    /// restart, crash) and could not be resumed safely. Whether the work
+    /// finished is unknown: this is neither `completed` nor `failed`.
+    Interrupted,
 }
 
 impl fmt::Display for PlanRunStatus {
@@ -338,6 +342,7 @@ impl fmt::Display for PlanRunStatus {
             Self::Failed => write!(f, "failed"),
             Self::Cancelled => write!(f, "cancelled"),
             Self::BudgetExceeded => write!(f, "budget_exceeded"),
+            Self::Interrupted => write!(f, "interrupted"),
         }
     }
 }

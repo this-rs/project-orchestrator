@@ -61,7 +61,10 @@ pub use prompt::{
     build_runner_constraints, PromptBuilder, PromptSection, RunnerPromptContext, StructuredPrompt,
 };
 pub use providers::TriggerProvider;
-pub use runner::{PlanRunner, RunStatus, RUNNER_CANCEL, RUNNER_STATE};
+pub use runner::{
+    is_plan_run_live, reconcile_stale_runs, LiveRunGuard, PlanRunner, ReconcileReport, RunStatus,
+    RUNNER_CANCEL, RUNNER_STATE,
+};
 pub use state::RunnerState;
 pub use trigger::TriggerEngine;
 pub use vector::{

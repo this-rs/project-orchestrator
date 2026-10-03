@@ -3466,6 +3466,13 @@ pub trait GraphStore: Send + Sync {
         run_id: Uuid,
     ) -> Result<Vec<crate::neo4j::agent_execution::AgentExecutionNode>>;
 
+    /// Every AgentExecution still `running`, across all runs (oldest first).
+    ///
+    /// Used by the reconciliation sweep to close the ones whose process is gone.
+    async fn list_running_agent_executions(
+        &self,
+    ) -> Result<Vec<crate::neo4j::agent_execution::AgentExecutionNode>>;
+
     /// Create a USED_SKILL relationship from AgentExecution to Skill.
     async fn create_used_skill_relation(
         &self,

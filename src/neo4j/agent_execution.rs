@@ -79,6 +79,10 @@ pub enum AgentExecutionStatus {
     Completed,
     Failed,
     Timeout,
+    /// The agent was left `running` by a process that no longer exists (server
+    /// restart, crash) or by a run that ended without closing it. Whether it
+    /// finished is unknown: this is neither `completed` nor `failed`.
+    Interrupted,
 }
 
 impl std::fmt::Display for AgentExecutionStatus {
@@ -88,6 +92,7 @@ impl std::fmt::Display for AgentExecutionStatus {
             Self::Completed => write!(f, "completed"),
             Self::Failed => write!(f, "failed"),
             Self::Timeout => write!(f, "timeout"),
+            Self::Interrupted => write!(f, "interrupted"),
         }
     }
 }
@@ -98,6 +103,7 @@ impl AgentExecutionStatus {
             "completed" => Self::Completed,
             "failed" => Self::Failed,
             "timeout" => Self::Timeout,
+            "interrupted" => Self::Interrupted,
             _ => Self::Running,
         }
     }
@@ -223,6 +229,25 @@ impl Neo4jClient {
             "#,
         )
         .param("run_id", run_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut executions = Vec::new();
+        while let Some(row) = result.next().await? {
+            let node: neo4rs::Node = row.get("ae")?;
+            executions.push(self.node_to_agent_execution(&node)?);
+        }
+        Ok(executions)
+    }
+
+    /// Every AgentExecution whose status is still `running`, oldest first.
+    pub async fn list_running_agent_executions_impl(&self) -> Result<Vec<AgentExecutionNode>> {
+        let q = query(
+            r#"
+            MATCH (ae:AgentExecution {status: 'running'})
+            RETURN ae
+            ORDER BY ae.started_at ASC
+            "#,
+        );
 
         let mut result = self.graph.execute(q).await?;
         let mut executions = Vec::new();

@@ -214,108 +214,161 @@ async fn trigger_protocols_for_event(
 // Orphan Run Recovery (server startup)
 // ============================================================================
 
-/// Maximum age for a Running run before it's considered orphaned (1 hour).
-const ORPHAN_RUN_MAX_AGE_SECS: i64 = 3600;
+/// Maximum age for a Running run before the PERIODIC sweep considers it orphaned
+/// (1 hour). It does not apply at boot, see [`recover_orphaned_runs`].
+pub const ORPHAN_RUN_MAX_AGE_SECS: i64 = 3600;
+
+/// Page size when walking protocols and runs (the store caps a page).
+const RECOVERY_PAGE_SIZE: usize = 100;
+
+/// Every protocol of a project, page after page.
+async fn all_protocols(
+    store: &dyn GraphStore,
+    project_id: Uuid,
+) -> anyhow::Result<Vec<crate::protocol::Protocol>> {
+    let mut all = Vec::new();
+    loop {
+        let (page, _) = store
+            .list_protocols(project_id, None, RECOVERY_PAGE_SIZE, all.len())
+            .await?;
+        let n = page.len();
+        all.extend(page);
+        if n < RECOVERY_PAGE_SIZE {
+            return Ok(all);
+        }
+    }
+}
+
+/// Every `running` run of a protocol, page after page (collected BEFORE any run is
+/// modified, so closing runs cannot shift the pages).
+async fn all_running_runs(
+    store: &dyn GraphStore,
+    protocol_id: Uuid,
+) -> anyhow::Result<Vec<crate::protocol::ProtocolRun>> {
+    let mut all = Vec::new();
+    loop {
+        let (page, _) = store
+            .list_protocol_runs(
+                protocol_id,
+                Some(crate::protocol::RunStatus::Running),
+                RECOVERY_PAGE_SIZE,
+                all.len(),
+            )
+            .await?;
+        let n = page.len();
+        all.extend(page);
+        if n < RECOVERY_PAGE_SIZE {
+            return Ok(all);
+        }
+    }
+}
 
 /// Recover orphaned protocol runs at server startup.
 ///
-/// Scans all projects for `ProtocolRun` nodes with `status = running` whose
-/// last state entry is older than [`ORPHAN_RUN_MAX_AGE_SECS`] (a run that keeps
-/// making progress is not orphaned just because it started long ago). Runs that
-/// still have a live runner in this process (present in `ACTIVE_RUNNERS`) are
-/// skipped: recovering them would fail them or spawn a second runner. The
-/// remaining runs were likely interrupted by a server crash or restart and will
-/// never complete on their own.
+/// At boot `ACTIVE_RUNNERS` is empty, so every run still `running` has no runner by
+/// construction: it is recovered whatever its age (see
+/// [`recover_orphaned_runs_older_than`] for the periodic variant, which keeps a
+/// threshold). Runner-managed runs are re-spawned when an emitter is available;
+/// the others are marked `Failed` ("Recovered: server restarted during execution").
 ///
-/// Each orphaned run is marked as `Failed` with the error message
-/// "Recovered: server restarted during execution".
-///
-/// This function should be called once at server startup, before spawning
-/// the scheduler or handling any requests.
+/// Call once at server startup, before spawning the scheduler.
 pub async fn recover_orphaned_runs(
     store: Arc<dyn GraphStore>,
     emitter: Option<Arc<dyn EventEmitter>>,
+) -> anyhow::Result<u32> {
+    recover_orphaned_runs_older_than(store, emitter, 0).await
+}
+
+/// Recover `running` protocol runs with no live runner in this process whose last
+/// activity is at least `min_age_secs` old (a run that keeps making progress is not
+/// orphaned just because it started long ago). Runs present in `ACTIVE_RUNNERS` are
+/// skipped: recovering them would fail them or spawn a second runner.
+///
+/// Every protocol and every run is handled independently: an error is logged and the
+/// sweep goes on. Projects, protocols and runs are walked page by page.
+pub async fn recover_orphaned_runs_older_than(
+    store: Arc<dyn GraphStore>,
+    emitter: Option<Arc<dyn EventEmitter>>,
+    min_age_secs: i64,
 ) -> anyhow::Result<u32> {
     let projects = store.list_projects().await?;
     let now = chrono::Utc::now();
     let mut total_recovered = 0u32;
 
     for project in &projects {
-        // List all protocols for this project
-        let (protocols, _) = store.list_protocols(project.id, None, 100, 0).await?;
+        let protocols = match all_protocols(&*store, project.id).await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(project_id = %project.id, "Orphan recovery: cannot list protocols: {}", e);
+                continue;
+            }
+        };
 
         for protocol in &protocols {
-            // List running runs for this protocol
-            let (running_runs, _) = store
-                .list_protocol_runs(
-                    protocol.id,
-                    Some(crate::protocol::RunStatus::Running),
-                    100,
-                    0,
-                )
-                .await?;
+            let running_runs = match all_running_runs(&*store, protocol.id).await {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(protocol_id = %protocol.id, "Orphan recovery: cannot list runs: {}", e);
+                    continue;
+                }
+            };
 
             for run in &running_runs {
-                // A runner is alive in this process: not an orphan. Recovering
-                // it would fail it or spawn a second runner for the same run.
+                // A runner is alive in this process: not an orphan.
                 if ACTIVE_RUNNERS.contains_key(&run.id) {
                     continue;
                 }
 
-                // Age since the last state entry, so a run that keeps making
-                // progress is not considered orphaned just because it started long ago.
+                // Age since the last state entry.
                 let last_activity = run
                     .states_visited
                     .last()
                     .map(|sv| sv.entered_at)
                     .unwrap_or(run.started_at);
                 let age_secs = (now - last_activity).num_seconds();
-                if age_secs > ORPHAN_RUN_MAX_AGE_SECS {
-                    if run.runner_managed {
-                        // Re-spawn the runner instead of failing
-                        if let Some(ref emitter) = emitter {
-                            tracing::info!(
-                                run_id = %run.id,
-                                protocol_id = %protocol.id,
-                                protocol_name = %protocol.name,
-                                age_secs,
-                                "Re-spawning runner for orphaned runner-managed run"
-                            );
-                            spawn_protocol_runner(store.clone(), run.id, emitter.clone(), None);
-                            total_recovered += 1;
-                        } else {
-                            let mut recovered_run = run.clone();
-                            recovered_run
-                                .fail("Recovered: server restarted (no emitter for re-spawn)");
-                            if let Err(e) = store.update_protocol_run(&mut recovered_run).await {
-                                tracing::warn!(
-                                    run_id = %run.id,
-                                    "Failed to recover orphaned run: {}", e
-                                );
-                            } else {
-                                total_recovered += 1;
-                            }
-                        }
-                    } else {
-                        // Not runner-managed — mark as failed
-                        let mut recovered_run = run.clone();
-                        recovered_run.fail("Recovered: server restarted during execution");
-                        if let Err(e) = store.update_protocol_run(&mut recovered_run).await {
-                            tracing::warn!(
-                                run_id = %run.id,
-                                protocol_id = %protocol.id,
-                                "Failed to recover orphaned run: {}", e
-                            );
-                        } else {
-                            tracing::info!(
-                                run_id = %run.id,
-                                protocol_id = %protocol.id,
-                                protocol_name = %protocol.name,
-                                age_secs,
-                                "Recovered orphaned protocol run"
-                            );
-                            total_recovered += 1;
-                        }
+                if age_secs < min_age_secs {
+                    continue;
+                }
+
+                if run.runner_managed && emitter.is_some() {
+                    if let Some(ref emitter) = emitter {
+                        tracing::info!(
+                            run_id = %run.id,
+                            protocol_id = %protocol.id,
+                            protocol_name = %protocol.name,
+                            age_secs,
+                            "Re-spawning runner for orphaned runner-managed run"
+                        );
+                        spawn_protocol_runner(store.clone(), run.id, emitter.clone(), None);
+                        total_recovered += 1;
+                    }
+                    continue;
+                }
+
+                let message = if run.runner_managed {
+                    "Recovered: server restarted (no emitter for re-spawn)"
+                } else {
+                    "Recovered: server restarted during execution"
+                };
+                let mut recovered_run = run.clone();
+                recovered_run.fail(message);
+                match store.update_protocol_run(&mut recovered_run).await {
+                    Ok(_) => {
+                        tracing::info!(
+                            run_id = %run.id,
+                            protocol_id = %protocol.id,
+                            protocol_name = %protocol.name,
+                            age_secs,
+                            "Recovered orphaned protocol run"
+                        );
+                        total_recovered += 1;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            run_id = %run.id,
+                            protocol_id = %protocol.id,
+                            "Failed to recover orphaned run: {}", e
+                        );
                     }
                 }
             }
@@ -330,6 +383,53 @@ pub async fn recover_orphaned_runs(
     }
 
     Ok(total_recovered)
+}
+
+/// Protocols whose `schedule` the scheduler does not understand, as
+/// `(protocol name, schedule value)`. Logs ONE warning per such protocol.
+///
+/// Such a protocol is never run by the scheduler (see `schedule_interval_secs`):
+/// the warning makes that silent no-op visible. Call at server startup.
+pub async fn unrecognized_schedules(store: &dyn GraphStore) -> Vec<(String, String)> {
+    let mut found = Vec::new();
+    let projects = match store.list_projects().await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("Schedule audit: cannot list projects: {}", e);
+            return found;
+        }
+    };
+    for project in &projects {
+        let protocols = match all_protocols(store, project.id).await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(project_id = %project.id, "Schedule audit: cannot list protocols: {}", e);
+                continue;
+            }
+        };
+        for protocol in protocols {
+            let Some(schedule) = protocol
+                .trigger_config
+                .as_ref()
+                .and_then(|c| c.schedule.as_deref())
+            else {
+                continue;
+            };
+            if crate::protocol::SUPPORTED_SCHEDULES
+                .iter()
+                .all(|(name, _)| *name != schedule)
+            {
+                tracing::warn!(
+                    protocol = %protocol.name,
+                    schedule,
+                    "Protocol has an unrecognized schedule and will never run on a schedule \
+                     (accepted: hourly, daily, weekly)"
+                );
+                found.push((protocol.name.clone(), schedule.to_string()));
+            }
+        }
+    }
+    found
 }
 
 // ============================================================================
@@ -436,15 +536,14 @@ const SCHEDULER_INTERVAL_SECS: u64 = 3600;
 
 /// Schedule thresholds: how long since `last_triggered_at` before re-triggering.
 fn schedule_interval_secs(schedule: &str) -> Option<i64> {
-    match schedule {
-        "hourly" => Some(3600),   // 1 hour
-        "daily" => Some(86400),   // 24 hours
-        "weekly" => Some(604800), // 7 days
-        _ => {
-            tracing::warn!(schedule, "Unknown schedule value — ignoring");
-            None
-        }
+    let found = crate::protocol::SUPPORTED_SCHEDULES
+        .iter()
+        .find(|(name, _)| *name == schedule)
+        .map(|(_, secs)| *secs);
+    if found.is_none() {
+        tracing::warn!(schedule, "Unknown schedule value — ignoring");
     }
+    found
 }
 
 /// Spawn the periodic protocol scheduler as a background task.
@@ -475,7 +574,13 @@ pub fn spawn_protocol_scheduler(
             tracing::debug!("Protocol scheduler: tick — orphan recovery + timeout + scheduling");
 
             // 1. Recover orphaned runs (same logic as startup, now periodic)
-            if let Err(e) = recover_orphaned_runs(store.clone(), emitter.clone()).await {
+            if let Err(e) = recover_orphaned_runs_older_than(
+                store.clone(),
+                emitter.clone(),
+                ORPHAN_RUN_MAX_AGE_SECS,
+            )
+            .await
+            {
                 tracing::warn!("Protocol scheduler: orphan recovery failed: {}", e);
             }
 
@@ -992,9 +1097,13 @@ mod tests {
         run.started_at = chrono::Utc::now() - chrono::Duration::minutes(5);
         store.create_protocol_run(&run).await.unwrap();
 
-        let count = recover_orphaned_runs(store.clone() as Arc<dyn GraphStore>, None)
-            .await
-            .unwrap();
+        let count = recover_orphaned_runs_older_than(
+            store.clone() as Arc<dyn GraphStore>,
+            None,
+            ORPHAN_RUN_MAX_AGE_SECS,
+        )
+        .await
+        .unwrap();
         assert_eq!(count, 0);
 
         // Run should still be Running
@@ -1074,13 +1183,137 @@ mod tests {
         }
         store.create_protocol_run(&run).await.unwrap();
 
-        let count = recover_orphaned_runs(store.clone() as Arc<dyn GraphStore>, None)
-            .await
-            .unwrap();
+        let count = recover_orphaned_runs_older_than(
+            store.clone() as Arc<dyn GraphStore>,
+            None,
+            ORPHAN_RUN_MAX_AGE_SECS,
+        )
+        .await
+        .unwrap();
         assert_eq!(count, 0);
 
         let updated = store.get_protocol_run(run.id).await.unwrap().unwrap();
         assert_eq!(updated.status, crate::protocol::RunStatus::Running);
+    }
+
+    #[tokio::test]
+    async fn boot_recovery_closes_a_run_that_is_only_minutes_old() {
+        // At boot ACTIVE_RUNNERS is empty, so a `running` run has no runner by
+        // construction: its age is irrelevant.
+        let store = Arc::new(MockGraphStore::new());
+        let (_, protocol) = setup_event_triggered_protocol(
+            &store,
+            TriggerMode::Event,
+            vec!["post_sync".to_string()],
+        )
+        .await;
+        let mut run = crate::protocol::ProtocolRun::new(protocol.id, protocol.entry_state, "Start");
+        run.started_at = chrono::Utc::now() - chrono::Duration::minutes(5);
+        store.create_protocol_run(&run).await.unwrap();
+
+        let count = recover_orphaned_runs(store.clone() as Arc<dyn GraphStore>, None)
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+        let updated = store.get_protocol_run(run.id).await.unwrap().unwrap();
+        assert_eq!(updated.status, crate::protocol::RunStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn recovery_closes_every_running_run_not_only_the_first_hundred() {
+        let store = Arc::new(MockGraphStore::new());
+        let (_, protocol) = setup_event_triggered_protocol(
+            &store,
+            TriggerMode::Event,
+            vec!["post_sync".to_string()],
+        )
+        .await;
+        // Child runs are exempt from the one-running-run-per-protocol guard.
+        let parent = Uuid::new_v4();
+        for _ in 0..130 {
+            let mut run =
+                crate::protocol::ProtocolRun::new(protocol.id, protocol.entry_state, "Start");
+            run.parent_run_id = Some(parent);
+            run.started_at = chrono::Utc::now() - chrono::Duration::hours(3);
+            if let Some(sv) = run.states_visited.first_mut() {
+                sv.entered_at = run.started_at;
+            }
+            store.create_protocol_run(&run).await.unwrap();
+        }
+
+        let count = recover_orphaned_runs(store.clone() as Arc<dyn GraphStore>, None)
+            .await
+            .unwrap();
+        assert_eq!(count, 130, "runs beyond the first page were left running");
+        let (still_running, _) = store
+            .list_protocol_runs(
+                protocol.id,
+                Some(crate::protocol::RunStatus::Running),
+                500,
+                0,
+            )
+            .await
+            .unwrap();
+        assert!(still_running.is_empty());
+    }
+
+    #[tokio::test]
+    async fn recovery_visits_every_protocol_not_only_the_first_hundred() {
+        let store = Arc::new(MockGraphStore::new());
+        let (project_id, first) = setup_event_triggered_protocol(
+            &store,
+            TriggerMode::Event,
+            vec!["post_sync".to_string()],
+        )
+        .await;
+        let mut run_ids = Vec::new();
+        for i in 0..120 {
+            let p = if i == 0 {
+                first.clone()
+            } else {
+                let mut p = first.clone();
+                p.id = Uuid::new_v4();
+                p.name = format!("proto-{i}");
+                store.upsert_protocol(&p).await.unwrap();
+                p
+            };
+            let mut run = crate::protocol::ProtocolRun::new(p.id, p.entry_state, "Start");
+            run.started_at = chrono::Utc::now() - chrono::Duration::hours(3);
+            if let Some(sv) = run.states_visited.first_mut() {
+                sv.entered_at = run.started_at;
+            }
+            store.create_protocol_run(&run).await.unwrap();
+            run_ids.push(run.id);
+        }
+        let _ = project_id;
+
+        let count = recover_orphaned_runs(store.clone() as Arc<dyn GraphStore>, None)
+            .await
+            .unwrap();
+        assert_eq!(count, 120);
+        for id in run_ids {
+            let r = store.get_protocol_run(id).await.unwrap().unwrap();
+            assert_eq!(r.status, crate::protocol::RunStatus::Failed);
+        }
+    }
+
+    #[tokio::test]
+    async fn unrecognized_schedule_is_reported_once_per_protocol_with_name_and_value() {
+        let store = Arc::new(MockGraphStore::new());
+        let (_, mut protocol) =
+            setup_scheduled_protocol(&store, TriggerMode::Scheduled, Some("6h")).await;
+        protocol.name = "fsm-watchdog".to_string();
+        store.upsert_protocol(&protocol).await.unwrap();
+
+        let found = unrecognized_schedules(&*store).await;
+        assert_eq!(found, vec![("fsm-watchdog".to_string(), "6h".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn recognized_schedules_are_not_reported() {
+        let store = Arc::new(MockGraphStore::new());
+        let _ = setup_scheduled_protocol(&store, TriggerMode::Scheduled, Some("daily")).await;
+        assert!(unrecognized_schedules(&*store).await.is_empty());
     }
 
     #[tokio::test]

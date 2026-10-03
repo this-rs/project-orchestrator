@@ -326,6 +326,31 @@ pub struct TriggerConfig {
     pub conditions: Vec<String>,
 }
 
+/// The `schedule` values the scheduler understands, with their interval in seconds.
+pub const SUPPORTED_SCHEDULES: &[(&str, i64)] =
+    &[("hourly", 3600), ("daily", 86_400), ("weekly", 604_800)];
+
+impl TriggerConfig {
+    /// Refuse a configuration the scheduler would silently ignore: a `schedule`
+    /// that is not one of [`SUPPORTED_SCHEDULES`]. The error lists the accepted values.
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(schedule) = self.schedule.as_deref() {
+            if SUPPORTED_SCHEDULES
+                .iter()
+                .all(|(name, _)| *name != schedule)
+            {
+                let accepted: Vec<&str> = SUPPORTED_SCHEDULES.iter().map(|(n, _)| *n).collect();
+                return Err(format!(
+                    "unsupported trigger_config.schedule '{}': accepted values are {}",
+                    schedule,
+                    accepted.join(", ")
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 // ============================================================================
 // Protocol
 // ============================================================================
@@ -1110,6 +1135,31 @@ mod tests {
             assert_eq!(cat.to_string(), expected);
             assert_eq!(ProtocolCategory::from_str(expected).unwrap(), cat);
         }
+    }
+
+    #[test]
+    fn trigger_config_refuses_an_unknown_schedule_and_lists_the_accepted_ones() {
+        let cfg = TriggerConfig {
+            schedule: Some("6h".to_string()),
+            ..Default::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("6h"), "{err}");
+        for accepted in ["hourly", "daily", "weekly"] {
+            assert!(err.contains(accepted), "{err}");
+        }
+    }
+
+    #[test]
+    fn trigger_config_accepts_known_schedules_and_no_schedule() {
+        for s in ["hourly", "daily", "weekly"] {
+            let cfg = TriggerConfig {
+                schedule: Some(s.to_string()),
+                ..Default::default()
+            };
+            assert!(cfg.validate().is_ok(), "{s}");
+        }
+        assert!(TriggerConfig::default().validate().is_ok());
     }
 
     #[test]
