@@ -1,7 +1,7 @@
 <!-- Genere par scripts/diagrams/check-index.mjs --write-orphans. Ne pas editer a la main. -->
-<!-- orphan-ceiling: 1120 -->
+<!-- orphan-ceiling: 1119 -->
 <!-- orphan-ceiling-backend: 446 -->
-<!-- orphan-ceiling-frontend: 543 -->
+<!-- orphan-ceiling-frontend: 542 -->
 <!-- orphan-ceiling-nexus: 4 -->
 <!-- orphan-ceiling-website: 127 -->
 
@@ -11,15 +11,15 @@ Un fichier source est **orphelin** quand aucun `covers` de `INDEX.yml` ne le mat
 aucun diagramme ne repond de son comportement. Cette liste est publiee pour etre honnete
 sur ce que la cartographie couvre reellement — on ne reduit pas le denominateur, on la reduit elle.
 
-**1120 orphelins sur 1254 fichiers source (89.3 %).**
+**1119 orphelins sur 1253 fichiers source (89.3 %).**
 
 SEULE une entree `verified` possede un fichier. Une entree `planned` annonce un perimetre
 sans qu'un diagramme existe : compter ses globs ferait baisser ce nombre sans qu'une ligne
 soit ecrite, et l'index acheterait du credit sur des intentions.
-Sur les 1120 orphelins, **440 sont deja reserves** par une entree `planned` :
+Sur les 1119 orphelins, **440 sont deja reserves** par une entree `planned` :
 leur proprietaire est designe, son diagramme reste a ecrire.
 
-Le plafond est **1120** : le verificateur echoue si le nombre reel le depasse.
+Le plafond est **1119** : le verificateur echoue si le nombre reel le depasse.
 Il ne peut que descendre. Ajouter un fichier source sans proprietaire fait echouer la build ;
 la sortie est un glob `covers`, pas un plafond plus haut. `--raise-ceiling` existe mais exige
 une raison ecrite, et un plafond releve se voit dans la revue.
@@ -95,7 +95,7 @@ collision entre les deux index est une erreur, pas un arrangement.
 - `src/utils/` (3) : `file_path_extractor.rs`, `mod.rs`, `paths.rs`
 - `src/vault/` (7) : `agent_cli.rs`, `crypto.rs`, `grants.rs`, `mask.rs`, `mod.rs`, `service.rs`, `store.rs`
 
-## frontend (543)
+## frontend (542)
 
 - `src/` (2) : `App.tsx`, `main.tsx`
 - `src/adapters/` (3) : `MilestoneGraphAdapter.ts`, `PlanGraphAdapter.ts`, `TaskGraphAdapter.ts`
@@ -133,7 +133,7 @@ collision entre les deux index est une erreur, pas un arrangement.
 - `src/components/plans/` (3) : `PlanUniverse3D.tsx`, `WaveView.tsx`, `usePlanUniverse.ts`
 - `src/components/protocols/` (13) : `Explainer.tsx`, `FsmBreadcrumbs.tsx`, `FsmViewer.tsx`, `GanttTimeline.tsx`, `RecentRunsPanel.tsx`, `RfcDashboardPage.tsx`, `RfcStatusBadge.tsx`, `RunStatusBadge.tsx`, `RunTreeView.tsx`, `ScheduledActionsPanel.tsx`, `index.ts`, `rfcLifecycle.ts`, `runHelpers.ts`
 - `src/components/registry/` (7) : `ImportWizard.tsx`, `SkillBrowser.tsx`, `TrustBadge.tsx`, `concepts.tsx`, `fetchAll.ts`, `index.ts`, `metrics.ts`
-- `src/components/runner/` (15) : `AgentExecutionDetail.tsx`, `BudgetEditor.tsx`, `CancelButton.tsx`, `ConversationPanel.tsx`, `InlineConversation.tsx`, `LiveProgress.tsx`, `PlanRunHistory.tsx`, `PlanRunRow.tsx`, `RunnerHeader.tsx`, `StatsRow.tsx`, `WaveAgentCard.tsx`, `WaveSection.tsx`, `WsStatusIndicator.tsx`, `index.ts`, `shared.ts`
+- `src/components/runner/` (14) : `AgentExecutionDetail.tsx`, `BudgetEditor.tsx`, `CancelButton.tsx`, `InlineConversation.tsx`, `LiveProgress.tsx`, `PlanRunHistory.tsx`, `PlanRunRow.tsx`, `RunnerHeader.tsx`, `StatsRow.tsx`, `WaveAgentCard.tsx`, `WaveSection.tsx`, `WsStatusIndicator.tsx`, `index.ts`, `shared.ts`
 - `src/components/settings/` (1) : `SettingRow.tsx`
 - `src/components/tasks/` (5) : `DetailRows.tsx`, `RowStateLink.tsx`, `StatusBreakdown.tsx`, `TaskUniverse3D.tsx`, `useTaskUniverse.ts`
 - `src/components/today/` (10) : `AttentionCard.tsx`, `ContinueSheet.tsx`, `LaneChips.tsx`, `MiniThreadGraph.tsx`, `PlanRunRow.tsx`, `ThinkingList.tsx`, `ThreadRow.tsx`, `TodayView.tsx`, `bands.ts`, `startHere.ts`

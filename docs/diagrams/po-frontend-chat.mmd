@@ -1,10 +1,10 @@
 %% name: po-frontend-chat
 %% covers: frontend:src/services/{chatWebSocket,chat,wsAdapter}.ts frontend:src/hooks/{useChat,useChatUrlSync,useSessionTree}.ts frontend:src/hooks/runner/useConversationWs.ts frontend:src/atoms/{chat,modelCatalog}.ts frontend:src/utils/chatAssembly.ts frontend:src/types/chat.ts frontend:src/constants/models.ts frontend:src/components/chat/{ChatPanel,ChatInput,ChatMessages,ChatMessageBubble,ChatSessionContext,PermissionRequestBlock,PermissionSettingsPanel,SessionList}.tsx frontend:src/components/chat/{messageQueue,inputAction,chatUrlState,sessionListUtils}.ts frontend:src/components/chat/tools/**
-%% verified: d42312a2
+%% verified: ff5bb7b0
 %% ---
 %% PROUVE : le harness de chat côté navigateur — du socket /ws/chat/{id} au rendu
 %%   des blocs et à la réponse aux demandes de permission — tel que le code le fait
-%%   au sha frontend 575bce1 (relu le 2026-10-02 ; le sha `verified` ci-dessus est
+%%   au sha frontend 575bce1 (relu le 2026-10-02), puis recoupé avec frontend 7e664ea (#198, #199) ; le sha `verified` ci-dessus est
 %%   celui du dépôt backend qui porte cet index).
 %% ---
 %% SOURCES LUES (frontend@575bce1) :
@@ -27,7 +27,7 @@
 %%     (groupBlocksByAgent), ChatSessionContext.tsx, PermissionRequestBlock.tsx (classifyTool),
 %%     PermissionSettingsPanel.tsx, SessionList.tsx, messageQueue.ts, inputAction.ts
 %%     (deriveInputAction), chatUrlState.ts, sessionListUtils.ts, tools/index.tsx (TOOL_REGISTRY)
-%%   Commandes : grep -rn 'function useConversationWs' src  → 3 définitions
+%%   Commandes : grep -rn 'function useConversationWs' src  → 1 définition (frontend@7e664ea ; 3 avant #199)
 %%               grep -n 'session_error\|tools_cancelled' src/hooks/useChat.ts src/utils/chatAssembly.ts → 0
 %%               grep -rn 'ClientMessage\b' src | grep -v WsChatClientMessage → 0 (type supprimé, frontend#198)
 %% ---
@@ -117,7 +117,7 @@ flowchart TD
     subgraph readonly["Lecteurs seuls — hooks/runner/useConversationWs.ts"]
         direction TB
         RO["🟠 useConversationWs : last_event=0, rejeu complet,<br/>n'envoie que #quot;ready#quot;, reconstruit historyEventsToMessages<br/>à chaque événement — écrit, sans test"]
-        DUP["🔴 trois implémentations sous le même nom useConversationWs (PAS des copies) :<br/>hooks/runner/useConversationWs.ts passe par historyEventsToMessages ;<br/>ConversationPanel.tsx et InlineConversationPanel.tsx ont chacun un ancien parseur privé<br/>(type local ConversationMessage) qui ne l'utilise pas — seul session_error y a été ajouté<br/><i>vérifié : grep -c historyEventsToMessages sur les trois fichiers → 4, 0, 0</i>"]
+        DUP["✅ UNE seule implémentation de useConversationWs : hooks/runner/useConversationWs.ts (assembleur partagé<br/>historyEventsToMessages + ChatMessageBubble), utilisée par runner/InlineConversation, ChatSessionPage et<br/>discussions/InlineConversationPanel ; le ConversationPanel du runner, que personne n'importait, est supprimé<br/><i>vérifié : grep -rn 'function useConversationWs' src → 1 ; InlineConversationPanel.events.test (rouge sur l'ancien panneau : tool_use lu par .name au lieu de .tool) ; frontend#199</i>"]
         RO --> DUP
     end
 
